@@ -1,0 +1,20 @@
+[package]
+name = "rs3-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Cryptographic boundaries for rs3"
+
+[dependencies]
+hex.workspace = true
+hmac.workspace = true
+rs3-types.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+/target/
+/.direnv/
+/.env
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*.tmp
+*.log
+result
+result-*
+/.local/
+/scratch/

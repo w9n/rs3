@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/rs3-crypto",
+  "crates/rs3-index",
+  "crates/rs3-k8s",
+  "crates/rs3-repository",
+  "crates/rs3-server",
+  "crates/rs3-storage",
+  "crates/rs3-types",
+  "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-only"
+repository = "https://github.com/w9n/rs3"
+authors = ["rs3 contributors"]
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+async-trait = "0.1.88"
+bytes = "1.10.1"
+clap = { version = "4.5.37", features = ["derive", "env"] }
+hex = "0.4.3"
+hmac = "0.12.1"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.8"
+thiserror = "2.0.12"
+tokio = { version = "1.44.2", features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
+zeroize = "1.8.1"
+
+rs3-crypto = { path = "crates/rs3-crypto" }
+rs3-index = { path = "crates/rs3-index" }
+rs3-k8s = { path = "crates/rs3-k8s" }
+rs3-repository = { path = "crates/rs3-repository" }
+rs3-storage = { path = "crates/rs3-storage" }
+rs3-types = { path = "crates/rs3-types" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"

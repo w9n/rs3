@@ -1,0 +1,21 @@
+[package]
+name = "rs3-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Object-store abstraction for rs3"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+rs3-types.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

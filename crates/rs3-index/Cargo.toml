@@ -1,0 +1,17 @@
+[package]
+name = "rs3-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Index delta and checkpoint model for rs3"
+
+[dependencies]
+rs3-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

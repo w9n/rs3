@@ -1,0 +1,17 @@
+[package]
+name = "rs3-k8s"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Kubernetes checkpoint anchoring contracts for rs3"
+
+[dependencies]
+async-trait.workspace = true
+rs3-types.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
