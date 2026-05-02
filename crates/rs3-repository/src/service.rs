@@ -7,6 +7,7 @@ use crate::model::{
     RepositoryObjectMetadata, RepositoryPutOptions,
 };
 use crate::namespace::{existing_blind_keys, first_namespace_entry, prefix_tokens_for_key};
+use crate::payload::{open_payload_object, seal_payload_object};
 use crate::state::{RepositoryState, TrustedManifest, next_sequence, object_material};
 use bytes::Bytes;
 use rs3_anchor::CheckpointAnchor;
@@ -87,11 +88,14 @@ where
             (sequence, object_id, manifest_id, stale_blind_keys)
         };
 
+        let plaintext_len = u64::try_from(body.len())
+            .map_err(|_| StorageError::Provider("payload length does not fit in u64".to_owned()))?;
+        let payload = seal_payload_object(&keyring, &object_id, &body)?;
         let storage_metadata = self
             .store
             .put(
                 &object_id,
-                body,
+                payload,
                 PutOptions {
                     retention: options.retention.clone(),
                     content_type: None,
@@ -108,14 +112,14 @@ where
             blind_key: primary_blind_key.blind_key,
             object_id,
             manifest_id: manifest_id.clone(),
-            content_len: storage_metadata.content_len,
+            content_len: plaintext_len,
             modified_at_ms,
             generation: sequence,
             retention: storage_metadata.retention.clone(),
         };
         let manifest = TrustedManifest {
             key: key.clone(),
-            content_len: storage_metadata.content_len,
+            content_len: plaintext_len,
             modified_at_ms,
             retention: storage_metadata.retention,
         };
@@ -185,11 +189,11 @@ where
 
     /// Reads a client-visible object or byte range.
     pub async fn get_range(&self, key: &LogicalPath, range: ByteRange) -> Result<Bytes> {
-        let object_id = self.object_id_for_key(key)?;
-        self.store
-            .get_range(&object_id, range)
-            .await
-            .map_err(Into::into)
+        let keyring = self.keyring()?;
+        let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
+        let object_id = self.object_id_for_candidates(key, &lookup_blind_keys)?;
+        let body = self.store.get_range(&object_id, ByteRange::Full).await?;
+        open_payload_object(&keyring, &object_id, body, range)
     }
 
     /// Lists client-visible entries for a prefix.
@@ -281,6 +285,11 @@ where
         let entry = first_namespace_entry(&state.namespace, &lookup_blind_keys)
             .ok_or_else(|| RepositoryError::NotFound(key.clone()))?
             .clone();
+        let content_len = state
+            .manifests
+            .get(&entry.manifest_id)
+            .map(|manifest| manifest.content_len)
+            .unwrap_or(entry.content_len);
         let sequence = next_sequence(&mut state)?;
         let material = object_material(key.as_str(), sequence);
         let manifest_id = keyring.derive_manifest_id(&material)?;
@@ -292,7 +301,7 @@ where
             prefix_tokens_for_key(&keyring, &updated.namespace_key_id, key.as_str())?;
         let manifest = TrustedManifest {
             key: key.clone(),
-            content_len: backend.content_len,
+            content_len,
             modified_at_ms: backend
                 .modified_at_ms
                 .unwrap_or_else(|| sequence.get() as i64),
@@ -308,12 +317,6 @@ where
         state.manifests.insert(manifest_id, manifest.clone());
 
         Ok(manifest.into_metadata())
-    }
-
-    fn object_id_for_key(&self, key: &LogicalPath) -> Result<BackendObjectId> {
-        let keyring = self.keyring()?;
-        let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
-        self.object_id_for_candidates(key, &lookup_blind_keys)
     }
 
     fn object_id_for_candidates(

@@ -104,6 +104,13 @@ fn signing_keyring() -> KeyRing {
             2,
         ),
         key_material(
+            "content",
+            KeyPurpose::Content,
+            KeyStatus::Primary,
+            "xchacha20poly1305",
+            4,
+        ),
+        key_material(
             "signing",
             KeyPurpose::CheckpointSigning,
             KeyStatus::Primary,

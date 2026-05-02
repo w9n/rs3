@@ -38,7 +38,7 @@ fn key(value: &str) -> LogicalPath {
     }
 }
 
-fn backend_object_id(value: &str) -> BackendObjectId {
+pub(crate) fn backend_object_id(value: &str) -> BackendObjectId {
     match BackendObjectId::new(value) {
         Ok(object_id) => object_id,
         Err(error) => panic!("{error}"),
@@ -87,6 +87,16 @@ fn checkpoint_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMateria
     )
 }
 
+fn content_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMaterial {
+    key_material(
+        value,
+        KeyPurpose::Content,
+        status,
+        "xchacha20poly1305",
+        secret_byte,
+    )
+}
+
 fn metadata_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMaterial {
     key_material(
         value,
@@ -122,6 +132,12 @@ fn key_material(
 fn keyring(mut keys: Vec<KeyMaterial>) -> KeyRing {
     if !keys
         .iter()
+        .any(|key| key.descriptor().purpose == KeyPurpose::Content)
+    {
+        keys.push(content_key("content", KeyStatus::Primary, 4));
+    }
+    if !keys
+        .iter()
         .any(|key| key.descriptor().purpose == KeyPurpose::Metadata)
     {
         keys.push(metadata_key("metadata", KeyStatus::Primary, 2));
@@ -133,11 +149,21 @@ fn keyring(mut keys: Vec<KeyMaterial>) -> KeyRing {
     }
 }
 
-fn signing_keyring() -> KeyRing {
+pub(crate) fn signing_keyring() -> KeyRing {
     keyring(vec![
         namespace_key("namespace", KeyStatus::Primary, 1),
         metadata_key("metadata", KeyStatus::Primary, 2),
         checkpoint_key("signing", KeyStatus::Primary, 3),
+        content_key("content", KeyStatus::Primary, 4),
+    ])
+}
+
+pub(crate) fn wrong_content_keyring() -> KeyRing {
+    keyring(vec![
+        namespace_key("namespace", KeyStatus::Primary, 1),
+        metadata_key("metadata", KeyStatus::Primary, 2),
+        checkpoint_key("signing", KeyStatus::Primary, 3),
+        content_key("content", KeyStatus::Primary, 44),
     ])
 }
 
@@ -401,6 +427,77 @@ async fn backend_object_ids_do_not_contain_client_key() {
 }
 
 #[tokio::test]
+async fn backend_payload_does_not_store_plaintext() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::new(store.clone(), secret());
+    let client_key = key("p/12/encrypted-client-blob");
+    let plaintext = Bytes::from_static(b"very sensitive payload marker");
+
+    let put = repo
+        .put(
+            client_key.clone(),
+            plaintext.clone(),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let payload = must_storage(store.list_prefix("segments/").await)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("missing payload object"));
+    let backend_body = must_storage(store.get_range(&payload.object_id, ByteRange::Full).await);
+    let repository_body = repo.get_range(&client_key, ByteRange::Full).await;
+    let head = repo.head(&client_key);
+
+    assert_ne!(backend_body, plaintext);
+    assert_body_does_not_contain(&backend_body, &["very sensitive payload marker"]);
+    assert_eq!(must(repository_body), plaintext);
+    assert_eq!(must(head).content_len, 29);
+    assert!(payload.content_len > 29);
+}
+
+#[tokio::test]
+async fn tampered_backend_payload_fails_repository_read() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::new(store.clone(), secret());
+    let client_key = key("p/12/tampered");
+
+    let put = repo
+        .put(
+            client_key.clone(),
+            Bytes::from_static(b"payload"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let payload = must_storage(store.list_prefix("segments/").await)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("missing payload object"));
+    let mut backend_body =
+        must_storage(store.get_range(&payload.object_id, ByteRange::Full).await).to_vec();
+    let last = backend_body
+        .last_mut()
+        .unwrap_or_else(|| panic!("payload object is empty"));
+    *last ^= 0x01;
+
+    let overwrite = store
+        .put(
+            &payload.object_id,
+            Bytes::from(backend_body),
+            PutOptions::default(),
+        )
+        .await;
+    assert!(overwrite.is_ok());
+
+    let read = repo.get_range(&client_key, ByteRange::Full).await;
+
+    assert!(matches!(read, Err(RepositoryError::Crypto(_))));
+}
+
+#[tokio::test]
 async fn range_get_uses_repository_mapping() {
     let repo = Repository::new(MemoryBlobStore::new(), secret());
     let key = key("p/12/abcdef");
@@ -485,6 +582,62 @@ async fn namespace_rotation_keeps_old_objects_readable_and_listable() {
             .collect::<Vec<_>>(),
         vec![new_key, old_key]
     );
+}
+
+#[tokio::test]
+async fn content_rotation_reads_old_enabled_payloads_and_uses_primary_for_new_writes() {
+    let repo = Repository::with_keyring(
+        MemoryBlobStore::new(),
+        keyring(vec![
+            namespace_key("namespace", KeyStatus::Primary, 1),
+            content_key("old-content", KeyStatus::Primary, 4),
+        ]),
+    );
+    let old_key = key("p/12/old-content");
+    let new_key = key("p/12/new-content");
+
+    let old_put = repo
+        .put(
+            old_key.clone(),
+            Bytes::from_static(b"old"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(old_put.is_ok());
+
+    let rotate = repo.replace_keyring(keyring(vec![
+        namespace_key("namespace", KeyStatus::Primary, 1),
+        content_key("old-content", KeyStatus::Enabled, 4),
+        content_key("new-content", KeyStatus::Primary, 5),
+    ]));
+    assert!(rotate.is_ok());
+
+    let old_body_while_enabled = repo.get_range(&old_key, ByteRange::Full).await;
+    let new_put = repo
+        .put(
+            new_key.clone(),
+            Bytes::from_static(b"new"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(new_put.is_ok());
+
+    let disable_old = repo.replace_keyring(keyring(vec![
+        namespace_key("namespace", KeyStatus::Primary, 1),
+        content_key("old-content", KeyStatus::Disabled, 4),
+        content_key("new-content", KeyStatus::Primary, 5),
+    ]));
+    assert!(disable_old.is_ok());
+
+    let old_body_after_disable = repo.get_range(&old_key, ByteRange::Full).await;
+    let new_body = repo.get_range(&new_key, ByteRange::Full).await;
+
+    assert_eq!(must(old_body_while_enabled), Bytes::from_static(b"old"));
+    assert!(matches!(
+        old_body_after_disable,
+        Err(RepositoryError::Crypto(_))
+    ));
+    assert_eq!(must(new_body), Bytes::from_static(b"new"));
 }
 
 #[tokio::test]
@@ -573,7 +726,10 @@ async fn overwrite_after_rotation_moves_lookup_to_primary_namespace_key() {
 async fn draft_commit_record_contains_rotated_keyring_metadata() {
     let repo = Repository::with_keyring(
         MemoryBlobStore::new(),
-        keyring(vec![namespace_key("old", KeyStatus::Primary, 1)]),
+        keyring(vec![
+            namespace_key("old", KeyStatus::Primary, 1),
+            content_key("old-content", KeyStatus::Primary, 4),
+        ]),
     );
     let old_key = key("p/12/old");
     let new_key = key("p/12/new");
@@ -590,6 +746,8 @@ async fn draft_commit_record_contains_rotated_keyring_metadata() {
     let replace = repo.replace_keyring(keyring(vec![
         namespace_key("old", KeyStatus::Enabled, 1),
         namespace_key("new", KeyStatus::Primary, 2),
+        content_key("old-content", KeyStatus::Enabled, 4),
+        content_key("new-content", KeyStatus::Primary, 5),
     ]));
     assert!(replace.is_ok());
 
@@ -622,6 +780,22 @@ async fn draft_commit_record_contains_rotated_keyring_metadata() {
             .map(|descriptor| descriptor.id.clone())
             .collect::<Vec<_>>(),
         vec![key_id("new"), key_id("old")]
+    );
+    assert_eq!(
+        record
+            .keyring
+            .primary_for(KeyPurpose::Content)
+            .map(|descriptor| descriptor.id.clone()),
+        Some(key_id("new-content"))
+    );
+    assert_eq!(
+        record
+            .keyring
+            .enabled_for(KeyPurpose::Content)
+            .into_iter()
+            .map(|descriptor| descriptor.id.clone())
+            .collect::<Vec<_>>(),
+        vec![key_id("new-content"), key_id("old-content")]
     );
 }
 

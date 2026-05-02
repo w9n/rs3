@@ -9,6 +9,8 @@ authors.workspace = true
 description = "Cryptographic boundaries for rs3"
 
 [dependencies]
+chacha20poly1305.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 hmac.workspace = true
 rs3-types.workspace = true

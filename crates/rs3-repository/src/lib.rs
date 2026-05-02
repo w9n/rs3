@@ -6,6 +6,7 @@ mod error;
 mod maintenance;
 mod model;
 mod namespace;
+mod payload;
 mod service;
 mod state;
 

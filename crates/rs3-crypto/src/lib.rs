@@ -5,6 +5,7 @@ mod derive;
 mod error;
 mod keyring;
 mod metadata;
+mod payload;
 mod primitives;
 mod secret;
 
@@ -19,4 +20,5 @@ pub use derive::{
 pub use error::CryptoError;
 pub use keyring::{KeyMaterial, KeyRing};
 pub use metadata::MetadataSeal;
+pub use payload::PayloadSeal;
 pub use secret::SecretBytes;

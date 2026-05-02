@@ -69,4 +69,10 @@ pub enum CryptoError {
     /// A signature or MAC did not verify.
     #[error("signature verification failed")]
     SignatureMismatch,
+    /// Authenticated encryption or decryption failed.
+    #[error("authenticated encryption operation failed")]
+    AeadOperationFailed,
+    /// The operating system random source failed.
+    #[error("system randomness unavailable")]
+    RandomnessUnavailable,
 }
