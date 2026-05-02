@@ -14,7 +14,7 @@ use rs3_index::{
     CHECKPOINT_OBJECT_DOMAIN, Checkpoint, INDEX_DELTA_OBJECT_DOMAIN, MANIFEST_OBJECT_DOMAIN,
     canonical_commit_record_bytes,
 };
-use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore, PutOptions};
+use rs3_storage::{BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions, StorageError};
 use rs3_types::{
     CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath, RetentionMode,
     RetentionPolicy, Sequence,
@@ -234,6 +234,91 @@ impl CheckpointAnchor for FailOnceAnchor {
         }
 
         self.inner.compare_and_advance(next).await
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FailOncePutStore {
+    inner: MemoryBlobStore,
+    prefix: &'static str,
+    fail_next: Arc<Mutex<bool>>,
+}
+
+impl FailOncePutStore {
+    fn new(inner: MemoryBlobStore, prefix: &'static str) -> Self {
+        Self {
+            inner,
+            prefix,
+            fail_next: Arc::new(Mutex::new(true)),
+        }
+    }
+
+    fn should_fail(&self, object_id: &rs3_types::BackendObjectId) -> rs3_storage::Result<bool> {
+        if !object_id.as_str().starts_with(self.prefix) {
+            return Ok(false);
+        }
+
+        let mut fail_next = self
+            .fail_next
+            .lock()
+            .map_err(|_| StorageError::Provider("fail store lock poisoned".to_owned()))?;
+        let should_fail = *fail_next;
+        *fail_next = false;
+        Ok(should_fail)
+    }
+}
+
+#[async_trait]
+impl BlobStore for FailOncePutStore {
+    async fn put(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        body: Bytes,
+        options: PutOptions,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        if self.should_fail(object_id)? {
+            return Err(StorageError::Provider(format!(
+                "injected put failure for {}",
+                self.prefix
+            )));
+        }
+
+        self.inner.put(object_id, body, options).await
+    }
+
+    async fn get_range(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Bytes> {
+        self.inner.get_range(object_id, range).await
+    }
+
+    async fn head(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        self.inner.head(object_id).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
+        self.inner.list_prefix(prefix).await
+    }
+
+    async fn delete(&self, object_id: &rs3_types::BackendObjectId) -> rs3_storage::Result<()> {
+        self.inner.delete(object_id).await
+    }
+
+    async fn extend_retention(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        policy: RetentionPolicy,
+    ) -> rs3_storage::Result<()> {
+        self.inner.extend_retention(object_id, policy).await
+    }
+
+    async fn flush_caches(&self) -> rs3_storage::Result<()> {
+        self.inner.flush_caches().await
     }
 }
 
@@ -816,6 +901,46 @@ async fn publish_checkpoint_persists_index_delta_without_client_key_material() {
 }
 
 #[tokio::test]
+async fn multiple_pending_puts_publish_as_one_checkpoint_batch() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let repo = Repository::with_keyring(store.clone(), keyring.clone());
+    let anchor = MemoryCheckpointAnchor::new();
+    let keys = vec![key("p/12/a"), key("p/12/b"), key("p/12/c")];
+
+    for (index, key) in keys.iter().enumerate() {
+        let put = repo
+            .put(
+                key.clone(),
+                Bytes::from(format!("body-{index}")),
+                RepositoryPutOptions::default(),
+            )
+            .await;
+        assert!(put.is_ok());
+    }
+
+    let position = must(repo.publish_checkpoint(&anchor).await);
+    let checkpoint_objects = must_storage(store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+    let index_delta_objects = must_storage(store.list_prefix("index/").await);
+    let payload_objects = must_storage(store.list_prefix("segments/").await);
+    let reloaded = Repository::with_keyring(store, keyring);
+    let loaded = must(reloaded.load_checkpoint_position(&position).await);
+    let listed = must(reloaded.list("p/12"));
+
+    assert_eq!(loaded, position);
+    assert_eq!(checkpoint_objects.len(), 1);
+    assert_eq!(index_delta_objects.len(), 1);
+    assert_eq!(payload_objects.len(), keys.len());
+    assert_eq!(
+        listed
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>(),
+        keys
+    );
+}
+
+#[tokio::test]
 async fn load_checkpoint_position_replays_checkpoint_chain_for_head_and_get() {
     let store = MemoryBlobStore::new();
     let keyring = signing_keyring();
@@ -904,6 +1029,54 @@ async fn load_checkpoint_position_rejects_tampered_index_delta_object() {
         loaded,
         Err(RepositoryError::IndexDeltaObjectConflict { .. })
     ));
+}
+
+#[tokio::test]
+async fn failed_checkpoint_put_leaves_batch_unaccepted_and_retryable() {
+    let inner = MemoryBlobStore::new();
+    let store = FailOncePutStore::new(inner.clone(), CHECKPOINT_OBJECT_PREFIX);
+    let keyring = signing_keyring();
+    let repo = Repository::with_keyring(store, keyring.clone());
+    let anchor = MemoryCheckpointAnchor::new();
+    let client_key = key("p/12/committed-after-retry");
+
+    let put = repo
+        .put(
+            client_key.clone(),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let first_publish = repo.publish_checkpoint(&anchor).await;
+    let checkpoint_objects_after_failure =
+        must_storage(inner.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+    let index_objects_after_failure = must_storage(inner.list_prefix("index/").await);
+    let payload_objects_after_failure = must_storage(inner.list_prefix("segments/").await);
+    let fresh = Repository::with_keyring(inner.clone(), keyring.clone());
+    let fresh_head = fresh.head(&client_key);
+
+    assert!(matches!(
+        first_publish,
+        Err(RepositoryError::Storage(StorageError::Provider(_)))
+    ));
+    assert!(matches!(
+        anchor.read().await,
+        Err(AnchorError::MissingAnchor)
+    ));
+    assert!(checkpoint_objects_after_failure.is_empty());
+    assert_eq!(index_objects_after_failure.len(), 1);
+    assert_eq!(payload_objects_after_failure.len(), 1);
+    assert!(matches!(fresh_head, Err(RepositoryError::NotFound(_))));
+
+    let position = must(repo.publish_checkpoint(&anchor).await);
+    let reloaded = Repository::with_keyring(inner, keyring);
+    let loaded = must(reloaded.load_checkpoint_position(&position).await);
+    let body = must(reloaded.get_range(&client_key, ByteRange::Full).await);
+
+    assert_eq!(loaded, position);
+    assert_eq!(body, Bytes::from_static(b"body"));
 }
 
 #[tokio::test]
