@@ -1,7 +1,7 @@
 //! Commit coordination for client-visible repository writes.
 
 use crate::error::{RepositoryError, Result};
-use crate::model::{CheckpointPosition, CommittedPut, RepositoryPutOptions};
+use crate::model::{CheckpointPosition, CommittedPut, DeleteOutcome, RepositoryPutOptions};
 use crate::service::Repository;
 use bytes::Bytes;
 use rs3_anchor::CheckpointAnchor;
@@ -200,6 +200,63 @@ where
             metadata,
             checkpoint,
         })
+    }
+
+    /// Deletes an object and returns only after the tombstone checkpoint is accepted.
+    pub async fn delete_committed(&self, key: LogicalPath) -> Result<DeleteOutcome> {
+        let _stage = self.stage_lock.lock().await;
+        self.publish_locked_batch().await?;
+        self.repository
+            .delete_committed(&key, self.anchor.as_ref())
+            .await
+    }
+
+    async fn publish_locked_batch(&self) -> Result<()> {
+        let waiters = {
+            let mut batch = self.batch.lock().await;
+            if let Some(reason) = batch.failed.as_ref() {
+                return Err(RepositoryError::CommitFailed {
+                    reason: reason.clone(),
+                });
+            }
+            if batch.waiters.is_empty() {
+                return Ok(());
+            }
+            batch.publishing = true;
+            std::mem::take(&mut batch.waiters)
+        };
+
+        let waiter_count = waiters.len();
+        let started = Instant::now();
+        let result = self
+            .repository
+            .publish_checkpoint(self.anchor.as_ref())
+            .await
+            .map_err(|error| error.to_string());
+        let result_label = if result.is_ok() { "ok" } else { "error" };
+
+        tracing::info!(
+            target: "rs3_repository",
+            operation = "commit_batch_publish",
+            waiters = waiter_count,
+            result = result_label,
+            elapsed_us = elapsed_us(started.elapsed()),
+            "commit coordinator publish completed",
+        );
+
+        let failure = result.as_ref().err().cloned();
+        for waiter in waiters {
+            let _ = waiter.tx.send(result.clone());
+        }
+
+        let mut batch = self.batch.lock().await;
+        batch.publishing = false;
+        if let Some(reason) = failure {
+            batch.failed = Some(reason.clone());
+            return Err(RepositoryError::CommitFailed { reason });
+        }
+
+        Ok(())
     }
 }
 

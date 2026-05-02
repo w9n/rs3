@@ -11,8 +11,15 @@ description = "Command-line entry point for the rs3 gateway"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 clap.workspace = true
+futures-util.workspace = true
+http.workspace = true
 hyper-util.workspace = true
+rs3-anchor = { path = "../rs3-anchor" }
+rs3-crypto = { path = "../rs3-crypto" }
+rs3-repository = { path = "../rs3-repository" }
+rs3-storage = { path = "../rs3-storage" }
 rs3-types = { path = "../rs3-types" }
 secrecy.workspace = true
 s3s.workspace = true

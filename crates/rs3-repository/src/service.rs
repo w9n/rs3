@@ -308,35 +308,55 @@ where
 
     /// Deletes a client-visible object from the trusted namespace.
     pub async fn delete(&self, key: &LogicalPath) -> Result<DeleteOutcome> {
+        let object_id = self.tombstone_namespace_for_delete(key)?;
+        let physical = self.delete_backend_object(&object_id).await?;
+
+        Ok(DeleteOutcome { physical })
+    }
+
+    /// Deletes a client-visible object and publishes the covering checkpoint before cleanup.
+    pub async fn delete_committed<A>(&self, key: &LogicalPath, anchor: &A) -> Result<DeleteOutcome>
+    where
+        A: CheckpointAnchor,
+    {
+        let object_id = self.tombstone_namespace_for_delete(key)?;
+        self.publish_checkpoint(anchor).await?;
+        let physical = self.delete_backend_object(&object_id).await?;
+
+        Ok(DeleteOutcome { physical })
+    }
+
+    fn tombstone_namespace_for_delete(&self, key: &LogicalPath) -> Result<BackendObjectId> {
         let keyring = self.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
-        let (object_id, sequence) = {
-            let mut state = self.write_state()?;
-            let entry = first_namespace_entry(&state.namespace, &lookup_blind_keys)
-                .ok_or_else(|| RepositoryError::NotFound(key.clone()))?
-                .clone();
-            let object_id = entry.object_id.clone();
-            let existing_blind_keys = existing_blind_keys(&state.namespace, &lookup_blind_keys);
-            let sequence = next_sequence(&mut state)?;
-            for blind_key in existing_blind_keys {
-                state.namespace.tombstone(blind_key.clone(), sequence);
-                state.pending_index_deltas.push(IndexDelta::Tombstone {
-                    blind_key,
-                    generation: sequence,
-                });
-            }
-            (object_id, sequence)
-        };
+        let mut state = self.write_state()?;
+        let entry = first_namespace_entry(&state.namespace, &lookup_blind_keys)
+            .ok_or_else(|| RepositoryError::NotFound(key.clone()))?
+            .clone();
+        let object_id = entry.object_id.clone();
+        let existing_blind_keys = existing_blind_keys(&state.namespace, &lookup_blind_keys);
+        let sequence = next_sequence(&mut state)?;
+        for blind_key in existing_blind_keys {
+            state.namespace.tombstone(blind_key.clone(), sequence);
+            state.pending_index_deltas.push(IndexDelta::Tombstone {
+                blind_key,
+                generation: sequence,
+            });
+        }
 
-        let physical = match self.store.delete(&object_id).await {
+        Ok(object_id)
+    }
+
+    async fn delete_backend_object(
+        &self,
+        object_id: &BackendObjectId,
+    ) -> Result<PhysicalDeleteOutcome> {
+        Ok(match self.store.delete(object_id).await {
             Ok(()) => PhysicalDeleteOutcome::Removed,
             Err(StorageError::RetentionBlocked) => PhysicalDeleteOutcome::Retained,
             Err(StorageError::NotFound(_)) => PhysicalDeleteOutcome::AlreadyGone,
             Err(error) => return Err(error.into()),
-        };
-
-        let _ = sequence;
-        Ok(DeleteOutcome { physical })
+        })
     }
 
     /// Extends retention for a client-visible object and its backend payload.
