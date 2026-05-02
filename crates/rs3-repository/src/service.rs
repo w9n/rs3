@@ -2,12 +2,13 @@
 
 use crate::error::{RepositoryError, Result};
 use crate::model::{
-    DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry, RepositoryObjectMetadata,
-    RepositoryPutOptions,
+    CommittedPut, DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry,
+    RepositoryObjectMetadata, RepositoryPutOptions,
 };
 use crate::namespace::{existing_blind_keys, first_namespace_entry, prefix_tokens_for_key};
 use crate::state::{RepositoryState, TrustedManifest, next_sequence, object_material};
 use bytes::Bytes;
+use rs3_anchor::CheckpointAnchor;
 use rs3_crypto::{KeyRing, NamespaceBlindKey, SecretBytes};
 use rs3_index::{IndexDelta, NamespaceEntry};
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
@@ -50,7 +51,10 @@ where
         Ok(())
     }
 
-    /// Writes a client-visible object.
+    /// Stages a client-visible object and writes its backend payload.
+    ///
+    /// The staged mutation becomes crash-durable repository state only after an
+    /// accepted checkpoint covers it.
     pub async fn put(
         &self,
         key: LogicalPath,
@@ -133,6 +137,26 @@ where
         }
 
         Ok(manifest.into_metadata())
+    }
+
+    /// Writes a client-visible object and publishes the covering checkpoint.
+    pub async fn put_committed<A>(
+        &self,
+        key: LogicalPath,
+        body: Bytes,
+        options: RepositoryPutOptions,
+        anchor: &A,
+    ) -> Result<CommittedPut>
+    where
+        A: CheckpointAnchor,
+    {
+        let metadata = self.put(key, body, options).await?;
+        let checkpoint = self.publish_checkpoint(anchor).await?;
+
+        Ok(CommittedPut {
+            metadata,
+            checkpoint,
+        })
     }
 
     /// Reads trusted metadata for a client-visible object.

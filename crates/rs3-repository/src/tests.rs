@@ -3,8 +3,8 @@
 use crate::checkpoint::{CHECKPOINT_OBJECT_PREFIX, MANIFEST_OBJECT_PREFIX, checkpoint_object_id};
 use crate::namespace::prefix_tokens_for_key;
 use crate::{
-    CheckpointPosition, PhysicalDeleteOutcome, Repository, RepositoryError, RepositoryPutOptions,
-    Result,
+    CheckpointPosition, CommitCoordinator, PhysicalDeleteOutcome, Repository, RepositoryError,
+    RepositoryPutOptions, Result,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -898,6 +898,136 @@ async fn publish_checkpoint_persists_index_delta_without_client_key_material() {
     assert_body_does_not_contain(&checkpoint_body, &["sensitive", "client-blob", "p/12"]);
     assert_body_does_not_contain(&delta_body, &["sensitive", "client-blob", "p/12"]);
     assert_body_does_not_contain(&manifest_body, &["sensitive", "client-blob", "p/12"]);
+}
+
+#[tokio::test]
+async fn put_committed_returns_after_anchor_accepts_checkpoint() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let repo = Repository::with_keyring(store.clone(), keyring.clone());
+    let anchor = CheckpointMustExistAnchor::new(store.clone());
+    let client_key = key("p/12/committed");
+
+    let committed = must(
+        repo.put_committed(
+            client_key.clone(),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+            &anchor,
+        )
+        .await,
+    );
+    let anchored = match anchor.read().await {
+        Ok(anchored) => anchored,
+        Err(error) => panic!("{error}"),
+    };
+    let reloaded = Repository::with_keyring(store, keyring);
+    let loaded = must(
+        reloaded
+            .load_checkpoint_position(&committed.checkpoint)
+            .await,
+    );
+    let body = must(reloaded.get_range(&client_key, ByteRange::Full).await);
+
+    assert_eq!(committed.metadata.content_len, 4);
+    assert_eq!(committed.checkpoint.sequence, Sequence::new(1));
+    assert_eq!(anchored.checkpoint_id, committed.checkpoint.checkpoint_id);
+    assert_eq!(loaded, committed.checkpoint);
+    assert_eq!(body, Bytes::from_static(b"body"));
+}
+
+#[tokio::test]
+async fn put_committed_does_not_accept_write_when_checkpoint_put_fails() {
+    let inner = MemoryBlobStore::new();
+    let store = FailOncePutStore::new(inner.clone(), CHECKPOINT_OBJECT_PREFIX);
+    let keyring = signing_keyring();
+    let repo = Repository::with_keyring(store, keyring.clone());
+    let anchor = MemoryCheckpointAnchor::new();
+    let client_key = key("p/12/unaccepted");
+
+    let committed = repo
+        .put_committed(
+            client_key.clone(),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+            &anchor,
+        )
+        .await;
+    let fresh = Repository::with_keyring(inner, keyring);
+    let fresh_head = fresh.head(&client_key);
+
+    assert!(matches!(
+        committed,
+        Err(RepositoryError::Storage(StorageError::Provider(_)))
+    ));
+    assert!(matches!(
+        anchor.read().await,
+        Err(AnchorError::MissingAnchor)
+    ));
+    assert!(matches!(fresh_head, Err(RepositoryError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn commit_coordinator_serializes_concurrent_committed_puts() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let repository = Arc::new(Repository::with_keyring(store.clone(), keyring.clone()));
+    let anchor = MemoryCheckpointAnchor::new();
+    let coordinator = Arc::new(CommitCoordinator::new(repository, anchor.clone()));
+    let first_key = key("p/12/a");
+    let second_key = key("p/12/b");
+
+    let first = {
+        let coordinator = Arc::clone(&coordinator);
+        let key = first_key.clone();
+        async move {
+            coordinator
+                .put_committed(
+                    key,
+                    Bytes::from_static(b"first"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    };
+    let second = {
+        let coordinator = Arc::clone(&coordinator);
+        let key = second_key.clone();
+        async move {
+            coordinator
+                .put_committed(
+                    key,
+                    Bytes::from_static(b"second"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    };
+
+    let (first, second) = tokio::join!(first, second);
+    let first = must(first);
+    let second = must(second);
+    let accepted = match anchor.read().await {
+        Ok(anchor) => CheckpointPosition::from(anchor),
+        Err(error) => panic!("{error}"),
+    };
+    let reloaded = Repository::with_keyring(store, keyring);
+    let loaded = must(reloaded.load_checkpoint_position(&accepted).await);
+    let listed = must(reloaded.list("p/12"));
+
+    assert_ne!(
+        first.checkpoint.checkpoint_id,
+        second.checkpoint.checkpoint_id
+    );
+    assert_eq!(accepted.sequence, Sequence::new(2));
+    assert_eq!(loaded, accepted);
+    assert_eq!(
+        listed
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>(),
+        vec![first_key, second_key]
+    );
 }
 
 #[tokio::test]

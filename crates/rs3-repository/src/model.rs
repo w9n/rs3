@@ -24,6 +24,15 @@ pub struct RepositoryObjectMetadata {
     pub retention: Option<RetentionPolicy>,
 }
 
+/// Result of a PUT that reached an accepted checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedPut {
+    /// Client-visible metadata for the written object.
+    pub metadata: RepositoryObjectMetadata,
+    /// Checkpoint that made the write durable repository state.
+    pub checkpoint: CheckpointPosition,
+}
+
 /// Entry returned from trusted namespace listing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryListEntry {

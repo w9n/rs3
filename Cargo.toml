@@ -35,6 +35,7 @@ tokio = { version = "1.44.2", features = [
   "macros",
   "rt-multi-thread",
   "signal",
+  "sync",
 ] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }

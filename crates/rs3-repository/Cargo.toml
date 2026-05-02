@@ -17,10 +17,10 @@ rs3-storage.workspace = true
 rs3-types.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true
