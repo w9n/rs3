@@ -45,6 +45,9 @@ pub enum RepositoryError {
         /// Failure reason.
         reason: String,
     },
+    /// Too many writes are waiting for coordinated commit.
+    #[error("commit coordinator is overloaded")]
+    CommitBackpressure,
     /// The checkpoint ID does not match the signed payload.
     #[error("checkpoint id mismatch")]
     CheckpointIdMismatch,

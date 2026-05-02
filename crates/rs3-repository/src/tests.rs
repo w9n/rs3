@@ -1100,6 +1100,92 @@ async fn commit_coordinator_batches_concurrent_committed_puts() {
 }
 
 #[tokio::test]
+async fn commit_coordinator_publishes_single_write_after_delay() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let repository = Arc::new(Repository::with_keyring(store.clone(), keyring));
+    let coordinator = CommitCoordinator::with_options(
+        repository,
+        MemoryCheckpointAnchor::new(),
+        CommitCoordinatorOptions::new(8, std::time::Duration::from_millis(5)),
+    );
+
+    let committed = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        coordinator.put_committed(
+            key("p/12/quiet"),
+            Bytes::from_static(b"quiet"),
+            RepositoryPutOptions::default(),
+        ),
+    )
+    .await;
+
+    let committed = match committed {
+        Ok(result) => must(result),
+        Err(error) => panic!("{error}"),
+    };
+    let counts = must_storage(store.operation_counts());
+    let indexes = must_storage(store.list_prefix("index/").await);
+    let checkpoints = must_storage(store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+
+    assert_eq!(committed.checkpoint.sequence, Sequence::new(1));
+    assert_eq!(counts.put, 3);
+    assert_eq!(indexes.len(), 1);
+    assert_eq!(checkpoints.len(), 1);
+}
+
+#[tokio::test]
+async fn commit_coordinator_applies_backpressure_before_writing_payload() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let repository = Arc::new(Repository::with_keyring(store.clone(), keyring));
+    let coordinator = Arc::new(CommitCoordinator::with_options(
+        repository,
+        MemoryCheckpointAnchor::new(),
+        CommitCoordinatorOptions::new(8, std::time::Duration::from_millis(25))
+            .with_max_pending_items(1),
+    ));
+
+    let first = {
+        let coordinator = Arc::clone(&coordinator);
+        tokio::spawn(async move {
+            coordinator
+                .put_committed(
+                    key("p/12/first"),
+                    Bytes::from_static(b"first"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        })
+    };
+
+    for _ in 0..100 {
+        let payloads = must_storage(store.list_prefix("segments/").await);
+        if payloads.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    let rejected = coordinator
+        .put_committed(
+            key("p/12/rejected"),
+            Bytes::from_static(b"rejected"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    let payloads_after_rejection = must_storage(store.list_prefix("segments/").await);
+    let first = tokio::time::timeout(std::time::Duration::from_secs(1), first).await;
+
+    assert!(matches!(rejected, Err(RepositoryError::CommitBackpressure)));
+    assert_eq!(payloads_after_rejection.len(), 1);
+    match first {
+        Ok(joined) => assert!(matches!(joined, Ok(Ok(_)))),
+        Err(error) => panic!("{error}"),
+    }
+}
+
+#[tokio::test]
 async fn multiple_pending_puts_publish_as_one_checkpoint_batch() {
     let store = MemoryBlobStore::new();
     let keyring = signing_keyring();
