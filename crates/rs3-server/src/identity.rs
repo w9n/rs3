@@ -1,0 +1,274 @@
+//! Request identity and authorization contracts.
+
+use rs3_types::PublicBucket;
+use std::fmt;
+use thiserror::Error;
+use zeroize::Zeroize;
+
+/// Redacted secret string used for runtime credentials.
+pub struct SecretString(String);
+
+impl SecretString {
+    /// Creates a secret string.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    fn constant_time_eq(&self, candidate: &str) -> bool {
+        constant_time_eq(self.0.as_bytes(), candidate.as_bytes())
+    }
+}
+
+impl Clone for SecretString {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl PartialEq for SecretString {
+    fn eq(&self, other: &Self) -> bool {
+        constant_time_eq(self.0.as_bytes(), other.0.as_bytes())
+    }
+}
+
+impl Eq for SecretString {}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+/// Static S3-compatible access credentials.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StaticCredentials {
+    /// S3 access key ID.
+    pub access_key_id: String,
+    /// S3 secret access key.
+    pub secret_access_key: SecretString,
+}
+
+impl fmt::Debug for StaticCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StaticCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &self.secret_access_key)
+            .finish()
+    }
+}
+
+/// Authenticated request identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identity {
+    /// Stable subject name used for authorization decisions and audit logs.
+    pub subject: String,
+}
+
+/// Repository operation requested through the server surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestAction {
+    /// List bucket contents.
+    ListBucket,
+    /// Read object metadata.
+    HeadObject,
+    /// Read object bytes.
+    GetObject,
+    /// Write object bytes.
+    PutObject,
+    /// Delete an object.
+    DeleteObject,
+    /// Run an administrative dry-run report.
+    AdminReport,
+}
+
+/// Authentication and authorization errors.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum AuthError {
+    /// The presented credentials are missing or invalid.
+    #[error("invalid credentials")]
+    InvalidCredentials,
+    /// The authenticated identity is not allowed to perform the requested action.
+    #[error("access denied for action {action:?} on bucket {bucket}")]
+    AccessDenied {
+        /// Requested bucket.
+        bucket: PublicBucket,
+        /// Requested operation.
+        action: RequestAction,
+    },
+}
+
+/// Authenticates presented request credentials.
+pub trait IdentityProvider {
+    /// Authenticates an access key ID and secret access key.
+    fn authenticate(
+        &self,
+        access_key_id: &str,
+        secret_access_key: &str,
+    ) -> Result<Identity, AuthError>;
+}
+
+/// Authorizes authenticated requests.
+pub trait Authorizer {
+    /// Checks whether an identity may perform an action on a bucket.
+    fn authorize(
+        &self,
+        identity: &Identity,
+        bucket: &PublicBucket,
+        action: RequestAction,
+    ) -> Result<(), AuthError>;
+}
+
+/// Static single-identity provider for deployments with externally managed credentials.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticCredentialProvider {
+    credentials: StaticCredentials,
+    allowed_bucket: PublicBucket,
+}
+
+impl StaticCredentialProvider {
+    /// Creates a static credential provider scoped to one public bucket.
+    pub fn new(credentials: StaticCredentials, allowed_bucket: PublicBucket) -> Self {
+        Self {
+            credentials,
+            allowed_bucket,
+        }
+    }
+}
+
+impl IdentityProvider for StaticCredentialProvider {
+    fn authenticate(
+        &self,
+        access_key_id: &str,
+        secret_access_key: &str,
+    ) -> Result<Identity, AuthError> {
+        if self.credentials.access_key_id != access_key_id
+            || !self
+                .credentials
+                .secret_access_key
+                .constant_time_eq(secret_access_key)
+        {
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        Ok(Identity {
+            subject: self.credentials.access_key_id.clone(),
+        })
+    }
+}
+
+impl Authorizer for StaticCredentialProvider {
+    fn authorize(
+        &self,
+        _identity: &Identity,
+        bucket: &PublicBucket,
+        action: RequestAction,
+    ) -> Result<(), AuthError> {
+        if bucket != &self.allowed_bucket {
+            return Err(AuthError::AccessDenied {
+                bucket: bucket.clone(),
+                action,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+
+    diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AuthError, Authorizer, IdentityProvider, RequestAction, SecretString,
+        StaticCredentialProvider, StaticCredentials,
+    };
+    use rs3_types::PublicBucket;
+
+    fn bucket(value: &str) -> PublicBucket {
+        match PublicBucket::new(value) {
+            Ok(bucket) => bucket,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    fn provider() -> StaticCredentialProvider {
+        StaticCredentialProvider::new(
+            StaticCredentials {
+                access_key_id: "access".to_owned(),
+                secret_access_key: SecretString::new("secret"),
+            },
+            bucket("backups"),
+        )
+    }
+
+    #[test]
+    fn authenticates_static_credentials() {
+        let provider = provider();
+
+        let identity = provider.authenticate("access", "secret");
+
+        assert_eq!(
+            identity,
+            Ok(super::Identity {
+                subject: "access".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_static_secret() {
+        let provider = provider();
+
+        let identity = provider.authenticate("access", "wrong");
+
+        assert_eq!(identity, Err(AuthError::InvalidCredentials));
+    }
+
+    #[test]
+    fn authorizes_only_configured_bucket() {
+        let provider = provider();
+        let identity = provider.authenticate("access", "secret");
+        let identity = match identity {
+            Ok(identity) => identity,
+            Err(error) => panic!("{error}"),
+        };
+
+        let allowed = provider.authorize(&identity, &bucket("backups"), RequestAction::PutObject);
+        let denied = provider.authorize(&identity, &bucket("other"), RequestAction::GetObject);
+
+        assert_eq!(allowed, Ok(()));
+        assert!(matches!(denied, Err(AuthError::AccessDenied { .. })));
+    }
+
+    #[test]
+    fn secret_debug_output_is_redacted() {
+        let credentials = StaticCredentials {
+            access_key_id: "access".to_owned(),
+            secret_access_key: SecretString::new("top-secret-token"),
+        };
+
+        let debug = format!("{credentials:?}");
+
+        assert!(debug.contains("access"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("top-secret-token"));
+    }
+}

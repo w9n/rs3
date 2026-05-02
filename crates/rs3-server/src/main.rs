@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use rs3_server::{AnchorConfig, RuntimeConfig};
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
@@ -24,8 +25,8 @@ enum LogFormat {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Serve {
-        #[arg(long, env = "RS3_BIND", default_value = "127.0.0.1:9080")]
-        bind: SocketAddr,
+        #[arg(long)]
+        bind: Option<SocketAddr>,
     },
     Doctor,
 }
@@ -37,14 +38,41 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Serve { bind } => {
-            tracing::info!(%bind, "gateway scaffold ready");
+            let mut config = RuntimeConfig::from_env()?;
+            if let Some(bind) = bind {
+                config.bind = bind;
+            }
+            log_runtime_config(&config);
         }
         Commands::Doctor => {
-            println!("rs3 doctor: scaffold ok");
+            let config = RuntimeConfig::from_env()?;
+            log_runtime_config(&config);
+            println!("rs3 doctor: runtime config ok");
         }
     }
 
     Ok(())
+}
+
+fn log_runtime_config(config: &RuntimeConfig) {
+    let anchor = match &config.anchor {
+        AnchorConfig::Memory => "memory",
+        AnchorConfig::KubernetesLease { .. } => "kubernetes-lease",
+    };
+
+    tracing::info!(
+        bind = %config.bind,
+        public_bucket = %config.public_bucket,
+        backend_endpoint = %config.backend.endpoint,
+        backend_bucket = %config.backend.bucket,
+        backend_prefix = ?config.backend.prefix,
+        anchor,
+        batch_max_items = config.batching.max_items,
+        batch_max_delay_ms = config.batching.max_delay.as_millis(),
+        batch_max_pending_items = config.batching.max_pending_items,
+        static_credentials = config.static_credentials.is_some(),
+        "gateway runtime configuration validated",
+    );
 }
 
 fn init_tracing(format: LogFormat) {

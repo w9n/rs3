@@ -394,9 +394,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "rs3-types",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
