@@ -1036,7 +1036,7 @@ async fn multiple_pending_puts_publish_as_one_checkpoint_batch() {
     let keyring = signing_keyring();
     let repo = Repository::with_keyring(store.clone(), keyring.clone());
     let anchor = MemoryCheckpointAnchor::new();
-    let keys = vec![key("p/12/a"), key("p/12/b"), key("p/12/c")];
+    let keys = [key("p/12/a"), key("p/12/b"), key("p/12/c")];
 
     for (index, key) in keys.iter().enumerate() {
         let put = repo
@@ -1068,6 +1068,70 @@ async fn multiple_pending_puts_publish_as_one_checkpoint_batch() {
             .collect::<Vec<_>>(),
         keys
     );
+}
+
+#[tokio::test]
+async fn operation_counts_show_checkpoint_batch_reduces_backend_puts() {
+    let single_store = MemoryBlobStore::new();
+    let single_repository = Arc::new(Repository::with_keyring(
+        single_store.clone(),
+        signing_keyring(),
+    ));
+    let single = CommitCoordinator::new(single_repository, MemoryCheckpointAnchor::new());
+    let keys = [key("p/12/a"), key("p/12/b"), key("p/12/c")];
+
+    for (index, key) in keys.iter().enumerate() {
+        let committed = single
+            .put_committed(
+                key.clone(),
+                Bytes::from(format!("single-{index}")),
+                RepositoryPutOptions::default(),
+            )
+            .await;
+        assert!(committed.is_ok());
+    }
+
+    let single_counts = must_storage(single_store.operation_counts());
+    let single_payloads = must_storage(single_store.list_prefix("segments/").await);
+    let single_manifests = must_storage(single_store.list_prefix(MANIFEST_OBJECT_PREFIX).await);
+    let single_indexes = must_storage(single_store.list_prefix("index/").await);
+    let single_checkpoints = must_storage(single_store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+
+    let batch_store = MemoryBlobStore::new();
+    let batch_repo = Repository::with_keyring(batch_store.clone(), signing_keyring());
+    let batch_anchor = MemoryCheckpointAnchor::new();
+
+    for (index, key) in keys.iter().enumerate() {
+        let put = batch_repo
+            .put(
+                key.clone(),
+                Bytes::from(format!("batch-{index}")),
+                RepositoryPutOptions::default(),
+            )
+            .await;
+        assert!(put.is_ok());
+    }
+    let published = batch_repo.publish_checkpoint(&batch_anchor).await;
+    assert!(published.is_ok());
+
+    let batch_counts = must_storage(batch_store.operation_counts());
+    let batch_payloads = must_storage(batch_store.list_prefix("segments/").await);
+    let batch_manifests = must_storage(batch_store.list_prefix(MANIFEST_OBJECT_PREFIX).await);
+    let batch_indexes = must_storage(batch_store.list_prefix("index/").await);
+    let batch_checkpoints = must_storage(batch_store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+
+    assert_eq!(single_counts.put, 12);
+    assert_eq!(batch_counts.put, 8);
+    assert_eq!(single_counts.get, 0);
+    assert_eq!(batch_counts.get, 0);
+    assert_eq!(single_payloads.len(), 3);
+    assert_eq!(single_manifests.len(), 3);
+    assert_eq!(single_indexes.len(), 3);
+    assert_eq!(single_checkpoints.len(), 3);
+    assert_eq!(batch_payloads.len(), 3);
+    assert_eq!(batch_manifests.len(), 3);
+    assert_eq!(batch_indexes.len(), 1);
+    assert_eq!(batch_checkpoints.len(), 1);
 }
 
 #[tokio::test]

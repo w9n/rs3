@@ -4,9 +4,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rs3_types::{BackendObjectId, RetentionMode, RetentionPolicy};
 use std::collections::BTreeMap;
-#[cfg(test)]
-use std::sync::RwLockReadGuard;
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use thiserror::Error;
 
 /// Metadata returned by object-store reads and heads.
@@ -118,6 +116,29 @@ pub trait BlobStore: Send + Sync {
     async fn flush_caches(&self) -> Result<()>;
 }
 
+/// Operation counters reported by instrumented blob-store implementations.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlobOperationCounts {
+    /// Number of PUT calls.
+    pub put: u64,
+    /// Number of GET calls.
+    pub get: u64,
+    /// Number of HEAD calls.
+    pub head: u64,
+    /// Number of LIST calls.
+    pub list: u64,
+    /// Number of DELETE calls.
+    pub delete: u64,
+    /// Number of retention-extension calls.
+    pub extend_retention: u64,
+    /// Number of cache flush calls.
+    pub flush: u64,
+    /// Bytes accepted by successful PUT calls.
+    pub bytes_written: u64,
+    /// Bytes returned by successful GET calls.
+    pub bytes_read: u64,
+}
+
 /// In-memory `BlobStore` implementation used for contract tests and local prototypes.
 #[derive(Clone, Debug)]
 pub struct MemoryBlobStore {
@@ -130,23 +151,12 @@ struct MemoryObject {
     metadata: BlobMetadata,
 }
 
-#[derive(Clone, Debug, Default)]
-struct MemoryOperationCounts {
-    put: u64,
-    get: u64,
-    head: u64,
-    list: u64,
-    delete: u64,
-    extend_retention: u64,
-    flush: u64,
-}
-
 #[derive(Debug, Default)]
 struct MemoryState {
     objects: BTreeMap<BackendObjectId, MemoryObject>,
     next_modified_at_ms: i64,
     next_version: u64,
-    counts: MemoryOperationCounts,
+    counts: BlobOperationCounts,
 }
 
 impl MemoryBlobStore {
@@ -157,11 +167,22 @@ impl MemoryBlobStore {
         }
     }
 
-    #[cfg(test)]
     fn read_state(&self) -> Result<RwLockReadGuard<'_, MemoryState>> {
         self.state
             .read()
             .map_err(|_| StorageError::Provider("memory blob store lock poisoned".to_owned()))
+    }
+
+    /// Returns a snapshot of in-memory operation counters.
+    pub fn operation_counts(&self) -> Result<BlobOperationCounts> {
+        self.read_state().map(|state| state.counts.clone())
+    }
+
+    /// Resets operation counters without changing stored objects.
+    pub fn reset_operation_counts(&self) -> Result<()> {
+        let mut state = self.write_state()?;
+        state.counts = BlobOperationCounts::default();
+        Ok(())
     }
 
     fn write_state(&self) -> Result<RwLockWriteGuard<'_, MemoryState>> {
@@ -195,16 +216,17 @@ impl BlobStore for MemoryBlobStore {
         state.next_modified_at_ms = state.next_modified_at_ms.saturating_add(1);
         state.next_version = state.next_version.saturating_add(1);
 
+        let content_len = u64::try_from(body.len())
+            .map_err(|_| StorageError::Provider("object length does not fit in u64".to_owned()))?;
         let metadata = BlobMetadata {
             object_id: object_id.clone(),
-            content_len: u64::try_from(body.len()).map_err(|_| {
-                StorageError::Provider("object length does not fit in u64".to_owned())
-            })?,
+            content_len,
             modified_at_ms: Some(state.next_modified_at_ms),
             etag: Some(format!("mem-{}-{}", state.next_version, body.len())),
             version_id: Some(format!("mem-v{}", state.next_version)),
             retention: options.retention,
         };
+        state.counts.bytes_written = state.counts.bytes_written.saturating_add(content_len);
 
         state.objects.insert(
             object_id.clone(),
@@ -226,7 +248,12 @@ impl BlobStore for MemoryBlobStore {
             .get(object_id)
             .ok_or_else(|| StorageError::NotFound(object_id.clone()))?;
 
-        read_range(&object.body, range)
+        let body = read_range(&object.body, range)?;
+        let bytes_read = u64::try_from(body.len())
+            .map_err(|_| StorageError::Provider("read length does not fit in u64".to_owned()))?;
+        state.counts.bytes_read = state.counts.bytes_read.saturating_add(bytes_read);
+
+        Ok(body)
     }
 
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {
@@ -359,9 +386,9 @@ mod tests {
         }
     }
 
-    fn counts(store: &MemoryBlobStore) -> super::MemoryOperationCounts {
-        match store.read_state() {
-            Ok(state) => state.counts.clone(),
+    fn counts(store: &MemoryBlobStore) -> super::BlobOperationCounts {
+        match store.operation_counts() {
+            Ok(counts) => counts,
             Err(error) => panic!("{error}"),
         }
     }
@@ -434,6 +461,10 @@ mod tests {
             .await;
 
         assert_eq!(body, Ok(Bytes::from_static(b"world")));
+
+        let counts = counts(&store);
+        assert_eq!(counts.get, 1);
+        assert_eq!(counts.bytes_read, 5);
     }
 
     #[tokio::test]
@@ -454,6 +485,35 @@ mod tests {
 
         assert!(first.is_ok());
         assert!(matches!(second, Err(StorageError::AlreadyExists(_))));
+
+        let counts = counts(&store);
+        assert_eq!(counts.put, 2);
+        assert_eq!(counts.bytes_written, 5);
+    }
+
+    #[tokio::test]
+    async fn operation_counts_can_be_reset_without_removing_objects() {
+        let store = MemoryBlobStore::new();
+        let object_id = object_id("segments/a");
+
+        let put = store
+            .put(
+                &object_id,
+                Bytes::from_static(b"body"),
+                PutOptions::default(),
+            )
+            .await;
+        assert!(put.is_ok());
+        let reset = store.reset_operation_counts();
+        let head = store.head(&object_id).await;
+
+        assert!(reset.is_ok());
+        assert!(head.is_ok());
+
+        let counts = counts(&store);
+        assert_eq!(counts.put, 0);
+        assert_eq!(counts.head, 1);
+        assert_eq!(counts.bytes_written, 0);
     }
 
     #[tokio::test]
