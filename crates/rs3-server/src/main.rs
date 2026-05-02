@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use rs3_server::{AnchorConfig, GatewayS3Boundary, RuntimeConfig};
+use rs3_server::{AnchorConfig, GatewayServer, RuntimeConfig};
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
@@ -43,8 +43,9 @@ async fn main() -> Result<()> {
                 config.bind = bind;
             }
             log_runtime_config(&config);
-            let _boundary = GatewayS3Boundary::build(config)?;
-            tracing::info!("gateway S3 boundary initialized");
+            let server = GatewayServer::bind(config).await?;
+            tracing::info!(bind = %server.local_addr(), "gateway S3 listener started");
+            server.run_until_shutdown(shutdown_signal()).await?;
         }
         Commands::Doctor => {
             let config = RuntimeConfig::from_env()?;
@@ -54,6 +55,12 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::warn!(%error, "failed to install Ctrl+C shutdown handler");
+    }
 }
 
 fn log_runtime_config(config: &RuntimeConfig) {
