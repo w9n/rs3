@@ -5,6 +5,7 @@ use crate::model::CheckpointPosition;
 use crate::service::Repository;
 use rs3_crypto::{derive_checkpoint_id, derive_checkpoint_payload_digest};
 use rs3_index::{Checkpoint, CommitRecord, KeyringSnapshot, canonical_commit_record_bytes};
+use rs3_k8s::CheckpointAnchor;
 use rs3_storage::BlobStore;
 use rs3_types::CheckpointId;
 
@@ -68,6 +69,42 @@ where
         };
 
         validate_position(&checkpoint.record, &position, accepted)?;
+        Ok(position)
+    }
+
+    /// Drafts, verifies, and advances an external checkpoint anchor.
+    pub async fn publish_checkpoint<A>(&self, anchor: &A) -> Result<CheckpointPosition>
+    where
+        A: CheckpointAnchor,
+    {
+        let accepted = match anchor.read().await {
+            Ok(state) => Some(CheckpointPosition::from(state)),
+            Err(rs3_k8s::K8sError::MissingAnchor) => None,
+            Err(error) => return Err(error.into()),
+        };
+
+        if let Some(position) = accepted.as_ref() {
+            let state = self.read_state()?;
+            if state.next_sequence < position.sequence {
+                return Err(crate::RepositoryError::StaleCheckpoint {
+                    sequence: state.next_sequence,
+                });
+            }
+            if state.next_sequence == position.sequence {
+                return Ok(position.clone());
+            }
+        }
+
+        let parent = accepted
+            .as_ref()
+            .map(|position| position.checkpoint_id.clone());
+        let checkpoint = self.draft_signed_checkpoint(parent)?;
+        let position = self.verify_signed_checkpoint(&checkpoint, accepted.as_ref())?;
+
+        anchor
+            .compare_and_advance(position.clone().into_anchor_state())
+            .await?;
+
         Ok(position)
     }
 }

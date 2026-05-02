@@ -8,6 +8,7 @@ use crate::{
 use bytes::Bytes;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_index::canonical_commit_record_bytes;
+use rs3_k8s::{AnchorState, MemoryCheckpointAnchor};
 use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore};
 use rs3_types::{
     CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath, RetentionMode,
@@ -43,6 +44,14 @@ fn checkpoint_id(value: &str) -> CheckpointId {
     match CheckpointId::new(value) {
         Ok(checkpoint_id) => checkpoint_id,
         Err(error) => panic!("{error}"),
+    }
+}
+
+fn anchor_state(sequence: u64, id: &str) -> AnchorState {
+    AnchorState {
+        sequence: Sequence::new(sequence),
+        checkpoint_id: checkpoint_id(id),
+        checkpoint_digest: format!("digest-{id}"),
     }
 }
 
@@ -93,6 +102,13 @@ fn keyring(keys: Vec<KeyMaterial>) -> KeyRing {
         Ok(keyring) => keyring,
         Err(error) => panic!("{error}"),
     }
+}
+
+fn signing_keyring() -> KeyRing {
+    keyring(vec![
+        namespace_key("namespace", KeyStatus::Primary, 1),
+        checkpoint_key("signing", KeyStatus::Primary, 2),
+    ])
 }
 
 fn primary_key_id(keyring: &KeyRing) -> KeyId {
@@ -589,6 +605,99 @@ async fn verify_signed_checkpoint_requires_parent_when_advancing() {
     let chained = must(repo.draft_signed_checkpoint(Some(accepted.checkpoint_id.clone())));
     let advanced = repo.verify_signed_checkpoint(&chained, Some(&accepted));
     assert!(advanced.is_ok());
+}
+
+#[tokio::test]
+async fn publish_checkpoint_initializes_empty_anchor() {
+    let repo = Repository::with_keyring(MemoryBlobStore::new(), signing_keyring());
+    let anchor = MemoryCheckpointAnchor::new();
+
+    let put = repo
+        .put(
+            key("p/12/abcdef"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let published = repo.publish_checkpoint(&anchor).await;
+
+    let position = must(published);
+    assert_eq!(position.sequence, Sequence::new(1));
+    assert!(!position.payload_digest.is_empty());
+}
+
+#[tokio::test]
+async fn publish_checkpoint_is_idempotent_without_changes() {
+    let repo = Repository::with_keyring(MemoryBlobStore::new(), signing_keyring());
+    let anchor = MemoryCheckpointAnchor::new();
+
+    let put = repo
+        .put(
+            key("p/12/abcdef"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let first = must(repo.publish_checkpoint(&anchor).await);
+    let second = must(repo.publish_checkpoint(&anchor).await);
+
+    assert_eq!(first, second);
+}
+
+#[tokio::test]
+async fn publish_checkpoint_advances_existing_anchor() {
+    let repo = Repository::with_keyring(MemoryBlobStore::new(), signing_keyring());
+    let anchor = MemoryCheckpointAnchor::new();
+
+    let first_put = repo
+        .put(
+            key("p/12/first"),
+            Bytes::from_static(b"first"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(first_put.is_ok());
+    let first = must(repo.publish_checkpoint(&anchor).await);
+
+    let second_put = repo
+        .put(
+            key("p/12/second"),
+            Bytes::from_static(b"second"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(second_put.is_ok());
+    let second = must(repo.publish_checkpoint(&anchor).await);
+
+    assert_eq!(first.sequence, Sequence::new(1));
+    assert_eq!(second.sequence, Sequence::new(2));
+    assert_ne!(first.checkpoint_id, second.checkpoint_id);
+}
+
+#[tokio::test]
+async fn publish_checkpoint_rejects_stale_external_anchor() {
+    let repo = Repository::with_keyring(MemoryBlobStore::new(), signing_keyring());
+    let anchor = MemoryCheckpointAnchor::with_state(anchor_state(5, "newer"));
+
+    let put = repo
+        .put(
+            key("p/12/abcdef"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let published = repo.publish_checkpoint(&anchor).await;
+
+    assert!(matches!(
+        published,
+        Err(RepositoryError::StaleCheckpoint { .. })
+    ));
 }
 
 #[test]

@@ -63,3 +63,24 @@ pub struct CheckpointPosition {
     /// Digest of the canonical checkpoint payload.
     pub payload_digest: String,
 }
+
+impl CheckpointPosition {
+    /// Converts this position into an external anchor state.
+    pub fn into_anchor_state(self) -> rs3_k8s::AnchorState {
+        rs3_k8s::AnchorState {
+            sequence: self.sequence,
+            checkpoint_id: self.checkpoint_id,
+            checkpoint_digest: self.payload_digest,
+        }
+    }
+}
+
+impl From<rs3_k8s::AnchorState> for CheckpointPosition {
+    fn from(value: rs3_k8s::AnchorState) -> Self {
+        Self {
+            sequence: value.sequence,
+            checkpoint_id: value.checkpoint_id,
+            payload_digest: value.checkpoint_digest,
+        }
+    }
+}

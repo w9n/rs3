@@ -1,6 +1,7 @@
 //! Repository error types.
 
 use rs3_crypto::CryptoError;
+use rs3_k8s::K8sError;
 use rs3_storage::StorageError;
 use rs3_types::{CheckpointId, LogicalPath, Sequence, TypeError};
 use thiserror::Error;
@@ -32,6 +33,9 @@ pub enum RepositoryError {
     /// Storage operation failed.
     #[error(transparent)]
     Storage(#[from] StorageError),
+    /// Checkpoint anchor operation failed.
+    #[error(transparent)]
+    Anchor(#[from] K8sError),
     /// Checkpoint canonical encoding failed.
     #[error(transparent)]
     CheckpointEncoding(#[from] serde_json::Error),

@@ -12,6 +12,7 @@ description = "Trusted repository workflow for rs3"
 bytes.workspace = true
 rs3-crypto.workspace = true
 rs3-index.workspace = true
+rs3-k8s.workspace = true
 rs3-storage.workspace = true
 rs3-types.workspace = true
 serde_json.workspace = true

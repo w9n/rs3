@@ -13,5 +13,8 @@ async-trait.workspace = true
 rs3-types.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+tokio.workspace = true
+
 [lints]
 workspace = true

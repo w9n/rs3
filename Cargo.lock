@@ -362,6 +362,7 @@ dependencies = [
  "async-trait",
  "rs3-types",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -371,6 +372,7 @@ dependencies = [
  "bytes",
  "rs3-crypto",
  "rs3-index",
+ "rs3-k8s",
  "rs3-storage",
  "rs3-types",
  "serde_json",
