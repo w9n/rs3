@@ -39,6 +39,12 @@ pub enum RepositoryError {
     /// Checkpoint canonical encoding failed.
     #[error(transparent)]
     CheckpointEncoding(#[from] serde_json::Error),
+    /// A coordinated commit failed and the coordinator stopped accepting writes.
+    #[error("commit coordinator failed: {reason}")]
+    CommitFailed {
+        /// Failure reason.
+        reason: String,
+    },
     /// The checkpoint ID does not match the signed payload.
     #[error("checkpoint id mismatch")]
     CheckpointIdMismatch,

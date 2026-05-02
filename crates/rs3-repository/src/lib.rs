@@ -11,7 +11,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use commit::CommitCoordinator;
+pub use commit::{CommitCoordinator, CommitCoordinatorOptions};
 pub use error::{RepositoryError, Result};
 pub use model::{
     CheckpointPosition, CommittedPut, DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry,

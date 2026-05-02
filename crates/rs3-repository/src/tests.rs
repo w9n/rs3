@@ -3,8 +3,8 @@
 use crate::checkpoint::{CHECKPOINT_OBJECT_PREFIX, checkpoint_object_id};
 use crate::namespace::prefix_tokens_for_key;
 use crate::{
-    CheckpointPosition, CommitCoordinator, PhysicalDeleteOutcome, Repository, RepositoryError,
-    RepositoryPutOptions, Result,
+    CheckpointPosition, CommitCoordinator, CommitCoordinatorOptions, PhysicalDeleteOutcome,
+    Repository, RepositoryError, RepositoryPutOptions, Result,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -967,12 +967,85 @@ async fn put_committed_does_not_accept_write_when_checkpoint_put_fails() {
 }
 
 #[tokio::test]
-async fn commit_coordinator_serializes_concurrent_committed_puts() {
+async fn commit_coordinator_fails_all_batch_waiters_when_checkpoint_put_fails() {
+    let inner = MemoryBlobStore::new();
+    let store = FailOncePutStore::new(inner.clone(), CHECKPOINT_OBJECT_PREFIX);
+    let keyring = signing_keyring();
+    let repository = Arc::new(Repository::with_keyring(store, keyring.clone()));
+    let anchor = MemoryCheckpointAnchor::new();
+    let coordinator = Arc::new(CommitCoordinator::with_options(
+        repository,
+        anchor.clone(),
+        CommitCoordinatorOptions::new(2, std::time::Duration::from_secs(60)),
+    ));
+    let first_key = key("p/12/failed-a");
+    let second_key = key("p/12/failed-b");
+
+    let first = {
+        let coordinator = Arc::clone(&coordinator);
+        let key = first_key.clone();
+        async move {
+            coordinator
+                .put_committed(
+                    key,
+                    Bytes::from_static(b"first"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    };
+    let second = {
+        let coordinator = Arc::clone(&coordinator);
+        let key = second_key.clone();
+        async move {
+            coordinator
+                .put_committed(
+                    key,
+                    Bytes::from_static(b"second"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    };
+
+    let (first, second) = tokio::join!(first, second);
+    let fresh = Repository::with_keyring(inner, keyring);
+    let later = coordinator
+        .put_committed(
+            key("p/12/later"),
+            Bytes::from_static(b"later"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+
+    assert!(matches!(first, Err(RepositoryError::CommitFailed { .. })));
+    assert!(matches!(second, Err(RepositoryError::CommitFailed { .. })));
+    assert!(matches!(later, Err(RepositoryError::CommitFailed { .. })));
+    assert!(matches!(
+        anchor.read().await,
+        Err(AnchorError::MissingAnchor)
+    ));
+    assert!(matches!(
+        fresh.head(&first_key),
+        Err(RepositoryError::NotFound(_))
+    ));
+    assert!(matches!(
+        fresh.head(&second_key),
+        Err(RepositoryError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn commit_coordinator_batches_concurrent_committed_puts() {
     let store = MemoryBlobStore::new();
     let keyring = signing_keyring();
     let repository = Arc::new(Repository::with_keyring(store.clone(), keyring.clone()));
     let anchor = MemoryCheckpointAnchor::new();
-    let coordinator = Arc::new(CommitCoordinator::new(repository, anchor.clone()));
+    let coordinator = Arc::new(CommitCoordinator::with_options(
+        repository,
+        anchor.clone(),
+        CommitCoordinatorOptions::new(2, std::time::Duration::from_secs(60)),
+    ));
     let first_key = key("p/12/a");
     let second_key = key("p/12/b");
 
@@ -1014,10 +1087,7 @@ async fn commit_coordinator_serializes_concurrent_committed_puts() {
     let loaded = must(reloaded.load_checkpoint_position(&accepted).await);
     let listed = must(reloaded.list("p/12"));
 
-    assert_ne!(
-        first.checkpoint.checkpoint_id,
-        second.checkpoint.checkpoint_id
-    );
+    assert_eq!(first.checkpoint, second.checkpoint);
     assert_eq!(accepted.sequence, Sequence::new(2));
     assert_eq!(loaded, accepted);
     assert_eq!(
@@ -1119,10 +1189,73 @@ async fn operation_counts_show_checkpoint_batch_reduces_backend_puts() {
     let batch_indexes = must_storage(batch_store.list_prefix("index/").await);
     let batch_checkpoints = must_storage(batch_store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
 
+    let grouped_store = MemoryBlobStore::new();
+    let grouped_repository = Arc::new(Repository::with_keyring(
+        grouped_store.clone(),
+        signing_keyring(),
+    ));
+    let grouped = Arc::new(CommitCoordinator::with_options(
+        grouped_repository,
+        MemoryCheckpointAnchor::new(),
+        CommitCoordinatorOptions::new(3, std::time::Duration::from_secs(60)),
+    ));
+    let grouped_a = {
+        let grouped = Arc::clone(&grouped);
+        let key = keys[0].clone();
+        async move {
+            grouped
+                .put_committed(
+                    key,
+                    Bytes::from_static(b"grouped-a"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    };
+    let grouped_b = {
+        let grouped = Arc::clone(&grouped);
+        let key = keys[1].clone();
+        async move {
+            grouped
+                .put_committed(
+                    key,
+                    Bytes::from_static(b"grouped-b"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    };
+    let grouped_c = {
+        let grouped = Arc::clone(&grouped);
+        let key = keys[2].clone();
+        async move {
+            grouped
+                .put_committed(
+                    key,
+                    Bytes::from_static(b"grouped-c"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    };
+
+    let grouped_results = tokio::join!(grouped_a, grouped_b, grouped_c);
+    assert!(grouped_results.0.is_ok());
+    assert!(grouped_results.1.is_ok());
+    assert!(grouped_results.2.is_ok());
+
+    let grouped_counts = must_storage(grouped_store.operation_counts());
+    let grouped_payloads = must_storage(grouped_store.list_prefix("segments/").await);
+    let grouped_indexes = must_storage(grouped_store.list_prefix("index/").await);
+    let grouped_checkpoints =
+        must_storage(grouped_store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+
     assert_eq!(single_counts.put, 9);
     assert_eq!(batch_counts.put, 5);
+    assert_eq!(grouped_counts.put, 5);
     assert_eq!(single_counts.get, 0);
     assert_eq!(batch_counts.get, 0);
+    assert_eq!(grouped_counts.get, 0);
     assert_eq!(single_payloads.len(), 3);
     assert_eq!(single_manifests.len(), 0);
     assert_eq!(single_indexes.len(), 3);
@@ -1131,6 +1264,9 @@ async fn operation_counts_show_checkpoint_batch_reduces_backend_puts() {
     assert_eq!(batch_manifests.len(), 0);
     assert_eq!(batch_indexes.len(), 1);
     assert_eq!(batch_checkpoints.len(), 1);
+    assert_eq!(grouped_payloads.len(), 3);
+    assert_eq!(grouped_indexes.len(), 1);
+    assert_eq!(grouped_checkpoints.len(), 1);
 }
 
 #[tokio::test]
