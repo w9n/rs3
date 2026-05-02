@@ -1,6 +1,8 @@
 //! Public repository operation models.
 
-use rs3_types::{CheckpointId, LogicalPath, RetentionPolicy, Sequence};
+use rs3_types::{
+    BackendObjectId, CheckpointId, LogicalPath, RetentionMode, RetentionPolicy, Sequence,
+};
 
 /// Options for a trusted repository PUT.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -22,6 +24,73 @@ pub struct RepositoryObjectMetadata {
     pub modified_at_ms: i64,
     /// Effective retention policy, if known.
     pub retention: Option<RetentionPolicy>,
+}
+
+/// Repository role for a reachable backend object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BackendObjectReferenceKind {
+    /// Signed checkpoint object.
+    Checkpoint,
+    /// Durable index delta object referenced by a checkpoint.
+    IndexDelta,
+    /// Payload object referenced by a durable index delta.
+    Payload,
+}
+
+/// Backend object proven reachable from an accepted checkpoint chain.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReachableBackendObject {
+    /// Opaque backend object identifier.
+    pub object_id: BackendObjectId,
+    /// Repository role for this object.
+    pub kind: BackendObjectReferenceKind,
+}
+
+/// Backend object present in storage but not referenced by the accepted chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryOrphanCandidate {
+    /// Opaque backend object identifier.
+    pub object_id: BackendObjectId,
+    /// Repository role inferred from the owned storage prefix.
+    pub kind: BackendObjectReferenceKind,
+    /// Object length in bytes.
+    pub content_len: u64,
+    /// Provider retention policy for this object version, when known.
+    pub retention: Option<RetentionPolicy>,
+    /// True when the known retention policy would block deletion.
+    pub delete_blocked_by_retention: bool,
+}
+
+/// Dry-run report for backend objects under repository-owned prefixes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryOrphanReport {
+    /// Objects referenced by the accepted checkpoint chain.
+    pub reachable: Vec<ReachableBackendObject>,
+    /// Objects under repository-owned prefixes that are not referenced.
+    pub candidates: Vec<RepositoryOrphanCandidate>,
+}
+
+impl RepositoryOrphanCandidate {
+    pub(crate) fn from_metadata(
+        metadata: rs3_storage::BlobMetadata,
+        kind: BackendObjectReferenceKind,
+    ) -> Self {
+        let delete_blocked_by_retention = retention_blocks_delete(metadata.retention.as_ref());
+        Self {
+            object_id: metadata.object_id,
+            kind,
+            content_len: metadata.content_len,
+            retention: metadata.retention,
+            delete_blocked_by_retention,
+        }
+    }
+}
+
+fn retention_blocks_delete(policy: Option<&RetentionPolicy>) -> bool {
+    match policy {
+        Some(policy) => policy.mode != RetentionMode::None && policy.retain_days > 0,
+        None => false,
+    }
 }
 
 /// Result of a PUT that reached an accepted checkpoint.

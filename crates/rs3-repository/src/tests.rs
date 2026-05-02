@@ -3,8 +3,8 @@
 use crate::checkpoint::{CHECKPOINT_OBJECT_PREFIX, checkpoint_object_id};
 use crate::namespace::prefix_tokens_for_key;
 use crate::{
-    CheckpointPosition, CommitCoordinator, CommitCoordinatorOptions, PhysicalDeleteOutcome,
-    Repository, RepositoryError, RepositoryPutOptions, Result,
+    BackendObjectReferenceKind, CheckpointPosition, CommitCoordinator, CommitCoordinatorOptions,
+    PhysicalDeleteOutcome, Repository, RepositoryError, RepositoryPutOptions, Result,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -15,8 +15,8 @@ use rs3_index::{
 };
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions, StorageError};
 use rs3_types::{
-    CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath, RetentionMode,
-    RetentionPolicy, Sequence,
+    BackendObjectId, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath,
+    RetentionMode, RetentionPolicy, Sequence,
 };
 use std::sync::{Arc, Mutex};
 
@@ -34,6 +34,13 @@ fn secret_with_byte(byte: u8) -> SecretBytes {
 fn key(value: &str) -> LogicalPath {
     match LogicalPath::new(value) {
         Ok(key) => key,
+        Err(error) => panic!("{error}"),
+    }
+}
+
+fn backend_object_id(value: &str) -> BackendObjectId {
+    match BackendObjectId::new(value) {
+        Ok(object_id) => object_id,
         Err(error) => panic!("{error}"),
     }
 }
@@ -1492,6 +1499,168 @@ async fn failed_checkpoint_put_leaves_batch_unaccepted_and_retryable() {
 
     assert_eq!(loaded, position);
     assert_eq!(body, Bytes::from_static(b"body"));
+}
+
+#[tokio::test]
+async fn orphan_report_is_empty_for_accepted_repository_objects() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let repo = Repository::with_keyring(store, keyring);
+    let anchor = MemoryCheckpointAnchor::new();
+
+    let first = repo
+        .put_committed(
+            key("p/12/a"),
+            Bytes::from_static(b"a"),
+            RepositoryPutOptions::default(),
+            &anchor,
+        )
+        .await;
+    assert!(first.is_ok());
+    let second = must(
+        repo.put_committed(
+            key("p/12/b"),
+            Bytes::from_static(b"b"),
+            RepositoryPutOptions::default(),
+            &anchor,
+        )
+        .await,
+    );
+
+    let report = must(repo.orphan_report(&second.checkpoint).await);
+
+    assert!(report.candidates.is_empty());
+    assert_eq!(
+        report
+            .reachable
+            .iter()
+            .filter(|object| object.kind == BackendObjectReferenceKind::Checkpoint)
+            .count(),
+        2
+    );
+    assert_eq!(
+        report
+            .reachable
+            .iter()
+            .filter(|object| object.kind == BackendObjectReferenceKind::IndexDelta)
+            .count(),
+        2
+    );
+    assert_eq!(
+        report
+            .reachable
+            .iter()
+            .filter(|object| object.kind == BackendObjectReferenceKind::Payload)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn orphan_report_finds_unaccepted_payload_and_index_objects() {
+    let inner = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let anchor = MemoryCheckpointAnchor::new();
+    let accepted_repo = Repository::with_keyring(inner.clone(), keyring.clone());
+    let accepted = must(
+        accepted_repo
+            .put_committed(
+                key("p/12/accepted"),
+                Bytes::from_static(b"accepted"),
+                RepositoryPutOptions::default(),
+                &anchor,
+            )
+            .await,
+    );
+    let failing_store = FailOncePutStore::new(inner.clone(), CHECKPOINT_OBJECT_PREFIX);
+    let writer = Repository::with_keyring(failing_store, keyring.clone());
+    let loaded = writer.load_checkpoint_position(&accepted.checkpoint).await;
+    assert!(loaded.is_ok());
+    let staged = writer
+        .put(
+            key("p/12/unaccepted"),
+            Bytes::from_static(b"unaccepted"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(staged.is_ok());
+
+    let failed = writer.publish_checkpoint(&anchor).await;
+    let current_anchor = match anchor.read().await {
+        Ok(anchor) => CheckpointPosition::from(anchor),
+        Err(error) => panic!("{error}"),
+    };
+    let report_repo = Repository::with_keyring(inner, keyring);
+    let report = must(report_repo.orphan_report(&accepted.checkpoint).await);
+    let candidate_ids = report
+        .candidates
+        .iter()
+        .map(|candidate| candidate.object_id.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(matches!(
+        failed,
+        Err(RepositoryError::Storage(StorageError::Provider(_)))
+    ));
+    assert_eq!(current_anchor, accepted.checkpoint);
+    assert_eq!(report.candidates.len(), 2);
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.kind == BackendObjectReferenceKind::IndexDelta)
+    );
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.kind == BackendObjectReferenceKind::Payload)
+    );
+    assert!(
+        candidate_ids
+            .iter()
+            .all(|id| id.starts_with("index/") || id.starts_with("segments/"))
+    );
+}
+
+#[tokio::test]
+async fn orphan_report_marks_retention_blocked_candidates() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let repo = Repository::with_keyring(store.clone(), keyring);
+    let anchor = MemoryCheckpointAnchor::new();
+    let committed = must(
+        repo.put_committed(
+            key("p/12/accepted"),
+            Bytes::from_static(b"accepted"),
+            RepositoryPutOptions::default(),
+            &anchor,
+        )
+        .await,
+    );
+    let retained_object = backend_object_id("segments/manual-retained");
+    let retention = RetentionPolicy::new(RetentionMode::Compliance, 30);
+    let put = store
+        .put(
+            &retained_object,
+            Bytes::from_static(b"retained"),
+            PutOptions {
+                retention: Some(retention.clone()),
+                ..PutOptions::default()
+            },
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let report = must(repo.orphan_report(&committed.checkpoint).await);
+    let candidate = report
+        .candidates
+        .iter()
+        .find(|candidate| candidate.object_id == retained_object)
+        .unwrap_or_else(|| panic!("missing retained candidate"));
+
+    assert_eq!(candidate.retention, Some(retention));
+    assert!(candidate.delete_blocked_by_retention);
 }
 
 #[tokio::test]

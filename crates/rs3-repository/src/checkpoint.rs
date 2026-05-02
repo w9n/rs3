@@ -280,7 +280,10 @@ where
         Ok(())
     }
 
-    async fn read_checkpoint_chain(&self, latest: &CheckpointId) -> Result<Vec<Checkpoint>> {
+    pub(crate) async fn read_checkpoint_chain(
+        &self,
+        latest: &CheckpointId,
+    ) -> Result<Vec<Checkpoint>> {
         let mut checkpoints = Vec::new();
         let mut next = latest.clone();
         let mut seen = BTreeSet::new();
@@ -319,24 +322,32 @@ where
         checkpoint: &Checkpoint,
     ) -> Result<()> {
         for object_id in &checkpoint.record.index_deltas {
-            let body = self.store.get_range(object_id, ByteRange::Full).await?;
-            let expected_object_id = derive_index_delta_object_id(&body)?;
-            if &expected_object_id != object_id {
-                return Err(crate::RepositoryError::IndexDeltaObjectConflict {
-                    object_id: object_id.clone(),
-                });
-            }
-            let Some(payload) = body.as_ref().strip_prefix(INDEX_DELTA_OBJECT_DOMAIN) else {
-                return Err(crate::RepositoryError::InvalidObjectFormat {
-                    object_id: object_id.clone(),
-                });
-            };
-            let delta = serde_json::from_slice::<IndexDeltaObject>(payload)?;
+            let delta = self.read_index_delta_object(object_id).await?;
             self.load_embedded_manifest_records(state, &delta)?;
             apply_index_delta_object(state, delta);
         }
 
         Ok(())
+    }
+
+    pub(crate) async fn read_index_delta_object(
+        &self,
+        object_id: &BackendObjectId,
+    ) -> Result<IndexDeltaObject> {
+        let body = self.store.get_range(object_id, ByteRange::Full).await?;
+        let expected_object_id = derive_index_delta_object_id(&body)?;
+        if &expected_object_id != object_id {
+            return Err(crate::RepositoryError::IndexDeltaObjectConflict {
+                object_id: object_id.clone(),
+            });
+        }
+        let Some(payload) = body.as_ref().strip_prefix(INDEX_DELTA_OBJECT_DOMAIN) else {
+            return Err(crate::RepositoryError::InvalidObjectFormat {
+                object_id: object_id.clone(),
+            });
+        };
+
+        serde_json::from_slice::<IndexDeltaObject>(payload).map_err(Into::into)
     }
 
     fn load_embedded_manifest_records(

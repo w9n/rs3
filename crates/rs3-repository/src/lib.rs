@@ -3,6 +3,7 @@
 mod checkpoint;
 mod commit;
 mod error;
+mod maintenance;
 mod model;
 mod namespace;
 mod service;
@@ -14,7 +15,8 @@ mod tests;
 pub use commit::{CommitCoordinator, CommitCoordinatorOptions};
 pub use error::{RepositoryError, Result};
 pub use model::{
-    CheckpointPosition, CommittedPut, DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry,
-    RepositoryObjectMetadata, RepositoryPutOptions,
+    BackendObjectReferenceKind, CheckpointPosition, CommittedPut, DeleteOutcome,
+    PhysicalDeleteOutcome, ReachableBackendObject, RepositoryListEntry, RepositoryObjectMetadata,
+    RepositoryOrphanCandidate, RepositoryOrphanReport, RepositoryPutOptions,
 };
 pub use service::Repository;
