@@ -10,7 +10,14 @@ description = "Local automation for rs3"
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 clap.workspace = true
+rs3-anchor = { version = "0.1.0", path = "../crates/rs3-anchor" }
+rs3-crypto = { version = "0.1.0", path = "../crates/rs3-crypto" }
+rs3-repository = { version = "0.1.0", path = "../crates/rs3-repository" }
+rs3-storage = { version = "0.1.0", path = "../crates/rs3-storage" }
+rs3-types = { version = "0.1.0", path = "../crates/rs3-types" }
+tokio.workspace = true
 
 [lints]
 workspace = true

@@ -1773,7 +1773,14 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
+ "rs3-anchor",
+ "rs3-crypto",
+ "rs3-repository",
+ "rs3-storage",
+ "rs3-types",
+ "tokio",
 ]
 
 [[package]]

@@ -20,6 +20,9 @@ check:
 test:
     cargo test --workspace
 
+perf *ARGS:
+    cargo run -p xtask -- perf {{ARGS}}
+
 nextest:
     cargo nextest run --workspace
 

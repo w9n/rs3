@@ -1,5 +1,7 @@
 //! Local automation for rs3.
 
+mod perf;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::process::Command;
@@ -16,6 +18,7 @@ struct Cli {
 enum Commands {
     Check,
     Fmt,
+    Perf(perf::PerfArgs),
     Test,
 }
 
@@ -40,6 +43,13 @@ fn main() -> Result<()> {
         }
         Some(Commands::Fmt) => {
             run("cargo", &["fmt", "--all"])?;
+        }
+        Some(Commands::Perf(args)) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime")?;
+            runtime.block_on(perf::run(args))?;
         }
         Some(Commands::Test) => {
             run("cargo", &["test", "--workspace"])?;
