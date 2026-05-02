@@ -9,8 +9,11 @@ use rs3_repository::{
     CommitCoordinator, CommitCoordinatorOptions, CommittedPut, DeleteOutcome, Repository,
     RepositoryError, RepositoryListEntry, RepositoryObjectMetadata, RepositoryPutOptions,
 };
-use rs3_storage::{BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions};
+use rs3_storage::{
+    BlobMetadata, BlobStore, ByteRange, FilesystemBlobStore, MemoryBlobStore, PutOptions,
+};
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 type RuntimeStore = DynBlobStore;
@@ -108,20 +111,61 @@ struct AnchorBuild {
 }
 
 fn build_store(config: &BackendConfig) -> Result<StoreBuild, S3BoundaryError> {
-    if !is_memory_backend(config) {
-        return Err(S3BoundaryError::UnsupportedBackendMode);
+    if is_memory_backend(config) {
+        let store = MemoryBlobStore::new();
+        return Ok(StoreBuild {
+            handle: RuntimeStore::new(store.clone()),
+            #[cfg(test)]
+            memory_store: Some(store),
+        });
     }
 
-    let store = MemoryBlobStore::new();
-    Ok(StoreBuild {
-        handle: RuntimeStore::new(store.clone()),
-        #[cfg(test)]
-        memory_store: Some(store),
-    })
+    if let Some(root) = filesystem_backend_root(config)? {
+        let store = FilesystemBlobStore::new(root).map_err(repository_init)?;
+        return Ok(StoreBuild {
+            handle: RuntimeStore::new(store),
+            #[cfg(test)]
+            memory_store: None,
+        });
+    }
+
+    Err(S3BoundaryError::UnsupportedBackendMode)
 }
 
 fn is_memory_backend(config: &BackendConfig) -> bool {
     config.endpoint == "memory" || config.endpoint.starts_with("memory://")
+}
+
+fn filesystem_backend_root(config: &BackendConfig) -> Result<Option<PathBuf>, S3BoundaryError> {
+    let Some(endpoint_path) = config.endpoint.strip_prefix("file://") else {
+        return Ok(None);
+    };
+    if endpoint_path.is_empty() {
+        return Err(repository_init("file backend endpoint must include a path"));
+    }
+
+    let mut root = PathBuf::from(endpoint_path);
+    push_relative_component(&mut root, &config.bucket)?;
+    if let Some(prefix) = config.prefix.as_deref() {
+        push_relative_component(&mut root, prefix)?;
+    }
+
+    Ok(Some(root))
+}
+
+fn push_relative_component(root: &mut PathBuf, value: &str) -> Result<(), S3BoundaryError> {
+    for component in Path::new(value).components() {
+        match component {
+            Component::Normal(component) => root.push(component),
+            Component::CurDir => {}
+            Component::RootDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(repository_init(
+                    "file backend bucket and prefix must be relative paths",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_anchor(config: &AnchorConfig) -> Result<AnchorBuild, S3BoundaryError> {
@@ -272,9 +316,42 @@ fn repository_init(error: impl ToString) -> S3BoundaryError {
 #[cfg(test)]
 mod tests {
     use super::RuntimeRepository;
-    use crate::AnchorConfig;
     use crate::s3::S3BoundaryError;
     use crate::s3::test_support::runtime_config;
+    use crate::{AnchorConfig, BatchConfig};
+    use bytes::Bytes;
+    use rs3_repository::RepositoryPutOptions;
+    use rs3_types::LogicalPath;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new() -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "rs3-server-runtime-test-{}-{nanos}",
+                std::process::id()
+            ));
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn runtime_factory_builds_memory_repository() {
@@ -283,6 +360,44 @@ mod tests {
 
         assert!(runtime.memory_store().is_some());
         assert!(runtime.memory_anchor().is_some());
+    }
+
+    #[tokio::test]
+    async fn runtime_factory_builds_file_repository() {
+        let dir = TestDir::new();
+        let mut config = runtime_config(true);
+        config.backend.endpoint = format!("file://{}", dir.path().display());
+        config.batching = BatchConfig {
+            max_items: 1,
+            max_delay: Duration::from_millis(10),
+            max_pending_items: 1,
+        };
+        let runtime =
+            RuntimeRepository::from_config(&config).unwrap_or_else(|error| panic!("{error}"));
+        let key = LogicalPath::new("snapshots/file.bin").unwrap_or_else(|error| {
+            panic!("{error}");
+        });
+
+        let put = runtime
+            .put_committed(
+                key.clone(),
+                Bytes::from_static(b"file-backed body"),
+                RepositoryPutOptions::default(),
+            )
+            .await;
+        assert!(put.is_ok());
+
+        let head = runtime.head(&key).unwrap_or_else(|error| {
+            panic!("{error}");
+        });
+        let payload_root = dir
+            .path()
+            .join("backend-bucket")
+            .join("repo")
+            .join("segments");
+
+        assert_eq!(head.content_len, 16);
+        assert!(payload_root.is_dir());
     }
 
     #[test]

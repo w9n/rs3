@@ -1,5 +1,7 @@
 //! Provider-neutral object-store abstractions.
 
+mod filesystem;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use rs3_types::{BackendObjectId, RetentionMode, RetentionPolicy};
@@ -7,6 +9,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+
+pub use filesystem::FilesystemBlobStore;
 
 /// Metadata returned by object-store reads and heads.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -377,7 +381,7 @@ impl BlobStore for MemoryBlobStore {
     }
 }
 
-fn record_blob_put(
+pub(crate) fn record_blob_put(
     object_kind: &str,
     requested_len: usize,
     retained: bool,
@@ -396,7 +400,7 @@ fn record_blob_put(
     );
 }
 
-fn record_blob_get(
+pub(crate) fn record_blob_get(
     object_kind: &str,
     range: ByteRange,
     bytes_read: u64,
@@ -429,7 +433,7 @@ fn record_blob_get(
     }
 }
 
-fn record_blob_head(object_kind: &str, result: &str, elapsed: Duration) {
+pub(crate) fn record_blob_head(object_kind: &str, result: &str, elapsed: Duration) {
     tracing::debug!(
         target: "rs3_storage",
         operation = "head",
@@ -440,7 +444,7 @@ fn record_blob_head(object_kind: &str, result: &str, elapsed: Duration) {
     );
 }
 
-fn record_blob_list(object_kind: &str, entries: usize, result: &str, elapsed: Duration) {
+pub(crate) fn record_blob_list(object_kind: &str, entries: usize, result: &str, elapsed: Duration) {
     tracing::debug!(
         target: "rs3_storage",
         operation = "list_prefix",
@@ -452,7 +456,7 @@ fn record_blob_list(object_kind: &str, entries: usize, result: &str, elapsed: Du
     );
 }
 
-fn record_blob_delete(object_kind: &str, result: &str, elapsed: Duration) {
+pub(crate) fn record_blob_delete(object_kind: &str, result: &str, elapsed: Duration) {
     tracing::debug!(
         target: "rs3_storage",
         operation = "delete",
@@ -463,7 +467,7 @@ fn record_blob_delete(object_kind: &str, result: &str, elapsed: Duration) {
     );
 }
 
-fn record_blob_extend_retention(object_kind: &str, result: &str, elapsed: Duration) {
+pub(crate) fn record_blob_extend_retention(object_kind: &str, result: &str, elapsed: Duration) {
     tracing::debug!(
         target: "rs3_storage",
         operation = "extend_retention",
@@ -474,7 +478,7 @@ fn record_blob_extend_retention(object_kind: &str, result: &str, elapsed: Durati
     );
 }
 
-fn read_range(body: &Bytes, range: ByteRange) -> Result<Bytes> {
+pub(crate) fn read_range(body: &Bytes, range: ByteRange) -> Result<Bytes> {
     match range {
         ByteRange::Full => Ok(body.clone()),
         ByteRange::Slice { offset, len } => {
@@ -522,15 +526,15 @@ fn stronger_retention_mode(left: RetentionMode, right: RetentionMode) -> Retenti
     }
 }
 
-fn object_kind(object_id: &BackendObjectId) -> &str {
+pub(crate) fn object_kind(object_id: &BackendObjectId) -> &str {
     prefix_kind(object_id.as_str())
 }
 
-fn prefix_kind(value: &str) -> &str {
+pub(crate) fn prefix_kind(value: &str) -> &str {
     value.split_once('/').map_or("other", |(prefix, _)| prefix)
 }
 
-fn elapsed_us(elapsed: Duration) -> u64 {
+pub(crate) fn elapsed_us(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
