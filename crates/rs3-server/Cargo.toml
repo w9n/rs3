@@ -10,6 +10,7 @@ description = "Command-line entry point for the rs3 gateway"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 rs3-types = { path = "../rs3-types" }
 secrecy.workspace = true

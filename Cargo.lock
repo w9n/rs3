@@ -960,6 +960,7 @@ name = "rs3-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "rs3-types",
  "s3s",

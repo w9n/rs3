@@ -9,5 +9,5 @@ pub use identity::{
     AuthError, Authorizer, Identity, IdentityProvider, RequestAction, StaticCredentialProvider,
     StaticCredentials,
 };
-pub use s3::{GatewayS3Service, S3Hardening};
+pub use s3::{GatewayS3Boundary, S3BoundaryError, S3Hardening};
 pub use secrecy::SecretString;

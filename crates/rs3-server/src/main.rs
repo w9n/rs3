@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use rs3_server::{AnchorConfig, RuntimeConfig};
+use rs3_server::{AnchorConfig, GatewayS3Boundary, RuntimeConfig};
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
@@ -43,6 +43,8 @@ async fn main() -> Result<()> {
                 config.bind = bind;
             }
             log_runtime_config(&config);
+            let _boundary = GatewayS3Boundary::build(config)?;
+            tracing::info!("gateway S3 boundary initialized");
         }
         Commands::Doctor => {
             let config = RuntimeConfig::from_env()?;
