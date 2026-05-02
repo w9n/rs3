@@ -3,6 +3,7 @@
 mod adapter;
 mod boundary;
 mod mapping;
+mod runtime;
 
 pub use boundary::{GatewayS3Boundary, S3Hardening};
 use thiserror::Error;
@@ -16,6 +17,9 @@ pub enum S3BoundaryError {
     /// The configured checkpoint anchor is not wired into the S3 adapter yet.
     #[error("configured checkpoint anchor mode is not supported by the S3 adapter yet")]
     UnsupportedAnchorMode,
+    /// The configured backend object store is not wired into the runtime yet.
+    #[error("configured backend object store is not supported by the S3 runtime yet")]
+    UnsupportedBackendMode,
     /// Repository state initialization failed.
     #[error("failed to initialize repository state: {reason}")]
     RepositoryInit {
@@ -44,7 +48,7 @@ pub(super) mod test_support {
             bind,
             public_bucket,
             backend: BackendConfig {
-                endpoint: "https://object.example".to_owned(),
+                endpoint: "memory://local".to_owned(),
                 bucket: "backend-bucket".to_owned(),
                 prefix: Some("repo".to_owned()),
             },

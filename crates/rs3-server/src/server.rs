@@ -164,7 +164,7 @@ mod tests {
             bind,
             public_bucket,
             backend: BackendConfig {
-                endpoint: "https://object.example".to_owned(),
+                endpoint: "memory://local".to_owned(),
                 bucket: "backend-bucket".to_owned(),
                 prefix: Some("repo".to_owned()),
             },

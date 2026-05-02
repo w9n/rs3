@@ -6,61 +6,29 @@ use super::mapping::{
     repository_error, resolve_range, timestamp, validate_delete_object_request,
     validate_get_object_request, validate_head_object_request, validate_put_object_request,
 };
-use crate::{AnchorConfig, RuntimeConfig};
-use rs3_anchor::MemoryCheckpointAnchor;
-use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_repository::{
-    CommitCoordinator, CommitCoordinatorOptions, Repository, RepositoryPutOptions,
-};
-use rs3_storage::{ByteRange, MemoryBlobStore};
-use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, PublicBucket};
+use super::runtime::RuntimeRepository;
+use crate::RuntimeConfig;
+use rs3_repository::RepositoryPutOptions;
+use rs3_storage::ByteRange;
+use rs3_types::PublicBucket;
 use s3s::dto::{
     DeleteObjectInput, DeleteObjectOutput, GetObjectInput, GetObjectOutput, HeadObjectInput,
     HeadObjectOutput, ListObjectsV2Input, ListObjectsV2Output, PutObjectInput, PutObjectOutput,
     StreamingBlob,
 };
 use s3s::{Body, S3, S3Request, S3Response, S3Result};
-use std::sync::Arc;
-
-type GatewayStore = MemoryBlobStore;
-type GatewayAnchor = MemoryCheckpointAnchor;
-type GatewayCommitCoordinator = CommitCoordinator<GatewayStore, GatewayAnchor>;
 
 #[derive(Clone)]
 pub(super) struct GatewayS3Service {
     public_bucket: PublicBucket,
-    coordinator: Arc<GatewayCommitCoordinator>,
-    #[cfg(test)]
-    store: GatewayStore,
-    #[cfg(test)]
-    anchor: GatewayAnchor,
+    repository: RuntimeRepository,
 }
 
 impl GatewayS3Service {
     pub(super) fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
-        if !matches!(config.anchor, AnchorConfig::Memory) {
-            return Err(S3BoundaryError::UnsupportedAnchorMode);
-        }
-
-        let store = MemoryBlobStore::new();
-        let repository = Arc::new(Repository::with_keyring(store.clone(), gateway_keyring()?));
-        let anchor = MemoryCheckpointAnchor::new();
-        let options =
-            CommitCoordinatorOptions::new(config.batching.max_items, config.batching.max_delay)
-                .with_max_pending_items(config.batching.max_pending_items);
-        let coordinator = Arc::new(CommitCoordinator::with_options(
-            repository,
-            anchor.clone(),
-            options,
-        ));
-
         Ok(Self {
             public_bucket: config.public_bucket.clone(),
-            coordinator,
-            #[cfg(test)]
-            store,
-            #[cfg(test)]
-            anchor,
+            repository: RuntimeRepository::from_config(config)?,
         })
     }
 
@@ -100,7 +68,7 @@ impl S3 for GatewayS3Service {
         let body = collect_body(input.body).await?;
 
         let committed = self
-            .coordinator
+            .repository
             .put_committed(
                 key,
                 body,
@@ -130,11 +98,7 @@ impl S3 for GatewayS3Service {
         validate_get_object_request(&input)?;
 
         let key = logical_path(input.key)?;
-        let metadata = self
-            .coordinator
-            .repository()
-            .head(&key)
-            .map_err(repository_error)?;
+        let metadata = self.repository.head(&key).map_err(repository_error)?;
         let resolved_range = resolve_range(input.range, metadata.content_len)?;
         let repository_range = resolved_range
             .as_ref()
@@ -144,8 +108,7 @@ impl S3 for GatewayS3Service {
             })
             .unwrap_or(ByteRange::Full);
         let body = self
-            .coordinator
-            .repository()
+            .repository
             .get_range(&key, repository_range)
             .await
             .map_err(repository_error)?;
@@ -181,11 +144,7 @@ impl S3 for GatewayS3Service {
         validate_head_object_request(&input)?;
 
         let key = logical_path(input.key)?;
-        let metadata = self
-            .coordinator
-            .repository()
-            .head(&key)
-            .map_err(repository_error)?;
+        let metadata = self.repository.head(&key).map_err(repository_error)?;
         let content_length = match resolve_range(input.range, metadata.content_len)? {
             Some(range) => range.end - range.start,
             None => metadata.content_len,
@@ -212,11 +171,7 @@ impl S3 for GatewayS3Service {
         let max_keys = max_keys(input.max_keys)?;
         let start_after = input.continuation_token.or(input.start_after);
         let delimiter = input.delimiter;
-        let entries = self
-            .coordinator
-            .repository()
-            .list(&prefix)
-            .map_err(repository_error)?;
+        let entries = self.repository.list(&prefix).map_err(repository_error)?;
         let page = list_page(
             entries,
             &prefix,
@@ -249,7 +204,7 @@ impl S3 for GatewayS3Service {
         validate_delete_object_request(&input)?;
 
         let key = logical_path(input.key)?;
-        self.coordinator
+        self.repository
             .delete_committed(key)
             .await
             .map_err(repository_error)?;
@@ -258,48 +213,6 @@ impl S3 for GatewayS3Service {
             delete_marker: Some(true),
             ..DeleteObjectOutput::default()
         }))
-    }
-}
-
-fn gateway_keyring() -> Result<KeyRing, S3BoundaryError> {
-    KeyRing::new(vec![
-        key_material("namespace", KeyPurpose::Namespace, "hmac-sha256", 1)?,
-        key_material("content", KeyPurpose::Content, "xchacha20poly1305", 2)?,
-        key_material("metadata", KeyPurpose::Metadata, "hmac-sha256-seal", 3)?,
-        key_material(
-            "checkpoint",
-            KeyPurpose::CheckpointSigning,
-            "hmac-sha256",
-            4,
-        )?,
-    ])
-    .map_err(repository_init)
-}
-
-fn key_material(
-    id: &str,
-    purpose: KeyPurpose,
-    algorithm: &str,
-    secret_byte: u8,
-) -> Result<KeyMaterial, S3BoundaryError> {
-    Ok(KeyMaterial::new(
-        KeyDescriptor {
-            id: KeyId::new(id.to_owned()).map_err(repository_init)?,
-            purpose,
-            algorithm: algorithm.to_owned(),
-            status: KeyStatus::Primary,
-            created_at_ms: 0,
-            not_before_ms: None,
-            not_after_ms: None,
-            external_kms_uri: None,
-        },
-        SecretBytes::new(vec![secret_byte; SecretBytes::MIN_LEN]).map_err(repository_init)?,
-    ))
-}
-
-fn repository_init(error: impl ToString) -> S3BoundaryError {
-    S3BoundaryError::RepositoryInit {
-        reason: error.to_string(),
     }
 }
 
@@ -378,13 +291,21 @@ mod tests {
             .await;
         assert!(put.is_ok());
 
-        let accepted = service.anchor.read().await.unwrap_or_else(|error| {
-            panic!("{error}");
-        });
+        let accepted = service
+            .repository
+            .memory_anchor()
+            .unwrap_or_else(|| panic!("missing memory anchor"))
+            .read()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{error}");
+            });
         assert_eq!(accepted.sequence.get(), 1);
 
         let backend_objects = service
-            .store
+            .repository
+            .memory_store()
+            .unwrap_or_else(|| panic!("missing memory store"))
             .list_prefix("segments/")
             .await
             .unwrap_or_else(|error| panic!("{error}"));
@@ -455,9 +376,15 @@ mod tests {
             .await;
         assert!(delete.is_ok());
 
-        let accepted = service.anchor.read().await.unwrap_or_else(|error| {
-            panic!("{error}");
-        });
+        let accepted = service
+            .repository
+            .memory_anchor()
+            .unwrap_or_else(|| panic!("missing memory anchor"))
+            .read()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{error}");
+            });
         assert_eq!(accepted.sequence.get(), 2);
 
         let missing = service
