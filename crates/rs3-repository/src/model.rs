@@ -1,6 +1,6 @@
 //! Public repository operation models.
 
-use rs3_types::{LogicalPath, RetentionPolicy};
+use rs3_types::{CheckpointId, LogicalPath, RetentionPolicy, Sequence};
 
 /// Options for a trusted repository PUT.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -51,4 +51,15 @@ pub enum PhysicalDeleteOutcome {
     Retained,
     /// The backend object was already gone.
     AlreadyGone,
+}
+
+/// Accepted checkpoint position used by monotonic validation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointPosition {
+    /// Accepted checkpoint sequence.
+    pub sequence: Sequence,
+    /// Accepted checkpoint ID.
+    pub checkpoint_id: CheckpointId,
+    /// Digest of the canonical checkpoint payload.
+    pub payload_digest: String,
 }

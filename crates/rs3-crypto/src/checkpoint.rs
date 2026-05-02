@@ -63,9 +63,18 @@ pub fn derive_checkpoint_id(
     CheckpointId::new(hex::encode(digest.finalize())).map_err(CryptoError::from)
 }
 
+/// Derives a stable digest for canonical checkpoint payload bytes.
+pub fn derive_checkpoint_payload_digest(canonical_payload: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"rs3:checkpoint-payload-digest:v1");
+    digest.update([0]);
+    digest.update(canonical_payload);
+    hex::encode(digest.finalize())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::derive_checkpoint_id;
+    use super::{derive_checkpoint_id, derive_checkpoint_payload_digest};
     use crate::{KeyMaterial, KeyRing, SecretBytes};
     use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus};
 
@@ -210,5 +219,13 @@ mod tests {
         assert!(first.is_ok());
         assert!(second.is_ok());
         assert_ne!(first.ok(), second.ok());
+    }
+
+    #[test]
+    fn checkpoint_payload_digest_ignores_signature() {
+        let first = derive_checkpoint_payload_digest(b"canonical checkpoint");
+        let second = derive_checkpoint_payload_digest(b"canonical checkpoint");
+
+        assert_eq!(first, second);
     }
 }

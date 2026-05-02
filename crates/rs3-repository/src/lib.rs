@@ -12,7 +12,7 @@ mod tests;
 
 pub use error::{RepositoryError, Result};
 pub use model::{
-    DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry, RepositoryObjectMetadata,
-    RepositoryPutOptions,
+    CheckpointPosition, DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry,
+    RepositoryObjectMetadata, RepositoryPutOptions,
 };
 pub use service::Repository;

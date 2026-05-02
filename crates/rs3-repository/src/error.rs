@@ -2,7 +2,7 @@
 
 use rs3_crypto::CryptoError;
 use rs3_storage::StorageError;
-use rs3_types::{LogicalPath, TypeError};
+use rs3_types::{CheckpointId, LogicalPath, Sequence, TypeError};
 use thiserror::Error;
 
 /// Repository operation result.
@@ -35,4 +35,22 @@ pub enum RepositoryError {
     /// Checkpoint canonical encoding failed.
     #[error(transparent)]
     CheckpointEncoding(#[from] serde_json::Error),
+    /// The checkpoint ID does not match the signed payload.
+    #[error("checkpoint id mismatch")]
+    CheckpointIdMismatch,
+    /// The checkpoint is older than the accepted position.
+    #[error("stale checkpoint sequence: {sequence:?}")]
+    StaleCheckpoint {
+        /// Stale checkpoint sequence.
+        sequence: Sequence,
+    },
+    /// The checkpoint reuses an accepted sequence with different content.
+    #[error("checkpoint conflicts with accepted position: {checkpoint_id}")]
+    CheckpointConflict {
+        /// Conflicting checkpoint ID.
+        checkpoint_id: CheckpointId,
+    },
+    /// The checkpoint does not chain from the accepted position.
+    #[error("checkpoint parent mismatch")]
+    CheckpointParentMismatch,
 }

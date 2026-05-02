@@ -1,8 +1,9 @@
 //! Repository checkpoint drafting.
 
 use crate::error::Result;
+use crate::model::CheckpointPosition;
 use crate::service::Repository;
-use rs3_crypto::derive_checkpoint_id;
+use rs3_crypto::{derive_checkpoint_id, derive_checkpoint_payload_digest};
 use rs3_index::{Checkpoint, CommitRecord, KeyringSnapshot, canonical_commit_record_bytes};
 use rs3_storage::BlobStore;
 use rs3_types::CheckpointId;
@@ -40,4 +41,65 @@ where
             signature: signature.signature,
         })
     }
+
+    /// Verifies a signed checkpoint and checks it against an accepted position.
+    pub fn verify_signed_checkpoint(
+        &self,
+        checkpoint: &Checkpoint,
+        accepted: Option<&CheckpointPosition>,
+    ) -> Result<CheckpointPosition> {
+        let canonical_payload = canonical_commit_record_bytes(&checkpoint.record)?;
+        let keyring = self.keyring()?;
+        keyring.verify_checkpoint_payload(
+            &checkpoint.signature_key_id,
+            &canonical_payload,
+            &checkpoint.signature,
+        )?;
+
+        let expected_id = derive_checkpoint_id(&canonical_payload, &checkpoint.signature)?;
+        if expected_id != checkpoint.id {
+            return Err(crate::RepositoryError::CheckpointIdMismatch);
+        }
+
+        let position = CheckpointPosition {
+            sequence: checkpoint.sequence(),
+            checkpoint_id: checkpoint.id.clone(),
+            payload_digest: derive_checkpoint_payload_digest(&canonical_payload),
+        };
+
+        validate_position(&checkpoint.record, &position, accepted)?;
+        Ok(position)
+    }
+}
+
+fn validate_position(
+    record: &CommitRecord,
+    position: &CheckpointPosition,
+    accepted: Option<&CheckpointPosition>,
+) -> Result<()> {
+    let Some(accepted) = accepted else {
+        return Ok(());
+    };
+
+    if position.sequence < accepted.sequence {
+        return Err(crate::RepositoryError::StaleCheckpoint {
+            sequence: position.sequence,
+        });
+    }
+
+    if position.sequence == accepted.sequence {
+        if position == accepted {
+            return Ok(());
+        }
+
+        return Err(crate::RepositoryError::CheckpointConflict {
+            checkpoint_id: position.checkpoint_id.clone(),
+        });
+    }
+
+    if record.parent.as_ref() != Some(&accepted.checkpoint_id) {
+        return Err(crate::RepositoryError::CheckpointParentMismatch);
+    }
+
+    Ok(())
 }

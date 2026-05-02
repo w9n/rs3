@@ -1,14 +1,17 @@
 //! Repository behavior tests.
 
 use crate::namespace::prefix_tokens_for_key;
-use crate::{PhysicalDeleteOutcome, Repository, RepositoryError, RepositoryPutOptions, Result};
+use crate::{
+    CheckpointPosition, PhysicalDeleteOutcome, Repository, RepositoryError, RepositoryPutOptions,
+    Result,
+};
 use bytes::Bytes;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_index::canonical_commit_record_bytes;
 use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore};
 use rs3_types::{
-    KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath, RetentionMode, RetentionPolicy,
-    Sequence,
+    CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath, RetentionMode,
+    RetentionPolicy, Sequence,
 };
 
 fn secret() -> SecretBytes {
@@ -32,6 +35,13 @@ fn key(value: &str) -> LogicalPath {
 fn key_id(value: &str) -> KeyId {
     match KeyId::new(value) {
         Ok(key_id) => key_id,
+        Err(error) => panic!("{error}"),
+    }
+}
+
+fn checkpoint_id(value: &str) -> CheckpointId {
+    match CheckpointId::new(value) {
+        Ok(checkpoint_id) => checkpoint_id,
         Err(error) => panic!("{error}"),
     }
 }
@@ -428,6 +438,157 @@ async fn draft_signed_checkpoint_has_verifiable_signature() {
     assert_eq!(checkpoint.signature_key_id, key_id("signing"));
     assert_eq!(checkpoint.sequence(), Sequence::new(1));
     assert!(verified.is_ok());
+}
+
+#[tokio::test]
+async fn verify_signed_checkpoint_returns_checkpoint_position() {
+    let active_keyring = keyring(vec![
+        namespace_key("namespace", KeyStatus::Primary, 1),
+        checkpoint_key("signing", KeyStatus::Primary, 2),
+    ]);
+    let repo = Repository::with_keyring(MemoryBlobStore::new(), active_keyring);
+
+    let put = repo
+        .put(
+            key("p/12/abcdef"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let checkpoint = must(repo.draft_signed_checkpoint(None));
+    let position = must(repo.verify_signed_checkpoint(&checkpoint, None));
+
+    assert_eq!(position.sequence, Sequence::new(1));
+    assert_eq!(position.checkpoint_id, checkpoint.id);
+    assert!(!position.payload_digest.is_empty());
+}
+
+#[tokio::test]
+async fn verify_signed_checkpoint_rejects_tampered_record() {
+    let active_keyring = keyring(vec![
+        namespace_key("namespace", KeyStatus::Primary, 1),
+        checkpoint_key("signing", KeyStatus::Primary, 2),
+    ]);
+    let repo = Repository::with_keyring(MemoryBlobStore::new(), active_keyring);
+
+    let put = repo
+        .put(
+            key("p/12/abcdef"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let mut checkpoint = must(repo.draft_signed_checkpoint(None));
+    checkpoint.record.sequence = Sequence::new(99);
+
+    let verified = repo.verify_signed_checkpoint(&checkpoint, None);
+
+    assert!(verified.is_err());
+}
+
+#[tokio::test]
+async fn verify_signed_checkpoint_rejects_id_mismatch() {
+    let active_keyring = keyring(vec![
+        namespace_key("namespace", KeyStatus::Primary, 1),
+        checkpoint_key("signing", KeyStatus::Primary, 2),
+    ]);
+    let repo = Repository::with_keyring(MemoryBlobStore::new(), active_keyring);
+
+    let put = repo
+        .put(
+            key("p/12/abcdef"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let mut checkpoint = must(repo.draft_signed_checkpoint(None));
+    checkpoint.id = checkpoint_id("wrong-checkpoint-id");
+
+    let verified = repo.verify_signed_checkpoint(&checkpoint, None);
+
+    assert!(matches!(
+        verified,
+        Err(RepositoryError::CheckpointIdMismatch)
+    ));
+}
+
+#[tokio::test]
+async fn verify_signed_checkpoint_rejects_stale_sequence() {
+    let active_keyring = keyring(vec![
+        namespace_key("namespace", KeyStatus::Primary, 1),
+        checkpoint_key("signing", KeyStatus::Primary, 2),
+    ]);
+    let repo = Repository::with_keyring(MemoryBlobStore::new(), active_keyring);
+
+    let put = repo
+        .put(
+            key("p/12/abcdef"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let checkpoint = must(repo.draft_signed_checkpoint(None));
+    let accepted = CheckpointPosition {
+        sequence: Sequence::new(2),
+        checkpoint_id: checkpoint_id("newer"),
+        payload_digest: "newer".to_string(),
+    };
+
+    let verified = repo.verify_signed_checkpoint(&checkpoint, Some(&accepted));
+
+    assert!(matches!(
+        verified,
+        Err(RepositoryError::StaleCheckpoint { .. })
+    ));
+}
+
+#[tokio::test]
+async fn verify_signed_checkpoint_requires_parent_when_advancing() {
+    let active_keyring = keyring(vec![
+        namespace_key("namespace", KeyStatus::Primary, 1),
+        checkpoint_key("signing", KeyStatus::Primary, 2),
+    ]);
+    let repo = Repository::with_keyring(MemoryBlobStore::new(), active_keyring);
+
+    let first_put = repo
+        .put(
+            key("p/12/first"),
+            Bytes::from_static(b"first"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(first_put.is_ok());
+
+    let first = must(repo.draft_signed_checkpoint(None));
+    let accepted = must(repo.verify_signed_checkpoint(&first, None));
+
+    let second_put = repo
+        .put(
+            key("p/12/second"),
+            Bytes::from_static(b"second"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(second_put.is_ok());
+
+    let wrong_parent = must(repo.draft_signed_checkpoint(None));
+    let rejected = repo.verify_signed_checkpoint(&wrong_parent, Some(&accepted));
+    assert!(matches!(
+        rejected,
+        Err(RepositoryError::CheckpointParentMismatch)
+    ));
+
+    let chained = must(repo.draft_signed_checkpoint(Some(accepted.checkpoint_id.clone())));
+    let advanced = repo.verify_signed_checkpoint(&chained, Some(&accepted));
+    assert!(advanced.is_ok());
 }
 
 #[test]
