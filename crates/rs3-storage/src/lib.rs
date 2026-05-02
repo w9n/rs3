@@ -5,6 +5,7 @@ use bytes::Bytes;
 use rs3_types::{BackendObjectId, RetentionMode, RetentionPolicy};
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// Metadata returned by object-store reads and heads.
@@ -206,10 +207,21 @@ impl BlobStore for MemoryBlobStore {
         body: Bytes,
         options: PutOptions,
     ) -> Result<BlobMetadata> {
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
+        let requested_len = body.len();
+        let retained = options.retention.is_some();
         let mut state = self.write_state()?;
         state.counts.put = state.counts.put.saturating_add(1);
 
         if options.do_not_recreate && state.objects.contains_key(object_id) {
+            record_blob_put(
+                object_kind,
+                requested_len,
+                retained,
+                "already_exists",
+                started.elapsed(),
+            );
             return Err(StorageError::AlreadyExists(object_id.clone()));
         }
 
@@ -236,63 +248,95 @@ impl BlobStore for MemoryBlobStore {
             },
         );
 
+        record_blob_put(
+            object_kind,
+            requested_len,
+            retained,
+            "ok",
+            started.elapsed(),
+        );
         Ok(metadata)
     }
 
     async fn get_range(&self, object_id: &BackendObjectId, range: ByteRange) -> Result<Bytes> {
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
         let mut state = self.write_state()?;
         state.counts.get = state.counts.get.saturating_add(1);
 
-        let object = state
-            .objects
-            .get(object_id)
-            .ok_or_else(|| StorageError::NotFound(object_id.clone()))?;
+        let Some(object) = state.objects.get(object_id) else {
+            record_blob_get(object_kind, range, 0, "not_found", started.elapsed());
+            return Err(StorageError::NotFound(object_id.clone()));
+        };
 
-        let body = read_range(&object.body, range)?;
+        let body = match read_range(&object.body, range) {
+            Ok(body) => body,
+            Err(error) => {
+                record_blob_get(object_kind, range, 0, "invalid_range", started.elapsed());
+                return Err(error);
+            }
+        };
         let bytes_read = u64::try_from(body.len())
             .map_err(|_| StorageError::Provider("read length does not fit in u64".to_owned()))?;
         state.counts.bytes_read = state.counts.bytes_read.saturating_add(bytes_read);
 
+        record_blob_get(object_kind, range, bytes_read, "ok", started.elapsed());
         Ok(body)
     }
 
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
         let mut state = self.write_state()?;
         state.counts.head = state.counts.head.saturating_add(1);
 
-        state
-            .objects
-            .get(object_id)
-            .map(|object| object.metadata.clone())
-            .ok_or_else(|| StorageError::NotFound(object_id.clone()))
+        match state.objects.get(object_id) {
+            Some(object) => {
+                record_blob_head(object_kind, "ok", started.elapsed());
+                Ok(object.metadata.clone())
+            }
+            None => {
+                record_blob_head(object_kind, "not_found", started.elapsed());
+                Err(StorageError::NotFound(object_id.clone()))
+            }
+        }
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
+        let started = Instant::now();
+        let object_kind = prefix_kind(prefix);
         let mut state = self.write_state()?;
         state.counts.list = state.counts.list.saturating_add(1);
 
-        Ok(state
+        let entries = state
             .objects
             .iter()
             .filter(|(object_id, _)| object_id.as_str().starts_with(prefix))
             .map(|(_, object)| object.metadata.clone())
-            .collect())
+            .collect::<Vec<_>>();
+        record_blob_list(object_kind, entries.len(), "ok", started.elapsed());
+
+        Ok(entries)
     }
 
     async fn delete(&self, object_id: &BackendObjectId) -> Result<()> {
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
         let mut state = self.write_state()?;
         state.counts.delete = state.counts.delete.saturating_add(1);
 
-        let object = state
-            .objects
-            .get(object_id)
-            .ok_or_else(|| StorageError::NotFound(object_id.clone()))?;
+        let Some(object) = state.objects.get(object_id) else {
+            record_blob_delete(object_kind, "not_found", started.elapsed());
+            return Err(StorageError::NotFound(object_id.clone()));
+        };
 
         if retention_blocks_delete(object.metadata.retention.as_ref()) {
+            record_blob_delete(object_kind, "retention_blocked", started.elapsed());
             return Err(StorageError::RetentionBlocked);
         }
 
         state.objects.remove(object_id);
+        record_blob_delete(object_kind, "ok", started.elapsed());
         Ok(())
     }
 
@@ -301,25 +345,133 @@ impl BlobStore for MemoryBlobStore {
         object_id: &BackendObjectId,
         policy: RetentionPolicy,
     ) -> Result<()> {
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
         let mut state = self.write_state()?;
         state.counts.extend_retention = state.counts.extend_retention.saturating_add(1);
 
-        let object = state
-            .objects
-            .get_mut(object_id)
-            .ok_or_else(|| StorageError::NotFound(object_id.clone()))?;
+        let Some(object) = state.objects.get_mut(object_id) else {
+            record_blob_extend_retention(object_kind, "not_found", started.elapsed());
+            return Err(StorageError::NotFound(object_id.clone()));
+        };
 
         object.metadata.retention =
             Some(merge_retention(object.metadata.retention.as_ref(), policy));
 
+        record_blob_extend_retention(object_kind, "ok", started.elapsed());
         Ok(())
     }
 
     async fn flush_caches(&self) -> Result<()> {
+        let started = Instant::now();
         let mut state = self.write_state()?;
         state.counts.flush = state.counts.flush.saturating_add(1);
+        tracing::debug!(
+            target: "rs3_storage",
+            operation = "flush_caches",
+            result = "ok",
+            elapsed_us = elapsed_us(started.elapsed()),
+            "blob store operation completed",
+        );
         Ok(())
     }
+}
+
+fn record_blob_put(
+    object_kind: &str,
+    requested_len: usize,
+    retained: bool,
+    result: &str,
+    elapsed: Duration,
+) {
+    tracing::debug!(
+        target: "rs3_storage",
+        operation = "put",
+        object_kind,
+        requested_len,
+        retained,
+        result,
+        elapsed_us = elapsed_us(elapsed),
+        "blob store operation completed",
+    );
+}
+
+fn record_blob_get(
+    object_kind: &str,
+    range: ByteRange,
+    bytes_read: u64,
+    result: &str,
+    elapsed: Duration,
+) {
+    match range {
+        ByteRange::Full => tracing::debug!(
+            target: "rs3_storage",
+            operation = "get_range",
+            object_kind,
+            range = "full",
+            bytes_read,
+            result,
+            elapsed_us = elapsed_us(elapsed),
+            "blob store operation completed",
+        ),
+        ByteRange::Slice { offset, len } => tracing::debug!(
+            target: "rs3_storage",
+            operation = "get_range",
+            object_kind,
+            range = "slice",
+            range_offset = offset,
+            range_len = len,
+            bytes_read,
+            result,
+            elapsed_us = elapsed_us(elapsed),
+            "blob store operation completed",
+        ),
+    }
+}
+
+fn record_blob_head(object_kind: &str, result: &str, elapsed: Duration) {
+    tracing::debug!(
+        target: "rs3_storage",
+        operation = "head",
+        object_kind,
+        result,
+        elapsed_us = elapsed_us(elapsed),
+        "blob store operation completed",
+    );
+}
+
+fn record_blob_list(object_kind: &str, entries: usize, result: &str, elapsed: Duration) {
+    tracing::debug!(
+        target: "rs3_storage",
+        operation = "list_prefix",
+        object_kind,
+        entries,
+        result,
+        elapsed_us = elapsed_us(elapsed),
+        "blob store operation completed",
+    );
+}
+
+fn record_blob_delete(object_kind: &str, result: &str, elapsed: Duration) {
+    tracing::debug!(
+        target: "rs3_storage",
+        operation = "delete",
+        object_kind,
+        result,
+        elapsed_us = elapsed_us(elapsed),
+        "blob store operation completed",
+    );
+}
+
+fn record_blob_extend_retention(object_kind: &str, result: &str, elapsed: Duration) {
+    tracing::debug!(
+        target: "rs3_storage",
+        operation = "extend_retention",
+        object_kind,
+        result,
+        elapsed_us = elapsed_us(elapsed),
+        "blob store operation completed",
+    );
 }
 
 fn read_range(body: &Bytes, range: ByteRange) -> Result<Bytes> {
@@ -368,6 +520,18 @@ fn stronger_retention_mode(left: RetentionMode, right: RetentionMode) -> Retenti
         }
         (RetentionMode::None, RetentionMode::None) => RetentionMode::None,
     }
+}
+
+fn object_kind(object_id: &BackendObjectId) -> &str {
+    prefix_kind(object_id.as_str())
+}
+
+fn prefix_kind(value: &str) -> &str {
+    value.split_once('/').map_or("other", |(prefix, _)| prefix)
+}
+
+fn elapsed_us(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

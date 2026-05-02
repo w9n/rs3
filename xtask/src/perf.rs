@@ -9,6 +9,7 @@ use rs3_repository::{Repository, RepositoryPutOptions};
 use rs3_storage::{BlobOperationCounts, ByteRange, MemoryBlobStore};
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath};
 use std::time::{Duration, Instant};
+use tracing_subscriber::EnvFilter;
 
 /// Runs lightweight repository performance scenarios.
 #[derive(Debug, Args)]
@@ -28,6 +29,18 @@ pub(crate) struct PerfArgs {
     /// Plaintext range length in bytes for range-read scenarios.
     #[arg(long, default_value_t = 4 * 1024)]
     range_len: usize,
+    /// Output format for scenario reports.
+    #[arg(long, value_enum, default_value_t = ReportFormat::Tsv)]
+    format: ReportFormat,
+    /// Enable tracing subscriber output while scenarios run.
+    #[arg(long)]
+    trace: bool,
+    /// Tracing filter used when `--trace` is enabled.
+    #[arg(long, default_value = "rs3_repository=info,rs3_storage=debug")]
+    trace_filter: String,
+    /// Tracing output format used when `--trace` is enabled.
+    #[arg(long, value_enum, default_value_t = TraceFormat::Plain)]
+    trace_format: TraceFormat,
 }
 
 /// Available performance scenarios.
@@ -43,7 +56,29 @@ pub(crate) enum PerfScenario {
     RangeRead,
 }
 
+/// Machine-readable report output options.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ReportFormat {
+    /// Tab-separated table.
+    Tsv,
+    /// One JSON object per scenario.
+    Jsonl,
+}
+
+/// Trace subscriber output options.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum TraceFormat {
+    /// Human-readable tracing output.
+    Plain,
+    /// JSON tracing output.
+    Json,
+}
+
 pub(crate) async fn run(args: PerfArgs) -> Result<()> {
+    if args.trace {
+        init_tracing(&args.trace_filter, args.trace_format)?;
+    }
+
     let scenarios = match args.scenario {
         PerfScenario::All => vec![
             PerfScenario::WriteBatch,
@@ -53,7 +88,9 @@ pub(crate) async fn run(args: PerfArgs) -> Result<()> {
         scenario => vec![scenario],
     };
 
-    print_header();
+    if args.format == ReportFormat::Tsv {
+        print_header();
+    }
     for scenario in scenarios {
         let report = match scenario {
             PerfScenario::All => unreachable!("expanded above"),
@@ -61,7 +98,7 @@ pub(crate) async fn run(args: PerfArgs) -> Result<()> {
             PerfScenario::FullRead => full_read(&args).await?,
             PerfScenario::RangeRead => range_read(&args).await?,
         };
-        report.print();
+        report.print(args.format)?;
     }
 
     Ok(())
@@ -96,7 +133,8 @@ async fn write_batch(args: &PerfArgs) -> Result<PerfReport> {
         objects: args.objects,
         object_size: args.object_size,
         operations: args.objects,
-        requested_plaintext_bytes: checked_mul(args.objects, args.object_size)?,
+        requested_plaintext_write_bytes: checked_mul(args.objects, args.object_size)?,
+        requested_plaintext_read_bytes: 0,
         elapsed,
         counts,
     })
@@ -130,7 +168,8 @@ async fn full_read(args: &PerfArgs) -> Result<PerfReport> {
         objects: 1,
         object_size: args.object_size,
         operations: args.reads,
-        requested_plaintext_bytes: checked_mul(args.reads, args.object_size)?,
+        requested_plaintext_write_bytes: 0,
+        requested_plaintext_read_bytes: checked_mul(args.reads, args.object_size)?,
         elapsed,
         counts,
     })
@@ -177,7 +216,8 @@ async fn range_read(args: &PerfArgs) -> Result<PerfReport> {
         objects: 1,
         object_size: args.object_size,
         operations: args.reads,
-        requested_plaintext_bytes: checked_mul(args.reads, range_len)?,
+        requested_plaintext_write_bytes: 0,
+        requested_plaintext_read_bytes: checked_mul(args.reads, range_len)?,
         elapsed,
         counts,
     })
@@ -188,26 +228,38 @@ struct PerfReport {
     objects: usize,
     object_size: usize,
     operations: usize,
-    requested_plaintext_bytes: usize,
+    requested_plaintext_write_bytes: usize,
+    requested_plaintext_read_bytes: usize,
     elapsed: Duration,
     counts: BlobOperationCounts,
 }
 
 impl PerfReport {
-    fn print(&self) {
+    fn print(&self, format: ReportFormat) -> Result<()> {
+        match format {
+            ReportFormat::Tsv => {
+                self.print_tsv();
+                Ok(())
+            }
+            ReportFormat::Jsonl => self.print_jsonl(),
+        }
+    }
+
+    fn print_tsv(&self) {
         let elapsed_ms = self.elapsed.as_secs_f64() * 1_000.0;
-        let throughput_mib_s = mib_per_second(self.requested_plaintext_bytes, self.elapsed);
-        let read_amplification = ratio(
+        let requested_plaintext_bytes = self.requested_plaintext_bytes();
+        let throughput_mib_s = mib_per_second(requested_plaintext_bytes, self.elapsed);
+        let read_amplification = format_amp(ratio_optional(
             self.counts.bytes_read,
-            self.requested_plaintext_bytes as u64,
-        );
-        let write_amplification = ratio(
+            self.requested_plaintext_read_bytes as u64,
+        ));
+        let write_amplification = format_amp(ratio_optional(
             self.counts.bytes_written,
-            self.requested_plaintext_bytes as u64,
-        );
+            self.requested_plaintext_write_bytes as u64,
+        ));
 
         println!(
-            "{}\t{}\t{}\t{}\t{:.3}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}",
+            "{}\t{}\t{}\t{}\t{:.3}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.scenario,
             self.objects,
             self.object_size,
@@ -220,16 +272,59 @@ impl PerfReport {
             self.counts.list,
             self.counts.bytes_written,
             self.counts.bytes_read,
-            self.requested_plaintext_bytes,
+            requested_plaintext_bytes,
+            self.requested_plaintext_write_bytes,
+            self.requested_plaintext_read_bytes,
             write_amplification,
             read_amplification,
         );
+    }
+
+    fn print_jsonl(&self) -> Result<()> {
+        let requested_plaintext_bytes = self.requested_plaintext_bytes();
+        let report = serde_json::json!({
+            "scenario": self.scenario,
+            "objects": self.objects,
+            "object_size": self.object_size,
+            "operations": self.operations,
+            "elapsed_ms": self.elapsed.as_secs_f64() * 1_000.0,
+            "plaintext_mib_s": mib_per_second(requested_plaintext_bytes, self.elapsed),
+            "backend": {
+                "puts": self.counts.put,
+                "gets": self.counts.get,
+                "heads": self.counts.head,
+                "lists": self.counts.list,
+                "deletes": self.counts.delete,
+                "extend_retention": self.counts.extend_retention,
+                "flushes": self.counts.flush,
+                "bytes_written": self.counts.bytes_written,
+                "bytes_read": self.counts.bytes_read,
+            },
+            "requested_plaintext_bytes": requested_plaintext_bytes,
+            "requested_plaintext_write_bytes": self.requested_plaintext_write_bytes,
+            "requested_plaintext_read_bytes": self.requested_plaintext_read_bytes,
+            "write_amp": ratio_optional(
+                self.counts.bytes_written,
+                self.requested_plaintext_write_bytes as u64,
+            ),
+            "read_amp": ratio_optional(
+                self.counts.bytes_read,
+                self.requested_plaintext_read_bytes as u64,
+            ),
+        });
+        println!("{}", serde_json::to_string(&report)?);
+        Ok(())
+    }
+
+    fn requested_plaintext_bytes(&self) -> usize {
+        self.requested_plaintext_write_bytes
+            .saturating_add(self.requested_plaintext_read_bytes)
     }
 }
 
 fn print_header() {
     println!(
-        "scenario\tobjects\tobject_size\toperations\telapsed_ms\tplaintext_mib_s\tputs\tgets\theads\tlists\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\twrite_amp\tread_amp"
+        "scenario\tobjects\tobject_size\toperations\telapsed_ms\tplaintext_mib_s\tputs\tgets\theads\tlists\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp"
     );
 }
 
@@ -313,10 +408,32 @@ fn mib_per_second(bytes: usize, elapsed: Duration) -> f64 {
     bytes as f64 / 1_048_576.0 / elapsed.as_secs_f64()
 }
 
-fn ratio(numerator: u64, denominator: u64) -> f64 {
+fn ratio_optional(numerator: u64, denominator: u64) -> Option<f64> {
     if denominator == 0 {
-        return 0.0;
+        return None;
     }
 
-    numerator as f64 / denominator as f64
+    Some(numerator as f64 / denominator as f64)
+}
+
+fn format_amp(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_owned(), |value| format!("{value:.3}"))
+}
+
+fn init_tracing(filter: &str, format: TraceFormat) -> Result<()> {
+    let filter = EnvFilter::try_new(filter).context("invalid tracing filter")?;
+    match format {
+        TraceFormat::Plain => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!("failed to initialize tracing subscriber: {error}"))?,
+        TraceFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!("failed to initialize tracing subscriber: {error}"))?,
+    }
+    Ok(())
 }

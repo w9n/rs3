@@ -17,6 +17,7 @@ use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, LogicalPath, RetentionPolicy};
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
 /// Trusted repository service.
 pub struct Repository<S> {
@@ -63,6 +64,11 @@ where
         body: Bytes,
         options: RepositoryPutOptions,
     ) -> Result<RepositoryObjectMetadata> {
+        let started = Instant::now();
+        let plaintext_len = u64::try_from(body.len())
+            .map_err(|_| StorageError::Provider("payload length does not fit in u64".to_owned()))?;
+        let create_only = options.create_only;
+        let requested_retention = options.retention.is_some();
         let keyring = self.keyring()?;
         let primary_blind_key = keyring.derive_primary_blind_index_key(&key)?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(&key)?;
@@ -73,6 +79,16 @@ where
             let mut state = self.write_state()?;
             let existing_blind_keys = existing_blind_keys(&state.namespace, &lookup_blind_keys);
             if options.create_only && !existing_blind_keys.is_empty() {
+                record_repository_put(RepositoryPutTrace {
+                    plaintext_len,
+                    backend_len: 0,
+                    sequence: 0,
+                    stale_entries: existing_blind_keys.len(),
+                    create_only,
+                    requested_retention,
+                    result: "already_exists",
+                    elapsed: started.elapsed(),
+                });
                 return Err(RepositoryError::AlreadyExists(key));
             }
 
@@ -88,8 +104,6 @@ where
             (sequence, object_id, manifest_id, stale_blind_keys)
         };
 
-        let plaintext_len = u64::try_from(body.len())
-            .map_err(|_| StorageError::Provider("payload length does not fit in u64".to_owned()))?;
         let payload = seal_payload_object(&keyring, &object_id, &body)?;
         let storage_metadata = self
             .store
@@ -124,6 +138,7 @@ where
             retention: storage_metadata.retention,
         };
         let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
+        let stale_entries = stale_blind_keys.len();
 
         {
             let mut state = self.write_state()?;
@@ -143,6 +158,16 @@ where
             state.manifests.insert(manifest_id, manifest.clone());
         }
 
+        record_repository_put(RepositoryPutTrace {
+            plaintext_len,
+            backend_len: storage_metadata.content_len,
+            sequence: sequence.get(),
+            stale_entries,
+            create_only,
+            requested_retention,
+            result: "ok",
+            elapsed: started.elapsed(),
+        });
         Ok(manifest.into_metadata())
     }
 
@@ -157,9 +182,20 @@ where
     where
         A: CheckpointAnchor,
     {
+        let started = Instant::now();
+        let plaintext_len = body.len();
         let metadata = self.put(key, body, options).await?;
         let checkpoint = self.publish_checkpoint(anchor).await?;
 
+        tracing::info!(
+            target: "rs3_repository",
+            operation = "put_committed",
+            result = "ok",
+            plaintext_len,
+            checkpoint_sequence = checkpoint.sequence.get(),
+            elapsed_us = elapsed_us(started.elapsed()),
+            "repository operation completed",
+        );
         Ok(CommittedPut {
             metadata,
             checkpoint,
@@ -189,11 +225,47 @@ where
 
     /// Reads a client-visible object or byte range.
     pub async fn get_range(&self, key: &LogicalPath, range: ByteRange) -> Result<Bytes> {
+        let started = Instant::now();
         let keyring = self.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
-        let object_id = self.object_id_for_candidates(key, &lookup_blind_keys)?;
-        let body = self.store.get_range(&object_id, ByteRange::Full).await?;
-        open_payload_object(&keyring, &object_id, body, range)
+        let object_id = match self.object_id_for_candidates(key, &lookup_blind_keys) {
+            Ok(object_id) => object_id,
+            Err(error) => {
+                record_repository_get(range, 0, 0, "not_found", started.elapsed());
+                return Err(error);
+            }
+        };
+        let body = match self.store.get_range(&object_id, ByteRange::Full).await {
+            Ok(body) => body,
+            Err(error) => {
+                record_repository_get(range, 0, 0, "storage_error", started.elapsed());
+                return Err(error.into());
+            }
+        };
+        let backend_bytes_read = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        match open_payload_object(&keyring, &object_id, body, range) {
+            Ok(plaintext) => {
+                let returned_len = u64::try_from(plaintext.len()).unwrap_or(u64::MAX);
+                record_repository_get(
+                    range,
+                    backend_bytes_read,
+                    returned_len,
+                    "ok",
+                    started.elapsed(),
+                );
+                Ok(plaintext)
+            }
+            Err(error) => {
+                record_repository_get(
+                    range,
+                    backend_bytes_read,
+                    0,
+                    "open_error",
+                    started.elapsed(),
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Lists client-visible entries for a prefix.
@@ -351,4 +423,68 @@ where
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)
     }
+}
+
+struct RepositoryPutTrace {
+    plaintext_len: u64,
+    backend_len: u64,
+    sequence: u64,
+    stale_entries: usize,
+    create_only: bool,
+    requested_retention: bool,
+    result: &'static str,
+    elapsed: Duration,
+}
+
+fn record_repository_put(record: RepositoryPutTrace) {
+    tracing::info!(
+        target: "rs3_repository",
+        operation = "put",
+        plaintext_len = record.plaintext_len,
+        backend_len = record.backend_len,
+        sequence = record.sequence,
+        stale_entries = record.stale_entries,
+        create_only = record.create_only,
+        requested_retention = record.requested_retention,
+        result = record.result,
+        elapsed_us = elapsed_us(record.elapsed),
+        "repository operation completed",
+    );
+}
+
+fn record_repository_get(
+    range: ByteRange,
+    backend_bytes_read: u64,
+    returned_len: u64,
+    result: &str,
+    elapsed: Duration,
+) {
+    match range {
+        ByteRange::Full => tracing::info!(
+            target: "rs3_repository",
+            operation = "get_range",
+            range = "full",
+            backend_bytes_read,
+            returned_len,
+            result,
+            elapsed_us = elapsed_us(elapsed),
+            "repository operation completed",
+        ),
+        ByteRange::Slice { offset, len } => tracing::info!(
+            target: "rs3_repository",
+            operation = "get_range",
+            range = "slice",
+            range_offset = offset,
+            range_len = len,
+            backend_bytes_read,
+            returned_len,
+            result,
+            elapsed_us = elapsed_us(elapsed),
+            "repository operation completed",
+        ),
+    }
+}
+
+fn elapsed_us(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }

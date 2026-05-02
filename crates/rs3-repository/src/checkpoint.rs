@@ -18,6 +18,7 @@ use rs3_index::{
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, CheckpointId, ManifestId};
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 pub(crate) const CHECKPOINT_OBJECT_PREFIX: &str = "checkpoints/";
 const CHECKPOINT_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.checkpoint+json";
@@ -109,20 +110,31 @@ where
     where
         A: CheckpointAnchor,
     {
+        let started = Instant::now();
         let accepted = match anchor.read().await {
             Ok(state) => Some(CheckpointPosition::from(state)),
             Err(AnchorError::MissingAnchor) => None,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                record_checkpoint_publish(0, 0, "anchor_read_error", started.elapsed());
+                return Err(error.into());
+            }
         };
 
         if let Some(position) = accepted.as_ref() {
             let state = self.read_state()?;
             if state.next_sequence < position.sequence {
+                record_checkpoint_publish(state.next_sequence.get(), 0, "stale", started.elapsed());
                 return Err(crate::RepositoryError::StaleCheckpoint {
                     sequence: state.next_sequence,
                 });
             }
             if state.next_sequence == position.sequence {
+                record_checkpoint_publish(
+                    position.sequence.get(),
+                    0,
+                    "idempotent",
+                    started.elapsed(),
+                );
                 return Ok(position.clone());
             }
         }
@@ -141,6 +153,7 @@ where
 
         let record = self.draft_commit_record_with_index_deltas(parent, index_deltas)?;
         let checkpoint = self.sign_commit_record(record)?;
+        let index_delta_count = checkpoint.record.index_deltas.len();
         let position = self.verify_signed_checkpoint(&checkpoint, accepted.as_ref())?;
 
         self.persist_signed_checkpoint(&checkpoint).await?;
@@ -150,6 +163,12 @@ where
             .await?;
         self.mark_index_deltas_published(position.sequence)?;
 
+        record_checkpoint_publish(
+            position.sequence.get(),
+            index_delta_count,
+            "ok",
+            started.elapsed(),
+        );
         Ok(position)
     }
 
@@ -454,4 +473,25 @@ fn validate_position(
     }
 
     Ok(())
+}
+
+fn record_checkpoint_publish(
+    sequence: u64,
+    index_delta_count: usize,
+    result: &str,
+    elapsed: Duration,
+) {
+    tracing::info!(
+        target: "rs3_repository",
+        operation = "publish_checkpoint",
+        sequence,
+        index_delta_count,
+        result,
+        elapsed_us = elapsed_us(elapsed),
+        "repository operation completed",
+    );
+}
+
+fn elapsed_us(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }

@@ -1127,6 +1127,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1155,6 +1156,7 @@ dependencies = [
  "rs3-types",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1780,7 +1782,9 @@ dependencies = [
  "rs3-repository",
  "rs3-storage",
  "rs3-types",
+ "serde_json",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
