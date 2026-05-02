@@ -10,17 +10,21 @@ use rs3_crypto::{
     derive_checkpoint_id, derive_checkpoint_payload_digest, derive_index_delta_object_id,
 };
 use rs3_index::{
-    CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CommitRecord, INDEX_DELTA_OBJECT_DOMAIN,
-    IndexDeltaObject, KeyringSnapshot, canonical_commit_record_bytes, checkpoint_object_bytes,
-    index_delta_object_bytes,
+    CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CommitRecord, DurableManifest, INDEX_DELTA_OBJECT_DOMAIN,
+    IndexDelta, IndexDeltaObject, KeyringSnapshot, MANIFEST_OBJECT_DOMAIN,
+    MANIFEST_PLAINTEXT_DOMAIN, ManifestObject, canonical_commit_record_bytes,
+    checkpoint_object_bytes, index_delta_object_bytes, manifest_object_bytes,
+    manifest_plaintext_bytes,
 };
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
-use rs3_types::{BackendObjectId, CheckpointId};
+use rs3_types::{BackendObjectId, CheckpointId, ManifestId};
 use std::collections::BTreeSet;
 
 pub(crate) const CHECKPOINT_OBJECT_PREFIX: &str = "checkpoints/";
+pub(crate) const MANIFEST_OBJECT_PREFIX: &str = "manifests/";
 const CHECKPOINT_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.checkpoint+json";
 const INDEX_DELTA_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.index-delta+json";
+const MANIFEST_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.manifest+json";
 
 struct PendingIndexDeltaObject {
     object_id: BackendObjectId,
@@ -130,6 +134,7 @@ where
             .as_ref()
             .map(|position| position.checkpoint_id.clone());
         let pending_index_delta = self.pending_index_delta_object()?;
+        self.persist_pending_manifest_objects().await?;
         if let Some(delta) = pending_index_delta.as_ref() {
             self.persist_index_delta_object(delta).await?;
         }
@@ -211,6 +216,74 @@ where
                     Ok(())
                 } else {
                     Err(crate::RepositoryError::CheckpointObjectConflict { object_id })
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn persist_pending_manifest_objects(&self) -> Result<()> {
+        let manifests = {
+            let state = self.read_state()?;
+            state
+                .pending_index_deltas
+                .iter()
+                .filter_map(|delta| match delta {
+                    IndexDelta::Upsert { entry, .. } => state
+                        .manifests
+                        .get(&entry.manifest_id)
+                        .map(|manifest| (entry.manifest_id.clone(), manifest.clone())),
+                    IndexDelta::Tombstone { .. } => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (manifest_id, manifest) in manifests {
+            self.persist_manifest_object(&manifest_id, manifest.into_durable())
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn persist_manifest_object(
+        &self,
+        manifest_id: &ManifestId,
+        manifest: DurableManifest,
+    ) -> Result<()> {
+        let keyring = self.keyring()?;
+        let plaintext = manifest_plaintext_bytes(&manifest)?;
+        let associated_data = manifest_associated_data(manifest_id);
+        let sealed = keyring.seal_metadata_payload(&associated_data, &plaintext)?;
+        let manifest_object = ManifestObject {
+            key_id: sealed.key_id,
+            nonce: sealed.nonce,
+            ciphertext: sealed.ciphertext,
+            tag: sealed.tag,
+        };
+        let body = Bytes::from(manifest_object_bytes(&manifest_object)?);
+        let object_id = manifest_object_id(manifest_id)?;
+        let put = self
+            .store
+            .put(
+                &object_id,
+                body.clone(),
+                PutOptions {
+                    retention: None,
+                    content_type: Some(MANIFEST_OBJECT_CONTENT_TYPE.to_owned()),
+                    do_not_recreate: true,
+                },
+            )
+            .await;
+
+        match put {
+            Ok(_) => Ok(()),
+            Err(StorageError::AlreadyExists(_)) => {
+                let existing = self.store.get_range(&object_id, ByteRange::Full).await?;
+                if existing == body {
+                    Ok(())
+                } else {
+                    Err(crate::RepositoryError::ManifestObjectConflict { object_id })
                 }
             }
             Err(error) => Err(error.into()),
@@ -319,16 +392,66 @@ where
     ) -> Result<()> {
         for object_id in &checkpoint.record.index_deltas {
             let body = self.store.get_range(object_id, ByteRange::Full).await?;
+            let expected_object_id = derive_index_delta_object_id(&body)?;
+            if &expected_object_id != object_id {
+                return Err(crate::RepositoryError::IndexDeltaObjectConflict {
+                    object_id: object_id.clone(),
+                });
+            }
             let Some(payload) = body.as_ref().strip_prefix(INDEX_DELTA_OBJECT_DOMAIN) else {
                 return Err(crate::RepositoryError::InvalidObjectFormat {
                     object_id: object_id.clone(),
                 });
             };
             let delta = serde_json::from_slice::<IndexDeltaObject>(payload)?;
+            self.load_manifest_objects(state, &delta).await?;
             apply_index_delta_object(state, delta);
         }
 
         Ok(())
+    }
+
+    async fn load_manifest_objects(
+        &self,
+        state: &mut RepositoryState,
+        delta: &IndexDeltaObject,
+    ) -> Result<()> {
+        for mutation in &delta.deltas {
+            let IndexDelta::Upsert { entry, .. } = mutation else {
+                continue;
+            };
+
+            let manifest = self.read_manifest_object(&entry.manifest_id).await?;
+            state.manifests.insert(entry.manifest_id.clone(), manifest);
+        }
+
+        Ok(())
+    }
+
+    async fn read_manifest_object(
+        &self,
+        manifest_id: &ManifestId,
+    ) -> Result<crate::state::TrustedManifest> {
+        let object_id = manifest_object_id(manifest_id)?;
+        let body = self.store.get_range(&object_id, ByteRange::Full).await?;
+        let Some(payload) = body.as_ref().strip_prefix(MANIFEST_OBJECT_DOMAIN) else {
+            return Err(crate::RepositoryError::InvalidObjectFormat { object_id });
+        };
+        let manifest_object = serde_json::from_slice::<ManifestObject>(payload)?;
+        let keyring = self.keyring()?;
+        let plaintext = keyring.open_metadata_payload(
+            &manifest_object.key_id,
+            &manifest_associated_data(manifest_id),
+            &manifest_object.nonce,
+            &manifest_object.ciphertext,
+            &manifest_object.tag,
+        )?;
+        let Some(payload) = plaintext.strip_prefix(MANIFEST_PLAINTEXT_DOMAIN) else {
+            return Err(crate::RepositoryError::InvalidObjectFormat { object_id });
+        };
+        let manifest = serde_json::from_slice::<DurableManifest>(payload)?;
+
+        Ok(crate::state::TrustedManifest::from_durable(manifest))
     }
 }
 
@@ -338,6 +461,15 @@ pub(crate) fn checkpoint_object_id(checkpoint_id: &CheckpointId) -> Result<Backe
         checkpoint_id.as_str()
     ))
     .map_err(Into::into)
+}
+
+pub(crate) fn manifest_object_id(manifest_id: &ManifestId) -> Result<BackendObjectId> {
+    BackendObjectId::new(format!("{MANIFEST_OBJECT_PREFIX}{}", manifest_id.as_str()))
+        .map_err(Into::into)
+}
+
+fn manifest_associated_data(manifest_id: &ManifestId) -> Vec<u8> {
+    format!("rs3:manifest-associated-data:v1:{}", manifest_id.as_str()).into_bytes()
 }
 
 fn validate_position(

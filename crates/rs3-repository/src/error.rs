@@ -66,6 +66,12 @@ pub enum RepositoryError {
         /// Conflicting backend object ID.
         object_id: BackendObjectId,
     },
+    /// A stored manifest object has different content than expected.
+    #[error("manifest object conflicts with expected content: {object_id}")]
+    ManifestObjectConflict {
+        /// Conflicting backend object ID.
+        object_id: BackendObjectId,
+    },
     /// A durable object does not match the expected format.
     #[error("invalid durable object format: {object_id}")]
     InvalidObjectFormat {

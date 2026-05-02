@@ -4,6 +4,7 @@ mod checkpoint;
 mod derive;
 mod error;
 mod keyring;
+mod metadata;
 mod primitives;
 mod secret;
 
@@ -17,4 +18,5 @@ pub use derive::{
 };
 pub use error::CryptoError;
 pub use keyring::{KeyMaterial, KeyRing};
+pub use metadata::MetadataSeal;
 pub use secret::SecretBytes;

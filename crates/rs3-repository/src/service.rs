@@ -254,7 +254,12 @@ where
         let entry = first_namespace_entry(&state.namespace, &lookup_blind_keys)
             .ok_or_else(|| RepositoryError::NotFound(key.clone()))?
             .clone();
+        let sequence = next_sequence(&mut state)?;
+        let material = object_material(key.as_str(), sequence);
+        let manifest_id = keyring.derive_manifest_id(&material)?;
         let mut updated = entry;
+        updated.manifest_id = manifest_id.clone();
+        updated.generation = sequence;
         updated.retention = backend.retention.clone();
         let prefix_tokens =
             prefix_tokens_for_key(&keyring, &updated.namespace_key_id, key.as_str())?;
@@ -263,13 +268,17 @@ where
             prefix_tokens: prefix_tokens.clone(),
         });
         state.namespace.upsert(updated.clone(), prefix_tokens);
-        let manifest = state
-            .manifests
-            .get_mut(&updated.manifest_id)
-            .ok_or_else(|| RepositoryError::NotFound(key.clone()))?;
-        manifest.retention = backend.retention;
+        let manifest = TrustedManifest {
+            key: key.clone(),
+            content_len: backend.content_len,
+            modified_at_ms: backend
+                .modified_at_ms
+                .unwrap_or_else(|| sequence.get() as i64),
+            retention: backend.retention,
+        };
+        state.manifests.insert(manifest_id, manifest.clone());
 
-        Ok(manifest.clone().into_metadata())
+        Ok(manifest.into_metadata())
     }
 
     fn object_id_for_key(&self, key: &LogicalPath) -> Result<BackendObjectId> {

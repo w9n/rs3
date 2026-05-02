@@ -1,6 +1,6 @@
 //! Repository behavior tests.
 
-use crate::checkpoint::{CHECKPOINT_OBJECT_PREFIX, checkpoint_object_id};
+use crate::checkpoint::{CHECKPOINT_OBJECT_PREFIX, MANIFEST_OBJECT_PREFIX, checkpoint_object_id};
 use crate::namespace::prefix_tokens_for_key;
 use crate::{
     CheckpointPosition, PhysicalDeleteOutcome, Repository, RepositoryError, RepositoryPutOptions,
@@ -11,9 +11,10 @@ use bytes::Bytes;
 use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor, MemoryCheckpointAnchor};
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_index::{
-    CHECKPOINT_OBJECT_DOMAIN, Checkpoint, INDEX_DELTA_OBJECT_DOMAIN, canonical_commit_record_bytes,
+    CHECKPOINT_OBJECT_DOMAIN, Checkpoint, INDEX_DELTA_OBJECT_DOMAIN, MANIFEST_OBJECT_DOMAIN,
+    canonical_commit_record_bytes,
 };
-use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore};
+use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore, PutOptions};
 use rs3_types::{
     CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath, RetentionMode,
     RetentionPolicy, Sequence,
@@ -80,6 +81,16 @@ fn checkpoint_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMateria
     )
 }
 
+fn metadata_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMaterial {
+    key_material(
+        value,
+        KeyPurpose::Metadata,
+        status,
+        "hmac-sha256-seal",
+        secret_byte,
+    )
+}
+
 fn key_material(
     value: &str,
     purpose: KeyPurpose,
@@ -112,7 +123,8 @@ fn keyring(keys: Vec<KeyMaterial>) -> KeyRing {
 fn signing_keyring() -> KeyRing {
     keyring(vec![
         namespace_key("namespace", KeyStatus::Primary, 1),
-        checkpoint_key("signing", KeyStatus::Primary, 2),
+        metadata_key("metadata", KeyStatus::Primary, 2),
+        checkpoint_key("signing", KeyStatus::Primary, 3),
     ])
 }
 
@@ -776,9 +788,11 @@ async fn publish_checkpoint_persists_index_delta_without_client_key_material() {
     );
     let checkpoint = decode_checkpoint_object(checkpoint_body.clone());
     let delta_objects = must_storage(store.list_prefix("index/").await);
+    let manifest_objects = must_storage(store.list_prefix(MANIFEST_OBJECT_PREFIX).await);
 
     assert_eq!(checkpoint.record.index_deltas.len(), 1);
     assert_eq!(delta_objects.len(), 1);
+    assert_eq!(manifest_objects.len(), 1);
     assert_eq!(
         checkpoint.record.index_deltas[0],
         delta_objects[0].object_id
@@ -789,9 +803,16 @@ async fn publish_checkpoint_persists_index_delta_without_client_key_material() {
             .get_range(&delta_objects[0].object_id, ByteRange::Full)
             .await,
     );
+    let manifest_body = must_storage(
+        store
+            .get_range(&manifest_objects[0].object_id, ByteRange::Full)
+            .await,
+    );
     assert!(delta_body.starts_with(INDEX_DELTA_OBJECT_DOMAIN));
+    assert!(manifest_body.starts_with(MANIFEST_OBJECT_DOMAIN));
     assert_body_does_not_contain(&checkpoint_body, &["sensitive", "client-blob", "p/12"]);
     assert_body_does_not_contain(&delta_body, &["sensitive", "client-blob", "p/12"]);
+    assert_body_does_not_contain(&manifest_body, &["sensitive", "client-blob", "p/12"]);
 }
 
 #[tokio::test]
@@ -830,12 +851,59 @@ async fn load_checkpoint_position_replays_checkpoint_chain_for_head_and_get() {
     let first_body = reloaded.get_range(&first_key, ByteRange::Full).await;
     let second_head = reloaded.head(&second_key);
     let second_body = reloaded.get_range(&second_key, ByteRange::Full).await;
+    let listed = reloaded.list("p/12");
 
     assert_eq!(loaded, latest);
     assert_eq!(must(first_head).content_len, 5);
     assert_eq!(must(first_body), Bytes::from_static(b"first"));
     assert_eq!(must(second_head).content_len, 6);
     assert_eq!(must(second_body), Bytes::from_static(b"second"));
+    assert_eq!(
+        must(listed)
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>(),
+        vec![first_key, second_key]
+    );
+}
+
+#[tokio::test]
+async fn load_checkpoint_position_rejects_tampered_index_delta_object() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let repo = Repository::with_keyring(store.clone(), keyring.clone());
+    let anchor = MemoryCheckpointAnchor::new();
+
+    let put = repo
+        .put(
+            key("p/12/abcdef"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+    let latest = must(repo.publish_checkpoint(&anchor).await);
+
+    let delta_object = must_storage(store.list_prefix("index/").await)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("missing index delta object"));
+    let overwrite = store
+        .put(
+            &delta_object.object_id,
+            Bytes::from_static(b"rs3:index-delta-object:v1\n{}"),
+            PutOptions::default(),
+        )
+        .await;
+    assert!(overwrite.is_ok());
+
+    let reloaded = Repository::with_keyring(store, keyring);
+    let loaded = reloaded.load_checkpoint_position(&latest).await;
+
+    assert!(matches!(
+        loaded,
+        Err(RepositoryError::IndexDeltaObjectConflict { .. })
+    ));
 }
 
 #[tokio::test]

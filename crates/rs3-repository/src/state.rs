@@ -2,7 +2,7 @@
 
 use crate::error::{RepositoryError, Result};
 use crate::model::RepositoryObjectMetadata;
-use rs3_index::{IndexDelta, IndexDeltaObject, NamespaceIndex};
+use rs3_index::{DurableManifest, IndexDelta, IndexDeltaObject, NamespaceIndex};
 use rs3_types::{LogicalPath, ManifestId, RetentionPolicy, Sequence};
 use std::collections::BTreeMap;
 
@@ -51,6 +51,26 @@ impl TrustedManifest {
             content_len: self.content_len,
             modified_at_ms: self.modified_at_ms,
             retention: self.retention,
+        }
+    }
+
+    /// Converts trusted manifest metadata into durable manifest metadata.
+    pub(crate) fn into_durable(self) -> DurableManifest {
+        DurableManifest {
+            key: self.key,
+            content_len: self.content_len,
+            modified_at_ms: self.modified_at_ms,
+            retention: self.retention,
+        }
+    }
+
+    /// Converts durable manifest metadata into trusted manifest metadata.
+    pub(crate) fn from_durable(manifest: DurableManifest) -> Self {
+        Self {
+            key: manifest.key,
+            content_len: manifest.content_len,
+            modified_at_ms: manifest.modified_at_ms,
+            retention: manifest.retention,
         }
     }
 }

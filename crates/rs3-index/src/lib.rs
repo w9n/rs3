@@ -16,6 +16,12 @@ pub const CHECKPOINT_OBJECT_DOMAIN: &[u8] = b"rs3:checkpoint-object:v1\n";
 /// Domain separator prepended to durable index delta objects.
 pub const INDEX_DELTA_OBJECT_DOMAIN: &[u8] = b"rs3:index-delta-object:v1\n";
 
+/// Domain separator prepended to plaintext manifest payloads before sealing.
+pub const MANIFEST_PLAINTEXT_DOMAIN: &[u8] = b"rs3:manifest-plaintext:v1\n";
+
+/// Domain separator prepended to durable manifest objects.
+pub const MANIFEST_OBJECT_DOMAIN: &[u8] = b"rs3:manifest-object:v1\n";
+
 /// Pointer to encrypted object payload stored in the backend.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObjectPointer {
@@ -57,6 +63,32 @@ pub struct IndexDeltaObject {
     pub sequence: Sequence,
     /// Ordered index mutations to replay.
     pub deltas: Vec<IndexDelta>,
+}
+
+/// Client-visible metadata stored in a sealed manifest object.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableManifest {
+    /// Client-visible key inside the trusted boundary.
+    pub key: rs3_types::LogicalPath,
+    /// Client-visible content length.
+    pub content_len: u64,
+    /// Last modification timestamp in milliseconds since the Unix epoch.
+    pub modified_at_ms: i64,
+    /// Effective retention policy, if known.
+    pub retention: Option<RetentionPolicy>,
+}
+
+/// Durable sealed manifest object.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestObject {
+    /// Metadata key that sealed the payload.
+    pub key_id: KeyId,
+    /// Nonce used for the sealed payload.
+    pub nonce: Vec<u8>,
+    /// Sealed manifest payload.
+    pub ciphertext: Vec<u8>,
+    /// Authentication tag over the manifest object context.
+    pub tag: Vec<u8>,
 }
 
 /// Public keyring metadata captured in a checkpoint.
@@ -159,6 +191,20 @@ pub fn checkpoint_object_bytes(checkpoint: &Checkpoint) -> Result<Vec<u8>, serde
 pub fn index_delta_object_bytes(delta: &IndexDeltaObject) -> Result<Vec<u8>, serde_json::Error> {
     let mut bytes = INDEX_DELTA_OBJECT_DOMAIN.to_vec();
     serde_json::to_writer(&mut bytes, delta)?;
+    Ok(bytes)
+}
+
+/// Encodes manifest plaintext before sealing.
+pub fn manifest_plaintext_bytes(manifest: &DurableManifest) -> Result<Vec<u8>, serde_json::Error> {
+    let mut bytes = MANIFEST_PLAINTEXT_DOMAIN.to_vec();
+    serde_json::to_writer(&mut bytes, manifest)?;
+    Ok(bytes)
+}
+
+/// Encodes a durable sealed manifest object.
+pub fn manifest_object_bytes(manifest: &ManifestObject) -> Result<Vec<u8>, serde_json::Error> {
+    let mut bytes = MANIFEST_OBJECT_DOMAIN.to_vec();
+    serde_json::to_writer(&mut bytes, manifest)?;
     Ok(bytes)
 }
 
@@ -287,12 +333,14 @@ impl NamespaceIndex {
 mod tests {
     use super::{
         CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CommitRecord, INDEX_DELTA_OBJECT_DOMAIN, IndexDelta,
-        IndexDeltaObject, KeyringSnapshot, NamespaceEntry, NamespaceIndex,
-        canonical_commit_record_bytes, checkpoint_object_bytes, index_delta_object_bytes,
+        IndexDeltaObject, KeyringSnapshot, MANIFEST_OBJECT_DOMAIN, MANIFEST_PLAINTEXT_DOMAIN,
+        ManifestObject, NamespaceEntry, NamespaceIndex, canonical_commit_record_bytes,
+        checkpoint_object_bytes, index_delta_object_bytes, manifest_object_bytes,
+        manifest_plaintext_bytes,
     };
     use rs3_types::{
         BackendObjectId, BlindIndexKey, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
-        ManifestId, PrefixToken, Sequence,
+        LogicalPath, ManifestId, PrefixToken, Sequence,
     };
 
     fn blind_key(value: &str) -> BlindIndexKey {
@@ -325,6 +373,13 @@ mod tests {
 
     fn key_id(value: &str) -> KeyId {
         match KeyId::new(value) {
+            Ok(value) => value,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    fn logical_path(value: &str) -> LogicalPath {
+        match LogicalPath::new(value) {
             Ok(value) => value,
             Err(error) => panic!("{error}"),
         }
@@ -485,6 +540,34 @@ mod tests {
         assert!(matches!(
             encoded,
             Ok(bytes) if bytes.starts_with(INDEX_DELTA_OBJECT_DOMAIN)
+        ));
+    }
+
+    #[test]
+    fn manifest_encodings_have_domain_prefixes() {
+        let manifest = super::DurableManifest {
+            key: logical_path("p/12/object"),
+            content_len: 42,
+            modified_at_ms: 7,
+            retention: None,
+        };
+        let sealed = ManifestObject {
+            key_id: key_id("metadata"),
+            nonce: vec![1, 2, 3],
+            ciphertext: vec![4, 5, 6],
+            tag: vec![7, 8, 9],
+        };
+
+        let plaintext = manifest_plaintext_bytes(&manifest);
+        let object = manifest_object_bytes(&sealed);
+
+        assert!(matches!(
+            plaintext,
+            Ok(bytes) if bytes.starts_with(MANIFEST_PLAINTEXT_DOMAIN)
+        ));
+        assert!(matches!(
+            object,
+            Ok(bytes) if bytes.starts_with(MANIFEST_OBJECT_DOMAIN)
         ));
     }
 
