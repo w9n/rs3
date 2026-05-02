@@ -1,15 +1,20 @@
 [package]
-name = "rs3-k8s"
+name = "rs3-anchor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Kubernetes checkpoint anchoring integration for rs3"
+description = "Checkpoint anchoring contracts for rs3"
 
 [dependencies]
-rs3-anchor.workspace = true
+async-trait.workspace = true
+rs3-types.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
 
 [lints]
 workspace = true

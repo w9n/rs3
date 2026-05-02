@@ -335,6 +335,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "rs3-anchor"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rs3-types",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "rs3-crypto"
 version = "0.1.0"
 dependencies = [
@@ -359,10 +369,7 @@ dependencies = [
 name = "rs3-k8s"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "rs3-types",
- "thiserror",
- "tokio",
+ "rs3-anchor",
 ]
 
 [[package]]
@@ -370,9 +377,9 @@ name = "rs3-repository"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "rs3-anchor",
  "rs3-crypto",
  "rs3-index",
- "rs3-k8s",
  "rs3-storage",
  "rs3-types",
  "serde_json",

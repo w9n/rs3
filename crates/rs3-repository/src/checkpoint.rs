@@ -3,9 +3,9 @@
 use crate::error::Result;
 use crate::model::CheckpointPosition;
 use crate::service::Repository;
+use rs3_anchor::{AnchorError, CheckpointAnchor};
 use rs3_crypto::{derive_checkpoint_id, derive_checkpoint_payload_digest};
 use rs3_index::{Checkpoint, CommitRecord, KeyringSnapshot, canonical_commit_record_bytes};
-use rs3_k8s::CheckpointAnchor;
 use rs3_storage::BlobStore;
 use rs3_types::CheckpointId;
 
@@ -79,7 +79,7 @@ where
     {
         let accepted = match anchor.read().await {
             Ok(state) => Some(CheckpointPosition::from(state)),
-            Err(rs3_k8s::K8sError::MissingAnchor) => None,
+            Err(AnchorError::MissingAnchor) => None,
             Err(error) => return Err(error.into()),
         };
 

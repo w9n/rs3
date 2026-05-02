@@ -6,9 +6,9 @@ use crate::{
     Result,
 };
 use bytes::Bytes;
+use rs3_anchor::{AnchorState, MemoryCheckpointAnchor};
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_index::canonical_commit_record_bytes;
-use rs3_k8s::{AnchorState, MemoryCheckpointAnchor};
 use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore};
 use rs3_types::{
     CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath, RetentionMode,
