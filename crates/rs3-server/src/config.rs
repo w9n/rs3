@@ -1,7 +1,8 @@
 //! Runtime configuration loaded from process environment.
 
-use crate::identity::{SecretString, StaticCredentials};
+use crate::identity::StaticCredentials;
 use rs3_types::PublicBucket;
+use secrecy::SecretString;
 use std::net::SocketAddr;
 use std::time::Duration;
 use thiserror::Error;
@@ -187,7 +188,7 @@ fn parse_static_credentials(
     match (access_key_id, secret_access_key) {
         (Some(access_key_id), Some(secret_access_key)) => Ok(Some(StaticCredentials {
             access_key_id,
-            secret_access_key: SecretString::new(secret_access_key),
+            secret_access_key: SecretString::from(secret_access_key),
         })),
         (None, None) => Ok(None),
         _ => Err(ConfigError::PartialStaticCredentials {
