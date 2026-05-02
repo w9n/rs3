@@ -6,9 +6,13 @@ use clap::{Args, ValueEnum};
 use rs3_anchor::MemoryCheckpointAnchor;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_repository::{Repository, RepositoryPutOptions};
-use rs3_storage::{BlobOperationCounts, ByteRange, MemoryBlobStore};
+use rs3_storage::{
+    BlobOperationCounts, BlobStore, ByteRange, CountingBlobStore, FilesystemBlobStore,
+    MemoryBlobStore,
+};
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath};
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
 /// Runs lightweight repository performance scenarios.
@@ -29,6 +33,12 @@ pub(crate) struct PerfArgs {
     /// Plaintext range length in bytes for range-read scenarios.
     #[arg(long, default_value_t = 4 * 1024)]
     range_len: usize,
+    /// Backend implementation used by the scenario.
+    #[arg(long, value_enum, default_value_t = PerfBackend::Memory)]
+    backend: PerfBackend,
+    /// Filesystem backend root used with `--backend filesystem`.
+    #[arg(long)]
+    backend_dir: Option<PathBuf>,
     /// Output format for scenario reports.
     #[arg(long, value_enum, default_value_t = ReportFormat::Tsv)]
     format: ReportFormat,
@@ -54,6 +64,24 @@ pub(crate) enum PerfScenario {
     FullRead,
     /// Repeatedly read plaintext ranges from one object.
     RangeRead,
+}
+
+/// Backend implementation used by performance scenarios.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum PerfBackend {
+    /// In-memory backend.
+    Memory,
+    /// Local filesystem backend.
+    Filesystem,
+}
+
+impl PerfBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Filesystem => "filesystem",
+        }
+    }
 }
 
 /// Machine-readable report output options.
@@ -105,7 +133,22 @@ pub(crate) async fn run(args: PerfArgs) -> Result<()> {
 }
 
 async fn write_batch(args: &PerfArgs) -> Result<PerfReport> {
-    let store = MemoryBlobStore::new();
+    match args.backend {
+        PerfBackend::Memory => write_batch_with_store(args, memory_store()).await,
+        PerfBackend::Filesystem => {
+            let (_dir, store) = filesystem_store(args)?;
+            write_batch_with_store(args, store).await
+        }
+    }
+}
+
+async fn write_batch_with_store<S>(
+    args: &PerfArgs,
+    store: CountingBlobStore<S>,
+) -> Result<PerfReport>
+where
+    S: BlobStore + Clone,
+{
     let repo = Repository::with_keyring(store.clone(), keyring()?);
     let anchor = MemoryCheckpointAnchor::new();
     let body = body(args.object_size);
@@ -130,6 +173,7 @@ async fn write_batch(args: &PerfArgs) -> Result<PerfReport> {
         .context("failed to read operation counts")?;
     Ok(PerfReport {
         scenario: "write-batch",
+        backend: args.backend,
         objects: args.objects,
         object_size: args.object_size,
         operations: args.objects,
@@ -141,7 +185,19 @@ async fn write_batch(args: &PerfArgs) -> Result<PerfReport> {
 }
 
 async fn full_read(args: &PerfArgs) -> Result<PerfReport> {
-    let store = MemoryBlobStore::new();
+    match args.backend {
+        PerfBackend::Memory => full_read_with_store(args, memory_store()).await,
+        PerfBackend::Filesystem => {
+            let (_dir, store) = filesystem_store(args)?;
+            full_read_with_store(args, store).await
+        }
+    }
+}
+
+async fn full_read_with_store<S>(args: &PerfArgs, store: CountingBlobStore<S>) -> Result<PerfReport>
+where
+    S: BlobStore + Clone,
+{
     let repo = Repository::with_keyring(store.clone(), keyring()?);
     let key = path("perf/read/full-object")?;
     let body = body(args.object_size);
@@ -165,6 +221,7 @@ async fn full_read(args: &PerfArgs) -> Result<PerfReport> {
         .context("failed to read operation counts")?;
     Ok(PerfReport {
         scenario: "full-read",
+        backend: args.backend,
         objects: 1,
         object_size: args.object_size,
         operations: args.reads,
@@ -176,7 +233,22 @@ async fn full_read(args: &PerfArgs) -> Result<PerfReport> {
 }
 
 async fn range_read(args: &PerfArgs) -> Result<PerfReport> {
-    let store = MemoryBlobStore::new();
+    match args.backend {
+        PerfBackend::Memory => range_read_with_store(args, memory_store()).await,
+        PerfBackend::Filesystem => {
+            let (_dir, store) = filesystem_store(args)?;
+            range_read_with_store(args, store).await
+        }
+    }
+}
+
+async fn range_read_with_store<S>(
+    args: &PerfArgs,
+    store: CountingBlobStore<S>,
+) -> Result<PerfReport>
+where
+    S: BlobStore + Clone,
+{
     let repo = Repository::with_keyring(store.clone(), keyring()?);
     let key = path("perf/read/range-object")?;
     let body = body(args.object_size);
@@ -213,6 +285,7 @@ async fn range_read(args: &PerfArgs) -> Result<PerfReport> {
         .context("failed to read operation counts")?;
     Ok(PerfReport {
         scenario: "range-read",
+        backend: args.backend,
         objects: 1,
         object_size: args.object_size,
         operations: args.reads,
@@ -225,6 +298,7 @@ async fn range_read(args: &PerfArgs) -> Result<PerfReport> {
 
 struct PerfReport {
     scenario: &'static str,
+    backend: PerfBackend,
     objects: usize,
     object_size: usize,
     operations: usize,
@@ -249,6 +323,8 @@ impl PerfReport {
         let elapsed_ms = self.elapsed.as_secs_f64() * 1_000.0;
         let requested_plaintext_bytes = self.requested_plaintext_bytes();
         let throughput_mib_s = mib_per_second(requested_plaintext_bytes, self.elapsed);
+        let backend_bytes = self.backend_bytes();
+        let backend_mib_s = mib_per_second(backend_bytes as usize, self.elapsed);
         let read_amplification = format_amp(ratio_optional(
             self.counts.bytes_read,
             self.requested_plaintext_read_bytes as u64,
@@ -257,19 +333,32 @@ impl PerfReport {
             self.counts.bytes_written,
             self.requested_plaintext_write_bytes as u64,
         ));
+        let backend_requests = self.backend_requests();
+        let backend_requests_per_s = per_second(backend_requests, self.elapsed);
+        let backend_requests_per_operation =
+            ratio_optional(backend_requests, self.operations as u64);
 
         println!(
-            "{}\t{}\t{}\t{}\t{:.3}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.scenario,
+            self.backend.as_str(),
             self.objects,
             self.object_size,
             self.operations,
             elapsed_ms,
             throughput_mib_s,
+            backend_mib_s,
+            backend_requests,
+            backend_requests_per_s,
+            format_amp(backend_requests_per_operation),
             self.counts.put,
             self.counts.get,
             self.counts.head,
             self.counts.list,
+            self.counts.delete,
+            self.counts.extend_retention,
+            self.counts.flush,
+            backend_bytes,
             self.counts.bytes_written,
             self.counts.bytes_read,
             requested_plaintext_bytes,
@@ -282,14 +371,21 @@ impl PerfReport {
 
     fn print_jsonl(&self) -> Result<()> {
         let requested_plaintext_bytes = self.requested_plaintext_bytes();
+        let backend_bytes = self.backend_bytes();
+        let backend_requests = self.backend_requests();
         let report = serde_json::json!({
             "scenario": self.scenario,
+            "backend_name": self.backend.as_str(),
             "objects": self.objects,
             "object_size": self.object_size,
             "operations": self.operations,
             "elapsed_ms": self.elapsed.as_secs_f64() * 1_000.0,
             "plaintext_mib_s": mib_per_second(requested_plaintext_bytes, self.elapsed),
+            "backend_mib_s": mib_per_second(backend_bytes as usize, self.elapsed),
             "backend": {
+                "requests": backend_requests,
+                "requests_per_s": per_second(backend_requests, self.elapsed),
+                "requests_per_operation": ratio_optional(backend_requests, self.operations as u64),
                 "puts": self.counts.put,
                 "gets": self.counts.get,
                 "heads": self.counts.head,
@@ -297,6 +393,7 @@ impl PerfReport {
                 "deletes": self.counts.delete,
                 "extend_retention": self.counts.extend_retention,
                 "flushes": self.counts.flush,
+                "bytes": backend_bytes,
                 "bytes_written": self.counts.bytes_written,
                 "bytes_read": self.counts.bytes_read,
             },
@@ -320,12 +417,77 @@ impl PerfReport {
         self.requested_plaintext_write_bytes
             .saturating_add(self.requested_plaintext_read_bytes)
     }
+
+    fn backend_bytes(&self) -> u64 {
+        self.counts
+            .bytes_written
+            .saturating_add(self.counts.bytes_read)
+    }
+
+    fn backend_requests(&self) -> u64 {
+        self.counts
+            .put
+            .saturating_add(self.counts.get)
+            .saturating_add(self.counts.head)
+            .saturating_add(self.counts.list)
+            .saturating_add(self.counts.delete)
+            .saturating_add(self.counts.extend_retention)
+            .saturating_add(self.counts.flush)
+    }
 }
 
 fn print_header() {
     println!(
-        "scenario\tobjects\tobject_size\toperations\telapsed_ms\tplaintext_mib_s\tputs\tgets\theads\tlists\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp"
+        "scenario\tbackend\tobjects\tobject_size\toperations\telapsed_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp"
     );
+}
+
+fn memory_store() -> CountingBlobStore<MemoryBlobStore> {
+    CountingBlobStore::new(MemoryBlobStore::new())
+}
+
+fn filesystem_store(
+    args: &PerfArgs,
+) -> Result<(
+    Option<TemporaryBackendDir>,
+    CountingBlobStore<FilesystemBlobStore>,
+)> {
+    let (root, temporary) = match args.backend_dir.as_ref() {
+        Some(path) => (path.clone(), None),
+        None => {
+            let temporary = TemporaryBackendDir::new()?;
+            (temporary.path().to_path_buf(), Some(temporary))
+        }
+    };
+    let store = FilesystemBlobStore::new(root).context("failed to create filesystem backend")?;
+    Ok((temporary, CountingBlobStore::new(store)))
+}
+
+struct TemporaryBackendDir {
+    path: PathBuf,
+}
+
+impl TemporaryBackendDir {
+    fn new() -> Result<Self> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("rs3-perf-backend-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&path).context("failed to create temporary backend directory")?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TemporaryBackendDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 fn body(size: usize) -> Bytes {
@@ -406,6 +568,14 @@ fn mib_per_second(bytes: usize, elapsed: Duration) -> f64 {
     }
 
     bytes as f64 / 1_048_576.0 / elapsed.as_secs_f64()
+}
+
+fn per_second(count: u64, elapsed: Duration) -> f64 {
+    if elapsed.is_zero() {
+        return 0.0;
+    }
+
+    count as f64 / elapsed.as_secs_f64()
 }
 
 fn ratio_optional(numerator: u64, denominator: u64) -> Option<f64> {

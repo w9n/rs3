@@ -13,12 +13,17 @@ use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_index::{
     CHECKPOINT_OBJECT_DOMAIN, Checkpoint, INDEX_DELTA_OBJECT_DOMAIN, canonical_commit_record_bytes,
 };
-use rs3_storage::{BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions, StorageError};
+use rs3_storage::{
+    BlobMetadata, BlobStore, ByteRange, FilesystemBlobStore, MemoryBlobStore, PutOptions,
+    StorageError,
+};
 use rs3_types::{
     BackendObjectId, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath,
     RetentionMode, RetentionPolicy, Sequence,
 };
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn secret() -> SecretBytes {
     secret_with_byte(9)
@@ -196,6 +201,34 @@ fn decode_checkpoint_object(body: Bytes) -> Checkpoint {
     match serde_json::from_slice(payload) {
         Ok(checkpoint) => checkpoint,
         Err(error) => panic!("{error}"),
+    }
+}
+
+struct TestDir {
+    path: PathBuf,
+}
+
+impl TestDir {
+    fn new() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rs3-repository-test-{}-{nanos}",
+            std::process::id()
+        ));
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
@@ -1567,6 +1600,61 @@ async fn load_checkpoint_position_replays_checkpoint_chain_for_head_and_get() {
     let latest = must(repo.publish_checkpoint(&anchor).await);
 
     let reloaded = Repository::with_keyring(store.clone(), keyring);
+    let loaded = must(reloaded.load_checkpoint_position(&latest).await);
+    let first_head = reloaded.head(&first_key);
+    let first_body = reloaded.get_range(&first_key, ByteRange::Full).await;
+    let second_head = reloaded.head(&second_key);
+    let second_body = reloaded.get_range(&second_key, ByteRange::Full).await;
+    let listed = reloaded.list("p/12");
+
+    assert_eq!(loaded, latest);
+    assert_eq!(must(first_head).content_len, 5);
+    assert_eq!(must(first_body), Bytes::from_static(b"first"));
+    assert_eq!(must(second_head).content_len, 6);
+    assert_eq!(must(second_body), Bytes::from_static(b"second"));
+    assert_eq!(
+        must(listed)
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>(),
+        vec![first_key, second_key]
+    );
+}
+
+#[tokio::test]
+async fn filesystem_store_reloads_checkpoint_chain_for_head_get_and_list() {
+    let dir = TestDir::new();
+    let store = FilesystemBlobStore::new(dir.path()).unwrap_or_else(|error| panic!("{error}"));
+    let keyring = signing_keyring();
+    let repo = Repository::with_keyring(store, keyring.clone());
+    let anchor = MemoryCheckpointAnchor::new();
+    let first_key = key("p/12/first");
+    let second_key = key("p/12/second");
+
+    let first_put = repo
+        .put(
+            first_key.clone(),
+            Bytes::from_static(b"first"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(first_put.is_ok());
+    let first_publish = repo.publish_checkpoint(&anchor).await;
+    assert!(first_publish.is_ok());
+
+    let second_put = repo
+        .put(
+            second_key.clone(),
+            Bytes::from_static(b"second"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(second_put.is_ok());
+    let latest = must(repo.publish_checkpoint(&anchor).await);
+
+    let reloaded_store =
+        FilesystemBlobStore::new(dir.path()).unwrap_or_else(|error| panic!("{error}"));
+    let reloaded = Repository::with_keyring(reloaded_store, keyring);
     let loaded = must(reloaded.load_checkpoint_position(&latest).await);
     let first_head = reloaded.head(&first_key);
     let first_body = reloaded.get_range(&first_key, ByteRange::Full).await;

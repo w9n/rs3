@@ -144,6 +144,129 @@ pub struct BlobOperationCounts {
     pub bytes_read: u64,
 }
 
+/// Counting `BlobStore` wrapper for backend pressure and throughput scenarios.
+#[derive(Clone, Debug)]
+pub struct CountingBlobStore<S> {
+    inner: S,
+    counts: Arc<RwLock<BlobOperationCounts>>,
+}
+
+impl<S> CountingBlobStore<S> {
+    /// Wraps an existing blob store and starts counters at zero.
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            counts: Arc::new(RwLock::new(BlobOperationCounts::default())),
+        }
+    }
+
+    /// Returns the wrapped blob store.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    /// Returns a snapshot of operation counters.
+    pub fn operation_counts(&self) -> Result<BlobOperationCounts> {
+        self.counts
+            .read()
+            .map(|counts| counts.clone())
+            .map_err(|_| StorageError::Provider("counting blob store lock poisoned".to_owned()))
+    }
+
+    /// Resets operation counters without changing stored objects.
+    pub fn reset_operation_counts(&self) -> Result<()> {
+        let mut counts = self
+            .counts
+            .write()
+            .map_err(|_| StorageError::Provider("counting blob store lock poisoned".to_owned()))?;
+        *counts = BlobOperationCounts::default();
+        Ok(())
+    }
+
+    fn mutate_counts(&self, update: impl FnOnce(&mut BlobOperationCounts)) -> Result<()> {
+        let mut counts = self
+            .counts
+            .write()
+            .map_err(|_| StorageError::Provider("counting blob store lock poisoned".to_owned()))?;
+        update(&mut counts);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<S> BlobStore for CountingBlobStore<S>
+where
+    S: BlobStore,
+{
+    async fn put(
+        &self,
+        object_id: &BackendObjectId,
+        body: Bytes,
+        options: PutOptions,
+    ) -> Result<BlobMetadata> {
+        self.mutate_counts(|counts| {
+            counts.put = counts.put.saturating_add(1);
+        })?;
+        let metadata = self.inner.put(object_id, body, options).await?;
+        self.mutate_counts(|counts| {
+            counts.bytes_written = counts.bytes_written.saturating_add(metadata.content_len);
+        })?;
+        Ok(metadata)
+    }
+
+    async fn get_range(&self, object_id: &BackendObjectId, range: ByteRange) -> Result<Bytes> {
+        self.mutate_counts(|counts| {
+            counts.get = counts.get.saturating_add(1);
+        })?;
+        let body = self.inner.get_range(object_id, range).await?;
+        let bytes_read = u64::try_from(body.len())
+            .map_err(|_| StorageError::Provider("read length does not fit in u64".to_owned()))?;
+        self.mutate_counts(|counts| {
+            counts.bytes_read = counts.bytes_read.saturating_add(bytes_read);
+        })?;
+        Ok(body)
+    }
+
+    async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {
+        self.mutate_counts(|counts| {
+            counts.head = counts.head.saturating_add(1);
+        })?;
+        self.inner.head(object_id).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
+        self.mutate_counts(|counts| {
+            counts.list = counts.list.saturating_add(1);
+        })?;
+        self.inner.list_prefix(prefix).await
+    }
+
+    async fn delete(&self, object_id: &BackendObjectId) -> Result<()> {
+        self.mutate_counts(|counts| {
+            counts.delete = counts.delete.saturating_add(1);
+        })?;
+        self.inner.delete(object_id).await
+    }
+
+    async fn extend_retention(
+        &self,
+        object_id: &BackendObjectId,
+        policy: RetentionPolicy,
+    ) -> Result<()> {
+        self.mutate_counts(|counts| {
+            counts.extend_retention = counts.extend_retention.saturating_add(1);
+        })?;
+        self.inner.extend_retention(object_id, policy).await
+    }
+
+    async fn flush_caches(&self) -> Result<()> {
+        self.mutate_counts(|counts| {
+            counts.flush = counts.flush.saturating_add(1);
+        })?;
+        self.inner.flush_caches().await
+    }
+}
+
 /// In-memory `BlobStore` implementation used for contract tests and local prototypes.
 #[derive(Clone, Debug)]
 pub struct MemoryBlobStore {
@@ -541,8 +664,8 @@ pub(crate) fn elapsed_us(elapsed: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlobStore, ByteRange, MemoryBlobStore, PutOptions, StorageError, read_range,
-        retention_blocks_delete,
+        BlobStore, ByteRange, CountingBlobStore, MemoryBlobStore, PutOptions, StorageError,
+        read_range, retention_blocks_delete,
     };
     use bytes::Bytes;
     use rs3_types::{BackendObjectId, RetentionMode, RetentionPolicy};
@@ -784,5 +907,39 @@ mod tests {
 
         assert!(delete.is_ok());
         assert!(matches!(head, Err(StorageError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn counting_store_tracks_backend_pressure() {
+        let store = CountingBlobStore::new(MemoryBlobStore::new());
+        let object_id = object_id("segments/a");
+
+        let put = store
+            .put(
+                &object_id,
+                Bytes::from_static(b"hello world"),
+                PutOptions::default(),
+            )
+            .await;
+        let head = store.head(&object_id).await;
+        let get = store
+            .get_range(&object_id, ByteRange::Slice { offset: 6, len: 5 })
+            .await;
+        let list = store.list_prefix("segments/").await;
+
+        assert!(put.is_ok());
+        assert!(head.is_ok());
+        assert_eq!(get, Ok(Bytes::from_static(b"world")));
+        assert!(list.is_ok());
+
+        let counts = store
+            .operation_counts()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(counts.put, 1);
+        assert_eq!(counts.head, 1);
+        assert_eq!(counts.get, 1);
+        assert_eq!(counts.list, 1);
+        assert_eq!(counts.bytes_written, 11);
+        assert_eq!(counts.bytes_read, 5);
     }
 }
