@@ -9,7 +9,7 @@ use crate::namespace::{existing_blind_keys, first_namespace_entry, prefix_tokens
 use crate::state::{RepositoryState, TrustedManifest, next_sequence, object_material};
 use bytes::Bytes;
 use rs3_crypto::{KeyRing, NamespaceBlindKey, SecretBytes};
-use rs3_index::NamespaceEntry;
+use rs3_index::{IndexDelta, NamespaceEntry};
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, LogicalPath, RetentionPolicy};
 use std::collections::{BTreeMap, btree_map::Entry};
@@ -118,8 +118,16 @@ where
         {
             let mut state = self.write_state()?;
             for stale_blind_key in stale_blind_keys {
-                state.namespace.tombstone(stale_blind_key, sequence);
+                state.namespace.tombstone(stale_blind_key.clone(), sequence);
+                state.pending_index_deltas.push(IndexDelta::Tombstone {
+                    blind_key: stale_blind_key,
+                    generation: sequence,
+                });
             }
+            state.pending_index_deltas.push(IndexDelta::Upsert {
+                entry: entry.clone(),
+                prefix_tokens: prefix_tokens.clone(),
+            });
             state.namespace.upsert(entry, prefix_tokens);
             state.manifests.insert(manifest_id, manifest.clone());
         }
@@ -137,9 +145,15 @@ where
         let manifest = state
             .manifests
             .get(&entry.manifest_id)
-            .ok_or_else(|| RepositoryError::NotFound(key.clone()))?;
+            .cloned()
+            .unwrap_or_else(|| TrustedManifest {
+                key: key.clone(),
+                content_len: entry.content_len,
+                modified_at_ms: entry.modified_at_ms,
+                retention: entry.retention.clone(),
+            });
 
-        Ok(manifest.clone().into_metadata())
+        Ok(manifest.into_metadata())
     }
 
     /// Reads a client-visible object or byte range.
@@ -202,7 +216,11 @@ where
             let existing_blind_keys = existing_blind_keys(&state.namespace, &lookup_blind_keys);
             let sequence = next_sequence(&mut state)?;
             for blind_key in existing_blind_keys {
-                state.namespace.tombstone(blind_key, sequence);
+                state.namespace.tombstone(blind_key.clone(), sequence);
+                state.pending_index_deltas.push(IndexDelta::Tombstone {
+                    blind_key,
+                    generation: sequence,
+                });
             }
             (object_id, sequence)
         };
@@ -238,10 +256,13 @@ where
             .clone();
         let mut updated = entry;
         updated.retention = backend.retention.clone();
-        state.namespace.upsert(
-            updated.clone(),
-            prefix_tokens_for_key(&keyring, &updated.namespace_key_id, key.as_str())?,
-        );
+        let prefix_tokens =
+            prefix_tokens_for_key(&keyring, &updated.namespace_key_id, key.as_str())?;
+        state.pending_index_deltas.push(IndexDelta::Upsert {
+            entry: updated.clone(),
+            prefix_tokens: prefix_tokens.clone(),
+        });
+        state.namespace.upsert(updated.clone(), prefix_tokens);
         let manifest = state
             .manifests
             .get_mut(&updated.manifest_id)

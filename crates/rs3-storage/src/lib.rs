@@ -90,8 +90,8 @@ pub trait BlobStore: Send + Sync {
 
     /// Reads an object or byte range.
     ///
-    /// Efficient range reads are required for Kopia-compatible restores because
-    /// Kopia may fetch sections of data pack blobs instead of whole packs.
+    /// Efficient range reads are required for backup restores that fetch
+    /// sections of large data objects instead of whole objects.
     async fn get_range(&self, object_id: &BackendObjectId, range: ByteRange) -> Result<Bytes>;
 
     /// Reads object metadata without fetching the body.
@@ -101,7 +101,7 @@ pub trait BlobStore: Send + Sync {
     ///
     /// The result must include objects written through the same gateway before
     /// the call starts. This is stronger than many backend object stores but is
-    /// required by Kopia's blob-storage contract.
+    /// required by common object-storage client contracts.
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobMetadata>>;
 
     /// Deletes an object or writes a provider-specific delete marker.

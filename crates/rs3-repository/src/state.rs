@@ -2,7 +2,7 @@
 
 use crate::error::{RepositoryError, Result};
 use crate::model::RepositoryObjectMetadata;
-use rs3_index::NamespaceIndex;
+use rs3_index::{IndexDelta, IndexDeltaObject, NamespaceIndex};
 use rs3_types::{LogicalPath, ManifestId, RetentionPolicy, Sequence};
 use std::collections::BTreeMap;
 
@@ -28,6 +28,8 @@ pub(crate) struct RepositoryState {
     pub(crate) manifests: BTreeMap<ManifestId, TrustedManifest>,
     /// Next logical sequence to allocate.
     pub(crate) next_sequence: Sequence,
+    /// Durable index mutations not yet covered by an accepted checkpoint.
+    pub(crate) pending_index_deltas: Vec<IndexDelta>,
 }
 
 impl Default for RepositoryState {
@@ -36,6 +38,7 @@ impl Default for RepositoryState {
             namespace: NamespaceIndex::new(),
             manifests: BTreeMap::new(),
             next_sequence: Sequence::ZERO,
+            pending_index_deltas: Vec::new(),
         }
     }
 }
@@ -65,4 +68,22 @@ pub(crate) fn next_sequence(state: &mut RepositoryState) -> Result<Sequence> {
 /// Builds deterministic material for opaque object IDs in the prototype model.
 pub(crate) fn object_material(key: &str, sequence: Sequence) -> Vec<u8> {
     format!("{key}\0{}", sequence.get()).into_bytes()
+}
+
+/// Applies a durable index delta object to trusted query state.
+pub(crate) fn apply_index_delta_object(state: &mut RepositoryState, delta: IndexDeltaObject) {
+    for delta in delta.deltas {
+        match delta {
+            IndexDelta::Upsert {
+                entry,
+                prefix_tokens,
+            } => state.namespace.upsert(entry, prefix_tokens),
+            IndexDelta::Tombstone {
+                blind_key,
+                generation,
+            } => state.namespace.tombstone(blind_key, generation),
+        }
+    }
+
+    state.next_sequence = state.next_sequence.max(delta.sequence);
 }

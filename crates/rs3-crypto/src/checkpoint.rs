@@ -3,7 +3,7 @@
 use crate::CryptoError;
 use crate::keyring::KeyRing;
 use crate::primitives::{derive_hmac, verify_hmac};
-use rs3_types::{CheckpointId, KeyId, KeyPurpose};
+use rs3_types::{BackendObjectId, CheckpointId, KeyId, KeyPurpose};
 use sha2::{Digest, Sha256};
 
 /// Checkpoint signature and the key that produced it.
@@ -72,9 +72,21 @@ pub fn derive_checkpoint_payload_digest(canonical_payload: &[u8]) -> String {
     hex::encode(digest.finalize())
 }
 
+/// Derives an opaque backend object ID for an encoded index delta object.
+pub fn derive_index_delta_object_id(delta_object: &[u8]) -> Result<BackendObjectId, CryptoError> {
+    let mut digest = Sha256::new();
+    digest.update(b"rs3:index-delta-object-id:v1");
+    digest.update([0]);
+    digest.update(delta_object);
+    BackendObjectId::new(format!("index/{}", hex::encode(digest.finalize())))
+        .map_err(CryptoError::from)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{derive_checkpoint_id, derive_checkpoint_payload_digest};
+    use super::{
+        derive_checkpoint_id, derive_checkpoint_payload_digest, derive_index_delta_object_id,
+    };
     use crate::{KeyMaterial, KeyRing, SecretBytes};
     use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus};
 
@@ -227,5 +239,15 @@ mod tests {
         let second = derive_checkpoint_payload_digest(b"canonical checkpoint");
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn index_delta_object_id_uses_index_prefix() {
+        let object_id = derive_index_delta_object_id(b"delta bytes");
+
+        assert!(matches!(
+            object_id,
+            Ok(object_id) if object_id.as_str().starts_with("index/")
+        ));
     }
 }

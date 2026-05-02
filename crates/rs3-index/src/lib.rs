@@ -13,6 +13,9 @@ pub const CHECKPOINT_RECORD_DOMAIN: &[u8] = b"rs3:checkpoint-record:v1\n";
 /// Domain separator prepended to durable checkpoint objects.
 pub const CHECKPOINT_OBJECT_DOMAIN: &[u8] = b"rs3:checkpoint-object:v1\n";
 
+/// Domain separator prepended to durable index delta objects.
+pub const INDEX_DELTA_OBJECT_DOMAIN: &[u8] = b"rs3:index-delta-object:v1\n";
+
 /// Pointer to encrypted object payload stored in the backend.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObjectPointer {
@@ -29,10 +32,15 @@ pub struct ObjectPointer {
 }
 
 /// A single index mutation.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexDelta {
-    /// Insert or replace an object pointer for a blind key.
-    Upsert(ObjectPointer),
+    /// Insert or replace a namespace entry for a blind key.
+    Upsert {
+        /// Namespace entry made visible by the update.
+        entry: NamespaceEntry,
+        /// Prefix tokens associated with the entry.
+        prefix_tokens: Vec<PrefixToken>,
+    },
     /// Mark a blind key as deleted at a repository generation.
     Tombstone {
         /// Blind key being tombstoned.
@@ -40,6 +48,15 @@ pub enum IndexDelta {
         /// Generation at which the tombstone was written.
         generation: Sequence,
     },
+}
+
+/// Durable index delta object referenced by a checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexDeltaObject {
+    /// Repository sequence represented by this delta batch.
+    pub sequence: Sequence,
+    /// Ordered index mutations to replay.
+    pub deltas: Vec<IndexDelta>,
 }
 
 /// Public keyring metadata captured in a checkpoint.
@@ -83,7 +100,7 @@ pub struct CommitRecord {
     pub sequence: Sequence,
     /// Previous checkpoint, if any.
     pub parent: Option<CheckpointId>,
-    /// Referenced encrypted index delta objects.
+    /// Referenced durable index delta objects.
     pub index_deltas: Vec<BackendObjectId>,
     /// Referenced compacted manifest objects.
     pub compacted_manifests: Vec<ManifestId>,
@@ -135,6 +152,13 @@ pub fn checkpoint_object_bytes(checkpoint: &Checkpoint) -> Result<Vec<u8>, serde
     checkpoint.record = checkpoint.record.canonicalized();
     let mut bytes = CHECKPOINT_OBJECT_DOMAIN.to_vec();
     serde_json::to_writer(&mut bytes, &checkpoint)?;
+    Ok(bytes)
+}
+
+/// Encodes a durable index delta object.
+pub fn index_delta_object_bytes(delta: &IndexDeltaObject) -> Result<Vec<u8>, serde_json::Error> {
+    let mut bytes = INDEX_DELTA_OBJECT_DOMAIN.to_vec();
+    serde_json::to_writer(&mut bytes, delta)?;
     Ok(bytes)
 }
 
@@ -262,8 +286,9 @@ impl NamespaceIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CommitRecord, IndexDelta, KeyringSnapshot,
-        NamespaceEntry, NamespaceIndex, canonical_commit_record_bytes, checkpoint_object_bytes,
+        CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CommitRecord, INDEX_DELTA_OBJECT_DOMAIN, IndexDelta,
+        IndexDeltaObject, KeyringSnapshot, NamespaceEntry, NamespaceIndex,
+        canonical_commit_record_bytes, checkpoint_object_bytes, index_delta_object_bytes,
     };
     use rs3_types::{
         BackendObjectId, BlindIndexKey, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
@@ -350,7 +375,7 @@ mod tests {
             IndexDelta::Tombstone { generation, .. } => {
                 assert_eq!(generation, Sequence::new(7));
             }
-            IndexDelta::Upsert(_) => panic!("unexpected upsert"),
+            IndexDelta::Upsert { .. } => panic!("unexpected upsert"),
         }
     }
 
@@ -442,6 +467,24 @@ mod tests {
         assert!(matches!(
             encoded,
             Ok(bytes) if bytes.starts_with(CHECKPOINT_OBJECT_DOMAIN)
+        ));
+    }
+
+    #[test]
+    fn index_delta_object_encoding_has_domain_prefix() {
+        let delta = IndexDeltaObject {
+            sequence: Sequence::new(1),
+            deltas: vec![IndexDelta::Upsert {
+                entry: entry(blind_key("blind-a"), object_id("segments/opaque-a")),
+                prefix_tokens: vec![prefix_token("prefix-a")],
+            }],
+        };
+
+        let encoded = index_delta_object_bytes(&delta);
+
+        assert!(matches!(
+            encoded,
+            Ok(bytes) if bytes.starts_with(INDEX_DELTA_OBJECT_DOMAIN)
         ));
     }
 

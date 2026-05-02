@@ -10,7 +10,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor, MemoryCheckpointAnchor};
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_index::{CHECKPOINT_OBJECT_DOMAIN, Checkpoint, canonical_commit_record_bytes};
+use rs3_index::{
+    CHECKPOINT_OBJECT_DOMAIN, Checkpoint, INDEX_DELTA_OBJECT_DOMAIN, canonical_commit_record_bytes,
+};
 use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore};
 use rs3_types::{
     CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath, RetentionMode,
@@ -146,6 +148,13 @@ fn decode_checkpoint_object(body: Bytes) -> Checkpoint {
     }
 }
 
+fn assert_body_does_not_contain(body: &Bytes, needles: &[&str]) {
+    let body = String::from_utf8_lossy(body);
+    for needle in needles {
+        assert!(!body.contains(needle));
+    }
+}
+
 struct CheckpointMustExistAnchor {
     inner: MemoryCheckpointAnchor,
     store: MemoryBlobStore,
@@ -259,7 +268,7 @@ async fn put_then_head_get_and_list() {
 async fn backend_object_ids_do_not_contain_client_key() {
     let store = MemoryBlobStore::new();
     let repo = Repository::new(store.clone(), secret());
-    let client_key = key("p/12/very-secret-kopia-blob");
+    let client_key = key("p/12/sensitive-client-blob");
 
     let put = repo
         .put(
@@ -277,8 +286,8 @@ async fn backend_object_ids_do_not_contain_client_key() {
         .collect::<Vec<_>>();
 
     assert_eq!(object_ids.len(), 1);
-    assert!(!object_ids[0].contains("very-secret"));
-    assert!(!object_ids[0].contains("kopia"));
+    assert!(!object_ids[0].contains("sensitive"));
+    assert!(!object_ids[0].contains("client-blob"));
 }
 
 #[tokio::test]
@@ -486,6 +495,7 @@ async fn draft_commit_record_contains_rotated_keyring_metadata() {
     let record = must(repo.draft_commit_record(None));
 
     assert_eq!(record.sequence, Sequence::new(2));
+    assert_eq!(record.index_deltas.len(), 1);
     assert_eq!(record.compacted_manifests.len(), 2);
     assert_eq!(
         record
@@ -739,6 +749,93 @@ async fn publish_checkpoint_persists_signed_checkpoint_before_anchor_advance() {
 
     assert_eq!(checkpoint.id, position.checkpoint_id);
     assert_eq!(verified.ok(), Some(position));
+}
+
+#[tokio::test]
+async fn publish_checkpoint_persists_index_delta_without_client_key_material() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
+    let anchor = MemoryCheckpointAnchor::new();
+    let client_key = key("p/12/sensitive-client-blob");
+
+    let put = repo
+        .put(
+            client_key,
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let position = must(repo.publish_checkpoint(&anchor).await);
+    let checkpoint_object_id = must(checkpoint_object_id(&position.checkpoint_id));
+    let checkpoint_body = must_storage(
+        store
+            .get_range(&checkpoint_object_id, ByteRange::Full)
+            .await,
+    );
+    let checkpoint = decode_checkpoint_object(checkpoint_body.clone());
+    let delta_objects = must_storage(store.list_prefix("index/").await);
+
+    assert_eq!(checkpoint.record.index_deltas.len(), 1);
+    assert_eq!(delta_objects.len(), 1);
+    assert_eq!(
+        checkpoint.record.index_deltas[0],
+        delta_objects[0].object_id
+    );
+
+    let delta_body = must_storage(
+        store
+            .get_range(&delta_objects[0].object_id, ByteRange::Full)
+            .await,
+    );
+    assert!(delta_body.starts_with(INDEX_DELTA_OBJECT_DOMAIN));
+    assert_body_does_not_contain(&checkpoint_body, &["sensitive", "client-blob", "p/12"]);
+    assert_body_does_not_contain(&delta_body, &["sensitive", "client-blob", "p/12"]);
+}
+
+#[tokio::test]
+async fn load_checkpoint_position_replays_checkpoint_chain_for_head_and_get() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let repo = Repository::with_keyring(store.clone(), keyring.clone());
+    let anchor = MemoryCheckpointAnchor::new();
+    let first_key = key("p/12/first");
+    let second_key = key("p/12/second");
+
+    let first_put = repo
+        .put(
+            first_key.clone(),
+            Bytes::from_static(b"first"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(first_put.is_ok());
+    let first_publish = repo.publish_checkpoint(&anchor).await;
+    assert!(first_publish.is_ok());
+
+    let second_put = repo
+        .put(
+            second_key.clone(),
+            Bytes::from_static(b"second"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(second_put.is_ok());
+    let latest = must(repo.publish_checkpoint(&anchor).await);
+
+    let reloaded = Repository::with_keyring(store.clone(), keyring);
+    let loaded = must(reloaded.load_checkpoint_position(&latest).await);
+    let first_head = reloaded.head(&first_key);
+    let first_body = reloaded.get_range(&first_key, ByteRange::Full).await;
+    let second_head = reloaded.head(&second_key);
+    let second_body = reloaded.get_range(&second_key, ByteRange::Full).await;
+
+    assert_eq!(loaded, latest);
+    assert_eq!(must(first_head).content_len, 5);
+    assert_eq!(must(first_body), Bytes::from_static(b"first"));
+    assert_eq!(must(second_head).content_len, 6);
+    assert_eq!(must(second_body), Bytes::from_static(b"second"));
 }
 
 #[tokio::test]

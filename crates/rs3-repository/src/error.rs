@@ -60,6 +60,18 @@ pub enum RepositoryError {
         /// Conflicting backend object ID.
         object_id: BackendObjectId,
     },
+    /// A stored index delta object has different content than expected.
+    #[error("index delta object conflicts with expected content: {object_id}")]
+    IndexDeltaObjectConflict {
+        /// Conflicting backend object ID.
+        object_id: BackendObjectId,
+    },
+    /// A durable object does not match the expected format.
+    #[error("invalid durable object format: {object_id}")]
+    InvalidObjectFormat {
+        /// Invalid backend object ID.
+        object_id: BackendObjectId,
+    },
     /// The checkpoint does not chain from the accepted position.
     #[error("checkpoint parent mismatch")]
     CheckpointParentMismatch,
