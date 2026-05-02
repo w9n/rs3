@@ -3,7 +3,7 @@
 use rs3_anchor::AnchorError;
 use rs3_crypto::CryptoError;
 use rs3_storage::StorageError;
-use rs3_types::{CheckpointId, LogicalPath, Sequence, TypeError};
+use rs3_types::{BackendObjectId, CheckpointId, LogicalPath, Sequence, TypeError};
 use thiserror::Error;
 
 /// Repository operation result.
@@ -53,6 +53,12 @@ pub enum RepositoryError {
     CheckpointConflict {
         /// Conflicting checkpoint ID.
         checkpoint_id: CheckpointId,
+    },
+    /// A stored checkpoint object has different content than expected.
+    #[error("checkpoint object conflicts with expected content: {object_id}")]
+    CheckpointObjectConflict {
+        /// Conflicting backend object ID.
+        object_id: BackendObjectId,
     },
     /// The checkpoint does not chain from the accepted position.
     #[error("checkpoint parent mismatch")]

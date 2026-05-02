@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Domain separator prepended to canonical checkpoint payload bytes.
 pub const CHECKPOINT_RECORD_DOMAIN: &[u8] = b"rs3:checkpoint-record:v1\n";
 
+/// Domain separator prepended to durable checkpoint objects.
+pub const CHECKPOINT_OBJECT_DOMAIN: &[u8] = b"rs3:checkpoint-object:v1\n";
+
 /// Pointer to encrypted object payload stored in the backend.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObjectPointer {
@@ -123,6 +126,15 @@ impl Checkpoint {
 pub fn canonical_commit_record_bytes(record: &CommitRecord) -> Result<Vec<u8>, serde_json::Error> {
     let mut bytes = CHECKPOINT_RECORD_DOMAIN.to_vec();
     serde_json::to_writer(&mut bytes, &record.canonicalized())?;
+    Ok(bytes)
+}
+
+/// Encodes a durable checkpoint object.
+pub fn checkpoint_object_bytes(checkpoint: &Checkpoint) -> Result<Vec<u8>, serde_json::Error> {
+    let mut checkpoint = checkpoint.clone();
+    checkpoint.record = checkpoint.record.canonicalized();
+    let mut bytes = CHECKPOINT_OBJECT_DOMAIN.to_vec();
+    serde_json::to_writer(&mut bytes, &checkpoint)?;
     Ok(bytes)
 }
 
@@ -250,12 +262,12 @@ impl NamespaceIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitRecord, IndexDelta, KeyringSnapshot, NamespaceEntry, NamespaceIndex,
-        canonical_commit_record_bytes,
+        CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CommitRecord, IndexDelta, KeyringSnapshot,
+        NamespaceEntry, NamespaceIndex, canonical_commit_record_bytes, checkpoint_object_bytes,
     };
     use rs3_types::{
-        BackendObjectId, BlindIndexKey, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, ManifestId,
-        PrefixToken, Sequence,
+        BackendObjectId, BlindIndexKey, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
+        ManifestId, PrefixToken, Sequence,
     };
 
     fn blind_key(value: &str) -> BlindIndexKey {
@@ -288,6 +300,13 @@ mod tests {
 
     fn key_id(value: &str) -> KeyId {
         match KeyId::new(value) {
+            Ok(value) => value,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    fn checkpoint_id(value: &str) -> CheckpointId {
+        match CheckpointId::new(value) {
             Ok(value) => value,
             Err(error) => panic!("{error}"),
         }
@@ -401,6 +420,29 @@ mod tests {
         assert!(first_bytes.is_ok());
         assert!(second_bytes.is_ok());
         assert_ne!(first_bytes.ok(), second_bytes.ok());
+    }
+
+    #[test]
+    fn checkpoint_object_encoding_has_domain_prefix() {
+        let checkpoint = Checkpoint {
+            id: checkpoint_id("checkpoint-a"),
+            record: CommitRecord {
+                sequence: Sequence::new(1),
+                parent: None,
+                index_deltas: Vec::new(),
+                compacted_manifests: Vec::new(),
+                keyring: KeyringSnapshot::default(),
+            },
+            signature_key_id: key_id("signing"),
+            signature: vec![1, 2, 3],
+        };
+
+        let encoded = checkpoint_object_bytes(&checkpoint);
+
+        assert!(matches!(
+            encoded,
+            Ok(bytes) if bytes.starts_with(CHECKPOINT_OBJECT_DOMAIN)
+        ));
     }
 
     #[test]

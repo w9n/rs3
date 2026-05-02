@@ -1,19 +1,22 @@
 //! Repository behavior tests.
 
+use crate::checkpoint::{CHECKPOINT_OBJECT_PREFIX, checkpoint_object_id};
 use crate::namespace::prefix_tokens_for_key;
 use crate::{
     CheckpointPosition, PhysicalDeleteOutcome, Repository, RepositoryError, RepositoryPutOptions,
     Result,
 };
+use async_trait::async_trait;
 use bytes::Bytes;
-use rs3_anchor::{AnchorState, MemoryCheckpointAnchor};
+use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor, MemoryCheckpointAnchor};
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_index::canonical_commit_record_bytes;
+use rs3_index::{CHECKPOINT_OBJECT_DOMAIN, Checkpoint, canonical_commit_record_bytes};
 use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore};
 use rs3_types::{
     CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath, RetentionMode,
     RetentionPolicy, Sequence,
 };
+use std::sync::{Arc, Mutex};
 
 fn secret() -> SecretBytes {
     secret_with_byte(9)
@@ -129,6 +132,87 @@ fn must_storage<T>(result: rs3_storage::Result<T>) -> T {
     match result {
         Ok(value) => value,
         Err(error) => panic!("{error}"),
+    }
+}
+
+fn decode_checkpoint_object(body: Bytes) -> Checkpoint {
+    let Some(payload) = body.as_ref().strip_prefix(CHECKPOINT_OBJECT_DOMAIN) else {
+        panic!("checkpoint object is missing domain prefix");
+    };
+
+    match serde_json::from_slice(payload) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => panic!("{error}"),
+    }
+}
+
+struct CheckpointMustExistAnchor {
+    inner: MemoryCheckpointAnchor,
+    store: MemoryBlobStore,
+}
+
+impl CheckpointMustExistAnchor {
+    fn new(store: MemoryBlobStore) -> Self {
+        Self {
+            inner: MemoryCheckpointAnchor::new(),
+            store,
+        }
+    }
+}
+
+#[async_trait]
+impl CheckpointAnchor for CheckpointMustExistAnchor {
+    async fn read(&self) -> rs3_anchor::Result<AnchorState> {
+        self.inner.read().await
+    }
+
+    async fn compare_and_advance(&self, next: AnchorState) -> rs3_anchor::Result<AnchorState> {
+        let object_id = checkpoint_object_id(&next.checkpoint_id)
+            .map_err(|error| AnchorError::Backend(error.to_string()))?;
+        self.store
+            .head(&object_id)
+            .await
+            .map_err(|error| AnchorError::Backend(error.to_string()))?;
+        self.inner.compare_and_advance(next).await
+    }
+}
+
+struct FailOnceAnchor {
+    inner: MemoryCheckpointAnchor,
+    fail_next: Arc<Mutex<bool>>,
+}
+
+impl FailOnceAnchor {
+    fn new() -> Self {
+        Self {
+            inner: MemoryCheckpointAnchor::new(),
+            fail_next: Arc::new(Mutex::new(true)),
+        }
+    }
+}
+
+#[async_trait]
+impl CheckpointAnchor for FailOnceAnchor {
+    async fn read(&self) -> rs3_anchor::Result<AnchorState> {
+        self.inner.read().await
+    }
+
+    async fn compare_and_advance(&self, next: AnchorState) -> rs3_anchor::Result<AnchorState> {
+        let should_fail = {
+            let mut fail_next = self
+                .fail_next
+                .lock()
+                .map_err(|_| AnchorError::StatePoisoned)?;
+            let should_fail = *fail_next;
+            *fail_next = false;
+            should_fail
+        };
+
+        if should_fail {
+            return Err(AnchorError::Backend("transient anchor failure".to_owned()));
+        }
+
+        self.inner.compare_and_advance(next).await
     }
 }
 
@@ -626,6 +710,64 @@ async fn publish_checkpoint_initializes_empty_anchor() {
     let position = must(published);
     assert_eq!(position.sequence, Sequence::new(1));
     assert!(!position.payload_digest.is_empty());
+}
+
+#[tokio::test]
+async fn publish_checkpoint_persists_signed_checkpoint_before_anchor_advance() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
+    let anchor = CheckpointMustExistAnchor::new(store.clone());
+
+    let put = repo
+        .put(
+            key("p/12/abcdef"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let position = must(repo.publish_checkpoint(&anchor).await);
+    let checkpoint_object_id = must(checkpoint_object_id(&position.checkpoint_id));
+    let body = must_storage(
+        store
+            .get_range(&checkpoint_object_id, ByteRange::Full)
+            .await,
+    );
+    let checkpoint = decode_checkpoint_object(body);
+    let verified = repo.verify_signed_checkpoint(&checkpoint, None);
+
+    assert_eq!(checkpoint.id, position.checkpoint_id);
+    assert_eq!(verified.ok(), Some(position));
+}
+
+#[tokio::test]
+async fn publish_checkpoint_retries_after_anchor_failure_without_rewriting_checkpoint() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
+    let anchor = FailOnceAnchor::new();
+
+    let put = repo
+        .put(
+            key("p/12/abcdef"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let first = repo.publish_checkpoint(&anchor).await;
+    let after_first = must_storage(store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+    let second = must(repo.publish_checkpoint(&anchor).await);
+    let after_second = must_storage(store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+
+    assert!(matches!(
+        first,
+        Err(RepositoryError::Anchor(AnchorError::Backend(_)))
+    ));
+    assert_eq!(after_first.len(), 1);
+    assert_eq!(second.sequence, Sequence::new(1));
+    assert_eq!(after_second.len(), 1);
 }
 
 #[tokio::test]

@@ -3,11 +3,18 @@
 use crate::error::Result;
 use crate::model::CheckpointPosition;
 use crate::service::Repository;
+use bytes::Bytes;
 use rs3_anchor::{AnchorError, CheckpointAnchor};
 use rs3_crypto::{derive_checkpoint_id, derive_checkpoint_payload_digest};
-use rs3_index::{Checkpoint, CommitRecord, KeyringSnapshot, canonical_commit_record_bytes};
-use rs3_storage::BlobStore;
-use rs3_types::CheckpointId;
+use rs3_index::{
+    Checkpoint, CommitRecord, KeyringSnapshot, canonical_commit_record_bytes,
+    checkpoint_object_bytes,
+};
+use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
+use rs3_types::{BackendObjectId, CheckpointId};
+
+pub(crate) const CHECKPOINT_OBJECT_PREFIX: &str = "checkpoints/";
+const CHECKPOINT_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.checkpoint+json";
 
 impl<S> Repository<S>
 where
@@ -101,12 +108,53 @@ where
         let checkpoint = self.draft_signed_checkpoint(parent)?;
         let position = self.verify_signed_checkpoint(&checkpoint, accepted.as_ref())?;
 
+        self.persist_signed_checkpoint(&checkpoint).await?;
+
         anchor
             .compare_and_advance(position.clone().into_anchor_state())
             .await?;
 
         Ok(position)
     }
+
+    /// Writes a signed checkpoint object if it has not already been written.
+    pub(crate) async fn persist_signed_checkpoint(&self, checkpoint: &Checkpoint) -> Result<()> {
+        let object_id = checkpoint_object_id(&checkpoint.id)?;
+        let body = Bytes::from(checkpoint_object_bytes(checkpoint)?);
+        let put = self
+            .store
+            .put(
+                &object_id,
+                body.clone(),
+                PutOptions {
+                    retention: None,
+                    content_type: Some(CHECKPOINT_OBJECT_CONTENT_TYPE.to_owned()),
+                    do_not_recreate: true,
+                },
+            )
+            .await;
+
+        match put {
+            Ok(_) => Ok(()),
+            Err(StorageError::AlreadyExists(_)) => {
+                let existing = self.store.get_range(&object_id, ByteRange::Full).await?;
+                if existing == body {
+                    Ok(())
+                } else {
+                    Err(crate::RepositoryError::CheckpointObjectConflict { object_id })
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+pub(crate) fn checkpoint_object_id(checkpoint_id: &CheckpointId) -> Result<BackendObjectId> {
+    BackendObjectId::new(format!(
+        "{CHECKPOINT_OBJECT_PREFIX}{}",
+        checkpoint_id.as_str()
+    ))
+    .map_err(Into::into)
 }
 
 fn validate_position(
