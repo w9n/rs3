@@ -36,10 +36,13 @@ impl KeyRing {
         Ok(Self { keys })
     }
 
-    /// Creates a keyring with one primary namespace key.
+    /// Creates a keyring with primary namespace and metadata keys.
     pub fn single_namespace(secret: SecretBytes) -> Self {
         Self {
-            keys: vec![KeyMaterial::new(default_namespace_descriptor(), secret)],
+            keys: vec![
+                KeyMaterial::new(default_namespace_descriptor(), secret.clone()),
+                KeyMaterial::new(default_metadata_descriptor(), secret),
+            ],
         }
     }
 
@@ -189,6 +192,19 @@ fn default_namespace_descriptor() -> KeyDescriptor {
         id: static_key_id("namespace-v1"),
         purpose: KeyPurpose::Namespace,
         algorithm: "hmac-sha256".to_string(),
+        status: KeyStatus::Primary,
+        created_at_ms: 0,
+        not_before_ms: None,
+        not_after_ms: None,
+        external_kms_uri: None,
+    }
+}
+
+fn default_metadata_descriptor() -> KeyDescriptor {
+    KeyDescriptor {
+        id: static_key_id("metadata-v1"),
+        purpose: KeyPurpose::Metadata,
+        algorithm: "hmac-sha256-seal".to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
         not_before_ms: None,

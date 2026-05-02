@@ -1,6 +1,6 @@
 //! Repository behavior tests.
 
-use crate::checkpoint::{CHECKPOINT_OBJECT_PREFIX, MANIFEST_OBJECT_PREFIX, checkpoint_object_id};
+use crate::checkpoint::{CHECKPOINT_OBJECT_PREFIX, checkpoint_object_id};
 use crate::namespace::prefix_tokens_for_key;
 use crate::{
     CheckpointPosition, CommitCoordinator, PhysicalDeleteOutcome, Repository, RepositoryError,
@@ -11,8 +11,7 @@ use bytes::Bytes;
 use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor, MemoryCheckpointAnchor};
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_index::{
-    CHECKPOINT_OBJECT_DOMAIN, Checkpoint, INDEX_DELTA_OBJECT_DOMAIN, MANIFEST_OBJECT_DOMAIN,
-    canonical_commit_record_bytes,
+    CHECKPOINT_OBJECT_DOMAIN, Checkpoint, INDEX_DELTA_OBJECT_DOMAIN, canonical_commit_record_bytes,
 };
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions, StorageError};
 use rs3_types::{
@@ -113,7 +112,14 @@ fn key_material(
     )
 }
 
-fn keyring(keys: Vec<KeyMaterial>) -> KeyRing {
+fn keyring(mut keys: Vec<KeyMaterial>) -> KeyRing {
+    if !keys
+        .iter()
+        .any(|key| key.descriptor().purpose == KeyPurpose::Metadata)
+    {
+        keys.push(metadata_key("metadata", KeyStatus::Primary, 2));
+    }
+
     match KeyRing::new(keys) {
         Ok(keyring) => keyring,
         Err(error) => panic!("{error}"),
@@ -593,7 +599,7 @@ async fn draft_commit_record_contains_rotated_keyring_metadata() {
 
     assert_eq!(record.sequence, Sequence::new(2));
     assert_eq!(record.index_deltas.len(), 1);
-    assert_eq!(record.compacted_manifests.len(), 2);
+    assert!(record.compacted_manifests.is_empty());
     assert_eq!(
         record
             .keyring
@@ -873,11 +879,11 @@ async fn publish_checkpoint_persists_index_delta_without_client_key_material() {
     );
     let checkpoint = decode_checkpoint_object(checkpoint_body.clone());
     let delta_objects = must_storage(store.list_prefix("index/").await);
-    let manifest_objects = must_storage(store.list_prefix(MANIFEST_OBJECT_PREFIX).await);
+    let manifest_objects = must_storage(store.list_prefix("manifests/").await);
 
     assert_eq!(checkpoint.record.index_deltas.len(), 1);
     assert_eq!(delta_objects.len(), 1);
-    assert_eq!(manifest_objects.len(), 1);
+    assert!(manifest_objects.is_empty());
     assert_eq!(
         checkpoint.record.index_deltas[0],
         delta_objects[0].object_id
@@ -888,16 +894,9 @@ async fn publish_checkpoint_persists_index_delta_without_client_key_material() {
             .get_range(&delta_objects[0].object_id, ByteRange::Full)
             .await,
     );
-    let manifest_body = must_storage(
-        store
-            .get_range(&manifest_objects[0].object_id, ByteRange::Full)
-            .await,
-    );
     assert!(delta_body.starts_with(INDEX_DELTA_OBJECT_DOMAIN));
-    assert!(manifest_body.starts_with(MANIFEST_OBJECT_DOMAIN));
     assert_body_does_not_contain(&checkpoint_body, &["sensitive", "client-blob", "p/12"]);
     assert_body_does_not_contain(&delta_body, &["sensitive", "client-blob", "p/12"]);
-    assert_body_does_not_contain(&manifest_body, &["sensitive", "client-blob", "p/12"]);
 }
 
 #[tokio::test]
@@ -1093,7 +1092,7 @@ async fn operation_counts_show_checkpoint_batch_reduces_backend_puts() {
 
     let single_counts = must_storage(single_store.operation_counts());
     let single_payloads = must_storage(single_store.list_prefix("segments/").await);
-    let single_manifests = must_storage(single_store.list_prefix(MANIFEST_OBJECT_PREFIX).await);
+    let single_manifests = must_storage(single_store.list_prefix("manifests/").await);
     let single_indexes = must_storage(single_store.list_prefix("index/").await);
     let single_checkpoints = must_storage(single_store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
 
@@ -1116,20 +1115,20 @@ async fn operation_counts_show_checkpoint_batch_reduces_backend_puts() {
 
     let batch_counts = must_storage(batch_store.operation_counts());
     let batch_payloads = must_storage(batch_store.list_prefix("segments/").await);
-    let batch_manifests = must_storage(batch_store.list_prefix(MANIFEST_OBJECT_PREFIX).await);
+    let batch_manifests = must_storage(batch_store.list_prefix("manifests/").await);
     let batch_indexes = must_storage(batch_store.list_prefix("index/").await);
     let batch_checkpoints = must_storage(batch_store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
 
-    assert_eq!(single_counts.put, 12);
-    assert_eq!(batch_counts.put, 8);
+    assert_eq!(single_counts.put, 9);
+    assert_eq!(batch_counts.put, 5);
     assert_eq!(single_counts.get, 0);
     assert_eq!(batch_counts.get, 0);
     assert_eq!(single_payloads.len(), 3);
-    assert_eq!(single_manifests.len(), 3);
+    assert_eq!(single_manifests.len(), 0);
     assert_eq!(single_indexes.len(), 3);
     assert_eq!(single_checkpoints.len(), 3);
     assert_eq!(batch_payloads.len(), 3);
-    assert_eq!(batch_manifests.len(), 3);
+    assert_eq!(batch_manifests.len(), 0);
     assert_eq!(batch_indexes.len(), 1);
     assert_eq!(batch_checkpoints.len(), 1);
 }

@@ -1,5 +1,6 @@
 //! Repository service implementation.
 
+use crate::checkpoint::seal_manifest_record;
 use crate::error::{RepositoryError, Result};
 use crate::model::{
     CommittedPut, DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry,
@@ -118,6 +119,7 @@ where
             modified_at_ms,
             retention: storage_metadata.retention,
         };
+        let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
 
         {
             let mut state = self.write_state()?;
@@ -131,6 +133,7 @@ where
             state.pending_index_deltas.push(IndexDelta::Upsert {
                 entry: entry.clone(),
                 prefix_tokens: prefix_tokens.clone(),
+                sealed_manifest: Box::new(sealed_manifest),
             });
             state.namespace.upsert(entry, prefix_tokens);
             state.manifests.insert(manifest_id, manifest.clone());
@@ -287,11 +290,6 @@ where
         updated.retention = backend.retention.clone();
         let prefix_tokens =
             prefix_tokens_for_key(&keyring, &updated.namespace_key_id, key.as_str())?;
-        state.pending_index_deltas.push(IndexDelta::Upsert {
-            entry: updated.clone(),
-            prefix_tokens: prefix_tokens.clone(),
-        });
-        state.namespace.upsert(updated.clone(), prefix_tokens);
         let manifest = TrustedManifest {
             key: key.clone(),
             content_len: backend.content_len,
@@ -300,6 +298,13 @@ where
                 .unwrap_or_else(|| sequence.get() as i64),
             retention: backend.retention,
         };
+        let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
+        state.pending_index_deltas.push(IndexDelta::Upsert {
+            entry: updated.clone(),
+            prefix_tokens: prefix_tokens.clone(),
+            sealed_manifest: Box::new(sealed_manifest),
+        });
+        state.namespace.upsert(updated.clone(), prefix_tokens);
         state.manifests.insert(manifest_id, manifest.clone());
 
         Ok(manifest.into_metadata())
