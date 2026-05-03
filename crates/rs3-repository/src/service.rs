@@ -243,11 +243,32 @@ where
 
     /// Reads trusted metadata for a client-visible object.
     pub fn head(&self, key: &LogicalPath) -> Result<RepositoryObjectMetadata> {
-        let keyring = self.keyring()?;
-        let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
-        let state = self.read_state()?;
-        let entry = first_namespace_entry(&state.namespace, &lookup_blind_keys)
-            .ok_or_else(|| RepositoryError::NotFound(key.clone()))?;
+        let started = Instant::now();
+        let keyring = match self.keyring() {
+            Ok(keyring) => keyring,
+            Err(error) => {
+                record_repository_head("keyring_error", started.elapsed());
+                return Err(error);
+            }
+        };
+        let lookup_blind_keys = match keyring.derive_blind_index_keys_for_lookup(key) {
+            Ok(lookup_blind_keys) => lookup_blind_keys,
+            Err(error) => {
+                record_repository_head("lookup_error", started.elapsed());
+                return Err(error.into());
+            }
+        };
+        let state = match self.read_state() {
+            Ok(state) => state,
+            Err(error) => {
+                record_repository_head("state_error", started.elapsed());
+                return Err(error);
+            }
+        };
+        let Some(entry) = first_namespace_entry(&state.namespace, &lookup_blind_keys) else {
+            record_repository_head("not_found", started.elapsed());
+            return Err(RepositoryError::NotFound(key.clone()));
+        };
         let manifest = state
             .manifests
             .get(&entry.manifest_id)
@@ -259,6 +280,7 @@ where
                 retention: entry.retention.clone(),
             });
 
+        record_repository_head("ok", started.elapsed());
         Ok(manifest.into_metadata())
     }
 
@@ -862,6 +884,28 @@ struct RepositoryListTrace {
 }
 
 fn record_repository_put(record: RepositoryPutTrace) {
+    record_repository_operation_metrics("put", record.result, record.elapsed);
+    if record.result == "ok" {
+        increment_repository_counter(
+            "rs3_repository_plaintext_bytes_total",
+            "operation",
+            "put",
+            record.plaintext_len,
+        );
+        increment_repository_counter(
+            "rs3_repository_backend_bytes_written_total",
+            "operation",
+            "put",
+            record.backend_len,
+        );
+        increment_repository_counter(
+            "rs3_repository_stale_entries_total",
+            "operation",
+            "put",
+            usize_to_u64(record.stale_entries),
+        );
+    }
+
     tracing::info!(
         target: "rs3_repository",
         operation = "put",
@@ -877,7 +921,50 @@ fn record_repository_put(record: RepositoryPutTrace) {
     );
 }
 
+fn record_repository_head(result: &'static str, elapsed: Duration) {
+    record_repository_operation_metrics("head", result, elapsed);
+    tracing::info!(
+        target: "rs3_repository",
+        operation = "head",
+        result,
+        elapsed_us = elapsed_us(elapsed),
+        "repository operation completed",
+    );
+}
+
 fn record_repository_list(record: RepositoryListTrace) {
+    record_repository_operation_metrics("list", record.result, record.elapsed);
+    metrics::counter!(
+        "rs3_repository_list_lookup_tokens_total",
+        "prefix_mode" => record.prefix_mode,
+        "result" => record.result.to_owned(),
+    )
+    .increment(usize_to_u64(record.lookup_token_count));
+    metrics::counter!(
+        "rs3_repository_list_candidates_total",
+        "prefix_mode" => record.prefix_mode,
+        "result" => record.result.to_owned(),
+    )
+    .increment(usize_to_u64(record.candidate_count));
+    metrics::counter!(
+        "rs3_repository_list_manifest_misses_total",
+        "prefix_mode" => record.prefix_mode,
+        "result" => record.result.to_owned(),
+    )
+    .increment(usize_to_u64(record.manifest_miss_count));
+    metrics::counter!(
+        "rs3_repository_list_prefix_misses_total",
+        "prefix_mode" => record.prefix_mode,
+        "result" => record.result.to_owned(),
+    )
+    .increment(usize_to_u64(record.prefix_miss_count));
+    metrics::counter!(
+        "rs3_repository_list_returned_total",
+        "prefix_mode" => record.prefix_mode,
+        "result" => record.result.to_owned(),
+    )
+    .increment(usize_to_u64(record.returned_count));
+
     tracing::info!(
         target: "rs3_repository",
         operation = "list",
@@ -900,6 +987,27 @@ fn record_repository_get(
     result: &str,
     elapsed: Duration,
 ) {
+    let range_label = match range {
+        ByteRange::Full => "full",
+        ByteRange::Slice { .. } => "slice",
+    };
+    record_repository_operation_metrics("get_range", result, elapsed);
+    metrics::counter!(
+        "rs3_repository_backend_bytes_read_total",
+        "operation" => "get_range",
+        "range" => range_label,
+        "result" => result.to_owned(),
+    )
+    .increment(backend_bytes_read);
+    if result == "ok" {
+        metrics::counter!(
+            "rs3_repository_returned_bytes_total",
+            "operation" => "get_range",
+            "range" => range_label,
+        )
+        .increment(returned_len);
+    }
+
     match range {
         ByteRange::Full => tracing::info!(
             target: "rs3_repository",
@@ -924,6 +1032,37 @@ fn record_repository_get(
             "repository operation completed",
         ),
     }
+}
+
+fn record_repository_operation_metrics(operation: &'static str, result: &str, elapsed: Duration) {
+    metrics::counter!(
+        "rs3_repository_operations_total",
+        "operation" => operation,
+        "result" => result.to_owned(),
+    )
+    .increment(1);
+    metrics::histogram!(
+        "rs3_repository_operation_duration_seconds",
+        "operation" => operation,
+        "result" => result.to_owned(),
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+fn increment_repository_counter(
+    name: &'static str,
+    label_name: &'static str,
+    label_value: &'static str,
+    amount: u64,
+) {
+    if amount == 0 {
+        return;
+    }
+    metrics::counter!(name, label_name => label_value).increment(amount);
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn elapsed_us(elapsed: Duration) -> u64 {

@@ -3302,6 +3302,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "getrandom 0.3.4",
+ "metrics",
  "proptest",
  "rs3-anchor",
  "rs3-crypto",

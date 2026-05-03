@@ -11,6 +11,7 @@ description = "Trusted repository workflow for rs3"
 [dependencies]
 bytes.workspace = true
 getrandom.workspace = true
+metrics.workspace = true
 rs3-anchor.workspace = true
 rs3-crypto.workspace = true
 rs3-index.workspace = true

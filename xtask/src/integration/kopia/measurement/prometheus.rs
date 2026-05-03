@@ -63,6 +63,19 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
     let mut storage_provider_bytes_received_by_operation = BTreeMap::new();
     let mut storage_provider_duration_counts = BTreeMap::new();
     let mut storage_provider_duration_sums = BTreeMap::new();
+    let mut repository_counts_by_operation = BTreeMap::new();
+    let mut repository_counts_by_result = BTreeMap::new();
+    let mut repository_plaintext_bytes_by_operation = BTreeMap::new();
+    let mut repository_backend_bytes_written_by_operation = BTreeMap::new();
+    let mut repository_backend_bytes_read_by_range = BTreeMap::new();
+    let mut repository_returned_bytes_by_range = BTreeMap::new();
+    let mut repository_list_lookup_tokens_by_prefix_mode = BTreeMap::new();
+    let mut repository_list_candidates_by_prefix_mode = BTreeMap::new();
+    let mut repository_list_manifest_misses_by_prefix_mode = BTreeMap::new();
+    let mut repository_list_prefix_misses_by_prefix_mode = BTreeMap::new();
+    let mut repository_list_returned_by_prefix_mode = BTreeMap::new();
+    let mut repository_duration_counts = BTreeMap::new();
+    let mut repository_duration_sums = BTreeMap::new();
 
     for (identity, sample) in after {
         let delta = metric_delta(
@@ -138,6 +151,95 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
                     delta,
                 );
             }
+            "rs3_repository_operations_total" => {
+                bump_f64_label(
+                    &mut repository_counts_by_operation,
+                    sample.label("operation"),
+                    delta,
+                );
+                bump_f64_label(
+                    &mut repository_counts_by_result,
+                    sample.label("result"),
+                    delta,
+                );
+            }
+            "rs3_repository_plaintext_bytes_total" => {
+                bump_f64_label(
+                    &mut repository_plaintext_bytes_by_operation,
+                    sample.label("operation"),
+                    delta,
+                );
+            }
+            "rs3_repository_backend_bytes_written_total" => {
+                bump_f64_label(
+                    &mut repository_backend_bytes_written_by_operation,
+                    sample.label("operation"),
+                    delta,
+                );
+            }
+            "rs3_repository_backend_bytes_read_total" => {
+                bump_f64_label(
+                    &mut repository_backend_bytes_read_by_range,
+                    sample.label("range"),
+                    delta,
+                );
+            }
+            "rs3_repository_returned_bytes_total" => {
+                bump_f64_label(
+                    &mut repository_returned_bytes_by_range,
+                    sample.label("range"),
+                    delta,
+                );
+            }
+            "rs3_repository_list_lookup_tokens_total" => {
+                bump_f64_label(
+                    &mut repository_list_lookup_tokens_by_prefix_mode,
+                    sample.label("prefix_mode"),
+                    delta,
+                );
+            }
+            "rs3_repository_list_candidates_total" => {
+                bump_f64_label(
+                    &mut repository_list_candidates_by_prefix_mode,
+                    sample.label("prefix_mode"),
+                    delta,
+                );
+            }
+            "rs3_repository_list_manifest_misses_total" => {
+                bump_f64_label(
+                    &mut repository_list_manifest_misses_by_prefix_mode,
+                    sample.label("prefix_mode"),
+                    delta,
+                );
+            }
+            "rs3_repository_list_prefix_misses_total" => {
+                bump_f64_label(
+                    &mut repository_list_prefix_misses_by_prefix_mode,
+                    sample.label("prefix_mode"),
+                    delta,
+                );
+            }
+            "rs3_repository_list_returned_total" => {
+                bump_f64_label(
+                    &mut repository_list_returned_by_prefix_mode,
+                    sample.label("prefix_mode"),
+                    delta,
+                );
+            }
+            "rs3_repository_operation_duration_seconds_count" => {
+                bump_f64_label(
+                    &mut repository_duration_counts,
+                    sample.label("operation"),
+                    delta,
+                );
+            }
+            "rs3_repository_operation_duration_seconds_sum" => {
+                bump_f64_label(
+                    &mut repository_duration_sums,
+                    sample.label("operation"),
+                    delta,
+                );
+            }
             _ => {}
         }
     }
@@ -158,6 +260,23 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
             "operation_duration_seconds": duration_summary_json(
                 storage_provider_duration_counts,
                 storage_provider_duration_sums,
+            ),
+        },
+        "repository": {
+            "counts_by_operation": repository_counts_by_operation,
+            "counts_by_result": repository_counts_by_result,
+            "plaintext_bytes_by_operation": repository_plaintext_bytes_by_operation,
+            "backend_bytes_written_by_operation": repository_backend_bytes_written_by_operation,
+            "backend_bytes_read_by_range": repository_backend_bytes_read_by_range,
+            "returned_bytes_by_range": repository_returned_bytes_by_range,
+            "list_lookup_tokens_by_prefix_mode": repository_list_lookup_tokens_by_prefix_mode,
+            "list_candidates_by_prefix_mode": repository_list_candidates_by_prefix_mode,
+            "list_manifest_misses_by_prefix_mode": repository_list_manifest_misses_by_prefix_mode,
+            "list_prefix_misses_by_prefix_mode": repository_list_prefix_misses_by_prefix_mode,
+            "list_returned_by_prefix_mode": repository_list_returned_by_prefix_mode,
+            "operation_duration_seconds": duration_summary_json(
+                repository_duration_counts,
+                repository_duration_sums,
             ),
         },
     })
@@ -291,6 +410,19 @@ rs3_storage_provider_bytes_sent_total{provider="s3",operation="put",object_kind=
 rs3_storage_provider_bytes_received_total{provider="s3",operation="get",object_kind="segments"} 2048
 rs3_storage_provider_operation_duration_seconds_count{provider="s3",operation="put",object_kind="segments",result="ok"} 4
 rs3_storage_provider_operation_duration_seconds_sum{provider="s3",operation="put",object_kind="segments",result="ok"} 0.8
+rs3_repository_operations_total{operation="put",result="ok"} 4
+rs3_repository_operations_total{operation="get_range",result="ok"} 2
+rs3_repository_plaintext_bytes_total{operation="put"} 2048
+rs3_repository_backend_bytes_written_total{operation="put"} 4096
+rs3_repository_backend_bytes_read_total{operation="get_range",range="slice",result="ok"} 1536
+rs3_repository_returned_bytes_total{operation="get_range",range="slice"} 512
+rs3_repository_list_lookup_tokens_total{prefix_mode="delimiter",result="ok"} 3
+rs3_repository_list_candidates_total{prefix_mode="delimiter",result="ok"} 12
+rs3_repository_list_manifest_misses_total{prefix_mode="delimiter",result="ok"} 1
+rs3_repository_list_prefix_misses_total{prefix_mode="delimiter",result="ok"} 2
+rs3_repository_list_returned_total{prefix_mode="delimiter",result="ok"} 9
+rs3_repository_operation_duration_seconds_count{operation="get_range",result="ok"} 2
+rs3_repository_operation_duration_seconds_sum{operation="get_range",result="ok"} 0.04
 "#;
 
         let metrics = prometheus_metrics_delta_json(before, after);
@@ -342,6 +474,52 @@ rs3_storage_provider_operation_duration_seconds_sum{provider="s3",operation="put
         assert_eq!(
             metrics["storage_provider"]["operation_duration_seconds"]["put"]["avg"],
             0.2
+        );
+        assert_eq!(metrics["repository"]["counts_by_operation"]["put"], 4.0);
+        assert_eq!(
+            metrics["repository"]["counts_by_operation"]["get_range"],
+            2.0
+        );
+        assert_eq!(metrics["repository"]["counts_by_result"]["ok"], 6.0);
+        assert_eq!(
+            metrics["repository"]["plaintext_bytes_by_operation"]["put"],
+            2048.0
+        );
+        assert_eq!(
+            metrics["repository"]["backend_bytes_written_by_operation"]["put"],
+            4096.0
+        );
+        assert_eq!(
+            metrics["repository"]["backend_bytes_read_by_range"]["slice"],
+            1536.0
+        );
+        assert_eq!(
+            metrics["repository"]["returned_bytes_by_range"]["slice"],
+            512.0
+        );
+        assert_eq!(
+            metrics["repository"]["list_lookup_tokens_by_prefix_mode"]["delimiter"],
+            3.0
+        );
+        assert_eq!(
+            metrics["repository"]["list_candidates_by_prefix_mode"]["delimiter"],
+            12.0
+        );
+        assert_eq!(
+            metrics["repository"]["list_manifest_misses_by_prefix_mode"]["delimiter"],
+            1.0
+        );
+        assert_eq!(
+            metrics["repository"]["list_prefix_misses_by_prefix_mode"]["delimiter"],
+            2.0
+        );
+        assert_eq!(
+            metrics["repository"]["list_returned_by_prefix_mode"]["delimiter"],
+            9.0
+        );
+        assert_eq!(
+            metrics["repository"]["operation_duration_seconds"]["get_range"]["avg"],
+            0.02
         );
     }
 }

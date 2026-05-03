@@ -201,6 +201,68 @@ fn aggregate_reports(reports: &[&Value]) -> Value {
                     "operation_duration_seconds",
                 ]),
             },
+            "repository": {
+                "counts_by_operation": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "counts_by_operation",
+                ]),
+                "counts_by_result": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "counts_by_result",
+                ]),
+                "plaintext_bytes_by_operation": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "plaintext_bytes_by_operation",
+                ]),
+                "backend_bytes_written_by_operation": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "backend_bytes_written_by_operation",
+                ]),
+                "backend_bytes_read_by_range": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "backend_bytes_read_by_range",
+                ]),
+                "returned_bytes_by_range": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "returned_bytes_by_range",
+                ]),
+                "list_lookup_tokens_by_prefix_mode": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "list_lookup_tokens_by_prefix_mode",
+                ]),
+                "list_candidates_by_prefix_mode": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "list_candidates_by_prefix_mode",
+                ]),
+                "list_manifest_misses_by_prefix_mode": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "list_manifest_misses_by_prefix_mode",
+                ]),
+                "list_prefix_misses_by_prefix_mode": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "list_prefix_misses_by_prefix_mode",
+                ]),
+                "list_returned_by_prefix_mode": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "list_returned_by_prefix_mode",
+                ]),
+                "operation_duration_seconds": aggregate_operation_latency_at(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "operation_duration_seconds",
+                ]),
+            },
         },
         "gateway_process": {
             "cpu_system_seconds": aggregate_f64_at(reports, &["gateway_process", "cpu_system_seconds"]),
