@@ -1,6 +1,8 @@
 //! Provider-neutral object-store abstractions.
 
 mod filesystem;
+#[cfg(feature = "s3")]
+mod s3;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -11,6 +13,8 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub use filesystem::FilesystemBlobStore;
+#[cfg(feature = "s3")]
+pub use s3::{S3BlobStore, S3BlobStoreConfig, S3ProviderMetrics, S3ProviderOperationMetrics};
 
 /// Metadata returned by object-store reads and heads.
 #[derive(Clone, Debug, PartialEq, Eq)]

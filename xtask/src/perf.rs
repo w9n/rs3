@@ -10,6 +10,8 @@ use rs3_storage::{
     BlobOperationCounts, BlobStore, ByteRange, CountingBlobStore, FilesystemBlobStore,
     MemoryBlobStore,
 };
+#[cfg(feature = "s3")]
+use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,6 +41,34 @@ pub(crate) struct PerfArgs {
     /// Filesystem backend root used with `--backend filesystem`.
     #[arg(long)]
     backend_dir: Option<PathBuf>,
+    /// S3 bucket used with `--backend s3`.
+    #[cfg(feature = "s3")]
+    #[arg(long, env = "RS3_PERF_S3_BUCKET")]
+    s3_bucket: Option<String>,
+    /// S3 key prefix used with `--backend s3`.
+    #[cfg(feature = "s3")]
+    #[arg(long, env = "RS3_PERF_S3_PREFIX")]
+    s3_prefix: Option<String>,
+    /// Custom S3 endpoint URL used with `--backend s3`.
+    #[cfg(feature = "s3")]
+    #[arg(long, env = "RS3_PERF_S3_ENDPOINT_URL")]
+    s3_endpoint_url: Option<String>,
+    /// AWS region override used with `--backend s3`.
+    #[cfg(feature = "s3")]
+    #[arg(long, env = "RS3_PERF_S3_REGION")]
+    s3_region: Option<String>,
+    /// Allow plain HTTP for local S3-compatible endpoints used with `--backend s3`.
+    #[cfg(feature = "s3")]
+    #[arg(long, env = "RS3_PERF_S3_ALLOW_HTTP", default_value_t = false)]
+    s3_allow_http: bool,
+    /// Use virtual-hosted bucket addressing instead of path-style addressing.
+    #[cfg(feature = "s3")]
+    #[arg(
+        long,
+        env = "RS3_PERF_S3_VIRTUAL_HOSTED_STYLE",
+        default_value_t = false
+    )]
+    s3_virtual_hosted_style: bool,
     /// Output format for scenario reports.
     #[arg(long, value_enum, default_value_t = ReportFormat::Tsv)]
     format: ReportFormat,
@@ -73,6 +103,9 @@ pub(crate) enum PerfBackend {
     Memory,
     /// Local filesystem backend.
     Filesystem,
+    /// S3-compatible backend using the default environment/config chain.
+    #[cfg(feature = "s3")]
+    S3,
 }
 
 impl PerfBackend {
@@ -80,6 +113,8 @@ impl PerfBackend {
         match self {
             Self::Memory => "memory",
             Self::Filesystem => "filesystem",
+            #[cfg(feature = "s3")]
+            Self::S3 => "s3",
         }
     }
 }
@@ -139,6 +174,8 @@ async fn write_batch(args: &PerfArgs) -> Result<PerfReport> {
             let (_dir, store) = filesystem_store(args)?;
             write_batch_with_store(args, store).await
         }
+        #[cfg(feature = "s3")]
+        PerfBackend::S3 => write_batch_with_store(args, s3_store(args).await?).await,
     }
 }
 
@@ -191,6 +228,8 @@ async fn full_read(args: &PerfArgs) -> Result<PerfReport> {
             let (_dir, store) = filesystem_store(args)?;
             full_read_with_store(args, store).await
         }
+        #[cfg(feature = "s3")]
+        PerfBackend::S3 => full_read_with_store(args, s3_store(args).await?).await,
     }
 }
 
@@ -239,6 +278,8 @@ async fn range_read(args: &PerfArgs) -> Result<PerfReport> {
             let (_dir, store) = filesystem_store(args)?;
             range_read_with_store(args, store).await
         }
+        #[cfg(feature = "s3")]
+        PerfBackend::S3 => range_read_with_store(args, s3_store(args).await?).await,
     }
 }
 
@@ -461,6 +502,25 @@ fn filesystem_store(
     };
     let store = FilesystemBlobStore::new(root).context("failed to create filesystem backend")?;
     Ok((temporary, CountingBlobStore::new(store)))
+}
+
+#[cfg(feature = "s3")]
+async fn s3_store(args: &PerfArgs) -> Result<CountingBlobStore<S3BlobStore>> {
+    let bucket = args
+        .s3_bucket
+        .clone()
+        .context("--s3-bucket or RS3_PERF_S3_BUCKET is required with --backend s3")?;
+    let config = S3BlobStoreConfig::new(bucket)
+        .context("failed to create S3 backend config")?
+        .with_prefix(args.s3_prefix.clone())
+        .with_endpoint_url(args.s3_endpoint_url.clone())
+        .with_region(args.s3_region.clone())
+        .with_allow_http(args.s3_allow_http)
+        .with_virtual_hosted_style(args.s3_virtual_hosted_style);
+    let store = S3BlobStore::from_environment(config)
+        .await
+        .context("failed to create S3 backend")?;
+    Ok(CountingBlobStore::new(store))
 }
 
 struct TemporaryBackendDir {

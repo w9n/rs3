@@ -25,6 +25,22 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+For faster local feedback, use `just nextest` when standard Cargo test output is
+not required. Use `cargo build --timings` when investigating compile-time
+regressions.
+
+Real S3 backend checks are opt-in so the normal edit/test loop stays small:
+
+```sh
+just check-s3
+just deny-s3
+just perf-s3 --s3-bucket test-bucket --s3-endpoint-url http://localhost:9000 --s3-allow-http
+```
+
+The Nix shell includes `sccache` for clean rebuild or CI-like cache experiments,
+but it is not enabled by default. Set `RUSTC_WRAPPER=sccache` for runs where that
+tradeoff is useful.
+
 ## Workspace Layout
 
 - `crates/rs3-types`: shared strongly typed identifiers and policy types.

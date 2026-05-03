@@ -8,6 +8,10 @@ repository.workspace = true
 authors.workspace = true
 description = "Local automation for rs3"
 
+[features]
+default = []
+s3 = ["rs3-storage/s3"]
+
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true

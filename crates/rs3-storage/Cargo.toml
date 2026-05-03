@@ -8,9 +8,14 @@ repository.workspace = true
 authors.workspace = true
 description = "Object-store abstraction for rs3"
 
+[features]
+default = []
+s3 = ["dep:object_store"]
+
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+object_store = { workspace = true, optional = true }
 rs3-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

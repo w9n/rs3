@@ -7,6 +7,48 @@ ignore = []
 version = 2
 confidence-threshold = 0.8
 allow = ["Apache-2.0", "BSD-3-Clause", "MIT", "Unicode-3.0"]
+unused-license-exception = "allow"
+exceptions = [
+  { allow = [
+    "AGPL-3.0-only",
+  ], name = "rs3-anchor" },
+  { allow = [
+    "AGPL-3.0-only",
+  ], name = "rs3-console" },
+  { allow = [
+    "AGPL-3.0-only",
+  ], name = "rs3-crypto" },
+  { allow = [
+    "AGPL-3.0-only",
+  ], name = "rs3-index" },
+  { allow = [
+    "AGPL-3.0-only",
+  ], name = "rs3-k8s" },
+  { allow = [
+    "AGPL-3.0-only",
+  ], name = "rs3-repository" },
+  { allow = [
+    "AGPL-3.0-only",
+  ], name = "rs3-server" },
+  { allow = [
+    "AGPL-3.0-only",
+  ], name = "rs3-storage" },
+  { allow = [
+    "AGPL-3.0-only",
+  ], name = "rs3-types" },
+  { allow = [
+    "AGPL-3.0-only",
+  ], name = "xtask" },
+  { allow = [
+    "ISC",
+  ], name = "ring" },
+  { allow = [
+    "ISC",
+  ], name = "rustls-webpki" },
+  { allow = [
+    "ISC",
+  ], name = "untrusted" },
+]
 
 [bans]
 multiple-versions = "warn"

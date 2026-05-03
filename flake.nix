@@ -37,6 +37,7 @@
             rust-analyzer
             rustc
             rustfmt
+            sccache
             taplo
           ];
 
