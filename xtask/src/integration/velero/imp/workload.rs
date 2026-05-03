@@ -1,7 +1,8 @@
 //! Workload lifecycle and proof checks for Velero integration lanes.
 
 use super::scenario::{Scenario, WorkloadKind, WorkloadVolume};
-use super::{kubectl, kubectl_capture, timeout_arg, velero_diagnostics};
+use super::velero_cli::velero_diagnostics;
+use super::{kubectl, kubectl_capture, timeout_arg};
 use crate::integration::k8s_support::{K8sWorkspace, path_str, run_command};
 use crate::integration::velero::VeleroKopiaSmokeArgs;
 use anyhow::{Context, Result, bail};
