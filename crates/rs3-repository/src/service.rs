@@ -6,7 +6,9 @@ use crate::model::{
     CommittedPut, DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry,
     RepositoryObjectMetadata, RepositoryPutOptions,
 };
-use crate::namespace::{existing_blind_keys, first_namespace_entry, prefix_tokens_for_key};
+use crate::namespace::{
+    existing_blind_keys, first_namespace_entry, indexed_list_prefix, prefix_tokens_for_key,
+};
 use crate::payload::{
     DEFAULT_PAYLOAD_SEGMENT_SIZE, PAYLOAD_HEADER_PROBE_LEN, PayloadHeaderProbe,
     SegmentedPayloadHeader, open_payload_object, open_segmented_payload_span,
@@ -457,7 +459,7 @@ where
     /// Lists client-visible entries for a prefix.
     pub fn list(&self, prefix: &str) -> Result<Vec<RepositoryListEntry>> {
         let keyring = self.keyring()?;
-        let prefix_tokens = keyring.derive_prefix_tokens_for_lookup(prefix)?;
+        let prefix_tokens = keyring.derive_prefix_tokens_for_lookup(indexed_list_prefix(prefix))?;
         let state = self.read_state()?;
         let mut entries_by_key = BTreeMap::new();
 

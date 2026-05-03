@@ -470,12 +470,12 @@ impl BlobStore for NoPutTimestampStore {
 }
 
 #[test]
-fn prefix_tokens_include_root_and_arbitrary_prefixes() {
+fn prefix_tokens_include_root_and_delimiter_prefixes() {
     let keyring = KeyRing::single_namespace(secret());
-    let tokens = prefix_tokens_for_key(&keyring, &primary_key_id(&keyring), "p/12")
+    let tokens = prefix_tokens_for_key(&keyring, &primary_key_id(&keyring), "p/12/abcdef")
         .unwrap_or_else(|error| panic!("{error}"));
 
-    assert_eq!(tokens.len(), 5);
+    assert_eq!(tokens.len(), 3);
 }
 
 #[tokio::test]
@@ -505,6 +505,43 @@ async fn put_then_head_get_and_list() {
             .map(|entry| entry.key)
             .collect::<Vec<_>>(),
         vec![key]
+    );
+}
+
+#[tokio::test]
+async fn list_preserves_arbitrary_prefix_semantics_with_delimiter_index() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::new(store, secret());
+    let first = key("p/12/a");
+    let second = key("p/123/b");
+
+    for key in [first.clone(), second.clone()] {
+        let put = repo
+            .put(
+                key,
+                Bytes::from_static(b"body"),
+                RepositoryPutOptions::default(),
+            )
+            .await;
+        assert!(put.is_ok());
+    }
+
+    let arbitrary_prefix = repo.list("p/12");
+    let delimiter_prefix = repo.list("p/12/");
+
+    assert_eq!(
+        must(arbitrary_prefix)
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>(),
+        vec![first.clone(), second]
+    );
+    assert_eq!(
+        must(delimiter_prefix)
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>(),
+        vec![first]
     );
 }
 
