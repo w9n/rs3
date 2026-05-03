@@ -9,7 +9,7 @@ use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_k8s::{KubernetesLeaseAnchor, LeaseSettings};
 use rs3_repository::{
     CheckpointPosition, CommitCoordinator, CommitCoordinatorOptions, CommittedPut, DeleteOutcome,
-    Repository, RepositoryError, RepositoryListEntry, RepositoryObjectMetadata,
+    Repository, RepositoryError, RepositoryListEntry, RepositoryObjectMetadata, RepositoryOptions,
     RepositoryPutOptions,
 };
 use rs3_storage::{
@@ -38,9 +38,12 @@ impl RuntimeRepository {
     pub(super) fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
         let store = build_store(&config.backend)?;
         let anchor = build_anchor(&config.anchor)?;
-        let repository = Arc::new(Repository::with_keyring(
+        let repository = Arc::new(Repository::with_keyring_and_options(
             store.handle.clone(),
             gateway_keyring()?,
+            RepositoryOptions {
+                payload_segment_size: config.repository.payload_segment_size,
+            },
         ));
         let coordinator = Arc::new(CommitCoordinator::with_options(
             repository,

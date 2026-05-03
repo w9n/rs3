@@ -3,6 +3,7 @@
 #[cfg(feature = "containers")]
 mod gateway_process;
 mod k8s;
+#[cfg(feature = "k8s")]
 mod k8s_support;
 mod kopia;
 mod s3;

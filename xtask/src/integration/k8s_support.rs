@@ -31,6 +31,7 @@ pub(crate) struct GatewayChartValues<'a> {
     pub(crate) anchor_name: &'a str,
     pub(crate) log_format: &'a str,
     pub(crate) rust_log: &'a str,
+    pub(crate) payload_segment_size: usize,
     pub(crate) persistence_enabled: bool,
     pub(crate) wait_secs: u64,
 }
@@ -94,6 +95,11 @@ pub(crate) fn helm_install_gateway(
             &format!("logging.format={}", values.log_format),
             "--set-string",
             &helm_set_string("logging.rustLog", values.rust_log),
+            "--set",
+            &format!(
+                "repository.payloadSegmentSizeBytes={}",
+                values.payload_segment_size
+            ),
             "--set",
             &format!("persistence.enabled={}", values.persistence_enabled),
         ],

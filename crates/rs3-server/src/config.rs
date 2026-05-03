@@ -1,6 +1,7 @@
 //! Runtime configuration loaded from process environment.
 
 use crate::identity::StaticCredentials;
+use rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE;
 use rs3_types::PublicBucket;
 use secrecy::SecretString;
 use std::net::SocketAddr;
@@ -26,6 +27,8 @@ pub struct RuntimeConfig {
     pub anchor: AnchorConfig,
     /// Coordinated commit batching settings.
     pub batching: BatchConfig,
+    /// Repository object layout settings.
+    pub repository: RepositoryConfig,
     /// Optional static credentials accepted by the server.
     pub static_credentials: Option<StaticCredentials>,
 }
@@ -66,6 +69,13 @@ pub struct BatchConfig {
     pub max_delay: Duration,
     /// Maximum number of writes waiting for commit before backpressure.
     pub max_pending_items: usize,
+}
+
+/// Repository object layout settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepositoryConfig {
+    /// Plaintext bytes per independently encrypted payload segment.
+    pub payload_segment_size: usize,
 }
 
 /// Runtime configuration errors.
@@ -121,6 +131,7 @@ impl RuntimeConfig {
         };
         let anchor = parse_anchor_config(source)?;
         let batching = parse_batch_config(source)?;
+        let repository = parse_repository_config(source)?;
         let static_credentials = parse_static_credentials(source)?;
 
         Ok(Self {
@@ -129,6 +140,7 @@ impl RuntimeConfig {
             backend,
             anchor,
             batching,
+            repository,
             static_credentials,
         })
     }
@@ -176,6 +188,18 @@ fn parse_batch_config(source: &impl ConfigSource) -> Result<BatchConfig, ConfigE
         max_items,
         max_delay: Duration::from_millis(max_delay_ms),
         max_pending_items,
+    })
+}
+
+fn parse_repository_config(source: &impl ConfigSource) -> Result<RepositoryConfig, ConfigError> {
+    let payload_segment_size = parse_positive_usize(
+        "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
+        source.value("RS3_PAYLOAD_SEGMENT_SIZE_BYTES"),
+        DEFAULT_PAYLOAD_SEGMENT_SIZE,
+    )?;
+
+    Ok(RepositoryConfig {
+        payload_segment_size,
     })
 }
 
@@ -282,7 +306,9 @@ fn parse_u64(key: &'static str, value: Option<String>, default: u64) -> Result<u
 
 #[cfg(test)]
 mod tests {
-    use super::{AnchorConfig, BatchConfig, ConfigError, ConfigSource, RuntimeConfig};
+    use super::{
+        AnchorConfig, BatchConfig, ConfigError, ConfigSource, RepositoryConfig, RuntimeConfig,
+    };
     use std::collections::BTreeMap;
     use std::time::Duration;
 
@@ -330,7 +356,27 @@ mod tests {
                 max_pending_items: 64,
             }
         );
+        assert_eq!(
+            config.repository,
+            RepositoryConfig {
+                payload_segment_size: 256 * 1024,
+            }
+        );
         assert!(config.static_credentials.is_none());
+    }
+
+    #[test]
+    fn parses_repository_payload_segment_size() {
+        let source = minimal_source().with("RS3_PAYLOAD_SEGMENT_SIZE_BYTES", "65536");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert_eq!(
+            config.map(|config| config.repository),
+            Ok(RepositoryConfig {
+                payload_segment_size: 65536,
+            })
+        );
     }
 
     #[test]
@@ -373,6 +419,17 @@ mod tests {
 
         assert!(
             matches!(config, Err(ConfigError::Invalid { key, .. }) if key == "RS3_COMMIT_MAX_PENDING_ITEMS")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_payload_segment_size() {
+        let source = minimal_source().with("RS3_PAYLOAD_SEGMENT_SIZE_BYTES", "0");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == "RS3_PAYLOAD_SEGMENT_SIZE_BYTES")
         );
     }
 

@@ -79,6 +79,7 @@ fn log_runtime_config(config: &RuntimeConfig) {
         batch_max_items = config.batching.max_items,
         batch_max_delay_ms = config.batching.max_delay.as_millis(),
         batch_max_pending_items = config.batching.max_pending_items,
+        payload_segment_size = config.repository.payload_segment_size,
         static_credentials = config.static_credentials.is_some(),
         "gateway runtime configuration validated",
     );

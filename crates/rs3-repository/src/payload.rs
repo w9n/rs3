@@ -9,7 +9,8 @@ use rs3_types::{BackendObjectId, KeyId};
 const PAYLOAD_OBJECT_DOMAIN: &[u8] = b"rs3:payload-object:v2-segmented\n";
 const PAYLOAD_SEGMENT_AAD_DOMAIN: &[u8] = b"rs3:payload-segment-associated-data:v2\n";
 pub(crate) const PAYLOAD_HEADER_PROBE_LEN: u64 = 128;
-pub(crate) const PAYLOAD_CHUNK_SIZE: usize = 256 * 1024;
+/// Default plaintext bytes per independently encrypted payload segment.
+pub const DEFAULT_PAYLOAD_SEGMENT_SIZE: usize = 256 * 1024;
 const U64_LEN: usize = 8;
 const AEAD_TAG_LEN: u64 = 16;
 const NONCE_PREFIX_LEN: usize = 16;
@@ -49,8 +50,9 @@ pub(crate) fn seal_payload_object(
     keyring: &KeyRing,
     object_id: &BackendObjectId,
     plaintext: &[u8],
+    chunk_size: usize,
 ) -> Result<Bytes> {
-    seal_segmented_payload_object(keyring, object_id, plaintext)
+    seal_segmented_payload_object(keyring, object_id, plaintext, chunk_size)
 }
 
 /// Opens a durable payload object body and applies a client-visible range.
@@ -227,14 +229,22 @@ fn seal_segmented_payload_object(
     keyring: &KeyRing,
     object_id: &BackendObjectId,
     plaintext: &[u8],
+    chunk_size: usize,
 ) -> Result<Bytes> {
-    let chunk_size = u64::try_from(PAYLOAD_CHUNK_SIZE)
+    if chunk_size == 0 {
+        return Err(StorageError::Provider(
+            "payload chunk size must be greater than zero".to_owned(),
+        )
+        .into());
+    }
+    let chunk_size_u64 = u64::try_from(chunk_size)
         .map_err(|_| StorageError::Provider("payload chunk size does not fit in u64".to_owned()))?;
     let plaintext_len = u64::try_from(plaintext.len())
         .map_err(|_| StorageError::Provider("payload length does not fit in u64".to_owned()))?;
     let key_id = keyring.primary_content_key_id()?;
     let nonce_prefix = random_nonce_prefix()?;
-    let header = segmented_payload_header_bytes(chunk_size, plaintext_len, &key_id, &nonce_prefix);
+    let header =
+        segmented_payload_header_bytes(chunk_size_u64, plaintext_len, &key_id, &nonce_prefix);
     let header_len = header.len();
     let mut body = Vec::with_capacity(
         header_len
@@ -242,7 +252,7 @@ fn seal_segmented_payload_object(
             .and_then(|len| {
                 len.checked_add(
                     plaintext
-                        .chunks(PAYLOAD_CHUNK_SIZE)
+                        .chunks(chunk_size)
                         .count()
                         .checked_mul(usize::try_from(AEAD_TAG_LEN).ok()?)?,
                 )
@@ -251,8 +261,8 @@ fn seal_segmented_payload_object(
     );
     body.extend_from_slice(&header);
 
-    let segment_count = plaintext.chunks(PAYLOAD_CHUNK_SIZE).count();
-    for (segment_index, segment) in plaintext.chunks(PAYLOAD_CHUNK_SIZE).enumerate() {
+    let segment_count = plaintext.chunks(chunk_size).count();
+    for (segment_index, segment) in plaintext.chunks(chunk_size).enumerate() {
         let is_final = segment_index + 1 == segment_count;
         let nonce = segment_nonce(
             &nonce_prefix,
@@ -262,7 +272,7 @@ fn seal_segmented_payload_object(
         let seal = keyring.seal_payload_with_nonce(
             &segment_associated_data(
                 object_id,
-                chunk_size,
+                chunk_size_u64,
                 plaintext_len,
                 u64::try_from(segment_index).map_err(|_| StorageError::InvalidRange)?,
                 is_final,
@@ -610,7 +620,7 @@ fn invalid_payload_object(object_id: &BackendObjectId) -> RepositoryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        PAYLOAD_CHUNK_SIZE, PayloadHeaderProbe, open_payload_object,
+        DEFAULT_PAYLOAD_SEGMENT_SIZE, PayloadHeaderProbe, open_payload_object,
         parse_segmented_payload_header, probe_payload_header, seal_payload_object,
         segmented_ciphertext_span,
     };
@@ -621,7 +631,12 @@ mod tests {
     fn payload_object_round_trips() {
         let keyring = signing_keyring();
         let object_id = backend_object_id("segments/object");
-        let body = match seal_payload_object(&keyring, &object_id, b"hello world") {
+        let body = match seal_payload_object(
+            &keyring,
+            &object_id,
+            b"hello world",
+            DEFAULT_PAYLOAD_SEGMENT_SIZE,
+        ) {
             Ok(body) => body,
             Err(error) => panic!("{error}"),
         };
@@ -634,8 +649,9 @@ mod tests {
     fn small_payloads_use_segmented_format_too() {
         let keyring = signing_keyring();
         let object_id = backend_object_id("segments/small");
-        let body = seal_payload_object(&keyring, &object_id, b"small")
-            .unwrap_or_else(|error| panic!("{error}"));
+        let body =
+            seal_payload_object(&keyring, &object_id, b"small", DEFAULT_PAYLOAD_SEGMENT_SIZE)
+                .unwrap_or_else(|error| panic!("{error}"));
 
         assert!(body.starts_with(super::PAYLOAD_OBJECT_DOMAIN));
         assert!(matches!(
@@ -648,7 +664,7 @@ mod tests {
     fn empty_payloads_use_segmented_format_too() {
         let keyring = signing_keyring();
         let object_id = backend_object_id("segments/empty");
-        let body = seal_payload_object(&keyring, &object_id, b"")
+        let body = seal_payload_object(&keyring, &object_id, b"", DEFAULT_PAYLOAD_SEGMENT_SIZE)
             .unwrap_or_else(|error| panic!("{error}"));
         let opened = open_payload_object(&keyring, &object_id, body.clone(), ByteRange::Full)
             .unwrap_or_else(|error| panic!("{error}"));
@@ -661,11 +677,12 @@ mod tests {
     fn segmented_payload_round_trips_and_supports_ranges() {
         let keyring = signing_keyring();
         let object_id = backend_object_id("segments/large");
-        let plaintext = (0..(PAYLOAD_CHUNK_SIZE * 2 + 17))
+        let chunk_size = DEFAULT_PAYLOAD_SEGMENT_SIZE;
+        let plaintext = (0..(chunk_size * 2 + 17))
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
 
-        let body = seal_payload_object(&keyring, &object_id, &plaintext)
+        let body = seal_payload_object(&keyring, &object_id, &plaintext, chunk_size)
             .unwrap_or_else(|error| panic!("{error}"));
         let full = open_payload_object(&keyring, &object_id, body.clone(), ByteRange::Full)
             .unwrap_or_else(|error| panic!("{error}"));
@@ -674,7 +691,7 @@ mod tests {
             &object_id,
             body.clone(),
             ByteRange::Slice {
-                offset: (PAYLOAD_CHUNK_SIZE - 3) as u64,
+                offset: (chunk_size - 3) as u64,
                 len: 16,
             },
         )
@@ -682,18 +699,16 @@ mod tests {
 
         assert!(body.starts_with(super::PAYLOAD_OBJECT_DOMAIN));
         assert_eq!(full, plaintext);
-        assert_eq!(
-            range,
-            &plaintext[PAYLOAD_CHUNK_SIZE - 3..PAYLOAD_CHUNK_SIZE + 13]
-        );
+        assert_eq!(range, &plaintext[chunk_size - 3..chunk_size + 13]);
     }
 
     #[test]
     fn segmented_payload_header_probe_finds_derivable_range_span() {
         let keyring = signing_keyring();
         let object_id = backend_object_id("segments/large");
-        let plaintext = vec![7_u8; PAYLOAD_CHUNK_SIZE * 2 + 17];
-        let body = seal_payload_object(&keyring, &object_id, &plaintext)
+        let chunk_size = DEFAULT_PAYLOAD_SEGMENT_SIZE;
+        let plaintext = vec![7_u8; chunk_size * 2 + 17];
+        let body = seal_payload_object(&keyring, &object_id, &plaintext, chunk_size)
             .unwrap_or_else(|error| panic!("{error}"));
         let probe_len = super::PAYLOAD_HEADER_PROBE_LEN as usize;
 
@@ -709,7 +724,7 @@ mod tests {
         let span = segmented_ciphertext_span(
             &header,
             ByteRange::Slice {
-                offset: (PAYLOAD_CHUNK_SIZE + 12) as u64,
+                offset: (chunk_size + 12) as u64,
                 len: 8,
             },
         )
@@ -726,7 +741,12 @@ mod tests {
         let keyring = signing_keyring();
         let object_id = backend_object_id("segments/object");
         let moved_object_id = backend_object_id("segments/other");
-        let body = match seal_payload_object(&keyring, &object_id, b"hello world") {
+        let body = match seal_payload_object(
+            &keyring,
+            &object_id,
+            b"hello world",
+            DEFAULT_PAYLOAD_SEGMENT_SIZE,
+        ) {
             Ok(body) => body,
             Err(error) => panic!("{error}"),
         };
@@ -741,7 +761,12 @@ mod tests {
         let writer = signing_keyring();
         let reader = wrong_content_keyring();
         let object_id = backend_object_id("segments/object");
-        let body = match seal_payload_object(&writer, &object_id, b"hello world") {
+        let body = match seal_payload_object(
+            &writer,
+            &object_id,
+            b"hello world",
+            DEFAULT_PAYLOAD_SEGMENT_SIZE,
+        ) {
             Ok(body) => body,
             Err(error) => panic!("{error}"),
         };

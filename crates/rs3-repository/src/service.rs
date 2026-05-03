@@ -8,9 +8,10 @@ use crate::model::{
 };
 use crate::namespace::{existing_blind_keys, first_namespace_entry, prefix_tokens_for_key};
 use crate::payload::{
-    PAYLOAD_HEADER_PROBE_LEN, PayloadHeaderProbe, SegmentedPayloadHeader, open_payload_object,
-    open_segmented_payload_span, parse_segmented_payload_header, probe_payload_header,
-    seal_payload_object, segmented_ciphertext_span,
+    DEFAULT_PAYLOAD_SEGMENT_SIZE, PAYLOAD_HEADER_PROBE_LEN, PayloadHeaderProbe,
+    SegmentedPayloadHeader, open_payload_object, open_segmented_payload_span,
+    parse_segmented_payload_header, probe_payload_header, seal_payload_object,
+    segmented_ciphertext_span,
 };
 use crate::state::{RepositoryState, TrustedManifest, next_sequence, object_material};
 use bytes::Bytes;
@@ -28,7 +29,23 @@ pub struct Repository<S> {
     pub(crate) store: S,
     pub(crate) keyring: RwLock<KeyRing>,
     pub(crate) state: RwLock<RepositoryState>,
+    options: RepositoryOptions,
     payload_headers: RwLock<PayloadHeaderCache>,
+}
+
+/// Repository runtime options.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepositoryOptions {
+    /// Plaintext bytes per independently encrypted payload segment.
+    pub payload_segment_size: usize,
+}
+
+impl Default for RepositoryOptions {
+    fn default() -> Self {
+        Self {
+            payload_segment_size: DEFAULT_PAYLOAD_SEGMENT_SIZE,
+        }
+    }
 }
 
 impl<S> Repository<S>
@@ -42,10 +59,20 @@ where
 
     /// Creates a trusted repository service with an explicit keyring.
     pub fn with_keyring(store: S, keyring: KeyRing) -> Self {
+        Self::with_keyring_and_options(store, keyring, RepositoryOptions::default())
+    }
+
+    /// Creates a trusted repository service with an explicit keyring and options.
+    pub fn with_keyring_and_options(
+        store: S,
+        keyring: KeyRing,
+        options: RepositoryOptions,
+    ) -> Self {
         Self {
             store,
             keyring: RwLock::new(keyring),
             state: RwLock::new(RepositoryState::default()),
+            options,
             payload_headers: RwLock::new(PayloadHeaderCache::default()),
         }
     }
@@ -110,7 +137,12 @@ where
             (sequence, object_id, manifest_id, stale_blind_keys)
         };
 
-        let payload = seal_payload_object(&keyring, &object_id, &body)?;
+        let payload = seal_payload_object(
+            &keyring,
+            &object_id,
+            &body,
+            self.options.payload_segment_size,
+        )?;
         let storage_metadata = self
             .store
             .put(

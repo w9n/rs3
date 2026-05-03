@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const DEFAULT_TEST_PAYLOAD_SEGMENT_SIZE: usize = 256 * 1024;
+
 fn secret() -> SecretBytes {
     secret_with_byte(9)
 }
@@ -161,6 +163,19 @@ pub(crate) fn signing_keyring() -> KeyRing {
         checkpoint_key("signing", KeyStatus::Primary, 3),
         content_key("content", KeyStatus::Primary, 4),
     ])
+}
+
+fn repository_with_payload_segment_size(
+    store: MemoryBlobStore,
+    payload_segment_size: usize,
+) -> Repository<MemoryBlobStore> {
+    Repository::with_keyring_and_options(
+        store,
+        signing_keyring(),
+        crate::RepositoryOptions {
+            payload_segment_size,
+        },
+    )
 }
 
 pub(crate) fn wrong_content_keyring() -> KeyRing {
@@ -665,6 +680,103 @@ async fn repeated_large_range_gets_reuse_payload_header() {
     let counts = must_storage(store.operation_counts());
     assert_eq!(counts.get, 3);
     assert!(counts.bytes_read < 600 * 1024);
+}
+
+#[tokio::test]
+async fn range_read_amplification_tracks_payload_segment_size() {
+    let object_size = 4 * 1024 * 1024;
+    let range_len = 8 * 1024;
+    let reads = 96;
+
+    let large = range_read_pressure(
+        DEFAULT_TEST_PAYLOAD_SEGMENT_SIZE,
+        object_size,
+        range_len,
+        reads,
+    )
+    .await;
+    let medium = range_read_pressure(32 * 1024, object_size, range_len, reads).await;
+    let small = range_read_pressure(8 * 1024, object_size, range_len, reads).await;
+
+    assert_eq!(large.gets, reads as u64 + 1);
+    assert_eq!(medium.gets, reads as u64 + 1);
+    assert_eq!(small.gets, reads as u64 + 1);
+    assert_eq!(large.returned_bytes, small.returned_bytes);
+    assert!(large.bytes_read > medium.bytes_read);
+    assert!(medium.bytes_read > small.bytes_read);
+    assert!(
+        large.read_amp() > 20.0,
+        "large segment amp was {}",
+        large.read_amp()
+    );
+    assert!(
+        medium.read_amp() < 6.5,
+        "medium segment amp was {}",
+        medium.read_amp()
+    );
+    assert!(
+        small.read_amp() < 2.5,
+        "small segment amp was {}",
+        small.read_amp()
+    );
+}
+
+struct RangeReadPressure {
+    gets: u64,
+    bytes_read: u64,
+    returned_bytes: u64,
+}
+
+impl RangeReadPressure {
+    fn read_amp(&self) -> f64 {
+        self.bytes_read as f64 / self.returned_bytes as f64
+    }
+}
+
+async fn range_read_pressure(
+    payload_segment_size: usize,
+    object_size: usize,
+    range_len: usize,
+    reads: usize,
+) -> RangeReadPressure {
+    let store = MemoryBlobStore::new();
+    let repo = repository_with_payload_segment_size(store.clone(), payload_segment_size);
+    let key = key(&format!("p/12/range-pressure-{payload_segment_size}"));
+    let body = Bytes::from(vec![17_u8; object_size]);
+    must(
+        repo.put(key.clone(), body, RepositoryPutOptions::default())
+            .await,
+    );
+    must_storage(store.reset_operation_counts());
+
+    let offset_window = object_size.saturating_sub(range_len);
+    let mut returned_bytes = 0_u64;
+    for index in 0..reads {
+        let offset = if offset_window == 0 {
+            0
+        } else {
+            index.wrapping_mul(65_537).wrapping_add(index / 7 * 4_096) % (offset_window + 1)
+        };
+        let body = must(
+            repo.get_range(
+                &key,
+                ByteRange::Slice {
+                    offset: offset as u64,
+                    len: range_len as u64,
+                },
+            )
+            .await,
+        );
+        assert_eq!(body.len(), range_len);
+        returned_bytes = returned_bytes.saturating_add(body.len() as u64);
+    }
+
+    let counts = must_storage(store.operation_counts());
+    RangeReadPressure {
+        gets: counts.get,
+        bytes_read: counts.bytes_read,
+        returned_bytes,
+    }
 }
 
 #[tokio::test]

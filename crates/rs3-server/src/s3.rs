@@ -30,7 +30,9 @@ pub enum S3BoundaryError {
 
 #[cfg(test)]
 pub(super) mod test_support {
-    use crate::{AnchorConfig, BackendConfig, BatchConfig, RuntimeConfig, SecretString};
+    use crate::{
+        AnchorConfig, BackendConfig, BatchConfig, RepositoryConfig, RuntimeConfig, SecretString,
+    };
     use rs3_types::PublicBucket;
     use std::time::Duration;
 
@@ -57,6 +59,9 @@ pub(super) mod test_support {
                 max_items: 64,
                 max_delay: Duration::from_millis(10),
                 max_pending_items: 64,
+            },
+            repository: RepositoryConfig {
+                payload_segment_size: 256 * 1024,
             },
             static_credentials: static_credentials.then(|| crate::StaticCredentials {
                 access_key_id: "access".to_owned(),

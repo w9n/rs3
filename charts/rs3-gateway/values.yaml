@@ -33,6 +33,9 @@ commit:
   maxBatchItems: 8
   maxBatchDelayMs: 5
 
+repository:
+  payloadSegmentSizeBytes: 262144
+
 anchor:
   mode: memory
   namespace: ""

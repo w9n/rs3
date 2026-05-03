@@ -1,8 +1,8 @@
 //! HTTP-level smoke tests for the S3 listener.
 
 use rs3_server::{
-    AnchorConfig, BackendConfig, BatchConfig, GatewayServer, GatewayServerError, RuntimeConfig,
-    SecretString, StaticCredentials,
+    AnchorConfig, BackendConfig, BatchConfig, GatewayServer, GatewayServerError, RepositoryConfig,
+    RuntimeConfig, SecretString, StaticCredentials,
 };
 use rs3_types::PublicBucket;
 use std::net::SocketAddr;
@@ -118,6 +118,9 @@ fn runtime_config() -> RuntimeConfig {
             max_items: 64,
             max_delay: Duration::from_millis(10),
             max_pending_items: 64,
+        },
+        repository: RepositoryConfig {
+            payload_segment_size: 256 * 1024,
         },
         static_credentials: Some(StaticCredentials {
             access_key_id: "access".to_owned(),

@@ -136,6 +136,7 @@ mod imp {
                 anchor_name: "checkpoint",
                 log_format: "plain",
                 rust_log: "info",
+                payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 persistence_enabled: false,
                 wait_secs: args.wait_secs,
             },

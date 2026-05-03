@@ -11,7 +11,8 @@ use clap::{Args, ValueEnum};
 use rs3_anchor::MemoryCheckpointAnchor;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_repository::{
-    CommitCoordinator, CommitCoordinatorOptions, Repository, RepositoryPutOptions,
+    CommitCoordinator, CommitCoordinatorOptions, DEFAULT_PAYLOAD_SEGMENT_SIZE, Repository,
+    RepositoryOptions, RepositoryPutOptions,
 };
 use rs3_storage::{
     BlobOperationCounts, BlobStore, ByteRange, CountingBlobStore, FilesystemBlobStore,
@@ -57,6 +58,9 @@ pub(crate) struct PerfArgs {
     /// Plaintext range length in bytes for range-read scenarios.
     #[arg(long, default_value_t = 4 * 1024)]
     range_len: usize,
+    /// Plaintext bytes per encrypted payload segment.
+    #[arg(long, default_value_t = DEFAULT_PAYLOAD_SEGMENT_SIZE)]
+    payload_segment_size: usize,
     /// Backend implementation used by the scenario.
     #[arg(long, value_enum, default_value_t = PerfBackend::Memory)]
     backend: PerfBackend,
@@ -313,6 +317,10 @@ fn add_perf_args(
     command.args(["--concurrency", &args.concurrency.to_string()]);
     command.args(["--reads", &args.reads.to_string()]);
     command.args(["--range-len", &args.range_len.to_string()]);
+    command.args([
+        "--payload-segment-size",
+        &args.payload_segment_size.to_string(),
+    ]);
     command.args(["--backend", "s3"]);
     command.args(["--s3-bucket", &target.bucket]);
     command.args(["--s3-endpoint-url", &target.endpoint_url]);
@@ -352,7 +360,7 @@ async fn write_batch_with_store<S>(
 where
     S: BlobStore + Clone,
 {
-    let repo = Repository::with_keyring(store.clone(), keyring()?);
+    let repo = repository_with_store(args, store.clone())?;
     let anchor = MemoryCheckpointAnchor::new();
     let body = body(args.object_size);
     let mut latencies = Vec::with_capacity(args.objects);
@@ -388,6 +396,7 @@ where
         commit_batch_items: commit_batch_items(args),
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
+        payload_segment_size: args.payload_segment_size,
         concurrency: concurrency(args),
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
@@ -418,7 +427,7 @@ async fn write_committed_with_store<S>(
 where
     S: BlobStore + Clone + 'static,
 {
-    let repo = Arc::new(Repository::with_keyring(store.clone(), keyring()?));
+    let repo = Arc::new(repository_with_store(args, store.clone())?);
     let anchor = MemoryCheckpointAnchor::new();
     let coordinator = CommitCoordinator::with_options(repo, anchor, commit_options(args));
     let body = body(args.object_size);
@@ -453,6 +462,7 @@ where
         commit_batch_items: commit_batch_items(args),
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
+        payload_segment_size: args.payload_segment_size,
         concurrency: concurrency(args),
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
@@ -483,7 +493,7 @@ async fn write_committed_parallel_with_store<S>(
 where
     S: BlobStore + Clone + Send + Sync + 'static,
 {
-    let repo = Arc::new(Repository::with_keyring(store.clone(), keyring()?));
+    let repo = Arc::new(repository_with_store(args, store.clone())?);
     let anchor = MemoryCheckpointAnchor::new();
     let coordinator = Arc::new(CommitCoordinator::with_options(
         repo,
@@ -539,6 +549,7 @@ where
         commit_batch_items: commit_batch_items(args),
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
+        payload_segment_size: args.payload_segment_size,
         concurrency: parallelism,
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
@@ -566,7 +577,7 @@ async fn full_read_with_store<S>(args: &PerfArgs, store: CountingBlobStore<S>) -
 where
     S: BlobStore + Clone,
 {
-    let repo = Repository::with_keyring(store.clone(), keyring()?);
+    let repo = repository_with_store(args, store.clone())?;
     let key = path("perf/read/full-object")?;
     let body = body(args.object_size);
     repo.put(key.clone(), body, RepositoryPutOptions::default())
@@ -601,6 +612,7 @@ where
         commit_batch_items: commit_batch_items(args),
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
+        payload_segment_size: args.payload_segment_size,
         concurrency: concurrency(args),
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
@@ -631,7 +643,7 @@ async fn range_read_with_store<S>(
 where
     S: BlobStore + Clone,
 {
-    let repo = Repository::with_keyring(store.clone(), keyring()?);
+    let repo = repository_with_store(args, store.clone())?;
     let key = path("perf/read/range-object")?;
     let body = body(args.object_size);
     repo.put(key.clone(), body, RepositoryPutOptions::default())
@@ -679,6 +691,7 @@ where
         commit_batch_items: commit_batch_items(args),
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
+        payload_segment_size: args.payload_segment_size,
         concurrency: concurrency(args),
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
@@ -697,6 +710,7 @@ struct PerfReport {
     commit_batch_items: usize,
     commit_batch_delay_ms: u64,
     commit_max_pending_items: usize,
+    payload_segment_size: usize,
     concurrency: usize,
     operation_latency: OperationLatencyStats,
     elapsed: Duration,
@@ -768,7 +782,7 @@ impl PerfReport {
         let latency = self.operation_latency;
 
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.scenario,
             self.backend.as_str(),
             self.objects,
@@ -777,6 +791,7 @@ impl PerfReport {
             self.commit_batch_items,
             self.commit_batch_delay_ms,
             self.commit_max_pending_items,
+            self.payload_segment_size,
             self.concurrency,
             elapsed_ms,
             latency.samples,
@@ -825,6 +840,7 @@ impl PerfReport {
                 "max_pending_items": self.commit_max_pending_items,
                 "concurrency": self.concurrency,
             },
+            "payload_segment_size": self.payload_segment_size,
             "elapsed_ms": self.elapsed.as_secs_f64() * 1_000.0,
             "operation_latency": {
                 "samples": self.operation_latency.samples,
@@ -893,12 +909,28 @@ impl PerfReport {
 
 fn print_header() {
     println!(
-        "scenario\tbackend\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tconcurrency\telapsed_ms\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp"
+        "scenario\tbackend\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tpayload_segment_size\tconcurrency\telapsed_ms\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp"
     );
 }
 
 fn memory_store() -> CountingBlobStore<MemoryBlobStore> {
     CountingBlobStore::new(MemoryBlobStore::new())
+}
+
+fn repository_with_store<S>(args: &PerfArgs, store: S) -> Result<Repository<S>>
+where
+    S: BlobStore,
+{
+    if args.payload_segment_size == 0 {
+        anyhow::bail!("--payload-segment-size must be greater than zero");
+    }
+    Ok(Repository::with_keyring_and_options(
+        store,
+        keyring()?,
+        RepositoryOptions {
+            payload_segment_size: args.payload_segment_size,
+        },
+    ))
 }
 
 fn filesystem_store(

@@ -69,6 +69,8 @@ spec:
               value: {{ .Values.commit.maxBatchItems | quote }}
             - name: RS3_COMMIT_MAX_BATCH_DELAY_MS
               value: {{ .Values.commit.maxBatchDelayMs | quote }}
+            - name: RS3_PAYLOAD_SEGMENT_SIZE_BYTES
+              value: {{ .Values.repository.payloadSegmentSizeBytes | quote }}
             - name: RS3_ANCHOR_MODE
               value: {{ .Values.anchor.mode | quote }}
             {{- if eq .Values.anchor.mode "kubernetes-lease" }}
