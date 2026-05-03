@@ -117,6 +117,7 @@ impl KopiaMatrixProfileSet {
         }
     }
 
+    #[cfg(any(feature = "containers", test))]
     fn profiles(self, single: KopiaWorkloadProfile) -> Vec<KopiaWorkloadProfile> {
         match self {
             Self::Single => vec![single],

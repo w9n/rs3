@@ -29,6 +29,7 @@ pub(super) enum KopiaWorkloadProfile {
     ChangedSnapshot,
 }
 
+#[cfg(any(feature = "containers", test))]
 impl KopiaWorkloadProfile {
     pub(super) fn as_str(self) -> &'static str {
         match self {
