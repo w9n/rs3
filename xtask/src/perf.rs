@@ -212,9 +212,11 @@ where
     let repo = Repository::with_keyring(store.clone(), keyring()?);
     let anchor = MemoryCheckpointAnchor::new();
     let body = body(args.object_size);
+    let mut latencies = Vec::with_capacity(args.objects);
     let started = Instant::now();
 
     for index in 0..args.objects {
+        let operation_started = Instant::now();
         repo.put(
             path(&format!("perf/write-batch/object-{index:08}"))?,
             body.clone(),
@@ -222,6 +224,7 @@ where
         )
         .await
         .with_context(|| format!("failed to write object {index}"))?;
+        latencies.push(operation_started.elapsed());
     }
     repo.publish_checkpoint(&anchor)
         .await
@@ -243,6 +246,7 @@ where
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
         concurrency: concurrency(args),
+        operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
     })
@@ -271,9 +275,11 @@ where
     let anchor = MemoryCheckpointAnchor::new();
     let coordinator = CommitCoordinator::with_options(repo, anchor, commit_options(args));
     let body = body(args.object_size);
+    let mut latencies = Vec::with_capacity(args.objects);
     let started = Instant::now();
 
     for index in 0..args.objects {
+        let operation_started = Instant::now();
         coordinator
             .put_committed(
                 path(&format!("perf/write-committed/object-{index:08}"))?,
@@ -282,6 +288,7 @@ where
             )
             .await
             .with_context(|| format!("failed to commit object {index}"))?;
+        latencies.push(operation_started.elapsed());
     }
 
     let elapsed = started.elapsed();
@@ -300,6 +307,7 @@ where
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
         concurrency: concurrency(args),
+        operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
     })
@@ -333,6 +341,7 @@ where
     ));
     let body = body(args.object_size);
     let parallelism = concurrency(args);
+    let mut latencies = Vec::with_capacity(args.objects);
     let started = Instant::now();
 
     let mut next = 0;
@@ -343,6 +352,7 @@ where
             let coordinator = Arc::clone(&coordinator);
             let body = body.clone();
             handles.push(tokio::spawn(async move {
+                let operation_started = Instant::now();
                 coordinator
                     .put_committed(
                         path(&format!("perf/write-committed-parallel/object-{index:08}"))?,
@@ -351,13 +361,14 @@ where
                     )
                     .await
                     .with_context(|| format!("failed to commit object {index}"))?;
-                Ok::<(), anyhow::Error>(())
+                Ok::<Duration, anyhow::Error>(operation_started.elapsed())
             }));
         }
         for handle in handles {
-            handle
+            let latency = handle
                 .await
                 .context("committed write task did not complete")??;
+            latencies.push(latency);
         }
         next = end;
     }
@@ -378,6 +389,7 @@ where
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
         concurrency: parallelism,
+        operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
     })
@@ -409,11 +421,14 @@ where
         .reset_operation_counts()
         .context("failed to reset operation counts")?;
 
+    let mut latencies = Vec::with_capacity(args.reads);
     let started = Instant::now();
     for _ in 0..args.reads {
+        let operation_started = Instant::now();
         repo.get_range(&key, ByteRange::Full)
             .await
             .context("failed to read full object")?;
+        latencies.push(operation_started.elapsed());
     }
 
     let elapsed = started.elapsed();
@@ -432,6 +447,7 @@ where
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
         concurrency: concurrency(args),
+        operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
     })
@@ -468,6 +484,7 @@ where
 
     let range_len = args.range_len.min(args.object_size);
     let offset_window = args.object_size.saturating_sub(range_len);
+    let mut latencies = Vec::with_capacity(args.reads);
     let started = Instant::now();
     for index in 0..args.reads {
         let offset = if offset_window == 0 {
@@ -475,6 +492,7 @@ where
         } else {
             index.wrapping_mul(range_len) % (offset_window + 1)
         };
+        let operation_started = Instant::now();
         repo.get_range(
             &key,
             ByteRange::Slice {
@@ -484,6 +502,7 @@ where
         )
         .await
         .with_context(|| format!("failed to read range {index}"))?;
+        latencies.push(operation_started.elapsed());
     }
 
     let elapsed = started.elapsed();
@@ -502,6 +521,7 @@ where
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
         concurrency: concurrency(args),
+        operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
     })
@@ -519,8 +539,42 @@ struct PerfReport {
     commit_batch_delay_ms: u64,
     commit_max_pending_items: usize,
     concurrency: usize,
+    operation_latency: OperationLatencyStats,
     elapsed: Duration,
     counts: BlobOperationCounts,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct OperationLatencyStats {
+    samples: usize,
+    min_ns: u128,
+    avg_ns: f64,
+    p50_ns: u128,
+    p95_ns: u128,
+    p99_ns: u128,
+    max_ns: u128,
+}
+
+impl OperationLatencyStats {
+    fn from_samples(mut samples: Vec<Duration>) -> Self {
+        if samples.is_empty() {
+            return Self::default();
+        }
+
+        samples.sort_unstable();
+        let count = samples.len();
+        let total_ns = samples.iter().map(Duration::as_nanos).sum::<u128>();
+
+        Self {
+            samples: count,
+            min_ns: samples[0].as_nanos(),
+            avg_ns: total_ns as f64 / count as f64,
+            p50_ns: percentile_duration(&samples, 0.50).as_nanos(),
+            p95_ns: percentile_duration(&samples, 0.95).as_nanos(),
+            p99_ns: percentile_duration(&samples, 0.99).as_nanos(),
+            max_ns: samples[count - 1].as_nanos(),
+        }
+    }
 }
 
 impl PerfReport {
@@ -552,9 +606,10 @@ impl PerfReport {
         let backend_requests_per_s = per_second(backend_requests, self.elapsed);
         let backend_requests_per_operation =
             ratio_optional(backend_requests, self.operations as u64);
+        let latency = self.operation_latency;
 
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.scenario,
             self.backend.as_str(),
             self.objects,
@@ -565,6 +620,13 @@ impl PerfReport {
             self.commit_max_pending_items,
             self.concurrency,
             elapsed_ms,
+            latency.samples,
+            ns_to_ms(latency.min_ns),
+            ns_f64_to_ms(latency.avg_ns),
+            ns_to_ms(latency.p50_ns),
+            ns_to_ms(latency.p95_ns),
+            ns_to_ms(latency.p99_ns),
+            ns_to_ms(latency.max_ns),
             throughput_mib_s,
             backend_mib_s,
             backend_requests,
@@ -605,6 +667,15 @@ impl PerfReport {
                 "concurrency": self.concurrency,
             },
             "elapsed_ms": self.elapsed.as_secs_f64() * 1_000.0,
+            "operation_latency": {
+                "samples": self.operation_latency.samples,
+                "min_ms": ns_to_ms(self.operation_latency.min_ns),
+                "avg_ms": ns_f64_to_ms(self.operation_latency.avg_ns),
+                "p50_ms": ns_to_ms(self.operation_latency.p50_ns),
+                "p95_ms": ns_to_ms(self.operation_latency.p95_ns),
+                "p99_ms": ns_to_ms(self.operation_latency.p99_ns),
+                "max_ms": ns_to_ms(self.operation_latency.max_ns),
+            },
             "plaintext_mib_s": mib_per_second(requested_plaintext_bytes, self.elapsed),
             "backend_mib_s": mib_per_second(backend_bytes as usize, self.elapsed),
             "backend": {
@@ -663,7 +734,7 @@ impl PerfReport {
 
 fn print_header() {
     println!(
-        "scenario\tbackend\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tconcurrency\telapsed_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp"
+        "scenario\tbackend\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tconcurrency\telapsed_ms\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp"
     );
 }
 
@@ -850,6 +921,21 @@ fn ratio_optional(numerator: u64, denominator: u64) -> Option<f64> {
     }
 
     Some(numerator as f64 / denominator as f64)
+}
+
+fn percentile_duration(samples: &[Duration], quantile: f64) -> Duration {
+    let index = ((samples.len() as f64 * quantile).ceil() as usize)
+        .saturating_sub(1)
+        .min(samples.len() - 1);
+    samples[index]
+}
+
+fn ns_to_ms(value: u128) -> f64 {
+    value as f64 / 1_000_000.0
+}
+
+fn ns_f64_to_ms(value: f64) -> f64 {
+    value / 1_000_000.0
 }
 
 fn format_amp(value: Option<f64>) -> String {
