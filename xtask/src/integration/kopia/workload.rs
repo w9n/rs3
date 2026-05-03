@@ -153,7 +153,7 @@ fn write_deterministic_file(path: &Path, len: usize) -> Result<()> {
     let mut file =
         fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     const CHUNK: usize = 1024 * 1024;
-    let mut state = 0x7d3f_2a91_b6c8_e405_u64 ^ len as u64;
+    let mut state = deterministic_file_seed(path, len);
     let mut buffer = vec![0; CHUNK];
     let mut written = 0;
     while written < len {
@@ -165,6 +165,18 @@ fn write_deterministic_file(path: &Path, len: usize) -> Result<()> {
     }
     file.flush()
         .with_context(|| format!("failed to flush {}", path.display()))
+}
+
+#[cfg(feature = "containers")]
+fn deterministic_file_seed(path: &Path, len: usize) -> u64 {
+    let mut state = 0x7d3f_2a91_b6c8_e405_u64 ^ len as u64;
+    if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+        for byte in file_name.bytes() {
+            state ^= u64::from(byte);
+            state = splitmix64(state);
+        }
+    }
+    state
 }
 
 #[cfg(feature = "containers")]
@@ -295,4 +307,22 @@ fn assert_file_eq(expected: &Path, actual: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "containers"))]
+mod tests {
+    use super::deterministic_file_seed;
+    use std::path::Path;
+
+    #[test]
+    fn deterministic_file_seed_distinguishes_equal_size_files() {
+        assert_ne!(
+            deterministic_file_seed(Path::new("0"), 1024 * 1024),
+            deterministic_file_seed(Path::new("1"), 1024 * 1024)
+        );
+        assert_eq!(
+            deterministic_file_seed(Path::new("0"), 1024 * 1024),
+            deterministic_file_seed(Path::new("0"), 1024 * 1024)
+        );
+    }
 }
