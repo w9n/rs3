@@ -27,6 +27,16 @@ gateway, and drives object operations through the gateway's S3 endpoint:
 cargo run -p xtask --features containers -- integration s3-gateway
 ```
 
+The Kopia gateway mode uses the same local provider and gateway, then runs a
+real Kopia repository create/snapshot/restore smoke test:
+
+```sh
+cargo run -p xtask --features containers -- integration kopia-gateway
+```
+
+Set `RS3_TEST_KOPIA_BIN` or pass `--kopia-bin` when the executable is not named
+`kopia`.
+
 Container provider setup stays behind the opt-in `xtask/containers` feature so
 Docker and provider bootstrap dependencies stay outside normal unit tests and
 runtime crates.

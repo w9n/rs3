@@ -33,6 +33,9 @@ integration-s3-container *ARGS:
 integration-s3-gateway *ARGS:
     cargo run -p xtask --features containers -- integration s3-gateway {{ARGS}}
 
+integration-kopia-gateway *ARGS:
+    cargo run -p xtask --features containers -- integration kopia-gateway {{ARGS}}
+
 test:
     cargo test --workspace
 

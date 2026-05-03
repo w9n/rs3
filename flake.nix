@@ -31,6 +31,9 @@
             cargo-nextest
             clippy
             just
+            kind
+            kopia
+            kubectl
             mdbook
             openssl
             pkg-config
@@ -39,6 +42,7 @@
             rustfmt
             sccache
             taplo
+            velero
           ];
 
           RUST_BACKTRACE = "1";
