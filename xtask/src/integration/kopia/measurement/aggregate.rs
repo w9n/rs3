@@ -121,6 +121,10 @@ fn aggregate_reports(reports: &[&Value]) -> Value {
         "phase_timings": aggregate_phase_timings(reports),
         "backend_metrics": {
             "counts": aggregate_object(reports, &["backend_metrics", "counts"]),
+            "by_s3_operation": aggregate_nested_object(reports, &[
+                "backend_metrics",
+                "by_s3_operation",
+            ]),
             "transport": aggregate_object(reports, &["backend_metrics", "transport"]),
             "operation_latency_us": aggregate_operation_latency_at(reports, &[
                 "backend_metrics",
@@ -285,6 +289,46 @@ fn aggregate_object(reports: &[&Value], path: &[&str]) -> Value {
     )
 }
 
+fn aggregate_nested_object(reports: &[&Value], path: &[&str]) -> Value {
+    let mut values_by_outer_key: BTreeMap<String, BTreeMap<String, Vec<u64>>> = BTreeMap::new();
+    for report in reports {
+        let Some(object) = value_at(report, path).and_then(Value::as_object) else {
+            continue;
+        };
+        for (outer_key, nested) in object {
+            let Some(nested) = nested.as_object() else {
+                continue;
+            };
+            let values_by_inner_key = values_by_outer_key.entry(outer_key.clone()).or_default();
+            for (inner_key, value) in nested {
+                if let Some(value) = value.as_u64() {
+                    values_by_inner_key
+                        .entry(inner_key.clone())
+                        .or_default()
+                        .push(value);
+                }
+            }
+        }
+    }
+
+    Value::Object(
+        values_by_outer_key
+            .into_iter()
+            .map(|(outer_key, values_by_inner_key)| {
+                (
+                    outer_key,
+                    Value::Object(
+                        values_by_inner_key
+                            .into_iter()
+                            .map(|(inner_key, values)| (inner_key, summarize_u64(&values)))
+                            .collect(),
+                    ),
+                )
+            })
+            .collect(),
+    )
+}
+
 fn aggregate_u64_at(reports: &[&Value], path: &[&str]) -> Value {
     let values = reports
         .iter()
@@ -426,6 +470,16 @@ mod tests {
                             "extend_retention": 0,
                             "bytes_written": 1250,
                             "bytes_read": 3000,
+                        },
+                        "by_s3_operation": {
+                            "PutObject": {
+                                "put": 12,
+                                "bytes_written": 1250
+                            },
+                            "GetObject": {
+                                "get": 3,
+                                "bytes_read": 3000
+                            }
                         }
                     },
                     "client_metrics": {
@@ -493,6 +547,14 @@ mod tests {
         assert_eq!(
             aggregate["gateway"]["gateway_process"]["cpu_total_seconds"]["avg"],
             serde_json::json!(1.5)
+        );
+        assert_eq!(
+            aggregate["gateway"]["backend_metrics"]["by_s3_operation"]["PutObject"]["put"]["avg"],
+            serde_json::json!(12.0)
+        );
+        assert_eq!(
+            aggregate["gateway"]["backend_metrics"]["by_s3_operation"]["GetObject"]["bytes_read"]["avg"],
+            serde_json::json!(3000.0)
         );
     }
 }

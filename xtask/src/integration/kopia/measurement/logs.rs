@@ -11,16 +11,8 @@ pub(crate) fn gateway_backend_metrics_json(logs: &[String]) -> Value {
     let counts = parse_gateway_backend_counts(logs);
     serde_json::json!({
         "source": "gateway-storage-logs",
-        "counts": {
-            "put": counts.put,
-            "get": counts.get,
-            "head": counts.head,
-            "list": counts.list,
-            "delete": counts.delete,
-            "extend_retention": counts.extend_retention,
-            "bytes_written": counts.bytes_written,
-            "bytes_read": counts.bytes_read,
-        },
+        "counts": backend_counts_json(&counts),
+        "by_s3_operation": parse_gateway_backend_counts_by_s3_operation(logs),
         "operation_latency_us": parse_gateway_backend_latency(logs),
     })
 }
@@ -144,31 +136,93 @@ fn parse_gateway_backend_counts(logs: &[String]) -> rs3_storage::BlobOperationCo
         if json_field_str(fields, "provider") != Some("s3") {
             continue;
         }
-        let Some(operation) = json_field_str(fields, "operation") else {
-            continue;
-        };
-        match operation {
-            "put" => counts.put = counts.put.saturating_add(1),
-            "get" => counts.get = counts.get.saturating_add(1),
-            "head" => counts.head = counts.head.saturating_add(1),
-            "list" => counts.list = counts.list.saturating_add(1),
-            "delete" => counts.delete = counts.delete.saturating_add(1),
-            "extend_retention" => {
-                counts.extend_retention = counts.extend_retention.saturating_add(1);
-            }
-            _ => continue,
-        }
-
-        if json_field_str(fields, "result") == Some("ok") {
-            counts.bytes_written = counts
-                .bytes_written
-                .saturating_add(json_field_u64(fields, "bytes_sent"));
-            counts.bytes_read = counts
-                .bytes_read
-                .saturating_add(json_field_u64(fields, "bytes_received"));
-        }
+        bump_gateway_backend_counts(fields, &mut counts);
     }
     counts
+}
+
+fn parse_gateway_backend_counts_by_s3_operation(logs: &[String]) -> Value {
+    let mut by_s3_operation: BTreeMap<String, rs3_storage::BlobOperationCounts> = BTreeMap::new();
+    for line in logs {
+        let Some(value) = parse_log_json(line) else {
+            continue;
+        };
+        let fields = value.get("fields").unwrap_or(&value);
+        if json_field_str(fields, "provider") != Some("s3") {
+            continue;
+        }
+        let Some(s3_operation) = s3_request_span_operation(&value) else {
+            continue;
+        };
+        bump_gateway_backend_counts(
+            fields,
+            by_s3_operation.entry(s3_operation.to_owned()).or_default(),
+        );
+    }
+
+    Value::Object(
+        by_s3_operation
+            .into_iter()
+            .map(|(operation, counts)| (operation, backend_counts_json(&counts)))
+            .collect(),
+    )
+}
+
+fn bump_gateway_backend_counts(fields: &Value, counts: &mut rs3_storage::BlobOperationCounts) {
+    let Some(operation) = json_field_str(fields, "operation") else {
+        return;
+    };
+    match operation {
+        "put" => counts.put = counts.put.saturating_add(1),
+        "get" => counts.get = counts.get.saturating_add(1),
+        "head" => counts.head = counts.head.saturating_add(1),
+        "list" => counts.list = counts.list.saturating_add(1),
+        "delete" => counts.delete = counts.delete.saturating_add(1),
+        "extend_retention" => {
+            counts.extend_retention = counts.extend_retention.saturating_add(1);
+        }
+        _ => return,
+    }
+
+    if json_field_str(fields, "result") == Some("ok") {
+        counts.bytes_written = counts
+            .bytes_written
+            .saturating_add(json_field_u64(fields, "bytes_sent"));
+        counts.bytes_read = counts
+            .bytes_read
+            .saturating_add(json_field_u64(fields, "bytes_received"));
+    }
+}
+
+fn s3_request_span_operation(value: &Value) -> Option<&str> {
+    value
+        .get("spans")
+        .and_then(Value::as_array)
+        .and_then(|spans| {
+            spans
+                .iter()
+                .rev()
+                .find(|span| json_field_str(span, "name") == Some("s3_request"))
+        })
+        .or_else(|| {
+            value
+                .get("span")
+                .filter(|span| json_field_str(span, "name") == Some("s3_request"))
+        })
+        .and_then(|span| json_field_str(span, "operation"))
+}
+
+fn backend_counts_json(counts: &rs3_storage::BlobOperationCounts) -> Value {
+    serde_json::json!({
+        "put": counts.put,
+        "get": counts.get,
+        "head": counts.head,
+        "list": counts.list,
+        "delete": counts.delete,
+        "extend_retention": counts.extend_retention,
+        "bytes_written": counts.bytes_written,
+        "bytes_read": counts.bytes_read,
+    })
 }
 
 #[cfg(test)]
@@ -178,9 +232,9 @@ mod tests {
     #[test]
     fn gateway_metrics_include_operation_latency() {
         let logs = vec![
-            r#"{"target":"rs3_storage","fields":{"provider":"s3","operation":"put","result":"ok","bytes_sent":12,"bytes_received":0,"elapsed_us":100}}"#.to_owned(),
-            r#"{"target":"rs3_storage","fields":{"provider":"s3","operation":"put","result":"ok","bytes_sent":7,"bytes_received":0,"elapsed_us":"300"}}"#.to_owned(),
-            r#"{"target":"rs3_storage","fields":{"provider":"s3","operation":"get","result":"ok","bytes_sent":0,"bytes_received":5,"elapsed_us":200}}"#.to_owned(),
+            r#"{"target":"rs3_storage","spans":[{"name":"s3_request","operation":"PutObject","request_id":7}],"fields":{"provider":"s3","operation":"put","result":"ok","bytes_sent":12,"bytes_received":0,"elapsed_us":100}}"#.to_owned(),
+            r#"{"target":"rs3_storage","span":{"name":"s3_request","operation":"PutObject","request_id":7},"fields":{"provider":"s3","operation":"put","result":"ok","bytes_sent":7,"bytes_received":0,"elapsed_us":"300"}}"#.to_owned(),
+            r#"{"target":"rs3_storage","spans":[{"name":"s3_request","operation":"GetObject","request_id":8}],"fields":{"provider":"s3","operation":"get","result":"ok","bytes_sent":0,"bytes_received":5,"elapsed_us":200}}"#.to_owned(),
             r#"{"target":"rs3_storage","fields":{"operation":"put","elapsed_us":999}}"#.to_owned(),
         ];
 
@@ -197,6 +251,10 @@ mod tests {
         assert_eq!(metrics["operation_latency_us"]["put"]["max"], 300);
         assert_eq!(metrics["operation_latency_us"]["get"]["samples"], 1);
         assert_eq!(metrics["operation_latency_us"]["get"]["p95"], 200);
+        assert_eq!(metrics["by_s3_operation"]["PutObject"]["put"], 2);
+        assert_eq!(metrics["by_s3_operation"]["PutObject"]["bytes_written"], 19);
+        assert_eq!(metrics["by_s3_operation"]["GetObject"]["get"], 1);
+        assert_eq!(metrics["by_s3_operation"]["GetObject"]["bytes_read"], 5);
     }
 
     #[test]

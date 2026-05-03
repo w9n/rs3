@@ -42,6 +42,10 @@ New gateway matrix artifacts also record `gateway_process.cpu_*_seconds`,
 measured gateway process. Historical artifacts listed below may predate those
 fields.
 
+Gateway backend metrics also include `backend_metrics.by_s3_operation`, a
+span-derived breakdown of backend operations and bytes by client S3 operation.
+This gives a request-to-backend cost map without recording object keys.
+
 ## Current Results
 
 Run date: 2026-05-03. Each row is the average of three direct/gateway run pairs.
