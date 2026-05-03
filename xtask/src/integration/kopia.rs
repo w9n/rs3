@@ -87,6 +87,7 @@ pub(crate) struct KopiaMatrixArgs {
     #[arg(long, env = "RS3_TEST_ARTIFACT_DIR")]
     artifact_dir: Option<PathBuf>,
     /// Cargo profile used for the gateway process under measurement.
+    #[cfg(feature = "containers")]
     #[arg(long, value_enum, default_value_t = GatewayBuildProfile::Release)]
     gateway_build_profile: GatewayBuildProfile,
     /// Plaintext bytes per encrypted gateway payload segment.
@@ -255,6 +256,7 @@ struct MeasuredGatewayRun<'a> {
     payload_segment_size: usize,
 }
 
+#[cfg(feature = "containers")]
 async fn run_measured_gateway_kopia(args: MeasuredGatewayRun<'_>) -> Result<serde_json::Value> {
     let workspace = KopiaWorkspace::new()?;
     workspace.populate_source(args.profile)?;
