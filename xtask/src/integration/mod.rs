@@ -30,6 +30,8 @@ enum IntegrationCommand {
     S3Gateway(s3_gateway::S3GatewayArgs),
     /// Run a real Kopia S3 smoke test through the local gateway.
     KopiaGateway(kopia::KopiaGatewayArgs),
+    /// Run Kopia through direct storage and gateway paths with backend measurements.
+    KopiaMeasuredMatrix(kopia::KopiaMatrixArgs),
     /// Run the gateway inside a disposable kind cluster.
     K8sGateway(k8s::K8sGatewayArgs),
     /// Run a Velero node-agent/Kopia backup and restore through the gateway.
@@ -67,6 +69,7 @@ pub(crate) fn run(args: IntegrationArgs) -> Result<()> {
         IntegrationCommand::S3Local(args) => s3::run_s3_local(args),
         IntegrationCommand::S3Gateway(args) => s3_gateway::run_s3_gateway(args),
         IntegrationCommand::KopiaGateway(args) => kopia::run_kopia_gateway(args),
+        IntegrationCommand::KopiaMeasuredMatrix(args) => kopia::run_kopia_measured_matrix(args),
         IntegrationCommand::K8sGateway(args) => k8s::run_k8s_gateway(args),
         IntegrationCommand::VeleroKopiaSmoke(args) => velero::run_velero_kopia_smoke(args),
         IntegrationCommand::VeleroKopiaLocalPvSmoke(args) => {

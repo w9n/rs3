@@ -3,8 +3,11 @@
 use super::s3_container::{self, RunningS3Container};
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
+use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
@@ -15,6 +18,8 @@ pub(crate) const SECRET_ACCESS_KEY: &str = "secret";
 pub(crate) struct RunningGateway {
     addr: SocketAddr,
     child: Child,
+    logs: Option<Arc<Mutex<Vec<String>>>>,
+    readers: Vec<JoinHandle<()>>,
 }
 
 impl RunningGateway {
@@ -22,22 +27,43 @@ impl RunningGateway {
         backend: &RunningS3Container,
         backend_prefix: String,
     ) -> Result<Self> {
+        Self::start_inner(backend, backend_prefix, None).await
+    }
+
+    pub(crate) async fn start_with_log_capture(
+        backend: &RunningS3Container,
+        backend_prefix: String,
+        rust_log: &str,
+    ) -> Result<Self> {
+        Self::start_inner(backend, backend_prefix, Some(rust_log)).await
+    }
+
+    async fn start_inner(
+        backend: &RunningS3Container,
+        backend_prefix: String,
+        rust_log: Option<&str>,
+    ) -> Result<Self> {
         let addr = reserve_gateway_addr()?;
+        let bind = addr.to_string();
+        let capture_logs = rust_log.is_some();
+        let mut gateway_args = vec![
+            "run",
+            "-p",
+            "rs3-server",
+            "--bin",
+            "rs3-server",
+            "--features",
+            "s3",
+            "--",
+        ];
+        if capture_logs {
+            gateway_args.extend(["--log-format", "json"]);
+        }
+        gateway_args.extend(["serve", "--bind", bind.as_str()]);
+
         let mut child = Command::new("cargo");
         child
-            .args([
-                "run",
-                "-p",
-                "rs3-server",
-                "--bin",
-                "rs3-server",
-                "--features",
-                "s3",
-                "--",
-                "serve",
-                "--bind",
-                &addr.to_string(),
-            ])
+            .args(gateway_args)
             .env("RS3_PUBLIC_BUCKET", PUBLIC_BUCKET)
             .env("RS3_BACKEND_ENDPOINT", &backend.endpoint_url)
             .env("RS3_BACKEND_BUCKET", &backend.bucket)
@@ -54,15 +80,60 @@ impl RunningGateway {
             .env_remove("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
             .env_remove("AWS_CONTAINER_CREDENTIALS_FULL_URI")
             .env_remove("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(if capture_logs {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stderr(if capture_logs {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
+        if let Some(rust_log) = rust_log {
+            child.env("RUST_LOG", rust_log);
+        }
 
         let mut child = child
             .spawn()
             .context("failed to start rs3-server process")?;
-        wait_for_gateway(addr, &mut child).await?;
+        let logs = if capture_logs {
+            let stdout = child
+                .stdout
+                .take()
+                .context("gateway stdout was not captured")?;
+            let stderr = child
+                .stderr
+                .take()
+                .context("gateway stderr was not captured")?;
+            let logs = Arc::new(Mutex::new(Vec::new()));
+            let readers = vec![
+                spawn_gateway_log_reader(stdout, Arc::clone(&logs)),
+                spawn_gateway_log_reader(stderr, Arc::clone(&logs)),
+            ];
+            let mut gateway = Self {
+                addr,
+                child,
+                logs: Some(logs),
+                readers,
+            };
+            if let Err(error) = wait_for_gateway(addr, &mut gateway.child).await {
+                let _ = gateway.shutdown();
+                return Err(error);
+            }
+            gateway.clear_captured_logs()?;
+            return Ok(gateway);
+        } else {
+            wait_for_gateway(addr, &mut child).await?;
+            None
+        };
 
-        Ok(Self { addr, child })
+        Ok(Self {
+            addr,
+            child,
+            logs,
+            readers: Vec::new(),
+        })
     }
 
     pub(crate) fn endpoint_url(&self) -> String {
@@ -82,22 +153,45 @@ impl RunningGateway {
         )
     }
 
+    pub(crate) fn clear_captured_logs(&self) -> Result<()> {
+        let Some(logs) = &self.logs else {
+            return Ok(());
+        };
+        let mut logs = logs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("gateway log capture lock poisoned"))?;
+        logs.clear();
+        Ok(())
+    }
+
+    pub(crate) fn captured_logs(&self) -> Result<Vec<String>> {
+        let Some(logs) = &self.logs else {
+            return Ok(Vec::new());
+        };
+        let logs = logs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("gateway log capture lock poisoned"))?;
+        Ok(logs.clone())
+    }
+
     pub(crate) fn shutdown(&mut self) -> Result<()> {
         if self
             .child
             .try_wait()
             .context("failed to inspect gateway process")?
-            .is_some()
+            .is_none()
         {
-            return Ok(());
+            self.child
+                .kill()
+                .context("failed to stop gateway process")?;
         }
-        self.child
-            .kill()
-            .context("failed to stop gateway process")?;
         let _status = self
             .child
             .wait()
             .context("failed to reap gateway process")?;
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
         Ok(())
     }
 }
@@ -136,4 +230,20 @@ async fn wait_for_gateway(addr: SocketAddr, child: &mut Child) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+fn spawn_gateway_log_reader<R>(reader: R, logs: Arc<Mutex<Vec<String>>>) -> JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if let Ok(mut captured) = logs.lock() {
+                captured.push(line);
+            }
+        }
+    })
 }
