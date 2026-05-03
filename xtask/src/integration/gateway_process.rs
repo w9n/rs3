@@ -3,6 +3,7 @@
 use super::s3_container::{self, RunningS3Container};
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
@@ -240,6 +241,19 @@ impl RunningGateway {
         Ok(logs.clone())
     }
 
+    pub(crate) fn process_metrics_json(&self) -> Value {
+        let pid = self.child.id();
+        let status = i32::try_from(pid)
+            .ok()
+            .and_then(|pid| procfs::process::Process::new(pid).ok())
+            .and_then(|process| process.status().ok());
+        json!({
+            "pid": pid,
+            "vm_hwm_bytes": status.as_ref().and_then(|status| kib_to_bytes(status.vmhwm)),
+            "vm_rss_bytes": status.as_ref().and_then(|status| kib_to_bytes(status.vmrss)),
+        })
+    }
+
     pub(crate) fn shutdown(&mut self) -> Result<()> {
         if self
             .child
@@ -260,6 +274,10 @@ impl RunningGateway {
         }
         Ok(())
     }
+}
+
+fn kib_to_bytes(kib: Option<u64>) -> Option<u64> {
+    kib?.checked_mul(1024)
 }
 
 impl Drop for RunningGateway {
@@ -316,4 +334,15 @@ where
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kib_to_bytes;
+
+    #[test]
+    fn converts_procfs_kib_fields_to_bytes() {
+        assert_eq!(kib_to_bytes(Some(1234)), Some(1_263_616));
+        assert_eq!(kib_to_bytes(None), None);
+    }
 }

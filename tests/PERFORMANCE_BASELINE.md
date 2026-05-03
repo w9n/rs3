@@ -37,6 +37,10 @@ production gateway mode. The proxy lives under `xtask` as
 records HTTP method, status, request body bytes, response body bytes, transport
 bytes, and connection counts while forwarding requests unchanged to RustFS.
 
+New gateway matrix artifacts also record `gateway_process.vm_hwm_bytes` and
+`gateway_process.vm_rss_bytes` from the measured gateway process. Historical
+artifacts listed below may predate those fields.
+
 ## Current Results
 
 Run date: 2026-05-03. Each row is the average of three direct/gateway run pairs.
@@ -151,7 +155,7 @@ Interpretation:
 
 ## Follow-Up Work
 
-- Add CPU and memory high-water marks to the harness.
+- Add CPU accounting to the harness.
 - Add a real Velero/Postgres cluster matrix once the smoke lane can scale row
   counts and data volume without changing its correctness proof.
 - Keep release-profile gateway execution for performance lanes; debug builds are

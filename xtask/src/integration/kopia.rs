@@ -376,6 +376,7 @@ async fn run_measured_gateway_kopia(args: MeasuredGatewayRun<'_>) -> Result<serd
     std::thread::sleep(Duration::from_millis(100));
     let prometheus_after = scrape_prometheus_metrics(&metrics_authority).await?;
     let logs = gateway.captured_logs()?;
+    let process_metrics = gateway.process_metrics_json();
     let shutdown = gateway.shutdown();
     let stats = stats?;
     shutdown?;
@@ -383,6 +384,7 @@ async fn run_measured_gateway_kopia(args: MeasuredGatewayRun<'_>) -> Result<serd
     report["client_metrics"] = gateway_client_metrics_json(&logs);
     report["prometheus_metrics"] =
         prometheus_metrics_delta_json(&prometheus_before, &prometheus_after);
+    report["gateway_process"] = process_metrics;
     Ok(report)
 }
 

@@ -171,6 +171,10 @@ fn aggregate_reports(reports: &[&Value]) -> Value {
                 "request_duration_seconds",
             ]),
         },
+        "gateway_process": {
+            "vm_hwm_bytes": aggregate_u64_at(reports, &["gateway_process", "vm_hwm_bytes"]),
+            "vm_rss_bytes": aggregate_u64_at(reports, &["gateway_process", "vm_rss_bytes"]),
+        },
     })
 }
 
@@ -278,6 +282,14 @@ fn aggregate_object(reports: &[&Value], path: &[&str]) -> Value {
     )
 }
 
+fn aggregate_u64_at(reports: &[&Value], path: &[&str]) -> Value {
+    let values = reports
+        .iter()
+        .filter_map(|report| value_u64_at(report, path))
+        .collect::<Vec<_>>();
+    summarize_u64(&values)
+}
+
 fn aggregate_number_object(reports: &[&Value], path: &[&str]) -> Value {
     let mut values_by_key: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for report in reports {
@@ -365,7 +377,7 @@ fn push_ratio(ratios: &mut Vec<f64>, numerator: Option<u64>, denominator: Option
 
 #[cfg(test)]
 mod tests {
-    use super::compare_runs;
+    use super::{aggregate_runs, compare_runs};
 
     #[test]
     fn compares_gateway_and_direct_run_ratios() {
@@ -386,6 +398,10 @@ mod tests {
                 {
                     "storage_path": "gateway",
                     "elapsed_ms": 150,
+                    "gateway_process": {
+                        "vm_hwm_bytes": 4096,
+                        "vm_rss_bytes": 2048
+                    },
                     "backend_metrics": {
                         "counts": {
                             "put": 12,
@@ -441,6 +457,16 @@ mod tests {
         assert_eq!(
             comparison["gateway_internal"]["backend_gets_per_client_get"]["avg"],
             serde_json::json!(0.5)
+        );
+
+        let aggregate = aggregate_runs(&runs);
+        assert_eq!(
+            aggregate["gateway"]["gateway_process"]["vm_hwm_bytes"]["avg"],
+            serde_json::json!(4096.0)
+        );
+        assert_eq!(
+            aggregate["gateway"]["gateway_process"]["vm_rss_bytes"]["avg"],
+            serde_json::json!(2048.0)
         );
     }
 }

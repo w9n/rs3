@@ -11,7 +11,7 @@ description = "Local automation for rs3"
 [features]
 default = []
 s3 = ["rs3-storage/s3"]
-containers = ["s3", "dep:aws-sdk-s3", "dep:testcontainers"]
+containers = ["s3", "dep:aws-sdk-s3", "dep:procfs", "dep:testcontainers"]
 k8s = ["s3", "dep:aws-sdk-s3"]
 
 [dependencies]
@@ -19,6 +19,7 @@ anyhow.workspace = true
 aws-sdk-s3 = { version = "1", optional = true }
 bytes.workspace = true
 clap.workspace = true
+procfs = { version = "0.18.0", optional = true }
 rs3-anchor = { version = "0.1.0", path = "../crates/rs3-anchor" }
 rs3-crypto = { version = "0.1.0", path = "../crates/rs3-crypto" }
 rs3-repository = { version = "0.1.0", path = "../crates/rs3-repository" }
