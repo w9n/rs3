@@ -48,6 +48,9 @@ perf-commit-parallel *ARGS:
 perf-s3 *ARGS:
     cargo run -p xtask --features s3 -- perf --backend s3 {{ARGS}}
 
+perf-s3-container *ARGS:
+    cargo run -p xtask --features containers -- perf --backend s3-container {{ARGS}}
+
 nextest:
     cargo nextest run --workspace
 

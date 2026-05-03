@@ -1,5 +1,7 @@
 //! Performance scenario harness.
 
+#[cfg(feature = "containers")]
+use crate::integration::{S3ContainerProvider, s3_container};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::{Args, ValueEnum};
@@ -16,6 +18,8 @@ use rs3_storage::{
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "containers")]
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
@@ -84,6 +88,10 @@ pub(crate) struct PerfArgs {
         default_value_t = false
     )]
     s3_virtual_hosted_style: bool,
+    /// Local S3-compatible container provider used with `--backend s3-container`.
+    #[cfg(feature = "containers")]
+    #[arg(long, value_enum, default_value_t = S3ContainerProvider::Rustfs)]
+    container_provider: S3ContainerProvider,
     /// Output format for scenario reports.
     #[arg(long, value_enum, default_value_t = ReportFormat::Tsv)]
     format: ReportFormat,
@@ -125,6 +133,9 @@ pub(crate) enum PerfBackend {
     /// S3-compatible backend using the default environment/config chain.
     #[cfg(feature = "s3")]
     S3,
+    /// Ephemeral local S3-compatible container.
+    #[cfg(feature = "containers")]
+    S3Container,
 }
 
 impl PerfBackend {
@@ -134,6 +145,22 @@ impl PerfBackend {
             Self::Filesystem => "filesystem",
             #[cfg(feature = "s3")]
             Self::S3 => "s3",
+            #[cfg(feature = "containers")]
+            Self::S3Container => "s3-container",
+        }
+    }
+}
+
+#[cfg(feature = "containers")]
+impl PerfScenario {
+    fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::WriteBatch => "write-batch",
+            Self::WriteCommitted => "write-committed",
+            Self::WriteCommittedParallel => "write-committed-parallel",
+            Self::FullRead => "full-read",
+            Self::RangeRead => "range-read",
         }
     }
 }
@@ -147,6 +174,16 @@ pub(crate) enum ReportFormat {
     Jsonl,
 }
 
+#[cfg(feature = "containers")]
+impl ReportFormat {
+    fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Tsv => "tsv",
+            Self::Jsonl => "jsonl",
+        }
+    }
+}
+
 /// Trace subscriber output options.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum TraceFormat {
@@ -156,11 +193,34 @@ pub(crate) enum TraceFormat {
     Json,
 }
 
-pub(crate) async fn run(args: PerfArgs) -> Result<()> {
+#[cfg(feature = "containers")]
+impl TraceFormat {
+    fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Json => "json",
+        }
+    }
+}
+
+pub(crate) fn run(args: PerfArgs) -> Result<()> {
     if args.trace {
         init_tracing(&args.trace_filter, args.trace_format)?;
     }
 
+    #[cfg(feature = "containers")]
+    if args.backend == PerfBackend::S3Container {
+        return run_s3_container_perf(&args);
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build perf runtime")?;
+    runtime.block_on(run_async(args))
+}
+
+async fn run_async(args: PerfArgs) -> Result<()> {
     let scenarios = match args.scenario {
         PerfScenario::All => vec![
             PerfScenario::WriteBatch,
@@ -190,6 +250,73 @@ pub(crate) async fn run(args: PerfArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "containers")]
+fn run_s3_container_perf(args: &PerfArgs) -> Result<()> {
+    let target = s3_container::start_s3_container(
+        args.container_provider,
+        args.s3_bucket.clone(),
+        args.s3_region.clone(),
+    )?;
+    let mut command = Command::new("cargo");
+    command.args(["run", "-p", "xtask", "--features", "s3", "--", "perf"]);
+    add_perf_args(&mut command, args, &target);
+    command.env("AWS_ACCESS_KEY_ID", &target.access_key_id);
+    command.env("AWS_SECRET_ACCESS_KEY", &target.secret_access_key);
+    command.env("AWS_DEFAULT_REGION", &target.region);
+    command.env_remove("AWS_SESSION_TOKEN");
+    command.env_remove("AWS_PROFILE");
+    command.env_remove("AWS_WEB_IDENTITY_TOKEN_FILE");
+    command.env_remove("AWS_ROLE_ARN");
+    command.env_remove("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI");
+    command.env_remove("AWS_CONTAINER_CREDENTIALS_FULL_URI");
+    command.env_remove("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE");
+
+    let status = command
+        .status()
+        .context("failed to start container-backed S3 perf run")?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("container-backed S3 perf run exited with {status}");
+    }
+}
+
+#[cfg(feature = "containers")]
+fn add_perf_args(
+    command: &mut Command,
+    args: &PerfArgs,
+    target: &s3_container::RunningS3Container,
+) {
+    command.args(["--scenario", args.scenario.as_cli_value()]);
+    command.args(["--objects", &args.objects.to_string()]);
+    command.args(["--object-size", &args.object_size.to_string()]);
+    command.args(["--commit-batch-items", &args.commit_batch_items.to_string()]);
+    command.args([
+        "--commit-batch-delay-ms",
+        &args.commit_batch_delay_ms.to_string(),
+    ]);
+    if let Some(max_pending_items) = args.commit_max_pending_items {
+        command.args(["--commit-max-pending-items", &max_pending_items.to_string()]);
+    }
+    command.args(["--concurrency", &args.concurrency.to_string()]);
+    command.args(["--reads", &args.reads.to_string()]);
+    command.args(["--range-len", &args.range_len.to_string()]);
+    command.args(["--backend", "s3"]);
+    command.args(["--s3-bucket", &target.bucket]);
+    command.args(["--s3-endpoint-url", &target.endpoint_url]);
+    command.args(["--s3-region", &target.region]);
+    if let Some(prefix) = args.s3_prefix.as_deref() {
+        command.args(["--s3-prefix", prefix]);
+    }
+    command.arg("--s3-allow-http");
+    command.args(["--format", args.format.as_cli_value()]);
+    if args.trace {
+        command.arg("--trace");
+        command.args(["--trace-filter", &args.trace_filter]);
+        command.args(["--trace-format", args.trace_format.as_cli_value()]);
+    }
+}
+
 async fn write_batch(args: &PerfArgs) -> Result<PerfReport> {
     match args.backend {
         PerfBackend::Memory => write_batch_with_store(args, memory_store()).await,
@@ -199,6 +326,8 @@ async fn write_batch(args: &PerfArgs) -> Result<PerfReport> {
         }
         #[cfg(feature = "s3")]
         PerfBackend::S3 => write_batch_with_store(args, s3_store(args).await?).await,
+        #[cfg(feature = "containers")]
+        PerfBackend::S3Container => unreachable!("handled before scenario dispatch"),
     }
 }
 
@@ -261,6 +390,8 @@ async fn write_committed(args: &PerfArgs) -> Result<PerfReport> {
         }
         #[cfg(feature = "s3")]
         PerfBackend::S3 => write_committed_with_store(args, s3_store(args).await?).await,
+        #[cfg(feature = "containers")]
+        PerfBackend::S3Container => unreachable!("handled before scenario dispatch"),
     }
 }
 
@@ -322,6 +453,8 @@ async fn write_committed_parallel(args: &PerfArgs) -> Result<PerfReport> {
         }
         #[cfg(feature = "s3")]
         PerfBackend::S3 => write_committed_parallel_with_store(args, s3_store(args).await?).await,
+        #[cfg(feature = "containers")]
+        PerfBackend::S3Container => unreachable!("handled before scenario dispatch"),
     }
 }
 
@@ -404,6 +537,8 @@ async fn full_read(args: &PerfArgs) -> Result<PerfReport> {
         }
         #[cfg(feature = "s3")]
         PerfBackend::S3 => full_read_with_store(args, s3_store(args).await?).await,
+        #[cfg(feature = "containers")]
+        PerfBackend::S3Container => unreachable!("handled before scenario dispatch"),
     }
 }
 
@@ -462,6 +597,8 @@ async fn range_read(args: &PerfArgs) -> Result<PerfReport> {
         }
         #[cfg(feature = "s3")]
         PerfBackend::S3 => range_read_with_store(args, s3_store(args).await?).await,
+        #[cfg(feature = "containers")]
+        PerfBackend::S3Container => unreachable!("handled before scenario dispatch"),
     }
 }
 

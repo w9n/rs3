@@ -50,11 +50,7 @@ fn main() -> Result<()> {
             integration::run(args)?;
         }
         Some(Commands::Perf(args)) => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("failed to build tokio runtime")?;
-            runtime.block_on(perf::run(args))?;
+            perf::run(args)?;
         }
         Some(Commands::Test) => {
             run("cargo", &["test", "--workspace"])?;

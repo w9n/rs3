@@ -2,7 +2,7 @@
 
 mod s3;
 #[cfg(feature = "containers")]
-mod s3_container;
+pub(crate) mod s3_container;
 mod s3_gateway;
 
 use anyhow::Result;
@@ -31,7 +31,7 @@ pub(crate) enum S3ContainerProvider {
 
 #[cfg(feature = "containers")]
 impl S3ContainerProvider {
-    fn as_label(self) -> &'static str {
+    pub(crate) fn as_label(self) -> &'static str {
         match self {
             Self::Rustfs => "rustfs",
         }

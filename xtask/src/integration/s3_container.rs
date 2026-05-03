@@ -21,17 +21,17 @@ const RUSTFS_API_PORT: u16 = 9000;
 const RUSTFS_IMAGE: &str = "rustfs/rustfs";
 const RUSTFS_TAG: &str = "latest";
 
-pub(super) struct RunningS3Container {
-    pub(super) provider: S3ContainerProvider,
-    pub(super) endpoint_url: String,
-    pub(super) bucket: String,
-    pub(super) region: String,
-    pub(super) access_key_id: String,
-    pub(super) secret_access_key: String,
+pub(crate) struct RunningS3Container {
+    pub(crate) provider: S3ContainerProvider,
+    pub(crate) endpoint_url: String,
+    pub(crate) bucket: String,
+    pub(crate) region: String,
+    pub(crate) access_key_id: String,
+    pub(crate) secret_access_key: String,
     _container: Container<GenericImage>,
 }
 
-pub(super) fn start_s3_container(
+pub(crate) fn start_s3_container(
     provider: S3ContainerProvider,
     bucket: Option<String>,
     region: Option<String>,
@@ -41,7 +41,7 @@ pub(super) fn start_s3_container(
     }
 }
 
-pub(super) fn s3_client(
+pub(crate) fn s3_client(
     endpoint_url: &str,
     region: &str,
     access_key_id: &str,
