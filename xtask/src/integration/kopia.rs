@@ -11,7 +11,7 @@ use super::s3_container;
 use anyhow::Result;
 #[cfg(feature = "containers")]
 use anyhow::{Context, bail};
-use clap::Args;
+use clap::{Args, ValueEnum};
 #[cfg(feature = "containers")]
 #[path = "kopia/measurement.rs"]
 mod measurement;
@@ -23,6 +23,8 @@ use measurement::{
     gateway_backend_metrics_json, gateway_client_metrics_json, measurement_json, now_millis,
     prometheus_metrics_delta_json, scrape_prometheus_metrics, wait_for_storage_proxy_metrics,
 };
+#[cfg(feature = "containers")]
+use std::collections::BTreeMap;
 #[cfg(feature = "containers")]
 use std::ffi::{OsStr, OsString};
 #[cfg(feature = "containers")]
@@ -80,6 +82,9 @@ pub(crate) struct KopiaMatrixArgs {
     /// Workload shape to snapshot and restore.
     #[arg(long, value_enum, default_value_t = KopiaWorkloadProfile::SmallSmoke)]
     workload_profile: KopiaWorkloadProfile,
+    /// Named set of workload profiles to run.
+    #[arg(long, value_enum, default_value_t = KopiaMatrixProfileSet::Single)]
+    profile_set: KopiaMatrixProfileSet,
     /// Number of direct/gateway run pairs to execute.
     #[arg(long, default_value_t = 1)]
     runs: usize,
@@ -93,6 +98,35 @@ pub(crate) struct KopiaMatrixArgs {
     /// Plaintext bytes per encrypted gateway payload segment.
     #[arg(long, default_value_t = rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE)]
     payload_segment_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum KopiaMatrixProfileSet {
+    /// Run only `--workload-profile`.
+    Single,
+    /// Run larger restore profiles shaped like Kubernetes and Postgres backups.
+    LargerRestores,
+}
+
+impl KopiaMatrixProfileSet {
+    #[cfg(feature = "containers")]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::LargerRestores => "larger-restores",
+        }
+    }
+
+    fn profiles(self, single: KopiaWorkloadProfile) -> Vec<KopiaWorkloadProfile> {
+        match self {
+            Self::Single => vec![single],
+            Self::LargerRestores => vec![
+                KopiaWorkloadProfile::MediumRestore,
+                KopiaWorkloadProfile::KubernetesObjects,
+                KopiaWorkloadProfile::PostgresPgdata,
+            ],
+        }
+    }
 }
 
 #[cfg(not(feature = "containers"))]
@@ -162,6 +196,7 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
     }
     let run_id = now_millis();
     let backend_prefix = args.backend_prefix.trim_end_matches('/').to_owned();
+    let profiles = args.profile_set.profiles(args.workload_profile);
     let artifact_dir = args.artifact_dir.clone().unwrap_or_else(|| {
         PathBuf::from(".local")
             .join("integration")
@@ -181,32 +216,35 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         .context("failed to build Kopia matrix runtime")?;
 
     let runs = runtime.block_on(async {
-        let mut runs = Vec::with_capacity(args.runs);
-        for run_index in 1..=args.runs {
-            let direct = run_measured_direct_kopia(
-                &args.kopia_bin,
-                &backend,
-                &backend_prefix,
-                run_id,
-                run_index,
-                args.workload_profile,
-            )
-            .await?;
-            let gateway = run_measured_gateway_kopia(MeasuredGatewayRun {
-                kopia_bin: &args.kopia_bin,
-                backend: &backend,
-                backend_prefix: &backend_prefix,
-                run_id,
-                run_index,
-                profile: args.workload_profile,
-                gateway_build_profile: args.gateway_build_profile,
-                payload_segment_size: args.payload_segment_size,
-            })
-            .await?;
-            runs.push(serde_json::json!({
-                "run": run_index,
-                "reports": [direct, gateway],
-            }));
+        let mut runs = Vec::with_capacity(args.runs.saturating_mul(profiles.len()));
+        for profile in profiles.iter().copied() {
+            for run_index in 1..=args.runs {
+                let direct = run_measured_direct_kopia(
+                    &args.kopia_bin,
+                    &backend,
+                    &backend_prefix,
+                    run_id,
+                    run_index,
+                    profile,
+                )
+                .await?;
+                let gateway = run_measured_gateway_kopia(MeasuredGatewayRun {
+                    kopia_bin: &args.kopia_bin,
+                    backend: &backend,
+                    backend_prefix: &backend_prefix,
+                    run_id,
+                    run_index,
+                    profile,
+                    gateway_build_profile: args.gateway_build_profile,
+                    payload_segment_size: args.payload_segment_size,
+                })
+                .await?;
+                runs.push(serde_json::json!({
+                    "profile": profile.as_str(),
+                    "run": run_index,
+                    "reports": [direct, gateway],
+                }));
+            }
         }
         Ok::<_, anyhow::Error>(runs)
     })?;
@@ -215,7 +253,9 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         "scenario": "kopia-measured-matrix",
         "run_id": run_id,
         "runs": args.runs,
+        "profile_set": args.profile_set.as_str(),
         "workload_profile": args.workload_profile.as_str(),
+        "workload_profiles": profiles.iter().map(|profile| profile.as_str()).collect::<Vec<_>>(),
         "backend_provider": args.container_provider.as_label(),
         "backend_bucket": backend.bucket,
         "backend_region": backend.region,
@@ -223,8 +263,10 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         "payload_segment_size": args.payload_segment_size,
         "aggregate": aggregate_runs(&runs),
         "comparison": compare_runs(&runs),
+        "profiles": profile_summaries(&runs),
         "run_reports": runs,
     });
+    let multi_profile = profiles.len() > 1;
     for run in summary["run_reports"]
         .as_array()
         .context("summary run_reports was not an array")?
@@ -232,7 +274,15 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         let run_index = run["run"]
             .as_u64()
             .context("run report did not include numeric run index")?;
-        write_json_file(&artifact_dir.join(format!("run-{run_index:03}.json")), run)?;
+        let file_name = if multi_profile {
+            let profile = run["profile"]
+                .as_str()
+                .context("run report did not include profile")?;
+            format!("{profile}-run-{run_index:03}.json")
+        } else {
+            format!("run-{run_index:03}.json")
+        };
+        write_json_file(&artifact_dir.join(file_name), run)?;
     }
     let summary_path = artifact_dir.join("summary.json");
     write_json_file(&summary_path, &summary)?;
@@ -242,6 +292,36 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
     );
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
+}
+
+#[cfg(feature = "containers")]
+fn profile_summaries(runs: &[serde_json::Value]) -> serde_json::Value {
+    let mut runs_by_profile: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+    for run in runs {
+        let Some(profile) = run.get("profile").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        runs_by_profile
+            .entry(profile.to_owned())
+            .or_default()
+            .push(run.clone());
+    }
+
+    serde_json::Value::Object(
+        runs_by_profile
+            .into_iter()
+            .map(|(profile, runs)| {
+                (
+                    profile,
+                    serde_json::json!({
+                        "runs": runs.len(),
+                        "aggregate": aggregate_runs(&runs),
+                        "comparison": compare_runs(&runs),
+                    }),
+                )
+            })
+            .collect(),
+    )
 }
 
 #[cfg(feature = "containers")]
@@ -536,4 +616,29 @@ fn os(value: impl AsRef<OsStr>) -> OsString {
 fn write_json_file(path: &Path, value: &serde_json::Value) -> Result<()> {
     fs::write(path, format!("{}\n", serde_json::to_string_pretty(value)?))
         .with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KopiaMatrixProfileSet, KopiaWorkloadProfile};
+
+    #[test]
+    fn larger_restore_profile_set_has_stable_order() {
+        assert_eq!(
+            KopiaMatrixProfileSet::LargerRestores
+                .profiles(KopiaWorkloadProfile::SmallSmoke)
+                .into_iter()
+                .map(KopiaWorkloadProfile::as_str)
+                .collect::<Vec<_>>(),
+            vec!["medium-restore", "kubernetes-objects", "postgres-pgdata"]
+        );
+    }
+
+    #[test]
+    fn single_profile_set_preserves_selected_profile() {
+        assert_eq!(
+            KopiaMatrixProfileSet::Single.profiles(KopiaWorkloadProfile::ManySmallFiles),
+            vec![KopiaWorkloadProfile::ManySmallFiles]
+        );
+    }
 }

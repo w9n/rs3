@@ -21,17 +21,22 @@ pub(super) enum KopiaWorkloadProfile {
     MediumRestore,
     /// Metadata-heavy profile with many small files.
     ManySmallFiles,
+    /// Kubernetes-object-shaped restore profile with many manifests and metadata files.
+    KubernetesObjects,
+    /// Postgres-pgdata-shaped restore profile with relation, WAL, and dump files.
+    PostgresPgdata,
     /// Take a second snapshot after modifying the source tree.
     ChangedSnapshot,
 }
 
-#[cfg(feature = "containers")]
 impl KopiaWorkloadProfile {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::SmallSmoke => "small-smoke",
             Self::MediumRestore => "medium-restore",
             Self::ManySmallFiles => "many-small-files",
+            Self::KubernetesObjects => "kubernetes-objects",
+            Self::PostgresPgdata => "postgres-pgdata",
             Self::ChangedSnapshot => "changed-snapshot",
         }
     }
@@ -107,6 +112,12 @@ impl KopiaWorkspace {
                     .context("failed to write many-small-files payload")?;
                 }
             }
+            KopiaWorkloadProfile::KubernetesObjects => {
+                populate_kubernetes_objects(&self.source_dir())?;
+            }
+            KopiaWorkloadProfile::PostgresPgdata => {
+                populate_postgres_pgdata(&self.source_dir())?;
+            }
         }
         Ok(())
     }
@@ -154,6 +165,63 @@ fn write_deterministic_file(path: &Path, len: usize) -> Result<()> {
     }
     file.flush()
         .with_context(|| format!("failed to flush {}", path.display()))
+}
+
+#[cfg(feature = "containers")]
+fn populate_kubernetes_objects(source: &Path) -> Result<()> {
+    let root = source.join("kubernetes");
+    fs::create_dir_all(&root).context("failed to create Kubernetes object tree")?;
+    for namespace in 0..16 {
+        let namespace_dir = root.join(format!("namespace-{namespace:02}"));
+        fs::create_dir_all(&namespace_dir)
+            .context("failed to create Kubernetes namespace directory")?;
+        for object in 0..96 {
+            let kind = match object % 6 {
+                0 => "deployment",
+                1 => "configmap",
+                2 => "service",
+                3 => "role",
+                4 => "secret-metadata",
+                _ => "custom-resource",
+            };
+            let manifest = kubernetes_manifest(namespace, object, kind);
+            fs::write(
+                namespace_dir.join(format!("{kind}-{object:04}.yaml")),
+                manifest,
+            )
+            .context("failed to write Kubernetes manifest")?;
+        }
+    }
+    write_deterministic_file(&root.join("etcd-snapshot-fragment.bin"), 32 * 1024 * 1024)
+}
+
+#[cfg(feature = "containers")]
+fn kubernetes_manifest(namespace: usize, object: usize, kind: &str) -> String {
+    format!(
+        "apiVersion: rs3.dev/v1\nkind: {kind}\nmetadata:\n  name: object-{object:04}\n  namespace: namespace-{namespace:02}\n  labels:\n    app.kubernetes.io/name: rs3-perf\n    rs3.dev/profile: kubernetes-objects\nspec:\n  generation: {object}\n  payload: {}\n",
+        "x".repeat(256 + object % 97),
+    )
+}
+
+#[cfg(feature = "containers")]
+fn populate_postgres_pgdata(source: &Path) -> Result<()> {
+    let root = source.join("postgres");
+    let base = root.join("base").join("16384");
+    let wal = root.join("pg_wal");
+    fs::create_dir_all(&base).context("failed to create Postgres base directory")?;
+    fs::create_dir_all(&wal).context("failed to create Postgres WAL directory")?;
+
+    for relation in 0..96 {
+        write_deterministic_file(&base.join(format!("{relation}")), 1024 * 1024)?;
+    }
+    for segment in 0..4 {
+        write_deterministic_file(
+            &wal.join(format!("0000000100000000000000{segment:02X}")),
+            16 * 1024 * 1024,
+        )?;
+    }
+    write_deterministic_file(&root.join("rs3-proof.sql"), 8 * 1024 * 1024)?;
+    fs::write(root.join("PG_VERSION"), b"17\n").context("failed to write Postgres version marker")
 }
 
 #[cfg(feature = "containers")]
