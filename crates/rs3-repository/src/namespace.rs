@@ -10,7 +10,8 @@ use rs3_types::{BlindIndexKey, KeyId, PrefixToken};
 pub(crate) enum IndexedListPrefixMode {
     Root,
     Delimiter,
-    Fallback,
+    ParentDelimiterFallback,
+    RootFallback,
 }
 
 impl IndexedListPrefixMode {
@@ -18,7 +19,8 @@ impl IndexedListPrefixMode {
         match self {
             Self::Root => "root",
             Self::Delimiter => "delimiter",
-            Self::Fallback => "fallback",
+            Self::ParentDelimiterFallback => "parent_delimiter_fallback",
+            Self::RootFallback => "root_fallback",
         }
     }
 }
@@ -68,7 +70,13 @@ pub(crate) fn prefix_tokens_for_key(
 pub(crate) fn indexed_list_prefix(prefix: &str) -> &str {
     match indexed_list_prefix_mode(prefix) {
         IndexedListPrefixMode::Root | IndexedListPrefixMode::Delimiter => prefix,
-        IndexedListPrefixMode::Fallback => "",
+        IndexedListPrefixMode::ParentDelimiterFallback => {
+            let Some(boundary) = prefix.rfind('/') else {
+                return "";
+            };
+            &prefix[..boundary + 1]
+        }
+        IndexedListPrefixMode::RootFallback => "",
     }
 }
 
@@ -78,7 +86,9 @@ pub(crate) fn indexed_list_prefix_mode(prefix: &str) -> IndexedListPrefixMode {
         IndexedListPrefixMode::Root
     } else if prefix.ends_with('/') {
         IndexedListPrefixMode::Delimiter
+    } else if prefix.contains('/') {
+        IndexedListPrefixMode::ParentDelimiterFallback
     } else {
-        IndexedListPrefixMode::Fallback
+        IndexedListPrefixMode::RootFallback
     }
 }

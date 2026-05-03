@@ -484,8 +484,18 @@ fn indexed_list_prefix_classifies_fallback_without_prefix_value() {
     assert_eq!(indexed_list_prefix_mode("").as_str(), "root");
     assert_eq!(indexed_list_prefix("p/12/"), "p/12/");
     assert_eq!(indexed_list_prefix_mode("p/12/").as_str(), "delimiter");
-    assert_eq!(indexed_list_prefix("p/12"), "");
-    assert_eq!(indexed_list_prefix_mode("p/12").as_str(), "fallback");
+    assert_eq!(indexed_list_prefix("p/12"), "p/");
+    assert_eq!(
+        indexed_list_prefix_mode("p/12").as_str(),
+        "parent_delimiter_fallback"
+    );
+    assert_eq!(indexed_list_prefix("p/12/abc"), "p/12/");
+    assert_eq!(
+        indexed_list_prefix_mode("p/12/abc").as_str(),
+        "parent_delimiter_fallback"
+    );
+    assert_eq!(indexed_list_prefix("p12"), "");
+    assert_eq!(indexed_list_prefix_mode("p12").as_str(), "root_fallback");
 }
 
 #[tokio::test]
