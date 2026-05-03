@@ -230,10 +230,10 @@ pub(crate) fn run_velero_kopia_postgres_direct_smoke(args: VeleroKopiaSmokeArgs)
 mod imp {
     #[path = "velero_artifacts.rs"]
     mod artifacts;
+    #[path = "integration_storage_proxy.rs"]
+    mod integration_storage_proxy;
     #[path = "rustfs_backend.rs"]
     mod rustfs_backend;
-    #[path = "storage_measure_proxy.rs"]
-    mod storage_measure_proxy;
 
     use super::VeleroKopiaSmokeArgs;
     use crate::integration::k8s_support::{
@@ -294,12 +294,12 @@ mod imp {
             matches!(self, Self::Gateway)
         }
 
-        pub(super) fn uses_storage_measure_proxy(self) -> bool {
+        pub(super) fn uses_integration_storage_proxy(self) -> bool {
             matches!(self, Self::DirectRustfs)
         }
 
         fn uses_rs3_image(self) -> bool {
-            self.uses_gateway() || self.uses_storage_measure_proxy()
+            self.uses_gateway() || self.uses_integration_storage_proxy()
         }
     }
 
@@ -422,7 +422,7 @@ mod imp {
 
         if scenario.storage_path.uses_rs3_image() && !args.skip_image_build {
             let mut build_args = vec!["build"];
-            if scenario.storage_path.uses_storage_measure_proxy() {
+            if scenario.storage_path.uses_integration_storage_proxy() {
                 build_args.extend(["--target", "integration-tools"]);
             }
             build_args.extend(["-t", args.image.as_str(), "."]);
@@ -496,8 +496,8 @@ mod imp {
         let result = (|| -> Result<()> {
             rustfs_backend::install(&args, cluster.kubeconfig_path(), &workspace)?;
             rustfs_backend::create_bucket(&args, cluster.kubeconfig_path())?;
-            if scenario.storage_path.uses_storage_measure_proxy() {
-                storage_measure_proxy::install(
+            if scenario.storage_path.uses_integration_storage_proxy() {
+                integration_storage_proxy::install(
                     &args,
                     cluster.kubeconfig_path(),
                     &workspace,
@@ -942,7 +942,7 @@ mod imp {
             }
             StoragePath::DirectRustfs => VeleroS3Target {
                 bucket: BACKEND_BUCKET,
-                endpoint_url: storage_measure_proxy::service_endpoint(&args.gateway_namespace),
+                endpoint_url: integration_storage_proxy::service_endpoint(&args.gateway_namespace),
                 access_key_id: RUSTFS_ACCESS_KEY_ID,
                 secret_access_key: RUSTFS_SECRET_ACCESS_KEY,
             },

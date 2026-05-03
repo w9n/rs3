@@ -1,6 +1,6 @@
 //! Artifact and backend-pressure capture for Velero integration lanes.
 
-use super::{RunState, kubectl_capture, storage_measure_proxy};
+use super::{RunState, integration_storage_proxy, kubectl_capture};
 use crate::integration::k8s_support::{helm_fullname, now_millis};
 use crate::integration::velero::VeleroKopiaSmokeArgs;
 use anyhow::{Context, Result};
@@ -289,7 +289,7 @@ impl ArtifactCollector {
                 "get",
                 "pods",
                 "-l",
-                &format!("app.kubernetes.io/name={}", storage_measure_proxy::NAME),
+                &format!("app.kubernetes.io/name={}", integration_storage_proxy::NAME),
                 "-o",
                 "yaml",
             ],
@@ -301,7 +301,7 @@ impl ArtifactCollector {
                 "-n",
                 &args.gateway_namespace,
                 "logs",
-                &format!("deployment/{}", storage_measure_proxy::NAME),
+                &format!("deployment/{}", integration_storage_proxy::NAME),
                 "--all-containers=true",
                 "--tail=-1",
             ],
@@ -310,7 +310,7 @@ impl ArtifactCollector {
             self.write_result("integration-storage-proxy-log.jsonl", measure_logs)?;
         self.write_json(
             "storage-backend-metrics.json",
-            storage_measure_proxy_metrics_json(&measure_logs),
+            integration_storage_proxy_metrics_json(&measure_logs),
         )
     }
 
@@ -424,7 +424,7 @@ fn gateway_backend_metrics_json(logs: &str) -> Value {
     })
 }
 
-fn storage_measure_proxy_metrics_json(logs: &str) -> Value {
+fn integration_storage_proxy_metrics_json(logs: &str) -> Value {
     let mut latest = None;
     for value in logs.lines().filter_map(parse_log_json) {
         if value.get("target").and_then(Value::as_str) == Some("rs3_storage_measure") {
@@ -699,7 +699,7 @@ fn parse_log_json(line: &str) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{gateway_backend_metrics_json, storage_measure_proxy_metrics_json};
+    use super::{gateway_backend_metrics_json, integration_storage_proxy_metrics_json};
 
     #[test]
     fn metrics_parse_kubectl_prefixed_json_logs() {
@@ -730,8 +730,8 @@ mod tests {
     }
 
     #[test]
-    fn metrics_parse_storage_measure_proxy_latest_log() {
-        let metrics = storage_measure_proxy_metrics_json(
+    fn metrics_parse_integration_storage_proxy_latest_log() {
+        let metrics = integration_storage_proxy_metrics_json(
             r#"{"target":"rs3_storage_measure","fields":{"requests":1,"responses":1,"request_body_bytes":10,"response_body_bytes":20,"bytes_to_backend":100,"bytes_from_backend":200,"accepted_connections":1,"active_connections":1,"failed_connections":0,"methods":{"PUT":1},"statuses":{"200":1}}}
 {"target":"rs3_storage_measure","fields":{"requests":2,"responses":2,"request_body_bytes":30,"response_body_bytes":40,"bytes_to_backend":300,"bytes_from_backend":400,"accepted_connections":1,"active_connections":0,"failed_connections":0,"methods":{"PUT":1,"GET":1},"statuses":{"200":2}}}
 "#,

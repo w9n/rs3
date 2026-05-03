@@ -1,4 +1,4 @@
-//! Kubernetes deployment for the direct-storage measurement proxy.
+//! Kubernetes deployment for the direct-storage integration proxy.
 
 use super::{kubectl, timeout_arg};
 use crate::integration::k8s_support::{K8sWorkspace, path_str};
@@ -29,7 +29,7 @@ pub(super) fn install(
         kubeconfig_path,
         &["apply", "-f", path_str(&manifest_path)?],
     )
-    .context("failed to apply storage measurement proxy manifest")?;
+    .context("failed to apply integration storage proxy manifest")?;
 
     let timeout = timeout_arg(args.wait_secs);
     kubectl(
@@ -45,7 +45,7 @@ pub(super) fn install(
             timeout.as_str(),
         ],
     )
-    .context("storage measurement proxy did not become ready")
+    .context("integration storage proxy did not become ready")
 }
 
 fn manifest(args: &VeleroKopiaSmokeArgs, target: &str) -> String {
