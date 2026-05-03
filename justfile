@@ -39,6 +39,12 @@ test:
 perf *ARGS:
     cargo run -p xtask -- perf {{ARGS}}
 
+perf-commit *ARGS:
+    cargo run -p xtask -- perf --scenario write-committed {{ARGS}}
+
+perf-commit-parallel *ARGS:
+    cargo run -p xtask -- perf --scenario write-committed-parallel {{ARGS}}
+
 perf-s3 *ARGS:
     cargo run -p xtask --features s3 -- perf --backend s3 {{ARGS}}
 

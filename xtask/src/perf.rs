@@ -5,7 +5,9 @@ use bytes::Bytes;
 use clap::{Args, ValueEnum};
 use rs3_anchor::MemoryCheckpointAnchor;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_repository::{Repository, RepositoryPutOptions};
+use rs3_repository::{
+    CommitCoordinator, CommitCoordinatorOptions, Repository, RepositoryPutOptions,
+};
 use rs3_storage::{
     BlobOperationCounts, BlobStore, ByteRange, CountingBlobStore, FilesystemBlobStore,
     MemoryBlobStore,
@@ -14,6 +16,7 @@ use rs3_storage::{
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
@@ -29,6 +32,18 @@ pub(crate) struct PerfArgs {
     /// Plaintext object size in bytes.
     #[arg(long, default_value_t = 1024 * 1024)]
     object_size: usize,
+    /// Maximum number of committed writes covered by one checkpoint.
+    #[arg(long, default_value_t = 64)]
+    commit_batch_items: usize,
+    /// Maximum commit batching delay in milliseconds.
+    #[arg(long, default_value_t = 10)]
+    commit_batch_delay_ms: u64,
+    /// Maximum committed writes allowed to wait for checkpoint publication.
+    #[arg(long)]
+    commit_max_pending_items: Option<usize>,
+    /// Parallel client writes used by parallel scenarios.
+    #[arg(long, default_value_t = 8)]
+    concurrency: usize,
     /// Number of read operations in read scenarios.
     #[arg(long, default_value_t = 128)]
     reads: usize,
@@ -90,6 +105,10 @@ pub(crate) enum PerfScenario {
     All,
     /// Stage many objects and publish one checkpoint.
     WriteBatch,
+    /// Write objects through the commit coordinator sequentially.
+    WriteCommitted,
+    /// Write objects through the commit coordinator concurrently.
+    WriteCommittedParallel,
     /// Repeatedly read a full object.
     FullRead,
     /// Repeatedly read plaintext ranges from one object.
@@ -145,6 +164,8 @@ pub(crate) async fn run(args: PerfArgs) -> Result<()> {
     let scenarios = match args.scenario {
         PerfScenario::All => vec![
             PerfScenario::WriteBatch,
+            PerfScenario::WriteCommitted,
+            PerfScenario::WriteCommittedParallel,
             PerfScenario::FullRead,
             PerfScenario::RangeRead,
         ],
@@ -158,6 +179,8 @@ pub(crate) async fn run(args: PerfArgs) -> Result<()> {
         let report = match scenario {
             PerfScenario::All => unreachable!("expanded above"),
             PerfScenario::WriteBatch => write_batch(&args).await?,
+            PerfScenario::WriteCommitted => write_committed(&args).await?,
+            PerfScenario::WriteCommittedParallel => write_committed_parallel(&args).await?,
             PerfScenario::FullRead => full_read(&args).await?,
             PerfScenario::RangeRead => range_read(&args).await?,
         };
@@ -216,6 +239,145 @@ where
         operations: args.objects,
         requested_plaintext_write_bytes: checked_mul(args.objects, args.object_size)?,
         requested_plaintext_read_bytes: 0,
+        commit_batch_items: commit_batch_items(args),
+        commit_batch_delay_ms: args.commit_batch_delay_ms,
+        commit_max_pending_items: commit_max_pending_items(args),
+        concurrency: concurrency(args),
+        elapsed,
+        counts,
+    })
+}
+
+async fn write_committed(args: &PerfArgs) -> Result<PerfReport> {
+    match args.backend {
+        PerfBackend::Memory => write_committed_with_store(args, memory_store()).await,
+        PerfBackend::Filesystem => {
+            let (_dir, store) = filesystem_store(args)?;
+            write_committed_with_store(args, store).await
+        }
+        #[cfg(feature = "s3")]
+        PerfBackend::S3 => write_committed_with_store(args, s3_store(args).await?).await,
+    }
+}
+
+async fn write_committed_with_store<S>(
+    args: &PerfArgs,
+    store: CountingBlobStore<S>,
+) -> Result<PerfReport>
+where
+    S: BlobStore + Clone + 'static,
+{
+    let repo = Arc::new(Repository::with_keyring(store.clone(), keyring()?));
+    let anchor = MemoryCheckpointAnchor::new();
+    let coordinator = CommitCoordinator::with_options(repo, anchor, commit_options(args));
+    let body = body(args.object_size);
+    let started = Instant::now();
+
+    for index in 0..args.objects {
+        coordinator
+            .put_committed(
+                path(&format!("perf/write-committed/object-{index:08}"))?,
+                body.clone(),
+                RepositoryPutOptions::default(),
+            )
+            .await
+            .with_context(|| format!("failed to commit object {index}"))?;
+    }
+
+    let elapsed = started.elapsed();
+    let counts = store
+        .operation_counts()
+        .context("failed to read operation counts")?;
+    Ok(PerfReport {
+        scenario: "write-committed",
+        backend: args.backend,
+        objects: args.objects,
+        object_size: args.object_size,
+        operations: args.objects,
+        requested_plaintext_write_bytes: checked_mul(args.objects, args.object_size)?,
+        requested_plaintext_read_bytes: 0,
+        commit_batch_items: commit_batch_items(args),
+        commit_batch_delay_ms: args.commit_batch_delay_ms,
+        commit_max_pending_items: commit_max_pending_items(args),
+        concurrency: concurrency(args),
+        elapsed,
+        counts,
+    })
+}
+
+async fn write_committed_parallel(args: &PerfArgs) -> Result<PerfReport> {
+    match args.backend {
+        PerfBackend::Memory => write_committed_parallel_with_store(args, memory_store()).await,
+        PerfBackend::Filesystem => {
+            let (_dir, store) = filesystem_store(args)?;
+            write_committed_parallel_with_store(args, store).await
+        }
+        #[cfg(feature = "s3")]
+        PerfBackend::S3 => write_committed_parallel_with_store(args, s3_store(args).await?).await,
+    }
+}
+
+async fn write_committed_parallel_with_store<S>(
+    args: &PerfArgs,
+    store: CountingBlobStore<S>,
+) -> Result<PerfReport>
+where
+    S: BlobStore + Clone + Send + Sync + 'static,
+{
+    let repo = Arc::new(Repository::with_keyring(store.clone(), keyring()?));
+    let anchor = MemoryCheckpointAnchor::new();
+    let coordinator = Arc::new(CommitCoordinator::with_options(
+        repo,
+        anchor,
+        commit_options(args),
+    ));
+    let body = body(args.object_size);
+    let parallelism = concurrency(args);
+    let started = Instant::now();
+
+    let mut next = 0;
+    while next < args.objects {
+        let end = next.saturating_add(parallelism).min(args.objects);
+        let mut handles = Vec::with_capacity(end - next);
+        for index in next..end {
+            let coordinator = Arc::clone(&coordinator);
+            let body = body.clone();
+            handles.push(tokio::spawn(async move {
+                coordinator
+                    .put_committed(
+                        path(&format!("perf/write-committed-parallel/object-{index:08}"))?,
+                        body,
+                        RepositoryPutOptions::default(),
+                    )
+                    .await
+                    .with_context(|| format!("failed to commit object {index}"))?;
+                Ok::<(), anyhow::Error>(())
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .context("committed write task did not complete")??;
+        }
+        next = end;
+    }
+
+    let elapsed = started.elapsed();
+    let counts = store
+        .operation_counts()
+        .context("failed to read operation counts")?;
+    Ok(PerfReport {
+        scenario: "write-committed-parallel",
+        backend: args.backend,
+        objects: args.objects,
+        object_size: args.object_size,
+        operations: args.objects,
+        requested_plaintext_write_bytes: checked_mul(args.objects, args.object_size)?,
+        requested_plaintext_read_bytes: 0,
+        commit_batch_items: commit_batch_items(args),
+        commit_batch_delay_ms: args.commit_batch_delay_ms,
+        commit_max_pending_items: commit_max_pending_items(args),
+        concurrency: parallelism,
         elapsed,
         counts,
     })
@@ -266,6 +428,10 @@ where
         operations: args.reads,
         requested_plaintext_write_bytes: 0,
         requested_plaintext_read_bytes: checked_mul(args.reads, args.object_size)?,
+        commit_batch_items: commit_batch_items(args),
+        commit_batch_delay_ms: args.commit_batch_delay_ms,
+        commit_max_pending_items: commit_max_pending_items(args),
+        concurrency: concurrency(args),
         elapsed,
         counts,
     })
@@ -332,6 +498,10 @@ where
         operations: args.reads,
         requested_plaintext_write_bytes: 0,
         requested_plaintext_read_bytes: checked_mul(args.reads, range_len)?,
+        commit_batch_items: commit_batch_items(args),
+        commit_batch_delay_ms: args.commit_batch_delay_ms,
+        commit_max_pending_items: commit_max_pending_items(args),
+        concurrency: concurrency(args),
         elapsed,
         counts,
     })
@@ -345,6 +515,10 @@ struct PerfReport {
     operations: usize,
     requested_plaintext_write_bytes: usize,
     requested_plaintext_read_bytes: usize,
+    commit_batch_items: usize,
+    commit_batch_delay_ms: u64,
+    commit_max_pending_items: usize,
+    concurrency: usize,
     elapsed: Duration,
     counts: BlobOperationCounts,
 }
@@ -380,12 +554,16 @@ impl PerfReport {
             ratio_optional(backend_requests, self.operations as u64);
 
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.scenario,
             self.backend.as_str(),
             self.objects,
             self.object_size,
             self.operations,
+            self.commit_batch_items,
+            self.commit_batch_delay_ms,
+            self.commit_max_pending_items,
+            self.concurrency,
             elapsed_ms,
             throughput_mib_s,
             backend_mib_s,
@@ -420,6 +598,12 @@ impl PerfReport {
             "objects": self.objects,
             "object_size": self.object_size,
             "operations": self.operations,
+            "commit": {
+                "batch_items": self.commit_batch_items,
+                "batch_delay_ms": self.commit_batch_delay_ms,
+                "max_pending_items": self.commit_max_pending_items,
+                "concurrency": self.concurrency,
+            },
             "elapsed_ms": self.elapsed.as_secs_f64() * 1_000.0,
             "plaintext_mib_s": mib_per_second(requested_plaintext_bytes, self.elapsed),
             "backend_mib_s": mib_per_second(backend_bytes as usize, self.elapsed),
@@ -479,7 +663,7 @@ impl PerfReport {
 
 fn print_header() {
     println!(
-        "scenario\tbackend\tobjects\tobject_size\toperations\telapsed_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp"
+        "scenario\tbackend\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tconcurrency\telapsed_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp"
     );
 }
 
@@ -559,6 +743,28 @@ fn body(size: usize) -> Bytes {
 
 fn path(value: &str) -> Result<LogicalPath> {
     LogicalPath::new(value.to_owned()).map_err(Into::into)
+}
+
+fn commit_options(args: &PerfArgs) -> CommitCoordinatorOptions {
+    CommitCoordinatorOptions::new(
+        commit_batch_items(args),
+        Duration::from_millis(args.commit_batch_delay_ms),
+    )
+    .with_max_pending_items(commit_max_pending_items(args))
+}
+
+fn commit_batch_items(args: &PerfArgs) -> usize {
+    args.commit_batch_items.max(1)
+}
+
+fn commit_max_pending_items(args: &PerfArgs) -> usize {
+    args.commit_max_pending_items
+        .unwrap_or_else(|| commit_batch_items(args).max(concurrency(args)))
+        .max(1)
+}
+
+fn concurrency(args: &PerfArgs) -> usize {
+    args.concurrency.max(1)
 }
 
 fn keyring() -> Result<KeyRing> {
