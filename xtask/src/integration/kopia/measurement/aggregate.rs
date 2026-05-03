@@ -172,6 +172,9 @@ fn aggregate_reports(reports: &[&Value]) -> Value {
             ]),
         },
         "gateway_process": {
+            "cpu_system_seconds": aggregate_f64_at(reports, &["gateway_process", "cpu_system_seconds"]),
+            "cpu_total_seconds": aggregate_f64_at(reports, &["gateway_process", "cpu_total_seconds"]),
+            "cpu_user_seconds": aggregate_f64_at(reports, &["gateway_process", "cpu_user_seconds"]),
             "vm_hwm_bytes": aggregate_u64_at(reports, &["gateway_process", "vm_hwm_bytes"]),
             "vm_rss_bytes": aggregate_u64_at(reports, &["gateway_process", "vm_rss_bytes"]),
         },
@@ -290,6 +293,14 @@ fn aggregate_u64_at(reports: &[&Value], path: &[&str]) -> Value {
     summarize_u64(&values)
 }
 
+fn aggregate_f64_at(reports: &[&Value], path: &[&str]) -> Value {
+    let values = reports
+        .iter()
+        .filter_map(|report| value_at(report, path)?.as_f64())
+        .collect::<Vec<_>>();
+    summarize_f64(&values)
+}
+
 fn aggregate_number_object(reports: &[&Value], path: &[&str]) -> Value {
     let mut values_by_key: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for report in reports {
@@ -399,6 +410,9 @@ mod tests {
                     "storage_path": "gateway",
                     "elapsed_ms": 150,
                     "gateway_process": {
+                        "cpu_system_seconds": 0.25,
+                        "cpu_total_seconds": 1.5,
+                        "cpu_user_seconds": 1.25,
                         "vm_hwm_bytes": 4096,
                         "vm_rss_bytes": 2048
                     },
@@ -467,6 +481,18 @@ mod tests {
         assert_eq!(
             aggregate["gateway"]["gateway_process"]["vm_rss_bytes"]["avg"],
             serde_json::json!(2048.0)
+        );
+        assert_eq!(
+            aggregate["gateway"]["gateway_process"]["cpu_user_seconds"]["avg"],
+            serde_json::json!(1.25)
+        );
+        assert_eq!(
+            aggregate["gateway"]["gateway_process"]["cpu_system_seconds"]["avg"],
+            serde_json::json!(0.25)
+        );
+        assert_eq!(
+            aggregate["gateway"]["gateway_process"]["cpu_total_seconds"]["avg"],
+            serde_json::json!(1.5)
         );
     }
 }

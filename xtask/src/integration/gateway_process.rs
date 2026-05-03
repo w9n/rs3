@@ -243,12 +243,26 @@ impl RunningGateway {
 
     pub(crate) fn process_metrics_json(&self) -> Value {
         let pid = self.child.id();
-        let status = i32::try_from(pid)
+        let process = i32::try_from(pid)
             .ok()
-            .and_then(|pid| procfs::process::Process::new(pid).ok())
-            .and_then(|process| process.status().ok());
+            .and_then(|pid| procfs::process::Process::new(pid).ok());
+        let status = process.as_ref().and_then(|process| process.status().ok());
+        let stat = process.as_ref().and_then(|process| process.stat().ok());
+        let ticks_per_second = procfs::ticks_per_second();
+        let cpu_user_seconds = stat
+            .as_ref()
+            .and_then(|stat| ticks_to_seconds(stat.utime, ticks_per_second));
+        let cpu_system_seconds = stat
+            .as_ref()
+            .and_then(|stat| ticks_to_seconds(stat.stime, ticks_per_second));
+        let cpu_total_seconds = cpu_user_seconds
+            .zip(cpu_system_seconds)
+            .map(|(user, system)| user + system);
         json!({
             "pid": pid,
+            "cpu_system_seconds": cpu_system_seconds,
+            "cpu_total_seconds": cpu_total_seconds,
+            "cpu_user_seconds": cpu_user_seconds,
             "vm_hwm_bytes": status.as_ref().and_then(|status| kib_to_bytes(status.vmhwm)),
             "vm_rss_bytes": status.as_ref().and_then(|status| kib_to_bytes(status.vmrss)),
         })
@@ -278,6 +292,13 @@ impl RunningGateway {
 
 fn kib_to_bytes(kib: Option<u64>) -> Option<u64> {
     kib?.checked_mul(1024)
+}
+
+fn ticks_to_seconds(ticks: u64, ticks_per_second: u64) -> Option<f64> {
+    if ticks_per_second == 0 {
+        return None;
+    }
+    Some(ticks as f64 / ticks_per_second as f64)
 }
 
 impl Drop for RunningGateway {
@@ -338,11 +359,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::kib_to_bytes;
+    use super::{kib_to_bytes, ticks_to_seconds};
 
     #[test]
     fn converts_procfs_kib_fields_to_bytes() {
         assert_eq!(kib_to_bytes(Some(1234)), Some(1_263_616));
         assert_eq!(kib_to_bytes(None), None);
+    }
+
+    #[test]
+    fn converts_procfs_cpu_ticks_to_seconds() {
+        assert_eq!(ticks_to_seconds(125, 100), Some(1.25));
+        assert_eq!(ticks_to_seconds(125, 0), None);
     }
 }
