@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 
-pub(super) const NAME: &str = "rs3-storage-measure";
+pub(super) const NAME: &str = "rs3-integration-storage-proxy";
 
 const PORT: u16 = 9000;
 
@@ -21,7 +21,7 @@ pub(super) fn install(
     workspace: &K8sWorkspace,
     target: &str,
 ) -> Result<()> {
-    let manifest_path = workspace.path("storage-measure-proxy.yaml");
+    let manifest_path = workspace.path("integration-storage-proxy.yaml");
     fs::write(&manifest_path, manifest(args, target))
         .with_context(|| format!("failed to write {}", manifest_path.display()))?;
     kubectl(
@@ -72,7 +72,7 @@ spec:
           image: {image}
           imagePullPolicy: IfNotPresent
           command:
-            - /usr/local/bin/rs3-storage-measure-proxy
+            - /usr/local/bin/rs3-integration-storage-proxy
           args:
             - --bind
             - 0.0.0.0:{port}

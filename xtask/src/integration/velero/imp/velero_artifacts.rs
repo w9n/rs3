@@ -282,7 +282,7 @@ impl ArtifactCollector {
         self.capture_kubectl(
             args,
             kubeconfig_path,
-            "storage-measure-proxy-pods.yaml",
+            "integration-storage-proxy-pods.yaml",
             &[
                 "-n",
                 &args.gateway_namespace,
@@ -306,7 +306,8 @@ impl ArtifactCollector {
                 "--tail=-1",
             ],
         );
-        let measure_logs = self.write_result("storage-measure-proxy-log.jsonl", measure_logs)?;
+        let measure_logs =
+            self.write_result("integration-storage-proxy-log.jsonl", measure_logs)?;
         self.write_json(
             "storage-backend-metrics.json",
             storage_measure_proxy_metrics_json(&measure_logs),

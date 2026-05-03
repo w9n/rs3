@@ -10,8 +10,14 @@ description = "Command-line entry point for the rs3 gateway"
 
 [features]
 default = []
+integration-tools = []
 s3 = ["rs3-storage/s3"]
 k8s = ["dep:rs3-k8s", "k8s-openapi/v1_35"]
+
+[[bin]]
+name = "rs3-integration-storage-proxy"
+path = "src/bin/rs3-integration-storage-proxy.rs"
+required-features = ["integration-tools"]
 
 [dependencies]
 anyhow.workspace = true

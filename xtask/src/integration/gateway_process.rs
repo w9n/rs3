@@ -29,6 +29,8 @@ impl RunningGateway {
                 "run",
                 "-p",
                 "rs3-server",
+                "--bin",
+                "rs3-server",
                 "--features",
                 "s3",
                 "--",

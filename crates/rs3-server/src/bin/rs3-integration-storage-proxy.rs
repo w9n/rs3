@@ -15,8 +15,8 @@ use tracing_subscriber::EnvFilter;
 type SharedMetrics = Arc<Mutex<ProxyMetrics>>;
 
 #[derive(Debug, Parser)]
-#[command(name = "rs3-storage-measure-proxy")]
-#[command(about = "TCP measurement proxy for integration baselines")]
+#[command(name = "rs3-integration-storage-proxy")]
+#[command(about = "Integration-only TCP measurement proxy for storage baselines")]
 struct Cli {
     #[arg(long)]
     bind: SocketAddr,
