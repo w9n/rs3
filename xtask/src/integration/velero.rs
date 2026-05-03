@@ -234,6 +234,8 @@ mod imp {
     mod integration_storage_proxy;
     #[path = "rustfs_backend.rs"]
     mod rustfs_backend;
+    #[path = "scenario.rs"]
+    mod scenario;
 
     use super::VeleroKopiaSmokeArgs;
     use crate::integration::k8s_support::{
@@ -246,6 +248,7 @@ mod imp {
     use rustfs_backend::{
         BACKEND_BUCKET, BACKEND_REGION, RUSTFS_ACCESS_KEY_ID, RUSTFS_SECRET_ACCESS_KEY,
     };
+    use scenario::{RunState, Scenario, StoragePath, WorkloadKind, WorkloadVolume};
     use std::fs;
     use std::path::Path;
     use std::thread;
@@ -263,142 +266,28 @@ mod imp {
     const EXPECTED_CONTENT: &str = "rs3 velero kopia smoke\n";
     const GATEWAY_RUST_LOG: &str = "rs3_storage=debug,rs3_repository=info,rs3_server=info,info";
 
-    #[derive(Clone, Copy, Debug)]
-    enum WorkloadVolume {
-        EmptyDir,
-        LocalPv,
-        DynamicPvc,
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    enum WorkloadKind {
-        ProofFile,
-        Postgres,
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    pub(super) enum StoragePath {
-        Gateway,
-        DirectRustfs,
-    }
-
-    impl StoragePath {
-        pub(super) fn as_str(self) -> &'static str {
-            match self {
-                Self::Gateway => "gateway",
-                Self::DirectRustfs => "direct-rustfs",
-            }
-        }
-
-        pub(super) fn uses_gateway(self) -> bool {
-            matches!(self, Self::Gateway)
-        }
-
-        pub(super) fn uses_integration_storage_proxy(self) -> bool {
-            matches!(self, Self::DirectRustfs)
-        }
-
-        fn uses_rs3_image(self) -> bool {
-            self.uses_gateway() || self.uses_integration_storage_proxy()
-        }
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    struct Scenario {
-        label: &'static str,
-        volume: WorkloadVolume,
-        workload: WorkloadKind,
-        storage_path: StoragePath,
-        restart_gateway_before_restore: bool,
-    }
-
-    #[derive(Debug)]
-    pub(super) struct RunState {
-        scenario_label: &'static str,
-        storage_path: StoragePath,
-        anchor_name: String,
-        backend_prefix: String,
-        backup_name: Option<String>,
-        restore_name: Option<String>,
-        started: Instant,
-    }
-
     pub(super) fn run_empty_dir(args: VeleroKopiaSmokeArgs) -> Result<()> {
-        run(
-            args,
-            Scenario {
-                label: "empty-dir",
-                volume: WorkloadVolume::EmptyDir,
-                workload: WorkloadKind::ProofFile,
-                storage_path: StoragePath::Gateway,
-                restart_gateway_before_restore: false,
-            },
-        )
+        run(args, Scenario::empty_dir())
     }
 
     pub(super) fn run_local_pv(args: VeleroKopiaSmokeArgs) -> Result<()> {
-        run(
-            args,
-            Scenario {
-                label: "local-pv",
-                volume: WorkloadVolume::LocalPv,
-                workload: WorkloadKind::ProofFile,
-                storage_path: StoragePath::Gateway,
-                restart_gateway_before_restore: false,
-            },
-        )
+        run(args, Scenario::local_pv())
     }
 
     pub(super) fn run_dynamic_pvc(args: VeleroKopiaSmokeArgs) -> Result<()> {
-        run(
-            args,
-            Scenario {
-                label: "dynamic-pvc",
-                volume: WorkloadVolume::DynamicPvc,
-                workload: WorkloadKind::ProofFile,
-                storage_path: StoragePath::Gateway,
-                restart_gateway_before_restore: false,
-            },
-        )
+        run(args, Scenario::dynamic_pvc())
     }
 
     pub(super) fn run_dynamic_pvc_gateway_restart(args: VeleroKopiaSmokeArgs) -> Result<()> {
-        run(
-            args,
-            Scenario {
-                label: "dynamic-pvc-gateway-restart",
-                volume: WorkloadVolume::DynamicPvc,
-                workload: WorkloadKind::ProofFile,
-                storage_path: StoragePath::Gateway,
-                restart_gateway_before_restore: true,
-            },
-        )
+        run(args, Scenario::dynamic_pvc_gateway_restart())
     }
 
     pub(super) fn run_postgres(args: VeleroKopiaSmokeArgs) -> Result<()> {
-        run(
-            args,
-            Scenario {
-                label: "postgres",
-                volume: WorkloadVolume::DynamicPvc,
-                workload: WorkloadKind::Postgres,
-                storage_path: StoragePath::Gateway,
-                restart_gateway_before_restore: false,
-            },
-        )
+        run(args, Scenario::postgres())
     }
 
     pub(super) fn run_postgres_direct(args: VeleroKopiaSmokeArgs) -> Result<()> {
-        run(
-            args,
-            Scenario {
-                label: "postgres-direct-rustfs",
-                volume: WorkloadVolume::DynamicPvc,
-                workload: WorkloadKind::Postgres,
-                storage_path: StoragePath::DirectRustfs,
-                restart_gateway_before_restore: false,
-            },
-        )
+        run(args, Scenario::postgres_direct_rustfs())
     }
 
     fn run(args: VeleroKopiaSmokeArgs, scenario: Scenario) -> Result<()> {
@@ -484,15 +373,7 @@ mod imp {
         let anchor_name = format!("{}-checkpoint", helm_fullname(&args.release_name));
         let velero_target = velero_s3_target(&args, scenario.storage_path);
         let artifacts = ArtifactCollector::new(&args, scenario.label)?;
-        let mut state = RunState {
-            scenario_label: scenario.label,
-            storage_path: scenario.storage_path,
-            anchor_name: anchor_name.clone(),
-            backend_prefix: backend_prefix.clone(),
-            backup_name: None,
-            restore_name: None,
-            started: Instant::now(),
-        };
+        let mut state = RunState::new(scenario, anchor_name.clone(), backend_prefix.clone());
         let result = (|| -> Result<()> {
             rustfs_backend::install(&args, cluster.kubeconfig_path(), &workspace)?;
             rustfs_backend::create_bucket(&args, cluster.kubeconfig_path())?;
