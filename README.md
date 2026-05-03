@@ -34,6 +34,7 @@ Real S3 backend checks are opt-in so the normal edit/test loop stays small:
 ```sh
 just check-s3
 just integration-s3
+just integration-s3-local
 just deny-s3
 just perf-s3 --s3-bucket test-bucket --s3-endpoint-url http://localhost:9000 --s3-allow-http
 ```
@@ -48,6 +49,11 @@ credential environment variables before running it. Optional knobs:
 The `rs3-server/s3` feature enables the server runtime to use the S3-compatible
 storage adapter. Set `RS3_BACKEND_ENDPOINT=s3` for the default AWS endpoint, or
 use an `http://` / `https://` endpoint URL for an S3-compatible service.
+
+`just integration-s3-local` is the orchestration entrypoint for local S3
+integration checks. It currently expects a provided endpoint and delegates to
+the live storage contract test; container and Kubernetes startup can be added
+behind this command.
 
 The Nix shell includes `sccache` for clean rebuild or CI-like cache experiments,
 but it is not enabled by default. Set `RUSTC_WRAPPER=sccache` for runs where that

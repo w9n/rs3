@@ -1,5 +1,6 @@
 //! Local automation for rs3.
 
+mod integration;
 mod perf;
 
 use anyhow::{Context, Result};
@@ -18,6 +19,7 @@ struct Cli {
 enum Commands {
     Check,
     Fmt,
+    Integration(integration::IntegrationArgs),
     Perf(perf::PerfArgs),
     Test,
 }
@@ -44,6 +46,9 @@ fn main() -> Result<()> {
         Some(Commands::Fmt) => {
             run("cargo", &["fmt", "--all"])?;
         }
+        Some(Commands::Integration(args)) => {
+            integration::run(args)?;
+        }
         Some(Commands::Perf(args)) => {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -55,7 +60,7 @@ fn main() -> Result<()> {
             run("cargo", &["test", "--workspace"])?;
         }
         None => {
-            println!("usage: cargo xtask <check|fmt|test>");
+            println!("usage: cargo xtask <check|fmt|integration|perf|test>");
         }
     }
 

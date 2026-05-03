@@ -24,6 +24,9 @@ check-s3:
 integration-s3:
     cargo test -p rs3-storage --features s3 --test s3_live -- --ignored --nocapture
 
+integration-s3-local *ARGS:
+    cargo run -p xtask -- integration s3-local {{ARGS}}
+
 test:
     cargo test --workspace
 
