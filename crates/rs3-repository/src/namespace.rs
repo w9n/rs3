@@ -5,6 +5,24 @@ use rs3_crypto::{KeyRing, NamespaceBlindKey};
 use rs3_index::{NamespaceEntry, NamespaceIndex};
 use rs3_types::{BlindIndexKey, KeyId, PrefixToken};
 
+/// Privacy-preserving class of a repository LIST lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IndexedListPrefixMode {
+    Root,
+    Delimiter,
+    Fallback,
+}
+
+impl IndexedListPrefixMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Delimiter => "delimiter",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
 /// Returns the first matching namespace entry for ordered blind-key candidates.
 pub(crate) fn first_namespace_entry<'a>(
     namespace: &'a NamespaceIndex,
@@ -48,9 +66,19 @@ pub(crate) fn prefix_tokens_for_key(
 
 /// Returns the indexed prefix used to collect trusted LIST candidates.
 pub(crate) fn indexed_list_prefix(prefix: &str) -> &str {
-    if prefix.is_empty() || prefix.ends_with('/') {
-        prefix
+    match indexed_list_prefix_mode(prefix) {
+        IndexedListPrefixMode::Root | IndexedListPrefixMode::Delimiter => prefix,
+        IndexedListPrefixMode::Fallback => "",
+    }
+}
+
+/// Returns the privacy-preserving LIST lookup mode for tracing.
+pub(crate) fn indexed_list_prefix_mode(prefix: &str) -> IndexedListPrefixMode {
+    if prefix.is_empty() {
+        IndexedListPrefixMode::Root
+    } else if prefix.ends_with('/') {
+        IndexedListPrefixMode::Delimiter
     } else {
-        ""
+        IndexedListPrefixMode::Fallback
     }
 }

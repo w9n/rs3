@@ -598,6 +598,10 @@ fn json_field_u64(fields: &Value, key: &str) -> u64 {
 struct RepositoryMetrics {
     operations: serde_json::Map<String, Value>,
     put_count: u64,
+    list_count: u64,
+    list_candidate_count: u64,
+    list_prefix_miss_count: u64,
+    list_returned_count: u64,
     delete_count: u64,
     publish_checkpoint_count: u64,
     client_bytes_written: u64,
@@ -608,6 +612,10 @@ impl RepositoryMetrics {
     fn to_json(&self) -> Value {
         json!({
             "put_count": self.put_count,
+            "list_count": self.list_count,
+            "list_candidate_count": self.list_candidate_count,
+            "list_prefix_miss_count": self.list_prefix_miss_count,
+            "list_returned_count": self.list_returned_count,
             "delete_count": self.delete_count,
             "publish_checkpoint_count": self.publish_checkpoint_count,
             "client_bytes_written": self.client_bytes_written,
@@ -641,6 +649,18 @@ fn parse_repository_metrics(logs: &[String]) -> RepositoryMetrics {
                     .backend_bytes_written_for_puts
                     .saturating_add(json_field_u64(fields, "backend_len"));
             }
+            "list" => {
+                metrics.list_count = metrics.list_count.saturating_add(1);
+                metrics.list_candidate_count = metrics
+                    .list_candidate_count
+                    .saturating_add(json_field_u64(fields, "candidate_count"));
+                metrics.list_prefix_miss_count = metrics
+                    .list_prefix_miss_count
+                    .saturating_add(json_field_u64(fields, "prefix_miss_count"));
+                metrics.list_returned_count = metrics
+                    .list_returned_count
+                    .saturating_add(json_field_u64(fields, "returned_count"));
+            }
             "delete" => metrics.delete_count = metrics.delete_count.saturating_add(1),
             "publish_checkpoint" => {
                 metrics.publish_checkpoint_count =
@@ -668,6 +688,14 @@ fn derived_metrics(counts: &BlobOperationCounts, repository: &RepositoryMetrics)
         "repository_mutations": repository_mutations,
         "backend_requests_per_repository_mutation": ratio(backend_requests, repository_mutations),
         "backend_puts_per_repository_put": ratio(counts.put, repository.put_count),
+        "repository_list_candidates_per_list": ratio(
+            repository.list_candidate_count,
+            repository.list_count,
+        ),
+        "repository_list_returned_per_list": ratio(
+            repository.list_returned_count,
+            repository.list_count,
+        ),
         "checkpoint_publishes_per_repository_mutation": ratio(
             repository.publish_checkpoint_count,
             repository_mutations,
@@ -711,12 +739,25 @@ mod tests {
         let metrics = gateway_backend_metrics_json(
             r#"[pod/rs3/gateway] {"target":"rs3_storage","fields":{"provider":"s3","operation":"put","object_kind":"segments","result":"ok","bytes_sent":42,"elapsed_us":7}}
 {"target":"rs3_repository","fields":{"operation":"put","result":"ok","plaintext_len":21,"backend_len":42,"elapsed_us":5}}
+{"target":"rs3_repository","fields":{"operation":"list","result":"ok","prefix_mode":"fallback","lookup_token_count":1,"candidate_count":7,"prefix_miss_count":5,"returned_count":2,"elapsed_us":3}}
 "#,
         );
 
         assert_eq!(metrics["counts"]["put"], 1);
         assert_eq!(metrics["counts"]["bytes_written"], 42);
         assert_eq!(metrics["repository"]["put_count"], 1);
+        assert_eq!(metrics["repository"]["list_count"], 1);
+        assert_eq!(metrics["repository"]["list_candidate_count"], 7);
+        assert_eq!(metrics["repository"]["list_prefix_miss_count"], 5);
+        assert_eq!(metrics["repository"]["list_returned_count"], 2);
+        assert_eq!(
+            metrics["repository"]["operations"]["list"]["successes"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            metrics["derived"]["repository_list_candidates_per_list"],
+            serde_json::json!(7.0)
+        );
         assert_eq!(
             metrics["derived"]["backend_puts_per_repository_put"],
             serde_json::json!(1.0)

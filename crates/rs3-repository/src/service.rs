@@ -7,7 +7,8 @@ use crate::model::{
     RepositoryObjectMetadata, RepositoryPutOptions,
 };
 use crate::namespace::{
-    existing_blind_keys, first_namespace_entry, indexed_list_prefix, prefix_tokens_for_key,
+    existing_blind_keys, first_namespace_entry, indexed_list_prefix, indexed_list_prefix_mode,
+    prefix_tokens_for_key,
 };
 use crate::payload::{
     DEFAULT_PAYLOAD_SEGMENT_SIZE, PAYLOAD_HEADER_PROBE_LEN, PayloadHeaderProbe,
@@ -458,17 +459,72 @@ where
 
     /// Lists client-visible entries for a prefix.
     pub fn list(&self, prefix: &str) -> Result<Vec<RepositoryListEntry>> {
-        let keyring = self.keyring()?;
-        let prefix_tokens = keyring.derive_prefix_tokens_for_lookup(indexed_list_prefix(prefix))?;
-        let state = self.read_state()?;
+        let started = Instant::now();
+        let prefix_mode = indexed_list_prefix_mode(prefix).as_str();
+        let keyring = match self.keyring() {
+            Ok(keyring) => keyring,
+            Err(error) => {
+                record_repository_list(RepositoryListTrace {
+                    prefix_mode,
+                    lookup_token_count: 0,
+                    candidate_count: 0,
+                    manifest_miss_count: 0,
+                    prefix_miss_count: 0,
+                    returned_count: 0,
+                    result: "keyring_error",
+                    elapsed: started.elapsed(),
+                });
+                return Err(error);
+            }
+        };
+        let prefix_tokens =
+            match keyring.derive_prefix_tokens_for_lookup(indexed_list_prefix(prefix)) {
+                Ok(prefix_tokens) => prefix_tokens,
+                Err(error) => {
+                    record_repository_list(RepositoryListTrace {
+                        prefix_mode,
+                        lookup_token_count: 0,
+                        candidate_count: 0,
+                        manifest_miss_count: 0,
+                        prefix_miss_count: 0,
+                        returned_count: 0,
+                        result: "lookup_error",
+                        elapsed: started.elapsed(),
+                    });
+                    return Err(error.into());
+                }
+            };
+        let lookup_token_count = prefix_tokens.len();
+        let state = match self.read_state() {
+            Ok(state) => state,
+            Err(error) => {
+                record_repository_list(RepositoryListTrace {
+                    prefix_mode,
+                    lookup_token_count,
+                    candidate_count: 0,
+                    manifest_miss_count: 0,
+                    prefix_miss_count: 0,
+                    returned_count: 0,
+                    result: "state_error",
+                    elapsed: started.elapsed(),
+                });
+                return Err(error);
+            }
+        };
         let mut entries_by_key = BTreeMap::new();
+        let mut candidate_count = 0_usize;
+        let mut manifest_miss_count = 0_usize;
+        let mut prefix_miss_count = 0_usize;
 
         for prefix_token in prefix_tokens {
             for entry in state.namespace.list_prefix(&prefix_token.prefix_token) {
+                candidate_count = candidate_count.saturating_add(1);
                 let Some(manifest) = state.manifests.get(&entry.manifest_id) else {
+                    manifest_miss_count = manifest_miss_count.saturating_add(1);
                     continue;
                 };
                 if !manifest.key.as_str().starts_with(prefix) {
+                    prefix_miss_count = prefix_miss_count.saturating_add(1);
                     continue;
                 }
 
@@ -490,6 +546,18 @@ where
                 }
             }
         }
+
+        let returned_count = entries_by_key.len();
+        record_repository_list(RepositoryListTrace {
+            prefix_mode,
+            lookup_token_count,
+            candidate_count,
+            manifest_miss_count,
+            prefix_miss_count,
+            returned_count,
+            result: "ok",
+            elapsed: started.elapsed(),
+        });
 
         Ok(entries_by_key.into_values().collect())
     }
@@ -698,6 +766,17 @@ struct RepositoryPutTrace {
     elapsed: Duration,
 }
 
+struct RepositoryListTrace {
+    prefix_mode: &'static str,
+    lookup_token_count: usize,
+    candidate_count: usize,
+    manifest_miss_count: usize,
+    prefix_miss_count: usize,
+    returned_count: usize,
+    result: &'static str,
+    elapsed: Duration,
+}
+
 fn record_repository_put(record: RepositoryPutTrace) {
     tracing::info!(
         target: "rs3_repository",
@@ -708,6 +787,22 @@ fn record_repository_put(record: RepositoryPutTrace) {
         stale_entries = record.stale_entries,
         create_only = record.create_only,
         requested_retention = record.requested_retention,
+        result = record.result,
+        elapsed_us = elapsed_us(record.elapsed),
+        "repository operation completed",
+    );
+}
+
+fn record_repository_list(record: RepositoryListTrace) {
+    tracing::info!(
+        target: "rs3_repository",
+        operation = "list",
+        prefix_mode = record.prefix_mode,
+        lookup_token_count = record.lookup_token_count,
+        candidate_count = record.candidate_count,
+        manifest_miss_count = record.manifest_miss_count,
+        prefix_miss_count = record.prefix_miss_count,
+        returned_count = record.returned_count,
         result = record.result,
         elapsed_us = elapsed_us(record.elapsed),
         "repository operation completed",

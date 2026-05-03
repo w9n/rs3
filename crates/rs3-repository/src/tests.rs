@@ -1,7 +1,7 @@
 //! Repository behavior tests.
 
 use crate::checkpoint::{CHECKPOINT_OBJECT_PREFIX, checkpoint_object_id};
-use crate::namespace::prefix_tokens_for_key;
+use crate::namespace::{indexed_list_prefix, indexed_list_prefix_mode, prefix_tokens_for_key};
 use crate::{
     BackendObjectReferenceKind, CheckpointPosition, CommitCoordinator, CommitCoordinatorOptions,
     PhysicalDeleteOutcome, Repository, RepositoryError, RepositoryPutOptions, Result,
@@ -476,6 +476,16 @@ fn prefix_tokens_include_root_and_delimiter_prefixes() {
         .unwrap_or_else(|error| panic!("{error}"));
 
     assert_eq!(tokens.len(), 3);
+}
+
+#[test]
+fn indexed_list_prefix_classifies_fallback_without_prefix_value() {
+    assert_eq!(indexed_list_prefix(""), "");
+    assert_eq!(indexed_list_prefix_mode("").as_str(), "root");
+    assert_eq!(indexed_list_prefix("p/12/"), "p/12/");
+    assert_eq!(indexed_list_prefix_mode("p/12/").as_str(), "delimiter");
+    assert_eq!(indexed_list_prefix("p/12"), "");
+    assert_eq!(indexed_list_prefix_mode("p/12").as_str(), "fallback");
 }
 
 #[tokio::test]
