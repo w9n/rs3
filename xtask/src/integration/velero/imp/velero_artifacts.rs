@@ -1,6 +1,6 @@
 //! Artifact and backend-pressure capture for Velero integration lanes.
 
-use super::{RunState, kubectl_capture};
+use super::{RunState, kubectl_capture, storage_measure_proxy};
 use crate::integration::k8s_support::{helm_fullname, now_millis};
 use crate::integration::velero::VeleroKopiaSmokeArgs;
 use anyhow::{Context, Result};
@@ -278,6 +278,38 @@ impl ArtifactCollector {
                 "--all-containers=true",
                 "--tail=-1",
             ],
+        )?;
+        self.capture_kubectl(
+            args,
+            kubeconfig_path,
+            "storage-measure-proxy-pods.yaml",
+            &[
+                "-n",
+                &args.gateway_namespace,
+                "get",
+                "pods",
+                "-l",
+                &format!("app.kubernetes.io/name={}", storage_measure_proxy::NAME),
+                "-o",
+                "yaml",
+            ],
+        )?;
+        let measure_logs = capture_kubectl_output(
+            args,
+            kubeconfig_path,
+            &[
+                "-n",
+                &args.gateway_namespace,
+                "logs",
+                &format!("deployment/{}", storage_measure_proxy::NAME),
+                "--all-containers=true",
+                "--tail=-1",
+            ],
+        );
+        let measure_logs = self.write_result("storage-measure-proxy-log.jsonl", measure_logs)?;
+        self.write_json(
+            "storage-backend-metrics.json",
+            storage_measure_proxy_metrics_json(&measure_logs),
         )
     }
 
@@ -388,6 +420,33 @@ fn gateway_backend_metrics_json(logs: &str) -> Value {
         "operations": operations,
         "object_kinds": object_kinds,
         "repository": repository.to_json(),
+    })
+}
+
+fn storage_measure_proxy_metrics_json(logs: &str) -> Value {
+    let mut latest = None;
+    for value in logs.lines().filter_map(parse_log_json) {
+        if value.get("target").and_then(Value::as_str) == Some("rs3_storage_measure") {
+            latest = value.get("fields").cloned();
+        }
+    }
+    let fields = latest.unwrap_or_else(|| json!({}));
+    json!({
+        "counts": {
+            "requests": json_field_u64(&fields, "requests"),
+            "responses": json_field_u64(&fields, "responses"),
+            "bytes_written": json_field_u64(&fields, "request_body_bytes"),
+            "bytes_read": json_field_u64(&fields, "response_body_bytes"),
+        },
+        "transport": {
+            "bytes_to_backend": json_field_u64(&fields, "bytes_to_backend"),
+            "bytes_from_backend": json_field_u64(&fields, "bytes_from_backend"),
+            "accepted_connections": json_field_u64(&fields, "accepted_connections"),
+            "active_connections": json_field_u64(&fields, "active_connections"),
+            "failed_connections": json_field_u64(&fields, "failed_connections"),
+        },
+        "methods": fields.get("methods").cloned().unwrap_or_else(|| json!({})),
+        "statuses": fields.get("statuses").cloned().unwrap_or_else(|| json!({})),
     })
 }
 
@@ -639,7 +698,7 @@ fn parse_log_json(line: &str) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::gateway_backend_metrics_json;
+    use super::{gateway_backend_metrics_json, storage_measure_proxy_metrics_json};
 
     #[test]
     fn metrics_parse_kubectl_prefixed_json_logs() {
@@ -667,5 +726,21 @@ mod tests {
 
         assert_eq!(metrics["counts"]["put"], 0);
         assert_eq!(metrics["counts"]["bytes_written"], 0);
+    }
+
+    #[test]
+    fn metrics_parse_storage_measure_proxy_latest_log() {
+        let metrics = storage_measure_proxy_metrics_json(
+            r#"{"target":"rs3_storage_measure","fields":{"requests":1,"responses":1,"request_body_bytes":10,"response_body_bytes":20,"bytes_to_backend":100,"bytes_from_backend":200,"accepted_connections":1,"active_connections":1,"failed_connections":0,"methods":{"PUT":1},"statuses":{"200":1}}}
+{"target":"rs3_storage_measure","fields":{"requests":2,"responses":2,"request_body_bytes":30,"response_body_bytes":40,"bytes_to_backend":300,"bytes_from_backend":400,"accepted_connections":1,"active_connections":0,"failed_connections":0,"methods":{"PUT":1,"GET":1},"statuses":{"200":2}}}
+"#,
+        );
+
+        assert_eq!(metrics["counts"]["requests"], 2);
+        assert_eq!(metrics["counts"]["bytes_written"], 30);
+        assert_eq!(metrics["counts"]["bytes_read"], 40);
+        assert_eq!(metrics["transport"]["bytes_to_backend"], 300);
+        assert_eq!(metrics["methods"]["GET"], 1);
+        assert_eq!(metrics["statuses"]["200"], 2);
     }
 }

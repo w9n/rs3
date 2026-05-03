@@ -29,6 +29,7 @@ rs3-repository = { path = "../rs3-repository" }
 rs3-storage = { path = "../rs3-storage" }
 rs3-types = { path = "../rs3-types" }
 secrecy.workspace = true
+serde_json.workspace = true
 s3s.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

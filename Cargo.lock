@@ -3121,6 +3121,7 @@ dependencies = [
  "rs3-types",
  "s3s",
  "secrecy",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

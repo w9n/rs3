@@ -21,8 +21,12 @@ pub(super) const RUSTFS_SECRET_ACCESS_KEY: &str = "rustfsadmin";
 const RUSTFS_NAME: &str = "rs3-rustfs";
 const RUSTFS_PORT: u16 = 9000;
 
+pub(super) fn service_host_port(namespace: &str) -> String {
+    format!("{RUSTFS_NAME}.{namespace}.svc:{RUSTFS_PORT}")
+}
+
 pub(super) fn service_endpoint(namespace: &str) -> String {
-    format!("http://{RUSTFS_NAME}.{namespace}.svc:{RUSTFS_PORT}")
+    format!("http://{}", service_host_port(namespace))
 }
 
 pub(super) fn install(

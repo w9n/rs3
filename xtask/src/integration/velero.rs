@@ -232,6 +232,8 @@ mod imp {
     mod artifacts;
     #[path = "rustfs_backend.rs"]
     mod rustfs_backend;
+    #[path = "storage_measure_proxy.rs"]
+    mod storage_measure_proxy;
 
     use super::VeleroKopiaSmokeArgs;
     use crate::integration::k8s_support::{
@@ -290,6 +292,14 @@ mod imp {
 
         pub(super) fn uses_gateway(self) -> bool {
             matches!(self, Self::Gateway)
+        }
+
+        pub(super) fn uses_storage_measure_proxy(self) -> bool {
+            matches!(self, Self::DirectRustfs)
+        }
+
+        fn uses_rs3_image(self) -> bool {
+            self.uses_gateway() || self.uses_storage_measure_proxy()
         }
     }
 
@@ -410,9 +420,13 @@ mod imp {
             prepare_postgres_image(&args)?;
         }
 
-        if scenario.storage_path.uses_gateway() && !args.skip_image_build {
-            run_command(&args.docker_bin, &["build", "-t", args.image.as_str(), "."])
-                .context("failed to build gateway image")?;
+        if scenario.storage_path.uses_rs3_image() && !args.skip_image_build {
+            let mut build_args = vec!["build"];
+            if scenario.storage_path.uses_storage_measure_proxy() {
+                build_args.extend(["--target", "integration-tools"]);
+            }
+            build_args.extend(["-t", args.image.as_str(), "."]);
+            run_command(&args.docker_bin, &build_args).context("failed to build gateway image")?;
         }
 
         let workspace = K8sWorkspace::new("rs3-velero-kopia-smoke")?;
@@ -443,7 +457,7 @@ mod imp {
             reset_reused_cluster(&args, cluster.kubeconfig_path())?;
         }
 
-        if scenario.storage_path.uses_gateway() && !args.skip_image_load {
+        if scenario.storage_path.uses_rs3_image() && !args.skip_image_load {
             cluster.load_image(&args.image)?;
         }
         if !args.skip_velero_image_load {
@@ -466,8 +480,9 @@ mod imp {
 
         let backend_prefix = format!("repository-{}", now_millis());
         let backend_endpoint = rustfs_backend::service_endpoint(&args.gateway_namespace);
+        let backend_target = rustfs_backend::service_host_port(&args.gateway_namespace);
         let anchor_name = format!("{}-checkpoint", helm_fullname(&args.release_name));
-        let velero_target = velero_s3_target(&args, scenario.storage_path, &backend_endpoint);
+        let velero_target = velero_s3_target(&args, scenario.storage_path);
         let artifacts = ArtifactCollector::new(&args, scenario.label)?;
         let mut state = RunState {
             scenario_label: scenario.label,
@@ -481,6 +496,14 @@ mod imp {
         let result = (|| -> Result<()> {
             rustfs_backend::install(&args, cluster.kubeconfig_path(), &workspace)?;
             rustfs_backend::create_bucket(&args, cluster.kubeconfig_path())?;
+            if scenario.storage_path.uses_storage_measure_proxy() {
+                storage_measure_proxy::install(
+                    &args,
+                    cluster.kubeconfig_path(),
+                    &workspace,
+                    &backend_target,
+                )?;
+            }
             if scenario.storage_path.uses_gateway() {
                 let (image_repository, image_tag) = split_image_ref(&args.image);
                 helm_install_gateway(
@@ -902,11 +925,7 @@ mod imp {
         secret_access_key: &'static str,
     }
 
-    fn velero_s3_target(
-        args: &VeleroKopiaSmokeArgs,
-        storage_path: StoragePath,
-        backend_endpoint: &str,
-    ) -> VeleroS3Target {
+    fn velero_s3_target(args: &VeleroKopiaSmokeArgs, storage_path: StoragePath) -> VeleroS3Target {
         match storage_path {
             StoragePath::Gateway => {
                 let service_name = helm_fullname(&args.release_name);
@@ -923,7 +942,7 @@ mod imp {
             }
             StoragePath::DirectRustfs => VeleroS3Target {
                 bucket: BACKEND_BUCKET,
-                endpoint_url: backend_endpoint.to_owned(),
+                endpoint_url: storage_measure_proxy::service_endpoint(&args.gateway_namespace),
                 access_key_id: RUSTFS_ACCESS_KEY_ID,
                 secret_access_key: RUSTFS_SECRET_ACCESS_KEY,
             },
