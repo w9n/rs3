@@ -57,6 +57,12 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
     let mut response_body_bytes_by_operation = BTreeMap::new();
     let mut duration_counts = BTreeMap::new();
     let mut duration_sums = BTreeMap::new();
+    let mut storage_provider_counts_by_operation = BTreeMap::new();
+    let mut storage_provider_counts_by_result = BTreeMap::new();
+    let mut storage_provider_bytes_sent_by_operation = BTreeMap::new();
+    let mut storage_provider_bytes_received_by_operation = BTreeMap::new();
+    let mut storage_provider_duration_counts = BTreeMap::new();
+    let mut storage_provider_duration_sums = BTreeMap::new();
 
     for (identity, sample) in after {
         let delta = metric_delta(
@@ -92,6 +98,46 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
             "rs3_s3_request_duration_seconds_sum" => {
                 bump_f64_label(&mut duration_sums, sample.label("operation"), delta);
             }
+            "rs3_storage_provider_operations_total" => {
+                bump_f64_label(
+                    &mut storage_provider_counts_by_operation,
+                    sample.label("operation"),
+                    delta,
+                );
+                bump_f64_label(
+                    &mut storage_provider_counts_by_result,
+                    sample.label("result"),
+                    delta,
+                );
+            }
+            "rs3_storage_provider_bytes_sent_total" => {
+                bump_f64_label(
+                    &mut storage_provider_bytes_sent_by_operation,
+                    sample.label("operation"),
+                    delta,
+                );
+            }
+            "rs3_storage_provider_bytes_received_total" => {
+                bump_f64_label(
+                    &mut storage_provider_bytes_received_by_operation,
+                    sample.label("operation"),
+                    delta,
+                );
+            }
+            "rs3_storage_provider_operation_duration_seconds_count" => {
+                bump_f64_label(
+                    &mut storage_provider_duration_counts,
+                    sample.label("operation"),
+                    delta,
+                );
+            }
+            "rs3_storage_provider_operation_duration_seconds_sum" => {
+                bump_f64_label(
+                    &mut storage_provider_duration_sums,
+                    sample.label("operation"),
+                    delta,
+                );
+            }
             _ => {}
         }
     }
@@ -104,6 +150,16 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
         "request_body_bytes_by_operation": request_body_bytes_by_operation,
         "response_body_bytes_by_operation": response_body_bytes_by_operation,
         "request_duration_seconds": duration_summary_json(duration_counts, duration_sums),
+        "storage_provider": {
+            "counts_by_operation": storage_provider_counts_by_operation,
+            "counts_by_result": storage_provider_counts_by_result,
+            "bytes_sent_by_operation": storage_provider_bytes_sent_by_operation,
+            "bytes_received_by_operation": storage_provider_bytes_received_by_operation,
+            "operation_duration_seconds": duration_summary_json(
+                storage_provider_duration_counts,
+                storage_provider_duration_sums,
+            ),
+        },
     })
 }
 
@@ -229,6 +285,12 @@ rs3_s3_request_body_bytes_total{operation="PutObject"} 1024
 rs3_s3_response_body_bytes_total{operation="GetObject"} 512
 rs3_s3_request_duration_seconds_count{operation="PutObject",result="ok",status_code="200"} 5
 rs3_s3_request_duration_seconds_sum{operation="PutObject",result="ok",status_code="200"} 1.25
+rs3_storage_provider_operations_total{provider="s3",operation="put",object_kind="segments",result="ok"} 4
+rs3_storage_provider_operations_total{provider="s3",operation="get",object_kind="segments",result="ok"} 2
+rs3_storage_provider_bytes_sent_total{provider="s3",operation="put",object_kind="segments"} 4096
+rs3_storage_provider_bytes_received_total{provider="s3",operation="get",object_kind="segments"} 2048
+rs3_storage_provider_operation_duration_seconds_count{provider="s3",operation="put",object_kind="segments",result="ok"} 4
+rs3_storage_provider_operation_duration_seconds_sum{provider="s3",operation="put",object_kind="segments",result="ok"} 0.8
 "#;
 
         let metrics = prometheus_metrics_delta_json(before, after);
@@ -259,6 +321,27 @@ rs3_s3_request_duration_seconds_sum{operation="PutObject",result="ok",status_cod
         assert_eq!(
             metrics["request_duration_seconds"]["PutObject"]["avg"],
             0.25
+        );
+        assert_eq!(
+            metrics["storage_provider"]["counts_by_operation"]["put"],
+            4.0
+        );
+        assert_eq!(
+            metrics["storage_provider"]["counts_by_operation"]["get"],
+            2.0
+        );
+        assert_eq!(metrics["storage_provider"]["counts_by_result"]["ok"], 6.0);
+        assert_eq!(
+            metrics["storage_provider"]["bytes_sent_by_operation"]["put"],
+            4096.0
+        );
+        assert_eq!(
+            metrics["storage_provider"]["bytes_received_by_operation"]["get"],
+            2048.0
+        );
+        assert_eq!(
+            metrics["storage_provider"]["operation_duration_seconds"]["put"]["avg"],
+            0.2
         );
     }
 }

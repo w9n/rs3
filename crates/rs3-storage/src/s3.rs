@@ -270,6 +270,14 @@ impl S3BlobStore {
         operation_metrics.elapsed_us = operation_metrics
             .elapsed_us
             .saturating_add(crate::elapsed_us(elapsed));
+        record_s3_provider_metrics(
+            operation.as_str(),
+            object_kind,
+            result,
+            bytes_sent,
+            bytes_received,
+            elapsed,
+        );
 
         tracing::debug!(
             target: "rs3_storage",
@@ -284,6 +292,49 @@ impl S3BlobStore {
         );
 
         Ok(())
+    }
+}
+
+fn record_s3_provider_metrics(
+    operation: &'static str,
+    object_kind: &str,
+    result: &str,
+    bytes_sent: u64,
+    bytes_received: u64,
+    elapsed: Duration,
+) {
+    metrics::counter!(
+        "rs3_storage_provider_operations_total",
+        "provider" => "s3",
+        "operation" => operation,
+        "object_kind" => object_kind.to_owned(),
+        "result" => result.to_owned(),
+    )
+    .increment(1);
+    metrics::histogram!(
+        "rs3_storage_provider_operation_duration_seconds",
+        "provider" => "s3",
+        "operation" => operation,
+        "object_kind" => object_kind.to_owned(),
+        "result" => result.to_owned(),
+    )
+    .record(elapsed.as_secs_f64());
+
+    if result == "ok" {
+        metrics::counter!(
+            "rs3_storage_provider_bytes_sent_total",
+            "provider" => "s3",
+            "operation" => operation,
+            "object_kind" => object_kind.to_owned(),
+        )
+        .increment(bytes_sent);
+        metrics::counter!(
+            "rs3_storage_provider_bytes_received_total",
+            "provider" => "s3",
+            "operation" => operation,
+            "object_kind" => object_kind.to_owned(),
+        )
+        .increment(bytes_received);
     }
 }
 

@@ -174,6 +174,33 @@ fn aggregate_reports(reports: &[&Value]) -> Value {
                 "prometheus_metrics",
                 "request_duration_seconds",
             ]),
+            "storage_provider": {
+                "counts_by_operation": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "storage_provider",
+                    "counts_by_operation",
+                ]),
+                "counts_by_result": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "storage_provider",
+                    "counts_by_result",
+                ]),
+                "bytes_sent_by_operation": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "storage_provider",
+                    "bytes_sent_by_operation",
+                ]),
+                "bytes_received_by_operation": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "storage_provider",
+                    "bytes_received_by_operation",
+                ]),
+                "operation_duration_seconds": aggregate_operation_latency_at(reports, &[
+                    "prometheus_metrics",
+                    "storage_provider",
+                    "operation_duration_seconds",
+                ]),
+            },
         },
         "gateway_process": {
             "cpu_system_seconds": aggregate_f64_at(reports, &["gateway_process", "cpu_system_seconds"]),

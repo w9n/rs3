@@ -46,6 +46,10 @@ Gateway backend metrics also include `backend_metrics.by_s3_operation`, a
 span-derived breakdown of backend operations and bytes by client S3 operation.
 This gives a request-to-backend cost map without recording object keys.
 
+The Prometheus delta includes `prometheus_metrics.storage_provider`, which
+summarizes S3 provider operation counts, bytes, and latency from the gateway's
+metrics endpoint.
+
 ## Current Results
 
 Run date: 2026-05-03. Each row is the average of three direct/gateway run pairs.

@@ -3350,6 +3350,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "metrics",
  "object_store",
  "rs3-types",
  "thiserror",
