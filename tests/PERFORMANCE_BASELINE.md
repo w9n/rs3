@@ -12,6 +12,16 @@ Command shape:
 cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix --runs 3 --workload-profile <profile>
 ```
 
+The larger restore matrix uses the same harness with a profile set:
+
+```sh
+cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix \
+  --runs 3 \
+  --profile-set larger-restores \
+  --gateway-build-profile release \
+  --payload-segment-size 512
+```
+
 The harness compares two paths against a disposable local RustFS container:
 
 - direct: Kopia talks to RustFS through the integration storage proxy,
@@ -35,7 +45,7 @@ Run date: 2026-05-03. Each row is the average of three direct/gateway run pairs.
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | small-smoke | `.local/integration/` | 1.84 s | 1.40 s | 0.76x | 1.11x | 1.10x | 1.48x |
 | changed-snapshot | `.local/integration/` | 2.19 s | 1.73 s | 0.79x | 1.13x | 1.04x | 1.24x |
-| many-small-files | `.local/integration/` | 3.15 s | 1.52 s | 0.48x | 1.02x | 1.88x | 323.75x |
+| many-small-files | `.local/integration/` | 2.99 s | 1.43 s | 0.49x | 1.02x | 1.91x | 4.54x |
 | medium-restore | `.local/integration/` | 2.96 s | 2.51 s | 0.85x | 1.16x | 1.00x | 1.06x |
 
 ## Reading The Numbers
@@ -49,11 +59,44 @@ and envelope costs show up more strongly.
 
 Backend read-byte amplification is the largest current concern. The
 many-small-files profile performs many small ranged reads, so the gateway reads
-encrypted payload segments that are much larger than the client-visible ranges.
+at least one authenticated payload segment for each tiny client-visible range.
 
 Wall-clock results are favorable for the gateway in this local setup, but they
 are less portable than request and byte ratios. Treat them as a regression
 signal for this harness, not as a general cloud-provider result.
+
+## Larger Restore Matrix
+
+Run date: 2026-05-03. Workload set: `larger-restores`. Each row is the
+average of three direct/gateway run pairs. Per-profile values come from
+`summary.json.profiles`; the top-level aggregate intentionally mixes profiles
+and should only be used as a smoke signal for the whole set.
+
+Artifact:
+`.local/integration/`.
+
+The direct baseline is the same straight integration storage proxy used by the
+single-profile rows. The Postgres-shaped profile uses file-specific deterministic
+payloads so equal-size relation and WAL files do not collapse into a
+deduplicated synthetic best case.
+
+| Profile | Shape | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend writes | Backend reads |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| medium-restore | one 64 MiB object | 2.92 s | 2.95 s | 1.01x | 1.16x | 1.03x | 1.03x |
+| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 9.75 s | 2.63 s | 0.27x | 1.01x | 1.03x | 1.05x |
+| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 2.76 s | 3.54 s | 1.29x | 1.13x | 1.03x | 1.03x |
+
+Interpretation:
+
+- Larger restore read and write byte ratios stay close to the straight proxy
+  baseline, about 1.03x to 1.05x in these runs.
+- The Kubernetes-shaped profile is dominated by many small ranged GETs on the
+  direct path. The gateway is faster locally despite similar backend bytes, but
+  that elapsed ratio should be treated as a local RustFS/proxy observation.
+- The Postgres-shaped profile now exercises roughly 176 MB of unique backend
+  restore reads on the direct baseline. Gateway byte overhead is modest, while
+  elapsed time is slower because large PUT tail latency is visible in the local
+  gateway path.
 
 ## Segment-Size Sweep
 
@@ -109,6 +152,7 @@ Interpretation:
 ## Follow-Up Work
 
 - Add CPU and memory high-water marks to the harness.
-- Add larger repeated restore profiles before making release claims.
+- Add a real Velero/Postgres cluster matrix once the smoke lane can scale row
+  counts and data volume without changing its correctness proof.
 - Keep release-profile gateway execution for performance lanes; debug builds are
   useful for development but distort medium payload timings.
