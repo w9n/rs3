@@ -258,7 +258,7 @@ mod imp {
         BACKEND_BUCKET, BACKEND_REGION, RUSTFS_ACCESS_KEY_ID, RUSTFS_SECRET_ACCESS_KEY,
     };
     use scenario::{RunState, Scenario, WorkloadKind, WorkloadVolume};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use velero_cli::{
         assert_pod_volume_backup_completed, assert_pod_volume_restore_completed,
         assert_velero_phase, create_backup, create_restore, install_velero, velero_s3_target,
@@ -295,6 +295,28 @@ mod imp {
 
     pub(super) fn run_postgres_direct(args: VeleroKopiaSmokeArgs) -> Result<()> {
         run(args, Scenario::postgres_direct_rustfs())
+    }
+
+    struct RunContext<'a> {
+        kubeconfig_path: PathBuf,
+        workspace: &'a K8sWorkspace,
+    }
+
+    impl<'a> RunContext<'a> {
+        fn new(kubeconfig_path: &Path, workspace: &'a K8sWorkspace) -> Self {
+            Self {
+                kubeconfig_path: kubeconfig_path.to_path_buf(),
+                workspace,
+            }
+        }
+
+        fn kubeconfig_path(&self) -> &Path {
+            &self.kubeconfig_path
+        }
+
+        fn workspace(&self) -> &K8sWorkspace {
+            self.workspace
+        }
     }
 
     fn run(args: VeleroKopiaSmokeArgs, scenario: Scenario) -> Result<()> {
@@ -373,6 +395,7 @@ mod imp {
         if matches!(scenario.volume, WorkloadVolume::LocalPv) {
             prepare_local_pv_path(&args, cluster.name())?;
         }
+        let context = RunContext::new(cluster.kubeconfig_path(), &workspace);
 
         let backend_prefix = format!("repository-{}", now_millis());
         let backend_endpoint = rustfs_backend::service_endpoint(&args.gateway_namespace);
@@ -382,13 +405,16 @@ mod imp {
         let artifacts = ArtifactCollector::new(&args, scenario.label)?;
         let mut state = RunState::new(scenario, anchor_name.clone(), backend_prefix.clone());
         let result = (|| -> Result<()> {
-            rustfs_backend::install(&args, cluster.kubeconfig_path(), &workspace)?;
-            rustfs_backend::create_bucket(&args, cluster.kubeconfig_path())?;
+            let kubeconfig_path = context.kubeconfig_path();
+            let workspace = context.workspace();
+
+            rustfs_backend::install(&args, kubeconfig_path, workspace)?;
+            rustfs_backend::create_bucket(&args, kubeconfig_path)?;
             if scenario.storage_path.uses_integration_storage_proxy() {
                 integration_storage_proxy::install(
                     &args,
-                    cluster.kubeconfig_path(),
-                    &workspace,
+                    kubeconfig_path,
+                    workspace,
                     &backend_target,
                 )?;
             }
@@ -396,7 +422,7 @@ mod imp {
                 let (image_repository, image_tag) = split_image_ref(&args.image);
                 helm_install_gateway(
                     &args.helm_bin,
-                    cluster.kubeconfig_path(),
+                    kubeconfig_path,
                     &GatewayChartValues {
                         release_name: &args.release_name,
                         namespace: &args.gateway_namespace,
@@ -421,102 +447,86 @@ mod imp {
             }
 
             if matches!(scenario.volume, WorkloadVolume::DynamicPvc) {
-                install_openebs(&args, cluster.kubeconfig_path())?;
+                install_openebs(&args, kubeconfig_path)?;
             }
 
             let credentials_path = workspace.path("credentials-velero");
             write_velero_credentials(&credentials_path, &velero_target)?;
-            install_velero(
-                &args,
-                cluster.kubeconfig_path(),
-                &credentials_path,
-                &velero_target,
-            )?;
-            apply_workload(&args, cluster.kubeconfig_path(), &workspace, scenario)?;
-            write_workload_proof(&args, cluster.kubeconfig_path(), scenario.workload)?;
-            assert_workload_proof(&args, cluster.kubeconfig_path(), scenario.workload)?;
+            install_velero(&args, kubeconfig_path, &credentials_path, &velero_target)?;
+            apply_workload(&args, kubeconfig_path, workspace, scenario)?;
+            write_workload_proof(&args, kubeconfig_path, scenario.workload)?;
+            assert_workload_proof(&args, kubeconfig_path, scenario.workload)?;
 
             let backup_name = format!("rs3-smoke-{}", now_millis());
             let restore_name = format!("rs3-restore-{}", now_millis());
             state.backup_name = Some(backup_name.clone());
             state.restore_name = Some(restore_name.clone());
-            create_backup(&args, cluster.kubeconfig_path(), &backup_name)?;
+            create_backup(&args, kubeconfig_path, &backup_name)?;
             assert_velero_phase(
                 &args.kubectl_bin,
-                cluster.kubeconfig_path(),
+                kubeconfig_path,
                 &args.velero_namespace,
                 "backups.velero.io",
                 &backup_name,
                 "Completed",
             )?;
-            assert_pod_volume_backup_completed(&args, cluster.kubeconfig_path(), &backup_name)?;
-            if let Err(error) = artifacts.collect_checkpoint(
-                &args,
-                cluster.kubeconfig_path(),
-                &state,
-                "after-backup",
-            ) {
+            assert_pod_volume_backup_completed(&args, kubeconfig_path, &backup_name)?;
+            if let Err(error) =
+                artifacts.collect_checkpoint(&args, kubeconfig_path, &state, "after-backup")
+            {
                 eprintln!("failed to collect after-backup checkpoint artifacts: {error:#}");
             }
 
             match scenario.volume {
                 WorkloadVolume::EmptyDir | WorkloadVolume::DynamicPvc => {
-                    delete_workload_namespace(&args, cluster.kubeconfig_path())?;
+                    delete_workload_namespace(&args, kubeconfig_path)?;
                 }
                 WorkloadVolume::LocalPv => {
-                    remove_workload_proof(&args, cluster.kubeconfig_path(), scenario.workload)?;
-                    delete_workload_pod(&args, cluster.kubeconfig_path())?;
+                    remove_workload_proof(&args, kubeconfig_path, scenario.workload)?;
+                    delete_workload_pod(&args, kubeconfig_path)?;
                 }
             }
             if scenario.restart_gateway_before_restore && scenario.storage_path.uses_gateway() {
                 if let Err(error) = artifacts.collect_checkpoint(
                     &args,
-                    cluster.kubeconfig_path(),
+                    kubeconfig_path,
                     &state,
                     "before-gateway-restart",
                 ) {
                     eprintln!("failed to collect pre-restart checkpoint artifacts: {error:#}");
                 }
-                restart_gateway(&args, cluster.kubeconfig_path())?;
+                restart_gateway(&args, kubeconfig_path)?;
                 if let Err(error) = artifacts.collect_checkpoint(
                     &args,
-                    cluster.kubeconfig_path(),
+                    kubeconfig_path,
                     &state,
                     "after-gateway-restart",
                 ) {
                     eprintln!("failed to collect post-restart checkpoint artifacts: {error:#}");
                 }
             }
-            create_restore(
-                &args,
-                cluster.kubeconfig_path(),
-                &backup_name,
-                &restore_name,
-            )?;
+            create_restore(&args, kubeconfig_path, &backup_name, &restore_name)?;
             assert_velero_phase(
                 &args.kubectl_bin,
-                cluster.kubeconfig_path(),
+                kubeconfig_path,
                 &args.velero_namespace,
                 "restores.velero.io",
                 &restore_name,
                 "Completed",
             )?;
-            assert_pod_volume_restore_completed(&args, cluster.kubeconfig_path(), &restore_name)?;
-            wait_for_workload_available(&args, cluster.kubeconfig_path())?;
-            wait_for_restored_proof(&args, cluster.kubeconfig_path(), scenario.workload)?;
-            if let Err(error) = artifacts.collect_checkpoint(
-                &args,
-                cluster.kubeconfig_path(),
-                &state,
-                "after-restore",
-            ) {
+            assert_pod_volume_restore_completed(&args, kubeconfig_path, &restore_name)?;
+            wait_for_workload_available(&args, kubeconfig_path)?;
+            wait_for_restored_proof(&args, kubeconfig_path, scenario.workload)?;
+            if let Err(error) =
+                artifacts.collect_checkpoint(&args, kubeconfig_path, &state, "after-restore")
+            {
                 eprintln!("failed to collect after-restore checkpoint artifacts: {error:#}");
             }
 
             Ok(())
         })();
 
-        if let Err(error) = artifacts.collect(&args, cluster.kubeconfig_path(), &state) {
+        if let Err(error) = artifacts.collect(&args, context.kubeconfig_path(), &state) {
             eprintln!("failed to collect Velero integration artifacts: {error:#}");
         }
 
