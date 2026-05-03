@@ -54,32 +54,37 @@ It also includes `prometheus_metrics.repository`, a path-private repository
 breakdown of gateway operation counts, bytes, LIST selectivity, commit batching,
 and latency.
 
+Repository metrics also include
+`prometheus_metrics.repository.payload_span_cache_events_by_result` and
+`payload_span_cache_bytes_by_result`, which show ciphertext span cache hits,
+misses, inserts, and bytes without exposing object keys.
+
 ## Current Results
 
 Run date: 2026-05-03. Each row is the average of three direct/gateway run pairs.
 
 | Profile | Artifact | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend writes | Backend reads |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| small-smoke | `.local/integration/` | 1.57 s | 1.29 s | 0.83x | 0.81x | 1.14x | 1.02x |
-| changed-snapshot | `.local/integration/` | 2.07 s | 1.59 s | 0.77x | 0.82x | 1.08x | 1.02x |
-| many-small-files | `.local/integration/` | 2.88 s | 1.38 s | 0.48x | 0.98x | 2.03x | 4.54x |
-| medium-restore | `.local/integration/` | 2.61 s | 2.79 s | 1.07x | 0.89x | 1.03x | 1.03x |
+| small-smoke | `.local/integration/` | 1.66 s | 1.28 s | 0.78x | 0.81x | 1.14x | 1.02x |
+| changed-snapshot | `.local/integration/` | 2.02 s | 1.58 s | 0.78x | 0.82x | 1.08x | 1.02x |
+| many-small-files | `.local/integration/` | 3.01 s | 1.30 s | 0.43x | 0.31x | 2.04x | 1.72x |
+| medium-restore | `.local/integration/` | 2.66 s | 2.75 s | 1.03x | 0.89x | 1.03x | 1.03x |
 
 ## Reading The Numbers
 
-Backend request counts are now below the straight proxy lane in these refreshed
-profiles: about 0.81x to 0.98x versus direct RustFS. The main improvement came
-from sealing committed index deltas inline with checkpoint objects instead of
-writing separate backend index objects.
+Backend request counts are below the straight proxy lane in these refreshed
+profiles: about 0.31x to 0.89x versus direct RustFS. Inline checkpoint deltas
+removed separate backend index writes, and the ciphertext span cache collapses
+repeated small ranged restores into fewer backend GETs.
 
 Backend write-byte amplification is low for the medium and incremental profiles.
 The many-small-files profile writes very little data directly, so fixed
 metadata, checkpoint, and envelope costs show up more strongly.
 
 Backend read-byte amplification is close to baseline for the small, changed,
-and medium profiles. The many-small-files profile remains the current edge case:
-it performs many tiny ranged reads, so the gateway reads at least one
-authenticated payload segment for each tiny client-visible range.
+and medium profiles. The many-small-files profile remains the current edge case,
+but the 512 B segment lane now reads 1.72x backend bytes instead of 4.54x
+because repeated tiny client ranges are served from cached ciphertext spans.
 
 Wall-clock results are favorable for the gateway in this local setup, but they
 are less portable than request and byte ratios. Treat them as a regression
@@ -102,9 +107,9 @@ deduplicated synthetic best case.
 
 | Profile | Shape | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend writes | Backend reads | Gateway CPU | Gateway HWM RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| medium-restore | one 64 MiB object | 2.61 s | 2.79 s | 1.07x | 0.89x | 1.03x | 1.03x | 1.03 s | 91.63 MiB |
-| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 9.24 s | 2.51 s | 0.27x | 0.99x | 1.03x | 1.05x | 1.51 s | 91.47 MiB |
-| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 2.70 s | 3.39 s | 1.26x | 0.99x | 1.03x | 1.03x | 2.74 s | 217.31 MiB |
+| medium-restore | one 64 MiB object | 2.66 s | 2.75 s | 1.03x | 0.89x | 1.03x | 1.03x | 1.00 s | 96.03 MiB |
+| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 9.40 s | 2.50 s | 0.27x | 0.99x | 1.03x | 1.05x | 1.50 s | 94.20 MiB |
+| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 2.56 s | 3.39 s | 1.32x | 0.99x | 1.03x | 1.03x | 2.68 s | 189.20 MiB |
 
 Interpretation:
 
@@ -113,6 +118,8 @@ Interpretation:
 - Backend request counts are now at or below the straight proxy baseline in the
   larger profiles after sealed index deltas moved inline with checkpoint
   objects.
+- The larger profiles did not produce payload span cache hits in this run; their
+  restore ranges already land on distinct spans.
 - Gateway CPU is cumulative process CPU time for the measured gateway run.
   Gateway HWM RSS is the average high-water resident set size across the three
   gateway runs for that profile.
@@ -143,26 +150,28 @@ cargo run -p xtask --bin xtask --features containers -- integration kopia-measur
 
 | Gateway segment size | Artifact | Direct read | Gateway read | Read ratio | Request ratio | Write ratio | Elapsed ratio |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 512 B | `.local/integration/` | 72.81 KB | 330.56 KB | 4.54x | 0.98x | 2.03x | 0.48x |
-| 1 KiB | `.local/integration/` | 72.81 KB | 592.89 KB | 8.14x | 0.98x | 2.02x | 0.45x |
-| 2 KiB | `.local/integration/` | 72.81 KB | 1.12 MB | 15.35x | 0.98x | 2.01x | 0.45x |
-| 4 KiB | `.local/integration/` | 72.81 KB | 2.17 MB | 29.77x | 0.98x | 2.01x | 0.46x |
-| 8 KiB | `.local/integration/` | 72.81 KB | 4.27 MB | 58.69x | 0.98x | 2.01x | 0.47x |
-| 16 KiB | `.local/integration/` | 72.81 KB | 8.48 MB | 116.40x | 0.97x | 2.01x | 0.47x |
-| 32 KiB | `.local/integration/` | 72.81 KB | 16.88 MB | 231.83x | 0.98x | 2.01x | 0.47x |
-| 256 KiB | `.local/integration/` | 72.81 KB | 23.58 MB | 323.87x | 0.98x | 2.01x | 0.47x |
+| 512 B | `.local/integration/` | 72.81 KB | 124.93 KB | 1.72x | 0.31x | 2.04x | 0.43x |
+| 1 KiB | `.local/integration/` | 72.81 KB | 127.97 KB | 1.76x | 0.21x | 2.02x | 0.43x |
+| 2 KiB | `.local/integration/` | 72.81 KB | 132.32 KB | 1.82x | 0.16x | 2.01x | 0.45x |
+| 4 KiB | `.local/integration/` | 72.81 KB | 143.65 KB | 1.97x | 0.14x | 2.01x | 0.43x |
+| 8 KiB | `.local/integration/` | 72.81 KB | 166.69 KB | 2.29x | 0.12x | 2.01x | 0.43x |
+| 16 KiB | `.local/integration/` | 72.81 KB | 188.32 KB | 2.59x | 0.11x | 2.00x | 0.43x |
+| 32 KiB | `.local/integration/` | 72.81 KB | 291.93 KB | 4.01x | 0.11x | 2.01x | 0.44x |
+| 256 KiB | `.local/integration/` | 72.81 KB | 396.20 KB | 5.44x | 0.11x | 2.00x | 0.44x |
 
 Interpretation:
 
-- Segment size dominates backend read bytes for tiny ranged restores. The 512 B
-  lane reads about 13x less backend data than the 8 KiB lane and about 71x less
-  than the 256 KiB default-era lane for this profile.
+- Segment size still affects backend read bytes for tiny ranged restores, but
+  the ciphertext span cache makes it a much smaller effect. The 512 B lane now
+  reads 1.72x the direct baseline, and the 256 KiB lane reads 5.44x.
 - The ratio is large because the denominator is small. The profile restores 512
   tiny files; Kopia issued 514 successful ranged GETs but received only about
   56 KB of total S3 response body. At 2 KiB segments each roughly 110-byte
-  response still forces at least one authenticated backend segment read.
-- Backend request count is effectively flat in this sweep and slightly below the
-  direct proxy baseline, about 0.97x to 0.98x after inline checkpoint deltas.
+  response still forces at least one authenticated backend segment read on the
+  first miss, then later reads can hit the cached ciphertext span.
+- Backend request count drops as segment size grows because fewer distinct
+  ciphertext spans are fetched: from 0.31x of direct requests at 512 B to 0.11x
+  at 32 KiB and 256 KiB. The tradeoff is larger backend reads for each miss.
 - Write-byte amplification is also flat because this workload's writes are
   mostly independent of restore segment size, sitting around 2.01x to 2.03x in
   this tiny-data profile.
@@ -171,9 +180,10 @@ Interpretation:
   treated as a harness/backend observation rather than a provider claim.
 - The repeated 512 B larger restore matrix read and wrote about 1.03x to 1.05x
   backend bytes versus direct RustFS. Keep 512 B as the current Kopia-first
-  default candidate, but keep tracking larger Postgres-shaped restore elapsed
-  time because large PUT tail latency is still visible in the local gateway
-  path.
+  default candidate, while treating 1 KiB to 4 KiB as plausible request-count
+  tradeoffs if cloud request cost dominates byte cost. Keep tracking larger
+  Postgres-shaped restore elapsed time because large PUT tail latency is still
+  visible in the local gateway path.
 
 ## Follow-Up Work
 
