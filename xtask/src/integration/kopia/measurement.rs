@@ -186,6 +186,115 @@ pub(super) fn now_millis() -> u128 {
         .as_millis()
 }
 
+pub(super) fn aggregate_runs(runs: &[Value]) -> Value {
+    let mut by_storage_path = serde_json::Map::new();
+    for storage_path in ["direct-rustfs", "gateway"] {
+        let reports = reports_for_storage_path(runs, storage_path);
+        by_storage_path.insert(storage_path.to_owned(), aggregate_reports(&reports));
+    }
+    Value::Object(by_storage_path)
+}
+
+fn reports_for_storage_path<'a>(runs: &'a [Value], storage_path: &str) -> Vec<&'a Value> {
+    runs.iter()
+        .filter_map(|run| run.get("reports").and_then(Value::as_array))
+        .flat_map(|reports| reports.iter())
+        .filter(|report| report.get("storage_path").and_then(Value::as_str) == Some(storage_path))
+        .collect()
+}
+
+fn aggregate_reports(reports: &[&Value]) -> Value {
+    let elapsed = reports
+        .iter()
+        .filter_map(|report| report.get("elapsed_ms").and_then(Value::as_u64))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "runs": reports.len(),
+        "elapsed_ms": summarize_u64(&elapsed),
+        "phase_timings": aggregate_phase_timings(reports),
+        "backend_metrics": {
+            "counts": aggregate_object(reports, &["backend_metrics", "counts"]),
+            "transport": aggregate_object(reports, &["backend_metrics", "transport"]),
+        },
+    })
+}
+
+fn aggregate_phase_timings(reports: &[&Value]) -> Value {
+    let mut timings: std::collections::BTreeMap<String, Vec<u64>> =
+        std::collections::BTreeMap::new();
+    for report in reports {
+        let Some(phases) = report.get("phase_timings").and_then(Value::as_array) else {
+            continue;
+        };
+        for phase in phases {
+            let Some(name) = phase.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(elapsed_ms) = phase.get("elapsed_ms").and_then(Value::as_u64) else {
+                continue;
+            };
+            timings.entry(name.to_owned()).or_default().push(elapsed_ms);
+        }
+    }
+
+    Value::Object(
+        timings
+            .into_iter()
+            .map(|(name, values)| (name, summarize_u64(&values)))
+            .collect(),
+    )
+}
+
+fn aggregate_object(reports: &[&Value], path: &[&str]) -> Value {
+    let mut values_by_key: std::collections::BTreeMap<String, Vec<u64>> =
+        std::collections::BTreeMap::new();
+    for report in reports {
+        let mut current = *report;
+        for segment in path {
+            let Some(next) = current.get(*segment) else {
+                current = &Value::Null;
+                break;
+            };
+            current = next;
+        }
+        let Some(object) = current.as_object() else {
+            continue;
+        };
+        for (key, value) in object {
+            if let Some(value) = value.as_u64() {
+                values_by_key.entry(key.clone()).or_default().push(value);
+            }
+        }
+    }
+
+    Value::Object(
+        values_by_key
+            .into_iter()
+            .map(|(key, values)| (key, summarize_u64(&values)))
+            .collect(),
+    )
+}
+
+fn summarize_u64(values: &[u64]) -> Value {
+    if values.is_empty() {
+        return serde_json::json!({
+            "min": null,
+            "max": null,
+            "avg": null,
+        });
+    }
+
+    let min = values.iter().copied().min().unwrap_or(0);
+    let max = values.iter().copied().max().unwrap_or(0);
+    let sum = values.iter().copied().map(u128::from).sum::<u128>();
+    let avg = sum as f64 / values.len() as f64;
+    serde_json::json!({
+        "min": min,
+        "max": max,
+        "avg": avg,
+    })
+}
+
 fn parse_gateway_backend_counts(logs: &[String]) -> rs3_storage::BlobOperationCounts {
     let mut counts = rs3_storage::BlobOperationCounts::default();
     for line in logs {

@@ -12,10 +12,12 @@ use clap::Args;
 #[cfg(feature = "containers")]
 #[path = "kopia/measurement.rs"]
 mod measurement;
+#[path = "kopia/workload.rs"]
+mod workload;
 #[cfg(feature = "containers")]
 use measurement::{
-    RunningStorageProxy, endpoint_authority, gateway_backend_metrics_json, measurement_json,
-    now_millis, wait_for_storage_proxy_metrics,
+    RunningStorageProxy, aggregate_runs, endpoint_authority, gateway_backend_metrics_json,
+    measurement_json, now_millis, wait_for_storage_proxy_metrics,
 };
 #[cfg(feature = "containers")]
 use std::ffi::{OsStr, OsString};
@@ -27,7 +29,10 @@ use std::path::PathBuf;
 #[cfg(feature = "containers")]
 use std::process::{Command, Stdio};
 #[cfg(feature = "containers")]
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+use workload::KopiaWorkloadProfile;
+#[cfg(feature = "containers")]
+use workload::KopiaWorkspace;
 
 #[cfg(feature = "containers")]
 const KOPIA_PASSWORD: &str = "rs3-local-integration-password";
@@ -68,6 +73,12 @@ pub(crate) struct KopiaMatrixArgs {
     /// Kopia executable to run.
     #[arg(long, env = "RS3_TEST_KOPIA_BIN", default_value = "kopia")]
     kopia_bin: String,
+    /// Workload shape to snapshot and restore.
+    #[arg(long, value_enum, default_value_t = KopiaWorkloadProfile::SmallSmoke)]
+    workload_profile: KopiaWorkloadProfile,
+    /// Number of direct/gateway run pairs to execute.
+    #[arg(long, default_value_t = 1)]
+    runs: usize,
     /// Directory where the matrix summary JSON is written.
     #[arg(long, env = "RS3_TEST_ARTIFACT_DIR")]
     artifact_dir: Option<PathBuf>,
@@ -99,7 +110,7 @@ pub(crate) fn run_kopia_gateway(args: KopiaGatewayArgs) -> Result<()> {
         args.region,
     )?;
     let workspace = KopiaWorkspace::new()?;
-    workspace.populate_source()?;
+    workspace.populate_source(KopiaWorkloadProfile::SmallSmoke)?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -116,7 +127,12 @@ pub(crate) fn run_kopia_gateway(args: KopiaGatewayArgs) -> Result<()> {
             region: backend.region.clone(),
             prefix: "kopia/".to_owned(),
         };
-        let result = run_kopia_smoke(&kopia_bin, &workspace, &target);
+        let result = run_kopia_smoke(
+            &kopia_bin,
+            &workspace,
+            &target,
+            KopiaWorkloadProfile::SmallSmoke,
+        );
         let shutdown = gateway.shutdown();
 
         result?;
@@ -127,8 +143,19 @@ pub(crate) fn run_kopia_gateway(args: KopiaGatewayArgs) -> Result<()> {
 
 #[cfg(feature = "containers")]
 pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
+    if args.runs == 0 {
+        bail!("--runs must be at least 1");
+    }
     let run_id = now_millis();
     let backend_prefix = args.backend_prefix.trim_end_matches('/').to_owned();
+    let artifact_dir = args.artifact_dir.clone().unwrap_or_else(|| {
+        PathBuf::from(".local")
+            .join("integration")
+            .join(format!("kopia-measured-matrix-{run_id}"))
+    });
+    fs::create_dir_all(&artifact_dir)
+        .with_context(|| format!("failed to create {}", artifact_dir.display()))?;
+
     let backend = s3_container::start_s3_container(
         args.container_provider,
         args.backend_bucket,
@@ -139,34 +166,57 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         .build()
         .context("failed to build Kopia matrix runtime")?;
 
-    let reports = runtime.block_on(async {
-        let direct =
-            run_measured_direct_kopia(&args.kopia_bin, &backend, &backend_prefix, run_id).await?;
-        let gateway =
-            run_measured_gateway_kopia(&args.kopia_bin, &backend, &backend_prefix, run_id).await?;
-        Ok::<_, anyhow::Error>(vec![direct, gateway])
+    let runs = runtime.block_on(async {
+        let mut runs = Vec::with_capacity(args.runs);
+        for run_index in 1..=args.runs {
+            let direct = run_measured_direct_kopia(
+                &args.kopia_bin,
+                &backend,
+                &backend_prefix,
+                run_id,
+                run_index,
+                args.workload_profile,
+            )
+            .await?;
+            let gateway = run_measured_gateway_kopia(
+                &args.kopia_bin,
+                &backend,
+                &backend_prefix,
+                run_id,
+                run_index,
+                args.workload_profile,
+            )
+            .await?;
+            runs.push(serde_json::json!({
+                "run": run_index,
+                "reports": [direct, gateway],
+            }));
+        }
+        Ok::<_, anyhow::Error>(runs)
     })?;
 
     let summary = serde_json::json!({
         "scenario": "kopia-measured-matrix",
+        "run_id": run_id,
+        "runs": args.runs,
+        "workload_profile": args.workload_profile.as_str(),
         "backend_provider": args.container_provider.as_label(),
         "backend_bucket": backend.bucket,
         "backend_region": backend.region,
-        "reports": reports,
+        "aggregate": aggregate_runs(&runs),
+        "run_reports": runs,
     });
-    let artifact_dir = args.artifact_dir.unwrap_or_else(|| {
-        PathBuf::from(".local")
-            .join("integration")
-            .join(format!("kopia-measured-matrix-{run_id}"))
-    });
-    fs::create_dir_all(&artifact_dir)
-        .with_context(|| format!("failed to create {}", artifact_dir.display()))?;
+    for run in summary["run_reports"]
+        .as_array()
+        .context("summary run_reports was not an array")?
+    {
+        let run_index = run["run"]
+            .as_u64()
+            .context("run report did not include numeric run index")?;
+        write_json_file(&artifact_dir.join(format!("run-{run_index:03}.json")), run)?;
+    }
     let summary_path = artifact_dir.join("summary.json");
-    fs::write(
-        &summary_path,
-        format!("{}\n", serde_json::to_string_pretty(&summary)?),
-    )
-    .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    write_json_file(&summary_path, &summary)?;
     eprintln!(
         "wrote Kopia measured matrix summary to {}",
         summary_path.display()
@@ -181,12 +231,18 @@ async fn run_measured_gateway_kopia(
     backend: &s3_container::RunningS3Container,
     backend_prefix: &str,
     run_id: u128,
+    run_index: usize,
+    profile: KopiaWorkloadProfile,
 ) -> Result<serde_json::Value> {
     let workspace = KopiaWorkspace::new()?;
-    workspace.populate_source()?;
+    workspace.populate_source(profile)?;
     let mut gateway = RunningGateway::start_with_log_capture(
         backend,
-        format!("{backend_prefix}/gateway-{run_id}"),
+        format!(
+            "{}/{}/run-{run_index:03}/gateway-{run_id}",
+            backend_prefix,
+            profile.as_str()
+        ),
         "rs3_storage=debug,rs3_repository=info,info",
     )
     .await?;
@@ -199,7 +255,7 @@ async fn run_measured_gateway_kopia(
         region: backend.region.clone(),
         prefix: "kopia/".to_owned(),
     };
-    let stats = run_kopia_smoke(kopia_bin, &workspace, &target);
+    let stats = run_kopia_smoke(kopia_bin, &workspace, &target, profile);
     std::thread::sleep(Duration::from_millis(100));
     let logs = gateway.captured_logs()?;
     let shutdown = gateway.shutdown();
@@ -218,9 +274,11 @@ async fn run_measured_direct_kopia(
     backend: &s3_container::RunningS3Container,
     backend_prefix: &str,
     run_id: u128,
+    run_index: usize,
+    profile: KopiaWorkloadProfile,
 ) -> Result<serde_json::Value> {
     let workspace = KopiaWorkspace::new()?;
-    workspace.populate_source()?;
+    workspace.populate_source(profile)?;
     let target_authority = endpoint_authority(&backend.endpoint_url)?;
     let mut proxy = RunningStorageProxy::start(&target_authority).await?;
     proxy.clear_logs()?;
@@ -230,9 +288,13 @@ async fn run_measured_direct_kopia(
         access_key_id: backend.access_key_id.clone(),
         secret_access_key: backend.secret_access_key.clone(),
         region: backend.region.clone(),
-        prefix: format!("{backend_prefix}/direct-{run_id}/kopia/"),
+        prefix: format!(
+            "{}/{}/run-{run_index:03}/direct-{run_id}/kopia/",
+            backend_prefix,
+            profile.as_str()
+        ),
     };
-    let stats = run_kopia_smoke(kopia_bin, &workspace, &target);
+    let stats = run_kopia_smoke(kopia_bin, &workspace, &target, profile);
     if stats.is_ok() {
         proxy.clear_logs()?;
     }
@@ -249,6 +311,7 @@ fn run_kopia_smoke(
     kopia_bin: &str,
     workspace: &KopiaWorkspace,
     target: &KopiaS3Target,
+    profile: KopiaWorkloadProfile,
 ) -> Result<KopiaRunStats> {
     require_kopia(kopia_bin)?;
     let started = Instant::now();
@@ -294,6 +357,22 @@ fn run_kopia_smoke(
             workspace.source_dir().into_os_string(),
         ],
     )?);
+
+    if matches!(profile, KopiaWorkloadProfile::ChangedSnapshot) {
+        phases.push(run_local_phase("mutate-source", || {
+            workspace.mutate_source_for_second_snapshot()
+        })?);
+        phases.push(run_kopia_phase(
+            kopia_bin,
+            workspace,
+            "snapshot-create-after-change",
+            vec![
+                os("snapshot"),
+                os("create"),
+                workspace.source_dir().into_os_string(),
+            ],
+        )?);
+    }
 
     phases.push(run_kopia_phase(
         kopia_bin,
@@ -419,104 +498,7 @@ fn os(value: impl AsRef<OsStr>) -> OsString {
 }
 
 #[cfg(feature = "containers")]
-struct KopiaWorkspace {
-    root: PathBuf,
-}
-
-#[cfg(feature = "containers")]
-impl KopiaWorkspace {
-    fn new() -> Result<Self> {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "rs3-kopia-integration-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).with_context(|| {
-            format!(
-                "failed to create Kopia integration workspace {}",
-                root.display()
-            )
-        })?;
-        Ok(Self { root })
-    }
-
-    fn config_file(&self) -> PathBuf {
-        self.root.join("repository.config")
-    }
-
-    fn cache_dir(&self) -> PathBuf {
-        self.root.join("cache")
-    }
-
-    fn source_dir(&self) -> PathBuf {
-        self.root.join("source")
-    }
-
-    fn restore_dir(&self) -> PathBuf {
-        self.root.join("restore")
-    }
-
-    fn populate_source(&self) -> Result<()> {
-        let nested = self.source_dir().join("nested");
-        fs::create_dir_all(&nested).context("failed to create Kopia source tree")?;
-        fs::write(self.source_dir().join("alpha.txt"), b"alpha\n")
-            .context("failed to write Kopia source file")?;
-        fs::write(nested.join("beta.txt"), b"beta\n")
-            .context("failed to write nested Kopia source file")?;
-        fs::write(
-            self.source_dir().join("large.bin"),
-            deterministic_bytes(1024 * 1024),
-        )
-        .context("failed to write large Kopia source file")?;
-        Ok(())
-    }
-
-    fn assert_restored(&self) -> Result<()> {
-        assert_file_eq(
-            &self.source_dir().join("alpha.txt"),
-            &self.restore_dir().join("alpha.txt"),
-        )?;
-        assert_file_eq(
-            &self.source_dir().join("nested").join("beta.txt"),
-            &self.restore_dir().join("nested").join("beta.txt"),
-        )?;
-        assert_file_eq(
-            &self.source_dir().join("large.bin"),
-            &self.restore_dir().join("large.bin"),
-        )?;
-        Ok(())
-    }
-}
-
-#[cfg(feature = "containers")]
-impl Drop for KopiaWorkspace {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
-#[cfg(feature = "containers")]
-fn deterministic_bytes(len: usize) -> Vec<u8> {
-    (0..len)
-        .map(|index| index.wrapping_mul(31).wrapping_add(17) as u8)
-        .collect()
-}
-
-#[cfg(feature = "containers")]
-fn assert_file_eq(expected: &Path, actual: &Path) -> Result<()> {
-    let expected_body =
-        fs::read(expected).with_context(|| format!("failed to read {}", expected.display()))?;
-    let actual_body =
-        fs::read(actual).with_context(|| format!("failed to read {}", actual.display()))?;
-    if expected_body != actual_body {
-        bail!(
-            "restored file {} did not match source {}",
-            actual.display(),
-            expected.display()
-        );
-    }
-    Ok(())
+fn write_json_file(path: &Path, value: &serde_json::Value) -> Result<()> {
+    fs::write(path, format!("{}\n", serde_json::to_string_pretty(value)?))
+        .with_context(|| format!("failed to write {}", path.display()))
 }
