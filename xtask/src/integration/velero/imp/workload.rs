@@ -115,7 +115,7 @@ pub(super) fn write_workload_proof(
                 "--",
                 "/bin/sh",
                 "-c",
-                &postgres_write_script(),
+                &postgres_write_script(args.postgres_row_count, args.postgres_padding_repeat),
             ],
         )
         .context("failed to write Postgres smoke proof data"),
@@ -502,21 +502,24 @@ fn read_workload_proof(
                 "--",
                 "/bin/sh",
                 "-c",
-                &postgres_verify_script(),
+                &postgres_verify_script(args.postgres_row_count, args.postgres_padding_repeat),
             ],
         ),
     }
 }
 
-fn postgres_write_script() -> String {
+fn postgres_write_script(row_count: u32, padding_repeat: u32) -> String {
+    let last_row = row_count.saturating_sub(1);
     format!(
-        "psql -U postgres -d {POSTGRES_DB} -v ON_ERROR_STOP=1 -c \"DROP TABLE IF EXISTS proof; CREATE TABLE proof(id integer PRIMARY KEY, value text NOT NULL); INSERT INTO proof SELECT i, 'row-' || lpad(i::text, 4, '0') FROM generate_series(0, 127) AS i; CHECKPOINT;\" && pg_dump -U postgres -d {POSTGRES_DB} -f {POSTGRES_DUMP_PATH} && sync",
+        "psql -U postgres -d {POSTGRES_DB} -v ON_ERROR_STOP=1 -c \"DROP TABLE IF EXISTS proof; CREATE TABLE proof(id integer PRIMARY KEY, value text NOT NULL, padding text NOT NULL); INSERT INTO proof SELECT i, 'row-' || lpad(i::text, 4, '0'), repeat(md5(i::text), {padding_repeat}) FROM generate_series(0, {last_row}) AS i; CHECKPOINT;\" && pg_dump -U postgres -d {POSTGRES_DB} -f {POSTGRES_DUMP_PATH} && sync",
     )
 }
 
-fn postgres_verify_script() -> String {
+fn postgres_verify_script(row_count: u32, padding_repeat: u32) -> String {
+    let last_row = row_count.saturating_sub(1);
+    let padding_len = padding_repeat.saturating_mul(32);
     format!(
-        "test -s {POSTGRES_DUMP_PATH} && psql -U postgres -d {POSTGRES_DB} -v ON_ERROR_STOP=1 -At -c \"SELECT CASE WHEN (SELECT count(*) FROM proof) = 128 AND (SELECT md5(string_agg(value, ',' ORDER BY id)) FROM proof) = (SELECT md5(string_agg('row-' || lpad(i::text, 4, '0'), ',' ORDER BY i)) FROM generate_series(0, 127) AS i) THEN 'ok' ELSE 'bad' END;\"",
+        "test -s {POSTGRES_DUMP_PATH} && psql -U postgres -d {POSTGRES_DB} -v ON_ERROR_STOP=1 -At -c \"SELECT CASE WHEN (SELECT count(*) FROM proof) = {row_count} AND (SELECT md5(string_agg(value, ',' ORDER BY id)) FROM proof) = (SELECT md5(string_agg('row-' || lpad(i::text, 4, '0'), ',' ORDER BY i)) FROM generate_series(0, {last_row}) AS i) AND (SELECT coalesce(min(length(padding)), 0) FROM proof) = {padding_len} AND (SELECT coalesce(max(length(padding)), 0) FROM proof) = {padding_len} THEN 'ok' ELSE 'bad' END;\"",
     )
 }
 
@@ -524,5 +527,21 @@ fn proof_matches(workload: WorkloadKind, actual: &str) -> bool {
     match workload {
         WorkloadKind::ProofFile => actual == EXPECTED_CONTENT,
         WorkloadKind::Postgres => actual.trim() == "ok",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{postgres_verify_script, postgres_write_script};
+
+    #[test]
+    fn postgres_scripts_scale_rows_and_padding() {
+        let write = postgres_write_script(1024, 16);
+        assert!(write.contains("generate_series(0, 1023)"));
+        assert!(write.contains("repeat(md5(i::text), 16)"));
+
+        let verify = postgres_verify_script(1024, 16);
+        assert!(verify.contains("(SELECT count(*) FROM proof) = 1024"));
+        assert!(verify.contains("length(padding)), 0) FROM proof) = 512"));
     }
 }

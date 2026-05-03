@@ -84,6 +84,12 @@ pub(crate) struct VeleroKopiaSmokeArgs {
         default_value = "postgres:17-alpine"
     )]
     postgres_image: String,
+    /// Rows inserted into the Postgres proof table.
+    #[arg(long, default_value_t = 128)]
+    postgres_row_count: u32,
+    /// Repetitions of md5(row id) stored as padding in each Postgres proof row.
+    #[arg(long, default_value_t = 1)]
+    postgres_padding_repeat: u32,
     /// S3-compatible backend image used behind the gateway for Velero lanes.
     #[arg(
         long,
@@ -347,6 +353,9 @@ mod imp {
             prepare_openebs_images(&args)?;
         }
         if matches!(scenario.workload, WorkloadKind::Postgres) {
+            if args.postgres_row_count == 0 {
+                bail!("--postgres-row-count must be greater than zero");
+            }
             prepare_postgres_image(&args)?;
         }
 
