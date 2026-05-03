@@ -3,6 +3,9 @@
 This directory is reserved for integration harness assets that are too broad
 for default Cargo tests.
 
+See [../TEST_LANES.md](../TEST_LANES.md) for the current lane map and planned
+restore coverage.
+
 Current entrypoint:
 
 ```sh
@@ -36,6 +39,18 @@ cargo run -p xtask --features containers -- integration kopia-gateway
 
 Set `RS3_TEST_KOPIA_BIN` or pass `--kopia-bin` when the executable is not named
 `kopia`.
+
+The Kubernetes gateway mode creates a disposable kind cluster, builds and loads
+the gateway image, deploys the gateway, waits for readiness, and runs an S3
+smoke test through `kubectl port-forward`:
+
+```sh
+cargo run -p xtask --features k8s -- integration k8s-gateway
+```
+
+Pass `--keep-cluster` to inspect a failing cluster before deletion. The Helm
+chart under `charts/rs3-gateway` is the install packaging surface; the `xtask`
+Kubernetes smoke remains the deterministic CI orchestrator.
 
 Container provider setup stays behind the opt-in `xtask/containers` feature so
 Docker and provider bootstrap dependencies stay outside normal unit tests and

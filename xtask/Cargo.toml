@@ -12,6 +12,7 @@ description = "Local automation for rs3"
 default = []
 s3 = ["rs3-storage/s3"]
 containers = ["s3", "dep:aws-sdk-s3", "dep:testcontainers"]
+k8s = ["s3", "dep:aws-sdk-s3"]
 
 [dependencies]
 anyhow.workspace = true

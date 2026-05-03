@@ -30,6 +30,8 @@
             cargo-deny
             cargo-nextest
             clippy
+            docker-client
+            kubernetes-helm
             just
             kind
             kopia

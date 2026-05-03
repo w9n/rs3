@@ -2,6 +2,7 @@
 
 #[cfg(feature = "containers")]
 mod gateway_process;
+mod k8s;
 mod kopia;
 mod s3;
 #[cfg(feature = "containers")]
@@ -26,6 +27,8 @@ enum IntegrationCommand {
     S3Gateway(s3_gateway::S3GatewayArgs),
     /// Run a real Kopia S3 smoke test through the local gateway.
     KopiaGateway(kopia::KopiaGatewayArgs),
+    /// Run the gateway inside a disposable kind cluster.
+    K8sGateway(k8s::K8sGatewayArgs),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -49,5 +52,6 @@ pub(crate) fn run(args: IntegrationArgs) -> Result<()> {
         IntegrationCommand::S3Local(args) => s3::run_s3_local(args),
         IntegrationCommand::S3Gateway(args) => s3_gateway::run_s3_gateway(args),
         IntegrationCommand::KopiaGateway(args) => kopia::run_kopia_gateway(args),
+        IntegrationCommand::K8sGateway(args) => k8s::run_k8s_gateway(args),
     }
 }

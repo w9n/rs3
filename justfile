@@ -36,6 +36,12 @@ integration-s3-gateway *ARGS:
 integration-kopia-gateway *ARGS:
     cargo run -p xtask --features containers -- integration kopia-gateway {{ARGS}}
 
+integration-k8s-gateway *ARGS:
+    cargo run -p xtask --features k8s -- integration k8s-gateway {{ARGS}}
+
+helm-lint:
+    helm lint charts/rs3-gateway
+
 test:
     cargo test --workspace
 

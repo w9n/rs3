@@ -1,0 +1,38 @@
+replicaCount: 1
+
+image:
+  repository: rs3-server
+  tag: ci
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 9080
+
+publicBucket: client-bucket
+
+backend:
+  endpoint: file:///data
+  bucket: backend
+  prefix: repository
+
+credentials:
+  create: false
+  existingSecret: ""
+  accessKeyId: ""
+  secretAccessKey: ""
+
+commit:
+  maxBatchItems: 8
+  maxBatchDelayMs: 5
+
+persistence:
+  mountPath: /data
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+
+resources: {}
