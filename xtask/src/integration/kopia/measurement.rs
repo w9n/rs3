@@ -3,6 +3,7 @@
 use super::KopiaRunStats;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
@@ -150,7 +151,8 @@ pub(super) fn gateway_backend_metrics_json(logs: &[String]) -> Value {
             "extend_retention": counts.extend_retention,
             "bytes_written": counts.bytes_written,
             "bytes_read": counts.bytes_read,
-        }
+        },
+        "operation_latency_us": parse_gateway_backend_latency(logs),
     })
 }
 
@@ -215,8 +217,55 @@ fn aggregate_reports(reports: &[&Value]) -> Value {
         "backend_metrics": {
             "counts": aggregate_object(reports, &["backend_metrics", "counts"]),
             "transport": aggregate_object(reports, &["backend_metrics", "transport"]),
+            "operation_latency_us": aggregate_operation_latency(reports),
         },
     })
+}
+
+fn aggregate_operation_latency(reports: &[&Value]) -> Value {
+    let mut metrics_by_operation: BTreeMap<String, BTreeMap<String, Vec<f64>>> = BTreeMap::new();
+    for report in reports {
+        let Some(latency_by_operation) = report
+            .get("backend_metrics")
+            .and_then(|metrics| metrics.get("operation_latency_us"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for (operation, summary) in latency_by_operation {
+            let Some(summary) = summary.as_object() else {
+                continue;
+            };
+            for (metric, value) in summary {
+                let Some(value) = value.as_f64() else {
+                    continue;
+                };
+                metrics_by_operation
+                    .entry(operation.clone())
+                    .or_default()
+                    .entry(metric.clone())
+                    .or_default()
+                    .push(value);
+            }
+        }
+    }
+
+    Value::Object(
+        metrics_by_operation
+            .into_iter()
+            .map(|(operation, metrics)| {
+                (
+                    operation,
+                    Value::Object(
+                        metrics
+                            .into_iter()
+                            .map(|(metric, values)| (metric, summarize_f64(&values)))
+                            .collect(),
+                    ),
+                )
+            })
+            .collect(),
+    )
 }
 
 fn aggregate_phase_timings(reports: &[&Value]) -> Value {
@@ -293,6 +342,90 @@ fn summarize_u64(values: &[u64]) -> Value {
         "max": max,
         "avg": avg,
     })
+}
+
+fn summarize_f64(values: &[f64]) -> Value {
+    if values.is_empty() {
+        return serde_json::json!({
+            "min": null,
+            "max": null,
+            "avg": null,
+        });
+    }
+
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let avg = values.iter().copied().sum::<f64>() / values.len() as f64;
+    serde_json::json!({
+        "min": min,
+        "max": max,
+        "avg": avg,
+    })
+}
+
+fn parse_gateway_backend_latency(logs: &[String]) -> Value {
+    let mut by_operation: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for line in logs {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let fields = value.get("fields").unwrap_or(&value);
+        if json_field_str(fields, "provider") != Some("s3") {
+            continue;
+        }
+        let Some(operation) = json_field_str(fields, "operation") else {
+            continue;
+        };
+        let Some(elapsed_us) = json_field_u64_opt(fields, "elapsed_us") else {
+            continue;
+        };
+        by_operation
+            .entry(operation.to_owned())
+            .or_default()
+            .push(elapsed_us);
+    }
+
+    Value::Object(
+        by_operation
+            .into_iter()
+            .map(|(operation, samples)| (operation, summarize_latency_us(&samples)))
+            .collect(),
+    )
+}
+
+fn summarize_latency_us(samples: &[u64]) -> Value {
+    if samples.is_empty() {
+        return serde_json::json!({
+            "samples": 0,
+            "min": null,
+            "avg": null,
+            "p50": null,
+            "p95": null,
+            "p99": null,
+            "max": null,
+        });
+    }
+
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let sum = sorted.iter().copied().map(u128::from).sum::<u128>();
+    let avg = sum as f64 / sorted.len() as f64;
+    serde_json::json!({
+        "samples": sorted.len(),
+        "min": sorted[0],
+        "avg": avg,
+        "p50": percentile_u64(&sorted, 0.50),
+        "p95": percentile_u64(&sorted, 0.95),
+        "p99": percentile_u64(&sorted, 0.99),
+        "max": sorted[sorted.len() - 1],
+    })
+}
+
+fn percentile_u64(sorted: &[u64], quantile: f64) -> u64 {
+    let index = ((sorted.len() as f64 * quantile).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
+    sorted[index]
 }
 
 fn parse_gateway_backend_counts(logs: &[String]) -> rs3_storage::BlobOperationCounts {
@@ -413,16 +546,46 @@ fn json_field_str<'a>(fields: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn json_field_u64(fields: &Value, key: &str) -> u64 {
-    fields
-        .get(key)
-        .and_then(|value| {
-            value
-                .as_u64()
-                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
-        })
-        .unwrap_or(0)
+    json_field_u64_opt(fields, key).unwrap_or(0)
+}
+
+fn json_field_u64_opt(fields: &Value, key: &str) -> Option<u64> {
+    fields.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+    })
 }
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_metrics_include_operation_latency() {
+        let logs = vec![
+            r#"{"target":"rs3_storage","fields":{"provider":"s3","operation":"put","result":"ok","bytes_sent":12,"bytes_received":0,"elapsed_us":100}}"#.to_owned(),
+            r#"{"target":"rs3_storage","fields":{"provider":"s3","operation":"put","result":"ok","bytes_sent":7,"bytes_received":0,"elapsed_us":"300"}}"#.to_owned(),
+            r#"{"target":"rs3_storage","fields":{"provider":"s3","operation":"get","result":"ok","bytes_sent":0,"bytes_received":5,"elapsed_us":200}}"#.to_owned(),
+            r#"{"target":"rs3_storage","fields":{"operation":"put","elapsed_us":999}}"#.to_owned(),
+        ];
+
+        let metrics = gateway_backend_metrics_json(&logs);
+
+        assert_eq!(metrics["counts"]["put"], 2);
+        assert_eq!(metrics["counts"]["get"], 1);
+        assert_eq!(metrics["counts"]["bytes_written"], 19);
+        assert_eq!(metrics["counts"]["bytes_read"], 5);
+        assert_eq!(metrics["operation_latency_us"]["put"]["samples"], 2);
+        assert_eq!(metrics["operation_latency_us"]["put"]["min"], 100);
+        assert_eq!(metrics["operation_latency_us"]["put"]["p50"], 100);
+        assert_eq!(metrics["operation_latency_us"]["put"]["p95"], 300);
+        assert_eq!(metrics["operation_latency_us"]["put"]["max"], 300);
+        assert_eq!(metrics["operation_latency_us"]["get"]["samples"], 1);
+        assert_eq!(metrics["operation_latency_us"]["get"]["p95"], 200);
+    }
 }
