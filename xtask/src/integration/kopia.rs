@@ -253,6 +253,8 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         "scenario": "kopia-measured-matrix",
         "run_id": run_id,
         "runs": args.runs,
+        "run_pairs_per_profile": args.runs,
+        "total_run_pairs": runs.len(),
         "profile_set": args.profile_set.as_str(),
         "workload_profile": args.workload_profile.as_str(),
         "workload_profiles": profiles.iter().map(|profile| profile.as_str()).collect::<Vec<_>>(),
