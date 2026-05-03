@@ -62,8 +62,10 @@ which Velero file-system backup intentionally skips.
 cargo run -p xtask --features k8s -- integration velero-kopia-smoke
 ```
 
-The local-PV variant adds static PV/PVC restore coverage without deploying a
-dynamic storage provider:
+The local-PV variant adds static PV data-restore coverage without deploying a
+dynamic storage provider. It keeps the PV/PVC bound, removes the original file,
+deletes the pod, restores the pod, and verifies that Velero repopulates the
+volume through Kopia..
 
 ```sh
 cargo run -p xtask --features k8s -- integration velero-kopia-local-pv-smoke
@@ -72,7 +74,9 @@ cargo run -p xtask --features k8s -- integration velero-kopia-local-pv-smoke
 Both Velero lanes load the Velero server and AWS plugin images from the local
 Docker daemon into kind by default. Preload or mirror
 `velero/velero:v1.18.0` and `velero/velero-plugin-for-aws:v1.14.0`, or pass
-`--pull-velero-images` when registry pulls are acceptable.
+`--pull-velero-images` when registry pulls are acceptable. CI can point at a
+mirror with `RS3_TEST_VELERO_IMAGE` and
+`RS3_TEST_VELERO_AWS_PLUGIN_IMAGE`.
 
 Container provider setup stays behind the opt-in `xtask/containers` feature so
 Docker and provider bootstrap dependencies stay outside normal unit tests and

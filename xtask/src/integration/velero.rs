@@ -27,10 +27,18 @@ pub(crate) struct VeleroKopiaSmokeArgs {
     #[arg(long)]
     workload_image: Option<String>,
     /// Velero server/node-agent image.
-    #[arg(long, default_value = "velero/velero:v1.18.0")]
+    #[arg(
+        long,
+        env = "RS3_TEST_VELERO_IMAGE",
+        default_value = "velero/velero:v1.18.0"
+    )]
     velero_image: String,
     /// Velero AWS plugin image matching the local Velero major/minor.
-    #[arg(long, default_value = "velero/velero-plugin-for-aws:v1.14.0")]
+    #[arg(
+        long,
+        env = "RS3_TEST_VELERO_AWS_PLUGIN_IMAGE",
+        default_value = "velero/velero-plugin-for-aws:v1.14.0"
+    )]
     velero_aws_plugin_image: String,
     /// kind executable.
     #[arg(long, env = "RS3_TEST_KIND_BIN", default_value = "kind")]
@@ -200,12 +208,14 @@ mod imp {
         )?;
         assert_pod_volume_backup_completed(&args, cluster.kubeconfig_path(), &backup_name)?;
 
-        if matches!(volume, WorkloadVolume::LocalPv) {
-            remove_workload_proof(&args, cluster.kubeconfig_path())?;
-        }
-        delete_workload_namespace(&args, cluster.kubeconfig_path())?;
-        if matches!(volume, WorkloadVolume::LocalPv) {
-            delete_local_pv(&args, cluster.kubeconfig_path())?;
+        match volume {
+            WorkloadVolume::EmptyDir => {
+                delete_workload_namespace(&args, cluster.kubeconfig_path())?;
+            }
+            WorkloadVolume::LocalPv => {
+                remove_workload_proof(&args, cluster.kubeconfig_path())?;
+                delete_workload_pod(&args, cluster.kubeconfig_path())?;
+            }
         }
         create_restore(
             &args,
@@ -647,19 +657,23 @@ spec:
         .context("failed to delete Velero smoke workload namespace")
     }
 
-    fn delete_local_pv(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
+    fn delete_workload_pod(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
+        let timeout = timeout_arg(args.wait_secs);
         kubectl(
             &args.kubectl_bin,
             kubeconfig_path,
             &[
+                "-n",
+                &args.workload_namespace,
                 "delete",
-                "persistentvolume",
-                LOCAL_PV_NAME,
-                "--ignore-not-found=true",
+                "pod",
+                WORKLOAD_NAME,
                 "--wait=true",
+                "--timeout",
+                timeout.as_str(),
             ],
         )
-        .context("failed to delete original local PV object before restore")
+        .context("failed to delete Velero smoke workload pod")
     }
 
     fn create_restore(
