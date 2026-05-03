@@ -43,6 +43,7 @@ impl ArtifactCollector {
             "summary.json",
             json!({
                 "scenario": state.scenario_label,
+                "storage_path": state.storage_path.as_str(),
                 "backup": state.backup_name,
                 "restore": state.restore_name,
                 "elapsed_ms": state.started.elapsed().as_millis(),
@@ -92,52 +93,7 @@ impl ArtifactCollector {
                 "yaml",
             ],
         )?;
-        self.capture_kubectl(
-            args,
-            kubeconfig_path,
-            "gateway-pods.yaml",
-            &[
-                "-n",
-                &args.gateway_namespace,
-                "get",
-                "pods",
-                "-l",
-                &gateway_selector(args),
-                "-o",
-                "yaml",
-            ],
-        )?;
-        self.capture_kubectl(
-            args,
-            kubeconfig_path,
-            "gateway-deployment.yaml",
-            &[
-                "-n",
-                &args.gateway_namespace,
-                "get",
-                &format!("deployment/{}", helm_fullname(&args.release_name)),
-                "-o",
-                "yaml",
-            ],
-        )?;
-        let gateway_logs = capture_kubectl_output(
-            args,
-            kubeconfig_path,
-            &[
-                "-n",
-                &args.gateway_namespace,
-                "logs",
-                &format!("deployment/{}", helm_fullname(&args.release_name)),
-                "--all-containers=true",
-                "--tail=-1",
-            ],
-        );
-        let gateway_logs = self.write_result("gateway-logs.jsonl", gateway_logs)?;
-        self.write_json(
-            "gateway-backend-metrics.json",
-            gateway_backend_metrics_json(&gateway_logs),
-        )?;
-        self.capture_anchor(args, kubeconfig_path, state, "final")?;
+        self.collect_storage_artifacts(args, kubeconfig_path, state, "final")?;
         self.capture_kubectl(
             args,
             kubeconfig_path,
@@ -195,6 +151,9 @@ impl ArtifactCollector {
         let Some(_) = &self.root else {
             return Ok(());
         };
+        if !state.storage_path.uses_gateway() {
+            return Ok(());
+        }
 
         let phase = sanitize_file_component(phase);
         self.capture_anchor(args, kubeconfig_path, state, &phase)?;
@@ -233,6 +192,93 @@ impl ArtifactCollector {
             gateway_backend_metrics_json(&logs),
         )?;
         Ok(())
+    }
+
+    fn collect_storage_artifacts(
+        &self,
+        args: &VeleroKopiaSmokeArgs,
+        kubeconfig_path: &Path,
+        state: &RunState,
+        phase: &str,
+    ) -> Result<()> {
+        if state.storage_path.uses_gateway() {
+            self.capture_kubectl(
+                args,
+                kubeconfig_path,
+                "gateway-pods.yaml",
+                &[
+                    "-n",
+                    &args.gateway_namespace,
+                    "get",
+                    "pods",
+                    "-l",
+                    &gateway_selector(args),
+                    "-o",
+                    "yaml",
+                ],
+            )?;
+            self.capture_kubectl(
+                args,
+                kubeconfig_path,
+                "gateway-deployment.yaml",
+                &[
+                    "-n",
+                    &args.gateway_namespace,
+                    "get",
+                    &format!("deployment/{}", helm_fullname(&args.release_name)),
+                    "-o",
+                    "yaml",
+                ],
+            )?;
+            let gateway_logs = capture_kubectl_output(
+                args,
+                kubeconfig_path,
+                &[
+                    "-n",
+                    &args.gateway_namespace,
+                    "logs",
+                    &format!("deployment/{}", helm_fullname(&args.release_name)),
+                    "--all-containers=true",
+                    "--tail=-1",
+                ],
+            );
+            let gateway_logs = self.write_result("gateway-logs.jsonl", gateway_logs)?;
+            self.write_json(
+                "gateway-backend-metrics.json",
+                gateway_backend_metrics_json(&gateway_logs),
+            )?;
+            self.capture_anchor(args, kubeconfig_path, state, phase)?;
+            return Ok(());
+        }
+
+        self.capture_kubectl(
+            args,
+            kubeconfig_path,
+            "rustfs-pods.yaml",
+            &[
+                "-n",
+                &args.gateway_namespace,
+                "get",
+                "pods",
+                "-l",
+                "app.kubernetes.io/name=rs3-rustfs",
+                "-o",
+                "yaml",
+            ],
+        )?;
+        self.capture_kubectl(
+            args,
+            kubeconfig_path,
+            "rustfs-log.txt",
+            &[
+                "-n",
+                &args.gateway_namespace,
+                "logs",
+                "deployment/rs3-rustfs",
+                "--all-containers=true",
+                "--tail=-1",
+            ],
+        )
     }
 
     fn capture_anchor(

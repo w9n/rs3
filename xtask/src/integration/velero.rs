@@ -187,6 +187,13 @@ pub(crate) fn run_velero_kopia_postgres_smoke(_args: VeleroKopiaSmokeArgs) -> Re
     )
 }
 
+#[cfg(not(feature = "k8s"))]
+pub(crate) fn run_velero_kopia_postgres_direct_smoke(_args: VeleroKopiaSmokeArgs) -> Result<()> {
+    anyhow::bail!(
+        "Velero Kopia Postgres direct RustFS smoke integration requires `cargo run -p xtask --features k8s -- integration velero-kopia-postgres-direct-smoke`",
+    )
+}
+
 #[cfg(feature = "k8s")]
 pub(crate) fn run_velero_kopia_smoke(args: VeleroKopiaSmokeArgs) -> Result<()> {
     imp::run_empty_dir(args)
@@ -212,6 +219,11 @@ pub(crate) fn run_velero_kopia_dynamic_pvc_gateway_restart_smoke(
 #[cfg(feature = "k8s")]
 pub(crate) fn run_velero_kopia_postgres_smoke(args: VeleroKopiaSmokeArgs) -> Result<()> {
     imp::run_postgres(args)
+}
+
+#[cfg(feature = "k8s")]
+pub(crate) fn run_velero_kopia_postgres_direct_smoke(args: VeleroKopiaSmokeArgs) -> Result<()> {
+    imp::run_postgres_direct(args)
 }
 
 #[cfg(feature = "k8s")]
@@ -263,16 +275,37 @@ mod imp {
     }
 
     #[derive(Clone, Copy, Debug)]
+    pub(super) enum StoragePath {
+        Gateway,
+        DirectRustfs,
+    }
+
+    impl StoragePath {
+        pub(super) fn as_str(self) -> &'static str {
+            match self {
+                Self::Gateway => "gateway",
+                Self::DirectRustfs => "direct-rustfs",
+            }
+        }
+
+        pub(super) fn uses_gateway(self) -> bool {
+            matches!(self, Self::Gateway)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
     struct Scenario {
         label: &'static str,
         volume: WorkloadVolume,
         workload: WorkloadKind,
+        storage_path: StoragePath,
         restart_gateway_before_restore: bool,
     }
 
     #[derive(Debug)]
-    struct RunState {
+    pub(super) struct RunState {
         scenario_label: &'static str,
+        storage_path: StoragePath,
         anchor_name: String,
         backend_prefix: String,
         backup_name: Option<String>,
@@ -287,6 +320,7 @@ mod imp {
                 label: "empty-dir",
                 volume: WorkloadVolume::EmptyDir,
                 workload: WorkloadKind::ProofFile,
+                storage_path: StoragePath::Gateway,
                 restart_gateway_before_restore: false,
             },
         )
@@ -299,6 +333,7 @@ mod imp {
                 label: "local-pv",
                 volume: WorkloadVolume::LocalPv,
                 workload: WorkloadKind::ProofFile,
+                storage_path: StoragePath::Gateway,
                 restart_gateway_before_restore: false,
             },
         )
@@ -311,6 +346,7 @@ mod imp {
                 label: "dynamic-pvc",
                 volume: WorkloadVolume::DynamicPvc,
                 workload: WorkloadKind::ProofFile,
+                storage_path: StoragePath::Gateway,
                 restart_gateway_before_restore: false,
             },
         )
@@ -323,6 +359,7 @@ mod imp {
                 label: "dynamic-pvc-gateway-restart",
                 volume: WorkloadVolume::DynamicPvc,
                 workload: WorkloadKind::ProofFile,
+                storage_path: StoragePath::Gateway,
                 restart_gateway_before_restore: true,
             },
         )
@@ -335,6 +372,20 @@ mod imp {
                 label: "postgres",
                 volume: WorkloadVolume::DynamicPvc,
                 workload: WorkloadKind::Postgres,
+                storage_path: StoragePath::Gateway,
+                restart_gateway_before_restore: false,
+            },
+        )
+    }
+
+    pub(super) fn run_postgres_direct(args: VeleroKopiaSmokeArgs) -> Result<()> {
+        run(
+            args,
+            Scenario {
+                label: "postgres-direct-rustfs",
+                volume: WorkloadVolume::DynamicPvc,
+                workload: WorkloadKind::Postgres,
+                storage_path: StoragePath::DirectRustfs,
                 restart_gateway_before_restore: false,
             },
         )
@@ -346,8 +397,10 @@ mod imp {
         require_command(&args.helm_bin, &["version", "--short"])?;
         require_command(&args.docker_bin, &["version"])?;
         require_command(&args.velero_bin, &["version", "--client-only"])?;
-        run_command(&args.helm_bin, &["lint", CHART_PATH])
-            .context("gateway Helm chart lint failed")?;
+        if scenario.storage_path.uses_gateway() {
+            run_command(&args.helm_bin, &["lint", CHART_PATH])
+                .context("gateway Helm chart lint failed")?;
+        }
         prepare_velero_images(&args)?;
         prepare_rustfs_image(&args)?;
         if matches!(scenario.volume, WorkloadVolume::DynamicPvc) {
@@ -357,7 +410,7 @@ mod imp {
             prepare_postgres_image(&args)?;
         }
 
-        if !args.skip_image_build {
+        if scenario.storage_path.uses_gateway() && !args.skip_image_build {
             run_command(&args.docker_bin, &["build", "-t", args.image.as_str(), "."])
                 .context("failed to build gateway image")?;
         }
@@ -390,7 +443,7 @@ mod imp {
             reset_reused_cluster(&args, cluster.kubeconfig_path())?;
         }
 
-        if !args.skip_image_load {
+        if scenario.storage_path.uses_gateway() && !args.skip_image_load {
             cluster.load_image(&args.image)?;
         }
         if !args.skip_velero_image_load {
@@ -411,13 +464,14 @@ mod imp {
             prepare_local_pv_path(&args, cluster.name())?;
         }
 
-        let (image_repository, image_tag) = split_image_ref(&args.image);
         let backend_prefix = format!("repository-{}", now_millis());
         let backend_endpoint = rustfs_backend::service_endpoint(&args.gateway_namespace);
         let anchor_name = format!("{}-checkpoint", helm_fullname(&args.release_name));
+        let velero_target = velero_s3_target(&args, scenario.storage_path, &backend_endpoint);
         let artifacts = ArtifactCollector::new(&args, scenario.label)?;
         let mut state = RunState {
             scenario_label: scenario.label,
+            storage_path: scenario.storage_path,
             anchor_name: anchor_name.clone(),
             backend_prefix: backend_prefix.clone(),
             backup_name: None,
@@ -427,38 +481,46 @@ mod imp {
         let result = (|| -> Result<()> {
             rustfs_backend::install(&args, cluster.kubeconfig_path(), &workspace)?;
             rustfs_backend::create_bucket(&args, cluster.kubeconfig_path())?;
-            helm_install_gateway(
-                &args.helm_bin,
-                cluster.kubeconfig_path(),
-                &GatewayChartValues {
-                    release_name: &args.release_name,
-                    namespace: &args.gateway_namespace,
-                    image_repository: &image_repository,
-                    image_tag: &image_tag,
-                    public_bucket: VELERO_BUCKET,
-                    backend_endpoint: &backend_endpoint,
-                    backend_bucket: BACKEND_BUCKET,
-                    backend_prefix: &backend_prefix,
-                    backend_region: BACKEND_REGION,
-                    backend_access_key_id: Some(RUSTFS_ACCESS_KEY_ID),
-                    backend_secret_access_key: Some(RUSTFS_SECRET_ACCESS_KEY),
-                    anchor_mode: "kubernetes-lease",
-                    anchor_name: &anchor_name,
-                    log_format: "json",
-                    rust_log: GATEWAY_RUST_LOG,
-                    payload_segment_size: args.payload_segment_size,
-                    persistence_enabled: false,
-                    wait_secs: args.wait_secs,
-                },
-            )?;
+            if scenario.storage_path.uses_gateway() {
+                let (image_repository, image_tag) = split_image_ref(&args.image);
+                helm_install_gateway(
+                    &args.helm_bin,
+                    cluster.kubeconfig_path(),
+                    &GatewayChartValues {
+                        release_name: &args.release_name,
+                        namespace: &args.gateway_namespace,
+                        image_repository: &image_repository,
+                        image_tag: &image_tag,
+                        public_bucket: VELERO_BUCKET,
+                        backend_endpoint: &backend_endpoint,
+                        backend_bucket: BACKEND_BUCKET,
+                        backend_prefix: &backend_prefix,
+                        backend_region: BACKEND_REGION,
+                        backend_access_key_id: Some(RUSTFS_ACCESS_KEY_ID),
+                        backend_secret_access_key: Some(RUSTFS_SECRET_ACCESS_KEY),
+                        anchor_mode: "kubernetes-lease",
+                        anchor_name: &anchor_name,
+                        log_format: "json",
+                        rust_log: GATEWAY_RUST_LOG,
+                        payload_segment_size: args.payload_segment_size,
+                        persistence_enabled: false,
+                        wait_secs: args.wait_secs,
+                    },
+                )?;
+            }
 
             if matches!(scenario.volume, WorkloadVolume::DynamicPvc) {
                 install_openebs(&args, cluster.kubeconfig_path())?;
             }
 
             let credentials_path = workspace.path("credentials-velero");
-            write_velero_credentials(&credentials_path)?;
-            install_velero(&args, cluster.kubeconfig_path(), &credentials_path)?;
+            write_velero_credentials(&credentials_path, &velero_target)?;
+            install_velero(
+                &args,
+                cluster.kubeconfig_path(),
+                &credentials_path,
+                &velero_target,
+            )?;
             apply_workload(&args, cluster.kubeconfig_path(), &workspace, scenario)?;
             write_workload_proof(&args, cluster.kubeconfig_path(), scenario.workload)?;
             assert_workload_proof(&args, cluster.kubeconfig_path(), scenario.workload)?;
@@ -495,7 +557,7 @@ mod imp {
                     delete_workload_pod(&args, cluster.kubeconfig_path())?;
                 }
             }
-            if scenario.restart_gateway_before_restore {
+            if scenario.restart_gateway_before_restore && scenario.storage_path.uses_gateway() {
                 if let Err(error) = artifacts.collect_checkpoint(
                     &args,
                     cluster.kubeconfig_path(),
@@ -833,6 +895,41 @@ mod imp {
         tag: String,
     }
 
+    struct VeleroS3Target {
+        bucket: &'static str,
+        endpoint_url: String,
+        access_key_id: &'static str,
+        secret_access_key: &'static str,
+    }
+
+    fn velero_s3_target(
+        args: &VeleroKopiaSmokeArgs,
+        storage_path: StoragePath,
+        backend_endpoint: &str,
+    ) -> VeleroS3Target {
+        match storage_path {
+            StoragePath::Gateway => {
+                let service_name = helm_fullname(&args.release_name);
+                VeleroS3Target {
+                    bucket: VELERO_BUCKET,
+                    endpoint_url: format!(
+                        "http://{}.{gateway_namespace}.svc:{GATEWAY_PORT}",
+                        service_name,
+                        gateway_namespace = args.gateway_namespace
+                    ),
+                    access_key_id: ACCESS_KEY_ID,
+                    secret_access_key: SECRET_ACCESS_KEY,
+                }
+            }
+            StoragePath::DirectRustfs => VeleroS3Target {
+                bucket: BACKEND_BUCKET,
+                endpoint_url: backend_endpoint.to_owned(),
+                access_key_id: RUSTFS_ACCESS_KEY_ID,
+                secret_access_key: RUSTFS_SECRET_ACCESS_KEY,
+            },
+        }
+    }
+
     fn chart_image(image: &str) -> Result<ChartImage> {
         let (repository, tag) = split_image_ref(image);
         if repository.contains('@') || tag.contains('@') {
@@ -855,11 +952,12 @@ mod imp {
         })
     }
 
-    fn write_velero_credentials(path: &Path) -> Result<()> {
+    fn write_velero_credentials(path: &Path, target: &VeleroS3Target) -> Result<()> {
         fs::write(
             path,
             format!(
-                "[default]\naws_access_key_id={ACCESS_KEY_ID}\naws_secret_access_key={SECRET_ACCESS_KEY}\n"
+                "[default]\naws_access_key_id={}\naws_secret_access_key={}\n",
+                target.access_key_id, target.secret_access_key
             ),
         )
         .with_context(|| format!("failed to write {}", path.display()))
@@ -869,15 +967,12 @@ mod imp {
         args: &VeleroKopiaSmokeArgs,
         kubeconfig_path: &Path,
         credentials_path: &Path,
+        target: &VeleroS3Target,
     ) -> Result<()> {
-        let service_name = helm_fullname(&args.release_name);
-        let s3_url = format!(
-            "http://{}.{gateway_namespace}.svc:{GATEWAY_PORT}",
-            service_name,
-            gateway_namespace = args.gateway_namespace
+        let backup_location_config = format!(
+            "region=us-east-1,s3ForcePathStyle=true,s3Url={},checksumAlgorithm=",
+            target.endpoint_url
         );
-        let backup_location_config =
-            format!("region=us-east-1,s3ForcePathStyle=true,s3Url={s3_url},checksumAlgorithm=");
 
         velero(
             &args.velero_bin,
@@ -893,7 +988,7 @@ mod imp {
                 "--plugins",
                 &args.velero_aws_plugin_image,
                 "--bucket",
-                VELERO_BUCKET,
+                target.bucket,
                 "--secret-file",
                 path_str(credentials_path)?,
                 "--use-volume-snapshots=false",
