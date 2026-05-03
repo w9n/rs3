@@ -22,6 +22,7 @@ Rules of thumb:
 - Default checks should stay deterministic and cheap.
 - Every compatibility lane must verify restored bytes or Kubernetes object state, not only command success.
 - Expensive lanes emit artifacts under `.local/integration` by default: gateway logs, anchor snapshots, backend operation counts, amplification ratios, latency summaries, and relevant Kubernetes resources.
+- Current local performance baseline results are summarized in `tests/PERFORMANCE_BASELINE.md`.
 - The Helm chart is the Kubernetes packaging source; tests should install it instead of duplicating manifests.
 - Local development can pass `--reuse-kind-cluster --cluster-name <name>` to avoid recreating kind on every run; CI should use disposable clusters unless cleanup is owned by the job.
 - CI should use mirrored third-party images through harness image variables instead of relying on anonymous public registry pulls.

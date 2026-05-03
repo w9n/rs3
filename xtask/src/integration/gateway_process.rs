@@ -15,6 +15,21 @@ pub(crate) const PUBLIC_BUCKET: &str = "client-bucket";
 pub(crate) const ACCESS_KEY_ID: &str = "access";
 pub(crate) const SECRET_ACCESS_KEY: &str = "secret";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+pub(crate) enum GatewayBuildProfile {
+    Dev,
+    Release,
+}
+
+impl GatewayBuildProfile {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dev => "dev",
+            Self::Release => "release",
+        }
+    }
+}
+
 pub(crate) struct RunningGateway {
     addr: SocketAddr,
     metrics_addr: Option<SocketAddr>,
@@ -28,29 +43,38 @@ impl RunningGateway {
         backend: &RunningS3Container,
         backend_prefix: String,
     ) -> Result<Self> {
-        Self::start_inner(backend, backend_prefix, None).await
+        Self::start_inner(backend, backend_prefix, None, GatewayBuildProfile::Dev).await
     }
 
-    pub(crate) async fn start_with_log_capture(
+    pub(crate) async fn start_with_log_capture_profile(
         backend: &RunningS3Container,
         backend_prefix: String,
         rust_log: &str,
+        build_profile: GatewayBuildProfile,
     ) -> Result<Self> {
-        Self::start_inner(backend, backend_prefix, Some(rust_log)).await
+        Self::start_inner(backend, backend_prefix, Some(rust_log), build_profile).await
     }
 
     async fn start_inner(
         backend: &RunningS3Container,
         backend_prefix: String,
         rust_log: Option<&str>,
+        build_profile: GatewayBuildProfile,
     ) -> Result<Self> {
         let addr = reserve_gateway_addr()?;
         let capture_logs = rust_log.is_some();
         let metrics_addr = capture_logs.then(reserve_gateway_addr).transpose()?;
         let bind = addr.to_string();
         let metrics_bind = metrics_addr.map(|addr| addr.to_string());
-        let mut gateway_args = vec![
-            "run",
+        let startup_timeout = match build_profile {
+            GatewayBuildProfile::Dev => Duration::from_secs(30),
+            GatewayBuildProfile::Release => Duration::from_secs(600),
+        };
+        let mut gateway_args = vec!["run"];
+        if build_profile == GatewayBuildProfile::Release {
+            gateway_args.push("--release");
+        }
+        gateway_args.extend([
             "-p",
             "rs3-server",
             "--bin",
@@ -58,7 +82,7 @@ impl RunningGateway {
             "--features",
             "s3",
             "--",
-        ];
+        ]);
         if capture_logs {
             gateway_args.extend(["--log-format", "json"]);
         }
@@ -124,14 +148,14 @@ impl RunningGateway {
                 logs: Some(logs),
                 readers,
             };
-            if let Err(error) = wait_for_gateway(addr, &mut gateway.child).await {
+            if let Err(error) = wait_for_gateway(addr, &mut gateway.child, startup_timeout).await {
                 let _ = gateway.shutdown();
                 return Err(error);
             }
             gateway.clear_captured_logs()?;
             return Ok(gateway);
         } else {
-            wait_for_gateway(addr, &mut child).await?;
+            wait_for_gateway(addr, &mut child, startup_timeout).await?;
             None
         };
 
@@ -224,7 +248,11 @@ fn reserve_gateway_addr() -> Result<SocketAddr> {
     Ok(addr)
 }
 
-async fn wait_for_gateway(addr: SocketAddr, child: &mut Child) -> Result<()> {
+async fn wait_for_gateway(
+    addr: SocketAddr,
+    child: &mut Child,
+    startup_timeout: Duration,
+) -> Result<()> {
     let started = Instant::now();
     loop {
         if let Some(status) = child
@@ -237,7 +265,7 @@ async fn wait_for_gateway(addr: SocketAddr, child: &mut Child) -> Result<()> {
         if TcpStream::connect(addr).await.is_ok() {
             return Ok(());
         }
-        if started.elapsed() >= Duration::from_secs(30) {
+        if started.elapsed() >= startup_timeout {
             anyhow::bail!("gateway did not start accepting connections at {addr}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

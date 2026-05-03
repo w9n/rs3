@@ -2,7 +2,9 @@
 
 use super::S3ContainerProvider;
 #[cfg(feature = "containers")]
-use super::gateway_process::{ACCESS_KEY_ID, PUBLIC_BUCKET, RunningGateway, SECRET_ACCESS_KEY};
+use super::gateway_process::{
+    ACCESS_KEY_ID, GatewayBuildProfile, PUBLIC_BUCKET, RunningGateway, SECRET_ACCESS_KEY,
+};
 #[cfg(feature = "containers")]
 use super::s3_container;
 use anyhow::Result;
@@ -83,6 +85,9 @@ pub(crate) struct KopiaMatrixArgs {
     /// Directory where the matrix summary JSON is written.
     #[arg(long, env = "RS3_TEST_ARTIFACT_DIR")]
     artifact_dir: Option<PathBuf>,
+    /// Cargo profile used for the gateway process under measurement.
+    #[arg(long, value_enum, default_value_t = GatewayBuildProfile::Release)]
+    gateway_build_profile: GatewayBuildProfile,
 }
 
 #[cfg(not(feature = "containers"))]
@@ -186,6 +191,7 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
                 run_id,
                 run_index,
                 args.workload_profile,
+                args.gateway_build_profile,
             )
             .await?;
             runs.push(serde_json::json!({
@@ -204,6 +210,7 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         "backend_provider": args.container_provider.as_label(),
         "backend_bucket": backend.bucket,
         "backend_region": backend.region,
+        "gateway_build_profile": args.gateway_build_profile.as_str(),
         "aggregate": aggregate_runs(&runs),
         "comparison": compare_runs(&runs),
         "run_reports": runs,
@@ -235,10 +242,11 @@ async fn run_measured_gateway_kopia(
     run_id: u128,
     run_index: usize,
     profile: KopiaWorkloadProfile,
+    gateway_build_profile: GatewayBuildProfile,
 ) -> Result<serde_json::Value> {
     let workspace = KopiaWorkspace::new()?;
     workspace.populate_source(profile)?;
-    let mut gateway = RunningGateway::start_with_log_capture(
+    let mut gateway = RunningGateway::start_with_log_capture_profile(
         backend,
         format!(
             "{}/{}/run-{run_index:03}/gateway-{run_id}",
@@ -246,6 +254,7 @@ async fn run_measured_gateway_kopia(
             profile.as_str()
         ),
         "rs3_storage=debug,rs3_repository=info,info",
+        gateway_build_profile,
     )
     .await?;
     gateway.clear_captured_logs()?;
