@@ -193,6 +193,14 @@ fn must_storage<T>(result: rs3_storage::Result<T>) -> T {
     }
 }
 
+fn now_ms() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
 fn decode_checkpoint_object(body: Bytes) -> Checkpoint {
     let Some(payload) = body.as_ref().strip_prefix(CHECKPOINT_OBJECT_DOMAIN) else {
         panic!("checkpoint object is missing domain prefix");
@@ -394,6 +402,60 @@ impl BlobStore for FailOncePutStore {
     }
 }
 
+#[derive(Clone, Debug)]
+struct NoPutTimestampStore {
+    inner: MemoryBlobStore,
+}
+
+#[async_trait]
+impl BlobStore for NoPutTimestampStore {
+    async fn put(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        body: Bytes,
+        options: PutOptions,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        let mut metadata = self.inner.put(object_id, body, options).await?;
+        metadata.modified_at_ms = None;
+        Ok(metadata)
+    }
+
+    async fn get_range(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Bytes> {
+        self.inner.get_range(object_id, range).await
+    }
+
+    async fn head(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        self.inner.head(object_id).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
+        self.inner.list_prefix(prefix).await
+    }
+
+    async fn delete(&self, object_id: &rs3_types::BackendObjectId) -> rs3_storage::Result<()> {
+        self.inner.delete(object_id).await
+    }
+
+    async fn extend_retention(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        policy: RetentionPolicy,
+    ) -> rs3_storage::Result<()> {
+        self.inner.extend_retention(object_id, policy).await
+    }
+
+    async fn flush_caches(&self) -> rs3_storage::Result<()> {
+        self.inner.flush_caches().await
+    }
+}
+
 #[test]
 fn prefix_tokens_include_root_and_arbitrary_prefixes() {
     let keyring = KeyRing::single_namespace(secret());
@@ -549,6 +611,33 @@ async fn range_get_uses_repository_mapping() {
         .await;
 
     assert_eq!(must(body), Bytes::from_static(b"world"));
+}
+
+#[tokio::test]
+async fn put_uses_wall_clock_when_backend_omits_put_timestamp() {
+    let repo = Repository::new(
+        NoPutTimestampStore {
+            inner: MemoryBlobStore::new(),
+        },
+        secret(),
+    );
+    let key = key("p/12/no-provider-timestamp");
+    let before = now_ms();
+
+    let put = repo
+        .put(
+            key.clone(),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    let after = now_ms();
+    let head = repo.head(&key);
+
+    assert!(put.is_ok());
+    let modified_at_ms = must(head).modified_at_ms;
+    assert!(modified_at_ms >= before);
+    assert!(modified_at_ms <= after);
 }
 
 #[tokio::test]

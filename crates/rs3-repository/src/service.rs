@@ -17,7 +17,7 @@ use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, LogicalPath, RetentionPolicy};
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Trusted repository service.
 pub struct Repository<S> {
@@ -118,9 +118,7 @@ where
             )
             .await?;
 
-        let modified_at_ms = storage_metadata
-            .modified_at_ms
-            .unwrap_or_else(|| sequence.get() as i64);
+        let modified_at_ms = modified_at_ms_or_now(storage_metadata.modified_at_ms, sequence);
         let entry = NamespaceEntry {
             namespace_key_id: primary_blind_key.key_id,
             blind_key: primary_blind_key.blind_key,
@@ -394,9 +392,7 @@ where
         let manifest = TrustedManifest {
             key: key.clone(),
             content_len,
-            modified_at_ms: backend
-                .modified_at_ms
-                .unwrap_or_else(|| sequence.get() as i64),
+            modified_at_ms: modified_at_ms_or_now(backend.modified_at_ms, sequence),
             retention: backend.retention,
         };
         let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
@@ -507,4 +503,16 @@ fn record_repository_get(
 
 fn elapsed_us(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn modified_at_ms_or_now(modified_at_ms: Option<i64>, sequence: rs3_types::Sequence) -> i64 {
+    modified_at_ms.unwrap_or_else(|| current_time_ms().unwrap_or(sequence.get() as i64))
+}
+
+fn current_time_ms() -> Option<i64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    i64::try_from(millis).ok()
 }
