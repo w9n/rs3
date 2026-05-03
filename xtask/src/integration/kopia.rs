@@ -16,8 +16,9 @@ mod measurement;
 mod workload;
 #[cfg(feature = "containers")]
 use measurement::{
-    RunningStorageProxy, aggregate_runs, endpoint_authority, gateway_backend_metrics_json,
-    gateway_client_metrics_json, measurement_json, now_millis, wait_for_storage_proxy_metrics,
+    RunningStorageProxy, aggregate_runs, compare_runs, endpoint_authority,
+    gateway_backend_metrics_json, gateway_client_metrics_json, measurement_json, now_millis,
+    wait_for_storage_proxy_metrics,
 };
 #[cfg(feature = "containers")]
 use std::ffi::{OsStr, OsString};
@@ -204,6 +205,7 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         "backend_bucket": backend.bucket,
         "backend_region": backend.region,
         "aggregate": aggregate_runs(&runs),
+        "comparison": compare_runs(&runs),
         "run_reports": runs,
     });
     for run in summary["run_reports"]
