@@ -121,7 +121,7 @@ fn runtime_config() -> RuntimeConfig {
             max_pending_items: 64,
         },
         repository: RepositoryConfig {
-            payload_segment_size: 256 * 1024,
+            payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
         },
         static_credentials: Some(StaticCredentials {
             access_key_id: "access".to_owned(),

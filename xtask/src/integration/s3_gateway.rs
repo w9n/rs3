@@ -42,7 +42,7 @@ pub(crate) struct S3GatewayArgs {
 #[cfg(not(feature = "containers"))]
 pub(crate) fn run_s3_gateway(args: S3GatewayArgs) -> Result<()> {
     anyhow::bail!(
-        "gateway container integration for {:?} requires `cargo run -p xtask --features containers -- integration s3-gateway`",
+        "gateway container integration for {:?} requires `cargo run -p xtask --bin xtask --features containers -- integration s3-gateway`",
         args.container_provider,
     )
 }

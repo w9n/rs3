@@ -9,7 +9,7 @@ claims.
 Command shape:
 
 ```sh
-cargo run -p xtask --features containers -- integration kopia-measured-matrix --runs 3 --workload-profile <profile>
+cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix --runs 3 --workload-profile <profile>
 ```
 
 The harness compares two paths against a disposable local RustFS container:
@@ -65,7 +65,7 @@ same straight proxy lane for every row.
 Command shape:
 
 ```sh
-cargo run -p xtask --features containers -- integration kopia-measured-matrix \
+cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix \
   --runs 3 \
   --workload-profile many-small-files \
   --gateway-build-profile release \
@@ -74,6 +74,10 @@ cargo run -p xtask --features containers -- integration kopia-measured-matrix \
 
 | Gateway segment size | Artifact | Direct read | Gateway read | Read ratio | Request ratio | Write ratio | Elapsed ratio |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 B | `.local/integration/` | 72.84 KB | 330.67 KB | 4.54x | 1.02x | 1.91x | 0.49x |
+| 1 KiB | `.local/integration/` | 72.84 KB | 593.22 KB | 8.14x | 1.02x | 1.89x | 0.46x |
+| 2 KiB | `.local/integration/` | 72.84 KB | 1.12 MB | 15.34x | 1.01x | 1.89x | 0.50x |
+| 4 KiB | `.local/integration/` | 72.84 KB | 2.17 MB | 29.76x | 1.01x | 1.88x | 0.48x |
 | 8 KiB | `.local/integration/` | 72.84 KB | 4.27 MB | 58.67x | 1.02x | 1.88x | 0.48x |
 | 16 KiB | `.local/integration/` | 72.84 KB | 8.48 MB | 116.37x | 1.02x | 1.88x | 0.47x |
 | 32 KiB | `.local/integration/` | 72.84 KB | 16.88 MB | 231.75x | 1.02x | 1.88x | 0.49x |
@@ -81,21 +85,26 @@ cargo run -p xtask --features containers -- integration kopia-measured-matrix \
 
 Interpretation:
 
-- Segment size dominates backend read bytes for tiny ranged restores. The 8 KiB
-  lane reads about 5.5x less backend data than the 32 KiB lane and about 5.5x
-  less than the 256 KiB default-era lane for this profile.
+- Segment size dominates backend read bytes for tiny ranged restores. The 512 B
+  lane reads about 13x less backend data than the 8 KiB lane and about 71x less
+  than the 256 KiB default-era lane for this profile.
+- The ratio is large because the denominator is small. The profile restores 512
+  tiny files; Kopia issued 514 successful ranged GETs but received only about
+  56 KB of total S3 response body. At 2 KiB segments each roughly 110-byte
+  response still forces at least one authenticated backend segment read.
 - Backend request amplification is effectively flat in this sweep. The gateway
   issues about 1.02x as many backend operations as the direct proxy baseline.
 - Write-byte amplification is also flat because this workload's writes are
-  mostly independent of restore segment size.
+  mostly independent of restore segment size, rising only from about 1.88x at
+  8 KiB to about 1.91x at 512 B in this tiny-data profile.
 - Wall-clock remains a weak ranking signal here. The local gateway lane is
-  faster than direct RustFS through the proxy for all four rows, which should be
+  faster than direct RustFS through the proxy for all rows, which should be
   treated as a harness/backend observation rather than a provider claim.
-- The current data supports 8 KiB as the best read-byte point for
-  many-small-file restore behavior, but earlier Velero/Postgres measurements saw
-  worse internal gateway range-read time at 8 KiB. Keep 16 KiB as the working
-  default candidate until CPU and p95/p99 latency are measured on repeated
-  larger restore profiles.
+- A single 512 B `medium-restore` sanity run read 1.03x and wrote 1.03x backend
+  bytes versus direct RustFS, but p95/p99 large-object PUT latency was visibly
+  higher. Keep 512 B as the current Kopia-first default candidate, and require
+  repeated larger restore runs plus CPU/memory capture before treating it as a
+  production default.
 
 ## Follow-Up Work
 

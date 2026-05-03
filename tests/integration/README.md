@@ -9,7 +9,7 @@ restore coverage.
 Current entrypoint:
 
 ```sh
-cargo run -p xtask -- integration s3-local
+cargo run -p xtask --bin xtask -- integration s3-local
 ```
 
 The default mode expects an already running S3-compatible endpoint and an
@@ -20,21 +20,21 @@ The container mode starts a local provider, creates a temporary bucket, and
 then runs the same storage contract:
 
 ```sh
-cargo run -p xtask --features containers -- integration s3-local --mode container
+cargo run -p xtask --bin xtask --features containers -- integration s3-local --mode container
 ```
 
 The gateway mode starts a local provider, creates a backend bucket, starts the
 gateway, and drives object operations through the gateway's S3 endpoint:
 
 ```sh
-cargo run -p xtask --features containers -- integration s3-gateway
+cargo run -p xtask --bin xtask --features containers -- integration s3-gateway
 ```
 
 The Kopia gateway mode uses the same local provider and gateway, then runs a
 real Kopia repository create/snapshot/restore smoke test:
 
 ```sh
-cargo run -p xtask --features containers -- integration kopia-gateway
+cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway
 ```
 
 Set `RS3_TEST_KOPIA_BIN` or pass `--kopia-bin` when the executable is not named
@@ -45,7 +45,7 @@ the gateway image, deploys the gateway, waits for readiness, and runs an S3
 smoke test through `kubectl port-forward`:
 
 ```sh
-cargo run -p xtask --features k8s -- integration k8s-gateway
+cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway
 ```
 
 Pass `--keep-cluster` to inspect a failing cluster before deletion. The Helm
@@ -65,7 +65,7 @@ local state in these lanes; object data lives in the backend service and current
 checkpoint state lives in the Lease.
 
 ```sh
-cargo run -p xtask --features k8s -- integration velero-kopia-smoke
+cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-smoke
 ```
 
 The local-PV variant adds static PV data-restore coverage without deploying a
@@ -74,7 +74,7 @@ deletes the pod, restores the pod, and verifies that Velero repopulates the
 volume through Kopia..
 
 ```sh
-cargo run -p xtask --features k8s -- integration velero-kopia-local-pv-smoke
+cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-local-pv-smoke
 ```
 
 The dynamic-PVC variant installs OpenEBS LocalPV Hostpath through its pinned Helm
@@ -83,7 +83,7 @@ backup, restores it, and verifies the restored file bytes. This is the first
 kind-friendly disaster-restore lane..
 
 ```sh
-cargo run -p xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke
+cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke
 ```
 
 The gateway-restart variant restarts the gateway after backup and before restore.
@@ -91,7 +91,7 @@ It is a targeted durability smoke for repository state that must survive process
 replacement without relying on a gateway PVC.
 
 ```sh
-cargo run -p xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke
+cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke
 ```
 
 The Postgres smoke uses a single Postgres pod on the same dynamic PVC path. It
@@ -99,7 +99,7 @@ writes deterministic rows, runs a `CHECKPOINT` and `pg_dump` pre-backup hook,
 then verifies live SQL state and the dump file after restore.
 
 ```sh
-cargo run -p xtask --features k8s -- integration velero-kopia-postgres-smoke
+cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke
 ```
 
 That Postgres smoke verifies only the gateway and Velero/Kopia compatibility path for a small

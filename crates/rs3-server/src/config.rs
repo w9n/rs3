@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(
             config.repository,
             RepositoryConfig {
-                payload_segment_size: 256 * 1024,
+                payload_segment_size: 512,
             }
         );
         assert!(config.static_credentials.is_none());

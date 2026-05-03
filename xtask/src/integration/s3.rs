@@ -69,7 +69,7 @@ fn run_provided_s3(args: S3LocalArgs) -> Result<()> {
 #[cfg(not(feature = "containers"))]
 fn run_container_s3(args: S3LocalArgs) -> Result<()> {
     anyhow::bail!(
-        "container integration for {:?} requires `cargo run -p xtask --features containers -- integration s3-local --mode container`",
+        "container integration for {:?} requires `cargo run -p xtask --bin xtask --features containers -- integration s3-local --mode container`",
         args.container_provider,
     )
 }

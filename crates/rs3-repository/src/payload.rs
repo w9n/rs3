@@ -10,7 +10,7 @@ const PAYLOAD_OBJECT_DOMAIN: &[u8] = b"rs3:payload-object:v2-segmented\n";
 const PAYLOAD_SEGMENT_AAD_DOMAIN: &[u8] = b"rs3:payload-segment-associated-data:v2\n";
 pub(crate) const PAYLOAD_HEADER_PROBE_LEN: u64 = 128;
 /// Default plaintext bytes per independently encrypted payload segment.
-pub const DEFAULT_PAYLOAD_SEGMENT_SIZE: usize = 256 * 1024;
+pub const DEFAULT_PAYLOAD_SEGMENT_SIZE: usize = 512;
 const U64_LEN: usize = 8;
 const AEAD_TAG_LEN: u64 = 16;
 const NONCE_PREFIX_LEN: usize = 16;

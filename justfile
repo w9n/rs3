@@ -25,34 +25,34 @@ integration-s3:
     cargo test -p rs3-storage --features s3 --test s3_live -- --ignored --nocapture
 
 integration-s3-local *ARGS:
-    cargo run -p xtask -- integration s3-local {{ARGS}}
+    cargo run -p xtask --bin xtask -- integration s3-local {{ARGS}}
 
 integration-s3-container *ARGS:
-    cargo run -p xtask --features containers -- integration s3-local --mode container {{ARGS}}
+    cargo run -p xtask --bin xtask --features containers -- integration s3-local --mode container {{ARGS}}
 
 integration-s3-gateway *ARGS:
-    cargo run -p xtask --features containers -- integration s3-gateway {{ARGS}}
+    cargo run -p xtask --bin xtask --features containers -- integration s3-gateway {{ARGS}}
 
 integration-kopia-gateway *ARGS:
-    cargo run -p xtask --features containers -- integration kopia-gateway {{ARGS}}
+    cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway {{ARGS}}
 
 integration-k8s-gateway *ARGS:
-    cargo run -p xtask --features k8s -- integration k8s-gateway {{ARGS}}
+    cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway {{ARGS}}
 
 integration-velero-kopia-smoke *ARGS:
-    cargo run -p xtask --features k8s -- integration velero-kopia-smoke {{ARGS}}
+    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-smoke {{ARGS}}
 
 integration-velero-kopia-local-pv-smoke *ARGS:
-    cargo run -p xtask --features k8s -- integration velero-kopia-local-pv-smoke {{ARGS}}
+    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-local-pv-smoke {{ARGS}}
 
 integration-velero-kopia-dynamic-pvc-smoke *ARGS:
-    cargo run -p xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke {{ARGS}}
+    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke {{ARGS}}
 
 integration-velero-kopia-dynamic-pvc-gateway-restart-smoke *ARGS:
-    cargo run -p xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke {{ARGS}}
+    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke {{ARGS}}
 
 integration-velero-kopia-postgres-smoke *ARGS:
-    cargo run -p xtask --features k8s -- integration velero-kopia-postgres-smoke {{ARGS}}
+    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke {{ARGS}}
 
 helm-lint:
     helm lint charts/rs3-gateway
@@ -61,22 +61,22 @@ test:
     cargo test --workspace
 
 perf *ARGS:
-    cargo run -p xtask -- perf {{ARGS}}
+    cargo run -p xtask --bin xtask -- perf {{ARGS}}
 
 perf-commit *ARGS:
-    cargo run -p xtask -- perf --scenario write-committed {{ARGS}}
+    cargo run -p xtask --bin xtask -- perf --scenario write-committed {{ARGS}}
 
 perf-commit-parallel *ARGS:
-    cargo run -p xtask -- perf --scenario write-committed-parallel {{ARGS}}
+    cargo run -p xtask --bin xtask -- perf --scenario write-committed-parallel {{ARGS}}
 
 perf-s3 *ARGS:
-    cargo run -p xtask --features s3 -- perf --backend s3 {{ARGS}}
+    cargo run -p xtask --bin xtask --features s3 -- perf --backend s3 {{ARGS}}
 
 perf-s3-container *ARGS:
-    cargo run -p xtask --features containers -- perf --backend s3-container {{ARGS}}
+    cargo run -p xtask --bin xtask --features containers -- perf --backend s3-container {{ARGS}}
 
 perf-s3-gateway *ARGS:
-    cargo run -p xtask --features containers -- perf --backend s3-gateway-container {{ARGS}}
+    cargo run -p xtask --bin xtask --features containers -- perf --backend s3-gateway-container {{ARGS}}
 
 nextest:
     cargo nextest run --workspace

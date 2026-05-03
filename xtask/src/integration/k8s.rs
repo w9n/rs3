@@ -52,7 +52,7 @@ pub(crate) struct K8sGatewayArgs {
 #[cfg(not(feature = "k8s"))]
 pub(crate) fn run_k8s_gateway(_args: K8sGatewayArgs) -> Result<()> {
     anyhow::bail!(
-        "Kubernetes gateway integration requires `cargo run -p xtask --features k8s -- integration k8s-gateway`",
+        "Kubernetes gateway integration requires `cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway`",
     )
 }
 

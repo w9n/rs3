@@ -97,7 +97,7 @@ pub(crate) struct KopiaMatrixArgs {
 #[cfg(not(feature = "containers"))]
 pub(crate) fn run_kopia_gateway(args: KopiaGatewayArgs) -> Result<()> {
     anyhow::bail!(
-        "Kopia gateway integration for {:?} requires `cargo run -p xtask --features containers -- integration kopia-gateway`",
+        "Kopia gateway integration for {:?} requires `cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway`",
         args.container_provider,
     )
 }
@@ -105,7 +105,7 @@ pub(crate) fn run_kopia_gateway(args: KopiaGatewayArgs) -> Result<()> {
 #[cfg(not(feature = "containers"))]
 pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
     anyhow::bail!(
-        "Kopia measured matrix integration for {:?} requires `cargo run -p xtask --features containers -- integration kopia-measured-matrix`",
+        "Kopia measured matrix integration for {:?} requires `cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix`",
         args.container_provider,
     )
 }

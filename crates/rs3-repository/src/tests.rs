@@ -25,8 +25,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_TEST_PAYLOAD_SEGMENT_SIZE: usize = 256 * 1024;
-
 fn secret() -> SecretBytes {
     secret_with_byte(9)
 }
@@ -688,13 +686,7 @@ async fn range_read_amplification_tracks_payload_segment_size() {
     let range_len = 8 * 1024;
     let reads = 96;
 
-    let large = range_read_pressure(
-        DEFAULT_TEST_PAYLOAD_SEGMENT_SIZE,
-        object_size,
-        range_len,
-        reads,
-    )
-    .await;
+    let large = range_read_pressure(256 * 1024, object_size, range_len, reads).await;
     let medium = range_read_pressure(32 * 1024, object_size, range_len, reads).await;
     let small = range_read_pressure(8 * 1024, object_size, range_len, reads).await;
 

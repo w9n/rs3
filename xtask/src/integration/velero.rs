@@ -153,21 +153,21 @@ pub(crate) struct VeleroKopiaSmokeArgs {
 #[cfg(not(feature = "k8s"))]
 pub(crate) fn run_velero_kopia_smoke(_args: VeleroKopiaSmokeArgs) -> Result<()> {
     anyhow::bail!(
-        "Velero Kopia smoke integration requires `cargo run -p xtask --features k8s -- integration velero-kopia-smoke`",
+        "Velero Kopia smoke integration requires `cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-smoke`",
     )
 }
 
 #[cfg(not(feature = "k8s"))]
 pub(crate) fn run_velero_kopia_local_pv_smoke(_args: VeleroKopiaSmokeArgs) -> Result<()> {
     anyhow::bail!(
-        "Velero Kopia local-PV smoke integration requires `cargo run -p xtask --features k8s -- integration velero-kopia-local-pv-smoke`",
+        "Velero Kopia local-PV smoke integration requires `cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-local-pv-smoke`",
     )
 }
 
 #[cfg(not(feature = "k8s"))]
 pub(crate) fn run_velero_kopia_dynamic_pvc_smoke(_args: VeleroKopiaSmokeArgs) -> Result<()> {
     anyhow::bail!(
-        "Velero Kopia dynamic-PVC smoke integration requires `cargo run -p xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke`",
+        "Velero Kopia dynamic-PVC smoke integration requires `cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke`",
     )
 }
 
@@ -176,21 +176,21 @@ pub(crate) fn run_velero_kopia_dynamic_pvc_gateway_restart_smoke(
     _args: VeleroKopiaSmokeArgs,
 ) -> Result<()> {
     anyhow::bail!(
-        "Velero Kopia dynamic-PVC gateway-restart smoke integration requires `cargo run -p xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke`",
+        "Velero Kopia dynamic-PVC gateway-restart smoke integration requires `cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke`",
     )
 }
 
 #[cfg(not(feature = "k8s"))]
 pub(crate) fn run_velero_kopia_postgres_smoke(_args: VeleroKopiaSmokeArgs) -> Result<()> {
     anyhow::bail!(
-        "Velero Kopia Postgres smoke integration requires `cargo run -p xtask --features k8s -- integration velero-kopia-postgres-smoke`",
+        "Velero Kopia Postgres smoke integration requires `cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke`",
     )
 }
 
 #[cfg(not(feature = "k8s"))]
 pub(crate) fn run_velero_kopia_postgres_direct_smoke(_args: VeleroKopiaSmokeArgs) -> Result<()> {
     anyhow::bail!(
-        "Velero Kopia Postgres direct RustFS smoke integration requires `cargo run -p xtask --features k8s -- integration velero-kopia-postgres-direct-smoke`",
+        "Velero Kopia Postgres direct RustFS smoke integration requires `cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-direct-smoke`",
     )
 }
 
