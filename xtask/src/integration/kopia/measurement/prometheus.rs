@@ -365,9 +365,9 @@ fn parse_prometheus_sample(line: &str) -> Option<PrometheusSample> {
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
-    let mut fields = line.split_whitespace();
-    let metric = fields.next()?;
-    let value = fields.next()?.parse::<f64>().ok()?;
+    let (metric, rest) = split_prometheus_sample(line)?;
+    let mut fields = rest.split_whitespace();
+    let value = parse_prometheus_float(fields.next()?)?;
     let (name, labels) = parse_prometheus_metric(metric)?;
     Some(PrometheusSample {
         name,
@@ -376,22 +376,119 @@ fn parse_prometheus_sample(line: &str) -> Option<PrometheusSample> {
     })
 }
 
+fn split_prometheus_sample(line: &str) -> Option<(&str, &str)> {
+    let mut in_labels = false;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, ch) in line.char_indices() {
+        if !in_labels && ch.is_whitespace() {
+            return Some((&line[..index], line[index..].trim_start()));
+        }
+
+        if !in_labels {
+            if ch == '{' {
+                in_labels = true;
+            }
+            continue;
+        }
+
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '}' => in_labels = false,
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn parse_prometheus_float(value: &str) -> Option<f64> {
+    match value {
+        "+Inf" | "Inf" => Some(f64::INFINITY),
+        "-Inf" => Some(f64::NEG_INFINITY),
+        "NaN" => Some(f64::NAN),
+        value => value.parse::<f64>().ok(),
+    }
+}
+
 fn parse_prometheus_metric(metric: &str) -> Option<(String, BTreeMap<String, String>)> {
     let Some((name, labels)) = metric.split_once('{') else {
         return Some((metric.to_owned(), BTreeMap::new()));
     };
     let labels = labels.strip_suffix('}')?;
-    Some((name.to_owned(), parse_prometheus_labels(labels)))
+    Some((name.to_owned(), parse_prometheus_labels(labels)?))
 }
 
-fn parse_prometheus_labels(labels: &str) -> BTreeMap<String, String> {
-    labels
-        .split(',')
-        .filter_map(|label| {
-            let (key, value) = label.split_once('=')?;
-            Some((key.to_owned(), value.trim_matches('"').to_owned()))
-        })
-        .collect()
+fn parse_prometheus_labels(labels: &str) -> Option<BTreeMap<String, String>> {
+    let mut parsed = BTreeMap::new();
+    let mut remaining = labels.trim();
+    if remaining.is_empty() {
+        return Some(parsed);
+    }
+
+    loop {
+        let (key, value_start) = remaining.split_once('=')?;
+        let key = key.trim();
+        if key.is_empty() {
+            return None;
+        }
+        let value_start = value_start.trim_start();
+        let (value, consumed) = parse_prometheus_label_value(value_start)?;
+        if parsed.insert(key.to_owned(), value).is_some() {
+            return None;
+        }
+
+        remaining = value_start[consumed..].trim_start();
+        if remaining.is_empty() {
+            return Some(parsed);
+        }
+        remaining = remaining.strip_prefix(',')?.trim_start();
+    }
+}
+
+fn parse_prometheus_label_value(value: &str) -> Option<(String, usize)> {
+    let mut chars = value.char_indices();
+    let (_, first) = chars.next()?;
+    if first != '"' {
+        return None;
+    }
+
+    let mut parsed = String::new();
+    let mut escaped = false;
+    for (index, ch) in chars {
+        if escaped {
+            match ch {
+                'n' => parsed.push('\n'),
+                '"' => parsed.push('"'),
+                '\\' => parsed.push('\\'),
+                other => parsed.push(other),
+            }
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some((parsed, index + ch.len_utf8())),
+            other => parsed.push(other),
+        }
+    }
+
+    None
 }
 
 fn prometheus_sample_identity(sample: &PrometheusSample) -> String {
@@ -444,7 +541,37 @@ fn duration_summary_json(
 
 #[cfg(test)]
 mod tests {
-    use super::prometheus_metrics_delta_json;
+    use super::{parse_prometheus_sample, prometheus_metrics_delta_json};
+
+    #[test]
+    fn parses_escaped_prometheus_labels() {
+        let sample = parse_prometheus_sample(
+            r#"rs3_s3_requests_total{operation="Put,Object",note="a b",quoted="quo\"ted",path="a\\b\nc"} 42 123"#,
+        )
+        .expect("sample should parse");
+
+        assert_eq!(sample.name, "rs3_s3_requests_total");
+        assert_eq!(sample.value, 42.0);
+        assert_eq!(
+            sample.labels.get("operation").map(String::as_str),
+            Some("Put,Object")
+        );
+        assert_eq!(sample.labels.get("note").map(String::as_str), Some("a b"));
+        assert_eq!(
+            sample.labels.get("quoted").map(String::as_str),
+            Some("quo\"ted")
+        );
+        assert_eq!(
+            sample.labels.get("path").map(String::as_str),
+            Some("a\\b\nc")
+        );
+    }
+
+    #[test]
+    fn skips_invalid_prometheus_label_sets() {
+        assert!(parse_prometheus_sample(r#"metric_total{label="a",label="b"} 1"#).is_none());
+        assert!(parse_prometheus_sample(r#"metric_total{label="unterminated} 1"#).is_none());
+    }
 
     #[test]
     fn summarizes_prometheus_metrics_delta_without_run_labels() {
