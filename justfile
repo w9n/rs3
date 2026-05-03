@@ -39,6 +39,12 @@ integration-kopia-gateway *ARGS:
 integration-k8s-gateway *ARGS:
     cargo run -p xtask --features k8s -- integration k8s-gateway {{ARGS}}
 
+integration-velero-kopia-smoke *ARGS:
+    cargo run -p xtask --features k8s -- integration velero-kopia-smoke {{ARGS}}
+
+integration-velero-kopia-local-pv-smoke *ARGS:
+    cargo run -p xtask --features k8s -- integration velero-kopia-local-pv-smoke {{ARGS}}
+
 helm-lint:
     helm lint charts/rs3-gateway
 

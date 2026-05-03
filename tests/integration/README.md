@@ -52,6 +52,28 @@ Pass `--keep-cluster` to inspect a failing cluster before deletion. The Helm
 chart under `charts/rs3-gateway` is the install packaging surface; the `xtask`
 Kubernetes smoke remains the deterministic CI orchestrator.
 
+The Velero Kopia smoke extends the Kubernetes path by installing Velero with the
+node-agent, pointing its S3 backup location at the gateway service, backing up a
+pod volume, restoring it, and checking the restored file content. It uses an
+`emptyDir` volume because kind's default PVC provisioner exposes `hostPath` PVs,
+which Velero file-system backup intentionally skips.
+
+```sh
+cargo run -p xtask --features k8s -- integration velero-kopia-smoke
+```
+
+The local-PV variant adds static PV/PVC restore coverage without deploying a
+dynamic storage provider:
+
+```sh
+cargo run -p xtask --features k8s -- integration velero-kopia-local-pv-smoke
+```
+
+Both Velero lanes load the Velero server and AWS plugin images from the local
+Docker daemon into kind by default. Preload or mirror
+`velero/velero:v1.18.0` and `velero/velero-plugin-for-aws:v1.14.0`, or pass
+`--pull-velero-images` when registry pulls are acceptable.
+
 Container provider setup stays behind the opt-in `xtask/containers` feature so
 Docker and provider bootstrap dependencies stay outside normal unit tests and
 runtime crates.

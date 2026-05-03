@@ -12,9 +12,10 @@ use rs3_repository::RepositoryPutOptions;
 use rs3_storage::ByteRange;
 use rs3_types::PublicBucket;
 use s3s::dto::{
-    DeleteObjectInput, DeleteObjectOutput, GetObjectInput, GetObjectOutput, HeadObjectInput,
-    HeadObjectOutput, ListObjectsV2Input, ListObjectsV2Output, PutObjectInput, PutObjectOutput,
-    StreamingBlob,
+    Bucket, DeleteObjectInput, DeleteObjectOutput, GetObjectInput, GetObjectOutput,
+    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
+    ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Owner, PutObjectInput,
+    PutObjectOutput, StreamingBlob,
 };
 use s3s::{Body, S3, S3Request, S3Response, S3Result};
 
@@ -46,6 +47,33 @@ impl GatewayS3Service {
 
 #[async_trait::async_trait]
 impl S3 for GatewayS3Service {
+    async fn head_bucket(
+        &self,
+        req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
+        let input = req.input;
+        self.check_bucket(&input.bucket)?;
+
+        Ok(S3Response::new(HeadBucketOutput::default()))
+    }
+
+    async fn list_buckets(
+        &self,
+        _req: S3Request<ListBucketsInput>,
+    ) -> S3Result<S3Response<ListBucketsOutput>> {
+        Ok(S3Response::new(ListBucketsOutput {
+            buckets: Some(vec![Bucket {
+                name: Some(self.public_bucket.as_str().to_owned()),
+                ..Bucket::default()
+            }]),
+            owner: Some(Owner {
+                display_name: Some("rs3".to_owned()),
+                id: Some("rs3".to_owned()),
+            }),
+            ..ListBucketsOutput::default()
+        }))
+    }
+
     async fn put_object(
         &self,
         req: S3Request<PutObjectInput>,
@@ -225,8 +253,8 @@ mod tests {
     use rs3_anchor::CheckpointAnchor;
     use rs3_storage::BlobStore;
     use s3s::dto::{
-        DeleteObjectInput, GetObjectInput, HeadObjectInput, ListObjectsV2Input, PutObjectInput,
-        StreamingBlob,
+        DeleteObjectInput, GetObjectInput, HeadBucketInput, HeadObjectInput, ListBucketsInput,
+        ListObjectsV2Input, PutObjectInput, StreamingBlob,
     };
     use s3s::{Body, S3, S3Request, S3Response};
 
@@ -273,6 +301,45 @@ mod tests {
         fn assert_s3<T: s3s::S3>() {}
 
         assert_s3::<GatewayS3Service>();
+    }
+
+    #[tokio::test]
+    async fn head_bucket_accepts_public_bucket() {
+        let service = gateway_service();
+        let response = service
+            .head_bucket(s3_request(HeadBucketInput {
+                bucket: "client-bucket".to_owned(),
+                ..HeadBucketInput::default()
+            }))
+            .await;
+
+        assert!(response.is_ok());
+    }
+
+    #[tokio::test]
+    async fn head_bucket_rejects_other_bucket() {
+        let service = gateway_service();
+        let response = service
+            .head_bucket(s3_request(HeadBucketInput {
+                bucket: "other-bucket".to_owned(),
+                ..HeadBucketInput::default()
+            }))
+            .await;
+
+        assert!(response.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_buckets_returns_public_bucket() {
+        let service = gateway_service();
+        let response = service
+            .list_buckets(s3_request(ListBucketsInput::default()))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let buckets = response.output.buckets.unwrap_or_default();
+
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].name.as_deref(), Some("client-bucket"));
     }
 
     #[tokio::test]

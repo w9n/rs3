@@ -3,11 +3,13 @@
 #[cfg(feature = "containers")]
 mod gateway_process;
 mod k8s;
+mod k8s_support;
 mod kopia;
 mod s3;
 #[cfg(feature = "containers")]
 pub(crate) mod s3_container;
 mod s3_gateway;
+mod velero;
 
 use anyhow::Result;
 use clap::{Args, Subcommand, ValueEnum};
@@ -29,6 +31,10 @@ enum IntegrationCommand {
     KopiaGateway(kopia::KopiaGatewayArgs),
     /// Run the gateway inside a disposable kind cluster.
     K8sGateway(k8s::K8sGatewayArgs),
+    /// Run a Velero node-agent/Kopia backup and restore through the gateway.
+    VeleroKopiaSmoke(velero::VeleroKopiaSmokeArgs),
+    /// Run a Velero node-agent/Kopia local-PV backup and restore through the gateway.
+    VeleroKopiaLocalPvSmoke(velero::VeleroKopiaSmokeArgs),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -53,5 +59,9 @@ pub(crate) fn run(args: IntegrationArgs) -> Result<()> {
         IntegrationCommand::S3Gateway(args) => s3_gateway::run_s3_gateway(args),
         IntegrationCommand::KopiaGateway(args) => kopia::run_kopia_gateway(args),
         IntegrationCommand::K8sGateway(args) => k8s::run_k8s_gateway(args),
+        IntegrationCommand::VeleroKopiaSmoke(args) => velero::run_velero_kopia_smoke(args),
+        IntegrationCommand::VeleroKopiaLocalPvSmoke(args) => {
+            velero::run_velero_kopia_local_pv_smoke(args)
+        }
     }
 }
