@@ -17,7 +17,7 @@ mod workload;
 #[cfg(feature = "containers")]
 use measurement::{
     RunningStorageProxy, aggregate_runs, endpoint_authority, gateway_backend_metrics_json,
-    measurement_json, now_millis, wait_for_storage_proxy_metrics,
+    gateway_client_metrics_json, measurement_json, now_millis, wait_for_storage_proxy_metrics,
 };
 #[cfg(feature = "containers")]
 use std::ffi::{OsStr, OsString};
@@ -261,11 +261,9 @@ async fn run_measured_gateway_kopia(
     let shutdown = gateway.shutdown();
     let stats = stats?;
     shutdown?;
-    Ok(measurement_json(
-        "gateway",
-        stats,
-        gateway_backend_metrics_json(&logs),
-    ))
+    let mut report = measurement_json("gateway", stats, gateway_backend_metrics_json(&logs));
+    report["client_metrics"] = gateway_client_metrics_json(&logs);
+    Ok(report)
 }
 
 #[cfg(feature = "containers")]
