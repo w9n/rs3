@@ -85,16 +85,19 @@ single-profile rows. The Postgres-shaped profile uses file-specific deterministi
 payloads so equal-size relation and WAL files do not collapse into a
 deduplicated synthetic best case.
 
-| Profile | Shape | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend writes | Backend reads |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| medium-restore | one 64 MiB object | 2.92 s | 2.95 s | 1.01x | 1.16x | 1.03x | 1.03x |
-| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 9.75 s | 2.63 s | 0.27x | 1.01x | 1.03x | 1.05x |
-| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 2.76 s | 3.54 s | 1.29x | 1.13x | 1.03x | 1.03x |
+| Profile | Shape | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend writes | Backend reads | Gateway CPU | Gateway HWM RSS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| medium-restore | one 64 MiB object | 2.49 s | 2.73 s | 1.10x | 1.16x | 1.03x | 1.03x | 0.98 s | 99.34 MiB |
+| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 9.15 s | 2.46 s | 0.27x | 1.01x | 1.03x | 1.05x | 1.41 s | 87.49 MiB |
+| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 2.56 s | 3.37 s | 1.32x | 1.11x | 1.03x | 1.03x | 2.70 s | 194.50 MiB |
 
 Interpretation:
 
 - Larger restore read and write byte ratios stay close to the straight proxy
   baseline, about 1.03x to 1.05x in these runs.
+- Gateway CPU is cumulative process CPU time for the measured gateway run.
+  Gateway HWM RSS is the average high-water resident set size across the three
+  gateway runs for that profile.
 - The Kubernetes-shaped profile is dominated by many small ranged GETs on the
   direct path. The gateway is faster locally despite similar backend bytes, but
   that elapsed ratio should be treated as a local RustFS/proxy observation.
