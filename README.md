@@ -48,7 +48,11 @@ credential environment variables before running it. Optional knobs:
 
 The `rs3-server/s3` feature enables the server runtime to use the S3-compatible
 storage adapter. Set `RS3_BACKEND_ENDPOINT=s3` for the default AWS endpoint, or
-use an `http://` / `https://` endpoint URL for an S3-compatible service.
+use an `http://` / `https://` endpoint URL for an S3-compatible service. The
+gateway also requires `RS3_REPOSITORY_MASTER_KEY_HEX`, a hex-encoded repository
+master key with at least 32 bytes of entropy. The server derives
+purpose-specific repository keys from that master key at startup; do not reuse
+it across repositories.
 
 `just integration-s3-local` is the orchestration entrypoint for local S3
 integration checks. It currently expects a provided endpoint and delegates to

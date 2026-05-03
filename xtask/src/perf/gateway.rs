@@ -21,6 +21,8 @@ use tokio::net::TcpStream;
 const GATEWAY_PUBLIC_BUCKET: &str = "client-bucket";
 const GATEWAY_ACCESS_KEY_ID: &str = "access";
 const GATEWAY_SECRET_ACCESS_KEY: &str = "secret";
+const GATEWAY_REPOSITORY_MASTER_KEY_HEX: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
 
 pub(super) fn run_s3_gateway_container_perf(args: &PerfArgs) -> Result<()> {
     let scenarios = gateway_perf_scenarios(args.scenario)?;
@@ -395,6 +397,10 @@ impl RunningPerfGateway {
             .env("RS3_BACKEND_ENDPOINT", &backend.endpoint_url)
             .env("RS3_BACKEND_BUCKET", &backend.bucket)
             .env("RS3_BACKEND_PREFIX", backend_prefix)
+            .env(
+                "RS3_REPOSITORY_MASTER_KEY_HEX",
+                GATEWAY_REPOSITORY_MASTER_KEY_HEX,
+            )
             .env(
                 "RS3_COMMIT_MAX_BATCH_ITEMS",
                 commit_batch_items(args).to_string(),

@@ -1,5 +1,6 @@
 //! Purpose-specific repository keyrings.
 
+use crate::primitives::derive_hmac;
 use crate::{CryptoError, SecretBytes};
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus};
 use std::collections::BTreeSet;
@@ -34,6 +35,28 @@ impl KeyRing {
     pub fn new(keys: Vec<KeyMaterial>) -> Result<Self, CryptoError> {
         validate_keyring(&keys)?;
         Ok(Self { keys })
+    }
+
+    /// Derives the default purpose-specific keyring from one repository master key.
+    pub fn from_repository_master_key(master_key: &SecretBytes) -> Result<Self, CryptoError> {
+        Self::new(vec![
+            KeyMaterial::new(
+                default_namespace_descriptor(),
+                derive_repository_subkey(master_key, b"namespace")?,
+            ),
+            KeyMaterial::new(
+                default_content_descriptor(),
+                derive_repository_subkey(master_key, b"content")?,
+            ),
+            KeyMaterial::new(
+                default_metadata_descriptor(),
+                derive_repository_subkey(master_key, b"metadata")?,
+            ),
+            KeyMaterial::new(
+                default_checkpoint_descriptor(),
+                derive_repository_subkey(master_key, b"checkpoint")?,
+            ),
+        ])
     }
 
     /// Creates a keyring with primary namespace and metadata keys.
@@ -186,6 +209,17 @@ fn validate_keyring(keys: &[KeyMaterial]) -> Result<(), CryptoError> {
     Ok(())
 }
 
+fn derive_repository_subkey(
+    master_key: &SecretBytes,
+    purpose: &[u8],
+) -> Result<SecretBytes, CryptoError> {
+    SecretBytes::new(derive_hmac(
+        master_key,
+        b"rs3:repository-subkey:v1",
+        purpose,
+    )?)
+}
+
 fn sort_descriptors(descriptors: &mut [KeyDescriptor]) {
     descriptors.sort_by(|left, right| {
         left.purpose
@@ -225,6 +259,19 @@ fn default_content_descriptor() -> KeyDescriptor {
         id: static_key_id("content-v1"),
         purpose: KeyPurpose::Content,
         algorithm: "xchacha20poly1305".to_string(),
+        status: KeyStatus::Primary,
+        created_at_ms: 0,
+        not_before_ms: None,
+        not_after_ms: None,
+        external_kms_uri: None,
+    }
+}
+
+fn default_checkpoint_descriptor() -> KeyDescriptor {
+    KeyDescriptor {
+        id: static_key_id("checkpoint-v1"),
+        purpose: KeyPurpose::CheckpointSigning,
+        algorithm: "hmac-sha256".to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
         not_before_ms: None,
@@ -308,5 +355,54 @@ mod tests {
                 (key_id("old"), KeyStatus::Enabled)
             ]
         );
+    }
+
+    #[test]
+    fn repository_master_key_derives_purpose_specific_keys() {
+        let master_key = secret(9);
+
+        let keyring = match KeyRing::from_repository_master_key(&master_key) {
+            Ok(keyring) => keyring,
+            Err(error) => panic!("{error}"),
+        };
+
+        assert_eq!(
+            keyring
+                .descriptors()
+                .into_iter()
+                .map(|descriptor| (descriptor.id, descriptor.purpose, descriptor.algorithm))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    key_id("namespace-v1"),
+                    KeyPurpose::Namespace,
+                    "hmac-sha256".to_owned()
+                ),
+                (
+                    key_id("content-v1"),
+                    KeyPurpose::Content,
+                    "xchacha20poly1305".to_owned()
+                ),
+                (
+                    key_id("metadata-v1"),
+                    KeyPurpose::Metadata,
+                    "hmac-sha256-seal".to_owned()
+                ),
+                (
+                    key_id("checkpoint-v1"),
+                    KeyPurpose::CheckpointSigning,
+                    "hmac-sha256".to_owned()
+                ),
+            ]
+        );
+
+        let mut secrets = keyring
+            .keys
+            .iter()
+            .map(|key| key.secret.expose().to_vec())
+            .collect::<Vec<_>>();
+        secrets.sort();
+        secrets.dedup();
+        assert_eq!(secrets.len(), 4);
     }
 }

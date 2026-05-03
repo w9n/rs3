@@ -31,6 +31,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{- define "rs3-gateway.repositoryKeySecretName" -}}
+{{- if .Values.repositoryKeys.existingSecret -}}
+{{- .Values.repositoryKeys.existingSecret -}}
+{{- else -}}
+{{- printf "%s-repository-keys" (include "rs3-gateway.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "rs3-gateway.serviceAccountName" -}}
 {{- if .Values.serviceAccount.name -}}
 {{- .Values.serviceAccount.name -}}

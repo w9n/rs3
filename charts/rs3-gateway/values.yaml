@@ -34,7 +34,12 @@ commit:
   maxBatchDelayMs: 5
 
 repository:
-  payloadSegmentSizeBytes: 262144
+  payloadSegmentSizeBytes: 512
+
+repositoryKeys:
+  create: false
+  existingSecret: ""
+  masterKeyHex: ""
 
 anchor:
   mode: memory

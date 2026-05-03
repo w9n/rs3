@@ -147,8 +147,8 @@ pub enum GatewayServerError {
 mod tests {
     use super::{GatewayServer, GatewayServerError};
     use crate::{
-        AnchorConfig, BackendConfig, BatchConfig, MetricsConfig, RepositoryConfig, RuntimeConfig,
-        SecretString,
+        AnchorConfig, BackendConfig, BatchConfig, MetricsConfig, RepositoryConfig,
+        RepositoryKeysConfig, RuntimeConfig, SecretString,
     };
     use rs3_types::PublicBucket;
     use std::time::Duration;
@@ -180,6 +180,11 @@ mod tests {
             },
             repository: RepositoryConfig {
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+            },
+            repository_keys: RepositoryKeysConfig {
+                master_key_hex: SecretString::from(
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                ),
             },
             static_credentials: static_credentials.then(|| crate::StaticCredentials {
                 access_key_id: "access".to_owned(),

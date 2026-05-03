@@ -71,6 +71,13 @@ spec:
               value: {{ .Values.commit.maxBatchDelayMs | quote }}
             - name: RS3_PAYLOAD_SEGMENT_SIZE_BYTES
               value: {{ .Values.repository.payloadSegmentSizeBytes | quote }}
+            {{- if or .Values.repositoryKeys.create .Values.repositoryKeys.existingSecret }}
+            - name: RS3_REPOSITORY_MASTER_KEY_HEX
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
+                  key: master-key-hex
+            {{- end }}
             - name: RS3_ANCHOR_MODE
               value: {{ .Values.anchor.mode | quote }}
             {{- if eq .Values.anchor.mode "kubernetes-lease" }}

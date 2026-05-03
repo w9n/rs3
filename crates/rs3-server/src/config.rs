@@ -1,9 +1,11 @@
 //! Runtime configuration loaded from process environment.
 
 use crate::identity::StaticCredentials;
+use rs3_crypto::SecretBytes;
 use rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE;
 use rs3_types::PublicBucket;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
+use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 use thiserror::Error;
@@ -13,6 +15,10 @@ const DEFAULT_ANCHOR_MODE: &str = "memory";
 const DEFAULT_ANCHOR_FIELD_MANAGER: &str = "rs3-server";
 const DEFAULT_BATCH_ITEMS: usize = 64;
 const DEFAULT_BATCH_DELAY_MS: u64 = 10;
+const REDACTED_SECRET_VALUE: &str = "<redacted>";
+const MIN_REPOSITORY_KEY_HEX_LEN: usize = SecretBytes::MIN_LEN * 2;
+
+pub(crate) const REPOSITORY_MASTER_KEY_HEX_ENV: &str = "RS3_REPOSITORY_MASTER_KEY_HEX";
 
 /// Complete runtime configuration for the gateway process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +37,8 @@ pub struct RuntimeConfig {
     pub batching: BatchConfig,
     /// Repository object layout settings.
     pub repository: RepositoryConfig,
+    /// Repository cryptographic key material.
+    pub repository_keys: RepositoryKeysConfig,
     /// Optional static credentials accepted by the server.
     pub static_credentials: Option<StaticCredentials>,
 }
@@ -87,6 +95,30 @@ pub struct RepositoryConfig {
     pub payload_segment_size: usize,
 }
 
+/// Hex-encoded repository master key loaded from external secret storage.
+#[derive(Clone)]
+pub struct RepositoryKeysConfig {
+    /// Repository master key used to derive purpose-specific keys.
+    pub master_key_hex: SecretString,
+}
+
+impl fmt::Debug for RepositoryKeysConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RepositoryKeysConfig")
+            .field("master_key_hex", &REDACTED_SECRET_VALUE)
+            .finish()
+    }
+}
+
+impl PartialEq for RepositoryKeysConfig {
+    fn eq(&self, other: &Self) -> bool {
+        secret_string_eq(&self.master_key_hex, &other.master_key_hex)
+    }
+}
+
+impl Eq for RepositoryKeysConfig {}
+
 /// Runtime configuration errors.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
@@ -142,6 +174,7 @@ impl RuntimeConfig {
         let anchor = parse_anchor_config(source)?;
         let batching = parse_batch_config(source)?;
         let repository = parse_repository_config(source)?;
+        let repository_keys = parse_repository_keys_config(source)?;
         let static_credentials = parse_static_credentials(source)?;
 
         Ok(Self {
@@ -152,6 +185,7 @@ impl RuntimeConfig {
             anchor,
             batching,
             repository,
+            repository_keys,
             static_credentials,
         })
     }
@@ -220,6 +254,54 @@ fn parse_repository_config(source: &impl ConfigSource) -> Result<RepositoryConfi
     Ok(RepositoryConfig {
         payload_segment_size,
     })
+}
+
+fn parse_repository_keys_config(
+    source: &impl ConfigSource,
+) -> Result<RepositoryKeysConfig, ConfigError> {
+    Ok(RepositoryKeysConfig {
+        master_key_hex: required_secret_hex(source, REPOSITORY_MASTER_KEY_HEX_ENV)?,
+    })
+}
+
+fn required_secret_hex(
+    source: &impl ConfigSource,
+    key: &'static str,
+) -> Result<SecretString, ConfigError> {
+    let value = required_value(source, key)?;
+    validate_repository_key_hex(key, &value)?;
+    Ok(SecretString::from(value))
+}
+
+fn validate_repository_key_hex(key: &'static str, value: &str) -> Result<(), ConfigError> {
+    if value.len() < MIN_REPOSITORY_KEY_HEX_LEN {
+        return Err(invalid_repository_key(
+            key,
+            "expected at least 32 bytes of hex-encoded key material",
+        ));
+    }
+    if !value.len().is_multiple_of(2) {
+        return Err(invalid_repository_key(
+            key,
+            "expected even-length hexadecimal text",
+        ));
+    }
+    if !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return Err(invalid_repository_key(
+            key,
+            "expected hexadecimal text only",
+        ));
+    }
+
+    Ok(())
+}
+
+fn invalid_repository_key(key: &'static str, reason: &str) -> ConfigError {
+    ConfigError::Invalid {
+        key,
+        value: REDACTED_SECRET_VALUE.to_owned(),
+        reason: reason.to_owned(),
+    }
 }
 
 fn parse_static_credentials(
@@ -323,14 +405,36 @@ fn parse_u64(key: &'static str, value: Option<String>, default: u64) -> Result<u
     })
 }
 
+fn secret_string_eq(left: &SecretString, right: &SecretString) -> bool {
+    constant_time_eq(
+        left.expose_secret().as_bytes(),
+        right.expose_secret().as_bytes(),
+    )
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let diff = left
+        .iter()
+        .zip(right.iter())
+        .fold(0_u8, |diff, (left, right)| diff | (left ^ right));
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AnchorConfig, BatchConfig, ConfigError, ConfigSource, MetricsConfig, RepositoryConfig,
-        RuntimeConfig,
+        RepositoryKeysConfig, RuntimeConfig,
     };
+    use secrecy::SecretString;
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    const MASTER_KEY_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
     #[derive(Default)]
     struct TestSource(BTreeMap<&'static str, String>);
@@ -338,6 +442,11 @@ mod tests {
     impl TestSource {
         fn with(mut self, key: &'static str, value: &str) -> Self {
             self.0.insert(key, value.to_owned());
+            self
+        }
+
+        fn without(mut self, key: &'static str) -> Self {
+            self.0.remove(key);
             self
         }
     }
@@ -353,6 +462,13 @@ mod tests {
             .with("RS3_PUBLIC_BUCKET", "client-bucket")
             .with("RS3_BACKEND_ENDPOINT", "https://object.example")
             .with("RS3_BACKEND_BUCKET", "backend-bucket")
+            .with(super::REPOSITORY_MASTER_KEY_HEX_ENV, MASTER_KEY_HEX)
+    }
+
+    fn repository_keys_config() -> RepositoryKeysConfig {
+        RepositoryKeysConfig {
+            master_key_hex: SecretString::from(MASTER_KEY_HEX),
+        }
     }
 
     #[test]
@@ -383,6 +499,7 @@ mod tests {
                 payload_segment_size: 512,
             }
         );
+        assert_eq!(config.repository_keys, repository_keys_config());
         assert!(config.static_credentials.is_none());
     }
 
@@ -420,6 +537,39 @@ mod tests {
             Ok(RepositoryConfig {
                 payload_segment_size: 65536,
             })
+        );
+    }
+
+    #[test]
+    fn rejects_missing_repository_key() {
+        let source = minimal_source().without(super::REPOSITORY_MASTER_KEY_HEX_ENV);
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Missing { key }) if key == super::REPOSITORY_MASTER_KEY_HEX_ENV)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_repository_key_hex() {
+        let source = minimal_source().with(super::REPOSITORY_MASTER_KEY_HEX_ENV, "not-hex");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, value, .. }) if key == super::REPOSITORY_MASTER_KEY_HEX_ENV && value == "<redacted>")
+        );
+    }
+
+    #[test]
+    fn rejects_short_repository_key_hex() {
+        let source = minimal_source().with(super::REPOSITORY_MASTER_KEY_HEX_ENV, "aa");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, value, .. }) if key == super::REPOSITORY_MASTER_KEY_HEX_ENV && value == "<redacted>")
         );
     }
 
@@ -491,6 +641,7 @@ mod tests {
 
         assert!(debug.contains("access"));
         assert!(!debug.contains("super-secret"));
+        assert!(!debug.contains(MASTER_KEY_HEX));
         assert!(debug.contains("<redacted>"));
     }
 }

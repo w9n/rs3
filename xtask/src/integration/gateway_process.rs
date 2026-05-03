@@ -14,6 +14,8 @@ use tokio::net::TcpStream;
 pub(crate) const PUBLIC_BUCKET: &str = "client-bucket";
 pub(crate) const ACCESS_KEY_ID: &str = "access";
 pub(crate) const SECRET_ACCESS_KEY: &str = "secret";
+pub(crate) const REPOSITORY_MASTER_KEY_HEX: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub(crate) enum GatewayBuildProfile {
@@ -119,6 +121,7 @@ impl RunningGateway {
             .env("RS3_BACKEND_ENDPOINT", &backend.endpoint_url)
             .env("RS3_BACKEND_BUCKET", &backend.bucket)
             .env("RS3_BACKEND_PREFIX", backend_prefix)
+            .env("RS3_REPOSITORY_MASTER_KEY_HEX", REPOSITORY_MASTER_KEY_HEX)
             .env("RS3_STATIC_ACCESS_KEY_ID", ACCESS_KEY_ID)
             .env("RS3_STATIC_SECRET_ACCESS_KEY", SECRET_ACCESS_KEY)
             .env("AWS_ACCESS_KEY_ID", &backend.access_key_id)

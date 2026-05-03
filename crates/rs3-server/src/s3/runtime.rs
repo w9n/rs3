@@ -1,10 +1,11 @@
 //! Runtime repository construction for the S3 service.
 
 use super::S3BoundaryError;
-use crate::{AnchorConfig, BackendConfig, BatchConfig, RuntimeConfig};
+use crate::config::REPOSITORY_MASTER_KEY_HEX_ENV;
+use crate::{AnchorConfig, BackendConfig, BatchConfig, RepositoryKeysConfig, RuntimeConfig};
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor, MemoryCheckpointAnchor};
-use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
+use rs3_crypto::{KeyRing, SecretBytes};
 #[cfg(feature = "k8s")]
 use rs3_k8s::{KubernetesLeaseAnchor, LeaseSettings};
 use rs3_repository::{
@@ -17,7 +18,8 @@ use rs3_storage::{
 };
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
-use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath};
+use rs3_types::LogicalPath;
+use secrecy::{ExposeSecret, SecretString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -40,7 +42,7 @@ impl RuntimeRepository {
         let anchor = build_anchor(&config.anchor)?;
         let repository = Arc::new(Repository::with_keyring_and_options(
             store.handle.clone(),
-            gateway_keyring()?,
+            gateway_keyring(&config.repository_keys)?,
             RepositoryOptions {
                 payload_segment_size: config.repository.payload_segment_size,
             },
@@ -365,40 +367,22 @@ impl CheckpointAnchor for DynCheckpointAnchor {
     }
 }
 
-fn gateway_keyring() -> Result<KeyRing, S3BoundaryError> {
-    KeyRing::new(vec![
-        key_material("namespace", KeyPurpose::Namespace, "hmac-sha256", 1)?,
-        key_material("content", KeyPurpose::Content, "xchacha20poly1305", 2)?,
-        key_material("metadata", KeyPurpose::Metadata, "hmac-sha256-seal", 3)?,
-        key_material(
-            "checkpoint",
-            KeyPurpose::CheckpointSigning,
-            "hmac-sha256",
-            4,
-        )?,
-    ])
-    .map_err(repository_init)
+fn gateway_keyring(keys: &RepositoryKeysConfig) -> Result<KeyRing, S3BoundaryError> {
+    let master_key = repository_master_key(&keys.master_key_hex)?;
+    KeyRing::from_repository_master_key(&master_key).map_err(repository_init)
 }
 
-fn key_material(
-    id: &str,
-    purpose: KeyPurpose,
-    algorithm: &str,
-    secret_byte: u8,
-) -> Result<KeyMaterial, S3BoundaryError> {
-    Ok(KeyMaterial::new(
-        KeyDescriptor {
-            id: KeyId::new(id.to_owned()).map_err(repository_init)?,
-            purpose,
-            algorithm: algorithm.to_owned(),
-            status: KeyStatus::Primary,
-            created_at_ms: 0,
-            not_before_ms: None,
-            not_after_ms: None,
-            external_kms_uri: None,
-        },
-        SecretBytes::new(vec![secret_byte; SecretBytes::MIN_LEN]).map_err(repository_init)?,
-    ))
+fn repository_master_key(secret_hex: &SecretString) -> Result<SecretBytes, S3BoundaryError> {
+    let bytes = hex::decode(secret_hex.expose_secret()).map_err(|error| {
+        repository_init(format!(
+            "{REPOSITORY_MASTER_KEY_HEX_ENV} must be hex-encoded repository key material: {error}",
+        ))
+    })?;
+    SecretBytes::new(bytes).map_err(|error| {
+        repository_init(format!(
+            "{REPOSITORY_MASTER_KEY_HEX_ENV} is not usable: {error}",
+        ))
+    })
 }
 
 fn repository_init(error: impl ToString) -> S3BoundaryError {
