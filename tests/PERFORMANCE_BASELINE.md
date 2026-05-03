@@ -57,7 +57,8 @@ and latency.
 Repository metrics also include
 `prometheus_metrics.repository.payload_span_cache_events_by_result` and
 `payload_span_cache_bytes_by_result`, which show ciphertext span cache hits,
-misses, inserts, and bytes without exposing object keys.
+misses, inserts, evictions, skipped inserts, and bytes without exposing object
+keys.
 
 The matrix comparison block includes derived gateway-internal cost ratios such
 as backend read bytes per returned GET byte, backend write bytes per PUT request

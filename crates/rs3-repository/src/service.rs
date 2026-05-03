@@ -609,8 +609,13 @@ where
             .map_err(|_| RepositoryError::StatePoisoned)?;
         let outcome = cache.insert(object_id.clone(), span, ciphertext);
         match outcome {
-            PayloadSpanCacheInsert::Inserted { bytes } => {
+            PayloadSpanCacheInsert::Inserted {
+                bytes,
+                evicted_entries,
+                evicted_bytes,
+            } => {
                 record_payload_span_cache("insert", bytes);
+                record_payload_span_cache_many("evict", evicted_entries, evicted_bytes);
             }
             PayloadSpanCacheInsert::SkippedTooLarge { bytes } => {
                 record_payload_span_cache("skip_too_large", bytes);
@@ -992,26 +997,46 @@ impl PayloadSpanCache {
                 entry.insert(ciphertext);
             }
         }
-        self.evict_over_limits();
-        PayloadSpanCacheInsert::Inserted { bytes }
+        let evicted = self.evict_over_limits();
+        PayloadSpanCacheInsert::Inserted {
+            bytes,
+            evicted_entries: evicted.entries,
+            evicted_bytes: evicted.bytes,
+        }
     }
 
-    fn evict_over_limits(&mut self) {
+    fn evict_over_limits(&mut self) -> PayloadSpanCacheEviction {
+        let mut evicted = PayloadSpanCacheEviction::default();
         while self.spans.len() > self.max_entries || self.current_bytes > self.max_bytes {
-            let Some(evicted) = self.order.pop_front() else {
+            let Some(evicted_key) = self.order.pop_front() else {
                 break;
             };
-            if let Some(ciphertext) = self.spans.remove(&evicted) {
+            if let Some(ciphertext) = self.spans.remove(&evicted_key) {
                 let bytes = u64::try_from(ciphertext.len()).unwrap_or(u64::MAX);
                 self.current_bytes = self.current_bytes.saturating_sub(bytes);
+                evicted.entries = evicted.entries.saturating_add(1);
+                evicted.bytes = evicted.bytes.saturating_add(bytes);
             }
         }
+        evicted
     }
 }
 
 enum PayloadSpanCacheInsert {
-    Inserted { bytes: u64 },
-    SkippedTooLarge { bytes: u64 },
+    Inserted {
+        bytes: u64,
+        evicted_entries: u64,
+        evicted_bytes: u64,
+    },
+    SkippedTooLarge {
+        bytes: u64,
+    },
+}
+
+#[derive(Default)]
+struct PayloadSpanCacheEviction {
+    entries: u64,
+    bytes: u64,
 }
 
 struct RepositoryPutTrace {
@@ -1203,11 +1228,18 @@ fn record_repository_operation_metrics(operation: &'static str, result: &str, el
 }
 
 fn record_payload_span_cache(result: &'static str, bytes: u64) {
+    record_payload_span_cache_many(result, 1, bytes);
+}
+
+fn record_payload_span_cache_many(result: &'static str, events: u64, bytes: u64) {
+    if events == 0 && bytes == 0 {
+        return;
+    }
     metrics::counter!(
         "rs3_repository_payload_span_cache_events_total",
         "result" => result,
     )
-    .increment(1);
+    .increment(events);
     metrics::counter!(
         "rs3_repository_payload_span_cache_bytes_total",
         "result" => result,
@@ -1245,4 +1277,82 @@ fn current_time_ms() -> Option<i64> {
         .ok()?
         .as_millis();
     i64::try_from(millis).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PayloadSpanCache, PayloadSpanCacheInsert, SegmentCiphertextSpan};
+    use bytes::Bytes;
+    use rs3_types::BackendObjectId;
+    use std::collections::{BTreeMap, VecDeque};
+
+    fn object_id(value: &str) -> BackendObjectId {
+        match BackendObjectId::new(value.to_owned()) {
+            Ok(object_id) => object_id,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    fn span(offset: u64, len: u64) -> SegmentCiphertextSpan {
+        SegmentCiphertextSpan {
+            offset,
+            len,
+            start_segment: 0,
+            segment_count: 1,
+        }
+    }
+
+    fn cache(max_entries: usize, max_bytes: u64) -> PayloadSpanCache {
+        PayloadSpanCache {
+            spans: BTreeMap::new(),
+            order: VecDeque::new(),
+            max_entries,
+            max_bytes,
+            current_bytes: 0,
+        }
+    }
+
+    fn inserted(outcome: PayloadSpanCacheInsert) -> (u64, u64, u64) {
+        match outcome {
+            PayloadSpanCacheInsert::Inserted {
+                bytes,
+                evicted_entries,
+                evicted_bytes,
+            } => (bytes, evicted_entries, evicted_bytes),
+            PayloadSpanCacheInsert::SkippedTooLarge { bytes } => {
+                panic!("insert skipped unexpectedly with {bytes} bytes")
+            }
+        }
+    }
+
+    #[test]
+    fn payload_span_cache_reports_entry_evictions() {
+        let mut cache = cache(1, 1024);
+        let first_span = span(0, 4);
+        let second_span = span(4, 4);
+
+        assert_eq!(
+            inserted(cache.insert(
+                object_id("payload-a"),
+                first_span,
+                Bytes::from_static(b"aaaa")
+            )),
+            (4, 0, 0)
+        );
+        assert_eq!(
+            inserted(cache.insert(
+                object_id("payload-b"),
+                second_span,
+                Bytes::from_static(b"bbbb")
+            )),
+            (4, 1, 4)
+        );
+
+        assert!(cache.get(&object_id("payload-a"), first_span).is_none());
+        assert_eq!(
+            cache.get(&object_id("payload-b"), second_span),
+            Some(Bytes::from_static(b"bbbb"))
+        );
+        assert_eq!(cache.current_bytes, 4);
+    }
 }
