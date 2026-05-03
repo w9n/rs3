@@ -9,10 +9,17 @@ Current entrypoint:
 cargo run -p xtask -- integration s3-local
 ```
 
-The first mode expects an already running S3-compatible endpoint and an existing
-test bucket. It delegates to the live storage contract test and uses
+The default mode expects an already running S3-compatible endpoint and an
+existing test bucket. It delegates to the live storage contract test and uses
 `RS3_TEST_S3_*` environment variables or matching command-line flags.
 
-Future modes should plug container and Kubernetes startup into the same xtask
-entrypoint, so provider setup, cleanup, logs, and generated artifacts stay
-outside normal unit tests.
+The container mode starts a local provider, creates a temporary bucket, and
+then runs the same storage contract:
+
+```sh
+cargo run -p xtask --features containers -- integration s3-local --mode container
+```
+
+Container provider setup stays behind the opt-in `xtask/containers` feature so
+Docker and provider bootstrap dependencies stay outside normal unit tests and
+runtime crates.

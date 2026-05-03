@@ -27,6 +27,9 @@ integration-s3:
 integration-s3-local *ARGS:
     cargo run -p xtask -- integration s3-local {{ARGS}}
 
+integration-s3-container *ARGS:
+    cargo run -p xtask --features containers -- integration s3-local --mode container {{ARGS}}
+
 test:
     cargo test --workspace
 
