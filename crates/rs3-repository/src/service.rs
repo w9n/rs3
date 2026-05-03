@@ -12,9 +12,9 @@ use crate::namespace::{
 };
 use crate::payload::{
     DEFAULT_PAYLOAD_SEGMENT_SIZE, PAYLOAD_HEADER_PROBE_LEN, PayloadHeaderProbe,
-    SegmentedPayloadHeader, open_payload_object, open_segmented_payload_span,
-    parse_segmented_payload_header, probe_payload_header, seal_payload_object,
-    segmented_ciphertext_span,
+    SegmentCiphertextSpan, SegmentedPayloadHeader, open_payload_object,
+    open_segmented_payload_span, parse_segmented_payload_header, probe_payload_header,
+    seal_payload_object, segmented_ciphertext_span,
 };
 use crate::state::{RepositoryState, TrustedManifest, next_sequence, object_material};
 use bytes::Bytes;
@@ -349,6 +349,91 @@ where
             },
         };
         let span = segmented_ciphertext_span(&header.header, range)?;
+        let span_read = self
+            .read_ciphertext_span(object_id, span, header.prefetched_body.as_ref())
+            .await?;
+        let backend_bytes_read = header
+            .backend_bytes_read
+            .saturating_add(span_read.backend_bytes_read);
+
+        Ok(PayloadRead {
+            backend_bytes_read,
+            opened: open_segmented_payload_span(
+                keyring,
+                object_id,
+                &header.header,
+                range,
+                span,
+                span_read.ciphertext,
+            ),
+        })
+    }
+
+    async fn read_ciphertext_span(
+        &self,
+        object_id: &BackendObjectId,
+        span: SegmentCiphertextSpan,
+        prefetched_body: Option<&Bytes>,
+    ) -> Result<CiphertextSpanRead> {
+        if span.len == 0 {
+            return Ok(CiphertextSpanRead {
+                backend_bytes_read: 0,
+                ciphertext: Bytes::new(),
+            });
+        }
+
+        if let Some(prefetched) = prefetched_body {
+            let prefetched_len = u64::try_from(prefetched.len()).unwrap_or(u64::MAX);
+            let span_end = span
+                .offset
+                .checked_add(span.len)
+                .ok_or(StorageError::InvalidRange)?;
+            if span_end <= prefetched_len {
+                let start = usize::try_from(span.offset).map_err(|_| StorageError::InvalidRange)?;
+                let end = usize::try_from(span_end).map_err(|_| StorageError::InvalidRange)?;
+                return Ok(CiphertextSpanRead {
+                    backend_bytes_read: 0,
+                    ciphertext: prefetched.slice(start..end),
+                });
+            }
+
+            if span.offset < prefetched_len {
+                let prefix_len = prefetched_len
+                    .checked_sub(span.offset)
+                    .ok_or(StorageError::InvalidRange)?
+                    .min(span.len);
+                let suffix_offset = span
+                    .offset
+                    .checked_add(prefix_len)
+                    .ok_or(StorageError::InvalidRange)?;
+                let suffix_len = span
+                    .len
+                    .checked_sub(prefix_len)
+                    .ok_or(StorageError::InvalidRange)?;
+                let suffix = self
+                    .store
+                    .get_range(
+                        object_id,
+                        ByteRange::Slice {
+                            offset: suffix_offset,
+                            len: suffix_len,
+                        },
+                    )
+                    .await?;
+                let mut ciphertext = Vec::with_capacity(
+                    usize::try_from(span.len).map_err(|_| StorageError::InvalidRange)?,
+                );
+                let prefix_start =
+                    usize::try_from(span.offset).map_err(|_| StorageError::InvalidRange)?;
+                ciphertext.extend_from_slice(&prefetched[prefix_start..]);
+                ciphertext.extend_from_slice(&suffix);
+                return Ok(CiphertextSpanRead {
+                    backend_bytes_read: u64::try_from(suffix.len()).unwrap_or(u64::MAX),
+                    ciphertext: Bytes::from(ciphertext),
+                });
+            }
+        }
+
         let ciphertext = self
             .store
             .get_range(
@@ -359,20 +444,9 @@ where
                 },
             )
             .await?;
-        let backend_bytes_read = header
-            .backend_bytes_read
-            .saturating_add(u64::try_from(ciphertext.len()).unwrap_or(u64::MAX));
-
-        Ok(PayloadRead {
-            backend_bytes_read,
-            opened: open_segmented_payload_span(
-                keyring,
-                object_id,
-                &header.header,
-                range,
-                span,
-                ciphertext,
-            ),
+        Ok(CiphertextSpanRead {
+            backend_bytes_read: u64::try_from(ciphertext.len()).unwrap_or(u64::MAX),
+            ciphertext,
         })
     }
 
@@ -402,8 +476,8 @@ where
             Err(error) => return Err(error.into()),
         };
         let mut backend_bytes_read = u64::try_from(probe.len()).unwrap_or(u64::MAX);
-        let header_bytes = match probe_payload_header(object_id, &probe)? {
-            PayloadHeaderProbe::Segmented { header_len } => probe.slice(..header_len),
+        let (header_bytes, prefetched_body) = match probe_payload_header(object_id, &probe)? {
+            PayloadHeaderProbe::Segmented { header_len } => (probe.slice(..header_len), probe),
             PayloadHeaderProbe::NeedMore { len } => {
                 let header = self
                     .store
@@ -412,7 +486,9 @@ where
                 backend_bytes_read = backend_bytes_read
                     .saturating_add(u64::try_from(header.len()).unwrap_or(u64::MAX));
                 match probe_payload_header(object_id, &header)? {
-                    PayloadHeaderProbe::Segmented { header_len } => header.slice(..header_len),
+                    PayloadHeaderProbe::Segmented { header_len } => {
+                        (header.slice(..header_len), header)
+                    }
                     PayloadHeaderProbe::NeedMore { .. } => {
                         return Err(RepositoryError::InvalidObjectFormat {
                             object_id: object_id.clone(),
@@ -427,6 +503,7 @@ where
         Ok(PayloadHeaderRead::Header(CachedPayloadHeader {
             backend_bytes_read,
             header,
+            prefetched_body: Some(prefetched_body),
         }))
     }
 
@@ -441,6 +518,7 @@ where
         Ok(cache.get(object_id).map(|header| CachedPayloadHeader {
             backend_bytes_read: 0,
             header,
+            prefetched_body: None,
         }))
     }
 
@@ -704,6 +782,11 @@ struct PayloadRead {
     opened: Result<Bytes>,
 }
 
+struct CiphertextSpanRead {
+    backend_bytes_read: u64,
+    ciphertext: Bytes,
+}
+
 enum PayloadHeaderRead {
     Header(CachedPayloadHeader),
     Full(PayloadRead),
@@ -712,6 +795,7 @@ enum PayloadHeaderRead {
 struct CachedPayloadHeader {
     backend_bytes_read: u64,
     header: SegmentedPayloadHeader,
+    prefetched_body: Option<Bytes>,
 }
 
 #[derive(Debug)]
