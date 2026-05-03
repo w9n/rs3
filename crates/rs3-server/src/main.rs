@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use rs3_server::{AnchorConfig, GatewayServer, RuntimeConfig};
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
@@ -27,6 +28,8 @@ enum Commands {
     Serve {
         #[arg(long)]
         bind: Option<SocketAddr>,
+        #[arg(long, env = "RS3_METRICS_BIND")]
+        metrics_bind: Option<SocketAddr>,
     },
     Doctor,
 }
@@ -37,11 +40,15 @@ async fn main() -> Result<()> {
     init_tracing(cli.log_format);
 
     match cli.command {
-        Commands::Serve { bind } => {
+        Commands::Serve { bind, metrics_bind } => {
             let mut config = RuntimeConfig::from_env()?;
             if let Some(bind) = bind {
                 config.bind = bind;
             }
+            if let Some(metrics_bind) = metrics_bind {
+                config.metrics.bind = Some(metrics_bind);
+            }
+            install_metrics(config.metrics.bind)?;
             log_runtime_config(&config);
             let server = GatewayServer::bind(config).await?;
             tracing::info!(bind = %server.local_addr(), "gateway S3 listener started");
@@ -54,6 +61,17 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn install_metrics(bind: Option<SocketAddr>) -> Result<()> {
+    let Some(bind) = bind else {
+        return Ok(());
+    };
+    PrometheusBuilder::new()
+        .with_http_listener(bind)
+        .install()?;
+    tracing::info!(bind = %bind, "gateway metrics listener started");
     Ok(())
 }
 
@@ -71,6 +89,7 @@ fn log_runtime_config(config: &RuntimeConfig) {
 
     tracing::info!(
         bind = %config.bind,
+        metrics_bind = ?config.metrics.bind,
         public_bucket = %config.public_bucket,
         backend_endpoint = %config.backend.endpoint,
         backend_bucket = %config.backend.bucket,

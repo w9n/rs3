@@ -19,6 +19,8 @@ const DEFAULT_BATCH_DELAY_MS: u64 = 10;
 pub struct RuntimeConfig {
     /// Socket address the gateway should bind to.
     pub bind: SocketAddr,
+    /// Metrics exporter settings.
+    pub metrics: MetricsConfig,
     /// Client-visible bucket served by this process.
     pub public_bucket: PublicBucket,
     /// Backend object-store settings.
@@ -42,6 +44,13 @@ pub struct BackendConfig {
     pub bucket: String,
     /// Optional backend prefix for repository-owned objects.
     pub prefix: Option<String>,
+}
+
+/// Metrics exporter settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetricsConfig {
+    /// Optional Prometheus/OpenMetrics scrape listener.
+    pub bind: Option<SocketAddr>,
 }
 
 /// Checkpoint anchor settings.
@@ -120,6 +129,7 @@ impl RuntimeConfig {
                 .value("RS3_BIND")
                 .unwrap_or_else(|| DEFAULT_BIND.to_owned()),
         )?;
+        let metrics = parse_metrics_config(source)?;
         let public_bucket = parse_public_bucket(
             "RS3_PUBLIC_BUCKET",
             required_value(source, "RS3_PUBLIC_BUCKET")?,
@@ -136,6 +146,7 @@ impl RuntimeConfig {
 
         Ok(Self {
             bind,
+            metrics,
             public_bucket,
             backend,
             anchor,
@@ -144,6 +155,14 @@ impl RuntimeConfig {
             static_credentials,
         })
     }
+}
+
+fn parse_metrics_config(source: &impl ConfigSource) -> Result<MetricsConfig, ConfigError> {
+    let bind = match optional_value(source, "RS3_METRICS_BIND") {
+        Some(value) => Some(parse_socket_addr("RS3_METRICS_BIND", value)?),
+        None => None,
+    };
+    Ok(MetricsConfig { bind })
 }
 
 fn parse_anchor_config(source: &impl ConfigSource) -> Result<AnchorConfig, ConfigError> {
@@ -307,7 +326,8 @@ fn parse_u64(key: &'static str, value: Option<String>, default: u64) -> Result<u
 #[cfg(test)]
 mod tests {
     use super::{
-        AnchorConfig, BatchConfig, ConfigError, ConfigSource, RepositoryConfig, RuntimeConfig,
+        AnchorConfig, BatchConfig, ConfigError, ConfigSource, MetricsConfig, RepositoryConfig,
+        RuntimeConfig,
     };
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -344,6 +364,7 @@ mod tests {
             Err(error) => panic!("{error}"),
         };
         assert_eq!(config.bind.to_string(), "127.0.0.1:9080");
+        assert_eq!(config.metrics, MetricsConfig { bind: None });
         assert_eq!(config.public_bucket.as_str(), "client-bucket");
         assert_eq!(config.backend.endpoint, "https://object.example");
         assert_eq!(config.backend.bucket, "backend-bucket");
@@ -363,6 +384,29 @@ mod tests {
             }
         );
         assert!(config.static_credentials.is_none());
+    }
+
+    #[test]
+    fn parses_metrics_bind() {
+        let source = minimal_source().with("RS3_METRICS_BIND", "127.0.0.1:19090");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert_eq!(
+            config.map(|config| config.metrics.bind.map(|bind| bind.to_string())),
+            Ok(Some("127.0.0.1:19090".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_metrics_bind() {
+        let source = minimal_source().with("RS3_METRICS_BIND", "nope");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == "RS3_METRICS_BIND")
+        );
     }
 
     #[test]

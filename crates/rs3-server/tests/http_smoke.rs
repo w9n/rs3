@@ -1,8 +1,8 @@
 //! HTTP-level smoke tests for the S3 listener.
 
 use rs3_server::{
-    AnchorConfig, BackendConfig, BatchConfig, GatewayServer, GatewayServerError, RepositoryConfig,
-    RuntimeConfig, SecretString, StaticCredentials,
+    AnchorConfig, BackendConfig, BatchConfig, GatewayServer, GatewayServerError, MetricsConfig,
+    RepositoryConfig, RuntimeConfig, SecretString, StaticCredentials,
 };
 use rs3_types::PublicBucket;
 use std::net::SocketAddr;
@@ -107,6 +107,7 @@ fn runtime_config() -> RuntimeConfig {
 
     RuntimeConfig {
         bind,
+        metrics: MetricsConfig { bind: None },
         public_bucket,
         backend: BackendConfig {
             endpoint: "memory://local".to_owned(),

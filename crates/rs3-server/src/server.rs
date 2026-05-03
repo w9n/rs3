@@ -147,7 +147,8 @@ pub enum GatewayServerError {
 mod tests {
     use super::{GatewayServer, GatewayServerError};
     use crate::{
-        AnchorConfig, BackendConfig, BatchConfig, RepositoryConfig, RuntimeConfig, SecretString,
+        AnchorConfig, BackendConfig, BatchConfig, MetricsConfig, RepositoryConfig, RuntimeConfig,
+        SecretString,
     };
     use rs3_types::PublicBucket;
     use std::time::Duration;
@@ -164,6 +165,7 @@ mod tests {
 
         RuntimeConfig {
             bind,
+            metrics: MetricsConfig { bind: None },
             public_bucket,
             backend: BackendConfig {
                 endpoint: "memory://local".to_owned(),

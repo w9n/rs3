@@ -31,7 +31,8 @@ pub enum S3BoundaryError {
 #[cfg(test)]
 pub(super) mod test_support {
     use crate::{
-        AnchorConfig, BackendConfig, BatchConfig, RepositoryConfig, RuntimeConfig, SecretString,
+        AnchorConfig, BackendConfig, BatchConfig, MetricsConfig, RepositoryConfig, RuntimeConfig,
+        SecretString,
     };
     use rs3_types::PublicBucket;
     use std::time::Duration;
@@ -48,6 +49,7 @@ pub(super) mod test_support {
 
         RuntimeConfig {
             bind,
+            metrics: MetricsConfig { bind: None },
             public_bucket,
             backend: BackendConfig {
                 endpoint: "memory://local".to_owned(),

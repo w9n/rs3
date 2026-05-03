@@ -75,6 +75,7 @@ impl GatewayS3Service {
         match result {
             Ok(response) => {
                 let status = response.status.unwrap_or(default_success_status);
+                record_s3_request_metrics(operation, "ok", status, elapsed);
                 tracing::info!(
                     target: "rs3_server",
                     operation,
@@ -90,6 +91,7 @@ impl GatewayS3Service {
                 let status = error
                     .status_code()
                     .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+                record_s3_request_metrics(operation, "error", status, elapsed);
                 tracing::info!(
                     target: "rs3_server",
                     operation,
@@ -209,6 +211,7 @@ impl S3 for GatewayS3Service {
                 None => false,
             };
             let body = collect_body(input.body).await?;
+            record_s3_request_body_bytes(OPERATION, body.len());
             tracing::debug!(
                 target: "rs3_server",
                 operation = OPERATION,
@@ -283,6 +286,7 @@ impl S3 for GatewayS3Service {
                 .get_range(&key, repository_range)
                 .await
                 .map_err(repository_error)?;
+            record_s3_response_body_bytes(OPERATION, body.len());
 
             tracing::debug!(
                 target: "rs3_server",
@@ -487,6 +491,45 @@ impl S3 for GatewayS3Service {
 
 fn elapsed_us(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn record_s3_request_metrics(
+    operation: &'static str,
+    result: &'static str,
+    status: http::StatusCode,
+    elapsed: Duration,
+) {
+    let status_code = status.as_u16().to_string();
+    metrics::counter!(
+        "rs3_s3_requests_total",
+        "operation" => operation,
+        "result" => result,
+        "status_code" => status_code.clone(),
+    )
+    .increment(1);
+    metrics::histogram!(
+        "rs3_s3_request_duration_seconds",
+        "operation" => operation,
+        "result" => result,
+        "status_code" => status_code,
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+fn record_s3_request_body_bytes(operation: &'static str, len: usize) {
+    metrics::counter!(
+        "rs3_s3_request_body_bytes_total",
+        "operation" => operation,
+    )
+    .increment(u64::try_from(len).unwrap_or(u64::MAX));
+}
+
+fn record_s3_response_body_bytes(operation: &'static str, len: usize) {
+    metrics::counter!(
+        "rs3_s3_response_body_bytes_total",
+        "operation" => operation,
+    )
+    .increment(u64::try_from(len).unwrap_or(u64::MAX));
 }
 
 #[cfg(test)]
