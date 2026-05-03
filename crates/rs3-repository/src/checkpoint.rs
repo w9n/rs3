@@ -13,8 +13,8 @@ use rs3_index::{
     CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CommitRecord, INDEX_DELTA_OBJECT_DOMAIN,
     INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta, IndexDeltaObject, KeyringSnapshot,
     MANIFEST_PLAINTEXT_DOMAIN, ManifestObject, SealedIndexDeltaObject,
-    canonical_commit_record_bytes, checkpoint_object_bytes, index_delta_object_bytes,
-    index_delta_plaintext_bytes, manifest_plaintext_bytes,
+    canonical_commit_record_bytes, checkpoint_object_bytes, index_delta_plaintext_bytes,
+    manifest_plaintext_bytes,
 };
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, CheckpointId, ManifestId};
@@ -23,13 +23,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) const CHECKPOINT_OBJECT_PREFIX: &str = "checkpoints/";
 const CHECKPOINT_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.checkpoint+json";
-const INDEX_DELTA_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.index-delta+json";
 const INDEX_DELTA_ASSOCIATED_DATA: &[u8] = b"rs3:index-delta-object:v1";
-
-struct PendingIndexDeltaObject {
-    object_id: BackendObjectId,
-    body: Bytes,
-}
 
 impl<S> Repository<S>
 where
@@ -37,14 +31,15 @@ where
 {
     /// Builds the checkpoint payload for the current trusted repository state.
     pub fn draft_commit_record(&self, parent: Option<CheckpointId>) -> Result<CommitRecord> {
-        let index_deltas = self.pending_index_delta_ids()?;
-        self.draft_commit_record_with_index_deltas(parent, index_deltas)
+        let inline_index_delta = self.pending_index_delta_object()?;
+        self.draft_commit_record_with_index_deltas(parent, Vec::new(), inline_index_delta)
     }
 
     fn draft_commit_record_with_index_deltas(
         &self,
         parent: Option<CheckpointId>,
         index_deltas: Vec<BackendObjectId>,
+        inline_index_delta: Option<SealedIndexDeltaObject>,
     ) -> Result<CommitRecord> {
         let keyring = self.keyring()?;
         let state = self.read_state()?;
@@ -53,6 +48,7 @@ where
             sequence: state.next_sequence,
             parent,
             index_deltas,
+            inline_index_delta,
             compacted_manifests: Vec::new(),
             keyring: KeyringSnapshot::new(keyring.descriptors()),
         })
@@ -144,18 +140,11 @@ where
         let parent = accepted
             .as_ref()
             .map(|position| position.checkpoint_id.clone());
-        let pending_index_delta = self.pending_index_delta_object()?;
-        if let Some(delta) = pending_index_delta.as_ref() {
-            self.persist_index_delta_object(delta).await?;
-        }
-        let index_deltas = pending_index_delta
-            .iter()
-            .map(|delta| delta.object_id.clone())
-            .collect();
-
-        let record = self.draft_commit_record_with_index_deltas(parent, index_deltas)?;
+        let inline_index_delta = self.pending_index_delta_object()?;
+        let record =
+            self.draft_commit_record_with_index_deltas(parent, Vec::new(), inline_index_delta)?;
         let checkpoint = self.sign_commit_record(record)?;
-        let index_delta_count = checkpoint.record.index_deltas.len();
+        let index_delta_count = checkpoint_index_delta_count(&checkpoint);
         let position = self.verify_signed_checkpoint(&checkpoint, accepted.as_ref())?;
 
         self.persist_signed_checkpoint(&checkpoint).await?;
@@ -239,12 +228,7 @@ where
         }
     }
 
-    fn pending_index_delta_ids(&self) -> Result<Vec<BackendObjectId>> {
-        self.pending_index_delta_object()
-            .map(|delta| delta.into_iter().map(|delta| delta.object_id).collect())
-    }
-
-    fn pending_index_delta_object(&self) -> Result<Option<PendingIndexDeltaObject>> {
+    fn pending_index_delta_object(&self) -> Result<Option<SealedIndexDeltaObject>> {
         let state = self.read_state()?;
         if state.pending_index_deltas.is_empty() {
             return Ok(None);
@@ -256,43 +240,7 @@ where
         };
         let keyring = self.keyring()?;
         let sealed_delta = seal_index_delta_object(&keyring, &delta)?;
-        let body = Bytes::from(index_delta_object_bytes(&sealed_delta)?);
-        let object_id = derive_index_delta_object_id(&body)?;
-
-        Ok(Some(PendingIndexDeltaObject { object_id, body }))
-    }
-
-    async fn persist_index_delta_object(&self, delta: &PendingIndexDeltaObject) -> Result<()> {
-        let put = self
-            .store
-            .put(
-                &delta.object_id,
-                delta.body.clone(),
-                PutOptions {
-                    retention: None,
-                    content_type: Some(INDEX_DELTA_OBJECT_CONTENT_TYPE.to_owned()),
-                    do_not_recreate: true,
-                },
-            )
-            .await;
-
-        match put {
-            Ok(_) => Ok(()),
-            Err(StorageError::AlreadyExists(_)) => {
-                let existing = self
-                    .store
-                    .get_range(&delta.object_id, ByteRange::Full)
-                    .await?;
-                if existing == delta.body {
-                    Ok(())
-                } else {
-                    Err(crate::RepositoryError::IndexDeltaObjectConflict {
-                        object_id: delta.object_id.clone(),
-                    })
-                }
-            }
-            Err(error) => Err(error.into()),
-        }
+        Ok(Some(sealed_delta))
     }
 
     fn mark_index_deltas_published(&self, sequence: rs3_types::Sequence) -> Result<()> {
@@ -349,8 +297,24 @@ where
             self.load_embedded_manifest_records(state, &delta)?;
             apply_index_delta_object(state, delta);
         }
+        if let Some(delta) = self.open_inline_index_delta_object(checkpoint)? {
+            self.load_embedded_manifest_records(state, &delta)?;
+            apply_index_delta_object(state, delta);
+        }
 
         Ok(())
+    }
+
+    pub(crate) fn open_inline_index_delta_object(
+        &self,
+        checkpoint: &Checkpoint,
+    ) -> Result<Option<IndexDeltaObject>> {
+        let Some(sealed_delta) = checkpoint.record.inline_index_delta.as_ref() else {
+            return Ok(None);
+        };
+        let object_id = inline_index_delta_object_id(&checkpoint.id)?;
+        let keyring = self.keyring()?;
+        open_index_delta_object(&keyring, &object_id, sealed_delta).map(Some)
     }
 
     pub(crate) async fn read_index_delta_object(
@@ -405,6 +369,19 @@ pub(crate) fn checkpoint_object_id(checkpoint_id: &CheckpointId) -> Result<Backe
         checkpoint_id.as_str()
     ))
     .map_err(Into::into)
+}
+
+fn inline_index_delta_object_id(checkpoint_id: &CheckpointId) -> Result<BackendObjectId> {
+    BackendObjectId::new(format!(
+        "{CHECKPOINT_OBJECT_PREFIX}{}/inline-index-delta",
+        checkpoint_id.as_str()
+    ))
+    .map_err(Into::into)
+}
+
+fn checkpoint_index_delta_count(checkpoint: &Checkpoint) -> usize {
+    checkpoint.record.index_deltas.len()
+        + usize::from(checkpoint.record.inline_index_delta.is_some())
 }
 
 fn manifest_associated_data(manifest_id: &ManifestId) -> Vec<u8> {

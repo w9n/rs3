@@ -11,9 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor, MemoryCheckpointAnchor};
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_index::{
-    CHECKPOINT_OBJECT_DOMAIN, Checkpoint, INDEX_DELTA_OBJECT_DOMAIN, canonical_commit_record_bytes,
-};
+use rs3_index::{CHECKPOINT_OBJECT_DOMAIN, Checkpoint, canonical_commit_record_bytes};
 use rs3_storage::{
     BlobMetadata, BlobStore, ByteRange, FilesystemBlobStore, MemoryBlobStore, PutOptions,
     StorageError,
@@ -1129,7 +1127,8 @@ async fn draft_commit_record_contains_rotated_keyring_metadata() {
     let record = must(repo.draft_commit_record(None));
 
     assert_eq!(record.sequence, Sequence::new(2));
-    assert_eq!(record.index_deltas.len(), 1);
+    assert!(record.index_deltas.is_empty());
+    assert!(record.inline_index_delta.is_some());
     assert!(record.compacted_manifests.is_empty());
     assert_eq!(
         record
@@ -1402,7 +1401,7 @@ async fn publish_checkpoint_persists_signed_checkpoint_before_anchor_advance() {
 }
 
 #[tokio::test]
-async fn publish_checkpoint_persists_index_delta_without_client_key_material() {
+async fn publish_checkpoint_embeds_index_delta_without_client_key_material() {
     let store = MemoryBlobStore::new();
     let repo = Repository::with_keyring(store.clone(), signing_keyring());
     let anchor = MemoryCheckpointAnchor::new();
@@ -1428,24 +1427,13 @@ async fn publish_checkpoint_persists_index_delta_without_client_key_material() {
     let delta_objects = must_storage(store.list_prefix("index/").await);
     let manifest_objects = must_storage(store.list_prefix("manifests/").await);
 
-    assert_eq!(checkpoint.record.index_deltas.len(), 1);
-    assert_eq!(delta_objects.len(), 1);
+    assert!(checkpoint.record.index_deltas.is_empty());
+    assert!(checkpoint.record.inline_index_delta.is_some());
+    assert!(delta_objects.is_empty());
     assert!(manifest_objects.is_empty());
-    assert_eq!(
-        checkpoint.record.index_deltas[0],
-        delta_objects[0].object_id
-    );
-
-    let delta_body = must_storage(
-        store
-            .get_range(&delta_objects[0].object_id, ByteRange::Full)
-            .await,
-    );
-    assert!(delta_body.starts_with(INDEX_DELTA_OBJECT_DOMAIN));
     assert_body_does_not_contain(&checkpoint_body, &["sensitive", "client-blob", "p/12"]);
-    assert_body_does_not_contain(&delta_body, &["sensitive", "client-blob", "p/12"]);
     assert_body_does_not_contain(
-        &delta_body,
+        &checkpoint_body,
         &[
             "blind_key",
             "prefix_tokens",
@@ -1687,8 +1675,8 @@ async fn commit_coordinator_publishes_single_write_after_delay() {
     let checkpoints = must_storage(store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
 
     assert_eq!(committed.checkpoint.sequence, Sequence::new(1));
-    assert_eq!(counts.put, 3);
-    assert_eq!(indexes.len(), 1);
+    assert_eq!(counts.put, 2);
+    assert!(indexes.is_empty());
     assert_eq!(checkpoints.len(), 1);
 }
 
@@ -1772,7 +1760,7 @@ async fn multiple_pending_puts_publish_as_one_checkpoint_batch() {
 
     assert_eq!(loaded, position);
     assert_eq!(checkpoint_objects.len(), 1);
-    assert_eq!(index_delta_objects.len(), 1);
+    assert!(index_delta_objects.is_empty());
     assert_eq!(payload_objects.len(), keys.len());
     assert_eq!(
         listed
@@ -1894,22 +1882,22 @@ async fn operation_counts_show_checkpoint_batch_reduces_backend_puts() {
     let grouped_checkpoints =
         must_storage(grouped_store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
 
-    assert_eq!(single_counts.put, 9);
-    assert_eq!(batch_counts.put, 5);
-    assert_eq!(grouped_counts.put, 5);
+    assert_eq!(single_counts.put, 6);
+    assert_eq!(batch_counts.put, 4);
+    assert_eq!(grouped_counts.put, 4);
     assert_eq!(single_counts.get, 0);
     assert_eq!(batch_counts.get, 0);
     assert_eq!(grouped_counts.get, 0);
     assert_eq!(single_payloads.len(), 3);
     assert_eq!(single_manifests.len(), 0);
-    assert_eq!(single_indexes.len(), 3);
+    assert!(single_indexes.is_empty());
     assert_eq!(single_checkpoints.len(), 3);
     assert_eq!(batch_payloads.len(), 3);
     assert_eq!(batch_manifests.len(), 0);
-    assert_eq!(batch_indexes.len(), 1);
+    assert!(batch_indexes.is_empty());
     assert_eq!(batch_checkpoints.len(), 1);
     assert_eq!(grouped_payloads.len(), 3);
-    assert_eq!(grouped_indexes.len(), 1);
+    assert!(grouped_indexes.is_empty());
     assert_eq!(grouped_checkpoints.len(), 1);
 }
 
@@ -2021,7 +2009,7 @@ async fn filesystem_store_reloads_checkpoint_chain_for_head_get_and_list() {
 }
 
 #[tokio::test]
-async fn load_checkpoint_position_rejects_tampered_index_delta_object() {
+async fn load_checkpoint_position_rejects_tampered_inline_index_delta() {
     let store = MemoryBlobStore::new();
     let keyring = signing_keyring();
     let repo = Repository::with_keyring(store.clone(), keyring.clone());
@@ -2036,15 +2024,24 @@ async fn load_checkpoint_position_rejects_tampered_index_delta_object() {
         .await;
     assert!(put.is_ok());
     let latest = must(repo.publish_checkpoint(&anchor).await);
-
-    let delta_object = must_storage(store.list_prefix("index/").await)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| panic!("missing index delta object"));
+    let checkpoint_object = must(checkpoint_object_id(&latest.checkpoint_id));
+    let checkpoint_body = must_storage(store.get_range(&checkpoint_object, ByteRange::Full).await);
+    let mut checkpoint = decode_checkpoint_object(checkpoint_body);
+    let Some(inline_delta) = checkpoint.record.inline_index_delta.as_mut() else {
+        panic!("missing inline index delta");
+    };
+    let Some(first_byte) = inline_delta.ciphertext.first_mut() else {
+        panic!("inline index delta ciphertext is empty");
+    };
+    *first_byte ^= 1;
+    let mut tampered_body = CHECKPOINT_OBJECT_DOMAIN.to_vec();
+    if let Err(error) = serde_json::to_writer(&mut tampered_body, &checkpoint) {
+        panic!("{error}");
+    }
     let overwrite = store
         .put(
-            &delta_object.object_id,
-            Bytes::from_static(b"rs3:index-delta-object:v1\n{}"),
+            &checkpoint_object,
+            Bytes::from(tampered_body),
             PutOptions::default(),
         )
         .await;
@@ -2055,7 +2052,7 @@ async fn load_checkpoint_position_rejects_tampered_index_delta_object() {
 
     assert!(matches!(
         loaded,
-        Err(RepositoryError::IndexDeltaObjectConflict { .. })
+        Err(RepositoryError::Crypto(_) | RepositoryError::CheckpointIdMismatch)
     ));
 }
 
@@ -2094,7 +2091,7 @@ async fn failed_checkpoint_put_leaves_batch_unaccepted_and_retryable() {
         Err(AnchorError::MissingAnchor)
     ));
     assert!(checkpoint_objects_after_failure.is_empty());
-    assert_eq!(index_objects_after_failure.len(), 1);
+    assert!(index_objects_after_failure.is_empty());
     assert_eq!(payload_objects_after_failure.len(), 1);
     assert!(matches!(fresh_head, Err(RepositoryError::NotFound(_))));
 
@@ -2150,7 +2147,7 @@ async fn orphan_report_is_empty_for_accepted_repository_objects() {
             .iter()
             .filter(|object| object.kind == BackendObjectReferenceKind::IndexDelta)
             .count(),
-        2
+        0
     );
     assert_eq!(
         report
@@ -2163,7 +2160,7 @@ async fn orphan_report_is_empty_for_accepted_repository_objects() {
 }
 
 #[tokio::test]
-async fn orphan_report_finds_unaccepted_payload_and_index_objects() {
+async fn orphan_report_finds_unaccepted_payload_objects() {
     let inner = MemoryBlobStore::new();
     let keyring = signing_keyring();
     let anchor = MemoryCheckpointAnchor::new();
@@ -2209,24 +2206,14 @@ async fn orphan_report_finds_unaccepted_payload_and_index_objects() {
         Err(RepositoryError::Storage(StorageError::Provider(_)))
     ));
     assert_eq!(current_anchor, accepted.checkpoint);
-    assert_eq!(report.candidates.len(), 2);
-    assert!(
-        report
-            .candidates
-            .iter()
-            .any(|candidate| candidate.kind == BackendObjectReferenceKind::IndexDelta)
-    );
+    assert_eq!(report.candidates.len(), 1);
     assert!(
         report
             .candidates
             .iter()
             .any(|candidate| candidate.kind == BackendObjectReferenceKind::Payload)
     );
-    assert!(
-        candidate_ids
-            .iter()
-            .all(|id| id.starts_with("index/") || id.starts_with("segments/"))
-    );
+    assert!(candidate_ids.iter().all(|id| id.starts_with("segments/")));
 }
 
 #[tokio::test]

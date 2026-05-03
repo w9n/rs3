@@ -149,6 +149,9 @@ pub struct CommitRecord {
     pub parent: Option<CheckpointId>,
     /// Referenced durable index delta objects.
     pub index_deltas: Vec<BackendObjectId>,
+    /// Sealed index delta embedded directly in this checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_index_delta: Option<SealedIndexDeltaObject>,
     /// Referenced compacted manifest objects.
     pub compacted_manifests: Vec<ManifestId>,
     /// Public keyring metadata active for this checkpoint.
@@ -466,6 +469,7 @@ mod tests {
             sequence: Sequence::ZERO,
             parent: None,
             index_deltas: Vec::new(),
+            inline_index_delta: None,
             compacted_manifests: Vec::new(),
             keyring: KeyringSnapshot::default(),
         };
@@ -479,6 +483,7 @@ mod tests {
             sequence: Sequence::new(3),
             parent: None,
             index_deltas: vec![object_id("segments/b"), object_id("segments/a")],
+            inline_index_delta: None,
             compacted_manifests: vec![manifest_id("manifest-b"), manifest_id("manifest-a")],
             keyring: KeyringSnapshot::new(vec![
                 key_descriptor("old", KeyPurpose::Namespace, KeyStatus::Enabled),
@@ -489,6 +494,7 @@ mod tests {
             sequence: Sequence::new(3),
             parent: None,
             index_deltas: vec![object_id("segments/a"), object_id("segments/b")],
+            inline_index_delta: None,
             compacted_manifests: vec![manifest_id("manifest-a"), manifest_id("manifest-b")],
             keyring: KeyringSnapshot::new(vec![
                 key_descriptor("new", KeyPurpose::Namespace, KeyStatus::Primary),
@@ -509,6 +515,7 @@ mod tests {
             sequence: Sequence::new(1),
             parent: None,
             index_deltas: Vec::new(),
+            inline_index_delta: None,
             compacted_manifests: Vec::new(),
             keyring: KeyringSnapshot::default(),
         };
@@ -516,6 +523,7 @@ mod tests {
             sequence: Sequence::new(2),
             parent: None,
             index_deltas: Vec::new(),
+            inline_index_delta: None,
             compacted_manifests: Vec::new(),
             keyring: KeyringSnapshot::default(),
         };
@@ -536,6 +544,7 @@ mod tests {
                 sequence: Sequence::new(1),
                 parent: None,
                 index_deltas: Vec::new(),
+                inline_index_delta: None,
                 compacted_manifests: Vec::new(),
                 keyring: KeyringSnapshot::default(),
             },

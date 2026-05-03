@@ -42,14 +42,11 @@ where
                 });
 
                 let delta = self.read_index_delta_object(object_id).await?;
-                for mutation in delta.deltas {
-                    if let IndexDelta::Upsert { entry, .. } = mutation {
-                        reachable.insert(ReachableBackendObject {
-                            object_id: entry.object_id,
-                            kind: BackendObjectReferenceKind::Payload,
-                        });
-                    }
-                }
+                insert_delta_payload_references(&mut reachable, delta);
+            }
+
+            if let Some(delta) = self.open_inline_index_delta_object(&checkpoint)? {
+                insert_delta_payload_references(&mut reachable, delta);
             }
 
             previous = Some(position);
@@ -106,5 +103,19 @@ where
             reachable,
             candidates,
         })
+    }
+}
+
+fn insert_delta_payload_references(
+    reachable: &mut BTreeSet<ReachableBackendObject>,
+    delta: rs3_index::IndexDeltaObject,
+) {
+    for mutation in delta.deltas {
+        if let IndexDelta::Upsert { entry, .. } = mutation {
+            reachable.insert(ReachableBackendObject {
+                object_id: entry.object_id,
+                kind: BackendObjectReferenceKind::Payload,
+            });
+        }
     }
 }
