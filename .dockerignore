@@ -6,3 +6,7 @@
 /.direnv
 /.devenv
 /.github
+/AGENTS.md
+/docs
+/tests
+/xtask/src

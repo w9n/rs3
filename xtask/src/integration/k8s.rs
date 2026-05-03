@@ -20,6 +20,9 @@ pub(crate) struct K8sGatewayArgs {
     /// Gateway image tag to build, load, and deploy.
     #[arg(long, default_value = "rs3-server:ci")]
     image: String,
+    /// Plaintext bytes per encrypted payload segment.
+    #[arg(long, default_value_t = rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE)]
+    payload_segment_size: usize,
     /// kind executable.
     #[arg(long, env = "RS3_TEST_KIND_BIN", default_value = "kind")]
     kind_bin: String,
@@ -136,7 +139,7 @@ mod imp {
                 anchor_name: "checkpoint",
                 log_format: "plain",
                 rust_log: "info",
-                payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+                payload_segment_size: args.payload_segment_size,
                 persistence_enabled: false,
                 wait_secs: args.wait_secs,
             },
@@ -158,7 +161,7 @@ mod imp {
                 args.wait_secs,
             )
             .await?;
-            let smoke = run_s3_smoke(port_forward.endpoint_url()).await;
+            let smoke = run_s3_smoke(port_forward.endpoint_url(), args.payload_segment_size).await;
             let shutdown = port_forward.shutdown();
 
             smoke?;
@@ -173,10 +176,18 @@ mod imp {
         result
     }
 
-    async fn run_s3_smoke(endpoint_url: String) -> Result<()> {
+    async fn run_s3_smoke(endpoint_url: String, payload_segment_size: usize) -> Result<()> {
+        if payload_segment_size == 0 {
+            bail!("payload segment size must be greater than zero");
+        }
         let client = s3_client(&endpoint_url);
         let key = "smoke/object.txt";
-        let expected = b"hello from kind";
+        let body_len = payload_segment_size
+            .checked_mul(2)
+            .and_then(|len| len.checked_add(123))
+            .filter(|len| *len <= 8 * 1024 * 1024)
+            .context("payload segment size is too large for the Kubernetes smoke body")?;
+        let expected = deterministic_body(body_len);
 
         client
             .head_bucket()
@@ -189,7 +200,7 @@ mod imp {
             .put_object()
             .bucket(DEFAULT_PUBLIC_BUCKET)
             .key(key)
-            .body(ByteStream::from_static(expected))
+            .body(ByteStream::from(expected.clone()))
             .send()
             .await
             .context("Kubernetes gateway PutObject failed")?;
@@ -222,8 +233,29 @@ mod imp {
             .await
             .context("failed to collect Kubernetes gateway GetObject body")?
             .into_bytes();
-        if actual.as_ref() != expected {
+        if actual.as_ref() != expected.as_slice() {
             bail!("Kubernetes gateway GetObject body mismatch");
+        }
+
+        let range_start = payload_segment_size.saturating_sub(17);
+        let range_len = 64_usize.min(expected.len() - range_start);
+        let range_end = range_start + range_len - 1;
+        let range = client
+            .get_object()
+            .bucket(DEFAULT_PUBLIC_BUCKET)
+            .key(key)
+            .range(format!("bytes={range_start}-{range_end}"))
+            .send()
+            .await
+            .context("Kubernetes gateway ranged GetObject failed")?;
+        let actual_range = range
+            .body
+            .collect()
+            .await
+            .context("failed to collect Kubernetes gateway ranged GetObject body")?
+            .into_bytes();
+        if actual_range.as_ref() != &expected[range_start..=range_end] {
+            bail!("Kubernetes gateway ranged GetObject body mismatch");
         }
 
         let listed = client
@@ -243,6 +275,15 @@ mod imp {
         }
 
         Ok(())
+    }
+
+    fn deterministic_body(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| {
+                let mixed = index.wrapping_mul(31).wrapping_add(index / 251);
+                (mixed % 251) as u8
+            })
+            .collect()
     }
 
     fn s3_client(endpoint_url: &str) -> Client {
