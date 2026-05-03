@@ -3,7 +3,8 @@
 use super::S3ContainerProvider;
 #[cfg(feature = "containers")]
 use super::gateway_process::{
-    ACCESS_KEY_ID, GatewayBuildProfile, PUBLIC_BUCKET, RunningGateway, SECRET_ACCESS_KEY,
+    ACCESS_KEY_ID, GatewayBuildProfile, GatewayProcessOptions, PUBLIC_BUCKET, RunningGateway,
+    SECRET_ACCESS_KEY,
 };
 #[cfg(feature = "containers")]
 use super::s3_container;
@@ -88,6 +89,9 @@ pub(crate) struct KopiaMatrixArgs {
     /// Cargo profile used for the gateway process under measurement.
     #[arg(long, value_enum, default_value_t = GatewayBuildProfile::Release)]
     gateway_build_profile: GatewayBuildProfile,
+    /// Plaintext bytes per encrypted gateway payload segment.
+    #[arg(long, default_value_t = rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE)]
+    payload_segment_size: usize,
 }
 
 #[cfg(not(feature = "containers"))]
@@ -152,6 +156,9 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
     if args.runs == 0 {
         bail!("--runs must be at least 1");
     }
+    if args.payload_segment_size == 0 {
+        bail!("--payload-segment-size must be greater than zero");
+    }
     let run_id = now_millis();
     let backend_prefix = args.backend_prefix.trim_end_matches('/').to_owned();
     let artifact_dir = args.artifact_dir.clone().unwrap_or_else(|| {
@@ -184,15 +191,16 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
                 args.workload_profile,
             )
             .await?;
-            let gateway = run_measured_gateway_kopia(
-                &args.kopia_bin,
-                &backend,
-                &backend_prefix,
+            let gateway = run_measured_gateway_kopia(MeasuredGatewayRun {
+                kopia_bin: &args.kopia_bin,
+                backend: &backend,
+                backend_prefix: &backend_prefix,
                 run_id,
                 run_index,
-                args.workload_profile,
-                args.gateway_build_profile,
-            )
+                profile: args.workload_profile,
+                gateway_build_profile: args.gateway_build_profile,
+                payload_segment_size: args.payload_segment_size,
+            })
             .await?;
             runs.push(serde_json::json!({
                 "run": run_index,
@@ -211,6 +219,7 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         "backend_bucket": backend.bucket,
         "backend_region": backend.region,
         "gateway_build_profile": args.gateway_build_profile.as_str(),
+        "payload_segment_size": args.payload_segment_size,
         "aggregate": aggregate_runs(&runs),
         "comparison": compare_runs(&runs),
         "run_reports": runs,
@@ -235,26 +244,34 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
 }
 
 #[cfg(feature = "containers")]
-async fn run_measured_gateway_kopia(
-    kopia_bin: &str,
-    backend: &s3_container::RunningS3Container,
-    backend_prefix: &str,
+struct MeasuredGatewayRun<'a> {
+    kopia_bin: &'a str,
+    backend: &'a s3_container::RunningS3Container,
+    backend_prefix: &'a str,
     run_id: u128,
     run_index: usize,
     profile: KopiaWorkloadProfile,
     gateway_build_profile: GatewayBuildProfile,
-) -> Result<serde_json::Value> {
+    payload_segment_size: usize,
+}
+
+async fn run_measured_gateway_kopia(args: MeasuredGatewayRun<'_>) -> Result<serde_json::Value> {
     let workspace = KopiaWorkspace::new()?;
-    workspace.populate_source(profile)?;
-    let mut gateway = RunningGateway::start_with_log_capture_profile(
-        backend,
+    workspace.populate_source(args.profile)?;
+    let mut gateway = RunningGateway::start_with_log_capture_options(
+        args.backend,
         format!(
             "{}/{}/run-{run_index:03}/gateway-{run_id}",
-            backend_prefix,
-            profile.as_str()
+            args.backend_prefix,
+            args.profile.as_str(),
+            run_index = args.run_index,
+            run_id = args.run_id
         ),
         "rs3_storage=debug,rs3_repository=info,info",
-        gateway_build_profile,
+        GatewayProcessOptions {
+            build_profile: args.gateway_build_profile,
+            payload_segment_size: Some(args.payload_segment_size),
+        },
     )
     .await?;
     gateway.clear_captured_logs()?;
@@ -267,10 +284,10 @@ async fn run_measured_gateway_kopia(
         endpoint_authority: gateway.endpoint_authority(),
         access_key_id: ACCESS_KEY_ID.to_owned(),
         secret_access_key: SECRET_ACCESS_KEY.to_owned(),
-        region: backend.region.clone(),
+        region: args.backend.region.clone(),
         prefix: "kopia/".to_owned(),
     };
-    let stats = run_kopia_smoke(kopia_bin, &workspace, &target, profile);
+    let stats = run_kopia_smoke(args.kopia_bin, &workspace, &target, args.profile);
     std::thread::sleep(Duration::from_millis(100));
     let prometheus_after = scrape_prometheus_metrics(&metrics_authority).await?;
     let logs = gateway.captured_logs()?;

@@ -20,7 +20,7 @@ FROM source AS build-integration-tools
 RUN --mount=type=cache,sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,sharing=locked,target=/src/target \
-    cargo build --locked --release -p rs3-server --features integration-tools --bin rs3-integration-storage-proxy \
+    cargo build --locked --release -p xtask --bin rs3-integration-storage-proxy \
     && cp /src/target/release/rs3-integration-storage-proxy /tmp/rs3-integration-storage-proxy
 
 FROM debian:bookworm-slim AS runtime-base

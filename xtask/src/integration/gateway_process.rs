@@ -30,6 +30,21 @@ impl GatewayBuildProfile {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GatewayProcessOptions {
+    pub(crate) build_profile: GatewayBuildProfile,
+    pub(crate) payload_segment_size: Option<usize>,
+}
+
+impl Default for GatewayProcessOptions {
+    fn default() -> Self {
+        Self {
+            build_profile: GatewayBuildProfile::Dev,
+            payload_segment_size: None,
+        }
+    }
+}
+
 pub(crate) struct RunningGateway {
     addr: SocketAddr,
     metrics_addr: Option<SocketAddr>,
@@ -43,35 +58,41 @@ impl RunningGateway {
         backend: &RunningS3Container,
         backend_prefix: String,
     ) -> Result<Self> {
-        Self::start_inner(backend, backend_prefix, None, GatewayBuildProfile::Dev).await
+        Self::start_inner(
+            backend,
+            backend_prefix,
+            None,
+            GatewayProcessOptions::default(),
+        )
+        .await
     }
 
-    pub(crate) async fn start_with_log_capture_profile(
+    pub(crate) async fn start_with_log_capture_options(
         backend: &RunningS3Container,
         backend_prefix: String,
         rust_log: &str,
-        build_profile: GatewayBuildProfile,
+        options: GatewayProcessOptions,
     ) -> Result<Self> {
-        Self::start_inner(backend, backend_prefix, Some(rust_log), build_profile).await
+        Self::start_inner(backend, backend_prefix, Some(rust_log), options).await
     }
 
     async fn start_inner(
         backend: &RunningS3Container,
         backend_prefix: String,
         rust_log: Option<&str>,
-        build_profile: GatewayBuildProfile,
+        options: GatewayProcessOptions,
     ) -> Result<Self> {
         let addr = reserve_gateway_addr()?;
         let capture_logs = rust_log.is_some();
         let metrics_addr = capture_logs.then(reserve_gateway_addr).transpose()?;
         let bind = addr.to_string();
         let metrics_bind = metrics_addr.map(|addr| addr.to_string());
-        let startup_timeout = match build_profile {
+        let startup_timeout = match options.build_profile {
             GatewayBuildProfile::Dev => Duration::from_secs(30),
             GatewayBuildProfile::Release => Duration::from_secs(600),
         };
         let mut gateway_args = vec!["run"];
-        if build_profile == GatewayBuildProfile::Release {
+        if options.build_profile == GatewayBuildProfile::Release {
             gateway_args.push("--release");
         }
         gateway_args.extend([
@@ -122,6 +143,12 @@ impl RunningGateway {
             });
         if let Some(rust_log) = rust_log {
             child.env("RUST_LOG", rust_log);
+        }
+        if let Some(payload_segment_size) = options.payload_segment_size {
+            child.env(
+                "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
+                payload_segment_size.to_string(),
+            );
         }
 
         let mut child = child

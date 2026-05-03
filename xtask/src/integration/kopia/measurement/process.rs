@@ -27,9 +27,7 @@ impl RunningStorageProxy {
             .args([
                 "run",
                 "-p",
-                "rs3-server",
-                "--features",
-                "integration-tools",
+                "xtask",
                 "--bin",
                 "rs3-integration-storage-proxy",
                 "--",

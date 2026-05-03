@@ -351,12 +351,16 @@ mod imp {
         }
 
         if scenario.storage_path.uses_rs3_image() && !args.skip_image_build {
-            let mut build_args = vec!["build"];
-            if scenario.storage_path.uses_integration_storage_proxy() {
-                build_args.extend(["--target", "integration-tools"]);
-            }
-            build_args.extend(["-t", args.image.as_str(), "."]);
-            run_command(&args.docker_bin, &build_args).context("failed to build gateway image")?;
+            let target = if scenario.storage_path.uses_integration_storage_proxy() {
+                "integration-tools"
+            } else {
+                "runtime"
+            };
+            run_command(
+                &args.docker_bin,
+                &["build", "--target", target, "-t", args.image.as_str(), "."],
+            )
+            .context("failed to build gateway image")?;
         }
 
         let workspace = K8sWorkspace::new("rs3-velero-kopia-smoke")?;

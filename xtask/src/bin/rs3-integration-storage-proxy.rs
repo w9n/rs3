@@ -470,8 +470,14 @@ fn usize_to_u64(value: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{RequestInfo, RequestParser, ResponseParser};
+    use super::{
+        ProxyMetrics, RequestInfo, RequestParser, ResponseParser, proxy_connection, with_metrics,
+    };
+    use anyhow::{Context, Result};
     use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     #[test]
     fn request_parser_counts_content_length_body() {
@@ -496,5 +502,103 @@ mod tests {
 
         assert_eq!(delta.responses, vec![200, 204]);
         assert_eq!(delta.body_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_http_and_counts_backend_body_bytes() -> Result<()> {
+        let backend = TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("failed to bind backend fixture")?;
+        let backend_addr = backend
+            .local_addr()
+            .context("failed to read backend fixture address")?;
+        let backend_task = tokio::spawn(async move {
+            let (mut stream, _) = backend
+                .accept()
+                .await
+                .context("backend fixture accept failed")?;
+            let request = read_until_marker(&mut stream, b"\r\n\r\nhello").await?;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nbackend")
+                .await
+                .context("backend fixture write failed")?;
+            Ok::<_, anyhow::Error>(request)
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("failed to bind proxy fixture")?;
+        let proxy_addr = listener
+            .local_addr()
+            .context("failed to read proxy fixture address")?;
+        let target = backend_addr.to_string();
+        let metrics = Arc::new(Mutex::new(ProxyMetrics::default()));
+        let proxy_metrics = Arc::clone(&metrics);
+        let proxy_task = tokio::spawn(async move {
+            let (client, _) = listener
+                .accept()
+                .await
+                .context("proxy fixture accept failed")?;
+            proxy_connection(client, &target, proxy_metrics).await
+        });
+
+        let mut client = TcpStream::connect(proxy_addr)
+            .await
+            .context("failed to connect to proxy fixture")?;
+        client
+            .write_all(b"PUT /bucket/key HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello")
+            .await
+            .context("failed to write client request")?;
+        client
+            .shutdown()
+            .await
+            .context("failed to close client write side")?;
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .context("failed to read proxied response")?;
+
+        let backend_request = backend_task
+            .await
+            .context("backend fixture task panicked")??;
+        proxy_task.await.context("proxy fixture task panicked")??;
+        let snapshot = with_metrics(&metrics, |metrics| metrics.to_json());
+
+        assert_eq!(
+            backend_request,
+            b"PUT /bucket/key HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"
+        );
+        assert_eq!(
+            response,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nbackend"
+        );
+        assert_eq!(snapshot["requests"], 1);
+        assert_eq!(snapshot["responses"], 1);
+        assert_eq!(snapshot["request_body_bytes"], 5);
+        assert_eq!(snapshot["response_body_bytes"], 7);
+        assert_eq!(snapshot["methods"]["PUT"], 1);
+        assert_eq!(snapshot["statuses"]["200"], 1);
+        assert_eq!(snapshot["active_connections"], 0);
+        Ok(())
+    }
+
+    async fn read_until_marker(stream: &mut TcpStream, marker: &[u8]) -> Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .context("fixture read failed")?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if buffer.windows(marker.len()).any(|window| window == marker) {
+                break;
+            }
+        }
+        Ok(buffer)
     }
 }
