@@ -47,6 +47,11 @@ impl ArtifactCollector {
                 "backup": state.backup_name,
                 "restore": state.restore_name,
                 "elapsed_ms": state.started.elapsed().as_millis(),
+                "phase_timings": state.phase_timings.iter().map(|phase| json!({
+                    "name": phase.name,
+                    "elapsed_ms": phase.elapsed_ms,
+                    "status": phase.status,
+                })).collect::<Vec<_>>(),
                 "anchor_name": state.anchor_name,
                 "backend_prefix": state.backend_prefix,
                 "gateway_namespace": args.gateway_namespace,

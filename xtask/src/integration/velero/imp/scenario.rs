@@ -1,6 +1,6 @@
 //! Scenario model shared by Velero integration lanes.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum WorkloadVolume {
@@ -114,6 +114,13 @@ impl Scenario {
 }
 
 #[derive(Debug)]
+pub(super) struct PhaseTiming {
+    pub(super) name: &'static str,
+    pub(super) elapsed_ms: u64,
+    pub(super) status: &'static str,
+}
+
+#[derive(Debug)]
 pub(super) struct RunState {
     pub(super) scenario_label: &'static str,
     pub(super) storage_path: StoragePath,
@@ -122,6 +129,7 @@ pub(super) struct RunState {
     pub(super) backup_name: Option<String>,
     pub(super) restore_name: Option<String>,
     pub(super) started: Instant,
+    pub(super) phase_timings: Vec<PhaseTiming>,
 }
 
 impl RunState {
@@ -134,6 +142,15 @@ impl RunState {
             backup_name: None,
             restore_name: None,
             started: Instant::now(),
+            phase_timings: Vec::new(),
         }
+    }
+
+    pub(super) fn record_phase(&mut self, name: &'static str, elapsed: Duration, succeeded: bool) {
+        self.phase_timings.push(PhaseTiming {
+            name,
+            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            status: if succeeded { "ok" } else { "failed" },
+        });
     }
 }
