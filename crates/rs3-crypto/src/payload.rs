@@ -27,18 +27,21 @@ impl KeyRing {
         associated_data: &[u8],
         plaintext: &[u8],
     ) -> Result<PayloadSeal, CryptoError> {
-        let key = self.primary_key(KeyPurpose::Content)?;
-        let cipher = payload_cipher(&key.secret)?;
         let nonce = random_payload_nonce()?;
-        let ciphertext = cipher
-            .encrypt(
-                XNonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext,
-                    aad: associated_data,
-                },
-            )
-            .map_err(|_| CryptoError::AeadOperationFailed)?;
+        self.seal_payload_with_nonce(associated_data, plaintext, &nonce)
+    }
+
+    /// Encrypts payload bytes with the primary content key and a caller-provided nonce.
+    ///
+    /// The caller must guarantee nonce uniqueness for the active content key.
+    pub fn seal_payload_with_nonce(
+        &self,
+        associated_data: &[u8],
+        plaintext: &[u8],
+        nonce: &[u8],
+    ) -> Result<PayloadSeal, CryptoError> {
+        let key = self.primary_key(KeyPurpose::Content)?;
+        let ciphertext = encrypt_payload_with_key(&key.secret, associated_data, plaintext, nonce)?;
 
         Ok(PayloadSeal {
             key_id: key.descriptor.id.clone(),
@@ -56,21 +59,50 @@ impl KeyRing {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
         let key = self.enabled_key_by_id(key_id, KeyPurpose::Content)?;
-        let cipher = payload_cipher(&key.secret)?;
-        if nonce.len() != XCHACHA20_NONCE_LEN {
-            return Err(CryptoError::AeadOperationFailed);
-        }
-        let nonce = XNonce::from_slice(nonce);
-        cipher
-            .decrypt(
-                nonce,
-                Payload {
-                    msg: ciphertext,
-                    aad: associated_data,
-                },
-            )
-            .map_err(|_| CryptoError::AeadOperationFailed)
+        decrypt_payload_with_key(&key.secret, associated_data, nonce, ciphertext)
     }
+}
+
+fn encrypt_payload_with_key(
+    secret: &crate::SecretBytes,
+    associated_data: &[u8],
+    plaintext: &[u8],
+    nonce: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = payload_cipher(secret)?;
+    if nonce.len() != XCHACHA20_NONCE_LEN {
+        return Err(CryptoError::AeadOperationFailed);
+    }
+    cipher
+        .encrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad: associated_data,
+            },
+        )
+        .map_err(|_| CryptoError::AeadOperationFailed)
+}
+
+fn decrypt_payload_with_key(
+    secret: &crate::SecretBytes,
+    associated_data: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = payload_cipher(secret)?;
+    if nonce.len() != XCHACHA20_NONCE_LEN {
+        return Err(CryptoError::AeadOperationFailed);
+    }
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: associated_data,
+            },
+        )
+        .map_err(|_| CryptoError::AeadOperationFailed)
 }
 
 fn random_payload_nonce() -> Result<[u8; XCHACHA20_NONCE_LEN], CryptoError> {

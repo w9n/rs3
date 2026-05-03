@@ -53,6 +53,12 @@ impl KeyRing {
             .map(|key| key.descriptor.id.clone())
     }
 
+    /// Returns the primary content key ID.
+    pub fn primary_content_key_id(&self) -> Result<KeyId, CryptoError> {
+        self.primary_key(KeyPurpose::Content)
+            .map(|key| key.descriptor.id.clone())
+    }
+
     /// Returns public key descriptors sorted for deterministic checkpoints.
     pub fn descriptors(&self) -> Vec<KeyDescriptor> {
         let mut descriptors = self

@@ -614,6 +614,60 @@ async fn range_get_uses_repository_mapping() {
 }
 
 #[tokio::test]
+async fn large_range_get_reads_only_header_and_selected_segment() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::new(store.clone(), secret());
+    let key = key("p/12/large-range");
+    let body = Bytes::from(vec![42_u8; 1024 * 1024]);
+
+    let put = repo
+        .put(key.clone(), body, RepositoryPutOptions::default())
+        .await;
+    assert!(put.is_ok());
+    must_storage(store.reset_operation_counts());
+
+    let read = repo
+        .get_range(
+            &key,
+            ByteRange::Slice {
+                offset: 512 * 1024,
+                len: 8192,
+            },
+        )
+        .await;
+    let counts = must_storage(store.operation_counts());
+
+    assert_eq!(must(read), Bytes::from(vec![42_u8; 8192]));
+    assert_eq!(counts.get, 2);
+    assert!(counts.bytes_read < 300 * 1024);
+}
+
+#[tokio::test]
+async fn repeated_large_range_gets_reuse_payload_header() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::new(store.clone(), secret());
+    let key = key("p/12/repeated-large-range");
+    let body = Bytes::from(vec![91_u8; 1024 * 1024]);
+
+    let put = repo
+        .put(key.clone(), body, RepositoryPutOptions::default())
+        .await;
+    assert!(put.is_ok());
+    must_storage(store.reset_operation_counts());
+
+    for offset in [256 * 1024, 512 * 1024] {
+        let read = repo
+            .get_range(&key, ByteRange::Slice { offset, len: 8192 })
+            .await;
+        assert_eq!(must(read), Bytes::from(vec![91_u8; 8192]));
+    }
+
+    let counts = must_storage(store.operation_counts());
+    assert_eq!(counts.get, 3);
+    assert!(counts.bytes_read < 600 * 1024);
+}
+
+#[tokio::test]
 async fn put_uses_wall_clock_when_backend_omits_put_timestamp() {
     let repo = Repository::new(
         NoPutTimestampStore {

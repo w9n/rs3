@@ -7,7 +7,11 @@ use crate::model::{
     RepositoryObjectMetadata, RepositoryPutOptions,
 };
 use crate::namespace::{existing_blind_keys, first_namespace_entry, prefix_tokens_for_key};
-use crate::payload::{open_payload_object, seal_payload_object};
+use crate::payload::{
+    PAYLOAD_HEADER_PROBE_LEN, PayloadHeaderProbe, SegmentedPayloadHeader, open_payload_object,
+    open_segmented_payload_span, parse_segmented_payload_header, probe_payload_header,
+    seal_payload_object, segmented_ciphertext_span,
+};
 use crate::state::{RepositoryState, TrustedManifest, next_sequence, object_material};
 use bytes::Bytes;
 use rs3_anchor::CheckpointAnchor;
@@ -15,7 +19,7 @@ use rs3_crypto::{KeyRing, NamespaceBlindKey, SecretBytes};
 use rs3_index::{IndexDelta, NamespaceEntry};
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, LogicalPath, RetentionPolicy};
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +28,7 @@ pub struct Repository<S> {
     pub(crate) store: S,
     pub(crate) keyring: RwLock<KeyRing>,
     pub(crate) state: RwLock<RepositoryState>,
+    payload_headers: RwLock<PayloadHeaderCache>,
 }
 
 impl<S> Repository<S>
@@ -41,6 +46,7 @@ where
             store,
             keyring: RwLock::new(keyring),
             state: RwLock::new(RepositoryState::default()),
+            payload_headers: RwLock::new(PayloadHeaderCache::default()),
         }
     }
 
@@ -233,20 +239,19 @@ where
                 return Err(error);
             }
         };
-        let body = match self.store.get_range(&object_id, ByteRange::Full).await {
-            Ok(body) => body,
+        let read = match self.read_payload_range(&keyring, &object_id, range).await {
+            Ok(read) => read,
             Err(error) => {
                 record_repository_get(range, 0, 0, "storage_error", started.elapsed());
-                return Err(error.into());
+                return Err(error);
             }
         };
-        let backend_bytes_read = u64::try_from(body.len()).unwrap_or(u64::MAX);
-        match open_payload_object(&keyring, &object_id, body, range) {
+        match read.opened {
             Ok(plaintext) => {
                 let returned_len = u64::try_from(plaintext.len()).unwrap_or(u64::MAX);
                 record_repository_get(
                     range,
-                    backend_bytes_read,
+                    read.backend_bytes_read,
                     returned_len,
                     "ok",
                     started.elapsed(),
@@ -256,7 +261,7 @@ where
             Err(error) => {
                 record_repository_get(
                     range,
-                    backend_bytes_read,
+                    read.backend_bytes_read,
                     0,
                     "open_error",
                     started.elapsed(),
@@ -264,6 +269,157 @@ where
                 Err(error)
             }
         }
+    }
+
+    async fn read_payload_range(
+        &self,
+        keyring: &KeyRing,
+        object_id: &BackendObjectId,
+        range: ByteRange,
+    ) -> Result<PayloadRead> {
+        match range {
+            ByteRange::Full => self.read_payload_full(keyring, object_id, range).await,
+            ByteRange::Slice { .. } => self.read_payload_slice(keyring, object_id, range).await,
+        }
+    }
+
+    async fn read_payload_full(
+        &self,
+        keyring: &KeyRing,
+        object_id: &BackendObjectId,
+        range: ByteRange,
+    ) -> Result<PayloadRead> {
+        let body = self.store.get_range(object_id, ByteRange::Full).await?;
+        let backend_bytes_read = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        Ok(PayloadRead {
+            backend_bytes_read,
+            opened: open_payload_object(keyring, object_id, body, range),
+        })
+    }
+
+    async fn read_payload_slice(
+        &self,
+        keyring: &KeyRing,
+        object_id: &BackendObjectId,
+        range: ByteRange,
+    ) -> Result<PayloadRead> {
+        let header = match self.cached_payload_header(object_id)? {
+            Some(header) => header,
+            None => match self
+                .read_and_cache_payload_header(keyring, object_id, range)
+                .await?
+            {
+                PayloadHeaderRead::Header(header) => header,
+                PayloadHeaderRead::Full(read) => return Ok(read),
+            },
+        };
+        let span = segmented_ciphertext_span(&header.header, range)?;
+        let ciphertext = self
+            .store
+            .get_range(
+                object_id,
+                ByteRange::Slice {
+                    offset: span.offset,
+                    len: span.len,
+                },
+            )
+            .await?;
+        let backend_bytes_read = header
+            .backend_bytes_read
+            .saturating_add(u64::try_from(ciphertext.len()).unwrap_or(u64::MAX));
+
+        Ok(PayloadRead {
+            backend_bytes_read,
+            opened: open_segmented_payload_span(
+                keyring,
+                object_id,
+                &header.header,
+                range,
+                span,
+                ciphertext,
+            ),
+        })
+    }
+
+    async fn read_and_cache_payload_header(
+        &self,
+        keyring: &KeyRing,
+        object_id: &BackendObjectId,
+        range: ByteRange,
+    ) -> Result<PayloadHeaderRead> {
+        let probe = match self
+            .store
+            .get_range(
+                object_id,
+                ByteRange::Slice {
+                    offset: 0,
+                    len: PAYLOAD_HEADER_PROBE_LEN,
+                },
+            )
+            .await
+        {
+            Ok(probe) => probe,
+            Err(StorageError::InvalidRange) => {
+                return Ok(PayloadHeaderRead::Full(
+                    self.read_payload_full(keyring, object_id, range).await?,
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut backend_bytes_read = u64::try_from(probe.len()).unwrap_or(u64::MAX);
+        let header_bytes = match probe_payload_header(object_id, &probe)? {
+            PayloadHeaderProbe::Segmented { header_len } => probe.slice(..header_len),
+            PayloadHeaderProbe::NeedMore { len } => {
+                let header = self
+                    .store
+                    .get_range(object_id, ByteRange::Slice { offset: 0, len })
+                    .await?;
+                backend_bytes_read = backend_bytes_read
+                    .saturating_add(u64::try_from(header.len()).unwrap_or(u64::MAX));
+                match probe_payload_header(object_id, &header)? {
+                    PayloadHeaderProbe::Segmented { header_len } => header.slice(..header_len),
+                    PayloadHeaderProbe::NeedMore { .. } => {
+                        return Err(RepositoryError::InvalidObjectFormat {
+                            object_id: object_id.clone(),
+                        });
+                    }
+                }
+            }
+        };
+        let header = parse_segmented_payload_header(object_id, &header_bytes)?;
+        self.cache_payload_header(object_id, header.clone())?;
+
+        Ok(PayloadHeaderRead::Header(CachedPayloadHeader {
+            backend_bytes_read,
+            header,
+        }))
+    }
+
+    fn cached_payload_header(
+        &self,
+        object_id: &BackendObjectId,
+    ) -> Result<Option<CachedPayloadHeader>> {
+        let cache = self
+            .payload_headers
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        Ok(cache.get(object_id).map(|header| CachedPayloadHeader {
+            backend_bytes_read: 0,
+            header,
+        }))
+    }
+
+    fn cache_payload_header(
+        &self,
+        object_id: &BackendObjectId,
+        header: SegmentedPayloadHeader,
+    ) -> Result<()> {
+        let mut cache = self
+            .payload_headers
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        cache.insert(object_id.clone(), header);
+        Ok(())
     }
 
     /// Lists client-visible entries for a prefix.
@@ -438,6 +594,62 @@ where
         self.state
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)
+    }
+}
+
+struct PayloadRead {
+    backend_bytes_read: u64,
+    opened: Result<Bytes>,
+}
+
+enum PayloadHeaderRead {
+    Header(CachedPayloadHeader),
+    Full(PayloadRead),
+}
+
+struct CachedPayloadHeader {
+    backend_bytes_read: u64,
+    header: SegmentedPayloadHeader,
+}
+
+#[derive(Debug)]
+struct PayloadHeaderCache {
+    headers: BTreeMap<BackendObjectId, SegmentedPayloadHeader>,
+    order: VecDeque<BackendObjectId>,
+    max_entries: usize,
+}
+
+impl Default for PayloadHeaderCache {
+    fn default() -> Self {
+        Self {
+            headers: BTreeMap::new(),
+            order: VecDeque::new(),
+            max_entries: 1024,
+        }
+    }
+}
+
+impl PayloadHeaderCache {
+    fn get(&self, object_id: &BackendObjectId) -> Option<SegmentedPayloadHeader> {
+        self.headers.get(object_id).cloned()
+    }
+
+    fn insert(&mut self, object_id: BackendObjectId, header: SegmentedPayloadHeader) {
+        match self.headers.entry(object_id.clone()) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(header);
+            }
+            Entry::Vacant(entry) => {
+                self.order.push_back(object_id);
+                entry.insert(header);
+                while self.headers.len() > self.max_entries {
+                    let Some(evicted) = self.order.pop_front() else {
+                        break;
+                    };
+                    self.headers.remove(&evicted);
+                }
+            }
+        }
     }
 }
 
