@@ -21,6 +21,17 @@ pub(crate) struct GatewayChartValues<'a> {
     pub(crate) image_repository: &'a str,
     pub(crate) image_tag: &'a str,
     pub(crate) public_bucket: &'a str,
+    pub(crate) backend_endpoint: &'a str,
+    pub(crate) backend_bucket: &'a str,
+    pub(crate) backend_prefix: &'a str,
+    pub(crate) backend_region: &'a str,
+    pub(crate) backend_access_key_id: Option<&'a str>,
+    pub(crate) backend_secret_access_key: Option<&'a str>,
+    pub(crate) anchor_mode: &'a str,
+    pub(crate) anchor_name: &'a str,
+    pub(crate) log_format: &'a str,
+    pub(crate) rust_log: &'a str,
+    pub(crate) persistence_enabled: bool,
     pub(crate) wait_secs: u64,
 }
 
@@ -52,9 +63,46 @@ pub(crate) fn helm_install_gateway(
             &format!("image.tag={}", values.image_tag),
             "--set-string",
             &format!("publicBucket={}", values.public_bucket),
+            "--set-string",
+            &helm_set_string("backend.endpoint", values.backend_endpoint),
+            "--set-string",
+            &helm_set_string("backend.bucket", values.backend_bucket),
+            "--set-string",
+            &helm_set_string("backend.prefix", values.backend_prefix),
+            "--set-string",
+            &helm_set_string("backend.region", values.backend_region),
+            "--set",
+            &format!(
+                "backendCredentials.create={}",
+                values.backend_access_key_id.is_some()
+            ),
+            "--set-string",
+            &helm_set_string(
+                "backendCredentials.accessKeyId",
+                values.backend_access_key_id.unwrap_or_default(),
+            ),
+            "--set-string",
+            &helm_set_string(
+                "backendCredentials.secretAccessKey",
+                values.backend_secret_access_key.unwrap_or_default(),
+            ),
+            "--set-string",
+            &helm_set_string("anchor.mode", values.anchor_mode),
+            "--set-string",
+            &helm_set_string("anchor.name", values.anchor_name),
+            "--set-string",
+            &format!("logging.format={}", values.log_format),
+            "--set-string",
+            &helm_set_string("logging.rustLog", values.rust_log),
+            "--set",
+            &format!("persistence.enabled={}", values.persistence_enabled),
         ],
     )
     .context("failed to install gateway Helm chart")
+}
+
+fn helm_set_string(key: &str, value: &str) -> String {
+    format!("{key}={}", value.replace('\\', "\\\\").replace(',', "\\,"))
 }
 
 pub(crate) fn helm_fullname(release_name: &str) -> String {
@@ -197,6 +245,24 @@ impl KindCluster {
             name,
             kubeconfig_path,
             keep,
+            deleted: false,
+        })
+    }
+
+    pub(crate) fn reuse(kind_bin: String, name: String, kubeconfig_path: PathBuf) -> Result<Self> {
+        let kubeconfig =
+            run_command_capture(&kind_bin, &["get", "kubeconfig", "--name", name.as_str()])
+                .with_context(|| {
+                    format!("failed to get kubeconfig for existing kind cluster `{name}`")
+                })?;
+        fs::write(&kubeconfig_path, kubeconfig)
+            .with_context(|| format!("failed to write {}", kubeconfig_path.display()))?;
+
+        Ok(Self {
+            kind_bin,
+            name,
+            kubeconfig_path,
+            keep: true,
             deleted: false,
         })
     }

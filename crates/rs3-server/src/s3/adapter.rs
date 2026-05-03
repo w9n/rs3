@@ -26,10 +26,13 @@ pub(super) struct GatewayS3Service {
 }
 
 impl GatewayS3Service {
-    pub(super) fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
+    pub(super) async fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
+        let repository = RuntimeRepository::from_config(config)?;
+        repository.load_accepted_checkpoint().await?;
+
         Ok(Self {
             public_bucket: config.public_bucket.clone(),
-            repository: RuntimeRepository::from_config(config)?,
+            repository,
         })
     }
 
@@ -258,10 +261,12 @@ mod tests {
     };
     use s3s::{Body, S3, S3Request, S3Response};
 
-    fn gateway_service() -> GatewayS3Service {
-        GatewayS3Service::from_config(&runtime_config(true)).unwrap_or_else(|error| {
-            panic!("{error}");
-        })
+    async fn gateway_service() -> GatewayS3Service {
+        GatewayS3Service::from_config(&runtime_config(true))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{error}");
+            })
     }
 
     fn s3_request<T>(input: T) -> S3Request<T> {
@@ -305,7 +310,7 @@ mod tests {
 
     #[tokio::test]
     async fn head_bucket_accepts_public_bucket() {
-        let service = gateway_service();
+        let service = gateway_service().await;
         let response = service
             .head_bucket(s3_request(HeadBucketInput {
                 bucket: "client-bucket".to_owned(),
@@ -318,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn head_bucket_rejects_other_bucket() {
-        let service = gateway_service();
+        let service = gateway_service().await;
         let response = service
             .head_bucket(s3_request(HeadBucketInput {
                 bucket: "other-bucket".to_owned(),
@@ -331,7 +336,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_buckets_returns_public_bucket() {
-        let service = gateway_service();
+        let service = gateway_service().await;
         let response = service
             .list_buckets(s3_request(ListBucketsInput::default()))
             .await
@@ -344,7 +349,7 @@ mod tests {
 
     #[tokio::test]
     async fn object_operations_use_repository_mapping() {
-        let service = gateway_service();
+        let service = gateway_service().await;
 
         let put = service
             .put_object(s3_request(PutObjectInput {
@@ -467,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_object_honors_create_only_condition() {
-        let service = gateway_service();
+        let service = gateway_service().await;
         let input = || PutObjectInput {
             bucket: "client-bucket".to_owned(),
             key: "snapshots/create-only.bin".to_owned(),

@@ -35,13 +35,13 @@ impl GatewayS3Boundary {
     ///
     /// Returns [`S3BoundaryError::MissingStaticCredentials`] when no static
     /// credentials are configured for the process.
-    pub fn build(config: RuntimeConfig) -> Result<Self, S3BoundaryError> {
+    pub async fn build(config: RuntimeConfig) -> Result<Self, S3BoundaryError> {
         let credentials = config
             .static_credentials
             .clone()
             .ok_or(S3BoundaryError::MissingStaticCredentials)?;
 
-        let adapter = GatewayS3Service::from_config(&config)?;
+        let adapter = GatewayS3Service::from_config(&config).await?;
         let mut builder = S3ServiceBuilder::new(adapter);
 
         let s3_config = Arc::new(S3Config::default());
@@ -158,9 +158,9 @@ mod tests {
     use rs3_types::PublicBucket;
     use s3s::path::S3Path;
 
-    #[test]
-    fn boundary_requires_static_credentials() {
-        let boundary = GatewayS3Boundary::build(runtime_config(false));
+    #[tokio::test]
+    async fn boundary_requires_static_credentials() {
+        let boundary = GatewayS3Boundary::build(runtime_config(false)).await;
 
         assert!(matches!(
             boundary,
@@ -168,11 +168,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn boundary_builds_authenticated_s3_service() {
+    #[tokio::test]
+    async fn boundary_builds_authenticated_s3_service() {
         let config = runtime_config(true);
 
-        let boundary = match GatewayS3Boundary::build(config.clone()) {
+        let boundary = match GatewayS3Boundary::build(config.clone()).await {
             Ok(boundary) => boundary,
             Err(error) => panic!("{error}"),
         };

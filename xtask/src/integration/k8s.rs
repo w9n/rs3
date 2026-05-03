@@ -8,6 +8,9 @@ pub(crate) struct K8sGatewayArgs {
     /// kind cluster name. Defaults to a unique disposable name.
     #[arg(long)]
     cluster_name: Option<String>,
+    /// Reuse an existing kind cluster instead of creating and deleting one.
+    #[arg(long)]
+    reuse_kind_cluster: bool,
     /// Kubernetes namespace used by the smoke test.
     #[arg(long, default_value = "rs3-ci")]
     namespace: String,
@@ -85,17 +88,29 @@ mod imp {
         }
 
         let workspace = K8sWorkspace::new("rs3-k8s-integration")?;
-        let cluster_name = args
-            .cluster_name
-            .clone()
-            .unwrap_or_else(|| default_cluster_name("rs3-ci"));
-        let mut cluster = KindCluster::create(
-            args.kind_bin.clone(),
-            cluster_name,
-            workspace.kubeconfig_path(),
-            args.keep_cluster,
-            args.wait_secs,
-        )?;
+        let mut cluster = if args.reuse_kind_cluster {
+            let cluster_name = args
+                .cluster_name
+                .clone()
+                .unwrap_or_else(|| "kind".to_owned());
+            KindCluster::reuse(
+                args.kind_bin.clone(),
+                cluster_name,
+                workspace.kubeconfig_path(),
+            )?
+        } else {
+            let cluster_name = args
+                .cluster_name
+                .clone()
+                .unwrap_or_else(|| default_cluster_name("rs3-ci"));
+            KindCluster::create(
+                args.kind_bin.clone(),
+                cluster_name,
+                workspace.kubeconfig_path(),
+                args.keep_cluster,
+                args.wait_secs,
+            )?
+        };
 
         if !args.skip_image_load {
             cluster.load_image(&args.image)?;
@@ -111,6 +126,17 @@ mod imp {
                 image_repository: &image_repository,
                 image_tag: &image_tag,
                 public_bucket: DEFAULT_PUBLIC_BUCKET,
+                backend_endpoint: "file:///data",
+                backend_bucket: "backend",
+                backend_prefix: "repository",
+                backend_region: "us-east-1",
+                backend_access_key_id: None,
+                backend_secret_access_key: None,
+                anchor_mode: "memory",
+                anchor_name: "checkpoint",
+                log_format: "plain",
+                rust_log: "info",
+                persistence_enabled: false,
                 wait_secs: args.wait_secs,
             },
         )?;

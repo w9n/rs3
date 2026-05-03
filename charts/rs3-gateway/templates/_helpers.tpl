@@ -30,3 +30,11 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- include "rs3-gateway.fullname" . -}}
 {{- end -}}
 {{- end -}}
+
+{{- define "rs3-gateway.serviceAccountName" -}}
+{{- if .Values.serviceAccount.name -}}
+{{- .Values.serviceAccount.name -}}
+{{- else -}}
+{{- include "rs3-gateway.fullname" . -}}
+{{- end -}}
+{{- end -}}

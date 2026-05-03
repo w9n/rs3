@@ -37,6 +37,10 @@ enum IntegrationCommand {
     VeleroKopiaLocalPvSmoke(velero::VeleroKopiaSmokeArgs),
     /// Run a Velero node-agent/Kopia dynamic-PVC backup and restore through the gateway.
     VeleroKopiaDynamicPvcSmoke(velero::VeleroKopiaSmokeArgs),
+    /// Run a Velero dynamic-PVC restore after restarting the gateway.
+    VeleroKopiaDynamicPvcGatewayRestartSmoke(velero::VeleroKopiaSmokeArgs),
+    /// Run a Velero node-agent/Kopia Postgres restore smoke through the gateway.
+    VeleroKopiaPostgresSmoke(velero::VeleroKopiaSmokeArgs),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -67,6 +71,12 @@ pub(crate) fn run(args: IntegrationArgs) -> Result<()> {
         }
         IntegrationCommand::VeleroKopiaDynamicPvcSmoke(args) => {
             velero::run_velero_kopia_dynamic_pvc_smoke(args)
+        }
+        IntegrationCommand::VeleroKopiaDynamicPvcGatewayRestartSmoke(args) => {
+            velero::run_velero_kopia_dynamic_pvc_gateway_restart_smoke(args)
+        }
+        IntegrationCommand::VeleroKopiaPostgresSmoke(args) => {
+            velero::run_velero_kopia_postgres_smoke(args)
         }
     }
 }

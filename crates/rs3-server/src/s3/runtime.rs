@@ -3,11 +3,14 @@
 use super::S3BoundaryError;
 use crate::{AnchorConfig, BackendConfig, BatchConfig, RuntimeConfig};
 use bytes::Bytes;
-use rs3_anchor::{AnchorState, CheckpointAnchor, MemoryCheckpointAnchor};
+use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor, MemoryCheckpointAnchor};
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
+#[cfg(feature = "k8s")]
+use rs3_k8s::{KubernetesLeaseAnchor, LeaseSettings};
 use rs3_repository::{
-    CommitCoordinator, CommitCoordinatorOptions, CommittedPut, DeleteOutcome, Repository,
-    RepositoryError, RepositoryListEntry, RepositoryObjectMetadata, RepositoryPutOptions,
+    CheckpointPosition, CommitCoordinator, CommitCoordinatorOptions, CommittedPut, DeleteOutcome,
+    Repository, RepositoryError, RepositoryListEntry, RepositoryObjectMetadata,
+    RepositoryPutOptions,
 };
 use rs3_storage::{
     BlobMetadata, BlobStore, ByteRange, FilesystemBlobStore, MemoryBlobStore, PutOptions,
@@ -52,6 +55,27 @@ impl RuntimeRepository {
             #[cfg(test)]
             memory_anchor: anchor.memory_anchor,
         })
+    }
+
+    pub(super) async fn load_accepted_checkpoint(&self) -> Result<(), S3BoundaryError> {
+        let accepted = match self.coordinator.anchor().read().await {
+            Ok(state) => CheckpointPosition::from(state),
+            Err(AnchorError::MissingAnchor) => return Ok(()),
+            Err(error) => return Err(repository_init(error)),
+        };
+
+        self.coordinator
+            .repository()
+            .load_checkpoint_position(&accepted)
+            .await
+            .map_err(repository_init)?;
+        tracing::info!(
+            target: "rs3_repository",
+            checkpoint_sequence = accepted.sequence.get(),
+            checkpoint_id = %accepted.checkpoint_id,
+            "repository checkpoint loaded from external anchor",
+        );
+        Ok(())
     }
 
     pub(super) async fn put_committed(
@@ -223,7 +247,29 @@ fn build_anchor(config: &AnchorConfig) -> Result<AnchorBuild, S3BoundaryError> {
                 memory_anchor: Some(anchor),
             })
         }
-        AnchorConfig::KubernetesLease { .. } => Err(S3BoundaryError::UnsupportedAnchorMode),
+        AnchorConfig::KubernetesLease {
+            namespace,
+            name,
+            field_manager,
+        } => {
+            #[cfg(feature = "k8s")]
+            {
+                Ok(AnchorBuild {
+                    handle: RuntimeAnchor::new(KubernetesLeaseAnchor::new(LeaseSettings {
+                        namespace: namespace.clone(),
+                        name: name.clone(),
+                        field_manager: field_manager.clone(),
+                    })),
+                    #[cfg(test)]
+                    memory_anchor: None,
+                })
+            }
+            #[cfg(not(feature = "k8s"))]
+            {
+                let _ = (namespace, name, field_manager);
+                Err(S3BoundaryError::UnsupportedAnchorMode)
+            }
+        }
     }
 }
 
@@ -363,9 +409,11 @@ mod tests {
     use super::RuntimeRepository;
     #[cfg(feature = "s3")]
     use super::s3_backend_config;
+    #[cfg(not(feature = "k8s"))]
+    use crate::AnchorConfig;
+    use crate::BatchConfig;
     use crate::s3::S3BoundaryError;
     use crate::s3::test_support::runtime_config;
-    use crate::{AnchorConfig, BatchConfig};
     use bytes::Bytes;
     use rs3_repository::RepositoryPutOptions;
     use rs3_types::LogicalPath;
@@ -482,6 +530,7 @@ mod tests {
         assert!(!store_config.virtual_hosted_style);
     }
 
+    #[cfg(not(feature = "k8s"))]
     #[test]
     fn runtime_factory_rejects_unwired_anchor() {
         let mut config = runtime_config(true);

@@ -15,6 +15,13 @@ backend:
   endpoint: file:///data
   bucket: backend
   prefix: repository
+  region: us-east-1
+
+backendCredentials:
+  create: false
+  existingSecret: ""
+  accessKeyId: ""
+  secretAccessKey: ""
 
 credentials:
   create: false
@@ -26,13 +33,33 @@ commit:
   maxBatchItems: 8
   maxBatchDelayMs: 5
 
+anchor:
+  mode: memory
+  namespace: ""
+  name: checkpoint
+  fieldManager: rs3-server
+
+logging:
+  format: plain
+  rustLog: info
+
 persistence:
+  enabled: false
   mountPath: /data
+  storageClassName: ""
+  size: 1Gi
 
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532
   runAsGroup: 65532
   fsGroup: 65532
+
+serviceAccount:
+  create: true
+  name: ""
+
+rbac:
+  create: true
 
 resources: {}

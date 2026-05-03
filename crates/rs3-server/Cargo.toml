@@ -11,6 +11,7 @@ description = "Command-line entry point for the rs3 gateway"
 [features]
 default = []
 s3 = ["rs3-storage/s3"]
+k8s = ["dep:rs3-k8s", "k8s-openapi/v1_35"]
 
 [dependencies]
 anyhow.workspace = true
@@ -20,8 +21,10 @@ clap.workspace = true
 futures-util.workspace = true
 http.workspace = true
 hyper-util.workspace = true
+k8s-openapi = { workspace = true, optional = true }
 rs3-anchor = { path = "../rs3-anchor" }
 rs3-crypto = { path = "../rs3-crypto" }
+rs3-k8s = { path = "../rs3-k8s", optional = true }
 rs3-repository = { path = "../rs3-repository" }
 rs3-storage = { path = "../rs3-storage" }
 rs3-types = { path = "../rs3-types" }

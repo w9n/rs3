@@ -28,7 +28,7 @@ impl GatewayServer {
     /// Returns an error when boundary construction fails, binding fails, or the
     /// listener address cannot be read.
     pub async fn bind(config: RuntimeConfig) -> Result<Self, GatewayServerError> {
-        let boundary = GatewayS3Boundary::build(config.clone())?;
+        let boundary = GatewayS3Boundary::build(config.clone()).await?;
         let listener =
             TcpListener::bind(config.bind)
                 .await

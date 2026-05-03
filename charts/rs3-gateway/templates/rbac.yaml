@@ -1,0 +1,32 @@
+{{- if and .Values.rbac.create (eq .Values.anchor.mode "kubernetes-lease") -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "rs3-gateway.fullname" . }}-anchor
+  labels:
+    {{- include "rs3-gateway.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - create
+      - get
+      - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "rs3-gateway.fullname" . }}-anchor
+  labels:
+    {{- include "rs3-gateway.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "rs3-gateway.fullname" . }}-anchor
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "rs3-gateway.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end -}}

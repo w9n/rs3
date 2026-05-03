@@ -109,6 +109,11 @@ where
         &self.repository
     }
 
+    /// Returns the checkpoint anchor used by this coordinator.
+    pub fn anchor(&self) -> &Arc<A> {
+        &self.anchor
+    }
+
     /// Writes an object and returns only after a covering checkpoint is accepted.
     pub async fn put_committed(
         &self,

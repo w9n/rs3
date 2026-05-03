@@ -2,12 +2,16 @@
 
 use anyhow::Result;
 use clap::Args;
+use std::path::PathBuf;
 
 #[derive(Debug, Args)]
 pub(crate) struct VeleroKopiaSmokeArgs {
     /// kind cluster name. Defaults to a unique disposable name.
     #[arg(long)]
     cluster_name: Option<String>,
+    /// Reuse an existing kind cluster instead of creating and deleting one.
+    #[arg(long)]
+    reuse_kind_cluster: bool,
     /// Kubernetes namespace used for the gateway.
     #[arg(long, default_value = "rs3-ci")]
     gateway_namespace: String,
@@ -70,6 +74,20 @@ pub(crate) struct VeleroKopiaSmokeArgs {
         default_value = "openebs/linux-utils:4.3.0"
     )]
     openebs_helper_image: String,
+    /// Postgres image used by the database restore lane.
+    #[arg(
+        long,
+        env = "RS3_TEST_POSTGRES_IMAGE",
+        default_value = "postgres:17-alpine"
+    )]
+    postgres_image: String,
+    /// S3-compatible backend image used behind the gateway for Velero lanes.
+    #[arg(
+        long,
+        env = "RS3_TEST_RUSTFS_IMAGE",
+        default_value = "rustfs/rustfs:latest"
+    )]
+    rustfs_image: String,
     /// kind executable.
     #[arg(long, env = "RS3_TEST_KIND_BIN", default_value = "kind")]
     kind_bin: String,
@@ -103,6 +121,24 @@ pub(crate) struct VeleroKopiaSmokeArgs {
     /// Do not require or load OpenEBS images from the local Docker daemon.
     #[arg(long)]
     skip_openebs_image_load: bool,
+    /// Pull the missing Postgres image into the local Docker daemon before loading it into kind.
+    #[arg(long)]
+    pull_postgres_image: bool,
+    /// Do not require or load the Postgres image from the local Docker daemon.
+    #[arg(long)]
+    skip_postgres_image_load: bool,
+    /// Pull the missing RustFS image into the local Docker daemon before loading it into kind.
+    #[arg(long)]
+    pull_rustfs_image: bool,
+    /// Do not require or load the RustFS image from the local Docker daemon.
+    #[arg(long)]
+    skip_rustfs_image_load: bool,
+    /// Directory for persisted integration artifacts. Defaults under `.local/integration`.
+    #[arg(long)]
+    artifact_dir: Option<PathBuf>,
+    /// Do not collect diagnostics and metrics artifacts.
+    #[arg(long)]
+    skip_artifacts: bool,
     /// Keep the kind cluster after the run for manual inspection.
     #[arg(long)]
     keep_cluster: bool,
@@ -132,6 +168,22 @@ pub(crate) fn run_velero_kopia_dynamic_pvc_smoke(_args: VeleroKopiaSmokeArgs) ->
     )
 }
 
+#[cfg(not(feature = "k8s"))]
+pub(crate) fn run_velero_kopia_dynamic_pvc_gateway_restart_smoke(
+    _args: VeleroKopiaSmokeArgs,
+) -> Result<()> {
+    anyhow::bail!(
+        "Velero Kopia dynamic-PVC gateway-restart smoke integration requires `cargo run -p xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke`",
+    )
+}
+
+#[cfg(not(feature = "k8s"))]
+pub(crate) fn run_velero_kopia_postgres_smoke(_args: VeleroKopiaSmokeArgs) -> Result<()> {
+    anyhow::bail!(
+        "Velero Kopia Postgres smoke integration requires `cargo run -p xtask --features k8s -- integration velero-kopia-postgres-smoke`",
+    )
+}
+
 #[cfg(feature = "k8s")]
 pub(crate) fn run_velero_kopia_smoke(args: VeleroKopiaSmokeArgs) -> Result<()> {
     imp::run_empty_dir(args)
@@ -148,7 +200,24 @@ pub(crate) fn run_velero_kopia_dynamic_pvc_smoke(args: VeleroKopiaSmokeArgs) -> 
 }
 
 #[cfg(feature = "k8s")]
+pub(crate) fn run_velero_kopia_dynamic_pvc_gateway_restart_smoke(
+    args: VeleroKopiaSmokeArgs,
+) -> Result<()> {
+    imp::run_dynamic_pvc_gateway_restart(args)
+}
+
+#[cfg(feature = "k8s")]
+pub(crate) fn run_velero_kopia_postgres_smoke(args: VeleroKopiaSmokeArgs) -> Result<()> {
+    imp::run_postgres(args)
+}
+
+#[cfg(feature = "k8s")]
 mod imp {
+    #[path = "velero_artifacts.rs"]
+    mod artifacts;
+    #[path = "rustfs_backend.rs"]
+    mod rustfs_backend;
+
     use super::VeleroKopiaSmokeArgs;
     use crate::integration::k8s_support::{
         ACCESS_KEY_ID, CHART_PATH, GATEWAY_PORT, GatewayChartValues, K8sWorkspace, KindCluster,
@@ -156,6 +225,10 @@ mod imp {
         path_str, require_command, run_command, run_command_capture, split_image_ref,
     };
     use anyhow::{Context, Result, bail};
+    use artifacts::ArtifactCollector;
+    use rustfs_backend::{
+        BACKEND_BUCKET, BACKEND_REGION, RUSTFS_ACCESS_KEY_ID, RUSTFS_SECRET_ACCESS_KEY,
+    };
     use std::fs;
     use std::path::Path;
     use std::thread;
@@ -167,7 +240,11 @@ mod imp {
     const LOCAL_STORAGE_CLASS: &str = "rs3-local";
     const LOCAL_PV_PATH: &str = "/var/local/rs3-velero-smoke-data";
     const PROOF_PATH: &str = "/data/proof.txt";
+    const POSTGRES_DATA_PATH: &str = "/var/lib/postgresql/data";
+    const POSTGRES_DUMP_PATH: &str = "/var/lib/postgresql/data/rs3-proof.sql";
+    const POSTGRES_DB: &str = "rs3";
     const EXPECTED_CONTENT: &str = "rs3 velero kopia smoke\n";
+    const GATEWAY_RUST_LOG: &str = "rs3_storage=debug,rs3_repository=info,rs3_server=info,info";
 
     #[derive(Clone, Copy, Debug)]
     enum WorkloadVolume {
@@ -176,19 +253,91 @@ mod imp {
         DynamicPvc,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum WorkloadKind {
+        ProofFile,
+        Postgres,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct Scenario {
+        label: &'static str,
+        volume: WorkloadVolume,
+        workload: WorkloadKind,
+        restart_gateway_before_restore: bool,
+    }
+
+    #[derive(Debug)]
+    struct RunState {
+        scenario_label: &'static str,
+        anchor_name: String,
+        backend_prefix: String,
+        backup_name: Option<String>,
+        restore_name: Option<String>,
+        started: Instant,
+    }
+
     pub(super) fn run_empty_dir(args: VeleroKopiaSmokeArgs) -> Result<()> {
-        run(args, WorkloadVolume::EmptyDir)
+        run(
+            args,
+            Scenario {
+                label: "empty-dir",
+                volume: WorkloadVolume::EmptyDir,
+                workload: WorkloadKind::ProofFile,
+                restart_gateway_before_restore: false,
+            },
+        )
     }
 
     pub(super) fn run_local_pv(args: VeleroKopiaSmokeArgs) -> Result<()> {
-        run(args, WorkloadVolume::LocalPv)
+        run(
+            args,
+            Scenario {
+                label: "local-pv",
+                volume: WorkloadVolume::LocalPv,
+                workload: WorkloadKind::ProofFile,
+                restart_gateway_before_restore: false,
+            },
+        )
     }
 
     pub(super) fn run_dynamic_pvc(args: VeleroKopiaSmokeArgs) -> Result<()> {
-        run(args, WorkloadVolume::DynamicPvc)
+        run(
+            args,
+            Scenario {
+                label: "dynamic-pvc",
+                volume: WorkloadVolume::DynamicPvc,
+                workload: WorkloadKind::ProofFile,
+                restart_gateway_before_restore: false,
+            },
+        )
     }
 
-    fn run(args: VeleroKopiaSmokeArgs, volume: WorkloadVolume) -> Result<()> {
+    pub(super) fn run_dynamic_pvc_gateway_restart(args: VeleroKopiaSmokeArgs) -> Result<()> {
+        run(
+            args,
+            Scenario {
+                label: "dynamic-pvc-gateway-restart",
+                volume: WorkloadVolume::DynamicPvc,
+                workload: WorkloadKind::ProofFile,
+                restart_gateway_before_restore: true,
+            },
+        )
+    }
+
+    pub(super) fn run_postgres(args: VeleroKopiaSmokeArgs) -> Result<()> {
+        run(
+            args,
+            Scenario {
+                label: "postgres",
+                volume: WorkloadVolume::DynamicPvc,
+                workload: WorkloadKind::Postgres,
+                restart_gateway_before_restore: false,
+            },
+        )
+    }
+
+    fn run(args: VeleroKopiaSmokeArgs, scenario: Scenario) -> Result<()> {
         require_command(&args.kind_bin, &["version"])?;
         require_command(&args.kubectl_bin, &["version", "--client"])?;
         require_command(&args.helm_bin, &["version", "--short"])?;
@@ -197,8 +346,12 @@ mod imp {
         run_command(&args.helm_bin, &["lint", CHART_PATH])
             .context("gateway Helm chart lint failed")?;
         prepare_velero_images(&args)?;
-        if matches!(volume, WorkloadVolume::DynamicPvc) {
+        prepare_rustfs_image(&args)?;
+        if matches!(scenario.volume, WorkloadVolume::DynamicPvc) {
             prepare_openebs_images(&args)?;
+        }
+        if matches!(scenario.workload, WorkloadKind::Postgres) {
+            prepare_postgres_image(&args)?;
         }
 
         if !args.skip_image_build {
@@ -207,17 +360,32 @@ mod imp {
         }
 
         let workspace = K8sWorkspace::new("rs3-velero-kopia-smoke")?;
-        let cluster_name = args
-            .cluster_name
-            .clone()
-            .unwrap_or_else(|| default_cluster_name("rs3-velero-ci"));
-        let mut cluster = KindCluster::create(
-            args.kind_bin.clone(),
-            cluster_name,
-            workspace.kubeconfig_path(),
-            args.keep_cluster,
-            args.wait_secs,
-        )?;
+        let mut cluster = if args.reuse_kind_cluster {
+            let cluster_name = args
+                .cluster_name
+                .clone()
+                .unwrap_or_else(|| "kind".to_owned());
+            KindCluster::reuse(
+                args.kind_bin.clone(),
+                cluster_name,
+                workspace.kubeconfig_path(),
+            )?
+        } else {
+            let cluster_name = args
+                .cluster_name
+                .clone()
+                .unwrap_or_else(|| default_cluster_name("rs3-velero-ci"));
+            KindCluster::create(
+                args.kind_bin.clone(),
+                cluster_name,
+                workspace.kubeconfig_path(),
+                args.keep_cluster,
+                args.wait_secs,
+            )?
+        };
+        if args.reuse_kind_cluster {
+            reset_reused_cluster(&args, cluster.kubeconfig_path())?;
+        }
 
         if !args.skip_image_load {
             cluster.load_image(&args.image)?;
@@ -226,79 +394,156 @@ mod imp {
             cluster.load_image(&args.velero_image)?;
             cluster.load_image(&args.velero_aws_plugin_image)?;
         }
-        if matches!(volume, WorkloadVolume::DynamicPvc) && !args.skip_openebs_image_load {
+        if !args.skip_rustfs_image_load {
+            cluster.load_image(&args.rustfs_image)?;
+        }
+        if matches!(scenario.volume, WorkloadVolume::DynamicPvc) && !args.skip_openebs_image_load {
             cluster.load_image(&args.openebs_provisioner_image)?;
             cluster.load_image(&args.openebs_helper_image)?;
         }
-        if matches!(volume, WorkloadVolume::LocalPv) {
+        if matches!(scenario.workload, WorkloadKind::Postgres) && !args.skip_postgres_image_load {
+            cluster.load_image(&args.postgres_image)?;
+        }
+        if matches!(scenario.volume, WorkloadVolume::LocalPv) {
             prepare_local_pv_path(&args, cluster.name())?;
         }
 
         let (image_repository, image_tag) = split_image_ref(&args.image);
-        helm_install_gateway(
-            &args.helm_bin,
-            cluster.kubeconfig_path(),
-            &GatewayChartValues {
-                release_name: &args.release_name,
-                namespace: &args.gateway_namespace,
-                image_repository: &image_repository,
-                image_tag: &image_tag,
-                public_bucket: VELERO_BUCKET,
-                wait_secs: args.wait_secs,
-            },
-        )?;
+        let backend_prefix = format!("repository-{}", now_millis());
+        let backend_endpoint = rustfs_backend::service_endpoint(&args.gateway_namespace);
+        let anchor_name = format!("{}-checkpoint", helm_fullname(&args.release_name));
+        let artifacts = ArtifactCollector::new(&args, scenario.label)?;
+        let mut state = RunState {
+            scenario_label: scenario.label,
+            anchor_name: anchor_name.clone(),
+            backend_prefix: backend_prefix.clone(),
+            backup_name: None,
+            restore_name: None,
+            started: Instant::now(),
+        };
+        let result = (|| -> Result<()> {
+            rustfs_backend::install(&args, cluster.kubeconfig_path(), &workspace)?;
+            rustfs_backend::create_bucket(&args, cluster.kubeconfig_path())?;
+            helm_install_gateway(
+                &args.helm_bin,
+                cluster.kubeconfig_path(),
+                &GatewayChartValues {
+                    release_name: &args.release_name,
+                    namespace: &args.gateway_namespace,
+                    image_repository: &image_repository,
+                    image_tag: &image_tag,
+                    public_bucket: VELERO_BUCKET,
+                    backend_endpoint: &backend_endpoint,
+                    backend_bucket: BACKEND_BUCKET,
+                    backend_prefix: &backend_prefix,
+                    backend_region: BACKEND_REGION,
+                    backend_access_key_id: Some(RUSTFS_ACCESS_KEY_ID),
+                    backend_secret_access_key: Some(RUSTFS_SECRET_ACCESS_KEY),
+                    anchor_mode: "kubernetes-lease",
+                    anchor_name: &anchor_name,
+                    log_format: "json",
+                    rust_log: GATEWAY_RUST_LOG,
+                    persistence_enabled: false,
+                    wait_secs: args.wait_secs,
+                },
+            )?;
 
-        if matches!(volume, WorkloadVolume::DynamicPvc) {
-            install_openebs(&args, cluster.kubeconfig_path())?;
+            if matches!(scenario.volume, WorkloadVolume::DynamicPvc) {
+                install_openebs(&args, cluster.kubeconfig_path())?;
+            }
+
+            let credentials_path = workspace.path("credentials-velero");
+            write_velero_credentials(&credentials_path)?;
+            install_velero(&args, cluster.kubeconfig_path(), &credentials_path)?;
+            apply_workload(&args, cluster.kubeconfig_path(), &workspace, scenario)?;
+            write_workload_proof(&args, cluster.kubeconfig_path(), scenario.workload)?;
+            assert_workload_proof(&args, cluster.kubeconfig_path(), scenario.workload)?;
+
+            let backup_name = format!("rs3-smoke-{}", now_millis());
+            let restore_name = format!("rs3-restore-{}", now_millis());
+            state.backup_name = Some(backup_name.clone());
+            state.restore_name = Some(restore_name.clone());
+            create_backup(&args, cluster.kubeconfig_path(), &backup_name)?;
+            assert_velero_phase(
+                &args.kubectl_bin,
+                cluster.kubeconfig_path(),
+                &args.velero_namespace,
+                "backups.velero.io",
+                &backup_name,
+                "Completed",
+            )?;
+            assert_pod_volume_backup_completed(&args, cluster.kubeconfig_path(), &backup_name)?;
+            if let Err(error) = artifacts.collect_checkpoint(
+                &args,
+                cluster.kubeconfig_path(),
+                &state,
+                "after-backup",
+            ) {
+                eprintln!("failed to collect after-backup checkpoint artifacts: {error:#}");
+            }
+
+            match scenario.volume {
+                WorkloadVolume::EmptyDir | WorkloadVolume::DynamicPvc => {
+                    delete_workload_namespace(&args, cluster.kubeconfig_path())?;
+                }
+                WorkloadVolume::LocalPv => {
+                    remove_workload_proof(&args, cluster.kubeconfig_path(), scenario.workload)?;
+                    delete_workload_pod(&args, cluster.kubeconfig_path())?;
+                }
+            }
+            if scenario.restart_gateway_before_restore {
+                if let Err(error) = artifacts.collect_checkpoint(
+                    &args,
+                    cluster.kubeconfig_path(),
+                    &state,
+                    "before-gateway-restart",
+                ) {
+                    eprintln!("failed to collect pre-restart checkpoint artifacts: {error:#}");
+                }
+                restart_gateway(&args, cluster.kubeconfig_path())?;
+                if let Err(error) = artifacts.collect_checkpoint(
+                    &args,
+                    cluster.kubeconfig_path(),
+                    &state,
+                    "after-gateway-restart",
+                ) {
+                    eprintln!("failed to collect post-restart checkpoint artifacts: {error:#}");
+                }
+            }
+            create_restore(
+                &args,
+                cluster.kubeconfig_path(),
+                &backup_name,
+                &restore_name,
+            )?;
+            assert_velero_phase(
+                &args.kubectl_bin,
+                cluster.kubeconfig_path(),
+                &args.velero_namespace,
+                "restores.velero.io",
+                &restore_name,
+                "Completed",
+            )?;
+            assert_pod_volume_restore_completed(&args, cluster.kubeconfig_path(), &restore_name)?;
+            wait_for_workload_available(&args, cluster.kubeconfig_path())?;
+            wait_for_restored_proof(&args, cluster.kubeconfig_path(), scenario.workload)?;
+            if let Err(error) = artifacts.collect_checkpoint(
+                &args,
+                cluster.kubeconfig_path(),
+                &state,
+                "after-restore",
+            ) {
+                eprintln!("failed to collect after-restore checkpoint artifacts: {error:#}");
+            }
+
+            Ok(())
+        })();
+
+        if let Err(error) = artifacts.collect(&args, cluster.kubeconfig_path(), &state) {
+            eprintln!("failed to collect Velero integration artifacts: {error:#}");
         }
 
-        let credentials_path = workspace.path("credentials-velero");
-        write_velero_credentials(&credentials_path)?;
-        install_velero(&args, cluster.kubeconfig_path(), &credentials_path)?;
-        apply_workload(&args, cluster.kubeconfig_path(), &workspace, volume)?;
-        write_workload_proof(&args, cluster.kubeconfig_path())?;
-        assert_workload_proof(&args, cluster.kubeconfig_path())?;
-
-        let backup_name = format!("rs3-smoke-{}", now_millis());
-        let restore_name = format!("rs3-restore-{}", now_millis());
-        create_backup(&args, cluster.kubeconfig_path(), &backup_name)?;
-        assert_velero_phase(
-            &args.kubectl_bin,
-            cluster.kubeconfig_path(),
-            &args.velero_namespace,
-            "backups.velero.io",
-            &backup_name,
-            "Completed",
-        )?;
-        assert_pod_volume_backup_completed(&args, cluster.kubeconfig_path(), &backup_name)?;
-
-        match volume {
-            WorkloadVolume::EmptyDir | WorkloadVolume::DynamicPvc => {
-                delete_workload_namespace(&args, cluster.kubeconfig_path())?;
-            }
-            WorkloadVolume::LocalPv => {
-                remove_workload_proof(&args, cluster.kubeconfig_path())?;
-                delete_workload_pod(&args, cluster.kubeconfig_path())?;
-            }
-        }
-        create_restore(
-            &args,
-            cluster.kubeconfig_path(),
-            &backup_name,
-            &restore_name,
-        )?;
-        assert_velero_phase(
-            &args.kubectl_bin,
-            cluster.kubeconfig_path(),
-            &args.velero_namespace,
-            "restores.velero.io",
-            &restore_name,
-            "Completed",
-        )?;
-        assert_pod_volume_restore_completed(&args, cluster.kubeconfig_path(), &restore_name)?;
-        wait_for_workload_available(&args, cluster.kubeconfig_path())?;
-        wait_for_restored_proof(&args, cluster.kubeconfig_path())?;
-
+        result?;
         cluster.delete()
     }
 
@@ -328,6 +573,29 @@ mod imp {
         Ok(())
     }
 
+    fn prepare_rustfs_image(args: &VeleroKopiaSmokeArgs) -> Result<()> {
+        if args.skip_rustfs_image_load {
+            return Ok(());
+        }
+        if docker_image_exists(&args.docker_bin, &args.rustfs_image)? {
+            return Ok(());
+        }
+        if args.pull_rustfs_image {
+            run_command(&args.docker_bin, &["pull", &args.rustfs_image]).with_context(|| {
+                format!(
+                    "failed to pull RustFS image `{}`; authenticate Docker or pass a mirror image if the registry rate-limits pulls",
+                    args.rustfs_image,
+                )
+            })?;
+            return Ok(());
+        }
+
+        bail!(
+            "RustFS image `{}` is not present locally. Pull or mirror it first, pass `--pull-rustfs-image`, or pass `--skip-rustfs-image-load` to let the cluster pull it directly.",
+            args.rustfs_image,
+        );
+    }
+
     fn prepare_openebs_images(args: &VeleroKopiaSmokeArgs) -> Result<()> {
         if args.skip_openebs_image_load {
             return Ok(());
@@ -354,6 +622,29 @@ mod imp {
         Ok(())
     }
 
+    fn prepare_postgres_image(args: &VeleroKopiaSmokeArgs) -> Result<()> {
+        if args.skip_postgres_image_load || args.postgres_image == args.image {
+            return Ok(());
+        }
+        if docker_image_exists(&args.docker_bin, &args.postgres_image)? {
+            return Ok(());
+        }
+        if args.pull_postgres_image {
+            run_command(&args.docker_bin, &["pull", &args.postgres_image]).with_context(|| {
+                format!(
+                    "failed to pull Postgres image `{}`; authenticate Docker or pass a mirror image if the registry rate-limits pulls",
+                    args.postgres_image,
+                )
+            })?;
+            return Ok(());
+        }
+
+        bail!(
+            "Postgres image `{}` is not present locally. Pull or mirror it first, pass `--pull-postgres-image`, or pass `--skip-postgres-image-load` to let the cluster pull it directly.",
+            args.postgres_image,
+        );
+    }
+
     fn docker_image_exists(docker_bin: &str, image: &str) -> Result<bool> {
         let result = run_command_capture(
             docker_bin,
@@ -370,6 +661,81 @@ mod imp {
                 }
             }
         }
+    }
+
+    fn reset_reused_cluster(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
+        let timeout = timeout_arg(args.wait_secs);
+        kubectl(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &[
+                "delete",
+                "crd",
+                "backuprepositories.velero.io",
+                "backups.velero.io",
+                "backupstoragelocations.velero.io",
+                "deletebackuprequests.velero.io",
+                "downloadrequests.velero.io",
+                "podvolumebackups.velero.io",
+                "podvolumerestores.velero.io",
+                "restores.velero.io",
+                "schedules.velero.io",
+                "serverstatusrequests.velero.io",
+                "volumesnapshotlocations.velero.io",
+                "datadownloads.velero.io",
+                "datauploads.velero.io",
+                "--ignore-not-found=true",
+                "--wait=true",
+                "--timeout",
+                timeout.as_str(),
+            ],
+        )
+        .context("failed to delete old Velero CRDs in reused cluster")?;
+        kubectl(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &[
+                "delete",
+                "clusterrolebinding",
+                "velero",
+                "--ignore-not-found=true",
+                "--wait=true",
+                "--timeout",
+                timeout.as_str(),
+            ],
+        )
+        .context("failed to delete old Velero ClusterRoleBinding in reused cluster")?;
+        kubectl(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &[
+                "delete",
+                "clusterrole",
+                "velero",
+                "--ignore-not-found=true",
+                "--wait=true",
+                "--timeout",
+                timeout.as_str(),
+            ],
+        )
+        .context("failed to delete old Velero ClusterRole in reused cluster")?;
+        kubectl(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &[
+                "delete",
+                "namespace",
+                &args.workload_namespace,
+                &args.velero_namespace,
+                &args.gateway_namespace,
+                &args.openebs_namespace,
+                "--ignore-not-found=true",
+                "--wait=true",
+                "--timeout",
+                timeout.as_str(),
+            ],
+        )
+        .context("failed to delete old namespaces in reused cluster")
     }
 
     fn prepare_local_pv_path(args: &VeleroKopiaSmokeArgs, cluster_name: &str) -> Result<()> {
@@ -572,16 +938,16 @@ mod imp {
         args: &VeleroKopiaSmokeArgs,
         kubeconfig_path: &Path,
         workspace: &K8sWorkspace,
-        volume: WorkloadVolume,
+        scenario: Scenario,
     ) -> Result<()> {
         let manifest_path = workspace.path("workload.yaml");
-        let node_name = match volume {
+        let node_name = match scenario.volume {
             WorkloadVolume::EmptyDir | WorkloadVolume::DynamicPvc => None,
             WorkloadVolume::LocalPv => Some(first_node_name(args, kubeconfig_path)?),
         };
         fs::write(
             &manifest_path,
-            workload_manifest(args, volume, node_name.as_deref()),
+            workload_manifest(args, scenario, node_name.as_deref()),
         )
         .with_context(|| format!("failed to write {}", manifest_path.display()))?;
         kubectl(
@@ -608,21 +974,23 @@ mod imp {
 
     fn workload_manifest(
         args: &VeleroKopiaSmokeArgs,
-        volume: WorkloadVolume,
+        scenario: Scenario,
         node_name: Option<&str>,
     ) -> String {
-        let workload_image = args.workload_image.as_deref().unwrap_or(&args.image);
-        let volume_resources = match volume {
+        let workload_image = workload_image(args, scenario.workload);
+        let volume_resources = match scenario.volume {
             WorkloadVolume::EmptyDir => String::new(),
             WorkloadVolume::LocalPv => local_pv_resources(args, node_name.expect("node name")),
             WorkloadVolume::DynamicPvc => dynamic_pvc_resources(args),
         };
-        let volume_spec = match volume {
+        let volume_spec = match scenario.volume {
             WorkloadVolume::EmptyDir => "emptyDir: {}".to_owned(),
             WorkloadVolume::LocalPv | WorkloadVolume::DynamicPvc => {
                 "persistentVolumeClaim:\n        claimName: data".to_owned()
             }
         };
+        let annotations = workload_annotations(scenario.workload);
+        let container_spec = workload_container_spec(scenario.workload, workload_image);
         format!(
             r#"apiVersion: v1
 kind: Namespace
@@ -636,12 +1004,51 @@ metadata:
   name: {name}
   namespace: {namespace}
   annotations:
-    backup.velero.io/backup-volumes: data
+{annotations}
   labels:
     app.kubernetes.io/name: {name}
 spec:
   containers:
-    - name: workload
+{container_spec}
+  volumes:
+    - name: data
+      {volume_spec}
+"#,
+            annotations = annotations,
+            container_spec = container_spec,
+            name = WORKLOAD_NAME,
+            namespace = args.workload_namespace,
+            volume_resources = volume_resources,
+            volume_spec = volume_spec,
+        )
+    }
+
+    fn workload_image(args: &VeleroKopiaSmokeArgs, workload: WorkloadKind) -> &str {
+        match workload {
+            WorkloadKind::ProofFile => args.workload_image.as_deref().unwrap_or(&args.image),
+            WorkloadKind::Postgres => args
+                .workload_image
+                .as_deref()
+                .unwrap_or(&args.postgres_image),
+        }
+    }
+
+    fn workload_annotations(workload: WorkloadKind) -> &'static str {
+        match workload {
+            WorkloadKind::ProofFile => "    backup.velero.io/backup-volumes: data",
+            WorkloadKind::Postgres => {
+                r#"    backup.velero.io/backup-volumes: data
+    pre.hook.backup.velero.io/container: postgres
+    pre.hook.backup.velero.io/command: '["/bin/sh","-c","psql -U postgres -d rs3 -v ON_ERROR_STOP=1 -c \"CHECKPOINT\" && pg_dump -U postgres -d rs3 -f /var/lib/postgresql/data/rs3-proof.sql && sync"]'
+    pre.hook.backup.velero.io/timeout: 60s"#
+            }
+        }
+    }
+
+    fn workload_container_spec(workload: WorkloadKind, image: &str) -> String {
+        match workload {
+            WorkloadKind::ProofFile => format!(
+                r#"    - name: workload
       image: {image}
       imagePullPolicy: IfNotPresent
       command:
@@ -650,17 +1057,41 @@ spec:
         - sleep 3600
       volumeMounts:
         - name: data
-          mountPath: /data
-  volumes:
-    - name: data
-      {volume_spec}
-"#,
-            image = workload_image,
-            name = WORKLOAD_NAME,
-            namespace = args.workload_namespace,
-            volume_resources = volume_resources,
-            volume_spec = volume_spec,
-        )
+          mountPath: /data"#,
+            ),
+            WorkloadKind::Postgres => format!(
+                r#"    - name: postgres
+      image: {image}
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: POSTGRES_DB
+          value: {db}
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_HOST_AUTH_METHOD
+          value: trust
+        - name: PGDATA
+          value: {data_path}/pgdata
+      ports:
+        - name: postgres
+          containerPort: 5432
+      readinessProbe:
+        exec:
+          command:
+            - pg_isready
+            - -U
+            - postgres
+            - -d
+            - {db}
+        periodSeconds: 2
+        failureThreshold: 30
+      volumeMounts:
+        - name: data
+          mountPath: {data_path}"#,
+                data_path = POSTGRES_DATA_PATH,
+                db = POSTGRES_DB,
+            ),
+        }
     }
 
     fn dynamic_pvc_resources(args: &VeleroKopiaSmokeArgs) -> String {
@@ -769,65 +1200,155 @@ spec:
         .context("Velero smoke workload did not become available")
     }
 
-    fn write_workload_proof(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
-        kubectl(
-            &args.kubectl_bin,
-            kubeconfig_path,
-            &[
-                "-n",
-                &args.workload_namespace,
-                "exec",
-                &format!("pod/{WORKLOAD_NAME}"),
-                "--",
-                "/bin/sh",
-                "-c",
-                &format!("printf '{EXPECTED_CONTENT}' > {PROOF_PATH} && sync"),
-            ],
-        )
-        .context("failed to write Velero smoke proof file")
+    fn write_workload_proof(
+        args: &VeleroKopiaSmokeArgs,
+        kubeconfig_path: &Path,
+        workload: WorkloadKind,
+    ) -> Result<()> {
+        match workload {
+            WorkloadKind::ProofFile => kubectl(
+                &args.kubectl_bin,
+                kubeconfig_path,
+                &[
+                    "-n",
+                    &args.workload_namespace,
+                    "exec",
+                    &format!("pod/{WORKLOAD_NAME}"),
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    &format!("printf '{EXPECTED_CONTENT}' > {PROOF_PATH} && sync"),
+                ],
+            )
+            .context("failed to write Velero smoke proof file"),
+            WorkloadKind::Postgres => kubectl(
+                &args.kubectl_bin,
+                kubeconfig_path,
+                &[
+                    "-n",
+                    &args.workload_namespace,
+                    "exec",
+                    &format!("pod/{WORKLOAD_NAME}"),
+                    "-c",
+                    "postgres",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    &postgres_write_script(),
+                ],
+            )
+            .context("failed to write Postgres smoke proof data"),
+        }
     }
 
-    fn assert_workload_proof(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
-        let actual = read_workload_proof(args, kubeconfig_path)
-            .context("failed to read Velero smoke proof file")?;
-        if actual != EXPECTED_CONTENT {
-            bail!("Velero smoke proof file mismatch before backup");
+    fn assert_workload_proof(
+        args: &VeleroKopiaSmokeArgs,
+        kubeconfig_path: &Path,
+        workload: WorkloadKind,
+    ) -> Result<()> {
+        let actual = read_workload_proof(args, kubeconfig_path, workload)
+            .context("failed to read Velero smoke proof")?;
+        match workload {
+            WorkloadKind::ProofFile if actual != EXPECTED_CONTENT => {
+                bail!("Velero smoke proof file mismatch before backup");
+            }
+            WorkloadKind::Postgres if actual.trim() != "ok" => {
+                bail!("Postgres smoke proof mismatch before backup: {actual:?}");
+            }
+            _ => {}
         }
         Ok(())
     }
 
-    fn read_workload_proof(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<String> {
-        kubectl_capture(
-            &args.kubectl_bin,
-            kubeconfig_path,
-            &[
-                "-n",
-                &args.workload_namespace,
-                "exec",
-                &format!("pod/{WORKLOAD_NAME}"),
-                "--",
-                "cat",
-                PROOF_PATH,
-            ],
+    fn read_workload_proof(
+        args: &VeleroKopiaSmokeArgs,
+        kubeconfig_path: &Path,
+        workload: WorkloadKind,
+    ) -> Result<String> {
+        match workload {
+            WorkloadKind::ProofFile => kubectl_capture(
+                &args.kubectl_bin,
+                kubeconfig_path,
+                &[
+                    "-n",
+                    &args.workload_namespace,
+                    "exec",
+                    &format!("pod/{WORKLOAD_NAME}"),
+                    "--",
+                    "cat",
+                    PROOF_PATH,
+                ],
+            ),
+            WorkloadKind::Postgres => kubectl_capture(
+                &args.kubectl_bin,
+                kubeconfig_path,
+                &[
+                    "-n",
+                    &args.workload_namespace,
+                    "exec",
+                    &format!("pod/{WORKLOAD_NAME}"),
+                    "-c",
+                    "postgres",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    &postgres_verify_script(),
+                ],
+            ),
+        }
+    }
+
+    fn remove_workload_proof(
+        args: &VeleroKopiaSmokeArgs,
+        kubeconfig_path: &Path,
+        workload: WorkloadKind,
+    ) -> Result<()> {
+        match workload {
+            WorkloadKind::ProofFile => kubectl(
+                &args.kubectl_bin,
+                kubeconfig_path,
+                &[
+                    "-n",
+                    &args.workload_namespace,
+                    "exec",
+                    &format!("pod/{WORKLOAD_NAME}"),
+                    "--",
+                    "rm",
+                    "-f",
+                    PROOF_PATH,
+                ],
+            )
+            .context("failed to remove original local-PV proof file before restore"),
+            WorkloadKind::Postgres => kubectl(
+                &args.kubectl_bin,
+                kubeconfig_path,
+                &[
+                    "-n",
+                    &args.workload_namespace,
+                    "exec",
+                    &format!("pod/{WORKLOAD_NAME}"),
+                    "-c",
+                    "postgres",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "rm -f /var/lib/postgresql/data/rs3-proof.sql",
+                ],
+            )
+            .context("failed to remove original Postgres proof file before restore"),
+        }
+    }
+
+    fn postgres_write_script() -> String {
+        format!(
+            "psql -U postgres -d {POSTGRES_DB} -v ON_ERROR_STOP=1 -c \"DROP TABLE IF EXISTS proof; CREATE TABLE proof(id integer PRIMARY KEY, value text NOT NULL); INSERT INTO proof SELECT i, 'row-' || lpad(i::text, 4, '0') FROM generate_series(0, 127) AS i; CHECKPOINT;\" && pg_dump -U postgres -d {POSTGRES_DB} -f {POSTGRES_DUMP_PATH} && sync",
         )
     }
 
-    fn remove_workload_proof(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
-        kubectl(
-            &args.kubectl_bin,
-            kubeconfig_path,
-            &[
-                "-n",
-                &args.workload_namespace,
-                "exec",
-                &format!("pod/{WORKLOAD_NAME}"),
-                "--",
-                "rm",
-                "-f",
-                PROOF_PATH,
-            ],
+    fn postgres_verify_script() -> String {
+        format!(
+            "test -s {POSTGRES_DUMP_PATH} && psql -U postgres -d {POSTGRES_DB} -v ON_ERROR_STOP=1 -At -c \"SELECT CASE WHEN (SELECT count(*) FROM proof) = 128 AND (SELECT md5(string_agg(value, ',' ORDER BY id)) FROM proof) = (SELECT md5(string_agg('row-' || lpad(i::text, 4, '0'), ',' ORDER BY i)) FROM generate_series(0, 127) AS i) THEN 'ok' ELSE 'bad' END;\"",
         )
-        .context("failed to remove original local-PV proof file before restore")
     }
 
     fn create_backup(
@@ -891,6 +1412,37 @@ spec:
             ],
         )
         .context("failed to delete Velero smoke workload pod")
+    }
+
+    fn restart_gateway(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
+        let timeout = timeout_arg(args.wait_secs);
+        let deployment = format!("deployment/{}", helm_fullname(&args.release_name));
+        kubectl(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &[
+                "-n",
+                &args.gateway_namespace,
+                "rollout",
+                "restart",
+                &deployment,
+            ],
+        )
+        .context("failed to restart gateway deployment")?;
+        kubectl(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &[
+                "-n",
+                &args.gateway_namespace,
+                "rollout",
+                "status",
+                &deployment,
+                "--timeout",
+                timeout.as_str(),
+            ],
+        )
+        .context("gateway deployment did not become ready after restart")
     }
 
     fn create_restore(
@@ -997,11 +1549,15 @@ spec:
         })
     }
 
-    fn wait_for_restored_proof(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
+    fn wait_for_restored_proof(
+        args: &VeleroKopiaSmokeArgs,
+        kubeconfig_path: &Path,
+        workload: WorkloadKind,
+    ) -> Result<()> {
         let started = Instant::now();
         loop {
-            match read_workload_proof(args, kubeconfig_path) {
-                Ok(actual) if actual == EXPECTED_CONTENT => return Ok(()),
+            match read_workload_proof(args, kubeconfig_path, workload) {
+                Ok(actual) if proof_matches(workload, &actual) => return Ok(()),
                 Ok(_) | Err(_) if started.elapsed() <= Duration::from_secs(args.wait_secs) => {
                     thread::sleep(Duration::from_secs(2));
                 }
@@ -1016,6 +1572,13 @@ spec:
                     ));
                 }
             }
+        }
+    }
+
+    fn proof_matches(workload: WorkloadKind, actual: &str) -> bool {
+        match workload {
+            WorkloadKind::ProofFile => actual == EXPECTED_CONTENT,
+            WorkloadKind::Postgres => actual.trim() == "ok",
         }
     }
 

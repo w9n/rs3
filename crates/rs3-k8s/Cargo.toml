@@ -9,7 +9,15 @@ authors.workspace = true
 description = "Kubernetes checkpoint anchoring integration for rs3"
 
 [dependencies]
+async-trait.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
 rs3-anchor.workspace = true
+rs3-types.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+k8s-openapi = { workspace = true, features = ["v1_35"] }
 
 [lints]
 workspace = true

@@ -4,7 +4,7 @@ FROM rust:${RUST_VERSION}-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN rm -f rust-toolchain.toml \
-    && cargo build --locked --release -p rs3-server --features s3
+    && cargo build --locked --release -p rs3-server --features s3,k8s
 
 FROM debian:bookworm-slim
 RUN apt-get update \
