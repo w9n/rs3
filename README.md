@@ -45,6 +45,10 @@ credential environment variables before running it. Optional knobs:
 `RS3_TEST_S3_PROVIDER`, `RS3_TEST_S3_ALLOW_HTTP`, and
 `RS3_TEST_S3_VIRTUAL_HOSTED_STYLE`.
 
+The `rs3-server/s3` feature enables the server runtime to use the S3-compatible
+storage adapter. Set `RS3_BACKEND_ENDPOINT=s3` for the default AWS endpoint, or
+use an `http://` / `https://` endpoint URL for an S3-compatible service.
+
 The Nix shell includes `sccache` for clean rebuild or CI-like cache experiments,
 but it is not enabled by default. Set `RUSTC_WRAPPER=sccache` for runs where that
 tradeoff is useful.

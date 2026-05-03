@@ -174,6 +174,15 @@ impl S3BlobStore {
     ///
     /// Returns a provider error when configuration cannot be constructed.
     pub async fn from_environment(config: S3BlobStoreConfig) -> Result<Self> {
+        Self::from_environment_sync(config)
+    }
+
+    /// Builds an S3 store from the default AWS environment/config chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider error when configuration cannot be constructed.
+    pub fn from_environment_sync(config: S3BlobStoreConfig) -> Result<Self> {
         let mut builder = AmazonS3Builder::from_env()
             .with_bucket_name(config.bucket.clone())
             .with_conditional_put(S3ConditionalPut::ETagMatch)

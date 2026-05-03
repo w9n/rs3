@@ -8,6 +8,10 @@ repository.workspace = true
 authors.workspace = true
 description = "Command-line entry point for the rs3 gateway"
 
+[features]
+default = []
+s3 = ["rs3-storage/s3"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

@@ -12,6 +12,8 @@ use rs3_repository::{
 use rs3_storage::{
     BlobMetadata, BlobStore, ByteRange, FilesystemBlobStore, MemoryBlobStore, PutOptions,
 };
+#[cfg(feature = "s3")]
+use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -129,6 +131,15 @@ fn build_store(config: &BackendConfig) -> Result<StoreBuild, S3BoundaryError> {
         });
     }
 
+    #[cfg(feature = "s3")]
+    if let Some(store) = s3_backend_store(config)? {
+        return Ok(StoreBuild {
+            handle: RuntimeStore::new(store),
+            #[cfg(test)]
+            memory_store: None,
+        });
+    }
+
     Err(S3BoundaryError::UnsupportedBackendMode)
 }
 
@@ -151,6 +162,40 @@ fn filesystem_backend_root(config: &BackendConfig) -> Result<Option<PathBuf>, S3
     }
 
     Ok(Some(root))
+}
+
+#[cfg(feature = "s3")]
+fn s3_backend_store(config: &BackendConfig) -> Result<Option<S3BlobStore>, S3BoundaryError> {
+    let Some(store_config) = s3_backend_config(config)? else {
+        return Ok(None);
+    };
+
+    S3BlobStore::from_environment_sync(store_config)
+        .map(Some)
+        .map_err(repository_init)
+}
+
+#[cfg(feature = "s3")]
+fn s3_backend_config(config: &BackendConfig) -> Result<Option<S3BlobStoreConfig>, S3BoundaryError> {
+    let endpoint_url = match config.endpoint.as_str() {
+        "s3" | "s3://" | "s3://aws" => None,
+        endpoint if endpoint.starts_with("https://") || endpoint.starts_with("http://") => {
+            Some(endpoint.to_owned())
+        }
+        _ => return Ok(None),
+    };
+    let allow_http = endpoint_url
+        .as_deref()
+        .is_some_and(|endpoint| endpoint.starts_with("http://"));
+    let config = S3BlobStoreConfig::new(config.bucket.clone())
+        .map_err(repository_init)?
+        .with_prefix(config.prefix.clone())
+        .with_endpoint_url(endpoint_url)
+        .with_region(None)
+        .with_allow_http(allow_http)
+        .with_virtual_hosted_style(false);
+
+    Ok(Some(config))
 }
 
 fn push_relative_component(root: &mut PathBuf, value: &str) -> Result<(), S3BoundaryError> {
@@ -316,6 +361,8 @@ fn repository_init(error: impl ToString) -> S3BoundaryError {
 #[cfg(test)]
 mod tests {
     use super::RuntimeRepository;
+    #[cfg(feature = "s3")]
+    use super::s3_backend_config;
     use crate::s3::S3BoundaryError;
     use crate::s3::test_support::runtime_config;
     use crate::{AnchorConfig, BatchConfig};
@@ -403,7 +450,7 @@ mod tests {
     #[test]
     fn runtime_factory_rejects_unwired_backend() {
         let mut config = runtime_config(true);
-        config.backend.endpoint = "https://object.example".to_owned();
+        config.backend.endpoint = "unsupported://object.example".to_owned();
 
         let runtime = RuntimeRepository::from_config(&config);
 
@@ -411,6 +458,28 @@ mod tests {
             runtime,
             Err(S3BoundaryError::UnsupportedBackendMode)
         ));
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn runtime_factory_maps_http_endpoint_to_s3_backend_config() {
+        let mut config = runtime_config(true);
+        config.backend.endpoint = "http://127.0.0.1:9000".to_owned();
+        config.backend.bucket = "backup-data".to_owned();
+        config.backend.prefix = Some("repo".to_owned());
+
+        let store_config = s3_backend_config(&config.backend)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("expected S3 backend config"));
+
+        assert_eq!(store_config.bucket, "backup-data");
+        assert_eq!(store_config.prefix.as_deref(), Some("repo"));
+        assert_eq!(
+            store_config.endpoint_url.as_deref(),
+            Some("http://127.0.0.1:9000")
+        );
+        assert!(store_config.allow_http);
+        assert!(!store_config.virtual_hosted_style);
     }
 
     #[test]

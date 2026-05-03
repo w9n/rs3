@@ -18,8 +18,8 @@ check:
     cargo test --workspace
 
 check-s3:
-    cargo clippy -p rs3-storage -p xtask --features xtask/s3 --all-targets -- -D warnings
-    cargo test -p rs3-storage -p xtask --features xtask/s3
+    cargo clippy -p rs3-storage -p rs3-server -p xtask --features rs3-server/s3,xtask/s3 --all-targets -- -D warnings
+    cargo test -p rs3-storage -p rs3-server -p xtask --features rs3-server/s3,xtask/s3
 
 integration-s3:
     cargo test -p rs3-storage --features s3 --test s3_live -- --ignored --nocapture
