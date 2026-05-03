@@ -1,6 +1,9 @@
 //! Performance scenario harness.
 
 #[cfg(feature = "containers")]
+mod gateway;
+
+#[cfg(feature = "containers")]
 use crate::integration::{S3ContainerProvider, s3_container};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -136,6 +139,9 @@ pub(crate) enum PerfBackend {
     /// Ephemeral local S3-compatible container.
     #[cfg(feature = "containers")]
     S3Container,
+    /// Gateway process backed by an ephemeral local S3-compatible container.
+    #[cfg(feature = "containers")]
+    S3GatewayContainer,
 }
 
 impl PerfBackend {
@@ -147,6 +153,8 @@ impl PerfBackend {
             Self::S3 => "s3",
             #[cfg(feature = "containers")]
             Self::S3Container => "s3-container",
+            #[cfg(feature = "containers")]
+            Self::S3GatewayContainer => "s3-gateway-container",
         }
     }
 }
@@ -211,6 +219,10 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
     #[cfg(feature = "containers")]
     if args.backend == PerfBackend::S3Container {
         return run_s3_container_perf(&args);
+    }
+    #[cfg(feature = "containers")]
+    if args.backend == PerfBackend::S3GatewayContainer {
+        return gateway::run_s3_gateway_container_perf(&args);
     }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -327,7 +339,9 @@ async fn write_batch(args: &PerfArgs) -> Result<PerfReport> {
         #[cfg(feature = "s3")]
         PerfBackend::S3 => write_batch_with_store(args, s3_store(args).await?).await,
         #[cfg(feature = "containers")]
-        PerfBackend::S3Container => unreachable!("handled before scenario dispatch"),
+        PerfBackend::S3Container | PerfBackend::S3GatewayContainer => {
+            unreachable!("handled before scenario dispatch")
+        }
     }
 }
 
@@ -391,7 +405,9 @@ async fn write_committed(args: &PerfArgs) -> Result<PerfReport> {
         #[cfg(feature = "s3")]
         PerfBackend::S3 => write_committed_with_store(args, s3_store(args).await?).await,
         #[cfg(feature = "containers")]
-        PerfBackend::S3Container => unreachable!("handled before scenario dispatch"),
+        PerfBackend::S3Container | PerfBackend::S3GatewayContainer => {
+            unreachable!("handled before scenario dispatch")
+        }
     }
 }
 
@@ -454,7 +470,9 @@ async fn write_committed_parallel(args: &PerfArgs) -> Result<PerfReport> {
         #[cfg(feature = "s3")]
         PerfBackend::S3 => write_committed_parallel_with_store(args, s3_store(args).await?).await,
         #[cfg(feature = "containers")]
-        PerfBackend::S3Container => unreachable!("handled before scenario dispatch"),
+        PerfBackend::S3Container | PerfBackend::S3GatewayContainer => {
+            unreachable!("handled before scenario dispatch")
+        }
     }
 }
 
@@ -538,7 +556,9 @@ async fn full_read(args: &PerfArgs) -> Result<PerfReport> {
         #[cfg(feature = "s3")]
         PerfBackend::S3 => full_read_with_store(args, s3_store(args).await?).await,
         #[cfg(feature = "containers")]
-        PerfBackend::S3Container => unreachable!("handled before scenario dispatch"),
+        PerfBackend::S3Container | PerfBackend::S3GatewayContainer => {
+            unreachable!("handled before scenario dispatch")
+        }
     }
 }
 
@@ -598,7 +618,9 @@ async fn range_read(args: &PerfArgs) -> Result<PerfReport> {
         #[cfg(feature = "s3")]
         PerfBackend::S3 => range_read_with_store(args, s3_store(args).await?).await,
         #[cfg(feature = "containers")]
-        PerfBackend::S3Container => unreachable!("handled before scenario dispatch"),
+        PerfBackend::S3Container | PerfBackend::S3GatewayContainer => {
+            unreachable!("handled before scenario dispatch")
+        }
     }
 }
 

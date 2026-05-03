@@ -51,6 +51,9 @@ perf-s3 *ARGS:
 perf-s3-container *ARGS:
     cargo run -p xtask --features containers -- perf --backend s3-container {{ARGS}}
 
+perf-s3-gateway *ARGS:
+    cargo run -p xtask --features containers -- perf --backend s3-gateway-container {{ARGS}}
+
 nextest:
     cargo nextest run --workspace
 
