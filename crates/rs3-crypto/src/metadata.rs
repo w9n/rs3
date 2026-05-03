@@ -1,4 +1,9 @@
 //! Metadata payload sealing helpers.
+//!
+//! Metadata uses the `chacha20poly1305` crate's XChaCha20-Poly1305 AEAD. The
+//! nonce is deterministically derived from secret key material, associated data,
+//! and plaintext so retrying the same manifest/index write is stable while
+//! retaining the AEAD implementation boundary.
 
 use crate::keyring::KeyRing;
 use crate::primitives::derive_hmac;
@@ -152,7 +157,7 @@ mod tests {
             KeyDescriptor {
                 id: key_id(value),
                 purpose: KeyPurpose::Metadata,
-                algorithm: "hmac-sha256-seal".to_string(),
+                algorithm: "xchacha20poly1305-hmac-sha256-nonce-v1".to_string(),
                 status,
                 created_at_ms: 0,
                 not_before_ms: None,

@@ -100,7 +100,7 @@ fn signing_keyring() -> KeyRing {
             "metadata",
             KeyPurpose::Metadata,
             KeyStatus::Primary,
-            "hmac-sha256-seal",
+            "xchacha20poly1305-hmac-sha256-nonce-v1",
             2,
         ),
         key_material(

@@ -106,7 +106,7 @@ fn metadata_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMaterial 
         value,
         KeyPurpose::Metadata,
         status,
-        "hmac-sha256-seal",
+        "xchacha20poly1305-hmac-sha256-nonce-v1",
         secret_byte,
     )
 }
@@ -495,6 +495,45 @@ fn indexed_list_prefix_classifies_fallback_without_prefix_value() {
     );
     assert_eq!(indexed_list_prefix("p12"), "");
     assert_eq!(indexed_list_prefix_mode("p12").as_str(), "root_fallback");
+}
+
+#[test]
+fn repository_new_derives_purpose_specific_keys_from_master_key() {
+    let repo = Repository::new(MemoryBlobStore::new(), secret());
+    let keyring = match repo.keyring.read() {
+        Ok(keyring) => keyring,
+        Err(error) => panic!("{error}"),
+    };
+
+    assert_eq!(
+        keyring
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| (descriptor.id, descriptor.purpose, descriptor.algorithm))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                key_id("namespace-v1"),
+                KeyPurpose::Namespace,
+                "hmac-sha256".to_owned()
+            ),
+            (
+                key_id("content-v1"),
+                KeyPurpose::Content,
+                "xchacha20poly1305".to_owned()
+            ),
+            (
+                key_id("metadata-v1"),
+                KeyPurpose::Metadata,
+                "xchacha20poly1305-hmac-sha256-nonce-v1".to_owned()
+            ),
+            (
+                key_id("checkpoint-v1"),
+                KeyPurpose::CheckpointSigning,
+                "hmac-sha256".to_owned()
+            ),
+        ]
+    );
 }
 
 #[tokio::test]

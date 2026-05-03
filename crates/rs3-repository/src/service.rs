@@ -57,8 +57,20 @@ where
     S: BlobStore,
 {
     /// Creates a trusted repository service over a blob store.
-    pub fn new(store: S, secret: SecretBytes) -> Self {
-        Self::with_keyring(store, KeyRing::single_namespace(secret))
+    ///
+    /// The provided secret is a repository master key. Purpose-specific
+    /// namespace, content, metadata, and checkpoint keys are derived from it.
+    pub fn new(store: S, master_key: SecretBytes) -> Self {
+        match Self::from_master_key(store, master_key) {
+            Ok(repository) => repository,
+            Err(error) => unreachable!("repository master key derivation is infallible: {error}"),
+        }
+    }
+
+    /// Creates a trusted repository service from a repository master key.
+    pub fn from_master_key(store: S, master_key: SecretBytes) -> Result<Self> {
+        let keyring = KeyRing::from_repository_master_key(&master_key)?;
+        Ok(Self::with_keyring(store, keyring))
     }
 
     /// Creates a trusted repository service with an explicit keyring.

@@ -5,6 +5,11 @@ use crate::{CryptoError, SecretBytes};
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus};
 use std::collections::BTreeSet;
 
+const NAMESPACE_ALGORITHM: &str = "hmac-sha256";
+const CONTENT_ALGORITHM: &str = "xchacha20poly1305";
+const METADATA_ALGORITHM: &str = "xchacha20poly1305-hmac-sha256-nonce-v1";
+const CHECKPOINT_ALGORITHM: &str = "hmac-sha256";
+
 /// Secret-bearing keyring entry.
 #[derive(Clone, Debug)]
 pub struct KeyMaterial {
@@ -59,7 +64,10 @@ impl KeyRing {
         ])
     }
 
-    /// Creates a keyring with primary namespace and metadata keys.
+    /// Creates a legacy single-secret keyring for focused tests.
+    ///
+    /// Production callers should derive purpose-specific keys from a repository
+    /// master key with [`Self::from_repository_master_key`].
     pub fn single_namespace(secret: SecretBytes) -> Self {
         Self {
             keys: vec![
@@ -232,7 +240,7 @@ fn default_namespace_descriptor() -> KeyDescriptor {
     KeyDescriptor {
         id: static_key_id("namespace-v1"),
         purpose: KeyPurpose::Namespace,
-        algorithm: "hmac-sha256".to_string(),
+        algorithm: NAMESPACE_ALGORITHM.to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
         not_before_ms: None,
@@ -245,7 +253,7 @@ fn default_metadata_descriptor() -> KeyDescriptor {
     KeyDescriptor {
         id: static_key_id("metadata-v1"),
         purpose: KeyPurpose::Metadata,
-        algorithm: "hmac-sha256-seal".to_string(),
+        algorithm: METADATA_ALGORITHM.to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
         not_before_ms: None,
@@ -258,7 +266,7 @@ fn default_content_descriptor() -> KeyDescriptor {
     KeyDescriptor {
         id: static_key_id("content-v1"),
         purpose: KeyPurpose::Content,
-        algorithm: "xchacha20poly1305".to_string(),
+        algorithm: CONTENT_ALGORITHM.to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
         not_before_ms: None,
@@ -271,7 +279,7 @@ fn default_checkpoint_descriptor() -> KeyDescriptor {
     KeyDescriptor {
         id: static_key_id("checkpoint-v1"),
         purpose: KeyPurpose::CheckpointSigning,
-        algorithm: "hmac-sha256".to_string(),
+        algorithm: CHECKPOINT_ALGORITHM.to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
         not_before_ms: None,
@@ -386,7 +394,7 @@ mod tests {
                 (
                     key_id("metadata-v1"),
                     KeyPurpose::Metadata,
-                    "hmac-sha256-seal".to_owned()
+                    "xchacha20poly1305-hmac-sha256-nonce-v1".to_owned()
                 ),
                 (
                     key_id("checkpoint-v1"),
