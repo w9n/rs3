@@ -34,6 +34,7 @@ pub struct Repository<S> {
     pub(crate) state: RwLock<RepositoryState>,
     options: RepositoryOptions,
     payload_headers: RwLock<PayloadHeaderCache>,
+    payload_spans: RwLock<PayloadSpanCache>,
 }
 
 /// Repository runtime options.
@@ -77,6 +78,7 @@ where
             state: RwLock::new(RepositoryState::default()),
             options,
             payload_headers: RwLock::new(PayloadHeaderCache::default()),
+            payload_spans: RwLock::new(PayloadSpanCache::default()),
         }
     }
 
@@ -404,6 +406,15 @@ where
             });
         }
 
+        if let Some(ciphertext) = self.cached_payload_span(object_id, span)? {
+            record_payload_span_cache("hit", span.len);
+            return Ok(CiphertextSpanRead {
+                backend_bytes_read: 0,
+                ciphertext,
+            });
+        }
+        record_payload_span_cache("miss", span.len);
+
         if let Some(prefetched) = prefetched_body {
             let prefetched_len = u64::try_from(prefetched.len()).unwrap_or(u64::MAX);
             let span_end = span
@@ -413,9 +424,11 @@ where
             if span_end <= prefetched_len {
                 let start = usize::try_from(span.offset).map_err(|_| StorageError::InvalidRange)?;
                 let end = usize::try_from(span_end).map_err(|_| StorageError::InvalidRange)?;
+                let ciphertext = prefetched.slice(start..end);
+                self.cache_payload_span(object_id, span, ciphertext.clone())?;
                 return Ok(CiphertextSpanRead {
                     backend_bytes_read: 0,
-                    ciphertext: prefetched.slice(start..end),
+                    ciphertext,
                 });
             }
 
@@ -449,9 +462,11 @@ where
                     usize::try_from(span.offset).map_err(|_| StorageError::InvalidRange)?;
                 ciphertext.extend_from_slice(&prefetched[prefix_start..]);
                 ciphertext.extend_from_slice(&suffix);
+                let ciphertext = Bytes::from(ciphertext);
+                self.cache_payload_span(object_id, span, ciphertext.clone())?;
                 return Ok(CiphertextSpanRead {
                     backend_bytes_read: u64::try_from(suffix.len()).unwrap_or(u64::MAX),
-                    ciphertext: Bytes::from(ciphertext),
+                    ciphertext,
                 });
             }
         }
@@ -466,6 +481,7 @@ where
                 },
             )
             .await?;
+        self.cache_payload_span(object_id, span, ciphertext.clone())?;
         Ok(CiphertextSpanRead {
             backend_bytes_read: u64::try_from(ciphertext.len()).unwrap_or(u64::MAX),
             ciphertext,
@@ -554,6 +570,40 @@ where
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)?;
         cache.insert(object_id.clone(), header);
+        Ok(())
+    }
+
+    fn cached_payload_span(
+        &self,
+        object_id: &BackendObjectId,
+        span: SegmentCiphertextSpan,
+    ) -> Result<Option<Bytes>> {
+        let cache = self
+            .payload_spans
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        Ok(cache.get(object_id, span))
+    }
+
+    fn cache_payload_span(
+        &self,
+        object_id: &BackendObjectId,
+        span: SegmentCiphertextSpan,
+        ciphertext: Bytes,
+    ) -> Result<()> {
+        let mut cache = self
+            .payload_spans
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let outcome = cache.insert(object_id.clone(), span, ciphertext);
+        match outcome {
+            PayloadSpanCacheInsert::Inserted { bytes } => {
+                record_payload_span_cache("insert", bytes);
+            }
+            PayloadSpanCacheInsert::SkippedTooLarge { bytes } => {
+                record_payload_span_cache("skip_too_large", bytes);
+            }
+        }
         Ok(())
     }
 
@@ -861,6 +911,97 @@ impl PayloadHeaderCache {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PayloadSpanCacheKey {
+    object_id: BackendObjectId,
+    offset: u64,
+    len: u64,
+}
+
+impl PayloadSpanCacheKey {
+    fn new(object_id: BackendObjectId, span: SegmentCiphertextSpan) -> Self {
+        Self {
+            object_id,
+            offset: span.offset,
+            len: span.len,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PayloadSpanCache {
+    spans: BTreeMap<PayloadSpanCacheKey, Bytes>,
+    order: VecDeque<PayloadSpanCacheKey>,
+    max_entries: usize,
+    max_bytes: u64,
+    current_bytes: u64,
+}
+
+impl Default for PayloadSpanCache {
+    fn default() -> Self {
+        Self {
+            spans: BTreeMap::new(),
+            order: VecDeque::new(),
+            max_entries: 4096,
+            max_bytes: 8 * 1024 * 1024,
+            current_bytes: 0,
+        }
+    }
+}
+
+impl PayloadSpanCache {
+    fn get(&self, object_id: &BackendObjectId, span: SegmentCiphertextSpan) -> Option<Bytes> {
+        let key = PayloadSpanCacheKey::new(object_id.clone(), span);
+        self.spans.get(&key).cloned()
+    }
+
+    fn insert(
+        &mut self,
+        object_id: BackendObjectId,
+        span: SegmentCiphertextSpan,
+        ciphertext: Bytes,
+    ) -> PayloadSpanCacheInsert {
+        let bytes = u64::try_from(ciphertext.len()).unwrap_or(u64::MAX);
+        if bytes > self.max_bytes {
+            return PayloadSpanCacheInsert::SkippedTooLarge { bytes };
+        }
+
+        let key = PayloadSpanCacheKey::new(object_id, span);
+        match self.spans.entry(key.clone()) {
+            Entry::Occupied(mut entry) => {
+                let previous = u64::try_from(entry.get().len()).unwrap_or(u64::MAX);
+                self.current_bytes = self.current_bytes.saturating_sub(previous);
+                self.current_bytes = self.current_bytes.saturating_add(bytes);
+                entry.insert(ciphertext);
+            }
+            Entry::Vacant(entry) => {
+                self.current_bytes = self.current_bytes.saturating_add(bytes);
+                self.order.push_back(key);
+                entry.insert(ciphertext);
+            }
+        }
+        self.evict_over_limits();
+        PayloadSpanCacheInsert::Inserted { bytes }
+    }
+
+    fn evict_over_limits(&mut self) {
+        while self.spans.len() > self.max_entries || self.current_bytes > self.max_bytes {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(ciphertext) = self.spans.remove(&evicted) {
+                let bytes = u64::try_from(ciphertext.len()).unwrap_or(u64::MAX);
+                self.current_bytes = self.current_bytes.saturating_sub(bytes);
+            }
+        }
+    }
+}
+
+enum PayloadSpanCacheInsert {
+    Inserted { bytes: u64 },
+    SkippedTooLarge { bytes: u64 },
+}
+
 struct RepositoryPutTrace {
     plaintext_len: u64,
     backend_len: u64,
@@ -1047,6 +1188,19 @@ fn record_repository_operation_metrics(operation: &'static str, result: &str, el
         "result" => result.to_owned(),
     )
     .record(elapsed.as_secs_f64());
+}
+
+fn record_payload_span_cache(result: &'static str, bytes: u64) {
+    metrics::counter!(
+        "rs3_repository_payload_span_cache_events_total",
+        "result" => result,
+    )
+    .increment(1);
+    metrics::counter!(
+        "rs3_repository_payload_span_cache_bytes_total",
+        "result" => result,
+    )
+    .increment(bytes);
 }
 
 fn increment_repository_counter(

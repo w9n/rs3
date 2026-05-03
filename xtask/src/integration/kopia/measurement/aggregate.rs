@@ -232,6 +232,16 @@ fn aggregate_reports(reports: &[&Value]) -> Value {
                     "repository",
                     "returned_bytes_by_range",
                 ]),
+                "payload_span_cache_events_by_result": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "payload_span_cache_events_by_result",
+                ]),
+                "payload_span_cache_bytes_by_result": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "payload_span_cache_bytes_by_result",
+                ]),
                 "list_lookup_tokens_by_prefix_mode": aggregate_number_object(reports, &[
                     "prometheus_metrics",
                     "repository",

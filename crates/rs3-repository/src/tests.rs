@@ -737,6 +737,37 @@ async fn repeated_large_range_gets_reuse_payload_header() {
 }
 
 #[tokio::test]
+async fn repeated_same_segment_range_gets_reuse_ciphertext_span() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::new(store.clone(), secret());
+    let key = key("p/12/repeated-same-segment-range");
+    let body = Bytes::from(vec![37_u8; 1024 * 1024]);
+
+    let put = repo
+        .put(key.clone(), body, RepositoryPutOptions::default())
+        .await;
+    assert!(put.is_ok());
+    must_storage(store.reset_operation_counts());
+
+    for _ in 0..3 {
+        let read = repo
+            .get_range(
+                &key,
+                ByteRange::Slice {
+                    offset: 512 * 1024,
+                    len: 64,
+                },
+            )
+            .await;
+        assert_eq!(must(read), Bytes::from(vec![37_u8; 64]));
+    }
+
+    let counts = must_storage(store.operation_counts());
+    assert_eq!(counts.get, 2);
+    assert!(counts.bytes_read < 1024);
+}
+
+#[tokio::test]
 async fn first_segment_range_reuses_header_probe_ciphertext() {
     let store = MemoryBlobStore::new();
     let repo = Repository::new(store.clone(), secret());
@@ -774,14 +805,26 @@ async fn range_read_amplification_tracks_payload_segment_size() {
     let medium = range_read_pressure(32 * 1024, object_size, range_len, reads).await;
     let small = range_read_pressure(8 * 1024, object_size, range_len, reads).await;
 
-    assert_eq!(large.gets, reads as u64 + 1);
-    assert_eq!(medium.gets, reads as u64 + 1);
-    assert_eq!(small.gets, reads as u64 + 1);
+    assert!(
+        large.gets < reads as u64 + 1,
+        "large segment cache did not reduce backend GETs: {}",
+        large.gets
+    );
+    assert!(
+        medium.gets <= reads as u64 + 1,
+        "medium segment GETs exceeded one span read per request plus header: {}",
+        medium.gets
+    );
+    assert!(
+        small.gets <= reads as u64 + 1,
+        "small segment GETs exceeded one span read per request plus header: {}",
+        small.gets
+    );
     assert_eq!(large.returned_bytes, small.returned_bytes);
     assert!(large.bytes_read > medium.bytes_read);
     assert!(medium.bytes_read > small.bytes_read);
     assert!(
-        large.read_amp() > 20.0,
+        large.read_amp() > 5.0,
         "large segment amp was {}",
         large.read_amp()
     );

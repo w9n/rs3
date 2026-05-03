@@ -69,6 +69,8 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
     let mut repository_backend_bytes_written_by_operation = BTreeMap::new();
     let mut repository_backend_bytes_read_by_range = BTreeMap::new();
     let mut repository_returned_bytes_by_range = BTreeMap::new();
+    let mut repository_payload_span_cache_events_by_result = BTreeMap::new();
+    let mut repository_payload_span_cache_bytes_by_result = BTreeMap::new();
     let mut repository_list_lookup_tokens_by_prefix_mode = BTreeMap::new();
     let mut repository_list_candidates_by_prefix_mode = BTreeMap::new();
     let mut repository_list_manifest_misses_by_prefix_mode = BTreeMap::new();
@@ -197,6 +199,20 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
                     delta,
                 );
             }
+            "rs3_repository_payload_span_cache_events_total" => {
+                bump_f64_label(
+                    &mut repository_payload_span_cache_events_by_result,
+                    sample.label("result"),
+                    delta,
+                );
+            }
+            "rs3_repository_payload_span_cache_bytes_total" => {
+                bump_f64_label(
+                    &mut repository_payload_span_cache_bytes_by_result,
+                    sample.label("result"),
+                    delta,
+                );
+            }
             "rs3_repository_list_lookup_tokens_total" => {
                 bump_f64_label(
                     &mut repository_list_lookup_tokens_by_prefix_mode,
@@ -317,6 +333,8 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
             "backend_bytes_written_by_operation": repository_backend_bytes_written_by_operation,
             "backend_bytes_read_by_range": repository_backend_bytes_read_by_range,
             "returned_bytes_by_range": repository_returned_bytes_by_range,
+            "payload_span_cache_events_by_result": repository_payload_span_cache_events_by_result,
+            "payload_span_cache_bytes_by_result": repository_payload_span_cache_bytes_by_result,
             "list_lookup_tokens_by_prefix_mode": repository_list_lookup_tokens_by_prefix_mode,
             "list_candidates_by_prefix_mode": repository_list_candidates_by_prefix_mode,
             "list_manifest_misses_by_prefix_mode": repository_list_manifest_misses_by_prefix_mode,
@@ -601,6 +619,10 @@ rs3_repository_plaintext_bytes_total{operation="put"} 2048
 rs3_repository_backend_bytes_written_total{operation="put"} 4096
 rs3_repository_backend_bytes_read_total{operation="get_range",range="slice",result="ok"} 1536
 rs3_repository_returned_bytes_total{operation="get_range",range="slice"} 512
+rs3_repository_payload_span_cache_events_total{result="miss"} 2
+rs3_repository_payload_span_cache_events_total{result="hit"} 3
+rs3_repository_payload_span_cache_bytes_total{result="miss"} 1056
+rs3_repository_payload_span_cache_bytes_total{result="hit"} 1584
 rs3_repository_list_lookup_tokens_total{prefix_mode="delimiter",result="ok"} 3
 rs3_repository_list_candidates_total{prefix_mode="delimiter",result="ok"} 12
 rs3_repository_list_manifest_misses_total{prefix_mode="delimiter",result="ok"} 1
@@ -687,6 +709,22 @@ rs3_repository_commit_batch_publish_duration_seconds_sum{result="ok"} 0.06
         assert_eq!(
             metrics["repository"]["returned_bytes_by_range"]["slice"],
             512.0
+        );
+        assert_eq!(
+            metrics["repository"]["payload_span_cache_events_by_result"]["miss"],
+            2.0
+        );
+        assert_eq!(
+            metrics["repository"]["payload_span_cache_events_by_result"]["hit"],
+            3.0
+        );
+        assert_eq!(
+            metrics["repository"]["payload_span_cache_bytes_by_result"]["miss"],
+            1056.0
+        );
+        assert_eq!(
+            metrics["repository"]["payload_span_cache_bytes_by_result"]["hit"],
+            1584.0
         );
         assert_eq!(
             metrics["repository"]["list_lookup_tokens_by_prefix_mode"]["delimiter"],
