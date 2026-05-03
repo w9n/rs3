@@ -78,6 +78,18 @@ Docker daemon into kind by default. Preload or mirror
 mirror with `RS3_TEST_VELERO_IMAGE` and
 `RS3_TEST_VELERO_AWS_PLUGIN_IMAGE`.
 
+CI should not depend on anonymous public registry pulls. Configure the CI secret
+store or image sync job outside this repository, mirror the pinned Velero images
+into a CI-owned registry, and set the image variables above for the job. Keep
+registry credentials out of command-line arguments because they are easy to leak
+through logs and process listings.
+
+The next PVC disaster-restore lane should add a disposable dynamic provisioner
+instead of extending the static local-PV smoke. OpenEBS Local PV Hostpath is the
+first candidate for kind because it provides dynamic PVC provisioning and has a
+documented Velero backup/restore flow. The CSI hostpath driver is a later
+candidate when the lane needs CSI snapshot or data-mover behavior.
+
 Container provider setup stays behind the opt-in `xtask/containers` feature so
 Docker and provider bootstrap dependencies stay outside normal unit tests and
 runtime crates.

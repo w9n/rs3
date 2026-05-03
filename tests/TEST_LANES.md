@@ -20,3 +20,4 @@ Rules of thumb:
 - Every compatibility lane must verify restored bytes or Kubernetes object state, not only command success.
 - Expensive lanes should emit artifacts: gateway logs, object request counts, latency summaries, and relevant Kubernetes resources.
 - The Helm chart is the Kubernetes packaging source; tests should install it instead of duplicating manifests.
+- CI should use mirrored third-party images through harness image variables instead of relying on anonymous public registry pulls.
