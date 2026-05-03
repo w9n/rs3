@@ -17,6 +17,7 @@ pub(crate) const SECRET_ACCESS_KEY: &str = "secret";
 
 pub(crate) struct RunningGateway {
     addr: SocketAddr,
+    metrics_addr: Option<SocketAddr>,
     child: Child,
     logs: Option<Arc<Mutex<Vec<String>>>>,
     readers: Vec<JoinHandle<()>>,
@@ -44,8 +45,10 @@ impl RunningGateway {
         rust_log: Option<&str>,
     ) -> Result<Self> {
         let addr = reserve_gateway_addr()?;
-        let bind = addr.to_string();
         let capture_logs = rust_log.is_some();
+        let metrics_addr = capture_logs.then(reserve_gateway_addr).transpose()?;
+        let bind = addr.to_string();
+        let metrics_bind = metrics_addr.map(|addr| addr.to_string());
         let mut gateway_args = vec![
             "run",
             "-p",
@@ -60,6 +63,9 @@ impl RunningGateway {
             gateway_args.extend(["--log-format", "json"]);
         }
         gateway_args.extend(["serve", "--bind", bind.as_str()]);
+        if let Some(metrics_bind) = metrics_bind.as_deref() {
+            gateway_args.extend(["--metrics-bind", metrics_bind]);
+        }
 
         let mut child = Command::new("cargo");
         child
@@ -113,6 +119,7 @@ impl RunningGateway {
             ];
             let mut gateway = Self {
                 addr,
+                metrics_addr,
                 child,
                 logs: Some(logs),
                 readers,
@@ -130,6 +137,7 @@ impl RunningGateway {
 
         Ok(Self {
             addr,
+            metrics_addr,
             child,
             logs,
             readers: Vec::new(),
@@ -142,6 +150,10 @@ impl RunningGateway {
 
     pub(crate) fn endpoint_authority(&self) -> String {
         self.addr.to_string()
+    }
+
+    pub(crate) fn metrics_endpoint_authority(&self) -> Option<String> {
+        self.metrics_addr.map(|addr| addr.to_string())
     }
 
     pub(crate) fn client(&self, backend: &RunningS3Container) -> Client {

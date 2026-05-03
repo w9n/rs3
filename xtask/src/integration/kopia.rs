@@ -18,7 +18,7 @@ mod workload;
 use measurement::{
     RunningStorageProxy, aggregate_runs, compare_runs, endpoint_authority,
     gateway_backend_metrics_json, gateway_client_metrics_json, measurement_json, now_millis,
-    wait_for_storage_proxy_metrics,
+    prometheus_metrics_delta_json, scrape_prometheus_metrics, wait_for_storage_proxy_metrics,
 };
 #[cfg(feature = "containers")]
 use std::ffi::{OsStr, OsString};
@@ -249,6 +249,10 @@ async fn run_measured_gateway_kopia(
     )
     .await?;
     gateway.clear_captured_logs()?;
+    let metrics_authority = gateway
+        .metrics_endpoint_authority()
+        .context("gateway metrics endpoint was not enabled for measured run")?;
+    let prometheus_before = scrape_prometheus_metrics(&metrics_authority).await?;
     let target = KopiaS3Target {
         bucket: PUBLIC_BUCKET.to_owned(),
         endpoint_authority: gateway.endpoint_authority(),
@@ -259,12 +263,15 @@ async fn run_measured_gateway_kopia(
     };
     let stats = run_kopia_smoke(kopia_bin, &workspace, &target, profile);
     std::thread::sleep(Duration::from_millis(100));
+    let prometheus_after = scrape_prometheus_metrics(&metrics_authority).await?;
     let logs = gateway.captured_logs()?;
     let shutdown = gateway.shutdown();
     let stats = stats?;
     shutdown?;
     let mut report = measurement_json("gateway", stats, gateway_backend_metrics_json(&logs));
     report["client_metrics"] = gateway_client_metrics_json(&logs);
+    report["prometheus_metrics"] =
+        prometheus_metrics_delta_json(&prometheus_before, &prometheus_after);
     Ok(report)
 }
 
