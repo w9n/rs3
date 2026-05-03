@@ -30,6 +30,9 @@ integration-s3-local *ARGS:
 integration-s3-container *ARGS:
     cargo run -p xtask --features containers -- integration s3-local --mode container {{ARGS}}
 
+integration-s3-gateway *ARGS:
+    cargo run -p xtask --features containers -- integration s3-gateway {{ARGS}}
+
 test:
     cargo test --workspace
 

@@ -20,6 +20,13 @@ then runs the same storage contract:
 cargo run -p xtask --features containers -- integration s3-local --mode container
 ```
 
+The gateway mode starts a local provider, creates a backend bucket, starts the
+gateway, and drives object operations through the gateway's S3 endpoint:
+
+```sh
+cargo run -p xtask --features containers -- integration s3-gateway
+```
+
 Container provider setup stays behind the opt-in `xtask/containers` feature so
 Docker and provider bootstrap dependencies stay outside normal unit tests and
 runtime crates.
