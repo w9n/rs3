@@ -18,11 +18,16 @@ use s3s::dto::{
     PutObjectOutput, StreamingBlob,
 };
 use s3s::{Body, S3, S3Request, S3Response, S3Result};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 #[derive(Clone)]
 pub(super) struct GatewayS3Service {
     public_bucket: PublicBucket,
     repository: RuntimeRepository,
+    request_sequence: Arc<AtomicU64>,
 }
 
 impl GatewayS3Service {
@@ -33,7 +38,71 @@ impl GatewayS3Service {
         Ok(Self {
             public_bucket: config.public_bucket.clone(),
             repository,
+            request_sequence: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    fn next_request_id(&self) -> u64 {
+        self.request_sequence.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn request_span(
+        &self,
+        operation: &'static str,
+        request_id: u64,
+        bucket: Option<&str>,
+    ) -> tracing::Span {
+        let bucket = bucket.unwrap_or("");
+        tracing::info_span!(
+            target: "rs3_server",
+            "s3_request",
+            operation,
+            request_id,
+            bucket,
+        )
+    }
+
+    fn record_request_result<T>(
+        &self,
+        operation: &'static str,
+        request_id: u64,
+        bucket: Option<&str>,
+        elapsed: Duration,
+        result: &S3Result<S3Response<T>>,
+        default_success_status: http::StatusCode,
+    ) {
+        let bucket = bucket.unwrap_or("");
+        match result {
+            Ok(response) => {
+                let status = response.status.unwrap_or(default_success_status);
+                tracing::info!(
+                    target: "rs3_server",
+                    operation,
+                    request_id,
+                    bucket,
+                    result = "ok",
+                    status_code = status.as_u16(),
+                    elapsed_us = elapsed_us(elapsed),
+                    "S3 request completed",
+                );
+            }
+            Err(error) => {
+                let status = error
+                    .status_code()
+                    .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+                tracing::info!(
+                    target: "rs3_server",
+                    operation,
+                    request_id,
+                    bucket,
+                    result = "error",
+                    status_code = status.as_u16(),
+                    error_code = error.code().as_str(),
+                    elapsed_us = elapsed_us(elapsed),
+                    "S3 request completed",
+                );
+            }
+        }
     }
 
     fn check_bucket(&self, bucket: &str) -> S3Result<()> {
@@ -54,197 +123,370 @@ impl S3 for GatewayS3Service {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
+        const OPERATION: &str = "HeadBucket";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
         let input = req.input;
-        self.check_bucket(&input.bucket)?;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
-        Ok(S3Response::new(HeadBucketOutput::default()))
+        let result = async {
+            self.check_bucket(&input.bucket)?;
+            Ok(S3Response::new(HeadBucketOutput::default()))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
     }
 
     async fn list_buckets(
         &self,
         _req: S3Request<ListBucketsInput>,
     ) -> S3Result<S3Response<ListBucketsOutput>> {
-        Ok(S3Response::new(ListBucketsOutput {
-            buckets: Some(vec![Bucket {
-                name: Some(self.public_bucket.as_str().to_owned()),
-                ..Bucket::default()
-            }]),
-            owner: Some(Owner {
-                display_name: Some("rs3".to_owned()),
-                id: Some("rs3".to_owned()),
-            }),
-            ..ListBucketsOutput::default()
-        }))
+        const OPERATION: &str = "ListBuckets";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
+        let span = self.request_span(OPERATION, request_id, None);
+
+        let result = async {
+            Ok(S3Response::new(ListBucketsOutput {
+                buckets: Some(vec![Bucket {
+                    name: Some(self.public_bucket.as_str().to_owned()),
+                    ..Bucket::default()
+                }]),
+                owner: Some(Owner {
+                    display_name: Some("rs3".to_owned()),
+                    id: Some("rs3".to_owned()),
+                }),
+                ..ListBucketsOutput::default()
+            }))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            None,
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
     }
 
     async fn put_object(
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        const OPERATION: &str = "PutObject";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
         let input = req.input;
-        self.check_bucket(&input.bucket)?;
-        validate_put_object_request(&input)?;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
-        let key = logical_path(input.key)?;
-        let create_only = match input.if_none_match.as_ref() {
-            Some(s3s::dto::ETagCondition::Any) => true,
-            Some(s3s::dto::ETagCondition::ETag(_)) => {
-                return Err(s3s::s3_error!(
-                    InvalidRequest,
-                    "only If-None-Match: * is supported"
-                ));
-            }
-            None => false,
-        };
-        let body = collect_body(input.body).await?;
+        let result = async {
+            self.check_bucket(&input.bucket)?;
+            validate_put_object_request(&input)?;
 
-        let committed = self
-            .repository
-            .put_committed(
-                key,
-                body,
-                RepositoryPutOptions {
-                    create_only,
-                    retention: None,
-                },
-            )
-            .await
-            .map_err(repository_error)?;
+            let key = logical_path(input.key)?;
+            let create_only = match input.if_none_match.as_ref() {
+                Some(s3s::dto::ETagCondition::Any) => true,
+                Some(s3s::dto::ETagCondition::ETag(_)) => {
+                    return Err(s3s::s3_error!(
+                        InvalidRequest,
+                        "only If-None-Match: * is supported"
+                    ));
+                }
+                None => false,
+            };
+            let body = collect_body(input.body).await?;
+            tracing::debug!(
+                target: "rs3_server",
+                operation = OPERATION,
+                request_id,
+                request_body_bytes = body.len(),
+                create_only,
+                "S3 request body collected",
+            );
 
-        Ok(S3Response::new(PutObjectOutput {
-            e_tag: Some(etag(
-                committed.metadata.content_len,
-                committed.metadata.modified_at_ms,
-            )),
-            ..PutObjectOutput::default()
-        }))
+            let committed = self
+                .repository
+                .put_committed(
+                    key,
+                    body,
+                    RepositoryPutOptions {
+                        create_only,
+                        retention: None,
+                    },
+                )
+                .await
+                .map_err(repository_error)?;
+
+            Ok(S3Response::new(PutObjectOutput {
+                e_tag: Some(etag(
+                    committed.metadata.content_len,
+                    committed.metadata.modified_at_ms,
+                )),
+                ..PutObjectOutput::default()
+            }))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
     }
 
     async fn get_object(
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        const OPERATION: &str = "GetObject";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
         let input = req.input;
-        self.check_bucket(&input.bucket)?;
-        validate_get_object_request(&input)?;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
-        let key = logical_path(input.key)?;
-        let metadata = self.repository.head(&key).map_err(repository_error)?;
-        let resolved_range = resolve_range(input.range, metadata.content_len)?;
-        let repository_range = resolved_range
-            .as_ref()
-            .map(|range| ByteRange::Slice {
-                offset: range.start,
-                len: range.end - range.start,
-            })
-            .unwrap_or(ByteRange::Full);
-        let body = self
-            .repository
-            .get_range(&key, repository_range)
-            .await
-            .map_err(repository_error)?;
+        let result = async {
+            self.check_bucket(&input.bucket)?;
+            validate_get_object_request(&input)?;
 
-        let content_length = i64_len(body.len() as u64)?;
-        let mut output = GetObjectOutput {
-            accept_ranges: Some("bytes".to_owned()),
-            body: Some(StreamingBlob::from(Body::from(body))),
-            content_length: Some(content_length),
-            content_type: Some("application/octet-stream".to_owned()),
-            e_tag: Some(etag(metadata.content_len, metadata.modified_at_ms)),
-            last_modified: Some(timestamp(metadata.modified_at_ms)?),
-            ..GetObjectOutput::default()
-        };
+            let requested_range = input.range.is_some();
+            let key = logical_path(input.key)?;
+            let metadata = self.repository.head(&key).map_err(repository_error)?;
+            let resolved_range = resolve_range(input.range, metadata.content_len)?;
+            let repository_range = resolved_range
+                .as_ref()
+                .map(|range| ByteRange::Slice {
+                    offset: range.start,
+                    len: range.end - range.start,
+                })
+                .unwrap_or(ByteRange::Full);
+            let body = self
+                .repository
+                .get_range(&key, repository_range)
+                .await
+                .map_err(repository_error)?;
 
-        let response = if let Some(range) = resolved_range {
-            output.content_range =
-                Some(content_range(range.start, range.end, metadata.content_len));
-            S3Response::with_status(output, http::StatusCode::PARTIAL_CONTENT)
-        } else {
-            S3Response::new(output)
-        };
+            tracing::debug!(
+                target: "rs3_server",
+                operation = OPERATION,
+                request_id,
+                requested_range,
+                response_body_bytes = body.len(),
+                "S3 response body prepared",
+            );
+            let content_length = i64_len(body.len() as u64)?;
+            let mut output = GetObjectOutput {
+                accept_ranges: Some("bytes".to_owned()),
+                body: Some(StreamingBlob::from(Body::from(body))),
+                content_length: Some(content_length),
+                content_type: Some("application/octet-stream".to_owned()),
+                e_tag: Some(etag(metadata.content_len, metadata.modified_at_ms)),
+                last_modified: Some(timestamp(metadata.modified_at_ms)?),
+                ..GetObjectOutput::default()
+            };
 
-        Ok(response)
+            let response = if let Some(range) = resolved_range {
+                output.content_range =
+                    Some(content_range(range.start, range.end, metadata.content_len));
+                S3Response::with_status(output, http::StatusCode::PARTIAL_CONTENT)
+            } else {
+                S3Response::new(output)
+            };
+
+            Ok(response)
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
     }
 
     async fn head_object(
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
+        const OPERATION: &str = "HeadObject";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
         let input = req.input;
-        self.check_bucket(&input.bucket)?;
-        validate_head_object_request(&input)?;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
-        let key = logical_path(input.key)?;
-        let metadata = self.repository.head(&key).map_err(repository_error)?;
-        let content_length = match resolve_range(input.range, metadata.content_len)? {
-            Some(range) => range.end - range.start,
-            None => metadata.content_len,
-        };
+        let result = async {
+            self.check_bucket(&input.bucket)?;
+            validate_head_object_request(&input)?;
 
-        Ok(S3Response::new(HeadObjectOutput {
-            accept_ranges: Some("bytes".to_owned()),
-            content_length: Some(i64_len(content_length)?),
-            content_type: Some("application/octet-stream".to_owned()),
-            e_tag: Some(etag(metadata.content_len, metadata.modified_at_ms)),
-            last_modified: Some(timestamp(metadata.modified_at_ms)?),
-            ..HeadObjectOutput::default()
-        }))
+            let requested_range = input.range.is_some();
+            let key = logical_path(input.key)?;
+            let metadata = self.repository.head(&key).map_err(repository_error)?;
+            let content_length = match resolve_range(input.range, metadata.content_len)? {
+                Some(range) => range.end - range.start,
+                None => metadata.content_len,
+            };
+
+            tracing::debug!(
+                target: "rs3_server",
+                operation = OPERATION,
+                request_id,
+                requested_range,
+                content_length,
+                "S3 object metadata prepared",
+            );
+            Ok(S3Response::new(HeadObjectOutput {
+                accept_ranges: Some("bytes".to_owned()),
+                content_length: Some(i64_len(content_length)?),
+                content_type: Some("application/octet-stream".to_owned()),
+                e_tag: Some(etag(metadata.content_len, metadata.modified_at_ms)),
+                last_modified: Some(timestamp(metadata.modified_at_ms)?),
+                ..HeadObjectOutput::default()
+            }))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
     }
 
     async fn list_objects_v2(
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        const OPERATION: &str = "ListObjectsV2";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
         let input = req.input;
-        self.check_bucket(&input.bucket)?;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
-        let prefix = input.prefix.unwrap_or_default();
-        let max_keys = max_keys(input.max_keys)?;
-        let start_after = input.continuation_token.or(input.start_after);
-        let delimiter = input.delimiter;
-        let entries = self.repository.list(&prefix).map_err(repository_error)?;
-        let page = list_page(
-            entries,
-            &prefix,
-            delimiter.as_deref(),
-            start_after.as_deref(),
-            max_keys,
-        )?;
+        let result = async {
+            self.check_bucket(&input.bucket)?;
 
-        Ok(S3Response::new(ListObjectsV2Output {
-            name: Some(input.bucket),
-            prefix: Some(prefix),
-            max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
-            key_count: Some(i32::try_from(page.key_count).unwrap_or(i32::MAX)),
-            is_truncated: Some(page.next_continuation_token.is_some()),
-            next_continuation_token: page.next_continuation_token,
-            contents: (!page.contents.is_empty()).then_some(page.contents),
-            common_prefixes: (!page.common_prefixes.is_empty()).then_some(page.common_prefixes),
-            delimiter,
-            start_after,
-            ..ListObjectsV2Output::default()
-        }))
+            let prefix = input.prefix.unwrap_or_default();
+            let prefix_present = !prefix.is_empty();
+            let max_keys = max_keys(input.max_keys)?;
+            let start_after = input.continuation_token.or(input.start_after);
+            let delimiter = input.delimiter;
+            let entries = self.repository.list(&prefix).map_err(repository_error)?;
+            let page = list_page(
+                entries,
+                &prefix,
+                delimiter.as_deref(),
+                start_after.as_deref(),
+                max_keys,
+            )?;
+
+            tracing::debug!(
+                target: "rs3_server",
+                operation = OPERATION,
+                request_id,
+                prefix_present,
+                max_keys,
+                key_count = page.key_count,
+                common_prefixes = page.common_prefixes.len(),
+                is_truncated = page.next_continuation_token.is_some(),
+                "S3 list page prepared",
+            );
+            Ok(S3Response::new(ListObjectsV2Output {
+                name: Some(input.bucket),
+                prefix: Some(prefix),
+                max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
+                key_count: Some(i32::try_from(page.key_count).unwrap_or(i32::MAX)),
+                is_truncated: Some(page.next_continuation_token.is_some()),
+                next_continuation_token: page.next_continuation_token,
+                contents: (!page.contents.is_empty()).then_some(page.contents),
+                common_prefixes: (!page.common_prefixes.is_empty()).then_some(page.common_prefixes),
+                delimiter,
+                start_after,
+                ..ListObjectsV2Output::default()
+            }))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
     }
 
     async fn delete_object(
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        const OPERATION: &str = "DeleteObject";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
         let input = req.input;
-        self.check_bucket(&input.bucket)?;
-        validate_delete_object_request(&input)?;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
-        let key = logical_path(input.key)?;
-        self.repository
-            .delete_committed(key)
-            .await
-            .map_err(repository_error)?;
+        let result = async {
+            self.check_bucket(&input.bucket)?;
+            validate_delete_object_request(&input)?;
 
-        Ok(S3Response::new(DeleteObjectOutput {
-            delete_marker: Some(true),
-            ..DeleteObjectOutput::default()
-        }))
+            let key = logical_path(input.key)?;
+            self.repository
+                .delete_committed(key)
+                .await
+                .map_err(repository_error)?;
+
+            Ok(S3Response::new(DeleteObjectOutput {
+                delete_marker: Some(true),
+                ..DeleteObjectOutput::default()
+            }))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
     }
+}
+
+fn elapsed_us(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
