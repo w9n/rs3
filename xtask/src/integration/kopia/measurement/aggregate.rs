@@ -262,6 +262,38 @@ fn aggregate_reports(reports: &[&Value]) -> Value {
                     "repository",
                     "operation_duration_seconds",
                 ]),
+                "commit": {
+                    "enqueues_by_result": aggregate_number_object(reports, &[
+                        "prometheus_metrics",
+                        "repository",
+                        "commit",
+                        "enqueues_by_result",
+                    ]),
+                    "enqueue_pending_items_by_result": aggregate_number_object(reports, &[
+                        "prometheus_metrics",
+                        "repository",
+                        "commit",
+                        "enqueue_pending_items_by_result",
+                    ]),
+                    "batch_publishes_by_result": aggregate_number_object(reports, &[
+                        "prometheus_metrics",
+                        "repository",
+                        "commit",
+                        "batch_publishes_by_result",
+                    ]),
+                    "batch_waiters_by_result": aggregate_number_object(reports, &[
+                        "prometheus_metrics",
+                        "repository",
+                        "commit",
+                        "batch_waiters_by_result",
+                    ]),
+                    "batch_publish_duration_seconds_by_result": aggregate_operation_latency_at(reports, &[
+                        "prometheus_metrics",
+                        "repository",
+                        "commit",
+                        "batch_publish_duration_seconds_by_result",
+                    ]),
+                },
             },
         },
         "gateway_process": {

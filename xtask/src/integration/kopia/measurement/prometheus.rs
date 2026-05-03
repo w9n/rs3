@@ -76,6 +76,12 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
     let mut repository_list_returned_by_prefix_mode = BTreeMap::new();
     let mut repository_duration_counts = BTreeMap::new();
     let mut repository_duration_sums = BTreeMap::new();
+    let mut repository_commit_enqueues_by_result = BTreeMap::new();
+    let mut repository_commit_enqueue_pending_items_by_result = BTreeMap::new();
+    let mut repository_commit_batch_publishes_by_result = BTreeMap::new();
+    let mut repository_commit_batch_waiters_by_result = BTreeMap::new();
+    let mut repository_commit_batch_duration_counts = BTreeMap::new();
+    let mut repository_commit_batch_duration_sums = BTreeMap::new();
 
     for (identity, sample) in after {
         let delta = metric_delta(
@@ -240,6 +246,48 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
                     delta,
                 );
             }
+            "rs3_repository_commit_enqueues_total" => {
+                bump_f64_label(
+                    &mut repository_commit_enqueues_by_result,
+                    sample.label("result"),
+                    delta,
+                );
+            }
+            "rs3_repository_commit_enqueue_pending_items_total" => {
+                bump_f64_label(
+                    &mut repository_commit_enqueue_pending_items_by_result,
+                    sample.label("result"),
+                    delta,
+                );
+            }
+            "rs3_repository_commit_batch_publishes_total" => {
+                bump_f64_label(
+                    &mut repository_commit_batch_publishes_by_result,
+                    sample.label("result"),
+                    delta,
+                );
+            }
+            "rs3_repository_commit_batch_waiters_total" => {
+                bump_f64_label(
+                    &mut repository_commit_batch_waiters_by_result,
+                    sample.label("result"),
+                    delta,
+                );
+            }
+            "rs3_repository_commit_batch_publish_duration_seconds_count" => {
+                bump_f64_label(
+                    &mut repository_commit_batch_duration_counts,
+                    sample.label("result"),
+                    delta,
+                );
+            }
+            "rs3_repository_commit_batch_publish_duration_seconds_sum" => {
+                bump_f64_label(
+                    &mut repository_commit_batch_duration_sums,
+                    sample.label("result"),
+                    delta,
+                );
+            }
             _ => {}
         }
     }
@@ -278,6 +326,16 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
                 repository_duration_counts,
                 repository_duration_sums,
             ),
+            "commit": {
+                "enqueues_by_result": repository_commit_enqueues_by_result,
+                "enqueue_pending_items_by_result": repository_commit_enqueue_pending_items_by_result,
+                "batch_publishes_by_result": repository_commit_batch_publishes_by_result,
+                "batch_waiters_by_result": repository_commit_batch_waiters_by_result,
+                "batch_publish_duration_seconds_by_result": duration_summary_json(
+                    repository_commit_batch_duration_counts,
+                    repository_commit_batch_duration_sums,
+                ),
+            },
         },
     })
 }
@@ -423,6 +481,12 @@ rs3_repository_list_prefix_misses_total{prefix_mode="delimiter",result="ok"} 2
 rs3_repository_list_returned_total{prefix_mode="delimiter",result="ok"} 9
 rs3_repository_operation_duration_seconds_count{operation="get_range",result="ok"} 2
 rs3_repository_operation_duration_seconds_sum{operation="get_range",result="ok"} 0.04
+rs3_repository_commit_enqueues_total{result="ok"} 4
+rs3_repository_commit_enqueue_pending_items_total{result="ok"} 10
+rs3_repository_commit_batch_publishes_total{result="ok"} 2
+rs3_repository_commit_batch_waiters_total{result="ok"} 4
+rs3_repository_commit_batch_publish_duration_seconds_count{result="ok"} 2
+rs3_repository_commit_batch_publish_duration_seconds_sum{result="ok"} 0.06
 "#;
 
         let metrics = prometheus_metrics_delta_json(before, after);
@@ -520,6 +584,26 @@ rs3_repository_operation_duration_seconds_sum{operation="get_range",result="ok"}
         assert_eq!(
             metrics["repository"]["operation_duration_seconds"]["get_range"]["avg"],
             0.02
+        );
+        assert_eq!(
+            metrics["repository"]["commit"]["enqueues_by_result"]["ok"],
+            4.0
+        );
+        assert_eq!(
+            metrics["repository"]["commit"]["enqueue_pending_items_by_result"]["ok"],
+            10.0
+        );
+        assert_eq!(
+            metrics["repository"]["commit"]["batch_publishes_by_result"]["ok"],
+            2.0
+        );
+        assert_eq!(
+            metrics["repository"]["commit"]["batch_waiters_by_result"]["ok"],
+            4.0
+        );
+        assert_eq!(
+            metrics["repository"]["commit"]["batch_publish_duration_seconds_by_result"]["ok"]["avg"],
+            0.03
         );
     }
 }

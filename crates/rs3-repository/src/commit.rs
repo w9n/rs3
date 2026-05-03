@@ -126,6 +126,7 @@ where
             let should_start_timer = {
                 let batch = self.batch.lock().await;
                 if let Some(reason) = batch.failed.as_ref() {
+                    record_commit_enqueue("failed", batch.waiters.len());
                     tracing::warn!(
                         target: "rs3_repository",
                         operation = "put_committed_enqueue",
@@ -137,6 +138,7 @@ where
                     });
                 }
                 if batch.waiters.len() >= self.options.max_pending_items {
+                    record_commit_enqueue("backpressure", batch.waiters.len());
                     tracing::warn!(
                         target: "rs3_repository",
                         operation = "put_committed_enqueue",
@@ -162,6 +164,7 @@ where
 
             batch.waiters.push(CommitWaiter { tx });
             let should_publish_now = batch.waiters.len() >= self.options.max_batch_items;
+            record_commit_enqueue("ok", batch.waiters.len());
             tracing::debug!(
                 target: "rs3_repository",
                 operation = "put_committed_enqueue",
@@ -239,6 +242,7 @@ where
             .await
             .map_err(|error| error.to_string());
         let result_label = if result.is_ok() { "ok" } else { "error" };
+        record_commit_batch_publish(waiter_count, result_label, started.elapsed());
 
         tracing::info!(
             target: "rs3_repository",
@@ -312,6 +316,7 @@ async fn publish_pending_batch<S, A>(
         .await
         .map_err(|error| error.to_string());
     let result_label = if result.is_ok() { "ok" } else { "error" };
+    record_commit_batch_publish(waiter_count, result_label, started.elapsed());
 
     tracing::info!(
         target: "rs3_repository",
@@ -338,6 +343,37 @@ fn commit_failed(reason: &str) -> RepositoryError {
     RepositoryError::CommitFailed {
         reason: reason.to_owned(),
     }
+}
+
+fn record_commit_enqueue(result: &'static str, pending_items: usize) {
+    metrics::counter!("rs3_repository_commit_enqueues_total", "result" => result).increment(1);
+    metrics::counter!(
+        "rs3_repository_commit_enqueue_pending_items_total",
+        "result" => result,
+    )
+    .increment(usize_to_u64(pending_items));
+}
+
+fn record_commit_batch_publish(waiter_count: usize, result: &'static str, elapsed: Duration) {
+    metrics::counter!(
+        "rs3_repository_commit_batch_publishes_total",
+        "result" => result,
+    )
+    .increment(1);
+    metrics::counter!(
+        "rs3_repository_commit_batch_waiters_total",
+        "result" => result,
+    )
+    .increment(usize_to_u64(waiter_count));
+    metrics::histogram!(
+        "rs3_repository_commit_batch_publish_duration_seconds",
+        "result" => result,
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn elapsed_us(elapsed: Duration) -> u64 {

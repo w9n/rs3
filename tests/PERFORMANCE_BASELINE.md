@@ -51,7 +51,8 @@ summarizes S3 provider operation counts, bytes, and latency from the gateway's
 metrics endpoint.
 
 It also includes `prometheus_metrics.repository`, a path-private repository
-breakdown of gateway operation counts, bytes, LIST selectivity, and latency.
+breakdown of gateway operation counts, bytes, LIST selectivity, commit batching,
+and latency.
 
 ## Current Results
 
