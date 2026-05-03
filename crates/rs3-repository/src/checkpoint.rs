@@ -10,10 +10,11 @@ use rs3_crypto::{
     KeyRing, derive_checkpoint_id, derive_checkpoint_payload_digest, derive_index_delta_object_id,
 };
 use rs3_index::{
-    CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CommitRecord, INDEX_DELTA_OBJECT_DOMAIN, IndexDelta,
-    IndexDeltaObject, KeyringSnapshot, MANIFEST_PLAINTEXT_DOMAIN, ManifestObject,
+    CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CommitRecord, INDEX_DELTA_OBJECT_DOMAIN,
+    INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta, IndexDeltaObject, KeyringSnapshot,
+    MANIFEST_PLAINTEXT_DOMAIN, ManifestObject, SealedIndexDeltaObject,
     canonical_commit_record_bytes, checkpoint_object_bytes, index_delta_object_bytes,
-    manifest_plaintext_bytes,
+    index_delta_plaintext_bytes, manifest_plaintext_bytes,
 };
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, CheckpointId, ManifestId};
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant};
 pub(crate) const CHECKPOINT_OBJECT_PREFIX: &str = "checkpoints/";
 const CHECKPOINT_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.checkpoint+json";
 const INDEX_DELTA_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.index-delta+json";
+const INDEX_DELTA_ASSOCIATED_DATA: &[u8] = b"rs3:index-delta-object:v1";
 
 struct PendingIndexDeltaObject {
     object_id: BackendObjectId,
@@ -252,7 +254,9 @@ where
             sequence: state.next_sequence,
             deltas: state.pending_index_deltas.clone(),
         };
-        let body = Bytes::from(index_delta_object_bytes(&delta)?);
+        let keyring = self.keyring()?;
+        let sealed_delta = seal_index_delta_object(&keyring, &delta)?;
+        let body = Bytes::from(index_delta_object_bytes(&sealed_delta)?);
         let object_id = derive_index_delta_object_id(&body)?;
 
         Ok(Some(PendingIndexDeltaObject { object_id, body }))
@@ -365,8 +369,10 @@ where
                 object_id: object_id.clone(),
             });
         };
+        let sealed_delta = serde_json::from_slice::<SealedIndexDeltaObject>(payload)?;
+        let keyring = self.keyring()?;
 
-        serde_json::from_slice::<IndexDeltaObject>(payload).map_err(Into::into)
+        open_index_delta_object(&keyring, object_id, &sealed_delta)
     }
 
     fn load_embedded_manifest_records(
@@ -403,6 +409,43 @@ pub(crate) fn checkpoint_object_id(checkpoint_id: &CheckpointId) -> Result<Backe
 
 fn manifest_associated_data(manifest_id: &ManifestId) -> Vec<u8> {
     format!("rs3:manifest-associated-data:v1:{}", manifest_id.as_str()).into_bytes()
+}
+
+fn seal_index_delta_object(
+    keyring: &KeyRing,
+    delta: &IndexDeltaObject,
+) -> Result<SealedIndexDeltaObject> {
+    let plaintext = index_delta_plaintext_bytes(delta)?;
+    let associated_data = INDEX_DELTA_ASSOCIATED_DATA;
+    let sealed = keyring.seal_metadata_payload(associated_data, &plaintext)?;
+
+    Ok(SealedIndexDeltaObject {
+        key_id: sealed.key_id,
+        nonce: sealed.nonce,
+        ciphertext: sealed.ciphertext,
+        tag: sealed.tag,
+    })
+}
+
+fn open_index_delta_object(
+    keyring: &KeyRing,
+    object_id: &BackendObjectId,
+    sealed_delta: &SealedIndexDeltaObject,
+) -> Result<IndexDeltaObject> {
+    let plaintext = keyring.open_metadata_payload(
+        &sealed_delta.key_id,
+        INDEX_DELTA_ASSOCIATED_DATA,
+        &sealed_delta.nonce,
+        &sealed_delta.ciphertext,
+        &sealed_delta.tag,
+    )?;
+    let Some(payload) = plaintext.strip_prefix(INDEX_DELTA_PLAINTEXT_DOMAIN) else {
+        return Err(crate::RepositoryError::InvalidObjectFormat {
+            object_id: object_id.clone(),
+        });
+    };
+
+    serde_json::from_slice(payload).map_err(Into::into)
 }
 
 pub(crate) fn seal_manifest_record(

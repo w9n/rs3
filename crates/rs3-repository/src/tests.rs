@@ -1358,6 +1358,17 @@ async fn publish_checkpoint_persists_index_delta_without_client_key_material() {
     assert!(delta_body.starts_with(INDEX_DELTA_OBJECT_DOMAIN));
     assert_body_does_not_contain(&checkpoint_body, &["sensitive", "client-blob", "p/12"]);
     assert_body_does_not_contain(&delta_body, &["sensitive", "client-blob", "p/12"]);
+    assert_body_does_not_contain(
+        &delta_body,
+        &[
+            "blind_key",
+            "prefix_tokens",
+            "content_len",
+            "modified_at_ms",
+            "generation",
+            "sealed_manifest",
+        ],
+    );
 }
 
 #[tokio::test]

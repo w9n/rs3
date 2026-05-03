@@ -1,11 +1,14 @@
 //! Metadata payload sealing helpers.
 
 use crate::keyring::KeyRing;
-use crate::primitives::{derive_hmac, verify_hmac};
+use crate::primitives::derive_hmac;
 use crate::{CryptoError, SecretBytes};
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::{Tag, XChaCha20Poly1305, XNonce};
 use rs3_types::{KeyId, KeyPurpose};
 
-const METADATA_NONCE_LEN: usize = 32;
+const METADATA_NONCE_LEN: usize = 24;
+const METADATA_TAG_LEN: usize = 16;
 
 /// Sealed metadata payload and the key that produced it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,8 +32,8 @@ impl KeyRing {
     ) -> Result<MetadataSeal, CryptoError> {
         let key = self.primary_key(KeyPurpose::Metadata)?;
         let nonce = metadata_nonce(&key.secret, associated_data, plaintext)?;
-        let ciphertext = xor_keystream(&key.secret, &nonce, plaintext)?;
-        let tag = metadata_tag(&key.secret, associated_data, &nonce, &ciphertext)?;
+        let (ciphertext, tag) =
+            encrypt_metadata_with_key(&key.secret, associated_data, &nonce, plaintext)?;
 
         Ok(MetadataSeal {
             key_id: key.descriptor.id.clone(),
@@ -50,9 +53,7 @@ impl KeyRing {
         tag: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
         let key = self.enabled_key_by_id(key_id, KeyPurpose::Metadata)?;
-        let tag_material = tag_material(associated_data, nonce, ciphertext);
-        verify_hmac(&key.secret, b"rs3:metadata-seal:tag:v1", &tag_material, tag)?;
-        xor_keystream(&key.secret, nonce, ciphertext)
+        decrypt_metadata_with_key(&key.secret, associated_data, nonce, ciphertext, tag)
     }
 }
 
@@ -62,50 +63,59 @@ fn metadata_nonce(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     let material = nonce_material(associated_data, plaintext);
-    let mut nonce = derive_hmac(secret, b"rs3:metadata-seal:nonce:v1", &material)?;
+    let mut nonce = derive_hmac(secret, b"rs3:metadata-aead-nonce:v1", &material)?;
     nonce.truncate(METADATA_NONCE_LEN);
     Ok(nonce)
 }
 
-fn metadata_tag(
+fn encrypt_metadata_with_key(
+    secret: &SecretBytes,
+    associated_data: &[u8],
+    nonce: &[u8],
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+    let cipher = metadata_cipher(secret)?;
+    if nonce.len() != METADATA_NONCE_LEN {
+        return Err(CryptoError::AeadOperationFailed);
+    }
+    let mut ciphertext = Vec::with_capacity(plaintext.len() + METADATA_TAG_LEN);
+    ciphertext.extend_from_slice(plaintext);
+    let tag = cipher
+        .encrypt_in_place_detached(XNonce::from_slice(nonce), associated_data, &mut ciphertext)
+        .map_err(|_| CryptoError::AeadOperationFailed)?;
+    Ok((ciphertext, tag.to_vec()))
+}
+
+fn decrypt_metadata_with_key(
     secret: &SecretBytes,
     associated_data: &[u8],
     nonce: &[u8],
     ciphertext: &[u8],
+    tag: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let material = tag_material(associated_data, nonce, ciphertext);
-    derive_hmac(secret, b"rs3:metadata-seal:tag:v1", &material)
+    let cipher = metadata_cipher(secret)?;
+    if nonce.len() != METADATA_NONCE_LEN || tag.len() != METADATA_TAG_LEN {
+        return Err(CryptoError::AeadOperationFailed);
+    }
+    let mut plaintext = ciphertext.to_vec();
+    cipher
+        .decrypt_in_place_detached(
+            XNonce::from_slice(nonce),
+            associated_data,
+            &mut plaintext,
+            Tag::from_slice(tag),
+        )
+        .map_err(|_| CryptoError::AeadOperationFailed)?;
+    Ok(plaintext)
 }
 
-fn xor_keystream(secret: &SecretBytes, nonce: &[u8], input: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let mut output = Vec::with_capacity(input.len());
-    let mut counter = 0_u64;
-
-    for chunk in input.chunks(32) {
-        let mut material = Vec::with_capacity(nonce.len() + 8);
-        material.extend_from_slice(nonce);
-        material.extend_from_slice(&counter.to_be_bytes());
-        let block = derive_hmac(secret, b"rs3:metadata-seal:stream:v1", &material)?;
-
-        output.extend(
-            chunk
-                .iter()
-                .zip(block.iter())
-                .map(|(left, right)| left ^ right),
-        );
-        counter = counter.saturating_add(1);
-    }
-
-    Ok(output)
+fn metadata_cipher(secret: &SecretBytes) -> Result<XChaCha20Poly1305, CryptoError> {
+    let key = derive_hmac(secret, b"rs3:metadata-aead-key:v1", b"xchacha20poly1305")?;
+    XChaCha20Poly1305::new_from_slice(&key).map_err(|_| CryptoError::AeadOperationFailed)
 }
 
 fn nonce_material(associated_data: &[u8], plaintext: &[u8]) -> Vec<u8> {
     framed_pair(associated_data, plaintext)
-}
-
-fn tag_material(associated_data: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Vec<u8> {
-    let first = framed_pair(associated_data, nonce);
-    framed_pair(&first, ciphertext)
 }
 
 fn framed_pair(left: &[u8], right: &[u8]) -> Vec<u8> {

@@ -16,6 +16,9 @@ pub const CHECKPOINT_OBJECT_DOMAIN: &[u8] = b"rs3:checkpoint-object:v1\n";
 /// Domain separator prepended to durable index delta objects.
 pub const INDEX_DELTA_OBJECT_DOMAIN: &[u8] = b"rs3:index-delta-object:v1\n";
 
+/// Domain separator prepended to plaintext index delta payloads before sealing.
+pub const INDEX_DELTA_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-delta-plaintext:v1\n";
+
 /// Domain separator prepended to plaintext manifest payloads before sealing.
 pub const MANIFEST_PLAINTEXT_DOMAIN: &[u8] = b"rs3:manifest-plaintext:v1\n";
 
@@ -62,6 +65,19 @@ pub struct IndexDeltaObject {
     pub sequence: Sequence,
     /// Ordered index mutations to replay.
     pub deltas: Vec<IndexDelta>,
+}
+
+/// Sealed index delta object stored in the backend and referenced by a checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedIndexDeltaObject {
+    /// Metadata key that sealed the payload.
+    pub key_id: KeyId,
+    /// Nonce used for the sealed payload.
+    pub nonce: Vec<u8>,
+    /// Sealed index delta payload.
+    pub ciphertext: Vec<u8>,
+    /// Authentication tag over the index delta object context.
+    pub tag: Vec<u8>,
 }
 
 /// Client-visible metadata stored in a sealed manifest object.
@@ -186,9 +202,18 @@ pub fn checkpoint_object_bytes(checkpoint: &Checkpoint) -> Result<Vec<u8>, serde
     Ok(bytes)
 }
 
-/// Encodes a durable index delta object.
-pub fn index_delta_object_bytes(delta: &IndexDeltaObject) -> Result<Vec<u8>, serde_json::Error> {
+/// Encodes a durable sealed index delta object.
+pub fn index_delta_object_bytes(
+    delta: &SealedIndexDeltaObject,
+) -> Result<Vec<u8>, serde_json::Error> {
     let mut bytes = INDEX_DELTA_OBJECT_DOMAIN.to_vec();
+    serde_json::to_writer(&mut bytes, delta)?;
+    Ok(bytes)
+}
+
+/// Encodes index delta plaintext before sealing.
+pub fn index_delta_plaintext_bytes(delta: &IndexDeltaObject) -> Result<Vec<u8>, serde_json::Error> {
+    let mut bytes = INDEX_DELTA_PLAINTEXT_DOMAIN.to_vec();
     serde_json::to_writer(&mut bytes, delta)?;
     Ok(bytes)
 }
@@ -324,10 +349,11 @@ impl NamespaceIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CommitRecord, INDEX_DELTA_OBJECT_DOMAIN, IndexDelta,
-        IndexDeltaObject, KeyringSnapshot, MANIFEST_PLAINTEXT_DOMAIN, ManifestObject,
-        NamespaceEntry, NamespaceIndex, canonical_commit_record_bytes, checkpoint_object_bytes,
-        index_delta_object_bytes, manifest_plaintext_bytes,
+        CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CommitRecord, INDEX_DELTA_OBJECT_DOMAIN,
+        INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta, IndexDeltaObject, KeyringSnapshot,
+        MANIFEST_PLAINTEXT_DOMAIN, ManifestObject, NamespaceEntry, NamespaceIndex,
+        SealedIndexDeltaObject, canonical_commit_record_bytes, checkpoint_object_bytes,
+        index_delta_object_bytes, index_delta_plaintext_bytes, manifest_plaintext_bytes,
     };
     use rs3_types::{
         BackendObjectId, BlindIndexKey, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
@@ -527,6 +553,23 @@ mod tests {
 
     #[test]
     fn index_delta_object_encoding_has_domain_prefix() {
+        let delta = SealedIndexDeltaObject {
+            key_id: key_id("metadata"),
+            nonce: vec![1; 24],
+            ciphertext: vec![2; 32],
+            tag: vec![3; 16],
+        };
+
+        let encoded = index_delta_object_bytes(&delta);
+
+        assert!(matches!(
+            encoded,
+            Ok(bytes) if bytes.starts_with(INDEX_DELTA_OBJECT_DOMAIN)
+        ));
+    }
+
+    #[test]
+    fn index_delta_plaintext_encoding_has_domain_prefix() {
         let delta = IndexDeltaObject {
             sequence: Sequence::new(1),
             deltas: vec![IndexDelta::Upsert {
@@ -536,11 +579,11 @@ mod tests {
             }],
         };
 
-        let encoded = index_delta_object_bytes(&delta);
+        let encoded = index_delta_plaintext_bytes(&delta);
 
         assert!(matches!(
             encoded,
-            Ok(bytes) if bytes.starts_with(INDEX_DELTA_OBJECT_DOMAIN)
+            Ok(bytes) if bytes.starts_with(INDEX_DELTA_PLAINTEXT_DOMAIN)
         ));
     }
 
