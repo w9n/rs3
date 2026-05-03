@@ -22,6 +22,10 @@ pub(crate) fn compare_runs(runs: &[Value]) -> Value {
     let mut backend_operations_per_client_request = Vec::new();
     let mut backend_puts_per_client_put = Vec::new();
     let mut backend_gets_per_client_get = Vec::new();
+    let mut backend_read_bytes_per_client_get_response_byte = Vec::new();
+    let mut backend_write_bytes_per_client_put_request_byte = Vec::new();
+    let mut payload_span_cache_event_hit_ratio = Vec::new();
+    let mut payload_span_cache_byte_hit_ratio = Vec::new();
 
     for run in runs {
         let Some(direct) = report_for_storage_path(run, "direct-rustfs") else {
@@ -77,6 +81,72 @@ pub(crate) fn compare_runs(runs: &[Value]) -> Value {
                 &["client_metrics", "counts_by_operation", "GetObject"],
             ),
         );
+        push_f64_ratio(
+            &mut backend_read_bytes_per_client_get_response_byte,
+            value_f64_at(gateway, &["backend_metrics", "counts", "bytes_read"]),
+            value_f64_at(
+                gateway,
+                &[
+                    "prometheus_metrics",
+                    "response_body_bytes_by_operation",
+                    "GetObject",
+                ],
+            ),
+        );
+        push_f64_ratio(
+            &mut backend_write_bytes_per_client_put_request_byte,
+            value_f64_at(gateway, &["backend_metrics", "counts", "bytes_written"]),
+            value_f64_at(
+                gateway,
+                &[
+                    "prometheus_metrics",
+                    "request_body_bytes_by_operation",
+                    "PutObject",
+                ],
+            ),
+        );
+        push_share(
+            &mut payload_span_cache_event_hit_ratio,
+            value_f64_at(
+                gateway,
+                &[
+                    "prometheus_metrics",
+                    "repository",
+                    "payload_span_cache_events_by_result",
+                    "hit",
+                ],
+            ),
+            value_f64_at(
+                gateway,
+                &[
+                    "prometheus_metrics",
+                    "repository",
+                    "payload_span_cache_events_by_result",
+                    "miss",
+                ],
+            ),
+        );
+        push_share(
+            &mut payload_span_cache_byte_hit_ratio,
+            value_f64_at(
+                gateway,
+                &[
+                    "prometheus_metrics",
+                    "repository",
+                    "payload_span_cache_bytes_by_result",
+                    "hit",
+                ],
+            ),
+            value_f64_at(
+                gateway,
+                &[
+                    "prometheus_metrics",
+                    "repository",
+                    "payload_span_cache_bytes_by_result",
+                    "miss",
+                ],
+            ),
+        );
     }
 
     serde_json::json!({
@@ -91,6 +161,10 @@ pub(crate) fn compare_runs(runs: &[Value]) -> Value {
             "backend_operations_per_client_request": summarize_f64(&backend_operations_per_client_request),
             "backend_puts_per_client_put": summarize_f64(&backend_puts_per_client_put),
             "backend_gets_per_client_get": summarize_f64(&backend_gets_per_client_get),
+            "backend_read_bytes_per_client_get_response_byte": summarize_f64(&backend_read_bytes_per_client_get_response_byte),
+            "backend_write_bytes_per_client_put_request_byte": summarize_f64(&backend_write_bytes_per_client_put_request_byte),
+            "payload_span_cache_event_hit_ratio": summarize_f64(&payload_span_cache_event_hit_ratio),
+            "payload_span_cache_byte_hit_ratio": summarize_f64(&payload_span_cache_byte_hit_ratio),
         },
     })
 }
@@ -540,6 +614,10 @@ fn value_u64_at(value: &Value, path: &[&str]) -> Option<u64> {
     value_at(value, path)?.as_u64()
 }
 
+fn value_f64_at(value: &Value, path: &[&str]) -> Option<f64> {
+    value_at(value, path)?.as_f64()
+}
+
 fn value_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     let mut current = value;
     for segment in path {
@@ -559,6 +637,33 @@ fn push_ratio(ratios: &mut Vec<f64>, numerator: Option<u64>, denominator: Option
         return;
     }
     ratios.push(numerator as f64 / denominator as f64);
+}
+
+fn push_f64_ratio(ratios: &mut Vec<f64>, numerator: Option<f64>, denominator: Option<f64>) {
+    let Some(numerator) = numerator else {
+        return;
+    };
+    let Some(denominator) = denominator else {
+        return;
+    };
+    if denominator == 0.0 {
+        return;
+    }
+    ratios.push(numerator / denominator);
+}
+
+fn push_share(ratios: &mut Vec<f64>, numerator: Option<f64>, other: Option<f64>) {
+    let (numerator, other) = match (numerator, other) {
+        (Some(numerator), Some(other)) => (numerator, other),
+        (Some(numerator), None) => (numerator, 0.0),
+        (None, Some(other)) => (0.0, other),
+        (None, None) => return,
+    };
+    let denominator = numerator + other;
+    if denominator == 0.0 {
+        return;
+    }
+    ratios.push(numerator / denominator);
 }
 
 #[cfg(test)]
@@ -618,6 +723,24 @@ mod tests {
                             "PutObject": 4,
                             "GetObject": 6,
                         }
+                    },
+                    "prometheus_metrics": {
+                        "request_body_bytes_by_operation": {
+                            "PutObject": 500
+                        },
+                        "response_body_bytes_by_operation": {
+                            "GetObject": 1000
+                        },
+                        "repository": {
+                            "payload_span_cache_events_by_result": {
+                                "hit": 6,
+                                "miss": 2
+                            },
+                            "payload_span_cache_bytes_by_result": {
+                                "hit": 1200,
+                                "miss": 300
+                            }
+                        }
                     }
                 }
             ]
@@ -657,6 +780,22 @@ mod tests {
             comparison["gateway_internal"]["backend_gets_per_client_get"]["avg"],
             serde_json::json!(0.5)
         );
+        assert_eq!(
+            comparison["gateway_internal"]["backend_read_bytes_per_client_get_response_byte"]["avg"],
+            serde_json::json!(3.0)
+        );
+        assert_eq!(
+            comparison["gateway_internal"]["backend_write_bytes_per_client_put_request_byte"]["avg"],
+            serde_json::json!(2.5)
+        );
+        assert_eq!(
+            comparison["gateway_internal"]["payload_span_cache_event_hit_ratio"]["avg"],
+            serde_json::json!(0.75)
+        );
+        assert_eq!(
+            comparison["gateway_internal"]["payload_span_cache_byte_hit_ratio"]["avg"],
+            serde_json::json!(0.8)
+        );
 
         let aggregate = aggregate_runs(&runs);
         assert_eq!(
@@ -686,6 +825,53 @@ mod tests {
         assert_eq!(
             aggregate["gateway"]["backend_metrics"]["by_s3_operation"]["GetObject"]["bytes_read"]["avg"],
             serde_json::json!(3000.0)
+        );
+    }
+
+    #[test]
+    fn cache_hit_ratios_treat_missing_hit_series_as_zero() {
+        let runs = vec![serde_json::json!({
+            "run": 1,
+            "reports": [
+                {
+                    "storage_path": "direct-rustfs",
+                    "backend_metrics": {
+                        "counts": {
+                            "requests": 1
+                        }
+                    }
+                },
+                {
+                    "storage_path": "gateway",
+                    "backend_metrics": {
+                        "counts": {}
+                    },
+                    "client_metrics": {
+                        "counts_by_operation": {}
+                    },
+                    "prometheus_metrics": {
+                        "repository": {
+                            "payload_span_cache_events_by_result": {
+                                "miss": 4
+                            },
+                            "payload_span_cache_bytes_by_result": {
+                                "miss": 2048
+                            }
+                        }
+                    }
+                }
+            ]
+        })];
+
+        let comparison = compare_runs(&runs);
+
+        assert_eq!(
+            comparison["gateway_internal"]["payload_span_cache_event_hit_ratio"]["avg"],
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            comparison["gateway_internal"]["payload_span_cache_byte_hit_ratio"]["avg"],
+            serde_json::json!(0.0)
         );
     }
 }

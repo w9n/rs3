@@ -59,6 +59,11 @@ Repository metrics also include
 `payload_span_cache_bytes_by_result`, which show ciphertext span cache hits,
 misses, inserts, and bytes without exposing object keys.
 
+The matrix comparison block includes derived gateway-internal cost ratios such
+as backend read bytes per returned GET byte, backend write bytes per PUT request
+byte, and payload span cache hit ratios. These fields are intended to make
+restore regressions explainable from one summary artifact.
+
 ## Current Results
 
 Run date: 2026-05-03. Each row is the average of three direct/gateway run pairs.
