@@ -28,6 +28,12 @@ const GATEWAY_SECRET_ACCESS_KEY: &str = "secret";
 const GATEWAY_TEST_KEY: &str = "snapshots/gateway-object.bin";
 #[cfg(feature = "containers")]
 const GATEWAY_TEST_BODY: &[u8] = b"hello gateway backend";
+#[cfg(feature = "containers")]
+const GATEWAY_LIST_KEYS: &[&str] = &[
+    "snapshots/paginated/a.bin",
+    "snapshots/paginated/b.bin",
+    "snapshots/paginated/c.bin",
+];
 
 #[derive(Debug, Args)]
 pub(crate) struct S3GatewayArgs {
@@ -198,14 +204,7 @@ async fn wait_for_gateway(addr: SocketAddr, child: &mut Child) -> Result<()> {
 
 #[cfg(feature = "containers")]
 async fn assert_gateway_contract(client: &Client) -> Result<()> {
-    client
-        .put_object()
-        .bucket(GATEWAY_PUBLIC_BUCKET)
-        .key(GATEWAY_TEST_KEY)
-        .body(ByteStream::from_static(GATEWAY_TEST_BODY))
-        .send()
-        .await
-        .context("gateway PutObject failed")?;
+    put_object(client, GATEWAY_TEST_KEY, GATEWAY_TEST_BODY).await?;
 
     let head = client
         .head_object()
@@ -258,6 +257,8 @@ async fn assert_gateway_contract(client: &Client) -> Result<()> {
         anyhow::bail!("gateway ListObjectsV2 did not include {GATEWAY_TEST_KEY}");
     }
 
+    assert_paginated_listing(client).await?;
+
     client
         .delete_object()
         .bucket(GATEWAY_PUBLIC_BUCKET)
@@ -279,6 +280,89 @@ async fn assert_gateway_contract(client: &Client) -> Result<()> {
         .any(|object| object.key() == Some(GATEWAY_TEST_KEY));
     if still_listed {
         anyhow::bail!("gateway DeleteObject did not remove {GATEWAY_TEST_KEY} from listings");
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "containers")]
+async fn put_object(client: &Client, key: &str, body: &[u8]) -> Result<()> {
+    client
+        .put_object()
+        .bucket(GATEWAY_PUBLIC_BUCKET)
+        .key(key)
+        .body(ByteStream::from(body.to_vec()))
+        .send()
+        .await
+        .with_context(|| format!("gateway PutObject failed for {key}"))?;
+    Ok(())
+}
+
+#[cfg(feature = "containers")]
+async fn assert_paginated_listing(client: &Client) -> Result<()> {
+    for key in GATEWAY_LIST_KEYS {
+        put_object(client, key, key.as_bytes()).await?;
+    }
+
+    let first = client
+        .list_objects_v2()
+        .bucket(GATEWAY_PUBLIC_BUCKET)
+        .prefix("snapshots/paginated/")
+        .max_keys(1)
+        .send()
+        .await
+        .context("gateway paginated ListObjectsV2 first page failed")?;
+    let first_key = first
+        .contents()
+        .first()
+        .and_then(|object| object.key())
+        .context("gateway paginated ListObjectsV2 first page was empty")?;
+    if first_key != GATEWAY_LIST_KEYS[0] {
+        anyhow::bail!(
+            "gateway paginated ListObjectsV2 first page returned {first_key}, expected {}",
+            GATEWAY_LIST_KEYS[0],
+        );
+    }
+
+    let token = first
+        .next_continuation_token()
+        .context("gateway paginated ListObjectsV2 first page had no continuation token")?;
+    let second = client
+        .list_objects_v2()
+        .bucket(GATEWAY_PUBLIC_BUCKET)
+        .prefix("snapshots/paginated/")
+        .max_keys(1)
+        .continuation_token(token)
+        .send()
+        .await
+        .context("gateway paginated ListObjectsV2 second page failed")?;
+    let second_key = second
+        .contents()
+        .first()
+        .and_then(|object| object.key())
+        .context("gateway paginated ListObjectsV2 second page was empty")?;
+    if second_key != GATEWAY_LIST_KEYS[1] {
+        anyhow::bail!(
+            "gateway paginated ListObjectsV2 second page returned {second_key}, expected {}",
+            GATEWAY_LIST_KEYS[1],
+        );
+    }
+
+    let delimiter = client
+        .list_objects_v2()
+        .bucket(GATEWAY_PUBLIC_BUCKET)
+        .prefix("snapshots/")
+        .delimiter("/")
+        .send()
+        .await
+        .context("gateway delimiter ListObjectsV2 failed")?;
+    let common_prefixes = delimiter
+        .common_prefixes()
+        .iter()
+        .filter_map(|prefix| prefix.prefix())
+        .collect::<Vec<_>>();
+    if !common_prefixes.contains(&"snapshots/paginated/") {
+        anyhow::bail!("gateway delimiter ListObjectsV2 did not include snapshots/paginated/");
     }
 
     Ok(())

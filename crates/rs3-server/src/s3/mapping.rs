@@ -167,12 +167,13 @@ pub(super) fn list_page(
 
     let mut contents = Vec::new();
     let mut common_prefixes = Vec::new();
+    let mut last_returned_key = None;
     let mut next_continuation_token = None;
     let mut key_count = 0usize;
 
     for (key, item) in items {
         if key_count == max_keys {
-            next_continuation_token = Some(key);
+            next_continuation_token = last_returned_key;
             break;
         }
 
@@ -180,6 +181,7 @@ pub(super) fn list_page(
             ListItem::Object(object) => contents.push(*object),
             ListItem::CommonPrefix(prefix) => common_prefixes.push(prefix),
         }
+        last_returned_key = Some(key);
         key_count += 1;
     }
 
@@ -253,5 +255,86 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
         | RepositoryError::CheckpointParentMismatch => {
             s3s::s3_error!(InternalError, "repository operation failed")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::list_page;
+    use rs3_repository::RepositoryListEntry;
+    use rs3_types::LogicalPath;
+
+    fn entry(key: &str) -> RepositoryListEntry {
+        RepositoryListEntry {
+            key: LogicalPath::new(key).unwrap_or_else(|error| panic!("{error}")),
+            content_len: 1,
+            modified_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn list_page_token_continues_after_last_returned_item() {
+        let entries = vec![entry("p/a"), entry("p/b"), entry("p/c")];
+
+        let first = list_page(entries.clone(), "p/", None, None, 1)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let second = list_page(
+            entries,
+            "p/",
+            None,
+            first.next_continuation_token.as_deref(),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(
+            first
+                .contents
+                .first()
+                .and_then(|object| object.key.as_deref()),
+            Some("p/a")
+        );
+        assert_eq!(first.next_continuation_token.as_deref(), Some("p/a"));
+        assert_eq!(
+            second
+                .contents
+                .first()
+                .and_then(|object| object.key.as_deref()),
+            Some("p/b")
+        );
+        assert_eq!(second.next_continuation_token.as_deref(), Some("p/b"));
+    }
+
+    #[test]
+    fn list_page_token_handles_common_prefixes() {
+        let entries = vec![entry("p/a/1"), entry("p/b/1"), entry("p/c/1")];
+
+        let first = list_page(entries.clone(), "p/", Some("/"), None, 1)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let second = list_page(
+            entries,
+            "p/",
+            Some("/"),
+            first.next_continuation_token.as_deref(),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(
+            first
+                .common_prefixes
+                .first()
+                .and_then(|prefix| prefix.prefix.as_deref()),
+            Some("p/a/")
+        );
+        assert_eq!(first.next_continuation_token.as_deref(), Some("p/a/"));
+        assert_eq!(
+            second
+                .common_prefixes
+                .first()
+                .and_then(|prefix| prefix.prefix.as_deref()),
+            Some("p/b/")
+        );
+        assert_eq!(second.next_continuation_token.as_deref(), Some("p/b/"));
     }
 }
