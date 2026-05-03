@@ -71,24 +71,32 @@ volume through Kopia..
 cargo run -p xtask --features k8s -- integration velero-kopia-local-pv-smoke
 ```
 
-Both Velero lanes load the Velero server and AWS plugin images from the local
+The dynamic-PVC variant installs OpenEBS LocalPV Hostpath through its pinned Helm
+chart, creates a PVC from that StorageClass, deletes the workload namespace after
+backup, restores it, and verifies the restored file bytes. This is the first
+kind-friendly disaster-restore lane..
+
+```sh
+cargo run -p xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke
+```
+
+The Velero lanes load the Velero server and AWS plugin images from the local
 Docker daemon into kind by default. Preload or mirror
 `velero/velero:v1.18.0` and `velero/velero-plugin-for-aws:v1.14.0`, or pass
 `--pull-velero-images` when registry pulls are acceptable. CI can point at a
 mirror with `RS3_TEST_VELERO_IMAGE` and
 `RS3_TEST_VELERO_AWS_PLUGIN_IMAGE`.
 
-CI should not depend on anonymous public registry pulls. Configure the CI secret
-store or image sync job outside this repository, mirror the pinned Velero images
-into a CI-owned registry, and set the image variables above for the job. Keep
-registry credentials out of command-line arguments because they are easy to leak
-through logs and process listings.
+The dynamic-PVC lane also loads `openebs/provisioner-localpv:4.4.0` and
+`openebs/linux-utils:4.3.0` by default. CI can mirror them with
+`RS3_TEST_OPENEBS_PROVISIONER_IMAGE` and `RS3_TEST_OPENEBS_HELPER_IMAGE`, and can
+mirror the chart package with `RS3_TEST_OPENEBS_CHART`.
 
-The next PVC disaster-restore lane should add a disposable dynamic provisioner
-instead of extending the static local-PV smoke. OpenEBS Local PV Hostpath is the
-first candidate for kind because it provides dynamic PVC provisioning and has a
-documented Velero backup/restore flow. The CSI hostpath driver is a later
-candidate when the lane needs CSI snapshot or data-mover behavior.
+CI should not depend on anonymous public registry pulls. Configure the CI secret
+store or image sync job outside this repository, mirror the pinned third-party
+images into a CI-owned registry, and set the image variables above for the job.
+Keep registry credentials out of command-line arguments because they are easy to
+leak through logs and process listings.
 
 Container provider setup stays behind the opt-in `xtask/containers` feature so
 Docker and provider bootstrap dependencies stay outside normal unit tests and

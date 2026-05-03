@@ -19,8 +19,8 @@ struct Cli {
 enum Commands {
     Check,
     Fmt,
-    Integration(integration::IntegrationArgs),
-    Perf(perf::PerfArgs),
+    Integration(Box<integration::IntegrationArgs>),
+    Perf(Box<perf::PerfArgs>),
     Test,
 }
 
@@ -47,10 +47,10 @@ fn main() -> Result<()> {
             run("cargo", &["fmt", "--all"])?;
         }
         Some(Commands::Integration(args)) => {
-            integration::run(args)?;
+            integration::run(*args)?;
         }
         Some(Commands::Perf(args)) => {
-            perf::run(args)?;
+            perf::run(*args)?;
         }
         Some(Commands::Test) => {
             run("cargo", &["test", "--workspace"])?;

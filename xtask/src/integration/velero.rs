@@ -40,6 +40,36 @@ pub(crate) struct VeleroKopiaSmokeArgs {
         default_value = "velero/velero-plugin-for-aws:v1.14.0"
     )]
     velero_aws_plugin_image: String,
+    /// Helm chart reference used for the OpenEBS LocalPV dynamic PVC lane.
+    #[arg(
+        long,
+        env = "RS3_TEST_OPENEBS_CHART",
+        default_value = "https://openebs.github.io/dynamic-localpv-provisioner/localpv-provisioner-4.4.0.tgz"
+    )]
+    openebs_chart: String,
+    /// Kubernetes namespace used for OpenEBS LocalPV.
+    #[arg(long, default_value = "openebs")]
+    openebs_namespace: String,
+    /// Helm release name for OpenEBS LocalPV.
+    #[arg(long, default_value = "rs3-openebs")]
+    openebs_release_name: String,
+    /// StorageClass name created by the OpenEBS LocalPV chart.
+    #[arg(long, default_value = "rs3-openebs-hostpath")]
+    openebs_storage_class: String,
+    /// OpenEBS LocalPV provisioner image.
+    #[arg(
+        long,
+        env = "RS3_TEST_OPENEBS_PROVISIONER_IMAGE",
+        default_value = "openebs/provisioner-localpv:4.4.0"
+    )]
+    openebs_provisioner_image: String,
+    /// OpenEBS helper image used by the provisioner.
+    #[arg(
+        long,
+        env = "RS3_TEST_OPENEBS_HELPER_IMAGE",
+        default_value = "openebs/linux-utils:4.3.0"
+    )]
+    openebs_helper_image: String,
     /// kind executable.
     #[arg(long, env = "RS3_TEST_KIND_BIN", default_value = "kind")]
     kind_bin: String,
@@ -67,6 +97,12 @@ pub(crate) struct VeleroKopiaSmokeArgs {
     /// Do not require or load Velero images from the local Docker daemon.
     #[arg(long)]
     skip_velero_image_load: bool,
+    /// Pull missing OpenEBS images into the local Docker daemon before loading them into kind.
+    #[arg(long)]
+    pull_openebs_images: bool,
+    /// Do not require or load OpenEBS images from the local Docker daemon.
+    #[arg(long)]
+    skip_openebs_image_load: bool,
     /// Keep the kind cluster after the run for manual inspection.
     #[arg(long)]
     keep_cluster: bool,
@@ -89,6 +125,13 @@ pub(crate) fn run_velero_kopia_local_pv_smoke(_args: VeleroKopiaSmokeArgs) -> Re
     )
 }
 
+#[cfg(not(feature = "k8s"))]
+pub(crate) fn run_velero_kopia_dynamic_pvc_smoke(_args: VeleroKopiaSmokeArgs) -> Result<()> {
+    anyhow::bail!(
+        "Velero Kopia dynamic-PVC smoke integration requires `cargo run -p xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke`",
+    )
+}
+
 #[cfg(feature = "k8s")]
 pub(crate) fn run_velero_kopia_smoke(args: VeleroKopiaSmokeArgs) -> Result<()> {
     imp::run_empty_dir(args)
@@ -97,6 +140,11 @@ pub(crate) fn run_velero_kopia_smoke(args: VeleroKopiaSmokeArgs) -> Result<()> {
 #[cfg(feature = "k8s")]
 pub(crate) fn run_velero_kopia_local_pv_smoke(args: VeleroKopiaSmokeArgs) -> Result<()> {
     imp::run_local_pv(args)
+}
+
+#[cfg(feature = "k8s")]
+pub(crate) fn run_velero_kopia_dynamic_pvc_smoke(args: VeleroKopiaSmokeArgs) -> Result<()> {
+    imp::run_dynamic_pvc(args)
 }
 
 #[cfg(feature = "k8s")]
@@ -125,6 +173,7 @@ mod imp {
     enum WorkloadVolume {
         EmptyDir,
         LocalPv,
+        DynamicPvc,
     }
 
     pub(super) fn run_empty_dir(args: VeleroKopiaSmokeArgs) -> Result<()> {
@@ -133,6 +182,10 @@ mod imp {
 
     pub(super) fn run_local_pv(args: VeleroKopiaSmokeArgs) -> Result<()> {
         run(args, WorkloadVolume::LocalPv)
+    }
+
+    pub(super) fn run_dynamic_pvc(args: VeleroKopiaSmokeArgs) -> Result<()> {
+        run(args, WorkloadVolume::DynamicPvc)
     }
 
     fn run(args: VeleroKopiaSmokeArgs, volume: WorkloadVolume) -> Result<()> {
@@ -144,6 +197,9 @@ mod imp {
         run_command(&args.helm_bin, &["lint", CHART_PATH])
             .context("gateway Helm chart lint failed")?;
         prepare_velero_images(&args)?;
+        if matches!(volume, WorkloadVolume::DynamicPvc) {
+            prepare_openebs_images(&args)?;
+        }
 
         if !args.skip_image_build {
             run_command(&args.docker_bin, &["build", "-t", args.image.as_str(), "."])
@@ -170,6 +226,10 @@ mod imp {
             cluster.load_image(&args.velero_image)?;
             cluster.load_image(&args.velero_aws_plugin_image)?;
         }
+        if matches!(volume, WorkloadVolume::DynamicPvc) && !args.skip_openebs_image_load {
+            cluster.load_image(&args.openebs_provisioner_image)?;
+            cluster.load_image(&args.openebs_helper_image)?;
+        }
         if matches!(volume, WorkloadVolume::LocalPv) {
             prepare_local_pv_path(&args, cluster.name())?;
         }
@@ -187,6 +247,10 @@ mod imp {
                 wait_secs: args.wait_secs,
             },
         )?;
+
+        if matches!(volume, WorkloadVolume::DynamicPvc) {
+            install_openebs(&args, cluster.kubeconfig_path())?;
+        }
 
         let credentials_path = workspace.path("credentials-velero");
         write_velero_credentials(&credentials_path)?;
@@ -209,7 +273,7 @@ mod imp {
         assert_pod_volume_backup_completed(&args, cluster.kubeconfig_path(), &backup_name)?;
 
         match volume {
-            WorkloadVolume::EmptyDir => {
+            WorkloadVolume::EmptyDir | WorkloadVolume::DynamicPvc => {
                 delete_workload_namespace(&args, cluster.kubeconfig_path())?;
             }
             WorkloadVolume::LocalPv => {
@@ -264,6 +328,32 @@ mod imp {
         Ok(())
     }
 
+    fn prepare_openebs_images(args: &VeleroKopiaSmokeArgs) -> Result<()> {
+        if args.skip_openebs_image_load {
+            return Ok(());
+        }
+
+        for image in [&args.openebs_provisioner_image, &args.openebs_helper_image] {
+            if docker_image_exists(&args.docker_bin, image)? {
+                continue;
+            }
+            if args.pull_openebs_images {
+                run_command(&args.docker_bin, &["pull", image]).with_context(|| {
+                    format!(
+                        "failed to pull OpenEBS image `{image}`; authenticate Docker or pass a mirror image if the registry rate-limits pulls",
+                    )
+                })?;
+                continue;
+            }
+
+            bail!(
+                "OpenEBS image `{image}` is not present locally. Pull or mirror it first, pass `--pull-openebs-images`, or pass `--skip-openebs-image-load` to let the cluster pull it directly."
+            );
+        }
+
+        Ok(())
+    }
+
     fn docker_image_exists(docker_bin: &str, image: &str) -> Result<bool> {
         let result = run_command_capture(
             docker_bin,
@@ -294,6 +384,105 @@ mod imp {
             &["exec", &node_container, "chmod", "0777", LOCAL_PV_PATH],
         )
         .with_context(|| format!("failed to make local PV path writable in `{node_container}`"))
+    }
+
+    fn install_openebs(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
+        let timeout = timeout_arg(args.wait_secs);
+        let provisioner = chart_image(&args.openebs_provisioner_image)?;
+        let helper = chart_image(&args.openebs_helper_image)?;
+        run_command(
+            &args.helm_bin,
+            &[
+                "--kubeconfig",
+                path_str(kubeconfig_path)?,
+                "upgrade",
+                "--install",
+                &args.openebs_release_name,
+                &args.openebs_chart,
+                "--namespace",
+                &args.openebs_namespace,
+                "--create-namespace",
+                "--wait",
+                "--timeout",
+                timeout.as_str(),
+                "--set-string",
+                "global.imageRegistry=",
+                "--set-string",
+                "analytics.enabled=false",
+                "--set-string",
+                &format!("hostpathClass.name={}", args.openebs_storage_class),
+                "--set-string",
+                &format!("localpv.image.registry={}", provisioner.registry),
+                "--set-string",
+                &format!("localpv.image.repository={}", provisioner.repository),
+                "--set-string",
+                &format!("localpv.image.tag={}", provisioner.tag),
+                "--set-string",
+                &format!("helperPod.image.registry={}", helper.registry),
+                "--set-string",
+                &format!("helperPod.image.repository={}", helper.repository),
+                "--set-string",
+                &format!("helperPod.image.tag={}", helper.tag),
+            ],
+        )
+        .context("failed to install OpenEBS LocalPV chart")?;
+
+        kubectl(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &[
+                "-n",
+                &args.openebs_namespace,
+                "rollout",
+                "status",
+                &format!(
+                    "deployment/{}-localpv-provisioner",
+                    args.openebs_release_name
+                ),
+                "--timeout",
+                timeout.as_str(),
+            ],
+        )
+        .context("OpenEBS LocalPV provisioner did not become ready")?;
+        kubectl(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &["get", "storageclass", &args.openebs_storage_class],
+        )
+        .with_context(|| {
+            format!(
+                "OpenEBS StorageClass `{}` is unavailable",
+                args.openebs_storage_class
+            )
+        })
+    }
+
+    struct ChartImage {
+        registry: String,
+        repository: String,
+        tag: String,
+    }
+
+    fn chart_image(image: &str) -> Result<ChartImage> {
+        let (repository, tag) = split_image_ref(image);
+        if repository.contains('@') || tag.contains('@') {
+            bail!("OpenEBS chart image `{image}` must use a tag, not a digest");
+        }
+        let (registry, repository) = repository.split_once('/').map_or_else(
+            || ("", repository.as_str()),
+            |(first, rest)| {
+                if first == "localhost" || first.contains('.') || first.contains(':') {
+                    (first, rest)
+                } else {
+                    ("", repository.as_str())
+                }
+            },
+        );
+        Ok(ChartImage {
+            registry: registry.to_owned(),
+            repository: repository.to_owned(),
+            tag,
+        })
     }
 
     fn write_velero_credentials(path: &Path) -> Result<()> {
@@ -387,7 +576,7 @@ mod imp {
     ) -> Result<()> {
         let manifest_path = workspace.path("workload.yaml");
         let node_name = match volume {
-            WorkloadVolume::EmptyDir => None,
+            WorkloadVolume::EmptyDir | WorkloadVolume::DynamicPvc => None,
             WorkloadVolume::LocalPv => Some(first_node_name(args, kubeconfig_path)?),
         };
         fs::write(
@@ -426,10 +615,13 @@ mod imp {
         let volume_resources = match volume {
             WorkloadVolume::EmptyDir => String::new(),
             WorkloadVolume::LocalPv => local_pv_resources(args, node_name.expect("node name")),
+            WorkloadVolume::DynamicPvc => dynamic_pvc_resources(args),
         };
         let volume_spec = match volume {
             WorkloadVolume::EmptyDir => "emptyDir: {}".to_owned(),
-            WorkloadVolume::LocalPv => "persistentVolumeClaim:\n        claimName: data".to_owned(),
+            WorkloadVolume::LocalPv | WorkloadVolume::DynamicPvc => {
+                "persistentVolumeClaim:\n        claimName: data".to_owned()
+            }
         };
         format!(
             r#"apiVersion: v1
@@ -468,6 +660,31 @@ spec:
             namespace = args.workload_namespace,
             volume_resources = volume_resources,
             volume_spec = volume_spec,
+        )
+    }
+
+    fn dynamic_pvc_resources(args: &VeleroKopiaSmokeArgs) -> String {
+        format!(
+            r#"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+  namespace: {namespace}
+  labels:
+    app.kubernetes.io/name: {name}
+spec:
+  storageClassName: {storage_class}
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 64Mi
+"#,
+            name = WORKLOAD_NAME,
+            namespace = args.workload_namespace,
+            storage_class = args.openebs_storage_class,
         )
     }
 
