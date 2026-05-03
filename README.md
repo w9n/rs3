@@ -42,7 +42,8 @@ just perf-s3 --s3-bucket test-bucket --s3-endpoint-url http://localhost:9000 --s
 existing S3-compatible endpoint. Set `RS3_TEST_S3_BUCKET` and standard AWS
 credential environment variables before running it. Optional knobs:
 `RS3_TEST_S3_ENDPOINT_URL`, `RS3_TEST_S3_REGION`, `RS3_TEST_S3_PREFIX`,
-`RS3_TEST_S3_ALLOW_HTTP`, and `RS3_TEST_S3_VIRTUAL_HOSTED_STYLE`.
+`RS3_TEST_S3_PROVIDER`, `RS3_TEST_S3_ALLOW_HTTP`, and
+`RS3_TEST_S3_VIRTUAL_HOSTED_STYLE`.
 
 The Nix shell includes `sccache` for clean rebuild or CI-like cache experiments,
 but it is not enabled by default. Set `RUSTC_WRAPPER=sccache` for runs where that
