@@ -197,6 +197,7 @@ pub(crate) fn open_segmented_payload_span(
     }
 
     let mut output = Vec::with_capacity(selection.output_capacity()?);
+    let mut associated_data = Vec::with_capacity(segment_associated_data_capacity(object_id));
     for segment_index in selection.start_segment..selection.end_segment {
         let segment_range =
             segment_ciphertext_range(header, segment_index)?.ok_or(StorageError::InvalidRange)?;
@@ -218,6 +219,7 @@ pub(crate) fn open_segmented_payload_span(
             header,
             segment_index,
             segment_ciphertext,
+            &mut associated_data,
         )?;
         append_segment_overlap(&mut output, header, &selection, segment_index, &plaintext)?;
     }
@@ -262,24 +264,21 @@ fn seal_segmented_payload_object(
     body.extend_from_slice(&header);
 
     let segment_count = plaintext.chunks(chunk_size).count();
+    let mut associated_data = Vec::with_capacity(segment_associated_data_capacity(object_id));
     for (segment_index, segment) in plaintext.chunks(chunk_size).enumerate() {
         let is_final = segment_index + 1 == segment_count;
-        let nonce = segment_nonce(
-            &nonce_prefix,
-            u64::try_from(segment_index).map_err(|_| StorageError::InvalidRange)?,
+        let segment_index_u64 =
+            u64::try_from(segment_index).map_err(|_| StorageError::InvalidRange)?;
+        let nonce = segment_nonce(&nonce_prefix, segment_index_u64, is_final)?;
+        write_segment_associated_data(
+            &mut associated_data,
+            object_id,
+            chunk_size_u64,
+            plaintext_len,
+            segment_index_u64,
             is_final,
-        )?;
-        let seal = keyring.seal_payload_with_nonce(
-            &segment_associated_data(
-                object_id,
-                chunk_size_u64,
-                plaintext_len,
-                u64::try_from(segment_index).map_err(|_| StorageError::InvalidRange)?,
-                is_final,
-            ),
-            segment,
-            &nonce,
-        )?;
+        );
+        let seal = keyring.seal_payload_with_nonce(&associated_data, segment, &nonce)?;
         if seal.key_id != key_id {
             return Err(invalid_payload_object(object_id));
         }
@@ -342,23 +341,21 @@ fn open_segment(
     header: &SegmentedPayloadHeader,
     segment_index: usize,
     ciphertext: &[u8],
+    associated_data: &mut Vec<u8>,
 ) -> Result<Vec<u8>> {
     let segment_index_u64 = u64::try_from(segment_index).map_err(|_| StorageError::InvalidRange)?;
     let is_final = final_segment_index(header)? == segment_index;
     let nonce = segment_nonce(&header.nonce_prefix, segment_index_u64, is_final)?;
+    write_segment_associated_data(
+        associated_data,
+        object_id,
+        header.chunk_size,
+        header.plaintext_len,
+        segment_index_u64,
+        is_final,
+    );
     keyring
-        .open_payload(
-            &header.key_id,
-            &segment_associated_data(
-                object_id,
-                header.chunk_size,
-                header.plaintext_len,
-                segment_index_u64,
-                is_final,
-            ),
-            &nonce,
-            ciphertext,
-        )
+        .open_payload(&header.key_id, associated_data, &nonce, ciphertext)
         .map_err(Into::into)
 }
 
@@ -553,21 +550,24 @@ fn segment_nonce(
     Ok(nonce)
 }
 
-fn segment_associated_data(
+fn segment_associated_data_capacity(object_id: &BackendObjectId) -> usize {
+    PAYLOAD_SEGMENT_AAD_DOMAIN
+        .len()
+        .saturating_add(object_id.as_str().len())
+        .saturating_add(1)
+        .saturating_add(U64_LEN * 3)
+        .saturating_add(1)
+}
+
+fn write_segment_associated_data(
+    aad: &mut Vec<u8>,
     object_id: &BackendObjectId,
     chunk_size: u64,
     plaintext_len: u64,
     segment_index: u64,
     is_final: bool,
-) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(
-        PAYLOAD_SEGMENT_AAD_DOMAIN
-            .len()
-            .saturating_add(object_id.as_str().len())
-            .saturating_add(1)
-            .saturating_add(U64_LEN * 3)
-            .saturating_add(1),
-    );
+) {
+    aad.clear();
     aad.extend_from_slice(PAYLOAD_SEGMENT_AAD_DOMAIN);
     aad.extend_from_slice(object_id.as_str().as_bytes());
     aad.push(0);
@@ -575,7 +575,6 @@ fn segment_associated_data(
     aad.extend_from_slice(&plaintext_len.to_be_bytes());
     aad.extend_from_slice(&segment_index.to_be_bytes());
     aad.push(u8::from(is_final));
-    aad
 }
 
 fn push_u64_len(body: &mut Vec<u8>, len: usize) {
