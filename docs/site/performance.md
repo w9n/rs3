@@ -168,4 +168,6 @@ because local container and host load can dominate.
 - Refresh the larger restore matrix after docs and cleanup changes.
 - Keep run order alternating between direct and gateway lanes.
 - Keep measuring variability with at least three runs for release claims.
+- Reduce commit stage-lock and checkpoint-wait time without allowing
+  checkpoints to race writes whose sequence state is not yet indexed.
 - Add provider matrix runs only after local release artifacts are consistent.
