@@ -32,6 +32,7 @@ checkpoint, then restore with the narrowest credentials practical.
 | Anchor unavailable | Do not accept newer-looking storage state silently. |
 | Evidence higher than anchor | Investigate anchor rollback or missed anchor advance. |
 | Evidence lower than anchor | Investigate failed evidence write or backend replay. |
+| Anchor missing but evidence exists | Require recovery bundle or external authority; do not trust storage alone. |
 
 ## Break Glass
 
@@ -50,6 +51,7 @@ Its job is data recovery, not making ambiguous state look healthy.
 - selected checkpoint ID, sequence, and digest
 - parent chain or compaction root
 - anchor and evidence state
+- repository ID, public salt, envelope object ID, and unwrap authority reference
 - gateway version and configuration hash
 - restore command and target
 - object-store audit events

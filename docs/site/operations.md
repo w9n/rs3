@@ -31,7 +31,7 @@ cargo run -p rs3-server -- serve --bind 127.0.0.1:9080
 See [Configuration](reference/configuration.md) for the environment variable
 reference.
 
-## Keys
+## Keys And Bootstrap
 
 The preferred production model is an encrypted keyring envelope. Generate
 random purpose-specific repository data keys, store them in an encrypted
@@ -49,19 +49,21 @@ Operational rules:
 - Prefer generated random data keys inside an encrypted keyring envelope.
 - Keep wrapping keys, KMS access, HSM access, or Vault tokens outside the object
   store and outside broad cluster write credentials.
-- Generate salts once per repository and keep them with trusted repository
-  configuration.
+- Provide a stable salt once per repository and keep it with trusted repository
+  configuration and recovery material.
 - Treat salts as public restore metadata, not as second passwords.
 - Do not reuse the same master key, repository id, and salt across repositories.
 - Keep historical keys available for at least the maximum retention window.
 - Do not destroy a key while any retained checkpoint can reference data that
   requires it.
 
-Create a new envelope with `xtask`, not the server binary:
+Create a new envelope with an explicit bootstrap step, not normal server
+startup:
 
 ```sh
 cargo run -p xtask --bin xtask -- keyring init \
   --repository-id prod-backups \
+  --repository-salt-hex <salt-hex> \
   --wrapping-key-id wrap-2026-05 \
   --generate-wrapping-key \
   --backend filesystem \
@@ -71,10 +73,15 @@ cargo run -p xtask --bin xtask -- keyring init \
 
 For S3-compatible storage, build the task with the S3 feature and use
 `--backend s3` plus the `RS3_KEYRING_S3_*` settings. The generated output gives
-the `RS3_REPOSITORY_ID`, `RS3_REPOSITORY_SALT_HEX`,
-`RS3_KEYRING_ENVELOPE_OBJECT_ID`, and wrapping-key settings for the gateway.
-In Helm, set `repositoryKeys.source=keyring-envelope` and provide the generated
+the `RS3_KEYRING_ENVELOPE_OBJECT_ID` and wrapping-key settings for the gateway.
+In Helm, set `repositoryKeys.source=keyring-envelope`, provide the same
+operator-chosen salt through `repositoryKeys.saltHex`, and provide the generated
 envelope fields through `repositoryKeys.create=true` or an existing Secret.
+
+The bootstrap step may initialize an empty backend prefix. If the prefix already
+contains repository objects, it must verify the repository identity and envelope
+instead of creating a second repository. Helm values should stay declarative; do
+not rely on first-run mutation as recovery state.
 
 Rotate the wrapping key without rewriting backup data:
 
@@ -116,6 +123,16 @@ RS3_ANCHOR_FIELD_MANAGER=rs3-server
 
 If the configured anchor cannot be read or advanced, writes must fail closed.
 Do not silently fall back to a memory anchor.
+
+For the production preview, the Kubernetes Lease is the authority for latest
+accepted state. Storage-side checkpoint evidence is the witness. If S3 serves an
+older valid checkpoint, hides the checkpoint or evidence named by the Lease, or
+presents evidence newer than the Lease, the gateway should stop or require an
+explicit recovery workflow rather than silently choosing storage state.
+
+A trusted external anchor can distribute trust outside the cluster by
+storing or signing the accepted checkpoint position: sequence, checkpoint ID,
+and checkpoint digest. It does not need to store the whole repository index.
 
 In Helm deployments, keep `rbac.create=true` unless equivalent Lease
 permissions already exist. Set `rbac.existing=true` only for that external-RBAC
@@ -173,6 +190,11 @@ During an incident, favor read-only restore with a verified checkpoint and
 external anchor over any mode that repairs state automatically. If break-glass
 restore is added, it should require explicit operator input and leave an audit
 trail.
+
+Disaster recovery into a new cluster requires the repository ID, public salt,
+keyring-envelope object ID, unwrap authority, and trusted checkpoint position.
+Backend evidence alone is not enough to recreate trust because the backend can
+hide or replay evidence.
 
 Verify a trusted checkpoint position before relying on it for restore. Build
 `xtask` with the S3 feature when verifying an S3-compatible backend:

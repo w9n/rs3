@@ -76,7 +76,7 @@ batching, compaction jitter, and stricter telemetry redaction.
 | Envelope swaps are detectable | Signed checkpoints bind the active keyring envelope generation, object ID, and digest. | Repository key-envelope checkpoint test. |
 | Old content remains readable after rotation | Enabled historical content keys are accepted for reads. | Repository key rotation tests. |
 | Writes are not acknowledged before checkpoint acceptance | Commit coordinator waits for covering checkpoint. | Commit coordinator and checkpoint tests. |
-| Storage rollback is not trusted as latest state | Ed25519 checkpoint verification, external anchor model, and retained checkpoint evidence. | Anchor, checkpoint replay, and orphan-report tests. |
+| Storage rollback is not trusted as latest state | Ed25519 checkpoint verification, Kubernetes Lease anchor, and retained checkpoint evidence. | Anchor, checkpoint replay, restore verification, and orphan-report tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 
 ## Rollback Rule
@@ -86,11 +86,16 @@ A checkpoint is acceptable only when:
 - its signature verifies
 - its sequence is not lower than the locally trusted sequence
 - its digest matches the external anchor when an anchor exists
-- its digest matches storage-side evidence when hardened evidence is configured
+- its digest matches storage-side evidence for the accepted checkpoint
 - its parent reference is valid or it is a trusted compaction root
 
 When the configured anchor cannot be checked, the default behavior is fail
 closed. Break-glass restore modes must be explicit and auditable.
+
+The Kubernetes Lease is the production-preview authority. Storage-side evidence
+is a retained witness. Evidence that is missing, lower, higher, or conflicting
+with the Lease is not a reason to trust storage; it is a reason to stop and
+recover from an explicitly chosen checkpoint.
 
 ## Object Lock Rule
 

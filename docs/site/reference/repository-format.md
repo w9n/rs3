@@ -77,7 +77,9 @@ canonical checkpoint digest, and signed checkpoint object ID. They are retained
 with the same policy and legal hold as the checkpoint object.
 
 Evidence is not a latest-state authority. It gives operators retained storage
-history to compare with the external anchor during rollback investigations.
+history to compare with the external anchor during open, restore, and rollback
+investigations. The external anchor decides which checkpoint position is
+accepted; evidence proves what storage retained for that position.
 
 ## Keyrings
 
@@ -91,11 +93,12 @@ The repository uses purpose-specific keys for:
 New writes use primary keys. Reads and replay accept enabled historical keys
 until retention and migration policy allow retirement.
 
-The preferred bootstrap shape is to generate random purpose-specific data keys
-and store them in an encrypted keyring envelope under `keyrings/`. The unwrap
-authority, such as a KMS key or high-entropy wrapping key, stays outside the
-repository. Signed checkpoints bind the active envelope by generation, object
-ID, and digest so a backend cannot silently swap envelopes.
+The preferred bootstrap shape is to use an operator-provided repository ID and
+public salt, generate random purpose-specific data keys, and store them in an
+encrypted keyring envelope under `keyrings/`. The unwrap authority, such as a
+KMS key or high-entropy wrapping key, stays outside the repository. Signed
+checkpoints bind the active envelope by generation, object ID, and digest so a
+backend cannot silently swap envelopes.
 
 The direct gateway master-key path remains available as a compatibility and
 bootstrap path. It derives purpose-specific keys with HKDF-SHA-256 from the
