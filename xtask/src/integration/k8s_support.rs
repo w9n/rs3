@@ -16,6 +16,8 @@ pub(crate) const GATEWAY_PORT: u16 = 9080;
 pub(crate) const REPOSITORY_ID: &str = "rs3-integration-repository";
 pub(crate) const REPOSITORY_MASTER_KEY_HEX: &str =
     "1111111111111111111111111111111111111111111111111111111111111111";
+pub(crate) const REPOSITORY_SALT_HEX: &str =
+    "2222222222222222222222222222222222222222222222222222222222222222";
 pub(crate) const SECRET_ACCESS_KEY: &str = "secret";
 
 pub(crate) struct GatewayChartValues<'a> {
@@ -37,6 +39,7 @@ pub(crate) struct GatewayChartValues<'a> {
     pub(crate) payload_segment_size: usize,
     pub(crate) repository_id: &'a str,
     pub(crate) repository_master_key_hex: &'a str,
+    pub(crate) repository_salt_hex: &'a str,
     pub(crate) persistence_enabled: bool,
     pub(crate) wait_secs: u64,
 }
@@ -114,6 +117,8 @@ pub(crate) fn helm_install_gateway(
                 "repositoryKeys.masterKeyHex",
                 values.repository_master_key_hex,
             ),
+            "--set-string",
+            &helm_set_string("repositoryKeys.saltHex", values.repository_salt_hex),
             "--set",
             &format!("anchor.allowMemory={}", values.anchor_mode == "memory"),
             "--set",

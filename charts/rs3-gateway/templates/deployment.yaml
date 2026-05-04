@@ -88,6 +88,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
                   key: master-key-hex
+            - name: RS3_REPOSITORY_SALT_HEX
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
+                  key: salt-hex
             {{- end }}
             - name: RS3_ANCHOR_MODE
               value: {{ .Values.anchor.mode | quote }}

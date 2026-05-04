@@ -2,13 +2,16 @@
 
 use crate::primitives::derive_hmac;
 use crate::{CryptoError, SecretBytes};
-use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus};
+use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, RepositoryId};
 use std::collections::BTreeSet;
 
 const NAMESPACE_ALGORITHM: &str = "hmac-sha256";
 const CONTENT_ALGORITHM: &str = "xchacha20poly1305";
 const METADATA_ALGORITHM: &str = "aes-256-gcm-siv-hmac-sha256-nonce-v1";
 const CHECKPOINT_ALGORITHM: &str = "hmac-sha256";
+
+/// Minimum public repository salt length accepted by the production KDF path.
+pub const MIN_REPOSITORY_SALT_LEN: usize = 32;
 
 /// Secret-bearing keyring entry.
 #[derive(Clone, Debug)]
@@ -29,6 +32,44 @@ impl KeyMaterial {
     }
 }
 
+/// Stable public context that binds derived keys to one repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryKeyContext {
+    repository_id: RepositoryId,
+    salt: Vec<u8>,
+}
+
+impl RepositoryKeyContext {
+    /// Creates a production repository key context.
+    pub fn new(repository_id: RepositoryId, salt: Vec<u8>) -> Result<Self, CryptoError> {
+        if salt.len() < MIN_REPOSITORY_SALT_LEN {
+            return Err(CryptoError::RepositorySaltTooShort {
+                minimum_len: MIN_REPOSITORY_SALT_LEN,
+            });
+        }
+
+        Ok(Self {
+            repository_id,
+            salt,
+        })
+    }
+
+    fn legacy_without_salt(repository_id: RepositoryId) -> Self {
+        Self {
+            repository_id,
+            salt: Vec::new(),
+        }
+    }
+
+    fn repository_id(&self) -> &RepositoryId {
+        &self.repository_id
+    }
+
+    fn salt(&self) -> &[u8] {
+        &self.salt
+    }
+}
+
 /// Repository keyring with purpose-specific primary and enabled old keys.
 #[derive(Clone, Debug)]
 pub struct KeyRing {
@@ -45,13 +86,16 @@ impl KeyRing {
     /// Derives the default purpose-specific keyring from one repository master key.
     ///
     /// This uses a legacy default repository context. Gateway deployments should
-    /// use [`Self::from_repository_master_key_for_repository`] with an explicit,
-    /// stable repository identifier.
+    /// use [`Self::from_repository_master_key_for_context`] with an explicit,
+    /// stable repository identifier and salt.
     pub fn from_repository_master_key(master_key: &SecretBytes) -> Result<Self, CryptoError> {
         Self::from_repository_master_key_for_repository(master_key, "default")
     }
 
     /// Derives the default purpose-specific keyring for one repository.
+    ///
+    /// This compatibility helper binds to a repository ID without a public salt.
+    /// Gateway deployments should use [`Self::from_repository_master_key_for_context`].
     pub fn from_repository_master_key_for_repository(
         master_key: &SecretBytes,
         repository_id: &str,
@@ -59,22 +103,32 @@ impl KeyRing {
         if repository_id.is_empty() {
             return Err(CryptoError::EmptyRepositoryContext);
         }
+        let repository_id = RepositoryId::new(repository_id.to_owned())?;
+        let context = RepositoryKeyContext::legacy_without_salt(repository_id);
+        Self::from_repository_master_key_for_context(master_key, &context)
+    }
+
+    /// Derives the default purpose-specific keyring for one repository context.
+    pub fn from_repository_master_key_for_context(
+        master_key: &SecretBytes,
+        context: &RepositoryKeyContext,
+    ) -> Result<Self, CryptoError> {
         Self::new(vec![
             KeyMaterial::new(
                 default_namespace_descriptor(),
-                derive_repository_subkey(master_key, repository_id, b"namespace")?,
+                derive_repository_subkey(master_key, context, b"namespace")?,
             ),
             KeyMaterial::new(
                 default_content_descriptor(),
-                derive_repository_subkey(master_key, repository_id, b"content")?,
+                derive_repository_subkey(master_key, context, b"content")?,
             ),
             KeyMaterial::new(
                 default_metadata_descriptor(),
-                derive_repository_subkey(master_key, repository_id, b"metadata")?,
+                derive_repository_subkey(master_key, context, b"metadata")?,
             ),
             KeyMaterial::new(
                 default_checkpoint_descriptor(),
-                derive_repository_subkey(master_key, repository_id, b"checkpoint")?,
+                derive_repository_subkey(master_key, context, b"checkpoint")?,
             ),
         ])
     }
@@ -234,22 +288,27 @@ fn validate_keyring(keys: &[KeyMaterial]) -> Result<(), CryptoError> {
 
 fn derive_repository_subkey(
     master_key: &SecretBytes,
-    repository_id: &str,
+    context: &RepositoryKeyContext,
     purpose: &[u8],
 ) -> Result<SecretBytes, CryptoError> {
+    let repository_id = context.repository_id().as_str().as_bytes();
+    let salt = context.salt();
     let mut material = Vec::with_capacity(
-        repository_id
-            .len()
-            .saturating_add(1)
+        24_usize
+            .saturating_add(repository_id.len())
+            .saturating_add(salt.len())
             .saturating_add(purpose.len()),
     );
-    material.extend_from_slice(repository_id.as_bytes());
-    material.push(0);
+    material.extend_from_slice(&(repository_id.len() as u64).to_be_bytes());
+    material.extend_from_slice(repository_id);
+    material.extend_from_slice(&(salt.len() as u64).to_be_bytes());
+    material.extend_from_slice(salt);
+    material.extend_from_slice(&(purpose.len() as u64).to_be_bytes());
     material.extend_from_slice(purpose);
 
     SecretBytes::new(derive_hmac(
         master_key,
-        b"rs3:repository-subkey:v2",
+        b"rs3:repository-subkey:v3",
         &material,
     )?)
 }
@@ -323,9 +382,9 @@ fn static_key_id(value: &str) -> KeyId {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyMaterial, KeyRing};
+    use super::{KeyMaterial, KeyRing, RepositoryKeyContext};
     use crate::SecretBytes;
-    use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus};
+    use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, RepositoryId};
 
     fn secret(byte: u8) -> SecretBytes {
         match SecretBytes::new(vec![byte; SecretBytes::MIN_LEN]) {
@@ -355,6 +414,20 @@ mod tests {
             },
             secret(secret_byte),
         )
+    }
+
+    fn repository_id(value: &str) -> RepositoryId {
+        match RepositoryId::new(value) {
+            Ok(repository_id) => repository_id,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    fn repository_context(id: &str, salt_byte: u8) -> RepositoryKeyContext {
+        match RepositoryKeyContext::new(repository_id(id), vec![salt_byte; 32]) {
+            Ok(context) => context,
+            Err(error) => panic!("{error}"),
+        }
     }
 
     #[test]
@@ -394,12 +467,12 @@ mod tests {
     #[test]
     fn repository_master_key_derives_purpose_specific_keys() {
         let master_key = secret(9);
+        let context = repository_context("repository-a", 1);
 
-        let keyring =
-            match KeyRing::from_repository_master_key_for_repository(&master_key, "repository-a") {
-                Ok(keyring) => keyring,
-                Err(error) => panic!("{error}"),
-            };
+        let keyring = match KeyRing::from_repository_master_key_for_context(&master_key, &context) {
+            Ok(keyring) => keyring,
+            Err(error) => panic!("{error}"),
+        };
 
         assert_eq!(
             keyring
@@ -444,13 +517,45 @@ mod tests {
     #[test]
     fn repository_master_key_derivation_is_bound_to_repository_id() {
         let master_key = secret(9);
+        let first_context = repository_context("repository-a", 1);
+        let second_context = repository_context("repository-b", 1);
         let first =
-            match KeyRing::from_repository_master_key_for_repository(&master_key, "repository-a") {
+            match KeyRing::from_repository_master_key_for_context(&master_key, &first_context) {
                 Ok(keyring) => keyring,
                 Err(error) => panic!("{error}"),
             };
         let second =
-            match KeyRing::from_repository_master_key_for_repository(&master_key, "repository-b") {
+            match KeyRing::from_repository_master_key_for_context(&master_key, &second_context) {
+                Ok(keyring) => keyring,
+                Err(error) => panic!("{error}"),
+            };
+
+        assert_ne!(
+            first
+                .keys
+                .iter()
+                .map(|key| key.secret.expose().to_vec())
+                .collect::<Vec<_>>(),
+            second
+                .keys
+                .iter()
+                .map(|key| key.secret.expose().to_vec())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn repository_master_key_derivation_is_bound_to_repository_salt() {
+        let master_key = secret(9);
+        let first_context = repository_context("repository-a", 1);
+        let second_context = repository_context("repository-a", 2);
+        let first =
+            match KeyRing::from_repository_master_key_for_context(&master_key, &first_context) {
+                Ok(keyring) => keyring,
+                Err(error) => panic!("{error}"),
+            };
+        let second =
+            match KeyRing::from_repository_master_key_for_context(&master_key, &second_context) {
                 Ok(keyring) => keyring,
                 Err(error) => panic!("{error}"),
             };
@@ -476,5 +581,12 @@ mod tests {
         let keyring = KeyRing::from_repository_master_key_for_repository(&master_key, "");
 
         assert!(keyring.is_err());
+    }
+
+    #[test]
+    fn repository_key_context_rejects_short_salt() {
+        let context = RepositoryKeyContext::new(repository_id("repository-a"), vec![7; 31]);
+
+        assert!(context.is_err());
     }
 }

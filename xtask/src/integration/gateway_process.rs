@@ -17,6 +17,8 @@ pub(crate) const ACCESS_KEY_ID: &str = "access";
 pub(crate) const SECRET_ACCESS_KEY: &str = "secret";
 pub(crate) const REPOSITORY_MASTER_KEY_HEX: &str =
     "1111111111111111111111111111111111111111111111111111111111111111";
+pub(crate) const REPOSITORY_SALT_HEX: &str =
+    "2222222222222222222222222222222222222222222222222222222222222222";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub(crate) enum GatewayBuildProfile {
@@ -131,6 +133,7 @@ impl RunningGateway {
             .env("RS3_ANCHOR_MODE", "memory")
             .env("RS3_ALLOW_MEMORY_ANCHOR", "true")
             .env("RS3_REPOSITORY_ID", "rs3-integration-repository")
+            .env("RS3_REPOSITORY_SALT_HEX", REPOSITORY_SALT_HEX)
             .env("RS3_REPOSITORY_MASTER_KEY_HEX", REPOSITORY_MASTER_KEY_HEX)
             .env("RS3_STATIC_ACCESS_KEY_ID", ACCESS_KEY_ID)
             .env("RS3_STATIC_SECRET_ACCESS_KEY", SECRET_ACCESS_KEY)

@@ -74,6 +74,10 @@ The repository uses purpose-specific keys for:
 New writes use primary keys. Reads and replay accept enabled historical keys
 until retention and migration policy allow retirement.
 
+Gateway-derived default keyrings bind the master key to a repository ID and a
+stable public repository salt. Both values must remain unchanged for the life of
+the repository.
+
 ## Compatibility Promise
 
 There is no stable-format promise yet. Before a stable format, the project still needs final

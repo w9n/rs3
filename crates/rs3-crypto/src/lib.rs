@@ -18,7 +18,7 @@ pub use derive::{
     derive_manifest_id, derive_prefix_token,
 };
 pub use error::CryptoError;
-pub use keyring::{KeyMaterial, KeyRing};
+pub use keyring::{KeyMaterial, KeyRing, MIN_REPOSITORY_SALT_LEN, RepositoryKeyContext};
 pub use metadata::MetadataSeal;
 pub use payload::PayloadSeal;
 pub use secret::SecretBytes;

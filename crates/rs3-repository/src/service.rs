@@ -19,7 +19,7 @@ use crate::payload::{
 use crate::state::{RepositoryState, TrustedManifest, next_sequence, object_material};
 use bytes::Bytes;
 use rs3_anchor::CheckpointAnchor;
-use rs3_crypto::{KeyRing, NamespaceBlindKey, SecretBytes};
+use rs3_crypto::{KeyRing, NamespaceBlindKey, RepositoryKeyContext, SecretBytes};
 use rs3_index::{IndexDelta, NamespaceEntry};
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy};
@@ -71,8 +71,21 @@ where
     }
 
     /// Creates a trusted repository service from a repository master key.
+    ///
+    /// This compatibility helper uses the legacy default repository context.
+    /// Production gateway paths should use [`Self::from_master_key_context`].
     pub fn from_master_key(store: S, master_key: SecretBytes) -> Result<Self> {
         let keyring = KeyRing::from_repository_master_key(&master_key)?;
+        Ok(Self::with_keyring(store, keyring))
+    }
+
+    /// Creates a trusted repository service from a bound repository key context.
+    pub fn from_master_key_context(
+        store: S,
+        master_key: SecretBytes,
+        context: &RepositoryKeyContext,
+    ) -> Result<Self> {
+        let keyring = KeyRing::from_repository_master_key_for_context(&master_key, context)?;
         Ok(Self::with_keyring(store, keyring))
     }
 

@@ -1,11 +1,11 @@
 //! Runtime repository construction for the S3 service.
 
 use super::S3BoundaryError;
-use crate::config::REPOSITORY_MASTER_KEY_HEX_ENV;
+use crate::config::{REPOSITORY_MASTER_KEY_HEX_ENV, REPOSITORY_SALT_HEX_ENV};
 use crate::{AnchorConfig, BackendConfig, BatchConfig, RepositoryKeysConfig, RuntimeConfig};
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor, MemoryCheckpointAnchor};
-use rs3_crypto::{KeyRing, SecretBytes};
+use rs3_crypto::{KeyRing, RepositoryKeyContext, SecretBytes};
 #[cfg(feature = "k8s")]
 use rs3_k8s::{KubernetesLeaseAnchor, LeaseSettings};
 use rs3_repository::{
@@ -414,8 +414,10 @@ impl CheckpointAnchor for DynCheckpointAnchor {
 
 fn gateway_keyring(keys: &RepositoryKeysConfig) -> Result<KeyRing, S3BoundaryError> {
     let master_key = repository_master_key(&keys.master_key_hex)?;
-    KeyRing::from_repository_master_key_for_repository(&master_key, &keys.repository_id)
-        .map_err(repository_init)
+    let salt = repository_salt(&keys.repository_salt_hex)?;
+    let context =
+        RepositoryKeyContext::new(keys.repository_id.clone(), salt).map_err(repository_init)?;
+    KeyRing::from_repository_master_key_for_context(&master_key, &context).map_err(repository_init)
 }
 
 fn repository_master_key(secret_hex: &SecretString) -> Result<SecretBytes, S3BoundaryError> {
@@ -427,6 +429,14 @@ fn repository_master_key(secret_hex: &SecretString) -> Result<SecretBytes, S3Bou
     SecretBytes::new(bytes).map_err(|error| {
         repository_init(format!(
             "{REPOSITORY_MASTER_KEY_HEX_ENV} is not usable: {error}",
+        ))
+    })
+}
+
+fn repository_salt(salt_hex: &str) -> Result<Vec<u8>, S3BoundaryError> {
+    hex::decode(salt_hex).map_err(|error| {
+        repository_init(format!(
+            "{REPOSITORY_SALT_HEX_ENV} must be hex-encoded repository salt: {error}",
         ))
     })
 }

@@ -4,7 +4,7 @@ use rs3_server::{
     AnchorConfig, BackendConfig, BatchConfig, GatewayServer, GatewayServerError, MetricsConfig,
     RepositoryConfig, RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
 };
-use rs3_types::PublicBucket;
+use rs3_types::{PublicBucket, RepositoryId};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -125,7 +125,10 @@ fn runtime_config() -> RuntimeConfig {
             retention: None,
         },
         repository_keys: RepositoryKeysConfig {
-            repository_id: "test-repository".to_owned(),
+            repository_id: RepositoryId::new("test-repository")
+                .unwrap_or_else(|error| panic!("{error}")),
+            repository_salt_hex: "2222222222222222222222222222222222222222222222222222222222222222"
+                .to_owned(),
             master_key_hex: SecretString::from(
                 "1111111111111111111111111111111111111111111111111111111111111111",
             ),

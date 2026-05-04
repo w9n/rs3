@@ -10,12 +10,14 @@ use crate::{
 };
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, CheckpointAnchor, MemoryCheckpointAnchor};
-use rs3_crypto::KeyRing;
+use rs3_crypto::{KeyRing, RepositoryKeyContext};
 use rs3_index::{CHECKPOINT_OBJECT_DOMAIN, canonical_commit_record_bytes};
 use rs3_storage::{
     BlobStore, ByteRange, FilesystemBlobStore, MemoryBlobStore, PutOptions, StorageError,
 };
-use rs3_types::{KeyPurpose, KeyStatus, LegalHoldStatus, RetentionMode, RetentionPolicy, Sequence};
+use rs3_types::{
+    KeyPurpose, KeyStatus, LegalHoldStatus, RepositoryId, RetentionMode, RetentionPolicy, Sequence,
+};
 use std::sync::Arc;
 
 mod basic_io;

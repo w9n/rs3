@@ -1,9 +1,9 @@
 //! Runtime configuration loaded from process environment.
 
 use crate::identity::StaticCredentials;
-use rs3_crypto::SecretBytes;
+use rs3_crypto::{MIN_REPOSITORY_SALT_LEN, SecretBytes};
 use rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE;
-use rs3_types::{PublicBucket, RetentionMode, RetentionPolicy};
+use rs3_types::{PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
 use std::fmt;
 use std::net::SocketAddr;
@@ -16,10 +16,12 @@ const DEFAULT_BATCH_ITEMS: usize = 64;
 const DEFAULT_BATCH_DELAY_MS: u64 = 10;
 const REDACTED_SECRET_VALUE: &str = "<redacted>";
 const MIN_REPOSITORY_KEY_HEX_LEN: usize = SecretBytes::MIN_LEN * 2;
+const MIN_REPOSITORY_SALT_HEX_LEN: usize = MIN_REPOSITORY_SALT_LEN * 2;
 const REPOSITORY_RETENTION_MODE_ENV: &str = "RS3_REPOSITORY_RETENTION_MODE";
 const REPOSITORY_RETENTION_DAYS_ENV: &str = "RS3_REPOSITORY_RETENTION_DAYS";
 
 pub(crate) const REPOSITORY_MASTER_KEY_HEX_ENV: &str = "RS3_REPOSITORY_MASTER_KEY_HEX";
+pub(crate) const REPOSITORY_SALT_HEX_ENV: &str = "RS3_REPOSITORY_SALT_HEX";
 const REPOSITORY_ID_ENV: &str = "RS3_REPOSITORY_ID";
 const ALLOW_MEMORY_ANCHOR_ENV: &str = "RS3_ALLOW_MEMORY_ANCHOR";
 
@@ -104,7 +106,9 @@ pub struct RepositoryConfig {
 #[derive(Clone)]
 pub struct RepositoryKeysConfig {
     /// Stable repository derivation context.
-    pub repository_id: String,
+    pub repository_id: RepositoryId,
+    /// Stable public salt used with the repository ID during key derivation.
+    pub repository_salt_hex: String,
     /// Repository master key used to derive purpose-specific keys.
     pub master_key_hex: SecretString,
 }
@@ -114,6 +118,7 @@ impl fmt::Debug for RepositoryKeysConfig {
         formatter
             .debug_struct("RepositoryKeysConfig")
             .field("repository_id", &"<configured>")
+            .field("repository_salt_hex", &"<configured>")
             .field("master_key_hex", &REDACTED_SECRET_VALUE)
             .finish()
     }
@@ -122,6 +127,7 @@ impl fmt::Debug for RepositoryKeysConfig {
 impl PartialEq for RepositoryKeysConfig {
     fn eq(&self, other: &Self) -> bool {
         self.repository_id == other.repository_id
+            && self.repository_salt_hex == other.repository_salt_hex
             && secret_string_eq(&self.master_key_hex, &other.master_key_hex)
     }
 }
@@ -318,9 +324,27 @@ fn parse_repository_keys_config(
     source: &impl ConfigSource,
 ) -> Result<RepositoryKeysConfig, ConfigError> {
     Ok(RepositoryKeysConfig {
-        repository_id: required_value(source, REPOSITORY_ID_ENV)?,
+        repository_id: parse_repository_id(required_value(source, REPOSITORY_ID_ENV)?)?,
+        repository_salt_hex: required_repository_salt_hex(source, REPOSITORY_SALT_HEX_ENV)?,
         master_key_hex: required_secret_hex(source, REPOSITORY_MASTER_KEY_HEX_ENV)?,
     })
+}
+
+fn parse_repository_id(value: String) -> Result<RepositoryId, ConfigError> {
+    RepositoryId::new(value.clone()).map_err(|error| ConfigError::Invalid {
+        key: REPOSITORY_ID_ENV,
+        value,
+        reason: error.to_string(),
+    })
+}
+
+fn required_repository_salt_hex(
+    source: &impl ConfigSource,
+    key: &'static str,
+) -> Result<String, ConfigError> {
+    let value = required_value(source, key)?;
+    validate_repository_salt_hex(key, &value)?;
+    Ok(value)
 }
 
 fn required_secret_hex(
@@ -337,6 +361,29 @@ fn validate_repository_key_hex(key: &'static str, value: &str) -> Result<(), Con
         return Err(invalid_repository_key(
             key,
             "expected at least 32 bytes of hex-encoded key material",
+        ));
+    }
+    if !value.len().is_multiple_of(2) {
+        return Err(invalid_repository_key(
+            key,
+            "expected even-length hexadecimal text",
+        ));
+    }
+    if !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return Err(invalid_repository_key(
+            key,
+            "expected hexadecimal text only",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_repository_salt_hex(key: &'static str, value: &str) -> Result<(), ConfigError> {
+    if value.len() < MIN_REPOSITORY_SALT_HEX_LEN {
+        return Err(invalid_repository_key(
+            key,
+            "expected at least 32 bytes of hex-encoded repository salt",
         ));
     }
     if !value.len().is_multiple_of(2) {
@@ -542,6 +589,8 @@ mod tests {
     use std::time::Duration;
 
     const MASTER_KEY_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const REPOSITORY_SALT_HEX: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
 
     #[derive(Default)]
     struct TestSource(BTreeMap<&'static str, String>);
@@ -572,12 +621,15 @@ mod tests {
             .with("RS3_ANCHOR_MODE", "memory")
             .with(super::ALLOW_MEMORY_ANCHOR_ENV, "true")
             .with(super::REPOSITORY_ID_ENV, "test-repository")
+            .with(super::REPOSITORY_SALT_HEX_ENV, REPOSITORY_SALT_HEX)
             .with(super::REPOSITORY_MASTER_KEY_HEX_ENV, MASTER_KEY_HEX)
     }
 
     fn repository_keys_config() -> RepositoryKeysConfig {
         RepositoryKeysConfig {
-            repository_id: "test-repository".to_owned(),
+            repository_id: rs3_types::RepositoryId::new("test-repository")
+                .unwrap_or_else(|error| panic!("{error}")),
+            repository_salt_hex: REPOSITORY_SALT_HEX.to_owned(),
             master_key_hex: SecretString::from(MASTER_KEY_HEX),
         }
     }
@@ -704,6 +756,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_repository_salt() {
+        let source = minimal_source().without(super::REPOSITORY_SALT_HEX_ENV);
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Missing { key }) if key == super::REPOSITORY_SALT_HEX_ENV)
+        );
+    }
+
+    #[test]
     fn rejects_malformed_repository_key_hex() {
         let source = minimal_source().with(super::REPOSITORY_MASTER_KEY_HEX_ENV, "not-hex");
 
@@ -722,6 +785,28 @@ mod tests {
 
         assert!(
             matches!(config, Err(ConfigError::Invalid { key, value, .. }) if key == super::REPOSITORY_MASTER_KEY_HEX_ENV && value == "<redacted>")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_repository_salt_hex() {
+        let source = minimal_source().with(super::REPOSITORY_SALT_HEX_ENV, "not-hex");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, value, .. }) if key == super::REPOSITORY_SALT_HEX_ENV && value == "<redacted>")
+        );
+    }
+
+    #[test]
+    fn rejects_short_repository_salt_hex() {
+        let source = minimal_source().with(super::REPOSITORY_SALT_HEX_ENV, "aa");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, value, .. }) if key == super::REPOSITORY_SALT_HEX_ENV && value == "<redacted>")
         );
     }
 
@@ -825,6 +910,7 @@ mod tests {
         assert!(debug.contains("access"));
         assert!(!debug.contains("super-secret"));
         assert!(!debug.contains("test-repository"));
+        assert!(!debug.contains(REPOSITORY_SALT_HEX));
         assert!(!debug.contains(MASTER_KEY_HEX));
         assert!(debug.contains("<redacted>"));
     }

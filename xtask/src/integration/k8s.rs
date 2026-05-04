@@ -67,8 +67,8 @@ mod imp {
     use crate::integration::k8s_support::{
         ACCESS_KEY_ID, CHART_PATH, DEFAULT_PUBLIC_BUCKET, GATEWAY_PORT, GatewayChartValues,
         K8sWorkspace, KindCluster, PortForward, REPOSITORY_ID, REPOSITORY_MASTER_KEY_HEX,
-        SECRET_ACCESS_KEY, default_cluster_name, helm_fullname, helm_install_gateway,
-        require_command, run_command, split_image_ref,
+        REPOSITORY_SALT_HEX, SECRET_ACCESS_KEY, default_cluster_name, helm_fullname,
+        helm_install_gateway, require_command, run_command, split_image_ref,
     };
     use anyhow::{Context, Result, bail};
     use aws_sdk_s3::{
@@ -143,6 +143,7 @@ mod imp {
                 payload_segment_size: args.payload_segment_size,
                 repository_id: REPOSITORY_ID,
                 repository_master_key_hex: REPOSITORY_MASTER_KEY_HEX,
+                repository_salt_hex: REPOSITORY_SALT_HEX,
                 persistence_enabled: false,
                 wait_secs: args.wait_secs,
             },

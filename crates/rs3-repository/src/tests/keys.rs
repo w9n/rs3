@@ -39,6 +39,55 @@ fn repository_new_derives_purpose_specific_keys_from_master_key() {
     );
 }
 
+#[test]
+fn repository_from_master_key_context_binds_to_repository_salt() {
+    let repository_id = match RepositoryId::new("repository-a") {
+        Ok(repository_id) => repository_id,
+        Err(error) => panic!("{error}"),
+    };
+    let first_context = match RepositoryKeyContext::new(repository_id.clone(), vec![1; 32]) {
+        Ok(context) => context,
+        Err(error) => panic!("{error}"),
+    };
+    let second_context = match RepositoryKeyContext::new(repository_id, vec![2; 32]) {
+        Ok(context) => context,
+        Err(error) => panic!("{error}"),
+    };
+    let first =
+        match Repository::from_master_key_context(MemoryBlobStore::new(), secret(), &first_context)
+        {
+            Ok(repository) => repository,
+            Err(error) => panic!("{error}"),
+        };
+    let second = match Repository::from_master_key_context(
+        MemoryBlobStore::new(),
+        secret(),
+        &second_context,
+    ) {
+        Ok(repository) => repository,
+        Err(error) => panic!("{error}"),
+    };
+    let first_id = match first.keyring.read() {
+        Ok(keyring) => keyring.derive_backend_object_id("segments", b"same"),
+        Err(error) => panic!("{error}"),
+    };
+    let second_id = match second.keyring.read() {
+        Ok(keyring) => keyring.derive_backend_object_id("segments", b"same"),
+        Err(error) => panic!("{error}"),
+    };
+
+    let first_id = match first_id {
+        Ok(object_id) => object_id,
+        Err(error) => panic!("{error}"),
+    };
+    let second_id = match second_id {
+        Ok(object_id) => object_id,
+        Err(error) => panic!("{error}"),
+    };
+
+    assert_ne!(first_id, second_id);
+}
+
 #[tokio::test]
 async fn namespace_rotation_keeps_old_objects_readable_and_listable() {
     let repo = Repository::with_keyring(

@@ -45,6 +45,7 @@ repositoryKeys:
   create: false
   existingSecret: ""
   masterKeyHex: ""
+  saltHex: ""
 
 anchor:
   mode: kubernetes-lease

@@ -21,6 +21,12 @@ pub enum CryptoError {
     /// Repository key derivation context is empty.
     #[error("repository key derivation context must not be empty")]
     EmptyRepositoryContext,
+    /// Repository key derivation salt is too short.
+    #[error("repository key derivation salt must be at least {minimum_len} bytes")]
+    RepositorySaltTooShort {
+        /// Minimum accepted salt length.
+        minimum_len: usize,
+    },
     /// No primary key exists for the requested purpose.
     #[error("no primary key for {purpose:?}")]
     NoPrimaryKey {
