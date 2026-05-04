@@ -31,6 +31,7 @@ mod keys;
 mod namespace_privacy;
 mod orphans;
 mod payload;
+mod restore_verification;
 mod support;
 use support::*;
 pub(crate) use support::{backend_object_id, signing_keyring, wrong_content_keyring};

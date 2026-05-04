@@ -2,17 +2,23 @@
 
 use crate::checkpoint::{
     CHECKPOINT_EVIDENCE_PREFIX, CHECKPOINT_OBJECT_PREFIX, KEYRING_ENVELOPE_OBJECT_PREFIX,
-    checkpoint_evidence_object_id, checkpoint_object_id,
+    checkpoint_evidence_object_id, checkpoint_object_id, open_index_delta_object,
+    open_manifest_record,
 };
 use crate::error::{RepositoryError, Result};
 use crate::model::{
     BackendObjectReferenceKind, CheckpointPosition, ReachableBackendObject,
-    RepositoryOrphanCandidate, RepositoryOrphanReport,
+    RepositoryOrphanCandidate, RepositoryOrphanReport, RestoreVerificationReport,
 };
+use crate::payload::{open_payload_object, parse_segmented_payload_header};
 use crate::service::Repository;
-use rs3_index::IndexDelta;
-use rs3_storage::BlobStore;
-use rs3_types::BackendObjectId;
+use rs3_crypto::KeyringEnvelope;
+use rs3_index::{
+    CHECKPOINT_EVIDENCE_DOMAIN, CheckpointEvidence, IndexDelta, IndexDeltaObject,
+    checkpoint_evidence_bytes,
+};
+use rs3_storage::{BlobStore, ByteRange};
+use rs3_types::{BackendObjectId, KeyId};
 use std::collections::BTreeSet;
 
 const INDEX_DELTA_OBJECT_PREFIX: &str = "index/";
@@ -126,6 +132,106 @@ where
             candidates,
         })
     }
+
+    /// Verifies that an accepted checkpoint chain can be used for restore.
+    ///
+    /// This reads and verifies every checkpoint, checkpoint evidence object,
+    /// referenced keyring envelope, index delta, embedded manifest, and unique
+    /// payload object reachable from the accepted checkpoint chain. The report
+    /// intentionally contains counts, byte totals, and key IDs, not logical
+    /// paths or backend object IDs.
+    pub async fn verify_restore(
+        &self,
+        accepted: &CheckpointPosition,
+    ) -> Result<RestoreVerificationReport> {
+        let checkpoints = self.read_checkpoint_chain(&accepted.checkpoint_id).await?;
+        let keyring = self.keyring()?;
+        let mut previous = None;
+        let mut checkpoint_count = 0;
+        let mut checkpoint_evidence_count = 0;
+        let mut index_delta_object_count = 0;
+        let mut inline_index_delta_count = 0;
+        let mut verified_keyring_envelopes = BTreeSet::new();
+        let mut verified_payloads = BTreeSet::new();
+        let mut payload_plaintext_bytes = 0_u64;
+        let mut required_key_ids = BTreeSet::new();
+
+        for checkpoint in checkpoints.into_iter().rev() {
+            let position = self.verify_signed_checkpoint(&checkpoint, previous.as_ref())?;
+            required_key_ids.insert(checkpoint.signature_key_id.clone());
+            verify_checkpoint_evidence_object(self, &position).await?;
+            checkpoint_count += 1;
+            checkpoint_evidence_count += 1;
+
+            if let Some(envelope) = checkpoint.record.keyring_envelope.as_ref()
+                && verified_keyring_envelopes.insert(envelope.object_id.clone())
+            {
+                verify_keyring_envelope_object(self, envelope).await?;
+            }
+
+            for object_id in &checkpoint.record.index_deltas {
+                let sealed_delta = self.read_sealed_index_delta_object(object_id).await?;
+                required_key_ids.insert(sealed_delta.key_id.clone());
+                let delta = open_index_delta_object(&keyring, object_id, &sealed_delta)?;
+                verify_index_delta_payloads(
+                    self,
+                    &keyring,
+                    delta,
+                    &mut verified_payloads,
+                    &mut payload_plaintext_bytes,
+                    &mut required_key_ids,
+                )
+                .await?;
+                index_delta_object_count += 1;
+            }
+
+            if let Some(sealed_delta) = checkpoint.record.inline_index_delta.as_ref() {
+                required_key_ids.insert(sealed_delta.key_id.clone());
+                let delta = self.open_inline_index_delta_object(&checkpoint)?;
+                let Some(delta) = delta else {
+                    return Err(RepositoryError::InvalidObjectFormat {
+                        object_id: checkpoint_object_id(&checkpoint.id)?,
+                    });
+                };
+                verify_index_delta_payloads(
+                    self,
+                    &keyring,
+                    delta,
+                    &mut verified_payloads,
+                    &mut payload_plaintext_bytes,
+                    &mut required_key_ids,
+                )
+                .await?;
+                inline_index_delta_count += 1;
+            }
+
+            previous = Some(position);
+        }
+
+        let Some(loaded) = previous else {
+            return Err(RepositoryError::CheckpointConflict {
+                checkpoint_id: accepted.checkpoint_id.clone(),
+            });
+        };
+
+        if &loaded != accepted {
+            return Err(RepositoryError::CheckpointConflict {
+                checkpoint_id: accepted.checkpoint_id.clone(),
+            });
+        }
+
+        Ok(RestoreVerificationReport {
+            accepted: loaded,
+            checkpoint_count,
+            checkpoint_evidence_count,
+            index_delta_object_count,
+            inline_index_delta_count,
+            keyring_envelope_count: verified_keyring_envelopes.len(),
+            payload_object_count: verified_payloads.len(),
+            payload_plaintext_bytes,
+            required_key_ids: required_key_ids.into_iter().collect(),
+        })
+    }
 }
 
 fn insert_delta_payload_references(
@@ -140,4 +246,102 @@ fn insert_delta_payload_references(
             });
         }
     }
+}
+
+async fn verify_checkpoint_evidence_object<S>(
+    repo: &Repository<S>,
+    position: &CheckpointPosition,
+) -> Result<()>
+where
+    S: BlobStore,
+{
+    let object_id = checkpoint_evidence_object_id(position)?;
+    let expected = checkpoint_evidence_bytes(&CheckpointEvidence {
+        sequence: position.sequence,
+        checkpoint_id: position.checkpoint_id.clone(),
+        checkpoint_digest: position.payload_digest.clone(),
+        checkpoint_object_id: checkpoint_object_id(&position.checkpoint_id)?,
+    })?;
+    let body = repo.store.get_range(&object_id, ByteRange::Full).await?;
+    if !body.starts_with(CHECKPOINT_EVIDENCE_DOMAIN) || body.as_ref() != expected.as_slice() {
+        return Err(RepositoryError::CheckpointEvidenceObjectConflict { object_id });
+    }
+
+    Ok(())
+}
+
+async fn verify_keyring_envelope_object<S>(
+    repo: &Repository<S>,
+    reference: &rs3_index::KeyringEnvelopeReference,
+) -> Result<()>
+where
+    S: BlobStore,
+{
+    let body = repo
+        .store
+        .get_range(&reference.object_id, ByteRange::Full)
+        .await?;
+    let envelope = KeyringEnvelope::from_object_bytes(&body)?;
+    let digest = envelope.digest()?;
+    if envelope.generation != reference.generation || digest != reference.digest {
+        return Err(RepositoryError::KeyringEnvelopeObjectConflict {
+            object_id: reference.object_id.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+async fn verify_index_delta_payloads<S>(
+    repo: &Repository<S>,
+    keyring: &rs3_crypto::KeyRing,
+    delta: IndexDeltaObject,
+    verified_payloads: &mut BTreeSet<BackendObjectId>,
+    payload_plaintext_bytes: &mut u64,
+    required_key_ids: &mut BTreeSet<KeyId>,
+) -> Result<()>
+where
+    S: BlobStore,
+{
+    for mutation in delta.deltas {
+        let IndexDelta::Upsert {
+            entry,
+            sealed_manifest,
+            ..
+        } = mutation
+        else {
+            continue;
+        };
+        required_key_ids.insert(entry.namespace_key_id);
+        required_key_ids.insert(sealed_manifest.key_id.clone());
+        let manifest = open_manifest_record(keyring, &entry.manifest_id, &sealed_manifest)?;
+        if manifest.content_len != entry.content_len {
+            return Err(RepositoryError::InvalidObjectFormat {
+                object_id: entry.object_id,
+            });
+        }
+        if !verified_payloads.insert(entry.object_id.clone()) {
+            continue;
+        }
+
+        let body = repo
+            .store
+            .get_range(&entry.object_id, ByteRange::Full)
+            .await?;
+        let header = parse_segmented_payload_header(&entry.object_id, &body)?;
+        required_key_ids.insert(header.key_id.clone());
+        let plaintext = open_payload_object(keyring, &entry.object_id, body, ByteRange::Full)?;
+        let plaintext_len =
+            u64::try_from(plaintext.len()).map_err(|_| RepositoryError::InvalidObjectFormat {
+                object_id: entry.object_id.clone(),
+            })?;
+        if plaintext_len != entry.content_len {
+            return Err(RepositoryError::InvalidObjectFormat {
+                object_id: entry.object_id,
+            });
+        }
+        *payload_plaintext_bytes = payload_plaintext_bytes.saturating_add(plaintext_len);
+    }
+
+    Ok(())
 }

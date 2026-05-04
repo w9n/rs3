@@ -400,7 +400,10 @@ where
         Ok(checkpoints)
     }
 
-    async fn read_checkpoint_object(&self, checkpoint_id: &CheckpointId) -> Result<Checkpoint> {
+    pub(crate) async fn read_checkpoint_object(
+        &self,
+        checkpoint_id: &CheckpointId,
+    ) -> Result<Checkpoint> {
         let object_id = checkpoint_object_id(checkpoint_id)?;
         let body = self.store.get_range(&object_id, ByteRange::Full).await?;
         let Some(payload) = body.as_ref().strip_prefix(CHECKPOINT_OBJECT_DOMAIN) else {
@@ -444,6 +447,16 @@ where
         &self,
         object_id: &BackendObjectId,
     ) -> Result<IndexDeltaObject> {
+        let sealed_delta = self.read_sealed_index_delta_object(object_id).await?;
+        let keyring = self.keyring()?;
+
+        open_index_delta_object(&keyring, object_id, &sealed_delta)
+    }
+
+    pub(crate) async fn read_sealed_index_delta_object(
+        &self,
+        object_id: &BackendObjectId,
+    ) -> Result<SealedIndexDeltaObject> {
         let body = self.store.get_range(object_id, ByteRange::Full).await?;
         let expected_object_id = derive_index_delta_object_id(&body)?;
         if &expected_object_id != object_id {
@@ -456,10 +469,8 @@ where
                 object_id: object_id.clone(),
             });
         };
-        let sealed_delta = serde_json::from_slice::<SealedIndexDeltaObject>(payload)?;
-        let keyring = self.keyring()?;
 
-        open_index_delta_object(&keyring, object_id, &sealed_delta)
+        serde_json::from_slice(payload).map_err(Into::into)
     }
 
     fn load_embedded_manifest_records(
@@ -545,7 +556,7 @@ fn seal_index_delta_object(
     })
 }
 
-fn open_index_delta_object(
+pub(crate) fn open_index_delta_object(
     keyring: &KeyRing,
     object_id: &BackendObjectId,
     sealed_delta: &SealedIndexDeltaObject,
@@ -583,7 +594,7 @@ pub(crate) fn seal_manifest_record(
     })
 }
 
-fn open_manifest_record(
+pub(crate) fn open_manifest_record(
     keyring: &KeyRing,
     manifest_id: &ManifestId,
     manifest_object: &ManifestObject,

@@ -1,8 +1,8 @@
 //! Public repository operation models.
 
 use rs3_types::{
-    BackendObjectId, CheckpointId, LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy,
-    Sequence,
+    BackendObjectId, CheckpointId, KeyId, LegalHoldStatus, LogicalPath, RetentionMode,
+    RetentionPolicy, Sequence,
 };
 
 /// Options for a trusted repository PUT.
@@ -79,6 +79,29 @@ pub struct RepositoryOrphanReport {
     pub reachable: Vec<ReachableBackendObject>,
     /// Objects under repository-owned prefixes that are not referenced.
     pub candidates: Vec<RepositoryOrphanCandidate>,
+}
+
+/// Successful verification report for an accepted restore checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreVerificationReport {
+    /// Accepted checkpoint position that was verified.
+    pub accepted: CheckpointPosition,
+    /// Signed checkpoint objects verified in the parent chain.
+    pub checkpoint_count: usize,
+    /// Checkpoint evidence objects verified byte-for-byte.
+    pub checkpoint_evidence_count: usize,
+    /// Durable index delta objects verified and decrypted.
+    pub index_delta_object_count: usize,
+    /// Inline index deltas verified and decrypted.
+    pub inline_index_delta_count: usize,
+    /// Encrypted keyring envelope objects verified by digest.
+    pub keyring_envelope_count: usize,
+    /// Unique payload objects verified and decrypted.
+    pub payload_object_count: usize,
+    /// Plaintext bytes represented by unique verified payload objects.
+    pub payload_plaintext_bytes: u64,
+    /// Key identifiers required by the verified checkpoint chain.
+    pub required_key_ids: Vec<KeyId>,
 }
 
 impl RepositoryOrphanCandidate {
