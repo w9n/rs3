@@ -2,21 +2,23 @@
 
 use super::S3BoundaryError;
 use super::mapping::{
-    collect_body, content_range, etag, i64_len, list_page, logical_path, max_keys,
+    collect_body, content_range, etag, i64_len, legal_hold_header, legal_hold_output, list_page,
+    logical_path, max_keys, put_object_legal_hold_request_status, put_object_legal_hold_status,
     put_object_retention_policy, repository_error, resolve_range, retention_headers, timestamp,
-    validate_delete_object_request, validate_get_object_request, validate_head_object_request,
-    validate_put_object_request,
+    validate_delete_object_request, validate_get_object_legal_hold_request,
+    validate_get_object_request, validate_head_object_request, validate_put_object_request,
 };
 use super::runtime::RuntimeRepository;
 use crate::RuntimeConfig;
 use rs3_repository::RepositoryPutOptions;
 use rs3_storage::ByteRange;
-use rs3_types::PublicBucket;
+use rs3_types::{LegalHoldStatus, PublicBucket};
 use s3s::dto::{
-    Bucket, DeleteObjectInput, DeleteObjectOutput, GetObjectInput, GetObjectOutput,
-    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
-    ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Owner, PutObjectInput,
-    PutObjectOutput, StreamingBlob,
+    Bucket, DeleteObjectInput, DeleteObjectOutput, GetObjectInput, GetObjectLegalHoldInput,
+    GetObjectLegalHoldOutput, GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
+    HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output,
+    Owner, PutObjectInput, PutObjectLegalHoldInput, PutObjectLegalHoldOutput, PutObjectOutput,
+    StreamingBlob,
 };
 use s3s::{Body, S3, S3Request, S3Response, S3Result};
 use std::sync::Arc;
@@ -204,6 +206,7 @@ impl S3 for GatewayS3Service {
             validate_put_object_request(&input)?;
 
             let retention = put_object_retention_policy(&input)?;
+            let legal_hold = put_object_legal_hold_status(&input)?;
             let key = logical_path(input.key)?;
             let create_only = match input.if_none_match.as_ref() {
                 Some(s3s::dto::ETagCondition::Any) => true,
@@ -239,6 +242,7 @@ impl S3 for GatewayS3Service {
                     RepositoryPutOptions {
                         create_only,
                         retention,
+                        legal_hold,
                     },
                 )
                 .await
@@ -320,6 +324,7 @@ impl S3 for GatewayS3Service {
                 retention_headers(metadata.retention.as_ref(), metadata.modified_at_ms)?;
             output.object_lock_mode = object_lock_mode;
             output.object_lock_retain_until_date = object_lock_retain_until_date;
+            output.object_lock_legal_hold_status = legal_hold_header(metadata.legal_hold);
 
             let response = if let Some(range) = resolved_range {
                 output.content_range =
@@ -385,8 +390,84 @@ impl S3 for GatewayS3Service {
                 last_modified: Some(timestamp(metadata.modified_at_ms)?),
                 object_lock_mode,
                 object_lock_retain_until_date,
+                object_lock_legal_hold_status: legal_hold_header(metadata.legal_hold),
                 ..HeadObjectOutput::default()
             }))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
+    }
+
+    async fn get_object_legal_hold(
+        &self,
+        req: S3Request<GetObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        const OPERATION: &str = "GetObjectLegalHold";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
+
+        let result = async {
+            self.check_bucket(&input.bucket)?;
+            validate_get_object_legal_hold_request(&input)?;
+
+            let key = logical_path(input.key)?;
+            let metadata = self.repository.head(&key).map_err(repository_error)?;
+            Ok(S3Response::new(GetObjectLegalHoldOutput {
+                legal_hold: Some(legal_hold_output(metadata.legal_hold)),
+            }))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
+    }
+
+    async fn put_object_legal_hold(
+        &self,
+        req: S3Request<PutObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        const OPERATION: &str = "PutObjectLegalHold";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
+
+        let result = async {
+            self.check_bucket(&input.bucket)?;
+            let status = put_object_legal_hold_request_status(&input)?;
+            if status == LegalHoldStatus::Off {
+                return Err(s3s::s3_error!(
+                    AccessDenied,
+                    "clearing Object Lock legal holds through this gateway is not supported"
+                ));
+            }
+
+            let key = logical_path(input.key)?;
+            self.repository
+                .set_legal_hold_committed(key, status)
+                .await
+                .map_err(repository_error)?;
+            Ok(S3Response::new(PutObjectLegalHoldOutput::default()))
         }
         .instrument(span)
         .await;
@@ -566,10 +647,12 @@ mod tests {
     use bytes::Bytes;
     use rs3_anchor::CheckpointAnchor;
     use rs3_storage::BlobStore;
-    use rs3_types::RetentionMode;
+    use rs3_types::{LegalHoldStatus, RetentionMode};
     use s3s::dto::{
-        DeleteObjectInput, GetObjectInput, HeadBucketInput, HeadObjectInput, ListBucketsInput,
-        ListObjectsV2Input, ObjectLockMode, PutObjectInput, StreamingBlob, Timestamp,
+        DeleteObjectInput, GetObjectInput, GetObjectLegalHoldInput, HeadBucketInput,
+        HeadObjectInput, ListBucketsInput, ListObjectsV2Input, ObjectLockLegalHold,
+        ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectInput, PutObjectLegalHoldInput,
+        StreamingBlob, Timestamp,
     };
     use s3s::{Body, S3, S3Request, S3Response};
     use std::time::{Duration, SystemTime};
@@ -832,6 +915,132 @@ mod tests {
             Some(ObjectLockMode::COMPLIANCE)
         );
         assert!(head.output.object_lock_retain_until_date.is_some());
+    }
+
+    #[tokio::test]
+    async fn put_object_maps_object_lock_legal_hold() {
+        let service = gateway_service().await;
+
+        let put = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/held.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(b"held")))),
+                object_lock_legal_hold_status: Some(ObjectLockLegalHoldStatus::from_static(
+                    ObjectLockLegalHoldStatus::ON,
+                )),
+                ..PutObjectInput::default()
+            }))
+            .await;
+        assert!(put.is_ok());
+
+        let backend_objects = service
+            .repository
+            .memory_store()
+            .unwrap_or_else(|| panic!("missing memory store"))
+            .list_prefix("segments/")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            backend_objects
+                .first()
+                .and_then(|metadata| metadata.legal_hold),
+            Some(LegalHoldStatus::On)
+        );
+
+        let head = service
+            .head_object(s3_request(HeadObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/held.bin".to_owned(),
+                ..HeadObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            head.output
+                .object_lock_legal_hold_status
+                .as_ref()
+                .map(|status| status.as_str()),
+            Some(ObjectLockLegalHoldStatus::ON)
+        );
+    }
+
+    #[tokio::test]
+    async fn object_legal_hold_operations_support_enable_and_read() {
+        let service = gateway_service().await;
+        let put = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/legal-hold-api.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(b"held")))),
+                ..PutObjectInput::default()
+            }))
+            .await;
+        assert!(put.is_ok());
+
+        let enable = service
+            .put_object_legal_hold(s3_request(PutObjectLegalHoldInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/legal-hold-api.bin".to_owned(),
+                legal_hold: Some(ObjectLockLegalHold {
+                    status: Some(ObjectLockLegalHoldStatus::from_static(
+                        ObjectLockLegalHoldStatus::ON,
+                    )),
+                }),
+                ..PutObjectLegalHoldInput::default()
+            }))
+            .await;
+        assert!(enable.is_ok());
+
+        let get = service
+            .get_object_legal_hold(s3_request(GetObjectLegalHoldInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/legal-hold-api.bin".to_owned(),
+                ..GetObjectLegalHoldInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            get.output
+                .legal_hold
+                .as_ref()
+                .and_then(|hold| hold.status.as_ref())
+                .map(|status| status.as_str()),
+            Some(ObjectLockLegalHoldStatus::ON)
+        );
+    }
+
+    #[tokio::test]
+    async fn put_object_legal_hold_refuses_release() {
+        let service = gateway_service().await;
+        let put = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/legal-hold-release.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(b"held")))),
+                object_lock_legal_hold_status: Some(ObjectLockLegalHoldStatus::from_static(
+                    ObjectLockLegalHoldStatus::ON,
+                )),
+                ..PutObjectInput::default()
+            }))
+            .await;
+        assert!(put.is_ok());
+
+        let release = service
+            .put_object_legal_hold(s3_request(PutObjectLegalHoldInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/legal-hold-release.bin".to_owned(),
+                legal_hold: Some(ObjectLockLegalHold {
+                    status: Some(ObjectLockLegalHoldStatus::from_static(
+                        ObjectLockLegalHoldStatus::OFF,
+                    )),
+                }),
+                ..PutObjectLegalHoldInput::default()
+            }))
+            .await
+            .expect_err("gateway should not clear legal hold");
+
+        assert_eq!(*release.code(), s3s::S3ErrorCode::AccessDenied);
     }
 
     #[tokio::test]

@@ -557,6 +557,9 @@ fn parse_gateway_backend_counts(logs: &[String]) -> BlobOperationCounts {
             "extend_retention" => {
                 counts.extend_retention = counts.extend_retention.saturating_add(1);
             }
+            "set_legal_hold" => {
+                counts.set_legal_hold = counts.set_legal_hold.saturating_add(1);
+            }
             _ => continue,
         }
 

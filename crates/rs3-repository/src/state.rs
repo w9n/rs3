@@ -3,7 +3,7 @@
 use crate::error::{RepositoryError, Result};
 use crate::model::RepositoryObjectMetadata;
 use rs3_index::{DurableManifest, IndexDelta, IndexDeltaObject, NamespaceIndex};
-use rs3_types::{LogicalPath, ManifestId, RetentionPolicy, Sequence};
+use rs3_types::{LegalHoldStatus, LogicalPath, ManifestId, RetentionPolicy, Sequence};
 use std::collections::BTreeMap;
 
 /// Trusted manifest metadata used by the current in-memory query model.
@@ -17,6 +17,8 @@ pub(crate) struct TrustedManifest {
     pub(crate) modified_at_ms: i64,
     /// Effective retention policy, if known.
     pub(crate) retention: Option<RetentionPolicy>,
+    /// Effective legal-hold status, if known.
+    pub(crate) legal_hold: Option<LegalHoldStatus>,
 }
 
 /// Mutable repository state guarded by the repository lock.
@@ -51,6 +53,7 @@ impl TrustedManifest {
             content_len: self.content_len,
             modified_at_ms: self.modified_at_ms,
             retention: self.retention,
+            legal_hold: self.legal_hold,
         }
     }
 
@@ -61,6 +64,7 @@ impl TrustedManifest {
             content_len: self.content_len,
             modified_at_ms: self.modified_at_ms,
             retention: self.retention,
+            legal_hold: self.legal_hold,
         }
     }
 
@@ -71,6 +75,7 @@ impl TrustedManifest {
             content_len: manifest.content_len,
             modified_at_ms: manifest.modified_at_ms,
             retention: manifest.retention,
+            legal_hold: manifest.legal_hold,
         }
     }
 }

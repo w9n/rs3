@@ -323,6 +323,15 @@ pub enum RetentionMode {
     Compliance,
 }
 
+/// Legal-hold status for backend object versions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LegalHoldStatus {
+    /// No provider legal hold is requested.
+    Off,
+    /// Provider legal hold is requested and should block deletion.
+    On,
+}
+
 /// Retention policy for backend object versions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetentionPolicy {

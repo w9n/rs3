@@ -4,11 +4,12 @@ use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use rs3_repository::{RepositoryError, RepositoryListEntry};
 use rs3_storage::StorageError;
-use rs3_types::{LogicalPath, RetentionMode, RetentionPolicy};
+use rs3_types::{LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy};
 use s3s::S3Result;
 use s3s::dto::{
-    CommonPrefix, DeleteObjectInput, GetObjectInput, HeadObjectInput, Object, PutObjectInput,
-    StreamingBlob, Timestamp,
+    CommonPrefix, DeleteObjectInput, GetObjectInput, GetObjectLegalHoldInput, HeadObjectInput,
+    Object, ObjectLockLegalHold, ObjectLockLegalHoldStatus, PutObjectInput,
+    PutObjectLegalHoldInput, StreamingBlob, Timestamp,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -59,13 +60,17 @@ pub(super) fn validate_put_object_request(input: &PutObjectInput) -> S3Result<()
             "append-style PutObject is not supported"
         ));
     }
-    if input.object_lock_legal_hold_status.is_some() {
-        return Err(s3s::s3_error!(
-            NotImplemented,
-            "Object Lock legal holds are not supported"
-        ));
-    }
     Ok(())
+}
+
+pub(super) fn put_object_legal_hold_status(
+    input: &PutObjectInput,
+) -> S3Result<Option<LegalHoldStatus>> {
+    input
+        .object_lock_legal_hold_status
+        .as_ref()
+        .map(legal_hold_status)
+        .transpose()
 }
 
 pub(super) fn put_object_retention_policy(
@@ -149,6 +154,35 @@ pub(super) fn validate_delete_object_request(input: &DeleteObjectInput) -> S3Res
         ));
     }
     Ok(())
+}
+
+pub(super) fn validate_get_object_legal_hold_request(
+    input: &GetObjectLegalHoldInput,
+) -> S3Result<()> {
+    if input.version_id.is_some() {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "versioned GetObjectLegalHold is not supported"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn put_object_legal_hold_request_status(
+    input: &PutObjectLegalHoldInput,
+) -> S3Result<LegalHoldStatus> {
+    if input.version_id.is_some() {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "versioned PutObjectLegalHold is not supported"
+        ));
+    }
+    let status = input
+        .legal_hold
+        .as_ref()
+        .and_then(|legal_hold| legal_hold.status.as_ref())
+        .ok_or_else(|| s3s::s3_error!(InvalidRequest, "legal hold status is required"))?;
+    legal_hold_status(status)
 }
 
 pub(super) fn logical_path(key: String) -> S3Result<LogicalPath> {
@@ -302,6 +336,40 @@ pub(super) fn retention_headers(
     Ok((Some(mode), Some(timestamp(retain_until_ms)?)))
 }
 
+pub(super) fn legal_hold_header(
+    status: Option<LegalHoldStatus>,
+) -> Option<ObjectLockLegalHoldStatus> {
+    status.map(s3_legal_hold_status)
+}
+
+pub(super) fn legal_hold_output(status: Option<LegalHoldStatus>) -> ObjectLockLegalHold {
+    ObjectLockLegalHold {
+        status: Some(s3_legal_hold_status(status.unwrap_or(LegalHoldStatus::Off))),
+    }
+}
+
+fn legal_hold_status(status: &ObjectLockLegalHoldStatus) -> S3Result<LegalHoldStatus> {
+    match status.as_str() {
+        ObjectLockLegalHoldStatus::ON => Ok(LegalHoldStatus::On),
+        ObjectLockLegalHoldStatus::OFF => Ok(LegalHoldStatus::Off),
+        _ => Err(s3s::s3_error!(
+            InvalidRequest,
+            "Object Lock legal hold status is not supported"
+        )),
+    }
+}
+
+fn s3_legal_hold_status(status: LegalHoldStatus) -> ObjectLockLegalHoldStatus {
+    match status {
+        LegalHoldStatus::Off => {
+            ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)
+        }
+        LegalHoldStatus::On => {
+            ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)
+        }
+    }
+}
+
 fn timestamp_system_time(timestamp: &Timestamp) -> S3Result<SystemTime> {
     let date_time: time::OffsetDateTime = timestamp.clone().into();
     let seconds = u64::try_from(date_time.unix_timestamp())
@@ -323,12 +391,26 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
             s3s::s3_error!(ServiceUnavailable, "commit coordinator is overloaded")
         }
         RepositoryError::Storage(StorageError::InvalidRange) => s3s::s3_error!(InvalidRange),
+        RepositoryError::Storage(StorageError::LegalHoldBlocked) => {
+            s3s::s3_error!(AccessDenied, "object legal hold blocked the operation")
+        }
+        RepositoryError::Storage(StorageError::LegalHoldUnsupported) => {
+            s3s::s3_error!(NotImplemented, "Object Lock legal hold is not supported")
+        }
+        RepositoryError::Storage(StorageError::RetentionBlocked) => {
+            s3s::s3_error!(AccessDenied, "object retention blocked the operation")
+        }
+        RepositoryError::Storage(StorageError::RetentionExtensionUnsupported) => {
+            s3s::s3_error!(NotImplemented, "Object Lock retention is not supported")
+        }
         RepositoryError::Type(_) => s3s::s3_error!(InvalidRequest, "invalid repository path"),
         RepositoryError::CommitFailed { .. }
         | RepositoryError::SequenceOverflow
         | RepositoryError::StatePoisoned
         | RepositoryError::Crypto(_)
-        | RepositoryError::Storage(_)
+        | RepositoryError::Storage(StorageError::AlreadyExists(_))
+        | RepositoryError::Storage(StorageError::NotFound(_))
+        | RepositoryError::Storage(StorageError::Provider(_))
         | RepositoryError::Anchor(_)
         | RepositoryError::CheckpointEncoding(_)
         | RepositoryError::CheckpointIdMismatch

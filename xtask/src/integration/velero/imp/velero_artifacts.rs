@@ -418,6 +418,7 @@ fn gateway_backend_metrics_json(logs: &str) -> Value {
             "list": counts.list,
             "delete": counts.delete,
             "extend_retention": counts.extend_retention,
+            "set_legal_hold": counts.set_legal_hold,
             "flush": counts.flush,
             "bytes_written": counts.bytes_written,
             "bytes_read": counts.bytes_read,
@@ -504,6 +505,9 @@ fn increment_blob_counts(counts: &mut BlobOperationCounts, operation: &str, fiel
         "delete" => counts.delete = counts.delete.saturating_add(1),
         "extend_retention" => {
             counts.extend_retention = counts.extend_retention.saturating_add(1);
+        }
+        "set_legal_hold" => {
+            counts.set_legal_hold = counts.set_legal_hold.saturating_add(1);
         }
         "flush" => counts.flush = counts.flush.saturating_add(1),
         _ => {}
@@ -680,6 +684,7 @@ fn derived_metrics(counts: &BlobOperationCounts, repository: &RepositoryMetrics)
         .saturating_add(counts.list)
         .saturating_add(counts.delete)
         .saturating_add(counts.extend_retention)
+        .saturating_add(counts.set_legal_hold)
         .saturating_add(counts.flush);
     let repository_mutations = repository.put_count.saturating_add(repository.delete_count);
 

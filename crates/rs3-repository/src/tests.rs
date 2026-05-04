@@ -17,8 +17,8 @@ use rs3_storage::{
     StorageError,
 };
 use rs3_types::{
-    BackendObjectId, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath,
-    RetentionMode, RetentionPolicy, Sequence,
+    BackendObjectId, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LegalHoldStatus,
+    LogicalPath, RetentionMode, RetentionPolicy, Sequence,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -411,6 +411,14 @@ impl BlobStore for FailOncePutStore {
         self.inner.extend_retention(object_id, policy).await
     }
 
+    async fn set_legal_hold(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        status: rs3_types::LegalHoldStatus,
+    ) -> rs3_storage::Result<()> {
+        self.inner.set_legal_hold(object_id, status).await
+    }
+
     async fn flush_caches(&self) -> rs3_storage::Result<()> {
         self.inner.flush_caches().await
     }
@@ -508,6 +516,14 @@ impl BlobStore for PauseFirstSegmentPutStore {
         self.inner.extend_retention(object_id, policy).await
     }
 
+    async fn set_legal_hold(
+        &self,
+        object_id: &BackendObjectId,
+        status: rs3_types::LegalHoldStatus,
+    ) -> rs3_storage::Result<()> {
+        self.inner.set_legal_hold(object_id, status).await
+    }
+
     async fn flush_caches(&self) -> rs3_storage::Result<()> {
         self.inner.flush_caches().await
     }
@@ -560,6 +576,14 @@ impl BlobStore for NoPutTimestampStore {
         policy: RetentionPolicy,
     ) -> rs3_storage::Result<()> {
         self.inner.extend_retention(object_id, policy).await
+    }
+
+    async fn set_legal_hold(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        status: rs3_types::LegalHoldStatus,
+    ) -> rs3_storage::Result<()> {
+        self.inner.set_legal_hold(object_id, status).await
     }
 
     async fn flush_caches(&self) -> rs3_storage::Result<()> {
@@ -1070,6 +1094,7 @@ async fn create_only_rejects_existing_namespace_entry() {
     let options = RepositoryPutOptions {
         create_only: true,
         retention: None,
+        legal_hold: None,
     };
 
     let first = repo
@@ -1215,6 +1240,7 @@ async fn create_only_rejects_existing_entry_under_old_namespace_key() {
             RepositoryPutOptions {
                 create_only: true,
                 retention: None,
+                legal_hold: None,
             },
         )
         .await;
@@ -2669,6 +2695,7 @@ async fn delete_tombstones_namespace_and_retains_locked_backend_object() {
     let options = RepositoryPutOptions {
         create_only: true,
         retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
+        legal_hold: None,
     };
 
     let put = repo
@@ -2683,6 +2710,52 @@ async fn delete_tombstones_namespace_and_retains_locked_backend_object() {
     assert_eq!(must(delete).physical, PhysicalDeleteOutcome::Retained);
     assert_eq!(must(listed).len(), 0);
     assert_eq!(must_storage(retained).len(), 1);
+}
+
+#[tokio::test]
+async fn delete_tombstones_namespace_and_retains_legal_held_backend_object() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::new(store.clone(), secret());
+    let key = key("p/12/held");
+    let options = RepositoryPutOptions {
+        create_only: true,
+        retention: None,
+        legal_hold: Some(LegalHoldStatus::On),
+    };
+
+    let put = repo
+        .put(key.clone(), Bytes::from_static(b"held"), options)
+        .await;
+    assert!(put.is_ok());
+
+    let delete = repo.delete(&key).await;
+    let listed = repo.list("p/12");
+    let retained = store.list_prefix("segments/").await;
+
+    assert_eq!(must(delete).physical, PhysicalDeleteOutcome::Retained);
+    assert_eq!(must(listed).len(), 0);
+    assert_eq!(must_storage(retained).len(), 1);
+}
+
+#[tokio::test]
+async fn legal_hold_update_updates_repository_metadata() {
+    let repo = Repository::new(MemoryBlobStore::new(), secret());
+    let key = key("p/12/legal-hold");
+
+    let put = repo
+        .put(
+            key.clone(),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let held = repo.set_legal_hold(&key, LegalHoldStatus::On).await;
+    let head = repo.head(&key);
+
+    assert_eq!(must(held).legal_hold, Some(LegalHoldStatus::On));
+    assert_eq!(must(head).legal_hold, Some(LegalHoldStatus::On));
 }
 
 #[tokio::test]
@@ -2728,6 +2801,45 @@ async fn default_retention_applies_to_payload_and_checkpoint() {
 }
 
 #[tokio::test]
+async fn legal_hold_applies_to_payload_and_checkpoint() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
+    let anchor = MemoryCheckpointAnchor::new();
+
+    let put = repo
+        .put_committed(
+            key("p/12/legal-hold-checkpoint"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions {
+                create_only: false,
+                retention: None,
+                legal_hold: Some(LegalHoldStatus::On),
+            },
+            &anchor,
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let payloads = store
+        .list_prefix("segments/")
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let checkpoints = store
+        .list_prefix(CHECKPOINT_OBJECT_PREFIX)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    assert_eq!(
+        payloads.first().and_then(|metadata| metadata.legal_hold),
+        Some(LegalHoldStatus::On)
+    );
+    assert_eq!(
+        checkpoints.first().and_then(|metadata| metadata.legal_hold),
+        Some(LegalHoldStatus::On)
+    );
+}
+
+#[tokio::test]
 async fn retention_extension_updates_repository_metadata() {
     let repo = Repository::new(MemoryBlobStore::new(), secret());
     let key = key("p/12/abcdef");
@@ -2739,6 +2851,7 @@ async fn retention_extension_updates_repository_metadata() {
             RepositoryPutOptions {
                 create_only: true,
                 retention: Some(RetentionPolicy::new(RetentionMode::Governance, 10)),
+                legal_hold: None,
             },
         )
         .await;

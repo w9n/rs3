@@ -2,7 +2,7 @@
 
 use rs3_types::{
     BackendObjectId, BlindIndexKey, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
-    ManifestId, PrefixToken, RetentionPolicy, Sequence,
+    LegalHoldStatus, ManifestId, PrefixToken, RetentionPolicy, Sequence,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -91,6 +91,9 @@ pub struct DurableManifest {
     pub modified_at_ms: i64,
     /// Effective retention policy, if known.
     pub retention: Option<RetentionPolicy>,
+    /// Effective legal-hold status, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legal_hold: Option<LegalHoldStatus>,
 }
 
 /// Sealed client-visible metadata embedded in an index delta.
@@ -247,6 +250,9 @@ pub struct NamespaceEntry {
     pub generation: Sequence,
     /// Effective retention policy, if known.
     pub retention: Option<RetentionPolicy>,
+    /// Effective legal-hold status, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legal_hold: Option<LegalHoldStatus>,
 }
 
 /// Tombstone for a removed namespace entry.
@@ -435,6 +441,7 @@ mod tests {
             modified_at_ms: 7,
             generation: Sequence::new(1),
             retention: None,
+            legal_hold: None,
         }
     }
 
@@ -603,6 +610,7 @@ mod tests {
             content_len: 42,
             modified_at_ms: 7,
             retention: None,
+            legal_hold: None,
         };
 
         let plaintext = manifest_plaintext_bytes(&manifest);

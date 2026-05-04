@@ -3,7 +3,7 @@
 use crate::{
     BlobMetadata, BlobStore, ByteRange, PutOptions, Result, StorageError, object_kind, prefix_kind,
     record_blob_delete, record_blob_extend_retention, record_blob_get, record_blob_head,
-    record_blob_list, record_blob_put,
+    record_blob_list, record_blob_put, record_blob_set_legal_hold,
 };
 use async_trait::async_trait;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
@@ -12,7 +12,8 @@ use aws_sdk_s3::{
     Client as SdkS3Client,
     config::{BehaviorVersion, Credentials, Region},
     types::{
-        BucketVersioningStatus, ChecksumAlgorithm, ObjectLockEnabled,
+        BucketVersioningStatus, ChecksumAlgorithm, ObjectLockEnabled, ObjectLockLegalHold,
+        ObjectLockLegalHoldStatus as SdkObjectLockLegalHoldStatus,
         ObjectLockMode as SdkObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode,
     },
 };
@@ -24,7 +25,7 @@ use object_store::{
     Attribute, Attributes, GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
     PutOptions as ObjectPutOptions,
 };
-use rs3_types::{BackendObjectId, RetentionMode, RetentionPolicy};
+use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -150,6 +151,8 @@ pub struct S3ProviderMetrics {
     pub delete: S3ProviderOperationMetrics,
     /// Retention-extension operation metrics.
     pub extend_retention: S3ProviderOperationMetrics,
+    /// Legal-hold update operation metrics.
+    pub set_legal_hold: S3ProviderOperationMetrics,
 }
 
 /// Per-operation S3 provider metrics.
@@ -317,19 +320,21 @@ impl S3BlobStore {
         object_path(&self.config.object_key(object_id))
     }
 
-    async fn put_retained_object(
+    async fn put_object_lock_object(
         &self,
         object_id: &BackendObjectId,
         body: Bytes,
         options: &PutOptions,
-        retention: &RetentionPolicy,
+        retention: Option<&RetentionPolicy>,
+        legal_hold: Option<LegalHoldStatus>,
     ) -> Result<BlobMetadata> {
-        let client = self
-            .sdk_client
-            .as_ref()
-            .ok_or(StorageError::RetentionExtensionUnsupported)?;
-        let retain_until = retain_until_date(retention)?;
-        let lock_mode = sdk_object_lock_mode(retention)?;
+        let client = self.sdk_client.as_ref().ok_or_else(|| {
+            if retention.is_some() {
+                StorageError::RetentionExtensionUnsupported
+            } else {
+                StorageError::LegalHoldUnsupported
+            }
+        })?;
         let key = self.config.object_key(object_id);
         let content_len = u64::try_from(body.len())
             .map_err(|_| StorageError::Provider("object length does not fit in u64".to_owned()))?;
@@ -338,9 +343,16 @@ impl S3BlobStore {
             .bucket(self.config.bucket.as_str())
             .key(key)
             .body(SdkByteStream::from(body))
-            .checksum_algorithm(ChecksumAlgorithm::Sha256)
-            .object_lock_mode(lock_mode)
-            .object_lock_retain_until_date(retain_until);
+            .checksum_algorithm(ChecksumAlgorithm::Sha256);
+
+        if let Some(retention) = retention {
+            request = request
+                .object_lock_mode(sdk_object_lock_mode(retention)?)
+                .object_lock_retain_until_date(retain_until_date(retention)?);
+        }
+        if let Some(legal_hold) = legal_hold {
+            request = request.object_lock_legal_hold_status(sdk_legal_hold_status(legal_hold));
+        }
 
         if options.do_not_recreate {
             request = request.if_none_match("*");
@@ -355,7 +367,12 @@ impl S3BlobStore {
             .map_err(|error| map_sdk_put_error(error, object_id))?;
         let version_id = output.version_id().map(str::to_owned);
         let mut metadata = self.head_with_sdk(object_id, version_id.as_deref()).await?;
-        verify_retention(metadata.retention.as_ref(), retention)?;
+        if let Some(retention) = retention {
+            verify_retention(metadata.retention.as_ref(), retention)?;
+        }
+        if let Some(legal_hold) = legal_hold {
+            verify_legal_hold(metadata.legal_hold, legal_hold)?;
+        }
         metadata.content_len = content_len;
         metadata.etag = output.e_tag().map(str::to_owned).or(metadata.etag);
         metadata.version_id = version_id.or(metadata.version_id);
@@ -400,6 +417,7 @@ impl S3BlobStore {
             output.object_lock_mode(),
             output.object_lock_retain_until_date(),
         )?;
+        let legal_hold = legal_hold_from_s3_head(output.object_lock_legal_hold_status())?;
 
         Ok(BlobMetadata {
             object_id: object_id.clone(),
@@ -408,6 +426,7 @@ impl S3BlobStore {
             etag: output.e_tag().map(str::to_owned),
             version_id: output.version_id().map(str::to_owned),
             retention,
+            legal_hold,
         })
     }
 
@@ -446,6 +465,41 @@ impl S3BlobStore {
         verify_retention(verified.retention.as_ref(), policy)
     }
 
+    async fn set_s3_legal_hold(
+        &self,
+        object_id: &BackendObjectId,
+        status: LegalHoldStatus,
+    ) -> Result<()> {
+        let client = self
+            .sdk_client
+            .as_ref()
+            .ok_or(StorageError::LegalHoldUnsupported)?;
+        let legal_hold = ObjectLockLegalHold::builder()
+            .status(sdk_legal_hold_status(status))
+            .build();
+        client
+            .put_object_legal_hold()
+            .bucket(self.config.bucket.as_str())
+            .key(self.config.object_key(object_id))
+            .legal_hold(legal_hold)
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
+            .send()
+            .await
+            .map_err(|error| map_sdk_common_error(error, object_id))?;
+
+        let verified = client
+            .get_object_legal_hold()
+            .bucket(self.config.bucket.as_str())
+            .key(self.config.object_key(object_id))
+            .send()
+            .await
+            .map_err(|error| map_sdk_common_error(error, object_id))?;
+        verify_legal_hold(
+            legal_hold_from_s3_legal_hold(verified.legal_hold())?,
+            status,
+        )
+    }
+
     fn record_provider_operation(
         &self,
         operation: S3ProviderOperation,
@@ -466,6 +520,7 @@ impl S3BlobStore {
             S3ProviderOperation::List => &mut metrics.list,
             S3ProviderOperation::Delete => &mut metrics.delete,
             S3ProviderOperation::ExtendRetention => &mut metrics.extend_retention,
+            S3ProviderOperation::SetLegalHold => &mut metrics.set_legal_hold,
         };
         operation_metrics.requests = operation_metrics.requests.saturating_add(1);
         if result == "ok" {
@@ -562,13 +617,14 @@ impl BlobStore for S3BlobStore {
         let bytes_sent = u64::try_from(requested_len)
             .map_err(|_| StorageError::Provider("object length does not fit in u64".to_owned()))?;
 
-        if let Some(retention) = options
+        let retention = options
             .retention
             .as_ref()
-            .filter(|policy| retention_is_active(policy))
-        {
+            .filter(|policy| retention_is_active(policy));
+        let legal_hold = provider_legal_hold(options.legal_hold);
+        if retention.is_some() || legal_hold.is_some() {
             let result = self
-                .put_retained_object(object_id, body, &options, retention)
+                .put_object_lock_object(object_id, body, &options, retention, legal_hold)
                 .await;
             let result_label = match &result {
                 Ok(_) => "ok",
@@ -616,6 +672,7 @@ impl BlobStore for S3BlobStore {
                     etag: output.e_tag,
                     version_id: output.version,
                     retention: None,
+                    legal_hold: None,
                 })
             }
             Err(error) => {
@@ -834,29 +891,81 @@ impl BlobStore for S3BlobStore {
         let object_kind = object_kind(object_id);
         let path = self.object_path(object_id)?;
 
-        match self.store.head(&path).await {
-            Ok(_) => {
-                self.record_provider_operation(
-                    S3ProviderOperation::Head,
-                    object_kind,
-                    "ok",
-                    0,
-                    0,
-                    started.elapsed(),
-                )?;
+        if self.sdk_client.is_some() {
+            match self.head_with_sdk(object_id, None).await {
+                Ok(metadata) if retention_blocks_delete(metadata.retention.as_ref()) => {
+                    self.record_provider_operation(
+                        S3ProviderOperation::Head,
+                        object_kind,
+                        "retention_blocked",
+                        0,
+                        0,
+                        started.elapsed(),
+                    )?;
+                    record_blob_delete(object_kind, "retention_blocked", started.elapsed());
+                    return Err(StorageError::RetentionBlocked);
+                }
+                Ok(metadata) if legal_hold_blocks_delete(metadata.legal_hold) => {
+                    self.record_provider_operation(
+                        S3ProviderOperation::Head,
+                        object_kind,
+                        "legal_hold_blocked",
+                        0,
+                        0,
+                        started.elapsed(),
+                    )?;
+                    record_blob_delete(object_kind, "legal_hold_blocked", started.elapsed());
+                    return Err(StorageError::LegalHoldBlocked);
+                }
+                Ok(_) => {
+                    self.record_provider_operation(
+                        S3ProviderOperation::Head,
+                        object_kind,
+                        "ok",
+                        0,
+                        0,
+                        started.elapsed(),
+                    )?;
+                }
+                Err(error) => {
+                    let result = storage_error_result(&error);
+                    self.record_provider_operation(
+                        S3ProviderOperation::Head,
+                        object_kind,
+                        result,
+                        0,
+                        0,
+                        started.elapsed(),
+                    )?;
+                    record_blob_delete(object_kind, result, started.elapsed());
+                    return Err(error);
+                }
             }
-            Err(error) => {
-                let result = common_error_result(&error);
-                self.record_provider_operation(
-                    S3ProviderOperation::Head,
-                    object_kind,
-                    result,
-                    0,
-                    0,
-                    started.elapsed(),
-                )?;
-                record_blob_delete(object_kind, result, started.elapsed());
-                return Err(map_common_error(error, object_id));
+        } else {
+            match self.store.head(&path).await {
+                Ok(_) => {
+                    self.record_provider_operation(
+                        S3ProviderOperation::Head,
+                        object_kind,
+                        "ok",
+                        0,
+                        0,
+                        started.elapsed(),
+                    )?;
+                }
+                Err(error) => {
+                    let result = common_error_result(&error);
+                    self.record_provider_operation(
+                        S3ProviderOperation::Head,
+                        object_kind,
+                        result,
+                        0,
+                        0,
+                        started.elapsed(),
+                    )?;
+                    record_blob_delete(object_kind, result, started.elapsed());
+                    return Err(map_common_error(error, object_id));
+                }
             }
         }
 
@@ -913,6 +1022,30 @@ impl BlobStore for S3BlobStore {
         result
     }
 
+    async fn set_legal_hold(
+        &self,
+        object_id: &BackendObjectId,
+        status: LegalHoldStatus,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
+        let result = self.set_s3_legal_hold(object_id, status).await;
+        let result_label = match &result {
+            Ok(()) => "ok",
+            Err(error) => storage_error_result(error),
+        };
+        self.record_provider_operation(
+            S3ProviderOperation::SetLegalHold,
+            object_kind,
+            result_label,
+            0,
+            0,
+            started.elapsed(),
+        )?;
+        record_blob_set_legal_hold(object_kind, result_label, started.elapsed());
+        result
+    }
+
     async fn flush_caches(&self) -> Result<()> {
         Ok(())
     }
@@ -926,6 +1059,7 @@ enum S3ProviderOperation {
     List,
     Delete,
     ExtendRetention,
+    SetLegalHold,
 }
 
 impl S3ProviderOperation {
@@ -937,6 +1071,7 @@ impl S3ProviderOperation {
             Self::List => "list",
             Self::Delete => "delete",
             Self::ExtendRetention => "extend_retention",
+            Self::SetLegalHold => "set_legal_hold",
         }
     }
 }
@@ -1094,6 +1229,18 @@ fn retention_is_active(policy: &RetentionPolicy) -> bool {
     policy.mode != RetentionMode::None && policy.retain_days > 0
 }
 
+fn retention_blocks_delete(policy: Option<&RetentionPolicy>) -> bool {
+    policy.is_some_and(retention_is_active)
+}
+
+fn legal_hold_blocks_delete(status: Option<LegalHoldStatus>) -> bool {
+    status == Some(LegalHoldStatus::On)
+}
+
+fn provider_legal_hold(status: Option<LegalHoldStatus>) -> Option<LegalHoldStatus> {
+    status.filter(|status| *status == LegalHoldStatus::On)
+}
+
 fn retain_until_date(policy: &RetentionPolicy) -> Result<SdkDateTime> {
     let now_secs = current_epoch_secs()?;
     let retain_secs = i64::from(policy.retain_days)
@@ -1134,6 +1281,13 @@ fn sdk_object_lock_retention_mode(policy: &RetentionPolicy) -> Result<ObjectLock
     }
 }
 
+fn sdk_legal_hold_status(status: LegalHoldStatus) -> SdkObjectLockLegalHoldStatus {
+    match status {
+        LegalHoldStatus::Off => SdkObjectLockLegalHoldStatus::Off,
+        LegalHoldStatus::On => SdkObjectLockLegalHoldStatus::On,
+    }
+}
+
 fn retention_from_s3_head(
     mode: Option<&SdkObjectLockMode>,
     retain_until_date: Option<&SdkDateTime>,
@@ -1165,6 +1319,34 @@ fn retention_from_s3_head(
     Ok(Some(RetentionPolicy::new(mode, retain_days)))
 }
 
+fn legal_hold_from_s3_head(
+    status: Option<&SdkObjectLockLegalHoldStatus>,
+) -> Result<Option<LegalHoldStatus>> {
+    status.map(legal_hold_from_sdk_status).transpose()
+}
+
+fn legal_hold_from_s3_legal_hold(
+    legal_hold: Option<&ObjectLockLegalHold>,
+) -> Result<Option<LegalHoldStatus>> {
+    let Some(legal_hold) = legal_hold else {
+        return Ok(None);
+    };
+    legal_hold
+        .status()
+        .map(legal_hold_from_sdk_status)
+        .transpose()
+}
+
+fn legal_hold_from_sdk_status(status: &SdkObjectLockLegalHoldStatus) -> Result<LegalHoldStatus> {
+    match status {
+        SdkObjectLockLegalHoldStatus::Off => Ok(LegalHoldStatus::Off),
+        SdkObjectLockLegalHoldStatus::On => Ok(LegalHoldStatus::On),
+        _ => Err(StorageError::Provider(
+            "S3 returned an unknown Object Lock legal hold status".to_owned(),
+        )),
+    }
+}
+
 fn ceil_days_from_seconds(seconds: i64) -> Result<u32> {
     let seconds = u64::try_from(seconds)
         .map_err(|_| StorageError::Provider("retention date is before current time".to_owned()))?;
@@ -1183,6 +1365,16 @@ fn verify_retention(actual: Option<&RetentionPolicy>, requested: &RetentionPolic
     }
 }
 
+fn verify_legal_hold(actual: Option<LegalHoldStatus>, requested: LegalHoldStatus) -> Result<()> {
+    if legal_hold_satisfies(actual, requested) {
+        Ok(())
+    } else {
+        Err(StorageError::Provider(
+            "S3 Object Lock legal hold verification failed".to_owned(),
+        ))
+    }
+}
+
 fn retention_satisfies(actual: Option<&RetentionPolicy>, requested: &RetentionPolicy) -> bool {
     if !retention_is_active(requested) {
         return true;
@@ -1192,6 +1384,13 @@ fn retention_satisfies(actual: Option<&RetentionPolicy>, requested: &RetentionPo
     };
     retention_mode_strength(actual.mode) >= retention_mode_strength(requested.mode)
         && actual.retain_days >= requested.retain_days
+}
+
+fn legal_hold_satisfies(actual: Option<LegalHoldStatus>, requested: LegalHoldStatus) -> bool {
+    match requested {
+        LegalHoldStatus::Off => actual.is_none_or(|actual| actual == LegalHoldStatus::Off),
+        LegalHoldStatus::On => actual == Some(LegalHoldStatus::On),
+    }
 }
 
 fn retention_mode_strength(mode: RetentionMode) -> u8 {
@@ -1217,6 +1416,8 @@ fn storage_error_result(error: &StorageError) -> &'static str {
         StorageError::InvalidRange => "invalid_range",
         StorageError::RetentionBlocked => "retention_blocked",
         StorageError::RetentionExtensionUnsupported => "retention_unsupported",
+        StorageError::LegalHoldBlocked => "legal_hold_blocked",
+        StorageError::LegalHoldUnsupported => "legal_hold_unsupported",
         StorageError::Provider(_) => "error",
     }
 }
@@ -1229,6 +1430,7 @@ fn metadata_from_object_meta(object_id: BackendObjectId, metadata: ObjectMeta) -
         etag: metadata.e_tag,
         version_id: metadata.version,
         retention: None,
+        legal_hold: None,
     }
 }
 

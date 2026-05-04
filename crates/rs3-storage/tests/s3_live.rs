@@ -9,7 +9,7 @@ use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use bytes::Bytes;
 use common::assert_core_blob_store_contract;
 use rs3_storage::{BlobStore, PutOptions, S3BlobStore, S3BlobStoreConfig};
-use rs3_types::{BackendObjectId, RetentionMode, RetentionPolicy};
+use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
 use std::env;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,6 +60,7 @@ async fn live_s3_object_lock_retention_round_trips_and_blocks_version_delete() {
             Bytes::from_static(b"retained object body"),
             PutOptions {
                 retention: Some(policy),
+                legal_hold: None,
                 content_type: Some("application/octet-stream".to_owned()),
                 do_not_recreate: true,
             },
@@ -97,6 +98,79 @@ async fn live_s3_object_lock_retention_round_trips_and_blocks_version_delete() {
         matches!(delete, Err(ref error) if retention_delete_blocked(error)),
         "version delete was not blocked by Object Lock: {delete:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires RS3_TEST_S3_OBJECT_LOCK=true and an Object Lock-enabled bucket"]
+async fn live_s3_object_lock_legal_hold_round_trips_and_blocks_version_delete() {
+    if !env_bool("RS3_TEST_S3_OBJECT_LOCK").unwrap_or(false) {
+        eprintln!("skipping live S3 Object Lock test: RS3_TEST_S3_OBJECT_LOCK is not true");
+        return;
+    }
+    let Some(target) = live_target() else {
+        eprintln!("skipping live S3 Object Lock test: RS3_TEST_S3_BUCKET is not set");
+        return;
+    };
+    let object_id = BackendObjectId::new("retention/live-legal-hold-object".to_owned())
+        .unwrap_or_else(|error| panic!("test object id: {error}"));
+    let object_key = backend_key(&target.config, &object_id);
+    let store = S3BlobStore::from_environment(target.config.clone())
+        .await
+        .unwrap_or_else(|error| panic!("build S3 blob store: {error}"));
+
+    let put = store
+        .put(
+            &object_id,
+            Bytes::from_static(b"legal hold object body"),
+            PutOptions {
+                retention: None,
+                legal_hold: Some(LegalHoldStatus::On),
+                content_type: Some("application/octet-stream".to_owned()),
+                do_not_recreate: true,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("put legal-held object: {error}"));
+    assert_eq!(put.legal_hold, Some(LegalHoldStatus::On));
+    let version_id = put
+        .version_id
+        .clone()
+        .unwrap_or_else(|| panic!("legal-held S3 PUT did not return a version id"));
+
+    let client = sdk_client(&target.config).await;
+    let delete_held = client
+        .delete_object()
+        .bucket(target.config.bucket.as_str())
+        .key(object_key.clone())
+        .version_id(version_id.clone())
+        .send()
+        .await;
+    assert!(
+        matches!(delete_held, Err(ref error) if retention_delete_blocked(error)),
+        "version delete was not blocked by legal hold: {delete_held:?}"
+    );
+
+    store
+        .set_legal_hold(&object_id, LegalHoldStatus::Off)
+        .await
+        .unwrap_or_else(|error| panic!("clear legal hold: {error}"));
+    let head = store
+        .head(&object_id)
+        .await
+        .unwrap_or_else(|error| panic!("head legal-held object: {error}"));
+    assert!(
+        head.legal_hold
+            .is_none_or(|status| status == LegalHoldStatus::Off)
+    );
+
+    client
+        .delete_object()
+        .bucket(target.config.bucket.as_str())
+        .key(object_key)
+        .version_id(version_id)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("delete released legal-held version: {error}"));
 }
 
 struct LiveS3Target {

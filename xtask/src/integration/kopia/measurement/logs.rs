@@ -181,6 +181,9 @@ fn bump_gateway_backend_counts(fields: &Value, counts: &mut rs3_storage::BlobOpe
         "extend_retention" => {
             counts.extend_retention = counts.extend_retention.saturating_add(1);
         }
+        "set_legal_hold" => {
+            counts.set_legal_hold = counts.set_legal_hold.saturating_add(1);
+        }
         _ => return,
     }
 
@@ -220,6 +223,7 @@ fn backend_counts_json(counts: &rs3_storage::BlobOperationCounts) -> Value {
         "list": counts.list,
         "delete": counts.delete,
         "extend_retention": counts.extend_retention,
+        "set_legal_hold": counts.set_legal_hold,
         "bytes_written": counts.bytes_written,
         "bytes_read": counts.bytes_read,
     })

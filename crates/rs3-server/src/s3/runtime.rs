@@ -18,7 +18,7 @@ use rs3_storage::{
 };
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
-use rs3_types::{LogicalPath, RetentionPolicy};
+use rs3_types::{LegalHoldStatus, LogicalPath, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -137,6 +137,14 @@ impl RuntimeRepository {
         key: LogicalPath,
     ) -> Result<DeleteOutcome, RepositoryError> {
         self.coordinator.delete_committed(key).await
+    }
+
+    pub(super) async fn set_legal_hold_committed(
+        &self,
+        key: LogicalPath,
+        status: LegalHoldStatus,
+    ) -> Result<RepositoryObjectMetadata, RepositoryError> {
+        self.coordinator.set_legal_hold_committed(key, status).await
     }
 
     #[cfg(test)]
@@ -365,6 +373,14 @@ impl BlobStore for DynBlobStore {
         policy: rs3_types::RetentionPolicy,
     ) -> rs3_storage::Result<()> {
         self.inner.extend_retention(object_id, policy).await
+    }
+
+    async fn set_legal_hold(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        status: rs3_types::LegalHoldStatus,
+    ) -> rs3_storage::Result<()> {
+        self.inner.set_legal_hold(object_id, status).await
     }
 
     async fn flush_caches(&self) -> rs3_storage::Result<()> {

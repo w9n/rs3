@@ -1,7 +1,8 @@
 //! Public repository operation models.
 
 use rs3_types::{
-    BackendObjectId, CheckpointId, LogicalPath, RetentionMode, RetentionPolicy, Sequence,
+    BackendObjectId, CheckpointId, LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy,
+    Sequence,
 };
 
 /// Options for a trusted repository PUT.
@@ -11,6 +12,8 @@ pub struct RepositoryPutOptions {
     pub create_only: bool,
     /// Optional retention policy to apply to backend objects.
     pub retention: Option<RetentionPolicy>,
+    /// Optional legal-hold status to apply to backend objects.
+    pub legal_hold: Option<LegalHoldStatus>,
 }
 
 /// Metadata returned for a client-visible object.
@@ -24,6 +27,8 @@ pub struct RepositoryObjectMetadata {
     pub modified_at_ms: i64,
     /// Effective retention policy, if known.
     pub retention: Option<RetentionPolicy>,
+    /// Effective legal-hold status, if known.
+    pub legal_hold: Option<LegalHoldStatus>,
 }
 
 /// Repository role for a reachable backend object.
@@ -59,6 +64,8 @@ pub struct RepositoryOrphanCandidate {
     pub retention: Option<RetentionPolicy>,
     /// True when the known retention policy would block deletion.
     pub delete_blocked_by_retention: bool,
+    /// True when legal hold would block deletion.
+    pub delete_blocked_by_legal_hold: bool,
 }
 
 /// Dry-run report for backend objects under repository-owned prefixes.
@@ -76,12 +83,14 @@ impl RepositoryOrphanCandidate {
         kind: BackendObjectReferenceKind,
     ) -> Self {
         let delete_blocked_by_retention = retention_blocks_delete(metadata.retention.as_ref());
+        let delete_blocked_by_legal_hold = metadata.legal_hold == Some(LegalHoldStatus::On);
         Self {
             object_id: metadata.object_id,
             kind,
             content_len: metadata.content_len,
             retention: metadata.retention,
             delete_blocked_by_retention,
+            delete_blocked_by_legal_hold,
         }
     }
 }

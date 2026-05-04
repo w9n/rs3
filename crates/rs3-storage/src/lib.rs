@@ -6,7 +6,7 @@ mod s3;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use rs3_types::{BackendObjectId, RetentionMode, RetentionPolicy};
+use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -31,6 +31,8 @@ pub struct BlobMetadata {
     pub version_id: Option<String>,
     /// Provider retention policy for this object version, when known.
     pub retention: Option<RetentionPolicy>,
+    /// Provider legal-hold status for this object version, when known.
+    pub legal_hold: Option<LegalHoldStatus>,
 }
 
 /// Byte range requested from an object.
@@ -52,6 +54,8 @@ pub enum ByteRange {
 pub struct PutOptions {
     /// Optional retention policy for this object version.
     pub retention: Option<RetentionPolicy>,
+    /// Optional legal-hold status for this object version.
+    pub legal_hold: Option<LegalHoldStatus>,
     /// Optional content type.
     pub content_type: Option<String>,
     /// Reject the write if an object already exists at this logical identifier.
@@ -79,6 +83,12 @@ pub enum StorageError {
     /// The provider cannot extend retention for an existing object version.
     #[error("retention extension is unsupported")]
     RetentionExtensionUnsupported,
+    /// The operation could not be completed because legal hold blocked it.
+    #[error("object legal hold blocked the operation")]
+    LegalHoldBlocked,
+    /// The provider cannot apply legal hold for an existing object version.
+    #[error("legal hold is unsupported")]
+    LegalHoldUnsupported,
 }
 
 /// Convenient result alias for storage operations.
@@ -121,6 +131,13 @@ pub trait BlobStore: Send + Sync {
         policy: RetentionPolicy,
     ) -> Result<()>;
 
+    /// Applies or clears legal hold for an existing object version.
+    async fn set_legal_hold(
+        &self,
+        object_id: &BackendObjectId,
+        status: LegalHoldStatus,
+    ) -> Result<()>;
+
     /// Flushes implementation-local caches before process shutdown or handoff.
     async fn flush_caches(&self) -> Result<()>;
 }
@@ -140,6 +157,8 @@ pub struct BlobOperationCounts {
     pub delete: u64,
     /// Number of retention-extension calls.
     pub extend_retention: u64,
+    /// Number of legal-hold update calls.
+    pub set_legal_hold: u64,
     /// Number of cache flush calls.
     pub flush: u64,
     /// Bytes accepted by successful PUT calls.
@@ -263,6 +282,17 @@ where
         self.inner.extend_retention(object_id, policy).await
     }
 
+    async fn set_legal_hold(
+        &self,
+        object_id: &BackendObjectId,
+        status: LegalHoldStatus,
+    ) -> Result<()> {
+        self.mutate_counts(|counts| {
+            counts.set_legal_hold = counts.set_legal_hold.saturating_add(1);
+        })?;
+        self.inner.set_legal_hold(object_id, status).await
+    }
+
     async fn flush_caches(&self) -> Result<()> {
         self.mutate_counts(|counts| {
             counts.flush = counts.flush.saturating_add(1);
@@ -342,6 +372,7 @@ impl BlobStore for MemoryBlobStore {
         let object_kind = object_kind(object_id);
         let requested_len = body.len();
         let retained = options.retention.is_some();
+        let legal_hold = options.legal_hold;
         let mut state = self.write_state()?;
         state.counts.put = state.counts.put.saturating_add(1);
 
@@ -368,6 +399,7 @@ impl BlobStore for MemoryBlobStore {
             etag: Some(format!("mem-{}-{}", state.next_version, body.len())),
             version_id: Some(format!("mem-v{}", state.next_version)),
             retention: options.retention,
+            legal_hold,
         };
         state.counts.bytes_written = state.counts.bytes_written.saturating_add(content_len);
 
@@ -465,6 +497,10 @@ impl BlobStore for MemoryBlobStore {
             record_blob_delete(object_kind, "retention_blocked", started.elapsed());
             return Err(StorageError::RetentionBlocked);
         }
+        if legal_hold_blocks_delete(object.metadata.legal_hold) {
+            record_blob_delete(object_kind, "legal_hold_blocked", started.elapsed());
+            return Err(StorageError::LegalHoldBlocked);
+        }
 
         state.objects.remove(object_id);
         record_blob_delete(object_kind, "ok", started.elapsed());
@@ -490,6 +526,27 @@ impl BlobStore for MemoryBlobStore {
             Some(merge_retention(object.metadata.retention.as_ref(), policy));
 
         record_blob_extend_retention(object_kind, "ok", started.elapsed());
+        Ok(())
+    }
+
+    async fn set_legal_hold(
+        &self,
+        object_id: &BackendObjectId,
+        status: LegalHoldStatus,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
+        let mut state = self.write_state()?;
+        state.counts.set_legal_hold = state.counts.set_legal_hold.saturating_add(1);
+
+        let Some(object) = state.objects.get_mut(object_id) else {
+            record_blob_set_legal_hold(object_kind, "not_found", started.elapsed());
+            return Err(StorageError::NotFound(object_id.clone()));
+        };
+
+        object.metadata.legal_hold = Some(status);
+
+        record_blob_set_legal_hold(object_kind, "ok", started.elapsed());
         Ok(())
     }
 
@@ -605,6 +662,17 @@ pub(crate) fn record_blob_extend_retention(object_kind: &str, result: &str, elap
     );
 }
 
+pub(crate) fn record_blob_set_legal_hold(object_kind: &str, result: &str, elapsed: Duration) {
+    tracing::debug!(
+        target: "rs3_storage",
+        operation = "set_legal_hold",
+        object_kind,
+        result,
+        elapsed_us = elapsed_us(elapsed),
+        "blob store operation completed",
+    );
+}
+
 pub(crate) fn read_range(body: &Bytes, range: ByteRange) -> Result<Bytes> {
     match range {
         ByteRange::Full => Ok(body.clone()),
@@ -629,6 +697,10 @@ fn retention_blocks_delete(policy: Option<&RetentionPolicy>) -> bool {
         Some(policy) => policy.mode != RetentionMode::None && policy.retain_days > 0,
         None => false,
     }
+}
+
+fn legal_hold_blocks_delete(status: Option<LegalHoldStatus>) -> bool {
+    status == Some(LegalHoldStatus::On)
 }
 
 fn merge_retention(existing: Option<&RetentionPolicy>, next: RetentionPolicy) -> RetentionPolicy {
@@ -672,7 +744,7 @@ mod tests {
         read_range, retention_blocks_delete,
     };
     use bytes::Bytes;
-    use rs3_types::{BackendObjectId, RetentionMode, RetentionPolicy};
+    use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
 
     fn object_id(value: &str) -> BackendObjectId {
         match BackendObjectId::new(value) {
@@ -711,6 +783,13 @@ mod tests {
         let policy = RetentionPolicy::new(RetentionMode::Compliance, 30);
 
         assert!(retention_blocks_delete(Some(&policy)));
+    }
+
+    #[test]
+    fn legal_hold_on_blocks_delete() {
+        assert!(super::legal_hold_blocks_delete(Some(LegalHoldStatus::On)));
+        assert!(!super::legal_hold_blocks_delete(Some(LegalHoldStatus::Off)));
+        assert!(!super::legal_hold_blocks_delete(None));
     }
 
     #[tokio::test]
@@ -857,6 +936,45 @@ mod tests {
         let delete = store.delete(&object_id).await;
 
         assert_eq!(delete, Err(StorageError::RetentionBlocked));
+    }
+
+    #[tokio::test]
+    async fn delete_is_blocked_by_legal_hold() {
+        let store = MemoryBlobStore::new();
+        let object_id = object_id("segments/a");
+        let options = PutOptions {
+            legal_hold: Some(LegalHoldStatus::On),
+            ..PutOptions::default()
+        };
+
+        let put = store
+            .put(&object_id, Bytes::from_static(b"body"), options)
+            .await;
+        assert!(put.is_ok());
+
+        let delete = store.delete(&object_id).await;
+
+        assert_eq!(delete, Err(StorageError::LegalHoldBlocked));
+    }
+
+    #[tokio::test]
+    async fn legal_hold_can_be_cleared() {
+        let store = MemoryBlobStore::new();
+        let object_id = object_id("segments/a");
+        let options = PutOptions {
+            legal_hold: Some(LegalHoldStatus::On),
+            ..PutOptions::default()
+        };
+
+        let put = store
+            .put(&object_id, Bytes::from_static(b"body"), options)
+            .await;
+        assert!(put.is_ok());
+        let clear = store.set_legal_hold(&object_id, LegalHoldStatus::Off).await;
+        let delete = store.delete(&object_id).await;
+
+        assert!(clear.is_ok());
+        assert!(delete.is_ok());
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ use rs3_anchor::CheckpointAnchor;
 use rs3_crypto::{KeyRing, NamespaceBlindKey, SecretBytes};
 use rs3_index::{IndexDelta, NamespaceEntry};
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
-use rs3_types::{BackendObjectId, LogicalPath, RetentionMode, RetentionPolicy};
+use rs3_types::{BackendObjectId, LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy};
 use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -124,6 +124,8 @@ where
         let retention =
             strongest_retention_policy(self.options.default_retention, options.retention);
         let requested_retention = retention.is_some();
+        let legal_hold = options.legal_hold;
+        let requested_legal_hold = legal_hold == Some(LegalHoldStatus::On);
         let keyring = self.keyring()?;
         let primary_blind_key = keyring.derive_primary_blind_index_key(&key)?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(&key)?;
@@ -141,6 +143,7 @@ where
                     stale_entries: existing_blind_keys.len(),
                     create_only,
                     requested_retention,
+                    requested_legal_hold,
                     result: "already_exists",
                     elapsed: started.elapsed(),
                 });
@@ -172,6 +175,7 @@ where
                 payload,
                 PutOptions {
                     retention,
+                    legal_hold,
                     content_type: None,
                     do_not_recreate: true,
                 },
@@ -188,12 +192,14 @@ where
             modified_at_ms,
             generation: sequence,
             retention: storage_metadata.retention,
+            legal_hold: storage_metadata.legal_hold,
         };
         let manifest = TrustedManifest {
             key: key.clone(),
             content_len: plaintext_len,
             modified_at_ms,
             retention: storage_metadata.retention,
+            legal_hold: storage_metadata.legal_hold,
         };
         let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
         let stale_entries = stale_blind_keys.len();
@@ -223,6 +229,7 @@ where
             stale_entries,
             create_only,
             requested_retention,
+            requested_legal_hold,
             result: "ok",
             elapsed: started.elapsed(),
         });
@@ -258,6 +265,21 @@ where
             metadata,
             checkpoint,
         })
+    }
+
+    /// Applies legal hold and publishes the covering checkpoint before returning.
+    pub async fn set_legal_hold_committed<A>(
+        &self,
+        key: &LogicalPath,
+        status: LegalHoldStatus,
+        anchor: &A,
+    ) -> Result<RepositoryObjectMetadata>
+    where
+        A: CheckpointAnchor,
+    {
+        let metadata = self.set_legal_hold(key, status).await?;
+        self.publish_checkpoint(anchor).await?;
+        Ok(metadata)
     }
 
     /// Reads trusted metadata for a client-visible object.
@@ -297,6 +319,7 @@ where
                 content_len: entry.content_len,
                 modified_at_ms: entry.modified_at_ms,
                 retention: entry.retention,
+                legal_hold: entry.legal_hold,
             });
 
         record_repository_head("ok", started.elapsed());
@@ -781,7 +804,9 @@ where
     ) -> Result<PhysicalDeleteOutcome> {
         Ok(match self.store.delete(object_id).await {
             Ok(()) => PhysicalDeleteOutcome::Removed,
-            Err(StorageError::RetentionBlocked) => PhysicalDeleteOutcome::Retained,
+            Err(StorageError::RetentionBlocked | StorageError::LegalHoldBlocked) => {
+                PhysicalDeleteOutcome::Retained
+            }
             Err(StorageError::NotFound(_)) => PhysicalDeleteOutcome::AlreadyGone,
             Err(error) => return Err(error.into()),
         })
@@ -815,6 +840,7 @@ where
         updated.manifest_id = manifest_id.clone();
         updated.generation = sequence;
         updated.retention = backend.retention;
+        updated.legal_hold = backend.legal_hold.or(updated.legal_hold);
         let prefix_tokens =
             prefix_tokens_for_key(&keyring, &updated.namespace_key_id, key.as_str())?;
         let manifest = TrustedManifest {
@@ -822,6 +848,62 @@ where
             content_len,
             modified_at_ms: modified_at_ms_or_now(backend.modified_at_ms, sequence),
             retention: backend.retention,
+            legal_hold: updated.legal_hold,
+        };
+        let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
+        state.pending_index_deltas.push(IndexDelta::Upsert {
+            entry: updated.clone(),
+            prefix_tokens: prefix_tokens.clone(),
+            sealed_manifest: Box::new(sealed_manifest),
+        });
+        state.namespace.upsert(updated.clone(), prefix_tokens);
+        state.manifests.insert(manifest_id, manifest.clone());
+
+        Ok(manifest.into_metadata())
+    }
+
+    /// Applies legal hold for a client-visible object and its backend payload.
+    pub async fn set_legal_hold(
+        &self,
+        key: &LogicalPath,
+        status: LegalHoldStatus,
+    ) -> Result<RepositoryObjectMetadata> {
+        let keyring = self.keyring()?;
+        let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
+        let object_id = self.object_id_for_candidates(key, &lookup_blind_keys)?;
+        self.store.set_legal_hold(&object_id, status).await?;
+        let backend = self.store.head(&object_id).await?;
+
+        let mut state = self.write_state()?;
+        let entry = first_namespace_entry(&state.namespace, &lookup_blind_keys)
+            .ok_or_else(|| RepositoryError::NotFound(key.clone()))?
+            .clone();
+        let content_len = state
+            .manifests
+            .get(&entry.manifest_id)
+            .map(|manifest| manifest.content_len)
+            .unwrap_or(entry.content_len);
+        let retention = state
+            .manifests
+            .get(&entry.manifest_id)
+            .map(|manifest| manifest.retention)
+            .unwrap_or(entry.retention);
+        let sequence = next_sequence(&mut state)?;
+        let material = object_material(key.as_str(), sequence);
+        let manifest_id = keyring.derive_manifest_id(&material)?;
+        let mut updated = entry;
+        updated.manifest_id = manifest_id.clone();
+        updated.generation = sequence;
+        updated.retention = retention;
+        updated.legal_hold = backend.legal_hold.or(Some(status));
+        let prefix_tokens =
+            prefix_tokens_for_key(&keyring, &updated.namespace_key_id, key.as_str())?;
+        let manifest = TrustedManifest {
+            key: key.clone(),
+            content_len,
+            modified_at_ms: modified_at_ms_or_now(backend.modified_at_ms, sequence),
+            retention,
+            legal_hold: updated.legal_hold,
         };
         let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
         state.pending_index_deltas.push(IndexDelta::Upsert {
@@ -1049,6 +1131,7 @@ struct RepositoryPutTrace {
     stale_entries: usize,
     create_only: bool,
     requested_retention: bool,
+    requested_legal_hold: bool,
     result: &'static str,
     elapsed: Duration,
 }
@@ -1096,6 +1179,7 @@ fn record_repository_put(record: RepositoryPutTrace) {
         stale_entries = record.stale_entries,
         create_only = record.create_only,
         requested_retention = record.requested_retention,
+        requested_legal_hold = record.requested_legal_hold,
         result = record.result,
         elapsed_us = elapsed_us(record.elapsed),
         "repository operation completed",

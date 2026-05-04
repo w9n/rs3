@@ -602,6 +602,7 @@ fn gateway_backend_operation_count(report: &Value) -> Option<u64> {
         "list",
         "delete",
         "extend_retention",
+        "set_legal_hold",
         "flush",
     ]
     .iter()
@@ -714,6 +715,7 @@ mod tests {
                             "list": 1,
                             "delete": 2,
                             "extend_retention": 0,
+                            "set_legal_hold": 0,
                             "bytes_written": 1250,
                             "bytes_read": 3000,
                         },

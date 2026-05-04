@@ -1,12 +1,14 @@
 //! Commit coordination for client-visible repository writes.
 
 use crate::error::{RepositoryError, Result};
-use crate::model::{CheckpointPosition, CommittedPut, DeleteOutcome, RepositoryPutOptions};
+use crate::model::{
+    CheckpointPosition, CommittedPut, DeleteOutcome, RepositoryObjectMetadata, RepositoryPutOptions,
+};
 use crate::service::Repository;
 use bytes::Bytes;
 use rs3_anchor::CheckpointAnchor;
 use rs3_storage::BlobStore;
-use rs3_types::LogicalPath;
+use rs3_types::{LegalHoldStatus, LogicalPath};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, oneshot};
@@ -241,6 +243,19 @@ where
         self.publish_locked_batch().await?;
         self.repository
             .delete_committed(&key, self.anchor.as_ref())
+            .await
+    }
+
+    /// Applies legal hold and returns only after the covering checkpoint is accepted.
+    pub async fn set_legal_hold_committed(
+        &self,
+        key: LogicalPath,
+        status: LegalHoldStatus,
+    ) -> Result<RepositoryObjectMetadata> {
+        let _stage = self.stage_lock.lock().await;
+        self.publish_locked_batch().await?;
+        self.repository
+            .set_legal_hold_committed(&key, status, self.anchor.as_ref())
             .await
     }
 

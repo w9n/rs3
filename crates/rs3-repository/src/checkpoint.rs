@@ -202,6 +202,7 @@ where
         let object_id = checkpoint_object_id(&checkpoint.id)?;
         let body = Bytes::from(checkpoint_object_bytes(checkpoint)?);
         let retention = self.checkpoint_retention_policy()?;
+        let legal_hold = self.checkpoint_legal_hold()?;
         let put = self
             .store
             .put(
@@ -209,6 +210,7 @@ where
                 body.clone(),
                 PutOptions {
                     retention,
+                    legal_hold,
                     content_type: Some(CHECKPOINT_OBJECT_CONTENT_TYPE.to_owned()),
                     do_not_recreate: true,
                 },
@@ -238,6 +240,19 @@ where
             }
         }
         Ok(retention)
+    }
+
+    fn checkpoint_legal_hold(&self) -> Result<Option<rs3_types::LegalHoldStatus>> {
+        let state = self.read_state()?;
+        Ok(state
+            .pending_index_deltas
+            .iter()
+            .find_map(|delta| match delta {
+                IndexDelta::Upsert { entry, .. } => entry
+                    .legal_hold
+                    .filter(|status| *status == rs3_types::LegalHoldStatus::On),
+                IndexDelta::Tombstone { .. } => None,
+            }))
     }
 
     fn pending_index_delta_object(&self) -> Result<Option<SealedIndexDeltaObject>> {

@@ -3,11 +3,11 @@
 use crate::{
     BlobMetadata, BlobStore, ByteRange, PutOptions, Result, StorageError, object_kind, prefix_kind,
     record_blob_delete, record_blob_extend_retention, record_blob_get, record_blob_head,
-    record_blob_list, record_blob_put,
+    record_blob_list, record_blob_put, record_blob_set_legal_hold,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use rs3_types::{BackendObjectId, RetentionPolicy};
+use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionPolicy};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -58,16 +58,25 @@ impl BlobStore for FilesystemBlobStore {
         let kind = object_kind(object_id);
         let requested_len = body.len();
         let retained = options.retention.is_some();
+        let legal_hold_requested = options.legal_hold == Some(LegalHoldStatus::On);
 
-        if retained {
+        if retained || legal_hold_requested {
             record_blob_put(
                 kind,
                 requested_len,
                 retained,
-                "retention_unsupported",
+                if retained {
+                    "retention_unsupported"
+                } else {
+                    "legal_hold_unsupported"
+                },
                 started.elapsed(),
             );
-            return Err(StorageError::RetentionExtensionUnsupported);
+            return Err(if retained {
+                StorageError::RetentionExtensionUnsupported
+            } else {
+                StorageError::LegalHoldUnsupported
+            });
         }
 
         let path = self.object_path(object_id)?;
@@ -211,6 +220,23 @@ impl BlobStore for FilesystemBlobStore {
         Err(StorageError::RetentionExtensionUnsupported)
     }
 
+    async fn set_legal_hold(
+        &self,
+        object_id: &BackendObjectId,
+        _status: LegalHoldStatus,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let kind = object_kind(object_id);
+        let path = self.object_path(object_id)?;
+        if !path.is_file() {
+            record_blob_set_legal_hold(kind, "not_found", started.elapsed());
+            return Err(StorageError::NotFound(object_id.clone()));
+        }
+
+        record_blob_set_legal_hold(kind, "unsupported", started.elapsed());
+        Err(StorageError::LegalHoldUnsupported)
+    }
+
     async fn flush_caches(&self) -> Result<()> {
         let started = Instant::now();
         tracing::debug!(
@@ -303,6 +329,7 @@ fn blob_metadata(object_id: BackendObjectId, metadata: fs::Metadata) -> BlobMeta
         etag: modified_at_ms.map(|modified| format!("fs-{modified:x}-{:x}", metadata.len())),
         version_id: None,
         retention: None,
+        legal_hold: None,
     }
 }
 
