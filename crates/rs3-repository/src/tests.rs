@@ -23,6 +23,7 @@ use rs3_types::{
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Notify;
 
 fn secret() -> SecretBytes {
     secret_with_byte(9)
@@ -404,6 +405,103 @@ impl BlobStore for FailOncePutStore {
     async fn extend_retention(
         &self,
         object_id: &rs3_types::BackendObjectId,
+        policy: RetentionPolicy,
+    ) -> rs3_storage::Result<()> {
+        self.inner.extend_retention(object_id, policy).await
+    }
+
+    async fn flush_caches(&self) -> rs3_storage::Result<()> {
+        self.inner.flush_caches().await
+    }
+}
+
+#[derive(Clone)]
+struct PauseFirstSegmentPutStore {
+    inner: MemoryBlobStore,
+    state: Arc<PauseFirstSegmentPutState>,
+}
+
+struct PauseFirstSegmentPutState {
+    pause_next_segment_put: Mutex<bool>,
+    entered: Notify,
+    release: Notify,
+}
+
+impl PauseFirstSegmentPutStore {
+    fn new(inner: MemoryBlobStore) -> Self {
+        Self {
+            inner,
+            state: Arc::new(PauseFirstSegmentPutState {
+                pause_next_segment_put: Mutex::new(true),
+                entered: Notify::new(),
+                release: Notify::new(),
+            }),
+        }
+    }
+
+    async fn wait_until_paused(&self) {
+        self.state.entered.notified().await;
+    }
+
+    fn release(&self) {
+        self.state.release.notify_waiters();
+    }
+
+    fn should_pause(&self, object_id: &BackendObjectId) -> rs3_storage::Result<bool> {
+        if !object_id.as_str().starts_with("segments/") {
+            return Ok(false);
+        }
+
+        let mut pause_next = self
+            .state
+            .pause_next_segment_put
+            .lock()
+            .map_err(|_| StorageError::Provider("pause store lock poisoned".to_owned()))?;
+        let should_pause = *pause_next;
+        *pause_next = false;
+        Ok(should_pause)
+    }
+}
+
+#[async_trait]
+impl BlobStore for PauseFirstSegmentPutStore {
+    async fn put(
+        &self,
+        object_id: &BackendObjectId,
+        body: Bytes,
+        options: PutOptions,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        if self.should_pause(object_id)? {
+            self.state.entered.notify_one();
+            self.state.release.notified().await;
+        }
+
+        self.inner.put(object_id, body, options).await
+    }
+
+    async fn get_range(
+        &self,
+        object_id: &BackendObjectId,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Bytes> {
+        self.inner.get_range(object_id, range).await
+    }
+
+    async fn head(&self, object_id: &BackendObjectId) -> rs3_storage::Result<BlobMetadata> {
+        self.inner.head(object_id).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
+        self.inner.list_prefix(prefix).await
+    }
+
+    async fn delete(&self, object_id: &BackendObjectId) -> rs3_storage::Result<()> {
+        self.inner.delete(object_id).await
+    }
+
+    async fn extend_retention(
+        &self,
+        object_id: &BackendObjectId,
         policy: RetentionPolicy,
     ) -> rs3_storage::Result<()> {
         self.inner.extend_retention(object_id, policy).await
@@ -1712,6 +1810,87 @@ async fn commit_coordinator_batches_concurrent_committed_puts() {
         Err(error) => panic!("{error}"),
     };
     let reloaded = Repository::with_keyring(store, keyring);
+    let loaded = must(reloaded.load_checkpoint_position(&accepted).await);
+    let listed = must(reloaded.list("p/12"));
+
+    assert_eq!(first.checkpoint, second.checkpoint);
+    assert_eq!(accepted.sequence, Sequence::new(2));
+    assert_eq!(loaded, accepted);
+    assert_eq!(
+        listed
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>(),
+        vec![first_key, second_key]
+    );
+}
+
+#[tokio::test]
+async fn commit_coordinator_does_not_publish_while_stage_write_is_in_flight() {
+    let inner = MemoryBlobStore::new();
+    let store = PauseFirstSegmentPutStore::new(inner.clone());
+    let keyring = signing_keyring();
+    let repository = Arc::new(Repository::with_keyring(store.clone(), keyring.clone()));
+    let anchor = MemoryCheckpointAnchor::new();
+    let coordinator = Arc::new(CommitCoordinator::with_options(
+        repository,
+        anchor.clone(),
+        CommitCoordinatorOptions::new(2, std::time::Duration::from_secs(60)),
+    ));
+    let first_key = key("p/12/paused-a");
+    let second_key = key("p/12/paused-b");
+
+    let first = {
+        let coordinator = Arc::clone(&coordinator);
+        let key = first_key.clone();
+        tokio::spawn(async move {
+            coordinator
+                .put_committed(
+                    key,
+                    Bytes::from_static(b"first"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        })
+    };
+    store.wait_until_paused().await;
+
+    let second = {
+        let coordinator = Arc::clone(&coordinator);
+        let key = second_key.clone();
+        tokio::spawn(async move {
+            coordinator
+                .put_committed(
+                    key,
+                    Bytes::from_static(b"second"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        })
+    };
+
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(matches!(
+        anchor.read().await,
+        Err(AnchorError::MissingAnchor)
+    ));
+
+    store.release();
+    let (first, second) = tokio::join!(first, second);
+    let first = match first {
+        Ok(result) => must(result),
+        Err(error) => panic!("{error}"),
+    };
+    let second = match second {
+        Ok(result) => must(result),
+        Err(error) => panic!("{error}"),
+    };
+    let accepted = match anchor.read().await {
+        Ok(anchor) => CheckpointPosition::from(anchor),
+        Err(error) => panic!("{error}"),
+    };
+    let reloaded = Repository::with_keyring(inner, keyring);
     let loaded = must(reloaded.load_checkpoint_position(&accepted).await);
     let listed = must(reloaded.list("p/12"));
 

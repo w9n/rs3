@@ -98,6 +98,15 @@ pub(crate) struct KopiaMatrixArgs {
     /// Plaintext bytes per encrypted gateway payload segment.
     #[arg(long, default_value_t = rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE)]
     payload_segment_size: usize,
+    /// Override gateway commit batch size for measured gateway runs.
+    #[arg(long)]
+    commit_batch_items: Option<usize>,
+    /// Override gateway commit batch delay in milliseconds for measured gateway runs.
+    #[arg(long)]
+    commit_batch_delay_ms: Option<u64>,
+    /// Override gateway commit pending-item backpressure limit for measured gateway runs.
+    #[arg(long)]
+    commit_max_pending_items: Option<usize>,
     /// Fail the command when built-in comparison budgets are exceeded.
     #[arg(long)]
     enforce_regression_budgets: bool,
@@ -198,6 +207,12 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
     if args.payload_segment_size == 0 {
         bail!("--payload-segment-size must be greater than zero");
     }
+    if args.commit_batch_items == Some(0) {
+        bail!("--commit-batch-items must be greater than zero");
+    }
+    if args.commit_max_pending_items == Some(0) {
+        bail!("--commit-max-pending-items must be greater than zero");
+    }
     let run_id = now_millis();
     let backend_prefix = args.backend_prefix.trim_end_matches('/').to_owned();
     let profiles = args.profile_set.profiles(args.workload_profile);
@@ -241,6 +256,9 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
                     profile,
                     gateway_build_profile: args.gateway_build_profile,
                     payload_segment_size: args.payload_segment_size,
+                    commit_batch_items: args.commit_batch_items,
+                    commit_batch_delay_ms: args.commit_batch_delay_ms,
+                    commit_max_pending_items: args.commit_max_pending_items,
                 })
                 .await?;
                 runs.push(serde_json::json!({
@@ -272,6 +290,11 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         "backend_region": backend.region,
         "gateway_build_profile": args.gateway_build_profile.as_str(),
         "payload_segment_size": args.payload_segment_size,
+        "commit_batch": {
+            "max_items": args.commit_batch_items,
+            "max_delay_ms": args.commit_batch_delay_ms,
+            "max_pending_items": args.commit_max_pending_items,
+        },
         "aggregate": aggregate,
         "comparison": comparison,
         "profiles": profiles_summary,
@@ -642,6 +665,9 @@ struct MeasuredGatewayRun<'a> {
     profile: KopiaWorkloadProfile,
     gateway_build_profile: GatewayBuildProfile,
     payload_segment_size: usize,
+    commit_batch_items: Option<usize>,
+    commit_batch_delay_ms: Option<u64>,
+    commit_max_pending_items: Option<usize>,
 }
 
 #[cfg(feature = "containers")]
@@ -661,6 +687,9 @@ async fn run_measured_gateway_kopia(args: MeasuredGatewayRun<'_>) -> Result<serd
         GatewayProcessOptions {
             build_profile: args.gateway_build_profile,
             payload_segment_size: Some(args.payload_segment_size),
+            commit_batch_items: args.commit_batch_items,
+            commit_batch_delay_ms: args.commit_batch_delay_ms,
+            commit_max_pending_items: args.commit_max_pending_items,
         },
     )
     .await?;

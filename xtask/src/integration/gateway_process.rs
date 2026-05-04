@@ -37,6 +37,9 @@ impl GatewayBuildProfile {
 pub(crate) struct GatewayProcessOptions {
     pub(crate) build_profile: GatewayBuildProfile,
     pub(crate) payload_segment_size: Option<usize>,
+    pub(crate) commit_batch_items: Option<usize>,
+    pub(crate) commit_batch_delay_ms: Option<u64>,
+    pub(crate) commit_max_pending_items: Option<usize>,
 }
 
 impl Default for GatewayProcessOptions {
@@ -44,6 +47,9 @@ impl Default for GatewayProcessOptions {
         Self {
             build_profile: GatewayBuildProfile::Dev,
             payload_segment_size: None,
+            commit_batch_items: None,
+            commit_batch_delay_ms: None,
+            commit_max_pending_items: None,
         }
     }
 }
@@ -155,6 +161,21 @@ impl RunningGateway {
             child.env(
                 "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
                 payload_segment_size.to_string(),
+            );
+        }
+        if let Some(commit_batch_items) = options.commit_batch_items {
+            child.env("RS3_COMMIT_MAX_BATCH_ITEMS", commit_batch_items.to_string());
+        }
+        if let Some(commit_batch_delay_ms) = options.commit_batch_delay_ms {
+            child.env(
+                "RS3_COMMIT_MAX_BATCH_DELAY_MS",
+                commit_batch_delay_ms.to_string(),
+            );
+        }
+        if let Some(commit_max_pending_items) = options.commit_max_pending_items {
+            child.env(
+                "RS3_COMMIT_MAX_PENDING_ITEMS",
+                commit_max_pending_items.to_string(),
             );
         }
 
