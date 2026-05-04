@@ -41,6 +41,17 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and (eq .Values.anchor.mode "memory") (not .Values.anchor.allowMemory) -}}
 {{- fail "anchor.mode=memory requires anchor.allowMemory=true; use kubernetes-lease for durable rollback protection" -}}
 {{- end -}}
+{{- if eq .Values.anchor.mode "kubernetes-lease" -}}
+{{- if not .Values.anchor.name -}}
+{{- fail "anchor.name is required when anchor.mode=kubernetes-lease" -}}
+{{- end -}}
+{{- if and (not .Values.serviceAccount.create) (not .Values.serviceAccount.name) -}}
+{{- fail "serviceAccount.name is required when serviceAccount.create=false and anchor.mode=kubernetes-lease" -}}
+{{- end -}}
+{{- if and (not .Values.rbac.create) (not .Values.rbac.existing) -}}
+{{- fail "rbac.create=false requires rbac.existing=true when anchor.mode=kubernetes-lease" -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.repository.retention.mode (and (ne .Values.repository.retention.mode "governance") (ne .Values.repository.retention.mode "compliance")) -}}
 {{- fail "repository.retention.mode must be empty, governance, or compliance" -}}
 {{- end -}}
@@ -66,4 +77,8 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- else -}}
 {{- include "rs3-gateway.fullname" . -}}
 {{- end -}}
+{{- end -}}
+
+{{- define "rs3-gateway.anchorNamespace" -}}
+{{- default .Release.Namespace .Values.anchor.namespace -}}
 {{- end -}}

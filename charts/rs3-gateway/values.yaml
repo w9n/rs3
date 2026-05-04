@@ -76,5 +76,6 @@ serviceAccount:
 
 rbac:
   create: true
+  existing: false
 
 resources: {}

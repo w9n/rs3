@@ -3,6 +3,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: {{ include "rs3-gateway.fullname" . }}-anchor
+  namespace: {{ include "rs3-gateway.anchorNamespace" . }}
   labels:
     {{- include "rs3-gateway.labels" . | nindent 4 }}
 rules:
@@ -19,6 +20,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: {{ include "rs3-gateway.fullname" . }}-anchor
+  namespace: {{ include "rs3-gateway.anchorNamespace" . }}
   labels:
     {{- include "rs3-gateway.labels" . | nindent 4 }}
 roleRef:

@@ -38,6 +38,10 @@ flags may override selected listener settings.
 | `RS3_ANCHOR_NAME` | for Kubernetes | none | Kubernetes Lease name. |
 | `RS3_ANCHOR_FIELD_MANAGER` | no | `rs3-server` | Server-side apply field manager. |
 
+Helm defaults to `anchor.mode=kubernetes-lease`. If `rbac.create=false`, set
+`rbac.existing=true` to document that equivalent Lease permissions are provided
+outside the chart. If `serviceAccount.create=false`, set `serviceAccount.name`.
+
 ## Repository Keys
 
 | Variable | Required | Default | Description |

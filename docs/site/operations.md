@@ -61,6 +61,11 @@ RS3_ANCHOR_FIELD_MANAGER=rs3-server
 If the configured anchor cannot be read or advanced, writes must fail closed.
 Do not silently fall back to a memory anchor.
 
+In Helm deployments, keep `rbac.create=true` unless equivalent Lease
+permissions already exist. Set `rbac.existing=true` only for that external-RBAC
+case. When the Lease lives outside the release namespace, set `anchor.namespace`
+so the generated Role and RoleBinding are created in the Lease namespace.
+
 ## Retention
 
 Repository retention is configured with:

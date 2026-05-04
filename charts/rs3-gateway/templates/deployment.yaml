@@ -102,7 +102,7 @@ spec:
             {{- end }}
             {{- if eq .Values.anchor.mode "kubernetes-lease" }}
             - name: RS3_ANCHOR_NAMESPACE
-              value: {{ default .Release.Namespace .Values.anchor.namespace | quote }}
+              value: {{ include "rs3-gateway.anchorNamespace" . | quote }}
             - name: RS3_ANCHOR_NAME
               value: {{ .Values.anchor.name | quote }}
             - name: RS3_ANCHOR_FIELD_MANAGER
