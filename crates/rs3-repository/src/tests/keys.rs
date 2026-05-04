@@ -1,93 +1,5 @@
 use super::*;
 
-#[test]
-fn repository_new_derives_purpose_specific_keys_from_master_key() {
-    let repo = Repository::new(MemoryBlobStore::new(), secret());
-    let keyring = match repo.keyring.read() {
-        Ok(keyring) => keyring,
-        Err(error) => panic!("{error}"),
-    };
-
-    assert_eq!(
-        keyring
-            .descriptors()
-            .into_iter()
-            .map(|descriptor| (descriptor.id, descriptor.purpose, descriptor.algorithm))
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                key_id("namespace-v1"),
-                KeyPurpose::Namespace,
-                "hmac-sha256".to_owned()
-            ),
-            (
-                key_id("content-v1"),
-                KeyPurpose::Content,
-                "xchacha20poly1305".to_owned()
-            ),
-            (
-                key_id("metadata-v1"),
-                KeyPurpose::Metadata,
-                "aes-256-gcm-siv-hmac-sha256-nonce-v1".to_owned()
-            ),
-            (
-                key_id("checkpoint-v1"),
-                KeyPurpose::CheckpointSigning,
-                "ed25519".to_owned()
-            ),
-        ]
-    );
-}
-
-#[test]
-fn repository_from_master_key_context_binds_to_repository_salt() {
-    let repository_id = match RepositoryId::new("repository-a") {
-        Ok(repository_id) => repository_id,
-        Err(error) => panic!("{error}"),
-    };
-    let first_context = match RepositoryKeyContext::new(repository_id.clone(), vec![1; 32]) {
-        Ok(context) => context,
-        Err(error) => panic!("{error}"),
-    };
-    let second_context = match RepositoryKeyContext::new(repository_id, vec![2; 32]) {
-        Ok(context) => context,
-        Err(error) => panic!("{error}"),
-    };
-    let first =
-        match Repository::from_master_key_context(MemoryBlobStore::new(), secret(), &first_context)
-        {
-            Ok(repository) => repository,
-            Err(error) => panic!("{error}"),
-        };
-    let second = match Repository::from_master_key_context(
-        MemoryBlobStore::new(),
-        secret(),
-        &second_context,
-    ) {
-        Ok(repository) => repository,
-        Err(error) => panic!("{error}"),
-    };
-    let first_id = match first.keyring.read() {
-        Ok(keyring) => keyring.derive_backend_object_id("segments", b"same"),
-        Err(error) => panic!("{error}"),
-    };
-    let second_id = match second.keyring.read() {
-        Ok(keyring) => keyring.derive_backend_object_id("segments", b"same"),
-        Err(error) => panic!("{error}"),
-    };
-
-    let first_id = match first_id {
-        Ok(object_id) => object_id,
-        Err(error) => panic!("{error}"),
-    };
-    let second_id = match second_id {
-        Ok(object_id) => object_id,
-        Err(error) => panic!("{error}"),
-    };
-
-    assert_ne!(first_id, second_id);
-}
-
 #[tokio::test]
 async fn stored_keyring_envelope_is_bound_into_signed_checkpoints() {
     let store = MemoryBlobStore::new();
@@ -99,11 +11,7 @@ async fn stored_keyring_envelope_is_bound_into_signed_checkpoints() {
         Ok(context) => context,
         Err(error) => panic!("{error}"),
     };
-    let active_keyring =
-        match KeyRing::from_repository_master_key_for_context(&secret_with_byte(11), &context) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
+    let active_keyring = signing_keyring();
     let envelope =
         match active_keyring.seal_keyring_envelope(&context, "wrap-v1", &secret_with_byte(12), 1) {
             Ok(envelope) => envelope,

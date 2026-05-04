@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn backend_payload_does_not_store_plaintext() {
     let store = MemoryBlobStore::new();
-    let repo = Repository::new(store.clone(), secret());
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
     let client_key = key("p/12/encrypted-client-blob");
     let plaintext = Bytes::from_static(b"very sensitive payload marker");
 
@@ -34,7 +34,7 @@ async fn backend_payload_does_not_store_plaintext() {
 #[tokio::test]
 async fn tampered_backend_payload_fails_repository_read() {
     let store = MemoryBlobStore::new();
-    let repo = Repository::new(store.clone(), secret());
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
     let client_key = key("p/12/tampered");
 
     let put = repo
@@ -73,7 +73,7 @@ async fn tampered_backend_payload_fails_repository_read() {
 
 #[tokio::test]
 async fn range_get_uses_repository_mapping() {
-    let repo = Repository::new(MemoryBlobStore::new(), secret());
+    let repo = Repository::with_keyring(MemoryBlobStore::new(), signing_keyring());
     let key = key("p/12/abcdef");
 
     let put = repo
@@ -95,7 +95,7 @@ async fn range_get_uses_repository_mapping() {
 #[tokio::test]
 async fn large_range_get_reads_only_header_and_selected_segment() {
     let store = MemoryBlobStore::new();
-    let repo = Repository::new(store.clone(), secret());
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
     let key = key("p/12/large-range");
     let body = Bytes::from(vec![42_u8; 1024 * 1024]);
 
@@ -124,7 +124,7 @@ async fn large_range_get_reads_only_header_and_selected_segment() {
 #[tokio::test]
 async fn repeated_large_range_gets_reuse_payload_header() {
     let store = MemoryBlobStore::new();
-    let repo = Repository::new(store.clone(), secret());
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
     let key = key("p/12/repeated-large-range");
     let body = Bytes::from(vec![91_u8; 1024 * 1024]);
 
@@ -149,7 +149,7 @@ async fn repeated_large_range_gets_reuse_payload_header() {
 #[tokio::test]
 async fn repeated_same_segment_range_gets_reuse_ciphertext_span() {
     let store = MemoryBlobStore::new();
-    let repo = Repository::new(store.clone(), secret());
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
     let key = key("p/12/repeated-same-segment-range");
     let body = Bytes::from(vec![37_u8; 1024 * 1024]);
 
@@ -180,7 +180,7 @@ async fn repeated_same_segment_range_gets_reuse_ciphertext_span() {
 #[tokio::test]
 async fn first_segment_range_reuses_header_probe_ciphertext() {
     let store = MemoryBlobStore::new();
-    let repo = Repository::new(store.clone(), secret());
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
     let key = key("p/12/first-segment-prefetch");
     let body = Bytes::from(vec![11_u8; 256]);
 

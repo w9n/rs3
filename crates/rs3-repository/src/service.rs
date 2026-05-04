@@ -19,7 +19,7 @@ use crate::payload::{
 use crate::state::{RepositoryState, TrustedManifest, next_sequence, object_material};
 use bytes::Bytes;
 use rs3_anchor::CheckpointAnchor;
-use rs3_crypto::{KeyRing, NamespaceBlindKey, RepositoryKeyContext, SecretBytes};
+use rs3_crypto::{KeyRing, NamespaceBlindKey};
 use rs3_index::{IndexDelta, KeyringEnvelopeReference, NamespaceEntry};
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy};
@@ -60,36 +60,6 @@ impl<S> Repository<S>
 where
     S: BlobStore,
 {
-    /// Creates a trusted repository service over a blob store.
-    ///
-    /// The provided secret is a repository master key. Purpose-specific
-    /// namespace, content, metadata, and checkpoint keys are derived from it.
-    pub fn new(store: S, master_key: SecretBytes) -> Self {
-        match Self::from_master_key(store, master_key) {
-            Ok(repository) => repository,
-            Err(error) => unreachable!("repository master key derivation is infallible: {error}"),
-        }
-    }
-
-    /// Creates a trusted repository service from a repository master key.
-    ///
-    /// This compatibility helper uses the legacy default repository context.
-    /// Production gateway paths should use [`Self::from_master_key_context`].
-    pub fn from_master_key(store: S, master_key: SecretBytes) -> Result<Self> {
-        let keyring = KeyRing::from_repository_master_key(&master_key)?;
-        Ok(Self::with_keyring(store, keyring))
-    }
-
-    /// Creates a trusted repository service from a bound repository key context.
-    pub fn from_master_key_context(
-        store: S,
-        master_key: SecretBytes,
-        context: &RepositoryKeyContext,
-    ) -> Result<Self> {
-        let keyring = KeyRing::from_repository_master_key_for_context(&master_key, context)?;
-        Ok(Self::with_keyring(store, keyring))
-    }
-
     /// Creates a trusted repository service with an explicit keyring.
     pub fn with_keyring(store: S, keyring: KeyRing) -> Self {
         Self::with_keyring_and_options(store, keyring, RepositoryOptions::default())

@@ -21,8 +21,10 @@ use tokio::net::TcpStream;
 const GATEWAY_PUBLIC_BUCKET: &str = "client-bucket";
 const GATEWAY_ACCESS_KEY_ID: &str = "access";
 const GATEWAY_SECRET_ACCESS_KEY: &str = "secret";
-const GATEWAY_REPOSITORY_MASTER_KEY_HEX: &str =
-    "1111111111111111111111111111111111111111111111111111111111111111";
+const GATEWAY_KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.json";
+const GATEWAY_KEYRING_WRAPPING_KEY_HEX: &str =
+    "3333333333333333333333333333333333333333333333333333333333333333";
+const GATEWAY_KEYRING_WRAPPING_KEY_ID: &str = "wrap-integration";
 const GATEWAY_REPOSITORY_SALT_HEX: &str =
     "2222222222222222222222222222222222222222222222222222222222222222";
 
@@ -401,8 +403,16 @@ impl RunningPerfGateway {
             .env("RS3_BACKEND_PREFIX", backend_prefix)
             .env("RS3_REPOSITORY_ID", "rs3-gateway-perf-repository")
             .env(
-                "RS3_REPOSITORY_MASTER_KEY_HEX",
-                GATEWAY_REPOSITORY_MASTER_KEY_HEX,
+                "RS3_KEYRING_ENVELOPE_OBJECT_ID",
+                GATEWAY_KEYRING_ENVELOPE_OBJECT_ID,
+            )
+            .env(
+                "RS3_KEYRING_WRAPPING_KEY_ID",
+                GATEWAY_KEYRING_WRAPPING_KEY_ID,
+            )
+            .env(
+                "RS3_KEYRING_WRAPPING_KEY_HEX",
+                GATEWAY_KEYRING_WRAPPING_KEY_HEX,
             )
             .env("RS3_REPOSITORY_SALT_HEX", GATEWAY_REPOSITORY_SALT_HEX)
             .env(

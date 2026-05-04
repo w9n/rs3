@@ -64,7 +64,7 @@ newer one. The backend can still deny service by hiding required objects.
 
 | Situation | Preview behavior |
 | --- | --- |
-| Empty backend prefix and no anchor | Explicit bootstrap may initialize the repository. Normal serving should not invent identity or keys. |
+| Empty backend prefix and no anchor | Startup may initialize the configured keyring envelope using the supplied repository ID, salt, envelope object ID, and unwrap authority. |
 | Existing backend prefix and matching anchor | Open after signed checkpoint, envelope, and evidence validation. |
 | Backend serves an older checkpoint than the Lease anchor | Fail closed as rollback. |
 | Backend hides the checkpoint or evidence named by the Lease anchor | Fail closed as unavailable or tampered. |
@@ -76,11 +76,11 @@ newer one. The backend can still deny service by hiding required objects.
 
 ## Bootstrap UX
 
-The preview bootstrap path is explicit and declarative:
+The preview bootstrap path is declarative:
 
 1. Choose a stable `repository.id`.
 2. Generate and keep a stable 32-byte public `repositoryKeys.saltHex`.
-3. Create an encrypted keyring envelope under `keyrings/`.
+3. Choose the initial keyring envelope object ID under `keyrings/`.
 4. Store the unwrap authority outside the object store.
 5. Deploy the gateway with Kubernetes Lease anchoring.
 
@@ -90,10 +90,10 @@ make the gateway generate an undeclared salt on first normal startup; that makes
 disaster recovery dependent on a cluster Secret that may be gone.
 
 For production-like Helm deployments, values remain declarative. The chart
-should consume an existing Secret or values provided by an explicit bootstrap
-step. It should not mutate Helm values after first run.
+should consume an existing Secret or explicit values. It should not mutate Helm
+values after first run.
 
-The intended bootstrap command/job behavior is:
+Startup bootstrap behavior is:
 
 - if the configured backend prefix is empty, initialize exactly one repository
   using the supplied repository ID, supplied salt, and unwrap authority
@@ -129,14 +129,11 @@ explicitly defer these gaps:
 
 - normal startup validation compares the accepted Kubernetes Lease position with
   storage-side evidence and fails closed on mismatch
-- bootstrap tooling initializes only an empty backend prefix and verifies, rather
-  than overwrites, an existing prefix
+- startup validation completes storage-evidence comparison for existing prefixes
 - disaster-recovery tooling exports or imports the trusted anchor position for a
   new cluster
 - Helm production-preview guidance uses an operator-provided salt and encrypted
   keyring envelope without hidden first-run mutation
-- direct master-key mode is either removed from the production path or clearly
-  confined to development and compatibility harnesses
 
 ## Non-Goals
 
@@ -170,7 +167,7 @@ position from the configured anchor.
 For a production-preview deployment:
 
 - use `RS3_ANCHOR_MODE=kubernetes-lease`
-- use `repositoryKeys.source=keyring-envelope` in Helm
+- use `repositoryKeys.create=true` or `repositoryKeys.existingSecret` in Helm
 - set a stable `repository.id`
 - set a stable, operator-provided `repositoryKeys.saltHex`
 - configure gateway access credentials explicitly
@@ -179,8 +176,9 @@ For a production-preview deployment:
 - keep restore verification inputs outside the object-store trust boundary
 - collect metrics and logs with path-safe labels only
 
-Do not use the direct master-key path for production-preview evidence. It remains
-a development and compatibility path until the codebase is made leaner.
+Do not rely on backend state alone for production-preview evidence. Use the
+configured anchor position and restore verification inputs from a trusted bundle
+or separate authority.
 
 ## Readiness Bar
 

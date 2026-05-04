@@ -42,8 +42,8 @@ The result is a system that should be evaluated on three axes:
 
 - Path-private repository object IDs and namespace lookup tokens.
 - Encrypted payload segments with authenticated object context.
-- Purpose-specific keys derived with HKDF-SHA-256 from a master key,
-  repository ID, and public salt.
+- Random purpose-specific keys sealed in an encrypted keyring envelope, with
+  repository ID and public salt bound into the unwrap context.
 - Signed checkpoint shape and external-anchor model.
 - Kubernetes Lease anchor for the preview deployment model.
 - Restore verification for checkpoint chain, reachable objects, decryptability,

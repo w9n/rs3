@@ -338,8 +338,7 @@ mod tests {
     }
 
     fn keyring() -> KeyRing {
-        KeyRing::from_repository_master_key_for_context(&secret(1), &context("repo-a", 2))
-            .unwrap_or_else(|error| panic!("{error}"))
+        KeyRing::generate_random().unwrap_or_else(|error| panic!("{error}"))
     }
 
     #[test]

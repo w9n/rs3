@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rs3_crypto::derive_public_fingerprint;
-use rs3_server::{AnchorConfig, GatewayServer, RepositoryKeySource, RuntimeConfig};
+use rs3_server::{AnchorConfig, GatewayServer, RuntimeConfig};
 use rs3_types::RetentionMode;
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
@@ -106,16 +106,6 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<DoctorFinding> {
         findings.push(DoctorFinding::new(
             "anchor.memory",
             "production profile requires a durable external checkpoint anchor",
-        ));
-    }
-
-    if matches!(
-        config.repository_keys.source,
-        RepositoryKeySource::MasterKey { .. }
-    ) {
-        findings.push(DoctorFinding::new(
-            "keys.master-key",
-            "production profile requires an encrypted keyring envelope",
         ));
     }
 
@@ -306,7 +296,7 @@ mod tests {
     use super::{DoctorProfile, backend_kind, doctor_findings, runtime_config_profile};
     use rs3_server::{
         AnchorConfig, BackendConfig, BatchConfig, MetricsConfig, RepositoryConfig,
-        RepositoryKeySource, RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
+        RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use std::time::Duration;
@@ -348,11 +338,14 @@ mod tests {
                 repository_id,
                 repository_salt_hex:
                     "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
-                source: RepositoryKeySource::MasterKey {
-                    master_key_hex: SecretString::from(
-                        "1111111111111111111111111111111111111111111111111111111111111111",
-                    ),
-                },
+                envelope_object_id: BackendObjectId::new(
+                    "keyrings/00000000000000000001-digest.json",
+                )
+                .unwrap_or_else(|error| panic!("{error}")),
+                wrapping_key_id: "wrap-v1".to_owned(),
+                wrapping_key_hex: SecretString::from(
+                    "3333333333333333333333333333333333333333333333333333333333333333",
+                ),
             },
             static_credentials: None,
         }
@@ -405,7 +398,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(codes.contains(&"anchor.memory"));
-        assert!(codes.contains(&"keys.master-key"));
         assert!(codes.contains(&"retention.missing"));
         assert!(codes.contains(&"auth.static-credentials"));
     }
@@ -419,14 +411,6 @@ mod tests {
             field_manager: "rs3-server".to_owned(),
         };
         config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 30));
-        config.repository_keys.source = RepositoryKeySource::KeyringEnvelope {
-            envelope_object_id: BackendObjectId::new("keyrings/00000000000000000001-digest.json")
-                .unwrap_or_else(|error| panic!("{error}")),
-            wrapping_key_id: "wrap-v1".to_owned(),
-            wrapping_key_hex: SecretString::from(
-                "3333333333333333333333333333333333333333333333333333333333333333",
-            ),
-        };
         config.static_credentials = Some(StaticCredentials {
             access_key_id: "access".to_owned(),
             secret_access_key: SecretString::from("secret"),

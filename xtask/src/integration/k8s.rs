@@ -65,10 +65,11 @@ pub(crate) fn run_k8s_gateway(args: K8sGatewayArgs) -> Result<()> {
 mod imp {
     use super::K8sGatewayArgs;
     use crate::integration::k8s_support::{
-        ACCESS_KEY_ID, CHART_PATH, DEFAULT_PUBLIC_BUCKET, GATEWAY_PORT, GatewayChartValues,
-        K8sWorkspace, KindCluster, PortForward, REPOSITORY_ID, REPOSITORY_MASTER_KEY_HEX,
-        REPOSITORY_SALT_HEX, SECRET_ACCESS_KEY, default_cluster_name, helm_fullname,
-        helm_install_gateway, require_command, run_command, split_image_ref,
+        ACCESS_KEY_ID, DEFAULT_PUBLIC_BUCKET, GATEWAY_PORT, GatewayChartValues, K8sWorkspace,
+        KEYRING_ENVELOPE_OBJECT_ID, KEYRING_WRAPPING_KEY_HEX, KEYRING_WRAPPING_KEY_ID, KindCluster,
+        PortForward, REPOSITORY_ID, REPOSITORY_SALT_HEX, SECRET_ACCESS_KEY, default_cluster_name,
+        helm_fullname, helm_install_gateway, helm_lint_gateway, require_command, run_command,
+        split_image_ref,
     };
     use anyhow::{Context, Result, bail};
     use aws_sdk_s3::{
@@ -83,8 +84,7 @@ mod imp {
         require_command(&args.kubectl_bin, &["version", "--client"])?;
         require_command(&args.helm_bin, &["version", "--short"])?;
         require_command(&args.docker_bin, &["version"])?;
-        run_command(&args.helm_bin, &["lint", CHART_PATH])
-            .context("gateway Helm chart lint failed")?;
+        helm_lint_gateway(&args.helm_bin)?;
 
         if !args.skip_image_build {
             run_command(&args.docker_bin, &["build", "-t", args.image.as_str(), "."])
@@ -142,8 +142,10 @@ mod imp {
                 rust_log: "info",
                 payload_segment_size: args.payload_segment_size,
                 repository_id: REPOSITORY_ID,
-                repository_master_key_hex: REPOSITORY_MASTER_KEY_HEX,
                 repository_salt_hex: REPOSITORY_SALT_HEX,
+                keyring_envelope_object_id: KEYRING_ENVELOPE_OBJECT_ID,
+                keyring_wrapping_key_id: KEYRING_WRAPPING_KEY_ID,
+                keyring_wrapping_key_hex: KEYRING_WRAPPING_KEY_HEX,
                 persistence_enabled: false,
                 wait_secs: args.wait_secs,
             },

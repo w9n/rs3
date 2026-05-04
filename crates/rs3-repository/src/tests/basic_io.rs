@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn put_then_head_get_and_list() {
     let store = MemoryBlobStore::new();
-    let repo = Repository::new(store, secret());
+    let repo = Repository::with_keyring(store, signing_keyring());
     let key = key("p/12/abcdef");
 
     let put = repo
@@ -33,7 +33,7 @@ async fn put_then_head_get_and_list() {
 #[tokio::test]
 async fn list_preserves_arbitrary_prefix_semantics_with_delimiter_index() {
     let store = MemoryBlobStore::new();
-    let repo = Repository::new(store, secret());
+    let repo = Repository::with_keyring(store, signing_keyring());
     let first = key("p/12/a");
     let second = key("p/123/b");
 
@@ -69,11 +69,11 @@ async fn list_preserves_arbitrary_prefix_semantics_with_delimiter_index() {
 
 #[tokio::test]
 async fn put_uses_wall_clock_when_backend_omits_put_timestamp() {
-    let repo = Repository::new(
+    let repo = Repository::with_keyring(
         NoPutTimestampStore {
             inner: MemoryBlobStore::new(),
         },
-        secret(),
+        signing_keyring(),
     );
     let key = key("p/12/no-provider-timestamp");
     let before = now_ms();
@@ -96,7 +96,7 @@ async fn put_uses_wall_clock_when_backend_omits_put_timestamp() {
 
 #[tokio::test]
 async fn create_only_rejects_existing_namespace_entry() {
-    let repo = Repository::new(MemoryBlobStore::new(), secret());
+    let repo = Repository::with_keyring(MemoryBlobStore::new(), signing_keyring());
     let key = key("p/12/abcdef");
     let options = RepositoryPutOptions {
         create_only: true,

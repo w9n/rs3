@@ -26,10 +26,10 @@ enum RestoreCommand {
 
 #[derive(Debug, Args)]
 struct RestoreVerifyArgs {
-    /// Stable repository identifier bound into key derivation.
+    /// Stable repository identifier bound into the keyring envelope context.
     #[arg(long, env = "RS3_REPOSITORY_ID")]
     repository_id: String,
-    /// Hex-encoded public repository salt bound into key derivation.
+    /// Hex-encoded public repository salt bound into the keyring envelope context.
     #[arg(long, env = "RS3_REPOSITORY_SALT_HEX")]
     repository_salt_hex: String,
     /// Accepted checkpoint sequence from the trusted anchor.
@@ -57,18 +57,12 @@ struct RestoreVerifyArgs {
 
 #[derive(Clone, Debug, Args)]
 struct RestoreKeySourceArgs {
-    /// Hex-encoded repository master key.
-    #[arg(long, env = "RS3_REPOSITORY_MASTER_KEY_HEX", hide_env_values = true)]
-    master_key_hex: Option<String>,
-    /// File containing the hex-encoded repository master key.
-    #[arg(long)]
-    master_key_hex_file: Option<PathBuf>,
     /// Backend object containing the encrypted keyring envelope.
     #[arg(long, env = "RS3_KEYRING_ENVELOPE_OBJECT_ID")]
-    keyring_envelope_object_id: Option<String>,
+    keyring_envelope_object_id: String,
     /// Operator-visible wrapping key identifier expected by the envelope.
     #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_ID")]
-    wrapping_key_id: Option<String>,
+    wrapping_key_id: String,
     /// Hex-encoded high-entropy wrapping key.
     #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_HEX", hide_env_values = true)]
     wrapping_key_hex: Option<String>,
@@ -181,7 +175,7 @@ where
         checkpoint_id: CheckpointId::new(args.checkpoint_id)?,
         payload_digest: args.checkpoint_digest,
     };
-    let keyring = keyring_from_source(&store, &context, &args.keys).await?;
+    let keyring = keyring_from_envelope(&store, &context, &args.keys).await?;
     let repository = Repository::with_keyring(store, keyring);
 
     let report = repository
@@ -205,38 +199,6 @@ where
     Ok(report)
 }
 
-async fn keyring_from_source<S>(
-    store: &S,
-    context: &RepositoryKeyContext,
-    args: &RestoreKeySourceArgs,
-) -> Result<KeyRing>
-where
-    S: BlobStore,
-{
-    let has_master = args.master_key_hex.is_some() || args.master_key_hex_file.is_some();
-    let has_envelope = args.keyring_envelope_object_id.is_some()
-        || args.wrapping_key_id.is_some()
-        || args.wrapping_key_hex.is_some()
-        || args.wrapping_key_hex_file.is_some();
-    match (has_master, has_envelope) {
-        (true, false) => {
-            let master_key = secret_input(
-                args.master_key_hex.clone(),
-                args.master_key_hex_file.as_deref(),
-                "--master-key-hex",
-                "--master-key-hex-file",
-            )?;
-            KeyRing::from_repository_master_key_for_context(&master_key, context)
-                .map_err(Into::into)
-        }
-        (false, true) => keyring_from_envelope(store, context, args).await,
-        (true, true) => {
-            bail!("master-key source cannot be combined with keyring-envelope source")
-        }
-        (false, false) => bail!("repository master key or keyring envelope source is required"),
-    }
-}
-
 async fn keyring_from_envelope<S>(
     store: &S,
     context: &RepositoryKeyContext,
@@ -245,15 +207,8 @@ async fn keyring_from_envelope<S>(
 where
     S: BlobStore,
 {
-    let object_id = BackendObjectId::new(
-        args.keyring_envelope_object_id
-            .clone()
-            .context("--keyring-envelope-object-id is required")?,
-    )?;
-    let wrapping_key_id = args
-        .wrapping_key_id
-        .as_deref()
-        .context("--wrapping-key-id is required")?;
+    let object_id = BackendObjectId::new(args.keyring_envelope_object_id.clone())?;
+    let wrapping_key_id = args.wrapping_key_id.as_str();
     let wrapping_key = secret_input(
         args.wrapping_key_hex.clone(),
         args.wrapping_key_hex_file.as_deref(),
@@ -418,26 +373,47 @@ mod tests {
     use rs3_crypto::{KeyRing, RepositoryKeyContext, SecretBytes};
     use rs3_repository::{CheckpointPosition, Repository, RepositoryOptions, RepositoryPutOptions};
     use rs3_storage::MemoryBlobStore;
-    use rs3_types::{RepositoryId, RetentionMode, RetentionPolicy};
+    use rs3_types::{BackendObjectId, RepositoryId, RetentionMode, RetentionPolicy};
 
-    const MASTER_KEY_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const SALT_HEX: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const WRAPPING_KEY_HEX: &str =
+        "3333333333333333333333333333333333333333333333333333333333333333";
+    const WRAPPING_KEY_ID: &str = "wrap-test";
 
-    fn test_keyring() -> KeyRing {
-        let context = RepositoryKeyContext::new(
+    fn test_context() -> RepositoryKeyContext {
+        RepositoryKeyContext::new(
             RepositoryId::new("restore-cli").unwrap_or_else(|error| panic!("{error}")),
             hex::decode(SALT_HEX).unwrap_or_else(|error| panic!("{error}")),
         )
-        .unwrap_or_else(|error| panic!("{error}"));
-        let master_key =
-            SecretBytes::new(hex::decode(MASTER_KEY_HEX).unwrap_or_else(|error| panic!("{error}")))
-                .unwrap_or_else(|error| panic!("{error}"));
-        KeyRing::from_repository_master_key_for_context(&master_key, &context)
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn wrapping_key() -> SecretBytes {
+        SecretBytes::new(hex::decode(WRAPPING_KEY_HEX).unwrap_or_else(|error| panic!("{error}")))
             .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn test_keyring() -> KeyRing {
+        KeyRing::generate_random().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    async fn store_keyring_envelope<S>(repo: &Repository<S>, keyring: &KeyRing) -> BackendObjectId
+    where
+        S: rs3_storage::BlobStore,
+    {
+        let envelope = keyring
+            .seal_keyring_envelope(&test_context(), WRAPPING_KEY_ID, &wrapping_key(), 1)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let reference = repo
+            .store_keyring_envelope(&envelope)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        reference.object_id
     }
 
     fn restore_verify_args(
         checkpoint: &CheckpointPosition,
+        keyring_envelope_object_id: &BackendObjectId,
         require_provider_delete_protection: bool,
     ) -> RestoreVerifyArgs {
         RestoreVerifyArgs {
@@ -447,11 +423,9 @@ mod tests {
             checkpoint_id: checkpoint.checkpoint_id.as_str().to_owned(),
             checkpoint_digest: checkpoint.payload_digest.clone(),
             keys: RestoreKeySourceArgs {
-                master_key_hex: Some(MASTER_KEY_HEX.to_owned()),
-                master_key_hex_file: None,
-                keyring_envelope_object_id: None,
-                wrapping_key_id: None,
-                wrapping_key_hex: None,
+                keyring_envelope_object_id: keyring_envelope_object_id.as_str().to_owned(),
+                wrapping_key_id: WRAPPING_KEY_ID.to_owned(),
+                wrapping_key_hex: Some(WRAPPING_KEY_HEX.to_owned()),
                 wrapping_key_hex_file: None,
             },
             backend: RestoreBackendArgs {
@@ -478,7 +452,9 @@ mod tests {
     #[tokio::test]
     async fn restore_verify_command_uses_supplied_checkpoint_position() {
         let store = MemoryBlobStore::new();
-        let repo = Repository::with_keyring(store.clone(), test_keyring());
+        let keyring = test_keyring();
+        let repo = Repository::with_keyring(store.clone(), keyring.clone());
+        let envelope_object_id = store_keyring_envelope(&repo, &keyring).await;
         let anchor = MemoryCheckpointAnchor::new();
         let committed = repo
             .put_committed(
@@ -490,7 +466,7 @@ mod tests {
             )
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        let args = restore_verify_args(&committed.checkpoint, false);
+        let args = restore_verify_args(&committed.checkpoint, &envelope_object_id, false);
 
         let report = verify_with_store(args, store)
             .await
@@ -503,14 +479,16 @@ mod tests {
     #[tokio::test]
     async fn restore_verify_can_require_provider_delete_protection() {
         let store = MemoryBlobStore::new();
+        let keyring = test_keyring();
         let repo = Repository::with_keyring_and_options(
             store.clone(),
-            test_keyring(),
+            keyring.clone(),
             RepositoryOptions {
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 default_retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
             },
         );
+        let envelope_object_id = store_keyring_envelope(&repo, &keyring).await;
         let anchor = MemoryCheckpointAnchor::new();
         let committed = repo
             .put_committed(
@@ -522,7 +500,7 @@ mod tests {
             )
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        let args = restore_verify_args(&committed.checkpoint, true);
+        let args = restore_verify_args(&committed.checkpoint, &envelope_object_id, true);
 
         let report = verify_with_store(args, store)
             .await
@@ -537,7 +515,9 @@ mod tests {
     #[tokio::test]
     async fn restore_verify_rejects_missing_provider_delete_protection_when_required() {
         let store = MemoryBlobStore::new();
-        let repo = Repository::with_keyring(store.clone(), test_keyring());
+        let keyring = test_keyring();
+        let repo = Repository::with_keyring(store.clone(), keyring.clone());
+        let envelope_object_id = store_keyring_envelope(&repo, &keyring).await;
         let anchor = MemoryCheckpointAnchor::new();
         let committed = repo
             .put_committed(
@@ -549,7 +529,7 @@ mod tests {
             )
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        let args = restore_verify_args(&committed.checkpoint, true);
+        let args = restore_verify_args(&committed.checkpoint, &envelope_object_id, true);
 
         let error = match verify_with_store(args, store).await {
             Ok(report) => panic!("restore verification unexpectedly passed: {report:?}"),
@@ -565,7 +545,7 @@ mod tests {
 
     #[test]
     fn restore_verify_rejects_bad_secret_hex() {
-        assert!(secret_from_hex("--master-key-hex", "not-hex").is_err());
-        assert!(secret_from_hex("--master-key-hex", "11").is_err());
+        assert!(secret_from_hex("--wrapping-key-hex", "not-hex").is_err());
+        assert!(secret_from_hex("--wrapping-key-hex", "11").is_err());
     }
 }

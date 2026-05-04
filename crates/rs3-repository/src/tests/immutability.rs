@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn delete_tombstones_namespace_and_retains_locked_backend_object() {
     let store = MemoryBlobStore::new();
-    let repo = Repository::new(store.clone(), secret());
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
     let key = key("p/12/abcdef");
     let options = RepositoryPutOptions {
         create_only: true,
@@ -28,7 +28,7 @@ async fn delete_tombstones_namespace_and_retains_locked_backend_object() {
 #[tokio::test]
 async fn delete_tombstones_namespace_and_retains_legal_held_backend_object() {
     let store = MemoryBlobStore::new();
-    let repo = Repository::new(store.clone(), secret());
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
     let key = key("p/12/held");
     let options = RepositoryPutOptions {
         create_only: true,
@@ -52,7 +52,7 @@ async fn delete_tombstones_namespace_and_retains_legal_held_backend_object() {
 
 #[tokio::test]
 async fn legal_hold_update_updates_repository_metadata() {
-    let repo = Repository::new(MemoryBlobStore::new(), secret());
+    let repo = Repository::with_keyring(MemoryBlobStore::new(), signing_keyring());
     let key = key("p/12/legal-hold");
 
     let put = repo
@@ -170,7 +170,7 @@ async fn legal_hold_applies_to_payload_and_checkpoint() {
 
 #[tokio::test]
 async fn retention_extension_updates_repository_metadata() {
-    let repo = Repository::new(MemoryBlobStore::new(), secret());
+    let repo = Repository::with_keyring(MemoryBlobStore::new(), signing_keyring());
     let key = key("p/12/abcdef");
 
     let put = repo

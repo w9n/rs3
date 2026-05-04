@@ -13,9 +13,11 @@ pub(crate) const CHART_NAME: &str = "rs3-gateway";
 pub(crate) const CHART_PATH: &str = "charts/rs3-gateway";
 pub(crate) const DEFAULT_PUBLIC_BUCKET: &str = "client-bucket";
 pub(crate) const GATEWAY_PORT: u16 = 9080;
+pub(crate) const KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.json";
+pub(crate) const KEYRING_WRAPPING_KEY_HEX: &str =
+    "3333333333333333333333333333333333333333333333333333333333333333";
+pub(crate) const KEYRING_WRAPPING_KEY_ID: &str = "wrap-integration";
 pub(crate) const REPOSITORY_ID: &str = "rs3-integration-repository";
-pub(crate) const REPOSITORY_MASTER_KEY_HEX: &str =
-    "1111111111111111111111111111111111111111111111111111111111111111";
 pub(crate) const REPOSITORY_SALT_HEX: &str =
     "2222222222222222222222222222222222222222222222222222222222222222";
 pub(crate) const SECRET_ACCESS_KEY: &str = "secret";
@@ -38,8 +40,10 @@ pub(crate) struct GatewayChartValues<'a> {
     pub(crate) rust_log: &'a str,
     pub(crate) payload_segment_size: usize,
     pub(crate) repository_id: &'a str,
-    pub(crate) repository_master_key_hex: &'a str,
     pub(crate) repository_salt_hex: &'a str,
+    pub(crate) keyring_envelope_object_id: &'a str,
+    pub(crate) keyring_wrapping_key_id: &'a str,
+    pub(crate) keyring_wrapping_key_hex: &'a str,
     pub(crate) persistence_enabled: bool,
     pub(crate) wait_secs: u64,
 }
@@ -113,12 +117,22 @@ pub(crate) fn helm_install_gateway(
             "--set",
             "repositoryKeys.create=true",
             "--set-string",
+            &helm_set_string("repositoryKeys.saltHex", values.repository_salt_hex),
+            "--set-string",
             &helm_set_string(
-                "repositoryKeys.masterKeyHex",
-                values.repository_master_key_hex,
+                "repositoryKeys.envelopeObjectId",
+                values.keyring_envelope_object_id,
             ),
             "--set-string",
-            &helm_set_string("repositoryKeys.saltHex", values.repository_salt_hex),
+            &helm_set_string(
+                "repositoryKeys.wrappingKeyId",
+                values.keyring_wrapping_key_id,
+            ),
+            "--set-string",
+            &helm_set_string(
+                "repositoryKeys.wrappingKeyHex",
+                values.keyring_wrapping_key_hex,
+            ),
             "--set",
             &format!("anchor.allowMemory={}", values.anchor_mode == "memory"),
             "--set",
@@ -126,6 +140,35 @@ pub(crate) fn helm_install_gateway(
         ],
     )
     .context("failed to install gateway Helm chart")
+}
+
+pub(crate) fn helm_lint_gateway(helm_bin: &str) -> Result<()> {
+    let salt = helm_set_string("repositoryKeys.saltHex", REPOSITORY_SALT_HEX);
+    let envelope = helm_set_string(
+        "repositoryKeys.envelopeObjectId",
+        KEYRING_ENVELOPE_OBJECT_ID,
+    );
+    let wrapping_key_id = helm_set_string("repositoryKeys.wrappingKeyId", KEYRING_WRAPPING_KEY_ID);
+    let wrapping_key_hex =
+        helm_set_string("repositoryKeys.wrappingKeyHex", KEYRING_WRAPPING_KEY_HEX);
+    run_command(
+        helm_bin,
+        &[
+            "lint",
+            CHART_PATH,
+            "--set",
+            "repositoryKeys.create=true",
+            "--set-string",
+            salt.as_str(),
+            "--set-string",
+            envelope.as_str(),
+            "--set-string",
+            wrapping_key_id.as_str(),
+            "--set-string",
+            wrapping_key_hex.as_str(),
+        ],
+    )
+    .context("gateway Helm chart lint failed")
 }
 
 fn helm_set_string(key: &str, value: &str) -> String {

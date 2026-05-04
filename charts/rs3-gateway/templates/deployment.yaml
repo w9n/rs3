@@ -88,13 +88,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
                   key: salt-hex
-            {{- if eq .Values.repositoryKeys.source "master-key" }}
-            - name: RS3_REPOSITORY_MASTER_KEY_HEX
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
-                  key: master-key-hex
-            {{- else if eq .Values.repositoryKeys.source "keyring-envelope" }}
             - name: RS3_KEYRING_ENVELOPE_OBJECT_ID
               valueFrom:
                 secretKeyRef:
@@ -110,7 +103,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
                   key: wrapping-key-hex
-            {{- end }}
             {{- end }}
             - name: RS3_ANCHOR_MODE
               value: {{ .Values.anchor.mode | quote }}

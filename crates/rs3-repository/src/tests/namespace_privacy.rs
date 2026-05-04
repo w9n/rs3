@@ -32,7 +32,7 @@ fn indexed_list_prefix_classifies_fallback_without_prefix_value() {
 #[tokio::test]
 async fn backend_object_ids_do_not_contain_client_key() {
     let store = MemoryBlobStore::new();
-    let repo = Repository::new(store.clone(), secret());
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
     let client_key = key("p/12/sensitive-client-blob");
 
     let put = repo

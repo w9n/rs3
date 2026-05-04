@@ -15,8 +15,10 @@ use tokio::net::TcpStream;
 pub(crate) const PUBLIC_BUCKET: &str = "client-bucket";
 pub(crate) const ACCESS_KEY_ID: &str = "access";
 pub(crate) const SECRET_ACCESS_KEY: &str = "secret";
-pub(crate) const REPOSITORY_MASTER_KEY_HEX: &str =
-    "1111111111111111111111111111111111111111111111111111111111111111";
+const KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.json";
+const KEYRING_WRAPPING_KEY_HEX: &str =
+    "3333333333333333333333333333333333333333333333333333333333333333";
+const KEYRING_WRAPPING_KEY_ID: &str = "wrap-integration";
 pub(crate) const REPOSITORY_SALT_HEX: &str =
     "2222222222222222222222222222222222222222222222222222222222222222";
 
@@ -134,7 +136,9 @@ impl RunningGateway {
             .env("RS3_ALLOW_MEMORY_ANCHOR", "true")
             .env("RS3_REPOSITORY_ID", "rs3-integration-repository")
             .env("RS3_REPOSITORY_SALT_HEX", REPOSITORY_SALT_HEX)
-            .env("RS3_REPOSITORY_MASTER_KEY_HEX", REPOSITORY_MASTER_KEY_HEX)
+            .env("RS3_KEYRING_ENVELOPE_OBJECT_ID", KEYRING_ENVELOPE_OBJECT_ID)
+            .env("RS3_KEYRING_WRAPPING_KEY_ID", KEYRING_WRAPPING_KEY_ID)
+            .env("RS3_KEYRING_WRAPPING_KEY_HEX", KEYRING_WRAPPING_KEY_HEX)
             .env("RS3_STATIC_ACCESS_KEY_ID", ACCESS_KEY_ID)
             .env("RS3_STATIC_SECRET_ACCESS_KEY", SECRET_ACCESS_KEY)
             .env("AWS_ACCESS_KEY_ID", &backend.access_key_id)

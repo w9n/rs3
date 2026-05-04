@@ -18,9 +18,8 @@ For production posture checks:
 cargo run -p rs3-server -- doctor --profile production
 ```
 
-The production profile rejects memory anchors, direct master-key mode, missing
-repository retention, retention-unsupported local backends, and missing gateway
-credentials.
+The production profile rejects memory anchors, missing repository retention,
+retention-unsupported local backends, and missing gateway credentials.
 
 For serving:
 
@@ -33,16 +32,16 @@ reference.
 
 ## Keys And Bootstrap
 
-The preferred production model is an encrypted keyring envelope. Generate
-random purpose-specific repository data keys, store them in an encrypted
-envelope under `keyrings/`, and keep the unwrap authority outside the object
-store.
+The gateway uses an encrypted keyring envelope. Operators provide a stable
+repository ID, a stable public salt, a configured envelope object ID, and an
+unwrap authority. The gateway opens the envelope if it exists. If it is missing,
+startup initializes a new random purpose-specific keyring only when the
+configured backend prefix is empty and the anchor is missing.
 
-The direct `RS3_REPOSITORY_MASTER_KEY_HEX` path is a compatibility and
-bootstrap mode. It must contain at least 32 bytes of hex-encoded entropy.
-`RS3_REPOSITORY_SALT_HEX` must contain a stable 32-byte public salt. The gateway
-uses HKDF-SHA-256 to derive purpose-specific repository keys from the master
-key, `RS3_REPOSITORY_ID`, and the repository salt.
+If the envelope is missing but the prefix already contains repository objects, or
+if the anchor already contains an accepted checkpoint position, startup fails
+closed. This prevents accidental second-repository initialization on top of
+existing backup data.
 
 Operational rules:
 
@@ -52,36 +51,25 @@ Operational rules:
 - Provide a stable salt once per repository and keep it with trusted repository
   configuration and recovery material.
 - Treat salts as public restore metadata, not as second passwords.
-- Do not reuse the same master key, repository id, and salt across repositories.
 - Keep historical keys available for at least the maximum retention window.
 - Do not destroy a key while any retained checkpoint can reference data that
   requires it.
 
-Create a new envelope with an explicit bootstrap step, not normal server
-startup:
+For a first empty repository, configure the envelope target and wrapping key:
 
 ```sh
-cargo run -p xtask --bin xtask -- keyring init \
-  --repository-id prod-backups \
-  --repository-salt-hex <salt-hex> \
-  --wrapping-key-id wrap-2026-05 \
-  --generate-wrapping-key \
-  --backend filesystem \
-  --backend-dir /var/lib/rs3/backend \
-  --format json
+RS3_REPOSITORY_ID=prod-backups
+RS3_REPOSITORY_SALT_HEX=<stable-public-salt-hex>
+RS3_KEYRING_ENVELOPE_OBJECT_ID=keyrings/bootstrap-envelope.json
+RS3_KEYRING_WRAPPING_KEY_ID=wrap-2026-05
+RS3_KEYRING_WRAPPING_KEY_HEX=<wrapping-key-hex>
 ```
 
-For S3-compatible storage, build the task with the S3 feature and use
-`--backend s3` plus the `RS3_KEYRING_S3_*` settings. The generated output gives
-the `RS3_KEYRING_ENVELOPE_OBJECT_ID` and wrapping-key settings for the gateway.
-In Helm, set `repositoryKeys.source=keyring-envelope`, provide the same
-operator-chosen salt through `repositoryKeys.saltHex`, and provide the generated
-envelope fields through `repositoryKeys.create=true` or an existing Secret.
-
-The bootstrap step may initialize an empty backend prefix. If the prefix already
-contains repository objects, it must verify the repository identity and envelope
-instead of creating a second repository. Helm values should stay declarative; do
-not rely on first-run mutation as recovery state.
+In Helm, set `repositoryKeys.create=true` or provide
+`repositoryKeys.existingSecret`. The Secret keys are `salt-hex`,
+`envelope-object-id`, `wrapping-key-id`, and `wrapping-key-hex`. Helm values stay
+declarative; the gateway writes the encrypted envelope object, not mutated chart
+state.
 
 Rotate the wrapping key without rewriting backup data:
 

@@ -7,7 +7,7 @@ mod server;
 
 pub use config::{
     AnchorConfig, BackendConfig, BatchConfig, ConfigError, MetricsConfig, RepositoryConfig,
-    RepositoryKeySource, RepositoryKeysConfig, RuntimeConfig,
+    RepositoryKeysConfig, RuntimeConfig,
 };
 pub use identity::{
     AuthError, Authorizer, Identity, IdentityProvider, RequestAction, StaticCredentialProvider,

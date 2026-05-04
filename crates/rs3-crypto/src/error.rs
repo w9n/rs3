@@ -18,18 +18,12 @@ pub enum CryptoError {
     /// A derived typed value failed validation.
     #[error(transparent)]
     Type(#[from] TypeError),
-    /// Repository key derivation context is empty.
-    #[error("repository key derivation context must not be empty")]
-    EmptyRepositoryContext,
-    /// Repository key derivation salt is too short.
-    #[error("repository key derivation salt must be at least {minimum_len} bytes")]
+    /// Repository key context salt is too short.
+    #[error("repository key context salt must be at least {minimum_len} bytes")]
     RepositorySaltTooShort {
         /// Minimum accepted salt length.
         minimum_len: usize,
     },
-    /// Repository key derivation failed.
-    #[error("repository key derivation failed")]
-    KeyDerivationRejected,
     /// No primary key exists for the requested purpose.
     #[error("no primary key for {purpose:?}")]
     NoPrimaryKey {

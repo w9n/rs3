@@ -251,10 +251,10 @@ mod imp {
 
     use super::VeleroKopiaSmokeArgs;
     use crate::integration::k8s_support::{
-        CHART_PATH, GatewayChartValues, K8sWorkspace, KindCluster, REPOSITORY_ID,
-        REPOSITORY_MASTER_KEY_HEX, REPOSITORY_SALT_HEX, default_cluster_name, helm_fullname,
-        helm_install_gateway, now_millis, path_str, require_command, run_command,
-        run_command_capture, split_image_ref,
+        GatewayChartValues, K8sWorkspace, KEYRING_ENVELOPE_OBJECT_ID, KEYRING_WRAPPING_KEY_HEX,
+        KEYRING_WRAPPING_KEY_ID, KindCluster, REPOSITORY_ID, REPOSITORY_SALT_HEX,
+        default_cluster_name, helm_fullname, helm_install_gateway, helm_lint_gateway, now_millis,
+        path_str, require_command, run_command, run_command_capture, split_image_ref,
     };
     use anyhow::{Context, Result, bail};
     use artifacts::ArtifactCollector;
@@ -345,8 +345,7 @@ mod imp {
         require_command(&args.docker_bin, &["version"])?;
         require_command(&args.velero_bin, &["version", "--client-only"])?;
         if scenario.storage_path.uses_gateway() {
-            run_command(&args.helm_bin, &["lint", CHART_PATH])
-                .context("gateway Helm chart lint failed")?;
+            helm_lint_gateway(&args.helm_bin)?;
         }
         prepare_velero_images(&args)?;
         prepare_rustfs_image(&args)?;
@@ -474,8 +473,10 @@ mod imp {
                             rust_log: GATEWAY_RUST_LOG,
                             payload_segment_size: args.payload_segment_size,
                             repository_id: REPOSITORY_ID,
-                            repository_master_key_hex: REPOSITORY_MASTER_KEY_HEX,
                             repository_salt_hex: REPOSITORY_SALT_HEX,
+                            keyring_envelope_object_id: KEYRING_ENVELOPE_OBJECT_ID,
+                            keyring_wrapping_key_id: KEYRING_WRAPPING_KEY_ID,
+                            keyring_wrapping_key_hex: KEYRING_WRAPPING_KEY_HEX,
                             persistence_enabled: false,
                             wait_secs: args.wait_secs,
                         },

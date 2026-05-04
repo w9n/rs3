@@ -46,27 +46,29 @@ outside the chart. If `serviceAccount.create=false`, set `serviceAccount.name`.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `RS3_REPOSITORY_ID` | yes | none | Stable repository context. Do not reuse a direct master-key context across repositories. |
+| `RS3_REPOSITORY_ID` | yes | none | Stable repository context. Keep it with trusted restore metadata. |
 | `RS3_REPOSITORY_SALT_HEX` | yes | none | Stable operator-provided 32-byte public salt, hex-encoded. Generate once per repository and keep with trusted public restore metadata. |
-| `RS3_REPOSITORY_MASTER_KEY_HEX` | one key source | none | Compatibility/bootstrap source. Hex-encoded repository master key with at least 32 bytes of entropy. Cannot be combined with envelope settings. |
-| `RS3_KEYRING_ENVELOPE_OBJECT_ID` | one key source | none | Backend object ID of the encrypted keyring envelope, for example `keyrings/<generation>-<digest>.json`. |
-| `RS3_KEYRING_WRAPPING_KEY_ID` | with envelope | none | Operator-visible wrapping key identifier expected by the envelope. |
-| `RS3_KEYRING_WRAPPING_KEY_HEX` | with envelope | none | Hex-encoded high-entropy wrapping key used to open the envelope. KMS/HSM/Vault integration should replace this for hardened deployments. |
+| `RS3_KEYRING_ENVELOPE_OBJECT_ID` | yes | none | Backend object ID of the encrypted keyring envelope, for example `keyrings/bootstrap-envelope.json`. |
+| `RS3_KEYRING_WRAPPING_KEY_ID` | yes | none | Operator-visible wrapping key identifier expected by the envelope. |
+| `RS3_KEYRING_WRAPPING_KEY_HEX` | yes | none | Hex-encoded high-entropy wrapping key used to open or initialize the envelope. KMS/HSM/Vault integration should replace this for hardened deployments. |
 
-Generate envelope settings with:
+If the configured envelope object is missing, startup initializes it only when
+the backend prefix is empty and the anchor is missing. A missing envelope on a
+non-empty prefix is a configuration or recovery error.
+
+Minimal first-run settings:
 
 ```sh
-cargo run -p xtask --bin xtask -- keyring init --repository-id <id> \
-  --repository-salt-hex <salt-hex> \
-  --wrapping-key-id <wrapping-key-id> \
-  --generate-wrapping-key \
-  --backend filesystem \
-  --backend-dir <repository-object-root>
+RS3_REPOSITORY_ID=<id>
+RS3_REPOSITORY_SALT_HEX=<salt-hex>
+RS3_KEYRING_ENVELOPE_OBJECT_ID=keyrings/bootstrap-envelope.json
+RS3_KEYRING_WRAPPING_KEY_ID=<wrapping-key-id>
+RS3_KEYRING_WRAPPING_KEY_HEX=<wrapping-key-hex>
 ```
 
-For production-like deployments, provide `--repository-salt-hex` explicitly and
+For production-like deployments, set `RS3_REPOSITORY_SALT_HEX` explicitly and
 keep the same value with trusted restore metadata. The salt is public, but a new
-cluster needs it to derive or open the same repository context.
+cluster needs it to open the same repository context.
 
 ## Repository Behavior
 
@@ -89,20 +91,22 @@ cargo run -p rs3-server -- doctor --profile production
 ```
 
 The local profile validates runtime configuration and redacts secrets in debug
-output. The production profile also rejects memory anchors, direct master-key
-mode, missing repository retention, retention-unsupported local backends, and
-missing gateway credentials.
+output. The production profile also rejects memory anchors, missing repository
+retention, retention-unsupported local backends, and missing gateway credentials.
 
-## Helm Key Source
+## Helm Repository Keys
 
-The chart selects the repository key source with `repositoryKeys.source`:
+The chart always uses the encrypted keyring-envelope model. Provide the
+repository key Secret with `repositoryKeys.create=true`, or reference one with
+`repositoryKeys.existingSecret`.
 
-| Value | Secret keys |
+| Secret key | Meaning |
 | --- | --- |
-| `master-key` | `salt-hex`, `master-key-hex` |
-| `keyring-envelope` | `salt-hex`, `envelope-object-id`, `wrapping-key-id`, `wrapping-key-hex` |
+| `salt-hex` | Stable public repository salt. |
+| `envelope-object-id` | Backend object ID for the encrypted keyring envelope. |
+| `wrapping-key-id` | Operator-visible wrapping key identifier. |
+| `wrapping-key-hex` | High-entropy wrapping key material for the preview. |
 
-Use `keyring-envelope` for production-like deployments. Helm should consume the
-configured repository ID, salt, envelope object ID, and unwrap settings from
-values or an existing Secret; it should not generate hidden first-run recovery
-state.
+Helm should consume the configured repository ID, salt, envelope object ID, and
+unwrap settings from values or an existing Secret; it should not generate hidden
+first-run recovery state.

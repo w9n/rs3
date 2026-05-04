@@ -100,10 +100,9 @@ KMS key or high-entropy wrapping key, stays outside the repository. Signed
 checkpoints bind the active envelope by generation, object ID, and digest so a
 backend cannot silently swap envelopes.
 
-The direct gateway master-key path remains available as a compatibility and
-bootstrap path. It derives purpose-specific keys with HKDF-SHA-256 from the
-master key, repository ID, and stable public repository salt. Both values must
-remain unchanged for the life of that repository.
+Initial empty repositories are initialized by writing the configured encrypted
+keyring envelope. Existing repositories must open through the envelope referenced
+by configuration and then by signed checkpoints.
 
 Checkpoint-signing descriptors include the Ed25519 public verification key so
 checkpoint payloads can be verified without exposing signing material.
