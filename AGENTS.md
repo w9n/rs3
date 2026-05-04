@@ -74,8 +74,6 @@ Before merging a feature, answer these questions in the change description:
 - Keep behavior, security, performance, operations, repository-format, and
   compatibility changes synchronized with the relevant `docs/site/` page in the
   same commit. If there is no docs impact, say so in the change description.
-- Keep old untracked `docs/*.md` design notes as local context until they are
-  deliberately curated into `docs/site/`.
 - Run `just docs-check` for docs-only changes and rely on `just check` before
   handoff when practical.
 
