@@ -8,6 +8,11 @@ mod restore;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::process::Command;
+#[cfg(any(feature = "containers", feature = "k8s"))]
+use std::sync::Once;
+
+#[cfg(any(feature = "containers", feature = "k8s"))]
+static RUSTLS_PROVIDER: Once = Once::new();
 
 #[derive(Debug, Parser)]
 #[command(name = "xtask")]
@@ -29,6 +34,7 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    install_rustls_provider();
     let cli = Cli::parse();
 
     match cli.command {
@@ -72,6 +78,16 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(any(feature = "containers", feature = "k8s"))]
+fn install_rustls_provider() {
+    RUSTLS_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+#[cfg(not(any(feature = "containers", feature = "k8s")))]
+fn install_rustls_provider() {}
 
 fn run(program: &str, args: &[&str]) -> Result<()> {
     let status = Command::new(program)

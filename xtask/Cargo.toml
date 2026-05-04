@@ -11,12 +11,24 @@ description = "Local automation for rs3"
 [features]
 default = []
 s3 = ["rs3-storage/s3"]
-containers = ["s3", "dep:aws-sdk-s3", "dep:procfs", "dep:testcontainers"]
-k8s = ["s3", "dep:aws-sdk-s3"]
+containers = [
+  "s3",
+  "dep:aws-sdk-s3",
+  "dep:procfs",
+  "dep:rustls",
+  "dep:testcontainers",
+]
+k8s = ["s3", "dep:aws-sdk-s3", "dep:rustls"]
 
 [dependencies]
 anyhow.workspace = true
-aws-sdk-s3 = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+  "behavior-version-latest",
+  "default-https-client",
+  "http-1x",
+  "rt-tokio",
+  "sigv4a",
+], optional = true }
 bytes.workspace = true
 clap.workspace = true
 getrandom.workspace = true
@@ -27,6 +39,9 @@ rs3-crypto = { version = "0.1.0", path = "../crates/rs3-crypto" }
 rs3-repository = { version = "0.1.0", path = "../crates/rs3-repository" }
 rs3-storage = { version = "0.1.0", path = "../crates/rs3-storage" }
 rs3-types = { version = "0.1.0", path = "../crates/rs3-types" }
+rustls = { version = "0.23", default-features = false, features = [
+  "aws_lc_rs",
+], optional = true }
 serde_json.workspace = true
 testcontainers = { version = "0.27.3", features = [
   "blocking",

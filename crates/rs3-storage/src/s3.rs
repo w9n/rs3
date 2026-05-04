@@ -26,8 +26,10 @@ use object_store::{
     PutOptions as ObjectPutOptions,
 };
 use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Once, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static RUSTLS_PROVIDER: Once = Once::new();
 
 /// Configuration for an S3-backed blob store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,12 +184,13 @@ pub struct S3BlobStore {
 }
 
 impl S3BlobStore {
-    /// Builds an S3 store from the default AWS environment/config chain.
+    /// Builds an S3 store from the supported AWS environment/config chain.
     ///
     /// # Errors
     ///
     /// Returns a provider error when configuration cannot be constructed.
     pub async fn from_environment(config: S3BlobStoreConfig) -> Result<Self> {
+        install_rustls_provider();
         let store = object_store_from_environment(&config)?;
         let sdk_client = Some(sdk_client_from_environment(&config).await?);
         Ok(Self {
@@ -208,6 +211,7 @@ impl S3BlobStore {
     ///
     /// Returns a provider error when configuration cannot be constructed.
     pub fn from_environment_sync(config: S3BlobStoreConfig) -> Result<Self> {
+        install_rustls_provider();
         let store = object_store_from_environment(&config)?;
         let sdk_client = sdk_client_from_static_environment(&config)?;
         Ok(Self {
@@ -1074,6 +1078,12 @@ impl S3ProviderOperation {
             Self::SetLegalHold => "set_legal_hold",
         }
     }
+}
+
+fn install_rustls_provider() {
+    RUSTLS_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
 }
 
 fn object_put_options(options: &PutOptions) -> ObjectPutOptions {
