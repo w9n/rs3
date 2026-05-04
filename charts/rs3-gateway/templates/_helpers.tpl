@@ -55,6 +55,12 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and .Values.repository.retention.mode (and (ne .Values.repository.retention.mode "governance") (ne .Values.repository.retention.mode "compliance")) -}}
 {{- fail "repository.retention.mode must be empty, governance, or compliance" -}}
 {{- end -}}
+{{- if and (ne .Values.gateway.mode "read-write") (ne .Values.gateway.mode "restore-readonly") -}}
+{{- fail "gateway.mode must be read-write or restore-readonly" -}}
+{{- end -}}
+{{- if and (eq .Values.gateway.mode "read-write") (gt (int .Values.replicaCount) 1) -}}
+{{- fail "gateway.mode=read-write currently supports replicaCount=1; use restore-readonly for scaled restore readers" -}}
+{{- end -}}
 {{- if and .Values.repository.retention.mode (not (gt (int .Values.repository.retention.days) 0)) -}}
 {{- fail "repository.retention.days must be greater than zero when repository.retention.mode is set" -}}
 {{- end -}}

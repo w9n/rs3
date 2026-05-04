@@ -147,7 +147,7 @@ pub enum GatewayServerError {
 mod tests {
     use super::{GatewayServer, GatewayServerError};
     use crate::{
-        AnchorConfig, BackendConfig, BatchConfig, MetricsConfig, RepositoryConfig,
+        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig, RepositoryConfig,
         RepositoryKeysConfig, RuntimeConfig, SecretString,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
@@ -164,6 +164,7 @@ mod tests {
         };
 
         RuntimeConfig {
+            mode: GatewayMode::ReadWrite,
             bind,
             metrics: MetricsConfig { bind: None },
             public_bucket,

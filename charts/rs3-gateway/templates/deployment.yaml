@@ -32,6 +32,8 @@ spec:
           env:
             - name: RS3_BIND
               value: "0.0.0.0:{{ .Values.service.port }}"
+            - name: RS3_GATEWAY_MODE
+              value: {{ .Values.gateway.mode | quote }}
             - name: RS3_PUBLIC_BUCKET
               value: {{ .Values.publicBucket | quote }}
             - name: RS3_BACKEND_ENDPOINT

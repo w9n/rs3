@@ -129,6 +129,7 @@ mod imp {
                 namespace: &args.namespace,
                 image_repository: &image_repository,
                 image_tag: &image_tag,
+                gateway_mode: "read-write",
                 public_bucket: DEFAULT_PUBLIC_BUCKET,
                 backend_endpoint: "file:///data",
                 backend_bucket: "backend",

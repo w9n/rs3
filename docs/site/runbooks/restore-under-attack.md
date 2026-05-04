@@ -19,7 +19,8 @@ checkpoint, then restore with the narrowest credentials practical.
 4. Read storage evidence if configured.
 5. Select the highest checkpoint whose signature, parent chain, and
    anchor/evidence relation verify.
-6. Restore with read-only credentials into an isolated target.
+6. Restore through `RS3_GATEWAY_MODE=restore-readonly` with read-only
+   credentials into an isolated target.
 
 ## Decision Table
 

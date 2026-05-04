@@ -9,7 +9,7 @@ use super::mapping::{
     validate_get_object_request, validate_head_object_request, validate_put_object_request,
 };
 use super::runtime::RuntimeRepository;
-use crate::RuntimeConfig;
+use crate::{GatewayMode, RuntimeConfig};
 use rs3_repository::RepositoryPutOptions;
 use rs3_storage::ByteRange;
 use rs3_types::{LegalHoldStatus, PublicBucket};
@@ -28,6 +28,7 @@ use tracing::Instrument;
 
 #[derive(Clone)]
 pub(super) struct GatewayS3Service {
+    mode: GatewayMode,
     public_bucket: PublicBucket,
     repository: RuntimeRepository,
     request_sequence: Arc<AtomicU64>,
@@ -39,9 +40,10 @@ impl GatewayS3Service {
         repository
             .validate_backend_retention(config.repository.retention)
             .await?;
-        repository.load_accepted_checkpoint().await?;
+        repository.load_accepted_checkpoint(config.mode).await?;
 
         Ok(Self {
+            mode: config.mode,
             public_bucket: config.public_bucket.clone(),
             repository,
             request_sequence: Arc::new(AtomicU64::new(0)),
@@ -120,6 +122,17 @@ impl GatewayS3Service {
             Err(s3s::s3_error!(
                 AccessDenied,
                 "request targets a bucket that is not served by this gateway"
+            ))
+        }
+    }
+
+    fn check_mutation_allowed(&self) -> S3Result<()> {
+        if self.mode.allows_mutation() {
+            Ok(())
+        } else {
+            Err(s3s::s3_error!(
+                AccessDenied,
+                "restore-readonly gateway mode rejects repository mutations"
             ))
         }
     }
@@ -203,6 +216,7 @@ impl S3 for GatewayS3Service {
 
         let result = async {
             self.check_bucket(&input.bucket)?;
+            self.check_mutation_allowed()?;
             validate_put_object_request(&input)?;
 
             let retention = put_object_retention_policy(&input)?;
@@ -454,6 +468,7 @@ impl S3 for GatewayS3Service {
 
         let result = async {
             self.check_bucket(&input.bucket)?;
+            self.check_mutation_allowed()?;
             let status = put_object_legal_hold_request_status(&input)?;
             if status == LegalHoldStatus::Off {
                 return Err(s3s::s3_error!(
@@ -561,6 +576,7 @@ impl S3 for GatewayS3Service {
 
         let result = async {
             self.check_bucket(&input.bucket)?;
+            self.check_mutation_allowed()?;
             validate_delete_object_request(&input)?;
 
             let key = logical_path(input.key)?;
@@ -643,6 +659,7 @@ fn record_s3_response_body_bytes(operation: &'static str, len: usize) {
 mod tests {
     use super::GatewayS3Service;
     use super::collect_body;
+    use crate::GatewayMode;
     use crate::s3::test_support::runtime_config;
     use bytes::Bytes;
     use rs3_anchor::CheckpointAnchor;
@@ -864,6 +881,81 @@ mod tests {
             .await
             .expect_err("deleted object should not be visible through HeadObject");
         assert_eq!(*missing.code(), s3s::S3ErrorCode::NoSuchKey);
+    }
+
+    #[tokio::test]
+    async fn restore_readonly_mode_rejects_repository_mutations() {
+        let mut service = gateway_service().await;
+        let initial_put = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/restorable.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"restore me",
+                )))),
+                ..PutObjectInput::default()
+            }))
+            .await;
+        assert!(initial_put.is_ok());
+
+        service.mode = GatewayMode::RestoreReadOnly;
+
+        let get = service
+            .get_object(s3_request(GetObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/restorable.bin".to_owned(),
+                ..GetObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(response_body(get).await, Bytes::from_static(b"restore me"));
+
+        let put = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/rejected.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"must not commit",
+                )))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect_err("restore-readonly mode should reject PutObject");
+        assert_eq!(*put.code(), s3s::S3ErrorCode::AccessDenied);
+
+        let legal_hold = service
+            .put_object_legal_hold(s3_request(PutObjectLegalHoldInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/restorable.bin".to_owned(),
+                legal_hold: Some(ObjectLockLegalHold {
+                    status: Some(ObjectLockLegalHoldStatus::from_static(
+                        ObjectLockLegalHoldStatus::ON,
+                    )),
+                }),
+                ..PutObjectLegalHoldInput::default()
+            }))
+            .await
+            .expect_err("restore-readonly mode should reject legal-hold mutation");
+        assert_eq!(*legal_hold.code(), s3s::S3ErrorCode::AccessDenied);
+
+        let delete = service
+            .delete_object(s3_request(DeleteObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/restorable.bin".to_owned(),
+                ..DeleteObjectInput::default()
+            }))
+            .await
+            .expect_err("restore-readonly mode should reject DeleteObject");
+        assert_eq!(*delete.code(), s3s::S3ErrorCode::AccessDenied);
+
+        let accepted = service
+            .repository
+            .memory_anchor()
+            .unwrap_or_else(|| panic!("missing memory anchor"))
+            .read()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(accepted.sequence.get(), 1);
     }
 
     #[tokio::test]

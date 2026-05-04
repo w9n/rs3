@@ -31,6 +31,8 @@ const ALLOW_MEMORY_ANCHOR_ENV: &str = "RS3_ALLOW_MEMORY_ANCHOR";
 /// Complete runtime configuration for the gateway process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {
+    /// Gateway mutation posture.
+    pub mode: GatewayMode,
     /// Socket address the gateway should bind to.
     pub bind: SocketAddr,
     /// Metrics exporter settings.
@@ -49,6 +51,38 @@ pub struct RuntimeConfig {
     pub repository_keys: RepositoryKeysConfig,
     /// Optional static credentials accepted by the server.
     pub static_credentials: Option<StaticCredentials>,
+}
+
+/// Gateway mutation posture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayMode {
+    /// Serve reads and accept checkpointed repository mutations.
+    ReadWrite,
+    /// Serve restore reads only; reject repository mutations and do not bootstrap.
+    RestoreReadOnly,
+}
+
+impl GatewayMode {
+    /// Returns the environment/configuration spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadWrite => "read-write",
+            Self::RestoreReadOnly => "restore-readonly",
+        }
+    }
+
+    /// Returns whether this mode accepts client-visible repository mutations.
+    pub const fn allows_mutation(self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
+
+    pub(crate) const fn allows_bootstrap(self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
+
+    pub(crate) const fn requires_anchor(self) -> bool {
+        matches!(self, Self::RestoreReadOnly)
+    }
 }
 
 /// Backend object-store settings.
@@ -181,6 +215,7 @@ impl RuntimeConfig {
     }
 
     fn from_source(source: &impl ConfigSource) -> Result<Self, ConfigError> {
+        let mode = parse_gateway_mode(source)?;
         let bind = parse_socket_addr(
             "RS3_BIND",
             source
@@ -204,6 +239,7 @@ impl RuntimeConfig {
         let static_credentials = parse_static_credentials(source)?;
 
         Ok(Self {
+            mode,
             bind,
             metrics,
             public_bucket,
@@ -214,6 +250,20 @@ impl RuntimeConfig {
             repository_keys,
             static_credentials,
         })
+    }
+}
+
+fn parse_gateway_mode(source: &impl ConfigSource) -> Result<GatewayMode, ConfigError> {
+    let value =
+        optional_value(source, "RS3_GATEWAY_MODE").unwrap_or_else(|| "read-write".to_owned());
+    match value.as_str() {
+        "read-write" => Ok(GatewayMode::ReadWrite),
+        "restore-readonly" => Ok(GatewayMode::RestoreReadOnly),
+        _ => Err(ConfigError::Invalid {
+            key: "RS3_GATEWAY_MODE",
+            value,
+            reason: "expected read-write or restore-readonly".to_owned(),
+        }),
     }
 }
 
@@ -608,8 +658,8 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnchorConfig, BatchConfig, ConfigError, ConfigSource, MetricsConfig, RepositoryConfig,
-        RepositoryKeysConfig, RuntimeConfig,
+        AnchorConfig, BatchConfig, ConfigError, ConfigSource, GatewayMode, MetricsConfig,
+        RepositoryConfig, RepositoryKeysConfig, RuntimeConfig,
     };
     use secrecy::SecretString;
     use std::collections::BTreeMap;
@@ -672,6 +722,7 @@ mod tests {
             Ok(config) => config,
             Err(error) => panic!("{error}"),
         };
+        assert_eq!(config.mode, GatewayMode::ReadWrite);
         assert_eq!(config.bind.to_string(), "127.0.0.1:9080");
         assert_eq!(config.metrics, MetricsConfig { bind: None });
         assert_eq!(config.public_bucket.as_str(), "client-bucket");
@@ -695,6 +746,29 @@ mod tests {
         );
         assert_eq!(config.repository_keys, repository_keys_config());
         assert!(config.static_credentials.is_none());
+    }
+
+    #[test]
+    fn parses_restore_readonly_gateway_mode() {
+        let source = minimal_source().with("RS3_GATEWAY_MODE", "restore-readonly");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert_eq!(
+            config.map(|config| config.mode),
+            Ok(GatewayMode::RestoreReadOnly)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_gateway_mode() {
+        let source = minimal_source().with("RS3_GATEWAY_MODE", "readonly");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == "RS3_GATEWAY_MODE")
+        );
     }
 
     #[test]

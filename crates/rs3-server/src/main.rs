@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rs3_crypto::derive_public_fingerprint;
 use rs3_server::{
-    AnchorConfig, AnchorRecoveryOptions, AnchorRecoveryReport, GatewayServer, RuntimeConfig,
-    recover_anchor_from_config,
+    AnchorConfig, AnchorRecoveryOptions, AnchorRecoveryReport, GatewayMode, GatewayServer,
+    RuntimeConfig, recover_anchor_from_config,
 };
 use rs3_types::RetentionMode;
 use std::net::SocketAddr;
@@ -35,6 +35,8 @@ enum Commands {
         bind: Option<SocketAddr>,
         #[arg(long, env = "RS3_METRICS_BIND")]
         metrics_bind: Option<SocketAddr>,
+        #[arg(long, value_enum)]
+        gateway_mode: Option<GatewayModeArg>,
     },
     Doctor {
         #[arg(long, env = "RS3_DOCTOR_PROFILE", value_enum, default_value_t = DoctorProfile::Local)]
@@ -48,6 +50,12 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum GatewayModeArg {
+    ReadWrite,
+    RestoreReadonly,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -68,13 +76,20 @@ async fn main() -> Result<()> {
     init_tracing(cli.log_format);
 
     match cli.command {
-        Commands::Serve { bind, metrics_bind } => {
+        Commands::Serve {
+            bind,
+            metrics_bind,
+            gateway_mode,
+        } => {
             let mut config = RuntimeConfig::from_env()?;
             if let Some(bind) = bind {
                 config.bind = bind;
             }
             if let Some(metrics_bind) = metrics_bind {
                 config.metrics.bind = Some(metrics_bind);
+            }
+            if let Some(gateway_mode) = gateway_mode {
+                config.mode = gateway_mode.into();
             }
             install_metrics(config.metrics.bind)?;
             log_runtime_config(&config);
@@ -184,7 +199,7 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<DoctorFinding> {
         ));
     }
 
-    if config.repository.retention.is_none() {
+    if config.mode.allows_mutation() && config.repository.retention.is_none() {
         findings.push(DoctorFinding::new(
             "retention.missing",
             "production profile requires repository retention",
@@ -216,6 +231,15 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<DoctorFinding> {
     }
 
     findings
+}
+
+impl From<GatewayModeArg> for GatewayMode {
+    fn from(value: GatewayModeArg) -> Self {
+        match value {
+            GatewayModeArg::ReadWrite => Self::ReadWrite,
+            GatewayModeArg::RestoreReadonly => Self::RestoreReadOnly,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -279,6 +303,7 @@ fn log_runtime_config(config: &RuntimeConfig) {
     let config_profile = runtime_config_profile(config);
 
     tracing::info!(
+        gateway_mode = config.mode.as_str(),
         bind = %config.bind,
         metrics_bind = ?config.metrics.bind,
         backend_kind,
@@ -316,6 +341,7 @@ fn runtime_config_profile(config: &RuntimeConfig) -> String {
         AnchorConfig::KubernetesLease { .. } => "kubernetes-lease".to_owned(),
     };
     let metrics = config.metrics.bind.is_some().to_string();
+    let gateway_mode = config.mode.as_str().to_owned();
     let backend_kind = backend_kind(&config.backend.endpoint).to_owned();
     let batch_max_items = config.batching.max_items.to_string();
     let batch_max_delay_ms = config.batching.max_delay.as_millis().to_string();
@@ -340,6 +366,7 @@ fn runtime_config_profile(config: &RuntimeConfig) -> String {
     let static_credentials = config.static_credentials.is_some().to_string();
     let fields = [
         anchor.as_bytes(),
+        gateway_mode.as_bytes(),
         metrics.as_bytes(),
         backend_kind.as_bytes(),
         batch_max_items.as_bytes(),
@@ -370,7 +397,7 @@ fn init_tracing(format: LogFormat) {
 mod tests {
     use super::{DoctorProfile, backend_kind, doctor_findings, runtime_config_profile};
     use rs3_server::{
-        AnchorConfig, BackendConfig, BatchConfig, MetricsConfig, RepositoryConfig,
+        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig, RepositoryConfig,
         RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
@@ -391,6 +418,7 @@ mod tests {
         };
 
         RuntimeConfig {
+            mode: GatewayMode::ReadWrite,
             bind,
             metrics: MetricsConfig { bind: None },
             public_bucket,
@@ -458,6 +486,18 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_profile_changes_for_gateway_mode() {
+        let first = runtime_config();
+        let mut second = runtime_config();
+        second.mode = GatewayMode::RestoreReadOnly;
+
+        assert_ne!(
+            runtime_config_profile(&first),
+            runtime_config_profile(&second)
+        );
+    }
+
+    #[test]
     fn local_doctor_allows_local_development_config() {
         let findings = doctor_findings(&runtime_config(), DoctorProfile::Local);
 
@@ -475,6 +515,29 @@ mod tests {
         assert!(codes.contains(&"anchor.memory"));
         assert!(codes.contains(&"retention.missing"));
         assert!(codes.contains(&"auth.static-credentials"));
+    }
+
+    #[test]
+    fn production_doctor_does_not_require_write_retention_for_restore_readonly() {
+        let mut config = runtime_config();
+        config.mode = GatewayMode::RestoreReadOnly;
+        config.anchor = AnchorConfig::KubernetesLease {
+            namespace: "backup".to_owned(),
+            name: "checkpoint".to_owned(),
+            field_manager: "rs3-server".to_owned(),
+        };
+        config.static_credentials = Some(StaticCredentials {
+            access_key_id: "access".to_owned(),
+            secret_access_key: SecretString::from("secret"),
+        });
+
+        let findings = doctor_findings(&config, DoctorProfile::Production);
+        let codes = findings
+            .iter()
+            .map(|finding| finding.code)
+            .collect::<Vec<_>>();
+
+        assert!(!codes.contains(&"retention.missing"));
     }
 
     #[test]

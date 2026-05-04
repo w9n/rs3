@@ -9,6 +9,9 @@ service:
   type: ClusterIP
   port: 9080
 
+gateway:
+  mode: read-write
+
 publicBucket: client-bucket
 
 backend:

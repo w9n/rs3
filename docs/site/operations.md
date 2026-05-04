@@ -18,8 +18,9 @@ For production posture checks:
 cargo run -p rs3-server -- doctor --profile production
 ```
 
-The production profile rejects memory anchors, missing repository retention,
-retention-unsupported local backends, and missing gateway credentials.
+The production profile rejects memory anchors, retention-unsupported local
+backends, missing gateway credentials, and missing repository retention for
+mutation-capable serving.
 
 For serving:
 
@@ -198,6 +199,22 @@ During an incident, favor read-only restore with a verified checkpoint and
 external anchor over any mode that repairs state automatically. If break-glass
 restore is added, it should require explicit operator input and leave an audit
 trail.
+
+Serve restore traffic with the gateway's read-only posture:
+
+```sh
+cargo run -p rs3-server -- serve --gateway-mode restore-readonly
+```
+
+This mode refuses first-run repository initialization, requires an accepted
+anchor, and rejects supported repository mutations such as PUT, DELETE, and
+object legal-hold changes. Pair it with Velero `BackupStorageLocation`
+read-only mode, Kopia read-only repository settings where practical, and
+backend credentials that cannot write.
+
+Run only one `read-write` gateway for a repository. Multiple independent
+writers cannot safely coordinate repository state without a stronger shared
+write protocol. Scaled restore readers should use `restore-readonly`.
 
 Disaster recovery into a new cluster requires the repository ID, public salt,
 unwrap authority, and either a trusted checkpoint position from outside S3 or an

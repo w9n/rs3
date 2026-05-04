@@ -2,7 +2,9 @@
 
 use super::S3BoundaryError;
 use crate::config::{KEYRING_WRAPPING_KEY_HEX_ENV, REPOSITORY_SALT_HEX_ENV};
-use crate::{AnchorConfig, BackendConfig, BatchConfig, RepositoryKeysConfig, RuntimeConfig};
+use crate::{
+    AnchorConfig, BackendConfig, BatchConfig, GatewayMode, RepositoryKeysConfig, RuntimeConfig,
+};
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor, MemoryCheckpointAnchor};
 use rs3_crypto::{
@@ -57,6 +59,7 @@ impl RuntimeRepository {
             &anchor.handle,
             &config.repository_keys,
             config.repository.retention,
+            config.mode.allows_bootstrap(),
         )
         .await?;
         let repository = Arc::new(Repository::with_keyring_and_options(
@@ -89,13 +92,21 @@ impl RuntimeRepository {
         })
     }
 
-    pub(super) async fn load_accepted_checkpoint(&self) -> Result<(), S3BoundaryError> {
+    pub(super) async fn load_accepted_checkpoint(
+        &self,
+        mode: GatewayMode,
+    ) -> Result<(), S3BoundaryError> {
         let accepted = match self.coordinator.anchor().read().await {
             Ok(state) => CheckpointPosition::from(state),
             Err(AnchorError::MissingAnchor) => {
                 if repository_has_committed_objects(&self.store).await? {
                     return Err(repository_init(
                         "checkpoint anchor is missing but repository objects already exist; restore or repair the anchor before starting",
+                    ));
+                }
+                if mode.requires_anchor() {
+                    return Err(repository_init(
+                        "restore-readonly gateway mode requires an accepted checkpoint anchor; run explicit anchor recovery before serving restore",
                     ));
                 }
                 return Ok(());
@@ -457,6 +468,7 @@ async fn gateway_keyring(
     anchor: &RuntimeAnchor,
     keys: &RepositoryKeysConfig,
     retention: Option<RetentionPolicy>,
+    allow_bootstrap: bool,
 ) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
     match anchor.read().await {
         Ok(state) => {
@@ -467,7 +479,9 @@ async fn gateway_keyring(
                 configured_envelope_override(store, keys, &loaded.keyring, &reference).await?;
             Ok(loaded)
         }
-        Err(AnchorError::MissingAnchor) => unanchored_gateway_keyring(store, keys, retention).await,
+        Err(AnchorError::MissingAnchor) => {
+            unanchored_gateway_keyring(store, keys, retention, allow_bootstrap).await
+        }
         Err(error) => Err(repository_init(error)),
     }
 }
@@ -476,11 +490,17 @@ async fn unanchored_gateway_keyring(
     store: &RuntimeStore,
     keys: &RepositoryKeysConfig,
     retention: Option<RetentionPolicy>,
+    allow_bootstrap: bool,
 ) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
     if let Some(object_id) = keys.envelope_object_id.as_ref() {
         return match store.get_range(object_id, ByteRange::Full).await {
             Ok(body) => open_gateway_keyring_object(keys, object_id.clone(), body),
             Err(StorageError::NotFound(_)) => {
+                if !allow_bootstrap {
+                    return Err(repository_init(
+                        "restore-readonly gateway mode refuses to initialize a missing keyring envelope",
+                    ));
+                }
                 bootstrap_missing_keyring_envelope(store, keys, Some(object_id.clone()), retention)
                     .await
             }
@@ -491,6 +511,12 @@ async fn unanchored_gateway_keyring(
     if repository_has_committed_objects(store).await? {
         return Err(repository_init(
             "checkpoint anchor is missing but repository objects already exist; run explicit anchor recovery instead of choosing a backend checkpoint",
+        ));
+    }
+
+    if !allow_bootstrap {
+        return Err(repository_init(
+            "restore-readonly gateway mode refuses first-run repository initialization",
         ));
     }
 
@@ -811,7 +837,7 @@ mod tests {
     use crate::AnchorConfig;
     use crate::s3::S3BoundaryError;
     use crate::s3::test_support::runtime_config;
-    use crate::{BatchConfig, RepositoryKeysConfig};
+    use crate::{BatchConfig, GatewayMode, RepositoryKeysConfig};
     use bytes::Bytes;
     use rs3_anchor::{CheckpointAnchor, MemoryCheckpointAnchor};
     use rs3_crypto::{KeyRing, RepositoryKeyContext, SecretBytes};
@@ -918,6 +944,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_readonly_runtime_refuses_empty_repository_bootstrap() {
+        let dir = TestDir::new();
+        let mut config = runtime_config(true);
+        config.mode = GatewayMode::RestoreReadOnly;
+        config.backend.endpoint = format!("file://{}", dir.path().display());
+
+        let runtime = RuntimeRepository::from_config(&config).await;
+
+        assert!(
+            matches!(runtime, Err(S3BoundaryError::RepositoryInit { reason }) if reason.contains("restore-readonly"))
+        );
+
+        let store_root = dir
+            .path()
+            .join(&config.backend.bucket)
+            .join(config.backend.prefix.as_deref().unwrap_or(""));
+        let store = FilesystemBlobStore::new(&store_root).unwrap_or_else(|error| panic!("{error}"));
+        let keyrings = store
+            .list_prefix("keyrings/")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(keyrings.is_empty());
+    }
+
+    #[tokio::test]
     async fn runtime_repository_default_retention_applies_to_writes() {
         let mut config = runtime_config(true);
         config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 30));
@@ -993,7 +1044,7 @@ mod tests {
         };
 
         let anchor = RuntimeAnchor::new(MemoryCheckpointAnchor::new());
-        let opened = gateway_keyring(&store, &anchor, &keys, None)
+        let opened = gateway_keyring(&store, &anchor, &keys, None, true)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
 
@@ -1064,6 +1115,7 @@ mod tests {
             &RuntimeAnchor::new(MemoryCheckpointAnchor::with_state(accepted)),
             &keys,
             None,
+            true,
         )
         .await
         .unwrap_or_else(|error| panic!("{error}"));

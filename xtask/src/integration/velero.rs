@@ -460,6 +460,7 @@ mod imp {
                             namespace: &args.gateway_namespace,
                             image_repository: &image_repository,
                             image_tag: &image_tag,
+                            gateway_mode: "read-write",
                             public_bucket: VELERO_BUCKET,
                             backend_endpoint: &backend_endpoint,
                             backend_bucket: BACKEND_BUCKET,

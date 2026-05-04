@@ -40,6 +40,7 @@ the repository-state transition model.
 | Storage witness | Create-only checkpoint evidence under `evidence/` |
 | Backend | RustFS/local S3-compatible first, live S3-compatible checks opt-in |
 | Keys | Encrypted keyring envelope |
+| Gateway modes | `read-write` for backups, `restore-readonly` for incident restore |
 | Retention | Provider retention/Object Lock capability checked where configured |
 | External trust sources | HSM/KMS/Vault anchor and unwrap authority, not a preview blocker |
 
@@ -72,6 +73,9 @@ newer one. The backend can still deny service by hiding required objects.
 | Backend overwrites checkpoint, evidence, index, metadata, or payload bytes | Reject through create-only write checks, signatures, digests, or AEAD authentication. |
 | Backend evidence appears newer than the Lease anchor | Treat as ambiguous; fail closed until explicit recovery resolves whether the anchor missed an advance or was rolled back. |
 | Lease missing but backend evidence exists | Do not silently trust storage. Require a trusted bundle or explicit bounded recovery that validates the highest observed valid checkpoint and enforces a maximum signed checkpoint age. |
+| Multiple gateways serve the same repository as `read-write` | Unsupported. Run one writer per repository; use `restore-readonly` for scaled restore readers. |
+| Gateway started as `restore-readonly` without an accepted anchor | Fail closed. Run explicit anchor recovery first, then serve restore traffic. |
+| Restore client attempts PUT, DELETE, or legal-hold mutation through `restore-readonly` | Reject the request instead of advancing repository state. |
 | Lease and backend are both compromised | Online protection is exhausted; recovery needs offline or externally protected authority. |
 | Wrapping key and old envelope are both exposed | Rewrap protects only future envelope handling; historical data under that keyring is treated as exposed. |
 
@@ -133,8 +137,8 @@ explicitly defer these gaps:
 - startup validation completes storage-evidence comparison for existing prefixes
 - disaster-recovery tooling exports or imports the trusted anchor position for a
   new cluster
-- Helm production-preview guidance uses an operator-provided salt and encrypted
-  keyring envelope without hidden first-run mutation
+- Velero restore acceptance runs with `restore-readonly` and asserts no backend
+  writes during restore
 
 ## Non-Goals
 
@@ -173,6 +177,7 @@ For a production-preview deployment:
 - set a stable, operator-provided `repositoryKeys.saltHex`
 - configure gateway access credentials explicitly
 - configure repository retention when retention evidence is part of the trial
+- use `gateway.mode=restore-readonly` for incident restore deployments
 - run `rs3-server doctor --profile production` before exposing the gateway
 - keep restore verification inputs outside the object-store trust boundary
 - collect metrics and logs with path-safe labels only
@@ -192,6 +197,7 @@ A preview is ready when the release evidence shows:
 - Kopia can create, snapshot, and restore through the gateway
 - Velero with Kopia uploader can restore a dynamic PVC after gateway restart
 - the Velero/Postgres compatibility smoke restores verified application data
+- restore-readonly mode rejects supported writes and still serves restore reads
 - restore verification succeeds for the checkpoint under test, including
   checkpoint evidence and keyring-envelope binding
 - performance evidence compares gateway behavior to the straight RustFS proxy

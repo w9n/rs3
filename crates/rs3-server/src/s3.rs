@@ -34,6 +34,7 @@ pub enum S3BoundaryError {
 
 #[cfg(test)]
 pub(super) mod test_support {
+    use crate::GatewayMode;
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, MetricsConfig, RepositoryConfig,
         RepositoryKeysConfig, RuntimeConfig, SecretString,
@@ -52,6 +53,7 @@ pub(super) mod test_support {
         };
 
         RuntimeConfig {
+            mode: GatewayMode::ReadWrite,
             bind,
             metrics: MetricsConfig { bind: None },
             public_bucket,

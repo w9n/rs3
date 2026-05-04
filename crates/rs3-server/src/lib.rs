@@ -6,8 +6,8 @@ mod s3;
 mod server;
 
 pub use config::{
-    AnchorConfig, BackendConfig, BatchConfig, ConfigError, MetricsConfig, RepositoryConfig,
-    RepositoryKeysConfig, RuntimeConfig,
+    AnchorConfig, BackendConfig, BatchConfig, ConfigError, GatewayMode, MetricsConfig,
+    RepositoryConfig, RepositoryKeysConfig, RuntimeConfig,
 };
 pub use identity::{
     AuthError, Authorizer, Identity, IdentityProvider, RequestAction, StaticCredentialProvider,

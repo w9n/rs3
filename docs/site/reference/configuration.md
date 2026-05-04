@@ -1,13 +1,14 @@
 # Configuration Reference
 
 The gateway reads runtime configuration from environment variables. Command-line
-flags may override selected listener settings.
+flags may override selected listener and gateway-mode settings.
 
 ## Server
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `RS3_BIND` | no | `127.0.0.1:9080` | Gateway S3 listener socket address. |
+| `RS3_GATEWAY_MODE` | no | `read-write` | `read-write` accepts checkpointed mutations. `restore-readonly` serves restore reads, rejects supported mutations, refuses bootstrap, and requires an accepted anchor. |
 | `RS3_METRICS_BIND` | no | unset | Prometheus/OpenMetrics listener socket address. |
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
 | `RUST_LOG` | no | `info` | Standard tracing filter. |
@@ -75,6 +76,20 @@ For production-like deployments, set `RS3_REPOSITORY_SALT_HEX` explicitly and
 keep the same value with trusted restore metadata. The salt is public, but a new
 cluster needs it to open the same repository context.
 
+## Gateway Mode
+
+`read-write` is the normal backup mode. It may initialize a first empty
+repository, publish committed checkpoints, and advance the configured anchor.
+Run only one read-write gateway for a repository.
+
+`restore-readonly` is the incident and disaster-recovery restore mode. It opens
+only from an existing accepted anchor, does not initialize a missing keyring
+envelope, and rejects supported repository mutations such as PUT, DELETE, and
+object legal-hold changes. Use it after explicit anchor recovery when a new
+cluster starts without the old Kubernetes Lease. Pair it with Velero
+`BackupStorageLocation` read-only mode, Kopia read-only repository settings
+where practical, and backend credentials that cannot write.
+
 ## Repository Behavior
 
 | Variable | Required | Default | Description |
@@ -96,8 +111,9 @@ cargo run -p rs3-server -- doctor --profile production
 ```
 
 The local profile validates runtime configuration and redacts secrets in debug
-output. The production profile also rejects memory anchors, missing repository
-retention, retention-unsupported local backends, and missing gateway credentials.
+output. The production profile also rejects memory anchors,
+retention-unsupported local backends, missing gateway credentials, and missing
+repository retention for mutation-capable serving.
 
 ## Helm Repository Keys
 
