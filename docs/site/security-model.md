@@ -70,6 +70,7 @@ batching, compaction jitter, and stricter telemetry redaction.
 | --- | --- | --- |
 | Backend keys do not reveal client paths | Opaque backend object IDs and path privacy property tests. | `crates/rs3-repository/tests/path_invariants.rs` |
 | Payload bytes are not plaintext in storage | Authenticated encrypted payload segments. | Repository payload tests in `crates/rs3-repository/src/tests/payload.rs` |
+| Metadata bytes are not plaintext in durable index state | AES-256-GCM-SIV sealed metadata records. | Crypto metadata tests and repository path-invariant tests. |
 | Payload objects cannot be moved silently | Associated data binds ciphertext to backend object context. | Payload tamper and object-context tests. |
 | Repository key reuse is compartmentalized | Purpose keys are derived with HKDF-SHA-256 from the master key, repository ID, and public salt. | Crypto key-derivation tests. |
 | Old content remains readable after rotation | Enabled historical content keys are accepted for reads. | Repository key rotation tests. |

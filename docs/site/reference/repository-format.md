@@ -44,6 +44,10 @@ behavior. This is a tuning parameter, not a permanent format guarantee.
 Namespace index state maps blinded logical names and prefix tokens to encrypted
 metadata needed for `HEAD`, `GET`, and `LIST`.
 
+Metadata records are sealed with AES-256-GCM-SIV. Associated data binds each
+sealed record to its repository context so moving metadata between contexts
+does not authenticate.
+
 Index changes are append-friendly deltas covered by checkpoints. Compaction can
 rewrite index state later, but it must preserve rollback and retention rules.
 
