@@ -1,6 +1,9 @@
 //! Dry-run repository maintenance reports.
 
-use crate::checkpoint::{CHECKPOINT_OBJECT_PREFIX, checkpoint_object_id};
+use crate::checkpoint::{
+    CHECKPOINT_EVIDENCE_PREFIX, CHECKPOINT_OBJECT_PREFIX, checkpoint_evidence_object_id,
+    checkpoint_object_id,
+};
 use crate::error::{RepositoryError, Result};
 use crate::model::{
     BackendObjectReferenceKind, CheckpointPosition, ReachableBackendObject,
@@ -33,6 +36,10 @@ where
             reachable.insert(ReachableBackendObject {
                 object_id: checkpoint_object_id(&checkpoint.id)?,
                 kind: BackendObjectReferenceKind::Checkpoint,
+            });
+            reachable.insert(ReachableBackendObject {
+                object_id: checkpoint_evidence_object_id(&position)?,
+                kind: BackendObjectReferenceKind::CheckpointEvidence,
             });
 
             for object_id in &checkpoint.record.index_deltas {
@@ -83,6 +90,10 @@ where
             (
                 CHECKPOINT_OBJECT_PREFIX,
                 BackendObjectReferenceKind::Checkpoint,
+            ),
+            (
+                CHECKPOINT_EVIDENCE_PREFIX,
+                BackendObjectReferenceKind::CheckpointEvidence,
             ),
             (
                 INDEX_DELTA_OBJECT_PREFIX,

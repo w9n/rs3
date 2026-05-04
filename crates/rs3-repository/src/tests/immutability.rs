@@ -102,6 +102,10 @@ async fn default_retention_applies_to_payload_and_checkpoint() {
         .list_prefix(CHECKPOINT_OBJECT_PREFIX)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
+    let evidence = store
+        .list_prefix(CHECKPOINT_EVIDENCE_PREFIX)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
 
     assert_eq!(
         payloads.first().and_then(|metadata| metadata.retention),
@@ -109,6 +113,10 @@ async fn default_retention_applies_to_payload_and_checkpoint() {
     );
     assert_eq!(
         checkpoints.first().and_then(|metadata| metadata.retention),
+        Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
+    );
+    assert_eq!(
+        evidence.first().and_then(|metadata| metadata.retention),
         Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
     );
 }
@@ -141,6 +149,10 @@ async fn legal_hold_applies_to_payload_and_checkpoint() {
         .list_prefix(CHECKPOINT_OBJECT_PREFIX)
         .await
         .unwrap_or_else(|error| panic!("{error}"));
+    let evidence = store
+        .list_prefix(CHECKPOINT_EVIDENCE_PREFIX)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
 
     assert_eq!(
         payloads.first().and_then(|metadata| metadata.legal_hold),
@@ -148,6 +160,10 @@ async fn legal_hold_applies_to_payload_and_checkpoint() {
     );
     assert_eq!(
         checkpoints.first().and_then(|metadata| metadata.legal_hold),
+        Some(LegalHoldStatus::On)
+    );
+    assert_eq!(
+        evidence.first().and_then(|metadata| metadata.legal_hold),
         Some(LegalHoldStatus::On)
     );
 }

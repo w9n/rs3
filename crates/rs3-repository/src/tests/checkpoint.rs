@@ -324,6 +324,7 @@ async fn multiple_pending_puts_publish_as_one_checkpoint_batch() {
 
     let position = must(repo.publish_checkpoint(&anchor).await);
     let checkpoint_objects = must_storage(store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+    let evidence_objects = must_storage(store.list_prefix(CHECKPOINT_EVIDENCE_PREFIX).await);
     let index_delta_objects = must_storage(store.list_prefix("index/").await);
     let payload_objects = must_storage(store.list_prefix("segments/").await);
     let reloaded = Repository::with_keyring(store, keyring);
@@ -332,6 +333,7 @@ async fn multiple_pending_puts_publish_as_one_checkpoint_batch() {
 
     assert_eq!(loaded, position);
     assert_eq!(checkpoint_objects.len(), 1);
+    assert_eq!(evidence_objects.len(), 1);
     assert!(index_delta_objects.is_empty());
     assert_eq!(payload_objects.len(), keys.len());
     assert_eq!(
@@ -519,6 +521,8 @@ async fn failed_checkpoint_put_leaves_batch_unaccepted_and_retryable() {
     let first_publish = repo.publish_checkpoint(&anchor).await;
     let checkpoint_objects_after_failure =
         must_storage(inner.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+    let evidence_objects_after_failure =
+        must_storage(inner.list_prefix(CHECKPOINT_EVIDENCE_PREFIX).await);
     let index_objects_after_failure = must_storage(inner.list_prefix("index/").await);
     let payload_objects_after_failure = must_storage(inner.list_prefix("segments/").await);
     let fresh = Repository::with_keyring(inner.clone(), keyring.clone());
@@ -533,6 +537,7 @@ async fn failed_checkpoint_put_leaves_batch_unaccepted_and_retryable() {
         Err(AnchorError::MissingAnchor)
     ));
     assert!(checkpoint_objects_after_failure.is_empty());
+    assert!(evidence_objects_after_failure.is_empty());
     assert!(index_objects_after_failure.is_empty());
     assert_eq!(payload_objects_after_failure.len(), 1);
     assert!(matches!(fresh_head, Err(RepositoryError::NotFound(_))));
@@ -563,16 +568,20 @@ async fn publish_checkpoint_retries_after_anchor_failure_without_rewriting_check
 
     let first = repo.publish_checkpoint(&anchor).await;
     let after_first = must_storage(store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+    let evidence_after_first = must_storage(store.list_prefix(CHECKPOINT_EVIDENCE_PREFIX).await);
     let second = must(repo.publish_checkpoint(&anchor).await);
     let after_second = must_storage(store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+    let evidence_after_second = must_storage(store.list_prefix(CHECKPOINT_EVIDENCE_PREFIX).await);
 
     assert!(matches!(
         first,
         Err(RepositoryError::Anchor(AnchorError::Backend(_)))
     ));
     assert_eq!(after_first.len(), 1);
+    assert_eq!(evidence_after_first.len(), 1);
     assert_eq!(second.sequence, Sequence::new(1));
     assert_eq!(after_second.len(), 1);
+    assert_eq!(evidence_after_second.len(), 1);
 }
 
 #[tokio::test]

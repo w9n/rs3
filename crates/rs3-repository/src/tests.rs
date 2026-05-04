@@ -1,6 +1,9 @@
 //! Repository behavior tests.
 
-use crate::checkpoint::{CHECKPOINT_OBJECT_PREFIX, checkpoint_object_id};
+use crate::checkpoint::{
+    CHECKPOINT_EVIDENCE_PREFIX, CHECKPOINT_OBJECT_PREFIX, checkpoint_evidence_object_id,
+    checkpoint_object_id,
+};
 use crate::namespace::{indexed_list_prefix, indexed_list_prefix_mode, prefix_tokens_for_key};
 use crate::payload::PAYLOAD_HEADER_PROBE_LEN;
 use crate::{

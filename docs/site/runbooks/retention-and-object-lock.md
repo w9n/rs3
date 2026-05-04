@@ -12,7 +12,7 @@ When retention is enabled, protect every object needed for restore:
 - metadata or manifest state
 - namespace/index state
 - checkpoints
-- storage evidence, when configured
+- storage evidence
 
 If one class is missing, the backup may become retained but unrestorable.
 

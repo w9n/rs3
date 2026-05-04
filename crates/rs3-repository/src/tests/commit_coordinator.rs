@@ -242,11 +242,13 @@ async fn commit_coordinator_publishes_single_write_after_delay() {
     let counts = must_storage(store.operation_counts());
     let indexes = must_storage(store.list_prefix("index/").await);
     let checkpoints = must_storage(store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+    let evidence = must_storage(store.list_prefix(CHECKPOINT_EVIDENCE_PREFIX).await);
 
     assert_eq!(committed.checkpoint.sequence, Sequence::new(1));
-    assert_eq!(counts.put, 2);
+    assert_eq!(counts.put, 3);
     assert!(indexes.is_empty());
     assert_eq!(checkpoints.len(), 1);
+    assert_eq!(evidence.len(), 1);
 }
 
 #[tokio::test]
@@ -326,6 +328,7 @@ async fn operation_counts_show_checkpoint_batch_reduces_backend_puts() {
     let single_manifests = must_storage(single_store.list_prefix("manifests/").await);
     let single_indexes = must_storage(single_store.list_prefix("index/").await);
     let single_checkpoints = must_storage(single_store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+    let single_evidence = must_storage(single_store.list_prefix(CHECKPOINT_EVIDENCE_PREFIX).await);
 
     let batch_store = MemoryBlobStore::new();
     let batch_repo = Repository::with_keyring(batch_store.clone(), signing_keyring());
@@ -349,6 +352,7 @@ async fn operation_counts_show_checkpoint_batch_reduces_backend_puts() {
     let batch_manifests = must_storage(batch_store.list_prefix("manifests/").await);
     let batch_indexes = must_storage(batch_store.list_prefix("index/").await);
     let batch_checkpoints = must_storage(batch_store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+    let batch_evidence = must_storage(batch_store.list_prefix(CHECKPOINT_EVIDENCE_PREFIX).await);
 
     let grouped_store = MemoryBlobStore::new();
     let grouped_repository = Arc::new(Repository::with_keyring(
@@ -410,10 +414,12 @@ async fn operation_counts_show_checkpoint_batch_reduces_backend_puts() {
     let grouped_indexes = must_storage(grouped_store.list_prefix("index/").await);
     let grouped_checkpoints =
         must_storage(grouped_store.list_prefix(CHECKPOINT_OBJECT_PREFIX).await);
+    let grouped_evidence =
+        must_storage(grouped_store.list_prefix(CHECKPOINT_EVIDENCE_PREFIX).await);
 
-    assert_eq!(single_counts.put, 6);
-    assert_eq!(batch_counts.put, 4);
-    assert_eq!(grouped_counts.put, 4);
+    assert_eq!(single_counts.put, 9);
+    assert_eq!(batch_counts.put, 5);
+    assert_eq!(grouped_counts.put, 5);
     assert_eq!(single_counts.get, 0);
     assert_eq!(batch_counts.get, 0);
     assert_eq!(grouped_counts.get, 0);
@@ -421,11 +427,14 @@ async fn operation_counts_show_checkpoint_batch_reduces_backend_puts() {
     assert_eq!(single_manifests.len(), 0);
     assert!(single_indexes.is_empty());
     assert_eq!(single_checkpoints.len(), 3);
+    assert_eq!(single_evidence.len(), 3);
     assert_eq!(batch_payloads.len(), 3);
     assert_eq!(batch_manifests.len(), 0);
     assert!(batch_indexes.is_empty());
     assert_eq!(batch_checkpoints.len(), 1);
+    assert_eq!(batch_evidence.len(), 1);
     assert_eq!(grouped_payloads.len(), 3);
     assert!(grouped_indexes.is_empty());
     assert_eq!(grouped_checkpoints.len(), 1);
+    assert_eq!(grouped_evidence.len(), 1);
 }

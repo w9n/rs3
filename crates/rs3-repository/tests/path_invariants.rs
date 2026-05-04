@@ -59,7 +59,10 @@ async fn check_committed_path(path: String) -> Result<(), String> {
             ));
         }
 
-        if object_id.starts_with("index/") || object_id.starts_with("checkpoints/") {
+        if object_id.starts_with("index/")
+            || object_id.starts_with("checkpoints/")
+            || object_id.starts_with("evidence/")
+        {
             let body = store
                 .get_range(&metadata.object_id, ByteRange::Full)
                 .await

@@ -54,8 +54,8 @@ The result is a system that should be evaluated on three axes:
   compatibility is not stable yet.
 - Some leakage is inherent: object counts, sizes, coarse timing, and operation
   cadence remain visible to the backend.
-- Hardened Kubernetes anchor wiring and storage-side evidence need continued
-  integration work.
+- Storage-side evidence now exists for checkpoint publication, but production
+  deletion resistance still depends on provider retention or Object Lock.
 - Compatibility beyond the Kopia-focused S3 surface is intentionally limited.
 
 ## Evaluation Standard

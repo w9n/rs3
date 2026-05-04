@@ -41,6 +41,14 @@ async fn orphan_report_is_empty_for_accepted_repository_objects() {
         report
             .reachable
             .iter()
+            .filter(|object| object.kind == BackendObjectReferenceKind::CheckpointEvidence)
+            .count(),
+        2
+    );
+    assert_eq!(
+        report
+            .reachable
+            .iter()
             .filter(|object| object.kind == BackendObjectReferenceKind::IndexDelta)
             .count(),
         0
@@ -110,6 +118,43 @@ async fn orphan_report_finds_unaccepted_payload_objects() {
             .any(|candidate| candidate.kind == BackendObjectReferenceKind::Payload)
     );
     assert!(candidate_ids.iter().all(|id| id.starts_with("segments/")));
+}
+
+#[tokio::test]
+async fn orphan_report_finds_unaccepted_checkpoint_evidence() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
+    let anchor = MemoryCheckpointAnchor::new();
+    let accepted = must(
+        repo.put_committed(
+            key("p/12/accepted"),
+            Bytes::from_static(b"accepted"),
+            RepositoryPutOptions::default(),
+            &anchor,
+        )
+        .await,
+    );
+    let unaccepted = CheckpointPosition {
+        sequence: Sequence::new(9),
+        checkpoint_id: checkpoint_id("unaccepted-checkpoint"),
+        payload_digest: "unaccepted-digest".to_owned(),
+    };
+    let evidence_id = must(checkpoint_evidence_object_id(&unaccepted));
+    let put = store
+        .put(
+            &evidence_id,
+            Bytes::from_static(b"manual-evidence"),
+            PutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let report = must(repo.orphan_report(&accepted.checkpoint).await);
+
+    assert!(report.candidates.iter().any(|candidate| {
+        candidate.object_id == evidence_id
+            && candidate.kind == BackendObjectReferenceKind::CheckpointEvidence
+    }));
 }
 
 async fn manual_orphan_candidate(

@@ -10,11 +10,11 @@ use rs3_crypto::{
     KeyRing, derive_checkpoint_id, derive_checkpoint_payload_digest, derive_index_delta_object_id,
 };
 use rs3_index::{
-    CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CommitRecord, INDEX_DELTA_OBJECT_DOMAIN,
-    INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta, IndexDeltaObject, KeyringSnapshot,
-    MANIFEST_PLAINTEXT_DOMAIN, ManifestObject, SealedIndexDeltaObject,
-    canonical_commit_record_bytes, checkpoint_object_bytes, index_delta_plaintext_bytes,
-    manifest_plaintext_bytes,
+    CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CheckpointEvidence, CommitRecord,
+    INDEX_DELTA_OBJECT_DOMAIN, INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta, IndexDeltaObject,
+    KeyringSnapshot, MANIFEST_PLAINTEXT_DOMAIN, ManifestObject, SealedIndexDeltaObject,
+    canonical_commit_record_bytes, checkpoint_evidence_bytes, checkpoint_object_bytes,
+    index_delta_plaintext_bytes, manifest_plaintext_bytes,
 };
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, CheckpointId, ManifestId};
@@ -22,7 +22,9 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 pub(crate) const CHECKPOINT_OBJECT_PREFIX: &str = "checkpoints/";
+pub(crate) const CHECKPOINT_EVIDENCE_PREFIX: &str = "evidence/";
 const CHECKPOINT_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.checkpoint+json";
+const CHECKPOINT_EVIDENCE_CONTENT_TYPE: &str = "application/vnd.rs3.checkpoint-evidence+json";
 const INDEX_DELTA_ASSOCIATED_DATA: &[u8] = b"rs3:index-delta-object:v1";
 
 impl<S> Repository<S>
@@ -148,6 +150,7 @@ where
         let position = self.verify_signed_checkpoint(&checkpoint, accepted.as_ref())?;
 
         self.persist_signed_checkpoint(&checkpoint).await?;
+        self.persist_checkpoint_evidence(&position).await?;
 
         anchor
             .compare_and_advance(position.clone().into_anchor_state())
@@ -225,6 +228,45 @@ where
                     Ok(())
                 } else {
                     Err(crate::RepositoryError::CheckpointObjectConflict { object_id })
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn persist_checkpoint_evidence(&self, position: &CheckpointPosition) -> Result<()> {
+        let object_id = checkpoint_evidence_object_id(position)?;
+        let evidence = CheckpointEvidence {
+            sequence: position.sequence,
+            checkpoint_id: position.checkpoint_id.clone(),
+            checkpoint_digest: position.payload_digest.clone(),
+            checkpoint_object_id: checkpoint_object_id(&position.checkpoint_id)?,
+        };
+        let body = Bytes::from(checkpoint_evidence_bytes(&evidence)?);
+        let retention = self.checkpoint_retention_policy()?;
+        let legal_hold = self.checkpoint_legal_hold()?;
+        let put = self
+            .store
+            .put(
+                &object_id,
+                body.clone(),
+                PutOptions {
+                    retention,
+                    legal_hold,
+                    content_type: Some(CHECKPOINT_EVIDENCE_CONTENT_TYPE.to_owned()),
+                    do_not_recreate: true,
+                },
+            )
+            .await;
+
+        match put {
+            Ok(_) => Ok(()),
+            Err(StorageError::AlreadyExists(_)) => {
+                let existing = self.store.get_range(&object_id, ByteRange::Full).await?;
+                if existing == body {
+                    Ok(())
+                } else {
+                    Err(crate::RepositoryError::CheckpointEvidenceObjectConflict { object_id })
                 }
             }
             Err(error) => Err(error.into()),
@@ -394,6 +436,17 @@ pub(crate) fn checkpoint_object_id(checkpoint_id: &CheckpointId) -> Result<Backe
     BackendObjectId::new(format!(
         "{CHECKPOINT_OBJECT_PREFIX}{}",
         checkpoint_id.as_str()
+    ))
+    .map_err(Into::into)
+}
+
+pub(crate) fn checkpoint_evidence_object_id(
+    position: &CheckpointPosition,
+) -> Result<BackendObjectId> {
+    BackendObjectId::new(format!(
+        "{CHECKPOINT_EVIDENCE_PREFIX}{:020}/{}",
+        position.sequence.get(),
+        position.checkpoint_id.as_str()
     ))
     .map_err(Into::into)
 }

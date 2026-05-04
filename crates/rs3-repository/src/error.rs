@@ -69,6 +69,12 @@ pub enum RepositoryError {
         /// Conflicting backend object ID.
         object_id: BackendObjectId,
     },
+    /// A stored checkpoint evidence object has different content than expected.
+    #[error("checkpoint evidence object conflicts with expected content: {object_id}")]
+    CheckpointEvidenceObjectConflict {
+        /// Conflicting backend object ID.
+        object_id: BackendObjectId,
+    },
     /// A stored index delta object has different content than expected.
     #[error("index delta object conflicts with expected content: {object_id}")]
     IndexDeltaObjectConflict {

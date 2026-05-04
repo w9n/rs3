@@ -62,6 +62,16 @@ A checkpoint records an ordered repository state transition:
 
 Checkpoints must not contain plaintext logical names.
 
+## Evidence
+
+Each newly published checkpoint writes a create-only evidence object under
+`evidence/`. Evidence records contain the checkpoint sequence, checkpoint ID,
+canonical checkpoint digest, and signed checkpoint object ID. They are retained
+with the same policy and legal hold as the checkpoint object.
+
+Evidence is not a latest-state authority. It gives operators retained storage
+history to compare with the external anchor during rollback investigations.
+
 ## Keyrings
 
 The repository uses purpose-specific keys for:

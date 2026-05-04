@@ -36,6 +36,8 @@ pub struct RepositoryObjectMetadata {
 pub enum BackendObjectReferenceKind {
     /// Signed checkpoint object.
     Checkpoint,
+    /// Retained checkpoint evidence object.
+    CheckpointEvidence,
     /// Durable index delta object referenced by a checkpoint.
     IndexDelta,
     /// Payload object referenced by a durable index delta.
