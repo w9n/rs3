@@ -2,7 +2,8 @@
 
 use rs3_server::{
     AnchorConfig, BackendConfig, BatchConfig, GatewayServer, GatewayServerError, MetricsConfig,
-    RepositoryConfig, RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
+    RepositoryConfig, RepositoryKeySource, RepositoryKeysConfig, RuntimeConfig, SecretString,
+    StaticCredentials,
 };
 use rs3_types::{PublicBucket, RepositoryId};
 use std::net::SocketAddr;
@@ -129,9 +130,11 @@ fn runtime_config() -> RuntimeConfig {
                 .unwrap_or_else(|error| panic!("{error}")),
             repository_salt_hex: "2222222222222222222222222222222222222222222222222222222222222222"
                 .to_owned(),
-            master_key_hex: SecretString::from(
-                "1111111111111111111111111111111111111111111111111111111111111111",
-            ),
+            source: RepositoryKeySource::MasterKey {
+                master_key_hex: SecretString::from(
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                ),
+            },
         },
         static_credentials: Some(StaticCredentials {
             access_key_id: "access".to_owned(),

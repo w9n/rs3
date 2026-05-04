@@ -38,6 +38,8 @@ pub enum BackendObjectReferenceKind {
     Checkpoint,
     /// Retained checkpoint evidence object.
     CheckpointEvidence,
+    /// Encrypted repository keyring envelope.
+    KeyringEnvelope,
     /// Durable index delta object referenced by a checkpoint.
     IndexDelta,
     /// Payload object referenced by a durable index delta.

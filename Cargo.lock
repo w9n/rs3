@@ -3431,6 +3431,8 @@ dependencies = [
  "hmac 0.12.1",
  "ring",
  "rs3-types",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror",
  "zeroize",

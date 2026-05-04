@@ -32,7 +32,7 @@ pub enum S3BoundaryError {
 pub(super) mod test_support {
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, MetricsConfig, RepositoryConfig,
-        RepositoryKeysConfig, RuntimeConfig, SecretString,
+        RepositoryKeySource, RepositoryKeysConfig, RuntimeConfig, SecretString,
     };
     use rs3_types::{PublicBucket, RepositoryId};
     use std::time::Duration;
@@ -71,9 +71,11 @@ pub(super) mod test_support {
                     .unwrap_or_else(|error| panic!("{error}")),
                 repository_salt_hex:
                     "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
-                master_key_hex: SecretString::from(
-                    "1111111111111111111111111111111111111111111111111111111111111111",
-                ),
+                source: RepositoryKeySource::MasterKey {
+                    master_key_hex: SecretString::from(
+                        "1111111111111111111111111111111111111111111111111111111111111111",
+                    ),
+                },
             },
             static_credentials: static_credentials.then(|| crate::StaticCredentials {
                 access_key_id: "access".to_owned(),

@@ -418,6 +418,7 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
         | RepositoryError::CheckpointConflict { .. }
         | RepositoryError::CheckpointObjectConflict { .. }
         | RepositoryError::CheckpointEvidenceObjectConflict { .. }
+        | RepositoryError::KeyringEnvelopeObjectConflict { .. }
         | RepositoryError::IndexDeltaObjectConflict { .. }
         | RepositoryError::InvalidObjectFormat { .. }
         | RepositoryError::CheckpointParentMismatch => {

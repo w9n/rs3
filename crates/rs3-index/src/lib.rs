@@ -146,6 +146,17 @@ impl KeyringSnapshot {
     }
 }
 
+/// Public reference to the encrypted keyring envelope active for a checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyringEnvelopeReference {
+    /// Envelope generation assigned by the operator workflow.
+    pub generation: u64,
+    /// Digest of the encrypted envelope object.
+    pub digest: String,
+    /// Backend object that stores the encrypted envelope.
+    pub object_id: BackendObjectId,
+}
+
 /// Signed checkpoint payload before signature wrapping.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitRecord {
@@ -162,6 +173,9 @@ pub struct CommitRecord {
     pub compacted_manifests: Vec<ManifestId>,
     /// Public keyring metadata active for this checkpoint.
     pub keyring: KeyringSnapshot,
+    /// Encrypted keyring envelope active for this checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyring_envelope: Option<KeyringEnvelopeReference>,
 }
 
 impl CommitRecord {
@@ -506,6 +520,7 @@ mod tests {
             inline_index_delta: None,
             compacted_manifests: Vec::new(),
             keyring: KeyringSnapshot::default(),
+            keyring_envelope: None,
         };
 
         assert!(record.parent.is_none());
@@ -523,6 +538,7 @@ mod tests {
                 key_descriptor("old", KeyPurpose::Namespace, KeyStatus::Enabled),
                 key_descriptor("new", KeyPurpose::Namespace, KeyStatus::Primary),
             ]),
+            keyring_envelope: None,
         };
         let sorted = CommitRecord {
             sequence: Sequence::new(3),
@@ -534,6 +550,7 @@ mod tests {
                 key_descriptor("new", KeyPurpose::Namespace, KeyStatus::Primary),
                 key_descriptor("old", KeyPurpose::Namespace, KeyStatus::Enabled),
             ]),
+            keyring_envelope: None,
         };
 
         let left = canonical_commit_record_bytes(&unsorted);
@@ -552,6 +569,7 @@ mod tests {
             inline_index_delta: None,
             compacted_manifests: Vec::new(),
             keyring: KeyringSnapshot::default(),
+            keyring_envelope: None,
         };
         let second = CommitRecord {
             sequence: Sequence::new(2),
@@ -560,6 +578,7 @@ mod tests {
             inline_index_delta: None,
             compacted_manifests: Vec::new(),
             keyring: KeyringSnapshot::default(),
+            keyring_envelope: None,
         };
 
         let first_bytes = canonical_commit_record_bytes(&first);
@@ -581,6 +600,7 @@ mod tests {
                 inline_index_delta: None,
                 compacted_manifests: Vec::new(),
                 keyring: KeyringSnapshot::default(),
+                keyring_envelope: None,
             },
             signature_key_id: key_id("signing"),
             signature: vec![1, 2, 3],

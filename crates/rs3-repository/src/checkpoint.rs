@@ -7,14 +7,15 @@ use crate::state::{RepositoryState, TrustedManifest, apply_index_delta_object};
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, CheckpointAnchor};
 use rs3_crypto::{
-    KeyRing, derive_checkpoint_id, derive_checkpoint_payload_digest, derive_index_delta_object_id,
+    KeyRing, KeyringEnvelope, derive_checkpoint_id, derive_checkpoint_payload_digest,
+    derive_index_delta_object_id,
 };
 use rs3_index::{
     CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CheckpointEvidence, CommitRecord,
     INDEX_DELTA_OBJECT_DOMAIN, INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta, IndexDeltaObject,
-    KeyringSnapshot, MANIFEST_PLAINTEXT_DOMAIN, ManifestObject, SealedIndexDeltaObject,
-    canonical_commit_record_bytes, checkpoint_evidence_bytes, checkpoint_object_bytes,
-    index_delta_plaintext_bytes, manifest_plaintext_bytes,
+    KeyringEnvelopeReference, KeyringSnapshot, MANIFEST_PLAINTEXT_DOMAIN, ManifestObject,
+    SealedIndexDeltaObject, canonical_commit_record_bytes, checkpoint_evidence_bytes,
+    checkpoint_object_bytes, index_delta_plaintext_bytes, manifest_plaintext_bytes,
 };
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, CheckpointId, ManifestId};
@@ -23,8 +24,10 @@ use std::time::{Duration, Instant};
 
 pub(crate) const CHECKPOINT_OBJECT_PREFIX: &str = "checkpoints/";
 pub(crate) const CHECKPOINT_EVIDENCE_PREFIX: &str = "evidence/";
+pub(crate) const KEYRING_ENVELOPE_OBJECT_PREFIX: &str = "keyrings/";
 const CHECKPOINT_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.checkpoint+json";
 const CHECKPOINT_EVIDENCE_CONTENT_TYPE: &str = "application/vnd.rs3.checkpoint-evidence+json";
+const KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.keyring-envelope+json";
 const INDEX_DELTA_ASSOCIATED_DATA: &[u8] = b"rs3:index-delta-object:v1";
 
 impl<S> Repository<S>
@@ -53,6 +56,7 @@ where
             inline_index_delta,
             compacted_manifests: Vec::new(),
             keyring: KeyringSnapshot::new(keyring.descriptors()),
+            keyring_envelope: self.keyring_envelope_reference()?,
         })
     }
 
@@ -174,12 +178,14 @@ where
         let checkpoints = self.read_checkpoint_chain(&accepted.checkpoint_id).await?;
         let mut previous = None;
         let mut rebuilt = RepositoryState::default();
+        let mut loaded_keyring_envelope = None;
 
         for checkpoint in checkpoints.into_iter().rev() {
             let position = self.verify_signed_checkpoint(&checkpoint, previous.as_ref())?;
             self.apply_checkpoint_deltas(&mut rebuilt, &checkpoint)
                 .await?;
             rebuilt.next_sequence = position.sequence;
+            loaded_keyring_envelope = checkpoint.record.keyring_envelope.clone();
             previous = Some(position);
         }
 
@@ -197,7 +203,55 @@ where
 
         let mut state = self.write_state()?;
         *state = rebuilt;
+        drop(state);
+        self.set_keyring_envelope_reference(loaded_keyring_envelope)?;
         Ok(loaded)
+    }
+
+    /// Stores an encrypted keyring envelope and records its reference for new checkpoints.
+    pub async fn store_keyring_envelope(
+        &self,
+        envelope: &KeyringEnvelope,
+    ) -> Result<KeyringEnvelopeReference> {
+        let digest = envelope.digest()?;
+        let object_id = keyring_envelope_object_id(envelope.generation, &digest)?;
+        let body = Bytes::from(envelope.to_object_bytes()?);
+        let retention = self.checkpoint_retention_policy()?;
+        let legal_hold = self.checkpoint_legal_hold()?;
+        let put = self
+            .store
+            .put(
+                &object_id,
+                body.clone(),
+                PutOptions {
+                    retention,
+                    legal_hold,
+                    content_type: Some(KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE.to_owned()),
+                    do_not_recreate: true,
+                },
+            )
+            .await;
+
+        match put {
+            Ok(_) => {}
+            Err(StorageError::AlreadyExists(_)) => {
+                let existing = self.store.get_range(&object_id, ByteRange::Full).await?;
+                if existing != body {
+                    return Err(crate::RepositoryError::KeyringEnvelopeObjectConflict {
+                        object_id,
+                    });
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let reference = KeyringEnvelopeReference {
+            generation: envelope.generation,
+            digest,
+            object_id,
+        };
+        self.set_keyring_envelope_reference(Some(reference.clone()))?;
+        Ok(reference)
     }
 
     /// Writes a signed checkpoint object if it has not already been written.
@@ -447,6 +501,13 @@ pub(crate) fn checkpoint_evidence_object_id(
         "{CHECKPOINT_EVIDENCE_PREFIX}{:020}/{}",
         position.sequence.get(),
         position.checkpoint_id.as_str()
+    ))
+    .map_err(Into::into)
+}
+
+pub(crate) fn keyring_envelope_object_id(generation: u64, digest: &str) -> Result<BackendObjectId> {
+    BackendObjectId::new(format!(
+        "{KEYRING_ENVELOPE_OBJECT_PREFIX}{generation:020}-{digest}.json"
     ))
     .map_err(Into::into)
 }

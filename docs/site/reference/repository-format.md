@@ -19,6 +19,7 @@ The design uses a small number of non-secret classes:
 
 ```text
 format/
+keyrings/
 segments/
 manifests/
 index/
@@ -59,6 +60,7 @@ A checkpoint records an ordered repository state transition:
 - parent checkpoint reference
 - referenced index deltas or compacted segments
 - active key descriptors
+- active keyring envelope generation, object ID, and digest when configured
 - repository-state digest
 - creation time
 - retention/evidence policy marker
@@ -88,11 +90,19 @@ The repository uses purpose-specific keys for:
 New writes use primary keys. Reads and replay accept enabled historical keys
 until retention and migration policy allow retirement.
 
-Gateway-derived default keyrings use HKDF-SHA-256 to bind the master key to a
-repository ID and a stable public repository salt. Both values must remain
-unchanged for the life of the repository. Checkpoint-signing descriptors include
-the Ed25519 public verification key so checkpoint payloads can be verified
-without exposing signing material.
+The preferred bootstrap shape is to generate random purpose-specific data keys
+and store them in an encrypted keyring envelope under `keyrings/`. The unwrap
+authority, such as a KMS key or high-entropy wrapping key, stays outside the
+repository. Signed checkpoints bind the active envelope by generation, object
+ID, and digest so a backend cannot silently swap envelopes.
+
+The direct gateway master-key path remains available as a compatibility and
+bootstrap path. It derives purpose-specific keys with HKDF-SHA-256 from the
+master key, repository ID, and stable public repository salt. Both values must
+remain unchanged for the life of that repository.
+
+Checkpoint-signing descriptors include the Ed25519 public verification key so
+checkpoint payloads can be verified without exposing signing material.
 
 ## Compatibility Promise
 
@@ -103,4 +113,4 @@ decisions for:
 - default segment-size policy
 - index compaction thresholds
 - padding policy
-- keyring envelope encoding
+- keyring-envelope init and KMS integration workflow

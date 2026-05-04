@@ -75,6 +75,12 @@ pub enum RepositoryError {
         /// Conflicting backend object ID.
         object_id: BackendObjectId,
     },
+    /// A stored keyring envelope object has different content than expected.
+    #[error("keyring envelope object conflicts with expected content: {object_id}")]
+    KeyringEnvelopeObjectConflict {
+        /// Conflicting backend object ID.
+        object_id: BackendObjectId,
+    },
     /// A stored index delta object has different content than expected.
     #[error("index delta object conflicts with expected content: {object_id}")]
     IndexDeltaObjectConflict {

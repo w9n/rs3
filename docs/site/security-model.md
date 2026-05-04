@@ -72,7 +72,8 @@ batching, compaction jitter, and stricter telemetry redaction.
 | Payload bytes are not plaintext in storage | Authenticated encrypted payload segments. | Repository payload tests in `crates/rs3-repository/src/tests/payload.rs` |
 | Metadata bytes are not plaintext in durable index state | AES-256-GCM-SIV sealed metadata records. | Crypto metadata tests and repository path-invariant tests. |
 | Payload objects cannot be moved silently | Associated data binds ciphertext to backend object context. | Payload tamper and object-context tests. |
-| Repository key reuse is compartmentalized | Purpose keys are derived with HKDF-SHA-256 from the master key, repository ID, and public salt. | Crypto key-derivation tests. |
+| Repository key reuse is compartmentalized | Purpose keys are generated into an encrypted keyring envelope or derived with HKDF-SHA-256 from the master key, repository ID, and public salt on the compatibility path. | Crypto keyring/envelope tests. |
+| Envelope swaps are detectable | Signed checkpoints bind the active keyring envelope generation, object ID, and digest. | Repository key-envelope checkpoint test. |
 | Old content remains readable after rotation | Enabled historical content keys are accepted for reads. | Repository key rotation tests. |
 | Writes are not acknowledged before checkpoint acceptance | Commit coordinator waits for covering checkpoint. | Commit coordinator and checkpoint tests. |
 | Storage rollback is not trusted as latest state | Ed25519 checkpoint verification, external anchor model, and retained checkpoint evidence. | Anchor, checkpoint replay, and orphan-report tests. |

@@ -89,6 +89,56 @@ fn repository_from_master_key_context_binds_to_repository_salt() {
 }
 
 #[tokio::test]
+async fn stored_keyring_envelope_is_bound_into_signed_checkpoints() {
+    let store = MemoryBlobStore::new();
+    let repository_id = match RepositoryId::new("repository-a") {
+        Ok(repository_id) => repository_id,
+        Err(error) => panic!("{error}"),
+    };
+    let context = match RepositoryKeyContext::new(repository_id, vec![7; 32]) {
+        Ok(context) => context,
+        Err(error) => panic!("{error}"),
+    };
+    let active_keyring =
+        match KeyRing::from_repository_master_key_for_context(&secret_with_byte(11), &context) {
+            Ok(keyring) => keyring,
+            Err(error) => panic!("{error}"),
+        };
+    let envelope =
+        match active_keyring.seal_keyring_envelope(&context, "wrap-v1", &secret_with_byte(12), 1) {
+            Ok(envelope) => envelope,
+            Err(error) => panic!("{error}"),
+        };
+    let repo = Repository::with_keyring(store.clone(), active_keyring);
+    let anchor = MemoryCheckpointAnchor::new();
+
+    let reference = must(repo.store_keyring_envelope(&envelope).await);
+    let put = repo
+        .put(
+            key("p/12/enveloped"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+    let position = must(repo.publish_checkpoint(&anchor).await);
+    let checkpoint_object = match checkpoint_object_id(&position.checkpoint_id) {
+        Ok(object_id) => object_id,
+        Err(error) => panic!("{error}"),
+    };
+    let checkpoint = decode_checkpoint_object(must_storage(
+        store.get_range(&checkpoint_object, ByteRange::Full).await,
+    ));
+
+    let envelope_digest = match envelope.digest() {
+        Ok(digest) => digest,
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!(reference.digest, envelope_digest);
+    assert_eq!(checkpoint.record.keyring_envelope, Some(reference));
+}
+
+#[tokio::test]
 async fn namespace_rotation_keeps_old_objects_readable_and_listable() {
     let repo = Repository::with_keyring(
         MemoryBlobStore::new(),

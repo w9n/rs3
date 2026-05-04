@@ -3,7 +3,7 @@
 use crate::identity::StaticCredentials;
 use rs3_crypto::{MIN_REPOSITORY_SALT_LEN, SecretBytes};
 use rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE;
-use rs3_types::{PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
+use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
 use std::fmt;
 use std::net::SocketAddr;
@@ -22,6 +22,9 @@ const REPOSITORY_RETENTION_DAYS_ENV: &str = "RS3_REPOSITORY_RETENTION_DAYS";
 
 pub(crate) const REPOSITORY_MASTER_KEY_HEX_ENV: &str = "RS3_REPOSITORY_MASTER_KEY_HEX";
 pub(crate) const REPOSITORY_SALT_HEX_ENV: &str = "RS3_REPOSITORY_SALT_HEX";
+pub(crate) const KEYRING_ENVELOPE_OBJECT_ID_ENV: &str = "RS3_KEYRING_ENVELOPE_OBJECT_ID";
+pub(crate) const KEYRING_WRAPPING_KEY_HEX_ENV: &str = "RS3_KEYRING_WRAPPING_KEY_HEX";
+pub(crate) const KEYRING_WRAPPING_KEY_ID_ENV: &str = "RS3_KEYRING_WRAPPING_KEY_ID";
 const REPOSITORY_ID_ENV: &str = "RS3_REPOSITORY_ID";
 const ALLOW_MEMORY_ANCHOR_ENV: &str = "RS3_ALLOW_MEMORY_ANCHOR";
 
@@ -109,8 +112,27 @@ pub struct RepositoryKeysConfig {
     pub repository_id: RepositoryId,
     /// Stable public salt used with the repository ID during key derivation.
     pub repository_salt_hex: String,
-    /// Repository master key used to derive purpose-specific keys.
-    pub master_key_hex: SecretString,
+    /// Source of repository key material.
+    pub source: RepositoryKeySource,
+}
+
+/// Source of repository key material.
+#[derive(Clone)]
+pub enum RepositoryKeySource {
+    /// Derive purpose-specific keys from a directly provided repository master key.
+    MasterKey {
+        /// Repository master key used to derive purpose-specific keys.
+        master_key_hex: SecretString,
+    },
+    /// Open an encrypted keyring envelope stored in the repository.
+    KeyringEnvelope {
+        /// Backend object containing the encrypted keyring envelope.
+        envelope_object_id: BackendObjectId,
+        /// Operator-visible wrapping key identifier.
+        wrapping_key_id: String,
+        /// Wrapping key used to decrypt the keyring envelope.
+        wrapping_key_hex: SecretString,
+    },
 }
 
 impl fmt::Debug for RepositoryKeysConfig {
@@ -119,8 +141,25 @@ impl fmt::Debug for RepositoryKeysConfig {
             .debug_struct("RepositoryKeysConfig")
             .field("repository_id", &"<configured>")
             .field("repository_salt_hex", &"<configured>")
-            .field("master_key_hex", &REDACTED_SECRET_VALUE)
+            .field("source", &self.source)
             .finish()
+    }
+}
+
+impl fmt::Debug for RepositoryKeySource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MasterKey { .. } => formatter
+                .debug_struct("MasterKey")
+                .field("master_key_hex", &REDACTED_SECRET_VALUE)
+                .finish(),
+            Self::KeyringEnvelope { .. } => formatter
+                .debug_struct("KeyringEnvelope")
+                .field("envelope_object_id", &"<configured>")
+                .field("wrapping_key_id", &"<configured>")
+                .field("wrapping_key_hex", &REDACTED_SECRET_VALUE)
+                .finish(),
+        }
     }
 }
 
@@ -128,11 +167,45 @@ impl PartialEq for RepositoryKeysConfig {
     fn eq(&self, other: &Self) -> bool {
         self.repository_id == other.repository_id
             && self.repository_salt_hex == other.repository_salt_hex
-            && secret_string_eq(&self.master_key_hex, &other.master_key_hex)
+            && self.source == other.source
     }
 }
 
 impl Eq for RepositoryKeysConfig {}
+
+impl PartialEq for RepositoryKeySource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::MasterKey {
+                    master_key_hex: left,
+                },
+                Self::MasterKey {
+                    master_key_hex: right,
+                },
+            ) => secret_string_eq(left, right),
+            (
+                Self::KeyringEnvelope {
+                    envelope_object_id: left_object_id,
+                    wrapping_key_id: left_key_id,
+                    wrapping_key_hex: left_secret,
+                },
+                Self::KeyringEnvelope {
+                    envelope_object_id: right_object_id,
+                    wrapping_key_id: right_key_id,
+                    wrapping_key_hex: right_secret,
+                },
+            ) => {
+                left_object_id == right_object_id
+                    && left_key_id == right_key_id
+                    && secret_string_eq(left_secret, right_secret)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for RepositoryKeySource {}
 
 /// Runtime configuration errors.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -326,13 +399,61 @@ fn parse_repository_keys_config(
     Ok(RepositoryKeysConfig {
         repository_id: parse_repository_id(required_value(source, REPOSITORY_ID_ENV)?)?,
         repository_salt_hex: required_repository_salt_hex(source, REPOSITORY_SALT_HEX_ENV)?,
-        master_key_hex: required_secret_hex(source, REPOSITORY_MASTER_KEY_HEX_ENV)?,
+        source: parse_repository_key_source(source)?,
     })
+}
+
+fn parse_repository_key_source(
+    source: &impl ConfigSource,
+) -> Result<RepositoryKeySource, ConfigError> {
+    let master_key_hex = optional_value(source, REPOSITORY_MASTER_KEY_HEX_ENV);
+    let envelope_object_id = optional_value(source, KEYRING_ENVELOPE_OBJECT_ID_ENV);
+
+    match (master_key_hex, envelope_object_id) {
+        (Some(master_key_hex), None) => {
+            validate_repository_key_hex(REPOSITORY_MASTER_KEY_HEX_ENV, &master_key_hex)?;
+            Ok(RepositoryKeySource::MasterKey {
+                master_key_hex: SecretString::from(master_key_hex),
+            })
+        }
+        (None, Some(envelope_object_id)) => {
+            let envelope_object_id =
+                parse_backend_object_id(KEYRING_ENVELOPE_OBJECT_ID_ENV, envelope_object_id)?;
+            let wrapping_key_id = required_value(source, KEYRING_WRAPPING_KEY_ID_ENV)?;
+            let wrapping_key_hex = required_secret_hex(source, KEYRING_WRAPPING_KEY_HEX_ENV)?;
+            Ok(RepositoryKeySource::KeyringEnvelope {
+                envelope_object_id,
+                wrapping_key_id,
+                wrapping_key_hex,
+            })
+        }
+        (Some(_), Some(_)) => Err(ConfigError::Invalid {
+            key: REPOSITORY_MASTER_KEY_HEX_ENV,
+            value: REDACTED_SECRET_VALUE.to_owned(),
+            reason: format!(
+                "{REPOSITORY_MASTER_KEY_HEX_ENV} cannot be combined with {KEYRING_ENVELOPE_OBJECT_ID_ENV}"
+            ),
+        }),
+        (None, None) => Err(ConfigError::Missing {
+            key: REPOSITORY_MASTER_KEY_HEX_ENV,
+        }),
+    }
 }
 
 fn parse_repository_id(value: String) -> Result<RepositoryId, ConfigError> {
     RepositoryId::new(value.clone()).map_err(|error| ConfigError::Invalid {
         key: REPOSITORY_ID_ENV,
+        value,
+        reason: error.to_string(),
+    })
+}
+
+fn parse_backend_object_id(
+    key: &'static str,
+    value: String,
+) -> Result<BackendObjectId, ConfigError> {
+    BackendObjectId::new(value.clone()).map_err(|error| ConfigError::Invalid {
+        key,
         value,
         reason: error.to_string(),
     })
@@ -582,7 +703,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 mod tests {
     use super::{
         AnchorConfig, BatchConfig, ConfigError, ConfigSource, MetricsConfig, RepositoryConfig,
-        RepositoryKeysConfig, RuntimeConfig,
+        RepositoryKeySource, RepositoryKeysConfig, RuntimeConfig,
     };
     use secrecy::SecretString;
     use std::collections::BTreeMap;
@@ -630,7 +751,9 @@ mod tests {
             repository_id: rs3_types::RepositoryId::new("test-repository")
                 .unwrap_or_else(|error| panic!("{error}")),
             repository_salt_hex: REPOSITORY_SALT_HEX.to_owned(),
-            master_key_hex: SecretString::from(MASTER_KEY_HEX),
+            source: RepositoryKeySource::MasterKey {
+                master_key_hex: SecretString::from(MASTER_KEY_HEX),
+            },
         }
     }
 
@@ -741,6 +864,76 @@ mod tests {
 
         assert!(
             matches!(config, Err(ConfigError::Missing { key }) if key == super::REPOSITORY_MASTER_KEY_HEX_ENV)
+        );
+    }
+
+    #[test]
+    fn parses_keyring_envelope_key_source() {
+        let source = minimal_source()
+            .without(super::REPOSITORY_MASTER_KEY_HEX_ENV)
+            .with(
+                super::KEYRING_ENVELOPE_OBJECT_ID_ENV,
+                "keyrings/00000000000000000001-digest.json",
+            )
+            .with(super::KEYRING_WRAPPING_KEY_ID_ENV, "wrap-v1")
+            .with(super::KEYRING_WRAPPING_KEY_HEX_ENV, MASTER_KEY_HEX);
+
+        let config = RuntimeConfig::from_source(&source);
+
+        let source = match config {
+            Ok(config) => config.repository_keys.source,
+            Err(error) => panic!("{error}"),
+        };
+        match source {
+            RepositoryKeySource::KeyringEnvelope {
+                envelope_object_id,
+                wrapping_key_id,
+                wrapping_key_hex,
+            } => {
+                assert_eq!(
+                    envelope_object_id.as_str(),
+                    "keyrings/00000000000000000001-digest.json"
+                );
+                assert_eq!(wrapping_key_id, "wrap-v1");
+                assert!(super::secret_string_eq(
+                    &wrapping_key_hex,
+                    &SecretString::from(MASTER_KEY_HEX)
+                ));
+            }
+            RepositoryKeySource::MasterKey { .. } => panic!("expected keyring envelope source"),
+        }
+    }
+
+    #[test]
+    fn rejects_combined_master_key_and_keyring_envelope_source() {
+        let source = minimal_source()
+            .with(
+                super::KEYRING_ENVELOPE_OBJECT_ID_ENV,
+                "keyrings/00000000000000000001-digest.json",
+            )
+            .with(super::KEYRING_WRAPPING_KEY_ID_ENV, "wrap-v1")
+            .with(super::KEYRING_WRAPPING_KEY_HEX_ENV, MASTER_KEY_HEX);
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::REPOSITORY_MASTER_KEY_HEX_ENV)
+        );
+    }
+
+    #[test]
+    fn rejects_partial_keyring_envelope_source() {
+        let source = minimal_source()
+            .without(super::REPOSITORY_MASTER_KEY_HEX_ENV)
+            .with(
+                super::KEYRING_ENVELOPE_OBJECT_ID_ENV,
+                "keyrings/00000000000000000001-digest.json",
+            );
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Missing { key }) if key == super::KEYRING_WRAPPING_KEY_ID_ENV)
         );
     }
 

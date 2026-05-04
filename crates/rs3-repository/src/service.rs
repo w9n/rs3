@@ -20,7 +20,7 @@ use crate::state::{RepositoryState, TrustedManifest, next_sequence, object_mater
 use bytes::Bytes;
 use rs3_anchor::CheckpointAnchor;
 use rs3_crypto::{KeyRing, NamespaceBlindKey, RepositoryKeyContext, SecretBytes};
-use rs3_index::{IndexDelta, NamespaceEntry};
+use rs3_index::{IndexDelta, KeyringEnvelopeReference, NamespaceEntry};
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy};
 use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
@@ -31,6 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub struct Repository<S> {
     pub(crate) store: S,
     pub(crate) keyring: RwLock<KeyRing>,
+    pub(crate) keyring_envelope: RwLock<Option<KeyringEnvelopeReference>>,
     pub(crate) state: RwLock<RepositoryState>,
     pub(crate) options: RepositoryOptions,
     payload_headers: RwLock<PayloadHeaderCache>,
@@ -103,6 +104,7 @@ where
         Self {
             store,
             keyring: RwLock::new(keyring),
+            keyring_envelope: RwLock::new(None),
             state: RwLock::new(RepositoryState::default()),
             options,
             payload_headers: RwLock::new(PayloadHeaderCache::default()),
@@ -947,6 +949,27 @@ where
             .read()
             .map_err(|_| RepositoryError::StatePoisoned)
             .map(|keyring| keyring.clone())
+    }
+
+    /// Replaces the keyring envelope reference recorded in future checkpoints.
+    pub(crate) fn set_keyring_envelope_reference(
+        &self,
+        reference: Option<KeyringEnvelopeReference>,
+    ) -> Result<()> {
+        let mut active = self
+            .keyring_envelope
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        *active = reference;
+        Ok(())
+    }
+
+    /// Returns the keyring envelope reference recorded in future checkpoints.
+    pub(crate) fn keyring_envelope_reference(&self) -> Result<Option<KeyringEnvelopeReference>> {
+        self.keyring_envelope
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)
+            .map(|reference| reference.clone())
     }
 
     /// Reads repository state.

@@ -2,6 +2,7 @@
 
 use crate::checkpoint::derive_checkpoint_public_key_descriptor;
 use crate::{CryptoError, SecretBytes};
+use getrandom::fill as fill_random;
 use ring::hkdf;
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, RepositoryId};
 use std::collections::BTreeSet;
@@ -62,11 +63,13 @@ impl RepositoryKeyContext {
         }
     }
 
-    fn repository_id(&self) -> &RepositoryId {
+    /// Returns the public repository identifier bound into derived keys.
+    pub fn repository_id(&self) -> &RepositoryId {
         &self.repository_id
     }
 
-    fn salt(&self) -> &[u8] {
+    /// Returns the public repository salt bound into derived keys.
+    pub fn salt(&self) -> &[u8] {
         &self.salt
     }
 }
@@ -135,6 +138,23 @@ impl KeyRing {
         ])
     }
 
+    /// Generates a new keyring from random purpose-specific data keys.
+    ///
+    /// This is the preferred production bootstrap shape when the generated
+    /// keyring is stored in an encrypted keyring envelope.
+    pub fn generate_random() -> Result<Self, CryptoError> {
+        let checkpoint_secret = random_secret()?;
+        Self::new(vec![
+            KeyMaterial::new(default_namespace_descriptor(), random_secret()?),
+            KeyMaterial::new(default_content_descriptor(), random_secret()?),
+            KeyMaterial::new(default_metadata_descriptor(), random_secret()?),
+            KeyMaterial::new(
+                default_checkpoint_descriptor(&checkpoint_secret)?,
+                checkpoint_secret,
+            ),
+        ])
+    }
+
     /// Creates a legacy single-secret keyring for focused tests.
     ///
     /// Production callers should derive purpose-specific keys from a repository
@@ -170,6 +190,10 @@ impl KeyRing {
             .collect::<Vec<_>>();
         sort_descriptors(&mut descriptors);
         descriptors
+    }
+
+    pub(crate) fn key_materials(&self) -> &[KeyMaterial] {
+        &self.keys
     }
 
     /// Returns the primary key for a cryptographic purpose.
@@ -313,6 +337,12 @@ fn derive_repository_subkey(
         .map_err(|_| CryptoError::KeyDerivationRejected)?;
 
     SecretBytes::new(output.to_vec())
+}
+
+fn random_secret() -> Result<SecretBytes, CryptoError> {
+    let mut secret = [0_u8; SecretBytes::MIN_LEN];
+    fill_random(&mut secret).map_err(|_| CryptoError::RandomnessUnavailable)?;
+    SecretBytes::new(secret.to_vec())
 }
 
 fn sort_descriptors(descriptors: &mut [KeyDescriptor]) {
@@ -521,6 +551,37 @@ mod tests {
                 .public_key
                 .as_deref()
                 .is_some_and(|public_key| public_key.starts_with("ed25519:"))
+        );
+
+        let mut secrets = keyring
+            .keys
+            .iter()
+            .map(|key| key.secret.expose().to_vec())
+            .collect::<Vec<_>>();
+        secrets.sort();
+        secrets.dedup();
+        assert_eq!(secrets.len(), 4);
+    }
+
+    #[test]
+    fn random_keyring_generates_distinct_purpose_keys() {
+        let keyring = match KeyRing::generate_random() {
+            Ok(keyring) => keyring,
+            Err(error) => panic!("{error}"),
+        };
+
+        assert_eq!(
+            keyring
+                .descriptors()
+                .into_iter()
+                .map(|descriptor| descriptor.purpose)
+                .collect::<Vec<_>>(),
+            vec![
+                KeyPurpose::Namespace,
+                KeyPurpose::Content,
+                KeyPurpose::Metadata,
+                KeyPurpose::CheckpointSigning,
+            ]
         );
 
         let mut secrets = keyring

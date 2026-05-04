@@ -23,17 +23,25 @@ reference.
 
 ## Keys
 
-`RS3_REPOSITORY_MASTER_KEY_HEX` must contain at least 32 bytes of hex-encoded
-entropy. `RS3_REPOSITORY_SALT_HEX` must contain a stable 32-byte public salt.
-The gateway uses HKDF-SHA-256 to derive purpose-specific repository keys from
-the master key, `RS3_REPOSITORY_ID`, and the repository salt.
+The preferred production model is an encrypted keyring envelope. Generate
+random purpose-specific repository data keys, store them in an encrypted
+envelope under `keyrings/`, and keep the unwrap authority outside the object
+store.
+
+The direct `RS3_REPOSITORY_MASTER_KEY_HEX` path is a compatibility and
+bootstrap mode. It must contain at least 32 bytes of hex-encoded entropy.
+`RS3_REPOSITORY_SALT_HEX` must contain a stable 32-byte public salt. The gateway
+uses HKDF-SHA-256 to derive purpose-specific repository keys from the master
+key, `RS3_REPOSITORY_ID`, and the repository salt.
 
 Operational rules:
 
-- Generate the master key outside the object store.
-- Generate the salt once per repository and keep it with trusted repository
+- Prefer generated random data keys inside an encrypted keyring envelope.
+- Keep wrapping keys, KMS access, HSM access, or Vault tokens outside the object
+  store and outside broad cluster write credentials.
+- Generate salts once per repository and keep them with trusted repository
   configuration.
-- Treat the salt as public restore metadata, not as a second password.
+- Treat salts as public restore metadata, not as second passwords.
 - Do not reuse the same master key, repository id, and salt across repositories.
 - Keep historical keys available for at least the maximum retention window.
 - Do not destroy a key while any retained checkpoint can reference data that

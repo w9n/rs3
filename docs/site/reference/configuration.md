@@ -46,9 +46,12 @@ outside the chart. If `serviceAccount.create=false`, set `serviceAccount.name`.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `RS3_REPOSITORY_ID` | yes | none | Stable repository derivation context. Do not reuse with the same master key for another repository. |
-| `RS3_REPOSITORY_SALT_HEX` | yes | none | Stable 32-byte public HKDF salt, hex-encoded. Generate once per repository and keep with trusted public restore metadata. |
-| `RS3_REPOSITORY_MASTER_KEY_HEX` | yes | none | Hex-encoded repository master key with at least 32 bytes of entropy. |
+| `RS3_REPOSITORY_ID` | yes | none | Stable repository context. Do not reuse a direct master-key context across repositories. |
+| `RS3_REPOSITORY_SALT_HEX` | yes | none | Stable 32-byte public salt, hex-encoded. Generate once per repository and keep with trusted public restore metadata. |
+| `RS3_REPOSITORY_MASTER_KEY_HEX` | one key source | none | Compatibility/bootstrap source. Hex-encoded repository master key with at least 32 bytes of entropy. Cannot be combined with envelope settings. |
+| `RS3_KEYRING_ENVELOPE_OBJECT_ID` | one key source | none | Backend object ID of the encrypted keyring envelope, for example `keyrings/<generation>-<digest>.json`. |
+| `RS3_KEYRING_WRAPPING_KEY_ID` | with envelope | none | Operator-visible wrapping key identifier expected by the envelope. |
+| `RS3_KEYRING_WRAPPING_KEY_HEX` | with envelope | none | Hex-encoded high-entropy wrapping key used to open the envelope. KMS/HSM/Vault integration should replace this for hardened deployments. |
 
 ## Repository Behavior
 

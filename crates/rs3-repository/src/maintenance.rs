@@ -1,8 +1,8 @@
 //! Dry-run repository maintenance reports.
 
 use crate::checkpoint::{
-    CHECKPOINT_EVIDENCE_PREFIX, CHECKPOINT_OBJECT_PREFIX, checkpoint_evidence_object_id,
-    checkpoint_object_id,
+    CHECKPOINT_EVIDENCE_PREFIX, CHECKPOINT_OBJECT_PREFIX, KEYRING_ENVELOPE_OBJECT_PREFIX,
+    checkpoint_evidence_object_id, checkpoint_object_id,
 };
 use crate::error::{RepositoryError, Result};
 use crate::model::{
@@ -56,6 +56,13 @@ where
                 insert_delta_payload_references(&mut reachable, delta);
             }
 
+            if let Some(envelope) = checkpoint.record.keyring_envelope.as_ref() {
+                reachable.insert(ReachableBackendObject {
+                    object_id: envelope.object_id.clone(),
+                    kind: BackendObjectReferenceKind::KeyringEnvelope,
+                });
+            }
+
             previous = Some(position);
         }
 
@@ -94,6 +101,10 @@ where
             (
                 CHECKPOINT_EVIDENCE_PREFIX,
                 BackendObjectReferenceKind::CheckpointEvidence,
+            ),
+            (
+                KEYRING_ENVELOPE_OBJECT_PREFIX,
+                BackendObjectReferenceKind::KeyringEnvelope,
             ),
             (
                 INDEX_DELTA_OBJECT_PREFIX,
