@@ -1,12 +1,22 @@
 # rs3
 
-`rs3` is an experimental Rust workspace for an S3-compatible backup gateway.
+`rs3` is an experimental Rust workspace for a path-private, tamper-evident,
+S3-compatible backup gateway for Kubernetes operators.
 
 ## Status
 
-This repository is a clean-room scaffold. The current code defines workspace
-boundaries, typed contracts, and initial implementation tests. It intentionally
-does not contain a wire-compatible gateway implementation yet.
+The project has a working local S3-compatible gateway path, repository
+encryption boundaries, signed checkpoint plumbing, integration harnesses, and
+Kopia-focused performance measurement. It is not a production release and does
+not yet make a stable repository-format or security guarantee.
+
+Current engineering priorities:
+
+- path privacy for client-visible keys and Kubernetes object names
+- rollback resistance through signed checkpoints and external anchors
+- restore correctness for S3-oriented backup tools, with Kopia first
+- measured performance against a straight proxy baseline
+- operational evidence for retention, tracing, and metrics
 
 ## Development
 
@@ -24,6 +34,15 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+The documentation site uses Material for MkDocs:
+
+```sh
+just docs-build
+just docs-serve
+```
+
+The public docs source lives under `docs/site/`.
 
 For faster local feedback, use `just nextest` when standard Cargo test output is
 not required. Use `cargo build --timings` when investigating compile-time
@@ -65,12 +84,16 @@ tradeoff is useful.
 
 ## Workspace Layout
 
+- `crates/rs3-anchor`: checkpoint-anchor contract and test anchor.
 - `crates/rs3-types`: shared strongly typed identifiers and policy types.
-- `crates/rs3-crypto`: cryptographic primitives and key derivation boundaries.
-- `crates/rs3-index`: append-friendly encrypted index and checkpoint model.
+- `crates/rs3-crypto`: cryptographic primitives, envelopes, and key derivation
+  boundaries.
+- `crates/rs3-index`: append-friendly index and checkpoint model.
 - `crates/rs3-storage`: object-store abstraction.
 - `crates/rs3-k8s`: Kubernetes checkpoint-anchor abstraction.
-- `crates/rs3-server`: command-line entry point for the future gateway.
+- `crates/rs3-repository`: repository write, read, checkpoint, and maintenance
+  behavior.
+- `crates/rs3-server`: command-line gateway process and S3 compatibility layer.
 - `xtask`: local automation used by `just`.
 
-Additional design notes will be added as interfaces stabilize.
+Start with `docs/site/index.md` for the curated project map.

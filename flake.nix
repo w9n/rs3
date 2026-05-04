@@ -39,6 +39,8 @@
             mdbook
             openssl
             pkg-config
+            python3Packages.mkdocs
+            python3Packages.mkdocs-material
             rust-analyzer
             rustc
             rustfmt

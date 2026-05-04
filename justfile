@@ -93,3 +93,9 @@ audit:
 
 doc:
     cargo doc --workspace --no-deps
+
+docs-build:
+    mkdocs build --strict
+
+docs-serve *ARGS:
+    mkdocs serve {{ARGS}}

@@ -1,0 +1,95 @@
+# Getting Started
+
+This page gives the local development path. Production deployment guidance will
+stay conservative until the repository format and anchor integrations are
+stabilized.
+
+## Prerequisites
+
+Use the Nix shell:
+
+```sh
+nix develop
+```
+
+Inside the shell, the default verification command is:
+
+```sh
+just check
+```
+
+The equivalent manual path is:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+## Build The Docs
+
+```sh
+just docs-build
+```
+
+For local browsing:
+
+```sh
+just docs-serve
+```
+
+The site builds from `docs/site/` into `target/mkdocs-site/`.
+
+## Run A Local Gateway Smoke
+
+The gateway runtime is configured through environment variables. A local
+development run can use the memory anchor only when it is explicitly allowed.
+
+```sh
+RS3_PUBLIC_BUCKET=backup \
+RS3_BACKEND_ENDPOINT=file:///tmp/rs3-backend \
+RS3_BACKEND_BUCKET=repo \
+RS3_ANCHOR_MODE=memory \
+RS3_ALLOW_MEMORY_ANCHOR=true \
+RS3_REPOSITORY_ID=local-dev \
+RS3_REPOSITORY_MASTER_KEY_HEX=1111111111111111111111111111111111111111111111111111111111111111 \
+RS3_STATIC_ACCESS_KEY_ID=local \
+RS3_STATIC_SECRET_ACCESS_KEY=local-secret \
+cargo run -p rs3-server -- serve --bind 127.0.0.1:9080
+```
+
+The memory anchor is for tests and local development. It is not a production
+rollback boundary.
+
+## Run S3 Contract Checks
+
+Local S3-compatible checks are opt-in:
+
+```sh
+just integration-s3-local --mode container
+just integration-s3-gateway
+```
+
+Live provider checks require an existing S3-compatible endpoint and credentials:
+
+```sh
+RS3_TEST_S3_BUCKET=<bucket> \
+RS3_TEST_S3_ENDPOINT_URL=<endpoint> \
+RS3_TEST_S3_REGION=<region> \
+just integration-s3
+```
+
+## Run Kopia Measurement
+
+The Kopia matrix compares the gateway to a straight RustFS proxy baseline:
+
+```sh
+cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix \
+  --runs 3 \
+  --profile-set larger-restores \
+  --gateway-build-profile release \
+  --payload-segment-size 512
+```
+
+Artifacts are written under `.local/integration/` by default. They are local
+evidence and should not be staged without review.
