@@ -210,13 +210,18 @@ impl S3 for GatewayS3Service {
                 }
                 None => false,
             };
-            let body = collect_body(input.body).await?;
+            let body_collect_started = Instant::now();
+            let body = collect_body(input.body).await;
+            let body_collect_elapsed = body_collect_started.elapsed();
+            record_s3_request_body_collect_metrics(OPERATION, body_collect_elapsed);
+            let body = body?;
             record_s3_request_body_bytes(OPERATION, body.len());
             tracing::debug!(
                 target: "rs3_server",
                 operation = OPERATION,
                 request_id,
                 request_body_bytes = body.len(),
+                request_body_collect_elapsed_us = elapsed_us(body_collect_elapsed),
                 create_only,
                 "S3 request body collected",
             );
@@ -522,6 +527,14 @@ fn record_s3_request_body_bytes(operation: &'static str, len: usize) {
         "operation" => operation,
     )
     .increment(u64::try_from(len).unwrap_or(u64::MAX));
+}
+
+fn record_s3_request_body_collect_metrics(operation: &'static str, elapsed: Duration) {
+    metrics::histogram!(
+        "rs3_s3_request_body_collect_duration_seconds",
+        "operation" => operation,
+    )
+    .record(elapsed.as_secs_f64());
 }
 
 fn record_s3_response_body_bytes(operation: &'static str, len: usize) {

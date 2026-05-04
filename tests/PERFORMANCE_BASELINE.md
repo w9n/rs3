@@ -48,7 +48,9 @@ This gives a request-to-backend cost map without recording object keys.
 
 The Prometheus delta includes `prometheus_metrics.storage_provider`, which
 summarizes S3 provider operation counts, bytes, and latency from the gateway's
-metrics endpoint.
+metrics endpoint. It also records
+`prometheus_metrics.request_body_collect_duration_seconds` so PUT ingestion time
+can be separated from repository sealing, storage writes, and commit publishing.
 
 It also includes `prometheus_metrics.repository`, a path-private repository
 breakdown of gateway operation counts, bytes, LIST selectivity, commit batching,

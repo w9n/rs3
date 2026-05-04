@@ -244,6 +244,10 @@ fn aggregate_reports(reports: &[&Value]) -> Value {
                 "prometheus_metrics",
                 "response_body_bytes_by_operation",
             ]),
+            "request_body_collect_duration_seconds": aggregate_operation_latency_at(reports, &[
+                "prometheus_metrics",
+                "request_body_collect_duration_seconds",
+            ]),
             "request_duration_seconds": aggregate_operation_latency_at(reports, &[
                 "prometheus_metrics",
                 "request_duration_seconds",
@@ -731,6 +735,13 @@ mod tests {
                         "response_body_bytes_by_operation": {
                             "GetObject": 1000
                         },
+                        "request_body_collect_duration_seconds": {
+                            "PutObject": {
+                                "count": 4.0,
+                                "sum": 0.08,
+                                "avg": 0.02
+                            }
+                        },
                         "repository": {
                             "payload_span_cache_events_by_result": {
                                 "hit": 6,
@@ -825,6 +836,11 @@ mod tests {
         assert_eq!(
             aggregate["gateway"]["backend_metrics"]["by_s3_operation"]["GetObject"]["bytes_read"]["avg"],
             serde_json::json!(3000.0)
+        );
+        assert_eq!(
+            aggregate["gateway"]["prometheus_metrics"]["request_body_collect_duration_seconds"]["PutObject"]
+                ["avg"]["avg"],
+            serde_json::json!(0.02)
         );
     }
 
