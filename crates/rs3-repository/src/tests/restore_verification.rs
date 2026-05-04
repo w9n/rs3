@@ -75,6 +75,7 @@ async fn verify_restore_reports_retention_protection_summary() {
     assert_eq!(report.protection.retention_object_count, 3);
     assert_eq!(report.protection.retention_delete_blocked_count, 3);
     assert_eq!(report.protection.legal_hold_object_count, 0);
+    assert_eq!(report.protection.delete_protected_object_count, 3);
     assert_eq!(report.protection.minimum_retention_days, Some(30));
 }
 

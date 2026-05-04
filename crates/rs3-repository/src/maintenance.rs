@@ -369,6 +369,7 @@ where
 {
     let metadata = repo.store.head(object_id).await?;
     summary.checked_object_count = summary.checked_object_count.saturating_add(1);
+    let mut delete_protected = false;
     if let Some(policy) = metadata.retention {
         summary.retention_object_count = summary.retention_object_count.saturating_add(1);
         summary.minimum_retention_days = Some(match summary.minimum_retention_days {
@@ -378,10 +379,16 @@ where
         if policy.mode != RetentionMode::None && policy.retain_days > 0 {
             summary.retention_delete_blocked_count =
                 summary.retention_delete_blocked_count.saturating_add(1);
+            delete_protected = true;
         }
     }
     if metadata.legal_hold == Some(LegalHoldStatus::On) {
         summary.legal_hold_object_count = summary.legal_hold_object_count.saturating_add(1);
+        delete_protected = true;
+    }
+    if delete_protected {
+        summary.delete_protected_object_count =
+            summary.delete_protected_object_count.saturating_add(1);
     }
 
     Ok(())

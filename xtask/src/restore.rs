@@ -47,6 +47,9 @@ struct RestoreVerifyArgs {
     /// Backend object-store target.
     #[command(flatten)]
     backend: RestoreBackendArgs,
+    /// Fail unless every restore-critical object is protected by provider retention or legal hold.
+    #[arg(long, default_value_t = false)]
+    require_provider_delete_protection: bool,
     /// Output format.
     #[arg(long, value_enum, default_value_t = RestoreReportFormat::Json)]
     format: RestoreReportFormat,
@@ -181,10 +184,25 @@ where
     let keyring = keyring_from_source(&store, &context, &args.keys).await?;
     let repository = Repository::with_keyring(store, keyring);
 
-    repository
+    let report = repository
         .verify_restore(&accepted)
         .await
-        .context("restore verification failed")
+        .context("restore verification failed")?;
+
+    if args.require_provider_delete_protection
+        && report.protection.delete_protected_object_count != report.protection.checked_object_count
+    {
+        let missing = report
+            .protection
+            .checked_object_count
+            .saturating_sub(report.protection.delete_protected_object_count);
+        bail!(
+            "provider delete protection missing on {missing}/{} restore-critical object(s)",
+            report.protection.checked_object_count
+        );
+    }
+
+    Ok(report)
 }
 
 async fn keyring_from_source<S>(
@@ -345,6 +363,7 @@ fn print_report_json(report: &RestoreVerificationReport) -> Result<()> {
             "retention_objects": report.protection.retention_object_count,
             "retention_delete_blocked_objects": report.protection.retention_delete_blocked_count,
             "legal_hold_objects": report.protection.legal_hold_object_count,
+            "delete_protected_objects": report.protection.delete_protected_object_count,
             "minimum_retention_days": report.protection.minimum_retention_days,
         },
     });
@@ -379,6 +398,10 @@ fn print_report_text(report: &RestoreVerificationReport) {
         "protection_legal_hold_objects={}",
         report.protection.legal_hold_object_count
     );
+    println!(
+        "protection_delete_protected_objects={}",
+        report.protection.delete_protected_object_count
+    );
     if let Some(days) = report.protection.minimum_retention_days {
         println!("protection_minimum_retention_days={days}");
     }
@@ -393,16 +416,14 @@ mod tests {
     use bytes::Bytes;
     use rs3_anchor::MemoryCheckpointAnchor;
     use rs3_crypto::{KeyRing, RepositoryKeyContext, SecretBytes};
-    use rs3_repository::{Repository, RepositoryPutOptions};
+    use rs3_repository::{CheckpointPosition, Repository, RepositoryOptions, RepositoryPutOptions};
     use rs3_storage::MemoryBlobStore;
-    use rs3_types::RepositoryId;
+    use rs3_types::{RepositoryId, RetentionMode, RetentionPolicy};
 
     const MASTER_KEY_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const SALT_HEX: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
-    #[tokio::test]
-    async fn restore_verify_command_uses_supplied_checkpoint_position() {
-        let store = MemoryBlobStore::new();
+    fn test_keyring() -> KeyRing {
         let context = RepositoryKeyContext::new(
             RepositoryId::new("restore-cli").unwrap_or_else(|error| panic!("{error}")),
             hex::decode(SALT_HEX).unwrap_or_else(|error| panic!("{error}")),
@@ -411,26 +432,20 @@ mod tests {
         let master_key =
             SecretBytes::new(hex::decode(MASTER_KEY_HEX).unwrap_or_else(|error| panic!("{error}")))
                 .unwrap_or_else(|error| panic!("{error}"));
-        let keyring = KeyRing::from_repository_master_key_for_context(&master_key, &context)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let repo = Repository::with_keyring(store.clone(), keyring);
-        let anchor = MemoryCheckpointAnchor::new();
-        let committed = repo
-            .put_committed(
-                rs3_types::LogicalPath::new("restore/cli")
-                    .unwrap_or_else(|error| panic!("{error}")),
-                Bytes::from_static(b"body"),
-                RepositoryPutOptions::default(),
-                &anchor,
-            )
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        let args = RestoreVerifyArgs {
+        KeyRing::from_repository_master_key_for_context(&master_key, &context)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn restore_verify_args(
+        checkpoint: &CheckpointPosition,
+        require_provider_delete_protection: bool,
+    ) -> RestoreVerifyArgs {
+        RestoreVerifyArgs {
             repository_id: "restore-cli".to_owned(),
             repository_salt_hex: SALT_HEX.to_owned(),
-            checkpoint_sequence: committed.checkpoint.sequence.get(),
-            checkpoint_id: committed.checkpoint.checkpoint_id.as_str().to_owned(),
-            checkpoint_digest: committed.checkpoint.payload_digest.clone(),
+            checkpoint_sequence: checkpoint.sequence.get(),
+            checkpoint_id: checkpoint.checkpoint_id.as_str().to_owned(),
+            checkpoint_digest: checkpoint.payload_digest.clone(),
             keys: RestoreKeySourceArgs {
                 master_key_hex: Some(MASTER_KEY_HEX.to_owned()),
                 master_key_hex_file: None,
@@ -455,8 +470,27 @@ mod tests {
                 #[cfg(feature = "s3")]
                 s3_virtual_hosted_style: false,
             },
+            require_provider_delete_protection,
             format: RestoreReportFormat::Json,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_verify_command_uses_supplied_checkpoint_position() {
+        let store = MemoryBlobStore::new();
+        let repo = Repository::with_keyring(store.clone(), test_keyring());
+        let anchor = MemoryCheckpointAnchor::new();
+        let committed = repo
+            .put_committed(
+                rs3_types::LogicalPath::new("restore/cli")
+                    .unwrap_or_else(|error| panic!("{error}")),
+                Bytes::from_static(b"body"),
+                RepositoryPutOptions::default(),
+                &anchor,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let args = restore_verify_args(&committed.checkpoint, false);
 
         let report = verify_with_store(args, store)
             .await
@@ -464,6 +498,69 @@ mod tests {
 
         assert_eq!(report.payload_object_count, 1);
         assert_eq!(report.payload_plaintext_bytes, 4);
+    }
+
+    #[tokio::test]
+    async fn restore_verify_can_require_provider_delete_protection() {
+        let store = MemoryBlobStore::new();
+        let repo = Repository::with_keyring_and_options(
+            store.clone(),
+            test_keyring(),
+            RepositoryOptions {
+                payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+                default_retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
+            },
+        );
+        let anchor = MemoryCheckpointAnchor::new();
+        let committed = repo
+            .put_committed(
+                rs3_types::LogicalPath::new("restore/protected")
+                    .unwrap_or_else(|error| panic!("{error}")),
+                Bytes::from_static(b"body"),
+                RepositoryPutOptions::default(),
+                &anchor,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let args = restore_verify_args(&committed.checkpoint, true);
+
+        let report = verify_with_store(args, store)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(
+            report.protection.delete_protected_object_count,
+            report.protection.checked_object_count
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_verify_rejects_missing_provider_delete_protection_when_required() {
+        let store = MemoryBlobStore::new();
+        let repo = Repository::with_keyring(store.clone(), test_keyring());
+        let anchor = MemoryCheckpointAnchor::new();
+        let committed = repo
+            .put_committed(
+                rs3_types::LogicalPath::new("restore/unprotected")
+                    .unwrap_or_else(|error| panic!("{error}")),
+                Bytes::from_static(b"body"),
+                RepositoryPutOptions::default(),
+                &anchor,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let args = restore_verify_args(&committed.checkpoint, true);
+
+        let error = match verify_with_store(args, store).await {
+            Ok(report) => panic!("restore verification unexpectedly passed: {report:?}"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("provider delete protection missing")
+        );
     }
 
     #[test]

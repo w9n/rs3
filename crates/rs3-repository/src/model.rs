@@ -117,6 +117,8 @@ pub struct RestoreProtectionSummary {
     pub retention_delete_blocked_count: usize,
     /// Objects with legal hold enabled.
     pub legal_hold_object_count: usize,
+    /// Objects whose known provider metadata should block deletion.
+    pub delete_protected_object_count: usize,
     /// Minimum configured retention duration observed across retained objects.
     pub minimum_retention_days: Option<u32>,
 }

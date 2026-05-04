@@ -68,8 +68,9 @@ Do not infer Object Lock semantics from S3 compatibility alone.
 
 During restore verification, `rs3` reports how many verified restore-critical
 objects expose retention or legal-hold metadata. Treat that as repository
-evidence; use S3 CLI probes to confirm provider behavior before trusting a new
-backend.
+evidence. Run with `--require-provider-delete-protection` for protected
+restores, and use S3 CLI probes to confirm provider behavior before trusting a
+new backend.
 
 ## Incident Rules
 
