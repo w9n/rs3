@@ -86,6 +86,8 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
     let mut repository_commit_batch_waiters_by_result = BTreeMap::new();
     let mut repository_commit_batch_duration_counts = BTreeMap::new();
     let mut repository_commit_batch_duration_sums = BTreeMap::new();
+    let mut repository_commit_put_phase_duration_counts = BTreeMap::new();
+    let mut repository_commit_put_phase_duration_sums = BTreeMap::new();
 
     for (identity, sample) in after {
         let delta = metric_delta(
@@ -320,6 +322,20 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
                     delta,
                 );
             }
+            "rs3_repository_commit_put_phase_duration_seconds_count" => {
+                bump_f64_label(
+                    &mut repository_commit_put_phase_duration_counts,
+                    sample.label("phase"),
+                    delta,
+                );
+            }
+            "rs3_repository_commit_put_phase_duration_seconds_sum" => {
+                bump_f64_label(
+                    &mut repository_commit_put_phase_duration_sums,
+                    sample.label("phase"),
+                    delta,
+                );
+            }
             _ => {}
         }
     }
@@ -372,6 +388,10 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
                 "batch_publish_duration_seconds_by_result": duration_summary_json(
                     repository_commit_batch_duration_counts,
                     repository_commit_batch_duration_sums,
+                ),
+                "put_phase_duration_seconds_by_phase": duration_summary_json(
+                    repository_commit_put_phase_duration_counts,
+                    repository_commit_put_phase_duration_sums,
                 ),
             },
         },
@@ -658,6 +678,8 @@ rs3_repository_commit_batch_publishes_total{result="ok"} 2
 rs3_repository_commit_batch_waiters_total{result="ok"} 4
 rs3_repository_commit_batch_publish_duration_seconds_count{result="ok"} 2
 rs3_repository_commit_batch_publish_duration_seconds_sum{result="ok"} 0.06
+rs3_repository_commit_put_phase_duration_seconds_count{phase="stage_lock_wait"} 4
+rs3_repository_commit_put_phase_duration_seconds_sum{phase="stage_lock_wait"} 0.12
 "#;
 
         let metrics = prometheus_metrics_delta_json(before, after);
@@ -802,6 +824,16 @@ rs3_repository_commit_batch_publish_duration_seconds_sum{result="ok"} 0.06
         );
         assert_eq!(
             metrics["repository"]["commit"]["batch_publish_duration_seconds_by_result"]["ok"]["avg"],
+            0.03
+        );
+        assert_eq!(
+            metrics["repository"]["commit"]["put_phase_duration_seconds_by_phase"]["stage_lock_wait"]
+                ["count"],
+            4.0
+        );
+        assert_eq!(
+            metrics["repository"]["commit"]["put_phase_duration_seconds_by_phase"]["stage_lock_wait"]
+                ["avg"],
             0.03
         );
     }

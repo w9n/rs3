@@ -54,7 +54,7 @@ can be separated from repository sealing, storage writes, and commit publishing.
 
 It also includes `prometheus_metrics.repository`, a path-private repository
 breakdown of gateway operation counts, bytes, LIST selectivity, commit batching,
-and latency.
+latency, and committed PUT phase timing.
 
 Repository metrics also include
 `prometheus_metrics.repository.payload_span_cache_events_by_result` and

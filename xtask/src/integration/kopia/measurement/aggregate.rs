@@ -381,6 +381,12 @@ fn aggregate_reports(reports: &[&Value]) -> Value {
                         "commit",
                         "batch_publish_duration_seconds_by_result",
                     ]),
+                    "put_phase_duration_seconds_by_phase": aggregate_operation_latency_at(reports, &[
+                        "prometheus_metrics",
+                        "repository",
+                        "commit",
+                        "put_phase_duration_seconds_by_phase",
+                    ]),
                 },
             },
         },
@@ -750,6 +756,15 @@ mod tests {
                             "payload_span_cache_bytes_by_result": {
                                 "hit": 1200,
                                 "miss": 300
+                            },
+                            "commit": {
+                                "put_phase_duration_seconds_by_phase": {
+                                    "stage_lock_wait": {
+                                        "count": 4.0,
+                                        "sum": 0.12,
+                                        "avg": 0.03
+                                    }
+                                }
                             }
                         }
                     }
@@ -841,6 +856,11 @@ mod tests {
             aggregate["gateway"]["prometheus_metrics"]["request_body_collect_duration_seconds"]["PutObject"]
                 ["avg"]["avg"],
             serde_json::json!(0.02)
+        );
+        assert_eq!(
+            aggregate["gateway"]["prometheus_metrics"]["repository"]["commit"]["put_phase_duration_seconds_by_phase"]
+                ["stage_lock_wait"]["avg"]["avg"],
+            serde_json::json!(0.03)
         );
     }
 

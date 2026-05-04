@@ -122,7 +122,9 @@ where
         options: RepositoryPutOptions,
     ) -> Result<CommittedPut> {
         let (metadata, rx, delayed_publish_generation, should_publish_now) = {
+            let stage_lock_started = Instant::now();
             let _stage = self.stage_lock.lock().await;
+            record_commit_put_phase_duration("stage_lock_wait", stage_lock_started.elapsed());
             let should_start_timer = {
                 let batch = self.batch.lock().await;
                 if let Some(reason) = batch.failed.as_ref() {
@@ -152,7 +154,10 @@ where
                 batch.waiters.is_empty()
             };
 
-            let metadata = self.repository.put(key, body, options).await?;
+            let stage_write_started = Instant::now();
+            let metadata = self.repository.put(key, body, options).await;
+            record_commit_put_phase_duration("stage_write", stage_write_started.elapsed());
+            let metadata = metadata?;
             let (tx, rx) = oneshot::channel();
             let mut batch = self.batch.lock().await;
             let delayed_publish_generation = if should_start_timer {
@@ -188,6 +193,7 @@ where
             (metadata, rx, delayed_publish_generation, should_publish_now)
         };
 
+        let checkpoint_wait_started = Instant::now();
         if should_publish_now {
             publish_pending_batch(
                 Arc::clone(&self.repository),
@@ -199,10 +205,29 @@ where
             .await;
         }
 
-        let checkpoint = rx
-            .await
-            .map_err(|_| commit_failed("commit waiter was dropped"))?
-            .map_err(|reason| RepositoryError::CommitFailed { reason })?;
+        let checkpoint = match rx.await {
+            Ok(Ok(checkpoint)) => {
+                record_commit_put_phase_duration(
+                    "checkpoint_wait",
+                    checkpoint_wait_started.elapsed(),
+                );
+                checkpoint
+            }
+            Ok(Err(reason)) => {
+                record_commit_put_phase_duration(
+                    "checkpoint_wait",
+                    checkpoint_wait_started.elapsed(),
+                );
+                return Err(RepositoryError::CommitFailed { reason });
+            }
+            Err(_) => {
+                record_commit_put_phase_duration(
+                    "checkpoint_wait",
+                    checkpoint_wait_started.elapsed(),
+                );
+                return Err(commit_failed("commit waiter was dropped"));
+            }
+        };
 
         Ok(CommittedPut {
             metadata,
@@ -368,6 +393,14 @@ fn record_commit_batch_publish(waiter_count: usize, result: &'static str, elapse
     metrics::histogram!(
         "rs3_repository_commit_batch_publish_duration_seconds",
         "result" => result,
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+fn record_commit_put_phase_duration(phase: &'static str, elapsed: Duration) {
+    metrics::histogram!(
+        "rs3_repository_commit_put_phase_duration_seconds",
+        "phase" => phase,
     )
     .record(elapsed.as_secs_f64());
 }
