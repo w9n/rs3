@@ -142,6 +142,32 @@ impl KopiaMatrixProfileSet {
     }
 }
 
+#[cfg(any(feature = "containers", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MatrixStoragePath {
+    DirectRustfs,
+    Gateway,
+}
+
+#[cfg(any(feature = "containers", test))]
+impl MatrixStoragePath {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectRustfs => "direct-rustfs",
+            Self::Gateway => "gateway",
+        }
+    }
+}
+
+#[cfg(any(feature = "containers", test))]
+fn measured_run_order(run_index: usize) -> [MatrixStoragePath; 2] {
+    if run_index.is_multiple_of(2) {
+        [MatrixStoragePath::Gateway, MatrixStoragePath::DirectRustfs]
+    } else {
+        [MatrixStoragePath::DirectRustfs, MatrixStoragePath::Gateway]
+    }
+}
+
 #[cfg(not(feature = "containers"))]
 pub(crate) fn run_kopia_gateway(args: KopiaGatewayArgs) -> Result<()> {
     anyhow::bail!(
@@ -238,32 +264,50 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         let mut runs = Vec::with_capacity(args.runs.saturating_mul(profiles.len()));
         for profile in profiles.iter().copied() {
             for run_index in 1..=args.runs {
-                let direct = run_measured_direct_kopia(
-                    &args.kopia_bin,
-                    &backend,
-                    &backend_prefix,
-                    run_id,
-                    run_index,
-                    profile,
-                )
-                .await?;
-                let gateway = run_measured_gateway_kopia(MeasuredGatewayRun {
-                    kopia_bin: &args.kopia_bin,
-                    backend: &backend,
-                    backend_prefix: &backend_prefix,
-                    run_id,
-                    run_index,
-                    profile,
-                    gateway_build_profile: args.gateway_build_profile,
-                    payload_segment_size: args.payload_segment_size,
-                    commit_batch_items: args.commit_batch_items,
-                    commit_batch_delay_ms: args.commit_batch_delay_ms,
-                    commit_max_pending_items: args.commit_max_pending_items,
-                })
-                .await?;
+                let order = measured_run_order(run_index);
+                let mut direct = None;
+                let mut gateway = None;
+                for storage_path in order {
+                    match storage_path {
+                        MatrixStoragePath::DirectRustfs => {
+                            direct = Some(
+                                run_measured_direct_kopia(
+                                    &args.kopia_bin,
+                                    &backend,
+                                    &backend_prefix,
+                                    run_id,
+                                    run_index,
+                                    profile,
+                                )
+                                .await?,
+                            );
+                        }
+                        MatrixStoragePath::Gateway => {
+                            gateway = Some(
+                                run_measured_gateway_kopia(MeasuredGatewayRun {
+                                    kopia_bin: &args.kopia_bin,
+                                    backend: &backend,
+                                    backend_prefix: &backend_prefix,
+                                    run_id,
+                                    run_index,
+                                    profile,
+                                    gateway_build_profile: args.gateway_build_profile,
+                                    payload_segment_size: args.payload_segment_size,
+                                    commit_batch_items: args.commit_batch_items,
+                                    commit_batch_delay_ms: args.commit_batch_delay_ms,
+                                    commit_max_pending_items: args.commit_max_pending_items,
+                                })
+                                .await?,
+                            );
+                        }
+                    }
+                }
+                let direct = direct.context("measured run did not produce a direct report")?;
+                let gateway = gateway.context("measured run did not produce a gateway report")?;
                 runs.push(serde_json::json!({
                     "profile": profile.as_str(),
                     "run": run_index,
+                    "run_order": order.map(MatrixStoragePath::as_str).to_vec(),
                     "reports": [direct, gateway],
                 }));
             }
@@ -1075,7 +1119,10 @@ fn write_json_file(path: &Path, value: &serde_json::Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{KopiaMatrixProfileSet, KopiaWorkloadProfile, regression_budgets_json};
+    use super::{
+        KopiaMatrixProfileSet, KopiaWorkloadProfile, MatrixStoragePath, measured_run_order,
+        regression_budgets_json,
+    };
 
     #[test]
     fn larger_restore_profile_set_has_stable_order() {
@@ -1095,6 +1142,20 @@ mod tests {
             KopiaMatrixProfileSet::Single.profiles(KopiaWorkloadProfile::ManySmallFiles),
             vec![KopiaWorkloadProfile::ManySmallFiles]
         );
+    }
+
+    #[test]
+    fn measured_matrix_alternates_storage_path_order() {
+        assert_eq!(
+            measured_run_order(1),
+            [MatrixStoragePath::DirectRustfs, MatrixStoragePath::Gateway]
+        );
+        assert_eq!(
+            measured_run_order(2),
+            [MatrixStoragePath::Gateway, MatrixStoragePath::DirectRustfs]
+        );
+        assert_eq!(MatrixStoragePath::Gateway.as_str(), "gateway");
+        assert_eq!(MatrixStoragePath::DirectRustfs.as_str(), "direct-rustfs");
     }
 
     #[test]
