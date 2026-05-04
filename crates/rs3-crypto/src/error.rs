@@ -18,6 +18,9 @@ pub enum CryptoError {
     /// A derived typed value failed validation.
     #[error(transparent)]
     Type(#[from] TypeError),
+    /// Repository key derivation context is empty.
+    #[error("repository key derivation context must not be empty")]
+    EmptyRepositoryContext,
     /// No primary key exists for the requested purpose.
     #[error("no primary key for {purpose:?}")]
     NoPrimaryKey {

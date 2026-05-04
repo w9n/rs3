@@ -369,7 +369,8 @@ impl CheckpointAnchor for DynCheckpointAnchor {
 
 fn gateway_keyring(keys: &RepositoryKeysConfig) -> Result<KeyRing, S3BoundaryError> {
     let master_key = repository_master_key(&keys.master_key_hex)?;
-    KeyRing::from_repository_master_key(&master_key).map_err(repository_init)
+    KeyRing::from_repository_master_key_for_repository(&master_key, &keys.repository_id)
+        .map_err(repository_init)
 }
 
 fn repository_master_key(secret_hex: &SecretString) -> Result<SecretBytes, S3BoundaryError> {

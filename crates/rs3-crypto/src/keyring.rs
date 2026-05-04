@@ -43,23 +43,38 @@ impl KeyRing {
     }
 
     /// Derives the default purpose-specific keyring from one repository master key.
+    ///
+    /// This uses a legacy default repository context. Gateway deployments should
+    /// use [`Self::from_repository_master_key_for_repository`] with an explicit,
+    /// stable repository identifier.
     pub fn from_repository_master_key(master_key: &SecretBytes) -> Result<Self, CryptoError> {
+        Self::from_repository_master_key_for_repository(master_key, "default")
+    }
+
+    /// Derives the default purpose-specific keyring for one repository.
+    pub fn from_repository_master_key_for_repository(
+        master_key: &SecretBytes,
+        repository_id: &str,
+    ) -> Result<Self, CryptoError> {
+        if repository_id.is_empty() {
+            return Err(CryptoError::EmptyRepositoryContext);
+        }
         Self::new(vec![
             KeyMaterial::new(
                 default_namespace_descriptor(),
-                derive_repository_subkey(master_key, b"namespace")?,
+                derive_repository_subkey(master_key, repository_id, b"namespace")?,
             ),
             KeyMaterial::new(
                 default_content_descriptor(),
-                derive_repository_subkey(master_key, b"content")?,
+                derive_repository_subkey(master_key, repository_id, b"content")?,
             ),
             KeyMaterial::new(
                 default_metadata_descriptor(),
-                derive_repository_subkey(master_key, b"metadata")?,
+                derive_repository_subkey(master_key, repository_id, b"metadata")?,
             ),
             KeyMaterial::new(
                 default_checkpoint_descriptor(),
-                derive_repository_subkey(master_key, b"checkpoint")?,
+                derive_repository_subkey(master_key, repository_id, b"checkpoint")?,
             ),
         ])
     }
@@ -219,12 +234,23 @@ fn validate_keyring(keys: &[KeyMaterial]) -> Result<(), CryptoError> {
 
 fn derive_repository_subkey(
     master_key: &SecretBytes,
+    repository_id: &str,
     purpose: &[u8],
 ) -> Result<SecretBytes, CryptoError> {
+    let mut material = Vec::with_capacity(
+        repository_id
+            .len()
+            .saturating_add(1)
+            .saturating_add(purpose.len()),
+    );
+    material.extend_from_slice(repository_id.as_bytes());
+    material.push(0);
+    material.extend_from_slice(purpose);
+
     SecretBytes::new(derive_hmac(
         master_key,
-        b"rs3:repository-subkey:v1",
-        purpose,
+        b"rs3:repository-subkey:v2",
+        &material,
     )?)
 }
 
@@ -369,10 +395,11 @@ mod tests {
     fn repository_master_key_derives_purpose_specific_keys() {
         let master_key = secret(9);
 
-        let keyring = match KeyRing::from_repository_master_key(&master_key) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
+        let keyring =
+            match KeyRing::from_repository_master_key_for_repository(&master_key, "repository-a") {
+                Ok(keyring) => keyring,
+                Err(error) => panic!("{error}"),
+            };
 
         assert_eq!(
             keyring
@@ -412,5 +439,42 @@ mod tests {
         secrets.sort();
         secrets.dedup();
         assert_eq!(secrets.len(), 4);
+    }
+
+    #[test]
+    fn repository_master_key_derivation_is_bound_to_repository_id() {
+        let master_key = secret(9);
+        let first =
+            match KeyRing::from_repository_master_key_for_repository(&master_key, "repository-a") {
+                Ok(keyring) => keyring,
+                Err(error) => panic!("{error}"),
+            };
+        let second =
+            match KeyRing::from_repository_master_key_for_repository(&master_key, "repository-b") {
+                Ok(keyring) => keyring,
+                Err(error) => panic!("{error}"),
+            };
+
+        assert_ne!(
+            first
+                .keys
+                .iter()
+                .map(|key| key.secret.expose().to_vec())
+                .collect::<Vec<_>>(),
+            second
+                .keys
+                .iter()
+                .map(|key| key.secret.expose().to_vec())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn repository_master_key_derivation_rejects_empty_repository_id() {
+        let master_key = secret(9);
+
+        let keyring = KeyRing::from_repository_master_key_for_repository(&master_key, "");
+
+        assert!(keyring.is_err());
     }
 }

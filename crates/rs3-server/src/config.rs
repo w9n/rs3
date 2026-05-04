@@ -18,6 +18,7 @@ const REDACTED_SECRET_VALUE: &str = "<redacted>";
 const MIN_REPOSITORY_KEY_HEX_LEN: usize = SecretBytes::MIN_LEN * 2;
 
 pub(crate) const REPOSITORY_MASTER_KEY_HEX_ENV: &str = "RS3_REPOSITORY_MASTER_KEY_HEX";
+const REPOSITORY_ID_ENV: &str = "RS3_REPOSITORY_ID";
 const ALLOW_MEMORY_ANCHOR_ENV: &str = "RS3_ALLOW_MEMORY_ANCHOR";
 
 /// Complete runtime configuration for the gateway process.
@@ -98,6 +99,8 @@ pub struct RepositoryConfig {
 /// Hex-encoded repository master key loaded from external secret storage.
 #[derive(Clone)]
 pub struct RepositoryKeysConfig {
+    /// Stable repository derivation context.
+    pub repository_id: String,
     /// Repository master key used to derive purpose-specific keys.
     pub master_key_hex: SecretString,
 }
@@ -106,6 +109,7 @@ impl fmt::Debug for RepositoryKeysConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RepositoryKeysConfig")
+            .field("repository_id", &"<configured>")
             .field("master_key_hex", &REDACTED_SECRET_VALUE)
             .finish()
     }
@@ -113,7 +117,8 @@ impl fmt::Debug for RepositoryKeysConfig {
 
 impl PartialEq for RepositoryKeysConfig {
     fn eq(&self, other: &Self) -> bool {
-        secret_string_eq(&self.master_key_hex, &other.master_key_hex)
+        self.repository_id == other.repository_id
+            && secret_string_eq(&self.master_key_hex, &other.master_key_hex)
     }
 }
 
@@ -272,6 +277,7 @@ fn parse_repository_keys_config(
     source: &impl ConfigSource,
 ) -> Result<RepositoryKeysConfig, ConfigError> {
     Ok(RepositoryKeysConfig {
+        repository_id: required_value(source, REPOSITORY_ID_ENV)?,
         master_key_hex: required_secret_hex(source, REPOSITORY_MASTER_KEY_HEX_ENV)?,
     })
 }
@@ -496,11 +502,13 @@ mod tests {
             .with("RS3_BACKEND_BUCKET", "backend-bucket")
             .with("RS3_ANCHOR_MODE", "memory")
             .with(super::ALLOW_MEMORY_ANCHOR_ENV, "true")
+            .with(super::REPOSITORY_ID_ENV, "test-repository")
             .with(super::REPOSITORY_MASTER_KEY_HEX_ENV, MASTER_KEY_HEX)
     }
 
     fn repository_keys_config() -> RepositoryKeysConfig {
         RepositoryKeysConfig {
+            repository_id: "test-repository".to_owned(),
             master_key_hex: SecretString::from(MASTER_KEY_HEX),
         }
     }
@@ -582,6 +590,17 @@ mod tests {
 
         assert!(
             matches!(config, Err(ConfigError::Missing { key }) if key == super::REPOSITORY_MASTER_KEY_HEX_ENV)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_repository_id() {
+        let source = minimal_source().without(super::REPOSITORY_ID_ENV);
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Missing { key }) if key == super::REPOSITORY_ID_ENV)
         );
     }
 
@@ -706,6 +725,7 @@ mod tests {
 
         assert!(debug.contains("access"));
         assert!(!debug.contains("super-secret"));
+        assert!(!debug.contains("test-repository"));
         assert!(!debug.contains(MASTER_KEY_HEX));
         assert!(debug.contains("<redacted>"));
     }

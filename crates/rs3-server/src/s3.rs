@@ -66,6 +66,7 @@ pub(super) mod test_support {
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
             },
             repository_keys: RepositoryKeysConfig {
+                repository_id: "test-repository".to_owned(),
                 master_key_hex: SecretString::from(
                     "1111111111111111111111111111111111111111111111111111111111111111",
                 ),
