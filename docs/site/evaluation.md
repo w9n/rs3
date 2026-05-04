@@ -41,7 +41,8 @@ The result is a system that should be evaluated on three axes:
 
 - Path-private repository object IDs and namespace lookup tokens.
 - Encrypted payload segments with authenticated object context.
-- Purpose-specific keys derived from a master key, repository ID, and salt.
+- Purpose-specific keys derived with HKDF-SHA-256 from a master key,
+  repository ID, and public salt.
 - Signed checkpoint shape and external-anchor model.
 - Retention and legal-hold contracts at the storage boundary.
 - Kopia measured matrix with a direct RustFS proxy baseline.

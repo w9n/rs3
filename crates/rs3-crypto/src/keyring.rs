@@ -1,8 +1,8 @@
 //! Purpose-specific repository keyrings.
 
 use crate::checkpoint::derive_checkpoint_public_key_descriptor;
-use crate::primitives::derive_hmac;
 use crate::{CryptoError, SecretBytes};
+use ring::hkdf;
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, RepositoryId};
 use std::collections::BTreeSet;
 
@@ -294,25 +294,25 @@ fn derive_repository_subkey(
     purpose: &[u8],
 ) -> Result<SecretBytes, CryptoError> {
     let repository_id = context.repository_id().as_str().as_bytes();
-    let salt = context.salt();
     let mut material = Vec::with_capacity(
-        24_usize
+        16_usize
             .saturating_add(repository_id.len())
-            .saturating_add(salt.len())
             .saturating_add(purpose.len()),
     );
     material.extend_from_slice(&(repository_id.len() as u64).to_be_bytes());
     material.extend_from_slice(repository_id);
-    material.extend_from_slice(&(salt.len() as u64).to_be_bytes());
-    material.extend_from_slice(salt);
     material.extend_from_slice(&(purpose.len() as u64).to_be_bytes());
     material.extend_from_slice(purpose);
 
-    SecretBytes::new(derive_hmac(
-        master_key,
-        b"rs3:repository-subkey:v3",
-        &material,
-    )?)
+    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, context.salt());
+    let prk = salt.extract(master_key.expose());
+    let info = [b"rs3:repository-subkey:v4".as_slice(), material.as_slice()];
+    let mut output = [0_u8; SecretBytes::MIN_LEN];
+    prk.expand(&info, hkdf::HKDF_SHA256)
+        .and_then(|okm| okm.fill(&mut output))
+        .map_err(|_| CryptoError::KeyDerivationRejected)?;
+
+    SecretBytes::new(output.to_vec())
 }
 
 fn sort_descriptors(descriptors: &mut [KeyDescriptor]) {

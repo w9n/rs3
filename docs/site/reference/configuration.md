@@ -47,7 +47,7 @@ outside the chart. If `serviceAccount.create=false`, set `serviceAccount.name`.
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `RS3_REPOSITORY_ID` | yes | none | Stable repository derivation context. Do not reuse with the same master key for another repository. |
-| `RS3_REPOSITORY_SALT_HEX` | yes | none | Stable 32-byte public salt, hex-encoded. Generate once per repository and keep with trusted config. |
+| `RS3_REPOSITORY_SALT_HEX` | yes | none | Stable 32-byte public HKDF salt, hex-encoded. Generate once per repository and keep with trusted public restore metadata. |
 | `RS3_REPOSITORY_MASTER_KEY_HEX` | yes | none | Hex-encoded repository master key with at least 32 bytes of entropy. |
 
 ## Repository Behavior

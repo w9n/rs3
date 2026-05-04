@@ -27,6 +27,9 @@ pub enum CryptoError {
         /// Minimum accepted salt length.
         minimum_len: usize,
     },
+    /// Repository key derivation failed.
+    #[error("repository key derivation failed")]
+    KeyDerivationRejected,
     /// No primary key exists for the requested purpose.
     #[error("no primary key for {purpose:?}")]
     NoPrimaryKey {
