@@ -88,7 +88,7 @@ passed.
 | `medium-restore` | 1.16x | 1.03x | 1.03x |
 | `kubernetes-objects` | 1.01x | 1.05x | 1.03x |
 | `kubernetes-objects-large` | 1.00x | 1.05x | 1.03x |
-| `postgres-pgdata` | 1.12x | 1.03x | 1.03x |
+| `postgres-pgdata` | 1.10x | 1.03x | 1.03x |
 | `postgres-pgdata-large` | 1.10x | 1.03x | 1.03x |
 
 ## Primary Ratios
@@ -165,7 +165,8 @@ because local container and host load can dominate.
 
 ## Next Measurements
 
-- Refresh the larger restore matrix after docs and cleanup changes.
+- Refresh the three-run larger restore release matrix after security and
+  restore-verification changes settle.
 - Keep run order alternating between direct and gateway lanes.
 - Keep measuring variability with at least three runs for release claims.
 - Reduce commit stage-lock and checkpoint-wait time without allowing
