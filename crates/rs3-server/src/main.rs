@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
+use rs3_crypto::derive_public_fingerprint;
 use rs3_server::{AnchorConfig, GatewayServer, RuntimeConfig};
 use rs3_types::RetentionMode;
 use std::net::SocketAddr;
@@ -87,6 +88,7 @@ fn log_runtime_config(config: &RuntimeConfig) {
         AnchorConfig::Memory => "memory",
         AnchorConfig::KubernetesLease { .. } => "kubernetes-lease",
     };
+    let backend_kind = backend_kind(&config.backend.endpoint);
     let repository_retention_mode = config
         .repository
         .retention
@@ -101,14 +103,12 @@ fn log_runtime_config(config: &RuntimeConfig) {
         .retention
         .map(|policy| policy.retain_days)
         .unwrap_or(0);
+    let config_profile = runtime_config_profile(config);
 
     tracing::info!(
         bind = %config.bind,
         metrics_bind = ?config.metrics.bind,
-        public_bucket = %config.public_bucket,
-        backend_endpoint = %config.backend.endpoint,
-        backend_bucket = %config.backend.bucket,
-        backend_prefix = ?config.backend.prefix,
+        backend_kind,
         anchor,
         batch_max_items = config.batching.max_items,
         batch_max_delay_ms = config.batching.max_delay.as_millis(),
@@ -117,8 +117,68 @@ fn log_runtime_config(config: &RuntimeConfig) {
         repository_retention_mode,
         repository_retention_days,
         static_credentials = config.static_credentials.is_some(),
+        config_profile,
         "gateway runtime configuration validated",
     );
+}
+
+fn backend_kind(endpoint: &str) -> &'static str {
+    if endpoint == "memory" || endpoint.starts_with("memory://") {
+        "memory"
+    } else if endpoint.starts_with("file://") {
+        "filesystem"
+    } else if endpoint == "s3"
+        || endpoint.starts_with("https://")
+        || endpoint.starts_with("http://")
+    {
+        "s3-compatible"
+    } else {
+        "unknown"
+    }
+}
+
+fn runtime_config_profile(config: &RuntimeConfig) -> String {
+    let anchor = match &config.anchor {
+        AnchorConfig::Memory => "memory".to_owned(),
+        AnchorConfig::KubernetesLease { .. } => "kubernetes-lease".to_owned(),
+    };
+    let metrics = config.metrics.bind.is_some().to_string();
+    let backend_kind = backend_kind(&config.backend.endpoint).to_owned();
+    let batch_max_items = config.batching.max_items.to_string();
+    let batch_max_delay_ms = config.batching.max_delay.as_millis().to_string();
+    let batch_max_pending_items = config.batching.max_pending_items.to_string();
+    let payload_segment_size = config.repository.payload_segment_size.to_string();
+    let retention_mode = config
+        .repository
+        .retention
+        .map(|policy| match policy.mode {
+            RetentionMode::None => "none",
+            RetentionMode::Governance => "governance",
+            RetentionMode::Compliance => "compliance",
+        })
+        .unwrap_or("none")
+        .to_owned();
+    let retention_days = config
+        .repository
+        .retention
+        .map(|policy| policy.retain_days)
+        .unwrap_or(0)
+        .to_string();
+    let static_credentials = config.static_credentials.is_some().to_string();
+    let fields = [
+        anchor.as_bytes(),
+        metrics.as_bytes(),
+        backend_kind.as_bytes(),
+        batch_max_items.as_bytes(),
+        batch_max_delay_ms.as_bytes(),
+        batch_max_pending_items.as_bytes(),
+        payload_segment_size.as_bytes(),
+        retention_mode.as_bytes(),
+        retention_days.as_bytes(),
+        static_credentials.as_bytes(),
+    ];
+
+    derive_public_fingerprint(b"rs3:server-runtime-config-profile:v1", &fields)
 }
 
 fn init_tracing(format: LogFormat) {
@@ -130,5 +190,92 @@ fn init_tracing(format: LogFormat) {
             .json()
             .with_env_filter(filter)
             .init(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{backend_kind, runtime_config_profile};
+    use rs3_server::{
+        AnchorConfig, BackendConfig, BatchConfig, MetricsConfig, RepositoryConfig,
+        RepositoryKeysConfig, RuntimeConfig, SecretString,
+    };
+    use rs3_types::{PublicBucket, RepositoryId};
+    use std::time::Duration;
+
+    fn runtime_config() -> RuntimeConfig {
+        let bind = match "127.0.0.1:9080".parse() {
+            Ok(bind) => bind,
+            Err(error) => panic!("{error}"),
+        };
+        let public_bucket = match PublicBucket::new("tenant-backups") {
+            Ok(bucket) => bucket,
+            Err(error) => panic!("{error}"),
+        };
+        let repository_id = match RepositoryId::new("tenant-repository") {
+            Ok(repository_id) => repository_id,
+            Err(error) => panic!("{error}"),
+        };
+
+        RuntimeConfig {
+            bind,
+            metrics: MetricsConfig { bind: None },
+            public_bucket,
+            backend: BackendConfig {
+                endpoint: "https://storage.example".to_owned(),
+                bucket: "tenant-backend-bucket".to_owned(),
+                prefix: Some("tenant/prefix".to_owned()),
+            },
+            anchor: AnchorConfig::Memory,
+            batching: BatchConfig {
+                max_items: 64,
+                max_delay: Duration::from_millis(10),
+                max_pending_items: 64,
+            },
+            repository: RepositoryConfig {
+                payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+                retention: None,
+            },
+            repository_keys: RepositoryKeysConfig {
+                repository_id,
+                repository_salt_hex:
+                    "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
+                master_key_hex: SecretString::from(
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                ),
+            },
+            static_credentials: None,
+        }
+    }
+
+    #[test]
+    fn backend_kind_redacts_endpoint_details() {
+        assert_eq!(backend_kind("memory://local"), "memory");
+        assert_eq!(backend_kind("file:///data/repo"), "filesystem");
+        assert_eq!(backend_kind("https://storage.example"), "s3-compatible");
+    }
+
+    #[test]
+    fn runtime_config_profile_is_stable_and_path_safe() {
+        let first = runtime_config();
+        let second = runtime_config();
+        let fingerprint = runtime_config_profile(&first);
+
+        assert_eq!(fingerprint, runtime_config_profile(&second));
+        assert_eq!(fingerprint.len(), 64);
+        assert!(!fingerprint.contains("tenant"));
+        assert!(!fingerprint.contains("storage.example"));
+    }
+
+    #[test]
+    fn runtime_config_profile_changes_for_operational_knobs() {
+        let first = runtime_config();
+        let mut second = runtime_config();
+        second.repository.payload_segment_size += 1;
+
+        assert_ne!(
+            runtime_config_profile(&first),
+            runtime_config_profile(&second)
+        );
     }
 }

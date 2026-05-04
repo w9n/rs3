@@ -3,6 +3,7 @@
 mod checkpoint;
 mod derive;
 mod error;
+mod fingerprint;
 mod keyring;
 mod metadata;
 mod payload;
@@ -18,6 +19,7 @@ pub use derive::{
     derive_manifest_id, derive_prefix_token,
 };
 pub use error::CryptoError;
+pub use fingerprint::derive_public_fingerprint;
 pub use keyring::{KeyMaterial, KeyRing, MIN_REPOSITORY_SALT_LEN, RepositoryKeyContext};
 pub use metadata::MetadataSeal;
 pub use payload::PayloadSeal;

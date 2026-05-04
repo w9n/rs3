@@ -29,6 +29,9 @@ Metrics labels must not include:
 - access keys or secret values
 - checkpoint digests or key material
 
+Startup logs use `backend_kind` and `config_profile` instead of configured
+bucket names, endpoints, prefixes, or repository IDs.
+
 ## Gateway Request Metrics
 
 The gateway records S3 request counts, response bytes, request body bytes,

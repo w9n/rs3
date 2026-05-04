@@ -102,6 +102,10 @@ Tracing filters use the standard `RUST_LOG` environment variable. Keep
 trace-level collection scoped and time-bounded because traces can be high
 volume even when labels are redacted.
 
+Startup logs include a path-safe `config_profile` fingerprint over operational
+knobs. They do not log configured bucket names, backend prefixes, repository
+IDs, or secret material.
+
 ## Restore Posture
 
 During an incident, favor read-only restore with a verified checkpoint and
