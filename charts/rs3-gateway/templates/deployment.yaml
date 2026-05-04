@@ -93,11 +93,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
                   key: envelope-object-id
+                  optional: true
             - name: RS3_KEYRING_WRAPPING_KEY_ID
               valueFrom:
                 secretKeyRef:
                   name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
                   key: wrapping-key-id
+                  optional: true
             - name: RS3_KEYRING_WRAPPING_KEY_HEX
               valueFrom:
                 secretKeyRef:

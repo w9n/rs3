@@ -74,7 +74,7 @@ batching, compaction jitter, and stricter telemetry redaction.
 | Payload objects cannot be moved silently | Associated data binds ciphertext to backend object context. | Payload tamper and object-context tests. |
 | Repository key reuse is compartmentalized | Random purpose keys are generated into an encrypted keyring envelope and bound to the repository ID, public salt, and wrapping-key identity. | Crypto keyring/envelope tests. |
 | Envelope swaps are detectable | Signed checkpoints bind the active keyring envelope generation, object ID, and digest. | Repository key-envelope checkpoint test. |
-| Old content remains readable after rotation | Enabled historical content keys are accepted for reads. | Repository key rotation tests. |
+| Old content remains readable after data-key rotation | Enabled historical content keys are accepted for reads. | Repository key rotation tests. |
 | Writes are not acknowledged before checkpoint acceptance | Commit coordinator waits for covering checkpoint. | Commit coordinator and checkpoint tests. |
 | Storage rollback is not trusted as latest state | Ed25519 checkpoint verification, Kubernetes Lease anchor, and retained checkpoint evidence. | Anchor, checkpoint replay, restore verification, and orphan-report tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
@@ -97,6 +97,11 @@ is a retained witness. Evidence that is missing, lower, higher, or conflicting
 with the Lease is not a reason to trust storage; it is a reason to stop and
 recover from an explicitly chosen checkpoint.
 
+If the Lease is lost during disaster recovery, the recovery mode may scan
+storage evidence and choose the highest observed valid checkpoint only with an
+operator-supplied maximum signed checkpoint age. This bounds replay of old valid
+checkpoints; it does not prove the backend showed every newer valid checkpoint.
+
 ## Object Lock Rule
 
 Object Lock protects object versions from deletion or overwrite before their
@@ -105,6 +110,20 @@ version as latest, and it does not make a latest pointer trustworthy by itself.
 
 Use Object Lock for retained payload segments, checkpoint objects, and evidence
 records. Do not use it as the only anti-rollback mechanism.
+
+## Key Compromise Rule
+
+Wrapping-key rewrap is not compromise recovery. Rewrap keeps the same repository
+data keys and creates a new envelope around them. If an attacker may have both an
+old wrapping key and the old envelope bytes, data protected by that keyring must
+be treated as exposed. Provider deletion or retention changes cannot revoke
+access to envelope bytes that a malicious backend may already have copied.
+
+Recovery from exposed repository data keys requires a new data-key epoch for
+future writes and, where historical confidentiality must be restored,
+re-encryption or expiry of old retained data. Retention may intentionally keep
+old ciphertext available for compliance, which also means old compromised
+ciphertext cannot be made confidential again by envelope rewrap alone.
 
 ## Current Open Risks
 

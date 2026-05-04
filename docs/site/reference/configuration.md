@@ -11,6 +11,7 @@ flags may override selected listener settings.
 | `RS3_METRICS_BIND` | no | unset | Prometheus/OpenMetrics listener socket address. |
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
 | `RUST_LOG` | no | `info` | Standard tracing filter. |
+| `RS3_RECOVERY_MAX_CHECKPOINT_AGE_SECONDS` | for `recover-anchor` | none | Maximum signed checkpoint age accepted by explicit anchor recovery. |
 
 ## Public S3 Surface
 
@@ -48,21 +49,25 @@ outside the chart. If `serviceAccount.create=false`, set `serviceAccount.name`.
 | --- | --- | --- | --- |
 | `RS3_REPOSITORY_ID` | yes | none | Stable repository context. Keep it with trusted restore metadata. |
 | `RS3_REPOSITORY_SALT_HEX` | yes | none | Stable operator-provided 32-byte public salt, hex-encoded. Generate once per repository and keep with trusted public restore metadata. |
-| `RS3_KEYRING_ENVELOPE_OBJECT_ID` | yes | none | Backend object ID of the encrypted keyring envelope, for example `keyrings/bootstrap-envelope.json`. |
-| `RS3_KEYRING_WRAPPING_KEY_ID` | yes | none | Operator-visible wrapping key identifier expected by the envelope. |
+| `RS3_KEYRING_ENVELOPE_OBJECT_ID` | no | unset | Bootstrap or recovery override for a specific encrypted keyring envelope object. Existing anchored repositories use the envelope reference bound into the signed checkpoint. |
+| `RS3_KEYRING_WRAPPING_KEY_ID` | no | `wrap-v1` | Operator-visible wrapping key identifier expected by the envelope. |
 | `RS3_KEYRING_WRAPPING_KEY_HEX` | yes | none | Hex-encoded high-entropy wrapping key used to open or initialize the envelope. KMS/HSM/Vault integration should replace this for hardened deployments. |
 
-If the configured envelope object is missing, startup initializes it only when
-the backend prefix is empty and the anchor is missing. A missing envelope on a
-non-empty prefix is a configuration or recovery error.
+For an anchored repository, startup reads the anchor, reads the accepted
+checkpoint, and opens the checkpoint-bound envelope. It does not list S3 and
+guess a latest envelope.
+
+For a first empty repository, startup creates a random purpose-specific keyring
+and stores the encrypted envelope under the default counted `keyrings/` object
+name. If `RS3_KEYRING_ENVELOPE_OBJECT_ID` is set, that object is used as an
+explicit bootstrap override. A missing anchor with committed repository objects
+is a recovery error, not an invitation to pick a backend checkpoint.
 
 Minimal first-run settings:
 
 ```sh
 RS3_REPOSITORY_ID=<id>
 RS3_REPOSITORY_SALT_HEX=<salt-hex>
-RS3_KEYRING_ENVELOPE_OBJECT_ID=keyrings/bootstrap-envelope.json
-RS3_KEYRING_WRAPPING_KEY_ID=<wrapping-key-id>
 RS3_KEYRING_WRAPPING_KEY_HEX=<wrapping-key-hex>
 ```
 
@@ -103,10 +108,11 @@ repository key Secret with `repositoryKeys.create=true`, or reference one with
 | Secret key | Meaning |
 | --- | --- |
 | `salt-hex` | Stable public repository salt. |
-| `envelope-object-id` | Backend object ID for the encrypted keyring envelope. |
-| `wrapping-key-id` | Operator-visible wrapping key identifier. |
+| `envelope-object-id` | Optional bootstrap or recovery override for the encrypted keyring envelope. |
+| `wrapping-key-id` | Optional operator-visible wrapping key identifier; defaults to `wrap-v1` when absent. |
 | `wrapping-key-hex` | High-entropy wrapping key material for the preview. |
 
-Helm should consume the configured repository ID, salt, envelope object ID, and
-unwrap settings from values or an existing Secret; it should not generate hidden
-first-run recovery state.
+Helm should consume the configured repository ID, salt, and unwrap settings from
+values or an existing Secret. The gateway writes the encrypted envelope object
+on first empty-repository startup; chart state does not need to mutate after
+that first run.

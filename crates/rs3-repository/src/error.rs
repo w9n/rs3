@@ -96,4 +96,10 @@ pub enum RepositoryError {
     /// The checkpoint does not chain from the accepted position.
     #[error("checkpoint parent mismatch")]
     CheckpointParentMismatch,
+    /// A checkpoint chain moves publish time backwards.
+    #[error("checkpoint published timestamp decreased: {checkpoint_id}")]
+    CheckpointPublishedAtDecreased {
+        /// Checkpoint whose publish timestamp moved backwards.
+        checkpoint_id: CheckpointId,
+    },
 }

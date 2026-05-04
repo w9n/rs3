@@ -3,9 +3,13 @@
 mod adapter;
 mod boundary;
 mod mapping;
+mod recovery;
 mod runtime;
 
 pub use boundary::{GatewayS3Boundary, S3Hardening};
+pub use recovery::{
+    AnchorRecoveryError, AnchorRecoveryOptions, AnchorRecoveryReport, recover_anchor_from_config,
+};
 use thiserror::Error;
 
 /// S3 boundary construction errors.
@@ -34,7 +38,7 @@ pub(super) mod test_support {
         AnchorConfig, BackendConfig, BatchConfig, MetricsConfig, RepositoryConfig,
         RepositoryKeysConfig, RuntimeConfig, SecretString,
     };
-    use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
+    use rs3_types::{PublicBucket, RepositoryId};
     use std::time::Duration;
 
     pub(super) fn runtime_config(static_credentials: bool) -> RuntimeConfig {
@@ -71,8 +75,7 @@ pub(super) mod test_support {
                     .unwrap_or_else(|error| panic!("{error}")),
                 repository_salt_hex:
                     "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
-                envelope_object_id: BackendObjectId::new("keyrings/test-envelope.json")
-                    .unwrap_or_else(|error| panic!("{error}")),
+                envelope_object_id: None,
                 wrapping_key_id: "wrap-v1".to_owned(),
                 wrapping_key_hex: SecretString::from(
                     "3333333333333333333333333333333333333333333333333333333333333333",

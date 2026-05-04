@@ -12,6 +12,7 @@ use thiserror::Error;
 
 const DEFAULT_BIND: &str = "127.0.0.1:9080";
 const DEFAULT_ANCHOR_FIELD_MANAGER: &str = "rs3-server";
+pub const DEFAULT_KEYRING_WRAPPING_KEY_ID: &str = "wrap-v1";
 const DEFAULT_BATCH_ITEMS: usize = 64;
 const DEFAULT_BATCH_DELAY_MS: u64 = 10;
 const REDACTED_SECRET_VALUE: &str = "<redacted>";
@@ -111,8 +112,8 @@ pub struct RepositoryKeysConfig {
     pub repository_id: RepositoryId,
     /// Stable public salt used with the repository ID when opening the envelope.
     pub repository_salt_hex: String,
-    /// Backend object containing the encrypted keyring envelope.
-    pub envelope_object_id: BackendObjectId,
+    /// Optional bootstrap or recovery override for the encrypted keyring envelope.
+    pub envelope_object_id: Option<BackendObjectId>,
     /// Operator-visible wrapping key identifier.
     pub wrapping_key_id: String,
     /// Wrapping key used to decrypt the keyring envelope.
@@ -336,11 +337,11 @@ fn parse_repository_keys_config(
     Ok(RepositoryKeysConfig {
         repository_id: parse_repository_id(required_value(source, REPOSITORY_ID_ENV)?)?,
         repository_salt_hex: required_repository_salt_hex(source, REPOSITORY_SALT_HEX_ENV)?,
-        envelope_object_id: parse_backend_object_id(
-            KEYRING_ENVELOPE_OBJECT_ID_ENV,
-            required_value(source, KEYRING_ENVELOPE_OBJECT_ID_ENV)?,
-        )?,
-        wrapping_key_id: required_value(source, KEYRING_WRAPPING_KEY_ID_ENV)?,
+        envelope_object_id: optional_value(source, KEYRING_ENVELOPE_OBJECT_ID_ENV)
+            .map(|value| parse_backend_object_id(KEYRING_ENVELOPE_OBJECT_ID_ENV, value))
+            .transpose()?,
+        wrapping_key_id: optional_value(source, KEYRING_WRAPPING_KEY_ID_ENV)
+            .unwrap_or_else(|| DEFAULT_KEYRING_WRAPPING_KEY_ID.to_owned()),
         wrapping_key_hex: required_secret_hex(source, KEYRING_WRAPPING_KEY_HEX_ENV)?,
     })
 }
@@ -649,11 +650,6 @@ mod tests {
             .with(super::ALLOW_MEMORY_ANCHOR_ENV, "true")
             .with(super::REPOSITORY_ID_ENV, "test-repository")
             .with(super::REPOSITORY_SALT_HEX_ENV, REPOSITORY_SALT_HEX)
-            .with(
-                super::KEYRING_ENVELOPE_OBJECT_ID_ENV,
-                "keyrings/00000000000000000001-digest.json",
-            )
-            .with(super::KEYRING_WRAPPING_KEY_ID_ENV, "wrap-v1")
             .with(super::KEYRING_WRAPPING_KEY_HEX_ENV, WRAPPING_KEY_HEX)
     }
 
@@ -662,11 +658,8 @@ mod tests {
             repository_id: rs3_types::RepositoryId::new("test-repository")
                 .unwrap_or_else(|error| panic!("{error}")),
             repository_salt_hex: REPOSITORY_SALT_HEX.to_owned(),
-            envelope_object_id: rs3_types::BackendObjectId::new(
-                "keyrings/00000000000000000001-digest.json",
-            )
-            .unwrap_or_else(|error| panic!("{error}")),
-            wrapping_key_id: "wrap-v1".to_owned(),
+            envelope_object_id: None,
+            wrapping_key_id: super::DEFAULT_KEYRING_WRAPPING_KEY_ID.to_owned(),
             wrapping_key_hex: SecretString::from(WRAPPING_KEY_HEX),
         }
     }
@@ -771,18 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_keyring_envelope_object_id() {
-        let source = minimal_source().without(super::KEYRING_ENVELOPE_OBJECT_ID_ENV);
-
-        let config = RuntimeConfig::from_source(&source);
-
-        assert!(
-            matches!(config, Err(ConfigError::Missing { key }) if key == super::KEYRING_ENVELOPE_OBJECT_ID_ENV)
-        );
-    }
-
-    #[test]
-    fn parses_keyring_envelope_key_source() {
+    fn parses_default_keyring_envelope_key_source() {
         let source = minimal_source();
 
         let config = RuntimeConfig::from_source(&source);
@@ -791,11 +773,8 @@ mod tests {
             Ok(config) => config.repository_keys,
             Err(error) => panic!("{error}"),
         };
-        assert_eq!(
-            keys.envelope_object_id.as_str(),
-            "keyrings/00000000000000000001-digest.json"
-        );
-        assert_eq!(keys.wrapping_key_id, "wrap-v1");
+        assert_eq!(keys.envelope_object_id, None);
+        assert_eq!(keys.wrapping_key_id, super::DEFAULT_KEYRING_WRAPPING_KEY_ID);
         assert!(super::secret_string_eq(
             &keys.wrapping_key_hex,
             &SecretString::from(WRAPPING_KEY_HEX)
@@ -803,14 +782,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_partial_keyring_envelope_source() {
-        let source = minimal_source().without(super::KEYRING_WRAPPING_KEY_ID_ENV);
+    fn parses_keyring_envelope_override() {
+        let source = minimal_source()
+            .with(
+                super::KEYRING_ENVELOPE_OBJECT_ID_ENV,
+                "keyrings/bootstrap-envelope.json",
+            )
+            .with(super::KEYRING_WRAPPING_KEY_ID_ENV, "wrap-custom");
 
         let config = RuntimeConfig::from_source(&source);
 
-        assert!(
-            matches!(config, Err(ConfigError::Missing { key }) if key == super::KEYRING_WRAPPING_KEY_ID_ENV)
+        let keys = match config {
+            Ok(config) => config.repository_keys,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(
+            keys.envelope_object_id.as_ref().map(|id| id.as_str()),
+            Some("keyrings/bootstrap-envelope.json")
         );
+        assert_eq!(keys.wrapping_key_id, "wrap-custom");
     }
 
     #[test]

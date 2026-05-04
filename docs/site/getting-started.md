@@ -55,8 +55,6 @@ RS3_ANCHOR_MODE=memory \
 RS3_ALLOW_MEMORY_ANCHOR=true \
 RS3_REPOSITORY_ID=local-dev \
 RS3_REPOSITORY_SALT_HEX=2222222222222222222222222222222222222222222222222222222222222222 \
-RS3_KEYRING_ENVELOPE_OBJECT_ID=keyrings/bootstrap-envelope.json \
-RS3_KEYRING_WRAPPING_KEY_ID=wrap-local \
 RS3_KEYRING_WRAPPING_KEY_HEX=3333333333333333333333333333333333333333333333333333333333333333 \
 RS3_STATIC_ACCESS_KEY_ID=local \
 RS3_STATIC_SECRET_ACCESS_KEY=local-secret \
@@ -64,7 +62,7 @@ cargo run -p rs3-server -- serve --bind 127.0.0.1:9080
 ```
 
 On first start with an empty backend prefix, the gateway writes an encrypted
-keyring envelope to the configured object ID. The memory anchor is only for local
+keyring envelope under `keyrings/`. The memory anchor is only for local
 development; it is not a production rollback boundary.
 
 ## Run S3 Contract Checks

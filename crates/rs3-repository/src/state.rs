@@ -32,6 +32,8 @@ pub(crate) struct RepositoryState {
     pub(crate) next_sequence: Sequence,
     /// Durable index mutations not yet covered by an accepted checkpoint.
     pub(crate) pending_index_deltas: Vec<IndexDelta>,
+    /// Stable timestamp for the current unaccepted checkpoint draft.
+    pub(crate) pending_checkpoint_published_at_ms: Option<i64>,
 }
 
 impl Default for RepositoryState {
@@ -41,6 +43,7 @@ impl Default for RepositoryState {
             manifests: BTreeMap::new(),
             next_sequence: Sequence::ZERO,
             pending_index_deltas: Vec::new(),
+            pending_checkpoint_published_at_ms: None,
         }
     }
 }

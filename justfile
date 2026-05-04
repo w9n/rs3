@@ -69,7 +69,10 @@ integration-velero-kopia-postgres-smoke *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke {{ARGS}}
 
 helm-lint:
-    helm lint charts/rs3-gateway
+    helm lint charts/rs3-gateway \
+        --set repositoryKeys.create=true \
+        --set-string repositoryKeys.saltHex=1111111111111111111111111111111111111111111111111111111111111111 \
+        --set-string repositoryKeys.wrappingKeyHex=2222222222222222222222222222222222222222222222222222222222222222
 
 test:
     cargo test --workspace

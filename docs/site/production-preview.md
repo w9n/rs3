@@ -64,15 +64,16 @@ newer one. The backend can still deny service by hiding required objects.
 
 | Situation | Preview behavior |
 | --- | --- |
-| Empty backend prefix and no anchor | Startup may initialize the configured keyring envelope using the supplied repository ID, salt, envelope object ID, and unwrap authority. |
+| Empty backend prefix and no anchor | Startup may initialize one generated keyring envelope using the supplied repository ID, salt, and unwrap authority. An envelope object ID is optional override state, not normal Helm state. |
 | Existing backend prefix and matching anchor | Open after signed checkpoint, envelope, and evidence validation. |
 | Backend serves an older checkpoint than the Lease anchor | Fail closed as rollback. |
 | Backend hides the checkpoint or evidence named by the Lease anchor | Fail closed as unavailable or tampered. |
 | Backend adds unrelated objects | Ignore them unless signed and reachable from anchored state. |
 | Backend overwrites checkpoint, evidence, index, metadata, or payload bytes | Reject through create-only write checks, signatures, digests, or AEAD authentication. |
 | Backend evidence appears newer than the Lease anchor | Treat as ambiguous; fail closed until explicit recovery resolves whether the anchor missed an advance or was rolled back. |
-| Lease missing but backend evidence exists | Do not silently trust storage. Require recovery input from a trusted bundle or future external anchor. |
+| Lease missing but backend evidence exists | Do not silently trust storage. Require a trusted bundle or explicit bounded recovery that validates the highest observed valid checkpoint and enforces a maximum signed checkpoint age. |
 | Lease and backend are both compromised | Online protection is exhausted; recovery needs offline or externally protected authority. |
+| Wrapping key and old envelope are both exposed | Rewrap protects only future envelope handling; historical data under that keyring is treated as exposed. |
 
 ## Bootstrap UX
 
@@ -80,9 +81,8 @@ The preview bootstrap path is declarative:
 
 1. Choose a stable `repository.id`.
 2. Generate and keep a stable 32-byte public `repositoryKeys.saltHex`.
-3. Choose the initial keyring envelope object ID under `keyrings/`.
-4. Store the unwrap authority outside the object store.
-5. Deploy the gateway with Kubernetes Lease anchoring.
+3. Store the unwrap authority outside the object store.
+4. Deploy the gateway with Kubernetes Lease anchoring.
 
 The salt is not secret, but it is required restore metadata. Put it in trusted
 GitOps or a recovery bundle with the repository ID and anchor position. Do not
@@ -98,7 +98,8 @@ Startup bootstrap behavior is:
 - if the configured backend prefix is empty, initialize exactly one repository
   using the supplied repository ID, supplied salt, and unwrap authority
 - if the prefix already contains repository state, verify that the configured
-  repository ID, salt, envelope, unwrap authority, anchor, and evidence match
+  repository ID, salt, checkpoint-bound envelope, unwrap authority, anchor, and
+  evidence match
 - if the prefix is non-empty but cannot be verified, stop with a precise error
   instead of creating new state
 
@@ -108,14 +109,14 @@ A new cluster needs more than backend credentials:
 
 - repository ID
 - repository salt
-- keyring-envelope object ID
 - unwrap authority for the envelope
-- trusted anchor position: sequence, checkpoint ID, and checkpoint digest
+- trusted anchor position: sequence, checkpoint ID, and checkpoint digest, or
+  an explicit bounded recovery decision from retained evidence
 
 The trusted anchor position can come from a recovery bundle, audited export, or
 trusted external anchor. Storage evidence can help prove what existed in the
-backend, but by itself it is not enough because a malicious backend can hide or
-replay evidence.
+backend, but by itself it is not a perfect latest-state authority because a
+malicious backend can hide newer valid evidence or replay older valid evidence.
 
 An external anchor can distribute trust outside the cluster. It should store
 or sign the accepted checkpoint position, not the whole repository index. That
@@ -175,6 +176,8 @@ For a production-preview deployment:
 - run `rs3-server doctor --profile production` before exposing the gateway
 - keep restore verification inputs outside the object-store trust boundary
 - collect metrics and logs with path-safe labels only
+- treat wrapping-key rewrap as hygiene, not as recovery from a leaked wrapping
+  key plus copied envelope
 
 Do not rely on backend state alone for production-preview evidence. Use the
 configured anchor position and restore verification inputs from a trusted bundle

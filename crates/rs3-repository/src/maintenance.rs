@@ -3,7 +3,7 @@
 use crate::checkpoint::{
     CHECKPOINT_EVIDENCE_PREFIX, CHECKPOINT_OBJECT_PREFIX, KEYRING_ENVELOPE_OBJECT_PREFIX,
     checkpoint_evidence_object_id, checkpoint_object_id, open_index_delta_object,
-    open_manifest_record,
+    open_manifest_record, validate_checkpoint_published_at,
 };
 use crate::error::{RepositoryError, Result};
 use crate::model::{
@@ -148,6 +148,7 @@ where
         let checkpoints = self.read_checkpoint_chain(&accepted.checkpoint_id).await?;
         let keyring = self.keyring()?;
         let mut previous = None;
+        let mut previous_published_at_ms = None;
         let mut checkpoint_count = 0;
         let mut checkpoint_evidence_count = 0;
         let mut index_delta_object_count = 0;
@@ -159,6 +160,7 @@ where
         let mut protection = RestoreProtectionSummary::default();
 
         for checkpoint in checkpoints.into_iter().rev() {
+            validate_checkpoint_published_at(&checkpoint, previous_published_at_ms)?;
             let position = self.verify_signed_checkpoint(&checkpoint, previous.as_ref())?;
             let checkpoint_backend_object_id = checkpoint_object_id(&checkpoint.id)?;
             summarize_object_protection(self, &checkpoint_backend_object_id, &mut protection)
@@ -215,6 +217,7 @@ where
                 inline_index_delta_count += 1;
             }
 
+            previous_published_at_ms = Some(checkpoint.record.published_at_ms);
             previous = Some(position);
         }
 

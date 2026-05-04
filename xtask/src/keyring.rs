@@ -5,15 +5,15 @@ use clap::{Args, Subcommand, ValueEnum};
 use rs3_crypto::{
     KeyRing, KeyringEnvelope, MIN_REPOSITORY_SALT_LEN, RepositoryKeyContext, SecretBytes,
 };
-use rs3_repository::Repository;
+use rs3_repository::{Repository, RepositoryOptions};
 use rs3_storage::{BlobStore, ByteRange, FilesystemBlobStore};
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
-use rs3_types::{BackendObjectId, RepositoryId};
+use rs3_types::{BackendObjectId, RepositoryId, RetentionMode, RetentionPolicy};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-/// Creates and rotates encrypted repository keyring envelopes.
+/// Creates and rewraps encrypted repository keyring envelopes.
 #[derive(Debug, Args)]
 pub(crate) struct KeyringArgs {
     #[command(subcommand)]
@@ -25,6 +25,9 @@ enum KeyringCommand {
     /// Generate random repository data keys and store a keyring envelope.
     Init(Box<KeyringInitArgs>),
     /// Re-encrypt an existing keyring envelope with a new wrapping key.
+    ///
+    /// This does not rotate repository data keys and is not compromise recovery
+    /// if the old wrapping key and old envelope may have been exposed together.
     Rewrap(Box<KeyringRewrapArgs>),
 }
 
@@ -54,6 +57,9 @@ struct KeyringInitArgs {
     /// Backend object-store target.
     #[command(flatten)]
     backend: KeyringBackendArgs,
+    /// Optional provider retention for the newly written envelope object.
+    #[command(flatten)]
+    retention: KeyringRetentionArgs,
     /// Output format.
     #[arg(long, value_enum, default_value_t = KeyringReportFormat::Json)]
     format: KeyringReportFormat,
@@ -97,6 +103,9 @@ struct KeyringRewrapArgs {
     /// Backend object-store target.
     #[command(flatten)]
     backend: KeyringBackendArgs,
+    /// Optional provider retention for the newly written envelope object.
+    #[command(flatten)]
+    retention: KeyringRetentionArgs,
     /// Output format.
     #[arg(long, value_enum, default_value_t = KeyringReportFormat::Json)]
     format: KeyringReportFormat,
@@ -140,6 +149,24 @@ struct KeyringBackendArgs {
     s3_virtual_hosted_style: bool,
 }
 
+#[derive(Clone, Debug, Default, Args)]
+struct KeyringRetentionArgs {
+    /// Provider retention mode for the newly written envelope object.
+    #[arg(long, value_enum)]
+    envelope_retention_mode: Option<KeyringRetentionMode>,
+    /// Provider retention duration in days for the newly written envelope object.
+    #[arg(long)]
+    envelope_retention_days: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum KeyringRetentionMode {
+    /// Governance retention, bypassable only with special provider permission.
+    Governance,
+    /// Compliance retention, not normally bypassable before expiry.
+    Compliance,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum KeyringBackend {
     /// Local filesystem backend.
@@ -165,6 +192,7 @@ struct KeyringReport {
     envelope_digest: String,
     generation: u64,
     wrapping_key_id: String,
+    envelope_retention: Option<RetentionPolicy>,
     generated_wrapping_key_hex: Option<String>,
 }
 
@@ -231,7 +259,8 @@ where
         &wrapping_key.secret,
         args.generation,
     )?;
-    let repository = Repository::with_keyring(store, keyring);
+    let envelope_retention = args.retention.policy()?;
+    let repository = repository_with_keyring(store, keyring, envelope_retention);
     let reference = repository.store_keyring_envelope(&envelope).await?;
 
     Ok(KeyringReport {
@@ -241,6 +270,7 @@ where
         envelope_digest: reference.digest,
         generation: reference.generation,
         wrapping_key_id: args.wrapping_key_id,
+        envelope_retention,
         generated_wrapping_key_hex: wrapping_key.generated_hex,
     })
 }
@@ -310,7 +340,8 @@ where
         &args.new_wrapping_key_id,
         &new_wrapping_key.secret,
     )?;
-    let repository = Repository::with_keyring(store, keyring);
+    let envelope_retention = args.retention.policy()?;
+    let repository = repository_with_keyring(store, keyring, envelope_retention);
     let reference = repository.store_keyring_envelope(&rewrapped).await?;
 
     Ok(KeyringReport {
@@ -320,8 +351,27 @@ where
         envelope_digest: reference.digest,
         generation: reference.generation,
         wrapping_key_id: args.new_wrapping_key_id,
+        envelope_retention,
         generated_wrapping_key_hex: new_wrapping_key.generated_hex,
     })
+}
+
+fn repository_with_keyring<S>(
+    store: S,
+    keyring: KeyRing,
+    default_retention: Option<RetentionPolicy>,
+) -> Repository<S>
+where
+    S: BlobStore,
+{
+    Repository::with_keyring_and_options(
+        store,
+        keyring,
+        RepositoryOptions {
+            default_retention,
+            ..RepositoryOptions::default()
+        },
+    )
 }
 
 fn filesystem_store(args: &KeyringBackendArgs) -> Result<FilesystemBlobStore> {
@@ -360,6 +410,33 @@ fn repository_context(
 ) -> Result<RepositoryKeyContext> {
     let salt = hex::decode(repository_salt_hex).context("repository salt must be hex encoded")?;
     RepositoryKeyContext::new(repository_id, salt).map_err(Into::into)
+}
+
+impl KeyringRetentionArgs {
+    fn policy(&self) -> Result<Option<RetentionPolicy>> {
+        match (self.envelope_retention_mode, self.envelope_retention_days) {
+            (None, None) => Ok(None),
+            (Some(_), None) => {
+                bail!("--envelope-retention-days is required with --envelope-retention-mode")
+            }
+            (None, Some(_)) => {
+                bail!("--envelope-retention-mode is required with --envelope-retention-days")
+            }
+            (Some(_), Some(0)) => {
+                bail!("--envelope-retention-days must be greater than zero")
+            }
+            (Some(mode), Some(days)) => Ok(Some(RetentionPolicy::new(mode.into(), days))),
+        }
+    }
+}
+
+impl From<KeyringRetentionMode> for RetentionMode {
+    fn from(mode: KeyringRetentionMode) -> Self {
+        match mode {
+            KeyringRetentionMode::Governance => Self::Governance,
+            KeyringRetentionMode::Compliance => Self::Compliance,
+        }
+    }
 }
 
 struct WrappingKeyInput {
@@ -445,6 +522,12 @@ impl KeyringReport {
                 "object_id": self.envelope_object_id,
                 "digest": self.envelope_digest,
                 "generation": self.generation,
+                "retention": self.envelope_retention.map(|retention| {
+                    serde_json::json!({
+                        "mode": retention_mode_name(retention.mode),
+                        "days": retention.retain_days,
+                    })
+                }),
             },
             "wrapping_key": {
                 "id": self.wrapping_key_id,
@@ -505,6 +588,14 @@ impl KeyringReport {
     }
 }
 
+fn retention_mode_name(mode: RetentionMode) -> &'static str {
+    match mode {
+        RetentionMode::None => "none",
+        RetentionMode::Governance => "governance",
+        RetentionMode::Compliance => "compliance",
+    }
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -512,13 +603,13 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyringInitArgs, KeyringReportFormat, KeyringRewrapArgs, init_with_store,
-        rewrap_with_store, secret_from_hex,
+        KeyringInitArgs, KeyringReportFormat, KeyringRetentionArgs, KeyringRetentionMode,
+        KeyringRewrapArgs, init_with_store, rewrap_with_store, secret_from_hex,
     };
     use crate::keyring::{KeyringBackend, KeyringBackendArgs};
     use rs3_crypto::{KeyringEnvelope, RepositoryKeyContext, SecretBytes};
     use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore};
-    use rs3_types::{BackendObjectId, RepositoryId};
+    use rs3_types::{BackendObjectId, RepositoryId, RetentionMode, RetentionPolicy};
 
     const SALT_HEX: &str = "2222222222222222222222222222222222222222222222222222222222222222";
     const OLD_WRAP_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -536,6 +627,7 @@ mod tests {
             generate_wrapping_key: false,
             generation: 1,
             backend: backend_args(),
+            retention: KeyringRetentionArgs::default(),
             format: KeyringReportFormat::Json,
         };
 
@@ -580,6 +672,7 @@ mod tests {
             generate_new_wrapping_key: false,
             new_generation: None,
             backend: backend_args(),
+            retention: KeyringRetentionArgs::default(),
             format: KeyringReportFormat::Json,
         };
 
@@ -603,6 +696,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn keyring_rewrap_applies_configured_envelope_retention() {
+        let store = MemoryBlobStore::new();
+        let init_report = init_with_store(init_args(), store.clone())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let rewrap = KeyringRewrapArgs {
+            repository_id: "repo-a".to_owned(),
+            repository_salt_hex: SALT_HEX.to_owned(),
+            envelope_object_id: init_report.envelope_object_id,
+            old_wrapping_key_id: "wrap-v1".to_owned(),
+            old_wrapping_key_hex: Some(OLD_WRAP_HEX.to_owned()),
+            old_wrapping_key_hex_file: None,
+            new_wrapping_key_id: "wrap-v2".to_owned(),
+            new_wrapping_key_hex: Some(NEW_WRAP_HEX.to_owned()),
+            new_wrapping_key_hex_file: None,
+            generate_new_wrapping_key: false,
+            new_generation: None,
+            backend: backend_args(),
+            retention: KeyringRetentionArgs {
+                envelope_retention_mode: Some(KeyringRetentionMode::Compliance),
+                envelope_retention_days: Some(30),
+            },
+            format: KeyringReportFormat::Json,
+        };
+
+        let rewrapped_report = rewrap_with_store(rewrap, store.clone())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let object_id = BackendObjectId::new(rewrapped_report.envelope_object_id)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let metadata = store
+            .head(&object_id)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(
+            metadata.retention,
+            Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
+        );
+        assert_eq!(
+            rewrapped_report.envelope_retention,
+            Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
+        );
+    }
+
     #[test]
     fn wrapping_key_requires_hex_secret_material() {
         assert!(secret_from_hex("--wrapping-key-hex", "not-hex").is_err());
@@ -619,6 +758,7 @@ mod tests {
             generate_wrapping_key: false,
             generation: 1,
             backend: backend_args(),
+            retention: KeyringRetentionArgs::default(),
             format: KeyringReportFormat::Json,
         }
     }

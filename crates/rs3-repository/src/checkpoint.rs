@@ -20,7 +20,7 @@ use rs3_index::{
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, CheckpointId, ManifestId};
 use std::collections::BTreeSet;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const CHECKPOINT_OBJECT_PREFIX: &str = "checkpoints/";
 pub(crate) const CHECKPOINT_EVIDENCE_PREFIX: &str = "evidence/";
@@ -47,10 +47,15 @@ where
         inline_index_delta: Option<SealedIndexDeltaObject>,
     ) -> Result<CommitRecord> {
         let keyring = self.keyring()?;
-        let state = self.read_state()?;
+        let mut state = self.write_state()?;
+        let published_at_ms = state
+            .pending_checkpoint_published_at_ms
+            .unwrap_or_else(|| current_time_ms().unwrap_or(state.next_sequence.get() as i64));
+        state.pending_checkpoint_published_at_ms = Some(published_at_ms);
 
         Ok(CommitRecord {
             sequence: state.next_sequence,
+            published_at_ms,
             parent,
             index_deltas,
             inline_index_delta,
@@ -177,15 +182,18 @@ where
     ) -> Result<CheckpointPosition> {
         let checkpoints = self.read_checkpoint_chain(&accepted.checkpoint_id).await?;
         let mut previous = None;
+        let mut previous_published_at_ms = None;
         let mut rebuilt = RepositoryState::default();
         let mut loaded_keyring_envelope = None;
 
         for checkpoint in checkpoints.into_iter().rev() {
+            validate_checkpoint_published_at(&checkpoint, previous_published_at_ms)?;
             let position = self.verify_signed_checkpoint(&checkpoint, previous.as_ref())?;
             self.apply_checkpoint_deltas(&mut rebuilt, &checkpoint)
                 .await?;
             rebuilt.next_sequence = position.sequence;
             loaded_keyring_envelope = checkpoint.record.keyring_envelope.clone();
+            previous_published_at_ms = Some(checkpoint.record.published_at_ms);
             previous = Some(position);
         }
 
@@ -370,6 +378,7 @@ where
         let mut state = self.write_state()?;
         if state.next_sequence == sequence {
             state.pending_index_deltas.clear();
+            state.pending_checkpoint_published_at_ms = None;
         }
         Ok(())
     }
@@ -647,6 +656,20 @@ fn validate_position(
     Ok(())
 }
 
+pub(crate) fn validate_checkpoint_published_at(
+    checkpoint: &Checkpoint,
+    previous_published_at_ms: Option<i64>,
+) -> Result<()> {
+    if previous_published_at_ms.is_some_and(|previous| checkpoint.record.published_at_ms < previous)
+    {
+        return Err(crate::RepositoryError::CheckpointPublishedAtDecreased {
+            checkpoint_id: checkpoint.id.clone(),
+        });
+    }
+
+    Ok(())
+}
+
 fn record_checkpoint_publish(
     sequence: u64,
     index_delta_count: usize,
@@ -666,4 +689,12 @@ fn record_checkpoint_publish(
 
 fn elapsed_us(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn current_time_ms() -> Option<i64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    i64::try_from(millis).ok()
 }

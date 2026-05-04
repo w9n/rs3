@@ -82,7 +82,7 @@ where
         }
     }
 
-    /// Replaces the active keyring after a validated rotation update.
+    /// Replaces the active keyring after a validated data-key update.
     pub fn replace_keyring(&self, keyring: KeyRing) -> Result<()> {
         let mut active = self
             .keyring

@@ -46,7 +46,7 @@ repositoryKeys:
   existingSecret: ""
   saltHex: ""
   envelopeObjectId: ""
-  wrappingKeyId: ""
+  wrappingKeyId: wrap-v1
   wrappingKeyHex: ""
 
 anchor:

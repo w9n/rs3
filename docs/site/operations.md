@@ -33,10 +33,15 @@ reference.
 ## Keys And Bootstrap
 
 The gateway uses an encrypted keyring envelope. Operators provide a stable
-repository ID, a stable public salt, a configured envelope object ID, and an
-unwrap authority. The gateway opens the envelope if it exists. If it is missing,
-startup initializes a new random purpose-specific keyring only when the
-configured backend prefix is empty and the anchor is missing.
+repository ID, a stable public salt, and an unwrap authority. For an anchored
+repository, startup reads the accepted checkpoint and opens the keyring envelope
+bound into that signed checkpoint. It does not trust S3 listing order or a
+mutable "latest" object to choose repository state.
+
+For a first empty repository, startup initializes a new random purpose-specific
+keyring and writes the encrypted envelope under a default counted `keyrings/`
+object name. `RS3_KEYRING_ENVELOPE_OBJECT_ID` is optional and exists only as an
+explicit bootstrap or recovery override.
 
 If the envelope is missing but the prefix already contains repository objects, or
 if the anchor already contains an accepted checkpoint position, startup fails
@@ -55,23 +60,23 @@ Operational rules:
 - Do not destroy a key while any retained checkpoint can reference data that
   requires it.
 
-For a first empty repository, configure the envelope target and wrapping key:
+For a first empty repository, configure the repository context and wrapping key:
 
 ```sh
 RS3_REPOSITORY_ID=prod-backups
 RS3_REPOSITORY_SALT_HEX=<stable-public-salt-hex>
-RS3_KEYRING_ENVELOPE_OBJECT_ID=keyrings/bootstrap-envelope.json
-RS3_KEYRING_WRAPPING_KEY_ID=wrap-2026-05
+RS3_KEYRING_WRAPPING_KEY_ID=wrap-2026-05 # optional; defaults to wrap-v1
 RS3_KEYRING_WRAPPING_KEY_HEX=<wrapping-key-hex>
 ```
 
 In Helm, set `repositoryKeys.create=true` or provide
-`repositoryKeys.existingSecret`. The Secret keys are `salt-hex`,
-`envelope-object-id`, `wrapping-key-id`, and `wrapping-key-hex`. Helm values stay
-declarative; the gateway writes the encrypted envelope object, not mutated chart
-state.
+`repositoryKeys.existingSecret`. The required Secret keys are `salt-hex` and
+`wrapping-key-hex`; `wrapping-key-id` is optional and defaults to `wrap-v1`;
+`envelope-object-id` is an optional override. Helm values stay declarative; the
+gateway writes the encrypted envelope object, not mutated chart state.
 
-Rotate the wrapping key without rewriting backup data:
+Rewrap the keyring envelope with a new wrapping key without rewriting backup
+data:
 
 ```sh
 cargo run -p xtask --bin xtask -- keyring rewrap \
@@ -82,12 +87,27 @@ cargo run -p xtask --bin xtask -- keyring rewrap \
   --old-wrapping-key-hex-file /run/secrets/rs3-wrap-v1.hex \
   --new-wrapping-key-id wrap-2026-06 \
   --generate-new-wrapping-key \
+  --envelope-retention-mode compliance \
+  --envelope-retention-days 30 \
   --backend filesystem \
   --backend-dir /var/lib/rs3/backend
 ```
 
-Keep the old wrapping key available until no retained checkpoint needs an
-envelope that was sealed with it.
+Rewrap is an operational hygiene step, not compromise recovery. It keeps the
+same repository data keys and only changes the key-encryption key around the
+envelope. If the old wrapping key and old envelope may both have been exposed,
+historical backup confidentiality must be treated as lost for data encrypted by
+that keyring. A malicious storage backend may also have copied the old envelope
+before it was deleted, so deleting or expiring the old envelope is not a
+cryptographic revocation mechanism.
+
+Keep the old wrapping authority available for restore paths that still trust
+checkpoints bound to the old envelope. A newly written rewrapped envelope only
+becomes active repository state after a later accepted checkpoint binds it.
+When writing envelopes outside the gateway, set envelope retention deliberately
+with `--envelope-retention-mode` and `--envelope-retention-days`; retention
+protects restore evidence from deletion but does not make a leaked old envelope
+safe.
 
 ## Anchors
 
@@ -180,9 +200,27 @@ restore is added, it should require explicit operator input and leave an audit
 trail.
 
 Disaster recovery into a new cluster requires the repository ID, public salt,
-keyring-envelope object ID, unwrap authority, and trusted checkpoint position.
-Backend evidence alone is not enough to recreate trust because the backend can
-hide or replay evidence.
+unwrap authority, and either a trusted checkpoint position from outside S3 or an
+explicit bounded recovery decision. Backend evidence alone is not a perfect
+latest-state oracle because the backend can hide newer valid evidence and replay
+older valid evidence.
+
+When the old Kubernetes Lease is gone, use explicit anchor recovery with a
+freshness bound:
+
+```sh
+cargo run -p rs3-server -- recover-anchor \
+  --max-checkpoint-age-seconds 86400 \
+  --apply-if-missing \
+  --format text
+```
+
+The command scans storage evidence, verifies the highest observed valid
+checkpoint chain and keyring envelope, rejects it if the signed checkpoint time
+is older than the configured bound, and writes the configured anchor only when
+it is missing. The report says "highest observed valid" deliberately: a
+malicious backend that cannot forge checkpoints may still hide newer valid
+ones.
 
 Verify a trusted checkpoint position before relying on it for restore. Build
 `xtask` with the S3 feature when verifying an S3-compatible backend:

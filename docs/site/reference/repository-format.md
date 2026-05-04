@@ -63,7 +63,7 @@ A checkpoint records an ordered repository state transition:
 - active key descriptors
 - active keyring envelope generation, object ID, and digest when configured
 - repository-state digest
-- creation time
+- signed publish time
 - retention/evidence policy marker
 - signature over the canonical payload
 
@@ -95,14 +95,19 @@ until retention and migration policy allow retirement.
 
 The preferred bootstrap shape is to use an operator-provided repository ID and
 public salt, generate random purpose-specific data keys, and store them in an
-encrypted keyring envelope under `keyrings/`. The unwrap authority, such as a
-KMS key or high-entropy wrapping key, stays outside the repository. Signed
-checkpoints bind the active envelope by generation, object ID, and digest so a
-backend cannot silently swap envelopes.
+encrypted keyring envelope under a counted `keyrings/` object. The unwrap
+authority, such as a KMS key or high-entropy wrapping key, stays outside the
+repository. Signed checkpoints bind the active envelope by generation, object
+ID, and digest so a backend cannot silently swap envelopes.
 
-Initial empty repositories are initialized by writing the configured encrypted
-keyring envelope. Existing repositories must open through the envelope referenced
-by configuration and then by signed checkpoints.
+Wrapping-key rewrap preserves the same repository data keys. It is useful for
+moving unwrap authority or retiring a clean wrapping key, but it is not recovery
+from exposure of an old wrapping key plus the old envelope bytes.
+
+Initial empty repositories are initialized by writing an encrypted keyring
+envelope. Existing anchored repositories open through the envelope reference
+inside the accepted signed checkpoint, not through S3 listing order or a mutable
+latest pointer.
 
 Checkpoint-signing descriptors include the Ed25519 public verification key so
 checkpoint payloads can be verified without exposing signing material.

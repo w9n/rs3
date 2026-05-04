@@ -67,12 +67,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and .Values.repositoryKeys.create (not .Values.repositoryKeys.saltHex) -}}
 {{- fail "repositoryKeys.saltHex is required when repositoryKeys.create=true" -}}
 {{- end -}}
-{{- if and .Values.repositoryKeys.create (not .Values.repositoryKeys.envelopeObjectId) -}}
-{{- fail "repositoryKeys.envelopeObjectId is required when repositoryKeys.create=true" -}}
-{{- end -}}
-{{- if and .Values.repositoryKeys.create (not .Values.repositoryKeys.wrappingKeyId) -}}
-{{- fail "repositoryKeys.wrappingKeyId is required when repositoryKeys.create=true" -}}
-{{- end -}}
 {{- if and .Values.repositoryKeys.create (not .Values.repositoryKeys.wrappingKeyHex) -}}
 {{- fail "repositoryKeys.wrappingKeyHex is required when repositoryKeys.create=true" -}}
 {{- end -}}

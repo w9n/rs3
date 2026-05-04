@@ -187,8 +187,10 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{error}")),
                 repository_salt_hex:
                     "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
-                envelope_object_id: BackendObjectId::new("keyrings/test-envelope.json")
-                    .unwrap_or_else(|error| panic!("{error}")),
+                envelope_object_id: Some(
+                    BackendObjectId::new("keyrings/test-envelope.json")
+                        .unwrap_or_else(|error| panic!("{error}")),
+                ),
                 wrapping_key_id: "wrap-v1".to_owned(),
                 wrapping_key_hex: SecretString::from(
                     "3333333333333333333333333333333333333333333333333333333333333333",

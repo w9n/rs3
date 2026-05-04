@@ -4,7 +4,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rs3_crypto::derive_public_fingerprint;
-use rs3_server::{AnchorConfig, GatewayServer, RuntimeConfig};
+use rs3_server::{
+    AnchorConfig, AnchorRecoveryOptions, AnchorRecoveryReport, GatewayServer, RuntimeConfig,
+    recover_anchor_from_config,
+};
 use rs3_types::RetentionMode;
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
@@ -37,12 +40,26 @@ enum Commands {
         #[arg(long, env = "RS3_DOCTOR_PROFILE", value_enum, default_value_t = DoctorProfile::Local)]
         profile: DoctorProfile,
     },
+    RecoverAnchor {
+        #[arg(long, env = "RS3_RECOVERY_MAX_CHECKPOINT_AGE_SECONDS")]
+        max_checkpoint_age_seconds: u64,
+        #[arg(long, default_value_t = false)]
+        apply_if_missing: bool,
+        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
+        format: RecoveryReportFormat,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum DoctorProfile {
     Local,
     Production,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum RecoveryReportFormat {
+    Json,
+    Text,
 }
 
 #[tokio::main]
@@ -70,8 +87,66 @@ async fn main() -> Result<()> {
             log_runtime_config(&config);
             run_doctor(&config, profile)?;
         }
+        Commands::RecoverAnchor {
+            max_checkpoint_age_seconds,
+            apply_if_missing,
+            format,
+        } => {
+            let config = RuntimeConfig::from_env()?;
+            log_runtime_config(&config);
+            if max_checkpoint_age_seconds == 0 {
+                anyhow::bail!("--max-checkpoint-age-seconds must be greater than zero");
+            }
+            let report = recover_anchor_from_config(
+                &config,
+                AnchorRecoveryOptions {
+                    max_checkpoint_age: std::time::Duration::from_secs(max_checkpoint_age_seconds),
+                    apply_if_missing,
+                },
+            )
+            .await?;
+            print_recovery_report(&report, format)?;
+        }
     }
 
+    Ok(())
+}
+
+fn print_recovery_report(
+    report: &AnchorRecoveryReport,
+    format: RecoveryReportFormat,
+) -> Result<()> {
+    match format {
+        RecoveryReportFormat::Json => {
+            let report = serde_json::json!({
+                "checkpoint": {
+                    "sequence": report.checkpoint.sequence.get(),
+                    "checkpoint_id": report.checkpoint.checkpoint_id.as_str(),
+                    "checkpoint_digest": report.checkpoint.payload_digest,
+                    "published_at_ms": report.published_at_ms,
+                },
+                "observed": {
+                    "evidence_objects": report.observed_evidence_objects,
+                    "candidate_checkpoints": report.candidate_count,
+                },
+                "applied": report.applied,
+            });
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        RecoveryReportFormat::Text => {
+            println!("rs3 anchor recovery: highest observed valid checkpoint");
+            println!("checkpoint_sequence={}", report.checkpoint.sequence.get());
+            println!("checkpoint_id={}", report.checkpoint.checkpoint_id.as_str());
+            println!("checkpoint_digest={}", report.checkpoint.payload_digest);
+            println!("published_at_ms={}", report.published_at_ms);
+            println!(
+                "observed_evidence_objects={}",
+                report.observed_evidence_objects
+            );
+            println!("candidate_checkpoints={}", report.candidate_count);
+            println!("applied={}", report.applied);
+        }
+    }
     Ok(())
 }
 
@@ -338,10 +413,10 @@ mod tests {
                 repository_id,
                 repository_salt_hex:
                     "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
-                envelope_object_id: BackendObjectId::new(
-                    "keyrings/00000000000000000001-digest.json",
-                )
-                .unwrap_or_else(|error| panic!("{error}")),
+                envelope_object_id: Some(
+                    BackendObjectId::new("keyrings/00000000000000000001-digest.json")
+                        .unwrap_or_else(|error| panic!("{error}")),
+                ),
                 wrapping_key_id: "wrap-v1".to_owned(),
                 wrapping_key_hex: SecretString::from(
                     "3333333333333333333333333333333333333333333333333333333333333333",

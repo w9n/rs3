@@ -134,7 +134,7 @@ impl KeyringEnvelope {
     /// Re-encrypts this envelope with a new wrapping authority.
     ///
     /// The repository data keys are preserved. Payload and metadata objects do
-    /// not need to be rewritten for normal wrapping-key rotation.
+    /// not need to be rewritten for normal wrapping-key rewrap.
     pub fn rewrap(
         &self,
         expected_context: &RepositoryKeyContext,

@@ -162,6 +162,8 @@ pub struct KeyringEnvelopeReference {
 pub struct CommitRecord {
     /// Checkpoint sequence.
     pub sequence: Sequence,
+    /// Checkpoint publish timestamp in milliseconds since the Unix epoch.
+    pub published_at_ms: i64,
     /// Previous checkpoint, if any.
     pub parent: Option<CheckpointId>,
     /// Referenced durable index delta objects.
@@ -515,6 +517,7 @@ mod tests {
     fn commit_record_starts_without_parent() {
         let record = CommitRecord {
             sequence: Sequence::ZERO,
+            published_at_ms: 0,
             parent: None,
             index_deltas: Vec::new(),
             inline_index_delta: None,
@@ -530,6 +533,7 @@ mod tests {
     fn canonical_commit_record_encoding_is_stable() {
         let unsorted = CommitRecord {
             sequence: Sequence::new(3),
+            published_at_ms: 123,
             parent: None,
             index_deltas: vec![object_id("segments/b"), object_id("segments/a")],
             inline_index_delta: None,
@@ -542,6 +546,7 @@ mod tests {
         };
         let sorted = CommitRecord {
             sequence: Sequence::new(3),
+            published_at_ms: 123,
             parent: None,
             index_deltas: vec![object_id("segments/a"), object_id("segments/b")],
             inline_index_delta: None,
@@ -564,6 +569,7 @@ mod tests {
     fn canonical_commit_record_encoding_changes_with_sequence() {
         let first = CommitRecord {
             sequence: Sequence::new(1),
+            published_at_ms: 123,
             parent: None,
             index_deltas: Vec::new(),
             inline_index_delta: None,
@@ -573,6 +579,7 @@ mod tests {
         };
         let second = CommitRecord {
             sequence: Sequence::new(2),
+            published_at_ms: 123,
             parent: None,
             index_deltas: Vec::new(),
             inline_index_delta: None,
@@ -595,6 +602,7 @@ mod tests {
             id: checkpoint_id("checkpoint-a"),
             record: CommitRecord {
                 sequence: Sequence::new(1),
+                published_at_ms: 123,
                 parent: None,
                 index_deltas: Vec::new(),
                 inline_index_delta: None,
