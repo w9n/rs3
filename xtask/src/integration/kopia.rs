@@ -828,11 +828,13 @@ fn check_failure_count(check_report: &serde_json::Value) -> usize {
 
 #[cfg(feature = "containers")]
 fn print_matrix_summary(summary: &serde_json::Value, profiles: &[KopiaWorkloadProfile]) {
-    println!("profile\tbackend_requests\tbackend_reads\tbackend_writes\trestore_elapsed");
+    println!(
+        "profile\tbackend_requests\tbackend_reads\tbackend_writes\trestore_elapsed\tstage_lock_wait\tcheckpoint_wait"
+    );
     for profile in profiles {
         let profile_summary = &summary["profiles"][profile.as_str()];
         println!(
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             profile.as_str(),
             format_ratio(value_f64_at(
                 profile_summary,
@@ -871,6 +873,26 @@ fn print_matrix_summary(summary: &serde_json::Value, profiles: &[KopiaWorkloadPr
                     "avg"
                 ],
             )),
+            format_seconds(value_f64_at(
+                profile_summary,
+                &[
+                    "comparison",
+                    "gateway_internal",
+                    "commit_put_phase_avg_seconds",
+                    "stage_lock_wait",
+                    "avg"
+                ],
+            )),
+            format_seconds(value_f64_at(
+                profile_summary,
+                &[
+                    "comparison",
+                    "gateway_internal",
+                    "commit_put_phase_avg_seconds",
+                    "checkpoint_wait",
+                    "avg"
+                ],
+            )),
         );
     }
     println!(
@@ -889,6 +911,13 @@ fn print_matrix_summary(summary: &serde_json::Value, profiles: &[KopiaWorkloadPr
 fn format_ratio(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.2}x"))
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+#[cfg(feature = "containers")]
+fn format_seconds(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}s"))
         .unwrap_or_else(|| "n/a".to_owned())
 }
 
@@ -1268,6 +1297,8 @@ mod tests {
     fn matrix_summary_formats_ratios_compactly() {
         assert_eq!(super::format_ratio(Some(1.234)), "1.23x");
         assert_eq!(super::format_ratio(None), "n/a");
+        assert_eq!(super::format_seconds(Some(0.1234)), "0.123s");
+        assert_eq!(super::format_seconds(None), "n/a");
     }
 
     #[test]

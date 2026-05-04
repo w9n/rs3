@@ -39,7 +39,7 @@ The summary includes a `workload_consistency` block. It checks that direct and
 gateway lanes see matching source and restored tree statistics for every run
 pair before ratios are interpreted. Artifacts are written under
 `.local/integration/` and should stay out of Git unless deliberately reviewed and promoted.
-The command prints a compact ratio table by default; pass
+The command prints a compact table by default; pass
 `--print-summary-json` when a caller needs the full JSON on stdout.
 
 ## Current Release Matrix
