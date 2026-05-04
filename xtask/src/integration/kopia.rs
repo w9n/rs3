@@ -938,6 +938,7 @@ fn run_kopia_smoke(
         )?);
     }
 
+    let source_tree = workspace.source_tree_stats()?;
     phases.push(run_kopia_phase(
         kopia_bin,
         workspace,
@@ -952,9 +953,12 @@ fn run_kopia_smoke(
     phases.push(run_local_phase("assert-restored", || {
         workspace.assert_restored()
     })?);
+    let restored_tree = workspace.restore_tree_stats()?;
     Ok(KopiaRunStats {
         elapsed: started.elapsed(),
         phases,
+        source_tree,
+        restored_tree,
     })
 }
 
@@ -972,6 +976,8 @@ struct KopiaS3Target {
 struct KopiaRunStats {
     elapsed: Duration,
     phases: Vec<KopiaPhaseTiming>,
+    source_tree: workload::KopiaTreeStats,
+    restored_tree: workload::KopiaTreeStats,
 }
 
 #[cfg(feature = "containers")]

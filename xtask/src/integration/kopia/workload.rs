@@ -49,6 +49,15 @@ pub(super) struct KopiaWorkspace {
 }
 
 #[cfg(feature = "containers")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct KopiaTreeStats {
+    pub(super) files: u64,
+    pub(super) directories: u64,
+    pub(super) bytes: u64,
+    pub(super) largest_file_bytes: u64,
+}
+
+#[cfg(feature = "containers")]
 impl KopiaWorkspace {
     pub(super) fn new() -> Result<Self> {
         let nanos = SystemTime::now()
@@ -139,6 +148,14 @@ impl KopiaWorkspace {
 
     pub(super) fn assert_restored(&self) -> Result<()> {
         assert_tree_eq(&self.source_dir(), &self.restore_dir())
+    }
+
+    pub(super) fn source_tree_stats(&self) -> Result<KopiaTreeStats> {
+        tree_stats(&self.source_dir())
+    }
+
+    pub(super) fn restore_tree_stats(&self) -> Result<KopiaTreeStats> {
+        tree_stats(&self.restore_dir())
     }
 }
 
@@ -291,6 +308,36 @@ fn assert_tree_eq(expected: &Path, actual: &Path) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "containers")]
+fn tree_stats(root: &Path) -> Result<KopiaTreeStats> {
+    let mut stats = KopiaTreeStats::default();
+    collect_tree_stats(root, &mut stats)?;
+    Ok(stats)
+}
+
+#[cfg(feature = "containers")]
+fn collect_tree_stats(path: &Path, stats: &mut KopiaTreeStats) -> Result<()> {
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("failed to read directory {}", path.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", path.display()))?;
+        let entry_path = entry.path();
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("failed to read metadata for {}", entry_path.display()))?;
+        if metadata.is_dir() {
+            stats.directories = stats.directories.saturating_add(1);
+            collect_tree_stats(&entry_path, stats)?;
+        } else if metadata.is_file() {
+            let len = metadata.len();
+            stats.files = stats.files.saturating_add(1);
+            stats.bytes = stats.bytes.saturating_add(len);
+            stats.largest_file_bytes = stats.largest_file_bytes.max(len);
+        }
+    }
     Ok(())
 }
 

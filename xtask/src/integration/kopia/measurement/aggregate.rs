@@ -196,6 +196,10 @@ fn aggregate_reports(reports: &[&Value]) -> Value {
         "runs": reports.len(),
         "elapsed_ms": summarize_u64(&elapsed),
         "phase_timings": aggregate_phase_timings(reports),
+        "workload": {
+            "source_tree": aggregate_object(reports, &["workload", "source_tree"]),
+            "restored_tree": aggregate_object(reports, &["workload", "restored_tree"]),
+        },
         "backend_metrics": {
             "counts": aggregate_object(reports, &["backend_metrics", "counts"]),
             "by_s3_operation": aggregate_nested_object(reports, &[
@@ -743,6 +747,20 @@ mod tests {
                         { "name": "repository-create", "elapsed_ms": 30 },
                         { "name": "restore", "elapsed_ms": 50 }
                     ],
+                    "workload": {
+                        "source_tree": {
+                            "files": 4,
+                            "directories": 1,
+                            "bytes": 2048,
+                            "largest_file_bytes": 1024
+                        },
+                        "restored_tree": {
+                            "files": 4,
+                            "directories": 1,
+                            "bytes": 2048,
+                            "largest_file_bytes": 1024
+                        }
+                    },
                     "backend_metrics": {
                         "counts": {
                             "requests": 10,
@@ -758,6 +776,20 @@ mod tests {
                         { "name": "repository-create", "elapsed_ms": 45 },
                         { "name": "restore", "elapsed_ms": 60 }
                     ],
+                    "workload": {
+                        "source_tree": {
+                            "files": 4,
+                            "directories": 1,
+                            "bytes": 2048,
+                            "largest_file_bytes": 1024
+                        },
+                        "restored_tree": {
+                            "files": 4,
+                            "directories": 1,
+                            "bytes": 2048,
+                            "largest_file_bytes": 1024
+                        }
+                    },
                     "gateway_process": {
                         "cpu_system_seconds": 0.25,
                         "cpu_total_seconds": 1.5,
@@ -899,6 +931,14 @@ mod tests {
         assert_eq!(
             aggregate["gateway"]["phase_timings"]["restore"]["p50"],
             serde_json::json!(60)
+        );
+        assert_eq!(
+            aggregate["gateway"]["workload"]["source_tree"]["files"]["avg"],
+            serde_json::json!(4.0)
+        );
+        assert_eq!(
+            aggregate["gateway"]["workload"]["restored_tree"]["bytes"]["avg"],
+            serde_json::json!(2048.0)
         );
         assert_eq!(
             aggregate["gateway"]["gateway_process"]["vm_rss_bytes"]["avg"],

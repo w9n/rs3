@@ -32,7 +32,20 @@ pub(super) fn measurement_json(
             "name": phase.name,
             "elapsed_ms": duration_ms(phase.elapsed),
         })).collect::<Vec<_>>(),
+        "workload": {
+            "source_tree": tree_stats_json(&stats.source_tree),
+            "restored_tree": tree_stats_json(&stats.restored_tree),
+        },
         "backend_metrics": backend_metrics,
+    })
+}
+
+fn tree_stats_json(stats: &super::workload::KopiaTreeStats) -> Value {
+    serde_json::json!({
+        "files": stats.files,
+        "directories": stats.directories,
+        "bytes": stats.bytes,
+        "largest_file_bytes": stats.largest_file_bytes,
     })
 }
 
