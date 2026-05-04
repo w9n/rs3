@@ -22,7 +22,7 @@ use rs3_anchor::CheckpointAnchor;
 use rs3_crypto::{KeyRing, NamespaceBlindKey, SecretBytes};
 use rs3_index::{IndexDelta, NamespaceEntry};
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
-use rs3_types::{BackendObjectId, LogicalPath, RetentionPolicy};
+use rs3_types::{BackendObjectId, LogicalPath, RetentionMode, RetentionPolicy};
 use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,7 +32,7 @@ pub struct Repository<S> {
     pub(crate) store: S,
     pub(crate) keyring: RwLock<KeyRing>,
     pub(crate) state: RwLock<RepositoryState>,
-    options: RepositoryOptions,
+    pub(crate) options: RepositoryOptions,
     payload_headers: RwLock<PayloadHeaderCache>,
     payload_spans: RwLock<PayloadSpanCache>,
 }
@@ -42,12 +42,15 @@ pub struct Repository<S> {
 pub struct RepositoryOptions {
     /// Plaintext bytes per independently encrypted payload segment.
     pub payload_segment_size: usize,
+    /// Default provider retention policy for repository-owned objects.
+    pub default_retention: Option<RetentionPolicy>,
 }
 
 impl Default for RepositoryOptions {
     fn default() -> Self {
         Self {
             payload_segment_size: DEFAULT_PAYLOAD_SEGMENT_SIZE,
+            default_retention: None,
         }
     }
 }
@@ -118,7 +121,9 @@ where
         let plaintext_len = u64::try_from(body.len())
             .map_err(|_| StorageError::Provider("payload length does not fit in u64".to_owned()))?;
         let create_only = options.create_only;
-        let requested_retention = options.retention.is_some();
+        let retention =
+            strongest_retention_policy(self.options.default_retention, options.retention);
+        let requested_retention = retention.is_some();
         let keyring = self.keyring()?;
         let primary_blind_key = keyring.derive_primary_blind_index_key(&key)?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(&key)?;
@@ -166,7 +171,7 @@ where
                 &object_id,
                 payload,
                 PutOptions {
-                    retention: options.retention.clone(),
+                    retention,
                     content_type: None,
                     do_not_recreate: true,
                 },
@@ -182,7 +187,7 @@ where
             content_len: plaintext_len,
             modified_at_ms,
             generation: sequence,
-            retention: storage_metadata.retention.clone(),
+            retention: storage_metadata.retention,
         };
         let manifest = TrustedManifest {
             key: key.clone(),
@@ -291,7 +296,7 @@ where
                 key: key.clone(),
                 content_len: entry.content_len,
                 modified_at_ms: entry.modified_at_ms,
-                retention: entry.retention.clone(),
+                retention: entry.retention,
             });
 
         record_repository_head("ok", started.elapsed());
@@ -791,9 +796,7 @@ where
         let keyring = self.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
         let object_id = self.object_id_for_candidates(key, &lookup_blind_keys)?;
-        self.store
-            .extend_retention(&object_id, policy.clone())
-            .await?;
+        self.store.extend_retention(&object_id, policy).await?;
         let backend = self.store.head(&object_id).await?;
 
         let mut state = self.write_state()?;
@@ -811,7 +814,7 @@ where
         let mut updated = entry;
         updated.manifest_id = manifest_id.clone();
         updated.generation = sequence;
-        updated.retention = backend.retention.clone();
+        updated.retention = backend.retention;
         let prefix_tokens =
             prefix_tokens_for_key(&keyring, &updated.namespace_key_id, key.as_str())?;
         let manifest = TrustedManifest {
@@ -1269,6 +1272,36 @@ fn elapsed_us(elapsed: Duration) -> u64 {
 
 fn modified_at_ms_or_now(modified_at_ms: Option<i64>, sequence: rs3_types::Sequence) -> i64 {
     modified_at_ms.unwrap_or_else(|| current_time_ms().unwrap_or(sequence.get() as i64))
+}
+
+pub(crate) fn strongest_retention_policy(
+    left: Option<RetentionPolicy>,
+    right: Option<RetentionPolicy>,
+) -> Option<RetentionPolicy> {
+    match (active_retention(left), active_retention(right)) {
+        (Some(left), Some(right)) => Some(RetentionPolicy::new(
+            stronger_retention_mode(left.mode, right.mode),
+            left.retain_days.max(right.retain_days),
+        )),
+        (Some(policy), None) | (None, Some(policy)) => Some(policy),
+        (None, None) => None,
+    }
+}
+
+fn active_retention(policy: Option<RetentionPolicy>) -> Option<RetentionPolicy> {
+    policy.filter(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
+}
+
+fn stronger_retention_mode(left: RetentionMode, right: RetentionMode) -> RetentionMode {
+    match (left, right) {
+        (RetentionMode::Compliance, _) | (_, RetentionMode::Compliance) => {
+            RetentionMode::Compliance
+        }
+        (RetentionMode::Governance, _) | (_, RetentionMode::Governance) => {
+            RetentionMode::Governance
+        }
+        (RetentionMode::None, RetentionMode::None) => RetentionMode::None,
+    }
 }
 
 fn current_time_ms() -> Option<i64> {

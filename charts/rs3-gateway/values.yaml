@@ -37,6 +37,9 @@ commit:
 repository:
   id: rs3-repository
   payloadSegmentSizeBytes: 512
+  retention:
+    mode: ""
+    days: 0
 
 repositoryKeys:
   create: false

@@ -45,6 +45,7 @@ impl RuntimeRepository {
             gateway_keyring(&config.repository_keys)?,
             RepositoryOptions {
                 payload_segment_size: config.repository.payload_segment_size,
+                default_retention: config.repository.retention,
             },
         ));
         let coordinator = Arc::new(CommitCoordinator::with_options(
@@ -404,7 +405,8 @@ mod tests {
     use crate::s3::test_support::runtime_config;
     use bytes::Bytes;
     use rs3_repository::RepositoryPutOptions;
-    use rs3_types::LogicalPath;
+    use rs3_storage::BlobStore;
+    use rs3_types::{LogicalPath, RetentionMode, RetentionPolicy};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -443,6 +445,35 @@ mod tests {
 
         assert!(runtime.memory_store().is_some());
         assert!(runtime.memory_anchor().is_some());
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_default_retention_applies_to_writes() {
+        let mut config = runtime_config(true);
+        config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 30));
+        let runtime =
+            RuntimeRepository::from_config(&config).unwrap_or_else(|error| panic!("{error}"));
+
+        let put = runtime
+            .put_committed(
+                LogicalPath::new("snapshots/retained-default.bin")
+                    .unwrap_or_else(|error| panic!("{error}")),
+                Bytes::from_static(b"body"),
+                RepositoryPutOptions::default(),
+            )
+            .await;
+        assert!(put.is_ok());
+
+        let payloads = runtime
+            .memory_store()
+            .unwrap_or_else(|| panic!("missing memory store"))
+            .list_prefix("segments/")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            payloads.first().and_then(|metadata| metadata.retention),
+            Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
+        );
     }
 
     #[tokio::test]

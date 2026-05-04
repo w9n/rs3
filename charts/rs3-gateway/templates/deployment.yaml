@@ -76,6 +76,12 @@ spec:
               value: {{ .Values.repository.id | quote }}
             - name: RS3_PAYLOAD_SEGMENT_SIZE_BYTES
               value: {{ .Values.repository.payloadSegmentSizeBytes | quote }}
+            {{- if .Values.repository.retention.mode }}
+            - name: RS3_REPOSITORY_RETENTION_MODE
+              value: {{ .Values.repository.retention.mode | quote }}
+            - name: RS3_REPOSITORY_RETENTION_DAYS
+              value: {{ .Values.repository.retention.days | quote }}
+            {{- end }}
             {{- if or .Values.repositoryKeys.create .Values.repositoryKeys.existingSecret }}
             - name: RS3_REPOSITORY_MASTER_KEY_HEX
               valueFrom:

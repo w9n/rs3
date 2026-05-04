@@ -172,6 +172,7 @@ fn repository_with_payload_segment_size(
         signing_keyring(),
         crate::RepositoryOptions {
             payload_segment_size,
+            default_retention: None,
         },
     )
 }
@@ -2499,7 +2500,7 @@ async fn orphan_report_marks_retention_blocked_candidates() {
             &retained_object,
             Bytes::from_static(b"retained"),
             PutOptions {
-                retention: Some(retention.clone()),
+                retention: Some(retention),
                 ..PutOptions::default()
             },
         )
@@ -2682,6 +2683,48 @@ async fn delete_tombstones_namespace_and_retains_locked_backend_object() {
     assert_eq!(must(delete).physical, PhysicalDeleteOutcome::Retained);
     assert_eq!(must(listed).len(), 0);
     assert_eq!(must_storage(retained).len(), 1);
+}
+
+#[tokio::test]
+async fn default_retention_applies_to_payload_and_checkpoint() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::with_keyring_and_options(
+        store.clone(),
+        signing_keyring(),
+        crate::RepositoryOptions {
+            payload_segment_size: crate::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+            default_retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
+        },
+    );
+    let anchor = MemoryCheckpointAnchor::new();
+
+    let put = repo
+        .put_committed(
+            key("p/12/default-retention"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+            &anchor,
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let payloads = store
+        .list_prefix("segments/")
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let checkpoints = store
+        .list_prefix(CHECKPOINT_OBJECT_PREFIX)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    assert_eq!(
+        payloads.first().and_then(|metadata| metadata.retention),
+        Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
+    );
+    assert_eq!(
+        checkpoints.first().and_then(|metadata| metadata.retention),
+        Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
+    );
 }
 
 #[tokio::test]

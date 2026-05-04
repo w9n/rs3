@@ -41,6 +41,15 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and (eq .Values.anchor.mode "memory") (not .Values.anchor.allowMemory) -}}
 {{- fail "anchor.mode=memory requires anchor.allowMemory=true; use kubernetes-lease for durable rollback protection" -}}
 {{- end -}}
+{{- if and .Values.repository.retention.mode (and (ne .Values.repository.retention.mode "governance") (ne .Values.repository.retention.mode "compliance")) -}}
+{{- fail "repository.retention.mode must be empty, governance, or compliance" -}}
+{{- end -}}
+{{- if and .Values.repository.retention.mode (not (gt (int .Values.repository.retention.days) 0)) -}}
+{{- fail "repository.retention.days must be greater than zero when repository.retention.mode is set" -}}
+{{- end -}}
+{{- if and (not .Values.repository.retention.mode) (gt (int .Values.repository.retention.days) 0) -}}
+{{- fail "repository.retention.mode is required when repository.retention.days is set" -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "rs3-gateway.repositoryKeySecretName" -}}

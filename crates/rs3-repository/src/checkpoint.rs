@@ -2,7 +2,7 @@
 
 use crate::error::Result;
 use crate::model::CheckpointPosition;
-use crate::service::Repository;
+use crate::service::{Repository, strongest_retention_policy};
 use crate::state::{RepositoryState, TrustedManifest, apply_index_delta_object};
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, CheckpointAnchor};
@@ -201,13 +201,14 @@ where
     pub(crate) async fn persist_signed_checkpoint(&self, checkpoint: &Checkpoint) -> Result<()> {
         let object_id = checkpoint_object_id(&checkpoint.id)?;
         let body = Bytes::from(checkpoint_object_bytes(checkpoint)?);
+        let retention = self.checkpoint_retention_policy()?;
         let put = self
             .store
             .put(
                 &object_id,
                 body.clone(),
                 PutOptions {
-                    retention: None,
+                    retention,
                     content_type: Some(CHECKPOINT_OBJECT_CONTENT_TYPE.to_owned()),
                     do_not_recreate: true,
                 },
@@ -226,6 +227,17 @@ where
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn checkpoint_retention_policy(&self) -> Result<Option<rs3_types::RetentionPolicy>> {
+        let state = self.read_state()?;
+        let mut retention = self.options.default_retention;
+        for delta in &state.pending_index_deltas {
+            if let IndexDelta::Upsert { entry, .. } = delta {
+                retention = strongest_retention_policy(retention, entry.retention);
+            }
+        }
+        Ok(retention)
     }
 
     fn pending_index_delta_object(&self) -> Result<Option<SealedIndexDeltaObject>> {

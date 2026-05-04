@@ -324,7 +324,7 @@ pub enum RetentionMode {
 }
 
 /// Retention policy for backend object versions.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetentionPolicy {
     /// Retention mode.
     pub mode: RetentionMode,

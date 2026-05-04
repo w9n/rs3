@@ -122,6 +122,7 @@ fn runtime_config() -> RuntimeConfig {
         },
         repository: RepositoryConfig {
             payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+            retention: None,
         },
         repository_keys: RepositoryKeysConfig {
             repository_id: "test-repository".to_owned(),

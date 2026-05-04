@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rs3_server::{AnchorConfig, GatewayServer, RuntimeConfig};
+use rs3_types::RetentionMode;
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
@@ -86,6 +87,20 @@ fn log_runtime_config(config: &RuntimeConfig) {
         AnchorConfig::Memory => "memory",
         AnchorConfig::KubernetesLease { .. } => "kubernetes-lease",
     };
+    let repository_retention_mode = config
+        .repository
+        .retention
+        .map(|policy| match policy.mode {
+            RetentionMode::None => "none",
+            RetentionMode::Governance => "governance",
+            RetentionMode::Compliance => "compliance",
+        })
+        .unwrap_or("none");
+    let repository_retention_days = config
+        .repository
+        .retention
+        .map(|policy| policy.retain_days)
+        .unwrap_or(0);
 
     tracing::info!(
         bind = %config.bind,
@@ -99,6 +114,8 @@ fn log_runtime_config(config: &RuntimeConfig) {
         batch_max_delay_ms = config.batching.max_delay.as_millis(),
         batch_max_pending_items = config.batching.max_pending_items,
         payload_segment_size = config.repository.payload_segment_size,
+        repository_retention_mode,
+        repository_retention_days,
         static_credentials = config.static_credentials.is_some(),
         "gateway runtime configuration validated",
     );

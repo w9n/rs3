@@ -929,6 +929,7 @@ where
         keyring()?,
         RepositoryOptions {
             payload_segment_size: args.payload_segment_size,
+            default_retention: None,
         },
     ))
 }

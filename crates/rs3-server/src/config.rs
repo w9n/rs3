@@ -3,7 +3,7 @@
 use crate::identity::StaticCredentials;
 use rs3_crypto::SecretBytes;
 use rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE;
-use rs3_types::PublicBucket;
+use rs3_types::{PublicBucket, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
 use std::fmt;
 use std::net::SocketAddr;
@@ -16,6 +16,8 @@ const DEFAULT_BATCH_ITEMS: usize = 64;
 const DEFAULT_BATCH_DELAY_MS: u64 = 10;
 const REDACTED_SECRET_VALUE: &str = "<redacted>";
 const MIN_REPOSITORY_KEY_HEX_LEN: usize = SecretBytes::MIN_LEN * 2;
+const REPOSITORY_RETENTION_MODE_ENV: &str = "RS3_REPOSITORY_RETENTION_MODE";
+const REPOSITORY_RETENTION_DAYS_ENV: &str = "RS3_REPOSITORY_RETENTION_DAYS";
 
 pub(crate) const REPOSITORY_MASTER_KEY_HEX_ENV: &str = "RS3_REPOSITORY_MASTER_KEY_HEX";
 const REPOSITORY_ID_ENV: &str = "RS3_REPOSITORY_ID";
@@ -94,6 +96,8 @@ pub struct BatchConfig {
 pub struct RepositoryConfig {
     /// Plaintext bytes per independently encrypted payload segment.
     pub payload_segment_size: usize,
+    /// Default provider retention policy for repository-owned objects.
+    pub retention: Option<RetentionPolicy>,
 }
 
 /// Hex-encoded repository master key loaded from external secret storage.
@@ -267,10 +271,47 @@ fn parse_repository_config(source: &impl ConfigSource) -> Result<RepositoryConfi
         source.value("RS3_PAYLOAD_SEGMENT_SIZE_BYTES"),
         DEFAULT_PAYLOAD_SEGMENT_SIZE,
     )?;
+    let retention = parse_retention_policy(source)?;
 
     Ok(RepositoryConfig {
         payload_segment_size,
+        retention,
     })
+}
+
+fn parse_retention_policy(
+    source: &impl ConfigSource,
+) -> Result<Option<RetentionPolicy>, ConfigError> {
+    let mode = optional_value(source, REPOSITORY_RETENTION_MODE_ENV);
+    let days = optional_value(source, REPOSITORY_RETENTION_DAYS_ENV);
+    let Some(mode) = mode else {
+        if let Some(value) = days {
+            return Err(ConfigError::Invalid {
+                key: REPOSITORY_RETENTION_DAYS_ENV,
+                value,
+                reason: format!("{REPOSITORY_RETENTION_MODE_ENV} must also be set"),
+            });
+        }
+        return Ok(None);
+    };
+
+    let retention_mode = match mode.as_str() {
+        "governance" => RetentionMode::Governance,
+        "compliance" => RetentionMode::Compliance,
+        _ => {
+            return Err(ConfigError::Invalid {
+                key: REPOSITORY_RETENTION_MODE_ENV,
+                value: mode,
+                reason: "expected governance or compliance".to_owned(),
+            });
+        }
+    };
+    let retain_days = parse_positive_u32(
+        REPOSITORY_RETENTION_DAYS_ENV,
+        days,
+        format!("{REPOSITORY_RETENTION_DAYS_ENV} is required when repository retention is enabled"),
+    )?;
+    Ok(Some(RetentionPolicy::new(retention_mode, retain_days)))
 }
 
 fn parse_repository_keys_config(
@@ -411,6 +452,34 @@ fn parse_positive_usize(
     Ok(parsed)
 }
 
+fn parse_positive_u32(
+    key: &'static str,
+    value: Option<String>,
+    missing_reason: String,
+) -> Result<u32, ConfigError> {
+    let Some(value) = value else {
+        return Err(ConfigError::Invalid {
+            key,
+            value: String::new(),
+            reason: missing_reason,
+        });
+    };
+    let parsed = value.parse::<u32>().map_err(|error| ConfigError::Invalid {
+        key,
+        value: value.clone(),
+        reason: format!("expected positive integer: {error}"),
+    })?;
+    if parsed == 0 {
+        return Err(ConfigError::Invalid {
+            key,
+            value,
+            reason: "expected value greater than zero".to_owned(),
+        });
+    }
+
+    Ok(parsed)
+}
+
 fn parse_u64(key: &'static str, value: Option<String>, default: u64) -> Result<u64, ConfigError> {
     let Some(value) = value else {
         return Ok(default);
@@ -539,6 +608,7 @@ mod tests {
             config.repository,
             RepositoryConfig {
                 payload_segment_size: 512,
+                retention: None,
             }
         );
         assert_eq!(config.repository_keys, repository_keys_config());
@@ -578,7 +648,36 @@ mod tests {
             config.map(|config| config.repository),
             Ok(RepositoryConfig {
                 payload_segment_size: 65536,
+                retention: None,
             })
+        );
+    }
+
+    #[test]
+    fn parses_repository_retention_policy() {
+        let source = minimal_source()
+            .with(super::REPOSITORY_RETENTION_MODE_ENV, "compliance")
+            .with(super::REPOSITORY_RETENTION_DAYS_ENV, "30");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert_eq!(
+            config.map(|config| config.repository.retention),
+            Ok(Some(rs3_types::RetentionPolicy::new(
+                rs3_types::RetentionMode::Compliance,
+                30
+            )))
+        );
+    }
+
+    #[test]
+    fn rejects_partial_repository_retention_policy() {
+        let source = minimal_source().with(super::REPOSITORY_RETENTION_DAYS_ENV, "30");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::REPOSITORY_RETENTION_DAYS_ENV)
         );
     }
 
