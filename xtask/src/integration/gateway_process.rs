@@ -204,8 +204,12 @@ impl RunningGateway {
                 readers,
             };
             if let Err(error) = wait_for_gateway(addr, &mut gateway.child, startup_timeout).await {
+                let startup_logs = gateway.startup_log_tail();
                 let _ = gateway.shutdown();
-                return Err(error);
+                if startup_logs.is_empty() {
+                    return Err(error);
+                }
+                return Err(error.context(format!("gateway startup logs:\n{startup_logs}")));
             }
             gateway.clear_captured_logs()?;
             return Ok(gateway);
@@ -263,6 +267,13 @@ impl RunningGateway {
             .lock()
             .map_err(|_| anyhow::anyhow!("gateway log capture lock poisoned"))?;
         Ok(logs.clone())
+    }
+
+    fn startup_log_tail(&self) -> String {
+        match self.captured_logs() {
+            Ok(logs) => tail_log_lines(&logs, 80),
+            Err(error) => format!("failed to read captured gateway logs: {error}"),
+        }
     }
 
     pub(crate) fn process_metrics_json(&self) -> Value {
@@ -381,9 +392,14 @@ where
     })
 }
 
+fn tail_log_lines(logs: &[String], max_lines: usize) -> String {
+    let start = logs.len().saturating_sub(max_lines);
+    logs[start..].join("\n")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{kib_to_bytes, ticks_to_seconds};
+    use super::{kib_to_bytes, tail_log_lines, ticks_to_seconds};
 
     #[test]
     fn converts_procfs_kib_fields_to_bytes() {
@@ -395,5 +411,16 @@ mod tests {
     fn converts_procfs_cpu_ticks_to_seconds() {
         assert_eq!(ticks_to_seconds(125, 100), Some(1.25));
         assert_eq!(ticks_to_seconds(125, 0), None);
+    }
+
+    #[test]
+    fn startup_log_tail_keeps_recent_lines() {
+        let logs = (0..100)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>();
+
+        let tail = tail_log_lines(&logs, 3);
+
+        assert_eq!(tail, "line-97\nline-98\nline-99");
     }
 }
