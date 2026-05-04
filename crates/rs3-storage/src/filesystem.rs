@@ -382,7 +382,9 @@ mod tests {
     use bytes::Bytes;
     use rs3_types::{BackendObjectId, RetentionMode, RetentionPolicy};
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir {
         path: PathBuf,
@@ -390,12 +392,9 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("rs3-storage-test-{}-{nanos}", std::process::id()));
+            let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("rs3-storage-test-{}-{id}", std::process::id()));
             Self { path }
         }
 

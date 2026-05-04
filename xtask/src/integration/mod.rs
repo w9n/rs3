@@ -52,6 +52,8 @@ enum IntegrationCommand {
 pub(crate) enum S3ContainerProvider {
     /// RustFS local object storage.
     Rustfs,
+    /// MinIO local object storage.
+    Minio,
 }
 
 #[cfg(feature = "containers")]
@@ -59,6 +61,7 @@ impl S3ContainerProvider {
     pub(crate) fn as_label(self) -> &'static str {
         match self {
             Self::Rustfs => "rustfs",
+            Self::Minio => "minio",
         }
     }
 }

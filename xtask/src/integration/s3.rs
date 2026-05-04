@@ -44,6 +44,12 @@ pub(crate) struct S3LocalArgs {
     /// Use virtual-hosted-style S3 requests.
     #[arg(long, env = "RS3_TEST_S3_VIRTUAL_HOSTED_STYLE")]
     virtual_hosted_style: Option<bool>,
+    /// Run Object Lock retention checks against the bucket.
+    #[arg(long, env = "RS3_TEST_S3_OBJECT_LOCK", default_value_t = false)]
+    object_lock: bool,
+    /// Retention duration used by the Object Lock live test.
+    #[arg(long, env = "RS3_TEST_S3_RETENTION_DAYS")]
+    retention_days: Option<u32>,
 }
 
 pub(crate) fn run_s3_local(args: S3LocalArgs) -> Result<()> {
@@ -62,6 +68,8 @@ fn run_provided_s3(args: S3LocalArgs) -> Result<()> {
         prefix: args.prefix,
         allow_http: args.allow_http,
         virtual_hosted_style: args.virtual_hosted_style,
+        object_lock: args.object_lock,
+        retention_days: args.retention_days,
         credentials: None,
     })
 }
@@ -76,8 +84,14 @@ fn run_container_s3(args: S3LocalArgs) -> Result<()> {
 
 #[cfg(feature = "containers")]
 fn run_container_s3(args: S3LocalArgs) -> Result<()> {
-    let target =
-        s3_container::start_s3_container(args.container_provider, args.bucket, args.region)?;
+    let target = s3_container::start_s3_container_with_options(
+        args.container_provider,
+        args.bucket,
+        args.region,
+        s3_container::S3ContainerOptions {
+            object_lock: args.object_lock,
+        },
+    )?;
 
     run_live_s3_contract(LiveS3Contract {
         provider: args
@@ -89,6 +103,8 @@ fn run_container_s3(args: S3LocalArgs) -> Result<()> {
         prefix: args.prefix,
         allow_http: Some(true),
         virtual_hosted_style: Some(false),
+        object_lock: args.object_lock,
+        retention_days: args.retention_days,
         credentials: Some(AwsCredentials {
             access_key_id: target.access_key_id,
             secret_access_key: target.secret_access_key,
@@ -104,6 +120,8 @@ struct LiveS3Contract {
     prefix: Option<String>,
     allow_http: Option<bool>,
     virtual_hosted_style: Option<bool>,
+    object_lock: bool,
+    retention_days: Option<u32>,
     credentials: Option<AwsCredentials>,
 }
 
@@ -140,6 +158,19 @@ fn run_live_s3_contract(contract: LiveS3Contract) -> Result<()> {
         &mut command,
         "RS3_TEST_S3_VIRTUAL_HOSTED_STYLE",
         contract.virtual_hosted_style,
+    );
+    command.env(
+        "RS3_TEST_S3_OBJECT_LOCK",
+        if contract.object_lock {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    set_env(
+        &mut command,
+        "RS3_TEST_S3_RETENTION_DAYS",
+        contract.retention_days.map(|days| days.to_string()),
     );
     if let Some(credentials) = contract.credentials {
         command.env("AWS_ACCESS_KEY_ID", credentials.access_key_id);
