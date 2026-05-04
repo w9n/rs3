@@ -3,8 +3,9 @@
 use super::S3BoundaryError;
 use super::mapping::{
     collect_body, content_range, etag, i64_len, list_page, logical_path, max_keys,
-    repository_error, resolve_range, timestamp, validate_delete_object_request,
-    validate_get_object_request, validate_head_object_request, validate_put_object_request,
+    put_object_retention_policy, repository_error, resolve_range, retention_headers, timestamp,
+    validate_delete_object_request, validate_get_object_request, validate_head_object_request,
+    validate_put_object_request,
 };
 use super::runtime::RuntimeRepository;
 use crate::RuntimeConfig;
@@ -199,6 +200,7 @@ impl S3 for GatewayS3Service {
             self.check_bucket(&input.bucket)?;
             validate_put_object_request(&input)?;
 
+            let retention = put_object_retention_policy(&input)?;
             let key = logical_path(input.key)?;
             let create_only = match input.if_none_match.as_ref() {
                 Some(s3s::dto::ETagCondition::Any) => true,
@@ -233,7 +235,7 @@ impl S3 for GatewayS3Service {
                     body,
                     RepositoryPutOptions {
                         create_only,
-                        retention: None,
+                        retention,
                     },
                 )
                 .await
@@ -311,6 +313,10 @@ impl S3 for GatewayS3Service {
                 last_modified: Some(timestamp(metadata.modified_at_ms)?),
                 ..GetObjectOutput::default()
             };
+            let (object_lock_mode, object_lock_retain_until_date) =
+                retention_headers(metadata.retention.as_ref(), metadata.modified_at_ms)?;
+            output.object_lock_mode = object_lock_mode;
+            output.object_lock_retain_until_date = object_lock_retain_until_date;
 
             let response = if let Some(range) = resolved_range {
                 output.content_range =
@@ -366,12 +372,16 @@ impl S3 for GatewayS3Service {
                 content_length,
                 "S3 object metadata prepared",
             );
+            let (object_lock_mode, object_lock_retain_until_date) =
+                retention_headers(metadata.retention.as_ref(), metadata.modified_at_ms)?;
             Ok(S3Response::new(HeadObjectOutput {
                 accept_ranges: Some("bytes".to_owned()),
                 content_length: Some(i64_len(content_length)?),
                 content_type: Some("application/octet-stream".to_owned()),
                 e_tag: Some(etag(metadata.content_len, metadata.modified_at_ms)),
                 last_modified: Some(timestamp(metadata.modified_at_ms)?),
+                object_lock_mode,
+                object_lock_retain_until_date,
                 ..HeadObjectOutput::default()
             }))
         }
@@ -553,11 +563,13 @@ mod tests {
     use bytes::Bytes;
     use rs3_anchor::CheckpointAnchor;
     use rs3_storage::BlobStore;
+    use rs3_types::RetentionMode;
     use s3s::dto::{
         DeleteObjectInput, GetObjectInput, HeadBucketInput, HeadObjectInput, ListBucketsInput,
-        ListObjectsV2Input, PutObjectInput, StreamingBlob,
+        ListObjectsV2Input, ObjectLockMode, PutObjectInput, StreamingBlob, Timestamp,
     };
     use s3s::{Body, S3, S3Request, S3Response};
+    use std::time::{Duration, SystemTime};
 
     async fn gateway_service() -> GatewayS3Service {
         GatewayS3Service::from_config(&runtime_config(true))
@@ -766,6 +778,57 @@ mod tests {
             .await
             .expect_err("deleted object should not be visible through HeadObject");
         assert_eq!(*missing.code(), s3s::S3ErrorCode::NoSuchKey);
+    }
+
+    #[tokio::test]
+    async fn put_object_maps_object_lock_retention() {
+        let service = gateway_service().await;
+        let retain_until = Timestamp::from(SystemTime::now() + Duration::from_secs(172_801));
+
+        let put = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/retained.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"retained",
+                )))),
+                object_lock_mode: Some(ObjectLockMode::from_static(ObjectLockMode::COMPLIANCE)),
+                object_lock_retain_until_date: Some(retain_until),
+                ..PutObjectInput::default()
+            }))
+            .await;
+        assert!(put.is_ok());
+
+        let backend_objects = service
+            .repository
+            .memory_store()
+            .unwrap_or_else(|| panic!("missing memory store"))
+            .list_prefix("segments/")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let retention = backend_objects
+            .first()
+            .and_then(|metadata| metadata.retention.as_ref())
+            .unwrap_or_else(|| panic!("missing backend retention"));
+        assert_eq!(retention.mode, RetentionMode::Compliance);
+        assert!(retention.retain_days >= 2);
+
+        let head = service
+            .head_object(s3_request(HeadObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/retained.bin".to_owned(),
+                ..HeadObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            head.output
+                .object_lock_mode
+                .as_ref()
+                .map(|mode| mode.as_str()),
+            Some(ObjectLockMode::COMPLIANCE)
+        );
+        assert!(head.output.object_lock_retain_until_date.is_some());
     }
 
     #[tokio::test]

@@ -4,14 +4,14 @@ use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use rs3_repository::{RepositoryError, RepositoryListEntry};
 use rs3_storage::StorageError;
-use rs3_types::LogicalPath;
+use rs3_types::{LogicalPath, RetentionMode, RetentionPolicy};
 use s3s::S3Result;
 use s3s::dto::{
     CommonPrefix, DeleteObjectInput, GetObjectInput, HeadObjectInput, Object, PutObjectInput,
     StreamingBlob, Timestamp,
 };
 use std::collections::BTreeMap;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(super) struct ListPage {
     pub(super) contents: Vec<Object>,
@@ -59,16 +59,62 @@ pub(super) fn validate_put_object_request(input: &PutObjectInput) -> S3Result<()
             "append-style PutObject is not supported"
         ));
     }
-    if input.object_lock_mode.is_some()
-        || input.object_lock_retain_until_date.is_some()
-        || input.object_lock_legal_hold_status.is_some()
-    {
+    if input.object_lock_legal_hold_status.is_some() {
         return Err(s3s::s3_error!(
             NotImplemented,
-            "per-object lock headers are not mapped by this adapter"
+            "Object Lock legal holds are not supported"
         ));
     }
     Ok(())
+}
+
+pub(super) fn put_object_retention_policy(
+    input: &PutObjectInput,
+) -> S3Result<Option<RetentionPolicy>> {
+    put_object_retention_policy_at(input, SystemTime::now())
+}
+
+fn put_object_retention_policy_at(
+    input: &PutObjectInput,
+    now: SystemTime,
+) -> S3Result<Option<RetentionPolicy>> {
+    let mode = input.object_lock_mode.as_ref();
+    let retain_until = input.object_lock_retain_until_date.as_ref();
+    let (Some(mode), Some(retain_until)) = (mode, retain_until) else {
+        if mode.is_some() || retain_until.is_some() {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "Object Lock mode and retain-until date must be provided together"
+            ));
+        }
+        return Ok(None);
+    };
+
+    let mode = match mode.as_str() {
+        s3s::dto::ObjectLockMode::COMPLIANCE => RetentionMode::Compliance,
+        s3s::dto::ObjectLockMode::GOVERNANCE => RetentionMode::Governance,
+        _ => {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "Object Lock mode is not supported"
+            ));
+        }
+    };
+    let retain_until = timestamp_system_time(retain_until)?;
+    let duration = retain_until.duration_since(now).map_err(|_| {
+        s3s::s3_error!(
+            InvalidRequest,
+            "Object Lock retain-until date must be in the future"
+        )
+    })?;
+    let retain_days = duration.as_secs().div_ceil(86_400).max(1);
+    let retain_days = u32::try_from(retain_days).map_err(|_| {
+        s3s::s3_error!(
+            InvalidRequest,
+            "Object Lock retain-until date exceeds the supported range"
+        )
+    })?;
+    Ok(Some(RetentionPolicy::new(mode, retain_days)))
 }
 
 pub(super) fn validate_get_object_request(input: &GetObjectInput) -> S3Result<()> {
@@ -224,6 +270,45 @@ pub(super) fn timestamp(modified_at_ms: i64) -> S3Result<Timestamp> {
         .checked_add(Duration::from_millis(millis))
         .ok_or_else(|| s3s::s3_error!(InternalError, "object timestamp is out of range"))?;
     Ok(Timestamp::from(system_time))
+}
+
+pub(super) fn retention_headers(
+    retention: Option<&RetentionPolicy>,
+    modified_at_ms: i64,
+) -> S3Result<(
+    Option<s3s::dto::ObjectLockMode>,
+    Option<s3s::dto::ObjectLockRetainUntilDate>,
+)> {
+    let Some(retention) =
+        retention.filter(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
+    else {
+        return Ok((None, None));
+    };
+    let mode = match retention.mode {
+        RetentionMode::Compliance => {
+            s3s::dto::ObjectLockMode::from_static(s3s::dto::ObjectLockMode::COMPLIANCE)
+        }
+        RetentionMode::Governance => {
+            s3s::dto::ObjectLockMode::from_static(s3s::dto::ObjectLockMode::GOVERNANCE)
+        }
+        RetentionMode::None => return Ok((None, None)),
+    };
+    let retain_ms = i64::from(retention.retain_days)
+        .checked_mul(86_400_000)
+        .ok_or_else(|| s3s::s3_error!(InternalError, "retention period is out of range"))?;
+    let retain_until_ms = modified_at_ms
+        .checked_add(retain_ms)
+        .ok_or_else(|| s3s::s3_error!(InternalError, "retention timestamp is out of range"))?;
+    Ok((Some(mode), Some(timestamp(retain_until_ms)?)))
+}
+
+fn timestamp_system_time(timestamp: &Timestamp) -> S3Result<SystemTime> {
+    let date_time: time::OffsetDateTime = timestamp.clone().into();
+    let seconds = u64::try_from(date_time.unix_timestamp())
+        .map_err(|_| s3s::s3_error!(InvalidRequest, "timestamp is outside the supported range"))?;
+    UNIX_EPOCH
+        .checked_add(Duration::new(seconds, date_time.nanosecond()))
+        .ok_or_else(|| s3s::s3_error!(InvalidRequest, "timestamp is out of range"))
 }
 
 pub(super) fn etag(content_len: u64, modified_at_ms: i64) -> s3s::dto::ETag {

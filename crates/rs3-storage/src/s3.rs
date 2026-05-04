@@ -6,6 +6,16 @@ use crate::{
     record_blob_list, record_blob_put,
 };
 use async_trait::async_trait;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::primitives::{ByteStream as SdkByteStream, DateTime as SdkDateTime};
+use aws_sdk_s3::{
+    Client as SdkS3Client,
+    config::{BehaviorVersion, Credentials, Region},
+    types::{
+        ChecksumAlgorithm, ObjectLockMode as SdkObjectLockMode, ObjectLockRetention,
+        ObjectLockRetentionMode,
+    },
+};
 use bytes::Bytes;
 use object_store::aws::{AmazonS3, AmazonS3Builder, S3ConditionalPut};
 use object_store::list::{PaginatedListOptions, PaginatedListStore};
@@ -14,9 +24,9 @@ use object_store::{
     Attribute, Attributes, GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
     PutOptions as ObjectPutOptions,
 };
-use rs3_types::{BackendObjectId, RetentionPolicy};
+use rs3_types::{BackendObjectId, RetentionMode, RetentionPolicy};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Configuration for an S3-backed blob store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,6 +173,7 @@ pub struct S3ProviderOperationMetrics {
 #[derive(Clone, Debug)]
 pub struct S3BlobStore {
     store: AmazonS3,
+    sdk_client: Option<SdkS3Client>,
     config: S3BlobStoreConfig,
     metrics: Arc<RwLock<S3ProviderMetrics>>,
 }
@@ -197,13 +208,20 @@ impl S3BlobStore {
         }
 
         let store = builder.build().map_err(provider_error)?;
-        Ok(Self::from_store(store, config))
+        let sdk_client = sdk_client_from_environment(&config)?;
+        Ok(Self {
+            store,
+            sdk_client,
+            config,
+            metrics: Arc::new(RwLock::new(S3ProviderMetrics::default())),
+        })
     }
 
     /// Builds an S3 blob store from an existing `object_store` S3 client.
     pub fn from_store(store: AmazonS3, config: S3BlobStoreConfig) -> Self {
         Self {
             store,
+            sdk_client: None,
             config,
             metrics: Arc::new(RwLock::new(S3ProviderMetrics::default())),
         }
@@ -234,6 +252,135 @@ impl S3BlobStore {
 
     fn object_path(&self, object_id: &BackendObjectId) -> Result<ObjectPath> {
         object_path(&self.config.object_key(object_id))
+    }
+
+    async fn put_retained_object(
+        &self,
+        object_id: &BackendObjectId,
+        body: Bytes,
+        options: &PutOptions,
+        retention: &RetentionPolicy,
+    ) -> Result<BlobMetadata> {
+        let client = self
+            .sdk_client
+            .as_ref()
+            .ok_or(StorageError::RetentionExtensionUnsupported)?;
+        let retain_until = retain_until_date(retention)?;
+        let lock_mode = sdk_object_lock_mode(retention)?;
+        let key = self.config.object_key(object_id);
+        let content_len = u64::try_from(body.len())
+            .map_err(|_| StorageError::Provider("object length does not fit in u64".to_owned()))?;
+        let mut request = client
+            .put_object()
+            .bucket(self.config.bucket.as_str())
+            .key(key)
+            .body(SdkByteStream::from(body))
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
+            .object_lock_mode(lock_mode)
+            .object_lock_retain_until_date(retain_until);
+
+        if options.do_not_recreate {
+            request = request.if_none_match("*");
+        }
+        if let Some(content_type) = options.content_type.as_deref() {
+            request = request.content_type(content_type);
+        }
+
+        let output = request
+            .send()
+            .await
+            .map_err(|error| map_sdk_put_error(error, object_id))?;
+        let version_id = output.version_id().map(str::to_owned);
+        let mut metadata = self.head_with_sdk(object_id, version_id.as_deref()).await?;
+        verify_retention(metadata.retention.as_ref(), retention)?;
+        metadata.content_len = content_len;
+        metadata.etag = output.e_tag().map(str::to_owned).or(metadata.etag);
+        metadata.version_id = version_id.or(metadata.version_id);
+        Ok(metadata)
+    }
+
+    async fn head_with_sdk(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&str>,
+    ) -> Result<BlobMetadata> {
+        let client = self
+            .sdk_client
+            .as_ref()
+            .ok_or(StorageError::RetentionExtensionUnsupported)?;
+        let mut request = client
+            .head_object()
+            .bucket(self.config.bucket.as_str())
+            .key(self.config.object_key(object_id));
+        if let Some(version_id) = version_id {
+            request = request.version_id(version_id);
+        }
+
+        let output = request
+            .send()
+            .await
+            .map_err(|error| map_sdk_common_error(error, object_id))?;
+        let content_len = output
+            .content_length()
+            .ok_or_else(|| StorageError::Provider("S3 HEAD omitted content length".to_owned()))
+            .and_then(|content_len| {
+                u64::try_from(content_len).map_err(|_| {
+                    StorageError::Provider("S3 HEAD returned negative content length".to_owned())
+                })
+            })?;
+        let modified_at_ms = output
+            .last_modified()
+            .map(|modified_at| modified_at.to_millis())
+            .transpose()
+            .map_err(provider_error)?;
+        let retention = retention_from_s3_head(
+            output.object_lock_mode(),
+            output.object_lock_retain_until_date(),
+        )?;
+
+        Ok(BlobMetadata {
+            object_id: object_id.clone(),
+            content_len,
+            modified_at_ms,
+            etag: output.e_tag().map(str::to_owned),
+            version_id: output.version_id().map(str::to_owned),
+            retention,
+        })
+    }
+
+    async fn extend_s3_retention(
+        &self,
+        object_id: &BackendObjectId,
+        policy: &RetentionPolicy,
+    ) -> Result<()> {
+        if !retention_is_active(policy) {
+            return Ok(());
+        }
+        let client = self
+            .sdk_client
+            .as_ref()
+            .ok_or(StorageError::RetentionExtensionUnsupported)?;
+        let existing = self.head_with_sdk(object_id, None).await?;
+        if retention_satisfies(existing.retention.as_ref(), policy) {
+            return Ok(());
+        }
+
+        let retention = ObjectLockRetention::builder()
+            .mode(sdk_object_lock_retention_mode(policy)?)
+            .retain_until_date(retain_until_date(policy)?)
+            .build();
+        client
+            .put_object_retention()
+            .bucket(self.config.bucket.as_str())
+            .key(self.config.object_key(object_id))
+            .retention(retention)
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
+            .send()
+            .await
+            .map_err(|error| map_sdk_common_error(error, object_id))?;
+
+        let verified = self.head_with_sdk(object_id, None).await?;
+        verify_retention(verified.retention.as_ref(), policy)
     }
 
     fn record_provider_operation(
@@ -352,11 +499,22 @@ impl BlobStore for S3BlobStore {
         let bytes_sent = u64::try_from(requested_len)
             .map_err(|_| StorageError::Provider("object length does not fit in u64".to_owned()))?;
 
-        if options.retention.is_some() {
+        if let Some(retention) = options
+            .retention
+            .as_ref()
+            .filter(|policy| retention_is_active(policy))
+        {
+            let result = self
+                .put_retained_object(object_id, body, &options, retention)
+                .await;
+            let result_label = match &result {
+                Ok(_) => "ok",
+                Err(error) => storage_error_result(error),
+            };
             self.record_provider_operation(
                 S3ProviderOperation::Put,
                 object_kind,
-                "retention_unsupported",
+                result_label,
                 bytes_sent,
                 0,
                 started.elapsed(),
@@ -365,10 +523,10 @@ impl BlobStore for S3BlobStore {
                 object_kind,
                 requested_len,
                 true,
-                "retention_unsupported",
+                result_label,
                 started.elapsed(),
             );
-            return Err(StorageError::RetentionExtensionUnsupported);
+            return result;
         }
 
         let path = self.object_path(object_id)?;
@@ -496,6 +654,25 @@ impl BlobStore for S3BlobStore {
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {
         let started = Instant::now();
         let object_kind = object_kind(object_id);
+
+        if self.sdk_client.is_some() {
+            let result = self.head_with_sdk(object_id, None).await;
+            let result_label = match &result {
+                Ok(_) => "ok",
+                Err(error) => storage_error_result(error),
+            };
+            self.record_provider_operation(
+                S3ProviderOperation::Head,
+                object_kind,
+                result_label,
+                0,
+                0,
+                started.elapsed(),
+            )?;
+            record_blob_head(object_kind, result_label, started.elapsed());
+            return result;
+        }
+
         let path = self.object_path(object_id)?;
 
         match self.store.head(&path).await {
@@ -652,20 +829,25 @@ impl BlobStore for S3BlobStore {
     async fn extend_retention(
         &self,
         object_id: &BackendObjectId,
-        _policy: RetentionPolicy,
+        policy: RetentionPolicy,
     ) -> Result<()> {
         let started = Instant::now();
         let object_kind = object_kind(object_id);
+        let result = self.extend_s3_retention(object_id, &policy).await;
+        let result_label = match &result {
+            Ok(()) => "ok",
+            Err(error) => storage_error_result(error),
+        };
         self.record_provider_operation(
             S3ProviderOperation::ExtendRetention,
             object_kind,
-            "unsupported",
+            result_label,
             0,
             0,
             started.elapsed(),
         )?;
-        record_blob_extend_retention(object_kind, "unsupported", started.elapsed());
-        Err(StorageError::RetentionExtensionUnsupported)
+        record_blob_extend_retention(object_kind, result_label, started.elapsed());
+        result
     }
 
     async fn flush_caches(&self) -> Result<()> {
@@ -759,6 +941,179 @@ fn join_key(prefix: Option<&str>, value: &str) -> String {
     }
 }
 
+fn sdk_client_from_environment(config: &S3BlobStoreConfig) -> Result<Option<SdkS3Client>> {
+    let access_key = optional_env_value("AWS_ACCESS_KEY_ID")?;
+    let secret_key = optional_env_value("AWS_SECRET_ACCESS_KEY")?;
+    let (access_key, secret_key) = match (access_key, secret_key) {
+        (Some(access_key), Some(secret_key)) => (access_key, secret_key),
+        (None, None) => return Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(StorageError::Provider(
+                "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be provided together".to_owned(),
+            ));
+        }
+    };
+
+    let session_token = optional_env_value("AWS_SESSION_TOKEN")?;
+    let region = config
+        .region
+        .clone()
+        .or(optional_env_value("AWS_REGION")?)
+        .or(optional_env_value("AWS_DEFAULT_REGION")?)
+        .unwrap_or_else(|| "us-east-1".to_owned());
+    let credentials = Credentials::new(
+        access_key,
+        secret_key,
+        session_token,
+        None,
+        "rs3-storage-env",
+    );
+    let mut builder = aws_sdk_s3::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new(region))
+        .force_path_style(!config.virtual_hosted_style)
+        .credentials_provider(credentials);
+
+    if let Some(endpoint_url) = config.endpoint_url.as_deref() {
+        builder = builder.endpoint_url(endpoint_url);
+    }
+
+    Ok(Some(SdkS3Client::from_conf(builder.build())))
+}
+
+fn optional_env_value(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(non_blank(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(StorageError::Provider(format!(
+            "{name} must be valid Unicode"
+        ))),
+    }
+}
+
+fn retention_is_active(policy: &RetentionPolicy) -> bool {
+    policy.mode != RetentionMode::None && policy.retain_days > 0
+}
+
+fn retain_until_date(policy: &RetentionPolicy) -> Result<SdkDateTime> {
+    let now_secs = current_epoch_secs()?;
+    let retain_secs = i64::from(policy.retain_days)
+        .checked_mul(86_400)
+        .ok_or_else(|| StorageError::Provider("retention period is out of range".to_owned()))?;
+    let retain_until_secs = now_secs
+        .checked_add(retain_secs)
+        .ok_or_else(|| StorageError::Provider("retention date is out of range".to_owned()))?;
+    Ok(SdkDateTime::from_secs(retain_until_secs))
+}
+
+fn current_epoch_secs() -> Result<i64> {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| StorageError::Provider(error.to_string()))?
+        .as_secs();
+    i64::try_from(secs)
+        .map_err(|_| StorageError::Provider("current time is out of range".to_owned()))
+}
+
+fn sdk_object_lock_mode(policy: &RetentionPolicy) -> Result<SdkObjectLockMode> {
+    match policy.mode {
+        RetentionMode::Compliance => Ok(SdkObjectLockMode::Compliance),
+        RetentionMode::Governance => Ok(SdkObjectLockMode::Governance),
+        RetentionMode::None => Err(StorageError::Provider(
+            "Object Lock mode cannot be None for retained S3 PUT".to_owned(),
+        )),
+    }
+}
+
+fn sdk_object_lock_retention_mode(policy: &RetentionPolicy) -> Result<ObjectLockRetentionMode> {
+    match policy.mode {
+        RetentionMode::Compliance => Ok(ObjectLockRetentionMode::Compliance),
+        RetentionMode::Governance => Ok(ObjectLockRetentionMode::Governance),
+        RetentionMode::None => Err(StorageError::Provider(
+            "Object Lock mode cannot be None for retained S3 operation".to_owned(),
+        )),
+    }
+}
+
+fn retention_from_s3_head(
+    mode: Option<&SdkObjectLockMode>,
+    retain_until_date: Option<&SdkDateTime>,
+) -> Result<Option<RetentionPolicy>> {
+    let (Some(mode), Some(retain_until_date)) = (mode, retain_until_date) else {
+        if mode.is_some() || retain_until_date.is_some() {
+            return Err(StorageError::Provider(
+                "S3 HEAD returned partial Object Lock metadata".to_owned(),
+            ));
+        }
+        return Ok(None);
+    };
+
+    let mode = match mode {
+        SdkObjectLockMode::Compliance => RetentionMode::Compliance,
+        SdkObjectLockMode::Governance => RetentionMode::Governance,
+        _ => {
+            return Err(StorageError::Provider(
+                "S3 HEAD returned an unknown Object Lock mode".to_owned(),
+            ));
+        }
+    };
+    let now_secs = current_epoch_secs()?;
+    let retain_days = if retain_until_date.secs() <= now_secs {
+        0
+    } else {
+        ceil_days_from_seconds(retain_until_date.secs() - now_secs)?
+    };
+    Ok(Some(RetentionPolicy::new(mode, retain_days)))
+}
+
+fn ceil_days_from_seconds(seconds: i64) -> Result<u32> {
+    let seconds = u64::try_from(seconds)
+        .map_err(|_| StorageError::Provider("retention date is before current time".to_owned()))?;
+    let days = seconds.div_ceil(86_400);
+    u32::try_from(days)
+        .map_err(|_| StorageError::Provider("retention period exceeds u32 days".to_owned()))
+}
+
+fn verify_retention(actual: Option<&RetentionPolicy>, requested: &RetentionPolicy) -> Result<()> {
+    if retention_satisfies(actual, requested) {
+        Ok(())
+    } else {
+        Err(StorageError::Provider(
+            "S3 Object Lock verification failed".to_owned(),
+        ))
+    }
+}
+
+fn retention_satisfies(actual: Option<&RetentionPolicy>, requested: &RetentionPolicy) -> bool {
+    if !retention_is_active(requested) {
+        return true;
+    }
+    let Some(actual) = actual else {
+        return false;
+    };
+    retention_mode_strength(actual.mode) >= retention_mode_strength(requested.mode)
+        && actual.retain_days >= requested.retain_days
+}
+
+fn retention_mode_strength(mode: RetentionMode) -> u8 {
+    match mode {
+        RetentionMode::None => 0,
+        RetentionMode::Governance => 1,
+        RetentionMode::Compliance => 2,
+    }
+}
+
+fn storage_error_result(error: &StorageError) -> &'static str {
+    match error {
+        StorageError::AlreadyExists(_) => "already_exists",
+        StorageError::NotFound(_) => "not_found",
+        StorageError::InvalidRange => "invalid_range",
+        StorageError::RetentionBlocked => "retention_blocked",
+        StorageError::RetentionExtensionUnsupported => "retention_unsupported",
+        StorageError::Provider(_) => "error",
+    }
+}
+
 fn metadata_from_object_meta(object_id: BackendObjectId, metadata: ObjectMeta) -> BlobMetadata {
     BlobMetadata {
         object_id,
@@ -816,6 +1171,40 @@ fn map_common_error(error: object_store::Error, object_id: &BackendObjectId) -> 
         object_store::Error::NotFound { .. } => StorageError::NotFound(object_id.clone()),
         _ => provider_error(error),
     }
+}
+
+fn map_sdk_put_error<E, R>(error: SdkError<E, R>, object_id: &BackendObjectId) -> StorageError
+where
+    E: ProvideErrorMetadata,
+    SdkError<E, R>: std::fmt::Display,
+{
+    match sdk_error_code(&error) {
+        Some("PreconditionFailed" | "ConditionalRequestConflict") => {
+            StorageError::AlreadyExists(object_id.clone())
+        }
+        Some("NoSuchKey" | "NotFound") => StorageError::NotFound(object_id.clone()),
+        _ => StorageError::Provider(error.to_string()),
+    }
+}
+
+fn map_sdk_common_error<E, R>(error: SdkError<E, R>, object_id: &BackendObjectId) -> StorageError
+where
+    E: ProvideErrorMetadata,
+    SdkError<E, R>: std::fmt::Display,
+{
+    match sdk_error_code(&error) {
+        Some("NoSuchKey" | "NotFound") => StorageError::NotFound(object_id.clone()),
+        _ => StorageError::Provider(error.to_string()),
+    }
+}
+
+fn sdk_error_code<E, R>(error: &SdkError<E, R>) -> Option<&str>
+where
+    E: ProvideErrorMetadata,
+{
+    error
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::code)
 }
 
 fn provider_error(error: impl std::error::Error) -> StorageError {

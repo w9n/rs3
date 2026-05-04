@@ -3340,6 +3340,7 @@ dependencies = [
  "secrecy",
  "serde_json",
  "thiserror",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3350,6 +3351,7 @@ name = "rs3-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-sdk-s3",
  "bytes",
  "metrics",
  "object_store",
