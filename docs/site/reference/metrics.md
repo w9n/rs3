@@ -49,7 +49,7 @@ Repository metrics cover:
 - backend bytes read and written by operation
 - range mode, returned bytes, and payload span cache behavior
 - list selectivity, candidate counts, and prefix misses
-- commit queue, batch publish, waiter, and phase durations
+- commit queue, batch publish, batch size, waiter, and phase durations
 
 The labels describe behavior without exposing logical names.
 

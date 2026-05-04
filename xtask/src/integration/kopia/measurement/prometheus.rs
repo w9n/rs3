@@ -84,6 +84,8 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
     let mut repository_commit_enqueue_pending_items_by_result = BTreeMap::new();
     let mut repository_commit_batch_publishes_by_result = BTreeMap::new();
     let mut repository_commit_batch_waiters_by_result = BTreeMap::new();
+    let mut repository_commit_batch_waiters_per_publish_counts = BTreeMap::new();
+    let mut repository_commit_batch_waiters_per_publish_sums = BTreeMap::new();
     let mut repository_commit_batch_duration_counts = BTreeMap::new();
     let mut repository_commit_batch_duration_sums = BTreeMap::new();
     let mut repository_commit_put_phase_duration_counts = BTreeMap::new();
@@ -308,6 +310,20 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
                     delta,
                 );
             }
+            "rs3_repository_commit_batch_waiters_per_publish_count" => {
+                bump_f64_label(
+                    &mut repository_commit_batch_waiters_per_publish_counts,
+                    sample.label("result"),
+                    delta,
+                );
+            }
+            "rs3_repository_commit_batch_waiters_per_publish_sum" => {
+                bump_f64_label(
+                    &mut repository_commit_batch_waiters_per_publish_sums,
+                    sample.label("result"),
+                    delta,
+                );
+            }
             "rs3_repository_commit_batch_publish_duration_seconds_count" => {
                 bump_f64_label(
                     &mut repository_commit_batch_duration_counts,
@@ -385,6 +401,10 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
                 "enqueue_pending_items_by_result": repository_commit_enqueue_pending_items_by_result,
                 "batch_publishes_by_result": repository_commit_batch_publishes_by_result,
                 "batch_waiters_by_result": repository_commit_batch_waiters_by_result,
+                "batch_waiters_per_publish_by_result": duration_summary_json(
+                    repository_commit_batch_waiters_per_publish_counts,
+                    repository_commit_batch_waiters_per_publish_sums,
+                ),
                 "batch_publish_duration_seconds_by_result": duration_summary_json(
                     repository_commit_batch_duration_counts,
                     repository_commit_batch_duration_sums,
@@ -676,6 +696,8 @@ rs3_repository_commit_enqueues_total{result="ok"} 4
 rs3_repository_commit_enqueue_pending_items_total{result="ok"} 10
 rs3_repository_commit_batch_publishes_total{result="ok"} 2
 rs3_repository_commit_batch_waiters_total{result="ok"} 4
+rs3_repository_commit_batch_waiters_per_publish_count{result="ok"} 2
+rs3_repository_commit_batch_waiters_per_publish_sum{result="ok"} 4
 rs3_repository_commit_batch_publish_duration_seconds_count{result="ok"} 2
 rs3_repository_commit_batch_publish_duration_seconds_sum{result="ok"} 0.06
 rs3_repository_commit_put_phase_duration_seconds_count{phase="stage_lock_wait"} 4
@@ -821,6 +843,10 @@ rs3_repository_commit_put_phase_duration_seconds_sum{phase="stage_lock_wait"} 0.
         assert_eq!(
             metrics["repository"]["commit"]["batch_waiters_by_result"]["ok"],
             4.0
+        );
+        assert_eq!(
+            metrics["repository"]["commit"]["batch_waiters_per_publish_by_result"]["ok"]["avg"],
+            2.0
         );
         assert_eq!(
             metrics["repository"]["commit"]["batch_publish_duration_seconds_by_result"]["ok"]["avg"],

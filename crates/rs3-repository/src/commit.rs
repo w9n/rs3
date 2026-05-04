@@ -406,6 +406,11 @@ fn record_commit_batch_publish(waiter_count: usize, result: &'static str, elapse
     )
     .increment(usize_to_u64(waiter_count));
     metrics::histogram!(
+        "rs3_repository_commit_batch_waiters_per_publish",
+        "result" => result,
+    )
+    .record(waiter_count as f64);
+    metrics::histogram!(
         "rs3_repository_commit_batch_publish_duration_seconds",
         "result" => result,
     )

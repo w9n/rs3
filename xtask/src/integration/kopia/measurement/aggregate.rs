@@ -211,40 +211,32 @@ pub(crate) fn workload_consistency_json(runs: &[Value]) -> Value {
             profile,
             run_index,
             "direct.source_matches_restore",
-            direct,
-            &["workload", "source_tree"],
-            direct,
-            &["workload", "restored_tree"],
+            value_at(direct, &["workload", "source_tree"]),
+            value_at(direct, &["workload", "restored_tree"]),
         );
         push_tree_consistency_check(
             &mut checks,
             profile,
             run_index,
             "gateway.source_matches_restore",
-            gateway,
-            &["workload", "source_tree"],
-            gateway,
-            &["workload", "restored_tree"],
+            value_at(gateway, &["workload", "source_tree"]),
+            value_at(gateway, &["workload", "restored_tree"]),
         );
         push_tree_consistency_check(
             &mut checks,
             profile,
             run_index,
             "direct_source_matches_gateway_source",
-            direct,
-            &["workload", "source_tree"],
-            gateway,
-            &["workload", "source_tree"],
+            value_at(direct, &["workload", "source_tree"]),
+            value_at(gateway, &["workload", "source_tree"]),
         );
         push_tree_consistency_check(
             &mut checks,
             profile,
             run_index,
             "direct_restore_matches_gateway_restore",
-            direct,
-            &["workload", "restored_tree"],
-            gateway,
-            &["workload", "restored_tree"],
+            value_at(direct, &["workload", "restored_tree"]),
+            value_at(gateway, &["workload", "restored_tree"]),
         );
     }
 
@@ -481,6 +473,12 @@ fn aggregate_reports(reports: &[&Value]) -> Value {
                         "repository",
                         "commit",
                         "batch_waiters_by_result",
+                    ]),
+                    "batch_waiters_per_publish_by_result": aggregate_operation_latency_at(reports, &[
+                        "prometheus_metrics",
+                        "repository",
+                        "commit",
+                        "batch_waiters_per_publish_by_result",
                     ]),
                     "batch_publish_duration_seconds_by_result": aggregate_operation_latency_at(reports, &[
                         "prometheus_metrics",
@@ -810,13 +808,9 @@ fn push_tree_consistency_check(
     profile: &str,
     run_index: u64,
     metric: &'static str,
-    left: &Value,
-    left_path: &[&str],
-    right: &Value,
-    right_path: &[&str],
+    left: Option<&Value>,
+    right: Option<&Value>,
 ) {
-    let left = value_at(left, left_path);
-    let right = value_at(right, right_path);
     checks.push(serde_json::json!({
         "profile": profile,
         "run": run_index,
@@ -1015,6 +1009,13 @@ mod tests {
                                 "miss": 300
                             },
                             "commit": {
+                                "batch_waiters_per_publish_by_result": {
+                                    "ok": {
+                                        "count": 2.0,
+                                        "sum": 4.0,
+                                        "avg": 2.0
+                                    }
+                                },
                                 "put_phase_duration_seconds_by_phase": {
                                     "stage_lock_wait": {
                                         "count": 4.0,
@@ -1137,6 +1138,11 @@ mod tests {
             aggregate["gateway"]["prometheus_metrics"]["request_body_collect_duration_seconds"]["PutObject"]
                 ["avg"]["avg"],
             serde_json::json!(0.02)
+        );
+        assert_eq!(
+            aggregate["gateway"]["prometheus_metrics"]["repository"]["commit"]["batch_waiters_per_publish_by_result"]
+                ["ok"]["avg"]["avg"],
+            serde_json::json!(2.0)
         );
         assert_eq!(
             aggregate["gateway"]["prometheus_metrics"]["repository"]["commit"]["put_phase_duration_seconds_by_phase"]
