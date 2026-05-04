@@ -35,6 +35,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if not .Values.repository.id -}}
 {{- fail "repository.id is required; use a stable value for key derivation" -}}
 {{- end -}}
+{{- if and (ne .Values.repositoryKeys.source "master-key") (ne .Values.repositoryKeys.source "keyring-envelope") -}}
+{{- fail "repositoryKeys.source must be master-key or keyring-envelope" -}}
+{{- end -}}
 {{- if and (ne .Values.anchor.mode "memory") (ne .Values.anchor.mode "kubernetes-lease") -}}
 {{- fail "anchor.mode must be memory or kubernetes-lease" -}}
 {{- end -}}
@@ -60,6 +63,21 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- if and (not .Values.repository.retention.mode) (gt (int .Values.repository.retention.days) 0) -}}
 {{- fail "repository.retention.mode is required when repository.retention.days is set" -}}
+{{- end -}}
+{{- if and .Values.repositoryKeys.create (not .Values.repositoryKeys.saltHex) -}}
+{{- fail "repositoryKeys.saltHex is required when repositoryKeys.create=true" -}}
+{{- end -}}
+{{- if and .Values.repositoryKeys.create (eq .Values.repositoryKeys.source "master-key") (not .Values.repositoryKeys.masterKeyHex) -}}
+{{- fail "repositoryKeys.masterKeyHex is required when repositoryKeys.create=true and repositoryKeys.source=master-key" -}}
+{{- end -}}
+{{- if and .Values.repositoryKeys.create (eq .Values.repositoryKeys.source "keyring-envelope") (not .Values.repositoryKeys.envelopeObjectId) -}}
+{{- fail "repositoryKeys.envelopeObjectId is required when repositoryKeys.create=true and repositoryKeys.source=keyring-envelope" -}}
+{{- end -}}
+{{- if and .Values.repositoryKeys.create (eq .Values.repositoryKeys.source "keyring-envelope") (not .Values.repositoryKeys.wrappingKeyId) -}}
+{{- fail "repositoryKeys.wrappingKeyId is required when repositoryKeys.create=true and repositoryKeys.source=keyring-envelope" -}}
+{{- end -}}
+{{- if and .Values.repositoryKeys.create (eq .Values.repositoryKeys.source "keyring-envelope") (not .Values.repositoryKeys.wrappingKeyHex) -}}
+{{- fail "repositoryKeys.wrappingKeyHex is required when repositoryKeys.create=true and repositoryKeys.source=keyring-envelope" -}}
 {{- end -}}
 {{- end -}}
 

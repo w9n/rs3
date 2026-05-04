@@ -83,6 +83,21 @@ Use:
 
 ```sh
 cargo run -p rs3-server -- doctor
+cargo run -p rs3-server -- doctor --profile production
 ```
 
-The command validates runtime configuration and redacts secrets in debug output.
+The local profile validates runtime configuration and redacts secrets in debug
+output. The production profile also rejects memory anchors, direct master-key
+mode, missing repository retention, retention-unsupported local backends, and
+missing gateway credentials.
+
+## Helm Key Source
+
+The chart selects the repository key source with `repositoryKeys.source`:
+
+| Value | Secret keys |
+| --- | --- |
+| `master-key` | `salt-hex`, `master-key-hex` |
+| `keyring-envelope` | `salt-hex`, `envelope-object-id`, `wrapping-key-id`, `wrapping-key-hex` |
+
+Use `keyring-envelope` for production-like deployments.

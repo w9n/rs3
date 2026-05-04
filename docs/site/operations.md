@@ -12,6 +12,16 @@ starting the listener:
 cargo run -p rs3-server -- doctor
 ```
 
+For production posture checks:
+
+```sh
+cargo run -p rs3-server -- doctor --profile production
+```
+
+The production profile rejects memory anchors, direct master-key mode, missing
+repository retention, retention-unsupported local backends, and missing gateway
+credentials.
+
 For serving:
 
 ```sh
@@ -63,6 +73,8 @@ For S3-compatible storage, build the task with the S3 feature and use
 `--backend s3` plus the `RS3_KEYRING_S3_*` settings. The generated output gives
 the `RS3_REPOSITORY_ID`, `RS3_REPOSITORY_SALT_HEX`,
 `RS3_KEYRING_ENVELOPE_OBJECT_ID`, and wrapping-key settings for the gateway.
+In Helm, set `repositoryKeys.source=keyring-envelope` and provide the generated
+envelope fields through `repositoryKeys.create=true` or an existing Secret.
 
 Rotate the wrapping key without rewriting backup data:
 

@@ -42,10 +42,14 @@ repository:
     days: 0
 
 repositoryKeys:
+  source: master-key
   create: false
   existingSecret: ""
   masterKeyHex: ""
   saltHex: ""
+  envelopeObjectId: ""
+  wrappingKeyId: ""
+  wrappingKeyHex: ""
 
 anchor:
   mode: kubernetes-lease
