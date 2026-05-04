@@ -3429,6 +3429,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hmac 0.12.1",
+ "ring",
  "rs3-types",
  "sha2 0.10.9",
  "thiserror",

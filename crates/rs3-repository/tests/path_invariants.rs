@@ -114,7 +114,7 @@ fn signing_keyring() -> KeyRing {
             "signing",
             KeyPurpose::CheckpointSigning,
             KeyStatus::Primary,
-            "hmac-sha256",
+            "ed25519",
             3,
         ),
     ])
@@ -143,6 +143,7 @@ fn key_material(
             created_at_ms: 0,
             not_before_ms: None,
             not_after_ms: None,
+            public_key: None,
             external_kms_uri: None,
         },
         secret(secret_byte),

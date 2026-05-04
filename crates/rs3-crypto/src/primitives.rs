@@ -19,19 +19,3 @@ pub(crate) fn derive_hmac(
     mac.update(material);
     Ok(mac.finalize().into_bytes().to_vec())
 }
-
-/// Verifies a domain-separated HMAC tag.
-pub(crate) fn verify_hmac(
-    repository_secret: &SecretBytes,
-    domain: &[u8],
-    material: &[u8],
-    tag: &[u8],
-) -> Result<(), CryptoError> {
-    let mut mac = HmacSha256::new_from_slice(repository_secret.expose())
-        .map_err(|_| CryptoError::InvalidHmacKey)?;
-    mac.update(domain);
-    mac.update(&[0]);
-    mac.update(material);
-    mac.verify_slice(tag)
-        .map_err(|_| CryptoError::SignatureMismatch)
-}

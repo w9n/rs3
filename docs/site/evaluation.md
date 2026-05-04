@@ -50,8 +50,8 @@ The result is a system that should be evaluated on three axes:
 ## Current Product Risks
 
 - The repository format is draft.
-- Metadata sealing uses a standard misuse-resistant AEAD, but durable envelopes
-  and checkpoint signatures still need final production-format decisions.
+- Metadata sealing uses a standard misuse-resistant AEAD, but durable envelope
+  compatibility is not stable yet.
 - Some leakage is inherent: object counts, sizes, coarse timing, and operation
   cadence remain visible to the backend.
 - Hardened Kubernetes anchor wiring and storage-side evidence need continued

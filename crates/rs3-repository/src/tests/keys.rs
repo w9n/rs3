@@ -33,7 +33,7 @@ fn repository_new_derives_purpose_specific_keys_from_master_key() {
             (
                 key_id("checkpoint-v1"),
                 KeyPurpose::CheckpointSigning,
-                "hmac-sha256".to_owned()
+                "ed25519".to_owned()
             ),
         ]
     );

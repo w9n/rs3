@@ -1,5 +1,6 @@
 //! Purpose-specific repository keyrings.
 
+use crate::checkpoint::derive_checkpoint_public_key_descriptor;
 use crate::primitives::derive_hmac;
 use crate::{CryptoError, SecretBytes};
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, RepositoryId};
@@ -8,7 +9,7 @@ use std::collections::BTreeSet;
 const NAMESPACE_ALGORITHM: &str = "hmac-sha256";
 const CONTENT_ALGORITHM: &str = "xchacha20poly1305";
 const METADATA_ALGORITHM: &str = "aes-256-gcm-siv-hmac-sha256-nonce-v1";
-const CHECKPOINT_ALGORITHM: &str = "hmac-sha256";
+const CHECKPOINT_ALGORITHM: &str = "ed25519";
 
 /// Minimum public repository salt length accepted by the production KDF path.
 pub const MIN_REPOSITORY_SALT_LEN: usize = 32;
@@ -113,6 +114,7 @@ impl KeyRing {
         master_key: &SecretBytes,
         context: &RepositoryKeyContext,
     ) -> Result<Self, CryptoError> {
+        let checkpoint_secret = derive_repository_subkey(master_key, context, b"checkpoint")?;
         Self::new(vec![
             KeyMaterial::new(
                 default_namespace_descriptor(),
@@ -127,8 +129,8 @@ impl KeyRing {
                 derive_repository_subkey(master_key, context, b"metadata")?,
             ),
             KeyMaterial::new(
-                default_checkpoint_descriptor(),
-                derive_repository_subkey(master_key, context, b"checkpoint")?,
+                default_checkpoint_descriptor(&checkpoint_secret)?,
+                checkpoint_secret,
             ),
         ])
     }
@@ -330,6 +332,7 @@ fn default_namespace_descriptor() -> KeyDescriptor {
         created_at_ms: 0,
         not_before_ms: None,
         not_after_ms: None,
+        public_key: None,
         external_kms_uri: None,
     }
 }
@@ -343,6 +346,7 @@ fn default_metadata_descriptor() -> KeyDescriptor {
         created_at_ms: 0,
         not_before_ms: None,
         not_after_ms: None,
+        public_key: None,
         external_kms_uri: None,
     }
 }
@@ -356,12 +360,13 @@ fn default_content_descriptor() -> KeyDescriptor {
         created_at_ms: 0,
         not_before_ms: None,
         not_after_ms: None,
+        public_key: None,
         external_kms_uri: None,
     }
 }
 
-fn default_checkpoint_descriptor() -> KeyDescriptor {
-    KeyDescriptor {
+fn default_checkpoint_descriptor(secret: &SecretBytes) -> Result<KeyDescriptor, CryptoError> {
+    Ok(KeyDescriptor {
         id: static_key_id("checkpoint-v1"),
         purpose: KeyPurpose::CheckpointSigning,
         algorithm: CHECKPOINT_ALGORITHM.to_string(),
@@ -369,8 +374,9 @@ fn default_checkpoint_descriptor() -> KeyDescriptor {
         created_at_ms: 0,
         not_before_ms: None,
         not_after_ms: None,
+        public_key: Some(derive_checkpoint_public_key_descriptor(secret)?),
         external_kms_uri: None,
-    }
+    })
 }
 
 fn static_key_id(value: &str) -> KeyId {
@@ -410,6 +416,7 @@ mod tests {
                 created_at_ms: 0,
                 not_before_ms: None,
                 not_after_ms: None,
+                public_key: None,
                 external_kms_uri: None,
             },
             secret(secret_byte),
@@ -499,9 +506,21 @@ mod tests {
                 (
                     key_id("checkpoint-v1"),
                     KeyPurpose::CheckpointSigning,
-                    "hmac-sha256".to_owned()
+                    "ed25519".to_owned()
                 ),
             ]
+        );
+
+        let checkpoint = keyring
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.purpose == KeyPurpose::CheckpointSigning)
+            .unwrap_or_else(|| panic!("missing checkpoint key descriptor"));
+        assert!(
+            checkpoint
+                .public_key
+                .as_deref()
+                .is_some_and(|public_key| public_key.starts_with("ed25519:"))
         );
 
         let mut secrets = keyring

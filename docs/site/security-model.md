@@ -74,7 +74,7 @@ batching, compaction jitter, and stricter telemetry redaction.
 | Repository key reuse is compartmentalized | Purpose keys are derived from the master key, repository ID, and public salt. | Crypto key-derivation tests. |
 | Old content remains readable after rotation | Enabled historical content keys are accepted for reads. | Repository key rotation tests. |
 | Writes are not acknowledged before checkpoint acceptance | Commit coordinator waits for covering checkpoint. | Commit coordinator and checkpoint tests. |
-| Storage rollback is not trusted as latest state | Checkpoint verification plus external anchor model. | Anchor and checkpoint replay tests. |
+| Storage rollback is not trusted as latest state | Ed25519 checkpoint verification plus external anchor model. | Anchor and checkpoint replay tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 
 ## Rollback Rule
@@ -104,7 +104,6 @@ records. Do not use it as the only anti-rollback mechanism.
 - Durable format compatibility is not promised yet.
 - Metadata sealing now uses a standard misuse-resistant AEAD, but the durable
   envelope format is still not stable.
-- Checkpoint signatures still need a final production primitive decision.
 - Prefix token shape currently prioritizes semantics and testability; it still
   leaks namespace structure through token count and shared-token relationships.
 - Hardened storage evidence needs continued deployment integration.

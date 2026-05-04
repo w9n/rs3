@@ -69,14 +69,16 @@ The repository uses purpose-specific keys for:
 - namespace PRF
 - content encryption
 - metadata and index encryption
-- checkpoint signing
+- Ed25519 checkpoint signing
 
 New writes use primary keys. Reads and replay accept enabled historical keys
 until retention and migration policy allow retirement.
 
 Gateway-derived default keyrings bind the master key to a repository ID and a
 stable public repository salt. Both values must remain unchanged for the life of
-the repository.
+the repository. Checkpoint-signing descriptors include the Ed25519 public
+verification key so checkpoint payloads can be verified without exposing signing
+material.
 
 ## Compatibility Promise
 
@@ -84,7 +86,6 @@ There is no stable-format promise yet. Before a stable format, the project still
 decisions for:
 
 - canonical metadata encoding
-- checkpoint signature scheme
 - default segment-size policy
 - index compaction thresholds
 - padding policy

@@ -279,7 +279,11 @@ pub struct KeyDescriptor {
     pub not_before_ms: Option<i64>,
     /// Optional upper validity bound in milliseconds since the Unix epoch.
     pub not_after_ms: Option<i64>,
+    /// Optional hex-encoded public verification key for asymmetric keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
     /// Optional external KMS key URI when material is provider-managed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_kms_uri: Option<String>,
 }
 

@@ -77,7 +77,7 @@ pub(super) fn checkpoint_key(value: &str, status: KeyStatus, secret_byte: u8) ->
         value,
         KeyPurpose::CheckpointSigning,
         status,
-        "hmac-sha256",
+        "ed25519",
         secret_byte,
     )
 }
@@ -118,6 +118,7 @@ fn key_material(
             created_at_ms: 0,
             not_before_ms: None,
             not_after_ms: None,
+            public_key: None,
             external_kms_uri: None,
         },
         secret_with_byte(secret_byte),

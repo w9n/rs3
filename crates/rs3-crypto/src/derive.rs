@@ -187,6 +187,7 @@ mod tests {
                 created_at_ms: 0,
                 not_before_ms: None,
                 not_after_ms: None,
+                public_key: None,
                 external_kms_uri: None,
             },
             secret(secret_byte),
