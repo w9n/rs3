@@ -18,7 +18,7 @@ use rs3_storage::{
 };
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
-use rs3_types::LogicalPath;
+use rs3_types::{LogicalPath, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -30,6 +30,8 @@ type RuntimeCommitCoordinator = CommitCoordinator<RuntimeStore, RuntimeAnchor>;
 #[derive(Clone)]
 pub(super) struct RuntimeRepository {
     coordinator: Arc<RuntimeCommitCoordinator>,
+    #[cfg(feature = "s3")]
+    s3_store: Option<S3BlobStore>,
     #[cfg(test)]
     memory_store: Option<MemoryBlobStore>,
     #[cfg(test)]
@@ -56,6 +58,8 @@ impl RuntimeRepository {
 
         Ok(Self {
             coordinator,
+            #[cfg(feature = "s3")]
+            s3_store: store.s3_store,
             #[cfg(test)]
             memory_store: store.memory_store,
             #[cfg(test)]
@@ -81,6 +85,22 @@ impl RuntimeRepository {
             checkpoint_id = %accepted.checkpoint_id,
             "repository checkpoint loaded from external anchor",
         );
+        Ok(())
+    }
+
+    pub(super) async fn validate_backend_retention(
+        &self,
+        retention: Option<RetentionPolicy>,
+    ) -> Result<(), S3BoundaryError> {
+        #[cfg(feature = "s3")]
+        if let Some(store) = self.s3_store.as_ref() {
+            return store
+                .validate_retention_support(retention.as_ref())
+                .await
+                .map_err(repository_init);
+        }
+
+        let _ = retention;
         Ok(())
     }
 
@@ -132,6 +152,8 @@ impl RuntimeRepository {
 
 struct StoreBuild {
     handle: RuntimeStore,
+    #[cfg(feature = "s3")]
+    s3_store: Option<S3BlobStore>,
     #[cfg(test)]
     memory_store: Option<MemoryBlobStore>,
 }
@@ -147,6 +169,8 @@ fn build_store(config: &BackendConfig) -> Result<StoreBuild, S3BoundaryError> {
         let store = MemoryBlobStore::new();
         return Ok(StoreBuild {
             handle: RuntimeStore::new(store.clone()),
+            #[cfg(feature = "s3")]
+            s3_store: None,
             #[cfg(test)]
             memory_store: Some(store),
         });
@@ -156,6 +180,8 @@ fn build_store(config: &BackendConfig) -> Result<StoreBuild, S3BoundaryError> {
         let store = FilesystemBlobStore::new(root).map_err(repository_init)?;
         return Ok(StoreBuild {
             handle: RuntimeStore::new(store),
+            #[cfg(feature = "s3")]
+            s3_store: None,
             #[cfg(test)]
             memory_store: None,
         });
@@ -164,7 +190,8 @@ fn build_store(config: &BackendConfig) -> Result<StoreBuild, S3BoundaryError> {
     #[cfg(feature = "s3")]
     if let Some(store) = s3_backend_store(config)? {
         return Ok(StoreBuild {
-            handle: RuntimeStore::new(store),
+            handle: RuntimeStore::new(store.clone()),
+            s3_store: Some(store),
             #[cfg(test)]
             memory_store: None,
         });

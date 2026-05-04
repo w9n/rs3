@@ -34,6 +34,9 @@ pub(super) struct GatewayS3Service {
 impl GatewayS3Service {
     pub(super) async fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
         let repository = RuntimeRepository::from_config(config)?;
+        repository
+            .validate_backend_retention(config.repository.retention)
+            .await?;
         repository.load_accepted_checkpoint().await?;
 
         Ok(Self {

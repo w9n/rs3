@@ -12,8 +12,8 @@ use aws_sdk_s3::{
     Client as SdkS3Client,
     config::{BehaviorVersion, Credentials, Region},
     types::{
-        ChecksumAlgorithm, ObjectLockMode as SdkObjectLockMode, ObjectLockRetention,
-        ObjectLockRetentionMode,
+        BucketVersioningStatus, ChecksumAlgorithm, ObjectLockEnabled,
+        ObjectLockMode as SdkObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode,
     },
 };
 use bytes::Bytes;
@@ -247,6 +247,71 @@ impl S3BlobStore {
             .write()
             .map_err(|_| StorageError::Provider("S3 metrics lock poisoned".to_owned()))?;
         *metrics = S3ProviderMetrics::default();
+        Ok(())
+    }
+
+    /// Validates that the configured bucket can enforce S3 Object Lock retention.
+    ///
+    /// This is intended for startup checks when repository-level retention is
+    /// enabled. It fails closed if the direct S3 SDK client is unavailable, if
+    /// bucket versioning is not enabled, or if Object Lock is not enabled.
+    pub async fn validate_retention_support(
+        &self,
+        retention: Option<&RetentionPolicy>,
+    ) -> Result<()> {
+        let Some(retention) = retention.filter(|policy| retention_is_active(policy)) else {
+            return Ok(());
+        };
+        let client = self
+            .sdk_client
+            .as_ref()
+            .ok_or(StorageError::RetentionExtensionUnsupported)?;
+
+        let versioning = client
+            .get_bucket_versioning()
+            .bucket(self.config.bucket.as_str())
+            .send()
+            .await
+            .map_err(|error| {
+                StorageError::Provider(format!("failed to read S3 bucket versioning: {error}"))
+            })?;
+        if versioning
+            .status()
+            .is_none_or(|status| status != &BucketVersioningStatus::Enabled)
+        {
+            return Err(StorageError::Provider(
+                "S3 Object Lock retention requires bucket versioning to be Enabled".to_owned(),
+            ));
+        }
+
+        let object_lock = client
+            .get_object_lock_configuration()
+            .bucket(self.config.bucket.as_str())
+            .send()
+            .await
+            .map_err(|error| {
+                StorageError::Provider(format!(
+                    "failed to read S3 Object Lock configuration: {error}"
+                ))
+            })?;
+        let object_lock_enabled = object_lock
+            .object_lock_configuration()
+            .and_then(|configuration| configuration.object_lock_enabled())
+            .is_some_and(|enabled| enabled == &ObjectLockEnabled::Enabled);
+        if !object_lock_enabled {
+            return Err(StorageError::Provider(
+                "S3 Object Lock retention requires bucket Object Lock to be Enabled".to_owned(),
+            ));
+        }
+
+        tracing::info!(
+            target: "rs3_storage",
+            provider = "s3",
+            bucket = %self.config.bucket,
+            retention_mode = retention_mode_label(retention.mode),
+            retention_days = retention.retain_days,
+            "S3 Object Lock retention support validated",
+        );
         Ok(())
     }
 
@@ -1103,6 +1168,14 @@ fn retention_mode_strength(mode: RetentionMode) -> u8 {
     }
 }
 
+fn retention_mode_label(mode: RetentionMode) -> &'static str {
+    match mode {
+        RetentionMode::None => "none",
+        RetentionMode::Governance => "governance",
+        RetentionMode::Compliance => "compliance",
+    }
+}
+
 fn storage_error_result(error: &StorageError) -> &'static str {
     match error {
         StorageError::AlreadyExists(_) => "already_exists",
@@ -1213,9 +1286,11 @@ fn provider_error(error: impl std::error::Error) -> StorageError {
 
 #[cfg(test)]
 mod tests {
-    use super::{S3BlobStoreConfig, object_get_options};
+    use super::{S3BlobStore, S3BlobStoreConfig, object_get_options};
     use crate::{ByteRange, StorageError};
+    use object_store::aws::AmazonS3Builder;
     use rs3_types::BackendObjectId;
+    use rs3_types::{RetentionMode, RetentionPolicy};
 
     fn object_id(value: &str) -> BackendObjectId {
         BackendObjectId::new(value).unwrap_or_else(|error| panic!("{error}"))
@@ -1244,5 +1319,28 @@ mod tests {
             object_get_options(ByteRange::Slice { offset: 10, len: 0 }).map(|_| ()),
             Err(StorageError::InvalidRange)
         );
+    }
+
+    #[tokio::test]
+    async fn retention_validation_fails_without_sdk_client() {
+        let config = S3BlobStoreConfig::new("bucket")
+            .unwrap_or_else(|error| panic!("{error}"))
+            .with_endpoint_url(Some("http://127.0.0.1:9".to_owned()))
+            .with_allow_http(true);
+        let object_store = AmazonS3Builder::new()
+            .with_bucket_name("bucket")
+            .with_endpoint("http://127.0.0.1:9")
+            .with_allow_http(true)
+            .with_access_key_id("access")
+            .with_secret_access_key("secret")
+            .build()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let store = S3BlobStore::from_store(object_store, config);
+
+        let result = store
+            .validate_retention_support(Some(&RetentionPolicy::new(RetentionMode::Compliance, 30)))
+            .await;
+
+        assert_eq!(result, Err(StorageError::RetentionExtensionUnsupported));
     }
 }
