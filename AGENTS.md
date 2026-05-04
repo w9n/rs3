@@ -79,6 +79,12 @@ Before merging a feature, answer these questions in the change description:
 
 ## Agent Workflow
 
+- Before starting non-trivial work, update the active todo/plan with the current
+  requirements, constraints, and intended verification. Keep the plan current as
+  requirements change.
+- When new user instructions arrive, first compare them with the active plan and
+  previously stated requirements. If they conflict, let the newest instruction
+  steer the work and update the plan before editing code or docs.
 - Read relevant docs before editing: `README.md`, `docs/site/index.md`,
   `docs/site/architecture.md`, `docs/site/security-model.md`,
   `docs/site/reference/repository-format.md`, and any crate-local docs.
