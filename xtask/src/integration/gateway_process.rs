@@ -122,6 +122,8 @@ impl RunningGateway {
             .env("RS3_BACKEND_ENDPOINT", &backend.endpoint_url)
             .env("RS3_BACKEND_BUCKET", &backend.bucket)
             .env("RS3_BACKEND_PREFIX", backend_prefix)
+            .env("RS3_ANCHOR_MODE", "memory")
+            .env("RS3_ALLOW_MEMORY_ANCHOR", "true")
             .env("RS3_REPOSITORY_MASTER_KEY_HEX", REPOSITORY_MASTER_KEY_HEX)
             .env("RS3_STATIC_ACCESS_KEY_ID", ACCESS_KEY_ID)
             .env("RS3_STATIC_SECRET_ACCESS_KEY", SECRET_ACCESS_KEY)

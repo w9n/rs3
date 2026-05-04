@@ -11,7 +11,6 @@ use std::time::Duration;
 use thiserror::Error;
 
 const DEFAULT_BIND: &str = "127.0.0.1:9080";
-const DEFAULT_ANCHOR_MODE: &str = "memory";
 const DEFAULT_ANCHOR_FIELD_MANAGER: &str = "rs3-server";
 const DEFAULT_BATCH_ITEMS: usize = 64;
 const DEFAULT_BATCH_DELAY_MS: u64 = 10;
@@ -19,6 +18,7 @@ const REDACTED_SECRET_VALUE: &str = "<redacted>";
 const MIN_REPOSITORY_KEY_HEX_LEN: usize = SecretBytes::MIN_LEN * 2;
 
 pub(crate) const REPOSITORY_MASTER_KEY_HEX_ENV: &str = "RS3_REPOSITORY_MASTER_KEY_HEX";
+const ALLOW_MEMORY_ANCHOR_ENV: &str = "RS3_ALLOW_MEMORY_ANCHOR";
 
 /// Complete runtime configuration for the gateway process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,12 +200,24 @@ fn parse_metrics_config(source: &impl ConfigSource) -> Result<MetricsConfig, Con
 }
 
 fn parse_anchor_config(source: &impl ConfigSource) -> Result<AnchorConfig, ConfigError> {
-    let mode = source
-        .value("RS3_ANCHOR_MODE")
-        .unwrap_or_else(|| DEFAULT_ANCHOR_MODE.to_owned());
+    let mode = required_value(source, "RS3_ANCHOR_MODE")?;
 
     match mode.as_str() {
-        "memory" => Ok(AnchorConfig::Memory),
+        "memory" => {
+            if parse_bool(
+                ALLOW_MEMORY_ANCHOR_ENV,
+                source.value(ALLOW_MEMORY_ANCHOR_ENV),
+                false,
+            )? {
+                Ok(AnchorConfig::Memory)
+            } else {
+                Err(ConfigError::Invalid {
+                    key: "RS3_ANCHOR_MODE",
+                    value: mode,
+                    reason: format!("memory anchor requires {ALLOW_MEMORY_ANCHOR_ENV}=true"),
+                })
+            }
+        }
         "kubernetes-lease" => Ok(AnchorConfig::KubernetesLease {
             namespace: required_value(source, "RS3_ANCHOR_NAMESPACE")?,
             name: required_value(source, "RS3_ANCHOR_NAME")?,
@@ -405,6 +417,26 @@ fn parse_u64(key: &'static str, value: Option<String>, default: u64) -> Result<u
     })
 }
 
+fn parse_bool(
+    key: &'static str,
+    value: Option<String>,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+
+    match value.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(ConfigError::Invalid {
+            key,
+            value,
+            reason: "expected true or false".to_owned(),
+        }),
+    }
+}
+
 fn secret_string_eq(left: &SecretString, right: &SecretString) -> bool {
     constant_time_eq(
         left.expose_secret().as_bytes(),
@@ -462,6 +494,8 @@ mod tests {
             .with("RS3_PUBLIC_BUCKET", "client-bucket")
             .with("RS3_BACKEND_ENDPOINT", "https://object.example")
             .with("RS3_BACKEND_BUCKET", "backend-bucket")
+            .with("RS3_ANCHOR_MODE", "memory")
+            .with(super::ALLOW_MEMORY_ANCHOR_ENV, "true")
             .with(super::REPOSITORY_MASTER_KEY_HEX_ENV, MASTER_KEY_HEX)
     }
 
@@ -590,6 +624,37 @@ mod tests {
                 name: "checkpoint".to_owned(),
                 field_manager: "rs3-controller".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn rejects_missing_anchor_mode() {
+        let source = minimal_source().without("RS3_ANCHOR_MODE");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(matches!(config, Err(ConfigError::Missing { key }) if key == "RS3_ANCHOR_MODE"));
+    }
+
+    #[test]
+    fn rejects_memory_anchor_without_explicit_allowance() {
+        let source = minimal_source().without(super::ALLOW_MEMORY_ANCHOR_ENV);
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == "RS3_ANCHOR_MODE")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_memory_anchor_allowance() {
+        let source = minimal_source().with(super::ALLOW_MEMORY_ANCHOR_ENV, "yes");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::ALLOW_MEMORY_ANCHOR_ENV)
         );
     }
 
