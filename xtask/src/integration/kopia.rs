@@ -589,6 +589,59 @@ fn add_common_budget_checks(
                 ],
                 1.10,
             );
+            push_optional_max_budget(
+                checks,
+                profile,
+                summary,
+                "gateway_vs_direct.backend_request_count_ratio.relative_stddev",
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "backend_request_count_ratio",
+                    "relative_stddev",
+                ],
+                0.05,
+            );
+            push_optional_max_budget(
+                checks,
+                profile,
+                summary,
+                "gateway_vs_direct.backend_read_bytes_ratio.relative_stddev",
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "backend_read_bytes_ratio",
+                    "relative_stddev",
+                ],
+                0.05,
+            );
+            push_optional_max_budget(
+                checks,
+                profile,
+                summary,
+                "gateway_internal.backend_read_bytes_per_client_get_response_byte.relative_stddev",
+                &[
+                    "comparison",
+                    "gateway_internal",
+                    "backend_read_bytes_per_client_get_response_byte",
+                    "relative_stddev",
+                ],
+                0.05,
+            );
+            push_optional_max_budget(
+                checks,
+                profile,
+                summary,
+                "gateway_vs_direct.phase_elapsed_ms_ratio.restore.relative_stddev",
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "phase_elapsed_ms_ratio",
+                    "restore",
+                    "relative_stddev",
+                ],
+                0.35,
+            );
         }
         _ => {}
     }
@@ -619,6 +672,37 @@ fn push_min_budget(
 }
 
 #[cfg(any(feature = "containers", test))]
+fn push_optional_max_budget(
+    checks: &mut Vec<serde_json::Value>,
+    profile: &str,
+    summary: &serde_json::Value,
+    metric: &'static str,
+    path: &[&str],
+    limit: f64,
+) {
+    let observed = value_f64_at(summary, path);
+    let status = match observed {
+        Some(observed) if observed <= limit => "pass",
+        Some(_) => "fail",
+        None => "skip",
+    };
+    checks.push(serde_json::json!({
+        "profile": profile,
+        "metric": metric,
+        "operator": "<=",
+        "limit": limit,
+        "observed_avg": observed,
+        "observed": observed,
+        "status": status,
+        "reason": if observed.is_none() {
+            Some("metric unavailable")
+        } else {
+            None
+        },
+    }));
+}
+
+#[cfg(any(feature = "containers", test))]
 fn push_budget(
     checks: &mut Vec<serde_json::Value>,
     profile: &str,
@@ -640,7 +724,19 @@ fn push_budget(
         "operator": operator,
         "limit": limit,
         "observed_avg": observed,
-        "status": if passed { "pass" } else { "fail" },
+        "observed": observed,
+        "status": if observed.is_none() {
+            "fail"
+        } else if passed {
+            "pass"
+        } else {
+            "fail"
+        },
+        "reason": if observed.is_none() {
+            Some("metric unavailable")
+        } else {
+            None
+        },
     }));
 }
 
@@ -1020,6 +1116,110 @@ mod tests {
 
         assert_eq!(budgets["status"], serde_json::json!("pass"));
         assert_eq!(budgets["failed"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn larger_restore_budgets_skip_stability_without_repeated_samples() {
+        let profiles = serde_json::json!({
+            "kubernetes-objects": {
+                "comparison": {
+                    "gateway_vs_direct": {
+                        "backend_request_count_ratio": {
+                            "avg": 1.00,
+                            "relative_stddev": null
+                        },
+                        "backend_read_bytes_ratio": {
+                            "avg": 1.04,
+                            "relative_stddev": null
+                        },
+                        "backend_write_bytes_ratio": { "avg": 1.04 },
+                        "phase_elapsed_ms_ratio": {
+                            "restore": {
+                                "avg": 1.04,
+                                "relative_stddev": null
+                            }
+                        }
+                    },
+                    "gateway_internal": {
+                        "backend_read_bytes_per_client_get_response_byte": {
+                            "avg": 1.04,
+                            "relative_stddev": null
+                        },
+                        "backend_write_bytes_per_client_put_request_byte": { "avg": 1.04 }
+                    }
+                }
+            }
+        });
+
+        let budgets = regression_budgets_json(&profiles, 512);
+
+        assert_eq!(budgets["status"], serde_json::json!("pass"));
+        assert_eq!(budgets["failed"], serde_json::json!(0));
+        assert!(
+            budgets["checks"]
+                .as_array()
+                .unwrap_or_else(|| panic!("checks should be an array"))
+                .iter()
+                .any(|check| {
+                    check["metric"]
+                        == serde_json::json!(
+                            "gateway_vs_direct.backend_read_bytes_ratio.relative_stddev"
+                        )
+                        && check["status"] == serde_json::json!("skip")
+                })
+        );
+    }
+
+    #[test]
+    fn larger_restore_budgets_fail_unstable_repeated_metrics() {
+        let profiles = serde_json::json!({
+            "postgres-pgdata": {
+                "comparison": {
+                    "gateway_vs_direct": {
+                        "backend_request_count_ratio": {
+                            "avg": 1.00,
+                            "relative_stddev": 0.01
+                        },
+                        "backend_read_bytes_ratio": {
+                            "avg": 1.04,
+                            "relative_stddev": 0.12
+                        },
+                        "backend_write_bytes_ratio": { "avg": 1.04 },
+                        "phase_elapsed_ms_ratio": {
+                            "restore": {
+                                "avg": 1.04,
+                                "relative_stddev": 0.10
+                            }
+                        }
+                    },
+                    "gateway_internal": {
+                        "backend_read_bytes_per_client_get_response_byte": {
+                            "avg": 1.04,
+                            "relative_stddev": 0.02
+                        },
+                        "backend_write_bytes_per_client_put_request_byte": { "avg": 1.04 }
+                    }
+                }
+            }
+        });
+
+        let budgets = regression_budgets_json(&profiles, 512);
+
+        assert_eq!(budgets["status"], serde_json::json!("fail"));
+        assert_eq!(budgets["failed"], serde_json::json!(1));
+        assert!(
+            budgets["checks"]
+                .as_array()
+                .unwrap_or_else(|| panic!("checks should be an array"))
+                .iter()
+                .any(|check| {
+                    check["metric"]
+                        == serde_json::json!(
+                            "gateway_vs_direct.backend_read_bytes_ratio.relative_stddev"
+                        )
+                        && check["status"] == serde_json::json!("fail")
+                })
+        );
     }
 
     #[test]

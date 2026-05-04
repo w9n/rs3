@@ -982,4 +982,74 @@ mod tests {
             serde_json::json!(0.0)
         );
     }
+
+    #[test]
+    fn ratio_summaries_include_repeated_run_variability() {
+        let runs = vec![
+            serde_json::json!({
+                "run": 1,
+                "reports": [
+                    {
+                        "storage_path": "direct-rustfs",
+                        "backend_metrics": {
+                            "counts": {
+                                "requests": 10,
+                                "bytes_read": 1000
+                            }
+                        }
+                    },
+                    {
+                        "storage_path": "gateway",
+                        "backend_metrics": {
+                            "counts": {
+                                "get": 10,
+                                "bytes_read": 1000
+                            }
+                        },
+                        "client_metrics": {
+                            "counts_by_operation": {
+                                "GetObject": 10
+                            }
+                        }
+                    }
+                ]
+            }),
+            serde_json::json!({
+                "run": 2,
+                "reports": [
+                    {
+                        "storage_path": "direct-rustfs",
+                        "backend_metrics": {
+                            "counts": {
+                                "requests": 10,
+                                "bytes_read": 1000
+                            }
+                        }
+                    },
+                    {
+                        "storage_path": "gateway",
+                        "backend_metrics": {
+                            "counts": {
+                                "get": 10,
+                                "bytes_read": 1500
+                            }
+                        },
+                        "client_metrics": {
+                            "counts_by_operation": {
+                                "GetObject": 10
+                            }
+                        }
+                    }
+                ]
+            }),
+        ];
+
+        let comparison = compare_runs(&runs);
+        let read_ratio = &comparison["gateway_vs_direct"]["backend_read_bytes_ratio"];
+
+        assert_eq!(read_ratio["samples"], serde_json::json!(2));
+        assert_eq!(read_ratio["avg"], serde_json::json!(1.25));
+        assert_eq!(read_ratio["spread"], serde_json::json!(0.5));
+        assert_eq!(read_ratio["relative_stddev"], serde_json::json!(0.2));
+    }
 }

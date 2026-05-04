@@ -41,8 +41,12 @@ pub(super) fn summarize_u64(values: &[u64]) -> Value {
             "samples": 0,
             "min": null,
             "p50": null,
+            "p95": null,
             "max": null,
             "avg": null,
+            "stddev": null,
+            "relative_stddev": null,
+            "spread": null,
         });
     }
 
@@ -50,12 +54,17 @@ pub(super) fn summarize_u64(values: &[u64]) -> Value {
     sorted.sort_unstable();
     let sum = sorted.iter().copied().map(u128::from).sum::<u128>();
     let avg = sum as f64 / sorted.len() as f64;
+    let stddev = stddev_u64(&sorted, avg);
     serde_json::json!({
         "samples": sorted.len(),
         "min": sorted[0],
         "p50": percentile_u64(&sorted, 0.50),
+        "p95": percentile_u64(&sorted, 0.95),
         "max": sorted[sorted.len() - 1],
         "avg": avg,
+        "stddev": stddev,
+        "relative_stddev": relative_stddev(stddev, avg, sorted.len()),
+        "spread": sorted[sorted.len() - 1].saturating_sub(sorted[0]),
     })
 }
 
@@ -65,20 +74,29 @@ pub(super) fn summarize_f64(values: &[f64]) -> Value {
             "samples": 0,
             "min": null,
             "p50": null,
+            "p95": null,
             "max": null,
             "avg": null,
+            "stddev": null,
+            "relative_stddev": null,
+            "spread": null,
         });
     }
 
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     let avg = sorted.iter().copied().sum::<f64>() / sorted.len() as f64;
+    let stddev = stddev_f64(&sorted, avg);
     serde_json::json!({
         "samples": sorted.len(),
         "min": sorted[0],
         "p50": percentile_f64(&sorted, 0.50),
+        "p95": percentile_f64(&sorted, 0.95),
         "max": sorted[sorted.len() - 1],
         "avg": avg,
+        "stddev": stddev,
+        "relative_stddev": relative_stddev(stddev, avg, sorted.len()),
+        "spread": sorted[sorted.len() - 1] - sorted[0],
     })
 }
 
@@ -122,4 +140,36 @@ fn percentile_f64(sorted: &[f64], quantile: f64) -> f64 {
         .saturating_sub(1)
         .min(sorted.len() - 1);
     sorted[index]
+}
+
+fn stddev_u64(values: &[u64], avg: f64) -> f64 {
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = *value as f64 - avg;
+            delta * delta
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt()
+}
+
+fn stddev_f64(values: &[f64], avg: f64) -> f64 {
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = *value - avg;
+            delta * delta
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt()
+}
+
+fn relative_stddev(stddev: f64, avg: f64, samples: usize) -> Option<f64> {
+    if samples < 2 || avg == 0.0 {
+        None
+    } else {
+        Some(stddev / avg.abs())
+    }
 }
