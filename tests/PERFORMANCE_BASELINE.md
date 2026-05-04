@@ -152,6 +152,27 @@ Interpretation:
   provider PUT work was 0.76 s; the next performance target is gateway-side
   request/body handling and commit wait around snapshot creation.
 
+## Expanded Restore Sanity Run
+
+Run date: 2026-05-04. Workload set: `larger-restores`. This is the latest
+performance artifact, but it uses one direct/gateway run pair per profile, so
+it validates expanded workload shape and budget wiring rather than replacing
+the three-run release matrix above.
+
+Artifact:
+`.local/integration/`.
+
+`workload_consistency` passed for every profile and `regression_budgets`
+reported `status: "pass"`.
+
+| Profile | Shape | Elapsed ratio | Backend requests | Backend reads | Backend writes | Gateway CPU | Gateway HWM RSS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| medium-restore | one 64 MiB object | 1.04x | 1.16x | 1.03x | 1.03x | 1.15 s | 100.14 MiB |
+| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 0.28x | 1.01x | 1.05x | 1.03x | 1.71 s | 105.40 MiB |
+| kubernetes-objects-large | 6,144 manifests plus a 128 MiB etcd-like fragment | 0.20x | 1.00x | 1.05x | 1.03x | 5.99 s | 210.27 MiB |
+| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.25x | 1.10x | 1.03x | 1.03x | 2.99 s | 230.54 MiB |
+| postgres-pgdata-large | larger relation/WAL/dump-shaped data directory | 1.62x | 1.10x | 1.03x | 1.03x | 5.93 s | 293.73 MiB |
+
 ## Regression Budgets
 
 The measured matrix now emits a `regression_budgets` block. The hard gate is
