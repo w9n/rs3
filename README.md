@@ -30,14 +30,16 @@ just check
 Equivalent Cargo commands inside the shell:
 
 ```sh
-cargo fmt --check
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+mkdocs build --strict
 ```
 
 The documentation site uses Material for MkDocs:
 
 ```sh
+just docs-check
 just docs-build
 just docs-serve
 ```

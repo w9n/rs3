@@ -24,11 +24,13 @@ The equivalent manual path is:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+mkdocs build --strict
 ```
 
 ## Build The Docs
 
 ```sh
+just docs-check
 just docs-build
 ```
 

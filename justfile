@@ -16,6 +16,7 @@ check:
     taplo fmt --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
+    just docs-check
 
 check-s3:
     cargo clippy -p rs3-storage -p rs3-server -p xtask --features rs3-server/s3,xtask/s3 --all-targets -- -D warnings
@@ -95,6 +96,9 @@ doc:
     cargo doc --workspace --no-deps
 
 docs-build:
+    just docs-check
+
+docs-check:
     mkdocs build --strict
 
 docs-serve *ARGS:

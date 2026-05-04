@@ -44,7 +44,7 @@ durable bytes and observable names.
 | Claim | Evidence |
 | --- | --- |
 | Default checks pass | `just check` |
-| Docs build | `just docs-build` inside Nix |
+| Docs build | `just docs-check` inside Nix |
 | S3 storage contract | `just integration-s3-local --mode container` |
 | Gateway S3 path | `just integration-s3-gateway` |
 | Kopia restore | `just integration-kopia-gateway` |
