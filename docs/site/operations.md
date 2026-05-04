@@ -194,8 +194,10 @@ cargo run -p xtask --bin xtask --features s3 -- restore verify \
 
 This is not just an S3 object listing. It verifies checkpoint signatures,
 checkpoint evidence, keyring envelope digest, encrypted index state, sealed
-metadata, and payload decryptability. Use S3 CLI checks separately for provider
-capabilities such as Object Lock headers and raw range reads.
+metadata, and payload decryptability. The report also summarizes provider
+retention and legal-hold metadata observed on the restore-critical objects it
+checked. Use S3 CLI checks separately for provider capabilities such as Object
+Lock headers and raw range reads.
 
 See [Restore Under Attack](runbooks/restore-under-attack.md) for the incident
 runbook.

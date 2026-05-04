@@ -102,6 +102,23 @@ pub struct RestoreVerificationReport {
     pub payload_plaintext_bytes: u64,
     /// Key identifiers required by the verified checkpoint chain.
     pub required_key_ids: Vec<KeyId>,
+    /// Provider protection observed on verified restore-critical objects.
+    pub protection: RestoreProtectionSummary,
+}
+
+/// Provider protection summary for restore-critical backend objects.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestoreProtectionSummary {
+    /// Restore-critical backend objects whose metadata was checked.
+    pub checked_object_count: usize,
+    /// Objects with a non-empty provider retention policy.
+    pub retention_object_count: usize,
+    /// Objects whose known retention policy would block deletion.
+    pub retention_delete_blocked_count: usize,
+    /// Objects with legal hold enabled.
+    pub legal_hold_object_count: usize,
+    /// Minimum configured retention duration observed across retained objects.
+    pub minimum_retention_days: Option<u32>,
 }
 
 impl RepositoryOrphanCandidate {

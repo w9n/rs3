@@ -19,7 +19,7 @@ pub use model::{
     BackendObjectReferenceKind, CheckpointPosition, CommittedPut, DeleteOutcome,
     PhysicalDeleteOutcome, ReachableBackendObject, RepositoryListEntry, RepositoryObjectMetadata,
     RepositoryOrphanCandidate, RepositoryOrphanReport, RepositoryPutOptions,
-    RestoreVerificationReport,
+    RestoreProtectionSummary, RestoreVerificationReport,
 };
 pub use payload::DEFAULT_PAYLOAD_SEGMENT_SIZE;
 pub use service::{Repository, RepositoryOptions};

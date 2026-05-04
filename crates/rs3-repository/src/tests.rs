@@ -8,8 +8,8 @@ use crate::namespace::{indexed_list_prefix, indexed_list_prefix_mode, prefix_tok
 use crate::payload::PAYLOAD_HEADER_PROBE_LEN;
 use crate::{
     BackendObjectReferenceKind, CheckpointPosition, CommitCoordinator, CommitCoordinatorOptions,
-    PhysicalDeleteOutcome, Repository, RepositoryError, RepositoryOrphanCandidate,
-    RepositoryPutOptions,
+    PhysicalDeleteOutcome, Repository, RepositoryError, RepositoryOptions,
+    RepositoryOrphanCandidate, RepositoryPutOptions,
 };
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, CheckpointAnchor, MemoryCheckpointAnchor};

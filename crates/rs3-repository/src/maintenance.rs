@@ -8,7 +8,8 @@ use crate::checkpoint::{
 use crate::error::{RepositoryError, Result};
 use crate::model::{
     BackendObjectReferenceKind, CheckpointPosition, ReachableBackendObject,
-    RepositoryOrphanCandidate, RepositoryOrphanReport, RestoreVerificationReport,
+    RepositoryOrphanCandidate, RepositoryOrphanReport, RestoreProtectionSummary,
+    RestoreVerificationReport,
 };
 use crate::payload::{open_payload_object, parse_segmented_payload_header};
 use crate::service::Repository;
@@ -18,7 +19,7 @@ use rs3_index::{
     checkpoint_evidence_bytes,
 };
 use rs3_storage::{BlobStore, ByteRange};
-use rs3_types::{BackendObjectId, KeyId};
+use rs3_types::{BackendObjectId, KeyId, LegalHoldStatus, RetentionMode};
 use std::collections::BTreeSet;
 
 const INDEX_DELTA_OBJECT_PREFIX: &str = "index/";
@@ -155,11 +156,16 @@ where
         let mut verified_payloads = BTreeSet::new();
         let mut payload_plaintext_bytes = 0_u64;
         let mut required_key_ids = BTreeSet::new();
+        let mut protection = RestoreProtectionSummary::default();
 
         for checkpoint in checkpoints.into_iter().rev() {
             let position = self.verify_signed_checkpoint(&checkpoint, previous.as_ref())?;
+            let checkpoint_backend_object_id = checkpoint_object_id(&checkpoint.id)?;
+            summarize_object_protection(self, &checkpoint_backend_object_id, &mut protection)
+                .await?;
             required_key_ids.insert(checkpoint.signature_key_id.clone());
-            verify_checkpoint_evidence_object(self, &position).await?;
+            let evidence_object_id = verify_checkpoint_evidence_object(self, &position).await?;
+            summarize_object_protection(self, &evidence_object_id, &mut protection).await?;
             checkpoint_count += 1;
             checkpoint_evidence_count += 1;
 
@@ -167,9 +173,11 @@ where
                 && verified_keyring_envelopes.insert(envelope.object_id.clone())
             {
                 verify_keyring_envelope_object(self, envelope).await?;
+                summarize_object_protection(self, &envelope.object_id, &mut protection).await?;
             }
 
             for object_id in &checkpoint.record.index_deltas {
+                summarize_object_protection(self, object_id, &mut protection).await?;
                 let sealed_delta = self.read_sealed_index_delta_object(object_id).await?;
                 required_key_ids.insert(sealed_delta.key_id.clone());
                 let delta = open_index_delta_object(&keyring, object_id, &sealed_delta)?;
@@ -180,6 +188,7 @@ where
                     &mut verified_payloads,
                     &mut payload_plaintext_bytes,
                     &mut required_key_ids,
+                    &mut protection,
                 )
                 .await?;
                 index_delta_object_count += 1;
@@ -200,6 +209,7 @@ where
                     &mut verified_payloads,
                     &mut payload_plaintext_bytes,
                     &mut required_key_ids,
+                    &mut protection,
                 )
                 .await?;
                 inline_index_delta_count += 1;
@@ -230,6 +240,7 @@ where
             payload_object_count: verified_payloads.len(),
             payload_plaintext_bytes,
             required_key_ids: required_key_ids.into_iter().collect(),
+            protection,
         })
     }
 }
@@ -251,7 +262,7 @@ fn insert_delta_payload_references(
 async fn verify_checkpoint_evidence_object<S>(
     repo: &Repository<S>,
     position: &CheckpointPosition,
-) -> Result<()>
+) -> Result<BackendObjectId>
 where
     S: BlobStore,
 {
@@ -267,7 +278,7 @@ where
         return Err(RepositoryError::CheckpointEvidenceObjectConflict { object_id });
     }
 
-    Ok(())
+    Ok(object_id)
 }
 
 async fn verify_keyring_envelope_object<S>(
@@ -299,6 +310,7 @@ async fn verify_index_delta_payloads<S>(
     verified_payloads: &mut BTreeSet<BackendObjectId>,
     payload_plaintext_bytes: &mut u64,
     required_key_ids: &mut BTreeSet<KeyId>,
+    protection: &mut RestoreProtectionSummary,
 ) -> Result<()>
 where
     S: BlobStore,
@@ -340,7 +352,36 @@ where
                 object_id: entry.object_id,
             });
         }
+        summarize_object_protection(repo, &entry.object_id, protection).await?;
         *payload_plaintext_bytes = payload_plaintext_bytes.saturating_add(plaintext_len);
+    }
+
+    Ok(())
+}
+
+async fn summarize_object_protection<S>(
+    repo: &Repository<S>,
+    object_id: &BackendObjectId,
+    summary: &mut RestoreProtectionSummary,
+) -> Result<()>
+where
+    S: BlobStore,
+{
+    let metadata = repo.store.head(object_id).await?;
+    summary.checked_object_count = summary.checked_object_count.saturating_add(1);
+    if let Some(policy) = metadata.retention {
+        summary.retention_object_count = summary.retention_object_count.saturating_add(1);
+        summary.minimum_retention_days = Some(match summary.minimum_retention_days {
+            Some(existing) => existing.min(policy.retain_days),
+            None => policy.retain_days,
+        });
+        if policy.mode != RetentionMode::None && policy.retain_days > 0 {
+            summary.retention_delete_blocked_count =
+                summary.retention_delete_blocked_count.saturating_add(1);
+        }
+    }
+    if metadata.legal_hold == Some(LegalHoldStatus::On) {
+        summary.legal_hold_object_count = summary.legal_hold_object_count.saturating_add(1);
     }
 
     Ok(())

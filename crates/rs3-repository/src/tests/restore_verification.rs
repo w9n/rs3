@@ -48,6 +48,37 @@ async fn verify_restore_reports_checkpoint_evidence_and_payloads() {
 }
 
 #[tokio::test]
+async fn verify_restore_reports_retention_protection_summary() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::with_keyring_and_options(
+        store,
+        signing_keyring(),
+        RepositoryOptions {
+            payload_segment_size: crate::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+            default_retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
+        },
+    );
+    let anchor = MemoryCheckpointAnchor::new();
+    let committed = must(
+        repo.put_committed(
+            key("restore/retained"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+            &anchor,
+        )
+        .await,
+    );
+
+    let report = must(repo.verify_restore(&committed.checkpoint).await);
+
+    assert_eq!(report.protection.checked_object_count, 3);
+    assert_eq!(report.protection.retention_object_count, 3);
+    assert_eq!(report.protection.retention_delete_blocked_count, 3);
+    assert_eq!(report.protection.legal_hold_object_count, 0);
+    assert_eq!(report.protection.minimum_retention_days, Some(30));
+}
+
+#[tokio::test]
 async fn verify_restore_rejects_tampered_checkpoint_evidence() {
     let store = MemoryBlobStore::new();
     let repo = Repository::with_keyring(store.clone(), signing_keyring());

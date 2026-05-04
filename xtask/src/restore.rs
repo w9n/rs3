@@ -340,6 +340,13 @@ fn print_report_json(report: &RestoreVerificationReport) -> Result<()> {
             "payload_plaintext_bytes": report.payload_plaintext_bytes,
             "required_key_ids": required_key_ids,
         },
+        "protection": {
+            "checked_objects": report.protection.checked_object_count,
+            "retention_objects": report.protection.retention_object_count,
+            "retention_delete_blocked_objects": report.protection.retention_delete_blocked_count,
+            "legal_hold_objects": report.protection.legal_hold_object_count,
+            "minimum_retention_days": report.protection.minimum_retention_days,
+        },
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
@@ -356,6 +363,25 @@ fn print_report_text(report: &RestoreVerificationReport) {
     println!("keyring_envelopes={}", report.keyring_envelope_count);
     println!("payload_objects={}", report.payload_object_count);
     println!("payload_plaintext_bytes={}", report.payload_plaintext_bytes);
+    println!(
+        "protection_checked_objects={}",
+        report.protection.checked_object_count
+    );
+    println!(
+        "protection_retention_objects={}",
+        report.protection.retention_object_count
+    );
+    println!(
+        "protection_retention_delete_blocked_objects={}",
+        report.protection.retention_delete_blocked_count
+    );
+    println!(
+        "protection_legal_hold_objects={}",
+        report.protection.legal_hold_object_count
+    );
+    if let Some(days) = report.protection.minimum_retention_days {
+        println!("protection_minimum_retention_days={days}");
+    }
 }
 
 #[cfg(test)]
