@@ -11,6 +11,7 @@ use crate::{
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor, MemoryCheckpointAnchor};
 use rs3_crypto::{KeyRing, KeyringEnvelope, RepositoryKeyContext, SecretBytes};
+use rs3_index::KeyringEnvelopeReference;
 #[cfg(feature = "k8s")]
 use rs3_k8s::{KubernetesLeaseAnchor, LeaseSettings};
 use rs3_repository::{
@@ -47,15 +48,18 @@ impl RuntimeRepository {
     pub(super) async fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
         let store = build_store(&config.backend).await?;
         let anchor = build_anchor(&config.anchor)?;
-        let keyring = gateway_keyring(&store.handle, &config.repository_keys).await?;
+        let loaded_keyring = gateway_keyring(&store.handle, &config.repository_keys).await?;
         let repository = Arc::new(Repository::with_keyring_and_options(
             store.handle.clone(),
-            keyring,
+            loaded_keyring.keyring,
             RepositoryOptions {
                 payload_segment_size: config.repository.payload_segment_size,
                 default_retention: config.repository.retention,
             },
         ));
+        repository
+            .set_keyring_envelope_reference(loaded_keyring.envelope_reference)
+            .map_err(repository_init)?;
         let coordinator = Arc::new(CommitCoordinator::with_options(
             repository,
             anchor.handle.clone(),
@@ -421,15 +425,19 @@ impl CheckpointAnchor for DynCheckpointAnchor {
 async fn gateway_keyring(
     store: &RuntimeStore,
     keys: &RepositoryKeysConfig,
-) -> Result<KeyRing, S3BoundaryError> {
+) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
     let salt = repository_salt(&keys.repository_salt_hex)?;
     let context =
         RepositoryKeyContext::new(keys.repository_id.clone(), salt).map_err(repository_init)?;
     match &keys.source {
         RepositoryKeySource::MasterKey { master_key_hex } => {
             let master_key = secret_hex(REPOSITORY_MASTER_KEY_HEX_ENV, master_key_hex)?;
-            KeyRing::from_repository_master_key_for_context(&master_key, &context)
-                .map_err(repository_init)
+            let keyring = KeyRing::from_repository_master_key_for_context(&master_key, &context)
+                .map_err(repository_init)?;
+            Ok(LoadedGatewayKeyring {
+                keyring,
+                envelope_reference: None,
+            })
         }
         RepositoryKeySource::KeyringEnvelope {
             envelope_object_id,
@@ -442,11 +450,25 @@ async fn gateway_keyring(
                 .map_err(repository_init)?;
             let envelope = KeyringEnvelope::from_object_bytes(&body).map_err(repository_init)?;
             let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, wrapping_key_hex)?;
-            envelope
+            let keyring = envelope
                 .open(&context, wrapping_key_id, &wrapping_key)
-                .map_err(repository_init)
+                .map_err(repository_init)?;
+            let reference = KeyringEnvelopeReference {
+                generation: envelope.generation,
+                digest: envelope.digest().map_err(repository_init)?,
+                object_id: envelope_object_id.clone(),
+            };
+            Ok(LoadedGatewayKeyring {
+                keyring,
+                envelope_reference: Some(reference),
+            })
         }
     }
+}
+
+struct LoadedGatewayKeyring {
+    keyring: KeyRing,
+    envelope_reference: Option<KeyringEnvelopeReference>,
 }
 
 fn secret_hex(
@@ -487,9 +509,11 @@ mod tests {
     use crate::s3::test_support::runtime_config;
     use crate::{BatchConfig, RepositoryKeySource, RepositoryKeysConfig};
     use bytes::Bytes;
+    use rs3_anchor::CheckpointAnchor;
     use rs3_crypto::{KeyRing, RepositoryKeyContext, SecretBytes};
+    use rs3_index::{CHECKPOINT_OBJECT_DOMAIN, Checkpoint};
     use rs3_repository::RepositoryPutOptions;
-    use rs3_storage::{BlobStore, MemoryBlobStore, PutOptions};
+    use rs3_storage::{BlobStore, ByteRange, FilesystemBlobStore, MemoryBlobStore, PutOptions};
     use rs3_types::{BackendObjectId, LogicalPath, RepositoryId, RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
     use std::path::{Path, PathBuf};
@@ -596,6 +620,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let store = RuntimeStore::new(memory);
+        let expected_object_id = object_id.clone();
         let keys = RepositoryKeysConfig {
             repository_id,
             repository_salt_hex: "0202020202020202020202020202020202020202020202020202020202020202"
@@ -613,14 +638,121 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
 
-        assert_eq!(opened.descriptors(), keyring.descriptors());
+        assert_eq!(opened.keyring.descriptors(), keyring.descriptors());
         assert_eq!(
             opened
+                .keyring
                 .derive_backend_object_id("segments", b"same")
                 .unwrap_or_else(|error| panic!("{error}")),
             keyring
                 .derive_backend_object_id("segments", b"same")
                 .unwrap_or_else(|error| panic!("{error}"))
+        );
+        assert_eq!(
+            opened
+                .envelope_reference
+                .as_ref()
+                .map(|reference| reference.object_id.clone()),
+            Some(expected_object_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_checkpoints_bind_configured_keyring_envelope() {
+        let dir = TestDir::new();
+        let mut config = runtime_config(true);
+        config.backend.endpoint = format!("file://{}", dir.path().display());
+        config.batching = BatchConfig {
+            max_items: 1,
+            max_delay: Duration::from_millis(10),
+            max_pending_items: 1,
+        };
+
+        let repository_id = config.repository_keys.repository_id.clone();
+        let repository_salt = hex::decode(&config.repository_keys.repository_salt_hex)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let context = RepositoryKeyContext::new(repository_id, repository_salt)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let keyring = KeyRing::generate_random().unwrap_or_else(|error| panic!("{error}"));
+        let wrapping_key = SecretBytes::new(vec![12; SecretBytes::MIN_LEN])
+            .unwrap_or_else(|error| panic!("{error}"));
+        let envelope = keyring
+            .seal_keyring_envelope(&context, "wrap-v1", &wrapping_key, 7)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let envelope_object_id = BackendObjectId::new("keyrings/runtime-envelope.json")
+            .unwrap_or_else(|error| panic!("{error}"));
+        config.repository_keys.source = RepositoryKeySource::KeyringEnvelope {
+            envelope_object_id: envelope_object_id.clone(),
+            wrapping_key_id: "wrap-v1".to_owned(),
+            wrapping_key_hex: SecretString::from(
+                "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+            ),
+        };
+
+        let store_root = dir
+            .path()
+            .join(&config.backend.bucket)
+            .join(config.backend.prefix.as_deref().unwrap_or(""));
+        let store = FilesystemBlobStore::new(&store_root).unwrap_or_else(|error| panic!("{error}"));
+        store
+            .put(
+                &envelope_object_id,
+                Bytes::from(
+                    envelope
+                        .to_object_bytes()
+                        .unwrap_or_else(|error| panic!("{error}")),
+                ),
+                PutOptions {
+                    retention: None,
+                    legal_hold: None,
+                    content_type: None,
+                    do_not_recreate: true,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let runtime = RuntimeRepository::from_config(&config)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        runtime
+            .put_committed(
+                LogicalPath::new("snapshots/enveloped.bin")
+                    .unwrap_or_else(|error| panic!("{error}")),
+                Bytes::from_static(b"body"),
+                RepositoryPutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let accepted = runtime
+            .memory_anchor()
+            .unwrap_or_else(|| panic!("missing memory anchor"))
+            .read()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let checkpoint_object_id =
+            BackendObjectId::new(format!("checkpoints/{}", accepted.checkpoint_id.as_str()))
+                .unwrap_or_else(|error| panic!("{error}"));
+        let body = store
+            .get_range(&checkpoint_object_id, ByteRange::Full)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let payload = body
+            .strip_prefix(CHECKPOINT_OBJECT_DOMAIN)
+            .unwrap_or_else(|| panic!("checkpoint object missing domain"));
+        let checkpoint: Checkpoint =
+            serde_json::from_slice(payload).unwrap_or_else(|error| panic!("{error}"));
+        let reference = checkpoint
+            .record
+            .keyring_envelope
+            .unwrap_or_else(|| panic!("missing keyring envelope reference"));
+
+        assert_eq!(reference.generation, 7);
+        assert_eq!(reference.object_id, envelope_object_id);
+        assert_eq!(
+            reference.digest,
+            envelope.digest().unwrap_or_else(|error| panic!("{error}"))
         );
     }
 

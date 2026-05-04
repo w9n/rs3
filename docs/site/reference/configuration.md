@@ -53,6 +53,19 @@ outside the chart. If `serviceAccount.create=false`, set `serviceAccount.name`.
 | `RS3_KEYRING_WRAPPING_KEY_ID` | with envelope | none | Operator-visible wrapping key identifier expected by the envelope. |
 | `RS3_KEYRING_WRAPPING_KEY_HEX` | with envelope | none | Hex-encoded high-entropy wrapping key used to open the envelope. KMS/HSM/Vault integration should replace this for hardened deployments. |
 
+Generate envelope settings with:
+
+```sh
+cargo run -p xtask --bin xtask -- keyring init --repository-id <id> \
+  --wrapping-key-id <wrapping-key-id> \
+  --generate-wrapping-key \
+  --backend filesystem \
+  --backend-dir <repository-object-root>
+```
+
+`xtask keyring init` generates a unique repository salt when
+`--repository-salt-hex` is omitted. There is no shared default salt.
+
 ## Repository Behavior
 
 | Variable | Required | Default | Description |

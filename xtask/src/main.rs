@@ -1,6 +1,7 @@
 //! Local automation for rs3.
 
 mod integration;
+mod keyring;
 mod perf;
 
 use anyhow::{Context, Result};
@@ -20,6 +21,7 @@ enum Commands {
     Check,
     Fmt,
     Integration(Box<integration::IntegrationArgs>),
+    Keyring(Box<keyring::KeyringArgs>),
     Perf(Box<perf::PerfArgs>),
     Test,
 }
@@ -49,6 +51,9 @@ fn main() -> Result<()> {
         Some(Commands::Integration(args)) => {
             integration::run(*args)?;
         }
+        Some(Commands::Keyring(args)) => {
+            keyring::run(*args)?;
+        }
         Some(Commands::Perf(args)) => {
             perf::run(*args)?;
         }
@@ -56,7 +61,7 @@ fn main() -> Result<()> {
             run("cargo", &["test", "--workspace"])?;
         }
         None => {
-            println!("usage: cargo xtask <check|fmt|integration|perf|test>");
+            println!("usage: cargo xtask <check|fmt|integration|keyring|perf|test>");
         }
     }
 

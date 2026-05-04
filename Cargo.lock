@@ -3496,6 +3496,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "rs3-anchor",
  "rs3-crypto",
+ "rs3-index",
  "rs3-k8s",
  "rs3-repository",
  "rs3-storage",
@@ -5108,6 +5109,8 @@ dependencies = [
  "aws-sdk-s3",
  "bytes",
  "clap",
+ "getrandom 0.3.4",
+ "hex",
  "procfs",
  "rs3-anchor",
  "rs3-crypto",
@@ -5119,6 +5122,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

@@ -47,6 +47,41 @@ Operational rules:
 - Do not destroy a key while any retained checkpoint can reference data that
   requires it.
 
+Create a new envelope with `xtask`, not the server binary:
+
+```sh
+cargo run -p xtask --bin xtask -- keyring init \
+  --repository-id prod-backups \
+  --wrapping-key-id wrap-2026-05 \
+  --generate-wrapping-key \
+  --backend filesystem \
+  --backend-dir /var/lib/rs3/backend \
+  --format json
+```
+
+For S3-compatible storage, build the task with the S3 feature and use
+`--backend s3` plus the `RS3_KEYRING_S3_*` settings. The generated output gives
+the `RS3_REPOSITORY_ID`, `RS3_REPOSITORY_SALT_HEX`,
+`RS3_KEYRING_ENVELOPE_OBJECT_ID`, and wrapping-key settings for the gateway.
+
+Rotate the wrapping key without rewriting backup data:
+
+```sh
+cargo run -p xtask --bin xtask -- keyring rewrap \
+  --repository-id prod-backups \
+  --repository-salt-hex <salt-hex> \
+  --envelope-object-id <current-envelope-object-id> \
+  --old-wrapping-key-id wrap-2026-05 \
+  --old-wrapping-key-hex-file /run/secrets/rs3-wrap-v1.hex \
+  --new-wrapping-key-id wrap-2026-06 \
+  --generate-new-wrapping-key \
+  --backend filesystem \
+  --backend-dir /var/lib/rs3/backend
+```
+
+Keep the old wrapping key available until no retained checkpoint needs an
+envelope that was sealed with it.
+
 ## Anchors
 
 The memory anchor is only for tests and local development:

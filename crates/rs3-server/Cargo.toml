@@ -27,6 +27,7 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 rs3-anchor = { path = "../rs3-anchor" }
 rs3-crypto = { path = "../rs3-crypto" }
+rs3-index = { path = "../rs3-index" }
 rs3-k8s = { path = "../rs3-k8s", optional = true }
 rs3-repository = { path = "../rs3-repository" }
 rs3-storage = { path = "../rs3-storage" }

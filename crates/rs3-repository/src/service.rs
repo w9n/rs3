@@ -952,7 +952,11 @@ where
     }
 
     /// Replaces the keyring envelope reference recorded in future checkpoints.
-    pub(crate) fn set_keyring_envelope_reference(
+    ///
+    /// Runtime constructors use this after opening an externally stored
+    /// encrypted keyring envelope so checkpoint records bind the active unwrap
+    /// source without requiring production server code to create key material.
+    pub fn set_keyring_envelope_reference(
         &self,
         reference: Option<KeyringEnvelopeReference>,
     ) -> Result<()> {

@@ -113,4 +113,4 @@ decisions for:
 - default segment-size policy
 - index compaction thresholds
 - padding policy
-- keyring-envelope init and KMS integration workflow
+- KMS/HSM/Vault wrapping-key integration workflow
