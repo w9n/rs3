@@ -26,6 +26,7 @@ pub(crate) fn compare_runs(runs: &[Value]) -> Value {
     let mut backend_write_bytes_per_client_put_request_byte = Vec::new();
     let mut payload_span_cache_event_hit_ratio = Vec::new();
     let mut payload_span_cache_byte_hit_ratio = Vec::new();
+    let mut phase_elapsed_ms_ratio: BTreeMap<String, Vec<f64>> = BTreeMap::new();
 
     for run in runs {
         let Some(direct) = report_for_storage_path(run, "direct-rustfs") else {
@@ -40,6 +41,7 @@ pub(crate) fn compare_runs(runs: &[Value]) -> Value {
             value_u64_at(gateway, &["elapsed_ms"]),
             value_u64_at(direct, &["elapsed_ms"]),
         );
+        push_phase_elapsed_ratios(&mut phase_elapsed_ms_ratio, direct, gateway);
         push_ratio(
             &mut client_request_count_ratio,
             gateway_client_request_count(gateway),
@@ -156,6 +158,7 @@ pub(crate) fn compare_runs(runs: &[Value]) -> Value {
             "backend_request_count_ratio": summarize_f64(&backend_request_count_ratio),
             "backend_write_bytes_ratio": summarize_f64(&backend_write_bytes_ratio),
             "backend_read_bytes_ratio": summarize_f64(&backend_read_bytes_ratio),
+            "phase_elapsed_ms_ratio": summarize_ratio_map(&phase_elapsed_ms_ratio),
         },
         "gateway_internal": {
             "backend_operations_per_client_request": summarize_f64(&backend_operations_per_client_request),
@@ -475,6 +478,44 @@ fn aggregate_phase_timings(reports: &[&Value]) -> Value {
     )
 }
 
+fn push_phase_elapsed_ratios(
+    ratios: &mut BTreeMap<String, Vec<f64>>,
+    direct: &Value,
+    gateway: &Value,
+) {
+    let direct_timings = phase_timings_map(direct);
+    let gateway_timings = phase_timings_map(gateway);
+    for (phase, gateway_elapsed_ms) in gateway_timings {
+        let Some(direct_elapsed_ms) = direct_timings.get(&phase).copied() else {
+            continue;
+        };
+        if direct_elapsed_ms == 0 {
+            continue;
+        }
+        ratios
+            .entry(phase)
+            .or_default()
+            .push(gateway_elapsed_ms as f64 / direct_elapsed_ms as f64);
+    }
+}
+
+fn phase_timings_map(report: &Value) -> BTreeMap<String, u64> {
+    let mut timings = BTreeMap::new();
+    let Some(phases) = report.get("phase_timings").and_then(Value::as_array) else {
+        return timings;
+    };
+    for phase in phases {
+        let Some(name) = phase.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(elapsed_ms) = phase.get("elapsed_ms").and_then(Value::as_u64) else {
+            continue;
+        };
+        timings.insert(name.to_owned(), elapsed_ms);
+    }
+    timings
+}
+
 fn aggregate_object(reports: &[&Value], path: &[&str]) -> Value {
     let mut values_by_key: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for report in reports {
@@ -589,6 +630,15 @@ fn aggregate_number_object(reports: &[&Value], path: &[&str]) -> Value {
     )
 }
 
+fn summarize_ratio_map(ratios: &BTreeMap<String, Vec<f64>>) -> Value {
+    Value::Object(
+        ratios
+            .iter()
+            .map(|(name, values)| (name.clone(), summarize_f64(values)))
+            .collect(),
+    )
+}
+
 fn gateway_client_request_count(report: &Value) -> Option<u64> {
     sum_object_u64_at(report, &["client_metrics", "counts_by_operation"])
 }
@@ -689,6 +739,10 @@ mod tests {
                 {
                     "storage_path": "direct-rustfs",
                     "elapsed_ms": 100,
+                    "phase_timings": [
+                        { "name": "repository-create", "elapsed_ms": 30 },
+                        { "name": "restore", "elapsed_ms": 50 }
+                    ],
                     "backend_metrics": {
                         "counts": {
                             "requests": 10,
@@ -700,6 +754,10 @@ mod tests {
                 {
                     "storage_path": "gateway",
                     "elapsed_ms": 150,
+                    "phase_timings": [
+                        { "name": "repository-create", "elapsed_ms": 45 },
+                        { "name": "restore", "elapsed_ms": 60 }
+                    ],
                     "gateway_process": {
                         "cpu_system_seconds": 0.25,
                         "cpu_total_seconds": 1.5,
@@ -797,6 +855,14 @@ mod tests {
             serde_json::json!(1.5)
         );
         assert_eq!(
+            comparison["gateway_vs_direct"]["phase_elapsed_ms_ratio"]["restore"]["avg"],
+            serde_json::json!(1.2)
+        );
+        assert_eq!(
+            comparison["gateway_vs_direct"]["phase_elapsed_ms_ratio"]["restore"]["samples"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
             comparison["gateway_internal"]["backend_operations_per_client_request"]["avg"],
             serde_json::json!(2.0)
         );
@@ -829,6 +895,10 @@ mod tests {
         assert_eq!(
             aggregate["gateway"]["gateway_process"]["vm_hwm_bytes"]["avg"],
             serde_json::json!(4096.0)
+        );
+        assert_eq!(
+            aggregate["gateway"]["phase_timings"]["restore"]["p50"],
+            serde_json::json!(60)
         );
         assert_eq!(
             aggregate["gateway"]["gateway_process"]["vm_rss_bytes"]["avg"],

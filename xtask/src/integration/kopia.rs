@@ -553,6 +553,20 @@ fn add_common_budget_checks(
                 checks,
                 profile,
                 summary,
+                "gateway_vs_direct.phase_elapsed_ms_ratio.restore",
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "phase_elapsed_ms_ratio",
+                    "restore",
+                    "avg",
+                ],
+                1.50,
+            );
+            push_max_budget(
+                checks,
+                profile,
+                summary,
                 "gateway_internal.backend_read_bytes_per_client_get_response_byte",
                 &[
                     "comparison",
@@ -989,7 +1003,10 @@ mod tests {
                     "gateway_vs_direct": {
                         "backend_request_count_ratio": { "avg": 1.00 },
                         "backend_read_bytes_ratio": { "avg": 1.04 },
-                        "backend_write_bytes_ratio": { "avg": 1.04 }
+                        "backend_write_bytes_ratio": { "avg": 1.04 },
+                        "phase_elapsed_ms_ratio": {
+                            "restore": { "avg": 1.04 }
+                        }
                     },
                     "gateway_internal": {
                         "backend_read_bytes_per_client_get_response_byte": { "avg": 1.04 },

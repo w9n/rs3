@@ -38,19 +38,23 @@ pub(super) fn bump_count(counts: &mut BTreeMap<String, u64>, key: &str) {
 pub(super) fn summarize_u64(values: &[u64]) -> Value {
     if values.is_empty() {
         return serde_json::json!({
+            "samples": 0,
             "min": null,
+            "p50": null,
             "max": null,
             "avg": null,
         });
     }
 
-    let min = values.iter().copied().min().unwrap_or(0);
-    let max = values.iter().copied().max().unwrap_or(0);
-    let sum = values.iter().copied().map(u128::from).sum::<u128>();
-    let avg = sum as f64 / values.len() as f64;
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let sum = sorted.iter().copied().map(u128::from).sum::<u128>();
+    let avg = sum as f64 / sorted.len() as f64;
     serde_json::json!({
-        "min": min,
-        "max": max,
+        "samples": sorted.len(),
+        "min": sorted[0],
+        "p50": percentile_u64(&sorted, 0.50),
+        "max": sorted[sorted.len() - 1],
         "avg": avg,
     })
 }
@@ -58,18 +62,22 @@ pub(super) fn summarize_u64(values: &[u64]) -> Value {
 pub(super) fn summarize_f64(values: &[f64]) -> Value {
     if values.is_empty() {
         return serde_json::json!({
+            "samples": 0,
             "min": null,
+            "p50": null,
             "max": null,
             "avg": null,
         });
     }
 
-    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let avg = values.iter().copied().sum::<f64>() / values.len() as f64;
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let avg = sorted.iter().copied().sum::<f64>() / sorted.len() as f64;
     serde_json::json!({
-        "min": min,
-        "max": max,
+        "samples": sorted.len(),
+        "min": sorted[0],
+        "p50": percentile_f64(&sorted, 0.50),
+        "max": sorted[sorted.len() - 1],
         "avg": avg,
     })
 }
@@ -103,6 +111,13 @@ pub(super) fn summarize_latency_us(samples: &[u64]) -> Value {
 }
 
 fn percentile_u64(sorted: &[u64], quantile: f64) -> u64 {
+    let index = ((sorted.len() as f64 * quantile).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
+    sorted[index]
+}
+
+fn percentile_f64(sorted: &[f64], quantile: f64) -> f64 {
     let index = ((sorted.len() as f64 * quantile).ceil() as usize)
         .saturating_sub(1)
         .min(sorted.len() - 1);
