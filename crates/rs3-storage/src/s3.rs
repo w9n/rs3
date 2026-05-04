@@ -185,30 +185,28 @@ impl S3BlobStore {
     ///
     /// Returns a provider error when configuration cannot be constructed.
     pub async fn from_environment(config: S3BlobStoreConfig) -> Result<Self> {
-        Self::from_environment_sync(config)
+        let store = object_store_from_environment(&config)?;
+        let sdk_client = Some(sdk_client_from_environment(&config).await?);
+        Ok(Self {
+            store,
+            sdk_client,
+            config,
+            metrics: Arc::new(RwLock::new(S3ProviderMetrics::default())),
+        })
     }
 
-    /// Builds an S3 store from the default AWS environment/config chain.
+    /// Builds an S3 store synchronously from environment credentials.
+    ///
+    /// This path only wires the direct SDK retention client when static
+    /// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` values are present. Use
+    /// [`Self::from_environment`] for the full AWS provider chain.
     ///
     /// # Errors
     ///
     /// Returns a provider error when configuration cannot be constructed.
     pub fn from_environment_sync(config: S3BlobStoreConfig) -> Result<Self> {
-        let mut builder = AmazonS3Builder::from_env()
-            .with_bucket_name(config.bucket.clone())
-            .with_conditional_put(S3ConditionalPut::ETagMatch)
-            .with_allow_http(config.allow_http)
-            .with_virtual_hosted_style_request(config.virtual_hosted_style);
-
-        if let Some(endpoint_url) = config.endpoint_url.as_deref() {
-            builder = builder.with_endpoint(endpoint_url);
-        }
-        if let Some(region) = config.region.as_deref() {
-            builder = builder.with_region(region);
-        }
-
-        let store = builder.build().map_err(provider_error)?;
-        let sdk_client = sdk_client_from_environment(&config)?;
+        let store = object_store_from_environment(&config)?;
+        let sdk_client = sdk_client_from_static_environment(&config)?;
         Ok(Self {
             store,
             sdk_client,
@@ -1006,7 +1004,43 @@ fn join_key(prefix: Option<&str>, value: &str) -> String {
     }
 }
 
-fn sdk_client_from_environment(config: &S3BlobStoreConfig) -> Result<Option<SdkS3Client>> {
+fn object_store_from_environment(config: &S3BlobStoreConfig) -> Result<AmazonS3> {
+    let mut builder = AmazonS3Builder::from_env()
+        .with_bucket_name(config.bucket.clone())
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .with_allow_http(config.allow_http)
+        .with_virtual_hosted_style_request(config.virtual_hosted_style);
+
+    if let Some(endpoint_url) = config.endpoint_url.as_deref() {
+        builder = builder.with_endpoint(endpoint_url);
+    }
+    if let Some(region) = config.region.as_deref() {
+        builder = builder.with_region(region);
+    }
+
+    builder.build().map_err(provider_error)
+}
+
+async fn sdk_client_from_environment(config: &S3BlobStoreConfig) -> Result<SdkS3Client> {
+    let region = aws_config::meta::region::RegionProviderChain::first_try(
+        config.region.clone().map(Region::new),
+    )
+    .or_default_provider()
+    .or_else(Region::new("us-east-1"));
+    let shared_config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region)
+        .load()
+        .await;
+    let mut builder = aws_sdk_s3::config::Builder::from(&shared_config)
+        .force_path_style(!config.virtual_hosted_style);
+    if let Some(endpoint_url) = config.endpoint_url.as_deref() {
+        builder = builder.endpoint_url(endpoint_url);
+    }
+
+    Ok(SdkS3Client::from_conf(builder.build()))
+}
+
+fn sdk_client_from_static_environment(config: &S3BlobStoreConfig) -> Result<Option<SdkS3Client>> {
     let access_key = optional_env_value("AWS_ACCESS_KEY_ID")?;
     let secret_key = optional_env_value("AWS_SECRET_ACCESS_KEY")?;
     let (access_key, secret_key) = match (access_key, secret_key) {

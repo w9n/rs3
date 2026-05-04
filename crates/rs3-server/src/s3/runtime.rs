@@ -39,8 +39,8 @@ pub(super) struct RuntimeRepository {
 }
 
 impl RuntimeRepository {
-    pub(super) fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
-        let store = build_store(&config.backend)?;
+    pub(super) async fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
+        let store = build_store(&config.backend).await?;
         let anchor = build_anchor(&config.anchor)?;
         let repository = Arc::new(Repository::with_keyring_and_options(
             store.handle.clone(),
@@ -164,7 +164,7 @@ struct AnchorBuild {
     memory_anchor: Option<MemoryCheckpointAnchor>,
 }
 
-fn build_store(config: &BackendConfig) -> Result<StoreBuild, S3BoundaryError> {
+async fn build_store(config: &BackendConfig) -> Result<StoreBuild, S3BoundaryError> {
     if is_memory_backend(config) {
         let store = MemoryBlobStore::new();
         return Ok(StoreBuild {
@@ -188,7 +188,7 @@ fn build_store(config: &BackendConfig) -> Result<StoreBuild, S3BoundaryError> {
     }
 
     #[cfg(feature = "s3")]
-    if let Some(store) = s3_backend_store(config)? {
+    if let Some(store) = s3_backend_store(config).await? {
         return Ok(StoreBuild {
             handle: RuntimeStore::new(store.clone()),
             s3_store: Some(store),
@@ -222,12 +222,13 @@ fn filesystem_backend_root(config: &BackendConfig) -> Result<Option<PathBuf>, S3
 }
 
 #[cfg(feature = "s3")]
-fn s3_backend_store(config: &BackendConfig) -> Result<Option<S3BlobStore>, S3BoundaryError> {
+async fn s3_backend_store(config: &BackendConfig) -> Result<Option<S3BlobStore>, S3BoundaryError> {
     let Some(store_config) = s3_backend_config(config)? else {
         return Ok(None);
     };
 
-    S3BlobStore::from_environment_sync(store_config)
+    S3BlobStore::from_environment(store_config)
+        .await
         .map(Some)
         .map_err(repository_init)
 }
@@ -465,9 +466,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn runtime_factory_builds_memory_repository() {
+    #[tokio::test]
+    async fn runtime_factory_builds_memory_repository() {
         let runtime = RuntimeRepository::from_config(&runtime_config(true))
+            .await
             .unwrap_or_else(|error| panic!("{error}"));
 
         assert!(runtime.memory_store().is_some());
@@ -478,8 +480,9 @@ mod tests {
     async fn runtime_repository_default_retention_applies_to_writes() {
         let mut config = runtime_config(true);
         config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 30));
-        let runtime =
-            RuntimeRepository::from_config(&config).unwrap_or_else(|error| panic!("{error}"));
+        let runtime = RuntimeRepository::from_config(&config)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
 
         let put = runtime
             .put_committed(
@@ -513,8 +516,9 @@ mod tests {
             max_delay: Duration::from_millis(10),
             max_pending_items: 1,
         };
-        let runtime =
-            RuntimeRepository::from_config(&config).unwrap_or_else(|error| panic!("{error}"));
+        let runtime = RuntimeRepository::from_config(&config)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
         let key = LogicalPath::new("snapshots/file.bin").unwrap_or_else(|error| {
             panic!("{error}");
         });
@@ -541,12 +545,12 @@ mod tests {
         assert!(payload_root.is_dir());
     }
 
-    #[test]
-    fn runtime_factory_rejects_unwired_backend() {
+    #[tokio::test]
+    async fn runtime_factory_rejects_unwired_backend() {
         let mut config = runtime_config(true);
         config.backend.endpoint = "unsupported://object.example".to_owned();
 
-        let runtime = RuntimeRepository::from_config(&config);
+        let runtime = RuntimeRepository::from_config(&config).await;
 
         assert!(matches!(
             runtime,
@@ -577,8 +581,8 @@ mod tests {
     }
 
     #[cfg(not(feature = "k8s"))]
-    #[test]
-    fn runtime_factory_rejects_unwired_anchor() {
+    #[tokio::test]
+    async fn runtime_factory_rejects_unwired_anchor() {
         let mut config = runtime_config(true);
         config.anchor = AnchorConfig::KubernetesLease {
             namespace: "backup".to_owned(),
@@ -586,7 +590,7 @@ mod tests {
             field_manager: "rs3-server".to_owned(),
         };
 
-        let runtime = RuntimeRepository::from_config(&config);
+        let runtime = RuntimeRepository::from_config(&config).await;
 
         assert!(matches!(
             runtime,
