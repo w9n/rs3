@@ -174,5 +174,28 @@ external anchor over any mode that repairs state automatically. If break-glass
 restore is added, it should require explicit operator input and leave an audit
 trail.
 
+Verify a trusted checkpoint position before relying on it for restore. Build
+`xtask` with the S3 feature when verifying an S3-compatible backend:
+
+```sh
+cargo run -p xtask --bin xtask --features s3 -- restore verify \
+  --repository-id prod-backups \
+  --repository-salt-hex <salt-hex> \
+  --keyring-envelope-object-id <envelope-object-id> \
+  --wrapping-key-id <wrapping-key-id> \
+  --wrapping-key-hex-file /run/secrets/rs3-wrap.hex \
+  --checkpoint-sequence <anchor-sequence> \
+  --checkpoint-id <anchor-checkpoint-id> \
+  --checkpoint-digest <anchor-checkpoint-digest> \
+  --backend s3 \
+  --s3-bucket <bucket> \
+  --format json
+```
+
+This is not just an S3 object listing. It verifies checkpoint signatures,
+checkpoint evidence, keyring envelope digest, encrypted index state, sealed
+metadata, and payload decryptability. Use S3 CLI checks separately for provider
+capabilities such as Object Lock headers and raw range reads.
+
 See [Restore Under Attack](runbooks/restore-under-attack.md) for the incident
 runbook.
