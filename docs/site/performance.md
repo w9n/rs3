@@ -47,15 +47,17 @@ Artifact:
 
 | Profile | Shape | Elapsed Ratio | Backend Requests | Backend Reads | Backend Writes | Gateway CPU | Gateway HWM RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `medium-restore` | one 64 MiB object | 1.11x | 0.89x | 1.03x | 1.03x | 1.07 s | 107.65 MiB |
-| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.27x | 0.99x | 1.05x | 1.03x | 1.58 s | 93.39 MiB |
-| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.31x | 1.00x | 1.03x | 1.03x | 2.77 s | 214.63 MiB |
+| `medium-restore` | one 64 MiB object | 1.06x | 0.88x | 1.03x | 1.03x | 1.42 s | 100.72 MiB |
+| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.28x | 0.99x | 1.05x | 1.03x | 1.73 s | 98.27 MiB |
+| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.40x | 0.99x | 1.03x | 1.03x | 3.07 s | 198.86 MiB |
 
 Interpretation:
 
 - Larger restore read and write bytes stay close to the straight proxy
   baseline, about 1.03x to 1.05x in these runs.
 - Backend request counts are at or below the straight proxy baseline.
+- Built-in regression budgets passed for request ratios, byte ratios, restore
+  phase ratios, and repeated-run stability.
 - The Kubernetes-shaped profile is faster in this local harness despite similar
   backend bytes. Treat that as a local RustFS/proxy observation, not a cloud
   provider claim.
