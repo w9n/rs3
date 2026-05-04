@@ -98,6 +98,9 @@ pub(crate) struct KopiaMatrixArgs {
     /// Plaintext bytes per encrypted gateway payload segment.
     #[arg(long, default_value_t = rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE)]
     payload_segment_size: usize,
+    /// Fail the command when built-in comparison budgets are exceeded.
+    #[arg(long)]
+    enforce_regression_budgets: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -250,6 +253,11 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         Ok::<_, anyhow::Error>(runs)
     })?;
 
+    let aggregate = aggregate_runs(&runs);
+    let comparison = compare_runs(&runs);
+    let profiles_summary = profile_summaries(&runs);
+    let regression_budgets = regression_budgets_json(&profiles_summary, args.payload_segment_size);
+
     let summary = serde_json::json!({
         "scenario": "kopia-measured-matrix",
         "run_id": run_id,
@@ -264,9 +272,10 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         "backend_region": backend.region,
         "gateway_build_profile": args.gateway_build_profile.as_str(),
         "payload_segment_size": args.payload_segment_size,
-        "aggregate": aggregate_runs(&runs),
-        "comparison": compare_runs(&runs),
-        "profiles": profile_summaries(&runs),
+        "aggregate": aggregate,
+        "comparison": comparison,
+        "profiles": profiles_summary,
+        "regression_budgets": regression_budgets,
         "run_reports": runs,
     });
     let multi_profile = profiles.len() > 1;
@@ -294,6 +303,15 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         summary_path.display()
     );
     println!("{}", serde_json::to_string_pretty(&summary)?);
+    if args.enforce_regression_budgets {
+        let failed = budget_failure_count(&summary["regression_budgets"]);
+        if failed > 0 {
+            bail!(
+                "Kopia measured matrix exceeded {failed} regression budget(s); summary written to {}",
+                summary_path.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -325,6 +343,293 @@ fn profile_summaries(runs: &[serde_json::Value]) -> serde_json::Value {
             })
             .collect(),
     )
+}
+
+#[cfg(any(feature = "containers", test))]
+fn regression_budgets_json(
+    profile_summaries: &serde_json::Value,
+    payload_segment_size: usize,
+) -> serde_json::Value {
+    let mut checks = Vec::new();
+    let Some(profiles) = profile_summaries.as_object() else {
+        return serde_json::json!({
+            "status": "missing",
+            "failed": 1,
+            "checks": [{
+                "profile": "",
+                "metric": "profiles",
+                "operator": "present",
+                "status": "fail",
+                "reason": "profile summaries were not an object",
+            }],
+        });
+    };
+
+    for (profile, summary) in profiles {
+        add_common_budget_checks(profile, summary, &mut checks);
+        match profile.as_str() {
+            "many-small-files" if payload_segment_size <= 512 => {
+                push_max_budget(
+                    &mut checks,
+                    profile,
+                    summary,
+                    "gateway_vs_direct.backend_request_count_ratio",
+                    &[
+                        "comparison",
+                        "gateway_vs_direct",
+                        "backend_request_count_ratio",
+                        "avg",
+                    ],
+                    0.50,
+                );
+                push_max_budget(
+                    &mut checks,
+                    profile,
+                    summary,
+                    "gateway_vs_direct.backend_read_bytes_ratio",
+                    &[
+                        "comparison",
+                        "gateway_vs_direct",
+                        "backend_read_bytes_ratio",
+                        "avg",
+                    ],
+                    2.00,
+                );
+                push_max_budget(
+                    &mut checks,
+                    profile,
+                    summary,
+                    "gateway_vs_direct.backend_write_bytes_ratio",
+                    &[
+                        "comparison",
+                        "gateway_vs_direct",
+                        "backend_write_bytes_ratio",
+                        "avg",
+                    ],
+                    2.25,
+                );
+                push_min_budget(
+                    &mut checks,
+                    profile,
+                    summary,
+                    "gateway_internal.payload_span_cache_event_hit_ratio",
+                    &[
+                        "comparison",
+                        "gateway_internal",
+                        "payload_span_cache_event_hit_ratio",
+                        "avg",
+                    ],
+                    0.70,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let failed = checks
+        .iter()
+        .filter(|check| check.get("status").and_then(serde_json::Value::as_str) == Some("fail"))
+        .count();
+
+    serde_json::json!({
+        "status": if failed == 0 { "pass" } else { "fail" },
+        "failed": failed,
+        "checks": checks,
+    })
+}
+
+#[cfg(any(feature = "containers", test))]
+fn add_common_budget_checks(
+    profile: &str,
+    summary: &serde_json::Value,
+    checks: &mut Vec<serde_json::Value>,
+) {
+    match profile {
+        "small-smoke" | "changed-snapshot" => {
+            push_max_budget(
+                checks,
+                profile,
+                summary,
+                "gateway_vs_direct.backend_request_count_ratio",
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "backend_request_count_ratio",
+                    "avg",
+                ],
+                0.90,
+            );
+            push_max_budget(
+                checks,
+                profile,
+                summary,
+                "gateway_vs_direct.backend_read_bytes_ratio",
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "backend_read_bytes_ratio",
+                    "avg",
+                ],
+                1.10,
+            );
+            push_max_budget(
+                checks,
+                profile,
+                summary,
+                "gateway_vs_direct.backend_write_bytes_ratio",
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "backend_write_bytes_ratio",
+                    "avg",
+                ],
+                1.20,
+            );
+        }
+        "medium-restore" | "kubernetes-objects" | "postgres-pgdata" => {
+            push_max_budget(
+                checks,
+                profile,
+                summary,
+                "gateway_vs_direct.backend_request_count_ratio",
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "backend_request_count_ratio",
+                    "avg",
+                ],
+                1.05,
+            );
+            push_max_budget(
+                checks,
+                profile,
+                summary,
+                "gateway_vs_direct.backend_read_bytes_ratio",
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "backend_read_bytes_ratio",
+                    "avg",
+                ],
+                1.10,
+            );
+            push_max_budget(
+                checks,
+                profile,
+                summary,
+                "gateway_vs_direct.backend_write_bytes_ratio",
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "backend_write_bytes_ratio",
+                    "avg",
+                ],
+                1.10,
+            );
+            push_max_budget(
+                checks,
+                profile,
+                summary,
+                "gateway_internal.backend_read_bytes_per_client_get_response_byte",
+                &[
+                    "comparison",
+                    "gateway_internal",
+                    "backend_read_bytes_per_client_get_response_byte",
+                    "avg",
+                ],
+                1.10,
+            );
+            push_max_budget(
+                checks,
+                profile,
+                summary,
+                "gateway_internal.backend_write_bytes_per_client_put_request_byte",
+                &[
+                    "comparison",
+                    "gateway_internal",
+                    "backend_write_bytes_per_client_put_request_byte",
+                    "avg",
+                ],
+                1.10,
+            );
+        }
+        _ => {}
+    }
+}
+
+#[cfg(any(feature = "containers", test))]
+fn push_max_budget(
+    checks: &mut Vec<serde_json::Value>,
+    profile: &str,
+    summary: &serde_json::Value,
+    metric: &'static str,
+    path: &[&str],
+    limit: f64,
+) {
+    push_budget(checks, profile, summary, metric, path, "<=", limit);
+}
+
+#[cfg(any(feature = "containers", test))]
+fn push_min_budget(
+    checks: &mut Vec<serde_json::Value>,
+    profile: &str,
+    summary: &serde_json::Value,
+    metric: &'static str,
+    path: &[&str],
+    limit: f64,
+) {
+    push_budget(checks, profile, summary, metric, path, ">=", limit);
+}
+
+#[cfg(any(feature = "containers", test))]
+fn push_budget(
+    checks: &mut Vec<serde_json::Value>,
+    profile: &str,
+    summary: &serde_json::Value,
+    metric: &'static str,
+    path: &[&str],
+    operator: &'static str,
+    limit: f64,
+) {
+    let observed = value_f64_at(summary, path);
+    let passed = match (operator, observed) {
+        ("<=", Some(observed)) => observed <= limit,
+        (">=", Some(observed)) => observed >= limit,
+        _ => false,
+    };
+    checks.push(serde_json::json!({
+        "profile": profile,
+        "metric": metric,
+        "operator": operator,
+        "limit": limit,
+        "observed_avg": observed,
+        "status": if passed { "pass" } else { "fail" },
+    }));
+}
+
+#[cfg(any(feature = "containers", test))]
+fn value_f64_at(value: &serde_json::Value, path: &[&str]) -> Option<f64> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    current.as_f64()
+}
+
+#[cfg(feature = "containers")]
+fn budget_failure_count(regression_budgets: &serde_json::Value) -> usize {
+    regression_budgets
+        .get("checks")
+        .and_then(serde_json::Value::as_array)
+        .map(|checks| {
+            checks
+                .iter()
+                .filter(|check| {
+                    check.get("status").and_then(serde_json::Value::as_str) == Some("fail")
+                })
+                .count()
+        })
+        .unwrap_or(1)
 }
 
 #[cfg(feature = "containers")]
@@ -625,7 +930,7 @@ fn write_json_file(path: &Path, value: &serde_json::Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{KopiaMatrixProfileSet, KopiaWorkloadProfile};
+    use super::{KopiaMatrixProfileSet, KopiaWorkloadProfile, regression_budgets_json};
 
     #[test]
     fn larger_restore_profile_set_has_stable_order() {
@@ -644,6 +949,57 @@ mod tests {
         assert_eq!(
             KopiaMatrixProfileSet::Single.profiles(KopiaWorkloadProfile::ManySmallFiles),
             vec![KopiaWorkloadProfile::ManySmallFiles]
+        );
+    }
+
+    #[test]
+    fn larger_restore_budgets_pass_for_close_backend_ratios() {
+        let profiles = serde_json::json!({
+            "postgres-pgdata": {
+                "comparison": {
+                    "gateway_vs_direct": {
+                        "backend_request_count_ratio": { "avg": 1.00 },
+                        "backend_read_bytes_ratio": { "avg": 1.04 },
+                        "backend_write_bytes_ratio": { "avg": 1.04 }
+                    },
+                    "gateway_internal": {
+                        "backend_read_bytes_per_client_get_response_byte": { "avg": 1.04 },
+                        "backend_write_bytes_per_client_put_request_byte": { "avg": 1.04 }
+                    }
+                }
+            }
+        });
+
+        let budgets = regression_budgets_json(&profiles, 512);
+
+        assert_eq!(budgets["status"], serde_json::json!("pass"));
+        assert_eq!(budgets["failed"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn many_small_512_budget_fails_without_cache_hit_ratio() {
+        let profiles = serde_json::json!({
+            "many-small-files": {
+                "comparison": {
+                    "gateway_vs_direct": {
+                        "backend_request_count_ratio": { "avg": 0.31 },
+                        "backend_read_bytes_ratio": { "avg": 1.72 },
+                        "backend_write_bytes_ratio": { "avg": 2.04 }
+                    },
+                    "gateway_internal": {
+                        "payload_span_cache_event_hit_ratio": { "avg": 0.10 }
+                    }
+                }
+            }
+        });
+
+        let budgets = regression_budgets_json(&profiles, 512);
+
+        assert_eq!(budgets["status"], serde_json::json!("fail"));
+        assert_eq!(budgets["failed"], serde_json::json!(1));
+        assert_eq!(
+            budgets["checks"][3]["metric"],
+            serde_json::json!("gateway_internal.payload_span_cache_event_hit_ratio")
         );
     }
 }

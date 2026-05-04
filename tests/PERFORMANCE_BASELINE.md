@@ -65,6 +65,11 @@ as backend read bytes per returned GET byte, backend write bytes per PUT request
 byte, and payload span cache hit ratios. These fields are intended to make
 restore regressions explainable from one summary artifact.
 
+The matrix command also writes `regression_budgets`. Passing
+`--enforce-regression-budgets` turns those built-in byte/request budget checks
+into a command failure. The budgets intentionally avoid wall-clock elapsed time,
+which is too environment-sensitive for a hard gate in this local harness.
+
 ## Current Results
 
 Run date: 2026-05-03. Each row is the average of three direct/gateway run pairs.
@@ -98,7 +103,7 @@ signal for this harness, not as a general cloud-provider result.
 
 ## Larger Restore Matrix
 
-Run date: 2026-05-03. Workload set: `larger-restores`. Each row is the
+Run date: 2026-05-04. Workload set: `larger-restores`. Each row is the
 average of three direct/gateway run pairs. Per-profile values come from
 `summary.json.profiles`; the top-level aggregate intentionally mixes profiles
 and should only be used as a smoke signal for the whole set.
@@ -113,19 +118,24 @@ deduplicated synthetic best case.
 
 | Profile | Shape | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend writes | Backend reads | Gateway CPU | Gateway HWM RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| medium-restore | one 64 MiB object | 2.66 s | 2.75 s | 1.03x | 0.89x | 1.03x | 1.03x | 1.00 s | 96.03 MiB |
-| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 9.40 s | 2.50 s | 0.27x | 0.99x | 1.03x | 1.05x | 1.50 s | 94.20 MiB |
-| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 2.56 s | 3.39 s | 1.32x | 0.99x | 1.03x | 1.03x | 2.68 s | 189.20 MiB |
+| medium-restore | one 64 MiB object | 2.65 s | 2.93 s | 1.11x | 0.89x | 1.03x | 1.03x | 1.07 s | 107.65 MiB |
+| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 9.79 s | 2.68 s | 0.27x | 0.99x | 1.03x | 1.05x | 1.58 s | 93.39 MiB |
+| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 2.68 s | 3.51 s | 1.31x | 1.00x | 1.03x | 1.03x | 2.77 s | 214.63 MiB |
 
 Interpretation:
 
 - Larger restore read and write byte ratios stay close to the straight proxy
   baseline, about 1.03x to 1.05x in these runs.
+- Gateway-internal derived byte ratios tell the same story: backend read bytes
+  per returned GET byte were 1.03x to 1.05x, and backend write bytes per PUT
+  request byte were about 1.03x to 1.04x.
 - Backend request counts are now at or below the straight proxy baseline in the
   larger profiles after sealed index deltas moved inline with checkpoint
   objects.
-- The larger profiles did not produce payload span cache hits in this run; their
-  restore ranges already land on distinct spans.
+- The larger profiles produced little or no payload span cache reuse. The
+  Postgres-shaped profile averaged only a 0.29% cache event hit ratio, with
+  evictions and skipped-too-large spans visible in the cache metrics. That is
+  expected for mostly distinct larger restore ranges.
 - Gateway CPU is cumulative process CPU time for the measured gateway run.
   Gateway HWM RSS is the average high-water resident set size across the three
   gateway runs for that profile.
@@ -135,7 +145,33 @@ Interpretation:
 - The Postgres-shaped profile now exercises roughly 176 MB of unique backend
   restore reads on the direct baseline. Gateway byte overhead is modest, while
   elapsed time is slower because large PUT tail latency is visible in the local
-  gateway path.
+  gateway path. In this artifact, average gateway `PutObject` request-duration
+  sum for Postgres was 7.64 s, while repository PUT work was 1.56 s and backend
+  provider PUT work was 0.76 s; the next performance target is gateway-side
+  request/body handling and commit wait around snapshot creation.
+
+## Regression Budgets
+
+The measured matrix now emits a `regression_budgets` block. The hard gate is
+opt-in:
+
+```sh
+cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix \
+  --runs 1 \
+  --workload-profile small-smoke \
+  --gateway-build-profile release \
+  --payload-segment-size 512 \
+  --enforce-regression-budgets
+```
+
+Validation artifact:
+`.local/integration/`.
+
+The current built-in budgets check backend request, read-byte, and write-byte
+ratios for the small and larger profiles. The 512 B `many-small-files` lane also
+checks that read bytes stay below 2.00x, write bytes below 2.25x, requests below
+0.50x, and payload span cache event hit ratio above 0.70. Elapsed ratios remain
+reported but are not enforced.
 
 ## Segment-Size Sweep
 
