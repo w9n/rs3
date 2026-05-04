@@ -111,6 +111,9 @@ pub(crate) struct KopiaMatrixArgs {
     /// Fail the command when built-in comparison budgets are exceeded.
     #[arg(long)]
     enforce_regression_budgets: bool,
+    /// Print the full summary JSON to stdout instead of the compact table.
+    #[arg(long)]
+    print_summary_json: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -374,7 +377,11 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         "wrote Kopia measured matrix summary to {}",
         summary_path.display()
     );
-    println!("{}", serde_json::to_string_pretty(&summary)?);
+    if args.print_summary_json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        print_matrix_summary(&summary, &profiles);
+    }
     if args.enforce_regression_budgets {
         let failed = check_failure_count(&summary["regression_budgets"])
             + check_failure_count(&summary["workload_consistency"]);
@@ -820,6 +827,88 @@ fn check_failure_count(check_report: &serde_json::Value) -> usize {
 }
 
 #[cfg(feature = "containers")]
+fn print_matrix_summary(summary: &serde_json::Value, profiles: &[KopiaWorkloadProfile]) {
+    println!("profile\tbackend_requests\tbackend_reads\tbackend_writes\trestore_elapsed");
+    for profile in profiles {
+        let profile_summary = &summary["profiles"][profile.as_str()];
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            profile.as_str(),
+            format_ratio(value_f64_at(
+                profile_summary,
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "backend_request_count_ratio",
+                    "avg"
+                ],
+            )),
+            format_ratio(value_f64_at(
+                profile_summary,
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "backend_read_bytes_ratio",
+                    "avg"
+                ],
+            )),
+            format_ratio(value_f64_at(
+                profile_summary,
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "backend_write_bytes_ratio",
+                    "avg"
+                ],
+            )),
+            format_ratio(value_f64_at(
+                profile_summary,
+                &[
+                    "comparison",
+                    "gateway_vs_direct",
+                    "phase_elapsed_ms_ratio",
+                    "restore",
+                    "avg"
+                ],
+            )),
+        );
+    }
+    println!(
+        "regression_budgets\tstatus={}\tfailed={}",
+        summary_status(&summary["regression_budgets"]),
+        summary_failed(&summary["regression_budgets"]),
+    );
+    println!(
+        "workload_consistency\tstatus={}\tfailed={}",
+        summary_status(&summary["workload_consistency"]),
+        summary_failed(&summary["workload_consistency"]),
+    );
+}
+
+#[cfg(feature = "containers")]
+fn format_ratio(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.2}x"))
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+#[cfg(feature = "containers")]
+fn summary_status(value: &serde_json::Value) -> &str {
+    value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+}
+
+#[cfg(feature = "containers")]
+fn summary_failed(value: &serde_json::Value) -> u64 {
+    value
+        .get("failed")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1)
+}
+
+#[cfg(feature = "containers")]
 struct MeasuredGatewayRun<'a> {
     kopia_bin: &'a str,
     backend: &'a s3_container::RunningS3Container,
@@ -1172,6 +1261,13 @@ mod tests {
         );
         assert_eq!(MatrixStoragePath::Gateway.as_str(), "gateway");
         assert_eq!(MatrixStoragePath::DirectRustfs.as_str(), "direct-rustfs");
+    }
+
+    #[cfg(feature = "containers")]
+    #[test]
+    fn matrix_summary_formats_ratios_compactly() {
+        assert_eq!(super::format_ratio(Some(1.234)), "1.23x");
+        assert_eq!(super::format_ratio(None), "n/a");
     }
 
     #[test]
