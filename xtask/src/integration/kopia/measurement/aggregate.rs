@@ -172,6 +172,100 @@ pub(crate) fn compare_runs(runs: &[Value]) -> Value {
     })
 }
 
+pub(crate) fn workload_consistency_json(runs: &[Value]) -> Value {
+    let mut checks = Vec::new();
+    for run in runs {
+        let profile = run.get("profile").and_then(Value::as_str).unwrap_or("");
+        let run_index = run.get("run").and_then(Value::as_u64).unwrap_or(0);
+        let reports = run.get("reports").and_then(Value::as_array);
+        let direct =
+            reports.and_then(|reports| report_for_storage_path_in(reports, "direct-rustfs"));
+        let gateway = reports.and_then(|reports| report_for_storage_path_in(reports, "gateway"));
+
+        let Some(direct) = direct else {
+            push_consistency_failure(
+                &mut checks,
+                profile,
+                run_index,
+                "direct.report_present",
+                "missing direct baseline report",
+            );
+            continue;
+        };
+        let Some(gateway) = gateway else {
+            push_consistency_failure(
+                &mut checks,
+                profile,
+                run_index,
+                "gateway.report_present",
+                "missing gateway report",
+            );
+            continue;
+        };
+
+        push_tree_consistency_check(
+            &mut checks,
+            profile,
+            run_index,
+            "direct.source_matches_restore",
+            direct,
+            &["workload", "source_tree"],
+            direct,
+            &["workload", "restored_tree"],
+        );
+        push_tree_consistency_check(
+            &mut checks,
+            profile,
+            run_index,
+            "gateway.source_matches_restore",
+            gateway,
+            &["workload", "source_tree"],
+            gateway,
+            &["workload", "restored_tree"],
+        );
+        push_tree_consistency_check(
+            &mut checks,
+            profile,
+            run_index,
+            "direct_source_matches_gateway_source",
+            direct,
+            &["workload", "source_tree"],
+            gateway,
+            &["workload", "source_tree"],
+        );
+        push_tree_consistency_check(
+            &mut checks,
+            profile,
+            run_index,
+            "direct_restore_matches_gateway_restore",
+            direct,
+            &["workload", "restored_tree"],
+            gateway,
+            &["workload", "restored_tree"],
+        );
+    }
+
+    if checks.is_empty() {
+        checks.push(serde_json::json!({
+            "profile": "",
+            "run": 0,
+            "metric": "run_reports",
+            "status": "fail",
+            "reason": "no run reports were available",
+        }));
+    }
+    let failed = checks
+        .iter()
+        .filter(|check| check.get("status").and_then(Value::as_str) == Some("fail"))
+        .count();
+
+    serde_json::json!({
+        "status": if failed == 0 { "pass" } else { "fail" },
+        "failed": failed,
+        "checks": checks,
+    })
+}
+
 fn reports_for_storage_path<'a>(runs: &'a [Value], storage_path: &str) -> Vec<&'a Value> {
     runs.iter()
         .filter_map(|run| run.get("reports").and_then(Value::as_array))
@@ -181,8 +275,11 @@ fn reports_for_storage_path<'a>(runs: &'a [Value], storage_path: &str) -> Vec<&'
 }
 
 fn report_for_storage_path<'a>(run: &'a Value, storage_path: &str) -> Option<&'a Value> {
-    run.get("reports")?
-        .as_array()?
+    report_for_storage_path_in(run.get("reports")?.as_array()?, storage_path)
+}
+
+fn report_for_storage_path_in<'a>(reports: &'a [Value], storage_path: &str) -> Option<&'a Value> {
+    reports
         .iter()
         .find(|report| report.get("storage_path").and_then(Value::as_str) == Some(storage_path))
 }
@@ -683,6 +780,49 @@ fn value_f64_at(value: &Value, path: &[&str]) -> Option<f64> {
     value_at(value, path)?.as_f64()
 }
 
+fn push_tree_consistency_check(
+    checks: &mut Vec<Value>,
+    profile: &str,
+    run_index: u64,
+    metric: &'static str,
+    left: &Value,
+    left_path: &[&str],
+    right: &Value,
+    right_path: &[&str],
+) {
+    let left = value_at(left, left_path);
+    let right = value_at(right, right_path);
+    checks.push(serde_json::json!({
+        "profile": profile,
+        "run": run_index,
+        "metric": metric,
+        "status": if left.is_some() && left == right { "pass" } else { "fail" },
+        "reason": if left.is_none() || right.is_none() {
+            Some("tree stats unavailable")
+        } else if left != right {
+            Some("tree stats differ")
+        } else {
+            None
+        },
+    }));
+}
+
+fn push_consistency_failure(
+    checks: &mut Vec<Value>,
+    profile: &str,
+    run_index: u64,
+    metric: &'static str,
+    reason: &'static str,
+) {
+    checks.push(serde_json::json!({
+        "profile": profile,
+        "run": run_index,
+        "metric": metric,
+        "status": "fail",
+        "reason": reason,
+    }));
+}
+
 fn value_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     let mut current = value;
     for segment in path {
@@ -733,7 +873,7 @@ fn push_share(ratios: &mut Vec<f64>, numerator: Option<f64>, other: Option<f64>)
 
 #[cfg(test)]
 mod tests {
-    use super::{aggregate_runs, compare_runs};
+    use super::{aggregate_runs, compare_runs, workload_consistency_json};
 
     #[test]
     fn compares_gateway_and_direct_run_ratios() {
@@ -1091,5 +1231,82 @@ mod tests {
         assert_eq!(read_ratio["avg"], serde_json::json!(1.25));
         assert_eq!(read_ratio["spread"], serde_json::json!(0.5));
         assert_eq!(read_ratio["relative_stddev"], serde_json::json!(0.2));
+    }
+
+    #[test]
+    fn workload_consistency_requires_matching_direct_and_gateway_tree_stats() {
+        let source_tree = serde_json::json!({
+            "files": 3,
+            "directories": 1,
+            "bytes": 128,
+            "largest_file_bytes": 120,
+        });
+        let runs = vec![serde_json::json!({
+            "profile": "kubernetes-objects-large",
+            "run": 1,
+            "reports": [
+                {
+                    "storage_path": "direct-rustfs",
+                    "workload": {
+                        "source_tree": source_tree.clone(),
+                        "restored_tree": source_tree.clone(),
+                    }
+                },
+                {
+                    "storage_path": "gateway",
+                    "workload": {
+                        "source_tree": source_tree.clone(),
+                        "restored_tree": source_tree.clone(),
+                    }
+                }
+            ]
+        })];
+
+        let consistency = workload_consistency_json(&runs);
+
+        assert_eq!(consistency["status"], serde_json::json!("pass"));
+        assert_eq!(consistency["failed"], serde_json::json!(0));
+        assert_eq!(consistency["checks"].as_array().map(Vec::len), Some(4));
+    }
+
+    #[test]
+    fn workload_consistency_fails_when_gateway_tree_differs() {
+        let direct_tree = serde_json::json!({
+            "files": 3,
+            "directories": 1,
+            "bytes": 128,
+            "largest_file_bytes": 120,
+        });
+        let gateway_tree = serde_json::json!({
+            "files": 4,
+            "directories": 1,
+            "bytes": 128,
+            "largest_file_bytes": 120,
+        });
+        let runs = vec![serde_json::json!({
+            "profile": "postgres-pgdata-large",
+            "run": 1,
+            "reports": [
+                {
+                    "storage_path": "direct-rustfs",
+                    "workload": {
+                        "source_tree": direct_tree.clone(),
+                        "restored_tree": direct_tree.clone(),
+                    }
+                },
+                {
+                    "storage_path": "gateway",
+                    "workload": {
+                        "source_tree": gateway_tree.clone(),
+                        "restored_tree": gateway_tree.clone(),
+                    }
+                }
+            ]
+        })];
+
+        let consistency = workload_consistency_json(&runs);
+
+        assert_eq!(consistency["status"], serde_json::json!("fail"));
+        assert_eq!(consistency["failed"], serde_json::json!(2));
     }
 }

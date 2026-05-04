@@ -23,8 +23,12 @@ pub(super) enum KopiaWorkloadProfile {
     ManySmallFiles,
     /// Kubernetes-object-shaped restore profile with many manifests and metadata files.
     KubernetesObjects,
+    /// Larger Kubernetes-object-shaped profile for restore-matrix runs.
+    KubernetesObjectsLarge,
     /// Postgres-pgdata-shaped restore profile with relation, WAL, and dump files.
     PostgresPgdata,
+    /// Larger Postgres-pgdata-shaped profile for restore-matrix runs.
+    PostgresPgdataLarge,
     /// Take a second snapshot after modifying the source tree.
     ChangedSnapshot,
 }
@@ -37,7 +41,9 @@ impl KopiaWorkloadProfile {
             Self::MediumRestore => "medium-restore",
             Self::ManySmallFiles => "many-small-files",
             Self::KubernetesObjects => "kubernetes-objects",
+            Self::KubernetesObjectsLarge => "kubernetes-objects-large",
             Self::PostgresPgdata => "postgres-pgdata",
+            Self::PostgresPgdataLarge => "postgres-pgdata-large",
             Self::ChangedSnapshot => "changed-snapshot",
         }
     }
@@ -123,10 +129,48 @@ impl KopiaWorkspace {
                 }
             }
             KopiaWorkloadProfile::KubernetesObjects => {
-                populate_kubernetes_objects(&self.source_dir())?;
+                populate_kubernetes_objects(
+                    &self.source_dir(),
+                    KubernetesObjectShape {
+                        namespaces: 16,
+                        objects_per_namespace: 96,
+                        fragment_bytes: 32 * 1024 * 1024,
+                        profile_label: KopiaWorkloadProfile::KubernetesObjects.as_str(),
+                    },
+                )?;
+            }
+            KopiaWorkloadProfile::KubernetesObjectsLarge => {
+                populate_kubernetes_objects(
+                    &self.source_dir(),
+                    KubernetesObjectShape {
+                        namespaces: 48,
+                        objects_per_namespace: 128,
+                        fragment_bytes: 128 * 1024 * 1024,
+                        profile_label: KopiaWorkloadProfile::KubernetesObjectsLarge.as_str(),
+                    },
+                )?;
             }
             KopiaWorkloadProfile::PostgresPgdata => {
-                populate_postgres_pgdata(&self.source_dir())?;
+                populate_postgres_pgdata(
+                    &self.source_dir(),
+                    PostgresPgdataShape {
+                        relation_files: 96,
+                        relation_bytes: 1024 * 1024,
+                        wal_segments: 4,
+                        dump_bytes: 8 * 1024 * 1024,
+                    },
+                )?;
+            }
+            KopiaWorkloadProfile::PostgresPgdataLarge => {
+                populate_postgres_pgdata(
+                    &self.source_dir(),
+                    PostgresPgdataShape {
+                        relation_files: 192,
+                        relation_bytes: 1024 * 1024,
+                        wal_segments: 8,
+                        dump_bytes: 32 * 1024 * 1024,
+                    },
+                )?;
             }
         }
         Ok(())
@@ -198,14 +242,23 @@ fn deterministic_file_seed(path: &Path, len: usize) -> u64 {
 }
 
 #[cfg(feature = "containers")]
-fn populate_kubernetes_objects(source: &Path) -> Result<()> {
+#[derive(Clone, Copy, Debug)]
+struct KubernetesObjectShape {
+    namespaces: usize,
+    objects_per_namespace: usize,
+    fragment_bytes: usize,
+    profile_label: &'static str,
+}
+
+#[cfg(feature = "containers")]
+fn populate_kubernetes_objects(source: &Path, shape: KubernetesObjectShape) -> Result<()> {
     let root = source.join("kubernetes");
     fs::create_dir_all(&root).context("failed to create Kubernetes object tree")?;
-    for namespace in 0..16 {
+    for namespace in 0..shape.namespaces {
         let namespace_dir = root.join(format!("namespace-{namespace:02}"));
         fs::create_dir_all(&namespace_dir)
             .context("failed to create Kubernetes namespace directory")?;
-        for object in 0..96 {
+        for object in 0..shape.objects_per_namespace {
             let kind = match object % 6 {
                 0 => "deployment",
                 1 => "configmap",
@@ -214,7 +267,7 @@ fn populate_kubernetes_objects(source: &Path) -> Result<()> {
                 4 => "secret-metadata",
                 _ => "custom-resource",
             };
-            let manifest = kubernetes_manifest(namespace, object, kind);
+            let manifest = kubernetes_manifest(namespace, object, kind, shape.profile_label);
             fs::write(
                 namespace_dir.join(format!("{kind}-{object:04}.yaml")),
                 manifest,
@@ -222,35 +275,47 @@ fn populate_kubernetes_objects(source: &Path) -> Result<()> {
             .context("failed to write Kubernetes manifest")?;
         }
     }
-    write_deterministic_file(&root.join("etcd-snapshot-fragment.bin"), 32 * 1024 * 1024)
+    write_deterministic_file(
+        &root.join("etcd-snapshot-fragment.bin"),
+        shape.fragment_bytes,
+    )
 }
 
 #[cfg(feature = "containers")]
-fn kubernetes_manifest(namespace: usize, object: usize, kind: &str) -> String {
+fn kubernetes_manifest(namespace: usize, object: usize, kind: &str, profile: &str) -> String {
     format!(
-        "apiVersion: rs3.dev/v1\nkind: {kind}\nmetadata:\n  name: object-{object:04}\n  namespace: namespace-{namespace:02}\n  labels:\n    app.kubernetes.io/name: rs3-perf\n    rs3.dev/profile: kubernetes-objects\nspec:\n  generation: {object}\n  payload: {}\n",
+        "apiVersion: rs3.dev/v1\nkind: {kind}\nmetadata:\n  name: object-{object:04}\n  namespace: namespace-{namespace:02}\n  labels:\n    app.kubernetes.io/name: rs3-perf\n    rs3.dev/profile: {profile}\nspec:\n  generation: {object}\n  payload: {}\n",
         "x".repeat(256 + object % 97),
     )
 }
 
 #[cfg(feature = "containers")]
-fn populate_postgres_pgdata(source: &Path) -> Result<()> {
+#[derive(Clone, Copy, Debug)]
+struct PostgresPgdataShape {
+    relation_files: usize,
+    relation_bytes: usize,
+    wal_segments: usize,
+    dump_bytes: usize,
+}
+
+#[cfg(feature = "containers")]
+fn populate_postgres_pgdata(source: &Path, shape: PostgresPgdataShape) -> Result<()> {
     let root = source.join("postgres");
     let base = root.join("base").join("16384");
     let wal = root.join("pg_wal");
     fs::create_dir_all(&base).context("failed to create Postgres base directory")?;
     fs::create_dir_all(&wal).context("failed to create Postgres WAL directory")?;
 
-    for relation in 0..96 {
-        write_deterministic_file(&base.join(format!("{relation}")), 1024 * 1024)?;
+    for relation in 0..shape.relation_files {
+        write_deterministic_file(&base.join(format!("{relation}")), shape.relation_bytes)?;
     }
-    for segment in 0..4 {
+    for segment in 0..shape.wal_segments {
         write_deterministic_file(
             &wal.join(format!("0000000100000000000000{segment:02X}")),
             16 * 1024 * 1024,
         )?;
     }
-    write_deterministic_file(&root.join("rs3-proof.sql"), 8 * 1024 * 1024)?;
+    write_deterministic_file(&root.join("rs3-proof.sql"), shape.dump_bytes)?;
     fs::write(root.join("PG_VERSION"), b"17\n").context("failed to write Postgres version marker")
 }
 

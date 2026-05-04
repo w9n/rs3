@@ -12,7 +12,7 @@ mod process;
 mod prometheus;
 
 use super::KopiaRunStats;
-pub(super) use aggregate::{aggregate_runs, compare_runs};
+pub(super) use aggregate::{aggregate_runs, compare_runs, workload_consistency_json};
 use anyhow::{Result, bail};
 pub(super) use logs::{gateway_backend_metrics_json, gateway_client_metrics_json};
 pub(super) use process::{RunningStorageProxy, wait_for_storage_proxy_metrics};

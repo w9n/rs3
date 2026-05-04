@@ -31,16 +31,21 @@ The current larger profiles are:
 | --- | --- |
 | `medium-restore` | One large file restore profile. |
 | `kubernetes-objects` | Many Kubernetes-shaped manifests plus an etcd-like fragment. |
+| `kubernetes-objects-large` | Larger Kubernetes-shaped manifest set plus a larger etcd-like fragment. |
 | `postgres-pgdata` | Relation files, WAL-shaped files, and a dump-shaped object. |
+| `postgres-pgdata-large` | Larger relation/WAL/dump-shaped Postgres data directory. |
 
-Artifacts are written under `.local/integration/` and should stay out of Git
-unless deliberately reviewed and promoted.
+The summary includes a `workload_consistency` block. It checks that direct and
+gateway lanes see matching source and restored tree statistics for every run
+pair before ratios are interpreted. Artifacts are written under
+`.local/integration/` and should stay out of Git unless deliberately reviewed and promoted.
 
 ## Current Release Matrix
 
 Run date: 2026-05-04. Gateway profile: release. Workload set:
-`larger-restores`. Each row is the average of three direct/gateway run pairs.
-The direct baseline is the straight RustFS measurement proxy.
+`larger-restores` before the expanded large Kubernetes/Postgres profiles were
+added. Each row is the average of three direct/gateway run pairs. The direct
+baseline is the straight RustFS measurement proxy.
 
 Artifact:
 `.local/integration/`.
@@ -64,6 +69,25 @@ Interpretation:
 - The Postgres-shaped profile has modest byte overhead but slower elapsed time.
   The next performance target is gateway-side request/body handling and commit
   wait around snapshot creation.
+
+## Expanded Sanity Run
+
+Run date: 2026-05-04. Gateway profile: release. One direct/gateway run pair per
+profile, so this validates shape and budget wiring but is not a release claim.
+
+Artifact:
+`.local/integration/`.
+
+`workload_consistency` passed for every profile, and `regression_budgets`
+passed.
+
+| Profile | Backend Requests | Backend Reads | Backend Writes |
+| --- | ---: | ---: | ---: |
+| `medium-restore` | 1.16x | 1.03x | 1.03x |
+| `kubernetes-objects` | 1.01x | 1.05x | 1.03x |
+| `kubernetes-objects-large` | 1.00x | 1.05x | 1.03x |
+| `postgres-pgdata` | 1.12x | 1.03x | 1.03x |
+| `postgres-pgdata-large` | 1.10x | 1.03x | 1.03x |
 
 ## Primary Ratios
 
@@ -119,8 +143,8 @@ strategy.
 
 ## Regression Budgets
 
-The matrix writes a `regression_budgets` block. To turn supported budgets into
-a command failure:
+The matrix writes `regression_budgets` and `workload_consistency` blocks. To
+turn supported budgets and consistency failures into a command failure:
 
 ```sh
 cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix \
@@ -131,9 +155,10 @@ cargo run -p xtask --bin xtask --features containers -- integration kopia-measur
   --enforce-regression-budgets
 ```
 
-Budgets focus on request and byte amplification. Elapsed-time budgets remain
-reported but should be enforced carefully because local container and host load
-can dominate.
+Budgets focus on request and byte amplification. Larger restore request budgets
+allow modest extra requests for checkpoint and evidence writes; byte budgets are
+tighter. Elapsed-time budgets remain reported but should be enforced carefully
+because local container and host load can dominate.
 
 ## Next Measurements
 

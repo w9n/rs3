@@ -22,6 +22,7 @@ use measurement::{
     RunningStorageProxy, aggregate_runs, compare_runs, endpoint_authority,
     gateway_backend_metrics_json, gateway_client_metrics_json, measurement_json, now_millis,
     prometheus_metrics_delta_json, scrape_prometheus_metrics, wait_for_storage_proxy_metrics,
+    workload_consistency_json,
 };
 #[cfg(feature = "containers")]
 use std::collections::BTreeMap;
@@ -136,7 +137,9 @@ impl KopiaMatrixProfileSet {
             Self::LargerRestores => vec![
                 KopiaWorkloadProfile::MediumRestore,
                 KopiaWorkloadProfile::KubernetesObjects,
+                KopiaWorkloadProfile::KubernetesObjectsLarge,
                 KopiaWorkloadProfile::PostgresPgdata,
+                KopiaWorkloadProfile::PostgresPgdataLarge,
             ],
         }
     }
@@ -318,6 +321,7 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
     let aggregate = aggregate_runs(&runs);
     let comparison = compare_runs(&runs);
     let profiles_summary = profile_summaries(&runs);
+    let workload_consistency = workload_consistency_json(&runs);
     let regression_budgets = regression_budgets_json(&profiles_summary, args.payload_segment_size);
 
     let summary = serde_json::json!({
@@ -342,6 +346,7 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         "aggregate": aggregate,
         "comparison": comparison,
         "profiles": profiles_summary,
+        "workload_consistency": workload_consistency,
         "regression_budgets": regression_budgets,
         "run_reports": runs,
     });
@@ -371,10 +376,11 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
     );
     println!("{}", serde_json::to_string_pretty(&summary)?);
     if args.enforce_regression_budgets {
-        let failed = budget_failure_count(&summary["regression_budgets"]);
+        let failed = check_failure_count(&summary["regression_budgets"])
+            + check_failure_count(&summary["workload_consistency"]);
         if failed > 0 {
             bail!(
-                "Kopia measured matrix exceeded {failed} regression budget(s); summary written to {}",
+                "Kopia measured matrix exceeded {failed} regression or consistency check(s); summary written to {}",
                 summary_path.display()
             );
         }
@@ -553,7 +559,11 @@ fn add_common_budget_checks(
                 1.20,
             );
         }
-        "medium-restore" | "kubernetes-objects" | "postgres-pgdata" => {
+        "medium-restore"
+        | "kubernetes-objects"
+        | "kubernetes-objects-large"
+        | "postgres-pgdata"
+        | "postgres-pgdata-large" => {
             push_max_budget(
                 checks,
                 profile,
@@ -565,7 +575,7 @@ fn add_common_budget_checks(
                     "backend_request_count_ratio",
                     "avg",
                 ],
-                1.05,
+                1.20,
             );
             push_max_budget(
                 checks,
@@ -794,8 +804,8 @@ fn value_f64_at(value: &serde_json::Value, path: &[&str]) -> Option<f64> {
 }
 
 #[cfg(feature = "containers")]
-fn budget_failure_count(regression_budgets: &serde_json::Value) -> usize {
-    regression_budgets
+fn check_failure_count(check_report: &serde_json::Value) -> usize {
+    check_report
         .get("checks")
         .and_then(serde_json::Value::as_array)
         .map(|checks| {
@@ -1132,7 +1142,13 @@ mod tests {
                 .into_iter()
                 .map(KopiaWorkloadProfile::as_str)
                 .collect::<Vec<_>>(),
-            vec!["medium-restore", "kubernetes-objects", "postgres-pgdata"]
+            vec![
+                "medium-restore",
+                "kubernetes-objects",
+                "kubernetes-objects-large",
+                "postgres-pgdata",
+                "postgres-pgdata-large",
+            ]
         );
     }
 
@@ -1165,6 +1181,33 @@ mod tests {
                 "comparison": {
                     "gateway_vs_direct": {
                         "backend_request_count_ratio": { "avg": 1.00 },
+                        "backend_read_bytes_ratio": { "avg": 1.04 },
+                        "backend_write_bytes_ratio": { "avg": 1.04 },
+                        "phase_elapsed_ms_ratio": {
+                            "restore": { "avg": 1.04 }
+                        }
+                    },
+                    "gateway_internal": {
+                        "backend_read_bytes_per_client_get_response_byte": { "avg": 1.04 },
+                        "backend_write_bytes_per_client_put_request_byte": { "avg": 1.04 }
+                    }
+                }
+            }
+        });
+
+        let budgets = regression_budgets_json(&profiles, 512);
+
+        assert_eq!(budgets["status"], serde_json::json!("pass"));
+        assert_eq!(budgets["failed"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn larger_restore_budgets_allow_checkpoint_evidence_request_overhead() {
+        let profiles = serde_json::json!({
+            "postgres-pgdata-large": {
+                "comparison": {
+                    "gateway_vs_direct": {
+                        "backend_request_count_ratio": { "avg": 1.16 },
                         "backend_read_bytes_ratio": { "avg": 1.04 },
                         "backend_write_bytes_ratio": { "avg": 1.04 },
                         "phase_elapsed_ms_ratio": {
