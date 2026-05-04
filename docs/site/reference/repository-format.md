@@ -37,8 +37,9 @@ Payload segments are independently encrypted so ranged reads can fetch only the
 overlapping backend segments. Segment associated data binds ciphertext to the
 repository context and object identity.
 
-The current default segment size is 512 plaintext bytes for Kopia-first restore
-behavior. This is a tuning parameter, not a permanent format guarantee.
+The current default segment size is 512 plaintext bytes for Kopia and Velero
+with Kopia-uploader restore behavior. This is a tuning parameter, not a
+permanent format guarantee.
 
 ## Index State
 
@@ -106,8 +107,9 @@ checkpoint payloads can be verified without exposing signing material.
 
 ## Compatibility Promise
 
-There is no stable-format promise yet. Before a stable format, the project still needs final
-decisions for:
+There is no stable-format promise yet. The production-preview target is an
+evaluation contract, not a durable repository-format guarantee. Before a stable
+format v1, the project still needs final decisions for:
 
 - canonical metadata encoding
 - default segment-size policy

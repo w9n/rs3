@@ -1,5 +1,5 @@
 <section class="rv-hero">
-  <p class="rv-eyebrow">Kubernetes backup gateway | S3-compatible | experimental</p>
+  <p class="rv-eyebrow">Kubernetes backup gateway | S3-compatible | production preview target</p>
   <h1>Backups under your control.</h1>
   <p class="rv-lead">
     <code>rs3</code> is a path-private, tamper-evident S3 gateway for operators who need
@@ -12,7 +12,7 @@
   </div>
   <div class="rv-proof-strip" aria-label="Project posture">
     <span>Path-private</span>
-    <span>Kopia-first</span>
+    <span>Kopia + Velero</span>
     <span>Anchor-aware</span>
     <span>Measured against baseline</span>
   </div>
@@ -53,15 +53,16 @@ checkpoint state directly to an object-store backend.
 
 ## Current Status
 
-`rs3` is experimental. The repository contains a working local gateway path,
-Kopia integration harnesses, repository encryption boundaries, checkpoint
-publishing, retention-aware storage contracts, metrics, tracing, and performance
-measurement against a straight proxy baseline.
+`rs3` is being prepared for a production preview. The repository contains a
+working local gateway path, Kopia and Velero integration harnesses, repository
+encryption boundaries, Kubernetes Lease anchoring, checkpoint publishing,
+restore verification, retention-aware storage contracts, metrics, tracing, and
+performance measurement against a straight proxy baseline.
 
 Do not treat the current repository format, cryptographic formats, or runtime
 defaults as production-stable yet.
 
-!!! warning "Experimental, not production-stable"
+!!! warning "Production preview, not stable format"
     The project is being built toward higher-fidelity backup infrastructure,
     but current docs intentionally separate measured facts from future design
     intent.
@@ -72,7 +73,8 @@ defaults as production-stable yet.
   unauthenticated metadata, metrics labels, traces, and logs.
 - Detect rollback through signed checkpoints and an external anchor instead of
   trusting a latest-object convention in the object store.
-- Preserve restore correctness for S3 backup clients, starting with Kopia.
+- Preserve restore correctness for S3 backup clients, starting with Kopia and
+  Velero/Kopia.
 - Measure request count, read bytes, write bytes, elapsed time, CPU, and memory
   against a straight proxy baseline before optimizing.
 - Keep operational failure modes explicit: anchors fail closed, retention is
@@ -83,6 +85,7 @@ defaults as production-stable yet.
 | Reader | Start Here |
 | --- | --- |
 | Platform lead | [Evaluation](evaluation.md) |
+| Release reviewer | [Production Preview](production-preview.md) |
 | Security reviewer | [Security Model](security-model.md) and [Security Review](security-review.md) |
 | Operator | [Operations](operations.md) and [Restore Under Attack](runbooks/restore-under-attack.md) |
 | Contributor | [Architecture](architecture.md) and [Testing](testing.md) |

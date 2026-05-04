@@ -6,17 +6,23 @@ S3-compatible backup gateway for Kubernetes operators.
 ## Status
 
 The project has a working local S3-compatible gateway path, repository
-encryption boundaries, signed checkpoint plumbing, integration harnesses, and
-Kopia-focused performance measurement. It is not a production release and does
-not yet make a stable repository-format or security guarantee.
+encryption boundaries, signed checkpoint plumbing, integration harnesses,
+Kubernetes Lease anchoring, restore verification, production posture checks, and
+Kopia-focused performance measurement. The current release target is a
+production preview: suitable for controlled evaluation, not yet a stable
+repository-format or security guarantee.
 
 Current engineering priorities:
 
 - path privacy for client-visible keys and Kubernetes object names
 - rollback resistance through signed checkpoints and external anchors
-- restore correctness for S3-oriented backup tools, with Kopia first
+- restore correctness for S3-oriented backup tools, with Kopia and
+  Velero/Kopia as the preview clients
 - measured performance against a straight proxy baseline
 - operational evidence for retention, tracing, and metrics
+
+See `docs/site/production-preview.md` for the preview contract and release
+gates.
 
 ## Development
 

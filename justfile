@@ -22,6 +22,19 @@ check-s3:
     cargo clippy -p rs3-storage -p rs3-server -p xtask --features rs3-server/s3,xtask/s3 --all-targets -- -D warnings
     cargo test -p rs3-storage -p rs3-server -p xtask --features rs3-server/s3,xtask/s3
 
+# Cheap production-preview gate for local handoff.
+preview-gate-local:
+    just check
+    just check-s3
+    just deny
+    just deny-s3
+
+# Expensive production-preview integration gate for release candidates.
+preview-gate-release:
+    just integration-kopia-gateway
+    just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke
+    just integration-velero-kopia-postgres-smoke
+
 integration-s3:
     cargo test -p rs3-storage --features s3 --test s3_live -- --ignored --nocapture
 

@@ -9,16 +9,17 @@ deeper technical trial.
 storage. It owns repository privacy, checkpoint publication, retention-aware
 storage behavior, and observability at the gateway boundary.
 
-The first compatibility target is Kopia because it is used by Kubernetes backup
-systems and exercises the important S3 behaviors: `PUT`, `HEAD`, ranged `GET`,
-`LIST`, delete/tombstone behavior, and immediate read/list-after-write
-semantics.
+The preview compatibility targets are Kopia and Velero with the Kopia uploader.
+Kopia defines the lower-level S3 behavior that matters first: `PUT`, `HEAD`,
+ranged `GET`, `LIST`, delete/tombstone behavior, and immediate
+read/list-after-write semantics. Velero proves the Kubernetes restore workflow
+through that storage path.
 
 ## What rs3 Is Not
 
 `rs3` is not a generic S3 server, an object-store replacement, or a mature
-production backup product today. The current code is a serious experimental
-base with measured behavior, but the durable format and production
+production backup product today. The current release target is a production
+preview for controlled evaluation. The durable format and production
 cryptographic choices are still moving.
 
 ## Trust Posture
@@ -44,6 +45,9 @@ The result is a system that should be evaluated on three axes:
 - Purpose-specific keys derived with HKDF-SHA-256 from a master key,
   repository ID, and public salt.
 - Signed checkpoint shape and external-anchor model.
+- Kubernetes Lease anchor for the preview deployment model.
+- Restore verification for checkpoint chain, reachable objects, decryptability,
+  keyring envelope binding, and retention evidence.
 - Retention and legal-hold contracts at the storage boundary.
 - Kopia measured matrix with a direct RustFS proxy baseline.
 - Prometheus metrics and structured traces that avoid path labels.
@@ -70,3 +74,5 @@ A useful trial should prove all of the following:
 - Performance is compared to the straight proxy baseline, not only to an
   absolute wall-clock number.
 - Metrics and traces explain restore cost without adding privacy leaks.
+
+See [Production Preview](production-preview.md) for the current release gates.

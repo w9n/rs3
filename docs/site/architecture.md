@@ -88,5 +88,8 @@ The first gateway surface focuses on the operations backup clients need:
 - conditional create behavior
 - retention and legal-hold plumbing where the backend supports it
 
-Kopia is the first compatibility workload. Broader S3 compatibility should be
-added behind tests that prove restored bytes and privacy invariants.
+The preview compatibility workloads are Kopia and Velero with the Kopia
+uploader. Kopia drives the lower-level S3 behavior; Velero proves the
+Kubernetes backup and restore workflow through that path. Broader S3
+compatibility should be added behind tests that prove restored bytes and
+privacy invariants.

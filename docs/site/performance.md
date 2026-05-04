@@ -118,9 +118,9 @@ segment size because Kopia can issue many small ranged reads whose response
 bodies are only a few dozen or hundred bytes each.
 
 For tiny ranged restores, smaller segments reduce read-byte amplification while
-larger segments reduce backend request count. The current Kopia-first candidate
-is 512 bytes because it keeps byte amplification low in the edge case while
-larger restore profiles stay close to baseline.
+larger segments reduce backend request count. The current Kopia/Velero preview
+candidate is 512 bytes because it keeps byte amplification low in the edge case
+while larger restore profiles stay close to baseline.
 
 ## Segment-Size Finding
 
