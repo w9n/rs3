@@ -13,6 +13,7 @@ pub(crate) const CHART_NAME: &str = "rs3-gateway";
 pub(crate) const CHART_PATH: &str = "charts/rs3-gateway";
 pub(crate) const DEFAULT_PUBLIC_BUCKET: &str = "client-bucket";
 pub(crate) const GATEWAY_PORT: u16 = 9080;
+pub(crate) const REPOSITORY_ID: &str = "rs3-integration-repository";
 pub(crate) const REPOSITORY_MASTER_KEY_HEX: &str =
     "1111111111111111111111111111111111111111111111111111111111111111";
 pub(crate) const SECRET_ACCESS_KEY: &str = "secret";
@@ -34,6 +35,7 @@ pub(crate) struct GatewayChartValues<'a> {
     pub(crate) log_format: &'a str,
     pub(crate) rust_log: &'a str,
     pub(crate) payload_segment_size: usize,
+    pub(crate) repository_id: &'a str,
     pub(crate) repository_master_key_hex: &'a str,
     pub(crate) persistence_enabled: bool,
     pub(crate) wait_secs: u64,
@@ -103,6 +105,8 @@ pub(crate) fn helm_install_gateway(
                 "repository.payloadSegmentSizeBytes={}",
                 values.payload_segment_size
             ),
+            "--set-string",
+            &helm_set_string("repository.id", values.repository_id),
             "--set",
             "repositoryKeys.create=true",
             "--set-string",
@@ -110,6 +114,8 @@ pub(crate) fn helm_install_gateway(
                 "repositoryKeys.masterKeyHex",
                 values.repository_master_key_hex,
             ),
+            "--set",
+            &format!("anchor.allowMemory={}", values.anchor_mode == "memory"),
             "--set",
             &format!("persistence.enabled={}", values.persistence_enabled),
         ],

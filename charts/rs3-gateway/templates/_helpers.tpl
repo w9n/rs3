@@ -31,6 +31,18 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{- define "rs3-gateway.validateValues" -}}
+{{- if not .Values.repository.id -}}
+{{- fail "repository.id is required; use a stable value for key derivation" -}}
+{{- end -}}
+{{- if and (ne .Values.anchor.mode "memory") (ne .Values.anchor.mode "kubernetes-lease") -}}
+{{- fail "anchor.mode must be memory or kubernetes-lease" -}}
+{{- end -}}
+{{- if and (eq .Values.anchor.mode "memory") (not .Values.anchor.allowMemory) -}}
+{{- fail "anchor.mode=memory requires anchor.allowMemory=true; use kubernetes-lease for durable rollback protection" -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "rs3-gateway.repositoryKeySecretName" -}}
 {{- if .Values.repositoryKeys.existingSecret -}}
 {{- .Values.repositoryKeys.existingSecret -}}

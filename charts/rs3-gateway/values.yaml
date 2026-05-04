@@ -32,8 +32,10 @@ credentials:
 commit:
   maxBatchItems: 8
   maxBatchDelayMs: 5
+  maxPendingItems: 8
 
 repository:
+  id: rs3-repository
   payloadSegmentSizeBytes: 512
 
 repositoryKeys:
@@ -42,7 +44,8 @@ repositoryKeys:
   masterKeyHex: ""
 
 anchor:
-  mode: memory
+  mode: kubernetes-lease
+  allowMemory: false
   namespace: ""
   name: checkpoint
   fieldManager: rs3-server

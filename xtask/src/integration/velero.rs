@@ -251,9 +251,9 @@ mod imp {
 
     use super::VeleroKopiaSmokeArgs;
     use crate::integration::k8s_support::{
-        CHART_PATH, GatewayChartValues, K8sWorkspace, KindCluster, REPOSITORY_MASTER_KEY_HEX,
-        default_cluster_name, helm_fullname, helm_install_gateway, now_millis, path_str,
-        require_command, run_command, run_command_capture, split_image_ref,
+        CHART_PATH, GatewayChartValues, K8sWorkspace, KindCluster, REPOSITORY_ID,
+        REPOSITORY_MASTER_KEY_HEX, default_cluster_name, helm_fullname, helm_install_gateway,
+        now_millis, path_str, require_command, run_command, run_command_capture, split_image_ref,
     };
     use anyhow::{Context, Result, bail};
     use artifacts::ArtifactCollector;
@@ -472,6 +472,7 @@ mod imp {
                             log_format: "json",
                             rust_log: GATEWAY_RUST_LOG,
                             payload_segment_size: args.payload_segment_size,
+                            repository_id: REPOSITORY_ID,
                             repository_master_key_hex: REPOSITORY_MASTER_KEY_HEX,
                             persistence_enabled: false,
                             wait_secs: args.wait_secs,
