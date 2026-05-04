@@ -80,7 +80,6 @@ There is no stable-format promise yet. Before a stable format, the project still
 decisions for:
 
 - canonical metadata encoding
-- production metadata encryption primitive
 - checkpoint signature scheme
 - default segment-size policy
 - index compaction thresholds

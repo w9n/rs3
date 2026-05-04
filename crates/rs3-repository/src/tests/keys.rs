@@ -28,7 +28,7 @@ fn repository_new_derives_purpose_specific_keys_from_master_key() {
             (
                 key_id("metadata-v1"),
                 KeyPurpose::Metadata,
-                "xchacha20poly1305-hmac-sha256-nonce-v1".to_owned()
+                "aes-256-gcm-siv-hmac-sha256-nonce-v1".to_owned()
             ),
             (
                 key_id("checkpoint-v1"),

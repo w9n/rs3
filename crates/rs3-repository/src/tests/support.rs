@@ -97,7 +97,7 @@ pub(super) fn metadata_key(value: &str, status: KeyStatus, secret_byte: u8) -> K
         value,
         KeyPurpose::Metadata,
         status,
-        "xchacha20poly1305-hmac-sha256-nonce-v1",
+        "aes-256-gcm-siv-hmac-sha256-nonce-v1",
         secret_byte,
     )
 }

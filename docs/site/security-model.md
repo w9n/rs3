@@ -101,8 +101,9 @@ records. Do not use it as the only anti-rollback mechanism.
 ## Current Open Risks
 
 - Durable format compatibility is not promised yet.
-- Metadata sealing and checkpoint signatures still need final production
-  primitive decisions.
+- Metadata sealing now uses a standard misuse-resistant AEAD, but the durable
+  envelope format is still not stable.
+- Checkpoint signatures still need a final production primitive decision.
 - Prefix token shape currently prioritizes semantics and testability; it still
   leaks namespace structure through token count and shared-token relationships.
 - Hardened storage evidence needs continued deployment integration.

@@ -1,18 +1,18 @@
 //! Metadata payload sealing helpers.
 //!
-//! Metadata uses the `chacha20poly1305` crate's XChaCha20-Poly1305 AEAD. The
-//! nonce is deterministically derived from secret key material, associated data,
-//! and plaintext so retrying the same manifest/index write is stable while
-//! retaining the AEAD implementation boundary.
+//! Metadata uses the `aes-gcm-siv` crate's AES-256-GCM-SIV AEAD. The nonce is
+//! deterministically derived from secret key material, associated data, and
+//! plaintext so retrying the same manifest/index write is stable. GCM-SIV keeps
+//! the metadata boundary on a standard misuse-resistant AEAD construction.
 
 use crate::keyring::KeyRing;
 use crate::primitives::derive_hmac;
 use crate::{CryptoError, SecretBytes};
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
-use chacha20poly1305::{Tag, XChaCha20Poly1305, XNonce};
+use aes_gcm_siv::aead::{AeadInPlace, KeyInit};
+use aes_gcm_siv::{Aes256GcmSiv, Nonce, Tag};
 use rs3_types::{KeyId, KeyPurpose};
 
-const METADATA_NONCE_LEN: usize = 24;
+const METADATA_NONCE_LEN: usize = 12;
 const METADATA_TAG_LEN: usize = 16;
 
 /// Sealed metadata payload and the key that produced it.
@@ -86,7 +86,7 @@ fn encrypt_metadata_with_key(
     let mut ciphertext = Vec::with_capacity(plaintext.len() + METADATA_TAG_LEN);
     ciphertext.extend_from_slice(plaintext);
     let tag = cipher
-        .encrypt_in_place_detached(XNonce::from_slice(nonce), associated_data, &mut ciphertext)
+        .encrypt_in_place_detached(Nonce::from_slice(nonce), associated_data, &mut ciphertext)
         .map_err(|_| CryptoError::AeadOperationFailed)?;
     Ok((ciphertext, tag.to_vec()))
 }
@@ -105,7 +105,7 @@ fn decrypt_metadata_with_key(
     let mut plaintext = ciphertext.to_vec();
     cipher
         .decrypt_in_place_detached(
-            XNonce::from_slice(nonce),
+            Nonce::from_slice(nonce),
             associated_data,
             &mut plaintext,
             Tag::from_slice(tag),
@@ -114,9 +114,9 @@ fn decrypt_metadata_with_key(
     Ok(plaintext)
 }
 
-fn metadata_cipher(secret: &SecretBytes) -> Result<XChaCha20Poly1305, CryptoError> {
-    let key = derive_hmac(secret, b"rs3:metadata-aead-key:v1", b"xchacha20poly1305")?;
-    XChaCha20Poly1305::new_from_slice(&key).map_err(|_| CryptoError::AeadOperationFailed)
+fn metadata_cipher(secret: &SecretBytes) -> Result<Aes256GcmSiv, CryptoError> {
+    let key = derive_hmac(secret, b"rs3:metadata-aead-key:v2", b"aes-256-gcm-siv")?;
+    Aes256GcmSiv::new_from_slice(&key).map_err(|_| CryptoError::AeadOperationFailed)
 }
 
 fn nonce_material(associated_data: &[u8], plaintext: &[u8]) -> Vec<u8> {
@@ -157,7 +157,7 @@ mod tests {
             KeyDescriptor {
                 id: key_id(value),
                 purpose: KeyPurpose::Metadata,
-                algorithm: "xchacha20poly1305-hmac-sha256-nonce-v1".to_string(),
+                algorithm: "aes-256-gcm-siv-hmac-sha256-nonce-v1".to_string(),
                 status,
                 created_at_ms: 0,
                 not_before_ms: None,
@@ -215,6 +215,24 @@ mod tests {
             Err(error) => panic!("{error}"),
         }
         assert_ne!(sealed.ciphertext, b"client/path");
+    }
+
+    #[test]
+    fn sealed_metadata_is_deterministic_for_retry_stability() {
+        let keyring = keyring();
+
+        let first = match keyring.seal_metadata_payload(b"manifest-a", b"client/path") {
+            Ok(sealed) => sealed,
+            Err(error) => panic!("{error}"),
+        };
+        let second = match keyring.seal_metadata_payload(b"manifest-a", b"client/path") {
+            Ok(sealed) => sealed,
+            Err(error) => panic!("{error}"),
+        };
+
+        assert_eq!(first, second);
+        assert_eq!(first.nonce.len(), 12);
+        assert_eq!(first.tag.len(), 16);
     }
 
     #[test]

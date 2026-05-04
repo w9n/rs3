@@ -1046,7 +1046,7 @@ fn keyring() -> Result<KeyRing> {
             "metadata",
             KeyPurpose::Metadata,
             KeyStatus::Primary,
-            "xchacha20poly1305-hmac-sha256-nonce-v1",
+            "aes-256-gcm-siv-hmac-sha256-nonce-v1",
             2,
         )?,
         key_material(

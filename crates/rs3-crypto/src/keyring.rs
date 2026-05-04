@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 const NAMESPACE_ALGORITHM: &str = "hmac-sha256";
 const CONTENT_ALGORITHM: &str = "xchacha20poly1305";
-const METADATA_ALGORITHM: &str = "xchacha20poly1305-hmac-sha256-nonce-v1";
+const METADATA_ALGORITHM: &str = "aes-256-gcm-siv-hmac-sha256-nonce-v1";
 const CHECKPOINT_ALGORITHM: &str = "hmac-sha256";
 
 /// Secret-bearing keyring entry.
@@ -421,7 +421,7 @@ mod tests {
                 (
                     key_id("metadata-v1"),
                     KeyPurpose::Metadata,
-                    "xchacha20poly1305-hmac-sha256-nonce-v1".to_owned()
+                    "aes-256-gcm-siv-hmac-sha256-nonce-v1".to_owned()
                 ),
                 (
                     key_id("checkpoint-v1"),
