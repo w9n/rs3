@@ -101,6 +101,7 @@ Track these before optimizing:
 - gateway backend read bytes per returned client `GET` byte
 - gateway backend write bytes per client `PUT` request byte
 - restore phase elapsed ratio
+- gateway commit phase averages, especially stage-lock wait and checkpoint wait
 - gateway CPU time and high-water RSS
 - variability across repeated runs
 

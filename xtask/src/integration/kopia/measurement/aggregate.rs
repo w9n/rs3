@@ -27,6 +27,7 @@ pub(crate) fn compare_runs(runs: &[Value]) -> Value {
     let mut payload_span_cache_event_hit_ratio = Vec::new();
     let mut payload_span_cache_byte_hit_ratio = Vec::new();
     let mut phase_elapsed_ms_ratio: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut commit_put_phase_avg_seconds: BTreeMap<String, Vec<f64>> = BTreeMap::new();
 
     for run in runs {
         let Some(direct) = report_for_storage_path(run, "direct-rustfs") else {
@@ -36,6 +37,7 @@ pub(crate) fn compare_runs(runs: &[Value]) -> Value {
             continue;
         };
 
+        push_gateway_commit_phase_averages(&mut commit_put_phase_avg_seconds, gateway);
         push_ratio(
             &mut elapsed_ms_ratio,
             value_u64_at(gateway, &["elapsed_ms"]),
@@ -168,6 +170,7 @@ pub(crate) fn compare_runs(runs: &[Value]) -> Value {
             "backend_write_bytes_per_client_put_request_byte": summarize_f64(&backend_write_bytes_per_client_put_request_byte),
             "payload_span_cache_event_hit_ratio": summarize_f64(&payload_span_cache_event_hit_ratio),
             "payload_span_cache_byte_hit_ratio": summarize_f64(&payload_span_cache_byte_hit_ratio),
+            "commit_put_phase_avg_seconds": summarize_ratio_map(&commit_put_phase_avg_seconds),
         },
     })
 }
@@ -617,6 +620,28 @@ fn phase_timings_map(report: &Value) -> BTreeMap<String, u64> {
     timings
 }
 
+fn push_gateway_commit_phase_averages(phases: &mut BTreeMap<String, Vec<f64>>, gateway: &Value) {
+    let Some(phase_values) = value_at(
+        gateway,
+        &[
+            "prometheus_metrics",
+            "repository",
+            "commit",
+            "put_phase_duration_seconds_by_phase",
+        ],
+    )
+    .and_then(Value::as_object) else {
+        return;
+    };
+
+    for (phase, value) in phase_values {
+        let Some(avg) = value.get("avg").and_then(Value::as_f64) else {
+            continue;
+        };
+        phases.entry(phase.clone()).or_default().push(avg);
+    }
+}
+
 fn aggregate_object(reports: &[&Value], path: &[&str]) -> Value {
     let mut values_by_key: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for report in reports {
@@ -1061,6 +1086,10 @@ mod tests {
         assert_eq!(
             comparison["gateway_internal"]["payload_span_cache_byte_hit_ratio"]["avg"],
             serde_json::json!(0.8)
+        );
+        assert_eq!(
+            comparison["gateway_internal"]["commit_put_phase_avg_seconds"]["stage_lock_wait"]["avg"],
+            serde_json::json!(0.03)
         );
 
         let aggregate = aggregate_runs(&runs);
