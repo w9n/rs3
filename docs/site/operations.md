@@ -105,3 +105,6 @@ During an incident, favor read-only restore with a verified checkpoint and
 external anchor over any mode that repairs state automatically. If break-glass
 restore is added, it should require explicit operator input and leave an audit
 trail.
+
+See [Restore Under Attack](runbooks/restore-under-attack.md) for the incident
+runbook.

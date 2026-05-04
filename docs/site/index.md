@@ -83,8 +83,8 @@ defaults as production-stable yet.
 | Reader | Start Here |
 | --- | --- |
 | Platform lead | [Evaluation](evaluation.md) |
-| Security reviewer | [Security Model](security-model.md) |
-| Operator | [Operations](operations.md) |
+| Security reviewer | [Security Model](security-model.md) and [Security Review](security-review.md) |
+| Operator | [Operations](operations.md) and [Restore Under Attack](runbooks/restore-under-attack.md) |
 | Contributor | [Architecture](architecture.md) and [Testing](testing.md) |
 | Performance reviewer | [Performance](performance.md) |
 

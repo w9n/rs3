@@ -49,7 +49,11 @@ nav:
   - Getting Started: getting-started.md
   - Architecture: architecture.md
   - Security Model: security-model.md
+  - Security Review: security-review.md
   - Operations: operations.md
+  - Runbooks:
+      - Retention And Object Lock: runbooks/retention-and-object-lock.md
+      - Restore Under Attack: runbooks/restore-under-attack.md
   - Performance: performance.md
   - Testing: testing.md
   - Reference:

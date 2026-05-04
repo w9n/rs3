@@ -49,17 +49,32 @@ labels, traces, checkpoints, and error messages.
 
 ## Accepted Leakage
 
-The default design accepts that the backend can observe:
+The default design accepts specific backend-visible leakage:
 
-- number of backend objects
-- encrypted object sizes
-- coarse write and restore timing
-- provider retention mode where configured
-- source network metadata visible to the provider
-- broad object classes when class prefixes are used
+| Leakage | Why It Exists | Current Mitigation |
+| --- | --- | --- |
+| Backend object count | Object stores expose object inventory and request effects. | Batch checkpoints and compact index state where possible. |
+| Encrypted object size | The provider stores ciphertext bytes. | Segment sizing and future padding policy. |
+| Coarse write and restore timing | The provider sees requests arrive. | Avoid path labels in telemetry; future batching/jitter where useful. |
+| Retention mode | Provider retention APIs expose mode and retain-until behavior. | Treat retention mode as policy metadata, not tenant identity. |
+| Source network metadata | The provider sees the gateway's network identity. | Deploy through controlled egress where required. |
+| Broad object class | Class prefixes support lifecycle and operations. | Keep class names generic and path-free; revisit in a new format if needed. |
+| Prefix-token structure | Current prefix tokens reveal token count and shared-token relationships. | Document as an open privacy risk; redesign index compaction before stable-format claims. |
 
 Optional mitigations include padding, pack-size normalization, checkpoint
 batching, compaction jitter, and stricter telemetry redaction.
+
+## Control Map
+
+| Requirement | Mechanism | Current Evidence |
+| --- | --- | --- |
+| Backend keys do not reveal client paths | Opaque backend object IDs and path privacy property tests. | `crates/rs3-repository/tests/path_invariants.rs` |
+| Payload bytes are not plaintext in storage | Authenticated encrypted payload segments. | Repository payload tests in `crates/rs3-repository/src/tests/payload.rs` |
+| Payload objects cannot be moved silently | Associated data binds ciphertext to backend object context. | Payload tamper and object-context tests. |
+| Old content remains readable after rotation | Enabled historical content keys are accepted for reads. | Repository key rotation tests. |
+| Writes are not acknowledged before checkpoint acceptance | Commit coordinator waits for covering checkpoint. | Commit coordinator and checkpoint tests. |
+| Storage rollback is not trusted as latest state | Checkpoint verification plus external anchor model. | Anchor and checkpoint replay tests. |
+| Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 
 ## Rollback Rule
 
@@ -93,3 +108,16 @@ records. Do not use it as the only anti-rollback mechanism.
 - Hardened storage evidence needs continued deployment integration.
 - Key retirement must remain retention-aware to avoid losing access to locked
   historical data.
+
+## Review Standard
+
+A security review should not accept prose claims alone. For every new feature,
+reviewers should ask:
+
+- What new backend-visible data exists?
+- Can the data reveal paths, tenant identity, object equality, object counts,
+  file size, timing, or Kubernetes resource names?
+- Which test proves the privacy boundary?
+- Which runbook explains recovery when the object store or anchor service is
+  hostile?
+- Does the change preserve fail-closed anchor behavior?
