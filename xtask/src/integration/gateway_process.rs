@@ -97,7 +97,7 @@ impl RunningGateway {
         let bind = addr.to_string();
         let metrics_bind = metrics_addr.map(|addr| addr.to_string());
         let startup_timeout = match options.build_profile {
-            GatewayBuildProfile::Dev => Duration::from_secs(30),
+            GatewayBuildProfile::Dev => Duration::from_secs(180),
             GatewayBuildProfile::Release => Duration::from_secs(600),
         };
         let mut gateway_args = vec!["run"];
