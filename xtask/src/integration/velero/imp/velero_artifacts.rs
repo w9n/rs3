@@ -406,6 +406,29 @@ fn capture_kubectl_output(
     kubectl_capture(&args.kubectl_bin, kubeconfig_path, kubectl_args)
 }
 
+pub(super) fn gateway_backend_counts(
+    args: &VeleroKopiaSmokeArgs,
+    kubeconfig_path: &Path,
+) -> Result<BlobOperationCounts> {
+    let logs = capture_kubectl_output(
+        args,
+        kubeconfig_path,
+        &[
+            "-n",
+            &args.gateway_namespace,
+            "logs",
+            "-l",
+            &gateway_selector(args),
+            "--all-containers=true",
+            "--prefix=true",
+            "--tail=-1",
+        ],
+    )?;
+    let lines = logs.lines().map(str::to_owned).collect::<Vec<_>>();
+    let (counts, _, _) = parse_gateway_backend_metrics(&lines);
+    Ok(counts)
+}
+
 fn gateway_backend_metrics_json(logs: &str) -> Value {
     let lines = logs.lines().map(str::to_owned).collect::<Vec<_>>();
     let (counts, operations, object_kinds) = parse_gateway_backend_metrics(&lines);

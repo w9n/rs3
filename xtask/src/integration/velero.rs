@@ -253,14 +253,16 @@ mod imp {
     use crate::integration::k8s_support::{
         GatewayChartValues, K8sWorkspace, KEYRING_ENVELOPE_OBJECT_ID, KEYRING_WRAPPING_KEY_HEX,
         KEYRING_WRAPPING_KEY_ID, KindCluster, REPOSITORY_ID, REPOSITORY_SALT_HEX,
-        default_cluster_name, helm_fullname, helm_install_gateway, helm_lint_gateway, now_millis,
-        path_str, require_command, run_command, run_command_capture, split_image_ref,
+        default_cluster_name, helm_fullname, helm_install_gateway, helm_lint_gateway,
+        helm_set_gateway_mode, now_millis, path_str, require_command, run_command,
+        run_command_capture, split_image_ref,
     };
     use anyhow::{Context, Result, bail};
-    use artifacts::ArtifactCollector;
+    use artifacts::{ArtifactCollector, gateway_backend_counts};
     use images::{
         prepare_openebs_images, prepare_postgres_image, prepare_rustfs_image, prepare_velero_images,
     };
+    use rs3_storage::BlobOperationCounts;
     use rustfs_backend::{
         BACKEND_BUCKET, BACKEND_REGION, RUSTFS_ACCESS_KEY_ID, RUSTFS_SECRET_ACCESS_KEY,
     };
@@ -269,8 +271,8 @@ mod imp {
     use std::time::Instant;
     use velero_cli::{
         assert_pod_volume_backup_completed, assert_pod_volume_restore_completed,
-        assert_velero_phase, create_backup, create_restore, install_velero, velero_s3_target,
-        write_velero_credentials,
+        assert_velero_phase, create_backup, create_restore, install_velero,
+        set_backup_storage_location_access_mode, velero_s3_target, write_velero_credentials,
     };
     use workload::{
         apply_workload, assert_workload_proof, delete_workload_namespace, delete_workload_pod,
@@ -558,6 +560,26 @@ mod imp {
                     eprintln!("failed to collect post-restart checkpoint artifacts: {error:#}");
                 }
             }
+            let restore_readonly_counts_before = if scenario.restore_readonly_before_restore
+                && scenario.storage_path.uses_gateway()
+            {
+                run_phase(&mut state, "switch-gateway-restore-readonly", || {
+                    set_backup_storage_location_access_mode(&args, kubeconfig_path, "ReadOnly")?;
+                    helm_set_gateway_mode(
+                        &args.helm_bin,
+                        kubeconfig_path,
+                        &args.release_name,
+                        &args.gateway_namespace,
+                        "restore-readonly",
+                        args.wait_secs,
+                    )?;
+                    wait_for_gateway_rollout(&args, kubeconfig_path)?;
+                    gateway_backend_counts(&args, kubeconfig_path)
+                })
+                .map(Some)?
+            } else {
+                None
+            };
             run_phase(&mut state, "restore", || {
                 create_restore(&args, kubeconfig_path, &backup_name, &restore_name)?;
                 assert_velero_phase(
@@ -570,6 +592,12 @@ mod imp {
                 )?;
                 assert_pod_volume_restore_completed(&args, kubeconfig_path, &restore_name)
             })?;
+            if let Some(before) = restore_readonly_counts_before {
+                run_phase(&mut state, "assert-restore-readonly-backend-writes", || {
+                    let after = gateway_backend_counts(&args, kubeconfig_path)?;
+                    assert_no_backend_writes_during_restore(&before, &after)
+                })?;
+            }
             run_phase(&mut state, "verify-restored-workload", || {
                 wait_for_workload_available(&args, kubeconfig_path)?;
                 wait_for_restored_proof(&args, kubeconfig_path, scenario.workload)
@@ -766,7 +794,6 @@ mod imp {
     }
 
     fn restart_gateway(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
-        let timeout = timeout_arg(args.wait_secs);
         let deployment = format!("deployment/{}", helm_fullname(&args.release_name));
         kubectl(
             &args.kubectl_bin,
@@ -780,6 +807,12 @@ mod imp {
             ],
         )
         .context("failed to restart gateway deployment")?;
+        wait_for_gateway_rollout(args, kubeconfig_path)
+    }
+
+    fn wait_for_gateway_rollout(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
+        let timeout = timeout_arg(args.wait_secs);
+        let deployment = format!("deployment/{}", helm_fullname(&args.release_name));
         kubectl(
             &args.kubectl_bin,
             kubeconfig_path,
@@ -794,6 +827,30 @@ mod imp {
             ],
         )
         .context("gateway deployment did not become ready after restart")
+    }
+
+    fn assert_no_backend_writes_during_restore(
+        before: &BlobOperationCounts,
+        after: &BlobOperationCounts,
+    ) -> Result<()> {
+        let put = after.put.saturating_sub(before.put);
+        let delete = after.delete.saturating_sub(before.delete);
+        let extend_retention = after
+            .extend_retention
+            .saturating_sub(before.extend_retention);
+        let set_legal_hold = after.set_legal_hold.saturating_sub(before.set_legal_hold);
+        let bytes_written = after.bytes_written.saturating_sub(before.bytes_written);
+        if put == 0
+            && delete == 0
+            && extend_retention == 0
+            && set_legal_hold == 0
+            && bytes_written == 0
+        {
+            return Ok(());
+        }
+        bail!(
+            "restore-readonly restore wrote to backend: put={put} delete={delete} extend_retention={extend_retention} set_legal_hold={set_legal_hold} bytes_written={bytes_written}"
+        )
     }
 
     fn kubectl(kubectl_bin: &str, kubeconfig_path: &Path, args: &[&str]) -> Result<()> {

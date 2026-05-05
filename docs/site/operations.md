@@ -222,6 +222,32 @@ explicit bounded recovery decision. Backend evidence alone is not a perfect
 latest-state oracle because the backend can hide newer valid evidence and replay
 older valid evidence.
 
+Export the trusted restore bundle from a healthy cluster or regular operations
+job and store it outside the object-store account:
+
+```sh
+cargo run -p rs3-server -- export-restore-bundle --format json
+```
+
+The bundle contains public repository restore metadata: repository ID, public
+salt, accepted checkpoint sequence, checkpoint ID, checkpoint digest, and the
+checkpoint-bound keyring-envelope reference. It does not contain wrapping-key
+material.
+
+On a new cluster with a missing anchor, import the trusted checkpoint position
+from that bundle after configuring the same repository ID, salt, and unwrap
+authority:
+
+```sh
+cargo run -p rs3-server -- import-anchor \
+  --checkpoint-sequence <bundle-sequence> \
+  --checkpoint-id <bundle-checkpoint-id> \
+  --checkpoint-digest <bundle-checkpoint-digest>
+```
+
+The import verifies the checkpoint chain, checkpoint evidence, keyring envelope,
+and reachable restore-critical objects before writing the missing anchor.
+
 When the old Kubernetes Lease is gone, use explicit anchor recovery with a
 freshness bound:
 

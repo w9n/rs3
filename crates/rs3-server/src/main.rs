@@ -5,10 +5,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rs3_crypto::derive_public_fingerprint;
 use rs3_server::{
-    AnchorConfig, AnchorRecoveryOptions, AnchorRecoveryReport, GatewayMode, GatewayServer,
-    RuntimeConfig, recover_anchor_from_config,
+    AnchorConfig, AnchorImportReport, AnchorRecoveryOptions, AnchorRecoveryReport, GatewayMode,
+    GatewayServer, RESTORE_BUNDLE_SCHEMA, RestoreTrustBundle, RuntimeConfig,
+    export_restore_bundle_from_config, import_anchor_from_config, recover_anchor_from_config,
 };
-use rs3_types::RetentionMode;
+use rs3_types::{CheckpointId, RetentionMode, Sequence};
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
@@ -47,6 +48,20 @@ enum Commands {
         max_checkpoint_age_seconds: u64,
         #[arg(long, default_value_t = false)]
         apply_if_missing: bool,
+        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
+        format: RecoveryReportFormat,
+    },
+    ExportRestoreBundle {
+        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
+        format: RecoveryReportFormat,
+    },
+    ImportAnchor {
+        #[arg(long)]
+        checkpoint_sequence: u64,
+        #[arg(long)]
+        checkpoint_id: String,
+        #[arg(long)]
+        checkpoint_digest: String,
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
@@ -122,8 +137,105 @@ async fn main() -> Result<()> {
             .await?;
             print_recovery_report(&report, format)?;
         }
+        Commands::ExportRestoreBundle { format } => {
+            let config = RuntimeConfig::from_env()?;
+            log_runtime_config(&config);
+            let bundle = export_restore_bundle_from_config(&config).await?;
+            print_restore_bundle(&bundle, format)?;
+        }
+        Commands::ImportAnchor {
+            checkpoint_sequence,
+            checkpoint_id,
+            checkpoint_digest,
+            format,
+        } => {
+            let config = RuntimeConfig::from_env()?;
+            log_runtime_config(&config);
+            let report = import_anchor_from_config(
+                &config,
+                rs3_repository::CheckpointPosition {
+                    sequence: Sequence::new(checkpoint_sequence),
+                    checkpoint_id: CheckpointId::new(checkpoint_id)?,
+                    payload_digest: checkpoint_digest,
+                },
+            )
+            .await?;
+            print_import_report(&report, format)?;
+        }
     }
 
+    Ok(())
+}
+
+fn print_restore_bundle(bundle: &RestoreTrustBundle, format: RecoveryReportFormat) -> Result<()> {
+    match format {
+        RecoveryReportFormat::Json => {
+            let keyring_envelope = bundle.keyring_envelope.as_ref().map(|envelope| {
+                serde_json::json!({
+                    "generation": envelope.generation,
+                    "object_id": envelope.object_id.as_str(),
+                    "digest": envelope.digest,
+                })
+            });
+            let bundle = serde_json::json!({
+                "schema": RESTORE_BUNDLE_SCHEMA,
+                "repository": {
+                    "id": bundle.repository_id.as_str(),
+                    "salt_hex": bundle.repository_salt_hex,
+                },
+                "checkpoint": {
+                    "sequence": bundle.checkpoint.sequence.get(),
+                    "checkpoint_id": bundle.checkpoint.checkpoint_id.as_str(),
+                    "checkpoint_digest": bundle.checkpoint.payload_digest,
+                    "published_at_ms": bundle.published_at_ms,
+                },
+                "keyring_envelope": keyring_envelope,
+                "generated_at_ms": bundle.generated_at_ms,
+            });
+            println!("{}", serde_json::to_string_pretty(&bundle)?);
+        }
+        RecoveryReportFormat::Text => {
+            println!("schema={RESTORE_BUNDLE_SCHEMA}");
+            println!("repository_id={}", bundle.repository_id.as_str());
+            println!("repository_salt_hex={}", bundle.repository_salt_hex);
+            println!("checkpoint_sequence={}", bundle.checkpoint.sequence.get());
+            println!("checkpoint_id={}", bundle.checkpoint.checkpoint_id.as_str());
+            println!("checkpoint_digest={}", bundle.checkpoint.payload_digest);
+            println!("published_at_ms={}", bundle.published_at_ms);
+            if let Some(envelope) = bundle.keyring_envelope.as_ref() {
+                println!("keyring_envelope_generation={}", envelope.generation);
+                println!("keyring_envelope_object_id={}", envelope.object_id.as_str());
+                println!("keyring_envelope_digest={}", envelope.digest);
+            }
+            println!("generated_at_ms={}", bundle.generated_at_ms);
+        }
+    }
+    Ok(())
+}
+
+fn print_import_report(report: &AnchorImportReport, format: RecoveryReportFormat) -> Result<()> {
+    match format {
+        RecoveryReportFormat::Json => {
+            let report = serde_json::json!({
+                "checkpoint": {
+                    "sequence": report.checkpoint.sequence.get(),
+                    "checkpoint_id": report.checkpoint.checkpoint_id.as_str(),
+                    "checkpoint_digest": report.checkpoint.payload_digest,
+                    "published_at_ms": report.published_at_ms,
+                },
+                "applied": report.applied,
+            });
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        RecoveryReportFormat::Text => {
+            println!("rs3 anchor import: trusted checkpoint applied");
+            println!("checkpoint_sequence={}", report.checkpoint.sequence.get());
+            println!("checkpoint_id={}", report.checkpoint.checkpoint_id.as_str());
+            println!("checkpoint_digest={}", report.checkpoint.payload_digest);
+            println!("published_at_ms={}", report.published_at_ms);
+            println!("applied={}", report.applied);
+        }
+    }
     Ok(())
 }
 

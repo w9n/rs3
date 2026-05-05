@@ -132,13 +132,9 @@ repository state reachable from it.
 This document defines the preview contract. Before freezing the preview, close or
 explicitly defer these gaps:
 
-- normal startup validation compares the accepted Kubernetes Lease position with
-  storage-side evidence and fails closed on mismatch
-- startup validation completes storage-evidence comparison for existing prefixes
-- disaster-recovery tooling exports or imports the trusted anchor position for a
-  new cluster
-- Velero restore acceptance runs with `restore-readonly` and asserts no backend
-  writes during restore
+- run the Velero dynamic-PVC gateway-restart lane with `restore-readonly` and
+  record the artifact path proving zero backend writes during restore
+- run the release gates and record the current result set
 
 ## Non-Goals
 
@@ -166,6 +162,10 @@ just preview-gate-release
 
 For restore evidence, run `xtask restore verify` against a trusted checkpoint
 position from the configured anchor.
+
+For disaster-recovery evidence, export a trusted restore bundle with
+`rs3-server export-restore-bundle` and prove anchor import with
+`rs3-server import-anchor` in a clean cluster.
 
 ## Configuration Checklist
 
@@ -200,6 +200,7 @@ A preview is ready when the release evidence shows:
 - restore-readonly mode rejects supported writes and still serves restore reads
 - restore verification succeeds for the checkpoint under test, including
   checkpoint evidence and keyring-envelope binding
+- a trusted restore bundle can be exported and imported into a missing anchor
 - performance evidence compares gateway behavior to the straight RustFS proxy
   baseline
 - accepted leakage is documented in the security model

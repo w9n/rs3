@@ -174,6 +174,44 @@ pub(super) fn create_restore(
     .context("Velero restore failed")
 }
 
+pub(super) fn set_backup_storage_location_access_mode(
+    args: &VeleroKopiaSmokeArgs,
+    kubeconfig_path: &Path,
+    access_mode: &str,
+) -> Result<()> {
+    let patch = format!(r#"{{"spec":{{"accessMode":"{access_mode}"}}}}"#);
+    kubectl(
+        &args.kubectl_bin,
+        kubeconfig_path,
+        &[
+            "-n",
+            &args.velero_namespace,
+            "patch",
+            "backupstoragelocations.velero.io/default",
+            "--type=merge",
+            "-p",
+            &patch,
+        ],
+    )
+    .with_context(|| format!("failed to set Velero backup storage location {access_mode}"))?;
+
+    let timeout = timeout_arg(args.wait_secs);
+    kubectl(
+        &args.kubectl_bin,
+        kubeconfig_path,
+        &[
+            "-n",
+            &args.velero_namespace,
+            "wait",
+            "--for=jsonpath={.status.phase}=Available",
+            "backupstoragelocations.velero.io/default",
+            "--timeout",
+            timeout.as_str(),
+        ],
+    )
+    .context("Velero backup storage location did not become available after access-mode change")
+}
+
 pub(super) fn assert_pod_volume_backup_completed(
     args: &VeleroKopiaSmokeArgs,
     kubeconfig_path: &Path,

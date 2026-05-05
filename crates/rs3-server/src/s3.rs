@@ -8,7 +8,9 @@ mod runtime;
 
 pub use boundary::{GatewayS3Boundary, S3Hardening};
 pub use recovery::{
-    AnchorRecoveryError, AnchorRecoveryOptions, AnchorRecoveryReport, recover_anchor_from_config,
+    AnchorImportReport, AnchorRecoveryError, AnchorRecoveryOptions, AnchorRecoveryReport,
+    RESTORE_BUNDLE_SCHEMA, RestoreBundleKeyringEnvelope, RestoreTrustBundle,
+    export_restore_bundle_from_config, import_anchor_from_config, recover_anchor_from_config,
 };
 use thiserror::Error;
 

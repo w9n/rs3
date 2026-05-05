@@ -145,6 +145,37 @@ pub(crate) fn helm_install_gateway(
     .context("failed to install gateway Helm chart")
 }
 
+pub(crate) fn helm_set_gateway_mode(
+    helm_bin: &str,
+    kubeconfig_path: &Path,
+    release_name: &str,
+    namespace: &str,
+    gateway_mode: &str,
+    wait_secs: u64,
+) -> Result<()> {
+    let kubeconfig = path_str(kubeconfig_path)?;
+    let timeout = format!("{wait_secs}s");
+    run_command(
+        helm_bin,
+        &[
+            "--kubeconfig",
+            kubeconfig,
+            "upgrade",
+            release_name,
+            CHART_PATH,
+            "--namespace",
+            namespace,
+            "--reuse-values",
+            "--wait",
+            "--timeout",
+            timeout.as_str(),
+            "--set-string",
+            &helm_set_string("gateway.mode", gateway_mode),
+        ],
+    )
+    .context("failed to update gateway Helm mode")
+}
+
 pub(crate) fn helm_lint_gateway(helm_bin: &str) -> Result<()> {
     let salt = helm_set_string("repositoryKeys.saltHex", REPOSITORY_SALT_HEX);
     let envelope = helm_set_string(

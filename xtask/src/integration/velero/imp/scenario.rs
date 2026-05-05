@@ -49,6 +49,7 @@ pub(super) struct Scenario {
     pub(super) workload: WorkloadKind,
     pub(super) storage_path: StoragePath,
     pub(super) restart_gateway_before_restore: bool,
+    pub(super) restore_readonly_before_restore: bool,
 }
 
 impl Scenario {
@@ -59,6 +60,7 @@ impl Scenario {
             workload: WorkloadKind::ProofFile,
             storage_path: StoragePath::Gateway,
             restart_gateway_before_restore: false,
+            restore_readonly_before_restore: false,
         }
     }
 
@@ -69,6 +71,7 @@ impl Scenario {
             workload: WorkloadKind::ProofFile,
             storage_path: StoragePath::Gateway,
             restart_gateway_before_restore: false,
+            restore_readonly_before_restore: false,
         }
     }
 
@@ -79,6 +82,7 @@ impl Scenario {
             workload: WorkloadKind::ProofFile,
             storage_path: StoragePath::Gateway,
             restart_gateway_before_restore: false,
+            restore_readonly_before_restore: false,
         }
     }
 
@@ -89,6 +93,7 @@ impl Scenario {
             workload: WorkloadKind::ProofFile,
             storage_path: StoragePath::Gateway,
             restart_gateway_before_restore: true,
+            restore_readonly_before_restore: true,
         }
     }
 
@@ -99,6 +104,7 @@ impl Scenario {
             workload: WorkloadKind::Postgres,
             storage_path: StoragePath::Gateway,
             restart_gateway_before_restore: false,
+            restore_readonly_before_restore: false,
         }
     }
 
@@ -109,6 +115,7 @@ impl Scenario {
             workload: WorkloadKind::Postgres,
             storage_path: StoragePath::DirectRustfs,
             restart_gateway_before_restore: false,
+            restore_readonly_before_restore: false,
         }
     }
 }

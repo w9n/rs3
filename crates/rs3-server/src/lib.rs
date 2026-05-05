@@ -14,8 +14,10 @@ pub use identity::{
     StaticCredentials,
 };
 pub use s3::{
-    AnchorRecoveryError, AnchorRecoveryOptions, AnchorRecoveryReport, GatewayS3Boundary,
-    S3BoundaryError, S3Hardening, recover_anchor_from_config,
+    AnchorImportReport, AnchorRecoveryError, AnchorRecoveryOptions, AnchorRecoveryReport,
+    GatewayS3Boundary, RESTORE_BUNDLE_SCHEMA, RestoreBundleKeyringEnvelope, RestoreTrustBundle,
+    S3BoundaryError, S3Hardening, export_restore_bundle_from_config, import_anchor_from_config,
+    recover_anchor_from_config,
 };
 pub use secrecy::SecretString;
 pub use server::{GatewayServer, GatewayServerError};

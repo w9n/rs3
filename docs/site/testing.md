@@ -24,7 +24,7 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | Kopia | `just integration-kopia-gateway` | Real Kopia create, snapshot, and restore through the gateway. |
 | Kubernetes | `just integration-k8s-gateway` | Image build, kind cluster, Helm install, readiness, S3 smoke. |
 | Velero/Kopia | `just integration-velero-kopia-smoke` | Velero node-agent/Kopia backup and restore smoke. |
-| Preview release gate | `just preview-gate-release` | Kopia gateway, Velero dynamic PVC gateway-restart, and Velero Postgres smoke. |
+| Preview release gate | `just preview-gate-release` | Kopia gateway, Velero dynamic PVC gateway-restart with `restore-readonly`, and Velero Postgres smoke. |
 | Performance | `just perf-s3-gateway -- --format jsonl` | Gateway scenario metrics and amplification. |
 
 Expensive lanes emit artifacts under `.local/integration/` by default.

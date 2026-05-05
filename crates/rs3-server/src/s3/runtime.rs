@@ -12,7 +12,8 @@ use rs3_crypto::{
     derive_checkpoint_payload_digest,
 };
 use rs3_index::{
-    CHECKPOINT_OBJECT_DOMAIN, Checkpoint, KeyringEnvelopeReference, canonical_commit_record_bytes,
+    CHECKPOINT_EVIDENCE_DOMAIN, CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CheckpointEvidence,
+    KeyringEnvelopeReference, canonical_commit_record_bytes, checkpoint_evidence_bytes,
 };
 #[cfg(feature = "k8s")]
 use rs3_k8s::{KubernetesLeaseAnchor, LeaseSettings};
@@ -36,6 +37,7 @@ pub(super) type RuntimeStore = DynBlobStore;
 pub(super) type RuntimeAnchor = DynCheckpointAnchor;
 type RuntimeCommitCoordinator = CommitCoordinator<RuntimeStore, RuntimeAnchor>;
 const KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.keyring-envelope+json";
+const CHECKPOINT_EVIDENCE_OBJECT_PREFIX: &str = "evidence/";
 
 #[derive(Clone)]
 pub(super) struct RuntimeRepository {
@@ -114,6 +116,7 @@ impl RuntimeRepository {
             Err(error) => return Err(repository_init(error)),
         };
 
+        validate_storage_evidence(&self.store, &accepted).await?;
         self.coordinator
             .repository()
             .load_checkpoint_position(&accepted)
@@ -766,6 +769,125 @@ pub(super) fn checkpoint_object_id(
     BackendObjectId::new(format!("checkpoints/{}", checkpoint_id.as_str())).map_err(repository_init)
 }
 
+pub(super) fn checkpoint_evidence_object_id(
+    position: &CheckpointPosition,
+) -> Result<BackendObjectId, S3BoundaryError> {
+    BackendObjectId::new(format!(
+        "{CHECKPOINT_EVIDENCE_OBJECT_PREFIX}{:020}/{}",
+        position.sequence.get(),
+        position.checkpoint_id.as_str()
+    ))
+    .map_err(repository_init)
+}
+
+async fn validate_storage_evidence(
+    store: &RuntimeStore,
+    accepted: &CheckpointPosition,
+) -> Result<(), S3BoundaryError> {
+    verify_checkpoint_evidence_object(store, accepted).await?;
+    reject_newer_storage_evidence(store, accepted).await
+}
+
+async fn verify_checkpoint_evidence_object(
+    store: &RuntimeStore,
+    accepted: &CheckpointPosition,
+) -> Result<(), S3BoundaryError> {
+    let object_id = checkpoint_evidence_object_id(accepted)?;
+    let expected = checkpoint_evidence_body(accepted)?;
+    let body = store
+        .get_range(&object_id, ByteRange::Full)
+        .await
+        .map_err(repository_init)?;
+    if !body.starts_with(CHECKPOINT_EVIDENCE_DOMAIN) || body.as_ref() != expected.as_slice() {
+        return Err(repository_init(
+            "checkpoint evidence object does not match the accepted anchor position",
+        ));
+    }
+    Ok(())
+}
+
+async fn reject_newer_storage_evidence(
+    store: &RuntimeStore,
+    accepted: &CheckpointPosition,
+) -> Result<(), S3BoundaryError> {
+    let evidence = store
+        .list_prefix(CHECKPOINT_EVIDENCE_OBJECT_PREFIX)
+        .await
+        .map_err(repository_init)?;
+    for metadata in evidence {
+        if evidence_object_sequence(&metadata.object_id)
+            .is_none_or(|sequence| sequence <= accepted.sequence.get())
+        {
+            continue;
+        }
+        let body = store
+            .get_range(&metadata.object_id, ByteRange::Full)
+            .await
+            .map_err(repository_init)?;
+        match checkpoint_position_from_evidence_object(&metadata.object_id, &body) {
+            Ok(position) if position.sequence.get() > accepted.sequence.get() => {
+                return Err(repository_init(
+                    "storage checkpoint evidence is newer than the accepted anchor position; run explicit recovery before serving",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "rs3_repository",
+                    object_class = "checkpoint_evidence",
+                    object_id = metadata.object_id.as_str(),
+                    error = %error,
+                    "ignored malformed newer checkpoint evidence during startup validation",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn checkpoint_evidence_body(position: &CheckpointPosition) -> Result<Vec<u8>, S3BoundaryError> {
+    checkpoint_evidence_bytes(&CheckpointEvidence {
+        sequence: position.sequence,
+        checkpoint_id: position.checkpoint_id.clone(),
+        checkpoint_digest: position.payload_digest.clone(),
+        checkpoint_object_id: checkpoint_object_id(&position.checkpoint_id)?,
+    })
+    .map_err(repository_init)
+}
+
+fn checkpoint_position_from_evidence_object(
+    object_id: &BackendObjectId,
+    body: &[u8],
+) -> Result<CheckpointPosition, S3BoundaryError> {
+    let Some(payload) = body.strip_prefix(CHECKPOINT_EVIDENCE_DOMAIN) else {
+        return Err(repository_init("invalid checkpoint evidence object format"));
+    };
+    let evidence: CheckpointEvidence = serde_json::from_slice(payload).map_err(repository_init)?;
+    let position = CheckpointPosition {
+        sequence: evidence.sequence,
+        checkpoint_id: evidence.checkpoint_id,
+        payload_digest: evidence.checkpoint_digest,
+    };
+    if evidence.checkpoint_object_id != checkpoint_object_id(&position.checkpoint_id)?
+        || checkpoint_evidence_object_id(&position)? != *object_id
+    {
+        return Err(repository_init(
+            "checkpoint evidence object does not match its object name",
+        ));
+    }
+    Ok(position)
+}
+
+fn evidence_object_sequence(object_id: &BackendObjectId) -> Option<u64> {
+    object_id
+        .as_str()
+        .strip_prefix(CHECKPOINT_EVIDENCE_OBJECT_PREFIX)?
+        .split_once('/')?
+        .0
+        .parse()
+        .ok()
+}
+
 async fn repository_has_committed_objects(store: &RuntimeStore) -> Result<bool, S3BoundaryError> {
     for prefix in ["checkpoints/", "evidence/", "index/", "segments/"] {
         if !store
@@ -832,7 +954,10 @@ fn repository_init(error: impl ToString) -> S3BoundaryError {
 mod tests {
     #[cfg(feature = "s3")]
     use super::s3_backend_config;
-    use super::{RuntimeAnchor, RuntimeRepository, RuntimeStore, gateway_keyring};
+    use super::{
+        RuntimeAnchor, RuntimeRepository, RuntimeStore, checkpoint_evidence_object_id,
+        checkpoint_object_id, gateway_keyring,
+    };
     #[cfg(not(feature = "k8s"))]
     use crate::AnchorConfig;
     use crate::s3::S3BoundaryError;
@@ -841,10 +966,14 @@ mod tests {
     use bytes::Bytes;
     use rs3_anchor::{CheckpointAnchor, MemoryCheckpointAnchor};
     use rs3_crypto::{KeyRing, RepositoryKeyContext, SecretBytes};
-    use rs3_index::{CHECKPOINT_OBJECT_DOMAIN, Checkpoint};
+    use rs3_index::{
+        CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CheckpointEvidence, checkpoint_evidence_bytes,
+    };
     use rs3_repository::RepositoryPutOptions;
     use rs3_storage::{BlobStore, ByteRange, FilesystemBlobStore, MemoryBlobStore, PutOptions};
-    use rs3_types::{BackendObjectId, LogicalPath, RepositoryId, RetentionMode, RetentionPolicy};
+    use rs3_types::{
+        BackendObjectId, LogicalPath, RepositoryId, RetentionMode, RetentionPolicy, Sequence,
+    };
     use secrecy::SecretString;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -966,6 +1095,92 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         assert!(keyrings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_validation_rejects_missing_accepted_checkpoint_evidence() {
+        let runtime = RuntimeRepository::from_config(&runtime_config(true))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let committed = runtime
+            .put_committed(
+                LogicalPath::new("snapshots/evidence-missing.bin")
+                    .unwrap_or_else(|error| panic!("{error}")),
+                Bytes::from_static(b"body"),
+                RepositoryPutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let evidence_id = checkpoint_evidence_object_id(&committed.checkpoint)
+            .unwrap_or_else(|error| panic!("{error}"));
+        runtime
+            .memory_store()
+            .unwrap_or_else(|| panic!("missing memory store"))
+            .delete(&evidence_id)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let loaded = runtime
+            .load_accepted_checkpoint(GatewayMode::ReadWrite)
+            .await;
+
+        assert!(
+            matches!(loaded, Err(S3BoundaryError::RepositoryInit { reason }) if reason.contains("evidence"))
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_validation_rejects_evidence_newer_than_anchor() {
+        let runtime = RuntimeRepository::from_config(&runtime_config(true))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let committed = runtime
+            .put_committed(
+                LogicalPath::new("snapshots/evidence-ahead.bin")
+                    .unwrap_or_else(|error| panic!("{error}")),
+                Bytes::from_static(b"body"),
+                RepositoryPutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let future = rs3_repository::CheckpointPosition {
+            sequence: Sequence::new(committed.checkpoint.sequence.get() + 1),
+            checkpoint_id: committed.checkpoint.checkpoint_id.clone(),
+            payload_digest: committed.checkpoint.payload_digest.clone(),
+        };
+        let future_evidence_id =
+            checkpoint_evidence_object_id(&future).unwrap_or_else(|error| panic!("{error}"));
+        let future_evidence = checkpoint_evidence_bytes(&CheckpointEvidence {
+            sequence: future.sequence,
+            checkpoint_id: future.checkpoint_id.clone(),
+            checkpoint_digest: future.payload_digest.clone(),
+            checkpoint_object_id: checkpoint_object_id(&future.checkpoint_id)
+                .unwrap_or_else(|error| panic!("{error}")),
+        })
+        .unwrap_or_else(|error| panic!("{error}"));
+        runtime
+            .memory_store()
+            .unwrap_or_else(|| panic!("missing memory store"))
+            .put(
+                &future_evidence_id,
+                Bytes::from(future_evidence),
+                PutOptions {
+                    retention: None,
+                    legal_hold: None,
+                    content_type: None,
+                    do_not_recreate: true,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let loaded = runtime
+            .load_accepted_checkpoint(GatewayMode::ReadWrite)
+            .await;
+
+        assert!(
+            matches!(loaded, Err(S3BoundaryError::RepositoryInit { reason }) if reason.contains("newer than the accepted anchor"))
+        );
     }
 
     #[tokio::test]

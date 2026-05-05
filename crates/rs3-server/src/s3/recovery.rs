@@ -2,16 +2,22 @@
 
 use super::S3BoundaryError;
 use super::runtime::{
-    RuntimeStore, build_anchor, build_store, checkpoint_object_id, open_gateway_keyring_reference,
-    read_checkpoint_for_position,
+    RuntimeAnchor, RuntimeStore, build_anchor, build_store, checkpoint_object_id,
+    open_gateway_keyring_reference, read_checkpoint_for_position,
 };
 use crate::RuntimeConfig;
 use rs3_anchor::{AnchorError, CheckpointAnchor};
-use rs3_index::{CHECKPOINT_EVIDENCE_DOMAIN, Checkpoint, CheckpointEvidence};
+use rs3_index::{
+    CHECKPOINT_EVIDENCE_DOMAIN, Checkpoint, CheckpointEvidence, KeyringEnvelopeReference,
+};
 use rs3_repository::{CheckpointPosition, Repository, RepositoryError, RepositoryOptions};
 use rs3_storage::{BlobStore, ByteRange, StorageError};
+use rs3_types::{BackendObjectId, RepositoryId};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+/// Schema marker printed with trusted restore bundles.
+pub const RESTORE_BUNDLE_SCHEMA: &str = "rs3.restore-bundle.v1";
 
 /// Options for explicit checkpoint-anchor recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +39,45 @@ pub struct AnchorRecoveryReport {
     pub observed_evidence_objects: usize,
     /// Candidate evidence records that parsed as checkpoint positions.
     pub candidate_count: usize,
+    /// True when the configured anchor was written.
+    pub applied: bool,
+}
+
+/// Trusted restore metadata exported from the configured anchor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreTrustBundle {
+    /// Stable repository identifier bound into keyring unwrap context.
+    pub repository_id: RepositoryId,
+    /// Stable public repository salt, hex-encoded.
+    pub repository_salt_hex: String,
+    /// Trusted accepted checkpoint position.
+    pub checkpoint: CheckpointPosition,
+    /// Signed checkpoint publish timestamp.
+    pub published_at_ms: i64,
+    /// Active keyring envelope reference bound into the checkpoint.
+    pub keyring_envelope: Option<RestoreBundleKeyringEnvelope>,
+    /// Bundle creation timestamp.
+    pub generated_at_ms: i64,
+}
+
+/// Keyring-envelope reference captured in a restore trust bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreBundleKeyringEnvelope {
+    /// Envelope generation.
+    pub generation: u64,
+    /// Backend object containing the encrypted keyring envelope.
+    pub object_id: BackendObjectId,
+    /// Expected envelope digest.
+    pub digest: String,
+}
+
+/// Result of importing a trusted checkpoint position into a missing anchor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnchorImportReport {
+    /// Imported checkpoint position.
+    pub checkpoint: CheckpointPosition,
+    /// Signed checkpoint publish timestamp.
+    pub published_at_ms: i64,
     /// True when the configured anchor was written.
     pub applied: bool,
 }
@@ -67,6 +112,26 @@ pub enum AnchorRecoveryError {
     /// Repository verification rejected the candidate.
     #[error(transparent)]
     Repository(#[from] RepositoryError),
+}
+
+/// Exports a trusted restore bundle from the configured anchor and backend.
+pub async fn export_restore_bundle_from_config(
+    config: &RuntimeConfig,
+) -> Result<RestoreTrustBundle, AnchorRecoveryError> {
+    let store = build_store(&config.backend).await?;
+    let anchor = build_anchor(&config.anchor)?;
+    let position = CheckpointPosition::from(anchor.handle.read().await?);
+    restore_bundle_for_position(config, &store.handle, position).await
+}
+
+/// Imports a trusted checkpoint position into the configured anchor if it is missing.
+pub async fn import_anchor_from_config(
+    config: &RuntimeConfig,
+    position: CheckpointPosition,
+) -> Result<AnchorImportReport, AnchorRecoveryError> {
+    let store = build_store(&config.backend).await?;
+    let anchor = build_anchor(&config.anchor)?;
+    import_anchor_position(config, &store.handle, &anchor.handle, position).await
 }
 
 /// Scans backend evidence and optionally writes a missing anchor.
@@ -107,20 +172,7 @@ pub async fn recover_anchor_from_config(
 
     let applied = if options.apply_if_missing {
         let anchor = build_anchor(&config.anchor)?;
-        match anchor.handle.read().await {
-            Ok(_) => return Err(AnchorRecoveryError::AnchorAlreadyExists),
-            Err(AnchorError::MissingAnchor) => {}
-            Err(error) => return Err(error.into()),
-        }
-        let advanced = anchor
-            .handle
-            .compare_and_advance(position.clone().into_anchor_state())
-            .await?;
-        if CheckpointPosition::from(advanced) != position {
-            return Err(AnchorRecoveryError::Anchor(AnchorError::Backend(
-                "checkpoint anchor accepted a different position".to_owned(),
-            )));
-        }
+        write_missing_anchor(&anchor.handle, &position).await?;
         true
     } else {
         false
@@ -133,6 +185,69 @@ pub async fn recover_anchor_from_config(
         candidate_count,
         applied,
     })
+}
+
+async fn restore_bundle_for_position(
+    config: &RuntimeConfig,
+    store: &RuntimeStore,
+    position: CheckpointPosition,
+) -> Result<RestoreTrustBundle, AnchorRecoveryError> {
+    let (checkpoint, position) = validate_candidate(config, store, position).await?;
+    Ok(RestoreTrustBundle {
+        repository_id: config.repository_keys.repository_id.clone(),
+        repository_salt_hex: config.repository_keys.repository_salt_hex.clone(),
+        checkpoint: position,
+        published_at_ms: checkpoint.record.published_at_ms,
+        keyring_envelope: checkpoint
+            .record
+            .keyring_envelope
+            .as_ref()
+            .map(restore_bundle_envelope),
+        generated_at_ms: current_time_ms().unwrap_or(checkpoint.record.published_at_ms),
+    })
+}
+
+fn restore_bundle_envelope(reference: &KeyringEnvelopeReference) -> RestoreBundleKeyringEnvelope {
+    RestoreBundleKeyringEnvelope {
+        generation: reference.generation,
+        object_id: reference.object_id.clone(),
+        digest: reference.digest.clone(),
+    }
+}
+
+async fn import_anchor_position(
+    config: &RuntimeConfig,
+    store: &RuntimeStore,
+    anchor: &RuntimeAnchor,
+    position: CheckpointPosition,
+) -> Result<AnchorImportReport, AnchorRecoveryError> {
+    let (checkpoint, position) = validate_candidate(config, store, position).await?;
+    write_missing_anchor(anchor, &position).await?;
+    Ok(AnchorImportReport {
+        checkpoint: position,
+        published_at_ms: checkpoint.record.published_at_ms,
+        applied: true,
+    })
+}
+
+async fn write_missing_anchor(
+    anchor: &RuntimeAnchor,
+    position: &CheckpointPosition,
+) -> Result<(), AnchorRecoveryError> {
+    match anchor.read().await {
+        Ok(_) => return Err(AnchorRecoveryError::AnchorAlreadyExists),
+        Err(AnchorError::MissingAnchor) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let advanced = anchor
+        .compare_and_advance(position.clone().into_anchor_state())
+        .await?;
+    if CheckpointPosition::from(advanced) != *position {
+        return Err(AnchorRecoveryError::Anchor(AnchorError::Backend(
+            "checkpoint anchor accepted a different position".to_owned(),
+        )));
+    }
+    Ok(())
 }
 
 struct ObservedCandidates {
@@ -259,10 +374,13 @@ fn runtime_init(error: impl ToString) -> S3BoundaryError {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeStore, observed_checkpoint_candidates, validate_candidate};
+    use super::{
+        RuntimeAnchor, RuntimeStore, import_anchor_position, observed_checkpoint_candidates,
+        restore_bundle_for_position, validate_candidate,
+    };
     use crate::s3::test_support::runtime_config;
     use bytes::Bytes;
-    use rs3_anchor::MemoryCheckpointAnchor;
+    use rs3_anchor::{CheckpointAnchor, MemoryCheckpointAnchor};
     use rs3_crypto::{KeyRing, RepositoryKeyContext, SecretBytes};
     use rs3_repository::{Repository, RepositoryOptions, RepositoryPutOptions};
     use rs3_storage::MemoryBlobStore;
@@ -346,5 +464,35 @@ mod tests {
         assert_eq!(report.checkpoint.sequence, Sequence::new(2));
         assert_eq!(report.checkpoint, second.checkpoint);
         assert!(!report.applied);
+
+        let bundle =
+            restore_bundle_for_position(&config, &runtime_store, second.checkpoint.clone())
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(bundle.checkpoint, second.checkpoint);
+        assert_eq!(
+            bundle.repository_salt_hex,
+            config.repository_keys.repository_salt_hex
+        );
+        assert!(bundle.keyring_envelope.is_some());
+
+        let import_anchor = RuntimeAnchor::new(MemoryCheckpointAnchor::new());
+        let imported = import_anchor_position(
+            &config,
+            &runtime_store,
+            &import_anchor,
+            bundle.checkpoint.clone(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(imported.checkpoint, bundle.checkpoint);
+        let imported_anchor_state = import_anchor
+            .read()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            rs3_repository::CheckpointPosition::from(imported_anchor_state),
+            bundle.checkpoint
+        );
     }
 }

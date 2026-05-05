@@ -14,6 +14,11 @@ flags may override selected listener and gateway-mode settings.
 | `RUST_LOG` | no | `info` | Standard tracing filter. |
 | `RS3_RECOVERY_MAX_CHECKPOINT_AGE_SECONDS` | for `recover-anchor` | none | Maximum signed checkpoint age accepted by explicit anchor recovery. |
 
+`export-restore-bundle` and `import-anchor` use the same repository, backend,
+anchor, and keyring settings as `serve`. The exported bundle contains public
+restore metadata only; keep wrapping-key material in the configured secret
+source.
+
 ## Public S3 Surface
 
 | Variable | Required | Default | Description |

@@ -18,6 +18,8 @@ Current engineering priorities:
 - rollback resistance through signed checkpoints and external anchors
 - restore correctness for S3-oriented backup tools, with Kopia and
   Velero/Kopia as the preview clients
+- incident restore through an explicit `restore-readonly` gateway mode and
+  trusted restore bundles
 - measured performance against a straight proxy baseline
 - operational evidence for retention, tracing, and metrics
 
