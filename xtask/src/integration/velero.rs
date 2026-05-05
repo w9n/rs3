@@ -271,7 +271,7 @@ mod imp {
     use std::time::Instant;
     use velero_cli::{
         assert_pod_volume_backup_completed, assert_pod_volume_restore_completed,
-        assert_velero_phase, create_backup, create_restore, install_velero,
+        assert_restore_phase, assert_velero_phase, create_backup, create_restore, install_velero,
         set_backup_storage_location_access_mode, velero_s3_target, write_velero_credentials,
     };
     use workload::{
@@ -582,13 +582,11 @@ mod imp {
             };
             run_phase(&mut state, "restore", || {
                 create_restore(&args, kubeconfig_path, &backup_name, &restore_name)?;
-                assert_velero_phase(
-                    &args.kubectl_bin,
+                assert_restore_phase(
+                    &args,
                     kubeconfig_path,
-                    &args.velero_namespace,
-                    "restores.velero.io",
                     &restore_name,
-                    "Completed",
+                    scenario.restore_readonly_before_restore,
                 )?;
                 assert_pod_volume_restore_completed(&args, kubeconfig_path, &restore_name)
             })?;

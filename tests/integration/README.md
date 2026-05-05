@@ -86,9 +86,12 @@ kind-friendly disaster-restore lane..
 cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke
 ```
 
-The gateway-restart variant restarts the gateway after backup and before restore.
-It is a targeted durability smoke for repository state that must survive process
-replacement without relying on a gateway PVC.
+The gateway-restart variant restarts the gateway after backup and before restore,
+then switches the gateway to `restore-readonly`. It verifies restored bytes and
+asserts that restore traffic did not write to the backend. Velero may mark this
+restore `PartiallyFailed` because it tries to upload restore result artifacts
+after the data restore; the lane accepts only that exact read-only metadata
+upload denial.
 
 ```sh
 cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke

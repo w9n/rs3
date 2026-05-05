@@ -286,6 +286,54 @@ pub(super) fn assert_velero_phase(
     Ok(())
 }
 
+pub(super) fn assert_restore_phase(
+    args: &VeleroKopiaSmokeArgs,
+    kubeconfig_path: &Path,
+    restore_name: &str,
+    allow_restore_readonly_upload_failure: bool,
+) -> Result<()> {
+    let phase = kubectl_capture(
+        &args.kubectl_bin,
+        kubeconfig_path,
+        &[
+            "-n",
+            &args.velero_namespace,
+            "get",
+            "restores.velero.io",
+            restore_name,
+            "-o",
+            "jsonpath={.status.phase}",
+        ],
+    )
+    .with_context(|| format!("failed to read phase for restores.velero.io/{restore_name}"))?;
+    if phase == "Completed" {
+        return Ok(());
+    }
+
+    if phase == "PartiallyFailed" && allow_restore_readonly_upload_failure {
+        let logs = kubectl_capture(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &[
+                "-n",
+                &args.velero_namespace,
+                "logs",
+                "deployment/velero",
+                "--tail=1000",
+            ],
+        )
+        .context("failed to read Velero controller logs")?;
+        if restore_readonly_upload_failure_is_expected(&logs, restore_name) {
+            return Ok(());
+        }
+    }
+
+    let diagnostics = velero_diagnostics(args, kubeconfig_path)?;
+    bail!(
+        "restores.velero.io/{restore_name} phase was {phase:?}, expected \"Completed\"\n{diagnostics}"
+    );
+}
+
 pub(super) fn velero_diagnostics(
     args: &VeleroKopiaSmokeArgs,
     kubeconfig_path: &Path,
@@ -395,10 +443,80 @@ fn append_diagnostic(out: &mut String, title: &str, result: Result<String>) {
     }
 }
 
+fn restore_readonly_upload_failure_is_expected(logs: &str, restore_name: &str) -> bool {
+    let mut saw_data_path_complete = false;
+    let mut saw_restore_complete = false;
+    let mut saw_expected_upload_denial = false;
+
+    for line in logs.lines().filter(|line| line.contains(restore_name)) {
+        if line.contains("Done waiting for all pod volume restores to complete") {
+            saw_data_path_complete = true;
+        }
+        if line.contains("restore completed") {
+            saw_restore_complete = true;
+        }
+        if line.contains("level=error") {
+            if !is_restore_readonly_upload_denial(line) {
+                return false;
+            }
+            saw_expected_upload_denial = true;
+        }
+    }
+
+    saw_data_path_complete && saw_restore_complete && saw_expected_upload_denial
+}
+
+fn is_restore_readonly_upload_denial(line: &str) -> bool {
+    const DENIAL: &str = "AccessDenied: restore-readonly gateway mode rejects repository mutations";
+    const UPLOAD_MESSAGES: [&str; 4] = [
+        "Error uploading restore results to backup storage",
+        "Error uploading restored resource list to backup storage",
+        "Error uploading restore item action operation resource list to backup storage",
+        "Error uploading restored volume info to backup storage",
+    ];
+
+    line.contains(DENIAL)
+        && line.contains("PutObject")
+        && UPLOAD_MESSAGES.iter().any(|message| line.contains(message))
+}
+
 fn velero(velero_bin: &str, kubeconfig_path: &Path, args: &[&str]) -> Result<()> {
     let mut full_args = Vec::with_capacity(args.len() + 2);
     full_args.push("--kubeconfig");
     full_args.push(path_str(kubeconfig_path)?);
     full_args.extend_from_slice(args);
     run_command(velero_bin, &full_args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restore_readonly_upload_failure_is_expected;
+
+    #[test]
+    fn accepts_restore_readonly_metadata_upload_denial() {
+        let logs = r#"
+time="2026-05-05T13:47:29Z" level=info msg="Done waiting for all pod volume restores to complete" restore=velero/rs3-restore-1
+time="2026-05-05T13:47:29Z" level=info msg="restore completed" restore=velero/rs3-restore-1
+time="2026-05-05T13:47:29Z" level=error msg="Error uploading restore results to backup storage" error="operation error S3: PutObject, api error AccessDenied: restore-readonly gateway mode rejects repository mutations" restore=velero/rs3-restore-1
+"#;
+
+        assert!(restore_readonly_upload_failure_is_expected(
+            logs,
+            "rs3-restore-1"
+        ));
+    }
+
+    #[test]
+    fn rejects_unexpected_restore_error() {
+        let logs = r#"
+time="2026-05-05T13:47:29Z" level=info msg="Done waiting for all pod volume restores to complete" restore=velero/rs3-restore-1
+time="2026-05-05T13:47:29Z" level=info msg="restore completed" restore=velero/rs3-restore-1
+time="2026-05-05T13:47:29Z" level=error msg="pod volume restore failed" restore=velero/rs3-restore-1
+"#;
+
+        assert!(!restore_readonly_upload_failure_is_expected(
+            logs,
+            "rs3-restore-1"
+        ));
+    }
 }
