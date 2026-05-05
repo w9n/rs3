@@ -105,13 +105,16 @@ signal for this harness, not as a general cloud-provider result.
 
 ## Larger Restore Matrix
 
-Run date: 2026-05-04. Workload set: `larger-restores`. Each row is the
+Run date: 2026-05-05. Workload set: `larger-restores`. Each row is the
 average of three direct/gateway run pairs. Per-profile values come from
 `summary.json.profiles`; the top-level aggregate intentionally mixes profiles
 and should only be used as a smoke signal for the whole set.
 
 Artifact:
 `.local/integration/`.
+
+`workload_consistency` passed for every profile and `regression_budgets`
+reported `status: "pass"`.
 
 The direct baseline is the same straight integration storage proxy used by the
 single-profile rows. The Postgres-shaped profile uses file-specific deterministic
@@ -120,9 +123,11 @@ deduplicated synthetic best case.
 
 | Profile | Shape | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend writes | Backend reads | Gateway CPU | Gateway HWM RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| medium-restore | one 64 MiB object | 2.65 s | 2.93 s | 1.11x | 0.89x | 1.03x | 1.03x | 1.07 s | 107.65 MiB |
-| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 9.79 s | 2.68 s | 0.27x | 0.99x | 1.03x | 1.05x | 1.58 s | 93.39 MiB |
-| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 2.68 s | 3.51 s | 1.31x | 1.00x | 1.03x | 1.03x | 2.77 s | 214.63 MiB |
+| medium-restore | one 64 MiB object | 2.92 s | 3.06 s | 1.05x | 1.16x | 1.03x | 1.03x | 1.18 s | 109.67 MiB |
+| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 9.89 s | 2.78 s | 0.28x | 1.01x | 1.03x | 1.05x | 1.73 s | 111.92 MiB |
+| kubernetes-objects-large | 6,144 manifests plus a 128 MiB etcd-like fragment | 34.22 s | 7.01 s | 0.20x | 1.00x | 1.03x | 1.05x | 6.07 s | 222.82 MiB |
+| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 2.79 s | 3.62 s | 1.30x | 1.12x | 1.03x | 1.03x | 2.99 s | 221.64 MiB |
+| postgres-pgdata-large | larger relation/WAL/dump-shaped data directory | 3.78 s | 5.93 s | 1.57x | 1.10x | 1.03x | 1.03x | 5.95 s | 343.51 MiB |
 
 Interpretation:
 
@@ -131,9 +136,10 @@ Interpretation:
 - Gateway-internal derived byte ratios tell the same story: backend read bytes
   per returned GET byte were 1.03x to 1.05x, and backend write bytes per PUT
   request byte were about 1.03x to 1.04x.
-- Backend request counts are now at or below the straight proxy baseline in the
-  larger profiles after sealed index deltas moved inline with checkpoint
-  objects.
+- Backend request counts are close to the straight proxy baseline in the larger
+  profiles. The current range is 1.00x to 1.16x, with the highest count in the
+  one-object medium restore profile where fixed checkpoint/evidence work has
+  little opportunity to amortize.
 - The larger profiles produced little or no payload span cache reuse. The
   Postgres-shaped profile averaged only a 0.29% cache event hit ratio, with
   evictions and skipped-too-large spans visible in the cache metrics. That is
@@ -144,20 +150,15 @@ Interpretation:
 - The Kubernetes-shaped profile is dominated by many small ranged GETs on the
   direct path. The gateway is faster locally despite similar backend bytes, but
   that elapsed ratio should be treated as a local RustFS/proxy observation.
-- The Postgres-shaped profile now exercises roughly 176 MB of unique backend
-  restore reads on the direct baseline. Gateway byte overhead is modest, while
-  elapsed time is slower because large PUT tail latency is visible in the local
-  gateway path. In this artifact, average gateway `PutObject` request-duration
-  sum for Postgres was 7.64 s, while repository PUT work was 1.56 s and backend
-  provider PUT work was 0.76 s; the next performance target is gateway-side
-  request/body handling and commit wait around snapshot creation.
+- The Postgres-shaped profiles still show slower gateway elapsed time despite
+  modest byte overhead. That keeps large PUT handling and commit wait around
+  snapshot creation as the next performance target.
 
 ## Expanded Restore Sanity Run
 
-Run date: 2026-05-04. Workload set: `larger-restores`. This is the latest
-performance artifact, but it uses one direct/gateway run pair per profile, so
-it validates expanded workload shape and budget wiring rather than replacing
-the three-run release matrix above.
+Run date: 2026-05-04. Workload set: `larger-restores`. This older artifact used
+one direct/gateway run pair per profile. It validated expanded workload shape
+and budget wiring before the five-profile three-run matrix above.
 
 Artifact:
 `.local/integration/`.
