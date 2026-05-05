@@ -250,6 +250,27 @@ Interpretation:
   Postgres-shaped restore elapsed time because large PUT tail latency is still
   visible in the local gateway path.
 
+## Lightweight Gateway Perf Smoke
+
+Run date: 2026-05-05. This is a command-level smoke for
+`just perf-s3-gateway`, not a replacement for the larger Kopia matrix above.
+
+Artifact: `.local/perf/`.
+
+Command:
+
+```sh
+just perf-s3-gateway --objects 16 --object-size 4096 --reads 16 \
+  --range-len 512 --commit-batch-items 8 --concurrency 8 --format jsonl
+```
+
+| Scenario | Elapsed | Backend requests/op | Write amp | Read amp |
+| --- | ---: | ---: | ---: | ---: |
+| write-committed | 447 ms | 3.00 | 2.68x | n/a |
+| write-committed-parallel | 153 ms | 1.25 | 2.26x | n/a |
+| full-read | 96 ms | 1.00 | n/a | 1.05x |
+| range-read | 120 ms | 1.00 | n/a | 1.43x |
+
 ## Follow-Up Work
 
 - Add restore-throughput and resource-efficiency columns once enough

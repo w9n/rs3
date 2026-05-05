@@ -27,6 +27,7 @@ const GATEWAY_KEYRING_WRAPPING_KEY_HEX: &str =
 const GATEWAY_KEYRING_WRAPPING_KEY_ID: &str = "wrap-integration";
 const GATEWAY_REPOSITORY_SALT_HEX: &str =
     "2222222222222222222222222222222222222222222222222222222222222222";
+const GATEWAY_START_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(super) fn run_s3_gateway_container_perf(args: &PerfArgs) -> Result<()> {
     let scenarios = gateway_perf_scenarios(args.scenario)?;
@@ -401,6 +402,8 @@ impl RunningPerfGateway {
             .env("RS3_BACKEND_ENDPOINT", &backend.endpoint_url)
             .env("RS3_BACKEND_BUCKET", &backend.bucket)
             .env("RS3_BACKEND_PREFIX", backend_prefix)
+            .env("RS3_ANCHOR_MODE", "memory")
+            .env("RS3_ALLOW_MEMORY_ANCHOR", "true")
             .env("RS3_REPOSITORY_ID", "rs3-gateway-perf-repository")
             .env(
                 "RS3_KEYRING_ENVELOPE_OBJECT_ID",
@@ -470,7 +473,7 @@ impl RunningPerfGateway {
             logs,
             readers,
         };
-        if let Err(error) = wait_for_gateway(addr, &mut gateway.child).await {
+        if let Err(error) = wait_for_gateway(addr, &mut gateway).await {
             let _ = gateway.shutdown();
             return Err(error);
         }
@@ -496,6 +499,24 @@ impl RunningPerfGateway {
             .lock()
             .map_err(|_| anyhow::anyhow!("gateway log capture lock poisoned"))?;
         Ok(parse_gateway_backend_counts(&logs))
+    }
+
+    fn captured_log_tail(&self, max_lines: usize) -> Result<String> {
+        let logs = self
+            .logs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("gateway log capture lock poisoned"))?;
+        if logs.is_empty() {
+            return Ok("gateway log tail:\n<empty>\n".to_owned());
+        }
+
+        let mut out = String::from("gateway log tail:\n");
+        let start = logs.len().saturating_sub(max_lines);
+        for line in &logs[start..] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -614,21 +635,30 @@ fn reserve_gateway_addr() -> Result<SocketAddr> {
     Ok(addr)
 }
 
-async fn wait_for_gateway(addr: SocketAddr, child: &mut Child) -> Result<()> {
+async fn wait_for_gateway(addr: SocketAddr, gateway: &mut RunningPerfGateway) -> Result<()> {
     let started = Instant::now();
     loop {
-        if let Some(status) = child
+        if let Some(status) = gateway
+            .child
             .try_wait()
             .context("failed to inspect gateway process")?
         {
-            anyhow::bail!("gateway process exited before accepting connections: {status}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            anyhow::bail!(
+                "gateway process exited before accepting connections: {status}\n{}",
+                gateway.captured_log_tail(80)?
+            );
         }
 
         if TcpStream::connect(addr).await.is_ok() {
             return Ok(());
         }
-        if started.elapsed() >= Duration::from_secs(30) {
-            anyhow::bail!("gateway did not start accepting connections at {addr}");
+        if started.elapsed() >= GATEWAY_START_TIMEOUT {
+            anyhow::bail!(
+                "gateway did not start accepting connections at {addr} within {:?}\n{}",
+                GATEWAY_START_TIMEOUT,
+                gateway.captured_log_tail(80)?
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
