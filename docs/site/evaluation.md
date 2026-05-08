@@ -76,3 +76,46 @@ A useful trial should prove all of the following:
 - Metrics and traces explain restore cost without adding privacy leaks.
 
 See [Production Preview](production-preview.md) for the current release gates.
+
+## Quick Local Evidence Path
+
+Use this path when deciding whether the project deserves a deeper provider trial.
+It exercises the current preview contract without changing external
+infrastructure.
+
+```sh
+nix develop
+just preview-gate-local
+just preview-gate-release
+```
+
+Expected result:
+
+- the local gate passes formatting, tests, S3-feature checks, and dependency
+  policy checks
+- the release gate passes Kopia gateway restore, Velero dynamic-PVC
+  gateway-restart restore through `restore-readonly`, and Velero/Postgres smoke
+  restore
+- artifacts are written under `.local/integration/`
+
+Run the larger performance matrix when storage or repository behavior changed, or
+when refreshing release evidence:
+
+```sh
+cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix \
+  --runs 3 \
+  --profile-set larger-restores \
+  --gateway-build-profile release \
+  --payload-segment-size 512 \
+  --enforce-regression-budgets
+```
+
+Expected result:
+
+- `regression_budgets status=pass`
+- `workload_consistency status=pass`
+- backend read and write bytes remain close to the straight RustFS proxy baseline
+
+After local evidence is green, run a separate live-provider trial with an empty
+bucket, preserved restore bundle, and provider retention settings that match the
+intended deployment.

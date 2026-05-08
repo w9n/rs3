@@ -29,6 +29,16 @@ provider can learn or change:
 application-aware restore validation. It protects the object-store boundary and
 the repository-state transition model.
 
+## Claim Boundaries
+
+| Safe preview claim | Not a preview claim |
+| --- | --- |
+| Backend object keys and path-sensitive metadata are opaque to the storage backend. | The backend learns nothing; object counts, sizes, timing, and broad object classes remain visible. |
+| Anchored signed checkpoints detect backend rollback against the trusted anchor. | S3 Object Lock or retention alone proves the latest repository state. |
+| `restore-readonly` serves restore reads and rejects supported repository mutations. | Every backup client will report a clean success status when its own restore bookkeeping writes are denied. |
+| Velero/Kopia and Kopia compatibility are covered by local integration evidence. | Broad generic S3 application compatibility is promised. |
+| The preview repository can be evaluated with documented recovery material. | The durable repository format is stable across future releases. |
+
 ## Supported Shape
 
 | Area | Preview scope |
@@ -76,6 +86,7 @@ newer one. The backend can still deny service by hiding required objects.
 | Multiple gateways serve the same repository as `read-write` | Unsupported. Run one writer per repository; use `restore-readonly` for scaled restore readers. |
 | Gateway started as `restore-readonly` without an accepted anchor | Fail closed. Run explicit anchor recovery first, then serve restore traffic. |
 | Restore client attempts PUT, DELETE, or legal-hold mutation through `restore-readonly` | Reject the request instead of advancing repository state. |
+| Velero restore reports `PartiallyFailed` only because restore-result artifact uploads were denied by `restore-readonly` | Accept only after proving restored data, completed pod-volume restore, and zero backend writes during restore. Treat any other restore error as failure. |
 | Lease and backend are both compromised | Online protection is exhausted; recovery needs offline or externally protected authority. |
 | Wrapping key and old envelope are both exposed | Rewrap protects only future envelope handling; historical data under that keyring is treated as exposed. |
 
@@ -127,14 +138,20 @@ or sign the accepted checkpoint position, not the whole repository index. That
 position already commits to the signed checkpoint chain and therefore to the
 repository state reachable from it.
 
-## Implementation Gaps Before Freeze
+## Current Evidence
 
-This document defines the preview contract. Before freezing the preview, close or
-explicitly defer these gaps:
+Latest recorded local evidence:
 
-- run the Velero dynamic-PVC gateway-restart lane with `restore-readonly` and
-  record the artifact path proving zero backend writes during restore
-- run the release gates and record the current result set
+| Evidence | Result |
+| --- | --- |
+| `just preview-gate-release` | Passed on 2026-05-05. |
+| Velero dynamic-PVC gateway-restart with `restore-readonly` | Passed; artifact `.local/integration/`. |
+| Velero/Postgres compatibility smoke | Passed; artifact `.local/integration/`. |
+| Larger Kopia restore matrix | Passed with `regression_budgets=pass` and `workload_consistency=pass`; artifact `.local/integration/`. |
+
+The release evidence is local harness evidence, not a provider certification. A
+production-preview trial should still run the selected live S3-compatible
+provider with an empty bucket and a deliberately preserved restore bundle.
 
 ## Non-Goals
 

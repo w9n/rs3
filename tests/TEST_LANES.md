@@ -17,7 +17,8 @@ notes in the specific harness README or code.
 | Velero gateway-restart smoke | `just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke` | Same dynamic PVC restore path, but restarts the stateless gateway between backup and restore, switches to `restore-readonly`, verifies restored bytes, and asserts restore traffic made no backend writes. | Very high | Nightly/release-gate |
 | Velero Postgres smoke | `just integration-velero-kopia-postgres-smoke` | Small Postgres pod on dynamic PVC, `pg_dump`/checkpoint hook before backup, live SQL verification after restore. Compatibility smoke only; not the production Postgres backup model. | Very high | Nightly/release-gate |
 | Preview release gate | `just preview-gate-release` | Kopia gateway, Velero dynamic PVC gateway-restart, and Velero Postgres smoke. | Very high | Manual release candidate |
-| Performance baseline | `just perf-s3-gateway -- --format jsonl` | Backend request counts, latency, read/write amplification, throughput for gateway scenarios. | Medium/High | Nightly and before protocol changes |
+| Lightweight gateway perf smoke | `just perf-s3-gateway -- --format jsonl` | Small-object gateway request counts, latency, read/write amplification, and throughput. | Medium/High | Nightly and before protocol changes |
+| Kopia measured matrix | `cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix --runs 3 --profile-set larger-restores --gateway-build-profile release --payload-segment-size 512 --enforce-regression-budgets` | Release-grade Kopia restore comparison against the straight RustFS proxy baseline with workload consistency and regression budgets. | High | Manual release candidate |
 
 Rules of thumb:
 

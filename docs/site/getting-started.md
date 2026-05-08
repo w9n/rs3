@@ -1,8 +1,9 @@
 # Getting Started
 
-This page gives the local development path. Production deployment guidance will
-stay conservative until the repository format and anchor integrations are
-stabilized.
+This page gives the local development path. If you are evaluating whether `rs3`
+is worth a controlled trial, start with [Evaluation](evaluation.md) first.
+Production deployment guidance stays conservative until the repository format
+and anchor integrations are stable.
 
 ## Prerequisites
 

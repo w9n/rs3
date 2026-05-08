@@ -44,25 +44,30 @@ The command prints a compact table by default; pass
 
 ## Current Release Matrix
 
-Run date: 2026-05-04. Gateway profile: release. Workload set:
-`larger-restores` before the expanded large Kubernetes/Postgres profiles were
-added. Each row is the average of three direct/gateway run pairs. The direct
-baseline is the straight RustFS measurement proxy.
+Run date: 2026-05-05. Gateway profile: release. Workload set:
+`larger-restores`. Each row is the average of three direct/gateway run pairs.
+The direct baseline is the straight RustFS measurement proxy.
 
 Artifact:
 `.local/integration/`.
 
+`workload_consistency` passed for every profile and `regression_budgets` passed.
+
 | Profile | Shape | Elapsed Ratio | Backend Requests | Backend Reads | Backend Writes | Gateway CPU | Gateway HWM RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `medium-restore` | one 64 MiB object | 1.06x | 0.88x | 1.03x | 1.03x | 1.42 s | 100.72 MiB |
-| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.28x | 0.99x | 1.05x | 1.03x | 1.73 s | 98.27 MiB |
-| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.40x | 0.99x | 1.03x | 1.03x | 3.07 s | 198.86 MiB |
+| `medium-restore` | one 64 MiB object | 1.05x | 1.16x | 1.03x | 1.03x | 1.18 s | 109.67 MiB |
+| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.28x | 1.01x | 1.05x | 1.03x | 1.73 s | 111.92 MiB |
+| `kubernetes-objects-large` | 6,144 manifests plus a 128 MiB fragment | 0.20x | 1.00x | 1.05x | 1.03x | 6.07 s | 222.82 MiB |
+| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.30x | 1.12x | 1.03x | 1.03x | 2.99 s | 221.64 MiB |
+| `postgres-pgdata-large` | larger relation/WAL/dump-shaped Postgres data directory | 1.57x | 1.10x | 1.03x | 1.03x | 5.95 s | 343.51 MiB |
 
 Interpretation:
 
 - Larger restore read and write bytes stay close to the straight proxy
   baseline, about 1.03x to 1.05x in these runs.
-- Backend request counts are at or below the straight proxy baseline.
+- Backend request counts are close to the straight proxy baseline, 1.00x to
+  1.16x in this run. The highest request ratio is the one-object medium profile,
+  where fixed checkpoint and evidence work has less opportunity to amortize.
 - Built-in regression budgets passed for request ratios, byte ratios, restore
   phase ratios, and repeated-run stability.
 - The Kubernetes-shaped profile is faster in this local harness despite similar
@@ -75,7 +80,8 @@ Interpretation:
 ## Expanded Sanity Run
 
 Run date: 2026-05-04. Gateway profile: release. One direct/gateway run pair per
-profile, so this validates shape and budget wiring but is not a release claim.
+profile, so this historical artifact validated shape and budget wiring before
+the five-profile release matrix above.
 
 Artifact:
 `.local/integration/`.

@@ -200,6 +200,20 @@ external anchor over any mode that repairs state automatically. If break-glass
 restore is added, it should require explicit operator input and leave an audit
 trail.
 
+!!! note "DR survival kit"
+    Keep this material outside the object-store account and outside the namespace
+    being protected:
+
+    - repository ID
+    - public repository salt
+    - unwrap authority for the keyring envelope
+    - trusted checkpoint position: sequence, checkpoint ID, and checkpoint digest
+    - checkpoint-bound keyring-envelope reference
+    - backend endpoint, bucket, and prefix
+    - restore verification command inputs
+
+    Backend credentials alone are not enough for disaster recovery.
+
 Serve restore traffic with the gateway's read-only posture:
 
 ```sh
@@ -211,6 +225,17 @@ anchor, and rejects supported repository mutations such as PUT, DELETE, and
 object legal-hold changes. Pair it with Velero `BackupStorageLocation`
 read-only mode, Kopia read-only repository settings where practical, and
 backend credentials that cannot write.
+
+!!! note "Velero restore status in strict read-only mode"
+    Velero may mark a restore `PartiallyFailed` after the pod-volume data restore
+    succeeds because it tries to upload restore result artifacts back to the
+    backup storage location. In `restore-readonly`, those `PUT` requests are
+    intentionally denied.
+
+    Treat this as acceptable only when Velero logs show denied restore-result
+    artifact uploads, pod-volume restore completed, restored data verifies, and
+    backend operation counters show no writes during restore. Any other restore
+    error remains a failure.
 
 Run only one `read-write` gateway for a repository. Multiple independent
 writers cannot safely coordinate repository state without a stronger shared
