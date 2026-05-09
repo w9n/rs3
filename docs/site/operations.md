@@ -34,7 +34,7 @@ reference.
 ## Keys And Bootstrap
 
 The gateway uses an encrypted keyring envelope. Operators provide a stable
-repository ID, a stable public salt, and an unwrap authority. For an anchored
+repository ID, a stable public salt, and a wrapping-key source. For an anchored
 repository, startup reads the accepted checkpoint and opens the keyring envelope
 bound into that signed checkpoint. It does not trust S3 listing order or a
 mutable "latest" object to choose repository state.
@@ -102,7 +102,7 @@ that keyring. A malicious storage backend may also have copied the old envelope
 before it was deleted, so deleting or expiring the old envelope is not a
 cryptographic revocation mechanism.
 
-Keep the old wrapping authority available for restore paths that still trust
+Keep the old wrapping-key source available for restore paths that still trust
 checkpoints bound to the old envelope. A newly written rewrapped envelope only
 becomes active repository state after a later accepted checkpoint binds it.
 When writing envelopes outside the gateway, set envelope retention deliberately
@@ -206,7 +206,7 @@ trail.
 
     - repository ID
     - public repository salt
-    - unwrap authority for the keyring envelope
+    - wrapping-key source for the keyring envelope
     - trusted checkpoint position: sequence, checkpoint ID, and checkpoint digest
     - checkpoint-bound keyring-envelope reference
     - backend endpoint, bucket, and prefix
@@ -242,8 +242,8 @@ writers cannot safely coordinate repository state without a stronger shared
 write protocol. Scaled restore readers should use `restore-readonly`.
 
 Disaster recovery into a new cluster requires the repository ID, public salt,
-unwrap authority, and either a trusted checkpoint position from outside S3 or an
-explicit bounded recovery decision. Backend evidence alone is not a perfect
+wrapping-key source, and either a trusted checkpoint position from outside S3 or
+an explicit bounded recovery decision. Backend evidence alone is not a perfect
 latest-state oracle because the backend can hide newer valid evidence and replay
 older valid evidence.
 

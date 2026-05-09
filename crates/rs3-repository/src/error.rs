@@ -13,10 +13,10 @@ pub type Result<T> = std::result::Result<T, RepositoryError>;
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     /// A client-visible object was not found in the namespace.
-    #[error("object not found: {0}")]
+    #[error("object not found")]
     NotFound(LogicalPath),
     /// The client-visible object already exists and create-only mode was requested.
-    #[error("object already exists: {0}")]
+    #[error("object already exists")]
     AlreadyExists(LogicalPath),
     /// Repository sequence allocation overflowed.
     #[error("repository sequence overflow")]

@@ -1,8 +1,8 @@
 //! Encrypted repository keyring envelopes.
 //!
-//! The envelope lets operators rotate a wrapping authority, such as a
+//! The envelope lets operators rotate a wrapping-key source, such as a
 //! passphrase-derived key or KMS key, without rewriting payload objects. The
-//! repository stores only encrypted key material; the unwrap authority stays
+//! repository stores only encrypted key material; the wrapping-key source stays
 //! outside the object store.
 
 use crate::fingerprint::derive_public_fingerprint;
@@ -131,7 +131,7 @@ impl KeyringEnvelope {
         decode_keyring_plaintext(&plaintext)
     }
 
-    /// Re-encrypts this envelope with a new wrapping authority.
+    /// Re-encrypts this envelope with a new wrapping-key source.
     ///
     /// The repository data keys are preserved. Payload and metadata objects do
     /// not need to be rewritten for normal wrapping-key rewrap.

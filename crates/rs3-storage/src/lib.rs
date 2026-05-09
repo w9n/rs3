@@ -58,7 +58,7 @@ pub struct PutOptions {
     pub legal_hold: Option<LegalHoldStatus>,
     /// Optional content type.
     pub content_type: Option<String>,
-    /// Reject the write if an object already exists at this logical identifier.
+    /// Reject the write if an object already exists at this backend identifier.
     pub do_not_recreate: bool,
 }
 

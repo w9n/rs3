@@ -14,13 +14,13 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 /// Creates and rewraps encrypted repository keyring envelopes.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub(crate) struct KeyringArgs {
     #[command(subcommand)]
     command: KeyringCommand,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum KeyringCommand {
     /// Generate random repository data keys and store a keyring envelope.
     Init(Box<KeyringInitArgs>),
@@ -31,7 +31,7 @@ enum KeyringCommand {
     Rewrap(Box<KeyringRewrapArgs>),
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 struct KeyringInitArgs {
     /// Stable repository identifier bound into the envelope.
     #[arg(long, env = "RS3_REPOSITORY_ID")]
@@ -40,7 +40,7 @@ struct KeyringInitArgs {
     #[arg(long, env = "RS3_REPOSITORY_SALT_HEX")]
     repository_salt_hex: Option<String>,
     /// Operator-visible wrapping key identifier.
-    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_ID")]
+    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_ID", default_value = "wrap-v1")]
     wrapping_key_id: String,
     /// Hex-encoded high-entropy wrapping key.
     #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_HEX", hide_env_values = true)]
@@ -65,7 +65,7 @@ struct KeyringInitArgs {
     format: KeyringReportFormat,
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 struct KeyringRewrapArgs {
     /// Stable repository identifier bound into the envelope.
     #[arg(long, env = "RS3_REPOSITORY_ID")]
@@ -77,7 +77,7 @@ struct KeyringRewrapArgs {
     #[arg(long, env = "RS3_KEYRING_ENVELOPE_OBJECT_ID")]
     envelope_object_id: String,
     /// Current wrapping key identifier.
-    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_ID")]
+    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_ID", default_value = "wrap-v1")]
     old_wrapping_key_id: String,
     /// Hex-encoded current wrapping key.
     #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_HEX", hide_env_values = true)]
@@ -184,7 +184,7 @@ enum KeyringReportFormat {
     Env,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct KeyringReport {
     repository_id: String,
     repository_salt_hex: String,

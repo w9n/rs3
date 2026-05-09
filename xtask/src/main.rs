@@ -14,7 +14,7 @@ use std::sync::Once;
 #[cfg(any(feature = "containers", feature = "k8s"))]
 static RUSTLS_PROVIDER: Once = Once::new();
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(name = "xtask")]
 #[command(about = "Repository automation")]
 struct Cli {
@@ -22,7 +22,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum Commands {
     Check,
     Fmt,

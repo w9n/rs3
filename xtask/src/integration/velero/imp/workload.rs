@@ -46,11 +46,9 @@ pub(super) fn apply_workload(
         WorkloadVolume::EmptyDir | WorkloadVolume::DynamicPvc => None,
         WorkloadVolume::LocalPv => Some(first_node_name(args, kubeconfig_path)?),
     };
-    fs::write(
-        &manifest_path,
-        workload_manifest(args, scenario, node_name.as_deref()),
-    )
-    .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+    let manifest = workload_manifest(args, scenario, node_name.as_deref())?;
+    fs::write(&manifest_path, manifest)
+        .with_context(|| format!("failed to write {}", manifest_path.display()))?;
     kubectl(
         &args.kubectl_bin,
         kubeconfig_path,
@@ -267,11 +265,16 @@ fn workload_manifest(
     args: &VeleroKopiaSmokeArgs,
     scenario: Scenario,
     node_name: Option<&str>,
-) -> String {
+) -> Result<String> {
     let workload_image = workload_image(args, scenario.workload);
     let volume_resources = match scenario.volume {
         WorkloadVolume::EmptyDir => String::new(),
-        WorkloadVolume::LocalPv => local_pv_resources(args, node_name.expect("node name")),
+        WorkloadVolume::LocalPv => {
+            let Some(node_name) = node_name else {
+                bail!("local PV workload requires a Kubernetes node name");
+            };
+            local_pv_resources(args, node_name)
+        }
         WorkloadVolume::DynamicPvc => dynamic_pvc_resources(args),
     };
     let volume_spec = match scenario.volume {
@@ -282,7 +285,7 @@ fn workload_manifest(
     };
     let annotations = workload_annotations(scenario.workload);
     let container_spec = workload_container_spec(scenario.workload, workload_image);
-    format!(
+    Ok(format!(
         r#"apiVersion: v1
 kind: Namespace
 metadata:
@@ -311,7 +314,7 @@ spec:
         namespace = args.workload_namespace,
         volume_resources = volume_resources,
         volume_spec = volume_spec,
-    )
+    ))
 }
 
 fn workload_image(args: &VeleroKopiaSmokeArgs, workload: WorkloadKind) -> &str {

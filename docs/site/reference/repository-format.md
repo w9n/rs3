@@ -95,14 +95,14 @@ until retention and migration policy allow retirement.
 
 The preferred bootstrap shape is to use an operator-provided repository ID and
 public salt, generate random purpose-specific data keys, and store them in an
-encrypted keyring envelope under a counted `keyrings/` object. The unwrap
-authority, such as a KMS key or high-entropy wrapping key, stays outside the
-repository. Signed checkpoints bind the active envelope by generation, object
-ID, and digest so a backend cannot silently swap envelopes.
+encrypted keyring envelope under a counted `keyrings/` object. The wrapping-key
+source, such as a KMS key or high-entropy wrapping key, stays outside the
+repository. Signed checkpoints bind the active envelope by generation, object ID,
+and digest so a backend cannot silently swap envelopes.
 
 Wrapping-key rewrap preserves the same repository data keys. It is useful for
-moving unwrap authority or retiring a clean wrapping key, but it is not recovery
-from exposure of an old wrapping key plus the old envelope bytes.
+moving the wrapping-key source or retiring a clean wrapping key, but it is not
+recovery from exposure of an old wrapping key plus the old envelope bytes.
 
 Initial empty repositories are initialized by writing an encrypted keyring
 envelope. Existing anchored repositories open through the envelope reference

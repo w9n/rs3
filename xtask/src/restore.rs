@@ -12,19 +12,19 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 /// Verifies restore-critical repository state.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub(crate) struct RestoreArgs {
     #[command(subcommand)]
     command: RestoreCommand,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum RestoreCommand {
     /// Verify an accepted checkpoint chain and reachable encrypted payloads.
     Verify(Box<RestoreVerifyArgs>),
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 struct RestoreVerifyArgs {
     /// Stable repository identifier bound into the keyring envelope context.
     #[arg(long, env = "RS3_REPOSITORY_ID")]
@@ -55,13 +55,13 @@ struct RestoreVerifyArgs {
     format: RestoreReportFormat,
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Args)]
 struct RestoreKeySourceArgs {
     /// Backend object containing the encrypted keyring envelope.
     #[arg(long, env = "RS3_KEYRING_ENVELOPE_OBJECT_ID")]
     keyring_envelope_object_id: String,
     /// Operator-visible wrapping key identifier expected by the envelope.
-    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_ID")]
+    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_ID", default_value = "wrap-v1")]
     wrapping_key_id: String,
     /// Hex-encoded high-entropy wrapping key.
     #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_HEX", hide_env_values = true)]

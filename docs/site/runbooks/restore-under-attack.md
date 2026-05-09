@@ -18,7 +18,7 @@ Before serving restore traffic, identify or recover:
 
 - repository ID
 - public repository salt
-- unwrap authority for the keyring envelope
+- wrapping-key source for the keyring envelope
 - accepted checkpoint sequence, checkpoint ID, and checkpoint digest
 - checkpoint-bound keyring-envelope reference
 - backend endpoint, bucket, and prefix
@@ -72,7 +72,7 @@ cargo run -p rs3-server -- export-restore-bundle --format json > rs3-restore-bun
 
 The bundle contains public restore metadata, not wrapping-key material. If a
 fresh cluster is missing the Kubernetes Lease, import the trusted checkpoint
-position after configuring the same repository ID, salt, unwrap authority, and
+position after configuring the same repository ID, salt, wrapping-key source, and
 backend.
 
 ```sh

@@ -52,7 +52,7 @@ the repository-state transition model.
 | Keys | Encrypted keyring envelope |
 | Gateway modes | `read-write` for backups, `restore-readonly` for incident restore |
 | Retention | Provider retention/Object Lock capability checked where configured |
-| External trust sources | HSM/KMS/Vault anchor and unwrap authority, not a preview blocker |
+| External trust sources | external anchor/key-provider source, not a preview blocker |
 
 ## Trust Model
 
@@ -75,7 +75,7 @@ newer one. The backend can still deny service by hiding required objects.
 
 | Situation | Preview behavior |
 | --- | --- |
-| Empty backend prefix and no anchor | Startup may initialize one generated keyring envelope using the supplied repository ID, salt, and unwrap authority. An envelope object ID is optional override state, not normal Helm state. |
+| Empty backend prefix and no anchor | Startup may initialize one generated keyring envelope using the supplied repository ID, salt, and wrapping-key source. An envelope object ID is optional override state, not normal Helm state. |
 | Existing backend prefix and matching anchor | Open after signed checkpoint, envelope, and evidence validation. |
 | Backend serves an older checkpoint than the Lease anchor | Fail closed as rollback. |
 | Backend hides the checkpoint or evidence named by the Lease anchor | Fail closed as unavailable or tampered. |
@@ -96,7 +96,7 @@ The preview bootstrap path is declarative:
 
 1. Choose a stable `repository.id`.
 2. Generate and keep a stable 32-byte public `repositoryKeys.saltHex`.
-3. Store the unwrap authority outside the object store.
+3. Store the wrapping-key source outside the object store.
 4. Deploy the gateway with Kubernetes Lease anchoring.
 
 The salt is not secret, but it is required restore metadata. Put it in trusted
@@ -111,10 +111,10 @@ values after first run.
 Startup bootstrap behavior is:
 
 - if the configured backend prefix is empty, initialize exactly one repository
-  using the supplied repository ID, supplied salt, and unwrap authority
+  using the supplied repository ID, supplied salt, and wrapping-key source
 - if the prefix already contains repository state, verify that the configured
-  repository ID, salt, checkpoint-bound envelope, unwrap authority, anchor, and
-  evidence match
+  repository ID, salt, checkpoint-bound envelope, wrapping-key source, anchor,
+  and evidence match
 - if the prefix is non-empty but cannot be verified, stop with a precise error
   instead of creating new state
 
@@ -124,7 +124,7 @@ A new cluster needs more than backend credentials:
 
 - repository ID
 - repository salt
-- unwrap authority for the envelope
+- wrapping-key source for the envelope
 - trusted anchor position: sequence, checkpoint ID, and checkpoint digest, or
   an explicit bounded recovery decision from retained evidence
 

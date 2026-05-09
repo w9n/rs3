@@ -1,10 +1,11 @@
 //! Secret memory containers.
 
 use crate::CryptoError;
+use std::fmt;
 use zeroize::Zeroizing;
 
 /// Secret bytes that are zeroized when dropped.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SecretBytes(Zeroizing<Vec<u8>>);
 
 impl SecretBytes {
@@ -28,6 +29,15 @@ impl SecretBytes {
     }
 }
 
+impl fmt::Debug for SecretBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("SecretBytes")
+            .field(&"<redacted>")
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SecretBytes;
@@ -35,5 +45,18 @@ mod tests {
     #[test]
     fn rejects_short_secret() {
         assert!(SecretBytes::new(vec![1; 8]).is_err());
+    }
+
+    #[test]
+    fn debug_output_is_redacted() {
+        let secret = match SecretBytes::new(vec![171; SecretBytes::MIN_LEN]) {
+            Ok(secret) => secret,
+            Err(error) => panic!("{error}"),
+        };
+
+        let debug = format!("{secret:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("171"));
     }
 }
