@@ -1,10 +1,17 @@
 //! Server-side runtime configuration and request identity contracts.
 
+mod admin;
 mod config;
 mod identity;
 mod s3;
 mod server;
 
+pub use admin::{
+    AdminAnchorSummary, AdminBackendSummary, AdminCheckpointSummary, AdminFinding,
+    AdminKeyringEnvelopeSummary, AdminReportProfile, AdminRepositorySummary, AdminRestoreSummary,
+    AdminRuntimeSummary, AdminSecuritySummary, AdminStatusReport, admin_status_report,
+    backend_kind, doctor_findings, runtime_config_profile,
+};
 pub use config::{
     AnchorConfig, BackendConfig, BatchConfig, ConfigError, GatewayMode, MetricsConfig,
     RepositoryConfig, RepositoryKeysConfig, RuntimeConfig,

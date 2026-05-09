@@ -3386,6 +3386,7 @@ dependencies = [
  "rs3-types",
  "s3s",
  "secrecy",
+ "serde",
  "serde_json",
  "thiserror",
  "time",

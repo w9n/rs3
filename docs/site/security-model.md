@@ -80,6 +80,7 @@ batching, compaction jitter, and stricter telemetry redaction.
 | Storage rollback is not trusted as latest state | Ed25519 checkpoint verification, Kubernetes Lease anchor, and retained checkpoint evidence. | Anchor, checkpoint replay, restore verification, and orphan-report tests. |
 | Incident restore does not advance repository state | `restore-readonly` mode requires an accepted anchor and rejects supported mutations. | Gateway mode config, startup, and S3 adapter tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
+| Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
 
 ## Rollback Rule
 
@@ -112,6 +113,25 @@ version as latest, and it does not make a latest pointer trustworthy by itself.
 
 Use Object Lock for retained payload segments, checkpoint objects, and evidence
 records. Do not use it as the only anti-rollback mechanism.
+
+## Operator Reporting Rule
+
+The core admin report model is path-redacted. Any operator UI or management integration built on it is not a repository browser. It may show profile
+findings, backend kind, anchor kind, checkpoint sequence, checkpoint ID,
+checkpoint digest, retention posture, and path-safe fingerprints. It must not
+show client-visible paths, Kubernetes object names, tenant names, configured
+backend bucket names, backend prefixes, repository IDs, access keys, wrapping
+keys, or raw backend object IDs.
+
+Expose any admin listener only on localhost, a protected cluster-only address,
+or behind an authenticated internal ingress. Mutating recovery and maintenance
+actions need explicit authorization and audit controls before they belong in an
+admin interface. Operator reports should stay fact-only until a
+separate authorization and audit design exists.
+
+Do not reuse backup-client S3 credentials as admin credentials. S3 client IAM
+controls backup-tool operations on the data plane; admin/operator identity is a
+separate admin boundary.
 
 ## Key Compromise Rule
 

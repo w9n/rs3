@@ -3,11 +3,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use rs3_crypto::derive_public_fingerprint;
 use rs3_server::{
-    AnchorConfig, AnchorImportReport, AnchorRecoveryOptions, AnchorRecoveryReport, GatewayMode,
-    GatewayServer, RESTORE_BUNDLE_SCHEMA, RestoreTrustBundle, RuntimeConfig,
-    export_restore_bundle_from_config, import_anchor_from_config, recover_anchor_from_config,
+    AdminReportProfile, AnchorConfig, AnchorImportReport, AnchorRecoveryOptions,
+    AnchorRecoveryReport, GatewayMode, GatewayServer, RESTORE_BUNDLE_SCHEMA, RestoreTrustBundle,
+    RuntimeConfig, backend_kind, doctor_findings, export_restore_bundle_from_config,
+    import_anchor_from_config, recover_anchor_from_config, runtime_config_profile,
 };
 use rs3_types::{CheckpointId, RetentionMode, Sequence};
 use std::net::SocketAddr;
@@ -278,7 +278,7 @@ fn print_recovery_report(
 }
 
 fn run_doctor(config: &RuntimeConfig, profile: DoctorProfile) -> Result<()> {
-    let findings = doctor_findings(config, profile);
+    let findings = doctor_findings(config, profile.into());
     if findings.is_empty() {
         println!("rs3 doctor: {} profile ok", profile.as_str());
         return Ok(());
@@ -294,57 +294,6 @@ fn run_doctor(config: &RuntimeConfig, profile: DoctorProfile) -> Result<()> {
     )
 }
 
-fn doctor_findings(config: &RuntimeConfig, profile: DoctorProfile) -> Vec<DoctorFinding> {
-    match profile {
-        DoctorProfile::Local => Vec::new(),
-        DoctorProfile::Production => production_doctor_findings(config),
-    }
-}
-
-fn production_doctor_findings(config: &RuntimeConfig) -> Vec<DoctorFinding> {
-    let mut findings = Vec::new();
-
-    if matches!(config.anchor, AnchorConfig::Memory) {
-        findings.push(DoctorFinding::new(
-            "anchor.memory",
-            "production profile requires a durable external checkpoint anchor",
-        ));
-    }
-
-    if config.mode.allows_mutation() && config.repository.retention.is_none() {
-        findings.push(DoctorFinding::new(
-            "retention.missing",
-            "production profile requires repository retention",
-        ));
-    }
-
-    match backend_kind(&config.backend.endpoint) {
-        "memory" => findings.push(DoctorFinding::new(
-            "backend.memory",
-            "production profile requires a durable object-store backend",
-        )),
-        "filesystem" => findings.push(DoctorFinding::new(
-            "retention.backend-unsupported",
-            "filesystem backend cannot enforce provider retention",
-        )),
-        "unknown" => findings.push(DoctorFinding::new(
-            "backend.unknown",
-            "configured backend is not supported by the gateway runtime",
-        )),
-        "s3-compatible" => {}
-        _ => {}
-    }
-
-    if config.static_credentials.is_none() {
-        findings.push(DoctorFinding::new(
-            "auth.static-credentials",
-            "production profile requires configured gateway credentials",
-        ));
-    }
-
-    findings
-}
-
 impl From<GatewayModeArg> for GatewayMode {
     fn from(value: GatewayModeArg) -> Self {
         match value {
@@ -354,15 +303,12 @@ impl From<GatewayModeArg> for GatewayMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DoctorFinding {
-    code: &'static str,
-    message: &'static str,
-}
-
-impl DoctorFinding {
-    fn new(code: &'static str, message: &'static str) -> Self {
-        Self { code, message }
+impl From<DoctorProfile> for AdminReportProfile {
+    fn from(value: DoctorProfile) -> Self {
+        match value {
+            DoctorProfile::Local => Self::Local,
+            DoctorProfile::Production => Self::Production,
+        }
     }
 }
 
@@ -430,67 +376,6 @@ fn log_runtime_config(config: &RuntimeConfig) {
         config_profile,
         "gateway runtime configuration validated",
     );
-}
-
-fn backend_kind(endpoint: &str) -> &'static str {
-    if endpoint == "memory" || endpoint.starts_with("memory://") {
-        "memory"
-    } else if endpoint.starts_with("file://") {
-        "filesystem"
-    } else if endpoint == "s3"
-        || endpoint.starts_with("https://")
-        || endpoint.starts_with("http://")
-    {
-        "s3-compatible"
-    } else {
-        "unknown"
-    }
-}
-
-fn runtime_config_profile(config: &RuntimeConfig) -> String {
-    let anchor = match &config.anchor {
-        AnchorConfig::Memory => "memory".to_owned(),
-        AnchorConfig::KubernetesLease { .. } => "kubernetes-lease".to_owned(),
-    };
-    let metrics = config.metrics.bind.is_some().to_string();
-    let gateway_mode = config.mode.as_str().to_owned();
-    let backend_kind = backend_kind(&config.backend.endpoint).to_owned();
-    let batch_max_items = config.batching.max_items.to_string();
-    let batch_max_delay_ms = config.batching.max_delay.as_millis().to_string();
-    let batch_max_pending_items = config.batching.max_pending_items.to_string();
-    let payload_segment_size = config.repository.payload_segment_size.to_string();
-    let retention_mode = config
-        .repository
-        .retention
-        .map(|policy| match policy.mode {
-            RetentionMode::None => "none",
-            RetentionMode::Governance => "governance",
-            RetentionMode::Compliance => "compliance",
-        })
-        .unwrap_or("none")
-        .to_owned();
-    let retention_days = config
-        .repository
-        .retention
-        .map(|policy| policy.retain_days)
-        .unwrap_or(0)
-        .to_string();
-    let static_credentials = config.static_credentials.is_some().to_string();
-    let fields = [
-        anchor.as_bytes(),
-        gateway_mode.as_bytes(),
-        metrics.as_bytes(),
-        backend_kind.as_bytes(),
-        batch_max_items.as_bytes(),
-        batch_max_delay_ms.as_bytes(),
-        batch_max_pending_items.as_bytes(),
-        payload_segment_size.as_bytes(),
-        retention_mode.as_bytes(),
-        retention_days.as_bytes(),
-        static_credentials.as_bytes(),
-    ];
-
-    derive_public_fingerprint(b"rs3:server-runtime-config-profile:v1", &fields)
 }
 
 fn init_tracing(format: LogFormat) {
@@ -611,14 +496,14 @@ mod tests {
 
     #[test]
     fn local_doctor_allows_local_development_config() {
-        let findings = doctor_findings(&runtime_config(), DoctorProfile::Local);
+        let findings = doctor_findings(&runtime_config(), DoctorProfile::Local.into());
 
         assert!(findings.is_empty());
     }
 
     #[test]
     fn production_doctor_rejects_dev_only_posture() {
-        let findings = doctor_findings(&runtime_config(), DoctorProfile::Production);
+        let findings = doctor_findings(&runtime_config(), DoctorProfile::Production.into());
         let codes = findings
             .iter()
             .map(|finding| finding.code)
@@ -643,7 +528,7 @@ mod tests {
             secret_access_key: SecretString::from("secret"),
         });
 
-        let findings = doctor_findings(&config, DoctorProfile::Production);
+        let findings = doctor_findings(&config, DoctorProfile::Production.into());
         let codes = findings
             .iter()
             .map(|finding| finding.code)
@@ -666,7 +551,7 @@ mod tests {
             secret_access_key: SecretString::from("secret"),
         });
 
-        let findings = doctor_findings(&config, DoctorProfile::Production);
+        let findings = doctor_findings(&config, DoctorProfile::Production.into());
 
         assert!(findings.is_empty());
     }

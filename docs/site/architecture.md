@@ -32,7 +32,7 @@ opaque object store                    external checkpoint anchor
 | `rs3-anchor` | Checkpoint anchor contract and in-memory test anchor. |
 | `rs3-repository` | Namespace, payload, checkpoint, replay, maintenance, and commit coordination. |
 | `rs3-k8s` | Kubernetes-facing anchor integration surface. |
-| `rs3-server` | Gateway process, configuration, identity, S3 boundary, metrics, and shutdown. |
+| `rs3-server` | Gateway process, configuration, identity, S3 boundary, core admin reports, metrics, and shutdown. |
 | `xtask` | Integration, performance, and compatibility automation. |
 
 Cryptographic operations stay behind `rs3-crypto`; higher-level crates should
@@ -93,3 +93,26 @@ uploader. Kopia drives the lower-level S3 behavior; Velero proves the
 Kubernetes backup and restore workflow through that path. Broader S3
 compatibility should be added behind tests that prove restored bytes and
 privacy invariants.
+
+## Admin Surface
+
+Core code owns the path-redacted admin report model used by doctor checks,
+runtime status, backend and anchor posture, retention settings, and
+restore-trust summaries. That keeps the S3 data plane independent from
+operator UX, management integrations, and management authorization.
+
+In `rs3-server`, `src/admin.rs` contains only the shared report builders and
+serializable summaries. A separate operator UI or platform integration should
+consume those summaries through an explicit admin boundary instead of
+sharing backup-client S3 credentials or browsing repository objects directly.
+The report shape is a preview fact contract, not a complete workflow API: fleet
+inventory, multi-management workflows, policy workflows, rotation workflows, approvals,
+auditing, and recovery orchestration require their own authorization, audit, and stabilization decision.
+
+Admin and platform surfaces are not part of the S3 data plane and should not
+expose client-visible object browsing, backend object IDs, configured bucket
+names, repository IDs, prefixes, or secret material.
+
+Mutating workflows such as anchor import, recovery apply, key rewrap,
+compaction, or garbage collection should stay explicit CLI/runbook actions until
+they have a dedicated authorization and audit model.

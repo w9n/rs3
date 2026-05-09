@@ -28,6 +28,13 @@ For serving:
 cargo run -p rs3-server -- serve --bind 127.0.0.1:9080
 ```
 
+The core server library also exposes a path-redacted admin report model for
+operator tooling. It reports runtime posture, profile findings, backend and
+anchor kind, retention settings, and restore-trust status without exposing a
+path browser, configured bucket names, backend prefixes, repository IDs,
+client-visible object paths, or secret material. Treat this report as a preview
+fact model, not as a stable workflow API.
+
 See [Configuration](reference/configuration.md) for the environment variable
 reference.
 
@@ -195,6 +202,10 @@ volume even when labels are redacted.
 Startup logs include a path-safe `config_profile` fingerprint over operational
 knobs. They do not log configured bucket names, backend prefixes, repository
 IDs, or secret material.
+
+The admin status API uses the same `config_profile` fingerprint and keeps the
+same redaction boundary as logs and metrics. Treat it as an operator control
+surface, not a backup data browser.
 
 ## Restore Posture
 

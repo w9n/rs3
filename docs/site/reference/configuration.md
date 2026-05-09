@@ -19,6 +19,13 @@ anchor, and keyring settings as `serve`. The exported bundle contains public
 restore metadata only; keep wrapping-key material in the configured secret
 source.
 
+The core server library exposes a path-redacted admin status report for operator
+tooling. It shows backend kind, anchor kind, retention posture, profile
+findings, and checkpoint trust status without configured bucket names, backend
+prefixes, repository IDs, client object paths, or secret values. The report is a
+preview fact contract; workflow APIs need a separate authorization, audit,
+approval, and orchestration model from the gateway data plane.
+
 ## Public S3 Surface
 
 | Variable | Required | Default | Description |
