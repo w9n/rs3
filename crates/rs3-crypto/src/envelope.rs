@@ -1,9 +1,9 @@
 //! Encrypted repository keyring envelopes.
 //!
 //! The envelope lets operators rotate a wrapping-key source, such as a
-//! passphrase-derived key or KMS key, without rewriting payload objects. The
-//! repository stores only encrypted key material; the wrapping-key source stays
-//! outside the object store.
+//! KMS/HSM/Vault-derived key or other high-entropy key, without rewriting
+//! payload objects. The repository stores only encrypted key material; the
+//! wrapping-key source stays outside the object store.
 
 use crate::fingerprint::derive_public_fingerprint;
 use crate::keyring::{KeyMaterial, KeyRing, RepositoryKeyContext};

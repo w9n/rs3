@@ -59,6 +59,7 @@ The default design accepts specific backend-visible leakage:
 | Retention mode | Provider retention APIs expose mode and retain-until behavior. | Treat retention mode as policy metadata, not tenant identity. |
 | Source network metadata | The provider sees the gateway's network identity. | Deploy through controlled egress where required. |
 | Broad object class | Class prefixes support lifecycle and operations. | Keep class names generic and path-free; revisit in a new format if needed. |
+| Deterministic metadata equality | Stable metadata sealing can produce identical sealed bytes for identical metadata under identical associated data. | Use object-type-specific associated data and signed reachability; revisit before stable-format. |
 | Prefix-token structure | Current prefix tokens reveal token count and shared-token relationships. | Document as an open privacy risk; redesign index compaction before stable-format claims. |
 
 Optional mitigations include padding, pack-size normalization, checkpoint
@@ -114,11 +115,13 @@ records. Do not use it as the only anti-rollback mechanism.
 
 ## Key Compromise Rule
 
-Wrapping-key rewrap is not compromise recovery. Rewrap keeps the same repository
-data keys and creates a new envelope around them. If an attacker may have both an
-old wrapping key and the old envelope bytes, data protected by that keyring must
-be treated as exposed. Provider deletion or retention changes cannot revoke
-access to envelope bytes that a malicious backend may already have copied.
+Wrapping-key rewrap is not compromise recovery. The wrapping key must be raw
+high-entropy key material or come from an external KMS/HSM/Vault/password-KDF
+workflow before it reaches `rs3`. Rewrap keeps the same repository data keys and
+creates a new envelope around them. If an attacker may have both an old wrapping
+key and the old envelope bytes, data protected by that keyring must be treated
+as exposed. Provider deletion or retention changes cannot revoke access to
+envelope bytes that a malicious backend may already have copied.
 
 Recovery from exposed repository data keys requires a new data-key epoch for
 future writes and, where historical confidentiality must be restored,
@@ -129,14 +132,18 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
 ## Current Open Risks
 
 - Durable format compatibility is not promised yet.
-- Metadata sealing now uses a standard misuse-resistant AEAD, but the durable
-  envelope format is still not stable.
+- The cryptographic design has not had an external review.
+- Metadata sealing uses a standard misuse-resistant AEAD, but deterministic
+  sealing leaks equality for identical metadata under identical associated data.
 - Prefix token shape currently prioritizes semantics and testability; it still
   leaks namespace structure through token count and shared-token relationships.
 - Storage evidence depends on provider retention or Object Lock to resist
   deletion by a storage administrator.
 - Key retirement must remain retention-aware to avoid losing access to locked
   historical data.
+
+See [Cryptography](reference/cryptography.md) for the primitive-level reference
+and review rules.
 
 ## Review Standard
 

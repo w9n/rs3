@@ -80,8 +80,10 @@ storage adapter. Set `RS3_BACKEND_ENDPOINT=s3` for the default AWS endpoint, or
 use an `http://` / `https://` endpoint URL for an S3-compatible service. For the
 production-preview shape, configure an encrypted keyring envelope with
 `RS3_KEYRING_WRAPPING_KEY_HEX`, `RS3_REPOSITORY_ID`, and a stable public
-`RS3_REPOSITORY_SALT_HEX`. `RS3_KEYRING_WRAPPING_KEY_ID` defaults to `wrap-v1`;
-`RS3_KEYRING_ENVELOPE_OBJECT_ID` is only a bootstrap or recovery override.
+`RS3_REPOSITORY_SALT_HEX`. The wrapping key must be high-entropy key material;
+derive human passphrases outside `rs3`. `RS3_KEYRING_WRAPPING_KEY_ID` defaults
+to `wrap-v1`; `RS3_KEYRING_ENVELOPE_OBJECT_ID` is only a bootstrap or recovery
+override.
 
 `just integration-s3-local` is the orchestration entrypoint for local S3
 integration checks. It currently expects a provided endpoint and delegates to

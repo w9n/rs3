@@ -59,6 +59,7 @@ nav:
   - Testing: testing.md
   - Reference:
       - Configuration: reference/configuration.md
+      - Cryptography: reference/cryptography.md
       - Metrics: reference/metrics.md
       - Repository Format: reference/repository-format.md
 

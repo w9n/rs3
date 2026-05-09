@@ -33,9 +33,10 @@ a future format version.
 
 ## Payload Segments
 
-Payload segments are independently encrypted so ranged reads can fetch only the
-overlapping backend segments. Segment associated data binds ciphertext to the
-repository context and object identity.
+Payload segments are independently encrypted with XChaCha20-Poly1305 so ranged
+reads can fetch only the overlapping backend segments. Segment associated data
+binds ciphertext to the backend object ID, segment size, plaintext length,
+segment index, and final-segment marker.
 
 The current default segment size is 512 plaintext bytes for Kopia and Velero
 with Kopia-uploader restore behavior. This is a tuning parameter, not a
@@ -46,9 +47,11 @@ permanent format guarantee.
 Namespace index state maps blinded logical names and prefix tokens to encrypted
 metadata needed for `HEAD`, `GET`, and `LIST`.
 
-Metadata records are sealed with AES-256-GCM-SIV. Associated data binds each
-sealed record to its repository context so moving metadata between contexts
-does not authenticate.
+Metadata records are sealed with AES-256-GCM-SIV under the repository metadata
+key. Associated data is object-type specific: manifest records bind to the
+manifest ID, and index deltas bind to the index-delta object domain. Signed
+checkpoints and object IDs decide which sealed metadata is reachable repository
+state.
 
 Index changes are append-friendly deltas covered by checkpoints. Compaction can
 rewrite index state later, but it must preserve rollback and retention rules.
@@ -111,6 +114,9 @@ latest pointer.
 
 Checkpoint-signing descriptors include the Ed25519 public verification key so
 checkpoint payloads can be verified without exposing signing material.
+
+See [Cryptography](cryptography.md) for primitive choices, nonce rules, and
+known preview limits.
 
 ## Compatibility Promise
 

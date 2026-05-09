@@ -52,6 +52,9 @@ existing backup data.
 Operational rules:
 
 - Prefer generated random data keys inside an encrypted keyring envelope.
+- Provide a high-entropy wrapping key. If the operator starts from a human
+  passphrase, derive the wrapping key outside `rs3` with a KMS, HSM, Vault, or
+  password KDF before setting `RS3_KEYRING_WRAPPING_KEY_HEX`.
 - Keep wrapping keys, KMS access, HSM access, or Vault tokens outside the object
   store and outside broad cluster write credentials.
 - Provide a stable salt once per repository and keep it with trusted repository
@@ -260,8 +263,8 @@ checkpoint-bound keyring-envelope reference. It does not contain wrapping-key
 material.
 
 On a new cluster with a missing anchor, import the trusted checkpoint position
-from that bundle after configuring the same repository ID, salt, and unwrap
-authority:
+from that bundle after configuring the same repository ID, salt, and
+wrapping-key source:
 
 ```sh
 cargo run -p rs3-server -- import-anchor \

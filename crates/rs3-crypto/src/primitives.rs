@@ -7,6 +7,9 @@ use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Derives bytes using HMAC with an explicit domain separator.
+///
+/// Callers that combine more than one variable-length field into `material`
+/// must canonicalize or length-frame those fields before calling this helper.
 pub(crate) fn derive_hmac(
     repository_secret: &SecretBytes,
     domain: &[u8],
