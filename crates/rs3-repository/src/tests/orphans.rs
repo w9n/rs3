@@ -217,3 +217,58 @@ async fn orphan_report_marks_legal_hold_blocked_candidates() {
     assert!(candidate.delete_blocked_by_legal_hold);
     assert!(!candidate.delete_blocked_by_retention);
 }
+
+#[tokio::test]
+async fn delete_unprotected_orphans_removes_only_unprotected_candidates() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
+    let anchor = MemoryCheckpointAnchor::new();
+    let committed = must(
+        repo.put_committed(
+            key("p/12/accepted"),
+            Bytes::from_static(b"accepted"),
+            RepositoryPutOptions::default(),
+            &anchor,
+        )
+        .await,
+    );
+    let removable_id = backend_object_id("segments/manual-removable");
+    let retained_id = backend_object_id("segments/manual-retained");
+    let held_id = backend_object_id("segments/manual-held");
+    for (object_id, options) in [
+        (removable_id.clone(), PutOptions::default()),
+        (
+            retained_id.clone(),
+            PutOptions {
+                retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
+                ..PutOptions::default()
+            },
+        ),
+        (
+            held_id.clone(),
+            PutOptions {
+                legal_hold: Some(LegalHoldStatus::On),
+                ..PutOptions::default()
+            },
+        ),
+    ] {
+        let put = store
+            .put(&object_id, Bytes::from_static(b"manual-orphan"), options)
+            .await;
+        assert!(put.is_ok());
+    }
+
+    let report = must(repo.delete_unprotected_orphans(&committed.checkpoint).await);
+    let remaining = must_storage(store.list_prefix("segments/").await)
+        .into_iter()
+        .map(|metadata| metadata.object_id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(report.candidate_count, 3);
+    assert_eq!(report.deleted_count, 1);
+    assert_eq!(report.retention_blocked_count, 1);
+    assert_eq!(report.legal_hold_blocked_count, 1);
+    assert!(!remaining.contains(&removable_id));
+    assert!(remaining.contains(&retained_id));
+    assert!(remaining.contains(&held_id));
+}

@@ -2,11 +2,16 @@
 
 mod adapter;
 mod boundary;
+mod key_management;
 mod mapping;
 mod recovery;
 mod runtime;
 
 pub use boundary::{GatewayS3Boundary, S3Hardening};
+pub use key_management::{
+    KeyRotationError, KeyRotationOptions, KeyRotationReport, RotatedKeyringEnvelope,
+    rotate_key_from_config,
+};
 pub use recovery::{
     AnchorImportReport, AnchorRecoveryError, AnchorRecoveryOptions, AnchorRecoveryReport,
     RESTORE_BUNDLE_SCHEMA, RestoreBundleKeyringEnvelope, RestoreTrustBundle,

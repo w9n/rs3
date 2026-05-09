@@ -81,6 +81,23 @@ pub struct RepositoryOrphanReport {
     pub candidates: Vec<RepositoryOrphanCandidate>,
 }
 
+/// Result of deleting unprotected orphan candidates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryOrphanDeleteReport {
+    /// Dry-run reachability count used for the delete decision.
+    pub reachable_count: usize,
+    /// Orphan candidates examined.
+    pub candidate_count: usize,
+    /// Candidates deleted from the backend.
+    pub deleted_count: usize,
+    /// Candidates already absent when deletion was attempted.
+    pub already_gone_count: usize,
+    /// Candidates skipped because known or provider-reported retention blocked deletion.
+    pub retention_blocked_count: usize,
+    /// Candidates skipped because known or provider-reported legal hold blocked deletion.
+    pub legal_hold_blocked_count: usize,
+}
+
 /// Successful verification report for an accepted restore checkpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreVerificationReport {

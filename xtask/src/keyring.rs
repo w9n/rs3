@@ -5,11 +5,15 @@ use clap::{Args, Subcommand, ValueEnum};
 use rs3_crypto::{
     KeyRing, KeyringEnvelope, MIN_REPOSITORY_SALT_LEN, RepositoryKeyContext, SecretBytes,
 };
-use rs3_repository::{Repository, RepositoryOptions};
+use rs3_repository::{CheckpointPosition, Repository, RepositoryOptions};
 use rs3_storage::{BlobStore, ByteRange, FilesystemBlobStore};
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
-use rs3_types::{BackendObjectId, RepositoryId, RetentionMode, RetentionPolicy};
+use rs3_types::{
+    BackendObjectId, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, RepositoryId,
+    RetentionMode, RetentionPolicy, Sequence,
+};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -29,6 +33,10 @@ enum KeyringCommand {
     /// This does not rotate repository data keys and is not compromise recovery
     /// if the old wrapping key and old envelope may have been exposed together.
     Rewrap(Box<KeyringRewrapArgs>),
+    /// Open an existing keyring envelope and print public key descriptors.
+    Inspect(Box<KeyringInspectArgs>),
+    /// Check whether keys are still required by a trusted checkpoint chain.
+    RetirementCheck(Box<KeyringRetirementCheckArgs>),
 }
 
 #[derive(Args)]
@@ -111,6 +119,74 @@ struct KeyringRewrapArgs {
     format: KeyringReportFormat,
 }
 
+#[derive(Args)]
+struct KeyringInspectArgs {
+    /// Stable repository identifier bound into the envelope.
+    #[arg(long, env = "RS3_REPOSITORY_ID")]
+    repository_id: String,
+    /// Hex-encoded public repository salt bound into the envelope.
+    #[arg(long, env = "RS3_REPOSITORY_SALT_HEX")]
+    repository_salt_hex: String,
+    /// Existing envelope object identifier.
+    #[arg(long, env = "RS3_KEYRING_ENVELOPE_OBJECT_ID")]
+    envelope_object_id: String,
+    /// Wrapping key identifier recorded in the envelope.
+    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_ID", default_value = "wrap-v1")]
+    wrapping_key_id: String,
+    /// Hex-encoded wrapping key.
+    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_HEX", hide_env_values = true)]
+    wrapping_key_hex: Option<String>,
+    /// File containing the hex-encoded wrapping key.
+    #[arg(long)]
+    wrapping_key_hex_file: Option<PathBuf>,
+    /// Backend object-store target.
+    #[command(flatten)]
+    backend: KeyringBackendArgs,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = KeyringInspectFormat::Json)]
+    format: KeyringInspectFormat,
+}
+
+#[derive(Args)]
+struct KeyringRetirementCheckArgs {
+    /// Stable repository identifier bound into the envelope.
+    #[arg(long, env = "RS3_REPOSITORY_ID")]
+    repository_id: String,
+    /// Hex-encoded public repository salt bound into the envelope.
+    #[arg(long, env = "RS3_REPOSITORY_SALT_HEX")]
+    repository_salt_hex: String,
+    /// Existing envelope object identifier.
+    #[arg(long, env = "RS3_KEYRING_ENVELOPE_OBJECT_ID")]
+    envelope_object_id: String,
+    /// Wrapping key identifier recorded in the envelope.
+    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_ID", default_value = "wrap-v1")]
+    wrapping_key_id: String,
+    /// Hex-encoded wrapping key.
+    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_HEX", hide_env_values = true)]
+    wrapping_key_hex: Option<String>,
+    /// File containing the hex-encoded wrapping key.
+    #[arg(long)]
+    wrapping_key_hex_file: Option<PathBuf>,
+    /// Accepted checkpoint sequence to analyze.
+    #[arg(long)]
+    checkpoint_sequence: u64,
+    /// Accepted checkpoint ID to analyze.
+    #[arg(long)]
+    checkpoint_id: String,
+    /// Accepted checkpoint payload digest to analyze.
+    #[arg(long)]
+    checkpoint_digest: String,
+    /// Optional key ID to filter. Repeat for multiple keys.
+    #[arg(long)]
+    key_id: Vec<String>,
+    /// Backend object-store target.
+    #[command(flatten)]
+    backend: KeyringBackendArgs,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = KeyringInspectFormat::Json)]
+    format: KeyringInspectFormat,
+}
+
 #[derive(Clone, Debug, Args)]
 struct KeyringBackendArgs {
     /// Backend implementation used by the keyring operation.
@@ -184,6 +260,14 @@ enum KeyringReportFormat {
     Env,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum KeyringInspectFormat {
+    /// JSON object.
+    Json,
+    /// Human-readable key-value lines.
+    Text,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct KeyringReport {
     repository_id: String,
@@ -194,6 +278,35 @@ struct KeyringReport {
     wrapping_key_id: String,
     envelope_retention: Option<RetentionPolicy>,
     generated_wrapping_key_hex: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct KeyringInspectReport {
+    repository_id: String,
+    repository_salt_hex: String,
+    envelope_object_id: String,
+    envelope_digest: String,
+    generation: u64,
+    wrapping_key_id: String,
+    keys: Vec<KeyDescriptor>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct KeyringRetirementCheckReport {
+    repository_id: String,
+    repository_salt_hex: String,
+    accepted: CheckpointPosition,
+    restore_checkpoint_count: usize,
+    restore_payload_object_count: usize,
+    required_key_ids: Vec<KeyId>,
+    keys: Vec<KeyRetirementStatus>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct KeyRetirementStatus {
+    descriptor: KeyDescriptor,
+    required_by_checkpoint: bool,
+    retirement_candidate: bool,
 }
 
 pub(crate) fn run(args: KeyringArgs) -> Result<()> {
@@ -214,6 +327,16 @@ async fn run_async(args: KeyringArgs) -> Result<()> {
         KeyringCommand::Rewrap(args) => {
             let format = args.format;
             let report = rewrap(*args).await?;
+            report.print(format)?;
+        }
+        KeyringCommand::Inspect(args) => {
+            let format = args.format;
+            let report = inspect(*args).await?;
+            report.print(format)?;
+        }
+        KeyringCommand::RetirementCheck(args) => {
+            let format = args.format;
+            let report = retirement_check(*args).await?;
             report.print(format)?;
         }
     }
@@ -296,13 +419,11 @@ where
     let repository_id = repository_id(&args.repository_id)?;
     let context = repository_context(repository_id, &args.repository_salt_hex)?;
     let envelope_object_id = BackendObjectId::new(args.envelope_object_id.clone())?;
-    let old_wrapping_key = wrapping_key_input(
+    let old_wrapping_key = required_wrapping_key_input(
         args.old_wrapping_key_hex,
         args.old_wrapping_key_hex_file,
-        false,
         "--old-wrapping-key-hex",
         "--old-wrapping-key-hex-file",
-        "--generate-new-wrapping-key",
     )?
     .secret;
     let new_wrapping_key = wrapping_key_input(
@@ -356,6 +477,132 @@ where
     })
 }
 
+async fn inspect(args: KeyringInspectArgs) -> Result<KeyringInspectReport> {
+    match args.backend.backend {
+        KeyringBackend::Filesystem => {
+            let store = filesystem_store(&args.backend)?;
+            inspect_with_store(args, store).await
+        }
+        #[cfg(feature = "s3")]
+        KeyringBackend::S3 => {
+            let store = s3_store(&args.backend).await?;
+            inspect_with_store(args, store).await
+        }
+    }
+}
+
+async fn inspect_with_store<S>(args: KeyringInspectArgs, store: S) -> Result<KeyringInspectReport>
+where
+    S: BlobStore,
+{
+    let opened = open_keyring_envelope(
+        &store,
+        &args.repository_id,
+        &args.repository_salt_hex,
+        &args.envelope_object_id,
+        &args.wrapping_key_id,
+        args.wrapping_key_hex,
+        args.wrapping_key_hex_file,
+    )
+    .await?;
+
+    Ok(KeyringInspectReport {
+        repository_id: opened.context.repository_id().as_str().to_owned(),
+        repository_salt_hex: args.repository_salt_hex,
+        envelope_object_id: opened.object_id.as_str().to_owned(),
+        envelope_digest: opened.envelope.digest()?,
+        generation: opened.envelope.generation,
+        wrapping_key_id: args.wrapping_key_id,
+        keys: opened.keyring.descriptors(),
+    })
+}
+
+async fn retirement_check(
+    args: KeyringRetirementCheckArgs,
+) -> Result<KeyringRetirementCheckReport> {
+    match args.backend.backend {
+        KeyringBackend::Filesystem => {
+            let store = filesystem_store(&args.backend)?;
+            retirement_check_with_store(args, store).await
+        }
+        #[cfg(feature = "s3")]
+        KeyringBackend::S3 => {
+            let store = s3_store(&args.backend).await?;
+            retirement_check_with_store(args, store).await
+        }
+    }
+}
+
+async fn retirement_check_with_store<S>(
+    args: KeyringRetirementCheckArgs,
+    store: S,
+) -> Result<KeyringRetirementCheckReport>
+where
+    S: BlobStore,
+{
+    let accepted = CheckpointPosition {
+        sequence: Sequence::new(args.checkpoint_sequence),
+        checkpoint_id: CheckpointId::new(args.checkpoint_id)?,
+        payload_digest: args.checkpoint_digest,
+    };
+    let target_key_ids = args
+        .key_id
+        .iter()
+        .map(|value| KeyId::new(value.clone()))
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    let opened = open_keyring_envelope(
+        &store,
+        &args.repository_id,
+        &args.repository_salt_hex,
+        &args.envelope_object_id,
+        &args.wrapping_key_id,
+        args.wrapping_key_hex,
+        args.wrapping_key_hex_file,
+    )
+    .await?;
+    let repository = Repository::with_keyring(store, opened.keyring.clone());
+    let restore = repository.verify_restore(&accepted).await?;
+    let required_key_ids = restore
+        .required_key_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let descriptors = opened.keyring.descriptors();
+
+    for key_id in &target_key_ids {
+        if !descriptors
+            .iter()
+            .any(|descriptor| &descriptor.id == key_id)
+        {
+            bail!("key id {key_id} is not present in the opened keyring");
+        }
+    }
+
+    let keys = descriptors
+        .into_iter()
+        .filter(|descriptor| target_key_ids.is_empty() || target_key_ids.contains(&descriptor.id))
+        .map(|descriptor| {
+            let required_by_checkpoint = required_key_ids.contains(&descriptor.id);
+            let retirement_candidate = !descriptor.status.is_primary() && !required_by_checkpoint;
+            KeyRetirementStatus {
+                descriptor,
+                required_by_checkpoint,
+                retirement_candidate,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(KeyringRetirementCheckReport {
+        repository_id: opened.context.repository_id().as_str().to_owned(),
+        repository_salt_hex: args.repository_salt_hex,
+        accepted,
+        restore_checkpoint_count: restore.checkpoint_count,
+        restore_payload_object_count: restore.payload_object_count,
+        required_key_ids: restore.required_key_ids,
+        keys,
+    })
+}
+
 fn repository_with_keyring<S>(
     store: S,
     keyring: KeyRing,
@@ -372,6 +619,50 @@ where
             ..RepositoryOptions::default()
         },
     )
+}
+
+struct OpenedKeyringEnvelope {
+    context: RepositoryKeyContext,
+    object_id: BackendObjectId,
+    envelope: KeyringEnvelope,
+    keyring: KeyRing,
+}
+
+async fn open_keyring_envelope<S>(
+    store: &S,
+    repository_id_value: &str,
+    repository_salt_hex: &str,
+    envelope_object_id_value: &str,
+    wrapping_key_id: &str,
+    wrapping_key_hex: Option<String>,
+    wrapping_key_hex_file: Option<PathBuf>,
+) -> Result<OpenedKeyringEnvelope>
+where
+    S: BlobStore,
+{
+    let repository_id = repository_id(repository_id_value)?;
+    let context = repository_context(repository_id, repository_salt_hex)?;
+    let object_id = BackendObjectId::new(envelope_object_id_value.to_owned())?;
+    let wrapping_key = required_wrapping_key_input(
+        wrapping_key_hex,
+        wrapping_key_hex_file,
+        "--wrapping-key-hex",
+        "--wrapping-key-hex-file",
+    )?
+    .secret;
+    let body = store
+        .get_range(&object_id, ByteRange::Full)
+        .await
+        .context("failed to read keyring envelope")?;
+    let envelope = KeyringEnvelope::from_object_bytes(&body)?;
+    let keyring = envelope.open(&context, wrapping_key_id, &wrapping_key)?;
+
+    Ok(OpenedKeyringEnvelope {
+        context,
+        object_id,
+        envelope,
+        keyring,
+    })
 }
 
 fn filesystem_store(args: &KeyringBackendArgs) -> Result<FilesystemBlobStore> {
@@ -484,6 +775,31 @@ fn wrapping_key_input(
     }
 }
 
+fn required_wrapping_key_input(
+    provided_hex: Option<String>,
+    provided_file: Option<PathBuf>,
+    provided_flag: &str,
+    file_flag: &str,
+) -> Result<WrappingKeyInput> {
+    match (provided_hex, provided_file) {
+        (Some(_), Some(_)) => {
+            bail!("exactly one of {provided_flag} or {file_flag} is required")
+        }
+        (Some(hex), None) => Ok(WrappingKeyInput {
+            secret: secret_from_hex(provided_flag, &hex)?,
+            generated_hex: None,
+        }),
+        (None, Some(path)) => {
+            let hex = read_secret_hex_file(file_flag, &path)?;
+            Ok(WrappingKeyInput {
+                secret: secret_from_hex(file_flag, &hex)?,
+                generated_hex: None,
+            })
+        }
+        (None, None) => bail!("one of {provided_flag} or {file_flag} is required"),
+    }
+}
+
 fn read_secret_hex_file(label: &str, path: &Path) -> Result<Zeroizing<String>> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {label} {}", path.display()))?;
@@ -588,6 +904,149 @@ impl KeyringReport {
     }
 }
 
+impl KeyringInspectReport {
+    fn print(&self, format: KeyringInspectFormat) -> Result<()> {
+        match format {
+            KeyringInspectFormat::Json => {
+                let report = serde_json::json!({
+                    "repository_id": self.repository_id,
+                    "repository_salt_hex": self.repository_salt_hex,
+                    "keyring_envelope": {
+                        "object_id": self.envelope_object_id,
+                        "digest": self.envelope_digest,
+                        "generation": self.generation,
+                    },
+                    "wrapping_key": {
+                        "id": self.wrapping_key_id,
+                    },
+                    "keys": self.keys.iter().map(key_descriptor_json).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            KeyringInspectFormat::Text => {
+                println!("repository_id={}", self.repository_id);
+                println!("repository_salt_hex={}", self.repository_salt_hex);
+                println!("keyring_envelope_object_id={}", self.envelope_object_id);
+                println!("keyring_envelope_digest={}", self.envelope_digest);
+                println!("keyring_envelope_generation={}", self.generation);
+                println!("wrapping_key_id={}", self.wrapping_key_id);
+                for key in &self.keys {
+                    println!(
+                        "key id={} purpose={} status={} algorithm={}",
+                        key.id.as_str(),
+                        key_purpose_name(key.purpose),
+                        key_status_name(key.status),
+                        key.algorithm
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl KeyringRetirementCheckReport {
+    fn print(&self, format: KeyringInspectFormat) -> Result<()> {
+        match format {
+            KeyringInspectFormat::Json => {
+                let report = serde_json::json!({
+                    "repository_id": self.repository_id,
+                    "repository_salt_hex": self.repository_salt_hex,
+                    "accepted": {
+                        "sequence": self.accepted.sequence.get(),
+                        "checkpoint_id": self.accepted.checkpoint_id.as_str(),
+                        "checkpoint_digest": self.accepted.payload_digest,
+                    },
+                    "restore": {
+                        "checkpoint_count": self.restore_checkpoint_count,
+                        "payload_object_count": self.restore_payload_object_count,
+                        "required_key_ids": self.required_key_ids.iter().map(KeyId::as_str).collect::<Vec<_>>(),
+                    },
+                    "keys": self.keys.iter().map(key_retirement_status_json).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            KeyringInspectFormat::Text => {
+                println!("repository_id={}", self.repository_id);
+                println!("repository_salt_hex={}", self.repository_salt_hex);
+                println!("checkpoint_sequence={}", self.accepted.sequence.get());
+                println!("checkpoint_id={}", self.accepted.checkpoint_id.as_str());
+                println!("checkpoint_digest={}", self.accepted.payload_digest);
+                println!("restore_checkpoint_count={}", self.restore_checkpoint_count);
+                println!(
+                    "restore_payload_object_count={}",
+                    self.restore_payload_object_count
+                );
+                let required = self
+                    .required_key_ids
+                    .iter()
+                    .map(KeyId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!("required_key_ids={required}");
+                for key in &self.keys {
+                    println!(
+                        "key id={} purpose={} status={} required_by_checkpoint={} retirement_candidate={}",
+                        key.descriptor.id.as_str(),
+                        key_purpose_name(key.descriptor.purpose),
+                        key_status_name(key.descriptor.status),
+                        key.required_by_checkpoint,
+                        key.retirement_candidate
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn key_retirement_status_json(key: &KeyRetirementStatus) -> serde_json::Value {
+    let mut value = key_descriptor_json(&key.descriptor);
+    if let serde_json::Value::Object(fields) = &mut value {
+        fields.insert(
+            "required_by_checkpoint".to_owned(),
+            serde_json::Value::Bool(key.required_by_checkpoint),
+        );
+        fields.insert(
+            "retirement_candidate".to_owned(),
+            serde_json::Value::Bool(key.retirement_candidate),
+        );
+    }
+    value
+}
+
+fn key_descriptor_json(descriptor: &KeyDescriptor) -> serde_json::Value {
+    serde_json::json!({
+        "id": descriptor.id.as_str(),
+        "purpose": key_purpose_name(descriptor.purpose),
+        "algorithm": descriptor.algorithm.as_str(),
+        "status": key_status_name(descriptor.status),
+        "created_at_ms": descriptor.created_at_ms,
+        "not_before_ms": descriptor.not_before_ms,
+        "not_after_ms": descriptor.not_after_ms,
+        "public_key": descriptor.public_key.as_deref(),
+        "external_kms_uri": descriptor.external_kms_uri.as_deref(),
+    })
+}
+
+fn key_purpose_name(purpose: KeyPurpose) -> &'static str {
+    match purpose {
+        KeyPurpose::Namespace => "namespace",
+        KeyPurpose::Content => "content",
+        KeyPurpose::Metadata => "metadata",
+        KeyPurpose::CheckpointSigning => "checkpoint",
+    }
+}
+
+fn key_status_name(status: KeyStatus) -> &'static str {
+    match status {
+        KeyStatus::Primary => "primary",
+        KeyStatus::Enabled => "enabled",
+        KeyStatus::Disabled => "disabled",
+        KeyStatus::Retired => "retired",
+    }
+}
+
 fn retention_mode_name(mode: RetentionMode) -> &'static str {
     match mode {
         RetentionMode::None => "none",
@@ -603,13 +1062,20 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyringInitArgs, KeyringReportFormat, KeyringRetentionArgs, KeyringRetentionMode,
-        KeyringRewrapArgs, init_with_store, rewrap_with_store, secret_from_hex,
+        KeyringInitArgs, KeyringInspectArgs, KeyringInspectFormat, KeyringReportFormat,
+        KeyringRetentionArgs, KeyringRetentionMode, KeyringRetirementCheckArgs, KeyringRewrapArgs,
+        init_with_store, inspect_with_store, retirement_check_with_store, rewrap_with_store,
+        secret_from_hex,
     };
     use crate::keyring::{KeyringBackend, KeyringBackendArgs};
+    use bytes::Bytes;
+    use rs3_anchor::MemoryCheckpointAnchor;
     use rs3_crypto::{KeyringEnvelope, RepositoryKeyContext, SecretBytes};
+    use rs3_repository::{Repository, RepositoryPutOptions};
     use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore};
-    use rs3_types::{BackendObjectId, RepositoryId, RetentionMode, RetentionPolicy};
+    use rs3_types::{
+        BackendObjectId, KeyPurpose, LogicalPath, RepositoryId, RetentionMode, RetentionPolicy,
+    };
 
     const SALT_HEX: &str = "2222222222222222222222222222222222222222222222222222222222222222";
     const OLD_WRAP_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -739,6 +1205,111 @@ mod tests {
         assert_eq!(
             rewrapped_report.envelope_retention,
             Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
+        );
+    }
+
+    #[tokio::test]
+    async fn keyring_inspect_reports_public_descriptors_without_secrets() {
+        let store = MemoryBlobStore::new();
+        let init_report = init_with_store(init_args(), store.clone())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let inspect = KeyringInspectArgs {
+            repository_id: "repo-a".to_owned(),
+            repository_salt_hex: SALT_HEX.to_owned(),
+            envelope_object_id: init_report.envelope_object_id,
+            wrapping_key_id: "wrap-v1".to_owned(),
+            wrapping_key_hex: Some(OLD_WRAP_HEX.to_owned()),
+            wrapping_key_hex_file: None,
+            backend: backend_args(),
+            format: KeyringInspectFormat::Json,
+        };
+
+        let report = inspect_with_store(inspect, store)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(report.generation, 1);
+        assert_eq!(report.wrapping_key_id, "wrap-v1");
+        assert_eq!(report.keys.len(), 4);
+        assert!(
+            report
+                .keys
+                .iter()
+                .any(|key| key.purpose == KeyPurpose::Content)
+        );
+        assert!(
+            report
+                .keys
+                .iter()
+                .all(|key| !key.algorithm.contains(OLD_WRAP_HEX))
+        );
+    }
+
+    #[tokio::test]
+    async fn keyring_retirement_check_reports_required_keys_for_checkpoint() {
+        let store = MemoryBlobStore::new();
+        let init_report = init_with_store(init_args(), store.clone())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let envelope = envelope_from_store(&store, &init_report.envelope_object_id).await;
+        let keyring = envelope
+            .open(&context(), "wrap-v1", &secret(OLD_WRAP_HEX))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let repository = Repository::with_keyring(store.clone(), keyring);
+        repository
+            .store_keyring_envelope(&envelope)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let key =
+            LogicalPath::new("p/12/retirement-check").unwrap_or_else(|error| panic!("{error}"));
+        repository
+            .put(
+                key,
+                Bytes::from_static(b"body"),
+                RepositoryPutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let anchor = MemoryCheckpointAnchor::new();
+        let checkpoint = repository
+            .publish_checkpoint(&anchor)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let check = KeyringRetirementCheckArgs {
+            repository_id: "repo-a".to_owned(),
+            repository_salt_hex: SALT_HEX.to_owned(),
+            envelope_object_id: init_report.envelope_object_id,
+            wrapping_key_id: "wrap-v1".to_owned(),
+            wrapping_key_hex: Some(OLD_WRAP_HEX.to_owned()),
+            wrapping_key_hex_file: None,
+            checkpoint_sequence: checkpoint.sequence.get(),
+            checkpoint_id: checkpoint.checkpoint_id.as_str().to_owned(),
+            checkpoint_digest: checkpoint.payload_digest,
+            key_id: Vec::new(),
+            backend: backend_args(),
+            format: KeyringInspectFormat::Json,
+        };
+
+        let report = retirement_check_with_store(check, store)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(report.restore_checkpoint_count, 1);
+        assert_eq!(report.restore_payload_object_count, 1);
+        assert!(
+            report
+                .required_key_ids
+                .iter()
+                .any(|key| key.as_str() == "content-v1")
+        );
+        assert!(
+            report
+                .keys
+                .iter()
+                .any(|key| key.descriptor.id.as_str() == "content-v1"
+                    && key.required_by_checkpoint
+                    && !key.retirement_candidate)
         );
     }
 

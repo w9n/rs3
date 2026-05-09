@@ -86,6 +86,22 @@ In Helm, set `repositoryKeys.create=true` or provide
 `envelope-object-id` is an optional override. Helm values stay declarative; the
 gateway writes the encrypted envelope object, not mutated chart state.
 
+Inspect an existing envelope when auditing key lifecycle state:
+
+```sh
+cargo run -p xtask --bin xtask -- keyring inspect \
+  --repository-id prod-backups \
+  --repository-salt-hex <salt-hex> \
+  --envelope-object-id <checkpoint-bound-envelope-object-id> \
+  --wrapping-key-id wrap-2026-05 \
+  --wrapping-key-hex-file /run/secrets/rs3-wrap.hex \
+  --backend filesystem \
+  --backend-dir /var/lib/rs3/backend
+```
+
+This opens the envelope and prints public key descriptors only. It does not
+print repository data keys or wrapping-key material.
+
 Rewrap the keyring envelope with a new wrapping key without rewriting backup
 data:
 
@@ -119,6 +135,43 @@ When writing envelopes outside the gateway, set envelope retention deliberately
 with `--envelope-retention-mode` and `--envelope-retention-days`; retention
 protects restore evidence from deletion but does not make a leaked old envelope
 safe.
+
+Rotate a purpose-specific repository data key through the configured backend
+and checkpoint anchor:
+
+```sh
+cargo run -p rs3-server -- rotate-key \
+  --purpose content \
+  --format text
+```
+
+Supported purposes are `namespace`, `content`, `metadata`, and `checkpoint`.
+The command opens the checkpoint-bound envelope, generates a fresh primary key
+for that purpose, demotes the previous primary to enabled historical use, writes
+a new encrypted envelope, and publishes a metadata-only checkpoint that binds
+the new envelope. This is a first-party operator primitive over the configured
+backend and anchor, not an S3 data-plane operation.
+
+Before disabling or retiring a historical key, check a trusted checkpoint chain:
+
+```sh
+cargo run -p xtask --bin xtask -- keyring retirement-check \
+  --repository-id prod-backups \
+  --repository-salt-hex <salt-hex> \
+  --envelope-object-id <checkpoint-bound-envelope-object-id> \
+  --wrapping-key-id wrap-2026-05 \
+  --wrapping-key-hex-file /run/secrets/rs3-wrap.hex \
+  --checkpoint-sequence <sequence> \
+  --checkpoint-id <checkpoint-id> \
+  --checkpoint-digest <checkpoint-digest> \
+  --key-id content-v1 \
+  --backend filesystem \
+  --backend-dir /var/lib/rs3/backend
+```
+
+Retirement is safe only when the key is not primary and the verified checkpoint
+chain no longer requires it. Keep historical keys for at least the maximum
+provider-retention window.
 
 ## Anchors
 

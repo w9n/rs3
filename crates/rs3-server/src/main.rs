@@ -5,11 +5,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rs3_server::{
     AdminReportProfile, AnchorConfig, AnchorImportReport, AnchorRecoveryOptions,
-    AnchorRecoveryReport, GatewayMode, GatewayServer, RESTORE_BUNDLE_SCHEMA, RestoreTrustBundle,
-    RuntimeConfig, backend_kind, doctor_findings, export_restore_bundle_from_config,
-    import_anchor_from_config, recover_anchor_from_config, runtime_config_profile,
+    AnchorRecoveryReport, GatewayMode, GatewayServer, KeyRotationOptions, KeyRotationReport,
+    RESTORE_BUNDLE_SCHEMA, RestoreTrustBundle, RuntimeConfig, backend_kind, doctor_findings,
+    export_restore_bundle_from_config, import_anchor_from_config, recover_anchor_from_config,
+    rotate_key_from_config, runtime_config_profile,
 };
-use rs3_types::{CheckpointId, RetentionMode, Sequence};
+use rs3_types::{CheckpointId, KeyId, KeyPurpose, RetentionMode, Sequence};
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
@@ -65,6 +66,14 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
+    RotateKey {
+        #[arg(long, value_enum)]
+        purpose: KeyPurposeArg,
+        #[arg(long)]
+        new_key_id: Option<String>,
+        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
+        format: RecoveryReportFormat,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -77,6 +86,14 @@ enum GatewayModeArg {
 enum DoctorProfile {
     Local,
     Production,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum KeyPurposeArg {
+    Namespace,
+    Content,
+    Metadata,
+    Checkpoint,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -162,8 +179,74 @@ async fn main() -> Result<()> {
             .await?;
             print_import_report(&report, format)?;
         }
+        Commands::RotateKey {
+            purpose,
+            new_key_id,
+            format,
+        } => {
+            let config = RuntimeConfig::from_env()?;
+            log_runtime_config(&config);
+            let report = rotate_key_from_config(
+                &config,
+                KeyRotationOptions {
+                    purpose: purpose.into(),
+                    new_key_id: new_key_id.map(KeyId::new).transpose()?,
+                },
+            )
+            .await?;
+            print_key_rotation_report(&report, format)?;
+        }
     }
 
+    Ok(())
+}
+
+fn print_key_rotation_report(
+    report: &KeyRotationReport,
+    format: RecoveryReportFormat,
+) -> Result<()> {
+    match format {
+        RecoveryReportFormat::Json => {
+            let report = serde_json::json!({
+                "purpose": key_purpose_name(report.purpose),
+                "old_primary_key_id": report.old_primary_key_id.as_str(),
+                "new_primary_key_id": report.new_primary_key_id.as_str(),
+                "staged_sequence": report.staged_sequence.get(),
+                "checkpoint": {
+                    "sequence": report.checkpoint.sequence.get(),
+                    "checkpoint_id": report.checkpoint.checkpoint_id.as_str(),
+                    "checkpoint_digest": report.checkpoint.payload_digest,
+                    "published_at_ms": report.published_at_ms,
+                },
+                "keyring_envelope": {
+                    "generation": report.keyring_envelope.generation,
+                    "object_id": report.keyring_envelope.object_id.as_str(),
+                    "digest": report.keyring_envelope.digest,
+                },
+            });
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        RecoveryReportFormat::Text => {
+            println!("rs3 key rotation: accepted checkpoint published");
+            println!("purpose={}", key_purpose_name(report.purpose));
+            println!("old_primary_key_id={}", report.old_primary_key_id.as_str());
+            println!("new_primary_key_id={}", report.new_primary_key_id.as_str());
+            println!("staged_sequence={}", report.staged_sequence.get());
+            println!("checkpoint_sequence={}", report.checkpoint.sequence.get());
+            println!("checkpoint_id={}", report.checkpoint.checkpoint_id.as_str());
+            println!("checkpoint_digest={}", report.checkpoint.payload_digest);
+            println!("published_at_ms={}", report.published_at_ms);
+            println!(
+                "keyring_envelope_generation={}",
+                report.keyring_envelope.generation
+            );
+            println!(
+                "keyring_envelope_object_id={}",
+                report.keyring_envelope.object_id.as_str()
+            );
+            println!("keyring_envelope_digest={}", report.keyring_envelope.digest);
+        }
+    }
     Ok(())
 }
 
@@ -309,6 +392,26 @@ impl From<DoctorProfile> for AdminReportProfile {
             DoctorProfile::Local => Self::Local,
             DoctorProfile::Production => Self::Production,
         }
+    }
+}
+
+impl From<KeyPurposeArg> for KeyPurpose {
+    fn from(value: KeyPurposeArg) -> Self {
+        match value {
+            KeyPurposeArg::Namespace => Self::Namespace,
+            KeyPurposeArg::Content => Self::Content,
+            KeyPurposeArg::Metadata => Self::Metadata,
+            KeyPurposeArg::Checkpoint => Self::CheckpointSigning,
+        }
+    }
+}
+
+fn key_purpose_name(purpose: KeyPurpose) -> &'static str {
+    match purpose {
+        KeyPurpose::Namespace => "namespace",
+        KeyPurpose::Content => "content",
+        KeyPurpose::Metadata => "metadata",
+        KeyPurpose::CheckpointSigning => "checkpoint",
     }
 }
 

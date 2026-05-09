@@ -159,8 +159,8 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
   leaks namespace structure through token count and shared-token relationships.
 - Storage evidence depends on provider retention or Object Lock to resist
   deletion by a storage administrator.
-- Key retirement must remain retention-aware to avoid losing access to locked
-  historical data.
+- Key retirement remains retention-aware and must not remove material still
+  required by locked historical checkpoints.
 
 See [Cryptography](reference/cryptography.md) for the primitive-level reference
 and review rules.

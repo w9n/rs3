@@ -3,7 +3,7 @@
 use crate::error::Result;
 use crate::model::CheckpointPosition;
 use crate::service::{Repository, strongest_retention_policy};
-use crate::state::{RepositoryState, TrustedManifest, apply_index_delta_object};
+use crate::state::{RepositoryState, TrustedManifest, apply_index_delta_object, next_sequence};
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, CheckpointAnchor};
 use rs3_crypto::{
@@ -18,7 +18,7 @@ use rs3_index::{
     checkpoint_object_bytes, index_delta_plaintext_bytes, manifest_plaintext_bytes,
 };
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
-use rs3_types::{BackendObjectId, CheckpointId, ManifestId};
+use rs3_types::{BackendObjectId, CheckpointId, ManifestId, Sequence};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -260,6 +260,27 @@ where
         };
         self.set_keyring_envelope_reference(Some(reference.clone()))?;
         Ok(reference)
+    }
+
+    /// Stores a new encrypted keyring envelope and stages a metadata-only checkpoint.
+    ///
+    /// This is used for key lifecycle updates that change checkpoint metadata
+    /// but do not necessarily include a client-visible object mutation. The
+    /// returned sequence is reserved for the next checkpoint publish.
+    pub async fn store_keyring_update(
+        &self,
+        keyring: KeyRing,
+        envelope: &KeyringEnvelope,
+    ) -> Result<(KeyringEnvelopeReference, Sequence)> {
+        self.replace_keyring(keyring)?;
+        let reference = self.store_keyring_envelope(envelope).await?;
+        let sequence = self.stage_repository_metadata_checkpoint()?;
+        Ok((reference, sequence))
+    }
+
+    fn stage_repository_metadata_checkpoint(&self) -> Result<Sequence> {
+        let mut state = self.write_state()?;
+        next_sequence(&mut state)
     }
 
     /// Writes a signed checkpoint object if it has not already been written.

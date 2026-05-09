@@ -106,6 +106,12 @@ repository state without breaking that checkpoint binding.
 Rewrapping an envelope changes only the wrapping-key source around the same
 repository data keys. It is operational hygiene, not compromise recovery.
 
+Data-key rotation changes one purpose-specific repository key at a time. The old
+primary remains enabled for historical reads or checkpoint verification until
+retention-aware retirement proves it is no longer required. A rotated keyring is
+stored in a new envelope and becomes active only when a signed checkpoint binds
+that envelope.
+
 ## Checkpoints
 
 Checkpoints sign canonical repository-state transitions with Ed25519. The signed
@@ -142,7 +148,7 @@ format v1, the project still needs final review of:
 - prefix-token structure and namespace-shape leakage
 - padding and pack-size policy
 - KMS/HSM/Vault wrapping-key workflow
-- key rotation, key retirement, and retained historical data
+- key-retirement policy for retained historical data
 - durable format compatibility guarantees
 
 ## References

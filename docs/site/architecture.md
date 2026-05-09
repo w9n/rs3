@@ -113,6 +113,6 @@ Admin and platform surfaces are not part of the S3 data plane and should not
 expose client-visible object browsing, backend object IDs, configured bucket
 names, repository IDs, prefixes, or secret material.
 
-Mutating workflows such as anchor import, recovery apply, key rewrap,
-compaction, or garbage collection should stay explicit CLI/runbook actions until
-they have a dedicated authorization and audit model.
+Mutating workflows such as anchor import, recovery apply, key rewrap, data-key
+rotation, compaction, or garbage collection should stay explicit operator
+actions until they have a dedicated authorization and audit model.

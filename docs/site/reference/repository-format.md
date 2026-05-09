@@ -94,18 +94,28 @@ The repository uses purpose-specific keys for:
 - Ed25519 checkpoint signing
 
 New writes use primary keys. Reads and replay accept enabled historical keys
-until retention and migration policy allow retirement.
+until retention and migration policy allow retirement. Data-key rotation adds a
+fresh primary key for one purpose and demotes the previous primary to enabled
+historical use.
 
 The preferred bootstrap shape is to use an operator-provided repository ID and
 public salt, generate random purpose-specific data keys, and store them in an
 encrypted keyring envelope under a counted `keyrings/` object. The wrapping-key
 source, such as a KMS key or high-entropy wrapping key, stays outside the
-repository. Signed checkpoints bind the active envelope by generation, object ID,
-and digest so a backend cannot silently swap envelopes.
+repository. Signed checkpoints bind the active envelope by generation, object
+ID, and digest so a backend cannot silently swap envelopes. The envelope is
+checkpoint-bound, not checkpoint-embedded: normal checkpoints do not rewrite key
+material, but a key update becomes accepted repository state only after a signed
+checkpoint names the new envelope.
 
 Wrapping-key rewrap preserves the same repository data keys. It is useful for
 moving the wrapping-key source or retiring a clean wrapping key, but it is not
 recovery from exposure of an old wrapping key plus the old envelope bytes.
+
+Repository-local orphan cleanup is reachability and retention aware. It derives
+candidates from an accepted checkpoint chain, skips objects with known retention
+or legal hold, and treats provider retention or legal-hold delete failures as
+blocked cleanup rather than as successful deletion.
 
 Initial empty repositories are initialized by writing an encrypted keyring
 envelope. Existing anchored repositories open through the envelope reference

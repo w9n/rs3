@@ -47,6 +47,133 @@ async fn stored_keyring_envelope_is_bound_into_signed_checkpoints() {
 }
 
 #[tokio::test]
+async fn metadata_key_rotation_replays_old_and_new_checkpoint_state() {
+    let store = MemoryBlobStore::new();
+    let anchor = MemoryCheckpointAnchor::new();
+    let context = repository_key_context();
+    let initial_keyring = signing_keyring();
+    let repo = Repository::with_keyring(store.clone(), initial_keyring.clone());
+    let initial_envelope = must_crypto(initial_keyring.seal_keyring_envelope(
+        &context,
+        "wrap-v1",
+        &secret_with_byte(12),
+        1,
+    ));
+    must(repo.store_keyring_envelope(&initial_envelope).await);
+
+    let old_key = key("p/12/metadata-old");
+    let new_key = key("p/12/metadata-new");
+    let old_put = repo
+        .put(
+            old_key.clone(),
+            Bytes::from_static(b"old"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(old_put.is_ok());
+    let first = must(repo.publish_checkpoint(&anchor).await);
+
+    let rotated_keyring = must_crypto(initial_keyring.rotate_purpose_key(
+        KeyPurpose::Metadata,
+        key_id("metadata-v2"),
+        now_ms(),
+    ));
+    let rotated_envelope = must_crypto(rotated_keyring.seal_keyring_envelope(
+        &context,
+        "wrap-v1",
+        &secret_with_byte(12),
+        2,
+    ));
+    let (_, staged_sequence) = must(
+        repo.store_keyring_update(rotated_keyring.clone(), &rotated_envelope)
+            .await,
+    );
+    assert_eq!(staged_sequence, Sequence::new(first.sequence.get() + 1));
+    let metadata_checkpoint = must(repo.publish_checkpoint(&anchor).await);
+
+    let new_put = repo
+        .put(
+            new_key.clone(),
+            Bytes::from_static(b"new"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(new_put.is_ok());
+    let latest = must(repo.publish_checkpoint(&anchor).await);
+
+    let fresh = Repository::with_keyring(store.clone(), rotated_keyring.clone());
+    let loaded = must(fresh.load_checkpoint_position(&latest).await);
+    let old_body = fresh.get_range(&old_key, ByteRange::Full).await;
+    let new_body = fresh.get_range(&new_key, ByteRange::Full).await;
+    let restore = must(fresh.verify_restore(&latest).await);
+
+    assert_eq!(loaded, latest);
+    assert_eq!(
+        metadata_checkpoint.sequence,
+        Sequence::new(first.sequence.get() + 1)
+    );
+    assert_eq!(must(old_body), Bytes::from_static(b"old"));
+    assert_eq!(must(new_body), Bytes::from_static(b"new"));
+    assert!(restore.required_key_ids.contains(&key_id("metadata")));
+    assert!(restore.required_key_ids.contains(&key_id("metadata-v2")));
+}
+
+#[tokio::test]
+async fn checkpoint_signing_rotation_verifies_mixed_signing_chain() {
+    let store = MemoryBlobStore::new();
+    let anchor = MemoryCheckpointAnchor::new();
+    let context = repository_key_context();
+    let initial_keyring = signing_keyring();
+    let repo = Repository::with_keyring(store.clone(), initial_keyring.clone());
+    let initial_envelope = must_crypto(initial_keyring.seal_keyring_envelope(
+        &context,
+        "wrap-v1",
+        &secret_with_byte(12),
+        1,
+    ));
+    must(repo.store_keyring_envelope(&initial_envelope).await);
+
+    let put = repo
+        .put(
+            key("p/12/signed-before-rotation"),
+            Bytes::from_static(b"old"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+    let first = must(repo.publish_checkpoint(&anchor).await);
+    let first_checkpoint = checkpoint_from_store(&store, &first).await;
+    assert_eq!(first_checkpoint.signature_key_id, key_id("signing"));
+
+    let rotated_keyring = must_crypto(initial_keyring.rotate_purpose_key(
+        KeyPurpose::CheckpointSigning,
+        key_id("signing-v2"),
+        now_ms(),
+    ));
+    let rotated_envelope = must_crypto(rotated_keyring.seal_keyring_envelope(
+        &context,
+        "wrap-v1",
+        &secret_with_byte(12),
+        2,
+    ));
+    must(
+        repo.store_keyring_update(rotated_keyring.clone(), &rotated_envelope)
+            .await,
+    );
+    let latest = must(repo.publish_checkpoint(&anchor).await);
+    let latest_checkpoint = checkpoint_from_store(&store, &latest).await;
+
+    let fresh = Repository::with_keyring(store.clone(), rotated_keyring);
+    let loaded = must(fresh.load_checkpoint_position(&latest).await);
+    let restore = must(fresh.verify_restore(&latest).await);
+
+    assert_eq!(loaded, latest);
+    assert_eq!(latest_checkpoint.signature_key_id, key_id("signing-v2"));
+    assert!(restore.required_key_ids.contains(&key_id("signing")));
+    assert!(restore.required_key_ids.contains(&key_id("signing-v2")));
+}
+
+#[tokio::test]
 async fn namespace_rotation_keeps_old_objects_readable_and_listable() {
     let repo = Repository::with_keyring(
         MemoryBlobStore::new(),
@@ -349,4 +476,35 @@ async fn disabled_old_namespace_key_stops_lookup() {
 
     assert!(matches!(head, Err(RepositoryError::NotFound(_))));
     assert!(must(listed).is_empty());
+}
+
+fn repository_key_context() -> RepositoryKeyContext {
+    let repository_id = match RepositoryId::new("repository-a") {
+        Ok(repository_id) => repository_id,
+        Err(error) => panic!("{error}"),
+    };
+    match RepositoryKeyContext::new(repository_id, vec![7; 32]) {
+        Ok(context) => context,
+        Err(error) => panic!("{error}"),
+    }
+}
+
+async fn checkpoint_from_store(
+    store: &MemoryBlobStore,
+    position: &CheckpointPosition,
+) -> rs3_index::Checkpoint {
+    let object_id = match checkpoint_object_id(&position.checkpoint_id) {
+        Ok(object_id) => object_id,
+        Err(error) => panic!("{error}"),
+    };
+    decode_checkpoint_object(must_storage(
+        store.get_range(&object_id, ByteRange::Full).await,
+    ))
+}
+
+fn must_crypto<T>(result: std::result::Result<T, rs3_crypto::CryptoError>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => panic!("{error}"),
+    }
 }

@@ -109,14 +109,48 @@ impl KeyRing {
 
     /// Returns the primary namespace key ID.
     pub fn primary_namespace_key_id(&self) -> Result<KeyId, CryptoError> {
-        self.primary_key(KeyPurpose::Namespace)
-            .map(|key| key.descriptor.id.clone())
+        self.primary_key_id(KeyPurpose::Namespace)
     }
 
     /// Returns the primary content key ID.
     pub fn primary_content_key_id(&self) -> Result<KeyId, CryptoError> {
-        self.primary_key(KeyPurpose::Content)
+        self.primary_key_id(KeyPurpose::Content)
+    }
+
+    /// Returns the primary key ID for a cryptographic purpose.
+    pub fn primary_key_id(&self, purpose: KeyPurpose) -> Result<KeyId, CryptoError> {
+        self.primary_key(purpose)
             .map(|key| key.descriptor.id.clone())
+    }
+
+    /// Returns a new keyring with a fresh primary key for `purpose`.
+    ///
+    /// The previous primary key for the same purpose is demoted to `Enabled`
+    /// so retained checkpoint chains and old objects can still be read or
+    /// verified. The caller is responsible for storing the returned keyring in
+    /// a new envelope and publishing a checkpoint that binds the envelope.
+    pub fn rotate_purpose_key(
+        &self,
+        purpose: KeyPurpose,
+        new_key_id: KeyId,
+        created_at_ms: i64,
+    ) -> Result<Self, CryptoError> {
+        let _ = self.primary_key(purpose)?;
+        let secret = random_secret()?;
+        let descriptor = rotated_descriptor(new_key_id, purpose, created_at_ms, &secret)?;
+        let mut keys = self
+            .keys
+            .iter()
+            .cloned()
+            .map(|mut key| {
+                if key.descriptor.purpose == purpose && key.descriptor.status.is_primary() {
+                    key.descriptor.status = KeyStatus::Enabled;
+                }
+                key
+            })
+            .collect::<Vec<_>>();
+        keys.push(KeyMaterial::new(descriptor, secret));
+        Self::new(keys)
     }
 
     /// Returns public key descriptors sorted for deterministic checkpoints.
@@ -320,6 +354,37 @@ fn default_checkpoint_descriptor(secret: &SecretBytes) -> Result<KeyDescriptor, 
     })
 }
 
+fn rotated_descriptor(
+    id: KeyId,
+    purpose: KeyPurpose,
+    created_at_ms: i64,
+    secret: &SecretBytes,
+) -> Result<KeyDescriptor, CryptoError> {
+    Ok(KeyDescriptor {
+        id,
+        purpose,
+        algorithm: algorithm_for_purpose(purpose).to_owned(),
+        status: KeyStatus::Primary,
+        created_at_ms,
+        not_before_ms: None,
+        not_after_ms: None,
+        public_key: match purpose {
+            KeyPurpose::CheckpointSigning => Some(derive_checkpoint_public_key_descriptor(secret)?),
+            KeyPurpose::Namespace | KeyPurpose::Content | KeyPurpose::Metadata => None,
+        },
+        external_kms_uri: None,
+    })
+}
+
+fn algorithm_for_purpose(purpose: KeyPurpose) -> &'static str {
+    match purpose {
+        KeyPurpose::Namespace => NAMESPACE_ALGORITHM,
+        KeyPurpose::Content => CONTENT_ALGORITHM,
+        KeyPurpose::Metadata => METADATA_ALGORITHM,
+        KeyPurpose::CheckpointSigning => CHECKPOINT_ALGORITHM,
+    }
+}
+
 fn static_key_id(value: &str) -> KeyId {
     match KeyId::new(value) {
         Ok(key_id) => key_id,
@@ -434,6 +499,75 @@ mod tests {
         secrets.sort();
         secrets.dedup();
         assert_eq!(secrets.len(), 4);
+    }
+
+    #[test]
+    fn rotate_purpose_key_demotes_old_primary_and_adds_new_primary() {
+        let keyring = match KeyRing::new(vec![namespace_key("old", KeyStatus::Primary, 1)]) {
+            Ok(keyring) => keyring,
+            Err(error) => panic!("{error}"),
+        };
+
+        let rotated = match keyring.rotate_purpose_key(KeyPurpose::Namespace, key_id("new"), 123) {
+            Ok(keyring) => keyring,
+            Err(error) => panic!("{error}"),
+        };
+
+        let descriptors = rotated.descriptors();
+        let primary = match rotated.primary_key_id(KeyPurpose::Namespace) {
+            Ok(key_id) => key_id,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(primary, key_id("new"));
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| (descriptor.id.clone(), descriptor.status))
+                .collect::<Vec<_>>(),
+            vec![
+                (key_id("new"), KeyStatus::Primary),
+                (key_id("old"), KeyStatus::Enabled)
+            ]
+        );
+    }
+
+    #[test]
+    fn rotate_checkpoint_signing_key_records_public_verification_key() {
+        let keyring = match KeyRing::generate_random() {
+            Ok(keyring) => keyring,
+            Err(error) => panic!("{error}"),
+        };
+
+        let rotated = match keyring.rotate_purpose_key(
+            KeyPurpose::CheckpointSigning,
+            key_id("checkpoint-v2"),
+            123,
+        ) {
+            Ok(keyring) => keyring,
+            Err(error) => panic!("{error}"),
+        };
+
+        let descriptor = rotated
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == key_id("checkpoint-v2"))
+            .unwrap_or_else(|| panic!("missing rotated descriptor"));
+
+        assert_eq!(descriptor.purpose, KeyPurpose::CheckpointSigning);
+        assert_eq!(descriptor.status, KeyStatus::Primary);
+        assert!(descriptor.public_key.is_some());
+    }
+
+    #[test]
+    fn rotate_purpose_key_rejects_duplicate_key_id() {
+        let keyring = match KeyRing::new(vec![namespace_key("old", KeyStatus::Primary, 1)]) {
+            Ok(keyring) => keyring,
+            Err(error) => panic!("{error}"),
+        };
+
+        let rotated = keyring.rotate_purpose_key(KeyPurpose::Namespace, key_id("old"), 123);
+
+        assert!(rotated.is_err());
     }
 
     #[test]

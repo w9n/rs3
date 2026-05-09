@@ -466,7 +466,7 @@ impl CheckpointAnchor for DynCheckpointAnchor {
     }
 }
 
-async fn gateway_keyring(
+pub(super) async fn gateway_keyring(
     store: &RuntimeStore,
     anchor: &RuntimeAnchor,
     keys: &RepositoryKeysConfig,
@@ -780,7 +780,7 @@ pub(super) fn checkpoint_evidence_object_id(
     .map_err(repository_init)
 }
 
-async fn validate_storage_evidence(
+pub(super) async fn validate_storage_evidence(
     store: &RuntimeStore,
     accepted: &CheckpointPosition,
 ) -> Result<(), S3BoundaryError> {
@@ -916,14 +916,14 @@ pub(super) struct LoadedGatewayKeyring {
     pub(super) pending_envelope_override: Option<KeyringEnvelopeReference>,
 }
 
-fn repository_key_context(
+pub(super) fn repository_key_context(
     keys: &RepositoryKeysConfig,
 ) -> Result<RepositoryKeyContext, S3BoundaryError> {
     let salt = repository_salt(&keys.repository_salt_hex)?;
     RepositoryKeyContext::new(keys.repository_id.clone(), salt).map_err(repository_init)
 }
 
-fn secret_hex(
+pub(super) fn secret_hex(
     env_name: &'static str,
     secret_hex: &SecretString,
 ) -> Result<SecretBytes, S3BoundaryError> {
@@ -944,7 +944,7 @@ fn repository_salt(salt_hex: &str) -> Result<Vec<u8>, S3BoundaryError> {
     })
 }
 
-fn repository_init(error: impl ToString) -> S3BoundaryError {
+pub(super) fn repository_init(error: impl ToString) -> S3BoundaryError {
     S3BoundaryError::RepositoryInit {
         reason: error.to_string(),
     }

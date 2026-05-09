@@ -8,8 +8,8 @@ use crate::checkpoint::{
 use crate::error::{RepositoryError, Result};
 use crate::model::{
     BackendObjectReferenceKind, CheckpointPosition, ReachableBackendObject,
-    RepositoryOrphanCandidate, RepositoryOrphanReport, RestoreProtectionSummary,
-    RestoreVerificationReport,
+    RepositoryOrphanCandidate, RepositoryOrphanDeleteReport, RepositoryOrphanReport,
+    RestoreProtectionSummary, RestoreVerificationReport,
 };
 use crate::payload::{open_payload_object, parse_segmented_payload_header};
 use crate::service::Repository;
@@ -18,7 +18,7 @@ use rs3_index::{
     CHECKPOINT_EVIDENCE_DOMAIN, CheckpointEvidence, IndexDelta, IndexDeltaObject,
     checkpoint_evidence_bytes,
 };
-use rs3_storage::{BlobStore, ByteRange};
+use rs3_storage::{BlobStore, ByteRange, StorageError};
 use rs3_types::{BackendObjectId, KeyId, LegalHoldStatus, RetentionMode};
 use std::collections::BTreeSet;
 
@@ -132,6 +132,61 @@ where
             reachable,
             candidates,
         })
+    }
+
+    /// Deletes orphan candidates that are not protected by retention or legal hold.
+    ///
+    /// Reachability is derived from the accepted checkpoint chain before any
+    /// delete is attempted. Objects with known retention or legal hold are
+    /// skipped, and provider-reported retention or legal-hold failures are
+    /// counted as blocked rather than escalated.
+    pub async fn delete_unprotected_orphans(
+        &self,
+        accepted: &CheckpointPosition,
+    ) -> Result<RepositoryOrphanDeleteReport> {
+        let report = self.orphan_report(accepted).await?;
+        let mut delete_report = RepositoryOrphanDeleteReport {
+            reachable_count: report.reachable.len(),
+            candidate_count: report.candidates.len(),
+            deleted_count: 0,
+            already_gone_count: 0,
+            retention_blocked_count: 0,
+            legal_hold_blocked_count: 0,
+        };
+
+        for candidate in report.candidates {
+            if candidate.delete_blocked_by_retention {
+                delete_report.retention_blocked_count =
+                    delete_report.retention_blocked_count.saturating_add(1);
+                continue;
+            }
+            if candidate.delete_blocked_by_legal_hold {
+                delete_report.legal_hold_blocked_count =
+                    delete_report.legal_hold_blocked_count.saturating_add(1);
+                continue;
+            }
+
+            match self.store.delete(&candidate.object_id).await {
+                Ok(()) => {
+                    delete_report.deleted_count = delete_report.deleted_count.saturating_add(1);
+                }
+                Err(StorageError::NotFound(_)) => {
+                    delete_report.already_gone_count =
+                        delete_report.already_gone_count.saturating_add(1);
+                }
+                Err(StorageError::RetentionBlocked) => {
+                    delete_report.retention_blocked_count =
+                        delete_report.retention_blocked_count.saturating_add(1);
+                }
+                Err(StorageError::LegalHoldBlocked) => {
+                    delete_report.legal_hold_blocked_count =
+                        delete_report.legal_hold_blocked_count.saturating_add(1);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Ok(delete_report)
     }
 
     /// Verifies that an accepted checkpoint chain can be used for restore.
