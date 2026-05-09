@@ -123,8 +123,11 @@ show client-visible paths, Kubernetes object names, tenant names, configured
 backend bucket names, backend prefixes, repository IDs, access keys, wrapping
 keys, or raw backend object IDs.
 
-Expose any admin listener only on localhost, a protected cluster-only address,
-or behind an authenticated internal ingress. Mutating recovery and maintenance
+Expose the admin listener only on localhost, a protected cluster-only address,
+or behind an authenticated internal ingress. The listener is separate from the
+S3 data plane and currently exposes path-redacted facts at `GET /admin/status`;
+it must use an admin bearer token that is separate from backup-client S3
+credentials and backend S3 credentials. Mutating recovery and maintenance
 actions need explicit authorization and audit controls before they belong in an
 admin interface. Operator reports should stay fact-only until a
 separate authorization and audit design exists.

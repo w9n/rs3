@@ -4,14 +4,16 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rs3_server::{
-    AdminReportProfile, AnchorConfig, AnchorImportReport, AnchorRecoveryOptions,
-    AnchorRecoveryReport, GatewayMode, GatewayServer, KeyRotationOptions, KeyRotationReport,
-    RESTORE_BUNDLE_SCHEMA, RestoreTrustBundle, RuntimeConfig, backend_kind, doctor_findings,
+    AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReportProfile,
+    AnchorConfig, AnchorImportReport, AnchorRecoveryOptions, AnchorRecoveryReport, GatewayMode,
+    GatewayServer, KeyRotationOptions, KeyRotationReport, RESTORE_BUNDLE_SCHEMA,
+    RestoreTrustBundle, RuntimeConfig, backend_kind, doctor_findings,
     export_restore_bundle_from_config, import_anchor_from_config, recover_anchor_from_config,
     rotate_key_from_config, runtime_config_profile,
 };
 use rs3_types::{CheckpointId, KeyId, KeyPurpose, RetentionMode, Sequence};
 use std::net::SocketAddr;
+use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -39,6 +41,12 @@ enum Commands {
         metrics_bind: Option<SocketAddr>,
         #[arg(long, value_enum)]
         gateway_mode: Option<GatewayModeArg>,
+        #[arg(long, env = "RS3_ADMIN_BIND")]
+        admin_bind: Option<SocketAddr>,
+        #[arg(long, env = "RS3_ADMIN_BEARER_TOKEN")]
+        admin_bearer_token: Option<String>,
+        #[arg(long, env = "RS3_ADMIN_PROFILE", value_enum, default_value_t = DoctorProfile::Production)]
+        admin_profile: DoctorProfile,
     },
     Doctor {
         #[arg(long, env = "RS3_DOCTOR_PROFILE", value_enum, default_value_t = DoctorProfile::Local)]
@@ -112,6 +120,9 @@ async fn main() -> Result<()> {
             bind,
             metrics_bind,
             gateway_mode,
+            admin_bind,
+            admin_bearer_token,
+            admin_profile,
         } => {
             let mut config = RuntimeConfig::from_env()?;
             if let Some(bind) = bind {
@@ -123,11 +134,24 @@ async fn main() -> Result<()> {
             if let Some(gateway_mode) = gateway_mode {
                 config.mode = gateway_mode.into();
             }
+            let admin_config = admin_http_config(admin_bind, admin_bearer_token, admin_profile)?;
             install_metrics(config.metrics.bind)?;
             log_runtime_config(&config);
-            let server = GatewayServer::bind(config).await?;
+            let server = GatewayServer::bind(config.clone()).await?;
             tracing::info!(bind = %server.local_addr(), "gateway S3 listener started");
-            server.run_until_shutdown(shutdown_signal()).await?;
+            match admin_config {
+                Some(admin_config) => {
+                    let admin_server = AdminHttpServer::bind(config, admin_config).await?;
+                    tracing::info!(
+                        bind = %admin_server.local_addr(),
+                        "gateway admin listener started",
+                    );
+                    run_gateway_and_admin(server, admin_server).await?;
+                }
+                None => {
+                    server.run_until_shutdown(shutdown_signal()).await?;
+                }
+            }
         }
         Commands::Doctor { profile } => {
             let config = RuntimeConfig::from_env()?;
@@ -375,6 +399,63 @@ fn run_doctor(config: &RuntimeConfig, profile: DoctorProfile) -> Result<()> {
         profile.as_str(),
         findings.len()
     )
+}
+
+fn admin_http_config(
+    bind: Option<SocketAddr>,
+    bearer_token: Option<String>,
+    profile: DoctorProfile,
+) -> Result<Option<AdminHttpConfig>> {
+    let Some(bind) = bind else {
+        return Ok(None);
+    };
+    let Some(bearer_token) = bearer_token else {
+        anyhow::bail!("RS3_ADMIN_BEARER_TOKEN is required when RS3_ADMIN_BIND is set");
+    };
+    let token = AdminBearerToken::new(bearer_token)?;
+    Ok(Some(AdminHttpConfig::new(
+        bind,
+        AdminHttpAuth::bearer(token),
+        profile.into(),
+    )))
+}
+
+async fn run_gateway_and_admin(gateway: GatewayServer, admin: AdminHttpServer) -> Result<()> {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let gateway_shutdown = shutdown_rx.clone();
+    let admin_shutdown = shutdown_rx;
+
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    let gateway_task = async move {
+        gateway
+            .run_until_shutdown(wait_for_shutdown(gateway_shutdown))
+            .await
+            .map_err(anyhow::Error::from)
+    };
+    let admin_task = async move {
+        admin
+            .run_until_shutdown(wait_for_shutdown(admin_shutdown))
+            .await
+            .map_err(anyhow::Error::from)
+    };
+
+    tokio::try_join!(gateway_task, admin_task)?;
+    Ok(())
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            break;
+        }
+    }
 }
 
 impl From<GatewayModeArg> for GatewayMode {

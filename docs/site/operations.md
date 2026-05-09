@@ -35,6 +35,18 @@ path browser, configured bucket names, backend prefixes, repository IDs,
 client-visible object paths, or secret material. Treat this report as a preview
 fact model, not as a stable workflow API.
 
+To expose those facts over HTTP for local diagnostics or a tightly controlled
+cluster integration, run a separate authenticated admin listener:
+
+```sh
+RS3_ADMIN_BIND=127.0.0.1:9082 \
+RS3_ADMIN_BEARER_TOKEN=<admin-token> \
+cargo run -p rs3-server -- serve --bind 127.0.0.1:9080
+```
+
+Then read `GET /admin/status` with a bearer token. Do not reuse Velero/Kopia S3
+credentials or backend S3 credentials for this admin channel.
+
 See [Configuration](reference/configuration.md) for the environment variable
 reference.
 

@@ -21,6 +21,8 @@ clap.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
 hyper-util.workspace = true
 k8s-openapi = { workspace = true, optional = true }
 metrics.workspace = true

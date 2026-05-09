@@ -1,6 +1,7 @@
 //! Server-side runtime configuration and request identity contracts.
 
 mod admin;
+mod admin_http;
 mod config;
 mod identity;
 mod s3;
@@ -11,6 +12,10 @@ pub use admin::{
     AdminKeyringEnvelopeSummary, AdminReportProfile, AdminRepositorySummary, AdminRestoreSummary,
     AdminRuntimeSummary, AdminSecuritySummary, AdminStatusReport, admin_status_report,
     backend_kind, doctor_findings, runtime_config_profile,
+};
+pub use admin_http::{
+    AdminBearerToken, AdminHttpAuth, AdminHttpAuthError, AdminHttpConfig, AdminHttpServer,
+    AdminHttpServerError, AdminHttpService,
 };
 pub use config::{
     AnchorConfig, BackendConfig, BatchConfig, ConfigError, GatewayMode, MetricsConfig,

@@ -10,6 +10,9 @@ flags may override selected listener and gateway-mode settings.
 | `RS3_BIND` | no | `127.0.0.1:9080` | Gateway S3 listener socket address. |
 | `RS3_GATEWAY_MODE` | no | `read-write` | `read-write` accepts checkpointed mutations. `restore-readonly` serves restore reads, rejects supported mutations, refuses bootstrap, and requires an accepted anchor. |
 | `RS3_METRICS_BIND` | no | unset | Prometheus/OpenMetrics listener socket address. |
+| `RS3_ADMIN_BIND` | no | unset | Separate gateway admin listener for path-redacted facts. |
+| `RS3_ADMIN_BEARER_TOKEN` | with admin listener | none | Bearer token for admin routes. Must be at least 16 bytes and separate from backup-client S3 credentials. |
+| `RS3_ADMIN_PROFILE` | no | `production` | Admin status profile: `local` or `production`. |
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
 | `RUST_LOG` | no | `info` | Standard tracing filter. |
 | `RS3_RECOVERY_MAX_CHECKPOINT_AGE_SECONDS` | for `recover-anchor` | none | Maximum signed checkpoint age accepted by explicit anchor recovery. |
@@ -25,6 +28,11 @@ findings, and checkpoint trust status without configured bucket names, backend
 prefixes, repository IDs, client object paths, or secret values. The report is a
 preview fact contract; workflow APIs need a separate authorization, audit,
 approval, and orchestration model from the gateway data plane.
+
+When `RS3_ADMIN_BIND` is set, `rs3-server serve` exposes `GET /admin/status` on
+that separate listener. `GET /healthz` is unauthenticated; admin routes require
+`Authorization: Bearer <token>`. Bind the admin listener only to localhost,
+cluster-internal addresses, or a protected internal ingress.
 
 ## Public S3 Surface
 
