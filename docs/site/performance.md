@@ -44,7 +44,7 @@ The command prints a compact table by default; pass
 
 ## Current Release Matrix
 
-Run date: 2026-05-05. Gateway profile: release. Workload set:
+Run date: 2026-05-09. Gateway profile: release. Workload set:
 `larger-restores`. Each row is the average of three direct/gateway run pairs.
 The direct baseline is the straight RustFS measurement proxy.
 
@@ -55,11 +55,11 @@ Artifact:
 
 | Profile | Shape | Elapsed Ratio | Backend Requests | Backend Reads | Backend Writes | Gateway CPU | Gateway HWM RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `medium-restore` | one 64 MiB object | 1.05x | 1.16x | 1.03x | 1.03x | 1.18 s | 109.67 MiB |
-| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.28x | 1.01x | 1.05x | 1.03x | 1.73 s | 111.92 MiB |
-| `kubernetes-objects-large` | 6,144 manifests plus a 128 MiB fragment | 0.20x | 1.00x | 1.05x | 1.03x | 6.07 s | 222.82 MiB |
-| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.30x | 1.12x | 1.03x | 1.03x | 2.99 s | 221.64 MiB |
-| `postgres-pgdata-large` | larger relation/WAL/dump-shaped Postgres data directory | 1.57x | 1.10x | 1.03x | 1.03x | 5.95 s | 343.51 MiB |
+| `medium-restore` | one 64 MiB object | 1.06x | 1.16x | 1.03x | 1.03x | 1.10 s | 104.40 MiB |
+| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.28x | 1.01x | 1.05x | 1.03x | 1.60 s | 103.55 MiB |
+| `kubernetes-objects-large` | 6,144 manifests plus a 128 MiB fragment | 0.20x | 1.00x | 1.05x | 1.03x | 5.79 s | 212.13 MiB |
+| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.27x | 1.11x | 1.03x | 1.03x | 2.88 s | 213.29 MiB |
+| `postgres-pgdata-large` | larger relation/WAL/dump-shaped Postgres data directory | 1.58x | 1.11x | 1.03x | 1.03x | 5.70 s | 313.95 MiB |
 
 Interpretation:
 
@@ -118,7 +118,7 @@ provider claim.
 ## Current Interpretation
 
 Recent release-profile artifacts show larger restore read and write byte ratios
-near the direct baseline, with request counts at or below the direct path in the
+near the direct baseline, with request counts close to the direct path in the
 measured local setup. Tiny-file restore profiles are more sensitive to payload
 segment size because Kopia can issue many small ranged reads whose response
 bodies are only a few dozen or hundred bytes each.

@@ -105,7 +105,7 @@ signal for this harness, not as a general cloud-provider result.
 
 ## Larger Restore Matrix
 
-Run date: 2026-05-05. Workload set: `larger-restores`. Each row is the
+Run date: 2026-05-09. Workload set: `larger-restores`. Each row is the
 average of three direct/gateway run pairs. Per-profile values come from
 `summary.json.profiles`; the top-level aggregate intentionally mixes profiles
 and should only be used as a smoke signal for the whole set.
@@ -123,11 +123,11 @@ deduplicated synthetic best case.
 
 | Profile | Shape | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend writes | Backend reads | Gateway CPU | Gateway HWM RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| medium-restore | one 64 MiB object | 2.92 s | 3.06 s | 1.05x | 1.16x | 1.03x | 1.03x | 1.18 s | 109.67 MiB |
-| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 9.89 s | 2.78 s | 0.28x | 1.01x | 1.03x | 1.05x | 1.73 s | 111.92 MiB |
-| kubernetes-objects-large | 6,144 manifests plus a 128 MiB etcd-like fragment | 34.22 s | 7.01 s | 0.20x | 1.00x | 1.03x | 1.05x | 6.07 s | 222.82 MiB |
-| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 2.79 s | 3.62 s | 1.30x | 1.12x | 1.03x | 1.03x | 2.99 s | 221.64 MiB |
-| postgres-pgdata-large | larger relation/WAL/dump-shaped data directory | 3.78 s | 5.93 s | 1.57x | 1.10x | 1.03x | 1.03x | 5.95 s | 343.51 MiB |
+| medium-restore | one 64 MiB object | 2.76 s | 2.92 s | 1.06x | 1.16x | 1.03x | 1.03x | 1.10 s | 104.40 MiB |
+| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 9.53 s | 2.63 s | 0.28x | 1.01x | 1.03x | 1.05x | 1.60 s | 103.55 MiB |
+| kubernetes-objects-large | 6,144 manifests plus a 128 MiB etcd-like fragment | 33.29 s | 6.65 s | 0.20x | 1.00x | 1.03x | 1.05x | 5.79 s | 212.13 MiB |
+| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 2.78 s | 3.53 s | 1.27x | 1.11x | 1.03x | 1.03x | 2.88 s | 213.29 MiB |
+| postgres-pgdata-large | larger relation/WAL/dump-shaped data directory | 3.69 s | 5.82 s | 1.58x | 1.11x | 1.03x | 1.03x | 5.70 s | 313.95 MiB |
 
 Interpretation:
 

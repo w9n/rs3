@@ -144,7 +144,7 @@ Latest recorded local evidence:
 
 | Evidence | Result |
 | --- | --- |
-| `just preview-gate-release` | Passed on 2026-05-05. |
+| `just preview-gate-release` | Passed on 2026-05-09. |
 | Velero dynamic-PVC gateway-restart with `restore-readonly` | Passed; artifact `.local/integration/`. |
 | Velero/Postgres compatibility smoke | Passed; artifact `.local/integration/`. |
 | Larger Kopia restore matrix | Passed with `regression_budgets=pass` and `workload_consistency=pass`; artifact `.local/integration/`. |
