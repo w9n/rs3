@@ -14,6 +14,9 @@ const nodes = {
   authForm: document.getElementById("auth-form"),
   tokenInput: document.getElementById("console-token"),
   lastRefresh: document.getElementById("last-refresh"),
+  summaryPrimary: document.getElementById("summary-primary"),
+  summarySecondary: document.getElementById("summary-secondary"),
+  statusSummary: document.querySelector(".status-summary"),
   metrics: {
     restore: document.getElementById("metric-restore"),
     mode: document.getElementById("metric-mode"),
@@ -93,6 +96,7 @@ async function refreshStatus(options = {}) {
 function render() {
   const status = state.status;
   renderMetrics(status);
+  renderSummary(status);
   renderDetails(status);
   renderFindings(status?.findings || []);
   nodes.lastRefresh.textContent = state.lastError
@@ -100,6 +104,41 @@ function render() {
     : status
       ? `Updated ${formatNow()}`
       : "Never refreshed";
+}
+
+function renderSummary(status) {
+  const restore = status?.restore || {};
+  const backend = status?.backend || {};
+  const anchor = status?.anchor || {};
+  const findings = status?.findings || [];
+  let kind = "neutral";
+  let primary = "Connect to a gateway to inspect restore trust.";
+  let secondary = "The console is read-only and shows path-redacted admin facts.";
+
+  if (state.lastError) {
+    kind = "bad";
+    primary = "The console could not read gateway status.";
+    secondary = state.lastError;
+  } else if (status) {
+    const restoreState = restore.state || "unknown";
+    if (restoreState === "verified") {
+      kind = findings.length === 0 ? "good" : "warn";
+      primary = `Restore trust is verified at checkpoint ${restore.checkpoint?.sequence ?? "unknown"}.`;
+      secondary = findings.length === 0
+        ? "No profile findings were reported by the gateway."
+        : `${findings.length} profile finding${findings.length === 1 ? "" : "s"} need review.`;
+    } else {
+      kind = "warn";
+      primary = `Restore trust is ${restoreState}.`;
+      secondary = restore.reason_code
+        ? `Reason: ${restore.reason_code}. ${stateContext(backend, anchor)}`
+        : stateContext(backend, anchor);
+    }
+  }
+
+  nodes.statusSummary.className = `status-summary summary-${kind}`;
+  nodes.summaryPrimary.textContent = primary;
+  nodes.summarySecondary.textContent = secondary;
 }
 
 function renderMetrics(status) {
@@ -124,7 +163,7 @@ function renderMetrics(status) {
 
   const restoreState = restore.state || "unknown";
   nodes.restoreBadge.textContent = restoreState;
-  nodes.restoreBadge.className = `state-pill ${pillClass(restoreState)}`;
+  nodes.restoreBadge.className = `state-pill ${restorePillClass(restoreState)}`;
 }
 
 function renderDetails(status) {
@@ -236,14 +275,30 @@ function setConnection(text, kind) {
   nodes.connectionState.className = `state-pill state-${kind}`;
 }
 
-function pillClass(value) {
+function restorePillClass(value) {
   if (value === "verified") {
     return "state-good";
   }
   if (value === "unavailable") {
-    return "state-bad";
+    return "state-warn";
   }
   return "state-neutral";
+}
+
+function stateContext(backend, anchor) {
+  const parts = [];
+  if (backend.kind) {
+    parts.push(`backend ${backend.kind}`);
+  }
+  if (backend.retention_capability) {
+    parts.push(`retention ${backend.retention_capability}`);
+  }
+  if (anchor.kind) {
+    parts.push(`anchor ${anchor.kind}${anchor.external ? "" : " local"}`);
+  }
+  return parts.length > 0
+    ? `Current posture: ${parts.join(", ")}.`
+    : "Current posture is unknown.";
 }
 
 function yesNo(value) {

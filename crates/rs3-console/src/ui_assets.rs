@@ -38,3 +38,18 @@ fn asset_response(content_type: &'static str, body: &'static str) -> Response<Fu
         .insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
     response
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CONSOLE_CSS, CONSOLE_JS, FAVICON_SVG, INDEX_HTML};
+
+    #[test]
+    fn ui_assets_do_not_reference_gateway_admin_secrets_or_routes() {
+        let combined = [INDEX_HTML, CONSOLE_JS, CONSOLE_CSS, FAVICON_SVG].join("\n");
+
+        assert!(!combined.contains("RS3_GATEWAY_ADMIN_BEARER_TOKEN"));
+        assert!(!combined.contains("RS3_GATEWAY_ADMIN_URL"));
+        assert!(!combined.contains("gateway-admin-token"));
+        assert!(!combined.contains("/admin/status"));
+    }
+}
