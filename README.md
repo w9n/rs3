@@ -97,6 +97,7 @@ tradeoff is useful.
 ## Workspace Layout
 
 - `crates/rs3-anchor`: checkpoint-anchor contract and test anchor.
+- `crates/rs3-console`: read-only single-gateway operations console.
 - `crates/rs3-types`: shared strongly typed identifiers and policy types.
 - `crates/rs3-crypto`: cryptographic primitives, envelopes, and key derivation
   boundaries.

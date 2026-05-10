@@ -3304,6 +3304,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rs3-console"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "secrecy",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rs3-crypto"
 version = "0.1.0"
 dependencies = [

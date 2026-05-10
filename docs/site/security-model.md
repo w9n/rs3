@@ -136,6 +136,12 @@ Do not reuse backup-client S3 credentials as admin credentials. S3 client IAM
 controls backup-tool operations on the data plane; admin/operator identity is a
 separate admin boundary.
 
+The single-gateway console follows the same reporting rule. It may render the
+gateway admin report in a browser, but it must keep the gateway admin bearer
+token server-side, require a separate console bearer token for `GET
+/api/status`, and stay read-only. It must not add object browsing, workflow
+execution, recovery mutation, key rotation, or backend-object inspection.
+
 ## Key Compromise Rule
 
 Wrapping-key rewrap is not compromise recovery. The wrapping key must be raw

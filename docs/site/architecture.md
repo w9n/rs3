@@ -33,6 +33,7 @@ opaque object store                    external checkpoint anchor
 | `rs3-repository` | Namespace, payload, checkpoint, replay, maintenance, and commit coordination. |
 | `rs3-k8s` | Kubernetes-facing anchor integration surface. |
 | `rs3-server` | Gateway process, configuration, identity, S3 boundary, core admin reports, metrics, and shutdown. |
+| `rs3-console` | Read-only single-gateway operations UI over the authenticated admin report. |
 | `xtask` | Integration, performance, and compatibility automation. |
 
 Cryptographic operations stay behind `rs3-crypto`; higher-level crates should
@@ -108,6 +109,12 @@ sharing backup-client S3 credentials or browsing repository objects directly.
 The report shape is a preview fact contract, not a complete workflow API: fleet
 inventory, multi-management workflows, policy workflows, rotation workflows, approvals,
 auditing, and recovery orchestration require their own authorization, audit, and stabilization decision.
+
+`rs3-console` is the narrow single-gateway UI for this report. It serves a
+browser interface and proxies `GET /api/status` to the gateway admin listener's
+`GET /admin/status`. The browser authenticates to the console; the gateway
+admin token remains server-side. The console has no repository browser,
+database, scheduler, work queue, or mutating recovery/key-management routes.
 
 Admin and platform surfaces are not part of the S3 data plane and should not
 expose client-visible object browsing, backend object IDs, configured bucket

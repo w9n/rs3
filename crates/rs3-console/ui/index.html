@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>rs3 Console</title>
+    <link rel="icon" href="/ui/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/ui/console.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Single gateway</p>
+          <h1>rs3 Console</h1>
+        </div>
+        <div class="topbar-actions">
+          <span id="connection-state" class="state-pill state-neutral">Disconnected</span>
+          <button id="refresh-button" class="button-primary" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <section class="auth-strip" aria-label="Console access">
+        <form id="auth-form" class="auth-form" autocomplete="off">
+          <label for="console-token">Console token</label>
+          <input id="console-token" name="token" type="password" autocomplete="off">
+          <button type="submit">Connect</button>
+        </form>
+        <button id="clear-token-button" class="button-secondary" type="button">Forget</button>
+      </section>
+
+      <section class="metric-grid" aria-label="Gateway summary">
+        <article class="metric-panel">
+          <span>Restore</span>
+          <strong id="metric-restore">unknown</strong>
+        </article>
+        <article class="metric-panel">
+          <span>Mode</span>
+          <strong id="metric-mode">unknown</strong>
+        </article>
+        <article class="metric-panel">
+          <span>Checkpoint</span>
+          <strong id="metric-checkpoint">none</strong>
+        </article>
+        <article class="metric-panel">
+          <span>Envelope</span>
+          <strong id="metric-envelope">none</strong>
+        </article>
+        <article class="metric-panel">
+          <span>Retention</span>
+          <strong id="metric-retention">unknown</strong>
+        </article>
+        <article class="metric-panel">
+          <span>Findings</span>
+          <strong id="metric-findings">0</strong>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Restore Trust</h2>
+            <span id="restore-badge" class="state-pill state-neutral">unknown</span>
+          </div>
+          <div id="restore-detail" class="detail-grid"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Runtime</h2>
+          </div>
+          <div id="runtime-detail" class="detail-grid"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Storage</h2>
+          </div>
+          <div id="storage-detail" class="detail-grid"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Security</h2>
+          </div>
+          <div id="security-detail" class="detail-grid"></div>
+        </section>
+      </section>
+
+      <section class="panel findings-panel">
+        <div class="panel-header">
+          <h2>Findings</h2>
+          <span id="last-refresh" class="muted">Never refreshed</span>
+        </div>
+        <div id="findings-table" class="table-wrap"></div>
+      </section>
+    </main>
+    <script src="/ui/console.js"></script>
+  </body>
+</html>

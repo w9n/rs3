@@ -34,6 +34,30 @@ that separate listener. `GET /healthz` is unauthenticated; admin routes require
 `Authorization: Bearer <token>`. Bind the admin listener only to localhost,
 cluster-internal addresses, or a protected internal ingress.
 
+## Console
+
+`rs3-console` is a read-only single-gateway UI. It keeps the gateway admin
+bearer token server-side and exposes `GET /api/status` to the browser after
+console bearer authentication.
+
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `RS3_CONSOLE_BIND` | no | `127.0.0.1:9083` | Console listener socket address. |
+| `RS3_CONSOLE_BEARER_TOKEN` | yes | none | Bearer token for console API routes. Must be at least 16 bytes. |
+| `RS3_GATEWAY_ADMIN_URL` | yes | none | Gateway admin origin, for example `http://127.0.0.1:9082`. The preview client supports HTTP origins; run it over loopback or a protected cluster-local path. |
+| `RS3_GATEWAY_ADMIN_BEARER_TOKEN` | yes | none | Bearer token used by the console to call the gateway admin listener. This token is never sent to the browser. |
+
+Console routes:
+
+| Route | Authentication | Purpose |
+| --- | --- | --- |
+| `GET /healthz` | none | Console health check. |
+| `GET /`, `/ui/*` | none | Static browser UI. |
+| `GET /api/status` | console bearer token | Fetch and return the gateway's path-redacted admin status report. |
+
+The console is not a repository browser and has no mutating recovery, key
+rotation, deployment, or storage-management API.
+
 ## Public S3 Surface
 
 | Variable | Required | Default | Description |

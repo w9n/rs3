@@ -47,6 +47,22 @@ cargo run -p rs3-server -- serve --bind 127.0.0.1:9080
 Then read `GET /admin/status` with a bearer token. Do not reuse Velero/Kopia S3
 credentials or backend S3 credentials for this admin channel.
 
+Run the read-only single-gateway console when an operator needs a browser view
+of the same path-redacted facts:
+
+```sh
+RS3_CONSOLE_BIND=127.0.0.1:9083 \
+RS3_CONSOLE_BEARER_TOKEN=<console-token> \
+RS3_GATEWAY_ADMIN_URL=http://127.0.0.1:9082 \
+RS3_GATEWAY_ADMIN_BEARER_TOKEN=<admin-token> \
+cargo run -p rs3-console
+```
+
+Open `http://127.0.0.1:9083/` and enter the console token. The browser calls the
+console, not the gateway admin listener; the gateway admin bearer token remains
+server-side. The console is read-only and does not execute recovery, key
+rotation, deployment, or cleanup workflows.
+
 See [Configuration](reference/configuration.md) for the environment variable
 reference.
 
