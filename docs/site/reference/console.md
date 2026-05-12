@@ -39,6 +39,11 @@ The console may display:
 - repository retention posture
 - production-profile findings
 
+Healthy privacy guardrails are silent in the main UI. If the gateway ever
+reports that an admin surface exposes client-visible path browsing or secret
+material, the console promotes that condition to a critical finding instead of
+showing it as a normal option-like row.
+
 The console must not display client-visible paths, Kubernetes object names,
 configured backend bucket names, backend prefixes, configured core repository
 IDs, access keys, wrapping keys, raw backend object IDs, or secret material.

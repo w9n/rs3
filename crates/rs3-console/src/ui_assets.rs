@@ -51,5 +51,7 @@ mod tests {
         assert!(!combined.contains("RS3_GATEWAY_ADMIN_URL"));
         assert!(!combined.contains("gateway-admin-token"));
         assert!(!combined.contains("/admin/status"));
+        assert!(!combined.contains("Path browsing"));
+        assert!(!combined.contains("Secrets exposed"));
     }
 }

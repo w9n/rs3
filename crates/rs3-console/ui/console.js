@@ -95,10 +95,11 @@ async function refreshStatus(options = {}) {
 
 function render() {
   const status = state.status;
-  renderMetrics(status);
-  renderSummary(status);
+  const findings = displayFindings(status);
+  renderMetrics(status, findings);
+  renderSummary(status, findings);
   renderDetails(status);
-  renderFindings(status?.findings || []);
+  renderFindings(findings);
   nodes.lastRefresh.textContent = state.lastError
     ? state.lastError
     : status
@@ -106,11 +107,10 @@ function render() {
       : "Never refreshed";
 }
 
-function renderSummary(status) {
+function renderSummary(status, findings) {
   const restore = status?.restore || {};
   const backend = status?.backend || {};
   const anchor = status?.anchor || {};
-  const findings = status?.findings || [];
   let kind = "neutral";
   let primary = "Connect to a gateway to inspect restore trust.";
   let secondary = "The console is read-only and shows path-redacted admin facts.";
@@ -141,7 +141,7 @@ function renderSummary(status) {
   nodes.summarySecondary.textContent = secondary;
 }
 
-function renderMetrics(status) {
+function renderMetrics(status, findings) {
   const restore = status?.restore || {};
   const runtime = status?.runtime || {};
   const repository = status?.repository || {};
@@ -159,7 +159,7 @@ function renderMetrics(status) {
     repository.retention_mode && repository.retention_mode !== "none"
       ? `${repository.retention_mode} ${repository.retention_days}d`
       : repository.retention_mode || "unknown";
-  nodes.metrics.findings.textContent = String((status?.findings || []).length);
+  nodes.metrics.findings.textContent = String(findings.length);
 
   const restoreState = restore.state || "unknown";
   nodes.restoreBadge.textContent = restoreState;
@@ -206,13 +206,34 @@ function renderDetails(status) {
   ]);
 
   replaceDetails(nodes.securityDetail, [
-    ["Path browsing", enabledDisabled(security.path_browsing_enabled)],
-    ["Secrets exposed", yesNo(security.secrets_exposed)],
     ["Action posture", security.action_posture || "unknown"],
     ["Batch max items", repository.commit_max_batch_items ?? "unknown"],
     ["Batch delay", millis(repository.commit_max_batch_delay_ms)],
     ["Pending limit", repository.commit_max_pending_items ?? "unknown"],
   ]);
+}
+
+function displayFindings(status) {
+  if (!status) {
+    return [];
+  }
+  const findings = [...(status.findings || [])];
+  const security = status.security || {};
+  if (security.secrets_exposed === true) {
+    findings.unshift({
+      severity: "critical",
+      code: "console.secrets-exposed",
+      message: "The gateway admin report says secret material is exposed.",
+    });
+  }
+  if (security.path_browsing_enabled === true) {
+    findings.unshift({
+      severity: "critical",
+      code: "console.path-browsing-exposed",
+      message: "The gateway admin surface says client-visible path browsing is exposed.",
+    });
+  }
+  return findings;
 }
 
 function renderFindings(findings) {
@@ -307,16 +328,6 @@ function yesNo(value) {
   }
   if (value === false) {
     return "no";
-  }
-  return "unknown";
-}
-
-function enabledDisabled(value) {
-  if (value === true) {
-    return "enabled";
-  }
-  if (value === false) {
-    return "disabled";
   }
   return "unknown";
 }
