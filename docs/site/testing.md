@@ -65,6 +65,17 @@ RS3_REPOSITORY_RETENTION_DAYS=1 \
 just integration-kopia-gateway --mode provided --backend-prefix <fresh-prefix>
 ```
 
+For the Kubernetes path, run the Velero dynamic PVC gateway-restart lane against
+the same provider. This creates a disposable kind cluster, runs a Velero/Kopia
+backup, deletes the namespace, restarts the stateless gateway, restores the
+namespace, and verifies the restored file bytes:
+
+```sh
+RS3_REPOSITORY_RETENTION_MODE=governance \
+RS3_REPOSITORY_RETENTION_DAYS=1 \
+just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke --backend-mode provided --backend-prefix <fresh-prefix>
+```
+
 ## Privacy Tests
 
 Features that handle logical names should prove:

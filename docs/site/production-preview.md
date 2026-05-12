@@ -148,6 +148,7 @@ Latest focused evidence:
 | --- | --- |
 | Live retained-backend retained-version S3 qualification | Passed on 2026-05-12 with Object Lock enabled, retained version IDs, and exact-version reads after a newer latest object. |
 | Live retained-backend Kopia gateway backup/restore | Passed on 2026-05-12 against an Object Lock bucket with repository governance retention enabled and a fresh backend prefix. |
+| Live retained-backend Velero dynamic-PVC gateway-restart restore | Passed on 2026-05-13 against an Object Lock bucket with repository governance retention enabled; artifact `.local/integration/`. |
 | Velero dynamic-PVC gateway-restart in `read-write` | Passed on 2026-05-12 with restore status `Completed`; artifact `.local/integration/`. |
 | Velero strict `restore-readonly` incident-restore smoke | Passed on 2026-05-12 with workload verification, expected restore-artifact write denial, and zero backend writes during restore; artifact `.local/integration/`. |
 | Velero/Postgres compatibility smoke | Passed on 2026-05-12; artifact `.local/integration/`. |

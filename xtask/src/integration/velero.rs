@@ -1,11 +1,32 @@
 //! Velero/Kopia restore integration harness.
 
 use anyhow::Result;
-use clap::Args;
+use clap::{Args, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Debug, Args)]
 pub(crate) struct VeleroKopiaSmokeArgs {
+    /// Backend mode used behind the gateway.
+    #[arg(long, value_enum, default_value_t = VeleroBackendMode::ClusterRustfs)]
+    backend_mode: VeleroBackendMode,
+    /// Provided S3-compatible backend endpoint URL.
+    #[arg(long, env = "RS3_TEST_S3_ENDPOINT_URL")]
+    backend_endpoint_url: Option<String>,
+    /// Provided S3-compatible backend bucket.
+    #[arg(long, env = "RS3_TEST_S3_BUCKET")]
+    backend_bucket: Option<String>,
+    /// Backend prefix for repository-owned objects. Defaults to a fresh prefix.
+    #[arg(long, env = "RS3_TEST_S3_PREFIX")]
+    backend_prefix: Option<String>,
+    /// Provided S3-compatible backend signing region.
+    #[arg(long, env = "RS3_TEST_S3_REGION")]
+    backend_region: Option<String>,
+    /// Retention mode applied by the gateway to repository objects.
+    #[arg(long, env = "RS3_REPOSITORY_RETENTION_MODE")]
+    repository_retention_mode: Option<String>,
+    /// Retention duration in days when repository retention mode is set.
+    #[arg(long, env = "RS3_REPOSITORY_RETENTION_DAYS")]
+    repository_retention_days: Option<u32>,
     /// kind cluster name. Defaults to a unique disposable name.
     #[arg(long)]
     cluster_name: Option<String>,
@@ -156,6 +177,14 @@ pub(crate) struct VeleroKopiaSmokeArgs {
     wait_secs: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum VeleroBackendMode {
+    /// Deploy a disposable RustFS backend inside the test cluster.
+    ClusterRustfs,
+    /// Use an already provisioned S3-compatible backend.
+    Provided,
+}
+
 #[cfg(not(feature = "k8s"))]
 pub(crate) fn run_velero_kopia_smoke(_args: VeleroKopiaSmokeArgs) -> Result<()> {
     anyhow::bail!(
@@ -265,7 +294,7 @@ mod imp {
     #[path = "workload.rs"]
     mod workload;
 
-    use super::VeleroKopiaSmokeArgs;
+    use super::{VeleroBackendMode, VeleroKopiaSmokeArgs};
     use crate::integration::k8s_support::{
         GatewayChartValues, K8sWorkspace, KEYRING_ENVELOPE_OBJECT_ID, KEYRING_WRAPPING_KEY_HEX,
         KEYRING_WRAPPING_KEY_ID, KindCluster, REPOSITORY_ID, REPOSITORY_SALT_HEX,
@@ -283,6 +312,7 @@ mod imp {
         BACKEND_BUCKET, BACKEND_REGION, RUSTFS_ACCESS_KEY_ID, RUSTFS_SECRET_ACCESS_KEY,
     };
     use scenario::{RunState, Scenario, WorkloadKind, WorkloadVolume};
+    use std::env;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
     use velero_cli::{
@@ -332,6 +362,15 @@ mod imp {
         workspace: &'a K8sWorkspace,
     }
 
+    struct BackendTarget {
+        endpoint: String,
+        bucket: String,
+        prefix: String,
+        region: String,
+        access_key_id: Option<String>,
+        secret_access_key: Option<String>,
+    }
+
     impl<'a> RunContext<'a> {
         fn new(kubeconfig_path: &Path, workspace: &'a K8sWorkspace) -> Self {
             Self {
@@ -360,7 +399,63 @@ mod imp {
         result
     }
 
+    fn backend_target(args: &VeleroKopiaSmokeArgs) -> Result<BackendTarget> {
+        let prefix = args
+            .backend_prefix
+            .clone()
+            .unwrap_or_else(|| format!("repository-{}", now_millis()));
+        match (
+            &args.repository_retention_mode,
+            args.repository_retention_days,
+        ) {
+            (Some(_), Some(_)) | (None, None) => {}
+            (Some(_), None) => bail!("--repository-retention-days is required with retention mode"),
+            (None, Some(_)) => bail!("--repository-retention-mode is required with retention days"),
+        }
+
+        match args.backend_mode {
+            VeleroBackendMode::ClusterRustfs => Ok(BackendTarget {
+                endpoint: rustfs_backend::service_endpoint(&args.gateway_namespace),
+                bucket: BACKEND_BUCKET.to_owned(),
+                prefix,
+                region: BACKEND_REGION.to_owned(),
+                access_key_id: Some(RUSTFS_ACCESS_KEY_ID.to_owned()),
+                secret_access_key: Some(RUSTFS_SECRET_ACCESS_KEY.to_owned()),
+            }),
+            VeleroBackendMode::Provided => {
+                let endpoint = args.backend_endpoint_url.clone().context(
+                    "--backend-endpoint-url or RS3_TEST_S3_ENDPOINT_URL is required with --backend-mode provided",
+                )?;
+                let bucket = args.backend_bucket.clone().context(
+                    "--backend-bucket or RS3_TEST_S3_BUCKET is required with --backend-mode provided",
+                )?;
+                let region = args
+                    .backend_region
+                    .clone()
+                    .unwrap_or_else(|| "us-east-1".to_owned());
+                let access_key_id = env::var("AWS_ACCESS_KEY_ID")
+                    .context("AWS_ACCESS_KEY_ID is required with --backend-mode provided")?;
+                let secret_access_key = env::var("AWS_SECRET_ACCESS_KEY")
+                    .context("AWS_SECRET_ACCESS_KEY is required with --backend-mode provided")?;
+                Ok(BackendTarget {
+                    endpoint,
+                    bucket,
+                    prefix,
+                    region,
+                    access_key_id: Some(access_key_id),
+                    secret_access_key: Some(secret_access_key),
+                })
+            }
+        }
+    }
+
     fn run(args: VeleroKopiaSmokeArgs, scenario: Scenario) -> Result<()> {
+        if scenario.storage_path.uses_integration_storage_proxy()
+            && args.backend_mode != VeleroBackendMode::ClusterRustfs
+        {
+            bail!("direct RustFS scenarios require --backend-mode cluster-rustfs");
+        }
+        let backend = backend_target(&args)?;
         require_command(&args.kind_bin, &["version"])?;
         require_command(&args.kubectl_bin, &["version", "--client"])?;
         require_command(&args.helm_bin, &["version", "--short"])?;
@@ -370,7 +465,9 @@ mod imp {
             helm_lint_gateway(&args.helm_bin)?;
         }
         prepare_velero_images(&args)?;
-        prepare_rustfs_image(&args)?;
+        if args.backend_mode == VeleroBackendMode::ClusterRustfs {
+            prepare_rustfs_image(&args)?;
+        }
         if matches!(scenario.volume, WorkloadVolume::DynamicPvc) {
             prepare_openebs_images(&args)?;
         }
@@ -429,7 +526,7 @@ mod imp {
             cluster.load_image(&args.velero_image)?;
             cluster.load_image(&args.velero_aws_plugin_image)?;
         }
-        if !args.skip_rustfs_image_load {
+        if args.backend_mode == VeleroBackendMode::ClusterRustfs && !args.skip_rustfs_image_load {
             cluster.load_image(&args.rustfs_image)?;
         }
         if matches!(scenario.volume, WorkloadVolume::DynamicPvc) && !args.skip_openebs_image_load {
@@ -444,9 +541,9 @@ mod imp {
         }
         let context = RunContext::new(cluster.kubeconfig_path(), &workspace);
 
-        let backend_prefix = format!("repository-{}", now_millis());
-        let backend_endpoint = rustfs_backend::service_endpoint(&args.gateway_namespace);
-        let backend_target = rustfs_backend::service_host_port(&args.gateway_namespace);
+        let backend_prefix = backend.prefix.clone();
+        let backend_endpoint = backend.endpoint.clone();
+        let rustfs_host_port = rustfs_backend::service_host_port(&args.gateway_namespace);
         let anchor_name = format!("{}-checkpoint", helm_fullname(&args.release_name));
         let velero_target = velero_s3_target(&args, scenario.storage_path);
         let artifacts = ArtifactCollector::new(&args, scenario.label)?;
@@ -455,19 +552,21 @@ mod imp {
             let kubeconfig_path = context.kubeconfig_path();
             let workspace = context.workspace();
 
-            run_phase(&mut state, "install-rustfs", || {
-                rustfs_backend::install(&args, kubeconfig_path, workspace)
-            })?;
-            run_phase(&mut state, "create-backend-bucket", || {
-                rustfs_backend::create_bucket(&args, kubeconfig_path)
-            })?;
+            if args.backend_mode == VeleroBackendMode::ClusterRustfs {
+                run_phase(&mut state, "install-rustfs", || {
+                    rustfs_backend::install(&args, kubeconfig_path, workspace)
+                })?;
+                run_phase(&mut state, "create-backend-bucket", || {
+                    rustfs_backend::create_bucket(&args, kubeconfig_path)
+                })?;
+            }
             if scenario.storage_path.uses_integration_storage_proxy() {
                 run_phase(&mut state, "install-integration-storage-proxy", || {
                     integration_storage_proxy::install(
                         &args,
                         kubeconfig_path,
                         workspace,
-                        &backend_target,
+                        &rustfs_host_port,
                     )
                 })?;
             }
@@ -485,16 +584,18 @@ mod imp {
                             gateway_mode: "read-write",
                             public_bucket: VELERO_BUCKET,
                             backend_endpoint: &backend_endpoint,
-                            backend_bucket: BACKEND_BUCKET,
+                            backend_bucket: &backend.bucket,
                             backend_prefix: &backend_prefix,
-                            backend_region: BACKEND_REGION,
-                            backend_access_key_id: Some(RUSTFS_ACCESS_KEY_ID),
-                            backend_secret_access_key: Some(RUSTFS_SECRET_ACCESS_KEY),
+                            backend_region: &backend.region,
+                            backend_access_key_id: backend.access_key_id.as_deref(),
+                            backend_secret_access_key: backend.secret_access_key.as_deref(),
                             anchor_mode: "kubernetes-lease",
                             anchor_name: &anchor_name,
                             log_format: "json",
                             rust_log: GATEWAY_RUST_LOG,
                             payload_segment_size: args.payload_segment_size,
+                            retention_mode: args.repository_retention_mode.as_deref(),
+                            retention_days: args.repository_retention_days,
                             repository_id: REPOSITORY_ID,
                             repository_salt_hex: REPOSITORY_SALT_HEX,
                             keyring_envelope_object_id: KEYRING_ENVELOPE_OBJECT_ID,

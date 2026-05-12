@@ -142,6 +142,8 @@ mod imp {
                 log_format: "plain",
                 rust_log: "info",
                 payload_segment_size: args.payload_segment_size,
+                retention_mode: None,
+                retention_days: None,
                 repository_id: REPOSITORY_ID,
                 repository_salt_hex: REPOSITORY_SALT_HEX,
                 keyring_envelope_object_id: KEYRING_ENVELOPE_OBJECT_ID,

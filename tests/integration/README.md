@@ -104,6 +104,15 @@ checkpointed repository state when the repository is healthy.
 cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke
 ```
 
+Use `--backend-mode provided` with `RS3_TEST_S3_BUCKET`,
+`RS3_TEST_S3_ENDPOINT_URL`, `RS3_TEST_S3_REGION`, `AWS_ACCESS_KEY_ID`, and
+`AWS_SECRET_ACCESS_KEY` to run the gateway-backed Velero lanes against an
+existing S3-compatible backend instead of the in-cluster RustFS backend. Use a
+fresh `--backend-prefix` for each live run. For an Object Lock bucket, set
+`RS3_REPOSITORY_RETENTION_MODE=governance` and
+`RS3_REPOSITORY_RETENTION_DAYS=1` so the cluster backup/restore exercises
+retained repository writes.
+
 The strict restore-readonly variant is the incident/DR path. It switches the
 gateway to `restore-readonly`, verifies restored bytes, asserts that restore
 traffic did not write to the backend, and accepts Velero `PartiallyFailed` only

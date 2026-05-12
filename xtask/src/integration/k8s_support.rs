@@ -40,6 +40,8 @@ pub(crate) struct GatewayChartValues<'a> {
     pub(crate) log_format: &'a str,
     pub(crate) rust_log: &'a str,
     pub(crate) payload_segment_size: usize,
+    pub(crate) retention_mode: Option<&'a str>,
+    pub(crate) retention_days: Option<u32>,
     pub(crate) repository_id: &'a str,
     pub(crate) repository_salt_hex: &'a str,
     pub(crate) keyring_envelope_object_id: &'a str,
@@ -114,6 +116,16 @@ pub(crate) fn helm_install_gateway(
             &format!(
                 "repository.payloadSegmentSizeBytes={}",
                 values.payload_segment_size
+            ),
+            "--set-string",
+            &helm_set_string(
+                "repository.retention.mode",
+                values.retention_mode.unwrap_or_default(),
+            ),
+            "--set",
+            &format!(
+                "repository.retention.days={}",
+                values.retention_days.unwrap_or_default()
             ),
             "--set-string",
             &helm_set_string("repository.id", values.repository_id),
