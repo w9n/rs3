@@ -9,9 +9,13 @@ pub(crate) fn object_id(value: &str) -> BackendObjectId {
     BackendObjectId::new(value).unwrap_or_else(|error| panic!("{error}"))
 }
 
-/// Verifies the core `BlobStore` behavior repository code relies on.
-pub(crate) async fn assert_core_blob_store_contract<S>(store: &S, scope: &str)
-where
+/// Verifies the core `BlobStore` behavior with configurable duplicate
+/// create-only semantics for provider qualification profiles.
+pub(crate) async fn assert_core_blob_store_contract_with_create_only<S>(
+    store: &S,
+    scope: &str,
+    require_duplicate_rejection: bool,
+) where
     S: BlobStore + ?Sized,
 {
     let scope = normalize_scope(scope);
@@ -47,18 +51,6 @@ where
         .await
         .unwrap_or_else(|error| panic!("put outside object: {error}"));
 
-    let duplicate = store
-        .put(
-            &first,
-            Bytes::from_static(b"must not overwrite"),
-            PutOptions {
-                do_not_recreate: true,
-                ..PutOptions::default()
-            },
-        )
-        .await;
-    assert!(matches!(duplicate, Err(StorageError::AlreadyExists(_))));
-
     let metadata = store
         .head(&first)
         .await
@@ -88,6 +80,25 @@ where
         .map(|metadata| metadata.object_id)
         .collect::<Vec<_>>();
     assert_eq!(listed_ids, vec![first.clone(), second.clone()]);
+
+    let duplicate = store
+        .put(
+            &first,
+            Bytes::from_static(b"must not overwrite"),
+            PutOptions {
+                do_not_recreate: true,
+                ..PutOptions::default()
+            },
+        )
+        .await;
+    if require_duplicate_rejection {
+        assert!(matches!(duplicate, Err(StorageError::AlreadyExists(_))));
+    } else {
+        match duplicate {
+            Ok(_) | Err(StorageError::AlreadyExists(_)) => {}
+            Err(error) => panic!("duplicate create-only probe failed unexpectedly: {error}"),
+        }
+    }
 
     store
         .delete(&first)

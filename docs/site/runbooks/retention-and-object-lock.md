@@ -58,13 +58,19 @@ Required posture:
 
 A provider must prove:
 
-- native conditional create rejects duplicate `PutObject` requests with
-  `If-None-Match: *`
 - retention can be set at write time
 - retention can be extended, not shortened
 - legal hold blocks deletion
 - delete markers do not remove locked historical versions
+- retained writes return provider version IDs
+- exact-version reads return the requested retained version after a newer
+  latest version exists
 - normal credentials cannot bypass governance
+
+Native conditional create remains the preferred qualification profile when the
+provider supports it. Providers that accept duplicate same-key writes can still
+qualify for retained repositories through the retained-version profile, but only
+when Object Lock, version IDs, and exact-version reads pass live tests.
 
 Do not infer Object Lock semantics from S3 compatibility alone.
 Do not treat `HEAD` before `PUT` as equivalent to native conditional create; it

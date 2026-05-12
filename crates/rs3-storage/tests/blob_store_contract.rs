@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::assert_core_blob_store_contract;
+use common::assert_core_blob_store_contract_with_create_only;
 use rs3_storage::{FilesystemBlobStore, MemoryBlobStore};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 async fn memory_store_satisfies_core_contract() {
     let store = MemoryBlobStore::new();
 
-    assert_core_blob_store_contract(&store, "memory").await;
+    assert_core_blob_store_contract_with_create_only(&store, "memory", true).await;
 }
 
 #[tokio::test]
@@ -19,7 +19,7 @@ async fn filesystem_store_satisfies_core_contract() {
     let dir = TestDir::new("filesystem-contract");
     let store = FilesystemBlobStore::new(dir.path()).unwrap_or_else(|error| panic!("{error}"));
 
-    assert_core_blob_store_contract(&store, "filesystem").await;
+    assert_core_blob_store_contract_with_create_only(&store, "filesystem", true).await;
 }
 
 struct TestDir {

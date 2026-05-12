@@ -78,8 +78,8 @@ batching, compaction jitter, and stricter telemetry redaction.
 | Old content remains readable after data-key rotation | Enabled historical content keys are accepted for reads. | Repository key rotation tests. |
 | Writes are not acknowledged before checkpoint acceptance | Commit coordinator waits for covering checkpoint. | Commit coordinator and checkpoint tests. |
 | Storage rollback is not trusted as latest state | Ed25519 checkpoint verification, Kubernetes Lease anchor, and retained checkpoint evidence. | Anchor, checkpoint replay, restore verification, and orphan-report tests. |
-| Create-only writes are not silently downgraded | S3 backends must honor `PutObject` with `If-None-Match: *`; non-atomic `HEAD` before `PUT` is not treated as production create-only. | Storage contract tests and opt-in live S3 tests. |
-| Retained restore reads do not trust mutable latest objects | Restore-critical references carry provider version IDs when the backend returns them; retained/Object Lock writes fail closed without them. | Memory version-addressed storage tests, restore latest-poisoning tests, and opt-in live S3 Object Lock tests. |
+| Create-only writes are not silently downgraded | Atomic-create providers must honor `PutObject` with `If-None-Match: *`; non-atomic `HEAD` before `PUT` is not treated as production create-only. | Storage contract tests and opt-in live S3 tests. |
+| Retained restore reads do not trust mutable latest objects | Retained-version providers must return version IDs for restore-critical writes; checkpoints bind those versions and restore reads exact versions. | Memory version-addressed storage tests, checkpoint retry tests, restore latest-poisoning tests, and opt-in live S3 Object Lock tests. |
 | Incident restore does not advance repository state | `restore-readonly` mode requires an accepted anchor and rejects supported mutations. | Gateway mode config, startup, and S3 adapter tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
@@ -128,6 +128,13 @@ version ID, startup or write flow must fail closed; otherwise a malicious
 backend could append a newer object version and make restore follow mutable
 latest state.
 
+A retained-version provider may accept a second same-key write instead of
+rejecting `If-None-Match: *`. That is acceptable only for retained/Object Lock
+repository objects when the new write returns a distinct version ID and old
+checkpoint-bound versions remain exactly readable. The object key is then not
+the uniqueness authority; the signed checkpoint, external anchor, object
+digest, and provider version ID are.
+
 Non-retained development backends may omit version IDs. In that mode `rs3` can
 still authenticate object bytes and detect tampering of the bytes it reads, but
 it cannot force the provider to return an older exact version after a newer
@@ -146,19 +153,21 @@ correct. Treat that status as acceptable only when the denied writes are restore
 bookkeeping artifacts, pod-volume restore completed, restored data verifies,
 and backend write counters remain unchanged.
 
-## Conditional Create Rule
+## Provider Qualification Rule
 
-Repository-critical objects are written with create-only semantics where
-collisions would indicate a retry, conflict, or malicious backend behavior. For
-S3-compatible providers, the production-preview standard is native conditional
-write support: `PutObject` with `If-None-Match: *` must fail when a current
-object already exists.
+S3-compatible providers qualify through one of two profiles:
+
+- **Atomic create:** `PutObject` with `If-None-Match: *` rejects an existing
+  current object. This is the preferred profile when provider versioning or
+  Object Lock is not part of the deployment.
+- **Retained version:** Object Lock and versioning are enabled; retained writes
+  return provider version IDs; exact-version reads return the checkpoint-bound
+  object after a newer latest version exists; retention or legal hold blocks
+  destructive cleanup before expiry.
 
 `HEAD` before `PUT` is not a security-equivalent fallback. It can improve UX for
 single-writer compatibility probes, but it is not atomic and does not protect
-against a provider that races requests, serves stale state, or ignores conditional headers. A provider
-that accepts a duplicate create-only write fails production qualification until
-an explicit degraded compatibility mode is designed, tested, and documented.
+against a provider that races requests, serves stale state, or ignores conditional headers.
 
 ## Operator Reporting Rule
 

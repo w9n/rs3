@@ -80,7 +80,7 @@ newer one. The backend can still deny service by hiding required objects.
 | Backend serves an older checkpoint than the Lease anchor | Fail closed as rollback. |
 | Backend hides the checkpoint or evidence named by the Lease anchor | Fail closed as unavailable or tampered. |
 | Backend adds unrelated objects | Ignore them unless signed and reachable from anchored state. |
-| Backend overwrites checkpoint, evidence, index, metadata, or payload bytes | Reject through native create-only write checks, signatures, digests, or AEAD authentication. S3-compatible providers must honor `If-None-Match: *`; `HEAD` before `PUT` is not a production fallback. |
+| Backend overwrites checkpoint, evidence, index, metadata, or payload bytes | Reject through native create-only write checks, signed/digested state, AEAD authentication, or retained-version exact reads. S3 providers qualify through either `atomic-create` or `retained-version`; `HEAD` before `PUT` is not a production fallback. |
 | Backend evidence appears newer than the Lease anchor | Treat as ambiguous; fail closed until explicit recovery resolves whether the anchor missed an advance or was rolled back. |
 | Lease missing but backend evidence exists | Do not silently trust storage. Require a trusted bundle or explicit bounded recovery that validates the highest observed valid checkpoint and enforces a maximum signed checkpoint age. |
 | Multiple gateways serve the same repository as `read-write` | Unsupported. Run one writer per repository; use `restore-readonly` for scaled restore readers. |
@@ -154,9 +154,9 @@ Latest focused local evidence:
 The release evidence is local harness evidence, not a provider certification. A
 production-preview trial should still run the selected live S3-compatible
 provider with an empty bucket and a deliberately preserved restore bundle. The
-provider trial must include native conditional create, retained version IDs, and
-exact-version reads after a newer latest object exists when retention/Object
-Lock is in scope.
+provider trial must explicitly choose `atomic-create` or `retained-version`.
+The retained-version profile must include Object Lock, retained version IDs, and
+exact-version reads after a newer latest object exists.
 
 ## Non-Goals
 

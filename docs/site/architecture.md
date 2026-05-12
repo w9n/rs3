@@ -88,10 +88,14 @@ The first gateway surface focuses on the operations backup clients need:
 - `DELETE Object`
 - native conditional create behavior (`PutObject` with `If-None-Match: *`)
 - retention and legal-hold plumbing where the backend supports it
+- provider version IDs and exact-version reads for retained/Object Lock
+  repositories
 
-Non-atomic `HEAD` before `PUT` is not part of the production-preview
-create-only contract. It may become an explicit degraded compatibility mode
-later, but provider qualification must first prove native conditional create.
+There are two production-capable storage profiles. The atomic-create profile
+requires native `PutObject` with `If-None-Match: *`. The retained-version
+profile requires Object Lock, provider version IDs for all restore-critical
+writes, and exact-version reads after a newer latest version exists. Non-atomic
+`HEAD` before `PUT` is not a security-equivalent fallback for either profile.
 
 The preview compatibility workloads are Kopia and Velero with the Kopia
 uploader. Kopia drives the lower-level S3 behavior; Velero proves the

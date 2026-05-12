@@ -1,5 +1,17 @@
 use super::*;
 
+async fn only_object_metadata_with_prefix(
+    store: &MemoryBlobStore,
+    prefix: &str,
+) -> rs3_storage::BlobMetadata {
+    let objects = must_storage(store.list_prefix(prefix).await);
+    let mut objects = objects.into_iter().collect::<Vec<_>>();
+    assert_eq!(objects.len(), 1);
+    objects
+        .pop()
+        .unwrap_or_else(|| panic!("missing object under prefix {prefix}"))
+}
+
 #[tokio::test]
 async fn draft_signed_checkpoint_has_verifiable_signature() {
     let active_keyring = keyring(vec![
@@ -591,6 +603,66 @@ async fn publish_checkpoint_retries_after_anchor_failure_without_rewriting_check
     assert_eq!(second.sequence, Sequence::new(1));
     assert_eq!(after_second.len(), 1);
     assert_eq!(evidence_after_second.len(), 1);
+}
+
+#[tokio::test]
+async fn retained_version_profile_retries_after_anchor_failure_with_new_checkpoint_version() {
+    let backend = MemoryBlobStore::new();
+    let store = RetainedVersionAppendStore {
+        backend: backend.clone(),
+    };
+    let repo = Repository::with_keyring_and_options(
+        store,
+        signing_keyring(),
+        RepositoryOptions {
+            payload_segment_size: crate::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+            default_retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
+        },
+    );
+    let anchor = FailOnceAnchor::new();
+    let client_key = key("p/12/retained-version-retry");
+
+    let put = repo
+        .put(
+            client_key.clone(),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(put.is_ok());
+
+    let first = repo.publish_checkpoint(&anchor).await;
+    let checkpoint_after_first =
+        only_object_metadata_with_prefix(&backend, CHECKPOINT_OBJECT_PREFIX)
+            .await
+            .version_id
+            .unwrap_or_else(|| panic!("retained checkpoint write should return a version id"));
+    let second = must(repo.publish_checkpoint(&anchor).await);
+    let checkpoint_after_second =
+        only_object_metadata_with_prefix(&backend, CHECKPOINT_OBJECT_PREFIX)
+            .await
+            .version_id
+            .unwrap_or_else(|| panic!("retained checkpoint retry should return a version id"));
+    let evidence = only_object_metadata_with_prefix(&backend, CHECKPOINT_EVIDENCE_PREFIX).await;
+    let reloaded = Repository::with_keyring(backend, signing_keyring());
+    let loaded = must(reloaded.load_checkpoint_position(&second).await);
+    let body = must(reloaded.get_range(&client_key, ByteRange::Full).await);
+
+    assert!(matches!(
+        first,
+        Err(RepositoryError::Anchor(AnchorError::Backend(_)))
+    ));
+    assert_ne!(checkpoint_after_first, checkpoint_after_second);
+    assert_eq!(
+        second.checkpoint_version_id.as_ref(),
+        Some(&checkpoint_after_second)
+    );
+    assert_eq!(
+        evidence.object_id,
+        must(checkpoint_evidence_object_id(&second))
+    );
+    assert_eq!(loaded, second);
+    assert_eq!(body, Bytes::from_static(b"body"));
 }
 
 #[tokio::test]

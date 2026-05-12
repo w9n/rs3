@@ -8,7 +8,7 @@ use rs3_index::{CHECKPOINT_OBJECT_DOMAIN, Checkpoint};
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions, StorageError};
 use rs3_types::{
     BackendObjectId, BackendVersionId, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
-    LegalHoldStatus, LogicalPath, RetentionPolicy, Sequence,
+    LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy, Sequence,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -699,6 +699,114 @@ pub(super) struct DropPutVersionStore {
     /// Version-capable backend used to poison latest objects while the repository
     /// sees a provider that does not return version ids.
     pub(super) backend: MemoryBlobStore,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct RetainedVersionAppendStore {
+    pub(super) backend: MemoryBlobStore,
+}
+
+fn provider_retained_write(options: &PutOptions) -> bool {
+    options
+        .retention
+        .is_some_and(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
+        || options.legal_hold == Some(LegalHoldStatus::On)
+}
+
+#[async_trait]
+impl BlobStore for RetainedVersionAppendStore {
+    async fn put(
+        &self,
+        object_id: &BackendObjectId,
+        body: Bytes,
+        mut options: PutOptions,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        if provider_retained_write(&options) {
+            options.do_not_recreate = false;
+        }
+        self.backend.put(object_id, body, options).await
+    }
+
+    async fn get_range(
+        &self,
+        object_id: &BackendObjectId,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Bytes> {
+        self.backend.get_range(object_id, range).await
+    }
+
+    async fn get_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Bytes> {
+        self.backend
+            .get_range_at(object_id, version_id, range)
+            .await
+    }
+
+    async fn head(&self, object_id: &BackendObjectId) -> rs3_storage::Result<BlobMetadata> {
+        self.backend.head(object_id).await
+    }
+
+    async fn head_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        self.backend.head_at(object_id, version_id).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
+        self.backend.list_prefix(prefix).await
+    }
+
+    async fn delete(&self, object_id: &BackendObjectId) -> rs3_storage::Result<()> {
+        self.backend.delete(object_id).await
+    }
+
+    async fn extend_retention(
+        &self,
+        object_id: &BackendObjectId,
+        policy: RetentionPolicy,
+    ) -> rs3_storage::Result<()> {
+        self.backend.extend_retention(object_id, policy).await
+    }
+
+    async fn extend_retention_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        policy: RetentionPolicy,
+    ) -> rs3_storage::Result<()> {
+        self.backend
+            .extend_retention_at(object_id, version_id, policy)
+            .await
+    }
+
+    async fn set_legal_hold(
+        &self,
+        object_id: &BackendObjectId,
+        status: LegalHoldStatus,
+    ) -> rs3_storage::Result<()> {
+        self.backend.set_legal_hold(object_id, status).await
+    }
+
+    async fn set_legal_hold_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        status: LegalHoldStatus,
+    ) -> rs3_storage::Result<()> {
+        self.backend
+            .set_legal_hold_at(object_id, version_id, status)
+            .await
+    }
+
+    async fn flush_caches(&self) -> rs3_storage::Result<()> {
+        self.backend.flush_caches().await
+    }
 }
 
 fn strip_version(mut metadata: BlobMetadata) -> BlobMetadata {

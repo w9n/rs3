@@ -15,6 +15,23 @@ enum S3LocalMode {
     Container,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum S3QualificationProfile {
+    /// Provider must reject duplicate create-only PUTs atomically.
+    AtomicCreate,
+    /// Provider qualifies through Object Lock, version IDs, and exact-version reads.
+    RetainedVersion,
+}
+
+impl S3QualificationProfile {
+    const fn as_env(self) -> &'static str {
+        match self {
+            Self::AtomicCreate => "atomic-create",
+            Self::RetainedVersion => "retained-version",
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct S3LocalArgs {
     /// Integration mode.
@@ -44,6 +61,14 @@ pub(crate) struct S3LocalArgs {
     /// Use virtual-hosted-style S3 requests.
     #[arg(long, env = "RS3_TEST_S3_VIRTUAL_HOSTED_STYLE")]
     virtual_hosted_style: Option<bool>,
+    /// Provider qualification profile.
+    #[arg(
+        long,
+        env = "RS3_TEST_S3_QUALIFICATION_PROFILE",
+        value_enum,
+        default_value_t = S3QualificationProfile::AtomicCreate
+    )]
+    qualification_profile: S3QualificationProfile,
     /// Run Object Lock retention checks against the bucket.
     #[arg(long, env = "RS3_TEST_S3_OBJECT_LOCK", default_value_t = false)]
     object_lock: bool,
@@ -53,10 +78,22 @@ pub(crate) struct S3LocalArgs {
 }
 
 pub(crate) fn run_s3_local(args: S3LocalArgs) -> Result<()> {
+    validate_s3_profile(&args)?;
+
     match args.mode {
         S3LocalMode::Provided => run_provided_s3(args),
         S3LocalMode::Container => run_container_s3(args),
     }
+}
+
+fn validate_s3_profile(args: &S3LocalArgs) -> Result<()> {
+    if args.qualification_profile == S3QualificationProfile::RetainedVersion && !args.object_lock {
+        anyhow::bail!(
+            "the retained-version S3 qualification profile requires --object-lock so retention, legal hold, version IDs, and exact-version reads are tested"
+        );
+    }
+
+    Ok(())
 }
 
 fn run_provided_s3(args: S3LocalArgs) -> Result<()> {
@@ -68,6 +105,7 @@ fn run_provided_s3(args: S3LocalArgs) -> Result<()> {
         prefix: args.prefix,
         allow_http: args.allow_http,
         virtual_hosted_style: args.virtual_hosted_style,
+        qualification_profile: args.qualification_profile,
         object_lock: args.object_lock,
         retention_days: args.retention_days,
         credentials: None,
@@ -103,6 +141,7 @@ fn run_container_s3(args: S3LocalArgs) -> Result<()> {
         prefix: args.prefix,
         allow_http: Some(true),
         virtual_hosted_style: Some(false),
+        qualification_profile: args.qualification_profile,
         object_lock: args.object_lock,
         retention_days: args.retention_days,
         credentials: Some(AwsCredentials {
@@ -120,6 +159,7 @@ struct LiveS3Contract {
     prefix: Option<String>,
     allow_http: Option<bool>,
     virtual_hosted_style: Option<bool>,
+    qualification_profile: S3QualificationProfile,
     object_lock: bool,
     retention_days: Option<u32>,
     credentials: Option<AwsCredentials>,
@@ -158,6 +198,10 @@ fn run_live_s3_contract(contract: LiveS3Contract) -> Result<()> {
         &mut command,
         "RS3_TEST_S3_VIRTUAL_HOSTED_STYLE",
         contract.virtual_hosted_style,
+    );
+    command.env(
+        "RS3_TEST_S3_QUALIFICATION_PROFILE",
+        contract.qualification_profile.as_env(),
     );
     command.env(
         "RS3_TEST_S3_OBJECT_LOCK",
@@ -204,5 +248,50 @@ fn set_env(command: &mut Command, key: &'static str, value: Option<String>) {
 fn set_env_bool(command: &mut Command, key: &'static str, value: Option<bool>) {
     if let Some(value) = value {
         command.env(key, if value { "true" } else { "false" });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_for_profile(
+        qualification_profile: S3QualificationProfile,
+        object_lock: bool,
+    ) -> S3LocalArgs {
+        S3LocalArgs {
+            mode: S3LocalMode::Provided,
+            container_provider: S3ContainerProvider::Rustfs,
+            provider: None,
+            bucket: None,
+            endpoint_url: None,
+            region: None,
+            prefix: None,
+            allow_http: None,
+            virtual_hosted_style: None,
+            qualification_profile,
+            object_lock,
+            retention_days: None,
+        }
+    }
+
+    #[test]
+    fn retained_version_profile_requires_object_lock_checks() {
+        let error = validate_s3_profile(&args_for_profile(
+            S3QualificationProfile::RetainedVersion,
+            false,
+        ))
+        .expect_err("retained-version without Object Lock should fail");
+
+        assert!(error.to_string().contains("requires --object-lock"));
+    }
+
+    #[test]
+    fn retained_version_profile_accepts_object_lock_checks() {
+        validate_s3_profile(&args_for_profile(
+            S3QualificationProfile::RetainedVersion,
+            true,
+        ))
+        .expect("retained-version with Object Lock should pass");
     }
 }

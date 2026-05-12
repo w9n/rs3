@@ -61,6 +61,11 @@ repository operation requires this version ID so restore can read the exact
 retained payload version even if the backend later presents a different latest
 version.
 
+For retained-version providers, a same-key write may create another retained
+version instead of failing as a duplicate. The format does not treat latest
+object state as authoritative in that profile; checkpoint-bound object IDs,
+provider version IDs, and digests decide reachable state.
+
 Index changes are append-friendly deltas covered by checkpoints. Compaction can
 rewrite index state later, but it must preserve rollback and retention rules.
 
