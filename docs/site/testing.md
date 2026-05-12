@@ -30,6 +30,17 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 
 Expensive lanes emit artifacts under `.local/integration/` by default.
 
+## S3 Provider Qualification
+
+Do not infer production support from S3 compatibility alone. A live provider
+trial must prove the storage contract against an empty prefix, including native
+conditional create: a second `PutObject` with `If-None-Match: *` for an existing
+current object must fail instead of creating a new version.
+
+`HEAD` before `PUT` is not the production fallback for create-only writes. It is
+non-atomic and only useful for a deliberately degraded compatibility mode, which
+is not part of the production-preview contract.
+
 ## Privacy Tests
 
 Features that handle logical names should prove:
@@ -54,6 +65,7 @@ Rollback-sensitive changes should cover:
 
 Retention and Object Lock work should cover:
 
+- native conditional create rejects duplicate create-only writes
 - retention extension never shortens existing retention
 - retained writes fail when the provider does not return version IDs
 - exact-version reads return the checkpoint-bound object after a newer latest

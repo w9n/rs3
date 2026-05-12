@@ -58,6 +58,8 @@ Required posture:
 
 A provider must prove:
 
+- native conditional create rejects duplicate `PutObject` requests with
+  `If-None-Match: *`
 - retention can be set at write time
 - retention can be extended, not shortened
 - legal hold blocks deletion
@@ -65,6 +67,8 @@ A provider must prove:
 - normal credentials cannot bypass governance
 
 Do not infer Object Lock semantics from S3 compatibility alone.
+Do not treat `HEAD` before `PUT` as equivalent to native conditional create; it
+is not atomic and is not a production-preview safety guarantee.
 
 During restore verification, `rs3` reports how many verified restore-critical
 objects expose retention or legal-hold metadata. Treat that as repository

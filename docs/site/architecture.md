@@ -86,8 +86,12 @@ The first gateway surface focuses on the operations backup clients need:
 - `HEAD Object`
 - `ListObjectsV2`
 - `DELETE Object`
-- conditional create behavior
+- native conditional create behavior (`PutObject` with `If-None-Match: *`)
 - retention and legal-hold plumbing where the backend supports it
+
+Non-atomic `HEAD` before `PUT` is not part of the production-preview
+create-only contract. It may become an explicit degraded compatibility mode
+later, but provider qualification must first prove native conditional create.
 
 The preview compatibility workloads are Kopia and Velero with the Kopia
 uploader. Kopia drives the lower-level S3 behavior; Velero proves the
