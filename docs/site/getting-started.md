@@ -92,8 +92,7 @@ The Kopia matrix compares the gateway to a straight RustFS proxy baseline:
 cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix \
   --runs 3 \
   --profile-set larger-restores \
-  --gateway-build-profile release \
-  --payload-segment-size 512
+  --gateway-build-profile release
 ```
 
 Artifacts are written under `.local/integration/` by default. They are local

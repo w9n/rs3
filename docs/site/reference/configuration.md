@@ -140,7 +140,8 @@ where practical, and backend credentials that cannot write.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `RS3_PAYLOAD_SEGMENT_SIZE_BYTES` | no | `512` | Plaintext bytes per independently encrypted payload segment. |
+| `RS3_PAYLOAD_SEGMENT_SIZE_BYTES` | no | adaptive, `512` B floor | Plaintext bytes per independently encrypted payload segment. Leave unset to use adaptive per-object defaults: 512 B for small objects, 8 KiB for medium objects, and 64 KiB for large objects. Set it to force a fixed segment size. |
+| `RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES` | no | `268435456` | Maximum plaintext bytes retained in the process-local decrypted segment LRU cache. Set to `0` to disable the cache. |
 | `RS3_COMMIT_MAX_BATCH_ITEMS` | no | `64` | Maximum staged writes covered by one checkpoint batch. |
 | `RS3_COMMIT_MAX_BATCH_DELAY_MS` | no | `10` | Maximum delay before publishing a partial commit batch. |
 | `RS3_COMMIT_MAX_PENDING_ITEMS` | no | batch item limit | Maximum writes waiting for commit before backpressure. |

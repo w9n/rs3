@@ -164,6 +164,8 @@ pub(super) fn repository_with_payload_segment_size(
         signing_keyring(),
         RepositoryOptions {
             payload_segment_size,
+            adaptive_payload_segment_size: false,
+            decrypted_segment_cache_max_bytes: crate::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
             default_retention: None,
         },
     )

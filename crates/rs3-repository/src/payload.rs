@@ -11,6 +11,10 @@ const PAYLOAD_SEGMENT_AAD_DOMAIN: &[u8] = b"rs3:payload-segment-associated-data:
 pub(crate) const PAYLOAD_HEADER_PROBE_LEN: u64 = 128;
 /// Default plaintext bytes per independently encrypted payload segment.
 pub const DEFAULT_PAYLOAD_SEGMENT_SIZE: usize = 512;
+const MEDIUM_PAYLOAD_SEGMENT_SIZE: usize = 8 * 1024;
+const LARGE_PAYLOAD_SEGMENT_SIZE: usize = 64 * 1024;
+const MEDIUM_PAYLOAD_THRESHOLD: usize = 8 * 1024;
+const LARGE_PAYLOAD_THRESHOLD: usize = 256 * 1024;
 const U64_LEN: usize = 8;
 const AEAD_TAG_LEN: u64 = 16;
 const NONCE_PREFIX_LEN: usize = 16;
@@ -45,6 +49,20 @@ pub(crate) struct SegmentCiphertextSpan {
     pub(crate) segment_count: usize,
 }
 
+/// Plaintext segment selection required for a client-visible range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SegmentPlaintextSelection {
+    pub(crate) start_segment: usize,
+    pub(crate) segment_count: usize,
+}
+
+/// Opened plaintext for a contiguous selected segment span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OpenedSegmentedPayloadSpan {
+    pub(crate) plaintext: Bytes,
+    pub(crate) segments: Vec<(usize, Bytes)>,
+}
+
 /// Encrypts plaintext into a durable payload object body.
 pub(crate) fn seal_payload_object(
     keyring: &KeyRing,
@@ -53,6 +71,21 @@ pub(crate) fn seal_payload_object(
     chunk_size: usize,
 ) -> Result<Bytes> {
     seal_segmented_payload_object(keyring, object_id, plaintext, chunk_size)
+}
+
+/// Selects an adaptive payload segment size for a plaintext object.
+pub(crate) fn adaptive_payload_segment_size(
+    plaintext_len: usize,
+    configured_floor: usize,
+) -> usize {
+    let target = if plaintext_len < MEDIUM_PAYLOAD_THRESHOLD {
+        DEFAULT_PAYLOAD_SEGMENT_SIZE
+    } else if plaintext_len < LARGE_PAYLOAD_THRESHOLD {
+        MEDIUM_PAYLOAD_SEGMENT_SIZE
+    } else {
+        LARGE_PAYLOAD_SEGMENT_SIZE
+    };
+    configured_floor.max(target)
 }
 
 /// Opens a durable payload object body and applies a client-visible range.
@@ -175,6 +208,26 @@ pub(crate) fn segmented_ciphertext_span(
     })
 }
 
+/// Returns the plaintext segments required for a requested plaintext range.
+pub(crate) fn segmented_plaintext_selection(
+    header: &SegmentedPayloadHeader,
+    range: ByteRange,
+) -> Result<SegmentPlaintextSelection> {
+    let selection = SegmentSelection::new(header, range)?;
+    Ok(SegmentPlaintextSelection {
+        start_segment: selection.start_segment,
+        segment_count: selection.segment_count(),
+    })
+}
+
+/// Returns the plaintext byte length of one encrypted payload segment.
+pub(crate) fn segmented_plaintext_segment_len(
+    header: &SegmentedPayloadHeader,
+    segment_index: usize,
+) -> Result<u64> {
+    segment_plaintext_len(header, segment_index)
+}
+
 /// Opens selected segmented ciphertext bytes and applies the requested plaintext range.
 pub(crate) fn open_segmented_payload_span(
     keyring: &KeyRing,
@@ -184,6 +237,19 @@ pub(crate) fn open_segmented_payload_span(
     span: SegmentCiphertextSpan,
     ciphertext: Bytes,
 ) -> Result<Bytes> {
+    open_segmented_payload_span_with_segments(keyring, object_id, header, range, span, ciphertext)
+        .map(|opened| opened.plaintext)
+}
+
+/// Opens selected segmented ciphertext bytes and returns decrypted segment cache material.
+pub(crate) fn open_segmented_payload_span_with_segments(
+    keyring: &KeyRing,
+    object_id: &BackendObjectId,
+    header: &SegmentedPayloadHeader,
+    range: ByteRange,
+    span: SegmentCiphertextSpan,
+    ciphertext: Bytes,
+) -> Result<OpenedSegmentedPayloadSpan> {
     let selection = SegmentSelection::new(header, range)?;
     if span.start_segment != selection.start_segment
         || span.segment_count != selection.segment_count()
@@ -197,6 +263,7 @@ pub(crate) fn open_segmented_payload_span(
     }
 
     let mut output = Vec::with_capacity(selection.output_capacity()?);
+    let mut segments = Vec::with_capacity(selection.segment_count());
     let mut associated_data = Vec::with_capacity(segment_associated_data_capacity(object_id));
     for segment_index in selection.start_segment..selection.end_segment {
         let segment_range =
@@ -222,6 +289,34 @@ pub(crate) fn open_segmented_payload_span(
             &mut associated_data,
         )?;
         append_segment_overlap(&mut output, header, &selection, segment_index, &plaintext)?;
+        segments.push((segment_index, Bytes::from(plaintext)));
+    }
+
+    Ok(OpenedSegmentedPayloadSpan {
+        plaintext: Bytes::from(output),
+        segments,
+    })
+}
+
+/// Applies a client-visible range to cached decrypted plaintext segments.
+pub(crate) fn open_segmented_payload_cached_segments(
+    object_id: &BackendObjectId,
+    header: &SegmentedPayloadHeader,
+    range: ByteRange,
+    start_segment: usize,
+    segments: &[Bytes],
+) -> Result<Bytes> {
+    let selection = SegmentSelection::new(header, range)?;
+    if start_segment != selection.start_segment || segments.len() != selection.segment_count() {
+        return Err(invalid_payload_object(object_id));
+    }
+
+    let mut output = Vec::with_capacity(selection.output_capacity()?);
+    for (relative_index, plaintext) in segments.iter().enumerate() {
+        let segment_index = start_segment
+            .checked_add(relative_index)
+            .ok_or(StorageError::InvalidRange)?;
+        append_segment_overlap(&mut output, header, &selection, segment_index, plaintext)?;
     }
 
     Ok(Bytes::from(output))

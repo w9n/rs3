@@ -616,6 +616,8 @@ async fn retained_version_profile_retries_after_anchor_failure_with_new_checkpoi
         signing_keyring(),
         RepositoryOptions {
             payload_segment_size: crate::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+            adaptive_payload_segment_size: true,
+            decrypted_segment_cache_max_bytes: crate::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
             default_retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
         },
     );

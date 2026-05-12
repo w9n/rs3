@@ -3,8 +3,8 @@
 use super::S3ContainerProvider;
 #[cfg(feature = "containers")]
 use super::gateway_process::{
-    ACCESS_KEY_ID, GatewayBuildProfile, GatewayProcessOptions, PUBLIC_BUCKET, RunningGateway,
-    SECRET_ACCESS_KEY,
+    ACCESS_KEY_ID, GatewayBackend, GatewayBuildProfile, GatewayProcessOptions, PUBLIC_BUCKET,
+    RunningGateway, SECRET_ACCESS_KEY,
 };
 #[cfg(feature = "containers")]
 use super::s3_container;
@@ -46,6 +46,9 @@ const KOPIA_PASSWORD: &str = "rs3-local-integration-password";
 
 #[derive(Debug, Args)]
 pub(crate) struct KopiaGatewayArgs {
+    /// Backend mode for the gateway under test.
+    #[arg(long, value_enum, default_value_t = KopiaGatewayMode::Container)]
+    mode: KopiaGatewayMode,
     /// Container provider used as the gateway backend.
     #[arg(long, value_enum, default_value_t = S3ContainerProvider::Rustfs)]
     container_provider: S3ContainerProvider,
@@ -55,12 +58,23 @@ pub(crate) struct KopiaGatewayArgs {
     /// Backend S3 signing region.
     #[arg(long, env = "RS3_TEST_S3_REGION")]
     region: Option<String>,
+    /// Provided S3-compatible endpoint URL used with `--mode provided`.
+    #[arg(long, env = "RS3_TEST_S3_ENDPOINT_URL")]
+    endpoint_url: Option<String>,
     /// Backend prefix for repository-owned objects.
     #[arg(long, env = "RS3_TEST_S3_PREFIX", default_value = "rs3-kopia")]
     backend_prefix: String,
     /// Kopia executable to run.
     #[arg(long, env = "RS3_TEST_KOPIA_BIN", default_value = "kopia")]
     kopia_bin: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum KopiaGatewayMode {
+    /// Start a disposable local S3-compatible backend.
+    Container,
+    /// Use an already provisioned S3-compatible backend.
+    Provided,
 }
 
 #[derive(Debug, Args)]
@@ -192,13 +206,22 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
 
 #[cfg(feature = "containers")]
 pub(crate) fn run_kopia_gateway(args: KopiaGatewayArgs) -> Result<()> {
-    let kopia_bin = args.kopia_bin;
-    let backend_prefix = args.backend_prefix;
-    let backend = s3_container::start_s3_container(
-        args.container_provider,
-        args.backend_bucket,
-        args.region,
-    )?;
+    let kopia_bin = args.kopia_bin.clone();
+    let backend_prefix = args.backend_prefix.clone();
+    let mut container_backend = None;
+    let backend = match args.mode {
+        KopiaGatewayMode::Container => {
+            let running = s3_container::start_s3_container(
+                args.container_provider,
+                args.backend_bucket,
+                args.region,
+            )?;
+            let backend = GatewayBackend::from_container(&running);
+            container_backend = Some(running);
+            backend
+        }
+        KopiaGatewayMode::Provided => provided_gateway_backend(&args)?,
+    };
     let workspace = KopiaWorkspace::new()?;
     workspace.populate_source(KopiaWorkloadProfile::SmallSmoke)?;
 
@@ -207,8 +230,9 @@ pub(crate) fn run_kopia_gateway(args: KopiaGatewayArgs) -> Result<()> {
         .build()
         .context("failed to build Kopia integration runtime")?;
 
-    runtime.block_on(async {
-        let mut gateway = RunningGateway::start(&backend, backend_prefix).await?;
+    let container_backend_guard = container_backend;
+    let result = runtime.block_on(async {
+        let mut gateway = RunningGateway::start_for_backend(&backend, backend_prefix).await?;
         let target = KopiaS3Target {
             bucket: PUBLIC_BUCKET.to_owned(),
             endpoint_authority: gateway.endpoint_authority(),
@@ -228,6 +252,36 @@ pub(crate) fn run_kopia_gateway(args: KopiaGatewayArgs) -> Result<()> {
         result?;
         shutdown?;
         Ok(())
+    });
+    drop(container_backend_guard);
+    result
+}
+
+#[cfg(feature = "containers")]
+fn provided_gateway_backend(args: &KopiaGatewayArgs) -> Result<GatewayBackend> {
+    let endpoint_url = args
+        .endpoint_url
+        .clone()
+        .context("--endpoint-url or RS3_TEST_S3_ENDPOINT_URL is required with --mode provided")?;
+    let bucket = args
+        .backend_bucket
+        .clone()
+        .context("--backend-bucket or RS3_TEST_S3_BUCKET is required with --mode provided")?;
+    let region = args
+        .region
+        .clone()
+        .unwrap_or_else(|| "us-east-1".to_owned());
+    let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
+        .context("AWS_ACCESS_KEY_ID is required with --mode provided")?;
+    let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+        .context("AWS_SECRET_ACCESS_KEY is required with --mode provided")?;
+
+    Ok(GatewayBackend {
+        endpoint_url,
+        bucket,
+        region,
+        access_key_id,
+        secret_access_key,
     })
 }
 

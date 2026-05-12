@@ -27,7 +27,7 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | Preview release gate | `just preview-gate-release` | Kopia gateway, Velero dynamic PVC gateway-restart in normal write mode, and Velero Postgres smoke. |
 | Velero strict restore-readonly | `just integration-velero-kopia-dynamic-pvc-restore-readonly-smoke` | Incident-restore behavior: restored bytes verify, Velero artifact writes are denied, and backend writes stay at zero during restore. |
 | Lightweight perf smoke | `just perf-s3-gateway -- --format jsonl` | Small gateway scenario metrics and amplification. |
-| Kopia measured matrix | `cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix --runs 3 --profile-set larger-restores --gateway-build-profile release --payload-segment-size 512 --enforce-regression-budgets` | Release-grade Kopia restore comparison against the straight RustFS proxy baseline. |
+| Kopia measured matrix | `cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix --runs 3 --profile-set larger-restores --gateway-build-profile release --enforce-regression-budgets` | Release-grade Kopia restore comparison against the straight RustFS proxy baseline with current gateway defaults. |
 
 Expensive lanes emit artifacts under `.local/integration/` by default.
 
@@ -53,6 +53,16 @@ meaningful when the retention and exact-version checks run:
 
 ```sh
 just integration-s3-local --qualification-profile retained-version --object-lock
+```
+
+After a provider passes qualification, run a real Kopia backup/restore through
+the gateway against the same backend. Use a fresh backend prefix for each live
+run, and enable repository retention when validating an Object Lock bucket:
+
+```sh
+RS3_REPOSITORY_RETENTION_MODE=governance \
+RS3_REPOSITORY_RETENTION_DAYS=1 \
+just integration-kopia-gateway --mode provided --backend-prefix <fresh-prefix>
 ```
 
 ## Privacy Tests
@@ -107,6 +117,8 @@ Performance changes should update the measured matrix when they affect:
 - S3 request body handling
 - backend storage adapters
 - metrics collection overhead
+- adaptive payload segment sizing
+- decrypted segment cache behavior
 
 Use release-profile gateway runs for performance claims. Debug builds are useful
 for development but distort medium and larger payload timings.

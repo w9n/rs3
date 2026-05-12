@@ -113,7 +113,6 @@ cargo run -p xtask --bin xtask --features containers -- integration kopia-measur
   --runs 3 \
   --profile-set larger-restores \
   --gateway-build-profile release \
-  --payload-segment-size 512 \
   --enforce-regression-budgets
 ```
 

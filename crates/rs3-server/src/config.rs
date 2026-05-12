@@ -135,6 +135,10 @@ pub struct BatchConfig {
 pub struct RepositoryConfig {
     /// Plaintext bytes per independently encrypted payload segment.
     pub payload_segment_size: usize,
+    /// Whether the gateway adapts payload segment size upward by object size.
+    pub adaptive_payload_segment_size: bool,
+    /// Maximum plaintext bytes retained in the decrypted segment LRU cache.
+    pub decrypted_segment_cache_max_bytes: u64,
     /// Default provider retention policy for repository-owned objects.
     pub retention: Option<RetentionPolicy>,
 }
@@ -333,15 +337,24 @@ fn parse_batch_config(source: &impl ConfigSource) -> Result<BatchConfig, ConfigE
 }
 
 fn parse_repository_config(source: &impl ConfigSource) -> Result<RepositoryConfig, ConfigError> {
+    let payload_segment_size_value = source.value("RS3_PAYLOAD_SEGMENT_SIZE_BYTES");
+    let adaptive_payload_segment_size = payload_segment_size_value.is_none();
     let payload_segment_size = parse_positive_usize(
         "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
-        source.value("RS3_PAYLOAD_SEGMENT_SIZE_BYTES"),
+        payload_segment_size_value,
         DEFAULT_PAYLOAD_SEGMENT_SIZE,
+    )?;
+    let decrypted_segment_cache_max_bytes = parse_u64(
+        "RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES",
+        source.value("RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES"),
+        rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
     )?;
     let retention = parse_retention_policy(source)?;
 
     Ok(RepositoryConfig {
         payload_segment_size,
+        adaptive_payload_segment_size,
+        decrypted_segment_cache_max_bytes,
         retention,
     })
 }
@@ -741,6 +754,9 @@ mod tests {
             config.repository,
             RepositoryConfig {
                 payload_segment_size: 512,
+                adaptive_payload_segment_size: true,
+                decrypted_segment_cache_max_bytes:
+                    rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
                 retention: None,
             }
         );
@@ -804,8 +820,23 @@ mod tests {
             config.map(|config| config.repository),
             Ok(RepositoryConfig {
                 payload_segment_size: 65536,
+                adaptive_payload_segment_size: false,
+                decrypted_segment_cache_max_bytes:
+                    rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
                 retention: None,
             })
+        );
+    }
+
+    #[test]
+    fn parses_decrypted_segment_cache_size() {
+        let source = minimal_source().with("RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES", "0");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert_eq!(
+            config.map(|config| config.repository.decrypted_segment_cache_max_bytes),
+            Ok(0)
         );
     }
 

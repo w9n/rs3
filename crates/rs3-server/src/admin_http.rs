@@ -394,6 +394,9 @@ mod tests {
             },
             repository: RepositoryConfig {
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+                adaptive_payload_segment_size: true,
+                decrypted_segment_cache_max_bytes:
+                    rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
                 retention: None,
             },
             repository_keys: RepositoryKeysConfig {

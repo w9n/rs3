@@ -37,6 +37,14 @@ real Kopia repository create/snapshot/restore smoke test:
 cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway
 ```
 
+Use `--mode provided` with `RS3_TEST_S3_BUCKET`, `RS3_TEST_S3_ENDPOINT_URL`,
+`RS3_TEST_S3_REGION`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` to run
+the same Kopia backup/restore through the gateway against an existing
+S3-compatible backend. Use a fresh `--backend-prefix` for each live run. For an
+Object Lock bucket, set `RS3_REPOSITORY_RETENTION_MODE=governance` and
+`RS3_REPOSITORY_RETENTION_DAYS=1` so the run exercises retained repository
+writes.
+
 Set `RS3_TEST_KOPIA_BIN` or pass `--kopia-bin` when the executable is not named
 `kopia`.
 

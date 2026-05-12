@@ -68,6 +68,21 @@ Payload authentication fails if a backend tampers with ciphertext, changes the
 segment context, or moves encrypted segment bytes under a different backend
 object ID.
 
+Segment size is recorded in each payload header and authenticated as segment
+associated data. The default writer chooses the segment size per object: small
+objects keep 512 B segments, medium objects use 8 KiB, and larger objects use
+64 KiB. This changes overhead and read granularity without changing the
+repository format because readers trust the authenticated header, not a global
+setting.
+
+The gateway may cache decrypted payload segments in memory. The default limit is
+256 MiB and can be disabled with
+`RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES=0`. The cache key uses the backend object
+ID, provider version ID when present, and segment index; it does not use
+client-visible paths. The cache is process-local acceleration only: checkpoint
+verification, AEAD authentication, and exact-version restore rules are
+unchanged.
+
 ## Metadata
 
 Manifest and index metadata are sealed with AES-256-GCM-SIV. The metadata nonce

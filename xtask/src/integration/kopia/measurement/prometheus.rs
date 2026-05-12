@@ -73,6 +73,8 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
     let mut repository_returned_bytes_by_range = BTreeMap::new();
     let mut repository_payload_span_cache_events_by_result = BTreeMap::new();
     let mut repository_payload_span_cache_bytes_by_result = BTreeMap::new();
+    let mut repository_decrypted_segment_cache_events_by_result = BTreeMap::new();
+    let mut repository_decrypted_segment_cache_bytes_by_result = BTreeMap::new();
     let mut repository_list_lookup_tokens_by_prefix_mode = BTreeMap::new();
     let mut repository_list_candidates_by_prefix_mode = BTreeMap::new();
     let mut repository_list_manifest_misses_by_prefix_mode = BTreeMap::new();
@@ -233,6 +235,20 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
                     delta,
                 );
             }
+            "rs3_repository_decrypted_segment_cache_events_total" => {
+                bump_f64_label(
+                    &mut repository_decrypted_segment_cache_events_by_result,
+                    sample.label("result"),
+                    delta,
+                );
+            }
+            "rs3_repository_decrypted_segment_cache_bytes_total" => {
+                bump_f64_label(
+                    &mut repository_decrypted_segment_cache_bytes_by_result,
+                    sample.label("result"),
+                    delta,
+                );
+            }
             "rs3_repository_list_lookup_tokens_total" => {
                 bump_f64_label(
                     &mut repository_list_lookup_tokens_by_prefix_mode,
@@ -387,6 +403,8 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
             "returned_bytes_by_range": repository_returned_bytes_by_range,
             "payload_span_cache_events_by_result": repository_payload_span_cache_events_by_result,
             "payload_span_cache_bytes_by_result": repository_payload_span_cache_bytes_by_result,
+            "decrypted_segment_cache_events_by_result": repository_decrypted_segment_cache_events_by_result,
+            "decrypted_segment_cache_bytes_by_result": repository_decrypted_segment_cache_bytes_by_result,
             "list_lookup_tokens_by_prefix_mode": repository_list_lookup_tokens_by_prefix_mode,
             "list_candidates_by_prefix_mode": repository_list_candidates_by_prefix_mode,
             "list_manifest_misses_by_prefix_mode": repository_list_manifest_misses_by_prefix_mode,
@@ -685,6 +703,10 @@ rs3_repository_payload_span_cache_events_total{result="miss"} 2
 rs3_repository_payload_span_cache_events_total{result="hit"} 3
 rs3_repository_payload_span_cache_bytes_total{result="miss"} 1056
 rs3_repository_payload_span_cache_bytes_total{result="hit"} 1584
+rs3_repository_decrypted_segment_cache_events_total{result="miss"} 1
+rs3_repository_decrypted_segment_cache_events_total{result="hit"} 2
+rs3_repository_decrypted_segment_cache_bytes_total{result="miss"} 512
+rs3_repository_decrypted_segment_cache_bytes_total{result="hit"} 1024
 rs3_repository_list_lookup_tokens_total{prefix_mode="delimiter",result="ok"} 3
 rs3_repository_list_candidates_total{prefix_mode="delimiter",result="ok"} 12
 rs3_repository_list_manifest_misses_total{prefix_mode="delimiter",result="ok"} 1
@@ -803,6 +825,22 @@ rs3_repository_commit_put_phase_duration_seconds_sum{phase="stage_lock_wait"} 0.
         assert_eq!(
             metrics["repository"]["payload_span_cache_bytes_by_result"]["hit"],
             1584.0
+        );
+        assert_eq!(
+            metrics["repository"]["decrypted_segment_cache_events_by_result"]["miss"],
+            1.0
+        );
+        assert_eq!(
+            metrics["repository"]["decrypted_segment_cache_events_by_result"]["hit"],
+            2.0
+        );
+        assert_eq!(
+            metrics["repository"]["decrypted_segment_cache_bytes_by_result"]["hit"],
+            1024.0
+        );
+        assert_eq!(
+            metrics["repository"]["decrypted_segment_cache_bytes_by_result"]["miss"],
+            512.0
         );
         assert_eq!(
             metrics["repository"]["list_lookup_tokens_by_prefix_mode"]["delimiter"],

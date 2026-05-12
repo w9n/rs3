@@ -21,9 +21,11 @@ Run the larger restore matrix with the release gateway profile:
 cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix \
   --runs 3 \
   --profile-set larger-restores \
-  --gateway-build-profile release \
-  --payload-segment-size 512
+  --gateway-build-profile release
 ```
+
+Add `--payload-segment-size 512` only when comparing against the historical
+fixed-segment lane.
 
 The current larger profiles are:
 
@@ -44,9 +46,10 @@ The command prints a compact table by default; pass
 
 ## Current Release Matrix
 
-Run date: 2026-05-09. Gateway profile: release. Workload set:
-`larger-restores`. Each row is the average of three direct/gateway run pairs.
-The direct baseline is the straight RustFS measurement proxy.
+Run date: 2026-05-09. Gateway profile: release. Payload segment lane: fixed
+512 B. Workload set: `larger-restores`. Each row is the average of three
+direct/gateway run pairs. The direct baseline is the straight RustFS
+measurement proxy.
 
 Artifact:
 `.local/integration/`.
@@ -123,16 +126,18 @@ measured local setup. Tiny-file restore profiles are more sensitive to payload
 segment size because Kopia can issue many small ranged reads whose response
 bodies are only a few dozen or hundred bytes each.
 
-For tiny ranged restores, smaller segments reduce read-byte amplification while
-larger segments reduce backend request count. The current Kopia/Velero preview
-candidate is 512 bytes because it keeps byte amplification low in the edge case
-while larger restore profiles stay close to baseline.
+The current writer default is adaptive: small objects keep 512 B segments,
+medium objects use 8 KiB segments, and larger objects use 64 KiB segments. The
+historical fixed-size matrix below still explains the byte/request tradeoff, but
+external performance claims should wait for a refreshed adaptive matrix with the
+decrypted segment cache enabled.
 
-## Segment-Size Finding
+## Historical Segment-Size Finding
 
 The `many-small-files` profile is the current edge case because Kopia issued
 hundreds of small ranged reads while receiving only about 56 KiB of total S3
-response body. Segment size strongly affects read-byte amplification there:
+response body. Fixed segment size strongly affected read-byte amplification
+there:
 
 | Segment Size | Gateway Read Ratio | Request Ratio | Write Ratio |
 | --- | ---: | ---: | ---: |
@@ -160,7 +165,6 @@ cargo run -p xtask --bin xtask --features containers -- integration kopia-measur
   --runs 1 \
   --workload-profile small-smoke \
   --gateway-build-profile release \
-  --payload-segment-size 512 \
   --enforce-regression-budgets
 ```
 
@@ -171,8 +175,8 @@ because local container and host load can dominate.
 
 ## Next Measurements
 
-- Refresh the three-run larger restore release matrix after security and
-  restore-verification changes settle.
+- Refresh the three-run larger restore release matrix with the current adaptive
+  writer default and decrypted segment cache enabled.
 - Keep run order alternating between direct and gateway lanes.
 - Keep measuring variability with at least three runs for release claims.
 - Reduce commit stage-lock and checkpoint-wait time without allowing

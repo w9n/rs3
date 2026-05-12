@@ -105,6 +105,10 @@ pub struct AdminAnchorSummary {
 pub struct AdminRepositorySummary {
     /// Plaintext payload segment size in bytes.
     pub payload_segment_size_bytes: usize,
+    /// Whether payload segment size is adapted upward for medium and large objects.
+    pub adaptive_payload_segment_size: bool,
+    /// Maximum plaintext bytes retained in the decrypted segment LRU cache.
+    pub decrypted_segment_cache_max_bytes: u64,
     /// Maximum staged writes covered by one checkpoint batch.
     pub commit_max_batch_items: usize,
     /// Maximum commit batch delay in milliseconds.
@@ -220,6 +224,8 @@ pub async fn admin_status_report(
         },
         repository: AdminRepositorySummary {
             payload_segment_size_bytes: config.repository.payload_segment_size,
+            adaptive_payload_segment_size: config.repository.adaptive_payload_segment_size,
+            decrypted_segment_cache_max_bytes: config.repository.decrypted_segment_cache_max_bytes,
             commit_max_batch_items: config.batching.max_items,
             commit_max_batch_delay_ms: config.batching.max_delay.as_millis(),
             commit_max_pending_items: config.batching.max_pending_items,
@@ -398,6 +404,11 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
     let batch_max_delay_ms = config.batching.max_delay.as_millis().to_string();
     let batch_max_pending_items = config.batching.max_pending_items.to_string();
     let payload_segment_size = config.repository.payload_segment_size.to_string();
+    let adaptive_payload_segment_size = config.repository.adaptive_payload_segment_size.to_string();
+    let decrypted_segment_cache_max_bytes = config
+        .repository
+        .decrypted_segment_cache_max_bytes
+        .to_string();
     let retention_mode = retention_mode(config).to_owned();
     let retention_days = config
         .repository
@@ -415,6 +426,8 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
         batch_max_delay_ms.as_bytes(),
         batch_max_pending_items.as_bytes(),
         payload_segment_size.as_bytes(),
+        adaptive_payload_segment_size.as_bytes(),
+        decrypted_segment_cache_max_bytes.as_bytes(),
         retention_mode.as_bytes(),
         retention_days.as_bytes(),
         static_credentials.as_bytes(),
@@ -466,6 +479,9 @@ mod tests {
             },
             repository: RepositoryConfig {
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+                adaptive_payload_segment_size: true,
+                decrypted_segment_cache_max_bytes:
+                    rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
                 retention: Some(RetentionPolicy {
                     mode: RetentionMode::Compliance,
                     retain_days: 30,

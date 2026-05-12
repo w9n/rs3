@@ -47,11 +47,17 @@ Repository metrics cover:
 - operation counts by repository operation
 - plaintext bytes by operation
 - backend bytes read and written by operation
-- range mode, returned bytes, and payload span cache behavior
+- range mode, returned bytes, payload span cache behavior, and decrypted
+  segment cache behavior
 - list selectivity, candidate counts, and prefix misses
 - commit queue, batch publish, batch size, waiter, and phase durations
 
 The labels describe behavior without exposing logical names.
+
+Cache counters use `result` labels such as `hit`, `miss`, `insert`, `evict`,
+and `skip_too_large`. Payload span cache byte counters describe ciphertext span
+bytes. Decrypted segment cache byte counters describe plaintext segment bytes
+retained or served from the process-local cache.
 
 ## Storage Provider Metrics
 

@@ -133,6 +133,8 @@ async fn rotate_key(
         loaded.keyring.clone(),
         RepositoryOptions {
             payload_segment_size: config.repository.payload_segment_size,
+            adaptive_payload_segment_size: config.repository.adaptive_payload_segment_size,
+            decrypted_segment_cache_max_bytes: config.repository.decrypted_segment_cache_max_bytes,
             default_retention: config.repository.retention,
         },
     );
@@ -271,6 +273,10 @@ mod tests {
             initial_keyring,
             RepositoryOptions {
                 payload_segment_size: config.repository.payload_segment_size,
+                adaptive_payload_segment_size: config.repository.adaptive_payload_segment_size,
+                decrypted_segment_cache_max_bytes: config
+                    .repository
+                    .decrypted_segment_cache_max_bytes,
                 default_retention: config.repository.retention,
             },
         );

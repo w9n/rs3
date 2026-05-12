@@ -932,6 +932,9 @@ where
         keyring()?,
         RepositoryOptions {
             payload_segment_size: args.payload_segment_size,
+            adaptive_payload_segment_size: false,
+            decrypted_segment_cache_max_bytes:
+                rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
             default_retention: None,
         },
     ))

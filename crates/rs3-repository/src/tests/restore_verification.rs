@@ -55,6 +55,8 @@ async fn verify_restore_reports_retention_protection_summary() {
         signing_keyring(),
         RepositoryOptions {
             payload_segment_size: crate::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+            adaptive_payload_segment_size: true,
+            decrypted_segment_cache_max_bytes: crate::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
             default_retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
         },
     );
@@ -262,6 +264,8 @@ async fn retained_write_requires_provider_version_id() {
         signing_keyring(),
         RepositoryOptions {
             payload_segment_size: crate::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+            adaptive_payload_segment_size: true,
+            decrypted_segment_cache_max_bytes: crate::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
             default_retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
         },
     );

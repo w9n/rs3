@@ -302,13 +302,8 @@ impl S3 for GatewayS3Service {
             let key = logical_path(input.key)?;
             let metadata = self.repository.head(&key).map_err(repository_error)?;
             let resolved_range = resolve_range(input.range, metadata.content_len)?;
-            let repository_range = resolved_range
-                .as_ref()
-                .map(|range| ByteRange::Slice {
-                    offset: range.start,
-                    len: range.end - range.start,
-                })
-                .unwrap_or(ByteRange::Full);
+            let repository_range =
+                repository_read_range(resolved_range.as_ref(), metadata.content_len);
             let body = self
                 .repository
                 .get_range(&key, repository_range)
@@ -631,6 +626,17 @@ fn record_s3_request_metrics(
     .record(elapsed.as_secs_f64());
 }
 
+fn repository_read_range(range: Option<&std::ops::Range<u64>>, content_len: u64) -> ByteRange {
+    match range {
+        Some(range) if range.start == 0 && range.end == content_len => ByteRange::Full,
+        Some(range) => ByteRange::Slice {
+            offset: range.start,
+            len: range.end - range.start,
+        },
+        None => ByteRange::Full,
+    }
+}
+
 fn record_s3_request_body_bytes(operation: &'static str, len: usize) {
     metrics::counter!(
         "rs3_s3_request_body_bytes_total",
@@ -881,6 +887,48 @@ mod tests {
             .await
             .expect_err("deleted object should not be visible through HeadObject");
         assert_eq!(*missing.code(), s3s::S3ErrorCode::NoSuchKey);
+    }
+
+    #[tokio::test]
+    async fn full_covering_range_reads_repository_payload_as_full_object() {
+        let service = gateway_service().await;
+        let body = Bytes::from(vec![42_u8; 1024]);
+        service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/full-range.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(body.clone()))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let store = service
+            .repository
+            .memory_store()
+            .unwrap_or_else(|| panic!("missing memory store"));
+        store
+            .reset_operation_counts()
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let get = service
+            .get_object(s3_request(GetObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/full-range.bin".to_owned(),
+                range: Some(s3s::dto::Range::Int {
+                    first: 0,
+                    last: Some(1023),
+                }),
+                ..GetObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let counts = store
+            .operation_counts()
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(get.status, Some(http::StatusCode::PARTIAL_CONTENT));
+        assert_eq!(response_body(get).await, body);
+        assert_eq!(counts.get, 1);
     }
 
     #[tokio::test]

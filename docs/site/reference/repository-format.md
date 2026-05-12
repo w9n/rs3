@@ -40,9 +40,10 @@ reads can fetch only the overlapping backend segments. Segment associated data
 binds ciphertext to the backend object ID, segment size, plaintext length,
 segment index, and final-segment marker.
 
-The current default segment size is 512 plaintext bytes for Kopia and Velero
-with Kopia-uploader restore behavior. This is a tuning parameter, not a
-permanent format guarantee.
+Segment size is recorded per payload object. The current writer default keeps
+small objects at 512 plaintext bytes per segment and uses larger segments for
+medium and large objects. This is a tuning policy, not a permanent format
+guarantee.
 
 ## Index State
 

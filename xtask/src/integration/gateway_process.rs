@@ -22,6 +22,26 @@ const KEYRING_WRAPPING_KEY_ID: &str = "wrap-integration";
 pub(crate) const REPOSITORY_SALT_HEX: &str =
     "2222222222222222222222222222222222222222222222222222222222222222";
 
+pub(crate) struct GatewayBackend {
+    pub(crate) endpoint_url: String,
+    pub(crate) bucket: String,
+    pub(crate) region: String,
+    pub(crate) access_key_id: String,
+    pub(crate) secret_access_key: String,
+}
+
+impl GatewayBackend {
+    pub(crate) fn from_container(backend: &RunningS3Container) -> Self {
+        Self {
+            endpoint_url: backend.endpoint_url.clone(),
+            bucket: backend.bucket.clone(),
+            region: backend.region.clone(),
+            access_key_id: backend.access_key_id.clone(),
+            secret_access_key: backend.secret_access_key.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub(crate) enum GatewayBuildProfile {
     Dev,
@@ -71,6 +91,14 @@ impl RunningGateway {
         backend: &RunningS3Container,
         backend_prefix: String,
     ) -> Result<Self> {
+        let backend = GatewayBackend::from_container(backend);
+        Self::start_for_backend(&backend, backend_prefix).await
+    }
+
+    pub(crate) async fn start_for_backend(
+        backend: &GatewayBackend,
+        backend_prefix: String,
+    ) -> Result<Self> {
         Self::start_inner(
             backend,
             backend_prefix,
@@ -86,11 +114,12 @@ impl RunningGateway {
         rust_log: &str,
         options: GatewayProcessOptions,
     ) -> Result<Self> {
-        Self::start_inner(backend, backend_prefix, Some(rust_log), options).await
+        let backend = GatewayBackend::from_container(backend);
+        Self::start_inner(&backend, backend_prefix, Some(rust_log), options).await
     }
 
     async fn start_inner(
-        backend: &RunningS3Container,
+        backend: &GatewayBackend,
         backend_prefix: String,
         rust_log: Option<&str>,
         options: GatewayProcessOptions,

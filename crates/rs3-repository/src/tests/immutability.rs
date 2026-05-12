@@ -79,6 +79,8 @@ async fn default_retention_applies_to_payload_and_checkpoint() {
         signing_keyring(),
         crate::RepositoryOptions {
             payload_segment_size: crate::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+            adaptive_payload_segment_size: true,
+            decrypted_segment_cache_max_bytes: crate::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
             default_retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
         },
     );

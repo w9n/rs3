@@ -584,6 +584,7 @@ fn log_runtime_config(config: &RuntimeConfig) {
         batch_max_delay_ms = config.batching.max_delay.as_millis(),
         batch_max_pending_items = config.batching.max_pending_items,
         payload_segment_size = config.repository.payload_segment_size,
+        adaptive_payload_segment_size = config.repository.adaptive_payload_segment_size,
         repository_retention_mode,
         repository_retention_days,
         static_credentials = config.static_credentials.is_some(),
@@ -646,6 +647,9 @@ mod tests {
             },
             repository: RepositoryConfig {
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+                adaptive_payload_segment_size: true,
+                decrypted_segment_cache_max_bytes:
+                    rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
                 retention: None,
             },
             repository_keys: RepositoryKeysConfig {

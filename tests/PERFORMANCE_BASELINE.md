@@ -22,6 +22,9 @@ cargo run -p xtask --bin xtask --features containers -- integration kopia-measur
   --payload-segment-size 512
 ```
 
+This command forces the historical fixed 512 B segment lane. Omit
+`--payload-segment-size` to measure the current adaptive writer default.
+
 The harness compares two paths against a disposable local RustFS container:
 
 - direct: Kopia talks to RustFS through the integration storage proxy,
@@ -62,10 +65,16 @@ Repository metrics also include
 misses, inserts, evictions, skipped inserts, and bytes without exposing object
 keys.
 
+Newer artifacts also include
+`prometheus_metrics.repository.decrypted_segment_cache_events_by_result` and
+`decrypted_segment_cache_bytes_by_result`, which show process-local decrypted
+segment cache behavior without exposing logical paths or backend object IDs.
+
 The matrix comparison block includes derived gateway-internal cost ratios such
 as backend read bytes per returned GET byte, backend write bytes per PUT request
-byte, and payload span cache hit ratios. These fields are intended to make
-restore regressions explainable from one summary artifact.
+byte, payload span cache hit ratios, and decrypted segment cache hit ratios.
+These fields are intended to make restore regressions explainable from one
+summary artifact.
 
 The matrix command also writes `regression_budgets`. Passing
 `--enforce-regression-budgets` turns those built-in byte/request budget checks
@@ -74,7 +83,8 @@ which is too environment-sensitive for a hard gate in this local harness.
 
 ## Current Results
 
-Run date: 2026-05-03. Each row is the average of three direct/gateway run pairs.
+Run date: 2026-05-03. Payload segment lane: fixed 512 B. Each row is the
+average of three direct/gateway run pairs.
 
 | Profile | Artifact | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend writes | Backend reads |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -96,7 +106,7 @@ metadata, checkpoint, and envelope costs show up more strongly.
 
 Backend read-byte amplification is close to baseline for the small, changed,
 and medium profiles. The many-small-files profile remains the current edge case,
-but the 512 B segment lane now reads 1.72x backend bytes instead of 4.54x
+but the fixed 512 B segment lane now reads 1.72x backend bytes instead of 4.54x
 because repeated tiny client ranges are served from cached ciphertext spans.
 
 Wall-clock results are favorable for the gateway in this local setup, but they
@@ -105,8 +115,9 @@ signal for this harness, not as a general cloud-provider result.
 
 ## Larger Restore Matrix
 
-Run date: 2026-05-09. Workload set: `larger-restores`. Each row is the
-average of three direct/gateway run pairs. Per-profile values come from
+Run date: 2026-05-09. Payload segment lane: fixed 512 B. Workload set:
+`larger-restores`. Each row is the average of three direct/gateway run pairs.
+Per-profile values come from
 `summary.json.profiles`; the top-level aggregate intentionally mixes profiles
 and should only be used as a smoke signal for the whole set.
 
@@ -192,7 +203,8 @@ Validation artifact:
 `.local/integration/`.
 
 The current built-in budgets check backend request, read-byte, and write-byte
-ratios for the small and larger profiles. The 512 B `many-small-files` lane also
+ratios for the small and larger profiles. The fixed 512 B `many-small-files`
+lane also
 checks that read bytes stay below 2.00x, write bytes below 2.25x, requests below
 0.50x, and payload span cache event hit ratio above 0.70. Elapsed ratios remain
 reported but are not enforced.
@@ -201,8 +213,8 @@ reported but are not enforced.
 
 Run date: 2026-05-03. Workload: `many-small-files`, because it is the current
 restore-heavy Kopia profile with many small ranged reads. Each row is the
-average of three direct/gateway run pairs. The direct RustFS baseline is the
-same straight proxy lane for every row.
+average of three direct/gateway run pairs with a fixed segment size. The direct
+RustFS baseline is the same straight proxy lane for every row.
 
 Command shape:
 
@@ -228,8 +240,8 @@ cargo run -p xtask --bin xtask --features containers -- integration kopia-measur
 Interpretation:
 
 - Segment size still affects backend read bytes for tiny ranged restores, but
-  the ciphertext span cache makes it a much smaller effect. The 512 B lane now
-  reads 1.72x the direct baseline, and the 256 KiB lane reads 5.44x.
+  the ciphertext span cache makes it a much smaller effect. The fixed 512 B lane
+  now reads 1.72x the direct baseline, and the 256 KiB lane reads 5.44x.
 - The ratio is large because the denominator is small. The profile restores 512
   tiny files; Kopia issued 514 successful ranged GETs but received only about
   56 KB of total S3 response body. At 2 KiB segments each roughly 110-byte
@@ -244,12 +256,12 @@ Interpretation:
 - Wall-clock remains a weak ranking signal here. The local gateway lane is
   faster than direct RustFS through the proxy for all rows, which should be
   treated as a harness/backend observation rather than a provider claim.
-- The repeated 512 B larger restore matrix read and wrote about 1.03x to 1.05x
-  backend bytes versus direct RustFS. Keep 512 B as the current Kopia-first
-  default candidate, while treating 1 KiB to 4 KiB as plausible request-count
-  tradeoffs if cloud request cost dominates byte cost. Keep tracking larger
-  Postgres-shaped restore elapsed time because large PUT tail latency is still
-  visible in the local gateway path.
+- The repeated fixed 512 B larger restore matrix read and wrote about 1.03x to
+  1.05x backend bytes versus direct RustFS. The current writer default is now
+  adaptive, so refresh this matrix before treating these historical numbers as
+  current performance evidence. Keep tracking larger Postgres-shaped restore
+  elapsed time because large PUT tail latency is still visible in the local
+  gateway path.
 
 ## Lightweight Gateway Perf Smoke
 

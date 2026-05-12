@@ -77,6 +77,11 @@ from latest-state authority:
 Provider retention and Object Lock are useful for preventing deletion of object
 versions. They do not replace checkpoint signatures or external anchors.
 
+Payload segment size is per object. The default writer keeps small objects at
+512 B segments and raises medium and large objects to larger authenticated
+segments to reduce AEAD overhead. Reads still follow the authenticated payload
+header, so this is a writer policy, not a repository-format change.
+
 ## S3 Compatibility
 
 The first gateway surface focuses on the operations backup clients need:

@@ -1,4 +1,5 @@
 use super::*;
+use crate::payload::parse_segmented_payload_header;
 
 #[tokio::test]
 async fn backend_payload_does_not_store_plaintext() {
@@ -29,6 +30,26 @@ async fn backend_payload_does_not_store_plaintext() {
     assert_eq!(must(repository_body), plaintext);
     assert_eq!(must(head).content_len, 29);
     assert!(payload.content_len > 29);
+}
+
+#[tokio::test]
+async fn default_payload_chunks_scale_with_object_size() {
+    assert_eq!(stored_payload_chunk_size(7 * 1024).await, 512);
+    assert_eq!(stored_payload_chunk_size(64 * 1024).await, 8 * 1024);
+    assert_eq!(stored_payload_chunk_size(512 * 1024).await, 64 * 1024);
+}
+
+#[tokio::test]
+async fn fixed_payload_segment_size_disables_adaptive_chunking() {
+    let store = MemoryBlobStore::new();
+    let repo = repository_with_payload_segment_size(store.clone(), 4 * 1024);
+    let key = key("p/12/fixed-chunk-size");
+    let body = Bytes::from(vec![3_u8; 512 * 1024]);
+
+    let put = repo.put(key, body, RepositoryPutOptions::default()).await;
+    assert!(put.is_ok());
+
+    assert_eq!(only_payload_chunk_size(&store).await, 4 * 1024);
 }
 
 #[tokio::test]
@@ -76,6 +97,29 @@ async fn tampered_backend_payload_fails_repository_read() {
     let read = repo.get_range(&client_key, ByteRange::Full).await;
 
     assert!(matches!(read, Err(RepositoryError::Crypto(_))));
+}
+
+async fn stored_payload_chunk_size(object_size: usize) -> u64 {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
+    let key = key(&format!("p/12/adaptive-chunk-size-{object_size}"));
+    let body = Bytes::from(vec![5_u8; object_size]);
+
+    let put = repo.put(key, body, RepositoryPutOptions::default()).await;
+    assert!(put.is_ok());
+
+    only_payload_chunk_size(&store).await
+}
+
+async fn only_payload_chunk_size(store: &MemoryBlobStore) -> u64 {
+    let payload = must_storage(store.list_prefix("segments/").await)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("missing payload object"));
+    let backend_body = must_storage(store.get_range(&payload.object_id, ByteRange::Full).await);
+    parse_segmented_payload_header(&payload.object_id, &backend_body)
+        .unwrap_or_else(|error| panic!("{error}"))
+        .chunk_size
 }
 
 #[tokio::test]
@@ -154,9 +198,10 @@ async fn repeated_large_range_gets_reuse_payload_header() {
 }
 
 #[tokio::test]
-async fn repeated_same_segment_range_gets_reuse_ciphertext_span() {
+async fn repeated_same_segment_range_gets_reuse_decrypted_segment() {
     let store = MemoryBlobStore::new();
-    let repo = Repository::with_keyring(store.clone(), signing_keyring());
+    let repo =
+        repository_with_payload_segment_size(store.clone(), crate::DEFAULT_PAYLOAD_SEGMENT_SIZE);
     let key = key("p/12/repeated-same-segment-range");
     let body = Bytes::from(vec![37_u8; 1024 * 1024]);
 

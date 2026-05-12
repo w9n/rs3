@@ -12,9 +12,11 @@ use crate::namespace::{
 };
 use crate::payload::{
     DEFAULT_PAYLOAD_SEGMENT_SIZE, PAYLOAD_HEADER_PROBE_LEN, PayloadHeaderProbe,
-    SegmentCiphertextSpan, SegmentedPayloadHeader, open_payload_object,
-    open_segmented_payload_span, parse_segmented_payload_header, probe_payload_header,
-    seal_payload_object, segmented_ciphertext_span,
+    SegmentCiphertextSpan, SegmentPlaintextSelection, SegmentedPayloadHeader,
+    adaptive_payload_segment_size, open_payload_object, open_segmented_payload_cached_segments,
+    open_segmented_payload_span_with_segments, parse_segmented_payload_header,
+    probe_payload_header, seal_payload_object, segmented_ciphertext_span,
+    segmented_plaintext_segment_len, segmented_plaintext_selection,
 };
 use crate::state::{RepositoryState, TrustedManifest, next_sequence, object_material};
 use bytes::Bytes;
@@ -30,6 +32,9 @@ use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Default maximum plaintext bytes retained in the decrypted segment LRU cache.
+pub const DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Trusted repository service.
 pub struct Repository<S> {
     pub(crate) store: S,
@@ -39,6 +44,7 @@ pub struct Repository<S> {
     pub(crate) options: RepositoryOptions,
     payload_headers: RwLock<PayloadHeaderCache>,
     payload_spans: RwLock<PayloadSpanCache>,
+    decrypted_segments: RwLock<DecryptedSegmentCache>,
 }
 
 /// Repository runtime options.
@@ -46,6 +52,12 @@ pub struct Repository<S> {
 pub struct RepositoryOptions {
     /// Plaintext bytes per independently encrypted payload segment.
     pub payload_segment_size: usize,
+    /// Adapt payload segment size upward for medium and large objects.
+    pub adaptive_payload_segment_size: bool,
+    /// Maximum plaintext bytes retained in the decrypted segment LRU cache.
+    ///
+    /// Set to zero to disable decrypted segment caching.
+    pub decrypted_segment_cache_max_bytes: u64,
     /// Default provider retention policy for repository-owned objects.
     pub default_retention: Option<RetentionPolicy>,
 }
@@ -54,6 +66,8 @@ impl Default for RepositoryOptions {
     fn default() -> Self {
         Self {
             payload_segment_size: DEFAULT_PAYLOAD_SEGMENT_SIZE,
+            adaptive_payload_segment_size: true,
+            decrypted_segment_cache_max_bytes: DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
             default_retention: None,
         }
     }
@@ -82,6 +96,9 @@ where
             options,
             payload_headers: RwLock::new(PayloadHeaderCache::default()),
             payload_spans: RwLock::new(PayloadSpanCache::default()),
+            decrypted_segments: RwLock::new(DecryptedSegmentCache::with_max_bytes(
+                options.decrypted_segment_cache_max_bytes,
+            )),
         }
     }
 
@@ -150,12 +167,8 @@ where
             (sequence, object_id, manifest_id, stale_blind_keys)
         };
 
-        let payload = seal_payload_object(
-            &keyring,
-            &object_id,
-            &body,
-            self.options.payload_segment_size,
-        )?;
+        let payload_segment_size = self.payload_segment_size_for_object(body.len());
+        let payload = seal_payload_object(&keyring, &object_id, &body, payload_segment_size)?;
         let storage_metadata = self
             .store
             .put(
@@ -229,6 +242,14 @@ where
             elapsed: started.elapsed(),
         });
         Ok(manifest.into_metadata())
+    }
+
+    fn payload_segment_size_for_object(&self, plaintext_len: usize) -> usize {
+        if self.options.adaptive_payload_segment_size {
+            adaptive_payload_segment_size(plaintext_len, self.options.payload_segment_size)
+        } else {
+            self.options.payload_segment_size
+        }
     }
 
     /// Writes a client-visible object and publishes the covering checkpoint.
@@ -415,6 +436,32 @@ where
             },
         };
         let span = segmented_ciphertext_span(&header.header, range)?;
+        let selection = segmented_plaintext_selection(&header.header, range)?;
+        match self.cached_decrypted_segments(object_ref, &header.header, selection)? {
+            DecryptedSegmentLookup::Hit { segments, bytes } => {
+                record_decrypted_segment_cache_many(
+                    "hit",
+                    u64::try_from(segments.len()).unwrap_or(u64::MAX),
+                    bytes,
+                );
+                return Ok(PayloadRead {
+                    backend_bytes_read: header.backend_bytes_read,
+                    opened: open_segmented_payload_cached_segments(
+                        &object_ref.object_id,
+                        &header.header,
+                        range,
+                        selection.start_segment,
+                        &segments,
+                    ),
+                });
+            }
+            DecryptedSegmentLookup::Miss {
+                missing_segments,
+                missing_bytes,
+            } => {
+                record_decrypted_segment_cache_many("miss", missing_segments, missing_bytes);
+            }
+        }
         let span_read = self
             .read_ciphertext_span(object_ref, span, header.prefetched_body.as_ref())
             .await?;
@@ -424,15 +471,36 @@ where
 
         Ok(PayloadRead {
             backend_bytes_read,
-            opened: open_segmented_payload_span(
+            opened: self.open_and_cache_decrypted_segments(
                 keyring,
-                &object_ref.object_id,
+                object_ref,
                 &header.header,
                 range,
                 span,
                 span_read.ciphertext,
             ),
         })
+    }
+
+    fn open_and_cache_decrypted_segments(
+        &self,
+        keyring: &KeyRing,
+        object_ref: &BackendObjectRef,
+        header: &SegmentedPayloadHeader,
+        range: ByteRange,
+        span: SegmentCiphertextSpan,
+        ciphertext: Bytes,
+    ) -> Result<Bytes> {
+        let opened = open_segmented_payload_span_with_segments(
+            keyring,
+            &object_ref.object_id,
+            header,
+            range,
+            span,
+            ciphertext,
+        )?;
+        self.cache_decrypted_segments(object_ref, &opened.segments)?;
+        Ok(opened.plaintext)
     }
 
     async fn read_ciphertext_span(
@@ -657,6 +725,82 @@ where
             }
             PayloadSpanCacheInsert::SkippedTooLarge { bytes } => {
                 record_payload_span_cache("skip_too_large", bytes);
+            }
+        }
+        Ok(())
+    }
+
+    fn cached_decrypted_segments(
+        &self,
+        object_ref: &BackendObjectRef,
+        header: &SegmentedPayloadHeader,
+        selection: SegmentPlaintextSelection,
+    ) -> Result<DecryptedSegmentLookup> {
+        if selection.segment_count == 0 {
+            return Ok(DecryptedSegmentLookup::Hit {
+                segments: Vec::new(),
+                bytes: 0,
+            });
+        }
+
+        let mut cache = self
+            .decrypted_segments
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let mut segments = Vec::with_capacity(selection.segment_count);
+        let mut bytes = 0_u64;
+        let mut missing_segments = 0_u64;
+        let mut missing_bytes = 0_u64;
+        for relative_index in 0..selection.segment_count {
+            let Some(segment_index) = selection.start_segment.checked_add(relative_index) else {
+                return Err(StorageError::InvalidRange.into());
+            };
+            match cache.get(object_ref, segment_index) {
+                Some(segment) => {
+                    bytes = bytes.saturating_add(u64::try_from(segment.len()).unwrap_or(u64::MAX));
+                    segments.push(segment);
+                }
+                None => {
+                    missing_segments = missing_segments.saturating_add(1);
+                    missing_bytes = missing_bytes
+                        .saturating_add(segmented_plaintext_segment_len(header, segment_index)?);
+                }
+            }
+        }
+
+        if missing_segments == 0 {
+            Ok(DecryptedSegmentLookup::Hit { segments, bytes })
+        } else {
+            Ok(DecryptedSegmentLookup::Miss {
+                missing_segments,
+                missing_bytes,
+            })
+        }
+    }
+
+    fn cache_decrypted_segments(
+        &self,
+        object_ref: &BackendObjectRef,
+        segments: &[(usize, Bytes)],
+    ) -> Result<()> {
+        let mut cache = self
+            .decrypted_segments
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        for (segment_index, plaintext) in segments {
+            let outcome = cache.insert(object_ref.clone(), *segment_index, plaintext.clone());
+            match outcome {
+                DecryptedSegmentCacheInsert::Inserted {
+                    bytes,
+                    evicted_entries,
+                    evicted_bytes,
+                } => {
+                    record_decrypted_segment_cache("insert", bytes);
+                    record_decrypted_segment_cache_many("evict", evicted_entries, evicted_bytes);
+                }
+                DecryptedSegmentCacheInsert::SkippedTooLarge { bytes } => {
+                    record_decrypted_segment_cache("skip_too_large", bytes);
+                }
             }
         }
         Ok(())
@@ -1020,6 +1164,17 @@ struct CiphertextSpanRead {
     ciphertext: Bytes,
 }
 
+enum DecryptedSegmentLookup {
+    Hit {
+        segments: Vec<Bytes>,
+        bytes: u64,
+    },
+    Miss {
+        missing_segments: u64,
+        missing_bytes: u64,
+    },
+}
+
 enum PayloadHeaderRead {
     Header(CachedPayloadHeader),
     Full(PayloadRead),
@@ -1197,6 +1352,129 @@ enum PayloadSpanCacheInsert {
 
 #[derive(Default)]
 struct PayloadSpanCacheEviction {
+    entries: u64,
+    bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DecryptedSegmentCacheKey {
+    object: PayloadCacheObjectKey,
+    segment_index: usize,
+}
+
+impl DecryptedSegmentCacheKey {
+    fn new(object_ref: &BackendObjectRef, segment_index: usize) -> Self {
+        Self {
+            object: PayloadCacheObjectKey::from(object_ref),
+            segment_index,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DecryptedSegmentCache {
+    segments: BTreeMap<DecryptedSegmentCacheKey, Bytes>,
+    order: VecDeque<DecryptedSegmentCacheKey>,
+    max_entries: usize,
+    max_bytes: u64,
+    current_bytes: u64,
+}
+
+impl Default for DecryptedSegmentCache {
+    fn default() -> Self {
+        Self::with_max_bytes(DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES)
+    }
+}
+
+impl DecryptedSegmentCache {
+    fn with_max_bytes(max_bytes: u64) -> Self {
+        Self {
+            segments: BTreeMap::new(),
+            order: VecDeque::new(),
+            max_entries: 65_536,
+            max_bytes,
+            current_bytes: 0,
+        }
+    }
+
+    fn get(&mut self, object_ref: &BackendObjectRef, segment_index: usize) -> Option<Bytes> {
+        let key = DecryptedSegmentCacheKey::new(object_ref, segment_index);
+        let segment = self.segments.get(&key).cloned()?;
+        self.touch(&key);
+        Some(segment)
+    }
+
+    fn insert(
+        &mut self,
+        object_ref: BackendObjectRef,
+        segment_index: usize,
+        plaintext: Bytes,
+    ) -> DecryptedSegmentCacheInsert {
+        let bytes = u64::try_from(plaintext.len()).unwrap_or(u64::MAX);
+        if bytes > self.max_bytes {
+            return DecryptedSegmentCacheInsert::SkippedTooLarge { bytes };
+        }
+
+        let key = DecryptedSegmentCacheKey::new(&object_ref, segment_index);
+        match self.segments.entry(key.clone()) {
+            Entry::Occupied(mut entry) => {
+                let previous = u64::try_from(entry.get().len()).unwrap_or(u64::MAX);
+                self.current_bytes = self.current_bytes.saturating_sub(previous);
+                self.current_bytes = self.current_bytes.saturating_add(bytes);
+                entry.insert(plaintext);
+                self.touch(&key);
+            }
+            Entry::Vacant(entry) => {
+                self.current_bytes = self.current_bytes.saturating_add(bytes);
+                self.order.push_back(key);
+                entry.insert(plaintext);
+            }
+        }
+        let evicted = self.evict_over_limits();
+        DecryptedSegmentCacheInsert::Inserted {
+            bytes,
+            evicted_entries: evicted.entries,
+            evicted_bytes: evicted.bytes,
+        }
+    }
+
+    fn touch(&mut self, key: &DecryptedSegmentCacheKey) {
+        if let Some(position) = self.order.iter().position(|candidate| candidate == key) {
+            self.order.remove(position);
+        }
+        self.order.push_back(key.clone());
+    }
+
+    fn evict_over_limits(&mut self) -> DecryptedSegmentCacheEviction {
+        let mut evicted = DecryptedSegmentCacheEviction::default();
+        while self.segments.len() > self.max_entries || self.current_bytes > self.max_bytes {
+            let Some(evicted_key) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(plaintext) = self.segments.remove(&evicted_key) {
+                let bytes = u64::try_from(plaintext.len()).unwrap_or(u64::MAX);
+                self.current_bytes = self.current_bytes.saturating_sub(bytes);
+                evicted.entries = evicted.entries.saturating_add(1);
+                evicted.bytes = evicted.bytes.saturating_add(bytes);
+            }
+        }
+        evicted
+    }
+}
+
+enum DecryptedSegmentCacheInsert {
+    Inserted {
+        bytes: u64,
+        evicted_entries: u64,
+        evicted_bytes: u64,
+    },
+    SkippedTooLarge {
+        bytes: u64,
+    },
+}
+
+#[derive(Default)]
+struct DecryptedSegmentCacheEviction {
     entries: u64,
     bytes: u64,
 }
@@ -1411,6 +1689,26 @@ fn record_payload_span_cache_many(result: &'static str, events: u64, bytes: u64)
     .increment(bytes);
 }
 
+fn record_decrypted_segment_cache(result: &'static str, bytes: u64) {
+    record_decrypted_segment_cache_many(result, 1, bytes);
+}
+
+fn record_decrypted_segment_cache_many(result: &'static str, events: u64, bytes: u64) {
+    if events == 0 && bytes == 0 {
+        return;
+    }
+    metrics::counter!(
+        "rs3_repository_decrypted_segment_cache_events_total",
+        "result" => result,
+    )
+    .increment(events);
+    metrics::counter!(
+        "rs3_repository_decrypted_segment_cache_bytes_total",
+        "result" => result,
+    )
+    .increment(bytes);
+}
+
 fn increment_repository_counter(
     name: &'static str,
     label_name: &'static str,
@@ -1494,7 +1792,10 @@ fn current_time_ms() -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PayloadSpanCache, PayloadSpanCacheInsert, SegmentCiphertextSpan};
+    use super::{
+        DecryptedSegmentCache, DecryptedSegmentCacheInsert, PayloadSpanCache,
+        PayloadSpanCacheInsert, SegmentCiphertextSpan,
+    };
     use bytes::Bytes;
     use rs3_types::{BackendObjectId, BackendObjectRef};
     use std::collections::{BTreeMap, VecDeque};
@@ -1525,6 +1826,16 @@ mod tests {
         }
     }
 
+    fn decrypted_cache(max_entries: usize, max_bytes: u64) -> DecryptedSegmentCache {
+        DecryptedSegmentCache {
+            segments: BTreeMap::new(),
+            order: VecDeque::new(),
+            max_entries,
+            max_bytes,
+            current_bytes: 0,
+        }
+    }
+
     fn inserted(outcome: PayloadSpanCacheInsert) -> (u64, u64, u64) {
         match outcome {
             PayloadSpanCacheInsert::Inserted {
@@ -1534,6 +1845,19 @@ mod tests {
             } => (bytes, evicted_entries, evicted_bytes),
             PayloadSpanCacheInsert::SkippedTooLarge { bytes } => {
                 panic!("insert skipped unexpectedly with {bytes} bytes")
+            }
+        }
+    }
+
+    fn decrypted_inserted(outcome: DecryptedSegmentCacheInsert) -> (u64, u64, u64) {
+        match outcome {
+            DecryptedSegmentCacheInsert::Inserted {
+                bytes,
+                evicted_entries,
+                evicted_bytes,
+            } => (bytes, evicted_entries, evicted_bytes),
+            DecryptedSegmentCacheInsert::SkippedTooLarge { bytes } => {
+                panic!("decrypted segment insert skipped unexpectedly with {bytes} bytes")
             }
         }
     }
@@ -1569,5 +1893,53 @@ mod tests {
             Some(Bytes::from_static(b"bbbb"))
         );
         assert_eq!(cache.current_bytes, 4);
+    }
+
+    #[test]
+    fn decrypted_segment_cache_is_lru_and_version_aware() {
+        let mut cache = decrypted_cache(2, 1024);
+        let object = BackendObjectRef::from(object_id("payload-a"));
+        let other_version = BackendObjectRef {
+            object_id: object.object_id.clone(),
+            version_id: Some(
+                rs3_types::BackendVersionId::new("version-2")
+                    .unwrap_or_else(|error| panic!("{error}")),
+            ),
+        };
+
+        assert_eq!(
+            decrypted_inserted(cache.insert(object.clone(), 0, Bytes::from_static(b"aaaa"))),
+            (4, 0, 0)
+        );
+        assert_eq!(
+            decrypted_inserted(cache.insert(object.clone(), 1, Bytes::from_static(b"bbbb"))),
+            (4, 0, 0)
+        );
+        assert_eq!(cache.get(&object, 0), Some(Bytes::from_static(b"aaaa")));
+        assert_eq!(
+            decrypted_inserted(cache.insert(object.clone(), 2, Bytes::from_static(b"cccc"))),
+            (4, 1, 4)
+        );
+
+        assert_eq!(cache.get(&object, 0), Some(Bytes::from_static(b"aaaa")));
+        assert!(cache.get(&object, 1).is_none());
+        assert_eq!(cache.get(&object, 2), Some(Bytes::from_static(b"cccc")));
+        assert!(cache.get(&other_version, 0).is_none());
+        assert_eq!(cache.current_bytes, 8);
+    }
+
+    #[test]
+    fn decrypted_segment_cache_can_be_disabled() {
+        let mut cache = DecryptedSegmentCache::with_max_bytes(0);
+        let object = BackendObjectRef::from(object_id("payload-disabled"));
+
+        match cache.insert(object.clone(), 0, Bytes::from_static(b"aaaa")) {
+            DecryptedSegmentCacheInsert::SkippedTooLarge { bytes } => assert_eq!(bytes, 4),
+            DecryptedSegmentCacheInsert::Inserted { .. } => {
+                panic!("disabled decrypted segment cache inserted plaintext")
+            }
+        }
+        assert!(cache.get(&object, 0).is_none());
+        assert_eq!(cache.current_bytes, 0);
     }
 }

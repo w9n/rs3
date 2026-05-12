@@ -26,6 +26,8 @@ pub(crate) fn compare_runs(runs: &[Value]) -> Value {
     let mut backend_write_bytes_per_client_put_request_byte = Vec::new();
     let mut payload_span_cache_event_hit_ratio = Vec::new();
     let mut payload_span_cache_byte_hit_ratio = Vec::new();
+    let mut decrypted_segment_cache_event_hit_ratio = Vec::new();
+    let mut decrypted_segment_cache_byte_hit_ratio = Vec::new();
     let mut phase_elapsed_ms_ratio: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut commit_put_phase_avg_seconds: BTreeMap<String, Vec<f64>> = BTreeMap::new();
 
@@ -151,6 +153,48 @@ pub(crate) fn compare_runs(runs: &[Value]) -> Value {
                 ],
             ),
         );
+        push_share(
+            &mut decrypted_segment_cache_event_hit_ratio,
+            value_f64_at(
+                gateway,
+                &[
+                    "prometheus_metrics",
+                    "repository",
+                    "decrypted_segment_cache_events_by_result",
+                    "hit",
+                ],
+            ),
+            value_f64_at(
+                gateway,
+                &[
+                    "prometheus_metrics",
+                    "repository",
+                    "decrypted_segment_cache_events_by_result",
+                    "miss",
+                ],
+            ),
+        );
+        push_share(
+            &mut decrypted_segment_cache_byte_hit_ratio,
+            value_f64_at(
+                gateway,
+                &[
+                    "prometheus_metrics",
+                    "repository",
+                    "decrypted_segment_cache_bytes_by_result",
+                    "hit",
+                ],
+            ),
+            value_f64_at(
+                gateway,
+                &[
+                    "prometheus_metrics",
+                    "repository",
+                    "decrypted_segment_cache_bytes_by_result",
+                    "miss",
+                ],
+            ),
+        );
     }
 
     serde_json::json!({
@@ -170,6 +214,8 @@ pub(crate) fn compare_runs(runs: &[Value]) -> Value {
             "backend_write_bytes_per_client_put_request_byte": summarize_f64(&backend_write_bytes_per_client_put_request_byte),
             "payload_span_cache_event_hit_ratio": summarize_f64(&payload_span_cache_event_hit_ratio),
             "payload_span_cache_byte_hit_ratio": summarize_f64(&payload_span_cache_byte_hit_ratio),
+            "decrypted_segment_cache_event_hit_ratio": summarize_f64(&decrypted_segment_cache_event_hit_ratio),
+            "decrypted_segment_cache_byte_hit_ratio": summarize_f64(&decrypted_segment_cache_byte_hit_ratio),
             "commit_put_phase_avg_seconds": summarize_ratio_map(&commit_put_phase_avg_seconds),
         },
     })
@@ -418,6 +464,16 @@ fn aggregate_reports(reports: &[&Value]) -> Value {
                     "prometheus_metrics",
                     "repository",
                     "payload_span_cache_bytes_by_result",
+                ]),
+                "decrypted_segment_cache_events_by_result": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "decrypted_segment_cache_events_by_result",
+                ]),
+                "decrypted_segment_cache_bytes_by_result": aggregate_number_object(reports, &[
+                    "prometheus_metrics",
+                    "repository",
+                    "decrypted_segment_cache_bytes_by_result",
                 ]),
                 "list_lookup_tokens_by_prefix_mode": aggregate_number_object(reports, &[
                     "prometheus_metrics",
@@ -1008,6 +1064,14 @@ mod tests {
                                 "hit": 1200,
                                 "miss": 300
                             },
+                            "decrypted_segment_cache_events_by_result": {
+                                "hit": 2,
+                                "miss": 2
+                            },
+                            "decrypted_segment_cache_bytes_by_result": {
+                                "hit": 1024,
+                                "miss": 1024
+                            },
                             "commit": {
                                 "batch_waiters_per_publish_by_result": {
                                     "ok": {
@@ -1087,6 +1151,14 @@ mod tests {
         assert_eq!(
             comparison["gateway_internal"]["payload_span_cache_byte_hit_ratio"]["avg"],
             serde_json::json!(0.8)
+        );
+        assert_eq!(
+            comparison["gateway_internal"]["decrypted_segment_cache_event_hit_ratio"]["avg"],
+            serde_json::json!(0.5)
+        );
+        assert_eq!(
+            comparison["gateway_internal"]["decrypted_segment_cache_byte_hit_ratio"]["avg"],
+            serde_json::json!(0.5)
         );
         assert_eq!(
             comparison["gateway_internal"]["commit_put_phase_avg_seconds"]["stage_lock_wait"]["avg"],
@@ -1179,6 +1251,12 @@ mod tests {
                             },
                             "payload_span_cache_bytes_by_result": {
                                 "miss": 2048
+                            },
+                            "decrypted_segment_cache_events_by_result": {
+                                "miss": 4
+                            },
+                            "decrypted_segment_cache_bytes_by_result": {
+                                "miss": 2048
                             }
                         }
                     }
@@ -1194,6 +1272,14 @@ mod tests {
         );
         assert_eq!(
             comparison["gateway_internal"]["payload_span_cache_byte_hit_ratio"]["avg"],
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            comparison["gateway_internal"]["decrypted_segment_cache_event_hit_ratio"]["avg"],
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            comparison["gateway_internal"]["decrypted_segment_cache_byte_hit_ratio"]["avg"],
             serde_json::json!(0.0)
         );
     }
