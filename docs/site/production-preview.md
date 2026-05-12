@@ -50,7 +50,7 @@ the repository-state transition model.
 | Storage witness | Create-only checkpoint evidence under `evidence/` |
 | Backend | RustFS/local S3-compatible first, live S3-compatible checks opt-in |
 | Keys | Encrypted keyring envelope |
-| Gateway modes | `read-write` for backups, `restore-readonly` for incident restore |
+| Gateway modes | `read-write` for backups and routine restores, `restore-readonly` for incident restore |
 | Retention | Provider retention/Object Lock capability checked where configured |
 | External trust sources | external anchor/key-provider source, not a preview blocker |
 
@@ -85,6 +85,7 @@ newer one. The backend can still deny service by hiding required objects.
 | Lease missing but backend evidence exists | Do not silently trust storage. Require a trusted bundle or explicit bounded recovery that validates the highest observed valid checkpoint and enforces a maximum signed checkpoint age. |
 | Multiple gateways serve the same repository as `read-write` | Unsupported. Run one writer per repository; use `restore-readonly` for scaled restore readers. |
 | Gateway started as `restore-readonly` without an accepted anchor | Fail closed. Run explicit anchor recovery first, then serve restore traffic. |
+| Healthy Velero restore through the primary path | Run through the single `read-write` gateway so Velero restore-result artifacts are checkpointed and the restore can report `Completed`. |
 | Restore client attempts PUT, DELETE, or legal-hold mutation through `restore-readonly` | Reject the request instead of advancing repository state. |
 | Velero restore reports `PartiallyFailed` only because restore-result artifact uploads were denied by `restore-readonly` | Accept only after proving restored data, completed pod-volume restore, and zero backend writes during restore. Treat any other restore error as failure. |
 | Lease and backend are both compromised | Online protection is exhausted; recovery needs offline or externally protected authority. |
@@ -141,13 +142,13 @@ repository state reachable from it.
 
 ## Current Evidence
 
-Latest recorded local evidence:
+Latest focused local evidence:
 
 | Evidence | Result |
 | --- | --- |
-| `just preview-gate-release` | Passed on 2026-05-09. |
-| Velero dynamic-PVC gateway-restart with `restore-readonly` | Passed; artifact `.local/integration/`. |
-| Velero/Postgres compatibility smoke | Passed; artifact `.local/integration/`. |
+| Velero dynamic-PVC gateway-restart in `read-write` | Passed on 2026-05-12 with restore status `Completed`; artifact `.local/integration/`. |
+| Velero strict `restore-readonly` incident-restore smoke | Passed on 2026-05-12 with workload verification, expected restore-artifact write denial, and zero backend writes during restore; artifact `.local/integration/`. |
+| Velero/Postgres compatibility smoke | Passed on 2026-05-12; artifact `.local/integration/`. |
 | Larger Kopia restore matrix | Passed with `regression_budgets=pass` and `workload_consistency=pass`; artifact `.local/integration/`. |
 
 The release evidence is local harness evidence, not a provider certification. A
@@ -216,7 +217,8 @@ A preview is ready when the release evidence shows:
 - default checks and S3-feature checks pass
 - dependency policy checks pass or have documented exceptions
 - Kopia can create, snapshot, and restore through the gateway
-- Velero with Kopia uploader can restore a dynamic PVC after gateway restart
+- Velero with Kopia uploader can restore a dynamic PVC after gateway restart in
+  normal `read-write` mode with restore status `Completed`
 - the Velero/Postgres compatibility smoke restores verified application data
 - restore-readonly mode rejects supported writes and still serves restore reads
 - restore verification succeeds for the checkpoint under test, including

@@ -122,9 +122,11 @@ cluster needs it to open the same repository context.
 
 ## Gateway Mode
 
-`read-write` is the normal backup mode. It may initialize a first empty
-repository, publish committed checkpoints, and advance the configured anchor.
-Run only one read-write gateway for a repository.
+`read-write` is the normal backup and routine-restore mode. It may initialize a
+first empty repository, publish committed checkpoints, and advance the
+configured anchor. Run only one read-write gateway for a repository. Velero
+restore result artifacts are repository writes in this mode and should be
+checkpointed like other accepted mutations.
 
 `restore-readonly` is the incident and disaster-recovery restore mode. It opens
 only from an existing accepted anchor, does not initialize a missing keyring

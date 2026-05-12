@@ -24,7 +24,8 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | Kopia | `just integration-kopia-gateway` | Real Kopia create, snapshot, and restore through the gateway. |
 | Kubernetes | `just integration-k8s-gateway` | Image build, kind cluster, Helm install, readiness, S3 smoke. |
 | Velero/Kopia | `just integration-velero-kopia-smoke` | Velero node-agent/Kopia backup and restore smoke. |
-| Preview release gate | `just preview-gate-release` | Kopia gateway, Velero dynamic PVC gateway-restart with `restore-readonly`, and Velero Postgres smoke. |
+| Preview release gate | `just preview-gate-release` | Kopia gateway, Velero dynamic PVC gateway-restart in normal write mode, and Velero Postgres smoke. |
+| Velero strict restore-readonly | `just integration-velero-kopia-dynamic-pvc-restore-readonly-smoke` | Incident-restore behavior: restored bytes verify, Velero artifact writes are denied, and backend writes stay at zero during restore. |
 | Lightweight perf smoke | `just perf-s3-gateway -- --format jsonl` | Small gateway scenario metrics and amplification. |
 | Kopia measured matrix | `cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix --runs 3 --profile-set larger-restores --gateway-build-profile release --payload-segment-size 512 --enforce-regression-budgets` | Release-grade Kopia restore comparison against the straight RustFS proxy baseline. |
 

@@ -86,15 +86,24 @@ kind-friendly disaster-restore lane..
 cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke
 ```
 
-The gateway-restart variant restarts the gateway after backup and before restore,
-then switches the gateway to `restore-readonly`. It verifies restored bytes and
-asserts that restore traffic did not write to the backend. Velero may mark this
-restore `PartiallyFailed` because it tries to upload restore result artifacts
-after the data restore; the lane accepts only that exact read-only metadata
-upload denial.
+The gateway-restart variant restarts the stateless gateway after backup and
+before restore, keeps the gateway in `read-write`, and expects Velero to report
+the restore as `Completed`. This is the primary Velero UX path because Velero
+writes restore result artifacts after data restore and those artifacts should be
+checkpointed repository state when the repository is healthy.
 
 ```sh
 cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke
+```
+
+The strict restore-readonly variant is the incident/DR path. It switches the
+gateway to `restore-readonly`, verifies restored bytes, asserts that restore
+traffic did not write to the backend, and accepts Velero `PartiallyFailed` only
+when the only errors are denied restore-result artifact uploads after the data
+restore completed.
+
+```sh
+cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-restore-readonly-smoke
 ```
 
 The Postgres smoke uses a single Postgres pod on the same dynamic PVC path. It

@@ -93,6 +93,17 @@ impl Scenario {
             workload: WorkloadKind::ProofFile,
             storage_path: StoragePath::Gateway,
             restart_gateway_before_restore: true,
+            restore_readonly_before_restore: false,
+        }
+    }
+
+    pub(super) const fn dynamic_pvc_restore_readonly() -> Self {
+        Self {
+            label: "dynamic-pvc-restore-readonly",
+            volume: WorkloadVolume::DynamicPvc,
+            workload: WorkloadKind::ProofFile,
+            storage_path: StoragePath::Gateway,
+            restart_gateway_before_restore: true,
             restore_readonly_before_restore: true,
         }
     }

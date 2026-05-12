@@ -42,6 +42,8 @@ enum IntegrationCommand {
     VeleroKopiaDynamicPvcSmoke(velero::VeleroKopiaSmokeArgs),
     /// Run a Velero dynamic-PVC restore after restarting the gateway.
     VeleroKopiaDynamicPvcGatewayRestartSmoke(velero::VeleroKopiaSmokeArgs),
+    /// Run a Velero dynamic-PVC restore through strict restore-readonly mode.
+    VeleroKopiaDynamicPvcRestoreReadonlySmoke(velero::VeleroKopiaSmokeArgs),
     /// Run a Velero node-agent/Kopia Postgres restore smoke through the gateway.
     VeleroKopiaPostgresSmoke(velero::VeleroKopiaSmokeArgs),
     /// Run a Velero node-agent/Kopia Postgres restore smoke directly against RustFS.
@@ -83,6 +85,9 @@ pub(crate) fn run(args: IntegrationArgs) -> Result<()> {
         }
         IntegrationCommand::VeleroKopiaDynamicPvcGatewayRestartSmoke(args) => {
             velero::run_velero_kopia_dynamic_pvc_gateway_restart_smoke(args)
+        }
+        IntegrationCommand::VeleroKopiaDynamicPvcRestoreReadonlySmoke(args) => {
+            velero::run_velero_kopia_dynamic_pvc_restore_readonly_smoke(args)
         }
         IntegrationCommand::VeleroKopiaPostgresSmoke(args) => {
             velero::run_velero_kopia_postgres_smoke(args)

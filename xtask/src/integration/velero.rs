@@ -187,6 +187,15 @@ pub(crate) fn run_velero_kopia_dynamic_pvc_gateway_restart_smoke(
 }
 
 #[cfg(not(feature = "k8s"))]
+pub(crate) fn run_velero_kopia_dynamic_pvc_restore_readonly_smoke(
+    _args: VeleroKopiaSmokeArgs,
+) -> Result<()> {
+    anyhow::bail!(
+        "Velero Kopia dynamic-PVC restore-readonly smoke integration requires `cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-restore-readonly-smoke`",
+    )
+}
+
+#[cfg(not(feature = "k8s"))]
 pub(crate) fn run_velero_kopia_postgres_smoke(_args: VeleroKopiaSmokeArgs) -> Result<()> {
     anyhow::bail!(
         "Velero Kopia Postgres smoke integration requires `cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke`",
@@ -220,6 +229,13 @@ pub(crate) fn run_velero_kopia_dynamic_pvc_gateway_restart_smoke(
     args: VeleroKopiaSmokeArgs,
 ) -> Result<()> {
     imp::run_dynamic_pvc_gateway_restart(args)
+}
+
+#[cfg(feature = "k8s")]
+pub(crate) fn run_velero_kopia_dynamic_pvc_restore_readonly_smoke(
+    args: VeleroKopiaSmokeArgs,
+) -> Result<()> {
+    imp::run_dynamic_pvc_restore_readonly(args)
 }
 
 #[cfg(feature = "k8s")]
@@ -297,6 +313,10 @@ mod imp {
 
     pub(super) fn run_dynamic_pvc_gateway_restart(args: VeleroKopiaSmokeArgs) -> Result<()> {
         run(args, Scenario::dynamic_pvc_gateway_restart())
+    }
+
+    pub(super) fn run_dynamic_pvc_restore_readonly(args: VeleroKopiaSmokeArgs) -> Result<()> {
+        run(args, Scenario::dynamic_pvc_restore_readonly())
     }
 
     pub(super) fn run_postgres(args: VeleroKopiaSmokeArgs) -> Result<()> {

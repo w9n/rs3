@@ -133,6 +133,19 @@ still authenticate object bytes and detect tampering of the bytes it reads, but
 it cannot force the provider to return an older exact version after a newer
 version has appeared.
 
+## Restore Mode Rule
+
+`read-write` is the normal Velero restore mode for a healthy repository. Velero
+restore result artifacts are writes, so they must be accepted only through the
+same checkpointed repository path as other mutations.
+
+`restore-readonly` is the incident and disaster-recovery mode. It rejects those
+artifact writes rather than storing uncheckpointed side-channel state. Velero
+may therefore report `PartiallyFailed` even when the restored workload data is
+correct. Treat that status as acceptable only when the denied writes are restore
+bookkeeping artifacts, pod-volume restore completed, restored data verifies,
+and backend write counters remain unchanged.
+
 ## Conditional Create Rule
 
 Repository-critical objects are written with create-only semantics where

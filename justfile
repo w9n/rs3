@@ -65,6 +65,9 @@ integration-velero-kopia-dynamic-pvc-smoke *ARGS:
 integration-velero-kopia-dynamic-pvc-gateway-restart-smoke *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke {{ARGS}}
 
+integration-velero-kopia-dynamic-pvc-restore-readonly-smoke *ARGS:
+    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-restore-readonly-smoke {{ARGS}}
+
 integration-velero-kopia-postgres-smoke *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke {{ARGS}}
 

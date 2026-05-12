@@ -291,10 +291,16 @@ surface, not a backup data browser.
 
 ## Restore Posture
 
-During an incident, favor read-only restore with a verified checkpoint and
-external anchor over any mode that repairs state automatically. If break-glass
-restore is added, it should require explicit operator input and leave an audit
-trail.
+For routine restores in a healthy repository, keep the single writer gateway in
+`read-write` and use the normal checkpoint-anchor path. Velero writes restore
+result artifacts after data restore; in normal operation those writes should be
+accepted, checkpointed, and anchored like other repository mutations so Velero
+can report `Completed`.
+
+During an incident or disaster-recovery drill, favor read-only restore with a
+verified checkpoint and external anchor over any mode that repairs state
+automatically. If break-glass restore is added, it should require explicit
+operator input and leave an audit trail.
 
 !!! note "DR survival kit"
     Keep this material outside the object-store account and outside the namespace

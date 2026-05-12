@@ -94,9 +94,16 @@ Expected result:
 - the local gate passes formatting, tests, S3-feature checks, and dependency
   policy checks
 - the release gate passes Kopia gateway restore, Velero dynamic-PVC
-  gateway-restart restore through `restore-readonly`, and Velero/Postgres smoke
+  gateway-restart restore in normal write mode, and Velero/Postgres smoke
   restore
 - artifacts are written under `.local/integration/`
+
+Run the strict restore-readonly Velero lane separately when evaluating incident
+restore posture:
+
+```sh
+just integration-velero-kopia-dynamic-pvc-restore-readonly-smoke
+```
 
 Run the larger performance matrix when storage or repository behavior changed, or
 when refreshing release evidence:
