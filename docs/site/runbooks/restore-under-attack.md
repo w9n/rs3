@@ -19,7 +19,8 @@ Before serving restore traffic, identify or recover:
 - repository ID
 - public repository salt
 - wrapping-key source for the keyring envelope
-- accepted checkpoint sequence, checkpoint ID, and checkpoint digest
+- accepted checkpoint sequence, checkpoint ID, checkpoint object version ID
+  when available, and checkpoint digest
 - checkpoint-bound keyring-envelope reference
 - backend endpoint, bucket, and prefix
 - object-store audit events where available
@@ -79,11 +80,14 @@ backend.
 cargo run -p rs3-server -- import-anchor \
   --checkpoint-sequence <bundle-sequence> \
   --checkpoint-id <bundle-checkpoint-id> \
+  --checkpoint-version-id <bundle-checkpoint-version-id> \
   --checkpoint-digest <bundle-checkpoint-digest>
 ```
 
 `import-anchor` verifies the checkpoint chain, checkpoint evidence, keyring
 envelope, and restore-critical objects before writing the missing anchor.
+Omit `--checkpoint-version-id` only for a trusted bundle that does not contain
+one; retained/Object Lock repositories should contain it.
 
 ## 4. If No Bundle Exists, Use Bounded Recovery
 

@@ -403,6 +403,13 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
         RepositoryError::Storage(StorageError::RetentionExtensionUnsupported) => {
             s3s::s3_error!(NotImplemented, "Object Lock retention is not supported")
         }
+        RepositoryError::Storage(StorageError::VersionUnsupported) => {
+            s3s::s3_error!(NotImplemented, "object version reads are not supported")
+        }
+        RepositoryError::Storage(StorageError::MissingVersionId(_)) => s3s::s3_error!(
+            InternalError,
+            "retained repository object is missing provider version metadata"
+        ),
         RepositoryError::Type(_) => s3s::s3_error!(InvalidRequest, "invalid repository path"),
         RepositoryError::CommitFailed { .. }
         | RepositoryError::SequenceOverflow

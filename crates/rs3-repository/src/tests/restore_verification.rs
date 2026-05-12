@@ -114,7 +114,10 @@ async fn verify_restore_rejects_tampered_checkpoint_evidence() {
 
 #[tokio::test]
 async fn verify_restore_rejects_tampered_payload() {
-    let store = MemoryBlobStore::new();
+    let versioned_backend = MemoryBlobStore::new();
+    let store = DropPutVersionStore {
+        backend: versioned_backend.clone(),
+    };
     let repo = Repository::with_keyring(store.clone(), signing_keyring());
     let anchor = MemoryCheckpointAnchor::new();
     let committed = must(
@@ -126,14 +129,18 @@ async fn verify_restore_rejects_tampered_payload() {
         )
         .await,
     );
-    let payload_id = only_object_with_prefix(&store, "segments/").await;
-    let body = must_storage(store.get_range(&payload_id, ByteRange::Full).await);
+    let payload_id = only_object_with_prefix(&versioned_backend, "segments/").await;
+    let body = must_storage(
+        versioned_backend
+            .get_range(&payload_id, ByteRange::Full)
+            .await,
+    );
     let mut tampered = body.to_vec();
     let last = tampered
         .last_mut()
         .unwrap_or_else(|| panic!("payload body should not be empty"));
     *last ^= 0x01;
-    let put = store
+    let put = versioned_backend
         .put(&payload_id, Bytes::from(tampered), PutOptions::default())
         .await;
     assert!(put.is_ok());
@@ -145,7 +152,10 @@ async fn verify_restore_rejects_tampered_payload() {
 
 #[tokio::test]
 async fn verify_restore_checks_keyring_envelope_digest() {
-    let store = MemoryBlobStore::new();
+    let versioned_backend = MemoryBlobStore::new();
+    let store = DropPutVersionStore {
+        backend: versioned_backend.clone(),
+    };
     let keyring = KeyRing::generate_random().unwrap_or_else(|error| panic!("{error}"));
     let repo = Repository::with_keyring(store.clone(), keyring.clone());
     let context = RepositoryKeyContext::new(
@@ -175,7 +185,7 @@ async fn verify_restore_checks_keyring_envelope_digest() {
 
     let mut changed = envelope.clone();
     changed.generation = 2;
-    let put = store
+    let put = versioned_backend
         .put(
             &reference.object_id,
             Bytes::from(
@@ -194,6 +204,79 @@ async fn verify_restore_checks_keyring_envelope_digest() {
         verified,
         Err(RepositoryError::KeyringEnvelopeObjectConflict { object_id })
             if object_id == reference.object_id
+    ));
+}
+
+#[tokio::test]
+async fn restore_uses_checkpoint_bound_payload_version_after_latest_poisoning() {
+    let store = MemoryBlobStore::new();
+    let repo = Repository::with_keyring(store.clone(), signing_keyring());
+    let anchor = MemoryCheckpointAnchor::new();
+    let committed = must(
+        repo.put_committed(
+            key("restore/version-bound-payload"),
+            Bytes::from_static(b"original"),
+            RepositoryPutOptions::default(),
+            &anchor,
+        )
+        .await,
+    );
+    let payload_id = only_object_with_prefix(&store, "segments/").await;
+    let poison = store
+        .put(
+            &payload_id,
+            Bytes::from_static(b"poisoned-latest"),
+            PutOptions::default(),
+        )
+        .await;
+    assert!(poison.is_ok());
+
+    let report = must(repo.verify_restore(&committed.checkpoint).await);
+    assert_eq!(report.payload_plaintext_bytes, 8);
+
+    let restored = must(
+        repo.get_range(&key("restore/version-bound-payload"), ByteRange::Full)
+            .await,
+    );
+    assert_eq!(restored, Bytes::from_static(b"original"));
+
+    let fresh = Repository::with_keyring(store, signing_keyring());
+    let loaded = must(fresh.load_checkpoint_position(&committed.checkpoint).await);
+    assert_eq!(loaded, committed.checkpoint);
+    let restored = must(
+        fresh
+            .get_range(&key("restore/version-bound-payload"), ByteRange::Full)
+            .await,
+    );
+    assert_eq!(restored, Bytes::from_static(b"original"));
+}
+
+#[tokio::test]
+async fn retained_write_requires_provider_version_id() {
+    let versioned_backend = MemoryBlobStore::new();
+    let store = DropPutVersionStore {
+        backend: versioned_backend,
+    };
+    let repo = Repository::with_keyring_and_options(
+        store,
+        signing_keyring(),
+        RepositoryOptions {
+            payload_segment_size: crate::DEFAULT_PAYLOAD_SEGMENT_SIZE,
+            default_retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
+        },
+    );
+
+    let written = repo
+        .put(
+            key("restore/retained-without-version"),
+            Bytes::from_static(b"body"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+
+    assert!(matches!(
+        written,
+        Err(RepositoryError::Storage(StorageError::MissingVersionId(_)))
     ));
 }
 

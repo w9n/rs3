@@ -134,6 +134,7 @@ async fn verify_signed_checkpoint_rejects_stale_sequence() {
     let accepted = CheckpointPosition {
         sequence: Sequence::new(2),
         checkpoint_id: checkpoint_id("newer"),
+        checkpoint_version_id: None,
         payload_digest: "newer".to_string(),
     };
 
@@ -230,7 +231,8 @@ async fn publish_checkpoint_persists_signed_checkpoint_before_anchor_advance() {
             .await,
     );
     let checkpoint = decode_checkpoint_object(body);
-    let verified = repo.verify_signed_checkpoint(&checkpoint, None);
+    let verified =
+        repo.verify_signed_checkpoint_at(&checkpoint, None, position.checkpoint_version_id.clone());
 
     assert_eq!(checkpoint.id, position.checkpoint_id);
     assert_eq!(verified.ok(), Some(position));
@@ -454,7 +456,10 @@ async fn filesystem_store_reloads_checkpoint_chain_for_head_get_and_list() {
 
 #[tokio::test]
 async fn load_checkpoint_position_rejects_tampered_inline_index_delta() {
-    let store = MemoryBlobStore::new();
+    let versioned_backend = MemoryBlobStore::new();
+    let store = DropPutVersionStore {
+        backend: versioned_backend.clone(),
+    };
     let keyring = signing_keyring();
     let repo = Repository::with_keyring(store.clone(), keyring.clone());
     let anchor = MemoryCheckpointAnchor::new();
@@ -469,7 +474,11 @@ async fn load_checkpoint_position_rejects_tampered_inline_index_delta() {
     assert!(put.is_ok());
     let latest = must(repo.publish_checkpoint(&anchor).await);
     let checkpoint_object = must(checkpoint_object_id(&latest.checkpoint_id));
-    let checkpoint_body = must_storage(store.get_range(&checkpoint_object, ByteRange::Full).await);
+    let checkpoint_body = must_storage(
+        versioned_backend
+            .get_range(&checkpoint_object, ByteRange::Full)
+            .await,
+    );
     let mut checkpoint = decode_checkpoint_object(checkpoint_body);
     let Some(inline_delta) = checkpoint.record.inline_index_delta.as_mut() else {
         panic!("missing inline index delta");
@@ -482,7 +491,7 @@ async fn load_checkpoint_position_rejects_tampered_inline_index_delta() {
     if let Err(error) = serde_json::to_writer(&mut tampered_body, &checkpoint) {
         panic!("{error}");
     }
-    let overwrite = store
+    let overwrite = versioned_backend
         .put(
             &checkpoint_object,
             Bytes::from(tampered_body),

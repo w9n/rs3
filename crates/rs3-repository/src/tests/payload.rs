@@ -33,7 +33,10 @@ async fn backend_payload_does_not_store_plaintext() {
 
 #[tokio::test]
 async fn tampered_backend_payload_fails_repository_read() {
-    let store = MemoryBlobStore::new();
+    let versioned_backend = MemoryBlobStore::new();
+    let store = DropPutVersionStore {
+        backend: versioned_backend.clone(),
+    };
     let repo = Repository::with_keyring(store.clone(), signing_keyring());
     let client_key = key("p/12/tampered");
 
@@ -46,18 +49,22 @@ async fn tampered_backend_payload_fails_repository_read() {
         .await;
     assert!(put.is_ok());
 
-    let payload = must_storage(store.list_prefix("segments/").await)
+    let payload = must_storage(versioned_backend.list_prefix("segments/").await)
         .into_iter()
         .next()
         .unwrap_or_else(|| panic!("missing payload object"));
-    let mut backend_body =
-        must_storage(store.get_range(&payload.object_id, ByteRange::Full).await).to_vec();
+    let mut backend_body = must_storage(
+        versioned_backend
+            .get_range(&payload.object_id, ByteRange::Full)
+            .await,
+    )
+    .to_vec();
     let last = backend_body
         .last_mut()
         .unwrap_or_else(|| panic!("payload object is empty"));
     *last ^= 0x01;
 
-    let overwrite = store
+    let overwrite = versioned_backend
         .put(
             &payload.object_id,
             Bytes::from(backend_body),

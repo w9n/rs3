@@ -7,7 +7,7 @@ use rs3_repository::{CheckpointPosition, Repository, RestoreVerificationReport};
 use rs3_storage::{BlobStore, ByteRange, FilesystemBlobStore};
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
-use rs3_types::{BackendObjectId, CheckpointId, RepositoryId, Sequence};
+use rs3_types::{BackendObjectId, BackendVersionId, CheckpointId, RepositoryId, Sequence};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -38,6 +38,9 @@ struct RestoreVerifyArgs {
     /// Accepted checkpoint identifier from the trusted anchor.
     #[arg(long)]
     checkpoint_id: String,
+    /// Provider version identifier for the accepted checkpoint object, when available.
+    #[arg(long)]
+    checkpoint_version_id: Option<String>,
     /// Accepted checkpoint payload digest from the trusted anchor.
     #[arg(long)]
     checkpoint_digest: String,
@@ -173,6 +176,10 @@ where
     let accepted = CheckpointPosition {
         sequence: Sequence::new(args.checkpoint_sequence),
         checkpoint_id: CheckpointId::new(args.checkpoint_id)?,
+        checkpoint_version_id: args
+            .checkpoint_version_id
+            .map(BackendVersionId::new)
+            .transpose()?,
         payload_digest: args.checkpoint_digest,
     };
     let keyring = keyring_from_envelope(&store, &context, &args.keys).await?;
@@ -301,6 +308,7 @@ fn print_report_json(report: &RestoreVerificationReport) -> Result<()> {
         "accepted": {
             "sequence": report.accepted.sequence.get(),
             "checkpoint_id": report.accepted.checkpoint_id.as_str(),
+            "checkpoint_version_id": report.accepted.checkpoint_version_id.as_ref().map(BackendVersionId::as_str),
             "checkpoint_digest": report.accepted.payload_digest,
         },
         "verified": {
@@ -330,6 +338,9 @@ fn print_report_text(report: &RestoreVerificationReport) {
     println!("rs3 restore verification: ok");
     println!("checkpoint_sequence={}", report.accepted.sequence.get());
     println!("checkpoint_id={}", report.accepted.checkpoint_id.as_str());
+    if let Some(version_id) = report.accepted.checkpoint_version_id.as_ref() {
+        println!("checkpoint_version_id={}", version_id.as_str());
+    }
     println!("checkpoints={}", report.checkpoint_count);
     println!("checkpoint_evidence={}", report.checkpoint_evidence_count);
     println!("index_delta_objects={}", report.index_delta_object_count);
@@ -421,6 +432,10 @@ mod tests {
             repository_salt_hex: SALT_HEX.to_owned(),
             checkpoint_sequence: checkpoint.sequence.get(),
             checkpoint_id: checkpoint.checkpoint_id.as_str().to_owned(),
+            checkpoint_version_id: checkpoint
+                .checkpoint_version_id
+                .as_ref()
+                .map(|version_id| version_id.as_str().to_owned()),
             checkpoint_digest: checkpoint.payload_digest.clone(),
             keys: RestoreKeySourceArgs {
                 keyring_envelope_object_id: keyring_envelope_object_id.as_str().to_owned(),

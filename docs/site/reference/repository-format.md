@@ -12,6 +12,8 @@ not a compatibility promise.
 - Checkpoints are signed and monotonic.
 - Old data remains readable while any protected checkpoint can reference it.
 - Provider retention is never shortened by `rs3`.
+- Retained restore-critical references are bound to provider object versions
+  when the backend supports version IDs.
 
 ## Backend Object Classes
 
@@ -53,6 +55,12 @@ manifest ID, and index deltas bind to the index-delta object domain. Signed
 checkpoints and object IDs decide which sealed metadata is reachable repository
 state.
 
+Namespace entries reference the encrypted payload object ID and, when available,
+the provider version ID returned by the backend write. Retained/Object Lock
+repository operation requires this version ID so restore can read the exact
+retained payload version even if the backend later presents a different latest
+version.
+
 Index changes are append-friendly deltas covered by checkpoints. Compaction can
 rewrite index state later, but it must preserve rollback and retention rules.
 
@@ -61,10 +69,12 @@ rewrite index state later, but it must preserve rollback and retention rules.
 A checkpoint records an ordered repository state transition:
 
 - sequence number
-- parent checkpoint reference
-- referenced index deltas or compacted segments
+- parent checkpoint reference and provider version ID when available
+- referenced index deltas or compacted segments, including provider version IDs
+  when available
 - active key descriptors
-- active keyring envelope generation, object ID, and digest when configured
+- active keyring envelope generation, object ID, provider version ID, and digest
+  when configured
 - repository-state digest
 - signed publish time
 - retention/evidence policy marker
@@ -76,8 +86,9 @@ Checkpoints must not contain plaintext logical names.
 
 Each newly published checkpoint writes a create-only evidence object under
 `evidence/`. Evidence records contain the checkpoint sequence, checkpoint ID,
-canonical checkpoint digest, and signed checkpoint object ID. They are retained
-with the same policy and legal hold as the checkpoint object.
+canonical checkpoint digest, signed checkpoint object ID, and signed checkpoint
+object version ID when available. They are retained with the same policy and
+legal hold as the checkpoint object.
 
 Evidence is not a latest-state authority. It gives operators retained storage
 history to compare with the external anchor during open, restore, and rollback
@@ -103,10 +114,10 @@ public salt, generate random purpose-specific data keys, and store them in an
 encrypted keyring envelope under a counted `keyrings/` object. The wrapping-key
 source, such as a KMS key or high-entropy wrapping key, stays outside the
 repository. Signed checkpoints bind the active envelope by generation, object
-ID, and digest so a backend cannot silently swap envelopes. The envelope is
-checkpoint-bound, not checkpoint-embedded: normal checkpoints do not rewrite key
-material, but a key update becomes accepted repository state only after a signed
-checkpoint names the new envelope.
+ID, provider version ID when available, and digest so a backend cannot silently
+swap envelopes. The envelope is checkpoint-bound, not checkpoint-embedded:
+normal checkpoints do not rewrite key material, but a key update becomes
+accepted repository state only after a signed checkpoint names the new envelope.
 
 Wrapping-key rewrap preserves the same repository data keys. It is useful for
 moving the wrapping-key source or retiring a clean wrapping key, but it is not
@@ -121,6 +132,11 @@ Initial empty repositories are initialized by writing an encrypted keyring
 envelope. Existing anchored repositories open through the envelope reference
 inside the accepted signed checkpoint, not through S3 listing order or a mutable
 latest pointer.
+
+In retained/Object Lock mode, keyring envelopes, checkpoints, index objects, and
+payload objects must all return provider version IDs at write time. Missing
+version IDs are treated as provider capability failures, because retained
+restore cannot depend on mutable latest-object reads.
 
 Checkpoint-signing descriptors include the Ed25519 public verification key so
 checkpoint payloads can be verified without exposing signing material.

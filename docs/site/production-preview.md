@@ -125,8 +125,9 @@ A new cluster needs more than backend credentials:
 - repository ID
 - repository salt
 - wrapping-key source for the envelope
-- trusted anchor position: sequence, checkpoint ID, and checkpoint digest, or
-  an explicit bounded recovery decision from retained evidence
+- trusted anchor position: sequence, checkpoint ID, checkpoint object version ID
+  when available, and checkpoint digest, or an explicit bounded recovery
+  decision from retained evidence
 
 The trusted anchor position can come from a recovery bundle, audited export, or
 trusted external anchor. Storage evidence can help prove what existed in the

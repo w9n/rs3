@@ -8,7 +8,7 @@ use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use bytes::Bytes;
 use common::assert_core_blob_store_contract;
-use rs3_storage::{BlobStore, PutOptions, S3BlobStore, S3BlobStoreConfig};
+use rs3_storage::{BlobStore, ByteRange, PutOptions, S3BlobStore, S3BlobStoreConfig};
 use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
 use std::env;
 use std::process;
@@ -73,12 +73,37 @@ async fn live_s3_object_lock_retention_round_trips_and_blocks_version_delete() {
         .clone()
         .unwrap_or_else(|| panic!("retained S3 PUT did not return a version id"));
 
+    let overwrite = store
+        .put(
+            &object_id,
+            Bytes::from_static(b"poisoned latest body"),
+            PutOptions {
+                retention: Some(policy),
+                legal_hold: None,
+                content_type: Some("application/octet-stream".to_owned()),
+                do_not_recreate: false,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("put newer retained object version: {error}"));
+    assert_ne!(overwrite.version_id, Some(version_id.clone()));
+    let exact = store
+        .get_range_at(&object_id, Some(&version_id), ByteRange::Full)
+        .await
+        .unwrap_or_else(|error| panic!("read exact retained object version: {error}"));
+    let latest = store
+        .get_range(&object_id, ByteRange::Full)
+        .await
+        .unwrap_or_else(|error| panic!("read latest retained object version: {error}"));
+    assert_eq!(exact, Bytes::from_static(b"retained object body"));
+    assert_eq!(latest, Bytes::from_static(b"poisoned latest body"));
+
     store
-        .extend_retention(&object_id, extended_policy)
+        .extend_retention_at(&object_id, Some(&version_id), extended_policy)
         .await
         .unwrap_or_else(|error| panic!("extend retained object: {error}"));
     let head = store
-        .head(&object_id)
+        .head_at(&object_id, Some(&version_id))
         .await
         .unwrap_or_else(|error| panic!("head retained object: {error}"));
     assert!(retention_satisfies(
@@ -91,7 +116,7 @@ async fn live_s3_object_lock_retention_round_trips_and_blocks_version_delete() {
         .delete_object()
         .bucket(target.config.bucket.as_str())
         .key(object_key)
-        .version_id(version_id)
+        .version_id(version_id.as_str())
         .send()
         .await;
     assert!(
@@ -142,7 +167,7 @@ async fn live_s3_object_lock_legal_hold_round_trips_and_blocks_version_delete() 
         .delete_object()
         .bucket(target.config.bucket.as_str())
         .key(object_key.clone())
-        .version_id(version_id.clone())
+        .version_id(version_id.as_str())
         .send()
         .await;
     assert!(
@@ -151,11 +176,11 @@ async fn live_s3_object_lock_legal_hold_round_trips_and_blocks_version_delete() 
     );
 
     store
-        .set_legal_hold(&object_id, LegalHoldStatus::Off)
+        .set_legal_hold_at(&object_id, Some(&version_id), LegalHoldStatus::Off)
         .await
         .unwrap_or_else(|error| panic!("clear legal hold: {error}"));
     let head = store
-        .head(&object_id)
+        .head_at(&object_id, Some(&version_id))
         .await
         .unwrap_or_else(|error| panic!("head legal-held object: {error}"));
     assert!(
@@ -167,7 +192,7 @@ async fn live_s3_object_lock_legal_hold_round_trips_and_blocks_version_delete() 
         .delete_object()
         .bucket(target.config.bucket.as_str())
         .key(object_key)
-        .version_id(version_id)
+        .version_id(version_id.as_str())
         .send()
         .await
         .unwrap_or_else(|error| panic!("delete released legal-held version: {error}"));

@@ -22,7 +22,10 @@ use rs3_anchor::CheckpointAnchor;
 use rs3_crypto::{KeyRing, NamespaceBlindKey};
 use rs3_index::{IndexDelta, KeyringEnvelopeReference, NamespaceEntry};
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
-use rs3_types::{BackendObjectId, LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy};
+use rs3_types::{
+    BackendObjectId, BackendObjectRef, BackendVersionId, LegalHoldStatus, LogicalPath,
+    RetentionMode, RetentionPolicy,
+};
 use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -166,12 +169,19 @@ where
                 },
             )
             .await?;
+        let object_version_id = require_version_for_retained_write(
+            &object_id,
+            &storage_metadata,
+            retention,
+            legal_hold,
+        )?;
 
         let modified_at_ms = modified_at_ms_or_now(storage_metadata.modified_at_ms, sequence);
         let entry = NamespaceEntry {
             namespace_key_id: primary_blind_key.key_id,
             blind_key: primary_blind_key.blind_key,
             object_id,
+            object_version_id,
             manifest_id: manifest_id.clone(),
             content_len: plaintext_len,
             modified_at_ms,
@@ -316,14 +326,14 @@ where
         let started = Instant::now();
         let keyring = self.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
-        let object_id = match self.object_id_for_candidates(key, &lookup_blind_keys) {
-            Ok(object_id) => object_id,
+        let object_ref = match self.object_ref_for_candidates(key, &lookup_blind_keys) {
+            Ok(object_ref) => object_ref,
             Err(error) => {
                 record_repository_get(range, 0, 0, "not_found", started.elapsed());
                 return Err(error);
             }
         };
-        let read = match self.read_payload_range(&keyring, &object_id, range).await {
+        let read = match self.read_payload_range(&keyring, &object_ref, range).await {
             Ok(read) => read,
             Err(error) => {
                 record_repository_get(range, 0, 0, "storage_error", started.elapsed());
@@ -358,39 +368,46 @@ where
     async fn read_payload_range(
         &self,
         keyring: &KeyRing,
-        object_id: &BackendObjectId,
+        object_ref: &BackendObjectRef,
         range: ByteRange,
     ) -> Result<PayloadRead> {
         match range {
-            ByteRange::Full => self.read_payload_full(keyring, object_id, range).await,
-            ByteRange::Slice { .. } => self.read_payload_slice(keyring, object_id, range).await,
+            ByteRange::Full => self.read_payload_full(keyring, object_ref, range).await,
+            ByteRange::Slice { .. } => self.read_payload_slice(keyring, object_ref, range).await,
         }
     }
 
     async fn read_payload_full(
         &self,
         keyring: &KeyRing,
-        object_id: &BackendObjectId,
+        object_ref: &BackendObjectRef,
         range: ByteRange,
     ) -> Result<PayloadRead> {
-        let body = self.store.get_range(object_id, ByteRange::Full).await?;
+        let body = self
+            .store
+            .get_range_at(
+                &object_ref.object_id,
+                object_ref.version_id.as_ref(),
+                ByteRange::Full,
+            )
+            .await?;
         let backend_bytes_read = u64::try_from(body.len()).unwrap_or(u64::MAX);
         Ok(PayloadRead {
             backend_bytes_read,
-            opened: open_payload_object(keyring, object_id, body, range),
+            opened: open_payload_object(keyring, &object_ref.object_id, body, range),
         })
     }
 
     async fn read_payload_slice(
         &self,
         keyring: &KeyRing,
-        object_id: &BackendObjectId,
+        object_ref: &BackendObjectRef,
         range: ByteRange,
     ) -> Result<PayloadRead> {
-        let header = match self.cached_payload_header(object_id)? {
+        let header = match self.cached_payload_header(object_ref)? {
             Some(header) => header,
             None => match self
-                .read_and_cache_payload_header(keyring, object_id, range)
+                .read_and_cache_payload_header(keyring, object_ref, range)
                 .await?
             {
                 PayloadHeaderRead::Header(header) => header,
@@ -399,7 +416,7 @@ where
         };
         let span = segmented_ciphertext_span(&header.header, range)?;
         let span_read = self
-            .read_ciphertext_span(object_id, span, header.prefetched_body.as_ref())
+            .read_ciphertext_span(object_ref, span, header.prefetched_body.as_ref())
             .await?;
         let backend_bytes_read = header
             .backend_bytes_read
@@ -409,7 +426,7 @@ where
             backend_bytes_read,
             opened: open_segmented_payload_span(
                 keyring,
-                object_id,
+                &object_ref.object_id,
                 &header.header,
                 range,
                 span,
@@ -420,7 +437,7 @@ where
 
     async fn read_ciphertext_span(
         &self,
-        object_id: &BackendObjectId,
+        object_ref: &BackendObjectRef,
         span: SegmentCiphertextSpan,
         prefetched_body: Option<&Bytes>,
     ) -> Result<CiphertextSpanRead> {
@@ -431,7 +448,7 @@ where
             });
         }
 
-        if let Some(ciphertext) = self.cached_payload_span(object_id, span)? {
+        if let Some(ciphertext) = self.cached_payload_span(object_ref, span)? {
             record_payload_span_cache("hit", span.len);
             return Ok(CiphertextSpanRead {
                 backend_bytes_read: 0,
@@ -450,7 +467,7 @@ where
                 let start = usize::try_from(span.offset).map_err(|_| StorageError::InvalidRange)?;
                 let end = usize::try_from(span_end).map_err(|_| StorageError::InvalidRange)?;
                 let ciphertext = prefetched.slice(start..end);
-                self.cache_payload_span(object_id, span, ciphertext.clone())?;
+                self.cache_payload_span(object_ref, span, ciphertext.clone())?;
                 return Ok(CiphertextSpanRead {
                     backend_bytes_read: 0,
                     ciphertext,
@@ -472,8 +489,9 @@ where
                     .ok_or(StorageError::InvalidRange)?;
                 let suffix = self
                     .store
-                    .get_range(
-                        object_id,
+                    .get_range_at(
+                        &object_ref.object_id,
+                        object_ref.version_id.as_ref(),
                         ByteRange::Slice {
                             offset: suffix_offset,
                             len: suffix_len,
@@ -488,7 +506,7 @@ where
                 ciphertext.extend_from_slice(&prefetched[prefix_start..]);
                 ciphertext.extend_from_slice(&suffix);
                 let ciphertext = Bytes::from(ciphertext);
-                self.cache_payload_span(object_id, span, ciphertext.clone())?;
+                self.cache_payload_span(object_ref, span, ciphertext.clone())?;
                 return Ok(CiphertextSpanRead {
                     backend_bytes_read: u64::try_from(suffix.len()).unwrap_or(u64::MAX),
                     ciphertext,
@@ -498,15 +516,16 @@ where
 
         let ciphertext = self
             .store
-            .get_range(
-                object_id,
+            .get_range_at(
+                &object_ref.object_id,
+                object_ref.version_id.as_ref(),
                 ByteRange::Slice {
                     offset: span.offset,
                     len: span.len,
                 },
             )
             .await?;
-        self.cache_payload_span(object_id, span, ciphertext.clone())?;
+        self.cache_payload_span(object_ref, span, ciphertext.clone())?;
         Ok(CiphertextSpanRead {
             backend_bytes_read: u64::try_from(ciphertext.len()).unwrap_or(u64::MAX),
             ciphertext,
@@ -516,13 +535,14 @@ where
     async fn read_and_cache_payload_header(
         &self,
         keyring: &KeyRing,
-        object_id: &BackendObjectId,
+        object_ref: &BackendObjectRef,
         range: ByteRange,
     ) -> Result<PayloadHeaderRead> {
         let probe = match self
             .store
-            .get_range(
-                object_id,
+            .get_range_at(
+                &object_ref.object_id,
+                object_ref.version_id.as_ref(),
                 ByteRange::Slice {
                     offset: 0,
                     len: PAYLOAD_HEADER_PROBE_LEN,
@@ -533,35 +553,40 @@ where
             Ok(probe) => probe,
             Err(StorageError::InvalidRange) => {
                 return Ok(PayloadHeaderRead::Full(
-                    self.read_payload_full(keyring, object_id, range).await?,
+                    self.read_payload_full(keyring, object_ref, range).await?,
                 ));
             }
             Err(error) => return Err(error.into()),
         };
         let mut backend_bytes_read = u64::try_from(probe.len()).unwrap_or(u64::MAX);
-        let (header_bytes, prefetched_body) = match probe_payload_header(object_id, &probe)? {
-            PayloadHeaderProbe::Segmented { header_len } => (probe.slice(..header_len), probe),
-            PayloadHeaderProbe::NeedMore { len } => {
-                let header = self
-                    .store
-                    .get_range(object_id, ByteRange::Slice { offset: 0, len })
-                    .await?;
-                backend_bytes_read = backend_bytes_read
-                    .saturating_add(u64::try_from(header.len()).unwrap_or(u64::MAX));
-                match probe_payload_header(object_id, &header)? {
-                    PayloadHeaderProbe::Segmented { header_len } => {
-                        (header.slice(..header_len), header)
-                    }
-                    PayloadHeaderProbe::NeedMore { .. } => {
-                        return Err(RepositoryError::InvalidObjectFormat {
-                            object_id: object_id.clone(),
-                        });
+        let (header_bytes, prefetched_body) =
+            match probe_payload_header(&object_ref.object_id, &probe)? {
+                PayloadHeaderProbe::Segmented { header_len } => (probe.slice(..header_len), probe),
+                PayloadHeaderProbe::NeedMore { len } => {
+                    let header = self
+                        .store
+                        .get_range_at(
+                            &object_ref.object_id,
+                            object_ref.version_id.as_ref(),
+                            ByteRange::Slice { offset: 0, len },
+                        )
+                        .await?;
+                    backend_bytes_read = backend_bytes_read
+                        .saturating_add(u64::try_from(header.len()).unwrap_or(u64::MAX));
+                    match probe_payload_header(&object_ref.object_id, &header)? {
+                        PayloadHeaderProbe::Segmented { header_len } => {
+                            (header.slice(..header_len), header)
+                        }
+                        PayloadHeaderProbe::NeedMore { .. } => {
+                            return Err(RepositoryError::InvalidObjectFormat {
+                                object_id: object_ref.object_id.clone(),
+                            });
+                        }
                     }
                 }
-            }
-        };
-        let header = parse_segmented_payload_header(object_id, &header_bytes)?;
-        self.cache_payload_header(object_id, header.clone())?;
+            };
+        let header = parse_segmented_payload_header(&object_ref.object_id, &header_bytes)?;
+        self.cache_payload_header(object_ref, header.clone())?;
 
         Ok(PayloadHeaderRead::Header(CachedPayloadHeader {
             backend_bytes_read,
@@ -572,13 +597,13 @@ where
 
     fn cached_payload_header(
         &self,
-        object_id: &BackendObjectId,
+        object_ref: &BackendObjectRef,
     ) -> Result<Option<CachedPayloadHeader>> {
         let cache = self
             .payload_headers
             .read()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        Ok(cache.get(object_id).map(|header| CachedPayloadHeader {
+        Ok(cache.get(object_ref).map(|header| CachedPayloadHeader {
             backend_bytes_read: 0,
             header,
             prefetched_body: None,
@@ -587,32 +612,32 @@ where
 
     fn cache_payload_header(
         &self,
-        object_id: &BackendObjectId,
+        object_ref: &BackendObjectRef,
         header: SegmentedPayloadHeader,
     ) -> Result<()> {
         let mut cache = self
             .payload_headers
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        cache.insert(object_id.clone(), header);
+        cache.insert(object_ref.clone(), header);
         Ok(())
     }
 
     fn cached_payload_span(
         &self,
-        object_id: &BackendObjectId,
+        object_ref: &BackendObjectRef,
         span: SegmentCiphertextSpan,
     ) -> Result<Option<Bytes>> {
         let cache = self
             .payload_spans
             .read()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        Ok(cache.get(object_id, span))
+        Ok(cache.get(object_ref, span))
     }
 
     fn cache_payload_span(
         &self,
-        object_id: &BackendObjectId,
+        object_ref: &BackendObjectRef,
         span: SegmentCiphertextSpan,
         ciphertext: Bytes,
     ) -> Result<()> {
@@ -620,7 +645,7 @@ where
             .payload_spans
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        let outcome = cache.insert(object_id.clone(), span, ciphertext);
+        let outcome = cache.insert(object_ref.clone(), span, ciphertext);
         match outcome {
             PayloadSpanCacheInsert::Inserted {
                 bytes,
@@ -805,9 +830,18 @@ where
     ) -> Result<RepositoryObjectMetadata> {
         let keyring = self.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
-        let object_id = self.object_id_for_candidates(key, &lookup_blind_keys)?;
-        self.store.extend_retention(&object_id, policy).await?;
-        let backend = self.store.head(&object_id).await?;
+        let object_ref = self.object_ref_for_candidates(key, &lookup_blind_keys)?;
+        self.store
+            .extend_retention_at(
+                &object_ref.object_id,
+                object_ref.version_id.as_ref(),
+                policy,
+            )
+            .await?;
+        let backend = self
+            .store
+            .head_at(&object_ref.object_id, object_ref.version_id.as_ref())
+            .await?;
 
         let mut state = self.write_state()?;
         let entry = first_namespace_entry(&state.namespace, &lookup_blind_keys)
@@ -826,6 +860,7 @@ where
         updated.generation = sequence;
         updated.retention = backend.retention;
         updated.legal_hold = backend.legal_hold.or(updated.legal_hold);
+        updated.object_version_id = backend.version_id.or(updated.object_version_id);
         let prefix_tokens =
             prefix_tokens_for_key(&keyring, &updated.namespace_key_id, key.as_str())?;
         let manifest = TrustedManifest {
@@ -855,9 +890,18 @@ where
     ) -> Result<RepositoryObjectMetadata> {
         let keyring = self.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
-        let object_id = self.object_id_for_candidates(key, &lookup_blind_keys)?;
-        self.store.set_legal_hold(&object_id, status).await?;
-        let backend = self.store.head(&object_id).await?;
+        let object_ref = self.object_ref_for_candidates(key, &lookup_blind_keys)?;
+        self.store
+            .set_legal_hold_at(
+                &object_ref.object_id,
+                object_ref.version_id.as_ref(),
+                status,
+            )
+            .await?;
+        let backend = self
+            .store
+            .head_at(&object_ref.object_id, object_ref.version_id.as_ref())
+            .await?;
 
         let mut state = self.write_state()?;
         let entry = first_namespace_entry(&state.namespace, &lookup_blind_keys)
@@ -881,6 +925,7 @@ where
         updated.generation = sequence;
         updated.retention = retention;
         updated.legal_hold = backend.legal_hold.or(Some(status));
+        updated.object_version_id = backend.version_id.or(updated.object_version_id);
         let prefix_tokens =
             prefix_tokens_for_key(&keyring, &updated.namespace_key_id, key.as_str())?;
         let manifest = TrustedManifest {
@@ -902,14 +947,17 @@ where
         Ok(manifest.into_metadata())
     }
 
-    fn object_id_for_candidates(
+    fn object_ref_for_candidates(
         &self,
         key: &LogicalPath,
         lookup_blind_keys: &[NamespaceBlindKey],
-    ) -> Result<BackendObjectId> {
+    ) -> Result<BackendObjectRef> {
         let state = self.read_state()?;
         first_namespace_entry(&state.namespace, lookup_blind_keys)
-            .map(|entry| entry.object_id.clone())
+            .map(|entry| BackendObjectRef {
+                object_id: entry.object_id.clone(),
+                version_id: entry.object_version_id.clone(),
+            })
             .ok_or_else(|| RepositoryError::NotFound(key.clone()))
     }
 
@@ -985,8 +1033,8 @@ struct CachedPayloadHeader {
 
 #[derive(Debug)]
 struct PayloadHeaderCache {
-    headers: BTreeMap<BackendObjectId, SegmentedPayloadHeader>,
-    order: VecDeque<BackendObjectId>,
+    headers: BTreeMap<PayloadCacheObjectKey, SegmentedPayloadHeader>,
+    order: VecDeque<PayloadCacheObjectKey>,
     max_entries: usize,
 }
 
@@ -1001,17 +1049,20 @@ impl Default for PayloadHeaderCache {
 }
 
 impl PayloadHeaderCache {
-    fn get(&self, object_id: &BackendObjectId) -> Option<SegmentedPayloadHeader> {
-        self.headers.get(object_id).cloned()
+    fn get(&self, object_ref: &BackendObjectRef) -> Option<SegmentedPayloadHeader> {
+        self.headers
+            .get(&PayloadCacheObjectKey::from(object_ref))
+            .cloned()
     }
 
-    fn insert(&mut self, object_id: BackendObjectId, header: SegmentedPayloadHeader) {
-        match self.headers.entry(object_id.clone()) {
+    fn insert(&mut self, object_ref: BackendObjectRef, header: SegmentedPayloadHeader) {
+        let key = PayloadCacheObjectKey::from(&object_ref);
+        match self.headers.entry(key.clone()) {
             Entry::Occupied(mut entry) => {
                 entry.insert(header);
             }
             Entry::Vacant(entry) => {
-                self.order.push_back(object_id);
+                self.order.push_back(key);
                 entry.insert(header);
                 while self.headers.len() > self.max_entries {
                     let Some(evicted) = self.order.pop_front() else {
@@ -1025,16 +1076,31 @@ impl PayloadHeaderCache {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct PayloadSpanCacheKey {
+struct PayloadCacheObjectKey {
     object_id: BackendObjectId,
+    version_id: Option<BackendVersionId>,
+}
+
+impl From<&BackendObjectRef> for PayloadCacheObjectKey {
+    fn from(object_ref: &BackendObjectRef) -> Self {
+        Self {
+            object_id: object_ref.object_id.clone(),
+            version_id: object_ref.version_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PayloadSpanCacheKey {
+    object: PayloadCacheObjectKey,
     offset: u64,
     len: u64,
 }
 
 impl PayloadSpanCacheKey {
-    fn new(object_id: BackendObjectId, span: SegmentCiphertextSpan) -> Self {
+    fn new(object_ref: &BackendObjectRef, span: SegmentCiphertextSpan) -> Self {
         Self {
-            object_id,
+            object: PayloadCacheObjectKey::from(object_ref),
             offset: span.offset,
             len: span.len,
         }
@@ -1063,14 +1129,14 @@ impl Default for PayloadSpanCache {
 }
 
 impl PayloadSpanCache {
-    fn get(&self, object_id: &BackendObjectId, span: SegmentCiphertextSpan) -> Option<Bytes> {
-        let key = PayloadSpanCacheKey::new(object_id.clone(), span);
+    fn get(&self, object_ref: &BackendObjectRef, span: SegmentCiphertextSpan) -> Option<Bytes> {
+        let key = PayloadSpanCacheKey::new(object_ref, span);
         self.spans.get(&key).cloned()
     }
 
     fn insert(
         &mut self,
-        object_id: BackendObjectId,
+        object_ref: BackendObjectRef,
         span: SegmentCiphertextSpan,
         ciphertext: Bytes,
     ) -> PayloadSpanCacheInsert {
@@ -1079,7 +1145,7 @@ impl PayloadSpanCache {
             return PayloadSpanCacheInsert::SkippedTooLarge { bytes };
         }
 
-        let key = PayloadSpanCacheKey::new(object_id, span);
+        let key = PayloadSpanCacheKey::new(&object_ref, span);
         match self.spans.entry(key.clone()) {
             Entry::Occupied(mut entry) => {
                 let previous = u64::try_from(entry.get().len()).unwrap_or(u64::MAX);
@@ -1383,6 +1449,25 @@ pub(crate) fn strongest_retention_policy(
     }
 }
 
+pub(crate) fn require_version_for_retained_write(
+    object_id: &BackendObjectId,
+    metadata: &rs3_storage::BlobMetadata,
+    retention: Option<RetentionPolicy>,
+    legal_hold: Option<LegalHoldStatus>,
+) -> Result<Option<BackendVersionId>> {
+    if version_binding_required(retention, legal_hold) && metadata.version_id.is_none() {
+        return Err(StorageError::MissingVersionId(object_id.clone()).into());
+    }
+    Ok(metadata.version_id.clone())
+}
+
+pub(crate) fn version_binding_required(
+    retention: Option<RetentionPolicy>,
+    legal_hold: Option<LegalHoldStatus>,
+) -> bool {
+    active_retention(retention).is_some() || legal_hold == Some(LegalHoldStatus::On)
+}
+
 fn active_retention(policy: Option<RetentionPolicy>) -> Option<RetentionPolicy> {
     policy.filter(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
 }
@@ -1411,7 +1496,7 @@ fn current_time_ms() -> Option<i64> {
 mod tests {
     use super::{PayloadSpanCache, PayloadSpanCacheInsert, SegmentCiphertextSpan};
     use bytes::Bytes;
-    use rs3_types::BackendObjectId;
+    use rs3_types::{BackendObjectId, BackendObjectRef};
     use std::collections::{BTreeMap, VecDeque};
 
     fn object_id(value: &str) -> BackendObjectId {
@@ -1456,12 +1541,14 @@ mod tests {
     #[test]
     fn payload_span_cache_reports_entry_evictions() {
         let mut cache = cache(1, 1024);
+        let first_object = BackendObjectRef::from(object_id("payload-a"));
+        let second_object = BackendObjectRef::from(object_id("payload-b"));
         let first_span = span(0, 4);
         let second_span = span(4, 4);
 
         assert_eq!(
             inserted(cache.insert(
-                object_id("payload-a"),
+                first_object.clone(),
                 first_span,
                 Bytes::from_static(b"aaaa")
             )),
@@ -1469,16 +1556,16 @@ mod tests {
         );
         assert_eq!(
             inserted(cache.insert(
-                object_id("payload-b"),
+                second_object.clone(),
                 second_span,
                 Bytes::from_static(b"bbbb")
             )),
             (4, 1, 4)
         );
 
-        assert!(cache.get(&object_id("payload-a"), first_span).is_none());
+        assert!(cache.get(&first_object, first_span).is_none());
         assert_eq!(
-            cache.get(&object_id("payload-b"), second_span),
+            cache.get(&second_object, second_span),
             Some(Bytes::from_static(b"bbbb"))
         );
         assert_eq!(cache.current_bytes, 4);

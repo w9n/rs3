@@ -28,7 +28,7 @@ use rs3_storage::{
 };
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
-use rs3_types::{BackendObjectId, LegalHoldStatus, LogicalPath, RetentionPolicy};
+use rs3_types::{BackendObjectId, LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -44,6 +44,7 @@ pub(super) struct RuntimeRepository {
     coordinator: Arc<RuntimeCommitCoordinator>,
     store: RuntimeStore,
     pending_envelope_override: Option<KeyringEnvelopeReference>,
+    require_anchor_checkpoint_version: bool,
     #[cfg(feature = "s3")]
     s3_store: Option<S3BlobStore>,
     #[cfg(test)]
@@ -85,6 +86,10 @@ impl RuntimeRepository {
             coordinator,
             store: store.handle,
             pending_envelope_override: loaded_keyring.pending_envelope_override,
+            require_anchor_checkpoint_version: retained_version_required(
+                config.repository.retention,
+                None,
+            ),
             #[cfg(feature = "s3")]
             s3_store: store.s3_store,
             #[cfg(test)]
@@ -115,6 +120,11 @@ impl RuntimeRepository {
             }
             Err(error) => return Err(repository_init(error)),
         };
+        if self.require_anchor_checkpoint_version && accepted.checkpoint_version_id.is_none() {
+            return Err(repository_init(
+                "retained repository anchor is missing the checkpoint object version id",
+            ));
+        }
 
         validate_storage_evidence(&self.store, &accepted).await?;
         self.coordinator
@@ -406,11 +416,28 @@ impl BlobStore for DynBlobStore {
         self.inner.get_range(object_id, range).await
     }
 
+    async fn get_range_at(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        version_id: Option<&rs3_types::BackendVersionId>,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Bytes> {
+        self.inner.get_range_at(object_id, version_id, range).await
+    }
+
     async fn head(
         &self,
         object_id: &rs3_types::BackendObjectId,
     ) -> rs3_storage::Result<BlobMetadata> {
         self.inner.head(object_id).await
+    }
+
+    async fn head_at(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        version_id: Option<&rs3_types::BackendVersionId>,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        self.inner.head_at(object_id, version_id).await
     }
 
     async fn list_prefix(&self, prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
@@ -429,12 +456,34 @@ impl BlobStore for DynBlobStore {
         self.inner.extend_retention(object_id, policy).await
     }
 
+    async fn extend_retention_at(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        version_id: Option<&rs3_types::BackendVersionId>,
+        policy: rs3_types::RetentionPolicy,
+    ) -> rs3_storage::Result<()> {
+        self.inner
+            .extend_retention_at(object_id, version_id, policy)
+            .await
+    }
+
     async fn set_legal_hold(
         &self,
         object_id: &rs3_types::BackendObjectId,
         status: rs3_types::LegalHoldStatus,
     ) -> rs3_storage::Result<()> {
         self.inner.set_legal_hold(object_id, status).await
+    }
+
+    async fn set_legal_hold_at(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        version_id: Option<&rs3_types::BackendVersionId>,
+        status: rs3_types::LegalHoldStatus,
+    ) -> rs3_storage::Result<()> {
+        self.inner
+            .set_legal_hold_at(object_id, version_id, status)
+            .await
     }
 
     async fn flush_caches(&self) -> rs3_storage::Result<()> {
@@ -496,8 +545,14 @@ async fn unanchored_gateway_keyring(
     allow_bootstrap: bool,
 ) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
     if let Some(object_id) = keys.envelope_object_id.as_ref() {
-        return match store.get_range(object_id, ByteRange::Full).await {
-            Ok(body) => open_gateway_keyring_object(keys, object_id.clone(), body),
+        return match store.head(object_id).await {
+            Ok(metadata) => {
+                let body = store
+                    .get_range_at(object_id, metadata.version_id.as_ref(), ByteRange::Full)
+                    .await
+                    .map_err(repository_init)?;
+                open_gateway_keyring_object(keys, object_id.clone(), metadata.version_id, body)
+            }
             Err(StorageError::NotFound(_)) => {
                 if !allow_bootstrap {
                     return Err(repository_init(
@@ -531,10 +586,19 @@ async fn unanchored_gateway_keyring(
         [] => bootstrap_missing_keyring_envelope(store, keys, None, retention).await,
         [metadata] => {
             let body = store
-                .get_range(&metadata.object_id, ByteRange::Full)
+                .get_range_at(
+                    &metadata.object_id,
+                    metadata.version_id.as_ref(),
+                    ByteRange::Full,
+                )
                 .await
                 .map_err(repository_init)?;
-            open_gateway_keyring_object(keys, metadata.object_id.clone(), body)
+            open_gateway_keyring_object(
+                keys,
+                metadata.object_id.clone(),
+                metadata.version_id.clone(),
+                body,
+            )
         }
         _ => Err(repository_init(
             "checkpoint anchor is missing and multiple unanchored keyring envelopes exist; provide an explicit envelope override or recover the anchor",
@@ -545,6 +609,7 @@ async fn unanchored_gateway_keyring(
 fn open_gateway_keyring(
     keys: &RepositoryKeysConfig,
     object_id: BackendObjectId,
+    version_id: Option<rs3_types::BackendVersionId>,
     envelope: KeyringEnvelope,
 ) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
     let context = repository_key_context(keys)?;
@@ -556,6 +621,7 @@ fn open_gateway_keyring(
         generation: envelope.generation,
         digest: envelope.digest().map_err(repository_init)?,
         object_id,
+        version_id,
     };
     Ok(LoadedGatewayKeyring {
         keyring,
@@ -567,10 +633,11 @@ fn open_gateway_keyring(
 fn open_gateway_keyring_object(
     keys: &RepositoryKeysConfig,
     object_id: BackendObjectId,
+    version_id: Option<rs3_types::BackendVersionId>,
     body: Bytes,
 ) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
     let envelope = KeyringEnvelope::from_object_bytes(&body).map_err(repository_init)?;
-    open_gateway_keyring(keys, object_id, envelope)
+    open_gateway_keyring(keys, object_id, version_id, envelope)
 }
 
 pub(super) async fn open_gateway_keyring_reference(
@@ -579,7 +646,11 @@ pub(super) async fn open_gateway_keyring_reference(
     reference: &KeyringEnvelopeReference,
 ) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
     let body = store
-        .get_range(&reference.object_id, ByteRange::Full)
+        .get_range_at(
+            &reference.object_id,
+            reference.version_id.as_ref(),
+            ByteRange::Full,
+        )
         .await
         .map_err(repository_init)?;
     let envelope = KeyringEnvelope::from_object_bytes(&body).map_err(repository_init)?;
@@ -590,7 +661,12 @@ pub(super) async fn open_gateway_keyring_reference(
             reference.object_id
         )));
     }
-    open_gateway_keyring(keys, reference.object_id.clone(), envelope)
+    open_gateway_keyring(
+        keys,
+        reference.object_id.clone(),
+        reference.version_id.clone(),
+        envelope,
+    )
 }
 
 async fn configured_envelope_override(
@@ -606,8 +682,14 @@ async fn configured_envelope_override(
         return Ok(None);
     }
 
-    let loaded = match store.get_range(object_id, ByteRange::Full).await {
-        Ok(body) => open_gateway_keyring_object(keys, object_id.clone(), body)?,
+    let loaded = match store.head(object_id).await {
+        Ok(metadata) => {
+            let body = store
+                .get_range_at(object_id, metadata.version_id.as_ref(), ByteRange::Full)
+                .await
+                .map_err(repository_init)?;
+            open_gateway_keyring_object(keys, object_id.clone(), metadata.version_id, body)?
+        }
         Err(StorageError::NotFound(_)) => {
             return Err(repository_init(
                 "configured keyring envelope override is missing",
@@ -694,14 +776,20 @@ async fn store_configured_keyring_envelope(
         .await;
 
     match put {
-        Ok(_) => Ok(KeyringEnvelopeReference {
-            generation: envelope.generation,
-            digest,
-            object_id: object_id.clone(),
-        }),
+        Ok(metadata) => {
+            let version_id = retained_version_id(object_id, &metadata, retention, None)
+                .map_err(repository_init)?;
+            Ok(KeyringEnvelopeReference {
+                generation: envelope.generation,
+                digest,
+                object_id: object_id.clone(),
+                version_id,
+            })
+        }
         Err(StorageError::AlreadyExists(_)) => {
+            let metadata = store.head(object_id).await.map_err(repository_init)?;
             let existing = store
-                .get_range(object_id, ByteRange::Full)
+                .get_range_at(object_id, metadata.version_id.as_ref(), ByteRange::Full)
                 .await
                 .map_err(repository_init)?;
             if existing != body {
@@ -709,14 +797,37 @@ async fn store_configured_keyring_envelope(
                     "keyring envelope object conflicts with expected content: {object_id}",
                 )));
             }
+            let version_id = retained_version_id(object_id, &metadata, retention, None)
+                .map_err(repository_init)?;
             Ok(KeyringEnvelopeReference {
                 generation: envelope.generation,
                 digest,
                 object_id: object_id.clone(),
+                version_id,
             })
         }
         Err(error) => Err(repository_init(error)),
     }
+}
+
+fn retained_version_id(
+    object_id: &BackendObjectId,
+    metadata: &BlobMetadata,
+    retention: Option<RetentionPolicy>,
+    legal_hold: Option<LegalHoldStatus>,
+) -> rs3_storage::Result<Option<rs3_types::BackendVersionId>> {
+    if retained_version_required(retention, legal_hold) && metadata.version_id.is_none() {
+        return Err(StorageError::MissingVersionId(object_id.clone()));
+    }
+    Ok(metadata.version_id.clone())
+}
+
+fn retained_version_required(
+    retention: Option<RetentionPolicy>,
+    legal_hold: Option<LegalHoldStatus>,
+) -> bool {
+    retention.is_some_and(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
+        || legal_hold == Some(LegalHoldStatus::On)
 }
 
 pub(super) async fn checkpoint_keyring_envelope_reference(
@@ -735,7 +846,11 @@ pub(super) async fn read_checkpoint_for_position(
 ) -> Result<Checkpoint, S3BoundaryError> {
     let object_id = checkpoint_object_id(&accepted.checkpoint_id)?;
     let body = store
-        .get_range(&object_id, ByteRange::Full)
+        .get_range_at(
+            &object_id,
+            accepted.checkpoint_version_id.as_ref(),
+            ByteRange::Full,
+        )
         .await
         .map_err(repository_init)?;
     let Some(payload) = body.as_ref().strip_prefix(CHECKPOINT_OBJECT_DOMAIN) else {
@@ -851,6 +966,7 @@ fn checkpoint_evidence_body(position: &CheckpointPosition) -> Result<Vec<u8>, S3
         checkpoint_id: position.checkpoint_id.clone(),
         checkpoint_digest: position.payload_digest.clone(),
         checkpoint_object_id: checkpoint_object_id(&position.checkpoint_id)?,
+        checkpoint_object_version_id: position.checkpoint_version_id.clone(),
     })
     .map_err(repository_init)
 }
@@ -866,6 +982,7 @@ fn checkpoint_position_from_evidence_object(
     let position = CheckpointPosition {
         sequence: evidence.sequence,
         checkpoint_id: evidence.checkpoint_id,
+        checkpoint_version_id: evidence.checkpoint_object_version_id,
         payload_digest: evidence.checkpoint_digest,
     };
     if evidence.checkpoint_object_id != checkpoint_object_id(&position.checkpoint_id)?
@@ -1146,6 +1263,7 @@ mod tests {
         let future = rs3_repository::CheckpointPosition {
             sequence: Sequence::new(committed.checkpoint.sequence.get() + 1),
             checkpoint_id: committed.checkpoint.checkpoint_id.clone(),
+            checkpoint_version_id: committed.checkpoint.checkpoint_version_id.clone(),
             payload_digest: committed.checkpoint.payload_digest.clone(),
         };
         let future_evidence_id =
@@ -1156,6 +1274,7 @@ mod tests {
             checkpoint_digest: future.payload_digest.clone(),
             checkpoint_object_id: checkpoint_object_id(&future.checkpoint_id)
                 .unwrap_or_else(|error| panic!("{error}")),
+            checkpoint_object_version_id: future.checkpoint_version_id.clone(),
         })
         .unwrap_or_else(|error| panic!("{error}"));
         runtime

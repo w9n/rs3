@@ -136,6 +136,62 @@ impl fmt::Display for BackendObjectId {
     }
 }
 
+/// Opaque provider version identifier for a backend object.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct BackendVersionId(String);
+
+impl BackendVersionId {
+    /// Creates a validated backend version identifier.
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        validate_non_empty("backend version id", value.into()).map(Self)
+    }
+
+    /// Returns the identifier as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for BackendVersionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Reference to a backend object, optionally bound to a provider version.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct BackendObjectRef {
+    /// Opaque backend object identifier.
+    pub object_id: BackendObjectId,
+    /// Provider version identifier for exact-version reads, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<BackendVersionId>,
+}
+
+impl BackendObjectRef {
+    /// Creates a reference to the latest backend object state.
+    pub fn latest(object_id: BackendObjectId) -> Self {
+        Self {
+            object_id,
+            version_id: None,
+        }
+    }
+
+    /// Creates a reference to a concrete backend object version.
+    pub fn versioned(object_id: BackendObjectId, version_id: BackendVersionId) -> Self {
+        Self {
+            object_id,
+            version_id: Some(version_id),
+        }
+    }
+}
+
+impl From<BackendObjectId> for BackendObjectRef {
+    fn from(object_id: BackendObjectId) -> Self {
+        Self::latest(object_id)
+    }
+}
+
 /// Identifier for an encrypted manifest.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ManifestId(String);

@@ -2,7 +2,7 @@
 
 use crate::error::Result;
 use crate::model::CheckpointPosition;
-use crate::service::{Repository, strongest_retention_policy};
+use crate::service::{Repository, require_version_for_retained_write, strongest_retention_policy};
 use crate::state::{RepositoryState, TrustedManifest, apply_index_delta_object, next_sequence};
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, CheckpointAnchor};
@@ -18,7 +18,9 @@ use rs3_index::{
     checkpoint_object_bytes, index_delta_plaintext_bytes, manifest_plaintext_bytes,
 };
 use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
-use rs3_types::{BackendObjectId, CheckpointId, ManifestId, Sequence};
+use rs3_types::{
+    BackendObjectId, BackendObjectRef, BackendVersionId, CheckpointId, ManifestId, Sequence,
+};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +32,11 @@ const CHECKPOINT_EVIDENCE_CONTENT_TYPE: &str = "application/vnd.rs3.checkpoint-e
 const KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.keyring-envelope+json";
 const INDEX_DELTA_ASSOCIATED_DATA: &[u8] = b"rs3:index-delta-object:v1";
 
+pub(crate) struct CheckpointChainEntry {
+    pub(crate) checkpoint: Checkpoint,
+    pub(crate) version_id: Option<BackendVersionId>,
+}
+
 impl<S> Repository<S>
 where
     S: BlobStore,
@@ -37,13 +44,14 @@ where
     /// Builds the checkpoint payload for the current trusted repository state.
     pub fn draft_commit_record(&self, parent: Option<CheckpointId>) -> Result<CommitRecord> {
         let inline_index_delta = self.pending_index_delta_object()?;
-        self.draft_commit_record_with_index_deltas(parent, Vec::new(), inline_index_delta)
+        self.draft_commit_record_with_index_deltas(parent, None, Vec::new(), inline_index_delta)
     }
 
     fn draft_commit_record_with_index_deltas(
         &self,
         parent: Option<CheckpointId>,
-        index_deltas: Vec<BackendObjectId>,
+        parent_checkpoint_version_id: Option<BackendVersionId>,
+        index_deltas: Vec<BackendObjectRef>,
         inline_index_delta: Option<SealedIndexDeltaObject>,
     ) -> Result<CommitRecord> {
         let keyring = self.keyring()?;
@@ -57,6 +65,7 @@ where
             sequence: state.next_sequence,
             published_at_ms,
             parent,
+            parent_checkpoint_version_id,
             index_deltas,
             inline_index_delta,
             compacted_manifests: Vec::new(),
@@ -91,6 +100,15 @@ where
         checkpoint: &Checkpoint,
         accepted: Option<&CheckpointPosition>,
     ) -> Result<CheckpointPosition> {
+        self.verify_signed_checkpoint_at(checkpoint, accepted, None)
+    }
+
+    pub(crate) fn verify_signed_checkpoint_at(
+        &self,
+        checkpoint: &Checkpoint,
+        accepted: Option<&CheckpointPosition>,
+        checkpoint_version_id: Option<BackendVersionId>,
+    ) -> Result<CheckpointPosition> {
         let canonical_payload = canonical_commit_record_bytes(&checkpoint.record)?;
         let keyring = self.keyring()?;
         keyring.verify_checkpoint_payload(
@@ -107,6 +125,7 @@ where
         let position = CheckpointPosition {
             sequence: checkpoint.sequence(),
             checkpoint_id: checkpoint.id.clone(),
+            checkpoint_version_id,
             payload_digest: derive_checkpoint_payload_digest(&canonical_payload),
         };
 
@@ -151,14 +170,21 @@ where
         let parent = accepted
             .as_ref()
             .map(|position| position.checkpoint_id.clone());
+        let parent_checkpoint_version_id = accepted
+            .as_ref()
+            .and_then(|position| position.checkpoint_version_id.clone());
         let inline_index_delta = self.pending_index_delta_object()?;
-        let record =
-            self.draft_commit_record_with_index_deltas(parent, Vec::new(), inline_index_delta)?;
+        let record = self.draft_commit_record_with_index_deltas(
+            parent,
+            parent_checkpoint_version_id,
+            Vec::new(),
+            inline_index_delta,
+        )?;
         let checkpoint = self.sign_commit_record(record)?;
         let index_delta_count = checkpoint_index_delta_count(&checkpoint);
-        let position = self.verify_signed_checkpoint(&checkpoint, accepted.as_ref())?;
+        let mut position = self.verify_signed_checkpoint(&checkpoint, accepted.as_ref())?;
 
-        self.persist_signed_checkpoint(&checkpoint).await?;
+        position.checkpoint_version_id = self.persist_signed_checkpoint(&checkpoint).await?;
         self.persist_checkpoint_evidence(&position).await?;
 
         anchor
@@ -180,20 +206,24 @@ where
         &self,
         accepted: &CheckpointPosition,
     ) -> Result<CheckpointPosition> {
-        let checkpoints = self.read_checkpoint_chain(&accepted.checkpoint_id).await?;
+        let checkpoints = self.read_checkpoint_chain(accepted).await?;
         let mut previous = None;
         let mut previous_published_at_ms = None;
         let mut rebuilt = RepositoryState::default();
         let mut loaded_keyring_envelope = None;
 
         for checkpoint in checkpoints.into_iter().rev() {
-            validate_checkpoint_published_at(&checkpoint, previous_published_at_ms)?;
-            let position = self.verify_signed_checkpoint(&checkpoint, previous.as_ref())?;
-            self.apply_checkpoint_deltas(&mut rebuilt, &checkpoint)
+            validate_checkpoint_published_at(&checkpoint.checkpoint, previous_published_at_ms)?;
+            let position = self.verify_signed_checkpoint_at(
+                &checkpoint.checkpoint,
+                previous.as_ref(),
+                checkpoint.version_id.clone(),
+            )?;
+            self.apply_checkpoint_deltas(&mut rebuilt, &checkpoint.checkpoint)
                 .await?;
             rebuilt.next_sequence = position.sequence;
-            loaded_keyring_envelope = checkpoint.record.keyring_envelope.clone();
-            previous_published_at_ms = Some(checkpoint.record.published_at_ms);
+            loaded_keyring_envelope = checkpoint.checkpoint.record.keyring_envelope.clone();
+            previous_published_at_ms = Some(checkpoint.checkpoint.record.published_at_ms);
             previous = Some(position);
         }
 
@@ -240,23 +270,33 @@ where
             )
             .await;
 
-        match put {
-            Ok(_) => {}
+        let version_id = match put {
+            Ok(metadata) => {
+                require_version_for_retained_write(&object_id, &metadata, retention, legal_hold)?
+            }
             Err(StorageError::AlreadyExists(_)) => {
+                let existing_metadata = self.store.head(&object_id).await?;
                 let existing = self.store.get_range(&object_id, ByteRange::Full).await?;
                 if existing != body {
                     return Err(crate::RepositoryError::KeyringEnvelopeObjectConflict {
                         object_id,
                     });
                 }
+                require_version_for_retained_write(
+                    &object_id,
+                    &existing_metadata,
+                    retention,
+                    legal_hold,
+                )?
             }
             Err(error) => return Err(error.into()),
-        }
+        };
 
         let reference = KeyringEnvelopeReference {
             generation: envelope.generation,
             digest,
             object_id,
+            version_id,
         };
         self.set_keyring_envelope_reference(Some(reference.clone()))?;
         Ok(reference)
@@ -284,7 +324,10 @@ where
     }
 
     /// Writes a signed checkpoint object if it has not already been written.
-    pub(crate) async fn persist_signed_checkpoint(&self, checkpoint: &Checkpoint) -> Result<()> {
+    pub(crate) async fn persist_signed_checkpoint(
+        &self,
+        checkpoint: &Checkpoint,
+    ) -> Result<Option<BackendVersionId>> {
         let object_id = checkpoint_object_id(&checkpoint.id)?;
         let body = Bytes::from(checkpoint_object_bytes(checkpoint)?);
         let retention = self.checkpoint_retention_policy()?;
@@ -304,11 +347,19 @@ where
             .await;
 
         match put {
-            Ok(_) => Ok(()),
+            Ok(metadata) => {
+                require_version_for_retained_write(&object_id, &metadata, retention, legal_hold)
+            }
             Err(StorageError::AlreadyExists(_)) => {
+                let existing_metadata = self.store.head(&object_id).await?;
                 let existing = self.store.get_range(&object_id, ByteRange::Full).await?;
                 if existing == body {
-                    Ok(())
+                    require_version_for_retained_write(
+                        &object_id,
+                        &existing_metadata,
+                        retention,
+                        legal_hold,
+                    )
                 } else {
                     Err(crate::RepositoryError::CheckpointObjectConflict { object_id })
                 }
@@ -324,6 +375,7 @@ where
             checkpoint_id: position.checkpoint_id.clone(),
             checkpoint_digest: position.payload_digest.clone(),
             checkpoint_object_id: checkpoint_object_id(&position.checkpoint_id)?,
+            checkpoint_object_version_id: position.checkpoint_version_id.clone(),
         };
         let body = Bytes::from(checkpoint_evidence_bytes(&evidence)?);
         let retention = self.checkpoint_retention_policy()?;
@@ -343,10 +395,20 @@ where
             .await;
 
         match put {
-            Ok(_) => Ok(()),
+            Ok(metadata) => {
+                require_version_for_retained_write(&object_id, &metadata, retention, legal_hold)?;
+                Ok(())
+            }
             Err(StorageError::AlreadyExists(_)) => {
+                let existing_metadata = self.store.head(&object_id).await?;
                 let existing = self.store.get_range(&object_id, ByteRange::Full).await?;
                 if existing == body {
+                    require_version_for_retained_write(
+                        &object_id,
+                        &existing_metadata,
+                        retention,
+                        legal_hold,
+                    )?;
                     Ok(())
                 } else {
                     Err(crate::RepositoryError::CheckpointEvidenceObjectConflict { object_id })
@@ -406,10 +468,11 @@ where
 
     pub(crate) async fn read_checkpoint_chain(
         &self,
-        latest: &CheckpointId,
-    ) -> Result<Vec<Checkpoint>> {
+        accepted: &CheckpointPosition,
+    ) -> Result<Vec<CheckpointChainEntry>> {
         let mut checkpoints = Vec::new();
-        let mut next = latest.clone();
+        let mut next = accepted.checkpoint_id.clone();
+        let mut next_version = accepted.checkpoint_version_id.clone();
         let mut seen = BTreeSet::new();
 
         loop {
@@ -417,25 +480,37 @@ where
                 return Err(crate::RepositoryError::CheckpointParentMismatch);
             }
 
-            let checkpoint = self.read_checkpoint_object(&next).await?;
+            let current_version = next_version.clone();
+            let checkpoint = self
+                .read_checkpoint_object_at(&next, current_version.as_ref())
+                .await?;
             let parent = checkpoint.record.parent.clone();
-            checkpoints.push(checkpoint);
+            let parent_version = checkpoint.record.parent_checkpoint_version_id.clone();
+            checkpoints.push(CheckpointChainEntry {
+                checkpoint,
+                version_id: current_version,
+            });
 
             let Some(parent) = parent else {
                 break;
             };
             next = parent;
+            next_version = parent_version;
         }
 
         Ok(checkpoints)
     }
 
-    pub(crate) async fn read_checkpoint_object(
+    pub(crate) async fn read_checkpoint_object_at(
         &self,
         checkpoint_id: &CheckpointId,
+        version_id: Option<&BackendVersionId>,
     ) -> Result<Checkpoint> {
         let object_id = checkpoint_object_id(checkpoint_id)?;
-        let body = self.store.get_range(&object_id, ByteRange::Full).await?;
+        let body = self
+            .store
+            .get_range_at(&object_id, version_id, ByteRange::Full)
+            .await?;
         let Some(payload) = body.as_ref().strip_prefix(CHECKPOINT_OBJECT_DOMAIN) else {
             return Err(crate::RepositoryError::InvalidObjectFormat { object_id });
         };
@@ -448,8 +523,8 @@ where
         state: &mut RepositoryState,
         checkpoint: &Checkpoint,
     ) -> Result<()> {
-        for object_id in &checkpoint.record.index_deltas {
-            let delta = self.read_index_delta_object(object_id).await?;
+        for object_ref in &checkpoint.record.index_deltas {
+            let delta = self.read_index_delta_object(object_ref).await?;
             self.load_embedded_manifest_records(state, &delta)?;
             apply_index_delta_object(state, delta);
         }
@@ -475,28 +550,35 @@ where
 
     pub(crate) async fn read_index_delta_object(
         &self,
-        object_id: &BackendObjectId,
+        object_ref: &BackendObjectRef,
     ) -> Result<IndexDeltaObject> {
-        let sealed_delta = self.read_sealed_index_delta_object(object_id).await?;
+        let sealed_delta = self.read_sealed_index_delta_object(object_ref).await?;
         let keyring = self.keyring()?;
 
-        open_index_delta_object(&keyring, object_id, &sealed_delta)
+        open_index_delta_object(&keyring, &object_ref.object_id, &sealed_delta)
     }
 
     pub(crate) async fn read_sealed_index_delta_object(
         &self,
-        object_id: &BackendObjectId,
+        object_ref: &BackendObjectRef,
     ) -> Result<SealedIndexDeltaObject> {
-        let body = self.store.get_range(object_id, ByteRange::Full).await?;
+        let body = self
+            .store
+            .get_range_at(
+                &object_ref.object_id,
+                object_ref.version_id.as_ref(),
+                ByteRange::Full,
+            )
+            .await?;
         let expected_object_id = derive_index_delta_object_id(&body)?;
-        if &expected_object_id != object_id {
+        if expected_object_id != object_ref.object_id {
             return Err(crate::RepositoryError::IndexDeltaObjectConflict {
-                object_id: object_id.clone(),
+                object_id: object_ref.object_id.clone(),
             });
         }
         let Some(payload) = body.as_ref().strip_prefix(INDEX_DELTA_OBJECT_DOMAIN) else {
             return Err(crate::RepositoryError::InvalidObjectFormat {
-                object_id: object_id.clone(),
+                object_id: object_ref.object_id.clone(),
             });
         };
 
@@ -661,7 +743,15 @@ fn validate_position(
     }
 
     if position.sequence == accepted.sequence {
-        if position == accepted {
+        if position.checkpoint_id == accepted.checkpoint_id
+            && position.payload_digest == accepted.payload_digest
+            && accepted
+                .checkpoint_version_id
+                .as_ref()
+                .is_none_or(|version_id| {
+                    position.checkpoint_version_id.as_ref() == Some(version_id)
+                })
+        {
             return Ok(());
         }
 
@@ -671,6 +761,9 @@ fn validate_position(
     }
 
     if record.parent.as_ref() != Some(&accepted.checkpoint_id) {
+        return Err(crate::RepositoryError::CheckpointParentMismatch);
+    }
+    if record.parent_checkpoint_version_id != accepted.checkpoint_version_id {
         return Err(crate::RepositoryError::CheckpointParentMismatch);
     }
 

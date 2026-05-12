@@ -137,6 +137,7 @@ async fn orphan_report_finds_unaccepted_checkpoint_evidence() {
     let unaccepted = CheckpointPosition {
         sequence: Sequence::new(9),
         checkpoint_id: checkpoint_id("unaccepted-checkpoint"),
+        checkpoint_version_id: None,
         payload_digest: "unaccepted-digest".to_owned(),
     };
     let evidence_id = must(checkpoint_evidence_object_id(&unaccepted));

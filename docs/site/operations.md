@@ -232,7 +232,8 @@ explicit recovery workflow rather than silently choosing storage state.
 
 A trusted external anchor can distribute trust outside the cluster by
 storing or signing the accepted checkpoint position: sequence, checkpoint ID,
-and checkpoint digest. It does not need to store the whole repository index.
+checkpoint object version ID when available, and checkpoint digest. It does not
+need to store the whole repository index.
 
 In Helm deployments, keep `rbac.create=true` unless equivalent Lease
 permissions already exist. Set `rbac.existing=true` only for that external-RBAC
@@ -302,7 +303,8 @@ trail.
     - repository ID
     - public repository salt
     - wrapping-key source for the keyring envelope
-    - trusted checkpoint position: sequence, checkpoint ID, and checkpoint digest
+    - trusted checkpoint position: sequence, checkpoint ID, checkpoint object
+      version ID when available, and checkpoint digest
     - checkpoint-bound keyring-envelope reference
     - backend endpoint, bucket, and prefix
     - restore verification command inputs
@@ -350,9 +352,9 @@ cargo run -p rs3-server -- export-restore-bundle --format json
 ```
 
 The bundle contains public repository restore metadata: repository ID, public
-salt, accepted checkpoint sequence, checkpoint ID, checkpoint digest, and the
-checkpoint-bound keyring-envelope reference. It does not contain wrapping-key
-material.
+salt, accepted checkpoint sequence, checkpoint ID, checkpoint object version ID
+when available, checkpoint digest, and the checkpoint-bound keyring-envelope
+reference. It does not contain wrapping-key material.
 
 On a new cluster with a missing anchor, import the trusted checkpoint position
 from that bundle after configuring the same repository ID, salt, and
@@ -362,8 +364,12 @@ wrapping-key source:
 cargo run -p rs3-server -- import-anchor \
   --checkpoint-sequence <bundle-sequence> \
   --checkpoint-id <bundle-checkpoint-id> \
+  --checkpoint-version-id <bundle-checkpoint-version-id> \
   --checkpoint-digest <bundle-checkpoint-digest>
 ```
+
+Omit `--checkpoint-version-id` only when the trusted bundle has no checkpoint
+version. Retained/Object Lock repositories should have one.
 
 The import verifies the checkpoint chain, checkpoint evidence, keyring envelope,
 and reachable restore-critical objects before writing the missing anchor.

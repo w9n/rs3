@@ -19,7 +19,7 @@ use rs3_index::{
     checkpoint_evidence_bytes,
 };
 use rs3_storage::{BlobStore, ByteRange, StorageError};
-use rs3_types::{BackendObjectId, KeyId, LegalHoldStatus, RetentionMode};
+use rs3_types::{BackendObjectId, BackendObjectRef, KeyId, LegalHoldStatus, RetentionMode};
 use std::collections::BTreeSet;
 
 const INDEX_DELTA_OBJECT_PREFIX: &str = "index/";
@@ -34,14 +34,18 @@ where
         &self,
         accepted: &CheckpointPosition,
     ) -> Result<Vec<ReachableBackendObject>> {
-        let checkpoints = self.read_checkpoint_chain(&accepted.checkpoint_id).await?;
+        let checkpoints = self.read_checkpoint_chain(accepted).await?;
         let mut previous = None;
         let mut reachable = BTreeSet::new();
 
         for checkpoint in checkpoints.into_iter().rev() {
-            let position = self.verify_signed_checkpoint(&checkpoint, previous.as_ref())?;
+            let position = self.verify_signed_checkpoint_at(
+                &checkpoint.checkpoint,
+                previous.as_ref(),
+                checkpoint.version_id.clone(),
+            )?;
             reachable.insert(ReachableBackendObject {
-                object_id: checkpoint_object_id(&checkpoint.id)?,
+                object_id: checkpoint_object_id(&checkpoint.checkpoint.id)?,
                 kind: BackendObjectReferenceKind::Checkpoint,
             });
             reachable.insert(ReachableBackendObject {
@@ -49,21 +53,21 @@ where
                 kind: BackendObjectReferenceKind::CheckpointEvidence,
             });
 
-            for object_id in &checkpoint.record.index_deltas {
+            for object_ref in &checkpoint.checkpoint.record.index_deltas {
                 reachable.insert(ReachableBackendObject {
-                    object_id: object_id.clone(),
+                    object_id: object_ref.object_id.clone(),
                     kind: BackendObjectReferenceKind::IndexDelta,
                 });
 
-                let delta = self.read_index_delta_object(object_id).await?;
+                let delta = self.read_index_delta_object(object_ref).await?;
                 insert_delta_payload_references(&mut reachable, delta);
             }
 
-            if let Some(delta) = self.open_inline_index_delta_object(&checkpoint)? {
+            if let Some(delta) = self.open_inline_index_delta_object(&checkpoint.checkpoint)? {
                 insert_delta_payload_references(&mut reachable, delta);
             }
 
-            if let Some(envelope) = checkpoint.record.keyring_envelope.as_ref() {
+            if let Some(envelope) = checkpoint.checkpoint.record.keyring_envelope.as_ref() {
                 reachable.insert(ReachableBackendObject {
                     object_id: envelope.object_id.clone(),
                     kind: BackendObjectReferenceKind::KeyringEnvelope,
@@ -200,7 +204,7 @@ where
         &self,
         accepted: &CheckpointPosition,
     ) -> Result<RestoreVerificationReport> {
-        let checkpoints = self.read_checkpoint_chain(&accepted.checkpoint_id).await?;
+        let checkpoints = self.read_checkpoint_chain(accepted).await?;
         let keyring = self.keyring()?;
         let mut previous = None;
         let mut previous_published_at_ms = None;
@@ -215,29 +219,54 @@ where
         let mut protection = RestoreProtectionSummary::default();
 
         for checkpoint in checkpoints.into_iter().rev() {
-            validate_checkpoint_published_at(&checkpoint, previous_published_at_ms)?;
-            let position = self.verify_signed_checkpoint(&checkpoint, previous.as_ref())?;
-            let checkpoint_backend_object_id = checkpoint_object_id(&checkpoint.id)?;
-            summarize_object_protection(self, &checkpoint_backend_object_id, &mut protection)
-                .await?;
-            required_key_ids.insert(checkpoint.signature_key_id.clone());
+            validate_checkpoint_published_at(&checkpoint.checkpoint, previous_published_at_ms)?;
+            let position = self.verify_signed_checkpoint_at(
+                &checkpoint.checkpoint,
+                previous.as_ref(),
+                checkpoint.version_id.clone(),
+            )?;
+            let checkpoint_backend_object_id = checkpoint_object_id(&checkpoint.checkpoint.id)?;
+            summarize_object_protection(
+                self,
+                &checkpoint_backend_object_id,
+                checkpoint.version_id.as_ref(),
+                &mut protection,
+            )
+            .await?;
+            required_key_ids.insert(checkpoint.checkpoint.signature_key_id.clone());
             let evidence_object_id = verify_checkpoint_evidence_object(self, &position).await?;
-            summarize_object_protection(self, &evidence_object_id, &mut protection).await?;
+            summarize_object_protection(self, &evidence_object_id, None, &mut protection).await?;
             checkpoint_count += 1;
             checkpoint_evidence_count += 1;
 
-            if let Some(envelope) = checkpoint.record.keyring_envelope.as_ref()
-                && verified_keyring_envelopes.insert(envelope.object_id.clone())
+            if let Some(envelope) = checkpoint.checkpoint.record.keyring_envelope.as_ref()
+                && verified_keyring_envelopes.insert(BackendObjectRef {
+                    object_id: envelope.object_id.clone(),
+                    version_id: envelope.version_id.clone(),
+                })
             {
                 verify_keyring_envelope_object(self, envelope).await?;
-                summarize_object_protection(self, &envelope.object_id, &mut protection).await?;
+                summarize_object_protection(
+                    self,
+                    &envelope.object_id,
+                    envelope.version_id.as_ref(),
+                    &mut protection,
+                )
+                .await?;
             }
 
-            for object_id in &checkpoint.record.index_deltas {
-                summarize_object_protection(self, object_id, &mut protection).await?;
-                let sealed_delta = self.read_sealed_index_delta_object(object_id).await?;
+            for object_ref in &checkpoint.checkpoint.record.index_deltas {
+                summarize_object_protection(
+                    self,
+                    &object_ref.object_id,
+                    object_ref.version_id.as_ref(),
+                    &mut protection,
+                )
+                .await?;
+                let sealed_delta = self.read_sealed_index_delta_object(object_ref).await?;
                 required_key_ids.insert(sealed_delta.key_id.clone());
-                let delta = open_index_delta_object(&keyring, object_id, &sealed_delta)?;
+                let delta =
+                    open_index_delta_object(&keyring, &object_ref.object_id, &sealed_delta)?;
                 verify_index_delta_payloads(
                     self,
                     &keyring,
@@ -251,12 +280,12 @@ where
                 index_delta_object_count += 1;
             }
 
-            if let Some(sealed_delta) = checkpoint.record.inline_index_delta.as_ref() {
+            if let Some(sealed_delta) = checkpoint.checkpoint.record.inline_index_delta.as_ref() {
                 required_key_ids.insert(sealed_delta.key_id.clone());
-                let delta = self.open_inline_index_delta_object(&checkpoint)?;
+                let delta = self.open_inline_index_delta_object(&checkpoint.checkpoint)?;
                 let Some(delta) = delta else {
                     return Err(RepositoryError::InvalidObjectFormat {
-                        object_id: checkpoint_object_id(&checkpoint.id)?,
+                        object_id: checkpoint_object_id(&checkpoint.checkpoint.id)?,
                     });
                 };
                 verify_index_delta_payloads(
@@ -272,7 +301,7 @@ where
                 inline_index_delta_count += 1;
             }
 
-            previous_published_at_ms = Some(checkpoint.record.published_at_ms);
+            previous_published_at_ms = Some(checkpoint.checkpoint.record.published_at_ms);
             previous = Some(position);
         }
 
@@ -330,6 +359,7 @@ where
         checkpoint_id: position.checkpoint_id.clone(),
         checkpoint_digest: position.payload_digest.clone(),
         checkpoint_object_id: checkpoint_object_id(&position.checkpoint_id)?,
+        checkpoint_object_version_id: position.checkpoint_version_id.clone(),
     })?;
     let body = repo.store.get_range(&object_id, ByteRange::Full).await?;
     if !body.starts_with(CHECKPOINT_EVIDENCE_DOMAIN) || body.as_ref() != expected.as_slice() {
@@ -348,7 +378,11 @@ where
 {
     let body = repo
         .store
-        .get_range(&reference.object_id, ByteRange::Full)
+        .get_range_at(
+            &reference.object_id,
+            reference.version_id.as_ref(),
+            ByteRange::Full,
+        )
         .await?;
     let envelope = KeyringEnvelope::from_object_bytes(&body)?;
     let digest = envelope.digest()?;
@@ -365,7 +399,7 @@ async fn verify_index_delta_payloads<S>(
     repo: &Repository<S>,
     keyring: &rs3_crypto::KeyRing,
     delta: IndexDeltaObject,
-    verified_payloads: &mut BTreeSet<BackendObjectId>,
+    verified_payloads: &mut BTreeSet<BackendObjectRef>,
     payload_plaintext_bytes: &mut u64,
     required_key_ids: &mut BTreeSet<KeyId>,
     protection: &mut RestoreProtectionSummary,
@@ -390,13 +424,21 @@ where
                 object_id: entry.object_id,
             });
         }
-        if !verified_payloads.insert(entry.object_id.clone()) {
+        let object_ref = BackendObjectRef {
+            object_id: entry.object_id.clone(),
+            version_id: entry.object_version_id.clone(),
+        };
+        if !verified_payloads.insert(object_ref.clone()) {
             continue;
         }
 
         let body = repo
             .store
-            .get_range(&entry.object_id, ByteRange::Full)
+            .get_range_at(
+                &object_ref.object_id,
+                object_ref.version_id.as_ref(),
+                ByteRange::Full,
+            )
             .await?;
         let header = parse_segmented_payload_header(&entry.object_id, &body)?;
         required_key_ids.insert(header.key_id.clone());
@@ -410,7 +452,13 @@ where
                 object_id: entry.object_id,
             });
         }
-        summarize_object_protection(repo, &entry.object_id, protection).await?;
+        summarize_object_protection(
+            repo,
+            &object_ref.object_id,
+            object_ref.version_id.as_ref(),
+            protection,
+        )
+        .await?;
         *payload_plaintext_bytes = payload_plaintext_bytes.saturating_add(plaintext_len);
     }
 
@@ -420,12 +468,13 @@ where
 async fn summarize_object_protection<S>(
     repo: &Repository<S>,
     object_id: &BackendObjectId,
+    version_id: Option<&rs3_types::BackendVersionId>,
     summary: &mut RestoreProtectionSummary,
 ) -> Result<()>
 where
     S: BlobStore,
 {
-    let metadata = repo.store.head(object_id).await?;
+    let metadata = repo.store.head_at(object_id, version_id).await?;
     summary.checked_object_count = summary.checked_object_count.saturating_add(1);
     let mut delete_protected = false;
     if let Some(policy) = metadata.retention {

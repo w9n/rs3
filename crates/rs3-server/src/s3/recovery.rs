@@ -67,6 +67,8 @@ pub struct RestoreBundleKeyringEnvelope {
     pub generation: u64,
     /// Backend object containing the encrypted keyring envelope.
     pub object_id: BackendObjectId,
+    /// Provider version identifier for exact envelope restore reads, when available.
+    pub version_id: Option<rs3_types::BackendVersionId>,
     /// Expected envelope digest.
     pub digest: String,
 }
@@ -211,6 +213,7 @@ fn restore_bundle_envelope(reference: &KeyringEnvelopeReference) -> RestoreBundl
     RestoreBundleKeyringEnvelope {
         generation: reference.generation,
         object_id: reference.object_id.clone(),
+        version_id: reference.version_id.clone(),
         digest: reference.digest.clone(),
     }
 }
@@ -312,6 +315,7 @@ fn checkpoint_position_from_evidence(body: &[u8]) -> Result<CheckpointPosition, 
     Ok(CheckpointPosition {
         sequence: evidence.sequence,
         checkpoint_id: evidence.checkpoint_id,
+        checkpoint_version_id: evidence.checkpoint_object_version_id,
         payload_digest: evidence.checkpoint_digest,
     })
 }

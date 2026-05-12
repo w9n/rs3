@@ -13,6 +13,7 @@ use tokio::sync::OnceCell;
 const CHECKPOINT_SEQUENCE_ANNOTATION: &str = "rs3.rs/checkpoint-sequence";
 const CHECKPOINT_ID_ANNOTATION: &str = "rs3.rs/checkpoint-id";
 const CHECKPOINT_DIGEST_ANNOTATION: &str = "rs3.rs/checkpoint-digest";
+const CHECKPOINT_VERSION_ID_ANNOTATION: &str = "rs3.rs/checkpoint-version-id";
 const MAX_ADVANCE_ATTEMPTS: usize = 16;
 
 /// Kubernetes object settings used for checkpoint anchoring.
@@ -137,6 +138,17 @@ fn lease_with_state(mut lease: Lease, state: &AnchorState, field_manager: &str) 
         CHECKPOINT_DIGEST_ANNOTATION.to_owned(),
         state.checkpoint_digest.clone(),
     );
+    match state.checkpoint_version_id.as_ref() {
+        Some(version_id) => {
+            annotations.insert(
+                CHECKPOINT_VERSION_ID_ANNOTATION.to_owned(),
+                version_id.as_str().to_owned(),
+            );
+        }
+        None => {
+            annotations.remove(CHECKPOINT_VERSION_ID_ANNOTATION);
+        }
+    }
 
     let spec = lease.spec.get_or_insert_with(LeaseSpec::default);
     spec.holder_identity = Some(format!(
@@ -161,6 +173,10 @@ fn anchor_state_from_lease(lease: &Lease) -> rs3_anchor::Result<AnchorState> {
     let checkpoint_id = CheckpointId::new(annotation(annotations, CHECKPOINT_ID_ANNOTATION)?)
         .map_err(anchor_backend)?;
     let checkpoint_digest = annotation(annotations, CHECKPOINT_DIGEST_ANNOTATION)?.to_owned();
+    let checkpoint_version_id = annotations
+        .get(CHECKPOINT_VERSION_ID_ANNOTATION)
+        .map(|value| rs3_types::BackendVersionId::new(value.to_owned()).map_err(anchor_backend))
+        .transpose()?;
 
     if checkpoint_digest.is_empty() {
         return Err(AnchorError::Backend(
@@ -172,6 +188,7 @@ fn anchor_state_from_lease(lease: &Lease) -> rs3_anchor::Result<AnchorState> {
         sequence: Sequence::new(sequence),
         checkpoint_id,
         checkpoint_digest,
+        checkpoint_version_id,
     })
 }
 
@@ -197,7 +214,7 @@ fn anchor_backend(error: impl ToString) -> AnchorError {
 mod tests {
     use super::{
         CHECKPOINT_DIGEST_ANNOTATION, CHECKPOINT_ID_ANNOTATION, CHECKPOINT_SEQUENCE_ANNOTATION,
-        anchor_state_from_lease, lease_with_state,
+        CHECKPOINT_VERSION_ID_ANNOTATION, anchor_state_from_lease, lease_with_state,
     };
     use k8s_openapi::api::coordination::v1::Lease;
     use rs3_anchor::{AnchorError, AnchorState};
@@ -208,6 +225,7 @@ mod tests {
             sequence: Sequence::new(sequence),
             checkpoint_id: CheckpointId::new(checkpoint_id).expect("valid checkpoint id"),
             checkpoint_digest: format!("digest-{checkpoint_id}"),
+            checkpoint_version_id: None,
         }
     }
 
@@ -219,6 +237,25 @@ mod tests {
         let actual = anchor_state_from_lease(&lease);
 
         assert_eq!(actual.ok(), Some(expected));
+    }
+
+    #[test]
+    fn lease_annotations_round_trip_checkpoint_version() {
+        let mut expected = state(8, "checkpoint-8");
+        expected.checkpoint_version_id =
+            Some(rs3_types::BackendVersionId::new("version-8").expect("valid backend version id"));
+        let lease = lease_with_state(Lease::default(), &expected, "rs3-test");
+
+        assert_eq!(
+            lease
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(CHECKPOINT_VERSION_ID_ANNOTATION))
+                .map(String::as_str),
+            Some("version-8")
+        );
+        assert_eq!(anchor_state_from_lease(&lease).ok(), Some(expected));
     }
 
     #[test]

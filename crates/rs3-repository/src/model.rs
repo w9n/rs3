@@ -1,8 +1,8 @@
 //! Public repository operation models.
 
 use rs3_types::{
-    BackendObjectId, CheckpointId, KeyId, LegalHoldStatus, LogicalPath, RetentionMode,
-    RetentionPolicy, Sequence,
+    BackendObjectId, BackendVersionId, CheckpointId, KeyId, LegalHoldStatus, LogicalPath,
+    RetentionMode, RetentionPolicy, Sequence,
 };
 
 /// Options for a trusted repository PUT.
@@ -210,6 +210,8 @@ pub struct CheckpointPosition {
     pub sequence: Sequence,
     /// Accepted checkpoint ID.
     pub checkpoint_id: CheckpointId,
+    /// Provider version identifier for the accepted checkpoint object, when available.
+    pub checkpoint_version_id: Option<BackendVersionId>,
     /// Digest of the canonical checkpoint payload.
     pub payload_digest: String,
 }
@@ -221,6 +223,7 @@ impl CheckpointPosition {
             sequence: self.sequence,
             checkpoint_id: self.checkpoint_id,
             checkpoint_digest: self.payload_digest,
+            checkpoint_version_id: self.checkpoint_version_id,
         }
     }
 }
@@ -230,6 +233,7 @@ impl From<rs3_anchor::AnchorState> for CheckpointPosition {
         Self {
             sequence: value.sequence,
             checkpoint_id: value.checkpoint_id,
+            checkpoint_version_id: value.checkpoint_version_id,
             payload_digest: value.checkpoint_digest,
         }
     }

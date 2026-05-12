@@ -1,7 +1,7 @@
 //! Checkpoint anchoring contracts.
 
 use async_trait::async_trait;
-use rs3_types::{CheckpointId, Sequence};
+use rs3_types::{BackendVersionId, CheckpointId, Sequence};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
@@ -14,6 +14,8 @@ pub struct AnchorState {
     pub checkpoint_id: CheckpointId,
     /// Digest of the accepted checkpoint payload.
     pub checkpoint_digest: String,
+    /// Provider version identifier for the accepted checkpoint object, when available.
+    pub checkpoint_version_id: Option<BackendVersionId>,
 }
 
 /// Errors returned by checkpoint anchor implementations.
@@ -107,6 +109,7 @@ mod tests {
             sequence: Sequence::new(sequence),
             checkpoint_id: checkpoint_id(id),
             checkpoint_digest: format!("digest-{id}"),
+            checkpoint_version_id: None,
         }
     }
 

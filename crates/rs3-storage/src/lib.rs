@@ -6,7 +6,9 @@ mod s3;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
+use rs3_types::{
+    BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionMode, RetentionPolicy,
+};
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -28,7 +30,7 @@ pub struct BlobMetadata {
     /// Provider entity tag, when available.
     pub etag: Option<String>,
     /// Provider version identifier, when available.
-    pub version_id: Option<String>,
+    pub version_id: Option<BackendVersionId>,
     /// Provider retention policy for this object version, when known.
     pub retention: Option<RetentionPolicy>,
     /// Provider legal-hold status for this object version, when known.
@@ -83,6 +85,12 @@ pub enum StorageError {
     /// The provider cannot extend retention for an existing object version.
     #[error("retention extension is unsupported")]
     RetentionExtensionUnsupported,
+    /// The provider cannot address exact object versions.
+    #[error("version-addressed operation is unsupported")]
+    VersionUnsupported,
+    /// A retained write did not return the provider version needed for exact restores.
+    #[error("provider did not return a version id for retained object: {0}")]
+    MissingVersionId(BackendObjectId),
     /// The operation could not be completed because legal hold blocked it.
     #[error("object legal hold blocked the operation")]
     LegalHoldBlocked,
@@ -111,8 +119,33 @@ pub trait BlobStore: Send + Sync {
     /// sections of large data objects instead of whole objects.
     async fn get_range(&self, object_id: &BackendObjectId, range: ByteRange) -> Result<Bytes>;
 
+    /// Reads an object or byte range from a specific provider version.
+    async fn get_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> Result<Bytes> {
+        if version_id.is_some() {
+            return Err(StorageError::VersionUnsupported);
+        }
+        self.get_range(object_id, range).await
+    }
+
     /// Reads object metadata without fetching the body.
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata>;
+
+    /// Reads object metadata for a specific provider version.
+    async fn head_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> Result<BlobMetadata> {
+        if version_id.is_some() {
+            return Err(StorageError::VersionUnsupported);
+        }
+        self.head(object_id).await
+    }
 
     /// Lists object metadata under an opaque prefix.
     ///
@@ -131,12 +164,38 @@ pub trait BlobStore: Send + Sync {
         policy: RetentionPolicy,
     ) -> Result<()>;
 
+    /// Extends retention for a specific existing object version.
+    async fn extend_retention_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        policy: RetentionPolicy,
+    ) -> Result<()> {
+        if version_id.is_some() {
+            return Err(StorageError::VersionUnsupported);
+        }
+        self.extend_retention(object_id, policy).await
+    }
+
     /// Applies or clears legal hold for an existing object version.
     async fn set_legal_hold(
         &self,
         object_id: &BackendObjectId,
         status: LegalHoldStatus,
     ) -> Result<()>;
+
+    /// Applies or clears legal hold for a specific existing object version.
+    async fn set_legal_hold_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        status: LegalHoldStatus,
+    ) -> Result<()> {
+        if version_id.is_some() {
+            return Err(StorageError::VersionUnsupported);
+        }
+        self.set_legal_hold(object_id, status).await
+    }
 
     /// Flushes implementation-local caches before process shutdown or handoff.
     async fn flush_caches(&self) -> Result<()>;
@@ -250,11 +309,43 @@ where
         Ok(body)
     }
 
+    async fn get_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> Result<Bytes> {
+        self.mutate_counts(|counts| {
+            counts.get = counts.get.saturating_add(1);
+        })?;
+        let body = self
+            .inner
+            .get_range_at(object_id, version_id, range)
+            .await?;
+        let bytes_read = u64::try_from(body.len())
+            .map_err(|_| StorageError::Provider("read length does not fit in u64".to_owned()))?;
+        self.mutate_counts(|counts| {
+            counts.bytes_read = counts.bytes_read.saturating_add(bytes_read);
+        })?;
+        Ok(body)
+    }
+
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {
         self.mutate_counts(|counts| {
             counts.head = counts.head.saturating_add(1);
         })?;
         self.inner.head(object_id).await
+    }
+
+    async fn head_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> Result<BlobMetadata> {
+        self.mutate_counts(|counts| {
+            counts.head = counts.head.saturating_add(1);
+        })?;
+        self.inner.head_at(object_id, version_id).await
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
@@ -282,6 +373,20 @@ where
         self.inner.extend_retention(object_id, policy).await
     }
 
+    async fn extend_retention_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        policy: RetentionPolicy,
+    ) -> Result<()> {
+        self.mutate_counts(|counts| {
+            counts.extend_retention = counts.extend_retention.saturating_add(1);
+        })?;
+        self.inner
+            .extend_retention_at(object_id, version_id, policy)
+            .await
+    }
+
     async fn set_legal_hold(
         &self,
         object_id: &BackendObjectId,
@@ -291,6 +396,20 @@ where
             counts.set_legal_hold = counts.set_legal_hold.saturating_add(1);
         })?;
         self.inner.set_legal_hold(object_id, status).await
+    }
+
+    async fn set_legal_hold_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        status: LegalHoldStatus,
+    ) -> Result<()> {
+        self.mutate_counts(|counts| {
+            counts.set_legal_hold = counts.set_legal_hold.saturating_add(1);
+        })?;
+        self.inner
+            .set_legal_hold_at(object_id, version_id, status)
+            .await
     }
 
     async fn flush_caches(&self) -> Result<()> {
@@ -315,7 +434,7 @@ struct MemoryObject {
 
 #[derive(Debug, Default)]
 struct MemoryState {
-    objects: BTreeMap<BackendObjectId, MemoryObject>,
+    objects: BTreeMap<BackendObjectId, Vec<MemoryObject>>,
     next_modified_at_ms: i64,
     next_version: u64,
     counts: BlobOperationCounts,
@@ -351,6 +470,30 @@ impl MemoryBlobStore {
         self.state
             .write()
             .map_err(|_| StorageError::Provider("memory blob store lock poisoned".to_owned()))
+    }
+}
+
+fn memory_object_at<'a>(
+    versions: &'a [MemoryObject],
+    version_id: Option<&BackendVersionId>,
+) -> Option<&'a MemoryObject> {
+    match version_id {
+        Some(version_id) => versions
+            .iter()
+            .find(|object| object.metadata.version_id.as_ref() == Some(version_id)),
+        None => versions.last(),
+    }
+}
+
+fn memory_object_at_mut<'a>(
+    versions: &'a mut [MemoryObject],
+    version_id: Option<&BackendVersionId>,
+) -> Option<&'a mut MemoryObject> {
+    match version_id {
+        Some(version_id) => versions
+            .iter_mut()
+            .find(|object| object.metadata.version_id.as_ref() == Some(version_id)),
+        None => versions.last_mut(),
     }
 }
 
@@ -397,19 +540,23 @@ impl BlobStore for MemoryBlobStore {
             content_len,
             modified_at_ms: Some(state.next_modified_at_ms),
             etag: Some(format!("mem-{}-{}", state.next_version, body.len())),
-            version_id: Some(format!("mem-v{}", state.next_version)),
+            version_id: Some(
+                BackendVersionId::new(format!("mem-v{}", state.next_version))
+                    .map_err(|error| StorageError::Provider(error.to_string()))?,
+            ),
             retention: options.retention,
             legal_hold,
         };
         state.counts.bytes_written = state.counts.bytes_written.saturating_add(content_len);
 
-        state.objects.insert(
-            object_id.clone(),
-            MemoryObject {
+        state
+            .objects
+            .entry(object_id.clone())
+            .or_default()
+            .push(MemoryObject {
                 body,
                 metadata: metadata.clone(),
-            },
-        );
+            });
 
         record_blob_put(
             object_kind,
@@ -427,7 +574,46 @@ impl BlobStore for MemoryBlobStore {
         let mut state = self.write_state()?;
         state.counts.get = state.counts.get.saturating_add(1);
 
-        let Some(object) = state.objects.get(object_id) else {
+        let Some(object) = state
+            .objects
+            .get(object_id)
+            .and_then(|versions| versions.last())
+        else {
+            record_blob_get(object_kind, range, 0, "not_found", started.elapsed());
+            return Err(StorageError::NotFound(object_id.clone()));
+        };
+
+        let body = match read_range(&object.body, range) {
+            Ok(body) => body,
+            Err(error) => {
+                record_blob_get(object_kind, range, 0, "invalid_range", started.elapsed());
+                return Err(error);
+            }
+        };
+        let bytes_read = u64::try_from(body.len())
+            .map_err(|_| StorageError::Provider("read length does not fit in u64".to_owned()))?;
+        state.counts.bytes_read = state.counts.bytes_read.saturating_add(bytes_read);
+
+        record_blob_get(object_kind, range, bytes_read, "ok", started.elapsed());
+        Ok(body)
+    }
+
+    async fn get_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> Result<Bytes> {
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
+        let mut state = self.write_state()?;
+        state.counts.get = state.counts.get.saturating_add(1);
+
+        let Some(object) = state
+            .objects
+            .get(object_id)
+            .and_then(|versions| memory_object_at(versions, version_id))
+        else {
             record_blob_get(object_kind, range, 0, "not_found", started.elapsed());
             return Err(StorageError::NotFound(object_id.clone()));
         };
@@ -453,7 +639,37 @@ impl BlobStore for MemoryBlobStore {
         let mut state = self.write_state()?;
         state.counts.head = state.counts.head.saturating_add(1);
 
-        match state.objects.get(object_id) {
+        match state
+            .objects
+            .get(object_id)
+            .and_then(|versions| versions.last())
+        {
+            Some(object) => {
+                record_blob_head(object_kind, "ok", started.elapsed());
+                Ok(object.metadata.clone())
+            }
+            None => {
+                record_blob_head(object_kind, "not_found", started.elapsed());
+                Err(StorageError::NotFound(object_id.clone()))
+            }
+        }
+    }
+
+    async fn head_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> Result<BlobMetadata> {
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
+        let mut state = self.write_state()?;
+        state.counts.head = state.counts.head.saturating_add(1);
+
+        match state
+            .objects
+            .get(object_id)
+            .and_then(|versions| memory_object_at(versions, version_id))
+        {
             Some(object) => {
                 record_blob_head(object_kind, "ok", started.elapsed());
                 Ok(object.metadata.clone())
@@ -475,7 +691,8 @@ impl BlobStore for MemoryBlobStore {
             .objects
             .iter()
             .filter(|(object_id, _)| object_id.as_str().starts_with(prefix))
-            .map(|(_, object)| object.metadata.clone())
+            .filter_map(|(_, versions)| versions.last())
+            .map(|object| object.metadata.clone())
             .collect::<Vec<_>>();
         record_blob_list(object_kind, entries.len(), "ok", started.elapsed());
 
@@ -488,7 +705,11 @@ impl BlobStore for MemoryBlobStore {
         let mut state = self.write_state()?;
         state.counts.delete = state.counts.delete.saturating_add(1);
 
-        let Some(object) = state.objects.get(object_id) else {
+        let Some(object) = state
+            .objects
+            .get(object_id)
+            .and_then(|versions| versions.last())
+        else {
             record_blob_delete(object_kind, "not_found", started.elapsed());
             return Err(StorageError::NotFound(object_id.clone()));
         };
@@ -517,7 +738,38 @@ impl BlobStore for MemoryBlobStore {
         let mut state = self.write_state()?;
         state.counts.extend_retention = state.counts.extend_retention.saturating_add(1);
 
-        let Some(object) = state.objects.get_mut(object_id) else {
+        let Some(object) = state
+            .objects
+            .get_mut(object_id)
+            .and_then(|versions| versions.last_mut())
+        else {
+            record_blob_extend_retention(object_kind, "not_found", started.elapsed());
+            return Err(StorageError::NotFound(object_id.clone()));
+        };
+
+        object.metadata.retention =
+            Some(merge_retention(object.metadata.retention.as_ref(), policy));
+
+        record_blob_extend_retention(object_kind, "ok", started.elapsed());
+        Ok(())
+    }
+
+    async fn extend_retention_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        policy: RetentionPolicy,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
+        let mut state = self.write_state()?;
+        state.counts.extend_retention = state.counts.extend_retention.saturating_add(1);
+
+        let Some(object) = state
+            .objects
+            .get_mut(object_id)
+            .and_then(|versions| memory_object_at_mut(versions, version_id))
+        else {
             record_blob_extend_retention(object_kind, "not_found", started.elapsed());
             return Err(StorageError::NotFound(object_id.clone()));
         };
@@ -539,7 +791,37 @@ impl BlobStore for MemoryBlobStore {
         let mut state = self.write_state()?;
         state.counts.set_legal_hold = state.counts.set_legal_hold.saturating_add(1);
 
-        let Some(object) = state.objects.get_mut(object_id) else {
+        let Some(object) = state
+            .objects
+            .get_mut(object_id)
+            .and_then(|versions| versions.last_mut())
+        else {
+            record_blob_set_legal_hold(object_kind, "not_found", started.elapsed());
+            return Err(StorageError::NotFound(object_id.clone()));
+        };
+
+        object.metadata.legal_hold = Some(status);
+
+        record_blob_set_legal_hold(object_kind, "ok", started.elapsed());
+        Ok(())
+    }
+
+    async fn set_legal_hold_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        status: LegalHoldStatus,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
+        let mut state = self.write_state()?;
+        state.counts.set_legal_hold = state.counts.set_legal_hold.saturating_add(1);
+
+        let Some(object) = state
+            .objects
+            .get_mut(object_id)
+            .and_then(|versions| memory_object_at_mut(versions, version_id))
+        else {
             record_blob_set_legal_hold(object_kind, "not_found", started.elapsed());
             return Err(StorageError::NotFound(object_id.clone()));
         };
@@ -839,6 +1121,42 @@ mod tests {
         let counts = counts(&store);
         assert_eq!(counts.get, 1);
         assert_eq!(counts.bytes_read, 5);
+    }
+
+    #[tokio::test]
+    async fn version_addressed_reads_return_requested_memory_version() {
+        let store = MemoryBlobStore::new();
+        let object_id = object_id("segments/versioned");
+
+        let first = store
+            .put(
+                &object_id,
+                Bytes::from_static(b"first"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let second = store
+            .put(
+                &object_id,
+                Bytes::from_static(b"second"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_ne!(first.version_id, second.version_id);
+        let first_version = first
+            .version_id
+            .as_ref()
+            .unwrap_or_else(|| panic!("memory put should return a version id"));
+
+        let latest = store.get_range(&object_id, ByteRange::Full).await;
+        let versioned = store
+            .get_range_at(&object_id, Some(first_version), ByteRange::Full)
+            .await;
+
+        assert_eq!(latest, Ok(Bytes::from_static(b"second")));
+        assert_eq!(versioned, Ok(Bytes::from_static(b"first")));
     }
 
     #[tokio::test]

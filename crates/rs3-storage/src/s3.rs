@@ -25,7 +25,9 @@ use object_store::{
     Attribute, Attributes, GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
     PutOptions as ObjectPutOptions,
 };
-use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
+use rs3_types::{
+    BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionMode, RetentionPolicy,
+};
 use std::sync::{Arc, Once, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -369,8 +371,11 @@ impl S3BlobStore {
             .send()
             .await
             .map_err(|error| map_sdk_put_error(error, object_id))?;
-        let version_id = output.version_id().map(str::to_owned);
-        let mut metadata = self.head_with_sdk(object_id, version_id.as_deref()).await?;
+        let version_id = output
+            .version_id()
+            .map(backend_version_id_from_str)
+            .transpose()?;
+        let mut metadata = self.head_with_sdk(object_id, version_id.as_ref()).await?;
         if let Some(retention) = retention {
             verify_retention(metadata.retention.as_ref(), retention)?;
         }
@@ -386,7 +391,7 @@ impl S3BlobStore {
     async fn head_with_sdk(
         &self,
         object_id: &BackendObjectId,
-        version_id: Option<&str>,
+        version_id: Option<&BackendVersionId>,
     ) -> Result<BlobMetadata> {
         let client = self
             .sdk_client
@@ -397,7 +402,7 @@ impl S3BlobStore {
             .bucket(self.config.bucket.as_str())
             .key(self.config.object_key(object_id));
         if let Some(version_id) = version_id {
-            request = request.version_id(version_id);
+            request = request.version_id(version_id.as_str());
         }
 
         let output = request
@@ -428,7 +433,10 @@ impl S3BlobStore {
             content_len,
             modified_at_ms,
             etag: output.e_tag().map(str::to_owned),
-            version_id: output.version_id().map(str::to_owned),
+            version_id: output
+                .version_id()
+                .map(backend_version_id_from_str)
+                .transpose()?,
             retention,
             legal_hold,
         })
@@ -437,6 +445,7 @@ impl S3BlobStore {
     async fn extend_s3_retention(
         &self,
         object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
         policy: &RetentionPolicy,
     ) -> Result<()> {
         if !retention_is_active(policy) {
@@ -446,7 +455,7 @@ impl S3BlobStore {
             .sdk_client
             .as_ref()
             .ok_or(StorageError::RetentionExtensionUnsupported)?;
-        let existing = self.head_with_sdk(object_id, None).await?;
+        let existing = self.head_with_sdk(object_id, version_id).await?;
         if retention_satisfies(existing.retention.as_ref(), policy) {
             return Ok(());
         }
@@ -455,23 +464,28 @@ impl S3BlobStore {
             .mode(sdk_object_lock_retention_mode(policy)?)
             .retain_until_date(retain_until_date(policy)?)
             .build();
-        client
+        let mut request = client
             .put_object_retention()
             .bucket(self.config.bucket.as_str())
             .key(self.config.object_key(object_id))
             .retention(retention)
-            .checksum_algorithm(ChecksumAlgorithm::Sha256)
+            .checksum_algorithm(ChecksumAlgorithm::Sha256);
+        if let Some(version_id) = version_id {
+            request = request.version_id(version_id.as_str());
+        }
+        request
             .send()
             .await
             .map_err(|error| map_sdk_common_error(error, object_id))?;
 
-        let verified = self.head_with_sdk(object_id, None).await?;
+        let verified = self.head_with_sdk(object_id, version_id).await?;
         verify_retention(verified.retention.as_ref(), policy)
     }
 
     async fn set_s3_legal_hold(
         &self,
         object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
         status: LegalHoldStatus,
     ) -> Result<()> {
         let client = self
@@ -481,20 +495,28 @@ impl S3BlobStore {
         let legal_hold = ObjectLockLegalHold::builder()
             .status(sdk_legal_hold_status(status))
             .build();
-        client
+        let mut request = client
             .put_object_legal_hold()
             .bucket(self.config.bucket.as_str())
             .key(self.config.object_key(object_id))
             .legal_hold(legal_hold)
-            .checksum_algorithm(ChecksumAlgorithm::Sha256)
+            .checksum_algorithm(ChecksumAlgorithm::Sha256);
+        if let Some(version_id) = version_id {
+            request = request.version_id(version_id.as_str());
+        }
+        request
             .send()
             .await
             .map_err(|error| map_sdk_common_error(error, object_id))?;
 
-        let verified = client
+        let mut request = client
             .get_object_legal_hold()
             .bucket(self.config.bucket.as_str())
-            .key(self.config.object_key(object_id))
+            .key(self.config.object_key(object_id));
+        if let Some(version_id) = version_id {
+            request = request.version_id(version_id.as_str());
+        }
+        let verified = request
             .send()
             .await
             .map_err(|error| map_sdk_common_error(error, object_id))?;
@@ -674,7 +696,10 @@ impl BlobStore for S3BlobStore {
                     content_len: bytes_sent,
                     modified_at_ms: None,
                     etag: output.e_tag,
-                    version_id: output.version,
+                    version_id: output
+                        .version
+                        .map(backend_version_id_from_string)
+                        .transpose()?,
                     retention: None,
                     legal_hold: None,
                 })
@@ -775,6 +800,97 @@ impl BlobStore for S3BlobStore {
         }
     }
 
+    async fn get_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> Result<Bytes> {
+        let Some(version_id) = version_id else {
+            return self.get_range(object_id, range).await;
+        };
+
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
+        let client = self
+            .sdk_client
+            .as_ref()
+            .ok_or(StorageError::VersionUnsupported)?;
+
+        if let ByteRange::Slice { offset, len: 0 } = range {
+            let metadata = self.head_with_sdk(object_id, Some(version_id)).await?;
+            if offset > metadata.content_len {
+                self.record_provider_operation(
+                    S3ProviderOperation::Head,
+                    object_kind,
+                    "invalid_range",
+                    0,
+                    0,
+                    started.elapsed(),
+                )?;
+                record_blob_get(object_kind, range, 0, "invalid_range", started.elapsed());
+                return Err(StorageError::InvalidRange);
+            }
+            self.record_provider_operation(
+                S3ProviderOperation::Head,
+                object_kind,
+                "ok",
+                0,
+                0,
+                started.elapsed(),
+            )?;
+            record_blob_get(object_kind, range, 0, "ok", started.elapsed());
+            return Ok(Bytes::new());
+        }
+
+        let mut request = client
+            .get_object()
+            .bucket(self.config.bucket.as_str())
+            .key(self.config.object_key(object_id))
+            .version_id(version_id.as_str());
+        if let Some(range_header) = sdk_range_header(range)? {
+            request = request.range(range_header);
+        }
+
+        match request.send().await {
+            Ok(output) => {
+                let body = output
+                    .body
+                    .collect()
+                    .await
+                    .map_err(provider_error)?
+                    .into_bytes();
+                let bytes_read = u64::try_from(body.len()).map_err(|_| {
+                    StorageError::Provider("read length does not fit in u64".to_owned())
+                })?;
+                self.record_provider_operation(
+                    S3ProviderOperation::Get,
+                    object_kind,
+                    "ok",
+                    0,
+                    bytes_read,
+                    started.elapsed(),
+                )?;
+                record_blob_get(object_kind, range, bytes_read, "ok", started.elapsed());
+                Ok(body)
+            }
+            Err(error) => {
+                let storage_error = map_sdk_common_error(error, object_id);
+                let result = storage_error_result(&storage_error);
+                self.record_provider_operation(
+                    S3ProviderOperation::Get,
+                    object_kind,
+                    result,
+                    0,
+                    0,
+                    started.elapsed(),
+                )?;
+                record_blob_get(object_kind, range, 0, result, started.elapsed());
+                Err(storage_error)
+            }
+        }
+    }
+
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {
         let started = Instant::now();
         let object_kind = object_kind(object_id);
@@ -810,7 +926,7 @@ impl BlobStore for S3BlobStore {
                     started.elapsed(),
                 )?;
                 record_blob_head(object_kind, "ok", started.elapsed());
-                Ok(metadata_from_object_meta(object_id.clone(), metadata))
+                metadata_from_object_meta(object_id.clone(), metadata)
             }
             Err(error) => {
                 let result = common_error_result(&error);
@@ -826,6 +942,34 @@ impl BlobStore for S3BlobStore {
                 Err(map_common_error(error, object_id))
             }
         }
+    }
+
+    async fn head_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> Result<BlobMetadata> {
+        let Some(version_id) = version_id else {
+            return self.head(object_id).await;
+        };
+
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
+        let result = self.head_with_sdk(object_id, Some(version_id)).await;
+        let result_label = match &result {
+            Ok(_) => "ok",
+            Err(error) => storage_error_result(error),
+        };
+        self.record_provider_operation(
+            S3ProviderOperation::Head,
+            object_kind,
+            result_label,
+            0,
+            0,
+            started.elapsed(),
+        )?;
+        record_blob_head(object_kind, result_label, started.elapsed());
+        result
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
@@ -861,7 +1005,7 @@ impl BlobStore for S3BlobStore {
                         else {
                             continue;
                         };
-                        entries.push(metadata_from_object_meta(object_id, object));
+                        entries.push(metadata_from_object_meta(object_id, object)?);
                     }
 
                     let Some(page_token) = page.page_token else {
@@ -1009,7 +1153,34 @@ impl BlobStore for S3BlobStore {
     ) -> Result<()> {
         let started = Instant::now();
         let object_kind = object_kind(object_id);
-        let result = self.extend_s3_retention(object_id, &policy).await;
+        let result = self.extend_s3_retention(object_id, None, &policy).await;
+        let result_label = match &result {
+            Ok(()) => "ok",
+            Err(error) => storage_error_result(error),
+        };
+        self.record_provider_operation(
+            S3ProviderOperation::ExtendRetention,
+            object_kind,
+            result_label,
+            0,
+            0,
+            started.elapsed(),
+        )?;
+        record_blob_extend_retention(object_kind, result_label, started.elapsed());
+        result
+    }
+
+    async fn extend_retention_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        policy: RetentionPolicy,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
+        let result = self
+            .extend_s3_retention(object_id, version_id, &policy)
+            .await;
         let result_label = match &result {
             Ok(()) => "ok",
             Err(error) => storage_error_result(error),
@@ -1033,7 +1204,32 @@ impl BlobStore for S3BlobStore {
     ) -> Result<()> {
         let started = Instant::now();
         let object_kind = object_kind(object_id);
-        let result = self.set_s3_legal_hold(object_id, status).await;
+        let result = self.set_s3_legal_hold(object_id, None, status).await;
+        let result_label = match &result {
+            Ok(()) => "ok",
+            Err(error) => storage_error_result(error),
+        };
+        self.record_provider_operation(
+            S3ProviderOperation::SetLegalHold,
+            object_kind,
+            result_label,
+            0,
+            0,
+            started.elapsed(),
+        )?;
+        record_blob_set_legal_hold(object_kind, result_label, started.elapsed());
+        result
+    }
+
+    async fn set_legal_hold_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        status: LegalHoldStatus,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
+        let result = self.set_s3_legal_hold(object_id, version_id, status).await;
         let result_label = match &result {
             Ok(()) => "ok",
             Err(error) => storage_error_result(error),
@@ -1116,6 +1312,19 @@ fn object_get_options(range: ByteRange) -> Result<GetOptions> {
         }
     };
     Ok(options)
+}
+
+fn sdk_range_header(range: ByteRange) -> Result<Option<String>> {
+    match range {
+        ByteRange::Full => Ok(None),
+        ByteRange::Slice { offset, len } => {
+            let end = offset.checked_add(len).ok_or(StorageError::InvalidRange)?;
+            if end <= offset {
+                return Err(StorageError::InvalidRange);
+            }
+            Ok(Some(format!("bytes={offset}-{}", end - 1)))
+        }
+    }
 }
 
 fn object_path(value: &str) -> Result<ObjectPath> {
@@ -1426,22 +1635,38 @@ fn storage_error_result(error: &StorageError) -> &'static str {
         StorageError::InvalidRange => "invalid_range",
         StorageError::RetentionBlocked => "retention_blocked",
         StorageError::RetentionExtensionUnsupported => "retention_unsupported",
+        StorageError::VersionUnsupported => "version_unsupported",
+        StorageError::MissingVersionId(_) => "missing_version_id",
         StorageError::LegalHoldBlocked => "legal_hold_blocked",
         StorageError::LegalHoldUnsupported => "legal_hold_unsupported",
         StorageError::Provider(_) => "error",
     }
 }
 
-fn metadata_from_object_meta(object_id: BackendObjectId, metadata: ObjectMeta) -> BlobMetadata {
-    BlobMetadata {
+fn metadata_from_object_meta(
+    object_id: BackendObjectId,
+    metadata: ObjectMeta,
+) -> Result<BlobMetadata> {
+    Ok(BlobMetadata {
         object_id,
         content_len: metadata.size,
         modified_at_ms: Some(metadata.last_modified.timestamp_millis()),
         etag: metadata.e_tag,
-        version_id: metadata.version,
+        version_id: metadata
+            .version
+            .map(backend_version_id_from_string)
+            .transpose()?,
         retention: None,
         legal_hold: None,
-    }
+    })
+}
+
+fn backend_version_id_from_string(value: String) -> Result<BackendVersionId> {
+    BackendVersionId::new(value).map_err(|error| StorageError::Provider(error.to_string()))
+}
+
+fn backend_version_id_from_str(value: &str) -> Result<BackendVersionId> {
+    backend_version_id_from_string(value.to_owned())
 }
 
 fn put_error_result(error: &object_store::Error) -> &'static str {

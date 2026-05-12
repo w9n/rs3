@@ -55,10 +55,17 @@ Rollback-sensitive changes should cover:
 Retention and Object Lock work should cover:
 
 - retention extension never shortens existing retention
+- retained writes fail when the provider does not return version IDs
+- exact-version reads return the checkpoint-bound object after a newer latest
+  version exists
 - legal hold blocks destructive cleanup
 - provider cannot extend retention
 - governance bypass is not present in normal gateway credentials
 - garbage collection does not remove reachable or retained objects
+
+The ignored live S3 Object Lock tests exercise provider version IDs against a
+real retained bucket. They are the lane for S3-compatible providers where local
+RustFS/container tests cannot prove retained version-addressed reads.
 
 ## Performance Tests
 

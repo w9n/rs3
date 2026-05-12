@@ -10,8 +10,8 @@ use rs3_storage::{BlobStore, ByteRange, FilesystemBlobStore};
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
 use rs3_types::{
-    BackendObjectId, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, RepositoryId,
-    RetentionMode, RetentionPolicy, Sequence,
+    BackendObjectId, BackendVersionId, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
+    RepositoryId, RetentionMode, RetentionPolicy, Sequence,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -173,6 +173,9 @@ struct KeyringRetirementCheckArgs {
     /// Accepted checkpoint ID to analyze.
     #[arg(long)]
     checkpoint_id: String,
+    /// Provider version identifier for the accepted checkpoint object, when available.
+    #[arg(long)]
+    checkpoint_version_id: Option<String>,
     /// Accepted checkpoint payload digest to analyze.
     #[arg(long)]
     checkpoint_digest: String,
@@ -543,6 +546,10 @@ where
     let accepted = CheckpointPosition {
         sequence: Sequence::new(args.checkpoint_sequence),
         checkpoint_id: CheckpointId::new(args.checkpoint_id)?,
+        checkpoint_version_id: args
+            .checkpoint_version_id
+            .map(BackendVersionId::new)
+            .transpose()?,
         payload_digest: args.checkpoint_digest,
     };
     let target_key_ids = args
@@ -955,6 +962,7 @@ impl KeyringRetirementCheckReport {
                     "accepted": {
                         "sequence": self.accepted.sequence.get(),
                         "checkpoint_id": self.accepted.checkpoint_id.as_str(),
+                        "checkpoint_version_id": self.accepted.checkpoint_version_id.as_ref().map(BackendVersionId::as_str),
                         "checkpoint_digest": self.accepted.payload_digest,
                     },
                     "restore": {
@@ -971,6 +979,9 @@ impl KeyringRetirementCheckReport {
                 println!("repository_salt_hex={}", self.repository_salt_hex);
                 println!("checkpoint_sequence={}", self.accepted.sequence.get());
                 println!("checkpoint_id={}", self.accepted.checkpoint_id.as_str());
+                if let Some(version_id) = self.accepted.checkpoint_version_id.as_ref() {
+                    println!("checkpoint_version_id={}", version_id.as_str());
+                }
                 println!("checkpoint_digest={}", self.accepted.payload_digest);
                 println!("restore_checkpoint_count={}", self.restore_checkpoint_count);
                 println!(
@@ -1285,6 +1296,10 @@ mod tests {
             wrapping_key_hex_file: None,
             checkpoint_sequence: checkpoint.sequence.get(),
             checkpoint_id: checkpoint.checkpoint_id.as_str().to_owned(),
+            checkpoint_version_id: checkpoint
+                .checkpoint_version_id
+                .as_ref()
+                .map(|version_id| version_id.as_str().to_owned()),
             checkpoint_digest: checkpoint.payload_digest,
             key_id: Vec::new(),
             backend: backend_args(),

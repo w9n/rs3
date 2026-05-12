@@ -1,8 +1,9 @@
 //! Append-friendly index and checkpoint model.
 
 use rs3_types::{
-    BackendObjectId, BlindIndexKey, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
-    LegalHoldStatus, ManifestId, PrefixToken, RetentionPolicy, Sequence,
+    BackendObjectId, BackendObjectRef, BackendVersionId, BlindIndexKey, CheckpointId,
+    KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LegalHoldStatus, ManifestId, PrefixToken,
+    RetentionPolicy, Sequence,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,6 +33,9 @@ pub struct ObjectPointer {
     pub blind_key: BlindIndexKey,
     /// Opaque backend object identifier.
     pub object_id: BackendObjectId,
+    /// Provider version identifier for exact restore reads, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_version_id: Option<BackendVersionId>,
     /// Sealed metadata record that describes the logical object.
     pub manifest_id: ManifestId,
     /// Logical generation assigned by the repository.
@@ -155,6 +159,9 @@ pub struct KeyringEnvelopeReference {
     pub digest: String,
     /// Backend object that stores the encrypted envelope.
     pub object_id: BackendObjectId,
+    /// Provider version identifier for the encrypted envelope, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<BackendVersionId>,
 }
 
 /// Signed checkpoint payload before signature wrapping.
@@ -166,8 +173,11 @@ pub struct CommitRecord {
     pub published_at_ms: i64,
     /// Previous checkpoint, if any.
     pub parent: Option<CheckpointId>,
+    /// Provider version identifier for the previous checkpoint object, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_checkpoint_version_id: Option<BackendVersionId>,
     /// Referenced durable index delta objects.
-    pub index_deltas: Vec<BackendObjectId>,
+    pub index_deltas: Vec<BackendObjectRef>,
     /// Sealed index delta embedded directly in this checkpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inline_index_delta: Option<SealedIndexDeltaObject>,
@@ -222,6 +232,9 @@ pub struct CheckpointEvidence {
     pub checkpoint_digest: String,
     /// Backend object that stores the signed checkpoint.
     pub checkpoint_object_id: BackendObjectId,
+    /// Provider version identifier for the signed checkpoint object, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_object_version_id: Option<BackendVersionId>,
 }
 
 /// Encodes a checkpoint payload into deterministic signed bytes.
@@ -281,6 +294,9 @@ pub struct NamespaceEntry {
     pub blind_key: BlindIndexKey,
     /// Opaque backend object identifier for the primary payload or segment root.
     pub object_id: BackendObjectId,
+    /// Provider version identifier for exact restore reads, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_version_id: Option<BackendVersionId>,
     /// Sealed metadata record containing client-visible metadata.
     pub manifest_id: ManifestId,
     /// Client-visible ciphertext-backed length in bytes.
@@ -479,6 +495,7 @@ mod tests {
             namespace_key_id: key_id("namespace-a"),
             blind_key,
             object_id,
+            object_version_id: None,
             manifest_id: manifest_id("manifest-a"),
             content_len: 42,
             modified_at_ms: 7,
@@ -519,6 +536,7 @@ mod tests {
             sequence: Sequence::ZERO,
             published_at_ms: 0,
             parent: None,
+            parent_checkpoint_version_id: None,
             index_deltas: Vec::new(),
             inline_index_delta: None,
             compacted_manifests: Vec::new(),
@@ -535,7 +553,11 @@ mod tests {
             sequence: Sequence::new(3),
             published_at_ms: 123,
             parent: None,
-            index_deltas: vec![object_id("segments/b"), object_id("segments/a")],
+            parent_checkpoint_version_id: None,
+            index_deltas: vec![
+                object_id("segments/b").into(),
+                object_id("segments/a").into(),
+            ],
             inline_index_delta: None,
             compacted_manifests: vec![manifest_id("manifest-b"), manifest_id("manifest-a")],
             keyring: KeyringSnapshot::new(vec![
@@ -548,7 +570,11 @@ mod tests {
             sequence: Sequence::new(3),
             published_at_ms: 123,
             parent: None,
-            index_deltas: vec![object_id("segments/a"), object_id("segments/b")],
+            parent_checkpoint_version_id: None,
+            index_deltas: vec![
+                object_id("segments/a").into(),
+                object_id("segments/b").into(),
+            ],
             inline_index_delta: None,
             compacted_manifests: vec![manifest_id("manifest-a"), manifest_id("manifest-b")],
             keyring: KeyringSnapshot::new(vec![
@@ -571,6 +597,7 @@ mod tests {
             sequence: Sequence::new(1),
             published_at_ms: 123,
             parent: None,
+            parent_checkpoint_version_id: None,
             index_deltas: Vec::new(),
             inline_index_delta: None,
             compacted_manifests: Vec::new(),
@@ -581,6 +608,7 @@ mod tests {
             sequence: Sequence::new(2),
             published_at_ms: 123,
             parent: None,
+            parent_checkpoint_version_id: None,
             index_deltas: Vec::new(),
             inline_index_delta: None,
             compacted_manifests: Vec::new(),
@@ -604,6 +632,7 @@ mod tests {
                 sequence: Sequence::new(1),
                 published_at_ms: 123,
                 parent: None,
+                parent_checkpoint_version_id: None,
                 index_deltas: Vec::new(),
                 inline_index_delta: None,
                 compacted_manifests: Vec::new(),
@@ -629,6 +658,7 @@ mod tests {
             checkpoint_id: checkpoint_id("checkpoint-a"),
             checkpoint_digest: "digest-a".to_owned(),
             checkpoint_object_id: object_id("checkpoints/checkpoint-a"),
+            checkpoint_object_version_id: None,
         };
 
         let encoded = checkpoint_evidence_bytes(&evidence);

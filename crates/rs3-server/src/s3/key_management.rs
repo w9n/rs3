@@ -52,6 +52,8 @@ pub struct RotatedKeyringEnvelope {
     pub generation: u64,
     /// Backend object containing the encrypted keyring envelope.
     pub object_id: rs3_types::BackendObjectId,
+    /// Provider version identifier for exact envelope restore reads, when available.
+    pub version_id: Option<rs3_types::BackendVersionId>,
     /// Expected envelope digest.
     pub digest: String,
 }
@@ -189,6 +191,7 @@ fn envelope_report(reference: KeyringEnvelopeReference) -> RotatedKeyringEnvelop
     RotatedKeyringEnvelope {
         generation: reference.generation,
         object_id: reference.object_id,
+        version_id: reference.version_id,
         digest: reference.digest,
     }
 }
@@ -332,12 +335,14 @@ mod tests {
                 (
                     envelope.generation,
                     envelope.object_id.clone(),
+                    envelope.version_id.clone(),
                     envelope.digest.clone(),
                 )
             }),
             Some((
                 report.keyring_envelope.generation,
                 report.keyring_envelope.object_id.clone(),
+                report.keyring_envelope.version_id.clone(),
                 report.keyring_envelope.digest.clone(),
             ))
         );

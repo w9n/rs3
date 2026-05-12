@@ -70,6 +70,8 @@ enum Commands {
         #[arg(long)]
         checkpoint_id: String,
         #[arg(long)]
+        checkpoint_version_id: Option<String>,
+        #[arg(long)]
         checkpoint_digest: String,
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
@@ -187,6 +189,7 @@ async fn main() -> Result<()> {
         Commands::ImportAnchor {
             checkpoint_sequence,
             checkpoint_id,
+            checkpoint_version_id,
             checkpoint_digest,
             format,
         } => {
@@ -197,6 +200,9 @@ async fn main() -> Result<()> {
                 rs3_repository::CheckpointPosition {
                     sequence: Sequence::new(checkpoint_sequence),
                     checkpoint_id: CheckpointId::new(checkpoint_id)?,
+                    checkpoint_version_id: checkpoint_version_id
+                        .map(rs3_types::BackendVersionId::new)
+                        .transpose()?,
                     payload_digest: checkpoint_digest,
                 },
             )
@@ -239,12 +245,14 @@ fn print_key_rotation_report(
                 "checkpoint": {
                     "sequence": report.checkpoint.sequence.get(),
                     "checkpoint_id": report.checkpoint.checkpoint_id.as_str(),
+                    "checkpoint_version_id": report.checkpoint.checkpoint_version_id.as_ref().map(|version_id| version_id.as_str()),
                     "checkpoint_digest": report.checkpoint.payload_digest,
                     "published_at_ms": report.published_at_ms,
                 },
                 "keyring_envelope": {
                     "generation": report.keyring_envelope.generation,
                     "object_id": report.keyring_envelope.object_id.as_str(),
+                    "version_id": report.keyring_envelope.version_id.as_ref().map(|version_id| version_id.as_str()),
                     "digest": report.keyring_envelope.digest,
                 },
             });
@@ -258,6 +266,9 @@ fn print_key_rotation_report(
             println!("staged_sequence={}", report.staged_sequence.get());
             println!("checkpoint_sequence={}", report.checkpoint.sequence.get());
             println!("checkpoint_id={}", report.checkpoint.checkpoint_id.as_str());
+            if let Some(version_id) = report.checkpoint.checkpoint_version_id.as_ref() {
+                println!("checkpoint_version_id={}", version_id.as_str());
+            }
             println!("checkpoint_digest={}", report.checkpoint.payload_digest);
             println!("published_at_ms={}", report.published_at_ms);
             println!(
@@ -268,6 +279,9 @@ fn print_key_rotation_report(
                 "keyring_envelope_object_id={}",
                 report.keyring_envelope.object_id.as_str()
             );
+            if let Some(version_id) = report.keyring_envelope.version_id.as_ref() {
+                println!("keyring_envelope_version_id={}", version_id.as_str());
+            }
             println!("keyring_envelope_digest={}", report.keyring_envelope.digest);
         }
     }
@@ -281,6 +295,7 @@ fn print_restore_bundle(bundle: &RestoreTrustBundle, format: RecoveryReportForma
                 serde_json::json!({
                     "generation": envelope.generation,
                     "object_id": envelope.object_id.as_str(),
+                    "version_id": envelope.version_id.as_ref().map(|version_id| version_id.as_str()),
                     "digest": envelope.digest,
                 })
             });
@@ -293,6 +308,7 @@ fn print_restore_bundle(bundle: &RestoreTrustBundle, format: RecoveryReportForma
                 "checkpoint": {
                     "sequence": bundle.checkpoint.sequence.get(),
                     "checkpoint_id": bundle.checkpoint.checkpoint_id.as_str(),
+                    "checkpoint_version_id": bundle.checkpoint.checkpoint_version_id.as_ref().map(|version_id| version_id.as_str()),
                     "checkpoint_digest": bundle.checkpoint.payload_digest,
                     "published_at_ms": bundle.published_at_ms,
                 },
@@ -307,11 +323,17 @@ fn print_restore_bundle(bundle: &RestoreTrustBundle, format: RecoveryReportForma
             println!("repository_salt_hex={}", bundle.repository_salt_hex);
             println!("checkpoint_sequence={}", bundle.checkpoint.sequence.get());
             println!("checkpoint_id={}", bundle.checkpoint.checkpoint_id.as_str());
+            if let Some(version_id) = bundle.checkpoint.checkpoint_version_id.as_ref() {
+                println!("checkpoint_version_id={}", version_id.as_str());
+            }
             println!("checkpoint_digest={}", bundle.checkpoint.payload_digest);
             println!("published_at_ms={}", bundle.published_at_ms);
             if let Some(envelope) = bundle.keyring_envelope.as_ref() {
                 println!("keyring_envelope_generation={}", envelope.generation);
                 println!("keyring_envelope_object_id={}", envelope.object_id.as_str());
+                if let Some(version_id) = envelope.version_id.as_ref() {
+                    println!("keyring_envelope_version_id={}", version_id.as_str());
+                }
                 println!("keyring_envelope_digest={}", envelope.digest);
             }
             println!("generated_at_ms={}", bundle.generated_at_ms);
@@ -327,6 +349,7 @@ fn print_import_report(report: &AnchorImportReport, format: RecoveryReportFormat
                 "checkpoint": {
                     "sequence": report.checkpoint.sequence.get(),
                     "checkpoint_id": report.checkpoint.checkpoint_id.as_str(),
+                    "checkpoint_version_id": report.checkpoint.checkpoint_version_id.as_ref().map(|version_id| version_id.as_str()),
                     "checkpoint_digest": report.checkpoint.payload_digest,
                     "published_at_ms": report.published_at_ms,
                 },
@@ -338,6 +361,9 @@ fn print_import_report(report: &AnchorImportReport, format: RecoveryReportFormat
             println!("rs3 anchor import: trusted checkpoint applied");
             println!("checkpoint_sequence={}", report.checkpoint.sequence.get());
             println!("checkpoint_id={}", report.checkpoint.checkpoint_id.as_str());
+            if let Some(version_id) = report.checkpoint.checkpoint_version_id.as_ref() {
+                println!("checkpoint_version_id={}", version_id.as_str());
+            }
             println!("checkpoint_digest={}", report.checkpoint.payload_digest);
             println!("published_at_ms={}", report.published_at_ms);
             println!("applied={}", report.applied);
@@ -356,6 +382,7 @@ fn print_recovery_report(
                 "checkpoint": {
                     "sequence": report.checkpoint.sequence.get(),
                     "checkpoint_id": report.checkpoint.checkpoint_id.as_str(),
+                    "checkpoint_version_id": report.checkpoint.checkpoint_version_id.as_ref().map(|version_id| version_id.as_str()),
                     "checkpoint_digest": report.checkpoint.payload_digest,
                     "published_at_ms": report.published_at_ms,
                 },
@@ -371,6 +398,9 @@ fn print_recovery_report(
             println!("rs3 anchor recovery: highest observed valid checkpoint");
             println!("checkpoint_sequence={}", report.checkpoint.sequence.get());
             println!("checkpoint_id={}", report.checkpoint.checkpoint_id.as_str());
+            if let Some(version_id) = report.checkpoint.checkpoint_version_id.as_ref() {
+                println!("checkpoint_version_id={}", version_id.as_str());
+            }
             println!("checkpoint_digest={}", report.checkpoint.payload_digest);
             println!("published_at_ms={}", report.published_at_ms);
             println!(

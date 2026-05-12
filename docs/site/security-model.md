@@ -78,6 +78,7 @@ batching, compaction jitter, and stricter telemetry redaction.
 | Old content remains readable after data-key rotation | Enabled historical content keys are accepted for reads. | Repository key rotation tests. |
 | Writes are not acknowledged before checkpoint acceptance | Commit coordinator waits for covering checkpoint. | Commit coordinator and checkpoint tests. |
 | Storage rollback is not trusted as latest state | Ed25519 checkpoint verification, Kubernetes Lease anchor, and retained checkpoint evidence. | Anchor, checkpoint replay, restore verification, and orphan-report tests. |
+| Retained restore reads do not trust mutable latest objects | Restore-critical references carry provider version IDs when the backend returns them; retained/Object Lock writes fail closed without them. | Memory version-addressed storage tests, restore latest-poisoning tests, and opt-in live S3 Object Lock tests. |
 | Incident restore does not advance repository state | `restore-readonly` mode requires an accepted anchor and rejects supported mutations. | Gateway mode config, startup, and S3 adapter tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
@@ -89,6 +90,8 @@ A checkpoint is acceptable only when:
 - its signature verifies
 - its sequence is not lower than the locally trusted sequence
 - its digest matches the external anchor when an anchor exists
+- its checkpoint object version matches the external anchor when the anchor
+  carries one
 - its digest matches storage-side evidence for the accepted checkpoint
 - its parent reference is valid or it is a trusted compaction root
 
@@ -111,8 +114,23 @@ Object Lock protects object versions from deletion or overwrite before their
 retention deadline. It does not prevent a backend from presenting an older valid
 version as latest, and it does not make a latest pointer trustworthy by itself.
 
-Use Object Lock for retained payload segments, checkpoint objects, and evidence
-records. Do not use it as the only anti-rollback mechanism.
+Use Object Lock for retained payload segments, checkpoint objects, keyring
+envelopes, and evidence records. Do not use it as the only anti-rollback
+mechanism.
+
+In retained/Object Lock mode, `rs3` requires the backend to return a provider
+version ID for restore-critical writes. Checkpoints bind the accepted checkpoint
+version, parent checkpoint version, keyring envelope version, index delta
+versions, and payload versions when those objects are referenced. Restore and
+verification read those exact versions. If a retained write does not return a
+version ID, startup or write flow must fail closed; otherwise a malicious
+backend could append a newer object version and make restore follow mutable
+latest state.
+
+Non-retained development backends may omit version IDs. In that mode `rs3` can
+still authenticate object bytes and detect tampering of the bytes it reads, but
+it cannot force the provider to return an older exact version after a newer
+version has appeared.
 
 ## Operator Reporting Rule
 
