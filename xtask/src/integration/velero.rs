@@ -48,9 +48,9 @@ pub(crate) struct VeleroKopiaSmokeArgs {
     /// Gateway image tag to build, load, and deploy.
     #[arg(long, default_value = "rs3-server:ci")]
     image: String,
-    /// Plaintext bytes per encrypted payload segment.
-    #[arg(long, default_value_t = rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE)]
-    payload_segment_size: usize,
+    /// Force a fixed payload segment size. Omit to use adaptive per-object sizing.
+    #[arg(long)]
+    payload_segment_size: Option<usize>,
     /// Workload image used for the volume restore check. Defaults to the gateway image.
     #[arg(long)]
     workload_image: Option<String>,

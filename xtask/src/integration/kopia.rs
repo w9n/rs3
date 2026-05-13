@@ -110,9 +110,9 @@ pub(crate) struct KopiaMatrixArgs {
     #[cfg(feature = "containers")]
     #[arg(long, value_enum, default_value_t = GatewayBuildProfile::Release)]
     gateway_build_profile: GatewayBuildProfile,
-    /// Plaintext bytes per encrypted gateway payload segment.
-    #[arg(long, default_value_t = rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE)]
-    payload_segment_size: usize,
+    /// Force a fixed gateway payload segment size. Omit to use adaptive per-object sizing.
+    #[arg(long)]
+    payload_segment_size: Option<usize>,
     /// Override gateway commit batch size for measured gateway runs.
     #[arg(long)]
     commit_batch_items: Option<usize>,
@@ -290,7 +290,7 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
     if args.runs == 0 {
         bail!("--runs must be at least 1");
     }
-    if args.payload_segment_size == 0 {
+    if args.payload_segment_size == Some(0) {
         bail!("--payload-segment-size must be greater than zero");
     }
     if args.commit_batch_items == Some(0) {
@@ -395,6 +395,7 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
         "backend_region": backend.region,
         "gateway_build_profile": args.gateway_build_profile.as_str(),
         "payload_segment_size": args.payload_segment_size,
+        "adaptive_payload_segment_size": args.payload_segment_size.is_none(),
         "commit_batch": {
             "max_items": args.commit_batch_items,
             "max_delay_ms": args.commit_batch_delay_ms,
@@ -482,7 +483,7 @@ fn profile_summaries(runs: &[serde_json::Value]) -> serde_json::Value {
 #[cfg(any(feature = "containers", test))]
 fn regression_budgets_json(
     profile_summaries: &serde_json::Value,
-    payload_segment_size: usize,
+    payload_segment_size: Option<usize>,
 ) -> serde_json::Value {
     let mut checks = Vec::new();
     let Some(profiles) = profile_summaries.as_object() else {
@@ -502,7 +503,10 @@ fn regression_budgets_json(
     for (profile, summary) in profiles {
         add_common_budget_checks(profile, summary, &mut checks);
         match profile.as_str() {
-            "many-small-files" if payload_segment_size <= 512 => {
+            "many-small-files"
+                if payload_segment_size.unwrap_or(rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE)
+                    <= 512 =>
+            {
                 push_max_budget(
                     &mut checks,
                     profile,
@@ -1000,7 +1004,7 @@ struct MeasuredGatewayRun<'a> {
     run_index: usize,
     profile: KopiaWorkloadProfile,
     gateway_build_profile: GatewayBuildProfile,
-    payload_segment_size: usize,
+    payload_segment_size: Option<usize>,
     commit_batch_items: Option<usize>,
     commit_batch_delay_ms: Option<u64>,
     commit_max_pending_items: Option<usize>,
@@ -1022,7 +1026,7 @@ async fn run_measured_gateway_kopia(args: MeasuredGatewayRun<'_>) -> Result<serd
         "rs3_storage=debug,rs3_repository=info,info",
         GatewayProcessOptions {
             build_profile: args.gateway_build_profile,
-            payload_segment_size: Some(args.payload_segment_size),
+            payload_segment_size: args.payload_segment_size,
             commit_batch_items: args.commit_batch_items,
             commit_batch_delay_ms: args.commit_batch_delay_ms,
             commit_max_pending_items: args.commit_max_pending_items,
@@ -1376,7 +1380,7 @@ mod tests {
             }
         });
 
-        let budgets = regression_budgets_json(&profiles, 512);
+        let budgets = regression_budgets_json(&profiles, Some(512));
 
         assert_eq!(budgets["status"], serde_json::json!("pass"));
         assert_eq!(budgets["failed"], serde_json::json!(0));
@@ -1403,7 +1407,7 @@ mod tests {
             }
         });
 
-        let budgets = regression_budgets_json(&profiles, 512);
+        let budgets = regression_budgets_json(&profiles, Some(512));
 
         assert_eq!(budgets["status"], serde_json::json!("pass"));
         assert_eq!(budgets["failed"], serde_json::json!(0));
@@ -1442,7 +1446,7 @@ mod tests {
             }
         });
 
-        let budgets = regression_budgets_json(&profiles, 512);
+        let budgets = regression_budgets_json(&profiles, Some(512));
 
         assert_eq!(budgets["status"], serde_json::json!("pass"));
         assert_eq!(budgets["failed"], serde_json::json!(0));
@@ -1494,7 +1498,7 @@ mod tests {
             }
         });
 
-        let budgets = regression_budgets_json(&profiles, 512);
+        let budgets = regression_budgets_json(&profiles, Some(512));
 
         assert_eq!(budgets["status"], serde_json::json!("fail"));
         assert_eq!(budgets["failed"], serde_json::json!(1));
@@ -1530,7 +1534,7 @@ mod tests {
             }
         });
 
-        let budgets = regression_budgets_json(&profiles, 512);
+        let budgets = regression_budgets_json(&profiles, Some(512));
 
         assert_eq!(budgets["status"], serde_json::json!("fail"));
         assert_eq!(budgets["failed"], serde_json::json!(1));

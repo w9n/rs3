@@ -76,8 +76,10 @@ spec:
               value: {{ .Values.commit.maxPendingItems | quote }}
             - name: RS3_REPOSITORY_ID
               value: {{ .Values.repository.id | quote }}
+            {{- if .Values.repository.payloadSegmentSizeBytes }}
             - name: RS3_PAYLOAD_SEGMENT_SIZE_BYTES
               value: {{ .Values.repository.payloadSegmentSizeBytes | quote }}
+            {{- end }}
             {{- if .Values.repository.retention.mode }}
             - name: RS3_REPOSITORY_RETENTION_MODE
               value: {{ .Values.repository.retention.mode | quote }}

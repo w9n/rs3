@@ -22,8 +22,9 @@ cargo run -p xtask --bin xtask --features containers -- integration kopia-measur
   --payload-segment-size 512
 ```
 
-This command forces the historical fixed 512 B segment lane. Omit
-`--payload-segment-size` to measure the current adaptive writer default.
+For the measured matrix, setting `--payload-segment-size` forces that fixed
+gateway segment size. Omit it to measure the current adaptive writer default.
+The lightweight `xtask perf` harness uses the same convention.
 
 The harness compares two paths against a disposable local RustFS container:
 

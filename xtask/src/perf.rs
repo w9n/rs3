@@ -58,9 +58,9 @@ pub(crate) struct PerfArgs {
     /// Plaintext range length in bytes for range-read scenarios.
     #[arg(long, default_value_t = 4 * 1024)]
     range_len: usize,
-    /// Plaintext bytes per encrypted payload segment.
-    #[arg(long, default_value_t = DEFAULT_PAYLOAD_SEGMENT_SIZE)]
-    payload_segment_size: usize,
+    /// Force a fixed payload segment size. Omit to use adaptive per-object sizing.
+    #[arg(long)]
+    payload_segment_size: Option<usize>,
     /// Backend implementation used by the scenario.
     #[arg(long, value_enum, default_value_t = PerfBackend::Memory)]
     backend: PerfBackend,
@@ -317,10 +317,9 @@ fn add_perf_args(
     command.args(["--concurrency", &args.concurrency.to_string()]);
     command.args(["--reads", &args.reads.to_string()]);
     command.args(["--range-len", &args.range_len.to_string()]);
-    command.args([
-        "--payload-segment-size",
-        &args.payload_segment_size.to_string(),
-    ]);
+    if let Some(payload_segment_size) = args.payload_segment_size {
+        command.args(["--payload-segment-size", &payload_segment_size.to_string()]);
+    }
     command.args(["--backend", "s3"]);
     command.args(["--s3-bucket", &target.bucket]);
     command.args(["--s3-endpoint-url", &target.endpoint_url]);
@@ -397,6 +396,7 @@ where
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
         payload_segment_size: args.payload_segment_size,
+        adaptive_payload_segment_size: adaptive_payload_segment_size(args),
         concurrency: concurrency(args),
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
@@ -463,6 +463,7 @@ where
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
         payload_segment_size: args.payload_segment_size,
+        adaptive_payload_segment_size: adaptive_payload_segment_size(args),
         concurrency: concurrency(args),
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
@@ -550,6 +551,7 @@ where
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
         payload_segment_size: args.payload_segment_size,
+        adaptive_payload_segment_size: adaptive_payload_segment_size(args),
         concurrency: parallelism,
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
@@ -613,6 +615,7 @@ where
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
         payload_segment_size: args.payload_segment_size,
+        adaptive_payload_segment_size: adaptive_payload_segment_size(args),
         concurrency: concurrency(args),
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
@@ -692,6 +695,7 @@ where
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
         payload_segment_size: args.payload_segment_size,
+        adaptive_payload_segment_size: adaptive_payload_segment_size(args),
         concurrency: concurrency(args),
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
@@ -710,7 +714,8 @@ struct PerfReport {
     commit_batch_items: usize,
     commit_batch_delay_ms: u64,
     commit_max_pending_items: usize,
-    payload_segment_size: usize,
+    payload_segment_size: Option<usize>,
+    adaptive_payload_segment_size: bool,
     concurrency: usize,
     operation_latency: OperationLatencyStats,
     elapsed: Duration,
@@ -782,7 +787,7 @@ impl PerfReport {
         let latency = self.operation_latency;
 
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.scenario,
             self.backend.as_str(),
             self.objects,
@@ -791,7 +796,8 @@ impl PerfReport {
             self.commit_batch_items,
             self.commit_batch_delay_ms,
             self.commit_max_pending_items,
-            self.payload_segment_size,
+            payload_segment_size_label(self.payload_segment_size),
+            self.adaptive_payload_segment_size,
             self.concurrency,
             elapsed_ms,
             latency.samples,
@@ -842,6 +848,7 @@ impl PerfReport {
                 "concurrency": self.concurrency,
             },
             "payload_segment_size": self.payload_segment_size,
+            "adaptive_payload_segment_size": self.adaptive_payload_segment_size,
             "elapsed_ms": self.elapsed.as_secs_f64() * 1_000.0,
             "operation_latency": {
                 "samples": self.operation_latency.samples,
@@ -912,7 +919,7 @@ impl PerfReport {
 
 fn print_header() {
     println!(
-        "scenario\tbackend\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tpayload_segment_size\tconcurrency\telapsed_ms\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tset_legal_hold\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp"
+        "scenario\tbackend\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tpayload_segment_size\tadaptive_payload_segment_size\tconcurrency\telapsed_ms\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tset_legal_hold\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp"
     );
 }
 
@@ -924,20 +931,35 @@ fn repository_with_store<S>(args: &PerfArgs, store: S) -> Result<Repository<S>>
 where
     S: BlobStore,
 {
-    if args.payload_segment_size == 0 {
+    if args.payload_segment_size == Some(0) {
         anyhow::bail!("--payload-segment-size must be greater than zero");
     }
     Ok(Repository::with_keyring_and_options(
         store,
         keyring()?,
         RepositoryOptions {
-            payload_segment_size: args.payload_segment_size,
-            adaptive_payload_segment_size: false,
+            payload_segment_size: effective_payload_segment_size(args),
+            adaptive_payload_segment_size: adaptive_payload_segment_size(args),
             decrypted_segment_cache_max_bytes:
                 rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
             default_retention: None,
         },
     ))
+}
+
+fn adaptive_payload_segment_size(args: &PerfArgs) -> bool {
+    args.payload_segment_size.is_none()
+}
+
+fn effective_payload_segment_size(args: &PerfArgs) -> usize {
+    args.payload_segment_size
+        .unwrap_or(DEFAULT_PAYLOAD_SEGMENT_SIZE)
+}
+
+fn payload_segment_size_label(payload_segment_size: Option<usize>) -> String {
+    payload_segment_size
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "adaptive".to_owned())
 }
 
 fn filesystem_store(

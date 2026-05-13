@@ -39,7 +39,7 @@ pub(crate) struct GatewayChartValues<'a> {
     pub(crate) anchor_name: &'a str,
     pub(crate) log_format: &'a str,
     pub(crate) rust_log: &'a str,
-    pub(crate) payload_segment_size: usize,
+    pub(crate) payload_segment_size: Option<usize>,
     pub(crate) retention_mode: Option<&'a str>,
     pub(crate) retention_days: Option<u32>,
     pub(crate) repository_id: &'a str,
@@ -58,6 +58,10 @@ pub(crate) fn helm_install_gateway(
 ) -> Result<()> {
     let kubeconfig = path_str(kubeconfig_path)?;
     let timeout = format!("{}s", values.wait_secs);
+    let payload_segment_size = values
+        .payload_segment_size
+        .map(|value| value.to_string())
+        .unwrap_or_default();
     run_command(
         helm_bin,
         &[
@@ -112,11 +116,8 @@ pub(crate) fn helm_install_gateway(
             &format!("logging.format={}", values.log_format),
             "--set-string",
             &helm_set_string("logging.rustLog", values.rust_log),
-            "--set",
-            &format!(
-                "repository.payloadSegmentSizeBytes={}",
-                values.payload_segment_size
-            ),
+            "--set-string",
+            &helm_set_string("repository.payloadSegmentSizeBytes", &payload_segment_size),
             "--set-string",
             &helm_set_string(
                 "repository.retention.mode",

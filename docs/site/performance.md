@@ -27,6 +27,10 @@ cargo run -p xtask --bin xtask --features containers -- integration kopia-measur
 Add `--payload-segment-size 512` only when comparing against the historical
 fixed-segment lane.
 
+The lightweight `xtask perf` harness follows the same convention: omit
+`--payload-segment-size` for adaptive writer defaults, or set it to force a
+fixed segment-size comparison.
+
 The current larger profiles are:
 
 | Profile | Shape |

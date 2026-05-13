@@ -231,6 +231,7 @@ async fn gateway_full_read(
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
         payload_segment_size: args.payload_segment_size,
+        adaptive_payload_segment_size: adaptive_payload_segment_size(args),
         concurrency: concurrency(args),
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
@@ -292,6 +293,7 @@ async fn gateway_range_read(
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
         payload_segment_size: args.payload_segment_size,
+        adaptive_payload_segment_size: adaptive_payload_segment_size(args),
         concurrency: concurrency(args),
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
@@ -320,6 +322,7 @@ fn gateway_write_report(
         commit_batch_delay_ms: args.commit_batch_delay_ms,
         commit_max_pending_items: commit_max_pending_items(args),
         payload_segment_size: args.payload_segment_size,
+        adaptive_payload_segment_size: adaptive_payload_segment_size(args),
         concurrency: concurrency(args),
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
@@ -430,10 +433,6 @@ impl RunningPerfGateway {
                 "RS3_COMMIT_MAX_PENDING_ITEMS",
                 commit_max_pending_items(args).to_string(),
             )
-            .env(
-                "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
-                args.payload_segment_size.to_string(),
-            )
             .env("RS3_STATIC_ACCESS_KEY_ID", GATEWAY_ACCESS_KEY_ID)
             .env("RS3_STATIC_SECRET_ACCESS_KEY", GATEWAY_SECRET_ACCESS_KEY)
             .env("AWS_ACCESS_KEY_ID", &backend.access_key_id)
@@ -448,6 +447,12 @@ impl RunningPerfGateway {
             .env_remove("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(payload_segment_size) = args.payload_segment_size {
+            child.env(
+                "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
+                payload_segment_size.to_string(),
+            );
+        }
 
         let mut child = child
             .spawn()
@@ -539,6 +544,10 @@ impl RunningPerfGateway {
         }
         Ok(())
     }
+}
+
+fn adaptive_payload_segment_size(args: &PerfArgs) -> bool {
+    args.payload_segment_size.is_none()
 }
 
 fn spawn_gateway_log_reader<R>(
