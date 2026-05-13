@@ -75,6 +75,12 @@ when Object Lock, version IDs, and exact-version reads pass live tests.
 Do not infer Object Lock semantics from S3 compatibility alone.
 Do not treat `HEAD` before `PUT` as equivalent to native conditional create; it
 is not atomic and is not a production-preview safety guarantee.
+Do not infer governance-bypass safety from Object Lock alone. For governance
+mode, normal gateway credentials must not have `s3:BypassGovernanceRetention`
+or provider-equivalent bypass permission. The live retained-version test proves
+retained writes, retained exact-version reads, retention extension, legal hold,
+and delete blocking without bypass headers; it does not replace an IAM or bucket
+policy review.
 
 During restore verification, `rs3` reports how many verified restore-critical
 objects expose retention or legal-hold metadata. Treat that as repository

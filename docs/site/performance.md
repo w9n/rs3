@@ -50,10 +50,10 @@ The command prints a compact table by default; pass
 
 ## Current Release Matrix
 
-Run date: 2026-05-09. Gateway profile: release. Payload segment lane: fixed
-512 B. Workload set: `larger-restores`. Each row is the average of three
-direct/gateway run pairs. The direct baseline is the straight RustFS
-measurement proxy.
+Run date: 2026-05-13. Gateway profile: release. Payload segment lane:
+adaptive writer default. Workload set: `larger-restores`. Each row is the
+average of three direct/gateway run pairs. The direct baseline is the straight
+RustFS measurement proxy.
 
 Artifact:
 `.local/integration/`.
@@ -62,27 +62,29 @@ Artifact:
 
 | Profile | Shape | Elapsed Ratio | Backend Requests | Backend Reads | Backend Writes | Gateway CPU | Gateway HWM RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `medium-restore` | one 64 MiB object | 1.06x | 1.16x | 1.03x | 1.03x | 1.10 s | 104.40 MiB |
-| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.28x | 1.01x | 1.05x | 1.03x | 1.60 s | 103.55 MiB |
-| `kubernetes-objects-large` | 6,144 manifests plus a 128 MiB fragment | 0.20x | 1.00x | 1.05x | 1.03x | 5.79 s | 212.13 MiB |
-| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.27x | 1.11x | 1.03x | 1.03x | 2.88 s | 213.29 MiB |
-| `postgres-pgdata-large` | larger relation/WAL/dump-shaped Postgres data directory | 1.58x | 1.11x | 1.03x | 1.03x | 5.70 s | 313.95 MiB |
+| `medium-restore` | one 64 MiB object | 0.88x | 1.16x | 1.01x | 1.00x | 1.32 s | 159.82 MiB |
+| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.21x | 0.07x | 1.04x | 1.00x | 0.71 s | 128.37 MiB |
+| `kubernetes-objects-large` | 6,144 manifests plus a 128 MiB fragment | 0.12x | 0.03x | 1.02x | 1.00x | 2.06 s | 305.40 MiB |
+| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.03x | 1.13x | 1.04x | 1.00x | 1.62 s | 289.71 MiB |
+| `postgres-pgdata-large` | larger relation/WAL/dump-shaped Postgres data directory | 1.15x | 1.10x | 1.04x | 1.00x | 3.13 s | 456.04 MiB |
 
 Interpretation:
 
-- Larger restore read and write bytes stay close to the straight proxy
-  baseline, about 1.03x to 1.05x in these runs.
-- Backend request counts are close to the straight proxy baseline, 1.00x to
-  1.16x in this run. The highest request ratio is the one-object medium profile,
-  where fixed checkpoint and evidence work has less opportunity to amortize.
+- Larger restore write bytes stay at about the straight proxy baseline, and
+  read bytes stay within about 1.01x to 1.04x in this run.
+- Backend request counts are at or below the straight proxy baseline for the
+  Kubernetes-shaped profiles and within 1.10x to 1.16x for the medium and
+  Postgres-shaped profiles. The highest request ratio remains the one-object
+  medium profile, where checkpoint and evidence work has little
+  opportunity to amortize.
 - Built-in regression budgets passed for request ratios, byte ratios, restore
   phase ratios, and repeated-run stability.
 - The Kubernetes-shaped profile is faster in this local harness despite similar
   backend bytes. Treat that as a local RustFS/proxy observation, not a cloud
   provider claim.
-- The Postgres-shaped profile has modest byte overhead but slower elapsed time.
-  The next performance target is gateway-side request/body handling and commit
-  wait around snapshot creation.
+- Postgres-shaped elapsed time is now close to the direct path in this local
+  harness. Keep tracking snapshot-create and large PUT phases because they
+  remain the most visible local latency contributors.
 
 ## Expanded Sanity Run
 
@@ -125,16 +127,13 @@ provider claim.
 ## Current Interpretation
 
 Recent release-profile artifacts show larger restore read and write byte ratios
-near the direct baseline, with request counts close to the direct path in the
-measured local setup. Tiny-file restore profiles are more sensitive to payload
-segment size because Kopia can issue many small ranged reads whose response
-bodies are only a few dozen or hundred bytes each.
+near the direct baseline. Tiny-file restore profiles are more sensitive to
+payload segment size because Kopia can issue many small ranged reads whose
+response bodies are only a few dozen or hundred bytes each.
 
 The current writer default is adaptive: small objects keep 512 B segments,
 medium objects use 8 KiB segments, and larger objects use 64 KiB segments. The
-historical fixed-size matrix below still explains the byte/request tradeoff, but
-external performance claims should wait for a refreshed adaptive matrix with the
-decrypted segment cache enabled.
+historical fixed-size matrix below still explains the byte/request tradeoff.
 
 ## Historical Segment-Size Finding
 
@@ -179,10 +178,9 @@ because local container and host load can dominate.
 
 ## Next Measurements
 
-- Refresh the three-run larger restore release matrix with the current adaptive
-  writer default and decrypted segment cache enabled.
 - Keep run order alternating between direct and gateway lanes.
 - Keep measuring variability with at least three runs for release claims.
 - Reduce commit stage-lock and checkpoint-wait time without allowing
   checkpoints to race writes whose sequence state is not yet indexed.
-- Add provider matrix runs only after local release artifacts are consistent.
+- Add provider matrix runs for additional S3-compatible stores after the
+  retained-backend retained-version lane remains repeatable.

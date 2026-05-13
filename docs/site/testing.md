@@ -55,6 +55,11 @@ meaningful when the retention and exact-version checks run:
 just integration-s3-local --qualification-profile retained-version --object-lock
 ```
 
+For governance mode, also review IAM or bucket policy so normal gateway
+credentials cannot bypass governance retention. The live retained-version test
+does not grant or use bypass headers, so it is not a substitute for that
+credential review.
+
 After a provider passes qualification, run a real Kopia backup/restore through
 the gateway against the same backend. Use a fresh backend prefix for each live
 run, and enable repository retention when validating an Object Lock bucket:

@@ -146,13 +146,13 @@ Latest focused evidence:
 
 | Evidence | Result |
 | --- | --- |
-| Live retained-backend retained-version S3 qualification | Passed on 2026-05-12 with Object Lock enabled, retained version IDs, and exact-version reads after a newer latest object. |
-| Live retained-backend Kopia gateway backup/restore | Passed on 2026-05-12 against an Object Lock bucket with repository governance retention enabled and a fresh backend prefix. |
-| Live retained-backend Velero dynamic-PVC gateway-restart restore | Passed on 2026-05-13 against an Object Lock bucket with repository governance retention enabled; artifact `.local/integration/`. |
+| Live retained-backend retained-version S3 qualification | Passed on 2026-05-13 with Object Lock enabled, retained version IDs, exact-version reads after a newer latest object, retention extension, and retention/legal-hold delete blocking; backend prefix `isolated live prefix`. |
+| Live retained-backend Kopia gateway backup/restore | Passed on 2026-05-13 against an Object Lock bucket with repository governance retention enabled; backend prefix `isolated live prefix`. |
+| Live retained-backend Velero dynamic-PVC gateway-restart restore | Passed on 2026-05-13 against an Object Lock bucket with repository governance retention enabled; artifact `.local/integration/`; backend prefix `isolated live prefix`. |
 | Velero dynamic-PVC gateway-restart in `read-write` | Passed on 2026-05-12 with restore status `Completed`; artifact `.local/integration/`. |
 | Velero strict `restore-readonly` incident-restore smoke | Passed on 2026-05-12 with workload verification, expected restore-artifact write denial, and zero backend writes during restore; artifact `.local/integration/`. |
 | Velero/Postgres compatibility smoke | Passed on 2026-05-12; artifact `.local/integration/`. |
-| Larger Kopia restore matrix | Passed with `regression_budgets=pass` and `workload_consistency=pass`; artifact `.local/integration/`. |
+| Larger Kopia restore matrix | Passed on 2026-05-13 with adaptive payload segment sizing, `regression_budgets=pass`, and `workload_consistency=pass`; artifact `.local/integration/`. |
 
 The release evidence is local harness evidence, not a provider certification. A
 production-preview trial should still run the selected live S3-compatible
@@ -160,6 +160,9 @@ provider with an empty bucket and a deliberately preserved restore bundle. The
 provider trial must explicitly choose `atomic-create` or `retained-version`.
 The retained-version profile must include Object Lock, retained version IDs, and
 exact-version reads after a newer latest object exists.
+For governance-mode buckets, also review IAM or bucket policy so normal gateway
+credentials cannot use governance-bypass permissions; the live retained-version
+test does not replace that credential review.
 
 ## Non-Goals
 

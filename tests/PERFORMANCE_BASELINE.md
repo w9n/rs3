@@ -82,7 +82,7 @@ The matrix command also writes `regression_budgets`. Passing
 into a command failure. The budgets intentionally avoid wall-clock elapsed time,
 which is too environment-sensitive for a hard gate in this local harness.
 
-## Current Results
+## Historical Small-Profile Results
 
 Run date: 2026-05-03. Payload segment lane: fixed 512 B. Each row is the
 average of three direct/gateway run pairs.
@@ -116,8 +116,9 @@ signal for this harness, not as a general cloud-provider result.
 
 ## Larger Restore Matrix
 
-Run date: 2026-05-09. Payload segment lane: fixed 512 B. Workload set:
-`larger-restores`. Each row is the average of three direct/gateway run pairs.
+Run date: 2026-05-13. Payload segment lane: adaptive writer default. Workload
+set: `larger-restores`. Each row is the average of three direct/gateway run
+pairs.
 Per-profile values come from
 `summary.json.profiles`; the top-level aggregate intentionally mixes profiles
 and should only be used as a smoke signal for the whole set.
@@ -135,23 +136,24 @@ deduplicated synthetic best case.
 
 | Profile | Shape | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend writes | Backend reads | Gateway CPU | Gateway HWM RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| medium-restore | one 64 MiB object | 2.76 s | 2.92 s | 1.06x | 1.16x | 1.03x | 1.03x | 1.10 s | 104.40 MiB |
-| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 9.53 s | 2.63 s | 0.28x | 1.01x | 1.03x | 1.05x | 1.60 s | 103.55 MiB |
-| kubernetes-objects-large | 6,144 manifests plus a 128 MiB etcd-like fragment | 33.29 s | 6.65 s | 0.20x | 1.00x | 1.03x | 1.05x | 5.79 s | 212.13 MiB |
-| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 2.78 s | 3.53 s | 1.27x | 1.11x | 1.03x | 1.03x | 2.88 s | 213.29 MiB |
-| postgres-pgdata-large | larger relation/WAL/dump-shaped data directory | 3.69 s | 5.82 s | 1.58x | 1.11x | 1.03x | 1.03x | 5.70 s | 313.95 MiB |
+| medium-restore | one 64 MiB object | 2.79 s | 2.44 s | 0.88x | 1.16x | 1.00x | 1.01x | 1.32 s | 159.82 MiB |
+| kubernetes-objects | 1,536 manifests plus a 32 MiB etcd-like fragment | 9.48 s | 2.03 s | 0.21x | 0.07x | 1.00x | 1.04x | 0.71 s | 128.37 MiB |
+| kubernetes-objects-large | 6,144 manifests plus a 128 MiB etcd-like fragment | 32.65 s | 4.07 s | 0.12x | 0.03x | 1.00x | 1.02x | 2.06 s | 305.40 MiB |
+| postgres-pgdata | 96 relation files, 4 WAL segments, and an 8 MiB dump | 2.73 s | 2.82 s | 1.03x | 1.13x | 1.00x | 1.04x | 1.62 s | 289.71 MiB |
+| postgres-pgdata-large | larger relation/WAL/dump-shaped data directory | 3.69 s | 4.24 s | 1.15x | 1.10x | 1.00x | 1.04x | 3.13 s | 456.04 MiB |
 
 Interpretation:
 
-- Larger restore read and write byte ratios stay close to the straight proxy
-  baseline, about 1.03x to 1.05x in these runs.
+- Larger restore write-byte ratios stay at about the straight proxy baseline.
+  Read-byte ratios stay within about 1.01x to 1.04x in these runs.
 - Gateway-internal derived byte ratios tell the same story: backend read bytes
-  per returned GET byte were 1.03x to 1.05x, and backend write bytes per PUT
-  request byte were about 1.03x to 1.04x.
-- Backend request counts are close to the straight proxy baseline in the larger
-  profiles. The current range is 1.00x to 1.16x, with the highest count in the
-  one-object medium restore profile where fixed checkpoint/evidence work has
-  little opportunity to amortize.
+  per returned GET byte were about 1.01x to 1.04x, and backend write bytes per
+  PUT request byte were about 1.001x to 1.004x.
+- Backend request counts are lower than the straight proxy baseline for the
+  Kubernetes-shaped profiles and within 1.10x to 1.16x for the medium and
+  Postgres-shaped profiles. The highest count remains the one-object medium
+  restore profile where checkpoint/evidence work has little opportunity to
+  amortize.
 - The larger profiles produced little or no payload span cache reuse. The
   Postgres-shaped profile averaged only a 0.29% cache event hit ratio, with
   evictions and skipped-too-large spans visible in the cache metrics. That is
@@ -162,9 +164,9 @@ Interpretation:
 - The Kubernetes-shaped profile is dominated by many small ranged GETs on the
   direct path. The gateway is faster locally despite similar backend bytes, but
   that elapsed ratio should be treated as a local RustFS/proxy observation.
-- The Postgres-shaped profiles still show slower gateway elapsed time despite
-  modest byte overhead. That keeps large PUT handling and commit wait around
-  snapshot creation as the next performance target.
+- The Postgres-shaped profiles are now close to the direct path in this local
+  harness. Keep tracking snapshot-create and large PUT phases because they
+  remain the most visible local latency contributors.
 
 ## Expanded Restore Sanity Run
 
@@ -257,12 +259,10 @@ Interpretation:
 - Wall-clock remains a weak ranking signal here. The local gateway lane is
   faster than direct RustFS through the proxy for all rows, which should be
   treated as a harness/backend observation rather than a provider claim.
-- The repeated fixed 512 B larger restore matrix read and wrote about 1.03x to
-  1.05x backend bytes versus direct RustFS. The current writer default is now
-  adaptive, so refresh this matrix before treating these historical numbers as
-  current performance evidence. Keep tracking larger Postgres-shaped restore
-  elapsed time because large PUT tail latency is still visible in the local
-  gateway path.
+- The adaptive larger restore matrix read about 1.01x to 1.04x backend bytes
+  and wrote about 1.00x backend bytes versus direct RustFS. Keep tracking larger
+  Postgres-shaped restore elapsed time because large PUT and snapshot-create
+  latency are still visible in the local gateway path.
 
 ## Lightweight Gateway Perf Smoke
 
