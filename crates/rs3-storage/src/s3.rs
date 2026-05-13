@@ -33,8 +33,8 @@ use client::{
 };
 use errors::{
     backend_version_id_from_string, common_error_result, get_error_result, map_common_error,
-    map_get_error, map_put_error, metadata_from_object_meta, provider_error, put_error_result,
-    storage_error_result,
+    map_get_error, map_put_error, map_sdk_common_error, metadata_from_object_meta, provider_error,
+    put_error_result, storage_error_result,
 };
 use metrics::S3ProviderOperation;
 use object_lock::{
