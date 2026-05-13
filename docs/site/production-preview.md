@@ -164,6 +164,19 @@ For governance-mode buckets, also review IAM or bucket policy so normal gateway
 credentials cannot use governance-bypass permissions; the live retained-version
 test does not replace that credential review.
 
+## Release Candidate Note
+
+`v0.1.0-preview.2` is a production-preview candidate for evaluating `rs3` with
+Velero/Kopia on Kubernetes and a retained S3-compatible backend. It includes the
+adaptive payload segment default, the decrypted-segment cache, retained-version
+restore checks, the live S3 provider qualification lane, and the refreshed
+retained-backend backup/restore evidence above.
+
+Use this candidate for controlled evaluation, not for a stable repository-format
+commitment. The durable format remains preview-scoped, governance-bypass IAM
+review remains operator-owned, and strong public security guarantees
+still need external review.
+
 ## Non-Goals
 
 The preview does not promise:
