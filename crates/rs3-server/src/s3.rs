@@ -6,6 +6,10 @@ mod key_management;
 mod mapping;
 mod recovery;
 mod runtime;
+mod runtime_builders;
+mod runtime_checkpoints;
+mod runtime_handles;
+mod runtime_keyring;
 
 pub use boundary::{GatewayS3Boundary, S3Hardening};
 pub use key_management::{
@@ -37,6 +41,12 @@ pub enum S3BoundaryError {
         /// Initialization failure reason.
         reason: String,
     },
+}
+
+pub(super) fn repository_init(error: impl ToString) -> S3BoundaryError {
+    S3BoundaryError::RepositoryInit {
+        reason: error.to_string(),
+    }
 }
 
 #[cfg(test)]

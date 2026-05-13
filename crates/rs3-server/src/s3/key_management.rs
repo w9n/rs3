@@ -1,11 +1,10 @@
 //! Explicit repository key lifecycle operations.
 
-use super::S3BoundaryError;
-use super::runtime::{
-    RuntimeAnchor, RuntimeStore, build_anchor, build_store, gateway_keyring,
-    read_checkpoint_for_position, repository_init, repository_key_context, secret_hex,
-    validate_storage_evidence,
-};
+use super::runtime_builders::{build_anchor, build_store};
+use super::runtime_checkpoints::{read_checkpoint_for_position, validate_storage_evidence};
+use super::runtime_handles::{RuntimeAnchor, RuntimeStore};
+use super::runtime_keyring::{gateway_keyring, repository_key_context, secret_hex};
+use super::{S3BoundaryError, repository_init};
 use crate::RuntimeConfig;
 use crate::config::KEYRING_WRAPPING_KEY_HEX_ENV;
 use rs3_anchor::{AnchorError, CheckpointAnchor};
@@ -82,7 +81,7 @@ pub async fn rotate_key_from_config(
 ) -> Result<KeyRotationReport, KeyRotationError> {
     let store = build_store(&config.backend).await?;
     let anchor = build_anchor(&config.anchor)?;
-    rotate_key(config, store.handle, anchor.handle, options).await
+    rotate_key(config, store.into_handle(), anchor.into_handle(), options).await
 }
 
 async fn rotate_key(
@@ -227,10 +226,9 @@ fn current_time_ms() -> i64 {
 mod tests {
     use super::{KeyRotationOptions, rotate_key};
     use crate::config::KEYRING_WRAPPING_KEY_HEX_ENV;
-    use crate::s3::runtime::{
-        RuntimeAnchor, RuntimeStore, read_checkpoint_for_position, repository_key_context,
-        secret_hex,
-    };
+    use crate::s3::runtime_checkpoints::read_checkpoint_for_position;
+    use crate::s3::runtime_handles::{RuntimeAnchor, RuntimeStore};
+    use crate::s3::runtime_keyring::{repository_key_context, secret_hex};
     use crate::s3::test_support::runtime_config;
     use bytes::Bytes;
     use rs3_anchor::MemoryCheckpointAnchor;

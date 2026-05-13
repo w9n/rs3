@@ -1,43 +1,33 @@
 //! Runtime repository construction for the S3 service.
 
 use super::S3BoundaryError;
-use crate::config::{KEYRING_WRAPPING_KEY_HEX_ENV, REPOSITORY_SALT_HEX_ENV};
-use crate::{
-    AnchorConfig, BackendConfig, BatchConfig, GatewayMode, RepositoryKeysConfig, RuntimeConfig,
-};
+use crate::{GatewayMode, RuntimeConfig};
 use bytes::Bytes;
-use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor, MemoryCheckpointAnchor};
-use rs3_crypto::{
-    KeyRing, KeyringEnvelope, RepositoryKeyContext, SecretBytes, derive_checkpoint_id,
-    derive_checkpoint_payload_digest,
-};
-use rs3_index::{
-    CHECKPOINT_EVIDENCE_DOMAIN, CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CheckpointEvidence,
-    KeyringEnvelopeReference, canonical_commit_record_bytes, checkpoint_evidence_bytes,
-};
-#[cfg(feature = "k8s")]
-use rs3_k8s::{KubernetesLeaseAnchor, LeaseSettings};
+#[cfg(test)]
+use rs3_anchor::MemoryCheckpointAnchor;
+use rs3_anchor::{AnchorError, CheckpointAnchor};
+use rs3_index::KeyringEnvelopeReference;
 use rs3_repository::{
-    CheckpointPosition, CommitCoordinator, CommitCoordinatorOptions, CommittedPut, DeleteOutcome,
-    Repository, RepositoryError, RepositoryListEntry, RepositoryObjectMetadata, RepositoryOptions,
+    CheckpointPosition, CommitCoordinator, CommittedPut, DeleteOutcome, Repository,
+    RepositoryError, RepositoryListEntry, RepositoryObjectMetadata, RepositoryOptions,
     RepositoryPutOptions,
 };
-use rs3_storage::{
-    BlobMetadata, BlobStore, ByteRange, FilesystemBlobStore, MemoryBlobStore, PutOptions,
-    StorageError,
-};
+use rs3_storage::ByteRange;
+#[cfg(test)]
+use rs3_storage::MemoryBlobStore;
 #[cfg(feature = "s3")]
-use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
-use rs3_types::{BackendObjectId, LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy};
-use secrecy::{ExposeSecret, SecretString};
-use std::path::{Component, Path, PathBuf};
+use rs3_storage::S3BlobStore;
+use rs3_types::{LegalHoldStatus, LogicalPath, RetentionPolicy};
 use std::sync::Arc;
 
-pub(super) type RuntimeStore = DynBlobStore;
-pub(super) type RuntimeAnchor = DynCheckpointAnchor;
+use super::repository_init;
+use super::runtime_builders::{build_anchor, build_store, coordinator_options};
+use super::runtime_checkpoints::{repository_has_committed_objects, validate_storage_evidence};
+use super::runtime_handles::{RuntimeAnchor, RuntimeStore};
+use super::runtime_keyring::gateway_keyring;
+use super::runtime_keyring::retained_version_required;
+
 type RuntimeCommitCoordinator = CommitCoordinator<RuntimeStore, RuntimeAnchor>;
-const KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.keyring-envelope+json";
-const CHECKPOINT_EVIDENCE_OBJECT_PREFIX: &str = "evidence/";
 
 #[derive(Clone)]
 pub(super) struct RuntimeRepository {
@@ -57,16 +47,18 @@ impl RuntimeRepository {
     pub(super) async fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
         let store = build_store(&config.backend).await?;
         let anchor = build_anchor(&config.anchor)?;
+        let store_handle = store.handle().clone();
+        let anchor_handle = anchor.handle().clone();
         let loaded_keyring = gateway_keyring(
-            &store.handle,
-            &anchor.handle,
+            &store_handle,
+            &anchor_handle,
             &config.repository_keys,
             config.repository.retention,
             config.mode.allows_bootstrap(),
         )
         .await?;
         let repository = Arc::new(Repository::with_keyring_and_options(
-            store.handle.clone(),
+            store_handle.clone(),
             loaded_keyring.keyring,
             RepositoryOptions {
                 payload_segment_size: config.repository.payload_segment_size,
@@ -82,24 +74,30 @@ impl RuntimeRepository {
             .map_err(repository_init)?;
         let coordinator = Arc::new(CommitCoordinator::with_options(
             repository,
-            anchor.handle.clone(),
+            anchor_handle,
             coordinator_options(config.batching),
         ));
+        #[cfg(feature = "s3")]
+        let s3_store = store.s3_store().cloned();
+        #[cfg(test)]
+        let memory_store = store.memory_store().cloned();
+        #[cfg(test)]
+        let memory_anchor = anchor.memory_anchor().cloned();
 
         Ok(Self {
             coordinator,
-            store: store.handle,
+            store: store_handle,
             pending_envelope_override: loaded_keyring.pending_envelope_override,
             require_anchor_checkpoint_version: retained_version_required(
                 config.repository.retention,
                 None,
             ),
             #[cfg(feature = "s3")]
-            s3_store: store.s3_store,
+            s3_store,
             #[cfg(test)]
-            memory_store: store.memory_store,
+            memory_store,
             #[cfg(test)]
-            memory_anchor: anchor.memory_anchor,
+            memory_anchor,
         })
     }
 
@@ -226,859 +224,14 @@ impl RuntimeRepository {
     }
 }
 
-pub(super) struct StoreBuild {
-    pub(super) handle: RuntimeStore,
-    #[cfg(feature = "s3")]
-    s3_store: Option<S3BlobStore>,
-    #[cfg(test)]
-    memory_store: Option<MemoryBlobStore>,
-}
-
-pub(super) struct AnchorBuild {
-    pub(super) handle: RuntimeAnchor,
-    #[cfg(test)]
-    memory_anchor: Option<MemoryCheckpointAnchor>,
-}
-
-pub(super) async fn build_store(config: &BackendConfig) -> Result<StoreBuild, S3BoundaryError> {
-    if is_memory_backend(config) {
-        let store = MemoryBlobStore::new();
-        return Ok(StoreBuild {
-            handle: RuntimeStore::new(store.clone()),
-            #[cfg(feature = "s3")]
-            s3_store: None,
-            #[cfg(test)]
-            memory_store: Some(store),
-        });
-    }
-
-    if let Some(root) = filesystem_backend_root(config)? {
-        let store = FilesystemBlobStore::new(root).map_err(repository_init)?;
-        return Ok(StoreBuild {
-            handle: RuntimeStore::new(store),
-            #[cfg(feature = "s3")]
-            s3_store: None,
-            #[cfg(test)]
-            memory_store: None,
-        });
-    }
-
-    #[cfg(feature = "s3")]
-    if let Some(store) = s3_backend_store(config).await? {
-        return Ok(StoreBuild {
-            handle: RuntimeStore::new(store.clone()),
-            s3_store: Some(store),
-            #[cfg(test)]
-            memory_store: None,
-        });
-    }
-
-    Err(S3BoundaryError::UnsupportedBackendMode)
-}
-
-fn is_memory_backend(config: &BackendConfig) -> bool {
-    config.endpoint == "memory" || config.endpoint.starts_with("memory://")
-}
-
-fn filesystem_backend_root(config: &BackendConfig) -> Result<Option<PathBuf>, S3BoundaryError> {
-    let Some(endpoint_path) = config.endpoint.strip_prefix("file://") else {
-        return Ok(None);
-    };
-    if endpoint_path.is_empty() {
-        return Err(repository_init("file backend endpoint must include a path"));
-    }
-
-    let mut root = PathBuf::from(endpoint_path);
-    push_relative_component(&mut root, &config.bucket)?;
-    if let Some(prefix) = config.prefix.as_deref() {
-        push_relative_component(&mut root, prefix)?;
-    }
-
-    Ok(Some(root))
-}
-
-#[cfg(feature = "s3")]
-async fn s3_backend_store(config: &BackendConfig) -> Result<Option<S3BlobStore>, S3BoundaryError> {
-    let Some(store_config) = s3_backend_config(config)? else {
-        return Ok(None);
-    };
-
-    S3BlobStore::from_environment(store_config)
-        .await
-        .map(Some)
-        .map_err(repository_init)
-}
-
-#[cfg(feature = "s3")]
-fn s3_backend_config(config: &BackendConfig) -> Result<Option<S3BlobStoreConfig>, S3BoundaryError> {
-    let endpoint_url = match config.endpoint.as_str() {
-        "s3" | "s3://" | "s3://aws" => None,
-        endpoint if endpoint.starts_with("https://") || endpoint.starts_with("http://") => {
-            Some(endpoint.to_owned())
-        }
-        _ => return Ok(None),
-    };
-    let allow_http = endpoint_url
-        .as_deref()
-        .is_some_and(|endpoint| endpoint.starts_with("http://"));
-    let config = S3BlobStoreConfig::new(config.bucket.clone())
-        .map_err(repository_init)?
-        .with_prefix(config.prefix.clone())
-        .with_endpoint_url(endpoint_url)
-        .with_region(None)
-        .with_allow_http(allow_http)
-        .with_virtual_hosted_style(false);
-
-    Ok(Some(config))
-}
-
-fn push_relative_component(root: &mut PathBuf, value: &str) -> Result<(), S3BoundaryError> {
-    for component in Path::new(value).components() {
-        match component {
-            Component::Normal(component) => root.push(component),
-            Component::CurDir => {}
-            Component::RootDir | Component::ParentDir | Component::Prefix(_) => {
-                return Err(repository_init(
-                    "file backend bucket and prefix must be relative paths",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn build_anchor(config: &AnchorConfig) -> Result<AnchorBuild, S3BoundaryError> {
-    match config {
-        AnchorConfig::Memory => {
-            let anchor = MemoryCheckpointAnchor::new();
-            Ok(AnchorBuild {
-                handle: RuntimeAnchor::new(anchor.clone()),
-                #[cfg(test)]
-                memory_anchor: Some(anchor),
-            })
-        }
-        AnchorConfig::KubernetesLease {
-            namespace,
-            name,
-            field_manager,
-        } => {
-            #[cfg(feature = "k8s")]
-            {
-                Ok(AnchorBuild {
-                    handle: RuntimeAnchor::new(KubernetesLeaseAnchor::new(LeaseSettings {
-                        namespace: namespace.clone(),
-                        name: name.clone(),
-                        field_manager: field_manager.clone(),
-                    })),
-                    #[cfg(test)]
-                    memory_anchor: None,
-                })
-            }
-            #[cfg(not(feature = "k8s"))]
-            {
-                let _ = (namespace, name, field_manager);
-                Err(S3BoundaryError::UnsupportedAnchorMode)
-            }
-        }
-    }
-}
-
-fn coordinator_options(config: BatchConfig) -> CommitCoordinatorOptions {
-    CommitCoordinatorOptions::new(config.max_items, config.max_delay)
-        .with_max_pending_items(config.max_pending_items)
-}
-
-#[derive(Clone)]
-pub(super) struct DynBlobStore {
-    inner: Arc<dyn BlobStore>,
-}
-
-impl DynBlobStore {
-    pub(super) fn new(store: impl BlobStore + 'static) -> Self {
-        Self {
-            inner: Arc::new(store),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl BlobStore for DynBlobStore {
-    async fn put(
-        &self,
-        object_id: &rs3_types::BackendObjectId,
-        body: Bytes,
-        options: PutOptions,
-    ) -> rs3_storage::Result<BlobMetadata> {
-        self.inner.put(object_id, body, options).await
-    }
-
-    async fn get_range(
-        &self,
-        object_id: &rs3_types::BackendObjectId,
-        range: ByteRange,
-    ) -> rs3_storage::Result<Bytes> {
-        self.inner.get_range(object_id, range).await
-    }
-
-    async fn get_range_at(
-        &self,
-        object_id: &rs3_types::BackendObjectId,
-        version_id: Option<&rs3_types::BackendVersionId>,
-        range: ByteRange,
-    ) -> rs3_storage::Result<Bytes> {
-        self.inner.get_range_at(object_id, version_id, range).await
-    }
-
-    async fn head(
-        &self,
-        object_id: &rs3_types::BackendObjectId,
-    ) -> rs3_storage::Result<BlobMetadata> {
-        self.inner.head(object_id).await
-    }
-
-    async fn head_at(
-        &self,
-        object_id: &rs3_types::BackendObjectId,
-        version_id: Option<&rs3_types::BackendVersionId>,
-    ) -> rs3_storage::Result<BlobMetadata> {
-        self.inner.head_at(object_id, version_id).await
-    }
-
-    async fn list_prefix(&self, prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
-        self.inner.list_prefix(prefix).await
-    }
-
-    async fn delete(&self, object_id: &rs3_types::BackendObjectId) -> rs3_storage::Result<()> {
-        self.inner.delete(object_id).await
-    }
-
-    async fn extend_retention(
-        &self,
-        object_id: &rs3_types::BackendObjectId,
-        policy: rs3_types::RetentionPolicy,
-    ) -> rs3_storage::Result<()> {
-        self.inner.extend_retention(object_id, policy).await
-    }
-
-    async fn extend_retention_at(
-        &self,
-        object_id: &rs3_types::BackendObjectId,
-        version_id: Option<&rs3_types::BackendVersionId>,
-        policy: rs3_types::RetentionPolicy,
-    ) -> rs3_storage::Result<()> {
-        self.inner
-            .extend_retention_at(object_id, version_id, policy)
-            .await
-    }
-
-    async fn set_legal_hold(
-        &self,
-        object_id: &rs3_types::BackendObjectId,
-        status: rs3_types::LegalHoldStatus,
-    ) -> rs3_storage::Result<()> {
-        self.inner.set_legal_hold(object_id, status).await
-    }
-
-    async fn set_legal_hold_at(
-        &self,
-        object_id: &rs3_types::BackendObjectId,
-        version_id: Option<&rs3_types::BackendVersionId>,
-        status: rs3_types::LegalHoldStatus,
-    ) -> rs3_storage::Result<()> {
-        self.inner
-            .set_legal_hold_at(object_id, version_id, status)
-            .await
-    }
-
-    async fn flush_caches(&self) -> rs3_storage::Result<()> {
-        self.inner.flush_caches().await
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct DynCheckpointAnchor {
-    inner: Arc<dyn CheckpointAnchor>,
-}
-
-impl DynCheckpointAnchor {
-    pub(super) fn new(anchor: impl CheckpointAnchor + 'static) -> Self {
-        Self {
-            inner: Arc::new(anchor),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl CheckpointAnchor for DynCheckpointAnchor {
-    async fn read(&self) -> rs3_anchor::Result<AnchorState> {
-        self.inner.read().await
-    }
-
-    async fn compare_and_advance(&self, next: AnchorState) -> rs3_anchor::Result<AnchorState> {
-        self.inner.compare_and_advance(next).await
-    }
-}
-
-pub(super) async fn gateway_keyring(
-    store: &RuntimeStore,
-    anchor: &RuntimeAnchor,
-    keys: &RepositoryKeysConfig,
-    retention: Option<RetentionPolicy>,
-    allow_bootstrap: bool,
-) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
-    match anchor.read().await {
-        Ok(state) => {
-            let accepted = CheckpointPosition::from(state);
-            let reference = checkpoint_keyring_envelope_reference(store, &accepted).await?;
-            let mut loaded = open_gateway_keyring_reference(store, keys, &reference).await?;
-            loaded.pending_envelope_override =
-                configured_envelope_override(store, keys, &loaded.keyring, &reference).await?;
-            Ok(loaded)
-        }
-        Err(AnchorError::MissingAnchor) => {
-            unanchored_gateway_keyring(store, keys, retention, allow_bootstrap).await
-        }
-        Err(error) => Err(repository_init(error)),
-    }
-}
-
-async fn unanchored_gateway_keyring(
-    store: &RuntimeStore,
-    keys: &RepositoryKeysConfig,
-    retention: Option<RetentionPolicy>,
-    allow_bootstrap: bool,
-) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
-    if let Some(object_id) = keys.envelope_object_id.as_ref() {
-        return match store.head(object_id).await {
-            Ok(metadata) => {
-                let body = store
-                    .get_range_at(object_id, metadata.version_id.as_ref(), ByteRange::Full)
-                    .await
-                    .map_err(repository_init)?;
-                open_gateway_keyring_object(keys, object_id.clone(), metadata.version_id, body)
-            }
-            Err(StorageError::NotFound(_)) => {
-                if !allow_bootstrap {
-                    return Err(repository_init(
-                        "restore-readonly gateway mode refuses to initialize a missing keyring envelope",
-                    ));
-                }
-                bootstrap_missing_keyring_envelope(store, keys, Some(object_id.clone()), retention)
-                    .await
-            }
-            Err(error) => Err(repository_init(error)),
-        };
-    }
-
-    if repository_has_committed_objects(store).await? {
-        return Err(repository_init(
-            "checkpoint anchor is missing but repository objects already exist; run explicit anchor recovery instead of choosing a backend checkpoint",
-        ));
-    }
-
-    if !allow_bootstrap {
-        return Err(repository_init(
-            "restore-readonly gateway mode refuses first-run repository initialization",
-        ));
-    }
-
-    let keyrings = store
-        .list_prefix("keyrings/")
-        .await
-        .map_err(repository_init)?;
-    match keyrings.as_slice() {
-        [] => bootstrap_missing_keyring_envelope(store, keys, None, retention).await,
-        [metadata] => {
-            let body = store
-                .get_range_at(
-                    &metadata.object_id,
-                    metadata.version_id.as_ref(),
-                    ByteRange::Full,
-                )
-                .await
-                .map_err(repository_init)?;
-            open_gateway_keyring_object(
-                keys,
-                metadata.object_id.clone(),
-                metadata.version_id.clone(),
-                body,
-            )
-        }
-        _ => Err(repository_init(
-            "checkpoint anchor is missing and multiple unanchored keyring envelopes exist; provide an explicit envelope override or recover the anchor",
-        )),
-    }
-}
-
-fn open_gateway_keyring(
-    keys: &RepositoryKeysConfig,
-    object_id: BackendObjectId,
-    version_id: Option<rs3_types::BackendVersionId>,
-    envelope: KeyringEnvelope,
-) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
-    let context = repository_key_context(keys)?;
-    let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
-    let keyring = envelope
-        .open(&context, &keys.wrapping_key_id, &wrapping_key)
-        .map_err(repository_init)?;
-    let reference = KeyringEnvelopeReference {
-        generation: envelope.generation,
-        digest: envelope.digest().map_err(repository_init)?,
-        object_id,
-        version_id,
-    };
-    Ok(LoadedGatewayKeyring {
-        keyring,
-        envelope_reference: Some(reference),
-        pending_envelope_override: None,
-    })
-}
-
-fn open_gateway_keyring_object(
-    keys: &RepositoryKeysConfig,
-    object_id: BackendObjectId,
-    version_id: Option<rs3_types::BackendVersionId>,
-    body: Bytes,
-) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
-    let envelope = KeyringEnvelope::from_object_bytes(&body).map_err(repository_init)?;
-    open_gateway_keyring(keys, object_id, version_id, envelope)
-}
-
-pub(super) async fn open_gateway_keyring_reference(
-    store: &RuntimeStore,
-    keys: &RepositoryKeysConfig,
-    reference: &KeyringEnvelopeReference,
-) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
-    let body = store
-        .get_range_at(
-            &reference.object_id,
-            reference.version_id.as_ref(),
-            ByteRange::Full,
-        )
-        .await
-        .map_err(repository_init)?;
-    let envelope = KeyringEnvelope::from_object_bytes(&body).map_err(repository_init)?;
-    let digest = envelope.digest().map_err(repository_init)?;
-    if envelope.generation != reference.generation || digest != reference.digest {
-        return Err(repository_init(format!(
-            "keyring envelope object {} does not match the checkpoint-bound envelope reference",
-            reference.object_id
-        )));
-    }
-    open_gateway_keyring(
-        keys,
-        reference.object_id.clone(),
-        reference.version_id.clone(),
-        envelope,
-    )
-}
-
-async fn configured_envelope_override(
-    store: &RuntimeStore,
-    keys: &RepositoryKeysConfig,
-    active_keyring: &KeyRing,
-    active_reference: &KeyringEnvelopeReference,
-) -> Result<Option<KeyringEnvelopeReference>, S3BoundaryError> {
-    let Some(object_id) = keys.envelope_object_id.as_ref() else {
-        return Ok(None);
-    };
-    if object_id == &active_reference.object_id {
-        return Ok(None);
-    }
-
-    let loaded = match store.head(object_id).await {
-        Ok(metadata) => {
-            let body = store
-                .get_range_at(object_id, metadata.version_id.as_ref(), ByteRange::Full)
-                .await
-                .map_err(repository_init)?;
-            open_gateway_keyring_object(keys, object_id.clone(), metadata.version_id, body)?
-        }
-        Err(StorageError::NotFound(_)) => {
-            return Err(repository_init(
-                "configured keyring envelope override is missing",
-            ));
-        }
-        Err(error) => return Err(repository_init(error)),
-    };
-    if loaded.keyring.descriptors() != active_keyring.descriptors() {
-        return Err(repository_init(
-            "configured keyring envelope override opens to different repository keys",
-        ));
-    }
-
-    Ok(loaded.envelope_reference)
-}
-
-async fn bootstrap_missing_keyring_envelope(
-    store: &RuntimeStore,
-    keys: &RepositoryKeysConfig,
-    configured_object_id: Option<BackendObjectId>,
-    retention: Option<RetentionPolicy>,
-) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
-    if repository_prefix_has_objects(store).await? {
-        return Err(repository_init(
-            "keyring envelope is missing and repository prefix is not empty; refusing to initialize a new keyring",
-        ));
-    }
-
-    let context = repository_key_context(keys)?;
-    let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
-    let keyring = KeyRing::generate_random().map_err(repository_init)?;
-    let envelope = keyring
-        .seal_keyring_envelope(&context, &keys.wrapping_key_id, &wrapping_key, 1)
-        .map_err(repository_init)?;
-    let reference = if let Some(object_id) = configured_object_id {
-        store_configured_keyring_envelope(store, &object_id, &envelope, retention).await?
-    } else {
-        let repository = Repository::with_keyring_and_options(
-            store.clone(),
-            keyring.clone(),
-            RepositoryOptions {
-                default_retention: retention,
-                ..RepositoryOptions::default()
-            },
-        );
-        repository
-            .store_keyring_envelope(&envelope)
-            .await
-            .map_err(repository_init)?
-    };
-
-    tracing::info!(
-        target: "rs3_repository",
-        keyring_envelope_generation = reference.generation,
-        "initialized keyring envelope in empty repository",
-    );
-
-    Ok(LoadedGatewayKeyring {
-        keyring,
-        envelope_reference: Some(reference),
-        pending_envelope_override: None,
-    })
-}
-
-async fn store_configured_keyring_envelope(
-    store: &RuntimeStore,
-    object_id: &BackendObjectId,
-    envelope: &KeyringEnvelope,
-    retention: Option<RetentionPolicy>,
-) -> Result<KeyringEnvelopeReference, S3BoundaryError> {
-    let digest = envelope.digest().map_err(repository_init)?;
-    let body = Bytes::from(envelope.to_object_bytes().map_err(repository_init)?);
-    let put = store
-        .put(
-            object_id,
-            body.clone(),
-            PutOptions {
-                retention,
-                legal_hold: None,
-                content_type: Some(KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE.to_owned()),
-                do_not_recreate: true,
-            },
-        )
-        .await;
-
-    match put {
-        Ok(metadata) => {
-            let version_id = retained_version_id(object_id, &metadata, retention, None)
-                .map_err(repository_init)?;
-            Ok(KeyringEnvelopeReference {
-                generation: envelope.generation,
-                digest,
-                object_id: object_id.clone(),
-                version_id,
-            })
-        }
-        Err(StorageError::AlreadyExists(_)) => {
-            let metadata = store.head(object_id).await.map_err(repository_init)?;
-            let existing = store
-                .get_range_at(object_id, metadata.version_id.as_ref(), ByteRange::Full)
-                .await
-                .map_err(repository_init)?;
-            if existing != body {
-                return Err(repository_init(format!(
-                    "keyring envelope object conflicts with expected content: {object_id}",
-                )));
-            }
-            let version_id = retained_version_id(object_id, &metadata, retention, None)
-                .map_err(repository_init)?;
-            Ok(KeyringEnvelopeReference {
-                generation: envelope.generation,
-                digest,
-                object_id: object_id.clone(),
-                version_id,
-            })
-        }
-        Err(error) => Err(repository_init(error)),
-    }
-}
-
-fn retained_version_id(
-    object_id: &BackendObjectId,
-    metadata: &BlobMetadata,
-    retention: Option<RetentionPolicy>,
-    legal_hold: Option<LegalHoldStatus>,
-) -> rs3_storage::Result<Option<rs3_types::BackendVersionId>> {
-    if retained_version_required(retention, legal_hold) && metadata.version_id.is_none() {
-        return Err(StorageError::MissingVersionId(object_id.clone()));
-    }
-    Ok(metadata.version_id.clone())
-}
-
-fn retained_version_required(
-    retention: Option<RetentionPolicy>,
-    legal_hold: Option<LegalHoldStatus>,
-) -> bool {
-    retention.is_some_and(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
-        || legal_hold == Some(LegalHoldStatus::On)
-}
-
-pub(super) async fn checkpoint_keyring_envelope_reference(
-    store: &RuntimeStore,
-    accepted: &CheckpointPosition,
-) -> Result<KeyringEnvelopeReference, S3BoundaryError> {
-    let checkpoint = read_checkpoint_for_position(store, accepted).await?;
-    checkpoint.record.keyring_envelope.ok_or_else(|| {
-        repository_init("anchor-bound checkpoint does not contain a keyring envelope reference")
-    })
-}
-
-pub(super) async fn read_checkpoint_for_position(
-    store: &RuntimeStore,
-    accepted: &CheckpointPosition,
-) -> Result<Checkpoint, S3BoundaryError> {
-    let object_id = checkpoint_object_id(&accepted.checkpoint_id)?;
-    let body = store
-        .get_range_at(
-            &object_id,
-            accepted.checkpoint_version_id.as_ref(),
-            ByteRange::Full,
-        )
-        .await
-        .map_err(repository_init)?;
-    let Some(payload) = body.as_ref().strip_prefix(CHECKPOINT_OBJECT_DOMAIN) else {
-        return Err(repository_init(format!(
-            "invalid checkpoint object format: {object_id}"
-        )));
-    };
-    let checkpoint: Checkpoint = serde_json::from_slice(payload).map_err(repository_init)?;
-    let canonical_payload =
-        canonical_commit_record_bytes(&checkpoint.record).map_err(repository_init)?;
-    let payload_digest = derive_checkpoint_payload_digest(&canonical_payload);
-    let expected_id =
-        derive_checkpoint_id(&canonical_payload, &checkpoint.signature).map_err(repository_init)?;
-
-    if checkpoint.record.sequence != accepted.sequence
-        || checkpoint.id != accepted.checkpoint_id
-        || expected_id != checkpoint.id
-        || payload_digest != accepted.payload_digest
-    {
-        return Err(repository_init(
-            "checkpoint object does not match the accepted anchor position",
-        ));
-    }
-
-    Ok(checkpoint)
-}
-
-pub(super) fn checkpoint_object_id(
-    checkpoint_id: &rs3_types::CheckpointId,
-) -> Result<BackendObjectId, S3BoundaryError> {
-    BackendObjectId::new(format!("checkpoints/{}", checkpoint_id.as_str())).map_err(repository_init)
-}
-
-pub(super) fn checkpoint_evidence_object_id(
-    position: &CheckpointPosition,
-) -> Result<BackendObjectId, S3BoundaryError> {
-    BackendObjectId::new(format!(
-        "{CHECKPOINT_EVIDENCE_OBJECT_PREFIX}{:020}/{}",
-        position.sequence.get(),
-        position.checkpoint_id.as_str()
-    ))
-    .map_err(repository_init)
-}
-
-pub(super) async fn validate_storage_evidence(
-    store: &RuntimeStore,
-    accepted: &CheckpointPosition,
-) -> Result<(), S3BoundaryError> {
-    verify_checkpoint_evidence_object(store, accepted).await?;
-    reject_newer_storage_evidence(store, accepted).await
-}
-
-async fn verify_checkpoint_evidence_object(
-    store: &RuntimeStore,
-    accepted: &CheckpointPosition,
-) -> Result<(), S3BoundaryError> {
-    let object_id = checkpoint_evidence_object_id(accepted)?;
-    let expected = checkpoint_evidence_body(accepted)?;
-    let body = store
-        .get_range(&object_id, ByteRange::Full)
-        .await
-        .map_err(repository_init)?;
-    if !body.starts_with(CHECKPOINT_EVIDENCE_DOMAIN) || body.as_ref() != expected.as_slice() {
-        return Err(repository_init(
-            "checkpoint evidence object does not match the accepted anchor position",
-        ));
-    }
-    Ok(())
-}
-
-async fn reject_newer_storage_evidence(
-    store: &RuntimeStore,
-    accepted: &CheckpointPosition,
-) -> Result<(), S3BoundaryError> {
-    let evidence = store
-        .list_prefix(CHECKPOINT_EVIDENCE_OBJECT_PREFIX)
-        .await
-        .map_err(repository_init)?;
-    for metadata in evidence {
-        if evidence_object_sequence(&metadata.object_id)
-            .is_none_or(|sequence| sequence <= accepted.sequence.get())
-        {
-            continue;
-        }
-        let body = store
-            .get_range(&metadata.object_id, ByteRange::Full)
-            .await
-            .map_err(repository_init)?;
-        match checkpoint_position_from_evidence_object(&metadata.object_id, &body) {
-            Ok(position) if position.sequence.get() > accepted.sequence.get() => {
-                return Err(repository_init(
-                    "storage checkpoint evidence is newer than the accepted anchor position; run explicit recovery before serving",
-                ));
-            }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(
-                    target: "rs3_repository",
-                    object_class = "checkpoint_evidence",
-                    object_id = metadata.object_id.as_str(),
-                    error = %error,
-                    "ignored malformed newer checkpoint evidence during startup validation",
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn checkpoint_evidence_body(position: &CheckpointPosition) -> Result<Vec<u8>, S3BoundaryError> {
-    checkpoint_evidence_bytes(&CheckpointEvidence {
-        sequence: position.sequence,
-        checkpoint_id: position.checkpoint_id.clone(),
-        checkpoint_digest: position.payload_digest.clone(),
-        checkpoint_object_id: checkpoint_object_id(&position.checkpoint_id)?,
-        checkpoint_object_version_id: position.checkpoint_version_id.clone(),
-    })
-    .map_err(repository_init)
-}
-
-fn checkpoint_position_from_evidence_object(
-    object_id: &BackendObjectId,
-    body: &[u8],
-) -> Result<CheckpointPosition, S3BoundaryError> {
-    let Some(payload) = body.strip_prefix(CHECKPOINT_EVIDENCE_DOMAIN) else {
-        return Err(repository_init("invalid checkpoint evidence object format"));
-    };
-    let evidence: CheckpointEvidence = serde_json::from_slice(payload).map_err(repository_init)?;
-    let position = CheckpointPosition {
-        sequence: evidence.sequence,
-        checkpoint_id: evidence.checkpoint_id,
-        checkpoint_version_id: evidence.checkpoint_object_version_id,
-        payload_digest: evidence.checkpoint_digest,
-    };
-    if evidence.checkpoint_object_id != checkpoint_object_id(&position.checkpoint_id)?
-        || checkpoint_evidence_object_id(&position)? != *object_id
-    {
-        return Err(repository_init(
-            "checkpoint evidence object does not match its object name",
-        ));
-    }
-    Ok(position)
-}
-
-fn evidence_object_sequence(object_id: &BackendObjectId) -> Option<u64> {
-    object_id
-        .as_str()
-        .strip_prefix(CHECKPOINT_EVIDENCE_OBJECT_PREFIX)?
-        .split_once('/')?
-        .0
-        .parse()
-        .ok()
-}
-
-async fn repository_has_committed_objects(store: &RuntimeStore) -> Result<bool, S3BoundaryError> {
-    for prefix in ["checkpoints/", "evidence/", "index/", "segments/"] {
-        if !store
-            .list_prefix(prefix)
-            .await
-            .map_err(repository_init)?
-            .is_empty()
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-async fn repository_prefix_has_objects(store: &RuntimeStore) -> Result<bool, S3BoundaryError> {
-    Ok(!store
-        .list_prefix("")
-        .await
-        .map_err(repository_init)?
-        .is_empty())
-}
-
-pub(super) struct LoadedGatewayKeyring {
-    pub(super) keyring: KeyRing,
-    pub(super) envelope_reference: Option<KeyringEnvelopeReference>,
-    pub(super) pending_envelope_override: Option<KeyringEnvelopeReference>,
-}
-
-pub(super) fn repository_key_context(
-    keys: &RepositoryKeysConfig,
-) -> Result<RepositoryKeyContext, S3BoundaryError> {
-    let salt = repository_salt(&keys.repository_salt_hex)?;
-    RepositoryKeyContext::new(keys.repository_id.clone(), salt).map_err(repository_init)
-}
-
-pub(super) fn secret_hex(
-    env_name: &'static str,
-    secret_hex: &SecretString,
-) -> Result<SecretBytes, S3BoundaryError> {
-    let bytes = hex::decode(secret_hex.expose_secret()).map_err(|error| {
-        repository_init(format!(
-            "{env_name} must be hex-encoded repository key material: {error}",
-        ))
-    })?;
-    SecretBytes::new(bytes)
-        .map_err(|error| repository_init(format!("{env_name} is not usable: {error}",)))
-}
-
-fn repository_salt(salt_hex: &str) -> Result<Vec<u8>, S3BoundaryError> {
-    hex::decode(salt_hex).map_err(|error| {
-        repository_init(format!(
-            "{REPOSITORY_SALT_HEX_ENV} must be hex-encoded repository salt: {error}",
-        ))
-    })
-}
-
-pub(super) fn repository_init(error: impl ToString) -> S3BoundaryError {
-    S3BoundaryError::RepositoryInit {
-        reason: error.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "s3")]
-    use super::s3_backend_config;
-    use super::{
-        RuntimeAnchor, RuntimeRepository, RuntimeStore, checkpoint_evidence_object_id,
-        checkpoint_object_id, gateway_keyring,
-    };
+    use super::super::runtime_builders::s3_backend_config;
+    use super::super::runtime_checkpoints::{checkpoint_evidence_object_id, checkpoint_object_id};
+    use super::super::runtime_handles::{RuntimeAnchor, RuntimeStore};
+    use super::super::runtime_keyring::gateway_keyring;
+    use super::RuntimeRepository;
     #[cfg(not(feature = "k8s"))]
     use crate::AnchorConfig;
     use crate::s3::S3BoundaryError;

@@ -1,10 +1,10 @@
 //! Explicit checkpoint-anchor recovery from retained backend evidence.
 
 use super::S3BoundaryError;
-use super::runtime::{
-    RuntimeAnchor, RuntimeStore, build_anchor, build_store, checkpoint_object_id,
-    open_gateway_keyring_reference, read_checkpoint_for_position,
-};
+use super::runtime_builders::{build_anchor, build_store};
+use super::runtime_checkpoints::{checkpoint_object_id, read_checkpoint_for_position};
+use super::runtime_handles::{RuntimeAnchor, RuntimeStore};
+use super::runtime_keyring::open_gateway_keyring_reference;
 use crate::RuntimeConfig;
 use rs3_anchor::{AnchorError, CheckpointAnchor};
 use rs3_index::{
@@ -122,8 +122,8 @@ pub async fn export_restore_bundle_from_config(
 ) -> Result<RestoreTrustBundle, AnchorRecoveryError> {
     let store = build_store(&config.backend).await?;
     let anchor = build_anchor(&config.anchor)?;
-    let position = CheckpointPosition::from(anchor.handle.read().await?);
-    restore_bundle_for_position(config, &store.handle, position).await
+    let position = CheckpointPosition::from(anchor.handle().read().await?);
+    restore_bundle_for_position(config, store.handle(), position).await
 }
 
 /// Imports a trusted checkpoint position into the configured anchor if it is missing.
@@ -133,7 +133,7 @@ pub async fn import_anchor_from_config(
 ) -> Result<AnchorImportReport, AnchorRecoveryError> {
     let store = build_store(&config.backend).await?;
     let anchor = build_anchor(&config.anchor)?;
-    import_anchor_position(config, &store.handle, &anchor.handle, position).await
+    import_anchor_position(config, store.handle(), anchor.handle(), position).await
 }
 
 /// Scans backend evidence and optionally writes a missing anchor.
@@ -142,13 +142,13 @@ pub async fn recover_anchor_from_config(
     options: AnchorRecoveryOptions,
 ) -> Result<AnchorRecoveryReport, AnchorRecoveryError> {
     let store = build_store(&config.backend).await?;
-    let candidates = observed_checkpoint_candidates(&store.handle).await?;
+    let candidates = observed_checkpoint_candidates(store.handle()).await?;
     let observed_evidence_objects = candidates.observed_evidence_objects;
     let candidate_count = candidates.positions.len();
 
     let mut selected = None;
     for position in candidates.positions {
-        match validate_candidate(config, &store.handle, position).await {
+        match validate_candidate(config, store.handle(), position).await {
             Ok((checkpoint, position)) => {
                 selected = Some((checkpoint, position));
                 break;
@@ -174,7 +174,7 @@ pub async fn recover_anchor_from_config(
 
     let applied = if options.apply_if_missing {
         let anchor = build_anchor(&config.anchor)?;
-        write_missing_anchor(&anchor.handle, &position).await?;
+        write_missing_anchor(anchor.handle(), &position).await?;
         true
     } else {
         false
