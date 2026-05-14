@@ -5,9 +5,10 @@ store backups on S3-compatible infrastructure they do not fully trust. The main
 client is Velero with Kopia uploader; direct Kopia use remains in scope because
 it is the compatibility substrate.
 
-The preview is a product contract, not a stable repository-format promise.
+The preview defines the behavior to evaluate. It is not a stable
+repository-format promise.
 
-## Product Claim
+## Preview Claim
 
 `rs3` is a path-private, tamper-evident S3 gateway for backup repositories.
 

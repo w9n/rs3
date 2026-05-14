@@ -67,7 +67,7 @@ pub enum AuthError {
     #[error("invalid credentials")]
     InvalidCredentials,
     /// The authenticated identity is not allowed to perform the requested action.
-    #[error("access denied for action {action:?} on bucket {bucket}")]
+    #[error("access denied for requested bucket/action")]
     AccessDenied {
         /// Requested bucket.
         bucket: PublicBucket,
@@ -232,6 +232,12 @@ mod tests {
 
         assert_eq!(allowed, Ok(()));
         assert!(matches!(denied, Err(AuthError::AccessDenied { .. })));
+        let rendered = denied
+            .err()
+            .unwrap_or_else(|| panic!("expected access denial"))
+            .to_string();
+        assert!(!rendered.contains("other"));
+        assert!(!rendered.contains("GetObject"));
     }
 
     #[test]

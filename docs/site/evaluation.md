@@ -24,13 +24,13 @@ cryptographic choices are still moving.
 
 ## Trust Posture
 
-The project is built around an uncomfortable assumption: object storage can be
-honest-but-curious, misconfigured, malicious, or controlled by an attacker
-during a restore. The design therefore avoids plaintext repository names in
-backend-visible places and treats the object store as insufficient for proving
-the newest valid checkpoint.
+The project is built around an explicit assumption: object storage can be
+observable by the provider, misconfigured, malicious, or controlled by an
+attacker during a restore. The design therefore avoids plaintext repository
+names in backend-visible places and treats the object store as insufficient for
+proving the newest valid checkpoint.
 
-The result is a system that should be evaluated on three axes:
+Evaluate the preview on three axes:
 
 | Axis | Evaluation Question |
 | --- | --- |
@@ -38,7 +38,7 @@ The result is a system that should be evaluated on three axes:
 | Integrity | Can a backend delete, replay, delay, or forge repository state without detection? |
 | Operations | Can an operator restore under pressure without bypassing the protection model? |
 
-## Current Strengths
+## Implemented Controls
 
 - Path-private repository object IDs and namespace lookup tokens.
 - Encrypted payload segments with authenticated object context.

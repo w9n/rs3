@@ -1,10 +1,10 @@
 <section class="rv-hero">
   <p class="rv-eyebrow">Kubernetes backup gateway | S3-compatible | production preview target</p>
-  <h1>Backups under your control.</h1>
+  <h1>Path-private S3 backup gateway.</h1>
   <p class="rv-lead">
-    <code>rs3</code> is a path-private, tamper-evident S3 gateway for operators who need
-    backup storage to stay useful even when the backend is curious, unreliable,
-    or under attack.
+    <code>rs3</code> is a path-private, tamper-evident S3 gateway for operators
+    evaluating Velero/Kopia backup storage on S3-compatible infrastructure that
+    may be untrusted or partially compromised.
   </p>
   <div class="rv-actions">
     <a class="md-button md-button--primary" href="evaluation/">Evaluate rs3</a>

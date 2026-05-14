@@ -60,14 +60,22 @@ impl GatewayS3Service {
         request_id: u64,
         bucket: Option<&str>,
     ) -> tracing::Span {
-        let bucket = bucket.unwrap_or("");
+        let bucket_scope = self.bucket_scope(bucket);
         tracing::info_span!(
             target: "rs3_server",
             "s3_request",
             operation,
             request_id,
-            bucket,
+            bucket_scope,
         )
+    }
+
+    fn bucket_scope(&self, bucket: Option<&str>) -> &'static str {
+        match bucket {
+            None => "none",
+            Some(bucket) if bucket == self.public_bucket.as_str() => "configured",
+            Some(_) => "other",
+        }
     }
 
     fn record_request_result<T>(
@@ -79,7 +87,7 @@ impl GatewayS3Service {
         result: &S3Result<S3Response<T>>,
         default_success_status: http::StatusCode,
     ) {
-        let bucket = bucket.unwrap_or("");
+        let bucket_scope = self.bucket_scope(bucket);
         match result {
             Ok(response) => {
                 let status = response.status.unwrap_or(default_success_status);
@@ -88,7 +96,7 @@ impl GatewayS3Service {
                     target: "rs3_server",
                     operation,
                     request_id,
-                    bucket,
+                    bucket_scope,
                     result = "ok",
                     status_code = status.as_u16(),
                     elapsed_us = elapsed_us(elapsed),
@@ -104,7 +112,7 @@ impl GatewayS3Service {
                     target: "rs3_server",
                     operation,
                     request_id,
-                    bucket,
+                    bucket_scope,
                     result = "error",
                     status_code = status.as_u16(),
                     error_code = error.code().as_str(),
@@ -725,6 +733,15 @@ mod tests {
         fn assert_s3<T: s3s::S3>() {}
 
         assert_s3::<GatewayS3Service>();
+    }
+
+    #[tokio::test]
+    async fn request_bucket_scope_is_path_safe() {
+        let service = gateway_service().await;
+
+        assert_eq!(service.bucket_scope(None), "none");
+        assert_eq!(service.bucket_scope(Some("client-bucket")), "configured");
+        assert_eq!(service.bucket_scope(Some("tenant-a")), "other");
     }
 
     #[tokio::test]
