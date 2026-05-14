@@ -173,8 +173,11 @@ cargo run -p xtask --bin xtask --features containers -- integration kopia-measur
 
 Budgets focus on request and byte amplification. Larger restore request budgets
 allow modest extra requests for checkpoint and evidence writes; byte budgets are
-tighter. Elapsed-time budgets remain reported but should be enforced carefully
-because local container and host load can dominate.
+tighter. Cache hit ratios remain reported diagnostics, but are not enforced for
+the `many-small-files` profile because that workload can legitimately pass the
+request and byte budgets without reusing decrypted payload spans. Elapsed-time
+budgets remain reported but should be enforced carefully because local container
+and host load can dominate.
 
 ## Next Measurements
 

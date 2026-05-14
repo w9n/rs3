@@ -65,19 +65,6 @@ pub(super) fn regression_budgets_json(
                     ],
                     2.25,
                 );
-                push_min_budget(
-                    &mut checks,
-                    profile,
-                    summary,
-                    "gateway_internal.payload_span_cache_event_hit_ratio",
-                    &[
-                        "comparison",
-                        "gateway_internal",
-                        "payload_span_cache_event_hit_ratio",
-                        "avg",
-                    ],
-                    0.70,
-                );
             }
             _ => {}
         }
@@ -289,17 +276,6 @@ fn push_max_budget(
     limit: f64,
 ) {
     push_budget(checks, profile, summary, metric, path, "<=", limit);
-}
-
-fn push_min_budget(
-    checks: &mut Vec<Value>,
-    profile: &str,
-    summary: &Value,
-    metric: &'static str,
-    path: &[&str],
-    limit: f64,
-) {
-    push_budget(checks, profile, summary, metric, path, ">=", limit);
 }
 
 fn push_optional_max_budget(
@@ -540,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn many_small_512_budget_fails_without_cache_hit_ratio() {
+    fn many_small_512_budget_enforces_request_and_byte_ratios() {
         let profiles = serde_json::json!({
             "many-small-files": {
                 "comparison": {
@@ -558,11 +534,14 @@ mod tests {
 
         let budgets = regression_budgets_json(&profiles, Some(512));
 
-        assert_eq!(budgets["status"], serde_json::json!("fail"));
-        assert_eq!(budgets["failed"], serde_json::json!(1));
+        assert_eq!(budgets["status"], serde_json::json!("pass"));
+        assert_eq!(budgets["failed"], serde_json::json!(0));
         assert_eq!(
-            budgets["checks"][3]["metric"],
-            serde_json::json!("gateway_internal.payload_span_cache_event_hit_ratio")
+            budgets["checks"]
+                .as_array()
+                .unwrap_or_else(|| panic!("checks should be an array"))
+                .len(),
+            3
         );
     }
 }
