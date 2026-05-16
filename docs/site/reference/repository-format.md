@@ -22,6 +22,7 @@ The design uses a small number of non-secret classes:
 ```text
 format/
 keyrings/
+commits/
 segments/
 manifests/
 index/
