@@ -21,6 +21,7 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | Preview local gate | `just preview-gate-local` | Default checks, S3-feature checks, and dependency policy checks. |
 | Storage S3 | `just integration-s3-local --mode container` | Storage contract against a disposable S3-compatible provider. |
 | Gateway S3 | `just integration-s3-gateway` | Gateway S3 operations through the repository path. |
+| Local v2 nightly gate | `just preview-gate-v2-nightly` | Scheduled or release-candidate gate: S3 feature checks plus v2 S3 tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes against disposable local backends. |
 | Live v2 preview gate | `just preview-gate-v2-live <bucket> <endpoint> <region>` | Consolidated retained-backend gate. Generates fresh sub-prefixes and runs v2 Gateway S3, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes. |
 | Live v2 Gateway S3 | `just integration-s3-gateway-v2-live --backend-bucket <bucket> --endpoint-url <endpoint> --region <region> --backend-prefix <fresh-prefix>` | v2-preview gateway smoke against an existing retained S3-compatible backend, including `mc`, default `rclone lsf`, and backend key privacy checks. |
 | Kopia | `just integration-kopia-gateway` | Real Kopia create, snapshot, and restore through the gateway. |

@@ -35,6 +35,13 @@ a future format version.
 experiments are historical tags, not a compatibility target for new
 deployments.
 
+Preview change control: after the current v2 preview evidence gate, changes to
+backend object classes, commit-key shape, signed header fields, section layout,
+anchor fields, keyring/format-root references, or provider-profile semantics
+must update this reference, the rationale/runbook text, and focused test
+vectors before implementation is considered complete. Treat undocumented
+format drift as a release blocker.
+
 v2 commit objects use random, path-private keys:
 
 ```text

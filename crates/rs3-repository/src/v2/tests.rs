@@ -10,7 +10,7 @@ use super::{
     V2CommitStoreOptions, V2CommitWrite, V2MemoryAnchor, V2OrphanGcOptions, V2RecoveryBundle,
     V2Repository,
 };
-use crate::{CommitCoordinatorOptions, RepositoryOptions, RepositoryPutOptions};
+use crate::{CommitCoordinatorOptions, RepositoryError, RepositoryOptions, RepositoryPutOptions};
 use bytes::Bytes;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions};
@@ -18,8 +18,8 @@ use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
     LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy, Sequence,
 };
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Barrier, Notify};
 
@@ -269,6 +269,7 @@ struct SlowCommitGetStore {
     ranged_commit_gets: Arc<AtomicUsize>,
     in_flight_ranged_commit_gets: Arc<AtomicUsize>,
     max_in_flight_ranged_commit_gets: Arc<AtomicUsize>,
+    corrupt_ranged_commit_gets_for: Arc<Mutex<Option<BackendObjectId>>>,
 }
 
 impl SlowCommitGetStore {
@@ -280,6 +281,7 @@ impl SlowCommitGetStore {
             ranged_commit_gets: Arc::new(AtomicUsize::new(0)),
             in_flight_ranged_commit_gets: Arc::new(AtomicUsize::new(0)),
             max_in_flight_ranged_commit_gets: Arc::new(AtomicUsize::new(0)),
+            corrupt_ranged_commit_gets_for: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -310,6 +312,38 @@ impl SlowCommitGetStore {
 
     fn max_in_flight_ranged_commit_get_count(&self) -> u64 {
         self.max_in_flight_ranged_commit_gets.load(Ordering::SeqCst) as u64
+    }
+
+    fn corrupt_ranged_commit_gets_for(&self, object_id: BackendObjectId) {
+        let mut guard = self
+            .corrupt_ranged_commit_gets_for
+            .lock()
+            .expect("corruption target lock should not be poisoned");
+        *guard = Some(object_id);
+    }
+
+    fn maybe_corrupt_commit_range(
+        &self,
+        object_id: &BackendObjectId,
+        range: ByteRange,
+        body: Bytes,
+    ) -> Bytes {
+        if matches!(range, ByteRange::Full) {
+            return body;
+        }
+        let should_corrupt = self
+            .corrupt_ranged_commit_gets_for
+            .lock()
+            .expect("corruption target lock should not be poisoned")
+            .as_ref()
+            == Some(object_id);
+        if !should_corrupt || body.is_empty() {
+            return body;
+        }
+        let mut corrupted = body.to_vec();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0x80;
+        Bytes::from(corrupted)
     }
 
     async fn record_commit_get(&self, object_id: &BackendObjectId, range: ByteRange) {
@@ -353,7 +387,8 @@ impl BlobStore for SlowCommitGetStore {
         range: ByteRange,
     ) -> rs3_storage::Result<Bytes> {
         self.record_commit_get(object_id, range).await;
-        self.inner.get_range(object_id, range).await
+        let body = self.inner.get_range(object_id, range).await?;
+        Ok(self.maybe_corrupt_commit_range(object_id, range, body))
     }
 
     async fn get_range_at(
@@ -363,7 +398,11 @@ impl BlobStore for SlowCommitGetStore {
         range: ByteRange,
     ) -> rs3_storage::Result<Bytes> {
         self.record_commit_get(object_id, range).await;
-        self.inner.get_range_at(object_id, version_id, range).await
+        let body = self
+            .inner
+            .get_range_at(object_id, version_id, range)
+            .await?;
+        Ok(self.maybe_corrupt_commit_range(object_id, range, body))
     }
 
     async fn head(&self, object_id: &BackendObjectId) -> rs3_storage::Result<BlobMetadata> {
@@ -1081,6 +1120,46 @@ async fn v2_repository_repeated_ranges_reuse_decrypted_segments() {
     assert_eq!(store.full_commit_get_count(), 0);
     assert_eq!(store.ranged_commit_get_count(), counts.get);
     assert_eq!(counts.get, 1);
+}
+
+#[tokio::test]
+async fn v2_repository_range_read_rejects_corrupted_payload_ciphertext() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    );
+    let anchor = V2MemoryAnchor::new();
+    let key = LogicalPath::new("snapshots/v2-corrupt-range.bin")
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                key.clone(),
+                Bytes::from(vec![13_u8; 2048]),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    let accepted = must_v2(anchor.read_v2().await).expect("v2 anchor should exist");
+    store.corrupt_ranged_commit_gets_for(accepted.commit_key);
+
+    let error = repository
+        .get_range(&key, ByteRange::Slice { offset: 0, len: 64 })
+        .await;
+
+    assert!(matches!(error, Err(RepositoryError::Crypto(_))));
 }
 
 #[tokio::test]

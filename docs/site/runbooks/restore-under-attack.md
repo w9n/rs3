@@ -71,8 +71,10 @@ store it outside the object-store account.
 cargo run -p rs3-server -- export-restore-bundle --format json > rs3-restore-bundle.json
 ```
 
-The bundle contains public restore metadata, not wrapping-key material. Verify
-the preserved bundle before anchor import:
+Export a new bundle after each successful backup window or at least before
+declaring a repository trial ready for incident restore. The bundle contains
+public restore metadata, not wrapping-key material. Verify the preserved bundle
+before anchor import:
 
 ```sh
 cargo run -p xtask --features s3 -- v2 verify-bundle \

@@ -35,6 +35,15 @@ preview-gate-release:
     just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke
     just integration-velero-kopia-postgres-smoke
 
+# Expensive local v2 gate for scheduled CI or release-candidate hardening.
+preview-gate-v2-nightly:
+    just check-s3
+    just integration-s3-gateway --repository-format v2-preview --tooling-smoke
+    just integration-kopia-gateway --repository-format v2-preview
+    just integration-k8s-gateway-v2 --wait-secs 240
+    just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke --repository-format v2-preview
+    just integration-velero-kopia-postgres-smoke --repository-format v2-preview
+
 # Live retained-backend v2 gate. Credentials are read from the normal AWS/S3 env.
 preview-gate-v2-live BACKEND_BUCKET ENDPOINT_URL REGION:
     #!/usr/bin/env bash
