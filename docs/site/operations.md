@@ -359,6 +359,13 @@ bundle after configuring the same repository ID, salt, wrapping-key source,
 backend, and retention settings:
 
 ```sh
+cargo run -p rs3-server -- import-v2-anchor --bundle-file rs3-restore-bundle.json
+```
+
+The import path also accepts explicit fields when a workflow cannot pass the
+bundle file directly:
+
+```sh
 cargo run -p rs3-server -- import-v2-anchor \
   --anchor-sequence <bundle-anchor-sequence> \
   --anchor-commit-key <bundle-anchor-commit-key> \
@@ -372,10 +379,10 @@ cargo run -p rs3-server -- import-v2-anchor \
   --weak-subjectivity-floor-sequence <bundle-floor-sequence>
 ```
 
-Omit version IDs only when the trusted bundle has none. Retained/Object Lock
-repositories should have commit and format version IDs. The import verifies the
-named signed commit chain, format root, and keyring envelope before writing the
-missing anchor.
+Do not mix `--bundle-file` and explicit anchor fields. Omit version IDs only
+when the trusted bundle has none. Retained/Object Lock repositories should have
+commit and format version IDs. The import verifies the named signed commit
+chain, format root, and keyring envelope before writing the missing anchor.
 
 Verify a trusted anchor position before relying on it for restore. For v2, the
 offline verifier and anchor import path both verify the named signed commit

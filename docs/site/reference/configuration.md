@@ -16,10 +16,11 @@ flags may override selected listener and gateway-mode settings.
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
 | `RUST_LOG` | no | `info` | Standard tracing filter. |
 
-`export-restore-bundle` and `import-v2-anchor` use the same repository,
-backend, anchor, and keyring settings as `serve`. The exported bundle contains
-public restore metadata only; keep wrapping-key material in the configured
-secret source.
+`export-restore-bundle`, `import-v2-anchor`, and `write-index-snapshot` use the
+same repository, backend, anchor, and keyring settings as `serve`. The exported
+bundle contains public restore metadata only; keep wrapping-key material in the
+configured secret source. Prefer `import-v2-anchor --bundle-file <json>` over
+manually transcribing anchor fields from the exported bundle.
 
 The core server library exposes a path-redacted admin status report for operator
 tooling. It shows backend kind, anchor kind, retention posture, profile

@@ -89,6 +89,13 @@ after configuring the same repository ID, salt, wrapping-key source, backend,
 and retention settings.
 
 ```sh
+cargo run -p rs3-server -- import-v2-anchor --bundle-file rs3-restore-bundle.json
+```
+
+If the incident workflow cannot pass the bundle file, import the same trusted
+anchor with explicit fields:
+
+```sh
 cargo run -p rs3-server -- import-v2-anchor \
   --anchor-sequence <bundle-anchor-sequence> \
   --anchor-commit-key <bundle-anchor-commit-key> \
@@ -104,8 +111,9 @@ cargo run -p rs3-server -- import-v2-anchor \
 
 `verify-bundle` does not write storage or anchors. `import-v2-anchor` repeats
 the named signed commit-chain, format-root, and keyring-envelope checks before
-writing the missing anchor. Omit version IDs only for a trusted bundle that does
-not contain them; retained/Object Lock repositories should contain them.
+writing the missing anchor. Do not mix `--bundle-file` and explicit anchor
+fields. Omit version IDs only for a trusted bundle that does not contain them;
+retained/Object Lock repositories should contain them.
 
 ## 4. If No Bundle Exists, Stop
 

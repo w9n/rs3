@@ -1,7 +1,7 @@
 //! Command-line entry point for the rs3 gateway.
 
-use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rs3_server::{
     AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReportProfile,
@@ -13,6 +13,8 @@ use rs3_server::{
     write_v2_index_snapshot_from_config,
 };
 use rs3_types::{BackendObjectId, BackendVersionId, KeyId, RetentionMode, Sequence};
+use serde::Deserialize;
+use std::io::Read;
 use std::net::SocketAddr;
 #[cfg(any(feature = "s3", feature = "k8s"))]
 use std::sync::Once;
@@ -76,30 +78,47 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
-    ImportV2Anchor {
-        #[arg(long)]
-        anchor_sequence: u64,
-        #[arg(long)]
-        anchor_commit_key: String,
-        #[arg(long)]
-        anchor_version_id: Option<String>,
-        #[arg(long)]
-        anchor_body_digest: String,
-        #[arg(long)]
-        signing_key_id: String,
-        #[arg(long)]
-        format_generation: u64,
-        #[arg(long)]
-        format_digest: String,
-        #[arg(long)]
-        format_object_id: String,
-        #[arg(long)]
-        format_version_id: Option<String>,
-        #[arg(long)]
-        weak_subjectivity_floor_sequence: Option<u64>,
-        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
-        format: RecoveryReportFormat,
-    },
+    ImportV2Anchor(Box<ImportV2AnchorArgs>),
+}
+
+#[derive(Debug, Args)]
+struct ImportV2AnchorArgs {
+    /// JSON bundle from `export-restore-bundle`; use `-` for stdin.
+    #[arg(long)]
+    bundle_file: Option<String>,
+    /// Accepted anchor sequence from a trusted bundle.
+    #[arg(long)]
+    anchor_sequence: Option<u64>,
+    /// Accepted commit key from a trusted bundle.
+    #[arg(long)]
+    anchor_commit_key: Option<String>,
+    /// Provider version identifier for the accepted commit object, when available.
+    #[arg(long)]
+    anchor_version_id: Option<String>,
+    /// Accepted commit body digest from a trusted bundle.
+    #[arg(long)]
+    anchor_body_digest: Option<String>,
+    /// Commit-signing key ID from a trusted bundle.
+    #[arg(long)]
+    signing_key_id: Option<String>,
+    /// Format-root generation from a trusted bundle.
+    #[arg(long)]
+    format_generation: Option<u64>,
+    /// Format-root digest from a trusted bundle.
+    #[arg(long)]
+    format_digest: Option<String>,
+    /// Format-root object ID from a trusted bundle.
+    #[arg(long)]
+    format_object_id: Option<String>,
+    /// Format-root version ID from a trusted bundle, when available.
+    #[arg(long)]
+    format_version_id: Option<String>,
+    /// Weak-subjectivity floor sequence. Defaults to `--anchor-sequence`.
+    #[arg(long)]
+    weak_subjectivity_floor_sequence: Option<u64>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
+    format: RecoveryReportFormat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -204,53 +223,223 @@ async fn main() -> Result<()> {
                 anyhow::bail!("v2 provider conformance failed");
             }
         }
-        Commands::ImportV2Anchor {
-            anchor_sequence,
-            anchor_commit_key,
-            anchor_version_id,
-            anchor_body_digest,
-            signing_key_id,
-            format_generation,
-            format_digest,
-            format_object_id,
-            format_version_id,
-            weak_subjectivity_floor_sequence,
-            format,
-        } => {
+        Commands::ImportV2Anchor(args) => {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
-            let anchor_sequence = Sequence::new(anchor_sequence);
-            let floor_sequence =
-                Sequence::new(weak_subjectivity_floor_sequence.unwrap_or(anchor_sequence.get()));
-            let anchor = V2AnchorState {
-                sequence: anchor_sequence,
-                commit_key: BackendObjectId::new(anchor_commit_key)?,
-                body_digest: decode_sha256_hex(&anchor_body_digest)?,
-                version_id: anchor_version_id.map(BackendVersionId::new).transpose()?,
-                signing_key_id: KeyId::new(signing_key_id)?,
-                format_ref: rs3_repository::v2::V2FormatRef {
-                    generation: format_generation,
-                    digest: format_digest.clone(),
-                    object_id: BackendObjectId::new(format_object_id)?,
-                    version_id: format_version_id.map(BackendVersionId::new).transpose()?,
-                },
-            };
-            let bundle = V2RecoveryBundle {
-                repository_id: Some(config.repository_keys.repository_id.clone()),
-                repository_salt_digest: None,
-                format_digest: Some(decode_sha256_hex(&format_digest)?),
-                format_generation: Some(format_generation),
-                anchor,
-                weak_subjectivity_floor_sequence: floor_sequence,
-                exported_at_ms: 0,
-                offline_signature: None,
-            };
+            let format = args.format;
+            let bundle = recovery_bundle_from_import_args(&config, *args)?;
             let report = import_v2_anchor_from_config(&config, bundle).await?;
             print_v2_anchor_import_report(&report, format)?;
         }
     }
 
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct RestoreBundleJson {
+    schema: String,
+    #[serde(default)]
+    repository: Option<RestoreBundleRepositoryJson>,
+    anchor: RestoreBundleAnchorJson,
+    weak_subjectivity_floor_sequence: u64,
+    #[serde(default)]
+    format_digest: Option<String>,
+    #[serde(default)]
+    format_generation: Option<u64>,
+    exported_at_ms: i64,
+    #[serde(default)]
+    offline_signature: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RestoreBundleRepositoryJson {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct RestoreBundleAnchorJson {
+    sequence: u64,
+    commit_key: String,
+    body_digest: String,
+    #[serde(default)]
+    version_id: Option<String>,
+    signing_key_id: String,
+    format: RestoreBundleFormatJson,
+}
+
+#[derive(Deserialize)]
+struct RestoreBundleFormatJson {
+    generation: u64,
+    digest: String,
+    object_id: String,
+    #[serde(default)]
+    version_id: Option<String>,
+}
+
+fn recovery_bundle_from_import_args(
+    config: &RuntimeConfig,
+    args: ImportV2AnchorArgs,
+) -> Result<V2RecoveryBundle> {
+    let explicit_field_count = usize::from(args.anchor_sequence.is_some())
+        + usize::from(args.anchor_commit_key.is_some())
+        + usize::from(args.anchor_body_digest.is_some())
+        + usize::from(args.signing_key_id.is_some())
+        + usize::from(args.format_generation.is_some())
+        + usize::from(args.format_digest.is_some())
+        + usize::from(args.format_object_id.is_some())
+        + usize::from(args.weak_subjectivity_floor_sequence.is_some())
+        + usize::from(args.anchor_version_id.is_some())
+        + usize::from(args.format_version_id.is_some());
+    match args.bundle_file {
+        Some(path) => {
+            if explicit_field_count > 0 {
+                bail!("--bundle-file cannot be combined with explicit anchor fields");
+            }
+            read_restore_bundle_json(&path, config)
+        }
+        None => recovery_bundle_from_explicit_args(config, args),
+    }
+}
+
+fn recovery_bundle_from_explicit_args(
+    config: &RuntimeConfig,
+    args: ImportV2AnchorArgs,
+) -> Result<V2RecoveryBundle> {
+    let anchor_sequence = require_arg(args.anchor_sequence, "--anchor-sequence")?;
+    let anchor_sequence = Sequence::new(anchor_sequence);
+    let floor_sequence = Sequence::new(
+        args.weak_subjectivity_floor_sequence
+            .unwrap_or(anchor_sequence.get()),
+    );
+    let format_generation = require_arg(args.format_generation, "--format-generation")?;
+    let format_digest = require_arg(args.format_digest, "--format-digest")?;
+    let anchor = V2AnchorState {
+        sequence: anchor_sequence,
+        commit_key: BackendObjectId::new(require_arg(
+            args.anchor_commit_key,
+            "--anchor-commit-key",
+        )?)?,
+        body_digest: decode_sha256_hex(&require_arg(
+            args.anchor_body_digest,
+            "--anchor-body-digest",
+        )?)?,
+        version_id: args
+            .anchor_version_id
+            .map(BackendVersionId::new)
+            .transpose()?,
+        signing_key_id: KeyId::new(require_arg(args.signing_key_id, "--signing-key-id")?)?,
+        format_ref: rs3_repository::v2::V2FormatRef {
+            generation: format_generation,
+            digest: format_digest.clone(),
+            object_id: BackendObjectId::new(require_arg(
+                args.format_object_id,
+                "--format-object-id",
+            )?)?,
+            version_id: args
+                .format_version_id
+                .map(BackendVersionId::new)
+                .transpose()?,
+        },
+    };
+    Ok(V2RecoveryBundle {
+        repository_id: Some(config.repository_keys.repository_id.clone()),
+        repository_salt_digest: None,
+        format_digest: Some(decode_sha256_hex(&format_digest)?),
+        format_generation: Some(format_generation),
+        anchor,
+        weak_subjectivity_floor_sequence: floor_sequence,
+        exported_at_ms: 0,
+        offline_signature: None,
+    })
+}
+
+fn read_restore_bundle_json(path: &str, config: &RuntimeConfig) -> Result<V2RecoveryBundle> {
+    let mut input = String::new();
+    if path == "-" {
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .context("failed to read restore bundle from stdin")?;
+    } else {
+        input = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read restore bundle {path}"))?;
+    }
+    parse_restore_bundle_json(&input, config)
+}
+
+fn parse_restore_bundle_json(input: &str, config: &RuntimeConfig) -> Result<V2RecoveryBundle> {
+    let decoded: RestoreBundleJson =
+        serde_json::from_str(input).context("failed to parse v2 restore bundle JSON")?;
+    if decoded.schema != V2_RESTORE_BUNDLE_SCHEMA {
+        bail!("unsupported restore bundle schema {}", decoded.schema);
+    }
+    let repository_id = decoded
+        .repository
+        .as_ref()
+        .map(|repository| rs3_types::RepositoryId::new(repository.id.clone()))
+        .transpose()?;
+    if let Some(repository_id) = repository_id.as_ref()
+        && repository_id != &config.repository_keys.repository_id
+    {
+        bail!("restore bundle repository ID does not match configured repository ID");
+    }
+    let format_ref = rs3_repository::v2::V2FormatRef {
+        generation: decoded.anchor.format.generation,
+        digest: decoded.anchor.format.digest,
+        object_id: BackendObjectId::new(decoded.anchor.format.object_id)?,
+        version_id: decoded
+            .anchor
+            .format
+            .version_id
+            .map(BackendVersionId::new)
+            .transpose()?,
+    };
+    if let Some(format_generation) = decoded.format_generation
+        && format_generation != format_ref.generation
+    {
+        bail!("bundle format_generation does not match anchor format generation");
+    }
+    if let Some(format_digest) = decoded.format_digest.as_ref()
+        && format_digest != &format_ref.digest
+    {
+        bail!("bundle format_digest does not match anchor format digest");
+    }
+    let anchor = V2AnchorState {
+        sequence: Sequence::new(decoded.anchor.sequence),
+        commit_key: BackendObjectId::new(decoded.anchor.commit_key)?,
+        body_digest: decode_sha256_hex(&decoded.anchor.body_digest)?,
+        version_id: decoded
+            .anchor
+            .version_id
+            .map(BackendVersionId::new)
+            .transpose()?,
+        signing_key_id: KeyId::new(decoded.anchor.signing_key_id)?,
+        format_ref,
+    };
+    let offline_signature = decoded
+        .offline_signature
+        .map(|signature| hex::decode(signature).context("offline signature must be hex encoded"))
+        .transpose()?;
+
+    Ok(V2RecoveryBundle {
+        repository_id: Some(
+            repository_id.unwrap_or_else(|| config.repository_keys.repository_id.clone()),
+        ),
+        repository_salt_digest: None,
+        format_digest: decoded
+            .format_digest
+            .map(|digest| decode_sha256_hex(&digest))
+            .transpose()?,
+        format_generation: decoded.format_generation,
+        anchor,
+        weak_subjectivity_floor_sequence: Sequence::new(decoded.weak_subjectivity_floor_sequence),
+        exported_at_ms: decoded.exported_at_ms,
+        offline_signature,
+    })
+}
+
+fn require_arg<T>(value: Option<T>, flag: &'static str) -> Result<T> {
+    value.ok_or_else(|| anyhow::anyhow!("{flag} is required without --bundle-file"))
 }
 
 #[cfg(any(feature = "s3", feature = "k8s"))]
@@ -676,7 +865,10 @@ fn decode_sha256_hex(value: &str) -> Result<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DoctorProfile, backend_kind, doctor_findings, runtime_config_profile};
+    use super::{
+        DoctorProfile, ImportV2AnchorArgs, RecoveryReportFormat, backend_kind, doctor_findings,
+        parse_restore_bundle_json, recovery_bundle_from_import_args, runtime_config_profile,
+    };
     use rs3_server::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig, RepositoryConfig,
         RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
@@ -842,5 +1034,110 @@ mod tests {
         let findings = doctor_findings(&config, DoctorProfile::Production.into());
 
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn import_bundle_parser_accepts_export_restore_bundle_shape() {
+        let config = runtime_config();
+        let input = serde_json::json!({
+            "schema": "rs3.restore-bundle.v2-preview.v1",
+            "repository": {
+                "id": "tenant-repository"
+            },
+            "anchor": {
+                "sequence": 7,
+                "commit_key": "commits/v01/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "body_digest": "11".repeat(32),
+                "version_id": "version-a",
+                "signing_key_id": "checkpoint-v1",
+                "format": {
+                    "generation": 1,
+                    "digest": "22".repeat(32),
+                    "object_id": "format/00000000000000000001/abc",
+                    "version_id": "format-version-a"
+                }
+            },
+            "weak_subjectivity_floor_sequence": 7,
+            "format_digest": "22".repeat(32),
+            "format_generation": 1,
+            "exported_at_ms": 42,
+            "offline_signature": null
+        })
+        .to_string();
+
+        let bundle =
+            parse_restore_bundle_json(&input, &config).unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(bundle.anchor.sequence.get(), 7);
+        assert_eq!(
+            bundle.repository_id.as_ref().map(RepositoryId::as_str),
+            Some("tenant-repository")
+        );
+        assert_eq!(bundle.format_generation, Some(1));
+        assert_eq!(
+            bundle.anchor.version_id.as_ref().map(|id| id.as_str()),
+            Some("version-a")
+        );
+    }
+
+    #[test]
+    fn import_bundle_parser_rejects_wrong_repository() {
+        let config = runtime_config();
+        let input = serde_json::json!({
+            "schema": "rs3.restore-bundle.v2-preview.v1",
+            "repository": {
+                "id": "other-repository"
+            },
+            "anchor": {
+                "sequence": 7,
+                "commit_key": "commits/v01/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "body_digest": "11".repeat(32),
+                "signing_key_id": "checkpoint-v1",
+                "format": {
+                    "generation": 1,
+                    "digest": "22".repeat(32),
+                    "object_id": "format/00000000000000000001/abc"
+                }
+            },
+            "weak_subjectivity_floor_sequence": 7,
+            "format_digest": "22".repeat(32),
+            "format_generation": 1,
+            "exported_at_ms": 42,
+            "offline_signature": null
+        })
+        .to_string();
+
+        let error = match parse_restore_bundle_json(&input, &config) {
+            Ok(_) => panic!("wrong-repository restore bundle should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("repository ID does not match"));
+    }
+
+    #[test]
+    fn import_v2_anchor_rejects_mixed_bundle_and_explicit_fields() {
+        let config = runtime_config();
+        let args = ImportV2AnchorArgs {
+            bundle_file: Some("bundle.json".to_owned()),
+            anchor_sequence: Some(1),
+            anchor_commit_key: None,
+            anchor_version_id: None,
+            anchor_body_digest: None,
+            signing_key_id: None,
+            format_generation: None,
+            format_digest: None,
+            format_object_id: None,
+            format_version_id: None,
+            weak_subjectivity_floor_sequence: None,
+            format: RecoveryReportFormat::Json,
+        };
+
+        let error = match recovery_bundle_from_import_args(&config, args) {
+            Ok(_) => panic!("mixed bundle-file and explicit fields should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("cannot be combined"));
     }
 }
