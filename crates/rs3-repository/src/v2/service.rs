@@ -33,7 +33,7 @@ use rs3_types::{
     Sequence,
 };
 use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
-use std::sync::{Mutex as StdMutex, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
@@ -50,6 +50,7 @@ pub struct V2Repository<S> {
     mutation_lock: Mutex<()>,
     pending_payloads: StdMutex<Vec<PendingV2Payload>>,
     payload_sections: StdRwLock<V2PayloadSectionCache>,
+    payload_section_fetches: StdMutex<BTreeMap<V2PayloadSectionCacheKey, Arc<Mutex<()>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +104,7 @@ where
             payload_sections: StdRwLock::new(V2PayloadSectionCache::with_max_bytes(
                 payload_section_cache_max_bytes,
             )),
+            payload_section_fetches: StdMutex::new(BTreeMap::new()),
         }
     }
 
@@ -368,16 +370,33 @@ where
             return open_payload_object(&keyring, &commit_key, payload, range);
         }
 
-        let commit = self
-            .commit_store
-            .read_commit_at(&commit_key, commit_version_id.as_ref())
-            .await
-            .map_err(v2_repository_error)?;
-        if commit.parsed_header.header.body_digest != body_digest {
-            return Err(v2_repository_error(V2FormatError::BodyDigestMismatch));
+        let fetch_lock = self.payload_section_fetch_lock(&cache_key)?;
+        let _fetch_guard = fetch_lock.lock().await;
+        if let Some(payload) = self.cached_payload_section(&cache_key)? {
+            return open_payload_object(&keyring, &commit_key, payload, range);
         }
-        let payload = commit_payload_section_bytes(&commit, offset, length)?;
-        self.cache_payload_section(cache_key, payload.clone())?;
+
+        let payload = match async {
+            let commit = self
+                .commit_store
+                .read_commit_at(&commit_key, commit_version_id.as_ref())
+                .await
+                .map_err(v2_repository_error)?;
+            if commit.parsed_header.header.body_digest != body_digest {
+                return Err(v2_repository_error(V2FormatError::BodyDigestMismatch));
+            }
+            commit_payload_section_bytes(&commit, offset, length)
+        }
+        .await
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.clear_payload_section_fetch_lock(&cache_key, &fetch_lock)?;
+                return Err(error);
+            }
+        };
+        self.cache_payload_section(cache_key.clone(), payload.clone())?;
+        self.clear_payload_section_fetch_lock(&cache_key, &fetch_lock)?;
         open_payload_object(&keyring, &commit_key, payload, range)
     }
 
@@ -700,6 +719,35 @@ where
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)?;
         cache.insert(key, payload);
+        Ok(())
+    }
+
+    fn payload_section_fetch_lock(&self, key: &V2PayloadSectionCacheKey) -> Result<Arc<Mutex<()>>> {
+        let mut fetches = self
+            .payload_section_fetches
+            .lock()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        Ok(fetches
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone())
+    }
+
+    fn clear_payload_section_fetch_lock(
+        &self,
+        key: &V2PayloadSectionCacheKey,
+        fetch_lock: &Arc<Mutex<()>>,
+    ) -> Result<()> {
+        let mut fetches = self
+            .payload_section_fetches
+            .lock()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        if fetches
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, fetch_lock))
+        {
+            fetches.remove(key);
+        }
         Ok(())
     }
 

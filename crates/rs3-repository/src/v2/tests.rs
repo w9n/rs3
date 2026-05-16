@@ -13,7 +13,7 @@ use super::{
 use crate::{CommitCoordinatorOptions, RepositoryOptions, RepositoryPutOptions};
 use bytes::Bytes;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore};
+use rs3_storage::{BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions};
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
     LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy, Sequence,
@@ -21,7 +21,7 @@ use rs3_types::{
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
 
 fn must_v2<T>(result: super::V2Result<T>) -> T {
     match result {
@@ -258,6 +258,129 @@ impl V2CommitAnchor for BlockingV2Anchor {
         self.blocked.notify_one();
         self.release.notified().await;
         self.inner.compare_and_advance_v2(expected, next).await
+    }
+}
+
+#[derive(Clone)]
+struct SlowCommitGetStore {
+    inner: MemoryBlobStore,
+    delay: Duration,
+}
+
+impl SlowCommitGetStore {
+    fn new(inner: MemoryBlobStore, delay: Duration) -> Self {
+        Self { inner, delay }
+    }
+
+    fn reset_operation_counts(&self) {
+        self.inner
+            .reset_operation_counts()
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    fn operation_counts(&self) -> rs3_storage::BlobOperationCounts {
+        self.inner
+            .operation_counts()
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    async fn delay_commit_full_get(&self, object_id: &BackendObjectId, range: ByteRange) {
+        if object_id.as_str().starts_with("commits/") && range == ByteRange::Full {
+            tokio::time::sleep(self.delay).await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl BlobStore for SlowCommitGetStore {
+    async fn put(
+        &self,
+        object_id: &BackendObjectId,
+        body: Bytes,
+        options: PutOptions,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        self.inner.put(object_id, body, options).await
+    }
+
+    async fn get_range(
+        &self,
+        object_id: &BackendObjectId,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Bytes> {
+        self.delay_commit_full_get(object_id, range).await;
+        self.inner.get_range(object_id, range).await
+    }
+
+    async fn get_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Bytes> {
+        self.delay_commit_full_get(object_id, range).await;
+        self.inner.get_range_at(object_id, version_id, range).await
+    }
+
+    async fn head(&self, object_id: &BackendObjectId) -> rs3_storage::Result<BlobMetadata> {
+        self.inner.head(object_id).await
+    }
+
+    async fn head_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        self.inner.head_at(object_id, version_id).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
+        self.inner.list_prefix(prefix).await
+    }
+
+    async fn delete(&self, object_id: &BackendObjectId) -> rs3_storage::Result<()> {
+        self.inner.delete(object_id).await
+    }
+
+    async fn extend_retention(
+        &self,
+        object_id: &BackendObjectId,
+        policy: RetentionPolicy,
+    ) -> rs3_storage::Result<()> {
+        self.inner.extend_retention(object_id, policy).await
+    }
+
+    async fn extend_retention_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        policy: RetentionPolicy,
+    ) -> rs3_storage::Result<()> {
+        self.inner
+            .extend_retention_at(object_id, version_id, policy)
+            .await
+    }
+
+    async fn set_legal_hold(
+        &self,
+        object_id: &BackendObjectId,
+        status: LegalHoldStatus,
+    ) -> rs3_storage::Result<()> {
+        self.inner.set_legal_hold(object_id, status).await
+    }
+
+    async fn set_legal_hold_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        status: LegalHoldStatus,
+    ) -> rs3_storage::Result<()> {
+        self.inner
+            .set_legal_hold_at(object_id, version_id, status)
+            .await
+    }
+
+    async fn flush_caches(&self) -> rs3_storage::Result<()> {
+        self.inner.flush_caches().await
     }
 }
 
@@ -691,6 +814,66 @@ async fn v2_repository_caches_verified_payload_sections_for_repeated_ranges() {
     let counts = store
         .operation_counts()
         .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(counts.get, 1);
+}
+
+#[tokio::test]
+async fn v2_repository_coalesces_concurrent_payload_section_cache_misses() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::from_millis(50));
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    let key = LogicalPath::new("snapshots/v2-concurrent-cache-miss.bin")
+        .unwrap_or_else(|error| panic!("{error}"));
+    let body = Bytes::from(vec![11_u8; 4096]);
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(&anchor, key.clone(), body, RepositoryPutOptions::default())
+            .await,
+    );
+    store.reset_operation_counts();
+
+    let readers = 8_usize;
+    let barrier = Arc::new(Barrier::new(readers + 1));
+    let tasks = (0..readers)
+        .map(|index| {
+            let repository = Arc::clone(&repository);
+            let key = key.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                repository
+                    .get_range(
+                        &key,
+                        ByteRange::Slice {
+                            offset: (index * 64) as u64,
+                            len: 64,
+                        },
+                    )
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait().await;
+
+    for task in tasks {
+        let read = must_repo(task.await.unwrap_or_else(|error| panic!("{error}")));
+        assert_eq!(read, Bytes::from(vec![11_u8; 64]));
+    }
+
+    let counts = store.operation_counts();
     assert_eq!(counts.get, 1);
 }
 
