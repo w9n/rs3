@@ -386,7 +386,10 @@ pub fn parse_v2_commit_header(
     if header.algorithms != V2Algorithms::v01() {
         return Err(V2FormatError::InvalidAlgorithms);
     }
-    V2CommitKey::parse(&header.self_ref.commit_key)?;
+    let commit_key = V2CommitKey::parse(&header.self_ref.commit_key)?;
+    if commit_key.sequence != header.self_ref.sequence {
+        return Err(V2FormatError::SelfKeyMismatch);
+    }
     if &header.self_ref.commit_key != object_id {
         return Err(V2FormatError::SelfKeyMismatch);
     }

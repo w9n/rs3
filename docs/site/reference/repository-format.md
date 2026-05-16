@@ -85,6 +85,8 @@ metadata are also skipped.
 anchor-selected commit chain and exports the anchor state as the normal DR
 weak-subjectivity bundle. If the external anchor is lost, `rs3 import-v2-anchor`
 recreates it from a trusted bundle after verifying the named commit chain.
+`xtask v2 verify-bundle` performs the same format-root, keyring-envelope, and
+commit-chain verification as a no-write preflight.
 `rs3 check-v2-provider` runs the selected v2 provider-profile probes against the
 configured backend; retained governance profiles require an explicit operator
 review flag because gateway credentials must not be able to bypass retention.

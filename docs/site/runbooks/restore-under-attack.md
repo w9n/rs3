@@ -71,8 +71,20 @@ store it outside the object-store account.
 cargo run -p rs3-server -- export-restore-bundle --format json > rs3-restore-bundle.json
 ```
 
-The bundle contains public restore metadata, not wrapping-key material. If a
-fresh cluster is missing the Kubernetes Lease, import the trusted v2 anchor
+The bundle contains public restore metadata, not wrapping-key material. Verify
+the preserved bundle before anchor import:
+
+```sh
+cargo run -p xtask --features s3 -- v2 verify-bundle \
+  --bundle-file rs3-restore-bundle.json \
+  --repository-salt-hex <repository-salt-hex> \
+  --wrapping-key-hex-file <wrapping-key-hex-file> \
+  --backend s3 \
+  --s3-bucket <bucket> \
+  --s3-prefix <repository-prefix>
+```
+
+If a fresh cluster is missing the Kubernetes Lease, import the trusted v2 anchor
 after configuring the same repository ID, salt, wrapping-key source, backend,
 and retention settings.
 
@@ -90,10 +102,10 @@ cargo run -p rs3-server -- import-v2-anchor \
   --weak-subjectivity-floor-sequence <bundle-floor-sequence>
 ```
 
-`import-v2-anchor` verifies the named signed commit chain, format root, and
-keyring envelope before writing the missing anchor. Omit version IDs only for a
-trusted bundle that does not contain them; retained/Object Lock repositories
-should contain them.
+`verify-bundle` does not write storage or anchors. `import-v2-anchor` repeats
+the named signed commit-chain, format-root, and keyring-envelope checks before
+writing the missing anchor. Omit version IDs only for a trusted bundle that does
+not contain them; retained/Object Lock repositories should contain them.
 
 ## 4. If No Bundle Exists, Stop
 
@@ -104,10 +116,11 @@ HSM/KMS-backed anchor record before recreating the Lease.
 
 ## 5. Verify Before Restore
 
-Verify the trusted v2 anchor before using it for restore. The import path checks
-the signed commit chain, format root, and keyring envelope. After the gateway
-starts from the recovered anchor, run the restore client and verify restored
-application bytes before declaring the incident restore successful.
+Verify the trusted v2 anchor before using it for restore. The
+`xtask v2 verify-bundle` command and the import path check the signed commit
+chain, format root, and keyring envelope. After the gateway starts from the
+recovered anchor, run the restore client and verify restored application bytes
+before declaring the incident restore successful.
 
 ## 6. Restore Read-Only
 

@@ -171,10 +171,12 @@ CLI command yet. Do not use older rotation workflows against a
 v2 repository. Until v2 rotation is implemented, keep historical keys enabled
 and treat wrapping-key rewrap as envelope hygiene only.
 
-Before disabling or retiring a historical key, verify a trusted anchored commit
-chain with a v2-aware retirement tool. That tooling is not part of the current
-production-preview CLI, so keep historical keys for at least the maximum
-provider-retention window.
+Before disabling or retiring a historical key, first verify the trusted anchored
+commit chain with `xtask v2 verify-bundle`. That proves the preserved bundle,
+format root, keyring envelope, and reachable commit chain are still usable, but
+it is not a data-key retirement decision. v2-aware retirement tooling is not
+part of the current production-preview CLI, so keep historical data keys for at
+least the maximum provider-retention window.
 
 ## Anchors
 
@@ -329,13 +331,28 @@ Export the trusted restore bundle from a healthy cluster or regular operations
 job and store it outside the object-store account:
 
 ```sh
-cargo run -p rs3-server -- export-restore-bundle --format json
+cargo run -p rs3-server -- export-restore-bundle --format json > rs3-restore-bundle.json
+```
+
+Verify the preserved bundle without writing a new anchor:
+
+```sh
+cargo run -p xtask --features s3 -- v2 verify-bundle \
+  --bundle-file rs3-restore-bundle.json \
+  --repository-salt-hex <repository-salt-hex> \
+  --wrapping-key-hex-file <wrapping-key-hex-file> \
+  --backend s3 \
+  --s3-bucket <bucket> \
+  --s3-prefix <repository-prefix>
 ```
 
 The bundle contains public repository restore metadata: repository ID, accepted
 commit sequence, commit key, commit object version ID when available, commit
 body digest, signing key ID, format-root reference, and weak-subjectivity floor.
-It does not contain wrapping-key material.
+It does not contain wrapping-key material. The verifier opens the encrypted
+format root and keyring envelope, then verifies the anchor-selected signed
+commit chain to the nearest snapshot without mutating storage or the external
+anchor.
 
 On a new cluster with a missing anchor, import the trusted v2 anchor from that
 bundle after configuring the same repository ID, salt, wrapping-key source,
@@ -361,10 +378,11 @@ named signed commit chain, format root, and keyring envelope before writing the
 missing anchor.
 
 Verify a trusted anchor position before relying on it for restore. For v2, the
-anchor import path verifies the named signed commit chain, format root, and
-keyring envelope. Then run the restore client through the recovered gateway and
-verify restored application bytes. Use S3 CLI checks separately for provider
-capabilities such as Object Lock headers and raw range reads.
+offline verifier and anchor import path both verify the named signed commit
+chain, format root, and keyring envelope. Then run the restore client through
+the recovered gateway and verify restored application bytes. Use S3 CLI checks
+separately for provider capabilities such as Object Lock headers and raw range
+reads.
 
 See [Restore Under Attack](runbooks/restore-under-attack.md) for the incident
 runbook.

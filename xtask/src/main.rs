@@ -3,7 +3,7 @@
 mod integration;
 mod keyring;
 mod perf;
-mod restore;
+mod v2;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -29,8 +29,8 @@ enum Commands {
     Integration(Box<integration::IntegrationArgs>),
     Keyring(Box<keyring::KeyringArgs>),
     Perf(Box<perf::PerfArgs>),
-    Restore(Box<restore::RestoreArgs>),
     Test,
+    V2(Box<v2::V2Args>),
 }
 
 fn main() -> Result<()> {
@@ -65,14 +65,14 @@ fn main() -> Result<()> {
         Some(Commands::Perf(args)) => {
             perf::run(*args)?;
         }
-        Some(Commands::Restore(args)) => {
-            restore::run(*args)?;
-        }
         Some(Commands::Test) => {
             run("cargo", &["test", "--workspace"])?;
         }
+        Some(Commands::V2(args)) => {
+            v2::run(*args)?;
+        }
         None => {
-            println!("usage: cargo xtask <check|fmt|integration|keyring|perf|restore|test>");
+            println!("usage: cargo xtask <check|fmt|integration|keyring|perf|test|v2>");
         }
     }
 

@@ -501,6 +501,7 @@ where
         let mut next_key = anchor_state.commit_key.clone();
         let mut next_version = anchor_state.version_id.clone();
         let mut next_digest = Some(anchor_state.body_digest);
+        let mut next_sequence = Some(anchor_state.sequence);
         let mut seen = BTreeSet::new();
 
         loop {
@@ -510,6 +511,11 @@ where
             let parsed = self
                 .read_commit_at(&next_key, next_version.as_ref())
                 .await?;
+            if let Some(expected_sequence) = next_sequence
+                && parsed.parsed_header.header.self_ref.sequence != expected_sequence
+            {
+                return Err(V2FormatError::SelfKeyMismatch);
+            }
             if let Some(expected_digest) = next_digest
                 && parsed.parsed_header.header.body_digest != expected_digest
             {
@@ -527,6 +533,7 @@ where
             next_key = parent.commit_key;
             next_version = parent.version_id;
             next_digest = Some(parent.body_digest);
+            next_sequence = Some(parent.sequence);
         }
 
         Ok(V2CommitChain {
@@ -551,6 +558,9 @@ where
             .await
             .map_err(|_| V2FormatError::StorageOperationFailed)?;
         let mut parsed = parse_v2_commit_object(object_id, body, &self.keyring)?;
+        if parsed.parsed_header.header.keyring_envelope_ref != self.options.keyring_envelope_ref {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
         parsed.version_id = version_id.cloned();
         Ok(parsed)
     }
@@ -562,6 +572,9 @@ where
         let parsed = self
             .read_commit_at(&state.commit_key, state.version_id.as_ref())
             .await?;
+        if parsed.parsed_header.header.self_ref.sequence != state.sequence {
+            return Err(V2FormatError::SelfKeyMismatch);
+        }
         if parsed.parsed_header.header.body_digest != state.body_digest {
             return Err(V2FormatError::BodyDigestMismatch);
         }

@@ -4977,6 +4977,7 @@ dependencies = [
  "rs3-storage",
  "rs3-types",
  "rustls",
+ "serde",
  "serde_json",
  "testcontainers",
  "tokio",

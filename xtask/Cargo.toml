@@ -42,6 +42,7 @@ rs3-types = { version = "0.1.0", path = "../crates/rs3-types" }
 rustls = { version = "0.23", default-features = false, features = [
   "aws_lc_rs",
 ], optional = true }
+serde.workspace = true
 serde_json.workspace = true
 testcontainers = { version = "0.27.3", features = [
   "blocking",
