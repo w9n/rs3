@@ -33,7 +33,7 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | Preview release gate | `just preview-gate-release` | v2 Kopia gateway, Velero dynamic PVC gateway-restart in normal write mode, and Velero Postgres smoke. |
 | Velero strict restore-readonly | `just integration-velero-kopia-dynamic-pvc-restore-readonly-smoke` | Incident-restore behavior: restored bytes verify, Velero artifact writes are denied, and backend writes stay at zero during restore. |
 | Lightweight perf smoke | `just perf-s3-gateway --format jsonl` | Small gateway scenario metrics and amplification. |
-| v1/v2 gateway perf comparison | `just perf-v1-v2-gateway --objects 32 --object-size 262144 --reads 64 --range-len 4096 --commit-batch-items 8 --concurrency 8` | Standard release-profile local gateway comparison between `v1-preview` and `v2-preview`; output is JSONL tagged with `repository_format`. |
+| Gateway perf smoke | `just perf-s3-gateway --objects 32 --object-size 262144 --reads 64 --range-len 4096 --commit-batch-items 8 --concurrency 8 --format jsonl` | Release-profile local gateway run for current v2 request cost, throughput, and amplification. |
 | Kopia measured matrix | `cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix --runs 3 --profile-set larger-restores --gateway-build-profile release --enforce-regression-budgets` | Release-grade Kopia restore comparison against the straight RustFS proxy baseline with current gateway defaults. |
 
 Expensive lanes emit artifacts under `.local/integration/` by default.
@@ -101,12 +101,12 @@ Features that handle logical names should prove:
 
 Rollback-sensitive changes should cover:
 
-- latest checkpoint accepted
-- stale checkpoint rejected after anchor advance
+- latest anchored commit accepted
+- stale commit rejected after anchor advance
 - anchor digest mismatch rejected
 - missing configured anchor fails closed
-- checkpoint write succeeded but anchor advance failed
-- recovery accepts an already-written identical checkpoint object
+- commit write succeeded but anchor advance failed
+- recovery accepts an already-written identical commit object
 
 ## Retention Tests
 
@@ -118,7 +118,7 @@ Retention and Object Lock work should cover:
 - retained writes fail when the provider does not return version IDs
 - retry after an anchor failure remains safe when a retained-version provider
   appends a same-key version instead of rejecting duplicate create-only writes
-- exact-version reads return the checkpoint-bound object after a newer latest
+- exact-version reads return the anchor-bound object after a newer latest
   version exists
 - legal hold blocks destructive cleanup
 - provider cannot extend retention

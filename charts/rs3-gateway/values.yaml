@@ -59,7 +59,7 @@ anchor:
   mode: kubernetes-lease
   allowMemory: false
   namespace: ""
-  name: checkpoint
+  name: v2-anchor
   fieldManager: rs3-server
 
 logging:

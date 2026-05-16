@@ -656,7 +656,7 @@ mod imp {
             {
                 eprintln!("failed to collect after-backup checkpoint artifacts: {error:#}");
             }
-            if args.repository_format.is_v2() && scenario.storage_path.uses_gateway() {
+            if scenario.storage_path.uses_gateway() {
                 let anchor_name = state.anchor_name.clone();
                 run_phase(&mut state, "assert-v2-anchor-after-backup", || {
                     assert_v2_gateway_anchor(&args, kubeconfig_path, &anchor_name)
@@ -692,7 +692,7 @@ mod imp {
                 ) {
                     eprintln!("failed to collect post-restart checkpoint artifacts: {error:#}");
                 }
-                if args.repository_format.is_v2() && scenario.storage_path.uses_gateway() {
+                if scenario.storage_path.uses_gateway() {
                     let anchor_name = state.anchor_name.clone();
                     run_phase(&mut state, "assert-v2-anchor-after-gateway-restart", || {
                         assert_v2_gateway_anchor(&args, kubeconfig_path, &anchor_name)
@@ -744,7 +744,7 @@ mod imp {
             {
                 eprintln!("failed to collect after-restore checkpoint artifacts: {error:#}");
             }
-            if args.repository_format.is_v2() && scenario.storage_path.uses_gateway() {
+            if scenario.storage_path.uses_gateway() {
                 let anchor_name = state.anchor_name.clone();
                 run_phase(&mut state, "assert-v2-anchor-after-restore", || {
                     assert_v2_gateway_anchor(&args, kubeconfig_path, &anchor_name)

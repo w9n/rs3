@@ -1,11 +1,10 @@
 //! Commit coordination for preview v2 repository writes.
 
 use super::repository::{V2AnchorState, V2CommitAnchor};
-use super::service::V2Repository;
+use super::service::{V2Repository, V2RepositorySnapshot};
 use crate::commit::CommitCoordinatorOptions;
 use crate::error::{RepositoryError, Result};
 use crate::model::{DeleteOutcome, RepositoryObjectMetadata, RepositoryPutOptions};
-use crate::state::RepositoryState;
 use bytes::Bytes;
 use rs3_storage::BlobStore;
 use rs3_types::{LegalHoldStatus, LogicalPath};
@@ -35,7 +34,7 @@ pub struct V2CommitCoordinator<S, A> {
 #[derive(Default)]
 struct PendingBatch {
     waiters: Vec<CommitWaiter>,
-    rollback_snapshot: Option<RepositoryState>,
+    rollback_snapshot: Option<V2RepositorySnapshot>,
     publishing: bool,
     generation: u64,
     failed: Option<String>,
@@ -270,7 +269,7 @@ where
 
 struct PendingPublish {
     waiters: Vec<CommitWaiter>,
-    rollback_snapshot: Option<RepositoryState>,
+    rollback_snapshot: Option<V2RepositorySnapshot>,
 }
 
 fn spawn_delayed_v2_publish<S, A>(
@@ -334,7 +333,7 @@ async fn publish_v2_waiters<S, A>(
     repository: &V2Repository<S>,
     anchor: &A,
     waiters: Vec<CommitWaiter>,
-    rollback_snapshot: Option<RepositoryState>,
+    rollback_snapshot: Option<V2RepositorySnapshot>,
 ) -> std::result::Result<(), String>
 where
     S: BlobStore + Clone + 'static,

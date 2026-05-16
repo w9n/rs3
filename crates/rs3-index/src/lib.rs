@@ -44,13 +44,39 @@ pub struct ObjectPointer {
     pub ciphertext_len: u64,
 }
 
+/// Payload location recorded inside encrypted namespace index state.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PayloadReference {
+    /// Payload bytes are in the current commit that carries this index delta.
+    V2Self {
+        /// Byte offset relative to the commit section region.
+        offset: u64,
+        /// Encrypted payload-section byte length.
+        length: u64,
+    },
+    /// Payload bytes are in a resolved v2 commit object.
+    V2Commit {
+        /// Commit object key containing the payload section.
+        commit_key: BackendObjectId,
+        /// Provider version identifier for exact-version reads, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit_version_id: Option<BackendVersionId>,
+        /// Commit body digest from the signed header.
+        body_digest: [u8; 32],
+        /// Byte offset relative to the commit section region.
+        offset: u64,
+        /// Encrypted payload-section byte length.
+        length: u64,
+    },
+}
+
 /// A single index mutation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexDelta {
     /// Insert or replace a namespace entry for a blind key.
     Upsert {
         /// Namespace entry made visible by the update.
-        entry: NamespaceEntry,
+        entry: Box<NamespaceEntry>,
         /// Prefix tokens associated with the entry.
         prefix_tokens: Vec<PrefixToken>,
         /// Sealed client-visible metadata needed to replay this entry.
@@ -297,6 +323,9 @@ pub struct NamespaceEntry {
     /// Provider version identifier for exact restore reads, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_version_id: Option<BackendVersionId>,
+    /// Commit-backed payload location for v2 repositories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_ref: Option<PayloadReference>,
     /// Sealed metadata record containing client-visible metadata.
     pub manifest_id: ManifestId,
     /// Client-visible ciphertext-backed length in bytes.
@@ -511,6 +540,7 @@ mod tests {
             blind_key,
             object_id,
             object_version_id: None,
+            payload_ref: None,
             manifest_id: manifest_id("manifest-a"),
             content_len: 42,
             modified_at_ms: 7,
@@ -706,7 +736,7 @@ mod tests {
         let delta = IndexDeltaObject {
             sequence: Sequence::new(1),
             deltas: vec![IndexDelta::Upsert {
-                entry: entry(blind_key("blind-a"), object_id("segments/opaque-a")),
+                entry: Box::new(entry(blind_key("blind-a"), object_id("segments/opaque-a"))),
                 prefix_tokens: vec![prefix_token("prefix-a")],
                 sealed_manifest: Box::new(sealed_manifest()),
             }],

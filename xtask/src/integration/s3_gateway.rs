@@ -46,9 +46,7 @@ enum S3GatewayMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum S3GatewayRepositoryFormat {
-    /// Legacy production-preview repository format.
-    V1Preview,
-    /// Primary production-preview repository format.
+    /// v2 production-preview repository format.
     V2Preview,
 }
 
@@ -56,7 +54,6 @@ enum S3GatewayRepositoryFormat {
 impl S3GatewayRepositoryFormat {
     const fn as_env(self) -> &'static str {
         match self {
-            Self::V1Preview => "v1-preview",
             Self::V2Preview => "v2-preview",
         }
     }

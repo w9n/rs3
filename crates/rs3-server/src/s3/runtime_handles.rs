@@ -1,11 +1,9 @@
 use bytes::Bytes;
-use rs3_anchor::{AnchorState, CheckpointAnchor};
 use rs3_repository::v2::{V2AnchorState, V2CommitAnchor, V2Result};
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, PutOptions};
 use std::sync::Arc;
 
 pub(super) type RuntimeStore = DynBlobStore;
-pub(super) type RuntimeAnchor = DynCheckpointAnchor;
 pub(super) type RuntimeV2Anchor = DynV2CommitAnchor;
 
 #[derive(Clone)]
@@ -112,30 +110,6 @@ impl BlobStore for DynBlobStore {
 
     async fn flush_caches(&self) -> rs3_storage::Result<()> {
         self.inner.flush_caches().await
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct DynCheckpointAnchor {
-    inner: Arc<dyn CheckpointAnchor>,
-}
-
-impl DynCheckpointAnchor {
-    pub(super) fn new(anchor: impl CheckpointAnchor + 'static) -> Self {
-        Self {
-            inner: Arc::new(anchor),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl CheckpointAnchor for DynCheckpointAnchor {
-    async fn read(&self) -> rs3_anchor::Result<AnchorState> {
-        self.inner.read().await
-    }
-
-    async fn compare_and_advance(&self, next: AnchorState) -> rs3_anchor::Result<AnchorState> {
-        self.inner.compare_and_advance(next).await
     }
 }
 

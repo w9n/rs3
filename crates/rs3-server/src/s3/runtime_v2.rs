@@ -150,7 +150,7 @@ impl RuntimeV2Repository {
         })
     }
 
-    pub(super) async fn load_accepted_checkpoint(
+    pub(super) async fn load_accepted_anchor(
         &self,
         _mode: GatewayMode,
     ) -> Result<(), S3BoundaryError> {

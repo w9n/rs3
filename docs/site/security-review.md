@@ -23,17 +23,17 @@ durable bytes and observable names.
 
 | Question | Pass Condition |
 | --- | --- |
-| Can backend replay old objects? | Replay is rejected unless checkpoint and anchor state accept it. |
-| Can partial writes become visible? | Visibility requires an accepted checkpoint. |
-| Can checkpoint be forged? | Signature verifies under an enabled signing key. |
-| Can old valid checkpoint appear latest? | Anchor or storage evidence detects stale sequence/digest. |
+| Can backend replay old objects? | Replay is rejected unless the signed commit chain and anchor state accept it. |
+| Can partial writes become visible? | Visibility requires an accepted commit. |
+| Can a commit be forged? | Signature verifies under an enabled signing key. |
+| Can an old valid commit appear latest? | The external anchor rejects stale sequence/digest state. |
 | Can cleanup delete needed objects? | GC is reachability and retention aware. |
 
 ## Retention
 
 | Question | Pass Condition |
 | --- | --- |
-| Writes restore-critical data? | Payload, metadata, index, checkpoint, and evidence receive effective retention. |
+| Writes restore-critical data? | Keyring envelopes, format roots, and commits receive effective retention. |
 | Extends retention? | Extension never shortens existing retention. |
 | Provider cannot extend? | Protected write fails instead of claiming protection. |
 | Dedup reuses old data? | Reused objects are retained until the newest protected reference expires. |
@@ -58,6 +58,6 @@ Stop the review if a change:
 - adds plaintext names to backend keys, telemetry, tags, or errors
 - treats Object Lock as the only latest-state authority
 - falls back from external anchor to memory
-- retires keys without retained-checkpoint analysis
+- retires keys without retained v2 commit-chain analysis
 - optimizes reads through path-indexed backend objects
 - adds provider behavior without a capability test or documented contract

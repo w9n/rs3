@@ -5,19 +5,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rs3_server::{
     AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReportProfile,
-    AnchorConfig, AnchorImportReport, AnchorRecoveryOptions, AnchorRecoveryReport, GatewayMode,
-    GatewayServer, KeyRotationOptions, KeyRotationReport, RESTORE_BUNDLE_SCHEMA, RepositoryFormat,
-    RestoreTrustBundle, RuntimeConfig, RuntimeV2ProviderConformanceOptions,
+    AnchorConfig, GatewayMode, GatewayServer, RuntimeConfig, RuntimeV2ProviderConformanceOptions,
     V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportReport, V2AnchorState, V2ProviderCheckStatus,
     V2ProviderConformanceReport, V2ProviderProfile, V2RecoveryBundle, backend_kind,
-    check_v2_provider_conformance_from_config, doctor_findings, export_restore_bundle_from_config,
-    export_v2_recovery_bundle_from_config, import_anchor_from_config, import_v2_anchor_from_config,
-    recover_anchor_from_config, rotate_key_from_config, runtime_config_profile,
+    check_v2_provider_conformance_from_config, doctor_findings,
+    export_v2_recovery_bundle_from_config, import_v2_anchor_from_config, runtime_config_profile,
     write_v2_index_snapshot_from_config,
 };
-use rs3_types::{
-    BackendObjectId, BackendVersionId, CheckpointId, KeyId, KeyPurpose, RetentionMode, Sequence,
-};
+use rs3_types::{BackendObjectId, BackendVersionId, KeyId, RetentionMode, Sequence};
 use std::net::SocketAddr;
 #[cfg(any(feature = "s3", feature = "k8s"))]
 use std::sync::Once;
@@ -63,14 +58,6 @@ enum Commands {
         #[arg(long, env = "RS3_DOCTOR_PROFILE", value_enum, default_value_t = DoctorProfile::Local)]
         profile: DoctorProfile,
     },
-    RecoverAnchor {
-        #[arg(long, env = "RS3_RECOVERY_MAX_CHECKPOINT_AGE_SECONDS")]
-        max_checkpoint_age_seconds: u64,
-        #[arg(long, default_value_t = false)]
-        apply_if_missing: bool,
-        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
-        format: RecoveryReportFormat,
-    },
     ExportRestoreBundle {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
@@ -86,18 +73,6 @@ enum Commands {
         legal_hold: bool,
         #[arg(long, default_value_t = false)]
         governance_bypass_reviewed: bool,
-        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
-        format: RecoveryReportFormat,
-    },
-    ImportAnchor {
-        #[arg(long)]
-        checkpoint_sequence: u64,
-        #[arg(long)]
-        checkpoint_id: String,
-        #[arg(long)]
-        checkpoint_version_id: Option<String>,
-        #[arg(long)]
-        checkpoint_digest: String,
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
@@ -125,14 +100,6 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
-    RotateKey {
-        #[arg(long, value_enum)]
-        purpose: KeyPurposeArg,
-        #[arg(long)]
-        new_key_id: Option<String>,
-        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
-        format: RecoveryReportFormat,
-    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -145,14 +112,6 @@ enum GatewayModeArg {
 enum DoctorProfile {
     Local,
     Production,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum KeyPurposeArg {
-    Namespace,
-    Content,
-    Metadata,
-    Checkpoint,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -210,39 +169,11 @@ async fn main() -> Result<()> {
             log_runtime_config(&config);
             run_doctor(&config, profile)?;
         }
-        Commands::RecoverAnchor {
-            max_checkpoint_age_seconds,
-            apply_if_missing,
-            format,
-        } => {
-            let config = RuntimeConfig::from_env()?;
-            log_runtime_config(&config);
-            if max_checkpoint_age_seconds == 0 {
-                anyhow::bail!("--max-checkpoint-age-seconds must be greater than zero");
-            }
-            let report = recover_anchor_from_config(
-                &config,
-                AnchorRecoveryOptions {
-                    max_checkpoint_age: std::time::Duration::from_secs(max_checkpoint_age_seconds),
-                    apply_if_missing,
-                },
-            )
-            .await?;
-            print_recovery_report(&report, format)?;
-        }
         Commands::ExportRestoreBundle { format } => {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
-            match config.repository.format {
-                RepositoryFormat::V1Preview => {
-                    let bundle = export_restore_bundle_from_config(&config).await?;
-                    print_restore_bundle(&bundle, format)?;
-                }
-                RepositoryFormat::V2Preview => {
-                    let bundle = export_v2_recovery_bundle_from_config(&config).await?;
-                    print_v2_restore_bundle(&bundle, format)?;
-                }
-            }
+            let bundle = export_v2_recovery_bundle_from_config(&config).await?;
+            print_v2_restore_bundle(&bundle, format)?;
         }
         Commands::WriteIndexSnapshot { format } => {
             let config = RuntimeConfig::from_env()?;
@@ -272,29 +203,6 @@ async fn main() -> Result<()> {
             if !passed {
                 anyhow::bail!("v2 provider conformance failed");
             }
-        }
-        Commands::ImportAnchor {
-            checkpoint_sequence,
-            checkpoint_id,
-            checkpoint_version_id,
-            checkpoint_digest,
-            format,
-        } => {
-            let config = RuntimeConfig::from_env()?;
-            log_runtime_config(&config);
-            let report = import_anchor_from_config(
-                &config,
-                rs3_repository::CheckpointPosition {
-                    sequence: Sequence::new(checkpoint_sequence),
-                    checkpoint_id: CheckpointId::new(checkpoint_id)?,
-                    checkpoint_version_id: checkpoint_version_id
-                        .map(rs3_types::BackendVersionId::new)
-                        .transpose()?,
-                    payload_digest: checkpoint_digest,
-                },
-            )
-            .await?;
-            print_import_report(&report, format)?;
         }
         Commands::ImportV2Anchor {
             anchor_sequence,
@@ -340,23 +248,6 @@ async fn main() -> Result<()> {
             let report = import_v2_anchor_from_config(&config, bundle).await?;
             print_v2_anchor_import_report(&report, format)?;
         }
-        Commands::RotateKey {
-            purpose,
-            new_key_id,
-            format,
-        } => {
-            let config = RuntimeConfig::from_env()?;
-            log_runtime_config(&config);
-            let report = rotate_key_from_config(
-                &config,
-                KeyRotationOptions {
-                    purpose: purpose.into(),
-                    new_key_id: new_key_id.map(KeyId::new).transpose()?,
-                },
-            )
-            .await?;
-            print_key_rotation_report(&report, format)?;
-        }
     }
 
     Ok(())
@@ -371,147 +262,6 @@ fn install_rustls_provider() {
 
 #[cfg(not(any(feature = "s3", feature = "k8s")))]
 fn install_rustls_provider() {}
-
-fn print_key_rotation_report(
-    report: &KeyRotationReport,
-    format: RecoveryReportFormat,
-) -> Result<()> {
-    match format {
-        RecoveryReportFormat::Json => {
-            let report = serde_json::json!({
-                "purpose": key_purpose_name(report.purpose),
-                "old_primary_key_id": report.old_primary_key_id.as_str(),
-                "new_primary_key_id": report.new_primary_key_id.as_str(),
-                "staged_sequence": report.staged_sequence.get(),
-                "checkpoint": {
-                    "sequence": report.checkpoint.sequence.get(),
-                    "checkpoint_id": report.checkpoint.checkpoint_id.as_str(),
-                    "checkpoint_version_id": report.checkpoint.checkpoint_version_id.as_ref().map(|version_id| version_id.as_str()),
-                    "checkpoint_digest": report.checkpoint.payload_digest,
-                    "published_at_ms": report.published_at_ms,
-                },
-                "keyring_envelope": {
-                    "generation": report.keyring_envelope.generation,
-                    "object_id": report.keyring_envelope.object_id.as_str(),
-                    "version_id": report.keyring_envelope.version_id.as_ref().map(|version_id| version_id.as_str()),
-                    "digest": report.keyring_envelope.digest,
-                },
-            });
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        RecoveryReportFormat::Text => {
-            println!("rs3 key rotation: accepted checkpoint published");
-            println!("purpose={}", key_purpose_name(report.purpose));
-            println!("old_primary_key_id={}", report.old_primary_key_id.as_str());
-            println!("new_primary_key_id={}", report.new_primary_key_id.as_str());
-            println!("staged_sequence={}", report.staged_sequence.get());
-            println!("checkpoint_sequence={}", report.checkpoint.sequence.get());
-            println!("checkpoint_id={}", report.checkpoint.checkpoint_id.as_str());
-            if let Some(version_id) = report.checkpoint.checkpoint_version_id.as_ref() {
-                println!("checkpoint_version_id={}", version_id.as_str());
-            }
-            println!("checkpoint_digest={}", report.checkpoint.payload_digest);
-            println!("published_at_ms={}", report.published_at_ms);
-            println!(
-                "keyring_envelope_generation={}",
-                report.keyring_envelope.generation
-            );
-            println!(
-                "keyring_envelope_object_id={}",
-                report.keyring_envelope.object_id.as_str()
-            );
-            if let Some(version_id) = report.keyring_envelope.version_id.as_ref() {
-                println!("keyring_envelope_version_id={}", version_id.as_str());
-            }
-            println!("keyring_envelope_digest={}", report.keyring_envelope.digest);
-        }
-    }
-    Ok(())
-}
-
-fn print_restore_bundle(bundle: &RestoreTrustBundle, format: RecoveryReportFormat) -> Result<()> {
-    match format {
-        RecoveryReportFormat::Json => {
-            let keyring_envelope = bundle.keyring_envelope.as_ref().map(|envelope| {
-                serde_json::json!({
-                    "generation": envelope.generation,
-                    "object_id": envelope.object_id.as_str(),
-                    "version_id": envelope.version_id.as_ref().map(|version_id| version_id.as_str()),
-                    "digest": envelope.digest,
-                })
-            });
-            let bundle = serde_json::json!({
-                "schema": RESTORE_BUNDLE_SCHEMA,
-                "repository": {
-                    "id": bundle.repository_id.as_str(),
-                    "salt_hex": bundle.repository_salt_hex,
-                },
-                "checkpoint": {
-                    "sequence": bundle.checkpoint.sequence.get(),
-                    "checkpoint_id": bundle.checkpoint.checkpoint_id.as_str(),
-                    "checkpoint_version_id": bundle.checkpoint.checkpoint_version_id.as_ref().map(|version_id| version_id.as_str()),
-                    "checkpoint_digest": bundle.checkpoint.payload_digest,
-                    "published_at_ms": bundle.published_at_ms,
-                },
-                "keyring_envelope": keyring_envelope,
-                "generated_at_ms": bundle.generated_at_ms,
-            });
-            println!("{}", serde_json::to_string_pretty(&bundle)?);
-        }
-        RecoveryReportFormat::Text => {
-            println!("schema={RESTORE_BUNDLE_SCHEMA}");
-            println!("repository_id={}", bundle.repository_id.as_str());
-            println!("repository_salt_hex={}", bundle.repository_salt_hex);
-            println!("checkpoint_sequence={}", bundle.checkpoint.sequence.get());
-            println!("checkpoint_id={}", bundle.checkpoint.checkpoint_id.as_str());
-            if let Some(version_id) = bundle.checkpoint.checkpoint_version_id.as_ref() {
-                println!("checkpoint_version_id={}", version_id.as_str());
-            }
-            println!("checkpoint_digest={}", bundle.checkpoint.payload_digest);
-            println!("published_at_ms={}", bundle.published_at_ms);
-            if let Some(envelope) = bundle.keyring_envelope.as_ref() {
-                println!("keyring_envelope_generation={}", envelope.generation);
-                println!("keyring_envelope_object_id={}", envelope.object_id.as_str());
-                if let Some(version_id) = envelope.version_id.as_ref() {
-                    println!("keyring_envelope_version_id={}", version_id.as_str());
-                }
-                println!("keyring_envelope_digest={}", envelope.digest);
-            }
-            println!("generated_at_ms={}", bundle.generated_at_ms);
-        }
-    }
-    Ok(())
-}
-
-fn print_import_report(report: &AnchorImportReport, format: RecoveryReportFormat) -> Result<()> {
-    match format {
-        RecoveryReportFormat::Json => {
-            let report = serde_json::json!({
-                "checkpoint": {
-                    "sequence": report.checkpoint.sequence.get(),
-                    "checkpoint_id": report.checkpoint.checkpoint_id.as_str(),
-                    "checkpoint_version_id": report.checkpoint.checkpoint_version_id.as_ref().map(|version_id| version_id.as_str()),
-                    "checkpoint_digest": report.checkpoint.payload_digest,
-                    "published_at_ms": report.published_at_ms,
-                },
-                "applied": report.applied,
-            });
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        RecoveryReportFormat::Text => {
-            println!("rs3 anchor import: trusted checkpoint applied");
-            println!("checkpoint_sequence={}", report.checkpoint.sequence.get());
-            println!("checkpoint_id={}", report.checkpoint.checkpoint_id.as_str());
-            if let Some(version_id) = report.checkpoint.checkpoint_version_id.as_ref() {
-                println!("checkpoint_version_id={}", version_id.as_str());
-            }
-            println!("checkpoint_digest={}", report.checkpoint.payload_digest);
-            println!("published_at_ms={}", report.published_at_ms);
-            println!("applied={}", report.applied);
-        }
-    }
-    Ok(())
-}
 
 fn print_v2_anchor_import_report(
     report: &V2AnchorImportReport,
@@ -731,48 +481,6 @@ fn print_v2_anchor_state(
     Ok(())
 }
 
-fn print_recovery_report(
-    report: &AnchorRecoveryReport,
-    format: RecoveryReportFormat,
-) -> Result<()> {
-    match format {
-        RecoveryReportFormat::Json => {
-            let report = serde_json::json!({
-                "checkpoint": {
-                    "sequence": report.checkpoint.sequence.get(),
-                    "checkpoint_id": report.checkpoint.checkpoint_id.as_str(),
-                    "checkpoint_version_id": report.checkpoint.checkpoint_version_id.as_ref().map(|version_id| version_id.as_str()),
-                    "checkpoint_digest": report.checkpoint.payload_digest,
-                    "published_at_ms": report.published_at_ms,
-                },
-                "observed": {
-                    "evidence_objects": report.observed_evidence_objects,
-                    "candidate_checkpoints": report.candidate_count,
-                },
-                "applied": report.applied,
-            });
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        RecoveryReportFormat::Text => {
-            println!("rs3 anchor recovery: highest observed valid checkpoint");
-            println!("checkpoint_sequence={}", report.checkpoint.sequence.get());
-            println!("checkpoint_id={}", report.checkpoint.checkpoint_id.as_str());
-            if let Some(version_id) = report.checkpoint.checkpoint_version_id.as_ref() {
-                println!("checkpoint_version_id={}", version_id.as_str());
-            }
-            println!("checkpoint_digest={}", report.checkpoint.payload_digest);
-            println!("published_at_ms={}", report.published_at_ms);
-            println!(
-                "observed_evidence_objects={}",
-                report.observed_evidence_objects
-            );
-            println!("candidate_checkpoints={}", report.candidate_count);
-            println!("applied={}", report.applied);
-        }
-    }
-    Ok(())
-}
-
 fn run_doctor(config: &RuntimeConfig, profile: DoctorProfile) -> Result<()> {
     let findings = doctor_findings(config, profile.into());
     if findings.is_empty() {
@@ -862,26 +570,6 @@ impl From<DoctorProfile> for AdminReportProfile {
             DoctorProfile::Local => Self::Local,
             DoctorProfile::Production => Self::Production,
         }
-    }
-}
-
-impl From<KeyPurposeArg> for KeyPurpose {
-    fn from(value: KeyPurposeArg) -> Self {
-        match value {
-            KeyPurposeArg::Namespace => Self::Namespace,
-            KeyPurposeArg::Content => Self::Content,
-            KeyPurposeArg::Metadata => Self::Metadata,
-            KeyPurposeArg::Checkpoint => Self::CheckpointSigning,
-        }
-    }
-}
-
-fn key_purpose_name(purpose: KeyPurpose) -> &'static str {
-    match purpose {
-        KeyPurpose::Namespace => "namespace",
-        KeyPurpose::Content => "content",
-        KeyPurpose::Metadata => "metadata",
-        KeyPurpose::CheckpointSigning => "checkpoint",
     }
 }
 
@@ -1027,7 +715,7 @@ mod tests {
                 max_pending_items: 64,
             },
             repository: RepositoryConfig {
-                format: RepositoryFormat::V1Preview,
+                format: RepositoryFormat::V2Preview,
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:
@@ -1120,7 +808,7 @@ mod tests {
         config.mode = GatewayMode::RestoreReadOnly;
         config.anchor = AnchorConfig::KubernetesLease {
             namespace: "backup".to_owned(),
-            name: "checkpoint".to_owned(),
+            name: "v2-anchor".to_owned(),
             field_manager: "rs3-server".to_owned(),
         };
         config.static_credentials = Some(StaticCredentials {
@@ -1142,7 +830,7 @@ mod tests {
         let mut config = runtime_config();
         config.anchor = AnchorConfig::KubernetesLease {
             namespace: "backup".to_owned(),
-            name: "checkpoint".to_owned(),
+            name: "v2-anchor".to_owned(),
             field_manager: "rs3-server".to_owned(),
         };
         config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 30));

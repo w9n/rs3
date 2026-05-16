@@ -350,6 +350,8 @@ pub struct V2ParsedCommitHeader {
 pub struct V2ParsedCommit {
     /// Decoded and verified header plus fixed-header metadata.
     pub parsed_header: V2ParsedCommitHeader,
+    /// Provider version identifier used to read this commit, when available.
+    pub version_id: Option<BackendVersionId>,
     /// Full object bytes that were verified.
     pub body: Bytes,
 }
@@ -419,6 +421,7 @@ pub fn parse_v2_commit_object(
     validate_commit_section_semantics(&parsed_header.header)?;
     Ok(V2ParsedCommit {
         parsed_header,
+        version_id: None,
         body,
     })
 }

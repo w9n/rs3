@@ -13,12 +13,12 @@ rs3 gateway
         +-- path-private namespace mapping
         +-- payload segment encryption
         +-- encrypted index deltas
-        +-- signed checkpoint publication
+        +-- signed v2 commit publication
         |
         +-------------------+-------------------+
         |                                       |
         v                                       v
-opaque object store                    external checkpoint anchor
+opaque object store                    external commit anchor
 ```
 
 ## Crate Boundaries
@@ -26,11 +26,11 @@ opaque object store                    external checkpoint anchor
 | Crate | Responsibility |
 | --- | --- |
 | `rs3-types` | Typed identifiers and shared policy types. |
-| `rs3-crypto` | Key derivation, encryption, metadata sealing, payload envelopes, checkpoint signatures. |
+| `rs3-crypto` | Key derivation, encryption, metadata sealing, payload envelopes, and commit signatures. |
 | `rs3-storage` | Provider-neutral object-store trait, local stores, S3 adapter, retention contracts. |
-| `rs3-index` | Durable index and checkpoint data model. |
-| `rs3-anchor` | Checkpoint anchor contract and in-memory test anchor. |
-| `rs3-repository` | Namespace, payload, checkpoint, replay, maintenance, and commit coordination. |
+| `rs3-index` | Durable index and repository state model. |
+| `rs3-anchor` | External anchor contracts and in-memory test anchors. |
+| `rs3-repository` | Namespace, payload, v2 commit, replay, maintenance, and commit coordination. |
 | `rs3-k8s` | Kubernetes-facing anchor integration surface. |
 | `rs3-server` | Gateway process, configuration, identity, S3 boundary, core admin reports, metrics, and shutdown. |
 | `rs3-console` | Read-only single-gateway operations UI over the authenticated admin report. |
@@ -43,18 +43,16 @@ not add ad hoc hashing, MAC, encryption, or key derivation logic.
 
 Normal writes are append-friendly:
 
-1. Write encrypted payload segments.
-2. Write encrypted or authenticated metadata/index state.
-3. Publish a signed checkpoint that references the new state.
-4. Advance the external checkpoint anchor.
-5. Acknowledge the client write only after the covering checkpoint is accepted.
+1. Stage encrypted payload and index delta sections.
+2. Publish a signed v2 commit under a random path-private key.
+3. Advance the external commit anchor.
+4. Acknowledge the client write only after the covering commit is accepted.
 
 This avoids rewriting many backend objects during normal operation and gives
 crash recovery a concrete boundary.
 
-`v2-preview` keeps the same payload and trusted namespace model, but replaces
-the v1 checkpoint object with a signed commit chain under random path-private
-keys. Concurrent PUTs can batch into one signed delta commit. Periodic index
+`v2-preview` stores payload and index-delta sections inside the signed commit
+chain. Concurrent PUTs can batch into one signed delta commit. Periodic index
 snapshot commits consolidate the live blinded namespace so cold-start replay
 walks only from the accepted anchor back to the nearest snapshot.
 
@@ -71,17 +69,16 @@ client paths as backend object keys.
 ## Rollback Resistance
 
 The object store can preserve encrypted bytes, but it cannot prove that it
-served the latest valid checkpoint. `rs3` therefore separates storage durability
+served the latest valid commit. `rs3` therefore separates storage durability
 from latest-state authority:
 
-- Object store: encrypted objects, checkpoint objects, and optional retained
-  evidence.
-- External anchor: monotonic latest checkpoint sequence and digest.
+- Object store: encrypted keyring envelopes, format roots, and signed commits.
+- External anchor: monotonic latest commit sequence and digest.
 - Gateway: verification, replay, and fail-closed behavior when the anchor
   cannot be trusted.
 
 Provider retention and Object Lock are useful for preventing deletion of object
-versions. They do not replace checkpoint signatures or external anchors.
+versions. They do not replace commit signatures or external anchors.
 
 For `v2-preview`, the external anchor stores the accepted commit key, body
 digest, provider version ID when needed, signing key ID, and active format-root

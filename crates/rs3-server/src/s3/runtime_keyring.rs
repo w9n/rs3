@@ -1,43 +1,16 @@
-use super::runtime_checkpoints::{
-    checkpoint_keyring_envelope_reference, repository_has_committed_objects,
-};
-use super::runtime_handles::{RuntimeAnchor, RuntimeStore};
+use super::runtime_handles::RuntimeStore;
 use super::{S3BoundaryError, repository_init};
 use crate::RepositoryKeysConfig;
 use crate::config::{KEYRING_WRAPPING_KEY_HEX_ENV, REPOSITORY_SALT_HEX_ENV};
 use bytes::Bytes;
-use rs3_anchor::{AnchorError, CheckpointAnchor};
 use rs3_crypto::{KeyRing, KeyringEnvelope, RepositoryKeyContext, SecretBytes};
 use rs3_index::KeyringEnvelopeReference;
-use rs3_repository::{CheckpointPosition, Repository, RepositoryOptions};
+use rs3_repository::{Repository, RepositoryOptions};
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
 
 const KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.keyring-envelope+json";
-
-pub(super) async fn gateway_keyring(
-    store: &RuntimeStore,
-    anchor: &RuntimeAnchor,
-    keys: &RepositoryKeysConfig,
-    retention: Option<RetentionPolicy>,
-    allow_bootstrap: bool,
-) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
-    match anchor.read().await {
-        Ok(state) => {
-            let accepted = CheckpointPosition::from(state);
-            let reference = checkpoint_keyring_envelope_reference(store, &accepted).await?;
-            let mut loaded = open_gateway_keyring_reference(store, keys, &reference).await?;
-            loaded.pending_envelope_override =
-                configured_envelope_override(store, keys, &loaded.keyring, &reference).await?;
-            Ok(loaded)
-        }
-        Err(AnchorError::MissingAnchor) => {
-            unanchored_gateway_keyring(store, keys, retention, allow_bootstrap).await
-        }
-        Err(error) => Err(repository_init(error)),
-    }
-}
 
 pub(super) async fn unanchored_gateway_keyring(
     store: &RuntimeStore,
@@ -67,9 +40,9 @@ pub(super) async fn unanchored_gateway_keyring(
         };
     }
 
-    if repository_has_committed_objects(store).await? {
+    if repository_has_anchor_bound_objects(store).await? {
         return Err(repository_init(
-            "checkpoint anchor is missing but repository objects already exist; run explicit anchor recovery instead of choosing a backend checkpoint",
+            "v2 commit anchor is missing but repository objects already exist; run explicit anchor recovery instead of choosing backend state",
         ));
     }
 
@@ -102,7 +75,7 @@ pub(super) async fn unanchored_gateway_keyring(
             )
         }
         _ => Err(repository_init(
-            "checkpoint anchor is missing and multiple unanchored keyring envelopes exist; provide an explicit envelope override or recover the anchor",
+            "v2 commit anchor is missing and multiple unanchored keyring envelopes exist; provide an explicit envelope override or recover the anchor",
         )),
     }
 }
@@ -127,7 +100,6 @@ fn open_gateway_keyring(
     Ok(LoadedGatewayKeyring {
         keyring,
         envelope_reference: Some(reference),
-        pending_envelope_override: None,
     })
 }
 
@@ -158,7 +130,7 @@ pub(super) async fn open_gateway_keyring_reference(
     let digest = envelope.digest().map_err(repository_init)?;
     if envelope.generation != reference.generation || digest != reference.digest {
         return Err(repository_init(format!(
-            "keyring envelope object {} does not match the checkpoint-bound envelope reference",
+            "keyring envelope object {} does not match the anchor-bound envelope reference",
             reference.object_id
         )));
     }
@@ -168,43 +140,6 @@ pub(super) async fn open_gateway_keyring_reference(
         reference.version_id.clone(),
         envelope,
     )
-}
-
-async fn configured_envelope_override(
-    store: &RuntimeStore,
-    keys: &RepositoryKeysConfig,
-    active_keyring: &KeyRing,
-    active_reference: &KeyringEnvelopeReference,
-) -> Result<Option<KeyringEnvelopeReference>, S3BoundaryError> {
-    let Some(object_id) = keys.envelope_object_id.as_ref() else {
-        return Ok(None);
-    };
-    if object_id == &active_reference.object_id {
-        return Ok(None);
-    }
-
-    let loaded = match store.head(object_id).await {
-        Ok(metadata) => {
-            let body = store
-                .get_range_at(object_id, metadata.version_id.as_ref(), ByteRange::Full)
-                .await
-                .map_err(repository_init)?;
-            open_gateway_keyring_object(keys, object_id.clone(), metadata.version_id, body)?
-        }
-        Err(StorageError::NotFound(_)) => {
-            return Err(repository_init(
-                "configured keyring envelope override is missing",
-            ));
-        }
-        Err(error) => return Err(repository_init(error)),
-    };
-    if loaded.keyring.descriptors() != active_keyring.descriptors() {
-        return Err(repository_init(
-            "configured keyring envelope override opens to different repository keys",
-        ));
-    }
-
-    Ok(loaded.envelope_reference)
 }
 
 async fn bootstrap_missing_keyring_envelope(
@@ -251,7 +186,6 @@ async fn bootstrap_missing_keyring_envelope(
     Ok(LoadedGatewayKeyring {
         keyring,
         envelope_reference: Some(reference),
-        pending_envelope_override: None,
     })
 }
 
@@ -339,10 +273,25 @@ async fn repository_prefix_has_objects(store: &RuntimeStore) -> Result<bool, S3B
         .is_empty())
 }
 
+async fn repository_has_anchor_bound_objects(
+    store: &RuntimeStore,
+) -> Result<bool, S3BoundaryError> {
+    for prefix in ["format/", "commits/"] {
+        if !store
+            .list_prefix(prefix)
+            .await
+            .map_err(repository_init)?
+            .is_empty()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) struct LoadedGatewayKeyring {
     pub(super) keyring: KeyRing,
     pub(super) envelope_reference: Option<KeyringEnvelopeReference>,
-    pub(super) pending_envelope_override: Option<KeyringEnvelopeReference>,
 }
 
 pub(super) fn repository_key_context(

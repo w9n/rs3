@@ -70,9 +70,10 @@ reference.
 
 The gateway uses an encrypted keyring envelope. Operators provide a stable
 repository ID, a stable public salt, and a wrapping-key source. For an anchored
-repository, startup reads the accepted checkpoint and opens the keyring envelope
-bound into that signed checkpoint. It does not trust S3 listing order or a
-mutable "latest" object to choose repository state.
+repository, startup reads the accepted v2 anchor, verifies the signed commit
+chain and format root, and opens the keyring envelope bound through that format
+root. It does not trust S3 listing order or a mutable "latest" object to choose
+repository state.
 
 For a first empty repository, startup initializes a new random purpose-specific
 keyring and writes the encrypted envelope under a default counted `keyrings/`
@@ -80,7 +81,7 @@ object name. `RS3_KEYRING_ENVELOPE_OBJECT_ID` is optional and exists only as an
 explicit bootstrap or recovery override.
 
 If the envelope is missing but the prefix already contains repository objects, or
-if the anchor already contains an accepted checkpoint position, startup fails
+if the anchor already contains an accepted commit position, startup fails
 closed. This prevents accidental second-repository initialization on top of
 existing backup data.
 
@@ -96,7 +97,7 @@ Operational rules:
   configuration and recovery material.
 - Treat salts as public restore metadata, not as second passwords.
 - Keep historical keys available for at least the maximum retention window.
-- Do not destroy a key while any retained checkpoint can reference data that
+- Do not destroy a key while any retained commit can reference data that
   requires it.
 
 For a first empty repository, configure the repository context and wrapping key:
@@ -120,7 +121,7 @@ Inspect an existing envelope when auditing key lifecycle state:
 cargo run -p xtask --bin xtask -- keyring inspect \
   --repository-id prod-backups \
   --repository-salt-hex <salt-hex> \
-  --envelope-object-id <checkpoint-bound-envelope-object-id> \
+  --envelope-object-id <format-bound-envelope-object-id> \
   --wrapping-key-id wrap-2026-05 \
   --wrapping-key-hex-file /run/secrets/rs3-wrap.hex \
   --backend filesystem \
@@ -157,48 +158,22 @@ before it was deleted, so deleting or expiring the old envelope is not a
 cryptographic revocation mechanism.
 
 Keep the old wrapping-key source available for restore paths that still trust
-checkpoints bound to the old envelope. A newly written rewrapped envelope only
-becomes active repository state after a later accepted checkpoint binds it.
+format roots or commits bound to the old envelope. A newly written rewrapped
+envelope only becomes active repository state after a later accepted format or
+keyring update binds it.
 When writing envelopes outside the gateway, set envelope retention deliberately
 with `--envelope-retention-mode` and `--envelope-retention-days`; retention
-protects restore evidence from deletion but does not make a leaked old envelope
+protects restore metadata from deletion but does not make a leaked old envelope
 safe.
 
-Rotate a purpose-specific repository data key through the configured backend
-and checkpoint anchor:
+Purpose-specific v2 data-key rotation is not exposed as a production-preview
+CLI command yet. Do not use older rotation workflows against a
+v2 repository. Until v2 rotation is implemented, keep historical keys enabled
+and treat wrapping-key rewrap as envelope hygiene only.
 
-```sh
-cargo run -p rs3-server -- rotate-key \
-  --purpose content \
-  --format text
-```
-
-Supported purposes are `namespace`, `content`, `metadata`, and `checkpoint`.
-The command opens the checkpoint-bound envelope, generates a fresh primary key
-for that purpose, demotes the previous primary to enabled historical use, writes
-a new encrypted envelope, and publishes a metadata-only checkpoint that binds
-the new envelope. This is a first-party operator primitive over the configured
-backend and anchor, not an S3 data-plane operation.
-
-Before disabling or retiring a historical key, check a trusted checkpoint chain:
-
-```sh
-cargo run -p xtask --bin xtask -- keyring retirement-check \
-  --repository-id prod-backups \
-  --repository-salt-hex <salt-hex> \
-  --envelope-object-id <checkpoint-bound-envelope-object-id> \
-  --wrapping-key-id wrap-2026-05 \
-  --wrapping-key-hex-file /run/secrets/rs3-wrap.hex \
-  --checkpoint-sequence <sequence> \
-  --checkpoint-id <checkpoint-id> \
-  --checkpoint-digest <checkpoint-digest> \
-  --key-id content-v1 \
-  --backend filesystem \
-  --backend-dir /var/lib/rs3/backend
-```
-
-Retirement is safe only when the key is not primary and the verified checkpoint
-chain no longer requires it. Keep historical keys for at least the maximum
+Before disabling or retiring a historical key, verify a trusted anchored commit
+chain with a v2-aware retirement tool. That tooling is not part of the current
+production-preview CLI, so keep historical keys for at least the maximum
 provider-retention window.
 
 ## Anchors
@@ -217,7 +192,7 @@ built with Kubernetes support:
 ```sh
 RS3_ANCHOR_MODE=kubernetes-lease
 RS3_ANCHOR_NAMESPACE=backup
-RS3_ANCHOR_NAME=rs3-checkpoint
+RS3_ANCHOR_NAME=rs3-v2-anchor
 RS3_ANCHOR_FIELD_MANAGER=rs3-server
 ```
 
@@ -225,15 +200,15 @@ If the configured anchor cannot be read or advanced, writes must fail closed.
 Do not silently fall back to a memory anchor.
 
 For the production preview, the Kubernetes Lease is the authority for latest
-accepted state. Storage-side checkpoint evidence is the witness. If S3 serves an
-older valid checkpoint, hides the checkpoint or evidence named by the Lease, or
-presents evidence newer than the Lease, the gateway should stop or require an
-explicit recovery workflow rather than silently choosing storage state.
+accepted state. Retained commit versions are useful history, not the authority.
+If S3 serves an older valid commit, hides the commit named by the Lease, or
+contains commits newer than the Lease, the gateway should stop or require a
+trusted recovery bundle rather than silently choosing storage state.
 
 A trusted external anchor can distribute trust outside the cluster by
-storing or signing the accepted checkpoint position: sequence, checkpoint ID,
-checkpoint object version ID when available, and checkpoint digest. It does not
-need to store the whole repository index.
+storing or signing the accepted commit position: sequence, commit key, commit
+object version ID when available, commit digest, signing key ID, and format-root
+reference. It does not need to store the whole repository index.
 
 In Helm deployments, keep `rbac.create=true` unless equivalent Lease
 permissions already exist. Set `rbac.existing=true` only for that external-RBAC
@@ -292,13 +267,13 @@ surface, not a backup data browser.
 ## Restore Posture
 
 For routine restores in a healthy repository, keep the single writer gateway in
-`read-write` and use the normal checkpoint-anchor path. Velero writes restore
+`read-write` and use the normal v2 anchor path. Velero writes restore
 result artifacts after data restore; in normal operation those writes should be
-accepted, checkpointed, and anchored like other repository mutations so Velero
+accepted, committed, and anchored like other repository mutations so Velero
 can report `Completed`.
 
 During an incident or disaster-recovery drill, favor read-only restore with a
-verified checkpoint and external anchor over any mode that repairs state
+verified commit chain and external anchor over any mode that repairs state
 automatically. If break-glass restore is added, it should require explicit
 operator input and leave an audit trail.
 
@@ -309,9 +284,10 @@ operator input and leave an audit trail.
     - repository ID
     - public repository salt
     - wrapping-key source for the keyring envelope
-    - trusted checkpoint position: sequence, checkpoint ID, checkpoint object
-      version ID when available, and checkpoint digest
-    - checkpoint-bound keyring-envelope reference
+    - trusted v2 anchor position: sequence, commit key, commit object version ID
+      when available, commit body digest, signing key ID, and format-root
+      reference
+    - format-bound keyring-envelope reference
     - backend endpoint, bucket, and prefix
     - restore verification command inputs
 
@@ -345,10 +321,9 @@ writers cannot safely coordinate repository state without a stronger shared
 write protocol. Scaled restore readers should use `restore-readonly`.
 
 Disaster recovery into a new cluster requires the repository ID, public salt,
-wrapping-key source, and either a trusted checkpoint position from outside S3 or
-an explicit bounded recovery decision. Backend evidence alone is not a perfect
-latest-state oracle because the backend can hide newer valid evidence and replay
-older valid evidence.
+wrapping-key source, and a trusted v2 anchor position from outside S3. Backend
+objects alone are not a latest-state oracle because the backend can hide newer
+valid commits and replay older valid commits.
 
 Export the trusted restore bundle from a healthy cluster or regular operations
 job and store it outside the object-store account:
@@ -357,78 +332,39 @@ job and store it outside the object-store account:
 cargo run -p rs3-server -- export-restore-bundle --format json
 ```
 
-The bundle contains public repository restore metadata: repository ID, public
-salt, accepted checkpoint sequence, checkpoint ID, checkpoint object version ID
-when available, checkpoint digest, and the checkpoint-bound keyring-envelope
-reference. It does not contain wrapping-key material.
+The bundle contains public repository restore metadata: repository ID, accepted
+commit sequence, commit key, commit object version ID when available, commit
+body digest, signing key ID, format-root reference, and weak-subjectivity floor.
+It does not contain wrapping-key material.
 
-On a new cluster with a missing anchor, import the trusted checkpoint position
-from that bundle after configuring the same repository ID, salt, and
-wrapping-key source:
-
-```sh
-cargo run -p rs3-server -- import-anchor \
-  --checkpoint-sequence <bundle-sequence> \
-  --checkpoint-id <bundle-checkpoint-id> \
-  --checkpoint-version-id <bundle-checkpoint-version-id> \
-  --checkpoint-digest <bundle-checkpoint-digest>
-```
-
-Omit `--checkpoint-version-id` only when the trusted bundle has no checkpoint
-version. Retained/Object Lock repositories should have one.
-
-The import verifies the checkpoint chain, checkpoint evidence, keyring envelope,
-and reachable restore-critical objects before writing the missing anchor.
-
-For `v2-preview`, the same `export-restore-bundle` command emits a v2 bundle.
-Recover a missing Lease with `import-v2-anchor` and the bundle's v2 anchor and
-format fields. Keep the repository retention settings identical to the original
-repository; v2 format-root verification rejects a mismatched context.
-
-When the old Kubernetes Lease is gone, use explicit anchor recovery with a
-freshness bound:
+On a new cluster with a missing anchor, import the trusted v2 anchor from that
+bundle after configuring the same repository ID, salt, wrapping-key source,
+backend, and retention settings:
 
 ```sh
-cargo run -p rs3-server -- recover-anchor \
-  --max-checkpoint-age-seconds 86400 \
-  --apply-if-missing \
-  --format text
+cargo run -p rs3-server -- import-v2-anchor \
+  --anchor-sequence <bundle-anchor-sequence> \
+  --anchor-commit-key <bundle-anchor-commit-key> \
+  --anchor-version-id <bundle-anchor-version-id> \
+  --anchor-body-digest <bundle-anchor-body-digest> \
+  --signing-key-id <bundle-signing-key-id> \
+  --format-generation <bundle-format-generation> \
+  --format-digest <bundle-format-digest> \
+  --format-object-id <bundle-format-object-id> \
+  --format-version-id <bundle-format-version-id> \
+  --weak-subjectivity-floor-sequence <bundle-floor-sequence>
 ```
 
-The command scans storage evidence, verifies the highest observed valid
-checkpoint chain and keyring envelope, rejects it if the signed checkpoint time
-is older than the configured bound, and writes the configured anchor only when
-it is missing. The report says "highest observed valid" deliberately: a
-malicious backend that cannot forge checkpoints may still hide newer valid
-ones.
+Omit version IDs only when the trusted bundle has none. Retained/Object Lock
+repositories should have commit and format version IDs. The import verifies the
+named signed commit chain, format root, and keyring envelope before writing the
+missing anchor.
 
-Verify a trusted checkpoint position before relying on it for restore. Build
-`xtask` with the S3 feature when verifying an S3-compatible backend:
-
-```sh
-cargo run -p xtask --bin xtask --features s3 -- restore verify \
-  --repository-id prod-backups \
-  --repository-salt-hex <salt-hex> \
-  --keyring-envelope-object-id <envelope-object-id> \
-  --wrapping-key-id <wrapping-key-id> \
-  --wrapping-key-hex-file /run/secrets/rs3-wrap.hex \
-  --checkpoint-sequence <anchor-sequence> \
-  --checkpoint-id <anchor-checkpoint-id> \
-  --checkpoint-digest <anchor-checkpoint-digest> \
-  --backend s3 \
-  --s3-bucket <bucket> \
-  --require-provider-delete-protection \
-  --format json
-```
-
-This is not just an S3 object listing. It verifies checkpoint signatures,
-checkpoint evidence, keyring envelope digest, encrypted index state, sealed
-metadata, and payload decryptability. The report also summarizes provider
-retention and legal-hold metadata observed on the restore-critical objects it
-checked. With `--require-provider-delete-protection`, the command fails unless
-every checked restore-critical object is protected by provider retention or
-legal hold. Use S3 CLI checks separately for provider capabilities such as
-Object Lock headers and raw range reads.
+Verify a trusted anchor position before relying on it for restore. For v2, the
+anchor import path verifies the named signed commit chain, format root, and
+keyring envelope. Then run the restore client through the recovered gateway and
+verify restored application bytes. Use S3 CLI checks separately for provider
+capabilities such as Object Lock headers and raw range reads.
 
 See [Restore Under Attack](runbooks/restore-under-attack.md) for the incident
 runbook.

@@ -1,7 +1,7 @@
 # Restore Under Attack
 
 Do not repair repository state automatically during an incident. First preserve
-evidence, then choose the trusted checkpoint, then restore with the narrowest
+evidence, then choose the trusted v2 anchor, then restore with the narrowest
 credentials practical.
 
 ## Assume
@@ -19,9 +19,9 @@ Before serving restore traffic, identify or recover:
 - repository ID
 - public repository salt
 - wrapping-key source for the keyring envelope
-- accepted checkpoint sequence, checkpoint ID, checkpoint object version ID
-  when available, and checkpoint digest
-- checkpoint-bound keyring-envelope reference
+- accepted v2 anchor sequence, commit key, commit object version ID when
+  available, commit body digest, signing key ID, and format-root reference
+- format-bound keyring-envelope reference
 - backend endpoint, bucket, and prefix
 - object-store audit events where available
 
@@ -45,7 +45,7 @@ helm upgrade <release> charts/rs3-gateway \
   --set-string gateway.mode=restore-readonly
 ```
 
-Do not switch back to `read-write` until the trusted checkpoint and anchor state
+Do not switch back to `read-write` until the trusted commit chain and anchor state
 are understood.
 
 ## 2. Preserve Evidence
@@ -72,71 +72,42 @@ cargo run -p rs3-server -- export-restore-bundle --format json > rs3-restore-bun
 ```
 
 The bundle contains public restore metadata, not wrapping-key material. If a
-fresh cluster is missing the Kubernetes Lease, import the trusted checkpoint
-position after configuring the same repository ID, salt, wrapping-key source, and
-backend.
+fresh cluster is missing the Kubernetes Lease, import the trusted v2 anchor
+after configuring the same repository ID, salt, wrapping-key source, backend,
+and retention settings.
 
 ```sh
-cargo run -p rs3-server -- import-anchor \
-  --checkpoint-sequence <bundle-sequence> \
-  --checkpoint-id <bundle-checkpoint-id> \
-  --checkpoint-version-id <bundle-checkpoint-version-id> \
-  --checkpoint-digest <bundle-checkpoint-digest>
+cargo run -p rs3-server -- import-v2-anchor \
+  --anchor-sequence <bundle-anchor-sequence> \
+  --anchor-commit-key <bundle-anchor-commit-key> \
+  --anchor-version-id <bundle-anchor-version-id> \
+  --anchor-body-digest <bundle-anchor-body-digest> \
+  --signing-key-id <bundle-signing-key-id> \
+  --format-generation <bundle-format-generation> \
+  --format-digest <bundle-format-digest> \
+  --format-object-id <bundle-format-object-id> \
+  --format-version-id <bundle-format-version-id> \
+  --weak-subjectivity-floor-sequence <bundle-floor-sequence>
 ```
 
-`import-anchor` verifies the checkpoint chain, checkpoint evidence, keyring
-envelope, and restore-critical objects before writing the missing anchor.
-Omit `--checkpoint-version-id` only for a trusted bundle that does not contain
-one; retained/Object Lock repositories should contain it.
+`import-v2-anchor` verifies the named signed commit chain, format root, and
+keyring envelope before writing the missing anchor. Omit version IDs only for a
+trusted bundle that does not contain them; retained/Object Lock repositories
+should contain them.
 
-For `v2-preview`, use `import-v2-anchor` with the bundle's anchor sequence,
-commit key, body digest, signing key ID, format generation, format digest,
-format object ID, optional version IDs, and weak-subjectivity floor. The
-repository ID, salt, wrapping-key source, backend, and retention settings must
-match the original repository or import fails closed.
+## 4. If No Bundle Exists, Stop
 
-## 4. If No Bundle Exists, Use Bounded Recovery
-
-When the old Lease is gone and no trusted bundle exists, storage evidence can
-help but is not a perfect latest-state authority. A malicious backend can hide
-newer valid evidence.
-
-Use explicit bounded recovery:
-
-```sh
-cargo run -p rs3-server -- recover-anchor \
-  --max-checkpoint-age-seconds <freshness-bound> \
-  --apply-if-missing \
-  --format text
-```
-
-Choose the freshness bound from the recovery objective. For example, `86400`
-means the recovered signed checkpoint must be no older than 24 hours. Do not use
-an unbounded scan as a substitute for a trusted anchor.
+When the old Lease is gone and no trusted v2 bundle exists, do not promote
+backend state by listing storage. A malicious backend can hide newer valid
+commits. Escalate to an operator-held authority, offline audit trail, or future
+HSM/KMS-backed anchor record before recreating the Lease.
 
 ## 5. Verify Before Restore
 
-Verify the chosen checkpoint against the backend before using it for restore.
-
-```sh
-cargo run -p xtask --bin xtask --features s3 -- restore verify \
-  --repository-id <repository-id> \
-  --repository-salt-hex <salt-hex> \
-  --keyring-envelope-object-id <envelope-object-id> \
-  --wrapping-key-id <wrapping-key-id> \
-  --wrapping-key-hex-file <wrapping-key-file> \
-  --checkpoint-sequence <checkpoint-sequence> \
-  --checkpoint-id <checkpoint-id> \
-  --checkpoint-digest <checkpoint-digest> \
-  --backend s3 \
-  --s3-bucket <bucket> \
-  --require-provider-delete-protection \
-  --format json
-```
-
-Reject the checkpoint if verification reports signature failure, broken parent
-chain, missing checkpoint evidence, keyring-envelope mismatch, payload
-decryptability failure, or missing required provider delete protection.
+Verify the trusted v2 anchor before using it for restore. The import path checks
+the signed commit chain, format root, and keyring envelope. After the gateway
+starts from the recovered anchor, run the restore client and verify restored
+application bytes before declaring the incident restore successful.
 
 ## 6. Restore Read-Only
 
@@ -180,21 +151,21 @@ Any other restore error is a failed restore.
 
 | Observation | Action |
 | --- | --- |
-| Signature fails | Reject checkpoint. |
-| Parent chain broken | Reject unless it is a trusted compaction root. |
+| Signature fails | Reject commit chain. |
+| Parent chain broken | Reject unless it is a trusted snapshot root. |
 | Sequence lower than trusted anchor | Treat as rollback. |
 | Digest differs from anchor | Fail closed and investigate. |
 | Anchor unavailable | Do not accept newer-looking storage state silently. |
-| Evidence higher than anchor | Investigate anchor rollback or missed anchor advance. |
-| Evidence lower than anchor | Investigate failed evidence write or backend replay. |
-| Anchor missing but evidence exists | Require recovery bundle or bounded recovery; do not trust storage alone. |
+| Backend contains commits newer than anchor | Investigate anchor rollback or missed anchor advance. |
+| Backend lacks the anchored commit | Treat as unavailable or tampered. |
+| Anchor missing but backend objects exist | Require a trusted recovery bundle; do not trust storage alone. |
 
 ## Break Glass
 
 Break-glass restore, if implemented, must require:
 
 - explicit operator command
-- selected checkpoint ID and sequence
+- selected commit key and sequence
 - audit reason or ticket
 - read-only backend credentials where possible
 - no automatic anchor repair

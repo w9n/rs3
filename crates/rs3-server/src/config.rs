@@ -58,7 +58,7 @@ pub struct RuntimeConfig {
 /// Gateway mutation posture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayMode {
-    /// Serve reads and accept checkpointed repository mutations.
+    /// Serve reads and accept committed repository mutations.
     ReadWrite,
     /// Serve restore reads only; reject repository mutations and do not bootstrap.
     RestoreReadOnly,
@@ -110,7 +110,7 @@ pub struct MetricsConfig {
 pub enum AnchorConfig {
     /// In-process anchor for local development and tests.
     Memory,
-    /// Kubernetes Lease object used as the monotonic checkpoint anchor.
+    /// Kubernetes Lease object used as the monotonic v2 commit anchor.
     KubernetesLease {
         /// Kubernetes namespace containing the Lease.
         namespace: String,
@@ -124,7 +124,7 @@ pub enum AnchorConfig {
 /// Coordinated commit batching settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatchConfig {
-    /// Maximum number of staged writes covered by one checkpoint.
+    /// Maximum number of staged writes covered by one commit.
     pub max_items: usize,
     /// Maximum delay before publishing a partial batch.
     pub max_delay: Duration,
@@ -150,9 +150,7 @@ pub struct RepositoryConfig {
 /// Durable repository format selected by this runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepositoryFormat {
-    /// Legacy production-preview format.
-    V1Preview,
-    /// Primary production-preview format for new repositories.
+    /// Production-preview format for new repositories.
     V2Preview,
 }
 
@@ -160,7 +158,6 @@ impl RepositoryFormat {
     /// Returns the environment/configuration spelling.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::V1Preview => "v1-preview",
             Self::V2Preview => "v2-preview",
         }
     }
@@ -388,12 +385,11 @@ fn parse_repository_format(source: &impl ConfigSource) -> Result<RepositoryForma
     let value = optional_value(source, REPOSITORY_FORMAT_ENV)
         .unwrap_or_else(|| DEFAULT_REPOSITORY_FORMAT.as_str().to_owned());
     match value.as_str() {
-        "v1-preview" => Ok(RepositoryFormat::V1Preview),
         "v2-preview" => Ok(RepositoryFormat::V2Preview),
         _ => Err(ConfigError::Invalid {
             key: REPOSITORY_FORMAT_ENV,
             value,
-            reason: "expected v1-preview or v2-preview".to_owned(),
+            reason: "expected v2-preview".to_owned(),
         }),
     }
 }
@@ -817,14 +813,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_repository_format_v1_preview() {
+    fn rejects_repository_format_v1_preview() {
         let source = minimal_source().with(super::REPOSITORY_FORMAT_ENV, "v1-preview");
 
         let config = RuntimeConfig::from_source(&source);
 
-        assert_eq!(
-            config.map(|config| config.repository.format),
-            Ok(RepositoryFormat::V1Preview)
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::REPOSITORY_FORMAT_ENV)
         );
     }
 
@@ -1055,7 +1050,7 @@ mod tests {
         let source = minimal_source()
             .with("RS3_ANCHOR_MODE", "kubernetes-lease")
             .with("RS3_ANCHOR_NAMESPACE", "backup")
-            .with("RS3_ANCHOR_NAME", "checkpoint")
+            .with("RS3_ANCHOR_NAME", "v2-anchor")
             .with("RS3_ANCHOR_FIELD_MANAGER", "rs3-controller");
 
         let config = RuntimeConfig::from_source(&source);
@@ -1064,7 +1059,7 @@ mod tests {
             config.map(|config| config.anchor),
             Ok(AnchorConfig::KubernetesLease {
                 namespace: "backup".to_owned(),
-                name: "checkpoint".to_owned(),
+                name: "v2-anchor".to_owned(),
                 field_manager: "rs3-controller".to_owned(),
             })
         );

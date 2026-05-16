@@ -27,7 +27,7 @@ Metrics labels must not include:
 - tenant names
 - backend object IDs
 - access keys or secret values
-- checkpoint digests or key material
+- commit digests or key material
 
 Startup logs use `backend_kind` and `config_profile` instead of configured
 bucket names, endpoints, prefixes, or repository IDs.

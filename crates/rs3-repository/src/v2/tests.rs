@@ -751,7 +751,15 @@ async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
     assert_eq!(accepted.sequence, Sequence::new(2));
     assert_eq!(chain.commits_newest_first.len(), 2);
     assert_eq!(commits.len(), 2);
-    assert_eq!(payloads.len(), 2);
+    let payload_section_count = chain.commits_newest_first[0]
+        .parsed_header
+        .header
+        .section_index
+        .iter()
+        .filter(|section| section.section_type == V2SectionType::Payload)
+        .count();
+    assert_eq!(payloads.len(), 0);
+    assert_eq!(payload_section_count, 2);
     assert_eq!(
         listed
             .into_iter()
@@ -759,6 +767,79 @@ async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
             .collect::<Vec<_>>(),
         vec![first_key, second_key]
     );
+}
+
+#[tokio::test]
+async fn v2_commit_retention_covers_strongest_staged_object() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        anchor.clone(),
+        CommitCoordinatorOptions::new(2, Duration::from_secs(60)),
+    ));
+
+    let weak = {
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .put_committed(
+                    LogicalPath::new("snapshots/weak-retention.bin")
+                        .unwrap_or_else(|error| panic!("{error}")),
+                    Bytes::from_static(b"weak"),
+                    RepositoryPutOptions {
+                        retention: Some(RetentionPolicy::new(RetentionMode::Governance, 1)),
+                        ..RepositoryPutOptions::default()
+                    },
+                )
+                .await
+        }
+    };
+    let strong = {
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .put_committed(
+                    LogicalPath::new("snapshots/strong-retention.bin")
+                        .unwrap_or_else(|error| panic!("{error}")),
+                    Bytes::from_static(b"strong"),
+                    RepositoryPutOptions {
+                        retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
+                        legal_hold: Some(LegalHoldStatus::On),
+                        ..RepositoryPutOptions::default()
+                    },
+                )
+                .await
+        }
+    };
+
+    let (weak, strong) = tokio::join!(weak, strong);
+    must_repo(weak);
+    must_repo(strong);
+    let accepted = must_v2(anchor.read_v2().await).expect("v2 anchor should exist");
+    let metadata = store
+        .head_at(&accepted.commit_key, accepted.version_id.as_ref())
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    assert_eq!(
+        metadata.retention,
+        Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
+    );
+    assert_eq!(metadata.legal_hold, Some(LegalHoldStatus::On));
 }
 
 #[tokio::test]
@@ -870,14 +951,16 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
         anchor,
         CommitCoordinatorOptions::new(8, Duration::from_millis(250)).with_max_pending_items(1),
     ));
+    let first_key = LogicalPath::new("snapshots/v2-backpressure-first.bin")
+        .unwrap_or_else(|error| panic!("{error}"));
 
     let first = {
         let coordinator = Arc::clone(&coordinator);
+        let key = first_key.clone();
         tokio::spawn(async move {
             coordinator
                 .put_committed(
-                    LogicalPath::new("snapshots/v2-backpressure-first.bin")
-                        .unwrap_or_else(|error| panic!("{error}")),
+                    key,
                     Bytes::from_static(b"first"),
                     RepositoryPutOptions::default(),
                 )
@@ -886,13 +969,7 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
     };
 
     for _ in 0..100 {
-        let payloads = must_v2(
-            store
-                .list_prefix("segments/")
-                .await
-                .map_err(|_| V2FormatError::StorageOperationFailed),
-        );
-        if payloads.len() == 1 {
+        if repository.head(&first_key).is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -906,9 +983,9 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
             RepositoryPutOptions::default(),
         )
         .await;
-    let payloads_after_rejection = must_v2(
+    let commits_after_rejection = must_v2(
         store
-            .list_prefix("segments/")
+            .list_prefix("commits/v01/")
             .await
             .map_err(|_| V2FormatError::StorageOperationFailed),
     );
@@ -918,7 +995,7 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
         rejected,
         Err(crate::RepositoryError::CommitBackpressure)
     ));
-    assert_eq!(payloads_after_rejection.len(), 1);
+    assert_eq!(commits_after_rejection.len(), 1);
     match first {
         Ok(joined) => assert!(matches!(joined, Ok(Ok(_)))),
         Err(error) => panic!("{error}"),

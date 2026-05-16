@@ -106,7 +106,7 @@ pub(crate) fn apply_index_delta_object(state: &mut RepositoryState, delta: Index
                 entry,
                 prefix_tokens,
                 sealed_manifest: _,
-            } => state.namespace.upsert(entry, prefix_tokens),
+            } => state.namespace.upsert(*entry, prefix_tokens),
             IndexDelta::Tombstone {
                 blind_key,
                 generation,

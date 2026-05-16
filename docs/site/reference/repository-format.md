@@ -7,10 +7,10 @@ not a compatibility promise.
 
 - Backend object names are opaque.
 - Plaintext logical paths and Kubernetes names do not appear in backend keys,
-  tags, unauthenticated metadata, checkpoints, metrics, or logs.
+  tags, unauthenticated metadata, commit headers, metrics, or logs.
 - Privacy-sensitive metadata is encrypted and authenticated.
-- Checkpoints are signed and monotonic.
-- Old data remains readable while any protected checkpoint can reference it.
+- Commits are signed, monotonic, and selected by an external anchor.
+- Old data remains readable while any protected anchored commit can reference it.
 - Provider retention is never shortened by `rs3`.
 - Retained restore-critical references are bound to provider object versions
   when the backend supports version IDs.
@@ -23,11 +23,6 @@ The design uses a small number of non-secret classes:
 format/
 keyrings/
 commits/
-segments/
-manifests/
-index/
-checkpoints/
-evidence/
 ```
 
 The class leaks broad object type. That is currently accepted because it helps
@@ -36,9 +31,9 @@ a future format version.
 
 ## v2 Preview
 
-`v2-preview` is the default format for new repositories. `v1-preview` remains
-selectable for legacy preview experiments, but new deployments should use a
-fresh `v2-preview` repository rather than carrying forward unused v1 state.
+`v2-preview` is the active preview format for new repositories. Older preview
+experiments are historical tags, not a compatibility target for new
+deployments.
 
 v2 commit objects use random, path-private keys:
 
@@ -57,16 +52,20 @@ The retained-version/Object Lock provider profile does not require atomic
 `HEAD`/`GET`/range `GET`, visible retention or legal-hold state, and preserved
 old versions after a newer latest version exists.
 
-The current v2 runtime reuses the trusted namespace, sealed manifest, and
-segmented encrypted payload model described below. The difference is the
-durable commit boundary: pending sealed index deltas are embedded in signed v2
-commit sections and replayed from the anchor-selected commit chain.
+Normal v2 delta commits contain zero or more encrypted `PAYLOAD` sections and
+one encrypted `INDEX_DELTA` section. Snapshot commits contain an
+`INDEX_SNAPSHOT` section. The encrypted index entries reference payload section
+offsets and lengths inside the same commit; once the commit is accepted, the
+reference is resolved to the anchored commit key, provider version ID when
+available, and commit body digest. v2 does not write repository payloads to
+backend `segments/`, nor does it write backend `index/`, `manifests/`,
+`checkpoints/`, or `evidence/` objects.
 
-The gateway uses the same commit batching knobs for v2 as for v1. Concurrent
-client PUTs can stage multiple encrypted payloads and publish one signed v2
-delta commit that covers all pending index updates; if commit publication or
-anchor advancement fails, the unaccepted in-memory namespace state is rolled
-back while the failed logical payload sequences remain reserved.
+The gateway uses commit batching knobs for v2. Concurrent client PUTs can stage
+multiple encrypted payloads and publish one signed v2 delta commit that covers
+all pending index updates; if commit publication or anchor advancement fails,
+the unaccepted in-memory namespace state is rolled back while the failed
+logical payload sequences remain reserved.
 
 v2 snapshot commits consolidate the live blinded namespace into an encrypted
 `INDEX_SNAPSHOT` section. Readers walk the signed parent chain only until the
@@ -90,17 +89,20 @@ recreates it from a trusted bundle after verifying the named commit chain.
 configured backend; retained governance profiles require an explicit operator
 review flag because gateway credentials must not be able to bypass retention.
 
-## Payload Segments
+## Payload Sections
 
-Payload segments are independently encrypted with XChaCha20-Poly1305 so ranged
-reads can fetch only the overlapping backend segments. Segment associated data
-binds ciphertext to the backend object ID, segment size, plaintext length,
-segment index, and final-segment marker.
+Payload sections are encrypted with XChaCha20-Poly1305 using the same payload
+envelope as earlier preview work, but the associated backend object ID is the
+commit key and the ciphertext bytes are stored inside the commit object.
+Segment associated data binds ciphertext to the commit key, segment size,
+plaintext length, segment index, and final-segment marker.
 
-Segment size is recorded per payload object. The current writer default keeps
+Segment size is recorded per payload section. The current writer default keeps
 small objects at 512 plaintext bytes per segment and uses larger segments for
 medium and large objects. This is a tuning policy, not a permanent format
-guarantee.
+guarantee. The current reader resolves the anchored commit and opens the named
+payload section; a later optimization may range-fetch just the header and
+overlapping payload section bytes.
 
 ## Index State
 
@@ -109,54 +111,38 @@ metadata needed for `HEAD`, `GET`, and `LIST`.
 
 Metadata records are sealed with AES-256-GCM-SIV under the repository metadata
 key. Associated data is object-type specific: manifest records bind to the
-manifest ID, and index deltas bind to the index-delta object domain. Signed
-checkpoints and object IDs decide which sealed metadata is reachable repository
+manifest ID, and index sections bind to the v2 commit key and section index.
+Anchored signed commits decide which sealed metadata is reachable repository
 state.
 
-Namespace entries reference the encrypted payload object ID and, when available,
-the provider version ID returned by the backend write. Retained/Object Lock
-repository operation requires this version ID so restore can read the exact
-retained payload version even if the backend later presents a different latest
+Namespace entries reference the accepted commit key, provider version ID when
+available, commit body digest, and payload section offset/length. Retained/Object
+Lock repository operation requires this version ID so restore can read the exact
+retained commit version even if the backend later presents a different latest
 version.
 
 For retained-version providers, a same-key write may create another retained
 version instead of failing as a duplicate. The format does not treat latest
-object state as authoritative in that profile; checkpoint-bound object IDs,
-provider version IDs, and digests decide reachable state.
+object state as authoritative in that profile; anchored commit keys, provider
+version IDs, and digests decide reachable state.
 
-Index changes are append-friendly deltas covered by checkpoints. Compaction can
-rewrite index state later, but it must preserve rollback and retention rules.
+Index changes are append-friendly deltas covered by signed commits. Snapshot
+commits compact live namespace state, but they must preserve rollback and
+retention rules.
 
-## Checkpoints
+## Anchors
 
-A checkpoint records an ordered repository state transition:
+The external v2 anchor records the accepted commit sequence, commit key, commit
+body digest, provider version ID when available, signing key ID, and format-root
+reference. It is the latest-state authority. A backend listing, a newest-looking
+commit key, or retained object history is never enough to advance repository
+state without the anchor.
 
-- sequence number
-- parent checkpoint reference and provider version ID when available
-- referenced index deltas or compacted segments, including provider version IDs
-  when available
-- active key descriptors
-- active keyring envelope generation, object ID, provider version ID, and digest
-  when configured
-- repository-state digest
-- signed publish time
-- retention/evidence policy marker
-- signature over the canonical payload
-
-Checkpoints must not contain plaintext logical names.
-
-## Evidence
-
-Each newly published checkpoint writes a create-only evidence object under
-`evidence/`. Evidence records contain the checkpoint sequence, checkpoint ID,
-canonical checkpoint digest, signed checkpoint object ID, and signed checkpoint
-object version ID when available. They are retained with the same policy and
-legal hold as the checkpoint object.
-
-Evidence is not a latest-state authority. It gives operators retained storage
-history to compare with the external anchor during open, restore, and rollback
-investigations. The external anchor decides which checkpoint position is
-accepted; evidence proves what storage retained for that position.
+Anchors must fail closed. If the anchor cannot be read, cannot be advanced, or
+does not match the verified commit chain, the gateway must not silently accept
+newer-looking backend state. Disaster recovery uses a trusted v2 restore bundle
+containing the anchor state and weak-subjectivity floor, then verifies the named
+commit chain before recreating the anchor.
 
 ## Keyrings
 
@@ -165,7 +151,7 @@ The repository uses purpose-specific keys for:
 - namespace PRF
 - content encryption
 - metadata and index encryption
-- Ed25519 checkpoint signing
+- Ed25519 commit signing
 
 New writes use primary keys. Reads and replay accept enabled historical keys
 until retention policy and repository reachability allow retirement. Data-key
@@ -176,42 +162,41 @@ The preferred bootstrap shape is to use an operator-provided repository ID and
 public salt, generate random purpose-specific data keys, and store them in an
 encrypted keyring envelope under a counted `keyrings/` object. The wrapping-key
 source, such as a KMS key or high-entropy wrapping key, stays outside the
-repository. Signed checkpoints bind the active envelope by generation, object
-ID, provider version ID when available, and digest so a backend cannot silently
-swap envelopes. The envelope is checkpoint-bound, not checkpoint-embedded:
-normal checkpoints do not rewrite key material, but a key update becomes
-accepted repository state only after a signed checkpoint names the new envelope.
+repository. The encrypted v2 format root binds the active envelope by
+generation, object ID, provider version ID when available, and digest so a
+backend cannot silently swap envelopes. The envelope is format-root-bound and
+commit-referenced, not embedded in every commit.
 
 Wrapping-key rewrap preserves the same repository data keys. It is useful for
 moving the wrapping-key source or retiring a clean wrapping key, but it is not
 recovery from exposure of an old wrapping key plus the old envelope bytes.
 
 Repository-local orphan cleanup is reachability and retention aware. It derives
-candidates from an accepted checkpoint chain, skips objects with known retention
-or legal hold, and treats provider retention or legal-hold delete failures as
+candidates from an accepted commit chain, skips objects with known retention or
+legal hold, and treats provider retention or legal-hold delete failures as
 blocked cleanup rather than as successful deletion.
 
 Initial empty repositories are initialized by writing an encrypted keyring
-envelope. Existing anchored repositories open through the envelope reference
-inside the accepted signed checkpoint, not through S3 listing order or a mutable
-latest pointer.
+envelope, an encrypted format root, and a genesis commit. Existing anchored
+repositories open through the format-root and commit-chain references inside
+the accepted anchor, not through S3 listing order or a mutable latest pointer.
 
-In retained/Object Lock mode, keyring envelopes, checkpoints, index objects, and
-payload objects must all return provider version IDs at write time. Missing
-version IDs are treated as provider capability failures, because retained
-restore cannot depend on mutable latest-object reads.
+In retained/Object Lock mode, keyring envelopes, format roots, and commit
+objects must all return provider version IDs at write time. Missing version IDs
+are treated as provider capability failures, because retained restore cannot
+depend on mutable latest-object reads.
 
-Checkpoint-signing descriptors include the Ed25519 public verification key so
-checkpoint payloads can be verified without exposing signing material.
+Commit-signing descriptors include the Ed25519 public verification key so commit
+headers can be verified without exposing signing material.
 
 See [Cryptography](cryptography.md) for primitive choices, nonce rules, and
 known preview limits.
 
 ## Compatibility Promise
 
-There is no stable-format promise yet. The production-preview target is an
-evaluation contract, not a durable repository-format guarantee. Before a stable
-format v1, the project still needs final decisions for:
+There is no stable repository-format promise yet. The production-preview target
+is an evaluation contract, not a durable repository-format guarantee. Before a
+stable format, the project still needs final decisions for:
 
 - canonical metadata encoding
 - default segment-size policy

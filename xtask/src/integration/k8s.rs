@@ -126,11 +126,7 @@ mod imp {
         }
 
         let (image_repository, image_tag) = split_image_ref(&args.image);
-        let anchor_mode = if args.repository_format.is_v2() {
-            "kubernetes-lease"
-        } else {
-            "memory"
-        };
+        let anchor_mode = "kubernetes-lease";
         helm_install_gateway(
             &args.helm_bin,
             cluster.kubeconfig_path(),
@@ -191,14 +187,12 @@ mod imp {
                 Ok(())
             })
             .and_then(|_| {
-                if args.repository_format.is_v2() {
-                    assert_v2_lease_anchor(
-                        &args.kubectl_bin,
-                        cluster.kubeconfig_path(),
-                        &args.namespace,
-                        "checkpoint",
-                    )?;
-                }
+                assert_v2_lease_anchor(
+                    &args.kubectl_bin,
+                    cluster.kubeconfig_path(),
+                    &args.namespace,
+                    "checkpoint",
+                )?;
                 Ok(())
             });
 

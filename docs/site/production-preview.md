@@ -1,4 +1,4 @@
-# V1 Production Preview
+# V2 Production Preview
 
 The first release target is a production preview for Kubernetes operators who
 store backups on S3-compatible infrastructure they do not fully trust. The main
@@ -23,8 +23,8 @@ provider can learn or change:
 - backend-injected objects are ignored unless they are referenced by signed
   repository state
 - backend rollback is rejected against the configured external anchor
-- retained storage evidence helps investigate whether the backend or control
-  plane lied
+- retained exact-version objects and trusted recovery bundles help investigate
+  whether the backend or anchor service served stale or inconsistent state
 
 `rs3` does not replace Velero, Kopia, database-native backup consistency, or
 application-aware restore validation. It protects the object-store boundary and
@@ -35,7 +35,7 @@ the repository-state transition model.
 | Safe preview claim | Not a preview claim |
 | --- | --- |
 | Backend object keys and path-sensitive metadata are opaque to the storage backend. | The backend learns nothing; object counts, sizes, timing, and broad object classes remain visible. |
-| Anchored signed checkpoints detect backend rollback against the trusted anchor. | S3 Object Lock or retention alone proves the latest repository state. |
+| Anchored signed commits detect backend rollback against the trusted anchor. | S3 Object Lock or retention alone proves the latest repository state. |
 | `restore-readonly` serves restore reads and rejects supported repository mutations. | Every backup client will report a clean success status when its own restore bookkeeping writes are denied. |
 | Velero/Kopia and Kopia compatibility are covered by local integration evidence. | Broad generic S3 application compatibility is promised. |
 | The preview repository can be evaluated with documented recovery material. | The durable repository format is stable across future releases. |
@@ -48,7 +48,7 @@ the repository-state transition model.
 | Compatibility client | Kopia |
 | Deployment | Kubernetes |
 | External anchor | Kubernetes Lease |
-| Storage witness | Create-only checkpoint evidence under `evidence/` |
+| Storage witness | Retained exact-version commit objects; the Kubernetes Lease remains the latest-state authority |
 | Backend | RustFS/local S3-compatible first, live S3-compatible checks opt-in |
 | Keys | Encrypted keyring envelope |
 | Gateway modes | `read-write` for backups and routine restores, `restore-readonly` for incident restore |
@@ -63,30 +63,30 @@ also assumes the Kubernetes API used for the Lease anchor is a separate trust
 domain from the storage backend.
 
 The Kubernetes Lease is the preview authority for latest accepted repository
-state. Storage-side checkpoint evidence is a witness, not the authority. On a
-healthy open, the accepted anchor position, signed checkpoint chain, keyring
-envelope reference, and checkpoint evidence must agree. If they do not agree,
-the gateway must fail closed or enter an explicit recovery workflow.
+state. Retained commit objects are useful history, not the authority. On a
+healthy open, the accepted anchor position, signed commit chain, format root,
+and keyring envelope reference must agree. If they do not agree, the gateway
+must fail closed or enter an explicit recovery workflow.
 
 This means a malicious backend should not be able to make the gateway silently
-restore an older valid checkpoint while the in-cluster anchor still records a
-newer one. The backend can still deny service by hiding required objects.
+restore an older valid commit while the in-cluster anchor still records a newer
+one. The backend can still deny service by hiding required objects.
 
 ## Failure Rules
 
 | Situation | Preview behavior |
 | --- | --- |
 | Empty backend prefix and no anchor | Startup may initialize one generated keyring envelope using the supplied repository ID, salt, and wrapping-key source. An envelope object ID is optional override state, not normal Helm state. |
-| Existing backend prefix and matching anchor | Open after signed checkpoint, envelope, and evidence validation. |
-| Backend serves an older checkpoint than the Lease anchor | Fail closed as rollback. |
-| Backend hides the checkpoint or evidence named by the Lease anchor | Fail closed as unavailable or tampered. |
+| Existing backend prefix and matching anchor | Open after signed commit-chain, format-root, and envelope validation. |
+| Backend serves an older commit than the Lease anchor | Fail closed as rollback. |
+| Backend hides the commit named by the Lease anchor | Fail closed as unavailable or tampered. |
 | Backend adds unrelated objects | Ignore them unless signed and reachable from anchored state. |
-| Backend overwrites checkpoint, evidence, index, metadata, or payload bytes | Reject through native create-only write checks, signed/digested state, AEAD authentication, or retained-version exact reads. S3 providers qualify through either `atomic-create` or `retained-version`; `HEAD` before `PUT` is not a production fallback. |
-| Backend evidence appears newer than the Lease anchor | Treat as ambiguous; fail closed until explicit recovery resolves whether the anchor missed an advance or was rolled back. |
-| Lease missing but backend evidence exists | Do not silently trust storage. Require a trusted bundle or explicit bounded recovery that validates the highest observed valid checkpoint and enforces a maximum signed checkpoint age. |
+| Backend overwrites format, keyring, commit, metadata, or payload bytes | Reject through native create-only write checks, signed/digested state, AEAD authentication, or retained-version exact reads. S3 providers qualify through either `atomic-create` or `retained-version`; `HEAD` before `PUT` is not a production fallback. |
+| Backend contains commits newer than the Lease anchor | Do not silently advance. Treat as ambiguous until explicit recovery validates a trusted bundle or a separately approved anchor decision. |
+| Lease missing but backend objects exist | Do not silently trust storage. Require a trusted v2 recovery bundle and verify the named commit chain before recreating the anchor. |
 | Multiple gateways serve the same repository as `read-write` | Unsupported. Run one writer per repository; use `restore-readonly` for scaled restore readers. |
 | Gateway started as `restore-readonly` without an accepted anchor | Fail closed. Run explicit anchor recovery first, then serve restore traffic. |
-| Healthy Velero restore through the primary path | Run through the single `read-write` gateway so Velero restore-result artifacts are checkpointed and the restore can report `Completed`. |
+| Healthy Velero restore through the primary path | Run through the single `read-write` gateway so Velero restore-result artifacts are committed and the restore can report `Completed`. |
 | Restore client attempts PUT, DELETE, or legal-hold mutation through `restore-readonly` | Reject the request instead of advancing repository state. |
 | Velero restore reports `PartiallyFailed` only because restore-result artifact uploads were denied by `restore-readonly` | Accept only after proving restored data, completed pod-volume restore, and zero backend writes during restore. Treat any other restore error as failure. |
 | Lease and backend are both compromised | Online protection is exhausted; recovery needs offline or externally protected authority. |
@@ -115,8 +115,8 @@ Startup bootstrap behavior is:
 - if the configured backend prefix is empty, initialize exactly one repository
   using the supplied repository ID, supplied salt, and wrapping-key source
 - if the prefix already contains repository state, verify that the configured
-  repository ID, salt, checkpoint-bound envelope, wrapping-key source, anchor,
-  and evidence match
+  repository ID, salt, format-bound envelope, wrapping-key source, anchor, and
+  commit chain match
 - if the prefix is non-empty but cannot be verified, stop with a precise error
   instead of creating new state
 
@@ -127,18 +127,18 @@ A new cluster needs more than backend credentials:
 - repository ID
 - repository salt
 - wrapping-key source for the envelope
-- trusted anchor position: sequence, checkpoint ID, checkpoint object version ID
-  when available, and checkpoint digest, or an explicit bounded recovery
-  decision from retained evidence
+- trusted v2 anchor position: sequence, commit key, commit object version ID
+  when available, commit body digest, signing key ID, and format-root reference
 
 The trusted anchor position can come from a recovery bundle, audited export, or
-trusted external anchor. Storage evidence can help prove what existed in the
-backend, but by itself it is not a perfect latest-state authority because a
-malicious backend can hide newer valid evidence or replay older valid evidence.
+trusted external anchor. Retained backend versions can help prove what
+existed in storage, but by themselves they are not a latest-state authority
+because a malicious backend can hide newer valid commits or replay older valid
+commits.
 
 An external anchor can distribute trust outside the cluster. It should store
-or sign the accepted checkpoint position, not the whole repository index. That
-position already commits to the signed checkpoint chain and therefore to the
+or sign the accepted commit position, not the whole repository index. That
+position already commits to the signed commit chain and therefore to the
 repository state reachable from it.
 
 ## Current Evidence
@@ -148,7 +148,7 @@ Latest focused evidence:
 | Evidence | Result |
 | --- | --- |
 | Live retained-backend clean v2 preview gate | Passed on 2026-05-16 with `just preview-gate-v2-live` after Postgres harness retry hardening. S3 gateway/tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes all passed under prefix base `isolated live prefix`; artifacts `.local/integration/` and `.local/integration/`. |
-| Local v1/v2 gateway perf comparison | Passed on 2026-05-16 with 3 repeated release-profile local RustFS gateway runs per workload. Median v2 write request cost dropped from 3.0 to 2.0 requests/object for sequential committed writes and from 1.25 to 1.125 requests/object for batch-8 parallel writes; read request cost was unchanged. Raw artifacts: `.local/perf/` and `.local/perf/`. |
+| Local v2 gateway perf baseline | Passed on 2026-05-16 with `just perf-s3-gateway --objects 16 --object-size 4096 --reads 16 --range-len 512 --commit-batch-items 8 --concurrency 8 --format jsonl`; v2-preview emitted only committed-write/read scenarios through the gateway container, with parallel write batching at 2 backend PUTs for 16 objects, full-read amplification about 2.39x, and 512-byte range-read amplification about 19.19x for this tiny smoke shape. |
 | Live retained-backend consolidated v2 preview gate | Exercised on 2026-05-16 with `just preview-gate-v2-live`: S3 gateway/tooling, Kopia, Kubernetes Lease, and Velero dynamic-PVC gateway-restart passed under prefix base `isolated live prefix`; the Velero/Postgres lane passed after harness retry hardening on fresh prefix `isolated live prefix`; artifacts `.local/integration/` and `.local/integration/`. |
 | Live retained-backend v2 provider conformance | Passed on 2026-05-16 with `rs3 check-v2-provider` for the retained-version/Object Lock profile, including exact-version `HEAD`, `GET`, range `GET`, overwrite version survival, retention extension, delete blocking, and the governance-bypass review marker; backend prefix `isolated live prefix`. |
 | Live retained-backend v2 gateway smoke | Passed on 2026-05-16 with `just integration-s3-gateway-v2-live` through the local gateway using `mc` and default `rclone lsf` for `PUT`, `HEAD`, `GET`, and prefix listing with governance retention; the xtask backend key check found no client-visible names in repository object keys; backend prefix `isolated live prefix`. |
@@ -213,12 +213,12 @@ Release candidates should also run the release integration gate:
 just preview-gate-release
 ```
 
-For restore evidence, run `xtask restore verify` against a trusted checkpoint
-position from the configured anchor.
+For restore evidence, run restore traffic through the anchored v2 gateway and
+verify the restored bytes against the application workload.
 
 For disaster-recovery evidence, export a trusted restore bundle with
 `rs3-server export-restore-bundle` and prove anchor import with
-`rs3-server import-anchor` in a clean cluster.
+`rs3-server import-v2-anchor` in a clean cluster.
 
 ## Configuration Checklist
 
@@ -252,8 +252,8 @@ A preview is ready when the release evidence shows:
   normal `read-write` mode with restore status `Completed`
 - the Velero/Postgres compatibility smoke restores verified application data
 - restore-readonly mode rejects supported writes and still serves restore reads
-- restore verification succeeds for the checkpoint under test, including
-  checkpoint evidence and keyring-envelope binding
+- restore verification succeeds for the anchored commit chain under test,
+  including format-root and keyring-envelope binding
 - a trusted restore bundle can be exported and imported into a missing anchor
 - performance evidence compares gateway behavior to the straight RustFS proxy
   baseline

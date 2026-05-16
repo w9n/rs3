@@ -75,7 +75,7 @@ Interpretation:
 - Backend request counts are at or below the straight proxy baseline for the
   Kubernetes-shaped profiles and within 1.10x to 1.16x for the medium and
   Postgres-shaped profiles. The highest request ratio remains the one-object
-  medium profile, where checkpoint and evidence work has little
+  medium profile, where commit and anchor work has little
   opportunity to amortize.
 - Built-in regression budgets passed for request ratios, byte ratios, restore
   phase ratios, and repeated-run stability.
@@ -116,7 +116,7 @@ Track these before optimizing:
 - gateway backend read bytes per returned client `GET` byte
 - gateway backend write bytes per client `PUT` request byte
 - restore phase elapsed ratio
-- gateway commit phase averages, especially stage-lock wait and checkpoint wait
+- gateway commit phase averages, especially stage-lock wait and commit wait
 - gateway CPU time and high-water RSS
 - variability across repeated runs
 
@@ -172,7 +172,7 @@ cargo run -p xtask --bin xtask --features containers -- integration kopia-measur
 ```
 
 Budgets focus on request and byte amplification. Larger restore request budgets
-allow modest extra requests for checkpoint and evidence writes; byte budgets are
+allow modest extra requests for v2 commit and anchor writes; byte budgets are
 tighter. Cache hit ratios remain reported diagnostics, but are not enforced for
 the `many-small-files` profile because that workload can legitimately pass the
 request and byte budgets without reusing decrypted payload spans. Elapsed-time
@@ -183,7 +183,7 @@ and host load can dominate.
 
 - Keep run order alternating between direct and gateway lanes.
 - Keep measuring variability with at least three runs for release claims.
-- Reduce commit stage-lock and checkpoint-wait time without allowing
-  checkpoints to race writes whose sequence state is not yet indexed.
+- Reduce commit stage-lock and commit-wait time without allowing commits to
+  race writes whose sequence state is not yet indexed.
 - Add provider matrix runs for additional S3-compatible stores after the
   retained-backend retained-version lane remains repeatable.

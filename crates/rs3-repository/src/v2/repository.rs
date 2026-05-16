@@ -192,6 +192,10 @@ pub struct V2CommitWrite {
     pub is_snapshot: bool,
     /// Opaque sections to include in physical order.
     pub sections: Vec<V2CommitSection>,
+    /// Retention required by objects represented in this commit.
+    pub retention: Option<RetentionPolicy>,
+    /// Legal hold required by objects represented in this commit.
+    pub legal_hold: Option<LegalHoldStatus>,
 }
 
 impl V2CommitWrite {
@@ -200,6 +204,8 @@ impl V2CommitWrite {
         Self {
             is_snapshot: true,
             sections,
+            retention: None,
+            legal_hold: None,
         }
     }
 
@@ -208,7 +214,21 @@ impl V2CommitWrite {
         Self {
             is_snapshot: false,
             sections,
+            retention: None,
+            legal_hold: None,
         }
+    }
+
+    /// Requests at least this retention for the physical commit object.
+    pub const fn with_retention(mut self, retention: Option<RetentionPolicy>) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    /// Requests this legal hold for the physical commit object.
+    pub const fn with_legal_hold(mut self, legal_hold: Option<LegalHoldStatus>) -> Self {
+        self.legal_hold = legal_hold;
+        self
     }
 }
 
@@ -428,6 +448,28 @@ where
             .await
     }
 
+    /// Writes and anchors a child commit whose sections depend on the generated commit key.
+    pub async fn write_child_commit_with<A, F>(
+        &self,
+        anchor: &A,
+        build: F,
+    ) -> V2Result<V2StoredCommit>
+    where
+        A: V2CommitAnchor,
+        F: FnMut(&V2CommitKey) -> V2Result<V2CommitWrite>,
+    {
+        let current = anchor.read_v2().await?;
+        let Some(current) = current else {
+            return Err(V2FormatError::MissingAnchor);
+        };
+        let next_sequence = current
+            .sequence
+            .checked_next()
+            .ok_or(V2FormatError::InvalidHeaderField)?;
+        self.write_commit_with_expected_anchor_builder(anchor, Some(current), next_sequence, build)
+            .await
+    }
+
     /// Reads and verifies the commit currently selected by the anchor.
     pub async fn read_anchor_head<A>(&self, anchor: &A) -> V2Result<Option<V2ParsedCommit>>
     where
@@ -508,7 +550,9 @@ where
             .get_range_at(object_id, version_id, ByteRange::Full)
             .await
             .map_err(|_| V2FormatError::StorageOperationFailed)?;
-        parse_v2_commit_object(object_id, body, &self.keyring)
+        let mut parsed = parse_v2_commit_object(object_id, body, &self.keyring)?;
+        parsed.version_id = version_id.cloned();
+        Ok(parsed)
     }
 
     async fn read_commit_from_anchor_state(
@@ -753,6 +797,23 @@ where
     where
         A: V2CommitAnchor,
     {
+        self.write_commit_with_expected_anchor_builder(anchor, expected, sequence, |_| {
+            Ok(write.clone())
+        })
+        .await
+    }
+
+    async fn write_commit_with_expected_anchor_builder<A, F>(
+        &self,
+        anchor: &A,
+        expected: Option<V2AnchorState>,
+        sequence: Sequence,
+        mut build: F,
+    ) -> V2Result<V2StoredCommit>
+    where
+        A: V2CommitAnchor,
+        F: FnMut(&V2CommitKey) -> V2Result<V2CommitWrite>,
+    {
         let parent = expected.as_ref().map(|state| V2CommitParentRef {
             sequence: state.sequence,
             commit_key: state.commit_key.clone(),
@@ -760,11 +821,15 @@ where
             version_id: state.version_id.clone(),
         });
 
-        let (section_index, section_region) = build_section_region(&write.sections)?;
-        let body_digest = body_digest_for_v2_sections(&section_index, &section_region)?;
         let mut last_collision = false;
         for _ in 0..MAX_RANDOM_KEY_ATTEMPTS {
             let commit_key = generate_v2_commit_key(sequence)?;
+            let write = build(&commit_key)?;
+            let commit_retention =
+                strongest_retention_policy(self.options.retention, write.retention);
+            let commit_legal_hold = strongest_legal_hold(self.options.legal_hold, write.legal_hold);
+            let (section_index, section_region) = build_section_region(&write.sections)?;
+            let body_digest = body_digest_for_v2_sections(&section_index, &section_region)?;
             let header = self.build_header(
                 &commit_key,
                 parent.clone(),
@@ -774,7 +839,12 @@ where
             )?;
             let object_body = header.encode_object(self.options.upload_mode, &section_region)?;
             let put = self
-                .put_commit_object(&commit_key.object_id, object_body)
+                .put_commit_object(
+                    &commit_key.object_id,
+                    object_body,
+                    commit_retention,
+                    commit_legal_hold,
+                )
                 .await;
             let metadata = match put {
                 Ok(metadata) => metadata,
@@ -785,7 +855,12 @@ where
                 Err(_) => return Err(V2FormatError::StorageOperationFailed),
             };
             let version_id = self
-                .verify_commit_postconditions(&commit_key.object_id, &metadata)
+                .verify_commit_postconditions(
+                    &commit_key.object_id,
+                    &metadata,
+                    commit_retention,
+                    commit_legal_hold,
+                )
                 .await?;
             let anchor_state = V2AnchorState {
                 sequence,
@@ -844,6 +919,8 @@ where
         &self,
         object_id: &BackendObjectId,
         body: Bytes,
+        retention: Option<RetentionPolicy>,
+        legal_hold: Option<LegalHoldStatus>,
     ) -> rs3_storage::Result<BlobMetadata> {
         if self.options.provider_profile == V2ProviderProfile::RetainedVersionObjectLock {
             match self.store.head(object_id).await {
@@ -857,8 +934,8 @@ where
                 object_id,
                 body,
                 PutOptions {
-                    retention: self.options.retention,
-                    legal_hold: self.options.legal_hold,
+                    retention,
+                    legal_hold,
                     content_type: Some(V2_COMMIT_CONTENT_TYPE.to_owned()),
                     do_not_recreate: self.options.provider_profile
                         != V2ProviderProfile::RetainedVersionObjectLock,
@@ -871,26 +948,26 @@ where
         &self,
         object_id: &BackendObjectId,
         metadata: &BlobMetadata,
+        retention: Option<RetentionPolicy>,
+        legal_hold: Option<LegalHoldStatus>,
     ) -> V2Result<Option<BackendVersionId>> {
         match self.options.provider_profile {
             V2ProviderProfile::Dev | V2ProviderProfile::AtomicCreate => {
                 Ok(metadata.version_id.clone())
             }
             V2ProviderProfile::RetainedVersionObjectLock => {
-                if self.options.retention.is_none()
-                    && self.options.legal_hold != Some(LegalHoldStatus::On)
-                {
+                if retention.is_none() && legal_hold != Some(LegalHoldStatus::On) {
                     return Err(V2FormatError::ProviderProfileFailed);
                 }
                 let Some(version_id) = metadata.version_id.clone() else {
                     return Err(V2FormatError::ProviderProfileFailed);
                 };
-                if let Some(retention) = self.options.retention
+                if let Some(retention) = retention
                     && !retention_satisfies(metadata.retention.as_ref(), &retention)
                 {
                     return Err(V2FormatError::ProviderProfileFailed);
                 }
-                if self.options.legal_hold == Some(LegalHoldStatus::On)
+                if legal_hold == Some(LegalHoldStatus::On)
                     && metadata.legal_hold != Some(LegalHoldStatus::On)
                 {
                     return Err(V2FormatError::ProviderProfileFailed);
@@ -966,6 +1043,24 @@ fn build_section_region(
         });
     }
     Ok((section_index, Bytes::from(region)))
+}
+
+fn strongest_retention_policy(
+    left: Option<RetentionPolicy>,
+    right: Option<RetentionPolicy>,
+) -> Option<RetentionPolicy> {
+    crate::service::strongest_retention_policy(left, right)
+}
+
+fn strongest_legal_hold(
+    left: Option<LegalHoldStatus>,
+    right: Option<LegalHoldStatus>,
+) -> Option<LegalHoldStatus> {
+    if left == Some(LegalHoldStatus::On) || right == Some(LegalHoldStatus::On) {
+        Some(LegalHoldStatus::On)
+    } else {
+        left.or(right)
+    }
 }
 
 fn current_time_ms() -> i64 {

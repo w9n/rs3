@@ -8,23 +8,22 @@ flags may override selected listener and gateway-mode settings.
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `RS3_BIND` | no | `127.0.0.1:9080` | Gateway S3 listener socket address. |
-| `RS3_GATEWAY_MODE` | no | `read-write` | `read-write` accepts checkpointed mutations. `restore-readonly` serves restore reads, rejects supported mutations, refuses bootstrap, and requires an accepted anchor. |
+| `RS3_GATEWAY_MODE` | no | `read-write` | `read-write` accepts committed mutations. `restore-readonly` serves restore reads, rejects supported mutations, refuses bootstrap, and requires an accepted anchor. |
 | `RS3_METRICS_BIND` | no | unset | Prometheus/OpenMetrics listener socket address. |
 | `RS3_ADMIN_BIND` | no | unset | Separate gateway admin listener for path-redacted facts. |
 | `RS3_ADMIN_BEARER_TOKEN` | with admin listener | none | Bearer token for admin routes. Must be at least 16 bytes and separate from backup-client S3 credentials. |
 | `RS3_ADMIN_PROFILE` | no | `production` | Admin status profile: `local` or `production`. |
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
 | `RUST_LOG` | no | `info` | Standard tracing filter. |
-| `RS3_RECOVERY_MAX_CHECKPOINT_AGE_SECONDS` | for `recover-anchor` | none | Maximum signed checkpoint age accepted by explicit anchor recovery. |
 
-`export-restore-bundle` and `import-anchor` use the same repository, backend,
-anchor, and keyring settings as `serve`. The exported bundle contains public
-restore metadata only; keep wrapping-key material in the configured secret
-source.
+`export-restore-bundle` and `import-v2-anchor` use the same repository,
+backend, anchor, and keyring settings as `serve`. The exported bundle contains
+public restore metadata only; keep wrapping-key material in the configured
+secret source.
 
 The core server library exposes a path-redacted admin status report for operator
 tooling. It shows backend kind, anchor kind, retention posture, profile
-findings, and checkpoint trust status without configured bucket names, backend
+findings, and commit trust status without configured bucket names, backend
 prefixes, repository IDs, client object paths, or secret values. The report is a
 preview fact contract; workflow APIs need a separate authorization, audit,
 approval, and orchestration model from the gateway data plane.
@@ -92,22 +91,22 @@ outside the chart. If `serviceAccount.create=false`, set `serviceAccount.name`.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `RS3_REPOSITORY_FORMAT` | no | `v2-preview` | Repository format for new repositories. `v1-preview` remains selectable for legacy preview experiments, but new deployments should use `v2-preview`. |
+| `RS3_REPOSITORY_FORMAT` | no | `v2-preview` | Repository format for new repositories. Only `v2-preview` is accepted by the current gateway. |
 | `RS3_REPOSITORY_ID` | yes | none | Stable repository context. Keep it with trusted restore metadata. |
 | `RS3_REPOSITORY_SALT_HEX` | yes | none | Stable operator-provided 32-byte public salt, hex-encoded. Generate once per repository and keep with trusted public restore metadata. |
-| `RS3_KEYRING_ENVELOPE_OBJECT_ID` | no | unset | Bootstrap or recovery override for a specific encrypted keyring envelope object. Existing anchored repositories use the envelope reference bound into the signed checkpoint. |
+| `RS3_KEYRING_ENVELOPE_OBJECT_ID` | no | unset | Bootstrap or recovery override for a specific encrypted keyring envelope object. Existing anchored repositories use the envelope reference bound through the v2 format root. |
 | `RS3_KEYRING_WRAPPING_KEY_ID` | no | `wrap-v1` | Operator-visible wrapping key identifier expected by the envelope. |
 | `RS3_KEYRING_WRAPPING_KEY_HEX` | yes | none | Hex-encoded high-entropy wrapping key used to open or initialize the envelope. KMS/HSM/Vault integration should replace this for hardened deployments. |
 
-For an anchored repository, startup reads the anchor, reads the accepted
-checkpoint, and opens the checkpoint-bound envelope. It does not list S3 and
-guess a latest envelope.
+For an anchored repository, startup reads the anchor, verifies the accepted
+commit chain and format root, and opens the format-bound envelope. It does not
+list S3 and guess a latest envelope.
 
 For a first empty repository, startup creates a random purpose-specific keyring
 and stores the encrypted envelope under the default counted `keyrings/` object
 name. If `RS3_KEYRING_ENVELOPE_OBJECT_ID` is set, that object is used as an
 explicit bootstrap override. A missing anchor with committed repository objects
-is a recovery error, not an invitation to pick a backend checkpoint.
+is a recovery error, not an invitation to pick backend state.
 
 Minimal first-run settings:
 
@@ -124,10 +123,10 @@ cluster needs it to open the same repository context.
 ## Gateway Mode
 
 `read-write` is the normal backup and routine-restore mode. It may initialize a
-first empty repository, publish committed checkpoints, and advance the
-configured anchor. Run only one read-write gateway for a repository. Velero
-restore result artifacts are repository writes in this mode and should be
-checkpointed like other accepted mutations.
+first empty repository, publish signed commits, and advance the configured
+anchor. Run only one read-write gateway for a repository. Velero restore result
+artifacts are repository writes in this mode and should be committed like other
+accepted mutations.
 
 `restore-readonly` is the incident and disaster-recovery restore mode. It opens
 only from an existing accepted anchor, does not initialize a missing keyring
@@ -143,7 +142,7 @@ where practical, and backend credentials that cannot write.
 | --- | --- | --- | --- |
 | `RS3_PAYLOAD_SEGMENT_SIZE_BYTES` | no | adaptive, `512` B floor | Plaintext bytes per independently encrypted payload segment. Leave unset to use adaptive per-object defaults: 512 B for small objects, 8 KiB for medium objects, and 64 KiB for large objects. Set it to force a fixed segment size. |
 | `RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES` | no | `268435456` | Maximum plaintext bytes retained in the process-local decrypted segment LRU cache. Set to `0` to disable the cache. |
-| `RS3_COMMIT_MAX_BATCH_ITEMS` | no | `64` | Maximum staged writes covered by one checkpoint batch. |
+| `RS3_COMMIT_MAX_BATCH_ITEMS` | no | `64` | Maximum staged writes covered by one commit batch. |
 | `RS3_COMMIT_MAX_BATCH_DELAY_MS` | no | `10` | Maximum delay before publishing a partial commit batch. |
 | `RS3_COMMIT_MAX_PENDING_ITEMS` | no | batch item limit | Maximum writes waiting for commit before backpressure. |
 | `RS3_REPOSITORY_RETENTION_MODE` | no | unset | `governance` or `compliance` when repository retention is enabled. |

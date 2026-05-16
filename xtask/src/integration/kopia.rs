@@ -93,9 +93,7 @@ enum KopiaGatewayMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum KopiaGatewayRepositoryFormat {
-    /// Legacy production-preview repository format.
-    V1Preview,
-    /// Primary production-preview repository format.
+    /// v2 production-preview repository format.
     V2Preview,
 }
 
@@ -103,7 +101,6 @@ enum KopiaGatewayRepositoryFormat {
 impl KopiaGatewayRepositoryFormat {
     const fn as_env(self) -> &'static str {
         match self {
-            Self::V1Preview => "v1-preview",
             Self::V2Preview => "v2-preview",
         }
     }

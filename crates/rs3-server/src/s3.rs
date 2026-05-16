@@ -2,26 +2,14 @@
 
 mod adapter;
 mod boundary;
-mod key_management;
 mod mapping;
-mod recovery;
 mod runtime;
 mod runtime_builders;
-mod runtime_checkpoints;
 mod runtime_handles;
 mod runtime_keyring;
 mod runtime_v2;
 
 pub use boundary::{GatewayS3Boundary, S3Hardening};
-pub use key_management::{
-    KeyRotationError, KeyRotationOptions, KeyRotationReport, RotatedKeyringEnvelope,
-    rotate_key_from_config,
-};
-pub use recovery::{
-    AnchorImportReport, AnchorRecoveryError, AnchorRecoveryOptions, AnchorRecoveryReport,
-    RESTORE_BUNDLE_SCHEMA, RestoreBundleKeyringEnvelope, RestoreTrustBundle,
-    export_restore_bundle_from_config, import_anchor_from_config, recover_anchor_from_config,
-};
 pub(crate) use runtime_v2::v2_quick_maintenance_from_config;
 pub use runtime_v2::{
     RuntimeV2ProviderConformanceOptions, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportReport,
@@ -36,8 +24,8 @@ pub enum S3BoundaryError {
     /// Static credentials are required before exposing the S3 service.
     #[error("static credentials are required to build the S3 boundary")]
     MissingStaticCredentials,
-    /// The configured checkpoint anchor is not wired into the S3 adapter yet.
-    #[error("configured checkpoint anchor mode is not supported by the S3 adapter yet")]
+    /// The configured v2 commit anchor is not wired into the S3 adapter yet.
+    #[error("configured v2 commit anchor mode is not supported by the S3 adapter yet")]
     UnsupportedAnchorMode,
     /// The configured backend object store is not wired into the runtime yet.
     #[error("configured backend object store is not supported by the S3 runtime yet")]
@@ -93,7 +81,7 @@ pub(super) mod test_support {
                 max_pending_items: 64,
             },
             repository: RepositoryConfig {
-                format: crate::RepositoryFormat::V1Preview,
+                format: crate::RepositoryFormat::V2Preview,
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:

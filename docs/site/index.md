@@ -22,7 +22,7 @@
 
 The gateway is designed for teams that need existing S3-oriented backup tools
 to work without exposing repository paths, Kubernetes resource names, or
-checkpoint state directly to an object-store backend.
+accepted repository state directly to an object-store backend.
 
 <div class="rv-proof-grid">
   <article>
@@ -35,9 +35,9 @@ checkpoint state directly to an object-store backend.
   </article>
   <article>
     <p class="rv-card-kicker">Integrity</p>
-    <h3>State is accepted through checkpoints.</h3>
+    <h3>State is accepted through signed commits.</h3>
     <p>
-      Repository changes are checkpointed and anchored instead of trusting a
+      Repository changes are committed and anchored instead of trusting a
       latest-object convention in the backend.
     </p>
   </article>
@@ -55,9 +55,9 @@ checkpoint state directly to an object-store backend.
 
 `rs3` is being prepared for a production preview. The repository contains a
 working local gateway path, Kopia and Velero integration harnesses, repository
-encryption boundaries, Kubernetes Lease anchoring, checkpoint publishing,
-restore verification, retention-aware storage contracts, metrics, tracing, and
-performance measurement against a straight proxy baseline.
+encryption boundaries, Kubernetes Lease anchoring, signed v2 commit publishing,
+restore-bundle workflows, retention-aware storage contracts, metrics, tracing,
+and performance measurement against a straight proxy baseline.
 
 Do not treat the current repository format, cryptographic formats, or runtime
 defaults as production-stable yet.
@@ -71,7 +71,7 @@ defaults as production-stable yet.
 
 - Hide client-visible paths and Kubernetes names from backend object keys,
   unauthenticated metadata, metrics labels, traces, and logs.
-- Detect rollback through signed checkpoints and an external anchor instead of
+- Detect rollback through signed commits and an external anchor instead of
   trusting a latest-object convention in the object store.
 - Preserve restore correctness for S3 backup clients, starting with Kopia and
   Velero/Kopia.

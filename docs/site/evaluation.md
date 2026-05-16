@@ -6,7 +6,7 @@ deeper technical trial.
 ## What rs3 Is
 
 `rs3` is an S3-compatible gateway that sits between backup clients and object
-storage. It owns repository privacy, checkpoint publication, retention-aware
+storage. It owns repository privacy, v2 commit publication, retention-aware
 storage behavior, and observability at the gateway boundary.
 
 The preview compatibility targets are Kopia and Velero with the Kopia uploader.
@@ -28,7 +28,7 @@ The project is built around an explicit assumption: object storage can be
 observable by the provider, misconfigured, malicious, or controlled by an
 attacker during a restore. The design therefore avoids plaintext repository
 names in backend-visible places and treats the object store as insufficient for
-proving the newest valid checkpoint.
+proving the newest valid commit.
 
 Evaluate the preview on three axes:
 
@@ -44,9 +44,9 @@ Evaluate the preview on three axes:
 - Encrypted payload segments with authenticated object context.
 - Random purpose-specific keys sealed in an encrypted keyring envelope, with
   repository ID and public salt bound into the unwrap context.
-- Signed checkpoint shape and external-anchor model.
+- Signed v2 commit shape and external-anchor model.
 - Kubernetes Lease anchor for the preview deployment model.
-- Restore verification for checkpoint chain, reachable objects, decryptability,
+- Restore-bundle verification for the signed commit chain, format-root binding,
   keyring envelope binding, and retention evidence.
 - Retention and legal-hold contracts at the storage boundary.
 - Kopia measured matrix with a direct RustFS proxy baseline.
@@ -59,8 +59,8 @@ Evaluate the preview on three axes:
   compatibility is not stable yet.
 - Some leakage is inherent: object counts, sizes, coarse timing, and operation
   cadence remain visible to the backend.
-- Storage-side evidence now exists for checkpoint publication, but production
-  deletion resistance still depends on provider retention or Object Lock.
+- Deletion resistance still depends on provider retention or Object Lock for
+  restore-critical keyring envelopes, format roots, and commits.
 - Compatibility beyond the Kopia-focused S3 surface is intentionally limited.
 
 ## Evaluation Standard

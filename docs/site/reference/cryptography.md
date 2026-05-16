@@ -23,7 +23,7 @@ An empty repository initializes a random purpose-specific keyring:
 | Namespace lookup | HMAC-SHA-256 blind path and prefix tokens |
 | Payload encryption | XChaCha20-Poly1305 content keys |
 | Metadata encryption | AES-256-GCM-SIV metadata keys |
-| Checkpoint signing | Ed25519 signing keys |
+| Commit signing | Ed25519 signing keys |
 
 The keyring is stored as an encrypted keyring envelope. The repository stores
 only encrypted key material plus public key descriptors. The wrapping-key source
@@ -79,7 +79,7 @@ The gateway may cache decrypted payload segments in memory. The default limit is
 256 MiB and can be disabled with
 `RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES=0`. The cache key uses the backend object
 ID, provider version ID when present, and segment index; it does not use
-client-visible paths. The cache is process-local acceleration only: checkpoint
+client-visible paths. The cache is process-local acceleration only: commit
 verification, AEAD authentication, and exact-version restore rules are
 unchanged.
 
@@ -99,7 +99,7 @@ Metadata associated data is object-type specific:
 - manifest records bind to the manifest ID
 - index deltas bind to the index-delta object domain
 
-Signed checkpoints and object IDs decide which sealed metadata is reachable
+Signed commits and object IDs decide which sealed metadata is reachable
 repository state.
 
 ## Keyring Envelopes
@@ -114,31 +114,31 @@ associated data binds:
 - wrapping-key ID
 - envelope nonce
 
-Signed checkpoints bind the active envelope by generation, object ID, and
-digest. The backend cannot silently swap a different envelope into accepted
-repository state without breaking that checkpoint binding.
+The encrypted v2 format root and signed commits bind the active envelope by
+generation, object ID, and digest. The backend cannot silently swap a different
+envelope into accepted repository state without breaking that binding.
 
 Rewrapping an envelope changes only the wrapping-key source around the same
 repository data keys. It is operational hygiene, not compromise recovery.
 
 Data-key rotation changes one purpose-specific repository key at a time. The old
-primary remains enabled for historical reads or checkpoint verification until
+primary remains enabled for historical reads or commit verification until
 retention-aware retirement proves it is no longer required. A rotated keyring is
-stored in a new envelope and becomes active only when a signed checkpoint binds
-that envelope.
+stored in a new envelope and becomes active only when accepted v2 repository
+state binds that envelope.
 
-## Checkpoints
+## V2 Commits
 
-Checkpoints sign canonical repository-state transitions with Ed25519. The signed
-payload includes the sequence, parent checkpoint reference, index deltas, active
-key descriptors, active keyring-envelope reference, publish time, and signature
-metadata.
+V2 commits sign canonical repository-state transitions with Ed25519. The signed
+header includes the sequence, parent commit reference, section table, active
+keyring-envelope reference, publish time, active format-root reference, and
+signature metadata.
 
-Checkpoint payload digests are domain-separated SHA-256 digests over canonical
-checkpoint payload bytes. Checkpoint IDs are domain-separated SHA-256 digests
-over the canonical payload and its Ed25519 signature. The Kubernetes Lease
-anchor stores the accepted checkpoint position. Retained storage evidence is a
-witness, not the latest-state authority.
+Commit body digests are domain-separated SHA-256 digests over the serialized
+commit body. Commit keys are random and path-private. The Kubernetes Lease
+anchor stores the accepted commit position: sequence, commit key, body digest,
+signing key ID, format-root reference, and provider version ID when required.
+Retained commit versions are useful history, not the latest-state authority.
 
 ## Review Rules
 

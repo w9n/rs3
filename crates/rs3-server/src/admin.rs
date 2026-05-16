@@ -5,10 +5,7 @@
 //! orchestration, approvals, management workflows, multi-management workflows, and audit model
 //! require a separate documented authorization and audit design and stabilization decision.
 
-use crate::s3::AnchorRecoveryError;
-use crate::{
-    AnchorConfig, BackendConfig, RepositoryFormat, RuntimeConfig, export_restore_bundle_from_config,
-};
+use crate::{AnchorConfig, BackendConfig, RuntimeConfig};
 use rs3_crypto::derive_public_fingerprint;
 use rs3_types::RetentionMode;
 use serde::Serialize;
@@ -115,7 +112,7 @@ pub struct AdminRepositorySummary {
     pub adaptive_payload_segment_size: bool,
     /// Maximum plaintext bytes retained in the decrypted segment LRU cache.
     pub decrypted_segment_cache_max_bytes: u64,
-    /// Maximum staged writes covered by one checkpoint batch.
+    /// Maximum staged writes covered by one commit batch.
     pub commit_max_batch_items: usize,
     /// Maximum commit batch delay in milliseconds.
     pub commit_max_batch_delay_ms: u128,
@@ -147,12 +144,8 @@ pub struct AdminRestoreSummary {
     pub state: &'static str,
     /// Machine-readable reason code when restore trust is unavailable.
     pub reason_code: Option<&'static str>,
-    /// Accepted checkpoint summary when available.
-    pub checkpoint: Option<AdminCheckpointSummary>,
     /// Accepted v2 anchor summary when available.
     pub v2_anchor: Option<AdminV2RestoreSummary>,
-    /// Checkpoint-bound keyring envelope summary when available.
-    pub keyring_envelope: Option<AdminKeyringEnvelopeSummary>,
 }
 
 /// Read-only maintenance status shown by operator reports.
@@ -183,20 +176,6 @@ pub struct AdminV2MaintenanceSummary {
     pub oldest_orphan_age_ms: Option<u128>,
 }
 
-/// Accepted checkpoint summary.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct AdminCheckpointSummary {
-    /// Accepted checkpoint sequence.
-    pub sequence: u64,
-    /// Accepted checkpoint ID.
-    pub checkpoint_id: String,
-    /// Accepted checkpoint payload digest.
-    pub checkpoint_digest: String,
-    /// Signed checkpoint publish timestamp in milliseconds since the Unix epoch.
-    pub published_at_ms: i64,
-}
-
 /// Accepted v2 anchor summary.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -213,16 +192,6 @@ pub struct AdminV2RestoreSummary {
     pub format_digest: String,
     /// Bundle export timestamp in milliseconds since the Unix epoch.
     pub exported_at_ms: i64,
-}
-
-/// Checkpoint-bound keyring envelope summary.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct AdminKeyringEnvelopeSummary {
-    /// Envelope generation.
-    pub generation: u64,
-    /// Expected envelope digest.
-    pub digest: String,
 }
 
 /// Admin posture finding.
@@ -317,7 +286,7 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
     if matches!(config.anchor, AnchorConfig::Memory) {
         findings.push(AdminFinding::error(
             "anchor.memory",
-            "production profile requires a durable external checkpoint anchor",
+            "production profile requires a durable external v2 commit anchor",
         ));
     }
 
@@ -356,39 +325,7 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
 }
 
 async fn restore_summary(config: &RuntimeConfig) -> AdminRestoreSummary {
-    match config.repository.format {
-        RepositoryFormat::V1Preview => restore_summary_v1(config).await,
-        RepositoryFormat::V2Preview => restore_summary_v2(config).await,
-    }
-}
-
-async fn restore_summary_v1(config: &RuntimeConfig) -> AdminRestoreSummary {
-    match export_restore_bundle_from_config(config).await {
-        Ok(bundle) => AdminRestoreSummary {
-            state: "verified",
-            reason_code: None,
-            checkpoint: Some(AdminCheckpointSummary {
-                sequence: bundle.checkpoint.sequence.get(),
-                checkpoint_id: bundle.checkpoint.checkpoint_id.as_str().to_owned(),
-                checkpoint_digest: bundle.checkpoint.payload_digest,
-                published_at_ms: bundle.published_at_ms,
-            }),
-            v2_anchor: None,
-            keyring_envelope: bundle
-                .keyring_envelope
-                .map(|envelope| AdminKeyringEnvelopeSummary {
-                    generation: envelope.generation,
-                    digest: envelope.digest,
-                }),
-        },
-        Err(error) => AdminRestoreSummary {
-            state: "unavailable",
-            reason_code: Some(anchor_recovery_error_code(&error)),
-            checkpoint: None,
-            v2_anchor: None,
-            keyring_envelope: None,
-        },
-    }
+    restore_summary_v2(config).await
 }
 
 async fn restore_summary_v2(config: &RuntimeConfig) -> AdminRestoreSummary {
@@ -396,7 +333,6 @@ async fn restore_summary_v2(config: &RuntimeConfig) -> AdminRestoreSummary {
         Ok(bundle) => AdminRestoreSummary {
             state: "verified",
             reason_code: None,
-            checkpoint: None,
             v2_anchor: Some(AdminV2RestoreSummary {
                 sequence: bundle.anchor.sequence.get(),
                 body_digest: hex::encode(bundle.anchor.body_digest),
@@ -405,27 +341,16 @@ async fn restore_summary_v2(config: &RuntimeConfig) -> AdminRestoreSummary {
                 format_digest: bundle.anchor.format_ref.digest,
                 exported_at_ms: bundle.exported_at_ms,
             }),
-            keyring_envelope: None,
         },
         Err(error) => AdminRestoreSummary {
             state: "unavailable",
             reason_code: Some(runtime_error_code(&error)),
-            checkpoint: None,
             v2_anchor: None,
-            keyring_envelope: None,
         },
     }
 }
 
 async fn maintenance_summary(config: &RuntimeConfig) -> AdminMaintenanceSummary {
-    if config.repository.format != RepositoryFormat::V2Preview {
-        return AdminMaintenanceSummary {
-            state: "not-applicable",
-            reason_code: None,
-            v2: None,
-        };
-    }
-
     match crate::s3::v2_quick_maintenance_from_config(config).await {
         Ok(report) => AdminMaintenanceSummary {
             state: "verified",
@@ -443,17 +368,6 @@ async fn maintenance_summary(config: &RuntimeConfig) -> AdminMaintenanceSummary 
             reason_code: Some(runtime_error_code(&error)),
             v2: None,
         },
-    }
-}
-
-fn anchor_recovery_error_code(error: &AnchorRecoveryError) -> &'static str {
-    match error {
-        AnchorRecoveryError::Runtime(error) => runtime_error_code(error),
-        AnchorRecoveryError::NoValidCheckpoint => "recovery.no-valid-checkpoint",
-        AnchorRecoveryError::CheckpointTooOld { .. } => "recovery.checkpoint-too-old",
-        AnchorRecoveryError::AnchorAlreadyExists => "anchor.already-exists",
-        AnchorRecoveryError::Anchor(_) => "anchor.error",
-        AnchorRecoveryError::Repository(_) => "repository.verify-failed",
     }
 }
 
@@ -603,7 +517,7 @@ mod tests {
                 max_pending_items: 64,
             },
             repository: RepositoryConfig {
-                format: RepositoryFormat::V1Preview,
+                format: RepositoryFormat::V2Preview,
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:
@@ -699,14 +613,13 @@ mod tests {
         assert_eq!(report.security.action_posture, "report-only");
         assert_eq!(report.schema, "rs3.admin-status.preview.v1");
         assert!(report.restore.v2_anchor.is_none());
-        assert_eq!(report.maintenance.state, "not-applicable");
+        assert_eq!(report.maintenance.state, "unavailable");
         assert!(report.maintenance.v2.is_none());
     }
 
     #[tokio::test]
     async fn admin_status_reports_v2_maintenance_without_paths_when_unavailable() {
-        let mut config = runtime_config();
-        config.repository.format = RepositoryFormat::V2Preview;
+        let config = runtime_config();
         let report = admin_status_report(&config, AdminReportProfile::Production).await;
         let json = serde_json::to_string(&report).unwrap_or_else(|error| panic!("{error}"));
 

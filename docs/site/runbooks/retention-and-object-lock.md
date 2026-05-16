@@ -1,18 +1,16 @@
 # Retention And Object Lock
 
 Retention protects object versions. It does not prove the provider served the
-latest valid checkpoint. Use retention for deletion resistance; use checkpoints
+latest valid commit. Use retention for deletion resistance; use signed commits
 and anchors for latest-state authority.
 
 ## Protected Set
 
 When retention is enabled, protect every object needed for restore:
 
-- payload segments
-- metadata or manifest state
-- namespace/index state
-- checkpoints
-- storage evidence
+- keyring envelopes
+- format roots
+- signed commits, including payload and index-delta sections
 
 If one class is missing, the backup may become retained but unrestorable.
 
@@ -52,7 +50,7 @@ Required posture:
 - retention on all restore-critical classes
 - audit logs outside the cluster and storage account
 - repository keys protected outside the attacked namespace
-- external review of anchor/evidence divergence
+- external review of anchor and retained-version divergence
 
 ## Provider Gate
 
@@ -92,6 +90,6 @@ new backend.
 
 - Do not delete retained objects during cleanup.
 - Freeze write credentials if bad writes continue.
-- Preserve gateway logs, metrics, checkpoint IDs, and anchor state.
-- Compare anchor with storage evidence where configured.
-- Restore from a verified checkpoint using read-only credentials where possible.
+- Preserve gateway logs, metrics, trusted restore bundles, and anchor state.
+- Compare anchor with retained commit versions where configured.
+- Restore from a verified v2 anchor using read-only credentials where possible.

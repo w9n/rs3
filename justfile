@@ -126,11 +126,6 @@ perf-s3-container *ARGS:
 perf-s3-gateway *ARGS:
     cargo run -p xtask --bin xtask --features containers -- perf --backend s3-gateway-container {{ARGS}}
 
-# Standard local gateway comparison between legacy v1 preview and v2 preview.
-perf-v1-v2-gateway *ARGS:
-    cargo run -p xtask --bin xtask --features containers -- perf --backend s3-gateway-container --repository-format v1-preview --gateway-build-profile release --format jsonl {{ARGS}}
-    cargo run -p xtask --bin xtask --features containers -- perf --backend s3-gateway-container --repository-format v2-preview --gateway-build-profile release --format jsonl {{ARGS}}
-
 nextest:
     cargo nextest run --workspace
 

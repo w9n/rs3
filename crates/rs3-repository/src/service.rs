@@ -195,6 +195,7 @@ where
             blind_key: primary_blind_key.blind_key,
             object_id,
             object_version_id,
+            payload_ref: None,
             manifest_id: manifest_id.clone(),
             content_len: plaintext_len,
             modified_at_ms,
@@ -222,7 +223,7 @@ where
                 });
             }
             state.pending_index_deltas.push(IndexDelta::Upsert {
-                entry: entry.clone(),
+                entry: Box::new(entry.clone()),
                 prefix_tokens: prefix_tokens.clone(),
                 sealed_manifest: Box::new(sealed_manifest),
             });
@@ -1019,7 +1020,7 @@ where
         };
         let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
         state.pending_index_deltas.push(IndexDelta::Upsert {
-            entry: updated.clone(),
+            entry: Box::new(updated.clone()),
             prefix_tokens: prefix_tokens.clone(),
             sealed_manifest: Box::new(sealed_manifest),
         });
@@ -1084,7 +1085,7 @@ where
         };
         let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
         state.pending_index_deltas.push(IndexDelta::Upsert {
-            entry: updated.clone(),
+            entry: Box::new(updated.clone()),
             prefix_tokens: prefix_tokens.clone(),
             sealed_manifest: Box::new(sealed_manifest),
         });

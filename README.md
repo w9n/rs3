@@ -6,9 +6,9 @@ S3-compatible backup gateway for Kubernetes operators.
 ## Status
 
 The project has a working local S3-compatible gateway path, repository
-encryption boundaries, signed checkpoint plumbing, integration harnesses,
-Kubernetes Lease anchoring, restore verification, production posture checks, and
-Kopia-focused performance measurement. The current release target is a
+encryption boundaries, signed v2 commit/anchor plumbing, integration harnesses,
+Kubernetes Lease anchoring, restore-bundle workflows, production posture checks,
+and Kopia-focused performance measurement. The current release target is a
 production preview: suitable for controlled evaluation, not yet a stable
 repository-format or security guarantee. New preview repositories use the
 `v2-preview` repository format by default.
@@ -16,7 +16,7 @@ repository-format or security guarantee. New preview repositories use the
 Current engineering priorities:
 
 - path privacy for client-visible keys and Kubernetes object names
-- rollback resistance through signed checkpoints and external anchors
+- rollback resistance through signed commits and external anchors
 - restore correctness for S3-oriented backup tools, with Kopia and
   Velero/Kopia as the preview clients
 - incident restore through an explicit `restore-readonly` gateway mode and
@@ -97,15 +97,15 @@ tradeoff is useful.
 
 ## Workspace Layout
 
-- `crates/rs3-anchor`: checkpoint-anchor contract and test anchor.
+- `crates/rs3-anchor`: external anchor contracts and test anchors.
 - `crates/rs3-console`: read-only single-gateway operations console.
 - `crates/rs3-types`: shared strongly typed identifiers and policy types.
 - `crates/rs3-crypto`: cryptographic primitives, envelopes, and key derivation
   boundaries.
-- `crates/rs3-index`: append-friendly index and checkpoint model.
+- `crates/rs3-index`: append-friendly index and repository state model.
 - `crates/rs3-storage`: object-store abstraction.
-- `crates/rs3-k8s`: Kubernetes checkpoint-anchor abstraction.
-- `crates/rs3-repository`: repository write, read, checkpoint, and maintenance
+- `crates/rs3-k8s`: Kubernetes anchor integration surface.
+- `crates/rs3-repository`: repository write, read, v2 commit, and maintenance
   behavior.
 - `crates/rs3-server`: command-line gateway process and S3 compatibility layer.
 - `xtask`: local automation used by `just`.

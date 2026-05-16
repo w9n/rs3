@@ -41,7 +41,7 @@ impl GatewayS3Service {
         repository
             .validate_backend_retention(config.repository.retention)
             .await?;
-        repository.load_accepted_checkpoint(config.mode).await?;
+        repository.load_accepted_anchor(config.mode).await?;
 
         Ok(Self {
             mode: config.mode,
@@ -772,7 +772,7 @@ mod tests {
     use crate::GatewayMode;
     use crate::s3::test_support::runtime_config;
     use bytes::Bytes;
-    use rs3_anchor::CheckpointAnchor;
+    use rs3_repository::v2::V2CommitAnchor;
     use rs3_storage::BlobStore;
     use rs3_types::{LegalHoldStatus, RetentionMode};
     use s3s::dto::{
@@ -814,6 +814,37 @@ mod tests {
         collect_body(body).await.unwrap_or_else(|error| {
             panic!("{error}");
         })
+    }
+
+    async fn accepted_v2_sequence(service: &GatewayS3Service) -> u64 {
+        service
+            .repository
+            .memory_v2_anchor()
+            .unwrap_or_else(|| panic!("missing v2 memory anchor"))
+            .read_v2()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("missing v2 anchor state"))
+            .sequence
+            .get()
+    }
+
+    async fn accepted_v2_commit_metadata(service: &GatewayS3Service) -> rs3_storage::BlobMetadata {
+        let accepted = service
+            .repository
+            .memory_v2_anchor()
+            .unwrap_or_else(|| panic!("missing v2 memory anchor"))
+            .read_v2()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("missing v2 anchor state"));
+        service
+            .repository
+            .memory_store()
+            .unwrap_or_else(|| panic!("missing memory store"))
+            .head_at(&accepted.commit_key, accepted.version_id.as_ref())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 
     struct GetObjectBody(Option<StreamingBlob>);
@@ -922,30 +953,20 @@ mod tests {
             .await;
         assert!(put.is_ok());
 
-        let accepted = service
-            .repository
-            .memory_anchor()
-            .unwrap_or_else(|| panic!("missing memory anchor"))
-            .read()
-            .await
-            .unwrap_or_else(|error| {
-                panic!("{error}");
-            });
-        assert_eq!(accepted.sequence.get(), 1);
+        assert_eq!(accepted_v2_sequence(&service).await, 2);
 
         let backend_objects = service
             .repository
             .memory_store()
             .unwrap_or_else(|| panic!("missing memory store"))
-            .list_prefix("segments/")
+            .list_prefix("commits/v01/")
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(backend_objects.len(), 1);
+        assert_eq!(backend_objects.len(), 2);
         assert!(
-            !backend_objects[0]
-                .object_id
-                .as_str()
-                .contains("snapshots/object.bin")
+            backend_objects
+                .iter()
+                .all(|metadata| { !metadata.object_id.as_str().contains("snapshots/object.bin") })
         );
 
         let head = service
@@ -1022,16 +1043,7 @@ mod tests {
             .await;
         assert!(delete.is_ok());
 
-        let accepted = service
-            .repository
-            .memory_anchor()
-            .unwrap_or_else(|| panic!("missing memory anchor"))
-            .read()
-            .await
-            .unwrap_or_else(|error| {
-                panic!("{error}");
-            });
-        assert_eq!(accepted.sequence.get(), 2);
+        assert_eq!(accepted_v2_sequence(&service).await, 3);
 
         let missing = service
             .head_object(s3_request(HeadObjectInput {
@@ -1151,14 +1163,7 @@ mod tests {
             .expect_err("restore-readonly mode should reject DeleteObject");
         assert_eq!(*delete.code(), s3s::S3ErrorCode::AccessDenied);
 
-        let accepted = service
-            .repository
-            .memory_anchor()
-            .unwrap_or_else(|| panic!("missing memory anchor"))
-            .read()
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(accepted.sequence.get(), 1);
+        assert_eq!(accepted_v2_sequence(&service).await, 2);
     }
 
     #[tokio::test]
@@ -1180,16 +1185,10 @@ mod tests {
             .await;
         assert!(put.is_ok());
 
-        let backend_objects = service
-            .repository
-            .memory_store()
-            .unwrap_or_else(|| panic!("missing memory store"))
-            .list_prefix("segments/")
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        let retention = backend_objects
-            .first()
-            .and_then(|metadata| metadata.retention.as_ref())
+        let commit = accepted_v2_commit_metadata(&service).await;
+        let retention = commit
+            .retention
+            .as_ref()
             .unwrap_or_else(|| panic!("missing backend retention"));
         assert_eq!(retention.mode, RetentionMode::Compliance);
         assert!(retention.retain_days >= 2);
@@ -1229,19 +1228,8 @@ mod tests {
             .await;
         assert!(put.is_ok());
 
-        let backend_objects = service
-            .repository
-            .memory_store()
-            .unwrap_or_else(|| panic!("missing memory store"))
-            .list_prefix("segments/")
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(
-            backend_objects
-                .first()
-                .and_then(|metadata| metadata.legal_hold),
-            Some(LegalHoldStatus::On)
-        );
+        let commit = accepted_v2_commit_metadata(&service).await;
+        assert_eq!(commit.legal_hold, Some(LegalHoldStatus::On));
 
         let head = service
             .head_object(s3_request(HeadObjectInput {

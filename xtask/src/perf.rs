@@ -172,16 +172,13 @@ impl PerfBackend {
 /// Repository format used by gateway-backed performance scenarios.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum PerfRepositoryFormat {
-    /// Legacy preview repository format.
-    V1Preview,
-    /// Primary v2 preview repository format.
+    /// v2 preview repository format.
     V2Preview,
 }
 
 impl PerfRepositoryFormat {
     pub(crate) const fn as_env(self) -> &'static str {
         match self {
-            Self::V1Preview => "v1-preview",
             Self::V2Preview => "v2-preview",
         }
     }

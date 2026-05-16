@@ -32,8 +32,7 @@ The console may display:
 
 - gateway mode
 - restore trust state and reason code
-- checkpoint sequence, ID, digest, and publish time
-- keyring envelope generation and digest
+- v2 anchor sequence, commit digest, format generation, and version-binding state
 - backend kind and retention capability
 - anchor kind and external-anchor posture
 - repository retention posture
