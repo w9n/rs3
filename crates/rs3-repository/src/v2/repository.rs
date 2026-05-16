@@ -1,9 +1,11 @@
 //! Preview v2 commit-store workflow.
 
 use super::commit::{
-    V2_COMMIT_CONTENT_TYPE, V2CommitHeader, V2CommitKey, V2CommitParentRef, V2CommitSelfRef,
-    V2KeyringEnvelopeRef, V2ParsedCommit, V2SectionDescriptor, V2SectionType, V2UploadMode,
-    body_digest_for_v2_sections, generate_v2_commit_key, parse_v2_commit_object,
+    V2_COMMIT_CONTENT_TYPE, V2_HEADER_META_LEN, V2_MAX_HEADER_SIZE, V2CommitHeader, V2CommitKey,
+    V2CommitParentRef, V2CommitSelfRef, V2KeyringEnvelopeRef, V2ParsedCommit, V2ParsedCommitHeader,
+    V2SectionDescriptor, V2SectionType, V2UploadMode, body_digest_for_v2_sections,
+    generate_v2_commit_key, parse_v2_commit_header, parse_v2_commit_object,
+    v2_commit_header_span_len,
 };
 use super::error::{V2FormatError, V2Result};
 use super::format::V2FormatRef;
@@ -129,7 +131,7 @@ impl V2CommitStoreOptions {
         format_ref: V2FormatRef,
     ) -> Self {
         Self {
-            upload_mode: V2UploadMode::SinglePut,
+            upload_mode: V2UploadMode::MultipartPadded,
             provider_profile: profile,
             retention: match profile {
                 V2ProviderProfile::RetainedVersionObjectLock => Some(RetentionPolicy::new(
@@ -563,6 +565,99 @@ where
         }
         parsed.version_id = version_id.cloned();
         Ok(parsed)
+    }
+
+    /// Reads and verifies only the signed commit header at a key and version.
+    pub(crate) async fn read_commit_header_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> V2Result<V2ParsedCommitHeader> {
+        if self.options.provider_profile == V2ProviderProfile::RetainedVersionObjectLock
+            && version_id.is_none()
+        {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
+        if self.options.upload_mode == V2UploadMode::MultipartPadded {
+            let header_bytes = self
+                .store
+                .get_range_at(
+                    object_id,
+                    version_id,
+                    ByteRange::Slice {
+                        offset: 0,
+                        len: V2_MAX_HEADER_SIZE as u64,
+                    },
+                )
+                .await;
+            if let Ok(header_bytes) = header_bytes {
+                let parsed = parse_v2_commit_header(object_id, &header_bytes, &self.keyring)?;
+                if parsed.header.keyring_envelope_ref != self.options.keyring_envelope_ref {
+                    return Err(V2FormatError::InvalidHeaderField);
+                }
+                return Ok(parsed);
+            }
+        }
+
+        let prefix = self
+            .store
+            .get_range_at(
+                object_id,
+                version_id,
+                ByteRange::Slice {
+                    offset: 0,
+                    len: V2_HEADER_META_LEN as u64,
+                },
+            )
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed)?;
+        let header_span_len = v2_commit_header_span_len(&prefix)?;
+        let header_bytes = if header_span_len == V2_HEADER_META_LEN {
+            prefix
+        } else {
+            let remaining_len = header_span_len
+                .checked_sub(V2_HEADER_META_LEN)
+                .ok_or(V2FormatError::HeaderTooLarge)?;
+            let remaining = self
+                .store
+                .get_range_at(
+                    object_id,
+                    version_id,
+                    ByteRange::Slice {
+                        offset: V2_HEADER_META_LEN as u64,
+                        len: remaining_len as u64,
+                    },
+                )
+                .await
+                .map_err(|_| V2FormatError::StorageOperationFailed)?;
+            let mut bytes = Vec::with_capacity(header_span_len);
+            bytes.extend_from_slice(&prefix);
+            bytes.extend_from_slice(&remaining);
+            Bytes::from(bytes)
+        };
+        let parsed = parse_v2_commit_header(object_id, &header_bytes, &self.keyring)?;
+        if parsed.header.keyring_envelope_ref != self.options.keyring_envelope_ref {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
+        Ok(parsed)
+    }
+
+    /// Reads commit bytes from a key and version without requiring a full object read.
+    pub(crate) async fn read_commit_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> V2Result<Bytes> {
+        if self.options.provider_profile == V2ProviderProfile::RetainedVersionObjectLock
+            && version_id.is_none()
+        {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
+        self.store
+            .get_range_at(object_id, version_id, range)
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed)
     }
 
     async fn read_commit_from_anchor_state(

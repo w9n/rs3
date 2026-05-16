@@ -50,7 +50,7 @@ The command prints a compact table by default; pass
 
 ## Current Release Matrix
 
-Run date: 2026-05-13. Gateway profile: release. Payload segment lane:
+Run date: 2026-05-16. Gateway profile: release. Payload segment lane:
 adaptive writer default. Workload set: `larger-restores`. Each row is the
 average of three direct/gateway run pairs. The direct baseline is the straight
 RustFS measurement proxy.
@@ -62,29 +62,29 @@ Artifact:
 
 | Profile | Shape | Elapsed Ratio | Backend Requests | Backend Reads | Backend Writes | Gateway CPU | Gateway HWM RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `medium-restore` | one 64 MiB object | 0.88x | 1.16x | 1.01x | 1.00x | 1.32 s | 159.82 MiB |
-| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.21x | 0.07x | 1.04x | 1.00x | 0.71 s | 128.37 MiB |
-| `kubernetes-objects-large` | 6,144 manifests plus a 128 MiB fragment | 0.12x | 0.03x | 1.02x | 1.00x | 2.06 s | 305.40 MiB |
-| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.03x | 1.13x | 1.04x | 1.00x | 1.62 s | 289.71 MiB |
-| `postgres-pgdata-large` | larger relation/WAL/dump-shaped Postgres data directory | 1.15x | 1.10x | 1.04x | 1.00x | 3.13 s | 456.04 MiB |
+| `medium-restore` | one 64 MiB object | 1.05x | 0.51x | 1.01x | 1.00x | 0.77 s | 151.32 MiB |
+| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.24x | 0.03x | 1.02x | 1.01x | 0.69 s | 132.92 MiB |
+| `kubernetes-objects-large` | 6,144 manifests plus a 128 MiB fragment | 0.14x | 0.02x | 1.01x | 1.00x | 2.06 s | 324.56 MiB |
+| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.30x | 0.74x | 1.04x | 1.00x | 1.95 s | 437.90 MiB |
+| `postgres-pgdata-large` | larger relation/WAL/dump-shaped Postgres data directory | 1.44x | 0.83x | 1.04x | 1.00x | 3.83 s | 787.62 MiB |
 
 Interpretation:
 
 - Larger restore write bytes stay at about the straight proxy baseline, and
   read bytes stay within about 1.01x to 1.04x in this run.
-- Backend request counts are at or below the straight proxy baseline for the
-  Kubernetes-shaped profiles and within 1.10x to 1.16x for the medium and
-  Postgres-shaped profiles. The highest request ratio remains the one-object
-  medium profile, where commit and anchor work has little
-  opportunity to amortize.
+- Backend request counts are below the straight proxy baseline for every larger
+  profile in this run. The lowest ratios are the Kubernetes-shaped profiles,
+  where the gateway's accepted index and decrypted segment cache avoid many
+  repeated direct-backend reads.
 - Built-in regression budgets passed for request ratios, byte ratios, restore
   phase ratios, and repeated-run stability.
 - The Kubernetes-shaped profile is faster in this local harness despite similar
   backend bytes. Treat that as a local RustFS/proxy observation, not a cloud
   provider claim.
-- Postgres-shaped elapsed time is now close to the direct path in this local
-  harness. Keep tracking snapshot-create and large PUT phases because they
-  remain the most visible local latency contributors.
+- Postgres-shaped restore phases are faster than the direct path in this local
+  harness, but full elapsed time is slower because commit publication and
+  snapshot-create phases dominate the local run. Keep tracking commit wait,
+  stage-lock wait, and large PUT phases.
 
 ## Expanded Sanity Run
 
@@ -138,10 +138,33 @@ historical fixed-size matrix below still explains the byte/request tradeoff.
 For `v2-preview`, payload bytes live inside signed commit objects. Current
 gateway smoke runs on 2026-05-16 show the expected write request floor: one
 backend commit PUT per sequential write, with concurrent writes batched into
-fewer commit PUTs. Repeated reads of the same object are served from a verified
-payload-section cache after the first commit GET; the cache is bounded by the
-repository decrypted-segment cache budget and can be disabled by setting that
-budget to zero.
+fewer commit PUTs. Payload sections now carry per-payload identities, so range
+reads can verify and decrypt the requested payload segments without reading the
+whole commit body. New v2 refs carry payload-header facts plus the padded
+commit section offset, so hot-path range reads fetch only the required
+ciphertext span. Repeated or concurrent overlapping ranges reuse the decrypted
+segment cache behind a striped per-payload fill gate, so independent payloads
+can still fill in parallel. Full-file reads fetch the named payload section.
+Older refs still fall back to bounded commit-header and payload-header probes.
+The default partial commit-batch wait is now 25 ms.
+
+A local Velero/Postgres smoke on 2026-05-16 exercised the concurrent restore
+path after v2 payload-section cache fills were coalesced. The gateway run
+completed backup and restore with `v2-preview`, emitted no backend `segments/`
+objects, and read 29.0 MB from the backend versus 28.9 MB for the direct RustFS
+baseline. Backend request count was lower through the gateway in that smoke:
+57 requests versus 708 for direct RustFS. Artifact:
+`.local/integration/`; direct
+baseline:
+`.local/integration/`.
+Treat this as Velero smoke evidence. The broader release-profile ratios still
+come from the Kopia measured matrix above until that matrix is refreshed after
+the v2 range-read change.
+
+The three-run 2026-05-16 Kopia matrix after payload-ref metadata, striped v2
+range-fill coordination, and 25 ms batching passed budgets. Restore-phase
+ratios were 0.04x to 0.65x; full elapsed remained slower for the Postgres
+profiles because local commit publication and snapshot-create phases dominated.
 
 ## Historical Segment-Size Finding
 

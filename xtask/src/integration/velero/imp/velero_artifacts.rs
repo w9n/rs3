@@ -743,7 +743,7 @@ fn derived_metrics(counts: &BlobOperationCounts, repository: &RepositoryMetrics)
             counts.bytes_written,
             repository.client_bytes_written,
         ),
-        "repository_backend_bytes_written_per_client_byte": ratio(
+        "repository_backend_bytes_written_per_client_byte": optional_ratio(
             repository.backend_bytes_written_for_puts,
             repository.client_bytes_written,
         ),
@@ -755,6 +755,14 @@ fn ratio(numerator: u64, denominator: u64) -> Value {
         Value::Null
     } else {
         json!(numerator as f64 / denominator as f64)
+    }
+}
+
+fn optional_ratio(numerator: u64, denominator: u64) -> Value {
+    if numerator == 0 {
+        Value::Null
+    } else {
+        ratio(numerator, denominator)
     }
 }
 
@@ -801,6 +809,10 @@ mod tests {
             metrics["derived"]["backend_puts_per_repository_put"],
             serde_json::json!(1.0)
         );
+        assert_eq!(
+            metrics["derived"]["repository_backend_bytes_written_per_client_byte"],
+            serde_json::json!(2.0)
+        );
     }
 
     #[test]
@@ -835,6 +847,11 @@ mod tests {
             metrics["derived"]["checkpoint_publishes_per_repository_mutation"],
             serde_json::json!(1.0)
         );
+        assert_eq!(
+            metrics["derived"]["backend_bytes_written_per_client_byte"],
+            serde_json::json!(2.0)
+        );
+        assert!(metrics["derived"]["repository_backend_bytes_written_per_client_byte"].is_null());
     }
 
     #[test]

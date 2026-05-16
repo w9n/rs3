@@ -54,7 +54,7 @@ impl Default for CommitCoordinatorOptions {
     fn default() -> Self {
         Self {
             max_batch_items: 64,
-            max_batch_delay: Duration::from_millis(10),
+            max_batch_delay: Duration::from_millis(25),
             max_pending_items: 64,
         }
     }

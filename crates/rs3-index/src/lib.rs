@@ -49,6 +49,14 @@ pub struct ObjectPointer {
 pub enum PayloadReference {
     /// Payload bytes are in the current commit that carries this index delta.
     V2Self {
+        /// Opaque payload identity used as the AEAD associated-data object id.
+        payload_id: BackendObjectId,
+        /// Parsed segmented-payload header needed for direct range reads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload_header: Option<PayloadHeaderReference>,
+        /// Absolute byte offset where the containing commit's section region starts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sections_start: Option<u64>,
         /// Byte offset relative to the commit section region.
         offset: u64,
         /// Encrypted payload-section byte length.
@@ -63,11 +71,34 @@ pub enum PayloadReference {
         commit_version_id: Option<BackendVersionId>,
         /// Commit body digest from the signed header.
         body_digest: [u8; 32],
+        /// Opaque payload identity used as the AEAD associated-data object id.
+        payload_id: BackendObjectId,
+        /// Parsed segmented-payload header needed for direct range reads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload_header: Option<PayloadHeaderReference>,
+        /// Absolute byte offset where the containing commit's section region starts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sections_start: Option<u64>,
         /// Byte offset relative to the commit section region.
         offset: u64,
         /// Encrypted payload-section byte length.
         length: u64,
     },
+}
+
+/// Signed/encrypted payload-header facts used to plan direct range reads.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PayloadHeaderReference {
+    /// Plaintext bytes per independently encrypted segment.
+    pub chunk_size: u64,
+    /// Total plaintext payload length.
+    pub plaintext_len: u64,
+    /// Content-encryption key identifier.
+    pub key_id: KeyId,
+    /// Per-payload nonce prefix used for segment nonce derivation.
+    pub nonce_prefix: [u8; 16],
+    /// Encoded payload-header byte length.
+    pub header_len: u64,
 }
 
 /// A single index mutation.

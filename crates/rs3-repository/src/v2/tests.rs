@@ -265,17 +265,33 @@ impl V2CommitAnchor for BlockingV2Anchor {
 struct SlowCommitGetStore {
     inner: MemoryBlobStore,
     delay: Duration,
+    full_commit_gets: Arc<AtomicUsize>,
+    ranged_commit_gets: Arc<AtomicUsize>,
+    in_flight_ranged_commit_gets: Arc<AtomicUsize>,
+    max_in_flight_ranged_commit_gets: Arc<AtomicUsize>,
 }
 
 impl SlowCommitGetStore {
     fn new(inner: MemoryBlobStore, delay: Duration) -> Self {
-        Self { inner, delay }
+        Self {
+            inner,
+            delay,
+            full_commit_gets: Arc::new(AtomicUsize::new(0)),
+            ranged_commit_gets: Arc::new(AtomicUsize::new(0)),
+            in_flight_ranged_commit_gets: Arc::new(AtomicUsize::new(0)),
+            max_in_flight_ranged_commit_gets: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     fn reset_operation_counts(&self) {
         self.inner
             .reset_operation_counts()
             .unwrap_or_else(|error| panic!("{error}"));
+        self.full_commit_gets.store(0, Ordering::SeqCst);
+        self.ranged_commit_gets.store(0, Ordering::SeqCst);
+        self.in_flight_ranged_commit_gets.store(0, Ordering::SeqCst);
+        self.max_in_flight_ranged_commit_gets
+            .store(0, Ordering::SeqCst);
     }
 
     fn operation_counts(&self) -> rs3_storage::BlobOperationCounts {
@@ -284,9 +300,38 @@ impl SlowCommitGetStore {
             .unwrap_or_else(|error| panic!("{error}"))
     }
 
-    async fn delay_commit_full_get(&self, object_id: &BackendObjectId, range: ByteRange) {
-        if object_id.as_str().starts_with("commits/") && range == ByteRange::Full {
-            tokio::time::sleep(self.delay).await;
+    fn full_commit_get_count(&self) -> u64 {
+        self.full_commit_gets.load(Ordering::SeqCst) as u64
+    }
+
+    fn ranged_commit_get_count(&self) -> u64 {
+        self.ranged_commit_gets.load(Ordering::SeqCst) as u64
+    }
+
+    fn max_in_flight_ranged_commit_get_count(&self) -> u64 {
+        self.max_in_flight_ranged_commit_gets.load(Ordering::SeqCst) as u64
+    }
+
+    async fn record_commit_get(&self, object_id: &BackendObjectId, range: ByteRange) {
+        if object_id.as_str().starts_with("commits/") {
+            match range {
+                ByteRange::Full => {
+                    self.full_commit_gets.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(self.delay).await;
+                }
+                ByteRange::Slice { .. } => {
+                    self.ranged_commit_gets.fetch_add(1, Ordering::SeqCst);
+                    let in_flight = self
+                        .in_flight_ranged_commit_gets
+                        .fetch_add(1, Ordering::SeqCst)
+                        .saturating_add(1);
+                    self.max_in_flight_ranged_commit_gets
+                        .fetch_max(in_flight, Ordering::SeqCst);
+                    tokio::time::sleep(self.delay).await;
+                    self.in_flight_ranged_commit_gets
+                        .fetch_sub(1, Ordering::SeqCst);
+                }
+            }
         }
     }
 }
@@ -307,7 +352,7 @@ impl BlobStore for SlowCommitGetStore {
         object_id: &BackendObjectId,
         range: ByteRange,
     ) -> rs3_storage::Result<Bytes> {
-        self.delay_commit_full_get(object_id, range).await;
+        self.record_commit_get(object_id, range).await;
         self.inner.get_range(object_id, range).await
     }
 
@@ -317,7 +362,7 @@ impl BlobStore for SlowCommitGetStore {
         version_id: Option<&BackendVersionId>,
         range: ByteRange,
     ) -> rs3_storage::Result<Bytes> {
-        self.delay_commit_full_get(object_id, range).await;
+        self.record_commit_get(object_id, range).await;
         self.inner.get_range_at(object_id, version_id, range).await
     }
 
@@ -773,8 +818,8 @@ async fn v2_repository_replays_committed_index_delta_after_reload() {
 }
 
 #[tokio::test]
-async fn v2_repository_caches_verified_payload_sections_for_repeated_ranges() {
-    let store = MemoryBlobStore::new();
+async fn v2_repository_range_reads_cache_headers_without_full_commit_gets() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
@@ -798,9 +843,7 @@ async fn v2_repository_caches_verified_payload_sections_for_repeated_ranges() {
             .put_committed(&anchor, key.clone(), body, RepositoryPutOptions::default())
             .await,
     );
-    store
-        .reset_operation_counts()
-        .unwrap_or_else(|error| panic!("{error}"));
+    store.reset_operation_counts();
 
     for offset in (0..4096).step_by(512) {
         let read = must_repo(
@@ -811,14 +854,14 @@ async fn v2_repository_caches_verified_payload_sections_for_repeated_ranges() {
         assert_eq!(read, Bytes::from(vec![42_u8; 512]));
     }
 
-    let counts = store
-        .operation_counts()
-        .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(counts.get, 1);
+    let counts = store.operation_counts();
+    assert_eq!(store.full_commit_get_count(), 0);
+    assert_eq!(store.ranged_commit_get_count(), counts.get);
+    assert_eq!(counts.get, 8);
 }
 
 #[tokio::test]
-async fn v2_repository_coalesces_concurrent_payload_section_cache_misses() {
+async fn v2_repository_concurrent_range_reads_avoid_full_commit_gets() {
     let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::from_millis(50));
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
@@ -873,13 +916,83 @@ async fn v2_repository_coalesces_concurrent_payload_section_cache_misses() {
         assert_eq!(read, Bytes::from(vec![11_u8; 64]));
     }
 
-    let counts = store.operation_counts();
-    assert_eq!(counts.get, 1);
+    assert_eq!(store.full_commit_get_count(), 0);
+    assert!(store.ranged_commit_get_count() >= 1);
+    assert!(store.ranged_commit_get_count() <= readers as u64);
 }
 
 #[tokio::test]
-async fn v2_repository_payload_section_cache_can_be_disabled() {
-    let store = MemoryBlobStore::new();
+async fn v2_repository_full_reads_fetch_payload_sections_not_full_commits() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::from_millis(10));
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        anchor,
+        CommitCoordinatorOptions::new(2, Duration::from_secs(60)),
+    ));
+    let first_key =
+        LogicalPath::new("snapshots/v2-cache-fill-a.bin").unwrap_or_else(|error| panic!("{error}"));
+    let second_key =
+        LogicalPath::new("snapshots/v2-cache-fill-b.bin").unwrap_or_else(|error| panic!("{error}"));
+
+    let first_put = {
+        let coordinator = Arc::clone(&coordinator);
+        let key = first_key.clone();
+        async move {
+            coordinator
+                .put_committed(
+                    key,
+                    Bytes::from(vec![1_u8; 4096]),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    };
+    let second_put = {
+        let coordinator = Arc::clone(&coordinator);
+        let key = second_key.clone();
+        async move {
+            coordinator
+                .put_committed(
+                    key,
+                    Bytes::from(vec![2_u8; 4096]),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    };
+    let (first_put, second_put) = tokio::join!(first_put, second_put);
+    must_repo(first_put);
+    must_repo(second_put);
+    store.reset_operation_counts();
+
+    let first = must_repo(repository.get_range(&first_key, ByteRange::Full).await);
+    let second = must_repo(repository.get_range(&second_key, ByteRange::Full).await);
+
+    assert_eq!(first, Bytes::from(vec![1_u8; 4096]));
+    assert_eq!(second, Bytes::from(vec![2_u8; 4096]));
+    let counts = store.operation_counts();
+    assert_eq!(store.full_commit_get_count(), 0);
+    assert_eq!(store.ranged_commit_get_count(), counts.get);
+    assert_eq!(counts.get, 2);
+}
+
+#[tokio::test]
+async fn v2_repository_range_reads_do_not_require_payload_section_cache() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
@@ -906,9 +1019,7 @@ async fn v2_repository_payload_section_cache_can_be_disabled() {
             )
             .await,
     );
-    store
-        .reset_operation_counts()
-        .unwrap_or_else(|error| panic!("{error}"));
+    store.reset_operation_counts();
 
     for offset in [0, 512] {
         let read = must_repo(
@@ -919,10 +1030,120 @@ async fn v2_repository_payload_section_cache_can_be_disabled() {
         assert_eq!(read, Bytes::from(vec![7_u8; 512]));
     }
 
-    let counts = store
-        .operation_counts()
-        .unwrap_or_else(|error| panic!("{error}"));
+    let counts = store.operation_counts();
+    assert_eq!(store.full_commit_get_count(), 0);
+    assert_eq!(store.ranged_commit_get_count(), counts.get);
     assert_eq!(counts.get, 2);
+}
+
+#[tokio::test]
+async fn v2_repository_repeated_ranges_reuse_decrypted_segments() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    );
+    let anchor = V2MemoryAnchor::new();
+    let key = LogicalPath::new("snapshots/v2-segment-cache.bin")
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                key.clone(),
+                Bytes::from(vec![9_u8; 2048]),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    store.reset_operation_counts();
+
+    for offset in [0, 64, 128] {
+        let read = must_repo(
+            repository
+                .get_range(&key, ByteRange::Slice { offset, len: 64 })
+                .await,
+        );
+        assert_eq!(read, Bytes::from(vec![9_u8; 64]));
+    }
+
+    let counts = store.operation_counts();
+    assert_eq!(store.full_commit_get_count(), 0);
+    assert_eq!(store.ranged_commit_get_count(), counts.get);
+    assert_eq!(counts.get, 1);
+}
+
+#[tokio::test]
+async fn v2_repository_independent_payload_range_fills_run_concurrently() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::from_millis(50));
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+
+    let object_count = 16_usize;
+    let mut keys = Vec::with_capacity(object_count);
+    for index in 0..object_count {
+        let key = LogicalPath::new(format!("snapshots/v2-independent-fill-{index}.bin"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        must_repo(
+            repository
+                .put_committed(
+                    &anchor,
+                    key.clone(),
+                    Bytes::from(vec![index as u8; 2048]),
+                    RepositoryPutOptions::default(),
+                )
+                .await,
+        );
+        keys.push(key);
+    }
+    store.reset_operation_counts();
+
+    let barrier = Arc::new(Barrier::new(object_count + 1));
+    let tasks = keys
+        .into_iter()
+        .map(|key| {
+            let repository = Arc::clone(&repository);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                repository
+                    .get_range(&key, ByteRange::Slice { offset: 0, len: 64 })
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait().await;
+
+    for (index, task) in tasks.into_iter().enumerate() {
+        let read = must_repo(task.await.unwrap_or_else(|error| panic!("{error}")));
+        assert_eq!(read, Bytes::from(vec![index as u8; 64]));
+    }
+
+    assert_eq!(store.full_commit_get_count(), 0);
+    assert_eq!(store.ranged_commit_get_count(), object_count as u64);
+    assert!(store.max_in_flight_ranged_commit_get_count() > 1);
 }
 
 #[tokio::test]

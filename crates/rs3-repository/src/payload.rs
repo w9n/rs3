@@ -577,7 +577,7 @@ fn append_segment_overlap(
     Ok(())
 }
 
-fn total_segmented_payload_len(header: &SegmentedPayloadHeader) -> Result<u64> {
+pub(crate) fn total_segmented_payload_len(header: &SegmentedPayloadHeader) -> Result<u64> {
     let count = segment_count(header)?;
     let Some(last_index) = count.checked_sub(1) else {
         return u64::try_from(header.header_len).map_err(|_| StorageError::InvalidRange.into());

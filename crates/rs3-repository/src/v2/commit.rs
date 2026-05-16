@@ -407,6 +407,61 @@ pub fn parse_v2_commit_header(
     })
 }
 
+/// Returns the exact header span length after reading the fixed v2 header.
+pub(crate) fn v2_commit_header_span_len(input: &[u8]) -> V2Result<usize> {
+    if input.len() < V2_HEADER_META_LEN {
+        return Err(V2FormatError::TruncatedHeader);
+    }
+    if &input[..V2_COMMIT_MAGIC.len()] != V2_COMMIT_MAGIC {
+        return Err(V2FormatError::TruncatedHeader);
+    }
+
+    let format_version = u32::from_be_bytes(
+        input[8..12]
+            .try_into()
+            .map_err(|_| V2FormatError::TruncatedHeader)?,
+    );
+    if format_version != V2_FORMAT_VERSION {
+        return Err(V2FormatError::UnsupportedFormatVersion);
+    }
+    let min_reader_version = u32::from_be_bytes(
+        input[12..16]
+            .try_into()
+            .map_err(|_| V2FormatError::TruncatedHeader)?,
+    );
+    if min_reader_version > V2_MIN_READER_VERSION {
+        return Err(V2FormatError::UnsupportedReaderVersion);
+    }
+    let capability_flags = u64::from_be_bytes(
+        input[16..24]
+            .try_into()
+            .map_err(|_| V2FormatError::TruncatedHeader)?,
+    );
+    if capability_flags & !V2_SUPPORTED_CAPABILITY_FLAGS != 0 {
+        return Err(V2FormatError::UnsupportedCapabilities);
+    }
+    let upload_mode = V2UploadMode::from_wire(input[24])?;
+    if input[25..28].iter().any(|byte| *byte != 0) {
+        return Err(V2FormatError::NonzeroReserved);
+    }
+    let header_len = usize::try_from(u32::from_be_bytes(
+        input[28..32]
+            .try_into()
+            .map_err(|_| V2FormatError::TruncatedHeader)?,
+    ))
+    .map_err(|_| V2FormatError::HeaderTooLarge)?;
+    if header_len > MAX_HEADER_CBOR_LEN {
+        return Err(V2FormatError::HeaderTooLarge);
+    }
+
+    match upload_mode {
+        V2UploadMode::SinglePut => V2_HEADER_META_LEN
+            .checked_add(header_len)
+            .ok_or(V2FormatError::HeaderTooLarge),
+        V2UploadMode::MultipartPadded => Ok(V2_MAX_HEADER_SIZE),
+    }
+}
+
 /// Parses and verifies a complete v2 commit object, including section digest.
 pub fn parse_v2_commit_object(
     object_id: &BackendObjectId,

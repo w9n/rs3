@@ -46,6 +46,9 @@ external anchor's full commit key, body digest, provider version ID when
 required, and signing key ID. A v2 reader verifies the fixed header, header
 digest, canonical CBOR header, signed `self.commit_key`, Ed25519 signature,
 section layout, and body digest before trusting a commit.
+Current v2 writers pad the signed header span to 4 KiB, which gives readers a
+single bounded prefix read for commit-header fallback and a stable section
+region offset for hot-path payload refs.
 
 The retained-version/Object Lock provider profile does not require atomic
 `If-None-Match: *` support. It requires provider version IDs, exact-version
@@ -61,11 +64,12 @@ available, and commit body digest. v2 does not write repository payloads to
 backend `segments/`, nor does it write backend `index/`, `manifests/`,
 `checkpoints/`, or `evidence/` objects.
 
-The gateway uses commit batching knobs for v2. Concurrent client PUTs can stage
-multiple encrypted payloads and publish one signed v2 delta commit that covers
-all pending index updates; if commit publication or anchor advancement fails,
-the unaccepted in-memory namespace state is rolled back while the failed
-logical payload sequences remain reserved.
+The gateway uses commit batching knobs for v2. The default partial-batch wait
+is 25 ms. Concurrent client PUTs can stage multiple encrypted payloads and
+publish one signed v2 delta commit that covers all pending index updates; if
+commit publication or anchor advancement fails, the unaccepted in-memory
+namespace state is rolled back while the failed logical payload sequences
+remain reserved.
 
 v2 snapshot commits consolidate the live blinded namespace into an encrypted
 `INDEX_SNAPSHOT` section. Readers walk the signed parent chain only until the
@@ -95,16 +99,20 @@ review flag because gateway credentials must not be able to bypass retention.
 
 Payload sections are encrypted with XChaCha20-Poly1305 using the same payload
 envelope as earlier preview work, but the associated backend object ID is the
-commit key and the ciphertext bytes are stored inside the commit object.
-Segment associated data binds ciphertext to the commit key, segment size,
-plaintext length, segment index, and final-segment marker.
+payload identity recorded in the encrypted index entry, while the ciphertext
+bytes are stored inside the commit object. Segment associated data binds
+ciphertext to that payload identity, segment size, plaintext length, segment
+index, and final-segment marker.
 
 Segment size is recorded per payload section. The current writer default keeps
 small objects at 512 plaintext bytes per segment and uses larger segments for
 medium and large objects. This is a tuning policy, not a permanent format
-guarantee. The current reader resolves the anchored commit and opens the named
-payload section; a later optimization may range-fetch just the header and
-overlapping payload section bytes.
+guarantee. Current writers also record the parsed payload-header facts and the
+commit section-region offset inside the encrypted index payload reference.
+Readers can therefore plan range reads from trusted index state and fetch only
+the overlapping encrypted segments on the hot path. Older or incomplete refs
+fall back to verifying the commit header and probing the payload header. Full
+file reads fetch the payload section, not the whole commit body.
 
 ## Index State
 
@@ -118,8 +126,11 @@ Anchored signed commits decide which sealed metadata is reachable repository
 state.
 
 Namespace entries reference the accepted commit key, provider version ID when
-available, commit body digest, and payload section offset/length. Retained/Object
-Lock repository operation requires this version ID so restore can read the exact
+available, commit body digest, payload identity, and payload section
+offset/length. New v2 refs also carry the payload segment size, plaintext
+length, payload key ID, nonce prefix, payload-header length, and section-region
+offset needed for one-range restore reads. Retained/Object Lock repository
+operation requires the provider version ID so restore can read the exact
 retained commit version even if the backend later presents a different latest
 version.
 

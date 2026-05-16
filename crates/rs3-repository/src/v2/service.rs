@@ -6,7 +6,9 @@ use super::repository::{
     V2CommitAnchor, V2CommitChain, V2CommitSection, V2CommitStore, V2CommitStoreOptions,
     V2CommitWrite, V2StoredCommit,
 };
-use super::{V2ParsedCommit, V2SectionType};
+use super::{
+    V2_MAX_HEADER_SIZE, V2ParsedCommit, V2ParsedCommitHeader, V2SectionType, V2UploadMode,
+};
 use crate::checkpoint::{open_index_delta_object, seal_index_delta_object, seal_manifest_record};
 use crate::error::{RepositoryError, Result};
 use crate::model::{
@@ -16,7 +18,11 @@ use crate::model::{
 use crate::namespace::{
     existing_blind_keys, first_namespace_entry, indexed_list_prefix, prefix_tokens_for_key,
 };
-use crate::payload::{adaptive_payload_segment_size, open_payload_object, seal_payload_object};
+use crate::payload::{
+    PayloadHeaderProbe, SegmentedPayloadHeader, adaptive_payload_segment_size, open_payload_object,
+    parse_segmented_payload_header, probe_payload_header, seal_payload_object,
+    segmented_ciphertext_span, total_segmented_payload_len,
+};
 use crate::service::{Repository, RepositoryOptions, strongest_retention_policy};
 use crate::state::{
     RepositoryState, TrustedManifest, apply_index_delta_object, next_sequence, object_material,
@@ -24,18 +30,21 @@ use crate::state::{
 use bytes::Bytes;
 use rs3_crypto::KeyRing;
 use rs3_index::{
-    INDEX_DELTA_OBJECT_DOMAIN, IndexDelta, IndexDeltaObject, NamespaceEntry, PayloadReference,
-    index_delta_object_bytes,
+    INDEX_DELTA_OBJECT_DOMAIN, IndexDelta, IndexDeltaObject, NamespaceEntry,
+    PayloadHeaderReference, PayloadReference, index_delta_object_bytes,
 };
 use rs3_storage::{BlobStore, ByteRange};
 use rs3_types::{
-    BackendObjectId, BackendVersionId, LegalHoldStatus, LogicalPath, ManifestId, RetentionPolicy,
-    Sequence,
+    BackendObjectId, BackendObjectRef, BackendVersionId, LegalHoldStatus, LogicalPath, ManifestId,
+    RetentionPolicy, Sequence,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
-use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use std::sync::{Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+
+const V2_PAYLOAD_FILL_LOCK_STRIPES: usize = 64;
 
 /// Preview v2 repository service.
 ///
@@ -46,11 +55,14 @@ use tokio::sync::Mutex;
 pub struct V2Repository<S> {
     repository: Repository<S>,
     commit_store: V2CommitStore<S>,
+    commit_upload_mode: V2UploadMode,
     accepted_state: StdRwLock<RepositoryState>,
     mutation_lock: Mutex<()>,
+    payload_segment_fill_locks: Vec<Mutex<()>>,
     pending_payloads: StdMutex<Vec<PendingV2Payload>>,
     payload_sections: StdRwLock<V2PayloadSectionCache>,
-    payload_section_fetches: StdMutex<BTreeMap<V2PayloadSectionCacheKey, Arc<Mutex<()>>>>,
+    commit_headers: StdRwLock<V2CommitHeaderCache>,
+    payload_headers: StdRwLock<V2PayloadHeaderCache>,
 }
 
 #[derive(Clone, Debug)]
@@ -68,6 +80,9 @@ struct PendingV2Payload {
 #[derive(Clone, Debug)]
 struct PendingV2PayloadLocation {
     manifest_id: ManifestId,
+    payload_id: BackendObjectId,
+    payload_header: PayloadHeaderReference,
+    sections_start: Option<u64>,
     offset: u64,
     length: u64,
 }
@@ -91,6 +106,7 @@ where
         commit_options: V2CommitStoreOptions,
     ) -> Self {
         let payload_section_cache_max_bytes = repository_options.decrypted_segment_cache_max_bytes;
+        let commit_upload_mode = commit_options.upload_mode;
         Self {
             repository: Repository::with_keyring_and_options(
                 store.clone(),
@@ -98,13 +114,18 @@ where
                 repository_options,
             ),
             commit_store: V2CommitStore::new(store, keyring, commit_options),
+            commit_upload_mode,
             accepted_state: StdRwLock::new(RepositoryState::default()),
             mutation_lock: Mutex::new(()),
+            payload_segment_fill_locks: (0..V2_PAYLOAD_FILL_LOCK_STRIPES)
+                .map(|_| Mutex::new(()))
+                .collect(),
             pending_payloads: StdMutex::new(Vec::new()),
             payload_sections: StdRwLock::new(V2PayloadSectionCache::with_max_bytes(
                 payload_section_cache_max_bytes,
             )),
-            payload_section_fetches: StdMutex::new(BTreeMap::new()),
+            commit_headers: StdRwLock::new(V2CommitHeaderCache::default()),
+            payload_headers: StdRwLock::new(V2PayloadHeaderCache::default()),
         }
     }
 
@@ -247,6 +268,7 @@ where
         };
 
         let pending_object_id = BackendObjectId::new(format!("v2-pending/{}", sequence.get()))?;
+        let entry_payload_id = pending_object_id.clone();
         let modified_at_ms = current_time_ms();
         let entry = NamespaceEntry {
             namespace_key_id: primary_blind_key.key_id,
@@ -254,6 +276,9 @@ where
             object_id: pending_object_id,
             object_version_id: None,
             payload_ref: Some(PayloadReference::V2Self {
+                payload_id: entry_payload_id,
+                payload_header: None,
+                sections_start: None,
                 offset: 0,
                 length: 0,
             }),
@@ -350,6 +375,9 @@ where
             commit_key,
             commit_version_id,
             body_digest,
+            payload_id,
+            payload_header,
+            sections_start,
             offset,
             length,
         }) = entry.payload_ref
@@ -363,41 +391,225 @@ where
             commit_key: commit_key.clone(),
             commit_version_id: commit_version_id.clone(),
             body_digest,
+            payload_id: payload_id.clone(),
             offset,
             length,
         };
         if let Some(payload) = self.cached_payload_section(&cache_key)? {
-            return open_payload_object(&keyring, &commit_key, payload, range);
+            return open_payload_object(&keyring, &payload_id, payload, range);
         }
 
-        let fetch_lock = self.payload_section_fetch_lock(&cache_key)?;
-        let _fetch_guard = fetch_lock.lock().await;
-        if let Some(payload) = self.cached_payload_section(&cache_key)? {
-            return open_payload_object(&keyring, &commit_key, payload, range);
-        }
-
-        let payload = match async {
-            let commit = self
-                .commit_store
-                .read_commit_at(&commit_key, commit_version_id.as_ref())
-                .await
-                .map_err(v2_repository_error)?;
-            if commit.parsed_header.header.body_digest != body_digest {
-                return Err(v2_repository_error(V2FormatError::BodyDigestMismatch));
-            }
-            commit_payload_section_bytes(&commit, offset, length)
-        }
+        self.read_payload_range_from_commit(
+            &keyring,
+            V2CommitPayloadRead {
+                commit_key,
+                commit_version_id,
+                body_digest,
+                payload_id,
+                payload_header,
+                sections_start,
+                offset,
+                length,
+            },
+            range,
+            cache_key,
+        )
         .await
-        {
-            Ok(payload) => payload,
-            Err(error) => {
-                self.clear_payload_section_fetch_lock(&cache_key, &fetch_lock)?;
-                return Err(error);
+    }
+
+    async fn read_payload_range_from_commit(
+        &self,
+        keyring: &KeyRing,
+        payload: V2CommitPayloadRead,
+        range: ByteRange,
+        cache_key: V2PayloadSectionCacheKey,
+    ) -> Result<Bytes> {
+        let sections_start = match payload.sections_start {
+            Some(sections_start) => sections_start,
+            None => {
+                let commit_header_key = V2CommitHeaderCacheKey {
+                    commit_key: payload.commit_key.clone(),
+                    commit_version_id: payload.commit_version_id.clone(),
+                    body_digest: payload.body_digest,
+                };
+                let header = self
+                    .read_commit_header_for_payload(&commit_header_key)
+                    .await?;
+                ensure_payload_section_declared_in_header(&header, payload.offset, payload.length)?;
+                u64::try_from(header.sections_start)
+                    .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?
             }
         };
-        self.cache_payload_section(cache_key.clone(), payload.clone())?;
-        self.clear_payload_section_fetch_lock(&cache_key, &fetch_lock)?;
-        open_payload_object(&keyring, &commit_key, payload, range)
+        let payload_start = sections_start
+            .checked_add(payload.offset)
+            .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?;
+
+        if range == ByteRange::Full {
+            let body = self
+                .commit_store
+                .read_commit_range_at(
+                    &payload.commit_key,
+                    payload.commit_version_id.as_ref(),
+                    ByteRange::Slice {
+                        offset: payload_start,
+                        len: payload.length,
+                    },
+                )
+                .await
+                .map_err(v2_repository_error)?;
+            self.cache_payload_section(cache_key, body.clone())?;
+            return open_payload_object(keyring, &payload.payload_id, body, range);
+        }
+
+        let payload_header = match payload.payload_header.as_ref() {
+            Some(reference) => payload_header_from_reference(reference)?,
+            None => {
+                self.read_payload_header_from_commit(&payload, payload_start, &cache_key)
+                    .await?
+            }
+        };
+        if total_segmented_payload_len(&payload_header)? != payload.length {
+            return Err(RepositoryError::InvalidObjectFormat {
+                object_id: payload.payload_id,
+            });
+        }
+        let span = segmented_ciphertext_span(&payload_header, range)?;
+        let payload_cache_ref = BackendObjectRef {
+            object_id: payload.payload_id.clone(),
+            version_id: payload.commit_version_id.clone(),
+        };
+        if let Some(plaintext) = self.repository.open_cached_decrypted_segments(
+            &payload_cache_ref,
+            &payload_header,
+            range,
+        )? {
+            return Ok(plaintext);
+        }
+        let fill_lock_index = payload_fill_lock_index(&payload.payload_id, span.start_segment);
+        let _fill_guard = self.payload_segment_fill_locks[fill_lock_index]
+            .lock()
+            .await;
+        if let Some(plaintext) = self.repository.open_cached_decrypted_segments(
+            &payload_cache_ref,
+            &payload_header,
+            range,
+        )? {
+            return Ok(plaintext);
+        }
+        let ciphertext = if span.len == 0 {
+            Bytes::new()
+        } else {
+            self.commit_store
+                .read_commit_range_at(
+                    &payload.commit_key,
+                    payload.commit_version_id.as_ref(),
+                    ByteRange::Slice {
+                        offset: payload_start
+                            .checked_add(span.offset)
+                            .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?,
+                        len: span.len,
+                    },
+                )
+                .await
+                .map_err(v2_repository_error)?
+        };
+        self.repository.open_and_cache_decrypted_segments(
+            keyring,
+            &payload_cache_ref,
+            &payload_header,
+            range,
+            span,
+            ciphertext,
+        )
+    }
+
+    async fn read_commit_header_for_payload(
+        &self,
+        key: &V2CommitHeaderCacheKey,
+    ) -> Result<V2ParsedCommitHeader> {
+        if let Some(header) = self.cached_commit_header(key)? {
+            return Ok(header);
+        }
+        let header = self
+            .commit_store
+            .read_commit_header_at(&key.commit_key, key.commit_version_id.as_ref())
+            .await
+            .map_err(v2_repository_error)?;
+        if header.header.body_digest != key.body_digest {
+            return Err(v2_repository_error(V2FormatError::BodyDigestMismatch));
+        }
+        self.cache_commit_header(key.clone(), header.clone())?;
+        Ok(header)
+    }
+
+    async fn read_payload_header_from_commit(
+        &self,
+        payload: &V2CommitPayloadRead,
+        payload_start: u64,
+        cache_key: &V2PayloadSectionCacheKey,
+    ) -> Result<SegmentedPayloadHeader> {
+        if let Some(header) = self.cached_payload_header(cache_key)? {
+            return Ok(header);
+        }
+        let initial_len = payload.length.min(crate::payload::PAYLOAD_HEADER_PROBE_LEN);
+        let initial = self
+            .commit_store
+            .read_commit_range_at(
+                &payload.commit_key,
+                payload.commit_version_id.as_ref(),
+                ByteRange::Slice {
+                    offset: payload_start,
+                    len: initial_len,
+                },
+            )
+            .await
+            .map_err(v2_repository_error)?;
+        let header_len = match probe_payload_header(&payload.payload_id, &initial)? {
+            PayloadHeaderProbe::Segmented { header_len } => header_len,
+            PayloadHeaderProbe::NeedMore { len } => {
+                if len > payload.length {
+                    return Err(RepositoryError::InvalidObjectFormat {
+                        object_id: payload.payload_id.clone(),
+                    });
+                }
+                let header = self
+                    .commit_store
+                    .read_commit_range_at(
+                        &payload.commit_key,
+                        payload.commit_version_id.as_ref(),
+                        ByteRange::Slice {
+                            offset: payload_start,
+                            len,
+                        },
+                    )
+                    .await
+                    .map_err(v2_repository_error)?;
+                let parsed = parse_segmented_payload_header(&payload.payload_id, &header)?;
+                self.cache_payload_header(cache_key.clone(), parsed.clone())?;
+                return Ok(parsed);
+            }
+        };
+        let parsed = parse_segmented_payload_header(&payload.payload_id, &initial[..header_len])?;
+        self.cache_payload_header(cache_key.clone(), parsed.clone())?;
+        Ok(parsed)
+    }
+
+    fn v2_payload_id(commit_key: &V2CommitKey, ordinal: usize) -> Result<BackendObjectId> {
+        let ordinal = u64::try_from(ordinal)
+            .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
+        let mut digest = Sha256::new();
+        digest.update(b"rs3:v2-payload-id:v1\n");
+        digest.update(commit_key.object_id.as_str().as_bytes());
+        digest.update(ordinal.to_be_bytes());
+        BackendObjectId::new(format!("v2-payload/{}", hex::encode(digest.finalize())))
+            .map_err(Into::into)
+    }
+
+    fn sections_start_for_upload_mode(upload_mode: V2UploadMode) -> Option<u64> {
+        match upload_mode {
+            V2UploadMode::MultipartPadded => Some(V2_MAX_HEADER_SIZE as u64),
+            V2UploadMode::SinglePut => None,
+        }
     }
 
     /// Lists client-visible entries for a prefix.
@@ -575,13 +787,16 @@ where
         let mut locations = Vec::with_capacity(pending_payloads.len());
         let mut next_offset = 0_u64;
 
-        for pending in pending_payloads {
+        for (ordinal, pending) in pending_payloads.iter().enumerate() {
+            let payload_id = Self::v2_payload_id(commit_key, ordinal)?;
             let payload = seal_payload_object(
                 &keyring,
-                &commit_key.object_id,
+                &payload_id,
                 &pending.body,
                 self.payload_segment_size_for_object(pending.body.len()),
             )?;
+            let payload_header =
+                payload_header_reference(&parse_segmented_payload_header(&payload_id, &payload)?)?;
             let length = u64::try_from(payload.len())
                 .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
             sections.push(V2CommitSection::new(
@@ -591,6 +806,9 @@ where
             ));
             locations.push(PendingV2PayloadLocation {
                 manifest_id: pending.manifest_id.clone(),
+                payload_id,
+                payload_header,
+                sections_start: Self::sections_start_for_upload_mode(self.commit_upload_mode),
                 offset: next_offset,
                 length,
             });
@@ -640,6 +858,9 @@ where
             entry.object_id = commit_key.object_id.clone();
             entry.object_version_id = None;
             entry.payload_ref = Some(PayloadReference::V2Self {
+                payload_id: location.payload_id.clone(),
+                payload_header: Some(location.payload_header.clone()),
+                sections_start: location.sections_start,
                 offset: location.offset,
                 length: location.length,
             });
@@ -676,6 +897,9 @@ where
                 commit_key: anchor_state.commit_key.clone(),
                 commit_version_id: anchor_state.version_id.clone(),
                 body_digest: anchor_state.body_digest,
+                payload_id: location.payload_id.clone(),
+                payload_header: Some(location.payload_header.clone()),
+                sections_start: location.sections_start,
                 offset: location.offset,
                 length: location.length,
             });
@@ -722,32 +946,60 @@ where
         Ok(())
     }
 
-    fn payload_section_fetch_lock(&self, key: &V2PayloadSectionCacheKey) -> Result<Arc<Mutex<()>>> {
-        let mut fetches = self
-            .payload_section_fetches
-            .lock()
+    fn cached_commit_header(
+        &self,
+        key: &V2CommitHeaderCacheKey,
+    ) -> Result<Option<V2ParsedCommitHeader>> {
+        let mut cache = self
+            .commit_headers
+            .write()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        Ok(fetches
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone())
+        Ok(cache.get(key))
     }
 
-    fn clear_payload_section_fetch_lock(
+    fn cache_commit_header(
+        &self,
+        key: V2CommitHeaderCacheKey,
+        header: V2ParsedCommitHeader,
+    ) -> Result<()> {
+        let mut cache = self
+            .commit_headers
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        cache.insert(key, header);
+        Ok(())
+    }
+
+    fn cache_verified_commit_header(&self, commit: &V2ParsedCommit) -> Result<()> {
+        let key = V2CommitHeaderCacheKey {
+            commit_key: commit.parsed_header.header.self_ref.commit_key.clone(),
+            commit_version_id: commit.version_id.clone(),
+            body_digest: commit.parsed_header.header.body_digest,
+        };
+        self.cache_commit_header(key, commit.parsed_header.clone())
+    }
+
+    fn cached_payload_header(
         &self,
         key: &V2PayloadSectionCacheKey,
-        fetch_lock: &Arc<Mutex<()>>,
-    ) -> Result<()> {
-        let mut fetches = self
-            .payload_section_fetches
-            .lock()
+    ) -> Result<Option<SegmentedPayloadHeader>> {
+        let mut cache = self
+            .payload_headers
+            .write()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        if fetches
-            .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, fetch_lock))
-        {
-            fetches.remove(key);
-        }
+        Ok(cache.get(key))
+    }
+
+    fn cache_payload_header(
+        &self,
+        key: V2PayloadSectionCacheKey,
+        header: SegmentedPayloadHeader,
+    ) -> Result<()> {
+        let mut cache = self
+            .payload_headers
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        cache.insert(key, header);
         Ok(())
     }
 
@@ -756,6 +1008,7 @@ where
         state: &mut RepositoryState,
         commit: &V2ParsedCommit,
     ) -> Result<()> {
+        self.cache_verified_commit_header(commit)?;
         for (index, section) in commit.parsed_header.header.section_index.iter().enumerate() {
             if section.flags & V2_SECTION_FLAG_COMPRESSED != 0 {
                 return Err(v2_repository_error(V2FormatError::UnsupportedSection));
@@ -850,11 +1103,65 @@ where
     }
 }
 
+fn payload_header_reference(header: &SegmentedPayloadHeader) -> Result<PayloadHeaderReference> {
+    Ok(PayloadHeaderReference {
+        chunk_size: header.chunk_size,
+        plaintext_len: header.plaintext_len,
+        key_id: header.key_id.clone(),
+        nonce_prefix: header.nonce_prefix,
+        header_len: u64::try_from(header.header_len)
+            .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+    })
+}
+
+fn payload_header_from_reference(
+    reference: &PayloadHeaderReference,
+) -> Result<SegmentedPayloadHeader> {
+    Ok(SegmentedPayloadHeader {
+        chunk_size: reference.chunk_size,
+        plaintext_len: reference.plaintext_len,
+        key_id: reference.key_id.clone(),
+        nonce_prefix: reference.nonce_prefix,
+        header_len: usize::try_from(reference.header_len)
+            .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+    })
+}
+
+fn payload_fill_lock_index(payload_id: &BackendObjectId, start_segment: usize) -> usize {
+    let mut digest = Sha256::new();
+    digest.update(payload_id.as_str().as_bytes());
+    digest.update((start_segment as u64).to_be_bytes());
+    let digest = digest.finalize();
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    (u64::from_be_bytes(prefix) % V2_PAYLOAD_FILL_LOCK_STRIPES as u64) as usize
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct V2CommitHeaderCacheKey {
+    commit_key: BackendObjectId,
+    commit_version_id: Option<BackendVersionId>,
+    body_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+struct V2CommitPayloadRead {
+    commit_key: BackendObjectId,
+    commit_version_id: Option<BackendVersionId>,
+    body_digest: [u8; 32],
+    payload_id: BackendObjectId,
+    payload_header: Option<PayloadHeaderReference>,
+    sections_start: Option<u64>,
+    offset: u64,
+    length: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct V2PayloadSectionCacheKey {
     commit_key: BackendObjectId,
     commit_version_id: Option<BackendVersionId>,
     body_digest: [u8; 32],
+    payload_id: BackendObjectId,
     offset: u64,
     length: u64,
 }
@@ -924,6 +1231,100 @@ impl V2PayloadSectionCache {
     }
 }
 
+#[derive(Debug)]
+struct V2CommitHeaderCache {
+    headers: BTreeMap<V2CommitHeaderCacheKey, V2ParsedCommitHeader>,
+    order: VecDeque<V2CommitHeaderCacheKey>,
+    max_entries: usize,
+}
+
+impl Default for V2CommitHeaderCache {
+    fn default() -> Self {
+        Self {
+            headers: BTreeMap::new(),
+            order: VecDeque::new(),
+            max_entries: 4096,
+        }
+    }
+}
+
+impl V2CommitHeaderCache {
+    fn get(&mut self, key: &V2CommitHeaderCacheKey) -> Option<V2ParsedCommitHeader> {
+        let header = self.headers.get(key).cloned()?;
+        self.order.retain(|candidate| candidate != key);
+        self.order.push_back(key.clone());
+        Some(header)
+    }
+
+    fn insert(&mut self, key: V2CommitHeaderCacheKey, header: V2ParsedCommitHeader) {
+        match self.headers.entry(key.clone()) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(header);
+                self.order.retain(|candidate| candidate != &key);
+                self.order.push_back(key);
+            }
+            Entry::Vacant(entry) => {
+                self.order.push_back(key);
+                entry.insert(header);
+            }
+        }
+
+        while self.headers.len() > self.max_entries {
+            let Some(evicted_key) = self.order.pop_front() else {
+                break;
+            };
+            self.headers.remove(&evicted_key);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct V2PayloadHeaderCache {
+    headers: BTreeMap<V2PayloadSectionCacheKey, SegmentedPayloadHeader>,
+    order: VecDeque<V2PayloadSectionCacheKey>,
+    max_entries: usize,
+}
+
+impl Default for V2PayloadHeaderCache {
+    fn default() -> Self {
+        Self {
+            headers: BTreeMap::new(),
+            order: VecDeque::new(),
+            max_entries: 4096,
+        }
+    }
+}
+
+impl V2PayloadHeaderCache {
+    fn get(&mut self, key: &V2PayloadSectionCacheKey) -> Option<SegmentedPayloadHeader> {
+        let header = self.headers.get(key).cloned()?;
+        self.order.retain(|candidate| candidate != key);
+        self.order.push_back(key.clone());
+        Some(header)
+    }
+
+    fn insert(&mut self, key: V2PayloadSectionCacheKey, header: SegmentedPayloadHeader) {
+        match self.headers.entry(key.clone()) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(header);
+                self.order.retain(|candidate| candidate != &key);
+                self.order.push_back(key);
+            }
+            Entry::Vacant(entry) => {
+                self.order.push_back(key);
+                entry.insert(header);
+            }
+        }
+
+        while self.headers.len() > self.max_entries {
+            let Some(evicted_key) = self.order.pop_front() else {
+                break;
+            };
+            self.headers.remove(&evicted_key);
+        }
+    }
+}
+
 fn commit_section_bytes(commit: &V2ParsedCommit, section_index: usize) -> Result<&[u8]> {
     let section = commit
         .parsed_header
@@ -947,27 +1348,20 @@ fn commit_section_bytes(commit: &V2ParsedCommit, section_index: usize) -> Result
         .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))
 }
 
-fn commit_payload_section_bytes(
-    commit: &V2ParsedCommit,
-    offset: u64,
-    length: u64,
-) -> Result<Bytes> {
-    ensure_payload_section_declared(commit, offset, length)?;
-    let absolute_start = u64::try_from(commit.parsed_header.sections_start)
-        .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?
-        .checked_add(offset)
-        .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?;
-    let absolute_end = absolute_start
+fn payload_section_bytes(commit: &V2ParsedCommit, offset: u64, length: u64) -> Result<&[u8]> {
+    let section_region = commit
+        .body
+        .get(commit.parsed_header.sections_start..)
+        .ok_or_else(|| v2_repository_error(V2FormatError::TruncatedBody))?;
+    let start =
+        usize::try_from(offset).map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
+    let length =
+        usize::try_from(length).map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
+    let end = start
         .checked_add(length)
         .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?;
-    let start = usize::try_from(absolute_start)
-        .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
-    let end = usize::try_from(absolute_end)
-        .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
-    commit
-        .body
+    section_region
         .get(start..end)
-        .map(Bytes::copy_from_slice)
         .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))
 }
 
@@ -976,10 +1370,35 @@ fn resolve_self_payload_refs(delta: &mut IndexDeltaObject, commit: &V2ParsedComm
         let IndexDelta::Upsert { entry, .. } = mutation else {
             continue;
         };
-        let Some(PayloadReference::V2Self { offset, length }) = entry.payload_ref.clone() else {
+        let Some(PayloadReference::V2Self {
+            payload_id,
+            payload_header,
+            sections_start: _,
+            offset,
+            length,
+        }) = entry.payload_ref.clone()
+        else {
             continue;
         };
         ensure_payload_section_declared(commit, offset, length)?;
+        let payload_header = match payload_header {
+            Some(reference) => reference,
+            None => {
+                let payload_bytes = payload_section_bytes(commit, offset, length)?;
+                payload_header_reference(&parse_segmented_payload_header(
+                    &payload_id,
+                    payload_bytes,
+                )?)?
+            }
+        };
+        if total_segmented_payload_len(&payload_header_from_reference(&payload_header)?)? != length
+        {
+            return Err(RepositoryError::InvalidObjectFormat {
+                object_id: payload_id,
+            });
+        }
+        let sections_start = u64::try_from(commit.parsed_header.sections_start)
+            .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
         let commit_key = commit.parsed_header.header.self_ref.commit_key.clone();
         entry.object_id = commit_key.clone();
         entry.object_version_id = commit.version_id.clone();
@@ -987,6 +1406,9 @@ fn resolve_self_payload_refs(delta: &mut IndexDeltaObject, commit: &V2ParsedComm
             commit_key,
             commit_version_id: commit.version_id.clone(),
             body_digest: commit.parsed_header.header.body_digest,
+            payload_id,
+            payload_header: Some(payload_header),
+            sections_start: Some(sections_start),
             offset,
             length,
         });
@@ -999,16 +1421,19 @@ fn ensure_payload_section_declared(
     offset: u64,
     length: u64,
 ) -> Result<()> {
-    let found = commit
-        .parsed_header
-        .header
-        .section_index
-        .iter()
-        .any(|section| {
-            section.section_type == V2SectionType::Payload
-                && section.offset == offset
-                && section.length == length
-        });
+    ensure_payload_section_declared_in_header(&commit.parsed_header, offset, length)
+}
+
+fn ensure_payload_section_declared_in_header(
+    header: &V2ParsedCommitHeader,
+    offset: u64,
+    length: u64,
+) -> Result<()> {
+    let found = header.header.section_index.iter().any(|section| {
+        section.section_type == V2SectionType::Payload
+            && section.offset == offset
+            && section.length == length
+    });
     if found {
         Ok(())
     } else {

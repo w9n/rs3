@@ -14,7 +14,7 @@ const DEFAULT_BIND: &str = "127.0.0.1:9080";
 const DEFAULT_ANCHOR_FIELD_MANAGER: &str = "rs3-server";
 pub const DEFAULT_KEYRING_WRAPPING_KEY_ID: &str = "wrap-v1";
 const DEFAULT_BATCH_ITEMS: usize = 64;
-const DEFAULT_BATCH_DELAY_MS: u64 = 10;
+const DEFAULT_BATCH_DELAY_MS: u64 = 25;
 const REDACTED_SECRET_VALUE: &str = "<redacted>";
 const MIN_REPOSITORY_KEY_HEX_LEN: usize = SecretBytes::MIN_LEN * 2;
 const MIN_REPOSITORY_SALT_HEX_LEN: usize = MIN_REPOSITORY_SALT_LEN * 2;
@@ -781,7 +781,7 @@ mod tests {
             config.batching,
             BatchConfig {
                 max_items: 64,
-                max_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(25),
                 max_pending_items: 64,
             }
         );

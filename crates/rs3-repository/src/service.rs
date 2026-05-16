@@ -483,7 +483,39 @@ where
         })
     }
 
-    fn open_and_cache_decrypted_segments(
+    pub(crate) fn open_cached_decrypted_segments(
+        &self,
+        object_ref: &BackendObjectRef,
+        header: &SegmentedPayloadHeader,
+        range: ByteRange,
+    ) -> Result<Option<Bytes>> {
+        let selection = segmented_plaintext_selection(header, range)?;
+        match self.cached_decrypted_segments(object_ref, header, selection)? {
+            DecryptedSegmentLookup::Hit { segments, bytes } => {
+                record_decrypted_segment_cache_many(
+                    "hit",
+                    u64::try_from(segments.len()).unwrap_or(u64::MAX),
+                    bytes,
+                );
+                Ok(Some(open_segmented_payload_cached_segments(
+                    &object_ref.object_id,
+                    header,
+                    range,
+                    selection.start_segment,
+                    &segments,
+                )?))
+            }
+            DecryptedSegmentLookup::Miss {
+                missing_segments,
+                missing_bytes,
+            } => {
+                record_decrypted_segment_cache_many("miss", missing_segments, missing_bytes);
+                Ok(None)
+            }
+        }
+    }
+
+    pub(crate) fn open_and_cache_decrypted_segments(
         &self,
         keyring: &KeyRing,
         object_ref: &BackendObjectRef,
