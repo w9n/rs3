@@ -89,3 +89,6 @@ Kopia matrix summaries include:
 
 These fields are designed to explain performance regressions without requiring
 path-bearing logs.
+
+See [Performance](../performance.md) for the current measured matrix and the
+ratio rules used for release evidence.

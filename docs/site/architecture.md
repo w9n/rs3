@@ -68,7 +68,7 @@ client paths as backend object keys.
 
 ## Rollback Resistance
 
-The object store can preserve encrypted bytes, but it cannot prove that it
+The object store can preserve encrypted bytes, but it cannot establish that it
 served the latest valid commit. `rs3` therefore separates storage durability
 from latest-state authority:
 
@@ -111,9 +111,9 @@ writes, and exact-version reads after a newer latest version exists. Non-atomic
 `HEAD` before `PUT` is not a security-equivalent fallback for either profile.
 
 The preview compatibility workloads are Kopia and Velero with the Kopia
-uploader. Kopia drives the lower-level S3 behavior; Velero proves the
+uploader. Kopia drives the lower-level S3 behavior; Velero exercises the
 Kubernetes backup and restore workflow through that path. Broader S3
-compatibility should be added behind tests that prove restored bytes and
+compatibility should be added behind tests that verify restored bytes and
 privacy invariants.
 
 ## Admin Surface

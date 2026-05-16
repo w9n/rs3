@@ -76,8 +76,9 @@ write logs to stderr. Do not redirect stderr into preserved JSON artifacts.
 
 Export a new bundle after each successful backup window or at least before
 declaring a repository trial ready for incident restore. The bundle contains
-public restore metadata, not wrapping-key material. Verify the preserved bundle
-before anchor import:
+public but integrity-sensitive restore metadata, not wrapping-key material.
+Store it outside the object-store account and outside the cluster whose Lease it
+may need to recreate. Verify the preserved bundle before anchor import:
 
 ```sh
 cargo run -p xtask --features s3 -- v2 verify-bundle \

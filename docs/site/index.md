@@ -1,5 +1,5 @@
 <section class="rv-hero">
-  <p class="rv-eyebrow">Kubernetes backup gateway | S3-compatible | production preview target</p>
+  <p class="rv-eyebrow">Kubernetes backup gateway | S3-compatible | production-preview evaluation</p>
   <h1>Path-private S3 backup gateway.</h1>
   <p class="rv-lead">
     <code>rs3</code> is a path-private, tamper-evident S3 gateway for operators
@@ -10,11 +10,11 @@
     <a class="md-button md-button--primary" href="evaluation/">Evaluate rs3</a>
     <a class="md-button" href="security-model/">Review the security model</a>
   </div>
-  <div class="rv-proof-strip" aria-label="Project posture">
-    <span>Path-private</span>
-    <span>Kopia + Velero</span>
-    <span>Anchor-aware</span>
-    <span>Measured against baseline</span>
+  <div class="rv-posture-strip" aria-label="Project posture">
+    <span>Path privacy target</span>
+    <span>Kopia + Velero focus</span>
+    <span>Lease anchor model</span>
+    <span>Measured locally</span>
   </div>
 </section>
 
@@ -24,10 +24,10 @@ The gateway is designed for teams that need existing S3-oriented backup tools
 to work without exposing repository paths, Kubernetes resource names, or
 accepted repository state directly to an object-store backend.
 
-<div class="rv-proof-grid">
+<div class="rv-posture-grid">
   <article>
     <p class="rv-card-kicker">Privacy</p>
-    <h3>Backend-visible names stay opaque.</h3>
+    <h3>Path and Kubernetes names stay opaque.</h3>
     <p>
       Client paths, Kubernetes object names, namespaces, and snapshot labels are
       treated as secrets at storage and telemetry boundaries.
@@ -63,8 +63,8 @@ Do not treat the current repository format, cryptographic formats, or runtime
 defaults as production-stable yet.
 
 !!! warning "Production preview, not stable format"
-    The project is being built toward higher-fidelity backup infrastructure,
-    but current docs intentionally separate measured facts from future design
+    The project is being built toward a production-preview evaluation target.
+    Current docs intentionally separate measured facts from future design
     intent.
 
 ## Design Priorities

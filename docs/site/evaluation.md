@@ -28,7 +28,7 @@ The project is built around an explicit assumption: object storage can be
 observable by the provider, misconfigured, malicious, or controlled by an
 attacker during a restore. The design therefore avoids plaintext repository
 names in backend-visible places and treats the object store as insufficient for
-proving the newest valid commit.
+establishing the newest valid commit.
 
 Evaluate the preview on three axes:
 
@@ -76,6 +76,23 @@ A useful trial should verify all of the following:
 - Metrics and traces explain restore cost without adding privacy leaks.
 
 See [Production Preview](production-preview.md) for the current release gates.
+
+## Trial Path
+
+Use the docs in this order when moving from interest to a controlled provider
+trial:
+
+| Step | Goal | Start With |
+| --- | --- | --- |
+| 1. Understand the boundary | Confirm the preview threat model, non-goals, and trust split. | [Production Preview](production-preview.md), [Security Model](security-model.md) |
+| 2. Build local evidence | Run the local gate and release integration gate before touching external infrastructure. | [Getting Started](getting-started.md), [Testing](testing.md) |
+| 3. Qualify the backend | Choose `atomic-create` or `retained-version`; use fresh prefixes and provider credentials scoped to the trial. | [Testing](testing.md#s3-provider-qualification), [Retention And Object Lock](runbooks/retention-and-object-lock.md) |
+| 4. Exercise Kubernetes restore | Run Kopia and Velero through the anchored gateway, including gateway restart. | [Testing](testing.md#important-lanes), [Operations](operations.md) |
+| 5. Rehearse recovery | Preserve a restore bundle outside the object-store account, then verify anchor import into a new cluster. | [Restore Under Attack](runbooks/restore-under-attack.md) |
+
+Do not skip from a green local smoke to a production backup target. The preview
+needs backend qualification, retained-version or atomic-create evidence, and a
+restore bundle that survives cluster loss.
 
 ## Quick Local Evidence Path
 

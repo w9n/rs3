@@ -141,14 +141,14 @@ body {
   margin-top: 1.35rem;
 }
 
-.rv-proof-strip {
+.rv-posture-strip {
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem;
   margin-top: 1.6rem;
 }
 
-.rv-proof-strip span {
+.rv-posture-strip span {
   border: 1px solid var(--rv-line-strong);
   border-radius: 6px;
   padding: 0.34rem 0.55rem;
@@ -158,14 +158,14 @@ body {
   font-weight: 700;
 }
 
-.rv-proof-grid {
+.rv-posture-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.9rem;
   margin: 1.4rem 0 2rem;
 }
 
-.rv-proof-grid article {
+.rv-posture-grid article {
   border: 1px solid var(--rv-line);
   border-top: 3px solid var(--rv-green-dark);
   border-radius: 8px;
@@ -173,12 +173,12 @@ body {
   background: var(--rv-surface);
 }
 
-.rv-proof-grid h3 {
+.rv-posture-grid h3 {
   margin: 0.25rem 0 0.45rem;
   font-size: 1.02rem;
 }
 
-.rv-proof-grid p {
+.rv-posture-grid p {
   margin: 0;
 }
 
@@ -205,7 +205,7 @@ body {
     font-size: 2.35rem;
   }
 
-  .rv-proof-grid {
+  .rv-posture-grid {
     grid-template-columns: 1fr;
   }
 }

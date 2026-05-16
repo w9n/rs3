@@ -125,7 +125,7 @@ repository data keys. It is operational hygiene, not compromise recovery.
 
 Data-key rotation changes one purpose-specific repository key at a time. The old
 primary remains enabled for historical reads or commit verification until
-retention-aware retirement proves it is no longer required. A rotated keyring is
+retention-aware retirement verifies it is no longer required. A rotated keyring is
 stored in a new envelope and becomes active only when accepted v2 repository
 state binds that envelope.
 

@@ -49,7 +49,7 @@ the repository-state transition model.
 | Deployment | Kubernetes |
 | External anchor | Kubernetes Lease |
 | Storage witness | Retained exact-version commit objects; the Kubernetes Lease remains the latest-state authority |
-| Backend | RustFS/local S3-compatible first, live S3-compatible checks opt-in |
+| Backend | S3-compatible retained-version backend; RustFS/local checks for disposable evidence, live checks opt-in |
 | Keys | Encrypted keyring envelope |
 | Gateway modes | `read-write` for backups and routine restores, `restore-readonly` for incident restore |
 | Retention | Provider retention/Object Lock capability checked where configured |
@@ -61,6 +61,12 @@ The preview assumes the S3-compatible backend can read, list, delay, delete,
 overwrite, replay, or inject objects unless provider retention prevents it. It
 also assumes the Kubernetes API used for the Lease anchor is a separate trust
 domain from the storage backend.
+
+That separation is operational, not automatic. If the same compromised control
+domain can rewrite the Lease, read the wrapping-key source, alter backend
+credentials, and replace preserved restore bundles, the online protection model
+is exhausted. Preview deployments should keep those authorities separated
+enough for incident recovery and audit.
 
 The Kubernetes Lease is the preview authority for latest accepted repository
 state. Retained commit objects are useful history, not the authority. On a
@@ -88,7 +94,7 @@ one. The backend can still deny service by hiding required objects.
 | Gateway started as `restore-readonly` without an accepted anchor | Fail closed. Run explicit anchor recovery first, then serve restore traffic. |
 | Healthy Velero restore through the primary path | Run through the single `read-write` gateway so Velero restore-result artifacts are committed and the restore can report `Completed`. |
 | Restore client attempts PUT, DELETE, or legal-hold mutation through `restore-readonly` | Reject the request instead of advancing repository state. |
-| Velero restore reports `PartiallyFailed` only because restore-result artifact uploads were denied by `restore-readonly` | Accept only after proving restored data, completed pod-volume restore, and zero backend writes during restore. Treat any other restore error as failure. |
+| Velero restore reports `PartiallyFailed` only because restore-result artifact uploads were denied by `restore-readonly` | Accept only after verifying restored data, completed pod-volume restore, and zero backend writes during restore. Treat any other restore error as failure. |
 | Lease and backend are both compromised | Online protection is exhausted; recovery needs offline or externally protected authority. |
 | Wrapping key and old envelope are both exposed | Rewrap protects only future envelope handling; historical data under that keyring is treated as exposed. |
 
@@ -142,6 +148,13 @@ position already commits to the signed commit chain and therefore to the
 repository state reachable from it.
 
 ## Current Evidence
+
+Release evidence below is maintainer-run evidence for the `v0.1.0-preview.3`
+candidate as of 2026-05-16. Paths under `.local/` are workspace-local artifact
+locations; copy artifacts or checksums into release assets when independent
+public review needs to inspect them. Older rows are retained as background
+compatibility evidence; the current v2 preview gate and DR rows are the
+candidate evidence.
 
 Latest focused evidence:
 

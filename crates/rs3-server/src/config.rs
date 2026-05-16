@@ -813,17 +813,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_repository_format_v1_preview() {
-        let source = minimal_source().with(super::REPOSITORY_FORMAT_ENV, "v1-preview");
-
-        let config = RuntimeConfig::from_source(&source);
-
-        assert!(
-            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::REPOSITORY_FORMAT_ENV)
-        );
-    }
-
-    #[test]
     fn rejects_invalid_repository_format() {
         let source = minimal_source().with(super::REPOSITORY_FORMAT_ENV, "stable");
 

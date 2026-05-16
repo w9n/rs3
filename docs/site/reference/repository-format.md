@@ -31,9 +31,8 @@ a future format version.
 
 ## v2 Preview
 
-`v2-preview` is the active preview format for new repositories. Older preview
-experiments are historical tags, not a compatibility target for new
-deployments.
+`v2-preview` is the active preview format for new repositories. It is an
+evaluation format, not a stable compatibility target yet.
 
 Preview change control: after the current v2 preview evidence gate, changes to
 backend object classes, commit-key shape, signed header fields, section layout,

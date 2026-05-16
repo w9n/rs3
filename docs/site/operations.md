@@ -172,7 +172,7 @@ v2 repository. Until v2 rotation is implemented, keep historical keys enabled
 and treat wrapping-key rewrap as envelope hygiene only.
 
 Before disabling or retiring a historical key, first verify the trusted anchored
-commit chain with `xtask v2 verify-bundle`. That proves the preserved bundle,
+commit chain with `xtask v2 verify-bundle`. That verifies the preserved bundle,
 format root, keyring envelope, and reachable commit chain are still usable, but
 it is not a data-key retirement decision. v2-aware retirement tooling is not
 part of the current production-preview CLI, so keep historical data keys for at
@@ -233,6 +233,15 @@ correctly.
 Provider retention is capability-gated. A backend that cannot extend retention
 must return an unsupported operation rather than pretending the object is
 protected.
+
+## Disaster Recovery Material
+
+Treat the restore bundle as public but integrity-sensitive recovery metadata.
+It should live outside the object-store account and outside the cluster whose
+Lease it may need to recreate. Backend credentials alone are not enough for
+disaster recovery; the bundle, repository ID, public salt, wrapping-key source,
+and selected retention context must agree before a new cluster imports an
+anchor. The operational procedure is [Restore Under Attack](runbooks/restore-under-attack.md).
 
 ## Metrics
 

@@ -78,13 +78,13 @@ Interpretation:
   repeated direct-backend reads.
 - Built-in regression budgets passed for request ratios, byte ratios, restore
   phase ratios, and repeated-run stability.
-- The Kubernetes-shaped profile is faster in this local harness despite similar
-  backend bytes. Treat that as a local RustFS/proxy observation, not a cloud
-  provider claim.
-- Postgres-shaped restore phases are faster than the direct path in this local
-  harness, but full elapsed time is slower because commit publication and
-  snapshot-create phases dominate the local run. Keep tracking commit wait,
-  stage-lock wait, and large PUT phases.
+- The Kubernetes-shaped profile had shorter elapsed time in this local harness
+  despite similar backend bytes. Treat that as a local RustFS/proxy
+  observation, not a cloud provider claim.
+- Postgres-shaped restore phases had shorter elapsed time than the direct path
+  in this local harness, but full elapsed time is slower because commit
+  publication and snapshot-create phases dominate the local run. Keep tracking
+  commit wait, stage-lock wait, and large PUT phases.
 
 ## Expanded Sanity Run
 

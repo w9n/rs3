@@ -28,6 +28,17 @@ cargo test --workspace
 mkdocs build --strict
 ```
 
+Local integration lanes also need the tooling for the lane being run:
+
+| Lane | Additional tools |
+| --- | --- |
+| Disposable S3 and Kopia lanes | Docker-compatible container runtime, Kopia, `mc`, and `rclone` from the Nix shell. |
+| Kubernetes and Velero lanes | Docker-compatible container runtime, `kind`, `kubectl`, Helm, Velero CLI, and the chart dependencies from the Nix shell. |
+| Live S3-compatible provider lanes | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, provider region, endpoint URL, empty bucket or fresh prefix, and provider retention/Object Lock when testing the retained-version profile. |
+
+Use [Testing](testing.md) for the full lane matrix and [Configuration](reference/configuration.md)
+for runtime variables.
+
 ## Build The Docs
 
 ```sh
@@ -78,11 +89,15 @@ just integration-s3-gateway
 Live provider checks require an existing S3-compatible endpoint and credentials:
 
 ```sh
-RS3_TEST_S3_BUCKET=<bucket> \
-RS3_TEST_S3_ENDPOINT_URL=<endpoint> \
-RS3_TEST_S3_REGION=<region> \
-just integration-s3
+export AWS_ACCESS_KEY_ID=<access-key-id>
+export AWS_SECRET_ACCESS_KEY=<secret-access-key>
+export AWS_REGION=<region>
+just preview-gate-v2-live <bucket> <endpoint> <region>
 ```
+
+Use an empty bucket or a fresh backend prefix for live trials. When evaluating
+the retained-version profile, enable provider versioning and Object Lock before
+running the gate.
 
 ## Run Kopia Measurement
 

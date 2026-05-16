@@ -42,7 +42,7 @@ Expensive lanes emit artifacts under `.local/integration/` by default.
 ## S3 Provider Qualification
 
 Do not infer production support from S3 compatibility alone. A live provider
-trial must choose and prove one storage safety profile:
+trial must choose and verify one storage safety profile:
 
 - `atomic-create`: a second `PutObject` with `If-None-Match: *` for an existing
   current object must fail instead of creating a new version.
@@ -61,6 +61,17 @@ meaningful when the retention and exact-version checks run:
 
 ```sh
 just integration-s3-local --qualification-profile retained-version --object-lock
+```
+
+For the consolidated v2 live preview gate, export provider credentials and use
+the positional gate command. The gate creates fresh sub-prefixes for the lanes
+it runs:
+
+```sh
+export AWS_ACCESS_KEY_ID=<access-key-id>
+export AWS_SECRET_ACCESS_KEY=<secret-access-key>
+export AWS_REGION=<region>
+just preview-gate-v2-live <bucket> <endpoint> <region>
 ```
 
 For governance mode, also review IAM or bucket policy so normal gateway
@@ -91,7 +102,7 @@ just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-pref
 
 ## Privacy Tests
 
-Features that handle logical names should prove:
+Features that handle logical names should verify:
 
 - plaintext paths do not appear in backend object IDs
 - plaintext paths do not appear in unauthenticated repository metadata
@@ -128,7 +139,7 @@ Retention and Object Lock work should cover:
 
 The ignored live S3 Object Lock tests exercise provider version IDs against a
 real retained bucket. They are the lane for S3-compatible providers where local
-RustFS/container tests cannot prove retained version-addressed reads.
+RustFS/container tests cannot verify retained version-addressed reads.
 
 ## Performance Tests
 

@@ -1,5 +1,5 @@
 site_name: rs3
-site_description: Path-private, tamper-evident S3-compatible backup gateway for Kubernetes operators.
+site_description: Production-preview path-private, tamper-evident S3-compatible backup gateway for Kubernetes operators.
 docs_dir: docs/site
 site_dir: target/mkdocs-site
 

@@ -1,8 +1,8 @@
 # Retention And Object Lock
 
-Retention protects object versions. It does not prove the provider served the
-latest valid commit. Use retention for deletion resistance; use signed commits
-and anchors for latest-state authority.
+Retention protects object versions. It does not verify that the provider served
+the latest valid commit. Use retention for deletion resistance; use signed
+commits and anchors for latest-state authority.
 
 ## Protected Set
 
@@ -54,7 +54,7 @@ Required posture:
 
 ## Provider Gate
 
-A provider must prove:
+A provider must verify:
 
 - retention can be set at write time
 - retention can be extended, not shortened
@@ -75,10 +75,10 @@ Do not treat `HEAD` before `PUT` as equivalent to native conditional create; it
 is not atomic and is not a production-preview safety guarantee.
 Do not infer governance-bypass safety from Object Lock alone. For governance
 mode, normal gateway credentials must not have `s3:BypassGovernanceRetention`
-or provider-equivalent bypass permission. The live retained-version test proves
-retained writes, retained exact-version reads, retention extension, legal hold,
-and delete blocking without bypass headers; it does not replace an IAM or bucket
-policy review.
+or provider-equivalent bypass permission. The live retained-version test
+verifies retained writes, retained exact-version reads, retention extension,
+legal hold, and delete blocking without bypass headers; it does not replace an
+IAM or bucket policy review.
 
 During restore verification, `rs3` reports how many verified restore-critical
 objects expose retention or legal-hold metadata. Treat that as repository

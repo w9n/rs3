@@ -87,9 +87,9 @@ to `wrap-v1`; `RS3_KEYRING_ENVELOPE_OBJECT_ID` is only a bootstrap or recovery
 override.
 
 `just integration-s3-local` is the orchestration entrypoint for local S3
-integration checks. It currently expects a provided endpoint and delegates to
-the live storage contract test; container and Kubernetes startup can be added
-behind this command.
+integration checks. Use `--mode container` for a disposable local provider, or
+`--mode provided` with the S3 environment above when qualifying an existing
+endpoint.
 
 The Nix shell includes `sccache` for clean rebuild or CI-like cache experiments,
 but it is not enabled by default. Set `RUSTC_WRAPPER=sccache` for runs where that

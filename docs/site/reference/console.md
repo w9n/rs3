@@ -62,3 +62,6 @@ cargo run -p rs3-console
 The preview client accepts HTTP gateway admin origins. Run the console next to
 the gateway over loopback, over a protected cluster-local network path, or
 behind infrastructure that terminates TLS before the console-to-gateway hop.
+
+See [Operations](../operations.md) for the admin listener setup and
+[Configuration](configuration.md) for the environment variable reference.

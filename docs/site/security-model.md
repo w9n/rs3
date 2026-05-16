@@ -28,7 +28,8 @@ is untrusted or partially compromised.
 | Compromised backup pod | Creates bad new backups while credentials are valid, but should not erase correctly retained old commit versions. |
 | Compromised Kubernetes control plane | Rewrites the anchor unless protected by RBAC, admission policy, audit logs, and offline recovery bundles. |
 
-If Kubernetes and the object-storage account are both fully compromised,
+If Kubernetes, the object-storage account, the wrapping-key source, and
+preserved restore bundles are all controlled by the same compromised authority,
 rollback resistance needs an offline or externally protected authority. Online
 anchors alone cannot outvote compromise of every online authority.
 
@@ -249,7 +250,7 @@ reviewers should ask:
 - What new backend-visible data exists?
 - Can the data reveal paths, tenant identity, object equality, object counts,
   file size, timing, or Kubernetes resource names?
-- Which test proves the privacy boundary?
+- Which test verifies the privacy boundary?
 - Which runbook explains recovery when the object store or anchor service is
   hostile?
 - Does the change preserve fail-closed anchor behavior?
