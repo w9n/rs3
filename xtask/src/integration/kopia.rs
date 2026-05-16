@@ -575,7 +575,7 @@ fn check_failure_count(check_report: &serde_json::Value) -> usize {
 #[cfg(feature = "containers")]
 fn print_matrix_summary(summary: &serde_json::Value, profiles: &[KopiaWorkloadProfile]) {
     println!(
-        "profile\tbackend_requests\tbackend_reads\tbackend_writes\trestore_elapsed\tstage_lock_wait\tcheckpoint_wait"
+        "profile\tbackend_requests\tbackend_reads\tbackend_writes\trestore_elapsed\tstage_lock_wait\tcommit_wait"
     );
     for profile in profiles {
         let profile_summary = &summary["profiles"][profile.as_str()];
@@ -629,16 +629,7 @@ fn print_matrix_summary(summary: &serde_json::Value, profiles: &[KopiaWorkloadPr
                     "avg"
                 ],
             )),
-            format_seconds(value_f64_at(
-                profile_summary,
-                &[
-                    "comparison",
-                    "gateway_internal",
-                    "commit_put_phase_avg_seconds",
-                    "checkpoint_wait",
-                    "avg"
-                ],
-            )),
+            format_seconds(commit_wait_avg_seconds(profile_summary)),
         );
     }
     println!(
@@ -651,6 +642,32 @@ fn print_matrix_summary(summary: &serde_json::Value, profiles: &[KopiaWorkloadPr
         summary_status(&summary["workload_consistency"]),
         summary_failed(&summary["workload_consistency"]),
     );
+}
+
+#[cfg(feature = "containers")]
+fn commit_wait_avg_seconds(profile_summary: &serde_json::Value) -> Option<f64> {
+    value_f64_at(
+        profile_summary,
+        &[
+            "comparison",
+            "gateway_internal",
+            "commit_put_phase_avg_seconds",
+            "commit_wait",
+            "avg",
+        ],
+    )
+    .or_else(|| {
+        value_f64_at(
+            profile_summary,
+            &[
+                "comparison",
+                "gateway_internal",
+                "commit_put_phase_avg_seconds",
+                "checkpoint_wait",
+                "avg",
+            ],
+        )
+    })
 }
 
 #[cfg(feature = "containers")]

@@ -631,6 +631,7 @@ struct RepositoryMetrics {
     list_prefix_miss_count: u64,
     list_returned_count: u64,
     delete_count: u64,
+    commit_publish_count: u64,
     publish_checkpoint_count: u64,
     client_bytes_written: u64,
     backend_bytes_written_for_puts: u64,
@@ -645,6 +646,7 @@ impl RepositoryMetrics {
             "list_prefix_miss_count": self.list_prefix_miss_count,
             "list_returned_count": self.list_returned_count,
             "delete_count": self.delete_count,
+            "commit_publish_count": self.commit_publish_count,
             "publish_checkpoint_count": self.publish_checkpoint_count,
             "client_bytes_written": self.client_bytes_written,
             "backend_bytes_written_for_puts": self.backend_bytes_written_for_puts,
@@ -668,7 +670,7 @@ fn parse_repository_metrics(logs: &[String]) -> RepositoryMetrics {
         };
         increment_operation_metrics(&mut metrics.operations, operation, fields);
         match operation {
-            "put" => {
+            "put" | "v2_stage_put" => {
                 metrics.put_count = metrics.put_count.saturating_add(1);
                 metrics.client_bytes_written = metrics
                     .client_bytes_written
@@ -691,8 +693,12 @@ fn parse_repository_metrics(logs: &[String]) -> RepositoryMetrics {
             }
             "delete" => metrics.delete_count = metrics.delete_count.saturating_add(1),
             "publish_checkpoint" => {
+                metrics.commit_publish_count = metrics.commit_publish_count.saturating_add(1);
                 metrics.publish_checkpoint_count =
                     metrics.publish_checkpoint_count.saturating_add(1);
+            }
+            "v2_commit_batch_publish" => {
+                metrics.commit_publish_count = metrics.commit_publish_count.saturating_add(1);
             }
             _ => {}
         }
@@ -725,8 +731,12 @@ fn derived_metrics(counts: &BlobOperationCounts, repository: &RepositoryMetrics)
             repository.list_returned_count,
             repository.list_count,
         ),
+        "commit_publishes_per_repository_mutation": ratio(
+            repository.commit_publish_count,
+            repository_mutations,
+        ),
         "checkpoint_publishes_per_repository_mutation": ratio(
-            repository.publish_checkpoint_count,
+            repository.commit_publish_count,
             repository_mutations,
         ),
         "backend_bytes_written_per_client_byte": ratio(
@@ -802,6 +812,29 @@ mod tests {
 
         assert_eq!(metrics["counts"]["put"], 0);
         assert_eq!(metrics["counts"]["bytes_written"], 0);
+    }
+
+    #[test]
+    fn metrics_count_v2_stage_puts_and_commit_publishes() {
+        let metrics = gateway_backend_metrics_json(
+            r#"{"target":"rs3_storage","fields":{"provider":"s3","operation":"put","object_kind":"commits","result":"ok","bytes_sent":100,"elapsed_us":7}}
+{"target":"rs3_repository","fields":{"operation":"v2_stage_put","result":"ok","plaintext_len":50,"sequence":2,"elapsed_us":5}}
+{"target":"rs3_repository","fields":{"operation":"v2_commit_batch_publish","result":"ok","waiters":1,"elapsed_us":3}}
+"#,
+        );
+
+        assert_eq!(metrics["counts"]["put"], 1);
+        assert_eq!(metrics["repository"]["put_count"], 1);
+        assert_eq!(metrics["repository"]["commit_publish_count"], 1);
+        assert_eq!(metrics["repository"]["publish_checkpoint_count"], 0);
+        assert_eq!(
+            metrics["derived"]["commit_publishes_per_repository_mutation"],
+            serde_json::json!(1.0)
+        );
+        assert_eq!(
+            metrics["derived"]["checkpoint_publishes_per_repository_mutation"],
+            serde_json::json!(1.0)
+        );
     }
 
     #[test]

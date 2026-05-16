@@ -40,13 +40,13 @@ pub(crate) struct PerfArgs {
     /// Plaintext object size in bytes.
     #[arg(long, default_value_t = 1024 * 1024)]
     object_size: usize,
-    /// Maximum number of committed writes covered by one checkpoint.
+    /// Maximum number of committed writes covered by one repository commit.
     #[arg(long, default_value_t = 64)]
     commit_batch_items: usize,
     /// Maximum commit batching delay in milliseconds.
     #[arg(long, default_value_t = 10)]
     commit_batch_delay_ms: u64,
-    /// Maximum committed writes allowed to wait for checkpoint publication.
+    /// Maximum committed writes allowed to wait for repository commit publication.
     #[arg(long)]
     commit_max_pending_items: Option<usize>,
     /// Parallel client writes used by parallel scenarios.
@@ -124,7 +124,7 @@ pub(crate) struct PerfArgs {
 pub(crate) enum PerfScenario {
     /// Run every built-in scenario.
     All,
-    /// Stage many objects and publish one checkpoint.
+    /// Stage many objects and publish one repository commit.
     WriteBatch,
     /// Write objects through the commit coordinator sequentially.
     WriteCommitted,

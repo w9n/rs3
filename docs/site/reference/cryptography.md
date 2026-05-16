@@ -58,15 +58,17 @@ Payloads are split into independently encrypted segments. Each segment uses:
 - XChaCha20-Poly1305
 - a content key selected from the repository keyring
 - a 24-byte nonce made from a random per-object prefix plus a segment counter
-- associated data containing the payload object domain, backend object ID,
-  segment size, plaintext length, segment index, and final-segment marker
+- associated data containing the payload domain, authenticated backend object
+  context, segment size, plaintext length, segment index, and final-segment
+  marker
 
 The associated data is authenticated but not encrypted. It is limited to public,
 path-free repository metadata.
 
 Payload authentication fails if a backend tampers with ciphertext, changes the
-segment context, or moves encrypted segment bytes under a different backend
-object ID.
+segment context, or moves encrypted segment bytes into a different authenticated
+backend object context. For `v2-preview`, that context is the containing commit
+object.
 
 Segment size is recorded in each payload header and authenticated as segment
 associated data. The default writer chooses the segment size per object: small

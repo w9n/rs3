@@ -298,70 +298,79 @@ pub(crate) fn prometheus_metrics_delta_json(before: &str, after: &str) -> Value 
                     delta,
                 );
             }
-            "rs3_repository_commit_enqueues_total" => {
+            "rs3_repository_commit_enqueues_total" | "rs3_repository_v2_commit_enqueues_total" => {
                 bump_f64_label(
                     &mut repository_commit_enqueues_by_result,
                     sample.label("result"),
                     delta,
                 );
             }
-            "rs3_repository_commit_enqueue_pending_items_total" => {
+            "rs3_repository_commit_enqueue_pending_items_total"
+            | "rs3_repository_v2_commit_enqueue_pending_items_total" => {
                 bump_f64_label(
                     &mut repository_commit_enqueue_pending_items_by_result,
                     sample.label("result"),
                     delta,
                 );
             }
-            "rs3_repository_commit_batch_publishes_total" => {
+            "rs3_repository_commit_batch_publishes_total"
+            | "rs3_repository_v2_commit_batch_publishes_total" => {
                 bump_f64_label(
                     &mut repository_commit_batch_publishes_by_result,
                     sample.label("result"),
                     delta,
                 );
             }
-            "rs3_repository_commit_batch_waiters_total" => {
+            "rs3_repository_commit_batch_waiters_total"
+            | "rs3_repository_v2_commit_batch_waiters_total" => {
                 bump_f64_label(
                     &mut repository_commit_batch_waiters_by_result,
                     sample.label("result"),
                     delta,
                 );
             }
-            "rs3_repository_commit_batch_waiters_per_publish_count" => {
+            "rs3_repository_commit_batch_waiters_per_publish_count"
+            | "rs3_repository_v2_commit_batch_waiters_per_publish_count" => {
                 bump_f64_label(
                     &mut repository_commit_batch_waiters_per_publish_counts,
                     sample.label("result"),
                     delta,
                 );
             }
-            "rs3_repository_commit_batch_waiters_per_publish_sum" => {
+            "rs3_repository_commit_batch_waiters_per_publish_sum"
+            | "rs3_repository_v2_commit_batch_waiters_per_publish_sum" => {
                 bump_f64_label(
                     &mut repository_commit_batch_waiters_per_publish_sums,
                     sample.label("result"),
                     delta,
                 );
             }
-            "rs3_repository_commit_batch_publish_duration_seconds_count" => {
+            "rs3_repository_commit_batch_publish_duration_seconds_count"
+            | "rs3_repository_v2_commit_batch_publish_duration_seconds_count" => {
                 bump_f64_label(
                     &mut repository_commit_batch_duration_counts,
                     sample.label("result"),
                     delta,
                 );
             }
-            "rs3_repository_commit_batch_publish_duration_seconds_sum" => {
+            "rs3_repository_commit_batch_publish_duration_seconds_sum"
+            | "rs3_repository_v2_commit_batch_publish_duration_seconds_sum" => {
                 bump_f64_label(
                     &mut repository_commit_batch_duration_sums,
                     sample.label("result"),
                     delta,
                 );
             }
-            "rs3_repository_commit_put_phase_duration_seconds_count" => {
+            "rs3_repository_commit_put_phase_duration_seconds_count"
+            | "rs3_repository_v2_commit_put_phase_duration_seconds_count" => {
                 bump_f64_label(
                     &mut repository_commit_put_phase_duration_counts,
                     sample.label("phase"),
                     delta,
                 );
             }
-            "rs3_repository_commit_put_phase_duration_seconds_sum" => {
+            "rs3_repository_commit_put_phase_duration_seconds_sum"
+            | "rs3_repository_v2_commit_put_phase_duration_seconds_sum" => {
                 bump_f64_label(
                     &mut repository_commit_put_phase_duration_sums,
                     sample.label("phase"),
@@ -724,6 +733,16 @@ rs3_repository_commit_batch_publish_duration_seconds_count{result="ok"} 2
 rs3_repository_commit_batch_publish_duration_seconds_sum{result="ok"} 0.06
 rs3_repository_commit_put_phase_duration_seconds_count{phase="stage_lock_wait"} 4
 rs3_repository_commit_put_phase_duration_seconds_sum{phase="stage_lock_wait"} 0.12
+rs3_repository_v2_commit_enqueues_total{result="ok"} 3
+rs3_repository_v2_commit_enqueue_pending_items_total{result="ok"} 6
+rs3_repository_v2_commit_batch_publishes_total{result="ok"} 1
+rs3_repository_v2_commit_batch_waiters_total{result="ok"} 3
+rs3_repository_v2_commit_batch_waiters_per_publish_count{result="ok"} 1
+rs3_repository_v2_commit_batch_waiters_per_publish_sum{result="ok"} 3
+rs3_repository_v2_commit_batch_publish_duration_seconds_count{result="ok"} 1
+rs3_repository_v2_commit_batch_publish_duration_seconds_sum{result="ok"} 0.09
+rs3_repository_v2_commit_put_phase_duration_seconds_count{phase="commit_wait"} 3
+rs3_repository_v2_commit_put_phase_duration_seconds_sum{phase="commit_wait"} 0.15
 "#;
 
         let metrics = prometheus_metrics_delta_json(before, after);
@@ -868,27 +887,27 @@ rs3_repository_commit_put_phase_duration_seconds_sum{phase="stage_lock_wait"} 0.
         );
         assert_eq!(
             metrics["repository"]["commit"]["enqueues_by_result"]["ok"],
-            4.0
+            7.0
         );
         assert_eq!(
             metrics["repository"]["commit"]["enqueue_pending_items_by_result"]["ok"],
-            10.0
+            16.0
         );
         assert_eq!(
             metrics["repository"]["commit"]["batch_publishes_by_result"]["ok"],
-            2.0
+            3.0
         );
         assert_eq!(
             metrics["repository"]["commit"]["batch_waiters_by_result"]["ok"],
-            4.0
+            7.0
         );
         assert_eq!(
             metrics["repository"]["commit"]["batch_waiters_per_publish_by_result"]["ok"]["avg"],
-            2.0
+            7.0 / 3.0
         );
         assert_eq!(
             metrics["repository"]["commit"]["batch_publish_duration_seconds_by_result"]["ok"]["avg"],
-            0.03
+            (0.06 + 0.09) / 3.0
         );
         assert_eq!(
             metrics["repository"]["commit"]["put_phase_duration_seconds_by_phase"]["stage_lock_wait"]
@@ -899,6 +918,14 @@ rs3_repository_commit_put_phase_duration_seconds_sum{phase="stage_lock_wait"} 0.
             metrics["repository"]["commit"]["put_phase_duration_seconds_by_phase"]["stage_lock_wait"]
                 ["avg"],
             0.03
+        );
+        assert_eq!(
+            metrics["repository"]["commit"]["put_phase_duration_seconds_by_phase"]["commit_wait"]["count"],
+            3.0
+        );
+        assert_eq!(
+            metrics["repository"]["commit"]["put_phase_duration_seconds_by_phase"]["commit_wait"]["avg"],
+            0.15 / 3.0
         );
     }
 }

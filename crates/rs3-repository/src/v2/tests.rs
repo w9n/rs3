@@ -989,9 +989,33 @@ async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
             .await
             .map_err(|_| V2FormatError::StorageOperationFailed),
     );
-    let payloads = must_v2(
+    let retired_payloads = must_v2(
         store
             .list_prefix("segments/")
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed),
+    );
+    let retired_index = must_v2(
+        store
+            .list_prefix("index/")
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed),
+    );
+    let retired_manifests = must_v2(
+        store
+            .list_prefix("manifests/")
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed),
+    );
+    let retired_checkpoints = must_v2(
+        store
+            .list_prefix("checkpoints/")
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed),
+    );
+    let retired_evidence = must_v2(
+        store
+            .list_prefix("evidence/")
             .await
             .map_err(|_| V2FormatError::StorageOperationFailed),
     );
@@ -1007,7 +1031,11 @@ async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
         .iter()
         .filter(|section| section.section_type == V2SectionType::Payload)
         .count();
-    assert_eq!(payloads.len(), 0);
+    assert_eq!(retired_payloads.len(), 0);
+    assert_eq!(retired_index.len(), 0);
+    assert_eq!(retired_manifests.len(), 0);
+    assert_eq!(retired_checkpoints.len(), 0);
+    assert_eq!(retired_evidence.len(), 0);
     assert_eq!(payload_section_count, 2);
     assert_eq!(
         listed
