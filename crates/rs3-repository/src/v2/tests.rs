@@ -21,6 +21,7 @@ use rs3_types::{
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 fn must_v2<T>(result: super::V2Result<T>) -> T {
     match result {
@@ -214,6 +215,48 @@ impl V2CommitAnchor for FailOnceV2Anchor {
         {
             return Err(V2FormatError::AnchorAdvanceFailed);
         }
+        self.inner.compare_and_advance_v2(expected, next).await
+    }
+}
+
+#[derive(Clone)]
+struct BlockingV2Anchor {
+    inner: V2MemoryAnchor,
+    blocked: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl BlockingV2Anchor {
+    fn new(inner: V2MemoryAnchor) -> Self {
+        Self {
+            inner,
+            blocked: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+
+    async fn wait_until_blocked(&self) {
+        self.blocked.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[async_trait::async_trait]
+impl V2CommitAnchor for BlockingV2Anchor {
+    async fn read_v2(&self) -> super::V2Result<Option<V2AnchorState>> {
+        self.inner.read_v2().await
+    }
+
+    async fn compare_and_advance_v2(
+        &self,
+        expected: Option<&V2AnchorState>,
+        next: V2AnchorState,
+    ) -> super::V2Result<V2AnchorState> {
+        self.blocked.notify_one();
+        self.release.notified().await;
         self.inner.compare_and_advance_v2(expected, next).await
     }
 }
@@ -665,6 +708,119 @@ async fn v2_repository_hides_unaccepted_mutation_after_anchor_failure() {
         Err(crate::RepositoryError::CommitFailed { .. })
     ));
     assert_eq!(body, Bytes::from_static(b"accepted"));
+}
+
+#[tokio::test]
+async fn v2_repository_does_not_expose_staged_put_before_anchor_acceptance() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store,
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    let blocking_anchor = BlockingV2Anchor::new(anchor.clone());
+    let key =
+        LogicalPath::new("snapshots/pending-put.bin").unwrap_or_else(|error| panic!("{error}"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let pending_put = {
+        let repository = Arc::clone(&repository);
+        let blocking_anchor = blocking_anchor.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            repository
+                .put_committed(
+                    &blocking_anchor,
+                    key,
+                    Bytes::from_static(b"pending"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        })
+    };
+    blocking_anchor.wait_until_blocked().await;
+
+    assert!(matches!(
+        repository.head(&key),
+        Err(crate::RepositoryError::NotFound(_))
+    ));
+    assert!(matches!(
+        repository.get_range(&key, ByteRange::Full).await,
+        Err(crate::RepositoryError::NotFound(_))
+    ));
+    assert!(must_repo(repository.list("snapshots/")).is_empty());
+
+    blocking_anchor.release();
+    must_repo(pending_put.await.unwrap_or_else(|error| panic!("{error}")));
+    assert_eq!(
+        must_repo(repository.get_range(&key, ByteRange::Full).await),
+        Bytes::from_static(b"pending")
+    );
+}
+
+#[tokio::test]
+async fn v2_repository_keeps_accepted_object_visible_during_pending_delete() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store,
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    let blocking_anchor = BlockingV2Anchor::new(anchor.clone());
+    let key =
+        LogicalPath::new("snapshots/pending-delete.bin").unwrap_or_else(|error| panic!("{error}"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                key.clone(),
+                Bytes::from_static(b"accepted"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    let pending_delete = {
+        let repository = Arc::clone(&repository);
+        let blocking_anchor = blocking_anchor.clone();
+        let key = key.clone();
+        tokio::spawn(async move { repository.delete_committed(&blocking_anchor, key).await })
+    };
+    blocking_anchor.wait_until_blocked().await;
+
+    assert_eq!(
+        must_repo(repository.get_range(&key, ByteRange::Full).await),
+        Bytes::from_static(b"accepted")
+    );
+    assert_eq!(must_repo(repository.list("snapshots/")).len(), 1);
+
+    blocking_anchor.release();
+    must_repo(
+        pending_delete
+            .await
+            .unwrap_or_else(|error| panic!("{error}")),
+    );
+    assert!(matches!(
+        repository.head(&key),
+        Err(crate::RepositoryError::NotFound(_))
+    ));
 }
 
 #[tokio::test]

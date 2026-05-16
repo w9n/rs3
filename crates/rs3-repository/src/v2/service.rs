@@ -13,7 +13,9 @@ use crate::model::{
     DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry, RepositoryObjectMetadata,
     RepositoryPutOptions,
 };
-use crate::namespace::{existing_blind_keys, first_namespace_entry, prefix_tokens_for_key};
+use crate::namespace::{
+    existing_blind_keys, first_namespace_entry, indexed_list_prefix, prefix_tokens_for_key,
+};
 use crate::payload::{adaptive_payload_segment_size, open_payload_object, seal_payload_object};
 use crate::service::{Repository, RepositoryOptions, strongest_retention_policy};
 use crate::state::{
@@ -29,7 +31,8 @@ use rs3_storage::{BlobStore, ByteRange};
 use rs3_types::{
     BackendObjectId, LegalHoldStatus, LogicalPath, ManifestId, RetentionPolicy, Sequence,
 };
-use std::sync::Mutex as StdMutex;
+use std::collections::{BTreeMap, btree_map::Entry};
+use std::sync::{Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
@@ -42,6 +45,7 @@ use tokio::sync::Mutex;
 pub struct V2Repository<S> {
     repository: Repository<S>,
     commit_store: V2CommitStore<S>,
+    accepted_state: StdRwLock<RepositoryState>,
     mutation_lock: Mutex<()>,
     pending_payloads: StdMutex<Vec<PendingV2Payload>>,
 }
@@ -90,6 +94,7 @@ where
                 repository_options,
             ),
             commit_store: V2CommitStore::new(store, keyring, commit_options),
+            accepted_state: StdRwLock::new(RepositoryState::default()),
             mutation_lock: Mutex::new(()),
             pending_payloads: StdMutex::new(Vec::new()),
         }
@@ -154,8 +159,13 @@ where
             self.apply_commit_sections(&mut rebuilt, commit)?;
         }
 
+        let accepted = rebuilt.clone();
         let mut state = self.repository.write_state()?;
         *state = rebuilt;
+        *self
+            .accepted_state
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? = accepted;
         Ok(())
     }
 
@@ -292,7 +302,27 @@ where
 
     /// Reads trusted metadata for a client-visible object.
     pub fn head(&self, key: &LogicalPath) -> Result<RepositoryObjectMetadata> {
-        self.repository.head(key)
+        let keyring = self.repository.keyring()?;
+        let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
+        let state = self
+            .accepted_state
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let Some(entry) = first_namespace_entry(&state.namespace, &lookup_blind_keys) else {
+            return Err(RepositoryError::NotFound(key.clone()));
+        };
+        let manifest = state
+            .manifests
+            .get(&entry.manifest_id)
+            .cloned()
+            .unwrap_or_else(|| TrustedManifest {
+                key: key.clone(),
+                content_len: entry.content_len,
+                modified_at_ms: entry.modified_at_ms,
+                retention: entry.retention,
+                legal_hold: entry.legal_hold,
+            });
+        Ok(manifest.into_metadata())
     }
 
     /// Reads a client-visible object or byte range.
@@ -300,7 +330,10 @@ where
         let keyring = self.repository.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
         let entry = {
-            let state = self.repository.read_state()?;
+            let state = self
+                .accepted_state
+                .read()
+                .map_err(|_| RepositoryError::StatePoisoned)?;
             first_namespace_entry(&state.namespace, &lookup_blind_keys)
                 .cloned()
                 .ok_or_else(|| RepositoryError::NotFound(key.clone()))?
@@ -332,7 +365,41 @@ where
 
     /// Lists client-visible entries for a prefix.
     pub fn list(&self, prefix: &str) -> Result<Vec<RepositoryListEntry>> {
-        self.repository.list(prefix)
+        let keyring = self.repository.keyring()?;
+        let prefix_tokens = keyring.derive_prefix_tokens_for_lookup(indexed_list_prefix(prefix))?;
+        let state = self
+            .accepted_state
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let mut entries_by_key = BTreeMap::new();
+
+        for prefix_token in prefix_tokens {
+            for entry in state.namespace.list_prefix(&prefix_token.prefix_token) {
+                let Some(manifest) = state.manifests.get(&entry.manifest_id) else {
+                    continue;
+                };
+                if !manifest.key.as_str().starts_with(prefix) {
+                    continue;
+                }
+                let list_entry = RepositoryListEntry {
+                    key: manifest.key.clone(),
+                    content_len: manifest.content_len,
+                    modified_at_ms: manifest.modified_at_ms,
+                };
+                match entries_by_key.entry(manifest.key.clone()) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(list_entry);
+                    }
+                    Entry::Occupied(mut slot) => {
+                        if list_entry.modified_at_ms >= slot.get().modified_at_ms {
+                            slot.insert(list_entry);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(entries_by_key.into_values().collect())
     }
 
     /// Deletes a client-visible object after the tombstone commit is accepted.
@@ -439,11 +506,21 @@ where
             .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
         self.resolve_accepted_payload_refs(&stored.anchor_state, &locations)?;
         self.repository.mark_index_deltas_published(sequence)?;
+        self.accept_current_state()?;
         self.pending_payloads
             .lock()
             .map_err(|_| RepositoryError::StatePoisoned)?
             .clear();
         Ok(Some(stored))
+    }
+
+    fn accept_current_state(&self) -> Result<()> {
+        let state = self.repository.read_state()?.clone();
+        *self
+            .accepted_state
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? = state;
+        Ok(())
     }
 
     fn pending_index_delta_sequence(&self) -> Result<Option<Sequence>> {
