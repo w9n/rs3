@@ -9,4 +9,6 @@
 /AGENTS.md
 /docs
 /tests
-/xtask/src
+/xtask/src/*
+!/xtask/src/bin
+!/xtask/src/bin/rs3-integration-storage-proxy.rs

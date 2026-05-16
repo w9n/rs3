@@ -16,7 +16,10 @@ RUN --mount=type=cache,sharing=locked,target=/usr/local/cargo/git \
     cargo build --locked --release -p rs3-server --features s3,k8s --bin rs3-server \
     && cp /src/target/release/rs3-server /tmp/rs3-server
 
-FROM source AS build-integration-tools
+FROM source AS integration-source
+COPY xtask/src ./xtask/src
+
+FROM integration-source AS build-integration-tools
 RUN --mount=type=cache,sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,sharing=locked,target=/src/target \
