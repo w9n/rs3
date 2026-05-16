@@ -9,6 +9,7 @@ mod namespace;
 mod payload;
 mod service;
 mod state;
+pub mod v2;
 
 #[cfg(test)]
 mod tests;

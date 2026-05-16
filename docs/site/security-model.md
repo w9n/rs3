@@ -78,6 +78,8 @@ batching, compaction jitter, and stricter telemetry redaction.
 | Old content remains readable after data-key rotation | Enabled historical content keys are accepted for reads. | Repository key rotation tests. |
 | Writes are not acknowledged before checkpoint acceptance | Commit coordinator waits for covering checkpoint. | Commit coordinator and checkpoint tests. |
 | Storage rollback is not trusted as latest state | Ed25519 checkpoint verification, Kubernetes Lease anchor, and retained checkpoint evidence. | Anchor, checkpoint replay, restore verification, and orphan-report tests. |
+| v2 writes are not acknowledged before signed commit acceptance | The v2 commit coordinator batches staged writes into a signed commit and advances the external v2 anchor before returning success. | v2 coordinator batching, rollback, and snapshot tests. |
+| v2 replay cost is bounded by signed snapshots | v2 readers walk the signed parent chain to the nearest encrypted index snapshot, then replay newer deltas. | v2 snapshot replay tests and format vectors. |
 | Create-only writes are not silently downgraded | Atomic-create providers must honor `PutObject` with `If-None-Match: *`; non-atomic `HEAD` before `PUT` is not treated as production create-only. | Storage contract tests and opt-in live S3 tests. |
 | Retained restore reads do not trust mutable latest objects | Retained-version providers must return version IDs for restore-critical writes; checkpoints bind those versions and restore reads exact versions. | Memory version-addressed storage tests, checkpoint retry tests, restore latest-poisoning tests, and opt-in live S3 Object Lock tests. |
 | Incident restore does not advance repository state | `restore-readonly` mode requires an accepted anchor and rejects supported mutations. | Gateway mode config, startup, and S3 adapter tests. |
@@ -109,6 +111,13 @@ storage evidence and choose the highest observed valid checkpoint only with an
 operator-supplied maximum signed checkpoint age. This bounds replay of old valid
 checkpoints; it does not prove the backend showed every newer valid checkpoint.
 
+For `v2-preview`, the external anchor names the accepted commit key, body
+digest, provider version ID when required, signing key ID, and format-root
+reference. Normal v2 disaster recovery requires a trusted exported bundle;
+`import-v2-anchor` verifies the named signed chain to the nearest snapshot
+before recreating a missing anchor. Missing anchor plus missing trusted bundle
+is fail-closed for normal recovery.
+
 ## Object Lock Rule
 
 Object Lock protects object versions from deletion or overwrite before their
@@ -134,6 +143,12 @@ repository objects when the new write returns a distinct version ID and old
 checkpoint-bound versions remain exactly readable. The object key is then not
 the uniqueness authority; the signed checkpoint, external anchor, object
 digest, and provider version ID are.
+
+In `v2-preview`, commit keys include a random component. For retained-version
+providers that do not support atomic create, the writer performs a preflight
+`HEAD` and binds the accepted object version into the anchor. A same-sequence
+or orphaned retained commit is reported and skipped by automatic GC until
+retention, legal-hold, and age checks allow safe cleanup.
 
 Non-retained development backends may omit version IDs. In that mode `rs3` can
 still authenticate object bytes and detect tampering of the bytes it reads, but
@@ -168,6 +183,10 @@ S3-compatible providers qualify through one of two profiles:
 `HEAD` before `PUT` is not a security-equivalent fallback. It can improve UX for
 single-writer compatibility probes, but it is not atomic and does not protect
 against a provider that races requests, serves stale state, or ignores conditional headers.
+
+`rs3 check-v2-provider` runs the selected v2 profile probes against the
+configured backend. Governance-retention deployments require an explicit
+operator review that gateway credentials cannot bypass retention.
 
 ## Operator Reporting Rule
 

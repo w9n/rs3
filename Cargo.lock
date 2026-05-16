@@ -3352,9 +3352,11 @@ name = "rs3-k8s"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hex",
  "k8s-openapi",
  "kube",
  "rs3-anchor",
+ "rs3-repository",
  "rs3-types",
  "tokio",
 ]
@@ -3364,8 +3366,10 @@ name = "rs3-repository"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "getrandom 0.3.4",
+ "hex",
  "metrics",
  "proptest",
  "rs3-anchor",
@@ -3373,7 +3377,9 @@ dependencies = [
  "rs3-index",
  "rs3-storage",
  "rs3-types",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tokio",
  "tracing",
@@ -3403,6 +3409,7 @@ dependencies = [
  "rs3-repository",
  "rs3-storage",
  "rs3-types",
+ "rustls",
  "s3s",
  "secrecy",
  "serde",

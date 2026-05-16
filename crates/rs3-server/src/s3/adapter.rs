@@ -14,11 +14,12 @@ use rs3_repository::RepositoryPutOptions;
 use rs3_storage::ByteRange;
 use rs3_types::{LegalHoldStatus, PublicBucket};
 use s3s::dto::{
-    Bucket, DeleteObjectInput, DeleteObjectOutput, GetObjectInput, GetObjectLegalHoldInput,
-    GetObjectLegalHoldOutput, GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
-    HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output,
-    Owner, PutObjectInput, PutObjectLegalHoldInput, PutObjectLegalHoldOutput, PutObjectOutput,
-    StreamingBlob,
+    Bucket, DeleteObjectInput, DeleteObjectOutput, GetBucketLocationInput, GetBucketLocationOutput,
+    GetObjectInput, GetObjectLegalHoldInput, GetObjectLegalHoldOutput, GetObjectOutput,
+    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
+    ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+    ListObjectsV2Output, Owner, PutObjectInput, PutObjectLegalHoldInput, PutObjectLegalHoldOutput,
+    PutObjectOutput, StreamingBlob,
 };
 use s3s::{Body, S3, S3Request, S3Response, S3Result};
 use std::sync::Arc;
@@ -204,6 +205,36 @@ impl S3 for GatewayS3Service {
             OPERATION,
             request_id,
             None,
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
+    }
+
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        const OPERATION: &str = "GetBucketLocation";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
+
+        let result = async {
+            self.check_bucket(&input.bucket)?;
+            Ok(S3Response::new(GetBucketLocationOutput {
+                location_constraint: None,
+            }))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
             started.elapsed(),
             &result,
             http::StatusCode::OK,
@@ -500,6 +531,71 @@ impl S3 for GatewayS3Service {
         result
     }
 
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
+        const OPERATION: &str = "ListObjects";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
+
+        let result = async {
+            self.check_bucket(&input.bucket)?;
+
+            let prefix = input.prefix.unwrap_or_default();
+            let prefix_present = !prefix.is_empty();
+            let max_keys = max_keys(input.max_keys)?;
+            let marker = input.marker;
+            let delimiter = input.delimiter;
+            let entries = self.repository.list(&prefix).map_err(repository_error)?;
+            let page = list_page(
+                entries,
+                &prefix,
+                delimiter.as_deref(),
+                marker.as_deref(),
+                max_keys,
+            )?;
+
+            tracing::debug!(
+                target: "rs3_server",
+                operation = OPERATION,
+                request_id,
+                prefix_present,
+                max_keys,
+                key_count = page.key_count,
+                common_prefixes = page.common_prefixes.len(),
+                is_truncated = page.next_continuation_token.is_some(),
+                "S3 list page prepared",
+            );
+            Ok(S3Response::new(ListObjectsOutput {
+                name: Some(input.bucket),
+                prefix: Some(prefix),
+                marker,
+                max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
+                is_truncated: Some(page.next_continuation_token.is_some()),
+                contents: (!page.contents.is_empty()).then_some(page.contents),
+                common_prefixes: (!page.common_prefixes.is_empty()).then_some(page.common_prefixes),
+                delimiter,
+                next_marker: page.next_continuation_token,
+                ..ListObjectsOutput::default()
+            }))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
+    }
+
     async fn list_objects_v2(
         &self,
         req: S3Request<ListObjectsV2Input>,
@@ -680,10 +776,10 @@ mod tests {
     use rs3_storage::BlobStore;
     use rs3_types::{LegalHoldStatus, RetentionMode};
     use s3s::dto::{
-        DeleteObjectInput, GetObjectInput, GetObjectLegalHoldInput, HeadBucketInput,
-        HeadObjectInput, ListBucketsInput, ListObjectsV2Input, ObjectLockLegalHold,
-        ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectInput, PutObjectLegalHoldInput,
-        StreamingBlob, Timestamp,
+        DeleteObjectInput, GetBucketLocationInput, GetObjectInput, GetObjectLegalHoldInput,
+        HeadBucketInput, HeadObjectInput, ListBucketsInput, ListObjectsInput, ListObjectsV2Input,
+        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectInput,
+        PutObjectLegalHoldInput, StreamingBlob, Timestamp,
     };
     use s3s::{Body, S3, S3Request, S3Response};
     use std::time::{Duration, SystemTime};
@@ -784,6 +880,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_bucket_location_accepts_public_bucket() {
+        let service = gateway_service().await;
+        let response = service
+            .get_bucket_location(s3_request(GetBucketLocationInput {
+                bucket: "client-bucket".to_owned(),
+                ..GetBucketLocationInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(response.output.location_constraint.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_bucket_location_rejects_other_bucket() {
+        let service = gateway_service().await;
+        let response = service
+            .get_bucket_location(s3_request(GetBucketLocationInput {
+                bucket: "other-bucket".to_owned(),
+                ..GetBucketLocationInput::default()
+            }))
+            .await;
+
+        assert!(response.is_err());
+    }
+
+    #[tokio::test]
     async fn object_operations_use_repository_mapping() {
         let service = gateway_service().await;
 
@@ -869,6 +992,21 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let contents = listed.output.contents.unwrap_or_default();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(
+            contents.first().and_then(|object| object.key.as_deref()),
+            Some("snapshots/object.bin")
+        );
+
+        let listed_v1 = service
+            .list_objects(s3_request(ListObjectsInput {
+                bucket: "client-bucket".to_owned(),
+                prefix: Some("snapshots/".to_owned()),
+                ..ListObjectsInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let contents = listed_v1.output.contents.unwrap_or_default();
         assert_eq!(contents.len(), 1);
         assert_eq!(
             contents.first().and_then(|object| object.key.as_deref()),

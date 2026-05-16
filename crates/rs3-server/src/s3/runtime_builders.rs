@@ -1,10 +1,11 @@
-use super::runtime_handles::{RuntimeAnchor, RuntimeStore};
+use super::runtime_handles::{RuntimeAnchor, RuntimeStore, RuntimeV2Anchor};
 use super::{S3BoundaryError, repository_init};
 use crate::{AnchorConfig, BackendConfig, BatchConfig};
 use rs3_anchor::MemoryCheckpointAnchor;
 #[cfg(feature = "k8s")]
 use rs3_k8s::{KubernetesLeaseAnchor, LeaseSettings};
 use rs3_repository::CommitCoordinatorOptions;
+use rs3_repository::v2::V2MemoryAnchor;
 use rs3_storage::{FilesystemBlobStore, MemoryBlobStore};
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
@@ -22,6 +23,12 @@ pub(super) struct AnchorBuild {
     handle: RuntimeAnchor,
     #[cfg(test)]
     memory_anchor: Option<MemoryCheckpointAnchor>,
+}
+
+pub(super) struct V2AnchorBuild {
+    handle: RuntimeV2Anchor,
+    #[cfg(test)]
+    memory_anchor: Option<V2MemoryAnchor>,
 }
 
 impl StoreBuild {
@@ -55,6 +62,17 @@ impl AnchorBuild {
 
     #[cfg(test)]
     pub(super) fn memory_anchor(&self) -> Option<&MemoryCheckpointAnchor> {
+        self.memory_anchor.as_ref()
+    }
+}
+
+impl V2AnchorBuild {
+    pub(super) fn handle(&self) -> &RuntimeV2Anchor {
+        &self.handle
+    }
+
+    #[cfg(test)]
+    pub(super) fn memory_anchor(&self) -> Option<&V2MemoryAnchor> {
         self.memory_anchor.as_ref()
     }
 }
@@ -114,6 +132,42 @@ pub(super) fn build_anchor(config: &AnchorConfig) -> Result<AnchorBuild, S3Bound
             {
                 Ok(AnchorBuild {
                     handle: RuntimeAnchor::new(KubernetesLeaseAnchor::new(LeaseSettings {
+                        namespace: namespace.clone(),
+                        name: name.clone(),
+                        field_manager: field_manager.clone(),
+                    })),
+                    #[cfg(test)]
+                    memory_anchor: None,
+                })
+            }
+            #[cfg(not(feature = "k8s"))]
+            {
+                let _ = (namespace, name, field_manager);
+                Err(S3BoundaryError::UnsupportedAnchorMode)
+            }
+        }
+    }
+}
+
+pub(super) fn build_v2_anchor(config: &AnchorConfig) -> Result<V2AnchorBuild, S3BoundaryError> {
+    match config {
+        AnchorConfig::Memory => {
+            let anchor = V2MemoryAnchor::new();
+            Ok(V2AnchorBuild {
+                handle: RuntimeV2Anchor::new(anchor.clone()),
+                #[cfg(test)]
+                memory_anchor: Some(anchor),
+            })
+        }
+        AnchorConfig::KubernetesLease {
+            namespace,
+            name,
+            field_manager,
+        } => {
+            #[cfg(feature = "k8s")]
+            {
+                Ok(V2AnchorBuild {
+                    handle: RuntimeV2Anchor::new(KubernetesLeaseAnchor::new(LeaseSettings {
                         namespace: namespace.clone(),
                         name: name.clone(),
                         field_manager: field_manager.clone(),

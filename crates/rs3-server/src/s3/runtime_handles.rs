@@ -1,10 +1,12 @@
 use bytes::Bytes;
 use rs3_anchor::{AnchorState, CheckpointAnchor};
+use rs3_repository::v2::{V2AnchorState, V2CommitAnchor, V2Result};
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, PutOptions};
 use std::sync::Arc;
 
 pub(super) type RuntimeStore = DynBlobStore;
 pub(super) type RuntimeAnchor = DynCheckpointAnchor;
+pub(super) type RuntimeV2Anchor = DynV2CommitAnchor;
 
 #[derive(Clone)]
 pub(super) struct DynBlobStore {
@@ -134,5 +136,33 @@ impl CheckpointAnchor for DynCheckpointAnchor {
 
     async fn compare_and_advance(&self, next: AnchorState) -> rs3_anchor::Result<AnchorState> {
         self.inner.compare_and_advance(next).await
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct DynV2CommitAnchor {
+    inner: Arc<dyn V2CommitAnchor>,
+}
+
+impl DynV2CommitAnchor {
+    pub(super) fn new(anchor: impl V2CommitAnchor + 'static) -> Self {
+        Self {
+            inner: Arc::new(anchor),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl V2CommitAnchor for DynV2CommitAnchor {
+    async fn read_v2(&self) -> V2Result<Option<V2AnchorState>> {
+        self.inner.read_v2().await
+    }
+
+    async fn compare_and_advance_v2(
+        &self,
+        expected: Option<&V2AnchorState>,
+        next: V2AnchorState,
+    ) -> V2Result<V2AnchorState> {
+        self.inner.compare_and_advance_v2(expected, next).await
     }
 }

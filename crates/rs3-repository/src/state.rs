@@ -22,7 +22,7 @@ pub(crate) struct TrustedManifest {
 }
 
 /// Mutable repository state guarded by the repository lock.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RepositoryState {
     /// Trusted namespace query model.
     pub(crate) namespace: NamespaceIndex,

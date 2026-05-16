@@ -10,8 +10,8 @@ description = "Command-line entry point for the rs3 gateway"
 
 [features]
 default = []
-s3 = ["rs3-storage/s3"]
-k8s = ["dep:rs3-k8s", "k8s-openapi/v1_35"]
+s3 = ["rs3-storage/s3", "dep:rustls"]
+k8s = ["dep:rs3-k8s", "dep:rustls", "k8s-openapi/v1_35"]
 
 [dependencies]
 anyhow.workspace = true
@@ -34,6 +34,9 @@ rs3-k8s = { path = "../rs3-k8s", optional = true }
 rs3-repository = { path = "../rs3-repository" }
 rs3-storage = { path = "../rs3-storage" }
 rs3-types = { path = "../rs3-types" }
+rustls = { version = "0.23", default-features = false, features = [
+  "aws_lc_rs",
+], optional = true }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

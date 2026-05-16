@@ -19,7 +19,7 @@ pub use derive::{
     NamespaceBlindKey, NamespacePrefixToken, derive_backend_object_id, derive_blind_index_key,
     derive_manifest_id, derive_prefix_token,
 };
-pub use envelope::{KEYRING_ENVELOPE_VERSION, KeyringEnvelope};
+pub use envelope::{FormatEnvelope, KEYRING_ENVELOPE_VERSION, KeyringEnvelope};
 pub use error::CryptoError;
 pub use fingerprint::derive_public_fingerprint;
 pub use keyring::{KeyMaterial, KeyRing, MIN_REPOSITORY_SALT_LEN, RepositoryKeyContext};

@@ -931,7 +931,10 @@ where
         Ok(DeleteOutcome { physical })
     }
 
-    fn tombstone_namespace_for_delete(&self, key: &LogicalPath) -> Result<BackendObjectId> {
+    pub(crate) fn tombstone_namespace_for_delete(
+        &self,
+        key: &LogicalPath,
+    ) -> Result<BackendObjectId> {
         let keyring = self.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
         let mut state = self.write_state()?;
@@ -952,7 +955,7 @@ where
         Ok(object_id)
     }
 
-    async fn delete_backend_object(
+    pub(crate) async fn delete_backend_object(
         &self,
         object_id: &BackendObjectId,
     ) -> Result<PhysicalDeleteOutcome> {

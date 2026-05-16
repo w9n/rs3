@@ -123,6 +123,7 @@ fn runtime_config() -> RuntimeConfig {
             max_pending_items: 64,
         },
         repository: RepositoryConfig {
+            format: rs3_server::RepositoryFormat::V1Preview,
             payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
             adaptive_payload_segment_size: true,
             decrypted_segment_cache_max_bytes:

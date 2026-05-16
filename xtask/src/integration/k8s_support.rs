@@ -39,6 +39,7 @@ pub(crate) struct GatewayChartValues<'a> {
     pub(crate) anchor_name: &'a str,
     pub(crate) log_format: &'a str,
     pub(crate) rust_log: &'a str,
+    pub(crate) repository_format: &'a str,
     pub(crate) payload_segment_size: Option<usize>,
     pub(crate) retention_mode: Option<&'a str>,
     pub(crate) retention_days: Option<u32>,
@@ -116,6 +117,8 @@ pub(crate) fn helm_install_gateway(
             &format!("logging.format={}", values.log_format),
             "--set-string",
             &helm_set_string("logging.rustLog", values.rust_log),
+            "--set-string",
+            &helm_set_string("repository.format", values.repository_format),
             "--set-string",
             &helm_set_string("repository.payloadSegmentSizeBytes", &payload_segment_size),
             "--set-string",
@@ -216,6 +219,75 @@ pub(crate) fn helm_lint_gateway(helm_bin: &str) -> Result<()> {
         ],
     )
     .context("gateway Helm chart lint failed")
+}
+
+pub(crate) fn assert_v2_lease_anchor(
+    kubectl_bin: &str,
+    kubeconfig_path: &Path,
+    namespace: &str,
+    anchor_name: &str,
+) -> Result<()> {
+    let kubeconfig = path_str(kubeconfig_path)?;
+    let lease = run_command_capture(
+        kubectl_bin,
+        &[
+            "--kubeconfig",
+            kubeconfig,
+            "-n",
+            namespace,
+            "get",
+            "lease",
+            anchor_name,
+            "-o",
+            "json",
+        ],
+    )
+    .with_context(|| format!("failed to read v2 Lease anchor `{anchor_name}`"))?;
+    let lease: serde_json::Value =
+        serde_json::from_str(&lease).context("Lease anchor JSON was not valid")?;
+    let annotations = lease
+        .pointer("/metadata/annotations")
+        .and_then(serde_json::Value::as_object)
+        .context("Lease anchor is missing annotations")?;
+
+    for key in [
+        "rs3.rs/v2-commit-key",
+        "rs3.rs/v2-body-digest",
+        "rs3.rs/v2-signing-key-id",
+        "rs3.rs/v2-format-digest",
+        "rs3.rs/v2-format-object-id",
+    ] {
+        let Some(value) = annotations.get(key).and_then(serde_json::Value::as_str) else {
+            bail!("Lease anchor is missing `{key}`");
+        };
+        if value.is_empty() {
+            bail!("Lease anchor annotation `{key}` is empty");
+        }
+    }
+
+    let sequence = required_u64_annotation(annotations, "rs3.rs/v2-sequence")?;
+    if sequence == 0 {
+        bail!("Lease anchor v2 sequence must be greater than zero");
+    }
+    let generation = required_u64_annotation(annotations, "rs3.rs/v2-format-generation")?;
+    if generation == 0 {
+        bail!("Lease anchor v2 format generation must be greater than zero");
+    }
+
+    Ok(())
+}
+
+fn required_u64_annotation(
+    annotations: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<u64> {
+    let value = annotations
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| format!("Lease anchor is missing `{key}`"))?;
+    value
+        .parse::<u64>()
+        .with_context(|| format!("Lease anchor annotation `{key}` is not an integer"))
 }
 
 fn helm_set_string(key: &str, value: &str) -> String {

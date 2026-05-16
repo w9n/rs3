@@ -390,6 +390,10 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
         RepositoryError::CommitBackpressure => {
             s3s::s3_error!(ServiceUnavailable, "commit coordinator is overloaded")
         }
+        RepositoryError::UnsupportedRepositoryFormat { .. } => s3s::s3_error!(
+            NotImplemented,
+            "repository format is not supported by this operation"
+        ),
         RepositoryError::Storage(StorageError::InvalidRange) => s3s::s3_error!(InvalidRange),
         RepositoryError::Storage(StorageError::LegalHoldBlocked) => {
             s3s::s3_error!(AccessDenied, "object legal hold blocked the operation")

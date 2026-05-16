@@ -89,6 +89,12 @@ envelope, and restore-critical objects before writing the missing anchor.
 Omit `--checkpoint-version-id` only for a trusted bundle that does not contain
 one; retained/Object Lock repositories should contain it.
 
+For `v2-preview`, use `import-v2-anchor` with the bundle's anchor sequence,
+commit key, body digest, signing key ID, format generation, format digest,
+format object ID, optional version IDs, and weak-subjectivity floor. The
+repository ID, salt, wrapping-key source, backend, and retention settings must
+match the original repository or import fails closed.
+
 ## 4. If No Bundle Exists, Use Bounded Recovery
 
 When the old Lease is gone and no trusted bundle exists, storage evidence can

@@ -63,8 +63,8 @@ cargo run -p rs3-server -- serve --bind 127.0.0.1:9080
 ```
 
 On first start with an empty backend prefix, the gateway writes an encrypted
-keyring envelope under `keyrings/`. The memory anchor is only for local
-development; it is not a production rollback boundary.
+keyring envelope under `keyrings/` and uses `v2-preview` by default. The memory
+anchor is only for local development; it is not a production rollback boundary.
 
 ## Run S3 Contract Checks
 

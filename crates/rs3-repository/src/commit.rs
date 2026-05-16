@@ -41,7 +41,7 @@ impl CommitCoordinatorOptions {
         self
     }
 
-    fn normalized(self) -> Self {
+    pub(crate) fn normalized(self) -> Self {
         Self {
             max_batch_items: self.max_batch_items.max(1),
             max_batch_delay: self.max_batch_delay,

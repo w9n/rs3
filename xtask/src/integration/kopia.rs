@@ -72,6 +72,15 @@ pub(crate) struct KopiaGatewayArgs {
     /// Kopia executable to run.
     #[arg(long, env = "RS3_TEST_KOPIA_BIN", default_value = "kopia")]
     kopia_bin: String,
+    /// Repository format used by the gateway process.
+    #[arg(long, env = "RS3_REPOSITORY_FORMAT", value_enum, default_value_t = KopiaGatewayRepositoryFormat::V2Preview)]
+    repository_format: KopiaGatewayRepositoryFormat,
+    /// Repository retention mode for repository-owned backend objects.
+    #[arg(long, env = "RS3_REPOSITORY_RETENTION_MODE", value_enum)]
+    retention_mode: Option<KopiaGatewayRetentionMode>,
+    /// Repository retention duration in days.
+    #[arg(long, env = "RS3_REPOSITORY_RETENTION_DAYS")]
+    retention_days: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -80,6 +89,40 @@ enum KopiaGatewayMode {
     Container,
     /// Use an already provisioned S3-compatible backend.
     Provided,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum KopiaGatewayRepositoryFormat {
+    /// Legacy production-preview repository format.
+    V1Preview,
+    /// Primary production-preview repository format.
+    V2Preview,
+}
+
+#[cfg(feature = "containers")]
+impl KopiaGatewayRepositoryFormat {
+    const fn as_env(self) -> &'static str {
+        match self {
+            Self::V1Preview => "v1-preview",
+            Self::V2Preview => "v2-preview",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum KopiaGatewayRetentionMode {
+    Governance,
+    Compliance,
+}
+
+#[cfg(feature = "containers")]
+impl KopiaGatewayRetentionMode {
+    const fn as_env(self) -> &'static str {
+        match self {
+            Self::Governance => "governance",
+            Self::Compliance => "compliance",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -211,15 +254,20 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
 
 #[cfg(feature = "containers")]
 pub(crate) fn run_kopia_gateway(args: KopiaGatewayArgs) -> Result<()> {
+    validate_kopia_gateway_args(&args)?;
     let kopia_bin = args.kopia_bin.clone();
     let backend_prefix = args.backend_prefix.clone();
+    let process_options = kopia_gateway_process_options(&args);
     let mut container_backend = None;
     let backend = match args.mode {
         KopiaGatewayMode::Container => {
-            let running = s3_container::start_s3_container(
+            let running = s3_container::start_s3_container_with_options(
                 args.container_provider,
                 args.backend_bucket,
                 args.region,
+                s3_container::S3ContainerOptions {
+                    object_lock: args.retention_mode.is_some(),
+                },
             )?;
             let backend = GatewayBackend::from_container(&running);
             container_backend = Some(running);
@@ -237,7 +285,12 @@ pub(crate) fn run_kopia_gateway(args: KopiaGatewayArgs) -> Result<()> {
 
     let container_backend_guard = container_backend;
     let result = runtime.block_on(async {
-        let mut gateway = RunningGateway::start_for_backend(&backend, backend_prefix).await?;
+        let mut gateway = RunningGateway::start_for_backend_with_options(
+            &backend,
+            backend_prefix,
+            process_options,
+        )
+        .await?;
         let target = KopiaS3Target {
             bucket: PUBLIC_BUCKET.to_owned(),
             endpoint_authority: gateway.endpoint_authority(),
@@ -260,6 +313,27 @@ pub(crate) fn run_kopia_gateway(args: KopiaGatewayArgs) -> Result<()> {
     });
     drop(container_backend_guard);
     result
+}
+
+#[cfg(feature = "containers")]
+fn validate_kopia_gateway_args(args: &KopiaGatewayArgs) -> Result<()> {
+    if args.retention_mode.is_some() && args.retention_days.is_none() {
+        bail!("--retention-days is required when --retention-mode is set");
+    }
+    if args.retention_days.is_some() && args.retention_mode.is_none() {
+        bail!("--retention-mode is required when --retention-days is set");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "containers")]
+fn kopia_gateway_process_options(args: &KopiaGatewayArgs) -> GatewayProcessOptions {
+    GatewayProcessOptions {
+        repository_format: Some(args.repository_format.as_env()),
+        repository_retention_mode: args.retention_mode.map(KopiaGatewayRetentionMode::as_env),
+        repository_retention_days: args.retention_days,
+        ..GatewayProcessOptions::default()
+    }
 }
 
 #[cfg(feature = "containers")]
@@ -647,6 +721,7 @@ async fn run_measured_gateway_kopia(args: MeasuredGatewayRun<'_>) -> Result<serd
             commit_batch_items: args.commit_batch_items,
             commit_batch_delay_ms: args.commit_batch_delay_ms,
             commit_max_pending_items: args.commit_max_pending_items,
+            ..GatewayProcessOptions::default()
         },
     )
     .await?;

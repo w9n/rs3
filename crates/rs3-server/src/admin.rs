@@ -6,7 +6,9 @@
 //! require a separate documented authorization and audit design and stabilization decision.
 
 use crate::s3::AnchorRecoveryError;
-use crate::{AnchorConfig, BackendConfig, RuntimeConfig, export_restore_bundle_from_config};
+use crate::{
+    AnchorConfig, BackendConfig, RepositoryFormat, RuntimeConfig, export_restore_bundle_from_config,
+};
 use rs3_crypto::derive_public_fingerprint;
 use rs3_types::RetentionMode;
 use serde::Serialize;
@@ -59,6 +61,8 @@ pub struct AdminStatusReport {
     pub security: AdminSecuritySummary,
     /// Restore-trust summary derived from the configured anchor when available.
     pub restore: AdminRestoreSummary,
+    /// Read-only maintenance summary.
+    pub maintenance: AdminMaintenanceSummary,
     /// Profile findings. Empty means the selected profile passed.
     pub findings: Vec<AdminFinding>,
 }
@@ -103,6 +107,8 @@ pub struct AdminAnchorSummary {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AdminRepositorySummary {
+    /// Durable repository format selected by the runtime.
+    pub format: &'static str,
     /// Plaintext payload segment size in bytes.
     pub payload_segment_size_bytes: usize,
     /// Whether payload segment size is adapted upward for medium and large objects.
@@ -143,8 +149,38 @@ pub struct AdminRestoreSummary {
     pub reason_code: Option<&'static str>,
     /// Accepted checkpoint summary when available.
     pub checkpoint: Option<AdminCheckpointSummary>,
+    /// Accepted v2 anchor summary when available.
+    pub v2_anchor: Option<AdminV2RestoreSummary>,
     /// Checkpoint-bound keyring envelope summary when available.
     pub keyring_envelope: Option<AdminKeyringEnvelopeSummary>,
+}
+
+/// Read-only maintenance status shown by operator reports.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AdminMaintenanceSummary {
+    /// Maintenance trust state: `verified`, `unavailable`, or `not-applicable`.
+    pub state: &'static str,
+    /// Machine-readable reason code when maintenance facts are unavailable.
+    pub reason_code: Option<&'static str>,
+    /// v2 maintenance facts, when the configured repository format is v2.
+    pub v2: Option<AdminV2MaintenanceSummary>,
+}
+
+/// Path-redacted v2 maintenance facts.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AdminV2MaintenanceSummary {
+    /// Whether the v2 anchor is present.
+    pub anchor_present: bool,
+    /// Verified commit count in the anchor-selected chain.
+    pub verified_commit_count: usize,
+    /// Unanchored v2 commit candidates observed under the commit prefix.
+    pub orphan_candidate_count: usize,
+    /// Orphan candidates blocked by retention or legal hold.
+    pub protected_orphan_candidate_count: usize,
+    /// Oldest visible orphan age in milliseconds, when provider timestamps exist.
+    pub oldest_orphan_age_ms: Option<u128>,
 }
 
 /// Accepted checkpoint summary.
@@ -159,6 +195,24 @@ pub struct AdminCheckpointSummary {
     pub checkpoint_digest: String,
     /// Signed checkpoint publish timestamp in milliseconds since the Unix epoch.
     pub published_at_ms: i64,
+}
+
+/// Accepted v2 anchor summary.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AdminV2RestoreSummary {
+    /// Accepted v2 commit sequence.
+    pub sequence: u64,
+    /// Accepted v2 commit body digest.
+    pub body_digest: String,
+    /// Whether the accepted commit is bound to a provider version ID.
+    pub version_bound: bool,
+    /// Active format generation bound into the anchor.
+    pub format_generation: u64,
+    /// Active format digest bound into the anchor.
+    pub format_digest: String,
+    /// Bundle export timestamp in milliseconds since the Unix epoch.
+    pub exported_at_ms: i64,
 }
 
 /// Checkpoint-bound keyring envelope summary.
@@ -203,6 +257,7 @@ pub async fn admin_status_report(
     profile: AdminReportProfile,
 ) -> AdminStatusReport {
     let restore = restore_summary(config).await;
+    let maintenance = maintenance_summary(config).await;
     AdminStatusReport {
         schema: ADMIN_STATUS_SCHEMA,
         profile: profile.as_str(),
@@ -223,6 +278,7 @@ pub async fn admin_status_report(
             external: !matches!(config.anchor, AnchorConfig::Memory),
         },
         repository: AdminRepositorySummary {
+            format: config.repository.format.as_str(),
             payload_segment_size_bytes: config.repository.payload_segment_size,
             adaptive_payload_segment_size: config.repository.adaptive_payload_segment_size,
             decrypted_segment_cache_max_bytes: config.repository.decrypted_segment_cache_max_bytes,
@@ -242,6 +298,7 @@ pub async fn admin_status_report(
             action_posture: "report-only",
         },
         restore,
+        maintenance,
         findings: doctor_findings(config, profile),
     }
 }
@@ -299,6 +356,13 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
 }
 
 async fn restore_summary(config: &RuntimeConfig) -> AdminRestoreSummary {
+    match config.repository.format {
+        RepositoryFormat::V1Preview => restore_summary_v1(config).await,
+        RepositoryFormat::V2Preview => restore_summary_v2(config).await,
+    }
+}
+
+async fn restore_summary_v1(config: &RuntimeConfig) -> AdminRestoreSummary {
     match export_restore_bundle_from_config(config).await {
         Ok(bundle) => AdminRestoreSummary {
             state: "verified",
@@ -309,6 +373,7 @@ async fn restore_summary(config: &RuntimeConfig) -> AdminRestoreSummary {
                 checkpoint_digest: bundle.checkpoint.payload_digest,
                 published_at_ms: bundle.published_at_ms,
             }),
+            v2_anchor: None,
             keyring_envelope: bundle
                 .keyring_envelope
                 .map(|envelope| AdminKeyringEnvelopeSummary {
@@ -320,26 +385,84 @@ async fn restore_summary(config: &RuntimeConfig) -> AdminRestoreSummary {
             state: "unavailable",
             reason_code: Some(anchor_recovery_error_code(&error)),
             checkpoint: None,
+            v2_anchor: None,
             keyring_envelope: None,
+        },
+    }
+}
+
+async fn restore_summary_v2(config: &RuntimeConfig) -> AdminRestoreSummary {
+    match crate::s3::export_v2_recovery_bundle_from_config(config).await {
+        Ok(bundle) => AdminRestoreSummary {
+            state: "verified",
+            reason_code: None,
+            checkpoint: None,
+            v2_anchor: Some(AdminV2RestoreSummary {
+                sequence: bundle.anchor.sequence.get(),
+                body_digest: hex::encode(bundle.anchor.body_digest),
+                version_bound: bundle.anchor.version_id.is_some(),
+                format_generation: bundle.anchor.format_ref.generation,
+                format_digest: bundle.anchor.format_ref.digest,
+                exported_at_ms: bundle.exported_at_ms,
+            }),
+            keyring_envelope: None,
+        },
+        Err(error) => AdminRestoreSummary {
+            state: "unavailable",
+            reason_code: Some(runtime_error_code(&error)),
+            checkpoint: None,
+            v2_anchor: None,
+            keyring_envelope: None,
+        },
+    }
+}
+
+async fn maintenance_summary(config: &RuntimeConfig) -> AdminMaintenanceSummary {
+    if config.repository.format != RepositoryFormat::V2Preview {
+        return AdminMaintenanceSummary {
+            state: "not-applicable",
+            reason_code: None,
+            v2: None,
+        };
+    }
+
+    match crate::s3::v2_quick_maintenance_from_config(config).await {
+        Ok(report) => AdminMaintenanceSummary {
+            state: "verified",
+            reason_code: None,
+            v2: Some(AdminV2MaintenanceSummary {
+                anchor_present: report.anchor_present,
+                verified_commit_count: report.verified_commit_count,
+                orphan_candidate_count: report.orphan_candidate_count,
+                protected_orphan_candidate_count: report.protected_orphan_candidate_count,
+                oldest_orphan_age_ms: report.oldest_orphan_age_ms,
+            }),
+        },
+        Err(error) => AdminMaintenanceSummary {
+            state: "unavailable",
+            reason_code: Some(runtime_error_code(&error)),
+            v2: None,
         },
     }
 }
 
 fn anchor_recovery_error_code(error: &AnchorRecoveryError) -> &'static str {
     match error {
-        AnchorRecoveryError::Runtime(error) => match error {
-            crate::S3BoundaryError::MissingStaticCredentials => {
-                "runtime.missing-static-credentials"
-            }
-            crate::S3BoundaryError::UnsupportedAnchorMode => "runtime.unsupported-anchor-mode",
-            crate::S3BoundaryError::UnsupportedBackendMode => "runtime.unsupported-backend-mode",
-            crate::S3BoundaryError::RepositoryInit { .. } => "runtime.repository-init",
-        },
+        AnchorRecoveryError::Runtime(error) => runtime_error_code(error),
         AnchorRecoveryError::NoValidCheckpoint => "recovery.no-valid-checkpoint",
         AnchorRecoveryError::CheckpointTooOld { .. } => "recovery.checkpoint-too-old",
         AnchorRecoveryError::AnchorAlreadyExists => "anchor.already-exists",
         AnchorRecoveryError::Anchor(_) => "anchor.error",
         AnchorRecoveryError::Repository(_) => "repository.verify-failed",
+    }
+}
+
+fn runtime_error_code(error: &crate::S3BoundaryError) -> &'static str {
+    match error {
+        crate::S3BoundaryError::MissingStaticCredentials => "runtime.missing-static-credentials",
+        crate::S3BoundaryError::UnsupportedAnchorMode => "runtime.unsupported-anchor-mode",
+        crate::S3BoundaryError::UnsupportedBackendMode => "runtime.unsupported-backend-mode",
+        crate::S3BoundaryError::RepositoryInit { .. } => "runtime.repository-init",
     }
 }
 
@@ -400,6 +523,7 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
     let metrics = config.metrics.bind.is_some().to_string();
     let gateway_mode = config.mode.as_str().to_owned();
     let backend_kind = backend_kind(&config.backend.endpoint).to_owned();
+    let repository_format = config.repository.format.as_str().to_owned();
     let batch_max_items = config.batching.max_items.to_string();
     let batch_max_delay_ms = config.batching.max_delay.as_millis().to_string();
     let batch_max_pending_items = config.batching.max_pending_items.to_string();
@@ -422,6 +546,7 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
         gateway_mode.as_bytes(),
         metrics.as_bytes(),
         backend_kind.as_bytes(),
+        repository_format.as_bytes(),
         batch_max_items.as_bytes(),
         batch_max_delay_ms.as_bytes(),
         batch_max_pending_items.as_bytes(),
@@ -452,7 +577,7 @@ mod tests {
     };
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig, RepositoryConfig,
-        RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
+        RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use std::time::Duration;
@@ -478,6 +603,7 @@ mod tests {
                 max_pending_items: 64,
             },
             repository: RepositoryConfig {
+                format: RepositoryFormat::V1Preview,
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:
@@ -572,5 +698,29 @@ mod tests {
         assert!(!report.security.secrets_exposed);
         assert_eq!(report.security.action_posture, "report-only");
         assert_eq!(report.schema, "rs3.admin-status.preview.v1");
+        assert!(report.restore.v2_anchor.is_none());
+        assert_eq!(report.maintenance.state, "not-applicable");
+        assert!(report.maintenance.v2.is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_status_reports_v2_maintenance_without_paths_when_unavailable() {
+        let mut config = runtime_config();
+        config.repository.format = RepositoryFormat::V2Preview;
+        let report = admin_status_report(&config, AdminReportProfile::Production).await;
+        let json = serde_json::to_string(&report).unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(report.maintenance.state, "unavailable");
+        assert_eq!(
+            report.maintenance.reason_code,
+            Some("runtime.repository-init")
+        );
+        assert_eq!(report.restore.reason_code, Some("runtime.repository-init"));
+        assert!(report.restore.v2_anchor.is_none());
+        assert!(report.maintenance.v2.is_none());
+        assert!(!json.contains("client-private-bucket"));
+        assert!(!json.contains("backend-secret-bucket"));
+        assert!(!json.contains("tenant/private/prefix"));
+        assert!(!json.contains("repo-secret-id"));
     }
 }

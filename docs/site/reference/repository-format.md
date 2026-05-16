@@ -33,6 +33,62 @@ The class leaks broad object type. That is currently accepted because it helps
 operations, lifecycle policy, and debugging. Hiding class prefixes would require
 a future format version.
 
+## v2 Preview
+
+`v2-preview` is the default format for new repositories. `v1-preview` remains
+selectable for legacy preview experiments, but new deployments should use a
+fresh `v2-preview` repository rather than carrying forward unused v1 state.
+
+v2 commit objects use random, path-private keys:
+
+```text
+commits/v01/<20-digit-sequence>/<32-byte-random-id-base64url>
+```
+
+The sequence segment is for bounded listing only. The accepted head is the
+external anchor's full commit key, body digest, provider version ID when
+required, and signing key ID. A v2 reader verifies the fixed header, header
+digest, canonical CBOR header, signed `self.commit_key`, Ed25519 signature,
+section layout, and body digest before trusting a commit.
+
+The retained-version/Object Lock provider profile does not require atomic
+`If-None-Match: *` support. It requires provider version IDs, exact-version
+`HEAD`/`GET`/range `GET`, visible retention or legal-hold state, and preserved
+old versions after a newer latest version exists.
+
+The current v2 runtime reuses the trusted namespace, sealed manifest, and
+segmented encrypted payload model described below. The difference is the
+durable commit boundary: pending sealed index deltas are embedded in signed v2
+commit sections and replayed from the anchor-selected commit chain.
+
+The gateway uses the same commit batching knobs for v2 as for v1. Concurrent
+client PUTs can stage multiple encrypted payloads and publish one signed v2
+delta commit that covers all pending index updates; if commit publication or
+anchor advancement fails, the unaccepted in-memory namespace state is rolled
+back while the failed logical payload sequences remain reserved.
+
+v2 snapshot commits consolidate the live blinded namespace into an encrypted
+`INDEX_SNAPSHOT` section. Readers walk the signed parent chain only until the
+nearest snapshot, apply that full state, then replay newer delta commits. A
+snapshot writer first flushes any pending client-write batch so the snapshot
+chains from an accepted state. Operators can force this maintenance action with
+`rs3 write-index-snapshot` on `v2-preview` repositories.
+
+v2 quick maintenance verifies the anchor-selected commit chain and reports
+path-redacted orphan counts. Conservative orphan GC can delete unanchored
+commit candidates only after reachability, visible retention, legal-hold, age,
+and same-sequence safety checks pass. Retained or legally held candidates are
+reported and skipped; retained-profile candidates with missing protection
+metadata are also skipped.
+
+`rs3 export-restore-bundle` is format-aware: for `v2-preview` it verifies the
+anchor-selected commit chain and exports the anchor state as the normal DR
+weak-subjectivity bundle. If the external anchor is lost, `rs3 import-v2-anchor`
+recreates it from a trusted bundle after verifying the named commit chain.
+`rs3 check-v2-provider` runs the selected v2 provider-profile probes against the
+configured backend; retained governance profiles require an explicit operator
+review flag because gateway credentials must not be able to bypass retention.
+
 ## Payload Segments
 
 Payload segments are independently encrypted with XChaCha20-Poly1305 so ranged
@@ -111,9 +167,9 @@ The repository uses purpose-specific keys for:
 - Ed25519 checkpoint signing
 
 New writes use primary keys. Reads and replay accept enabled historical keys
-until retention and migration policy allow retirement. Data-key rotation adds a
-fresh primary key for one purpose and demotes the previous primary to enabled
-historical use.
+until retention policy and repository reachability allow retirement. Data-key
+rotation adds a fresh primary key for one purpose and demotes the previous
+primary to enabled historical use.
 
 The preferred bootstrap shape is to use an operator-provided repository ID and
 public salt, generate random purpose-specific data keys, and store them in an

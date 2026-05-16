@@ -4,6 +4,8 @@ use anyhow::Result;
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
 
+use super::GatewayRepositoryFormat;
+
 #[derive(Debug, Args)]
 pub(crate) struct VeleroKopiaSmokeArgs {
     /// Backend mode used behind the gateway.
@@ -27,6 +29,9 @@ pub(crate) struct VeleroKopiaSmokeArgs {
     /// Retention duration in days when repository retention mode is set.
     #[arg(long, env = "RS3_REPOSITORY_RETENTION_DAYS")]
     repository_retention_days: Option<u32>,
+    /// Repository format used by the gateway-backed scenarios.
+    #[arg(long, env = "RS3_REPOSITORY_FORMAT", value_enum, default_value_t = GatewayRepositoryFormat::V2Preview)]
+    repository_format: GatewayRepositoryFormat,
     /// kind cluster name. Defaults to a unique disposable name.
     #[arg(long)]
     cluster_name: Option<String>,
@@ -298,9 +303,9 @@ mod imp {
     use crate::integration::k8s_support::{
         GatewayChartValues, K8sWorkspace, KEYRING_ENVELOPE_OBJECT_ID, KEYRING_WRAPPING_KEY_HEX,
         KEYRING_WRAPPING_KEY_ID, KindCluster, REPOSITORY_ID, REPOSITORY_SALT_HEX,
-        default_cluster_name, helm_fullname, helm_install_gateway, helm_lint_gateway,
-        helm_set_gateway_mode, now_millis, path_str, require_command, run_command,
-        run_command_capture, split_image_ref,
+        assert_v2_lease_anchor, default_cluster_name, helm_fullname, helm_install_gateway,
+        helm_lint_gateway, helm_set_gateway_mode, now_millis, path_str, require_command,
+        run_command, run_command_capture, split_image_ref,
     };
     use anyhow::{Context, Result, bail};
     use artifacts::{ArtifactCollector, gateway_backend_counts};
@@ -593,6 +598,7 @@ mod imp {
                             anchor_name: &anchor_name,
                             log_format: "json",
                             rust_log: GATEWAY_RUST_LOG,
+                            repository_format: args.repository_format.as_env(),
                             payload_segment_size: args.payload_segment_size,
                             retention_mode: args.repository_retention_mode.as_deref(),
                             retention_days: args.repository_retention_days,
@@ -650,6 +656,12 @@ mod imp {
             {
                 eprintln!("failed to collect after-backup checkpoint artifacts: {error:#}");
             }
+            if args.repository_format.is_v2() && scenario.storage_path.uses_gateway() {
+                let anchor_name = state.anchor_name.clone();
+                run_phase(&mut state, "assert-v2-anchor-after-backup", || {
+                    assert_v2_gateway_anchor(&args, kubeconfig_path, &anchor_name)
+                })?;
+            }
 
             run_phase(&mut state, "delete-workload", || match scenario.volume {
                 WorkloadVolume::EmptyDir | WorkloadVolume::DynamicPvc => {
@@ -679,6 +691,12 @@ mod imp {
                     "after-gateway-restart",
                 ) {
                     eprintln!("failed to collect post-restart checkpoint artifacts: {error:#}");
+                }
+                if args.repository_format.is_v2() && scenario.storage_path.uses_gateway() {
+                    let anchor_name = state.anchor_name.clone();
+                    run_phase(&mut state, "assert-v2-anchor-after-gateway-restart", || {
+                        assert_v2_gateway_anchor(&args, kubeconfig_path, &anchor_name)
+                    })?;
                 }
             }
             let restore_readonly_counts_before = if scenario.restore_readonly_before_restore
@@ -726,6 +744,12 @@ mod imp {
             {
                 eprintln!("failed to collect after-restore checkpoint artifacts: {error:#}");
             }
+            if args.repository_format.is_v2() && scenario.storage_path.uses_gateway() {
+                let anchor_name = state.anchor_name.clone();
+                run_phase(&mut state, "assert-v2-anchor-after-restore", || {
+                    assert_v2_gateway_anchor(&args, kubeconfig_path, &anchor_name)
+                })?;
+            }
 
             Ok(())
         })();
@@ -736,6 +760,19 @@ mod imp {
 
         result?;
         cluster.delete()
+    }
+
+    fn assert_v2_gateway_anchor(
+        args: &VeleroKopiaSmokeArgs,
+        kubeconfig_path: &Path,
+        anchor_name: &str,
+    ) -> Result<()> {
+        assert_v2_lease_anchor(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &args.gateway_namespace,
+            anchor_name,
+        )
     }
 
     fn reset_reused_cluster(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {

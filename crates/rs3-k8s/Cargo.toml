@@ -10,9 +10,11 @@ description = "Kubernetes checkpoint anchoring integration for rs3"
 
 [dependencies]
 async-trait.workspace = true
+hex.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 rs3-anchor.workspace = true
+rs3-repository.workspace = true
 rs3-types.workspace = true
 tokio.workspace = true
 

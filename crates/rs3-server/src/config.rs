@@ -20,6 +20,8 @@ const MIN_REPOSITORY_KEY_HEX_LEN: usize = SecretBytes::MIN_LEN * 2;
 const MIN_REPOSITORY_SALT_HEX_LEN: usize = MIN_REPOSITORY_SALT_LEN * 2;
 const REPOSITORY_RETENTION_MODE_ENV: &str = "RS3_REPOSITORY_RETENTION_MODE";
 const REPOSITORY_RETENTION_DAYS_ENV: &str = "RS3_REPOSITORY_RETENTION_DAYS";
+const REPOSITORY_FORMAT_ENV: &str = "RS3_REPOSITORY_FORMAT";
+const DEFAULT_REPOSITORY_FORMAT: RepositoryFormat = RepositoryFormat::V2Preview;
 
 pub(crate) const REPOSITORY_SALT_HEX_ENV: &str = "RS3_REPOSITORY_SALT_HEX";
 pub(crate) const KEYRING_ENVELOPE_OBJECT_ID_ENV: &str = "RS3_KEYRING_ENVELOPE_OBJECT_ID";
@@ -133,6 +135,8 @@ pub struct BatchConfig {
 /// Repository object layout settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RepositoryConfig {
+    /// Durable repository format selected by this runtime.
+    pub format: RepositoryFormat,
     /// Plaintext bytes per independently encrypted payload segment.
     pub payload_segment_size: usize,
     /// Whether the gateway adapts payload segment size upward by object size.
@@ -141,6 +145,25 @@ pub struct RepositoryConfig {
     pub decrypted_segment_cache_max_bytes: u64,
     /// Default provider retention policy for repository-owned objects.
     pub retention: Option<RetentionPolicy>,
+}
+
+/// Durable repository format selected by this runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepositoryFormat {
+    /// Legacy production-preview format.
+    V1Preview,
+    /// Primary production-preview format for new repositories.
+    V2Preview,
+}
+
+impl RepositoryFormat {
+    /// Returns the environment/configuration spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1Preview => "v1-preview",
+            Self::V2Preview => "v2-preview",
+        }
+    }
 }
 
 /// Encrypted repository keyring envelope settings.
@@ -337,6 +360,7 @@ fn parse_batch_config(source: &impl ConfigSource) -> Result<BatchConfig, ConfigE
 }
 
 fn parse_repository_config(source: &impl ConfigSource) -> Result<RepositoryConfig, ConfigError> {
+    let format = parse_repository_format(source)?;
     let payload_segment_size_value = source.value("RS3_PAYLOAD_SEGMENT_SIZE_BYTES");
     let adaptive_payload_segment_size = payload_segment_size_value.is_none();
     let payload_segment_size = parse_positive_usize(
@@ -352,11 +376,26 @@ fn parse_repository_config(source: &impl ConfigSource) -> Result<RepositoryConfi
     let retention = parse_retention_policy(source)?;
 
     Ok(RepositoryConfig {
+        format,
         payload_segment_size,
         adaptive_payload_segment_size,
         decrypted_segment_cache_max_bytes,
         retention,
     })
+}
+
+fn parse_repository_format(source: &impl ConfigSource) -> Result<RepositoryFormat, ConfigError> {
+    let value = optional_value(source, REPOSITORY_FORMAT_ENV)
+        .unwrap_or_else(|| DEFAULT_REPOSITORY_FORMAT.as_str().to_owned());
+    match value.as_str() {
+        "v1-preview" => Ok(RepositoryFormat::V1Preview),
+        "v2-preview" => Ok(RepositoryFormat::V2Preview),
+        _ => Err(ConfigError::Invalid {
+            key: REPOSITORY_FORMAT_ENV,
+            value,
+            reason: "expected v1-preview or v2-preview".to_owned(),
+        }),
+    }
 }
 
 fn parse_retention_policy(
@@ -672,7 +711,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 mod tests {
     use super::{
         AnchorConfig, BatchConfig, ConfigError, ConfigSource, GatewayMode, MetricsConfig,
-        RepositoryConfig, RepositoryKeysConfig, RuntimeConfig,
+        RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig,
     };
     use secrecy::SecretString;
     use std::collections::BTreeMap;
@@ -753,6 +792,7 @@ mod tests {
         assert_eq!(
             config.repository,
             RepositoryConfig {
+                format: RepositoryFormat::V2Preview,
                 payload_segment_size: 512,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:
@@ -762,6 +802,41 @@ mod tests {
         );
         assert_eq!(config.repository_keys, repository_keys_config());
         assert!(config.static_credentials.is_none());
+    }
+
+    #[test]
+    fn parses_repository_format_v2_preview() {
+        let source = minimal_source().with(super::REPOSITORY_FORMAT_ENV, "v2-preview");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert_eq!(
+            config.map(|config| config.repository.format),
+            Ok(RepositoryFormat::V2Preview)
+        );
+    }
+
+    #[test]
+    fn parses_repository_format_v1_preview() {
+        let source = minimal_source().with(super::REPOSITORY_FORMAT_ENV, "v1-preview");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert_eq!(
+            config.map(|config| config.repository.format),
+            Ok(RepositoryFormat::V1Preview)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_repository_format() {
+        let source = minimal_source().with(super::REPOSITORY_FORMAT_ENV, "stable");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::REPOSITORY_FORMAT_ENV)
+        );
     }
 
     #[test]
@@ -819,6 +894,7 @@ mod tests {
         assert_eq!(
             config.map(|config| config.repository),
             Ok(RepositoryConfig {
+                format: RepositoryFormat::V2Preview,
                 payload_segment_size: 65536,
                 adaptive_payload_segment_size: false,
                 decrypted_segment_cache_max_bytes:

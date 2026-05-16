@@ -380,6 +380,11 @@ version. Retained/Object Lock repositories should have one.
 The import verifies the checkpoint chain, checkpoint evidence, keyring envelope,
 and reachable restore-critical objects before writing the missing anchor.
 
+For `v2-preview`, the same `export-restore-bundle` command emits a v2 bundle.
+Recover a missing Lease with `import-v2-anchor` and the bundle's v2 anchor and
+format fields. Keep the repository retention settings identical to the original
+repository; v2 format-root verification rejects a mismatched context.
+
 When the old Kubernetes Lease is gone, use explicit anchor recovery with a
 freshness bound:
 

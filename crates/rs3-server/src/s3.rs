@@ -10,6 +10,7 @@ mod runtime_builders;
 mod runtime_checkpoints;
 mod runtime_handles;
 mod runtime_keyring;
+mod runtime_v2;
 
 pub use boundary::{GatewayS3Boundary, S3Hardening};
 pub use key_management::{
@@ -20,6 +21,12 @@ pub use recovery::{
     AnchorImportReport, AnchorRecoveryError, AnchorRecoveryOptions, AnchorRecoveryReport,
     RESTORE_BUNDLE_SCHEMA, RestoreBundleKeyringEnvelope, RestoreTrustBundle,
     export_restore_bundle_from_config, import_anchor_from_config, recover_anchor_from_config,
+};
+pub(crate) use runtime_v2::v2_quick_maintenance_from_config;
+pub use runtime_v2::{
+    RuntimeV2ProviderConformanceOptions, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportReport,
+    check_v2_provider_conformance_from_config, export_v2_recovery_bundle_from_config,
+    import_v2_anchor_from_config, write_v2_index_snapshot_from_config,
 };
 use thiserror::Error;
 
@@ -86,6 +93,7 @@ pub(super) mod test_support {
                 max_pending_items: 64,
             },
             repository: RepositoryConfig {
+                format: crate::RepositoryFormat::V1Preview,
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:

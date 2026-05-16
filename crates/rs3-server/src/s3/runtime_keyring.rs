@@ -39,7 +39,7 @@ pub(super) async fn gateway_keyring(
     }
 }
 
-async fn unanchored_gateway_keyring(
+pub(super) async fn unanchored_gateway_keyring(
     store: &RuntimeStore,
     keys: &RepositoryKeysConfig,
     retention: Option<RetentionPolicy>,
@@ -311,7 +311,7 @@ async fn store_configured_keyring_envelope(
     }
 }
 
-fn retained_version_id(
+pub(super) fn retained_version_id(
     object_id: &BackendObjectId,
     metadata: &BlobMetadata,
     retention: Option<RetentionPolicy>,

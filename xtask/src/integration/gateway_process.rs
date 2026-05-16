@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 
 pub(crate) const PUBLIC_BUCKET: &str = "client-bucket";
 pub(crate) const ACCESS_KEY_ID: &str = "access";
-pub(crate) const SECRET_ACCESS_KEY: &str = "secret";
+pub(crate) const SECRET_ACCESS_KEY: &str = "secretsecret";
 const KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.json";
 const KEYRING_WRAPPING_KEY_HEX: &str =
     "3333333333333333333333333333333333333333333333333333333333333333";
@@ -60,6 +60,9 @@ impl GatewayBuildProfile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GatewayProcessOptions {
     pub(crate) build_profile: GatewayBuildProfile,
+    pub(crate) repository_format: Option<&'static str>,
+    pub(crate) repository_retention_mode: Option<&'static str>,
+    pub(crate) repository_retention_days: Option<u32>,
     pub(crate) payload_segment_size: Option<usize>,
     pub(crate) commit_batch_items: Option<usize>,
     pub(crate) commit_batch_delay_ms: Option<u64>,
@@ -70,6 +73,9 @@ impl Default for GatewayProcessOptions {
     fn default() -> Self {
         Self {
             build_profile: GatewayBuildProfile::Dev,
+            repository_format: None,
+            repository_retention_mode: None,
+            repository_retention_days: None,
             payload_segment_size: None,
             commit_batch_items: None,
             commit_batch_delay_ms: None,
@@ -87,25 +93,12 @@ pub(crate) struct RunningGateway {
 }
 
 impl RunningGateway {
-    pub(crate) async fn start(
-        backend: &RunningS3Container,
-        backend_prefix: String,
-    ) -> Result<Self> {
-        let backend = GatewayBackend::from_container(backend);
-        Self::start_for_backend(&backend, backend_prefix).await
-    }
-
-    pub(crate) async fn start_for_backend(
+    pub(crate) async fn start_for_backend_with_options(
         backend: &GatewayBackend,
         backend_prefix: String,
+        options: GatewayProcessOptions,
     ) -> Result<Self> {
-        Self::start_inner(
-            backend,
-            backend_prefix,
-            None,
-            GatewayProcessOptions::default(),
-        )
-        .await
+        Self::start_inner(backend, backend_prefix, None, options).await
     }
 
     pub(crate) async fn start_with_log_capture_options(
@@ -193,6 +186,14 @@ impl RunningGateway {
         if let Some(rust_log) = rust_log {
             child.env("RUST_LOG", rust_log);
         }
+        if let Some(repository_format) = options.repository_format {
+            child.env("RS3_REPOSITORY_FORMAT", repository_format);
+        }
+        if let Some(repository_retention_mode) = options.repository_retention_mode {
+            child.env("RS3_REPOSITORY_RETENTION_MODE", repository_retention_mode);
+            let retention_days = options.repository_retention_days.unwrap_or(1);
+            child.env("RS3_REPOSITORY_RETENTION_DAYS", retention_days.to_string());
+        }
         if let Some(payload_segment_size) = options.payload_segment_size {
             child.env(
                 "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
@@ -275,7 +276,7 @@ impl RunningGateway {
         self.metrics_addr.map(|addr| addr.to_string())
     }
 
-    pub(crate) fn client(&self, backend: &RunningS3Container) -> Client {
+    pub(crate) fn client_for_backend(&self, backend: &GatewayBackend) -> Client {
         s3_container::s3_client(
             &self.endpoint_url(),
             &backend.region,

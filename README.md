@@ -10,7 +10,8 @@ encryption boundaries, signed checkpoint plumbing, integration harnesses,
 Kubernetes Lease anchoring, restore verification, production posture checks, and
 Kopia-focused performance measurement. The current release target is a
 production preview: suitable for controlled evaluation, not yet a stable
-repository-format or security guarantee.
+repository-format or security guarantee. New preview repositories use the
+`v2-preview` repository format by default.
 
 Current engineering priorities:
 

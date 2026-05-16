@@ -6,15 +6,26 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use rs3_server::{
     AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReportProfile,
     AnchorConfig, AnchorImportReport, AnchorRecoveryOptions, AnchorRecoveryReport, GatewayMode,
-    GatewayServer, KeyRotationOptions, KeyRotationReport, RESTORE_BUNDLE_SCHEMA,
-    RestoreTrustBundle, RuntimeConfig, backend_kind, doctor_findings,
-    export_restore_bundle_from_config, import_anchor_from_config, recover_anchor_from_config,
-    rotate_key_from_config, runtime_config_profile,
+    GatewayServer, KeyRotationOptions, KeyRotationReport, RESTORE_BUNDLE_SCHEMA, RepositoryFormat,
+    RestoreTrustBundle, RuntimeConfig, RuntimeV2ProviderConformanceOptions,
+    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportReport, V2AnchorState, V2ProviderCheckStatus,
+    V2ProviderConformanceReport, V2ProviderProfile, V2RecoveryBundle, backend_kind,
+    check_v2_provider_conformance_from_config, doctor_findings, export_restore_bundle_from_config,
+    export_v2_recovery_bundle_from_config, import_anchor_from_config, import_v2_anchor_from_config,
+    recover_anchor_from_config, rotate_key_from_config, runtime_config_profile,
+    write_v2_index_snapshot_from_config,
 };
-use rs3_types::{CheckpointId, KeyId, KeyPurpose, RetentionMode, Sequence};
+use rs3_types::{
+    BackendObjectId, BackendVersionId, CheckpointId, KeyId, KeyPurpose, RetentionMode, Sequence,
+};
 use std::net::SocketAddr;
+#[cfg(any(feature = "s3", feature = "k8s"))]
+use std::sync::Once;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
+
+#[cfg(any(feature = "s3", feature = "k8s"))]
+static RUSTLS_PROVIDER: Once = Once::new();
 
 #[derive(Debug, Parser)]
 #[command(name = "rs3")]
@@ -64,6 +75,20 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
+    WriteIndexSnapshot {
+        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
+        format: RecoveryReportFormat,
+    },
+    CheckV2Provider {
+        #[arg(long)]
+        probe_prefix: Option<String>,
+        #[arg(long, default_value_t = false)]
+        legal_hold: bool,
+        #[arg(long, default_value_t = false)]
+        governance_bypass_reviewed: bool,
+        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
+        format: RecoveryReportFormat,
+    },
     ImportAnchor {
         #[arg(long)]
         checkpoint_sequence: u64,
@@ -73,6 +98,30 @@ enum Commands {
         checkpoint_version_id: Option<String>,
         #[arg(long)]
         checkpoint_digest: String,
+        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
+        format: RecoveryReportFormat,
+    },
+    ImportV2Anchor {
+        #[arg(long)]
+        anchor_sequence: u64,
+        #[arg(long)]
+        anchor_commit_key: String,
+        #[arg(long)]
+        anchor_version_id: Option<String>,
+        #[arg(long)]
+        anchor_body_digest: String,
+        #[arg(long)]
+        signing_key_id: String,
+        #[arg(long)]
+        format_generation: u64,
+        #[arg(long)]
+        format_digest: String,
+        #[arg(long)]
+        format_object_id: String,
+        #[arg(long)]
+        format_version_id: Option<String>,
+        #[arg(long)]
+        weak_subjectivity_floor_sequence: Option<u64>,
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
@@ -114,6 +163,7 @@ enum RecoveryReportFormat {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_rustls_provider();
     let cli = Cli::parse();
     init_tracing(cli.log_format);
 
@@ -183,8 +233,45 @@ async fn main() -> Result<()> {
         Commands::ExportRestoreBundle { format } => {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
-            let bundle = export_restore_bundle_from_config(&config).await?;
-            print_restore_bundle(&bundle, format)?;
+            match config.repository.format {
+                RepositoryFormat::V1Preview => {
+                    let bundle = export_restore_bundle_from_config(&config).await?;
+                    print_restore_bundle(&bundle, format)?;
+                }
+                RepositoryFormat::V2Preview => {
+                    let bundle = export_v2_recovery_bundle_from_config(&config).await?;
+                    print_v2_restore_bundle(&bundle, format)?;
+                }
+            }
+        }
+        Commands::WriteIndexSnapshot { format } => {
+            let config = RuntimeConfig::from_env()?;
+            log_runtime_config(&config);
+            let anchor = write_v2_index_snapshot_from_config(&config).await?;
+            print_v2_anchor_state("rs3.v2-index-snapshot.v1", &anchor, format)?;
+        }
+        Commands::CheckV2Provider {
+            probe_prefix,
+            legal_hold,
+            governance_bypass_reviewed,
+            format,
+        } => {
+            let config = RuntimeConfig::from_env()?;
+            log_runtime_config(&config);
+            let report = check_v2_provider_conformance_from_config(
+                &config,
+                RuntimeV2ProviderConformanceOptions {
+                    probe_prefix,
+                    legal_hold,
+                    governance_bypass_reviewed,
+                },
+            )
+            .await?;
+            let passed = report.passed();
+            print_v2_provider_conformance_report(&report, format)?;
+            if !passed {
+                anyhow::bail!("v2 provider conformance failed");
+            }
         }
         Commands::ImportAnchor {
             checkpoint_sequence,
@@ -209,6 +296,50 @@ async fn main() -> Result<()> {
             .await?;
             print_import_report(&report, format)?;
         }
+        Commands::ImportV2Anchor {
+            anchor_sequence,
+            anchor_commit_key,
+            anchor_version_id,
+            anchor_body_digest,
+            signing_key_id,
+            format_generation,
+            format_digest,
+            format_object_id,
+            format_version_id,
+            weak_subjectivity_floor_sequence,
+            format,
+        } => {
+            let config = RuntimeConfig::from_env()?;
+            log_runtime_config(&config);
+            let anchor_sequence = Sequence::new(anchor_sequence);
+            let floor_sequence =
+                Sequence::new(weak_subjectivity_floor_sequence.unwrap_or(anchor_sequence.get()));
+            let anchor = V2AnchorState {
+                sequence: anchor_sequence,
+                commit_key: BackendObjectId::new(anchor_commit_key)?,
+                body_digest: decode_sha256_hex(&anchor_body_digest)?,
+                version_id: anchor_version_id.map(BackendVersionId::new).transpose()?,
+                signing_key_id: KeyId::new(signing_key_id)?,
+                format_ref: rs3_repository::v2::V2FormatRef {
+                    generation: format_generation,
+                    digest: format_digest.clone(),
+                    object_id: BackendObjectId::new(format_object_id)?,
+                    version_id: format_version_id.map(BackendVersionId::new).transpose()?,
+                },
+            };
+            let bundle = V2RecoveryBundle {
+                repository_id: Some(config.repository_keys.repository_id.clone()),
+                repository_salt_digest: None,
+                format_digest: Some(decode_sha256_hex(&format_digest)?),
+                format_generation: Some(format_generation),
+                anchor,
+                weak_subjectivity_floor_sequence: floor_sequence,
+                exported_at_ms: 0,
+                offline_signature: None,
+            };
+            let report = import_v2_anchor_from_config(&config, bundle).await?;
+            print_v2_anchor_import_report(&report, format)?;
+        }
         Commands::RotateKey {
             purpose,
             new_key_id,
@@ -230,6 +361,16 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(any(feature = "s3", feature = "k8s"))]
+fn install_rustls_provider() {
+    RUSTLS_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+#[cfg(not(any(feature = "s3", feature = "k8s")))]
+fn install_rustls_provider() {}
 
 fn print_key_rotation_report(
     report: &KeyRotationReport,
@@ -367,6 +508,224 @@ fn print_import_report(report: &AnchorImportReport, format: RecoveryReportFormat
             println!("checkpoint_digest={}", report.checkpoint.payload_digest);
             println!("published_at_ms={}", report.published_at_ms);
             println!("applied={}", report.applied);
+        }
+    }
+    Ok(())
+}
+
+fn print_v2_anchor_import_report(
+    report: &V2AnchorImportReport,
+    format: RecoveryReportFormat,
+) -> Result<()> {
+    match format {
+        RecoveryReportFormat::Json => {
+            let report_json = serde_json::json!({
+                "schema": "rs3.v2-anchor-import.v1",
+                "applied": report.applied,
+                "verified_commit_count": report.verified_commit_count,
+                "anchor": {
+                    "sequence": report.anchor.sequence.get(),
+                    "commit_key": report.anchor.commit_key.as_str(),
+                    "body_digest": hex::encode(report.anchor.body_digest),
+                    "version_id": report.anchor.version_id.as_ref().map(|version_id| version_id.as_str()),
+                    "signing_key_id": report.anchor.signing_key_id.as_str(),
+                    "format": {
+                        "generation": report.anchor.format_ref.generation,
+                        "digest": report.anchor.format_ref.digest,
+                        "object_id": report.anchor.format_ref.object_id.as_str(),
+                        "version_id": report.anchor.format_ref.version_id.as_ref().map(|version_id| version_id.as_str()),
+                    },
+                },
+            });
+            println!("{}", serde_json::to_string_pretty(&report_json)?);
+        }
+        RecoveryReportFormat::Text => {
+            println!("schema=rs3.v2-anchor-import.v1");
+            println!("applied={}", report.applied);
+            println!("verified_commit_count={}", report.verified_commit_count);
+            println!("anchor_sequence={}", report.anchor.sequence.get());
+            println!("anchor_commit_key={}", report.anchor.commit_key.as_str());
+            println!(
+                "anchor_body_digest={}",
+                hex::encode(report.anchor.body_digest)
+            );
+            if let Some(version_id) = report.anchor.version_id.as_ref() {
+                println!("anchor_version_id={}", version_id.as_str());
+            }
+            println!("signing_key_id={}", report.anchor.signing_key_id.as_str());
+            println!("format_generation={}", report.anchor.format_ref.generation);
+            println!("format_digest={}", report.anchor.format_ref.digest);
+            println!(
+                "format_object_id={}",
+                report.anchor.format_ref.object_id.as_str()
+            );
+            if let Some(version_id) = report.anchor.format_ref.version_id.as_ref() {
+                println!("format_version_id={}", version_id.as_str());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_v2_provider_conformance_report(
+    report: &V2ProviderConformanceReport,
+    format: RecoveryReportFormat,
+) -> Result<()> {
+    match format {
+        RecoveryReportFormat::Json => {
+            let checks = report
+                .checks
+                .iter()
+                .map(|check| {
+                    serde_json::json!({
+                        "name": check.name,
+                        "status": provider_check_status_name(check.status),
+                        "reason": check.reason,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let report_json = serde_json::json!({
+                "schema": "rs3.v2-provider-conformance.v1",
+                "profile": provider_profile_name(report.profile),
+                "passed": report.passed(),
+                "checks": checks,
+            });
+            println!("{}", serde_json::to_string_pretty(&report_json)?);
+        }
+        RecoveryReportFormat::Text => {
+            println!("schema=rs3.v2-provider-conformance.v1");
+            println!("profile={}", provider_profile_name(report.profile));
+            println!("passed={}", report.passed());
+            for check in &report.checks {
+                match check.reason {
+                    Some(reason) => println!(
+                        "check={} status={} reason={}",
+                        check.name,
+                        provider_check_status_name(check.status),
+                        reason
+                    ),
+                    None => println!(
+                        "check={} status={}",
+                        check.name,
+                        provider_check_status_name(check.status)
+                    ),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_v2_restore_bundle(bundle: &V2RecoveryBundle, format: RecoveryReportFormat) -> Result<()> {
+    match format {
+        RecoveryReportFormat::Json => {
+            let repository = bundle.repository_id.as_ref().map(|repository_id| {
+                serde_json::json!({
+                    "id": repository_id.as_str(),
+                })
+            });
+            let offline_signature = bundle.offline_signature.as_ref().map(hex::encode);
+            let bundle_json = serde_json::json!({
+                "schema": V2_RESTORE_BUNDLE_SCHEMA,
+                "repository": repository,
+                "anchor": {
+                    "sequence": bundle.anchor.sequence.get(),
+                    "commit_key": bundle.anchor.commit_key.as_str(),
+                    "body_digest": hex::encode(bundle.anchor.body_digest),
+                    "version_id": bundle.anchor.version_id.as_ref().map(|version_id| version_id.as_str()),
+                    "signing_key_id": bundle.anchor.signing_key_id.as_str(),
+                    "format": {
+                        "generation": bundle.anchor.format_ref.generation,
+                        "digest": bundle.anchor.format_ref.digest,
+                        "object_id": bundle.anchor.format_ref.object_id.as_str(),
+                        "version_id": bundle.anchor.format_ref.version_id.as_ref().map(|version_id| version_id.as_str()),
+                    },
+                },
+                "weak_subjectivity_floor_sequence": bundle.weak_subjectivity_floor_sequence.get(),
+                "format_digest": bundle.format_digest.map(hex::encode),
+                "format_generation": bundle.format_generation,
+                "exported_at_ms": bundle.exported_at_ms,
+                "offline_signature": offline_signature,
+            });
+            println!("{}", serde_json::to_string_pretty(&bundle_json)?);
+        }
+        RecoveryReportFormat::Text => {
+            println!("schema={V2_RESTORE_BUNDLE_SCHEMA}");
+            if let Some(repository_id) = bundle.repository_id.as_ref() {
+                println!("repository_id={}", repository_id.as_str());
+            }
+            println!("anchor_sequence={}", bundle.anchor.sequence.get());
+            println!("anchor_commit_key={}", bundle.anchor.commit_key.as_str());
+            println!(
+                "anchor_body_digest={}",
+                hex::encode(bundle.anchor.body_digest)
+            );
+            if let Some(version_id) = bundle.anchor.version_id.as_ref() {
+                println!("anchor_version_id={}", version_id.as_str());
+            }
+            println!("signing_key_id={}", bundle.anchor.signing_key_id.as_str());
+            println!("format_generation={}", bundle.anchor.format_ref.generation);
+            println!("format_digest={}", bundle.anchor.format_ref.digest);
+            println!(
+                "format_object_id={}",
+                bundle.anchor.format_ref.object_id.as_str()
+            );
+            if let Some(version_id) = bundle.anchor.format_ref.version_id.as_ref() {
+                println!("format_version_id={}", version_id.as_str());
+            }
+            println!(
+                "weak_subjectivity_floor_sequence={}",
+                bundle.weak_subjectivity_floor_sequence.get()
+            );
+            println!("exported_at_ms={}", bundle.exported_at_ms);
+            if let Some(signature) = bundle.offline_signature.as_ref() {
+                println!("offline_signature={}", hex::encode(signature));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_v2_anchor_state(
+    schema: &'static str,
+    anchor: &V2AnchorState,
+    format: RecoveryReportFormat,
+) -> Result<()> {
+    match format {
+        RecoveryReportFormat::Json => {
+            let report = serde_json::json!({
+                "schema": schema,
+                "anchor": {
+                    "sequence": anchor.sequence.get(),
+                    "commit_key": anchor.commit_key.as_str(),
+                    "body_digest": hex::encode(anchor.body_digest),
+                    "version_id": anchor.version_id.as_ref().map(|version_id| version_id.as_str()),
+                    "signing_key_id": anchor.signing_key_id.as_str(),
+                    "format": {
+                        "generation": anchor.format_ref.generation,
+                        "digest": anchor.format_ref.digest,
+                        "object_id": anchor.format_ref.object_id.as_str(),
+                        "version_id": anchor.format_ref.version_id.as_ref().map(|version_id| version_id.as_str()),
+                    },
+                },
+            });
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        RecoveryReportFormat::Text => {
+            println!("schema={schema}");
+            println!("anchor_sequence={}", anchor.sequence.get());
+            println!("anchor_commit_key={}", anchor.commit_key.as_str());
+            println!("anchor_body_digest={}", hex::encode(anchor.body_digest));
+            if let Some(version_id) = anchor.version_id.as_ref() {
+                println!("anchor_version_id={}", version_id.as_str());
+            }
+            println!("signing_key_id={}", anchor.signing_key_id.as_str());
+            println!("format_generation={}", anchor.format_ref.generation);
+            println!("format_digest={}", anchor.format_ref.digest);
+            println!("format_object_id={}", anchor.format_ref.object_id.as_str());
+            if let Some(version_id) = anchor.format_ref.version_id.as_ref() {
+                println!("format_version_id={}", version_id.as_str());
+            }
         }
     }
     Ok(())
@@ -526,6 +885,21 @@ fn key_purpose_name(purpose: KeyPurpose) -> &'static str {
     }
 }
 
+fn provider_profile_name(profile: V2ProviderProfile) -> &'static str {
+    match profile {
+        V2ProviderProfile::Dev => "dev",
+        V2ProviderProfile::AtomicCreate => "atomic-create",
+        V2ProviderProfile::RetainedVersionObjectLock => "retained-version-object-lock",
+    }
+}
+
+fn provider_check_status_name(status: V2ProviderCheckStatus) -> &'static str {
+    match status {
+        V2ProviderCheckStatus::Passed => "passed",
+        V2ProviderCheckStatus::Failed => "failed",
+    }
+}
+
 impl DoctorProfile {
     fn as_str(self) -> &'static str {
         match self {
@@ -605,12 +979,19 @@ fn init_tracing(format: LogFormat) {
     }
 }
 
+fn decode_sha256_hex(value: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(value)?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("expected a 32-byte hex digest"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DoctorProfile, backend_kind, doctor_findings, runtime_config_profile};
     use rs3_server::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig, RepositoryConfig,
-        RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
+        RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use std::time::Duration;
@@ -646,6 +1027,7 @@ mod tests {
                 max_pending_items: 64,
             },
             repository: RepositoryConfig {
+                format: RepositoryFormat::V1Preview,
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:

@@ -357,7 +357,8 @@ mod tests {
     use super::{AdminBearerToken, AdminHttpAuth, AdminHttpService};
     use crate::{
         AdminReportProfile, AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig,
-        RepositoryConfig, RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
+        RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, SecretString,
+        StaticCredentials,
     };
     use bytes::Bytes;
     use http::header::AUTHORIZATION;
@@ -393,6 +394,7 @@ mod tests {
                 max_pending_items: 64,
             },
             repository: RepositoryConfig {
+                format: RepositoryFormat::V1Preview,
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:

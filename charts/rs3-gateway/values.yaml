@@ -38,6 +38,7 @@ commit:
   maxPendingItems: 8
 
 repository:
+  format: v2-preview
   id: rs3-repository
   # Leave unset to use adaptive per-object segment sizing. Set a positive value
   # only for fixed-size compatibility or performance sweeps.

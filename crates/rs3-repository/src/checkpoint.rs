@@ -442,7 +442,7 @@ where
             }))
     }
 
-    fn pending_index_delta_object(&self) -> Result<Option<SealedIndexDeltaObject>> {
+    pub(crate) fn pending_index_delta_object(&self) -> Result<Option<SealedIndexDeltaObject>> {
         let state = self.read_state()?;
         if state.pending_index_deltas.is_empty() {
             return Ok(None);
@@ -457,7 +457,7 @@ where
         Ok(Some(sealed_delta))
     }
 
-    fn mark_index_deltas_published(&self, sequence: rs3_types::Sequence) -> Result<()> {
+    pub(crate) fn mark_index_deltas_published(&self, sequence: rs3_types::Sequence) -> Result<()> {
         let mut state = self.write_state()?;
         if state.next_sequence == sequence {
             state.pending_index_deltas.clear();
@@ -585,7 +585,7 @@ where
         serde_json::from_slice(payload).map_err(Into::into)
     }
 
-    fn load_embedded_manifest_records(
+    pub(crate) fn load_embedded_manifest_records(
         &self,
         state: &mut RepositoryState,
         delta: &IndexDeltaObject,
@@ -652,7 +652,7 @@ fn manifest_associated_data(manifest_id: &ManifestId) -> Vec<u8> {
     format!("rs3:manifest-associated-data:v1:{}", manifest_id.as_str()).into_bytes()
 }
 
-fn seal_index_delta_object(
+pub(crate) fn seal_index_delta_object(
     keyring: &KeyRing,
     delta: &IndexDeltaObject,
 ) -> Result<SealedIndexDeltaObject> {

@@ -100,23 +100,7 @@ pub(super) fn write_workload_proof(
             ],
         )
         .context("failed to write Velero smoke proof file"),
-        WorkloadKind::Postgres => kubectl(
-            &args.kubectl_bin,
-            kubeconfig_path,
-            &[
-                "-n",
-                &args.workload_namespace,
-                "exec",
-                &format!("pod/{WORKLOAD_NAME}"),
-                "-c",
-                "postgres",
-                "--",
-                "/bin/sh",
-                "-c",
-                &postgres_write_script(args.postgres_row_count, args.postgres_padding_repeat),
-            ],
-        )
-        .context("failed to write Postgres smoke proof data"),
+        WorkloadKind::Postgres => write_postgres_workload_proof(args, kubeconfig_path),
     }
 }
 
@@ -508,6 +492,41 @@ fn read_workload_proof(
                 &postgres_verify_script(args.postgres_row_count, args.postgres_padding_repeat),
             ],
         ),
+    }
+}
+
+fn write_postgres_workload_proof(
+    args: &VeleroKopiaSmokeArgs,
+    kubeconfig_path: &Path,
+) -> Result<()> {
+    let script = postgres_write_script(args.postgres_row_count, args.postgres_padding_repeat);
+    let started = Instant::now();
+    loop {
+        let result = kubectl_capture(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &[
+                "-n",
+                &args.workload_namespace,
+                "exec",
+                &format!("pod/{WORKLOAD_NAME}"),
+                "-c",
+                "postgres",
+                "--",
+                "/bin/sh",
+                "-c",
+                &script,
+            ],
+        );
+        match result {
+            Ok(_) => return Ok(()),
+            Err(_) if started.elapsed() <= Duration::from_secs(args.wait_secs) => {
+                thread::sleep(Duration::from_secs(2));
+            }
+            Err(error) => {
+                return Err(error).context("failed to write Postgres smoke proof data");
+            }
+        }
     }
 }
 

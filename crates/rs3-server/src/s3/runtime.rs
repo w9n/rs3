@@ -1,7 +1,7 @@
 //! Runtime repository construction for the S3 service.
 
 use super::S3BoundaryError;
-use crate::{GatewayMode, RuntimeConfig};
+use crate::{GatewayMode, RepositoryFormat, RuntimeConfig};
 use bytes::Bytes;
 #[cfg(test)]
 use rs3_anchor::MemoryCheckpointAnchor;
@@ -26,11 +26,29 @@ use super::runtime_checkpoints::{repository_has_committed_objects, validate_stor
 use super::runtime_handles::{RuntimeAnchor, RuntimeStore};
 use super::runtime_keyring::gateway_keyring;
 use super::runtime_keyring::retained_version_required;
+use super::runtime_v2::RuntimeV2Repository;
 
 type RuntimeCommitCoordinator = CommitCoordinator<RuntimeStore, RuntimeAnchor>;
 
 #[derive(Clone)]
 pub(super) struct RuntimeRepository {
+    inner: RuntimeRepositoryInner,
+}
+
+#[derive(Clone)]
+enum RuntimeRepositoryInner {
+    V1(Arc<RuntimeV1Repository>),
+    V2(Arc<RuntimeV2Repository>),
+}
+
+pub(super) struct RuntimeCommittedPut {
+    pub(super) metadata: RepositoryObjectMetadata,
+    #[cfg(test)]
+    pub(super) checkpoint: Option<CheckpointPosition>,
+}
+
+#[derive(Clone)]
+struct RuntimeV1Repository {
     coordinator: Arc<RuntimeCommitCoordinator>,
     store: RuntimeStore,
     pending_envelope_override: Option<KeyringEnvelopeReference>,
@@ -44,6 +62,151 @@ pub(super) struct RuntimeRepository {
 }
 
 impl RuntimeRepository {
+    pub(super) async fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
+        let inner = match config.repository.format {
+            RepositoryFormat::V1Preview => RuntimeRepositoryInner::V1(Arc::new(
+                RuntimeV1Repository::from_config(config).await?,
+            )),
+            RepositoryFormat::V2Preview => RuntimeRepositoryInner::V2(Arc::new(
+                RuntimeV2Repository::from_config(config).await?,
+            )),
+        };
+        Ok(Self { inner })
+    }
+
+    pub(super) async fn load_accepted_checkpoint(
+        &self,
+        mode: GatewayMode,
+    ) -> Result<(), S3BoundaryError> {
+        match &self.inner {
+            RuntimeRepositoryInner::V1(repository) => {
+                repository.load_accepted_checkpoint(mode).await
+            }
+            RuntimeRepositoryInner::V2(repository) => {
+                repository.load_accepted_checkpoint(mode).await
+            }
+        }
+    }
+
+    pub(super) async fn validate_backend_retention(
+        &self,
+        retention: Option<RetentionPolicy>,
+    ) -> Result<(), S3BoundaryError> {
+        match &self.inner {
+            RuntimeRepositoryInner::V1(repository) => {
+                repository.validate_backend_retention(retention).await
+            }
+            RuntimeRepositoryInner::V2(repository) => {
+                repository.validate_backend_retention(retention).await
+            }
+        }
+    }
+
+    pub(super) async fn put_committed(
+        &self,
+        key: LogicalPath,
+        body: Bytes,
+        options: RepositoryPutOptions,
+    ) -> Result<RuntimeCommittedPut, RepositoryError> {
+        match &self.inner {
+            RuntimeRepositoryInner::V1(repository) => repository
+                .put_committed(key, body, options)
+                .await
+                .map(|committed| RuntimeCommittedPut {
+                    metadata: committed.metadata,
+                    #[cfg(test)]
+                    checkpoint: Some(committed.checkpoint),
+                }),
+            RuntimeRepositoryInner::V2(repository) => repository
+                .put_committed(key, body, options)
+                .await
+                .map(|metadata| RuntimeCommittedPut {
+                    metadata,
+                    #[cfg(test)]
+                    checkpoint: None,
+                }),
+        }
+    }
+
+    pub(super) fn head(
+        &self,
+        key: &LogicalPath,
+    ) -> Result<RepositoryObjectMetadata, RepositoryError> {
+        match &self.inner {
+            RuntimeRepositoryInner::V1(repository) => repository.head(key),
+            RuntimeRepositoryInner::V2(repository) => repository.head(key),
+        }
+    }
+
+    pub(super) async fn get_range(
+        &self,
+        key: &LogicalPath,
+        range: ByteRange,
+    ) -> Result<Bytes, RepositoryError> {
+        match &self.inner {
+            RuntimeRepositoryInner::V1(repository) => repository.get_range(key, range).await,
+            RuntimeRepositoryInner::V2(repository) => repository.get_range(key, range).await,
+        }
+    }
+
+    pub(super) fn list(&self, prefix: &str) -> Result<Vec<RepositoryListEntry>, RepositoryError> {
+        match &self.inner {
+            RuntimeRepositoryInner::V1(repository) => repository.list(prefix),
+            RuntimeRepositoryInner::V2(repository) => repository.list(prefix),
+        }
+    }
+
+    pub(super) async fn delete_committed(
+        &self,
+        key: LogicalPath,
+    ) -> Result<DeleteOutcome, RepositoryError> {
+        match &self.inner {
+            RuntimeRepositoryInner::V1(repository) => repository.delete_committed(key).await,
+            RuntimeRepositoryInner::V2(repository) => repository.delete_committed(key).await,
+        }
+    }
+
+    pub(super) async fn set_legal_hold_committed(
+        &self,
+        key: LogicalPath,
+        status: LegalHoldStatus,
+    ) -> Result<RepositoryObjectMetadata, RepositoryError> {
+        match &self.inner {
+            RuntimeRepositoryInner::V1(repository) => {
+                repository.set_legal_hold_committed(key, status).await
+            }
+            RuntimeRepositoryInner::V2(repository) => {
+                repository.set_legal_hold_committed(key, status).await
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn memory_store(&self) -> Option<&MemoryBlobStore> {
+        match &self.inner {
+            RuntimeRepositoryInner::V1(repository) => repository.memory_store(),
+            RuntimeRepositoryInner::V2(repository) => repository.memory_store(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn memory_anchor(&self) -> Option<&MemoryCheckpointAnchor> {
+        match &self.inner {
+            RuntimeRepositoryInner::V1(repository) => repository.memory_anchor(),
+            RuntimeRepositoryInner::V2(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn memory_v2_anchor(&self) -> Option<&rs3_repository::v2::V2MemoryAnchor> {
+        match &self.inner {
+            RuntimeRepositoryInner::V1(_) => None,
+            RuntimeRepositoryInner::V2(repository) => repository.memory_anchor(),
+        }
+    }
+}
+
+impl RuntimeV1Repository {
     pub(super) async fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
         let store = build_store(&config.backend).await?;
         let anchor = build_anchor(&config.anchor)?;
@@ -236,7 +399,7 @@ mod tests {
     use crate::AnchorConfig;
     use crate::s3::S3BoundaryError;
     use crate::s3::test_support::runtime_config;
-    use crate::{BatchConfig, GatewayMode, RepositoryKeysConfig};
+    use crate::{BatchConfig, GatewayMode, RepositoryFormat, RepositoryKeysConfig};
     use bytes::Bytes;
     use rs3_anchor::{CheckpointAnchor, MemoryCheckpointAnchor};
     use rs3_crypto::{KeyRing, RepositoryKeyContext, SecretBytes};
@@ -244,6 +407,7 @@ mod tests {
         CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CheckpointEvidence, checkpoint_evidence_bytes,
     };
     use rs3_repository::RepositoryPutOptions;
+    use rs3_repository::v2::V2CommitAnchor;
     use rs3_storage::{BlobStore, ByteRange, FilesystemBlobStore, MemoryBlobStore, PutOptions};
     use rs3_types::{
         BackendObjectId, LogicalPath, RepositoryId, RetentionMode, RetentionPolicy, Sequence,
@@ -288,6 +452,83 @@ mod tests {
 
         assert!(runtime.memory_store().is_some());
         assert!(runtime.memory_anchor().is_some());
+    }
+
+    #[tokio::test]
+    async fn runtime_factory_builds_v2_preview_repository() {
+        let mut config = runtime_config(true);
+        config.repository.format = RepositoryFormat::V2Preview;
+        let runtime = RuntimeRepository::from_config(&config)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let store = runtime
+            .memory_store()
+            .unwrap_or_else(|| panic!("missing memory store"));
+        let format_roots = store
+            .list_prefix("format/")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let commits = store
+            .list_prefix("commits/v01/")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let v2_anchor = runtime
+            .memory_v2_anchor()
+            .unwrap_or_else(|| panic!("missing v2 memory anchor"));
+
+        assert_eq!(format_roots.len(), 1);
+        assert_eq!(commits.len(), 1);
+        assert!(
+            v2_anchor
+                .read_v2()
+                .await
+                .unwrap_or_else(|error| panic!("{error}"))
+                .is_some()
+        );
+        assert!(runtime.memory_anchor().is_none());
+        runtime
+            .load_accepted_checkpoint(GatewayMode::ReadWrite)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let key =
+            LogicalPath::new("snapshots/v2-preview.bin").unwrap_or_else(|error| panic!("{error}"));
+        let committed = runtime
+            .put_committed(
+                key.clone(),
+                Bytes::from_static(b"body"),
+                RepositoryPutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let head = runtime.head(&key).unwrap_or_else(|error| panic!("{error}"));
+        let body = runtime
+            .get_range(&key, ByteRange::Full)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let list = runtime
+            .list("snapshots/")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let commits = store
+            .list_prefix("commits/v01/")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let backend_objects = store
+            .list_prefix("")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(committed.checkpoint.is_none());
+        assert_eq!(committed.metadata.content_len, 4);
+        assert_eq!(head.content_len, 4);
+        assert_eq!(body, Bytes::from_static(b"body"));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].key, key);
+        assert_eq!(commits.len(), 2);
+        for metadata in backend_objects {
+            assert!(!metadata.object_id.as_str().contains("snapshots"));
+            assert!(!metadata.object_id.as_str().contains("v2-preview"));
+        }
     }
 
     #[tokio::test]
@@ -385,8 +626,12 @@ mod tests {
             )
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        let evidence_id = checkpoint_evidence_object_id(&committed.checkpoint)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let checkpoint = committed
+            .checkpoint
+            .as_ref()
+            .unwrap_or_else(|| panic!("v1 commit should expose checkpoint"));
+        let evidence_id =
+            checkpoint_evidence_object_id(checkpoint).unwrap_or_else(|error| panic!("{error}"));
         runtime
             .memory_store()
             .unwrap_or_else(|| panic!("missing memory store"))
@@ -417,11 +662,15 @@ mod tests {
             )
             .await
             .unwrap_or_else(|error| panic!("{error}"));
+        let checkpoint = committed
+            .checkpoint
+            .as_ref()
+            .unwrap_or_else(|| panic!("v1 commit should expose checkpoint"));
         let future = rs3_repository::CheckpointPosition {
-            sequence: Sequence::new(committed.checkpoint.sequence.get() + 1),
-            checkpoint_id: committed.checkpoint.checkpoint_id.clone(),
-            checkpoint_version_id: committed.checkpoint.checkpoint_version_id.clone(),
-            payload_digest: committed.checkpoint.payload_digest.clone(),
+            sequence: Sequence::new(checkpoint.sequence.get() + 1),
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            checkpoint_version_id: checkpoint.checkpoint_version_id.clone(),
+            payload_digest: checkpoint.payload_digest.clone(),
         };
         let future_evidence_id =
             checkpoint_evidence_object_id(&future).unwrap_or_else(|error| panic!("{error}"));

@@ -92,6 +92,7 @@ outside the chart. If `serviceAccount.create=false`, set `serviceAccount.name`.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
+| `RS3_REPOSITORY_FORMAT` | no | `v2-preview` | Repository format for new repositories. `v1-preview` remains selectable for legacy preview experiments, but new deployments should use `v2-preview`. |
 | `RS3_REPOSITORY_ID` | yes | none | Stable repository context. Keep it with trusted restore metadata. |
 | `RS3_REPOSITORY_SALT_HEX` | yes | none | Stable operator-provided 32-byte public salt, hex-encoded. Generate once per repository and keep with trusted public restore metadata. |
 | `RS3_KEYRING_ENVELOPE_OBJECT_ID` | no | unset | Bootstrap or recovery override for a specific encrypted keyring envelope object. Existing anchored repositories use the envelope reference bound into the signed checkpoint. |

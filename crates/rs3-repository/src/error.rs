@@ -18,6 +18,12 @@ pub enum RepositoryError {
     /// The client-visible object already exists and create-only mode was requested.
     #[error("object already exists")]
     AlreadyExists(LogicalPath),
+    /// The selected repository format cannot serve this operation yet.
+    #[error("repository format is not supported by this operation: {format}")]
+    UnsupportedRepositoryFormat {
+        /// Repository format spelling.
+        format: &'static str,
+    },
     /// Repository sequence allocation overflowed.
     #[error("repository sequence overflow")]
     SequenceOverflow,

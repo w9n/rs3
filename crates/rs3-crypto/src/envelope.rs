@@ -23,6 +23,11 @@ const ENVELOPE_TAG_LEN: usize = 16;
 const ENVELOPE_DIGEST_DOMAIN: &[u8] = b"rs3:keyring-envelope-digest:v1";
 const ENVELOPE_OBJECT_DOMAIN: &[u8] = b"rs3:keyring-envelope-object:v1\n";
 const ENVELOPE_PLAINTEXT_DOMAIN: &[u8] = b"rs3:keyring-envelope-plaintext:v1\n";
+const FORMAT_ENVELOPE_DIGEST_DOMAIN: &[u8] = b"rs3:format-envelope-digest:v1";
+const FORMAT_ENVELOPE_OBJECT_DOMAIN: &[u8] = b"rs3:format-envelope-object:v1\n";
+
+/// Current format-envelope version.
+pub const FORMAT_ENVELOPE_VERSION: u16 = 1;
 
 /// Encrypted repository keyring stored as public repository metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +45,27 @@ pub struct KeyringEnvelope {
     /// Random AEAD nonce.
     pub nonce: Vec<u8>,
     /// Encrypted keyring plaintext.
+    pub ciphertext: Vec<u8>,
+    /// AEAD authentication tag.
+    pub tag: Vec<u8>,
+}
+
+/// Encrypted v2 format-root metadata stored in the repository.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FormatEnvelope {
+    /// Envelope format version.
+    pub version: u16,
+    /// Monotonic format generation assigned by the operator workflow.
+    pub generation: u64,
+    /// Repository ID this format root is bound to.
+    pub repository_id: RepositoryId,
+    /// Public repository salt this format root is bound to.
+    pub repository_salt: Vec<u8>,
+    /// Operator-visible wrapping key identifier.
+    pub wrapping_key_id: String,
+    /// Random AEAD nonce.
+    pub nonce: Vec<u8>,
+    /// Encrypted format-root plaintext.
     pub ciphertext: Vec<u8>,
     /// AEAD authentication tag.
     pub tag: Vec<u8>,
@@ -101,6 +127,126 @@ impl KeyRing {
         envelope.tag = tag.to_vec();
 
         Ok(envelope)
+    }
+}
+
+impl FormatEnvelope {
+    /// Encrypts a v2 format-root plaintext with the operator wrapping key.
+    pub fn seal(
+        context: &RepositoryKeyContext,
+        wrapping_key_id: &str,
+        wrapping_key: &SecretBytes,
+        generation: u64,
+        plaintext: &[u8],
+    ) -> Result<Self, CryptoError> {
+        validate_wrapping_key_id(wrapping_key_id)?;
+        let nonce = random_envelope_nonce()?;
+        let mut envelope = Self {
+            version: FORMAT_ENVELOPE_VERSION,
+            generation,
+            repository_id: context.repository_id().clone(),
+            repository_salt: context.salt().to_vec(),
+            wrapping_key_id: wrapping_key_id.to_owned(),
+            nonce: nonce.to_vec(),
+            ciphertext: Vec::new(),
+            tag: Vec::new(),
+        };
+        let associated_data = envelope.associated_data()?;
+        let cipher = format_envelope_cipher(wrapping_key)?;
+        let mut ciphertext = plaintext.to_vec();
+        let tag = cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &associated_data, &mut ciphertext)
+            .map_err(|_| CryptoError::AeadOperationFailed)?;
+        envelope.ciphertext = ciphertext;
+        envelope.tag = tag.to_vec();
+        Ok(envelope)
+    }
+
+    /// Opens this format envelope into plaintext bytes.
+    pub fn open(
+        &self,
+        expected_context: &RepositoryKeyContext,
+        wrapping_key_id: &str,
+        wrapping_key: &SecretBytes,
+    ) -> Result<Vec<u8>, CryptoError> {
+        self.validate_public_fields(expected_context, wrapping_key_id)?;
+        if self.tag.len() != ENVELOPE_TAG_LEN || self.nonce.len() != ENVELOPE_NONCE_LEN {
+            return Err(CryptoError::AeadOperationFailed);
+        }
+        let associated_data = self.associated_data()?;
+        let cipher = format_envelope_cipher(wrapping_key)?;
+        let mut plaintext = self.ciphertext.clone();
+        cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&self.nonce),
+                &associated_data,
+                &mut plaintext,
+                Tag::from_slice(&self.tag),
+            )
+            .map_err(|_| CryptoError::AeadOperationFailed)?;
+        Ok(plaintext)
+    }
+
+    /// Returns a public digest suitable for anchor binding.
+    pub fn digest(&self) -> Result<String, CryptoError> {
+        let bytes = serde_json::to_vec(self).map_err(format_envelope_codec_error)?;
+        Ok(derive_public_fingerprint(
+            FORMAT_ENVELOPE_DIGEST_DOMAIN,
+            &[bytes.as_slice()],
+        ))
+    }
+
+    /// Encodes this envelope as a durable repository object.
+    pub fn to_object_bytes(&self) -> Result<Vec<u8>, CryptoError> {
+        let mut bytes = FORMAT_ENVELOPE_OBJECT_DOMAIN.to_vec();
+        serde_json::to_writer(&mut bytes, self).map_err(format_envelope_codec_error)?;
+        Ok(bytes)
+    }
+
+    /// Decodes a durable repository format envelope object.
+    pub fn from_object_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let Some(payload) = bytes.strip_prefix(FORMAT_ENVELOPE_OBJECT_DOMAIN) else {
+            return Err(invalid_format_envelope(
+                "missing format envelope object domain",
+            ));
+        };
+        serde_json::from_slice(payload).map_err(format_envelope_codec_error)
+    }
+
+    fn validate_public_fields(
+        &self,
+        expected_context: &RepositoryKeyContext,
+        wrapping_key_id: &str,
+    ) -> Result<(), CryptoError> {
+        validate_wrapping_key_id(wrapping_key_id)?;
+        if self.version != FORMAT_ENVELOPE_VERSION {
+            return Err(invalid_format_envelope("unsupported envelope version"));
+        }
+        if self.repository_id != *expected_context.repository_id()
+            || self.repository_salt != expected_context.salt()
+        {
+            return Err(invalid_format_envelope(
+                "repository context does not match format envelope",
+            ));
+        }
+        if self.wrapping_key_id != wrapping_key_id {
+            return Err(invalid_format_envelope(
+                "wrapping key id does not match format envelope",
+            ));
+        }
+        Ok(())
+    }
+
+    fn associated_data(&self) -> Result<Vec<u8>, CryptoError> {
+        let fields = EnvelopeAssociatedData {
+            version: self.version,
+            generation: self.generation,
+            repository_id: self.repository_id.clone(),
+            repository_salt: self.repository_salt.clone(),
+            wrapping_key_id: self.wrapping_key_id.clone(),
+            nonce: self.nonce.clone(),
+        };
+        serde_json::to_vec(&fields).map_err(format_envelope_codec_error)
     }
 }
 
@@ -294,6 +440,15 @@ fn envelope_cipher(wrapping_key: &SecretBytes) -> Result<Aes256GcmSiv, CryptoErr
     Aes256GcmSiv::new_from_slice(&key).map_err(|_| CryptoError::AeadOperationFailed)
 }
 
+fn format_envelope_cipher(wrapping_key: &SecretBytes) -> Result<Aes256GcmSiv, CryptoError> {
+    let key = derive_hmac(
+        wrapping_key,
+        b"rs3:format-envelope-aead-key:v1",
+        b"aes-256-gcm-siv",
+    )?;
+    Aes256GcmSiv::new_from_slice(&key).map_err(|_| CryptoError::AeadOperationFailed)
+}
+
 fn random_envelope_nonce() -> Result<[u8; ENVELOPE_NONCE_LEN], CryptoError> {
     let mut nonce = [0_u8; ENVELOPE_NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(|_| CryptoError::RandomnessUnavailable)?;
@@ -314,15 +469,27 @@ fn envelope_codec_error(error: serde_json::Error) -> CryptoError {
     }
 }
 
+fn format_envelope_codec_error(error: serde_json::Error) -> CryptoError {
+    CryptoError::FormatEnvelopeCodec {
+        reason: error.to_string(),
+    }
+}
+
 fn invalid_envelope(reason: &str) -> CryptoError {
     CryptoError::InvalidKeyringEnvelope {
         reason: reason.to_owned(),
     }
 }
 
+fn invalid_format_envelope(reason: &str) -> CryptoError {
+    CryptoError::InvalidFormatEnvelope {
+        reason: reason.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{KEYRING_ENVELOPE_VERSION, KeyringEnvelope};
+    use super::{FormatEnvelope, KEYRING_ENVELOPE_VERSION, KeyringEnvelope};
     use crate::{KeyRing, RepositoryKeyContext, SecretBytes};
     use rs3_types::RepositoryId;
 
@@ -394,6 +561,32 @@ mod tests {
         assert_eq!(rewrapped.generation, 2);
         assert_eq!(rewrapped.wrapping_key_id, "wrap-v2");
         assert_eq!(plaintext, b"payload");
+    }
+
+    #[test]
+    fn format_envelope_round_trips_and_rejects_wrong_context() {
+        let context = context("repo-a", 2);
+        let plaintext = b"rs3-format-root";
+        let envelope = FormatEnvelope::seal(&context, "wrap-v1", &secret(9), 1, plaintext)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let bytes = envelope
+            .to_object_bytes()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let decoded =
+            FormatEnvelope::from_object_bytes(&bytes).unwrap_or_else(|error| panic!("{error}"));
+
+        let opened = decoded
+            .open(&context, "wrap-v1", &secret(9))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let wrong = RepositoryKeyContext::new(
+            RepositoryId::new("other-repository").unwrap_or_else(|error| panic!("{error}")),
+            vec![7; 32],
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(opened, plaintext);
+        assert!(decoded.digest().is_ok());
+        assert!(decoded.open(&wrong, "wrap-v1", &secret(9)).is_err());
     }
 
     #[test]

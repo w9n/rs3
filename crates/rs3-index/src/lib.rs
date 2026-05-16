@@ -373,6 +373,21 @@ impl NamespaceIndex {
             .collect()
     }
 
+    /// Returns live entries with their associated prefix tokens in stable order.
+    pub fn live_entries_with_prefixes(&self) -> Vec<(NamespaceEntry, Vec<PrefixToken>)> {
+        self.entries
+            .values()
+            .map(|entry| {
+                let prefix_tokens = self
+                    .entry_prefixes
+                    .get(&entry.blind_key)
+                    .map(|tokens| tokens.iter().cloned().collect())
+                    .unwrap_or_default();
+                (entry.clone(), prefix_tokens)
+            })
+            .collect()
+    }
+
     /// Writes a tombstone and removes the live entry from prefix lists.
     pub fn tombstone(&mut self, blind_key: BlindIndexKey, generation: Sequence) {
         self.entries.remove(&blind_key);

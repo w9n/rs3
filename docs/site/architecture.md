@@ -52,6 +52,12 @@ Normal writes are append-friendly:
 This avoids rewriting many backend objects during normal operation and gives
 crash recovery a concrete boundary.
 
+`v2-preview` keeps the same payload and trusted namespace model, but replaces
+the v1 checkpoint object with a signed commit chain under random path-private
+keys. Concurrent PUTs can batch into one signed delta commit. Periodic index
+snapshot commits consolidate the live blinded namespace so cold-start replay
+walks only from the accepted anchor back to the nearest snapshot.
+
 ## Path Privacy
 
 The backend object store sees class-like prefixes and opaque object IDs. It must
@@ -76,6 +82,11 @@ from latest-state authority:
 
 Provider retention and Object Lock are useful for preventing deletion of object
 versions. They do not replace checkpoint signatures or external anchors.
+
+For `v2-preview`, the external anchor stores the accepted commit key, body
+digest, provider version ID when needed, signing key ID, and active format-root
+reference. Anchor import from a trusted v2 bundle verifies the signed chain
+before recreating a missing anchor.
 
 Payload segment size is per object. The default writer keeps small objects at
 512 B segments and raises medium and large objects to larger authenticated

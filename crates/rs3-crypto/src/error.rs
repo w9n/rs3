@@ -96,6 +96,18 @@ pub enum CryptoError {
         /// Public codec failure reason.
         reason: String,
     },
+    /// A format envelope is malformed or uses an unsupported format.
+    #[error("invalid format envelope: {reason}")]
+    InvalidFormatEnvelope {
+        /// Public validation failure reason.
+        reason: String,
+    },
+    /// Format envelope encoding or decoding failed.
+    #[error("format envelope codec failed: {reason}")]
+    FormatEnvelopeCodec {
+        /// Public codec failure reason.
+        reason: String,
+    },
     /// The operating system random source failed.
     #[error("system randomness unavailable")]
     RandomnessUnavailable,

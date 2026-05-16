@@ -29,11 +29,24 @@ preview-gate-local:
     just deny
     just deny-s3
 
-# Expensive production-preview integration gate for release candidates.
+# Expensive v2 production-preview integration gate for release candidates.
 preview-gate-release:
     just integration-kopia-gateway
     just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke
     just integration-velero-kopia-postgres-smoke
+
+# Live retained-backend v2 gate. Credentials are read from the normal AWS/S3 env.
+preview-gate-v2-live BACKEND_BUCKET ENDPOINT_URL REGION:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    base="isolated live prefix${timestamp}"
+    echo "v2 live gate prefix base: ${base}"
+    just integration-s3-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/s3-gateway"
+    just integration-kopia-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/kopia-gateway"
+    just integration-k8s-gateway-v2 --wait-secs 240
+    just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/velero-dynamic-pvc"
+    just integration-velero-kopia-postgres-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/velero-postgres"
 
 integration-s3:
     cargo test -p rs3-storage --features s3 --test s3_live -- --ignored --nocapture
@@ -47,11 +60,20 @@ integration-s3-container *ARGS:
 integration-s3-gateway *ARGS:
     cargo run -p xtask --bin xtask --features containers -- integration s3-gateway {{ARGS}}
 
+integration-s3-gateway-v2-live *ARGS:
+    cargo run -p xtask --bin xtask --features containers -- integration s3-gateway --mode provided --repository-format v2-preview --retention-mode governance --retention-days 1 --tooling-smoke {{ARGS}}
+
 integration-kopia-gateway *ARGS:
     cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway {{ARGS}}
 
+integration-kopia-gateway-v2-live *ARGS:
+    cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway --mode provided --repository-format v2-preview --retention-mode governance --retention-days 1 {{ARGS}}
+
 integration-k8s-gateway *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway {{ARGS}}
+
+integration-k8s-gateway-v2 *ARGS:
+    cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway --repository-format v2-preview {{ARGS}}
 
 integration-velero-kopia-smoke *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-smoke {{ARGS}}
@@ -65,11 +87,17 @@ integration-velero-kopia-dynamic-pvc-smoke *ARGS:
 integration-velero-kopia-dynamic-pvc-gateway-restart-smoke *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke {{ARGS}}
 
+integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live *ARGS:
+    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke --backend-mode provided --repository-format v2-preview --repository-retention-mode governance --repository-retention-days 1 {{ARGS}}
+
 integration-velero-kopia-dynamic-pvc-restore-readonly-smoke *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-restore-readonly-smoke {{ARGS}}
 
 integration-velero-kopia-postgres-smoke *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke {{ARGS}}
+
+integration-velero-kopia-postgres-v2-live *ARGS:
+    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke --backend-mode provided --repository-format v2-preview --repository-retention-mode governance --repository-retention-days 1 {{ARGS}}
 
 helm-lint:
     helm lint charts/rs3-gateway \
@@ -97,6 +125,11 @@ perf-s3-container *ARGS:
 
 perf-s3-gateway *ARGS:
     cargo run -p xtask --bin xtask --features containers -- perf --backend s3-gateway-container {{ARGS}}
+
+# Standard local gateway comparison between legacy v1 preview and v2 preview.
+perf-v1-v2-gateway *ARGS:
+    cargo run -p xtask --bin xtask --features containers -- perf --backend s3-gateway-container --repository-format v1-preview --gateway-build-profile release --format jsonl {{ARGS}}
+    cargo run -p xtask --bin xtask --features containers -- perf --backend s3-gateway-container --repository-format v2-preview --gateway-build-profile release --format jsonl {{ARGS}}
 
 nextest:
     cargo nextest run --workspace

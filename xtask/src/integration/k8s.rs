@@ -3,6 +3,8 @@
 use anyhow::Result;
 use clap::Args;
 
+use super::GatewayRepositoryFormat;
+
 #[derive(Debug, Args)]
 pub(crate) struct K8sGatewayArgs {
     /// kind cluster name. Defaults to a unique disposable name.
@@ -23,6 +25,9 @@ pub(crate) struct K8sGatewayArgs {
     /// Force a fixed payload segment size. Omit to use adaptive per-object sizing.
     #[arg(long)]
     payload_segment_size: Option<usize>,
+    /// Repository format used by the deployed gateway.
+    #[arg(long, env = "RS3_REPOSITORY_FORMAT", value_enum, default_value_t = GatewayRepositoryFormat::V2Preview)]
+    repository_format: GatewayRepositoryFormat,
     /// kind executable.
     #[arg(long, env = "RS3_TEST_KIND_BIN", default_value = "kind")]
     kind_bin: String,
@@ -67,9 +72,9 @@ mod imp {
     use crate::integration::k8s_support::{
         ACCESS_KEY_ID, DEFAULT_PUBLIC_BUCKET, GATEWAY_PORT, GatewayChartValues, K8sWorkspace,
         KEYRING_ENVELOPE_OBJECT_ID, KEYRING_WRAPPING_KEY_HEX, KEYRING_WRAPPING_KEY_ID, KindCluster,
-        PortForward, REPOSITORY_ID, REPOSITORY_SALT_HEX, SECRET_ACCESS_KEY, default_cluster_name,
-        helm_fullname, helm_install_gateway, helm_lint_gateway, require_command, run_command,
-        split_image_ref,
+        PortForward, REPOSITORY_ID, REPOSITORY_SALT_HEX, SECRET_ACCESS_KEY, assert_v2_lease_anchor,
+        default_cluster_name, helm_fullname, helm_install_gateway, helm_lint_gateway,
+        require_command, run_command, split_image_ref,
     };
     use anyhow::{Context, Result, bail};
     use aws_sdk_s3::{
@@ -121,6 +126,11 @@ mod imp {
         }
 
         let (image_repository, image_tag) = split_image_ref(&args.image);
+        let anchor_mode = if args.repository_format.is_v2() {
+            "kubernetes-lease"
+        } else {
+            "memory"
+        };
         helm_install_gateway(
             &args.helm_bin,
             cluster.kubeconfig_path(),
@@ -137,10 +147,11 @@ mod imp {
                 backend_region: "us-east-1",
                 backend_access_key_id: None,
                 backend_secret_access_key: None,
-                anchor_mode: "memory",
+                anchor_mode,
                 anchor_name: "checkpoint",
                 log_format: "plain",
                 rust_log: "info",
+                repository_format: args.repository_format.as_env(),
                 payload_segment_size: args.payload_segment_size,
                 retention_mode: None,
                 retention_days: None,
@@ -160,23 +171,36 @@ mod imp {
             .context("failed to build Kubernetes integration runtime")?;
 
         let service_name = helm_fullname(&args.release_name);
-        let result = runtime.block_on(async {
-            let mut port_forward = PortForward::start(
-                &args.kubectl_bin,
-                cluster.kubeconfig_path(),
-                &args.namespace,
-                &service_name,
-                GATEWAY_PORT,
-                args.wait_secs,
-            )
-            .await?;
-            let smoke = run_s3_smoke(port_forward.endpoint_url(), args.payload_segment_size).await;
-            let shutdown = port_forward.shutdown();
+        let result = runtime
+            .block_on(async {
+                let mut port_forward = PortForward::start(
+                    &args.kubectl_bin,
+                    cluster.kubeconfig_path(),
+                    &args.namespace,
+                    &service_name,
+                    GATEWAY_PORT,
+                    args.wait_secs,
+                )
+                .await?;
+                let smoke =
+                    run_s3_smoke(port_forward.endpoint_url(), args.payload_segment_size).await;
+                let shutdown = port_forward.shutdown();
 
-            smoke?;
-            shutdown?;
-            Ok(())
-        });
+                smoke?;
+                shutdown?;
+                Ok(())
+            })
+            .and_then(|_| {
+                if args.repository_format.is_v2() {
+                    assert_v2_lease_anchor(
+                        &args.kubectl_bin,
+                        cluster.kubeconfig_path(),
+                        &args.namespace,
+                        "checkpoint",
+                    )?;
+                }
+                Ok(())
+            });
 
         if result.is_ok() {
             cluster.delete()?;

@@ -147,6 +147,16 @@ Latest focused evidence:
 
 | Evidence | Result |
 | --- | --- |
+| Live retained-backend clean v2 preview gate | Passed on 2026-05-16 with `just preview-gate-v2-live` after Postgres harness retry hardening. S3 gateway/tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes all passed under prefix base `isolated live prefix`; artifacts `.local/integration/` and `.local/integration/`. |
+| Local v1/v2 gateway perf comparison | Passed on 2026-05-16 with 3 repeated release-profile local RustFS gateway runs per workload. Median v2 write request cost dropped from 3.0 to 2.0 requests/object for sequential committed writes and from 1.25 to 1.125 requests/object for batch-8 parallel writes; read request cost was unchanged. Raw artifacts: `.local/perf/` and `.local/perf/`. |
+| Live retained-backend consolidated v2 preview gate | Exercised on 2026-05-16 with `just preview-gate-v2-live`: S3 gateway/tooling, Kopia, Kubernetes Lease, and Velero dynamic-PVC gateway-restart passed under prefix base `isolated live prefix`; the Velero/Postgres lane passed after harness retry hardening on fresh prefix `isolated live prefix`; artifacts `.local/integration/` and `.local/integration/`. |
+| Live retained-backend v2 provider conformance | Passed on 2026-05-16 with `rs3 check-v2-provider` for the retained-version/Object Lock profile, including exact-version `HEAD`, `GET`, range `GET`, overwrite version survival, retention extension, delete blocking, and the governance-bypass review marker; backend prefix `isolated live prefix`. |
+| Live retained-backend v2 gateway smoke | Passed on 2026-05-16 with `just integration-s3-gateway-v2-live` through the local gateway using `mc` and default `rclone lsf` for `PUT`, `HEAD`, `GET`, and prefix listing with governance retention; the xtask backend key check found no client-visible names in repository object keys; backend prefix `isolated live prefix`. |
+| Live retained-backend v2 Kopia gateway backup/restore | Passed on 2026-05-16 with `just integration-kopia-gateway-v2-live` against an Object Lock bucket with repository governance retention enabled; restored bytes matched, and a backend key check found no obvious Kopia/source/restore names in 45 repository objects; backend prefix `isolated live prefix`. |
+| v2 Kubernetes Lease gateway smoke | Passed on 2026-05-16 with `just integration-k8s-gateway-v2`; Helm deployed `RS3_REPOSITORY_FORMAT=v2-preview` with Kubernetes Lease anchoring, the S3 smoke passed, and the harness verified v2 Lease annotations. |
+| Live retained-backend v2 Velero dynamic-PVC gateway-restart restore | Passed on 2026-05-16 with `just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live` against an Object Lock bucket with repository governance retention enabled; backup and restore completed, restored bytes matched, v2 Lease assertions passed after backup, after gateway restart, and after restore, and a backend key check found no obvious Velero/Kopia/workload names in 66 repository objects; artifact `.local/integration/`; backend prefix `isolated live prefix`. |
+| Live retained-backend v2 DR anchor import/export | Passed on 2026-05-16 against the v2 Velero repository above: a clean kind cluster with a missing Lease rejected an import when the retention context was omitted, then imported the trusted v2 anchor with matching governance retention, verified 34 commits, recreated the Lease, and exported `rs3.restore-bundle.v2-preview.v1` from the recovered anchor. |
+| Live retained-backend v2 Velero/Postgres restore | Passed on 2026-05-16 with `just integration-velero-kopia-postgres-v2-live` against an Object Lock bucket with repository governance retention enabled; Postgres rows were backed up and restored, v2 Lease assertions passed after backup and after restore, and a backend key check found no obvious Velero/Kopia/Postgres/workload names in 68 repository objects; artifact `.local/integration/`; backend prefix `isolated live prefix`. |
 | Live retained-backend retained-version S3 qualification | Passed on 2026-05-13 with Object Lock enabled, retained version IDs, exact-version reads after a newer latest object, retention extension, and retention/legal-hold delete blocking; backend prefix `isolated live prefix`. |
 | Live retained-backend Kopia gateway backup/restore | Passed on 2026-05-13 against an Object Lock bucket with repository governance retention enabled; backend prefix `isolated live prefix`. |
 | Live retained-backend Velero dynamic-PVC gateway-restart restore | Passed on 2026-05-13 against an Object Lock bucket with repository governance retention enabled; artifact `.local/integration/`; backend prefix `isolated live prefix`. |
@@ -168,10 +178,11 @@ test does not replace that credential review.
 ## Release Candidate Note
 
 `v0.1.0-preview.2` is a production-preview candidate for evaluating `rs3` with
-Velero/Kopia on Kubernetes and a retained S3-compatible backend. It includes the
-adaptive payload segment default, the decrypted-segment cache, retained-version
-restore checks, the live S3 provider qualification lane, and the refreshed
-retained-backend backup/restore evidence above.
+Velero/Kopia on Kubernetes and a retained S3-compatible backend. The primary
+repository format for new evaluation repositories is `v2-preview`. The
+candidate includes the adaptive payload segment default, the decrypted-segment
+cache, retained-version restore checks, the live S3 provider qualification
+lane, and the refreshed retained-backend backup/restore evidence above.
 
 Use this candidate for controlled evaluation, not for a stable repository-format
 commitment. The durable format remains preview-scoped, governance-bypass IAM
@@ -248,14 +259,13 @@ A preview is ready when the release evidence shows:
   baseline
 - accepted leakage is documented in the security model
 
-## Stable-Format Blockers
+## Stable Format Blockers
 
-A stable repository-format v1 needs more than the preview:
+A stable repository format needs more than the preview:
 
 - explicit repository-format compatibility policy
 - broader provider matrix
 - chaos coverage for stale backend state, anchor unavailability, backend
   injection, and retention failure
 - a finalized external anchor and key-provider interface
-- a committed repository migration policy
 - external security review for public guarantees
