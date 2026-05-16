@@ -334,6 +334,9 @@ job and store it outside the object-store account:
 cargo run -p rs3-server -- export-restore-bundle --format json > rs3-restore-bundle.json
 ```
 
+Machine-readable commands reserve stdout for the report or bundle payload and
+write logs to stderr. Do not redirect stderr into preserved JSON artifacts.
+
 Verify the preserved bundle without writing a new anchor:
 
 ```sh

@@ -14,7 +14,7 @@ use rs3_server::{
 };
 use rs3_types::{BackendObjectId, BackendVersionId, KeyId, RetentionMode, Sequence};
 use serde::Deserialize;
-use std::io::Read;
+use std::io::{self, Read};
 use std::net::SocketAddr;
 #[cfg(any(feature = "s3", feature = "k8s"))]
 use std::sync::Once;
@@ -848,10 +848,14 @@ fn init_tracing(format: LogFormat) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     match format {
-        LogFormat::Plain => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        LogFormat::Plain => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(io::stderr)
+            .init(),
         LogFormat::Json => tracing_subscriber::fmt()
             .json()
             .with_env_filter(filter)
+            .with_writer(io::stderr)
             .init(),
     }
 }

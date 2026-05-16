@@ -21,6 +21,8 @@ same repository, backend, anchor, and keyring settings as `serve`. The exported
 bundle contains public restore metadata only; keep wrapping-key material in the
 configured secret source. Prefer `import-v2-anchor --bundle-file <json>` over
 manually transcribing anchor fields from the exported bundle.
+Machine-readable command output is written to stdout; tracing logs are written
+to stderr for both `plain` and `json` log formats.
 
 The core server library exposes a path-redacted admin status report for operator
 tooling. It shows backend kind, anchor kind, retention posture, profile
