@@ -178,12 +178,13 @@ test does not replace that credential review.
 
 ## Release Candidate Note
 
-`v0.1.0-preview.2` is a production-preview candidate for evaluating `rs3` with
+`v0.1.0-preview.3` is a production-preview candidate for evaluating `rs3` with
 Velero/Kopia on Kubernetes and a retained S3-compatible backend. The primary
 repository format for new evaluation repositories is `v2-preview`. The
 candidate includes the adaptive payload segment default, the decrypted-segment
-cache, retained-version restore checks, the live S3 provider qualification
-lane, and the refreshed retained-backend backup/restore evidence above.
+cache, retained-version restore checks, clean machine-readable CLI output,
+the live S3 provider qualification lane, and the refreshed retained-backend
+backup/restore and DR evidence above.
 
 Use this candidate for controlled evaluation, not for a stable repository-format
 commitment. The durable format remains preview-scoped, governance-bypass IAM
