@@ -1126,20 +1126,7 @@ async fn v2_commit_coordinator_flushes_before_index_snapshot() {
                 .await
         })
     };
-    for _ in 0..100 {
-        if must_v2(
-            store
-                .list_prefix("segments/")
-                .await
-                .map_err(|_| V2FormatError::StorageOperationFailed),
-        )
-        .len()
-            == 1
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    tokio::task::yield_now().await;
 
     let snapshot = must_repo(coordinator.write_index_snapshot().await);
     let pending = tokio::time::timeout(Duration::from_secs(1), pending).await;
