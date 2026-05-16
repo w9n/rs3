@@ -650,6 +650,99 @@ async fn v2_repository_replays_committed_index_delta_after_reload() {
 }
 
 #[tokio::test]
+async fn v2_repository_caches_verified_payload_sections_for_repeated_ranges() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    );
+    let anchor = V2MemoryAnchor::new();
+    let key = LogicalPath::new("snapshots/v2-cached-ranges.bin")
+        .unwrap_or_else(|error| panic!("{error}"));
+    let body = Bytes::from(vec![42_u8; 4096]);
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(&anchor, key.clone(), body, RepositoryPutOptions::default())
+            .await,
+    );
+    store
+        .reset_operation_counts()
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    for offset in (0..4096).step_by(512) {
+        let read = must_repo(
+            repository
+                .get_range(&key, ByteRange::Slice { offset, len: 512 })
+                .await,
+        );
+        assert_eq!(read, Bytes::from(vec![42_u8; 512]));
+    }
+
+    let counts = store
+        .operation_counts()
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(counts.get, 1);
+}
+
+#[tokio::test]
+async fn v2_repository_payload_section_cache_can_be_disabled() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository_options = RepositoryOptions {
+        decrypted_segment_cache_max_bytes: 0,
+        ..RepositoryOptions::default()
+    };
+    let repository = V2Repository::new(store.clone(), keyring, repository_options, options);
+    let anchor = V2MemoryAnchor::new();
+    let key = LogicalPath::new("snapshots/v2-cache-disabled.bin")
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                key.clone(),
+                Bytes::from(vec![7_u8; 2048]),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    store
+        .reset_operation_counts()
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    for offset in [0, 512] {
+        let read = must_repo(
+            repository
+                .get_range(&key, ByteRange::Slice { offset, len: 512 })
+                .await,
+        );
+        assert_eq!(read, Bytes::from(vec![7_u8; 512]));
+    }
+
+    let counts = store
+        .operation_counts()
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(counts.get, 2);
+}
+
+#[tokio::test]
 async fn v2_repository_hides_unaccepted_mutation_after_anchor_failure() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());

@@ -29,9 +29,10 @@ use rs3_index::{
 };
 use rs3_storage::{BlobStore, ByteRange};
 use rs3_types::{
-    BackendObjectId, LegalHoldStatus, LogicalPath, ManifestId, RetentionPolicy, Sequence,
+    BackendObjectId, BackendVersionId, LegalHoldStatus, LogicalPath, ManifestId, RetentionPolicy,
+    Sequence,
 };
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
 use std::sync::{Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -48,6 +49,7 @@ pub struct V2Repository<S> {
     accepted_state: StdRwLock<RepositoryState>,
     mutation_lock: Mutex<()>,
     pending_payloads: StdMutex<Vec<PendingV2Payload>>,
+    payload_sections: StdRwLock<V2PayloadSectionCache>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +89,7 @@ where
         repository_options: RepositoryOptions,
         commit_options: V2CommitStoreOptions,
     ) -> Self {
+        let payload_section_cache_max_bytes = repository_options.decrypted_segment_cache_max_bytes;
         Self {
             repository: Repository::with_keyring_and_options(
                 store.clone(),
@@ -97,6 +100,9 @@ where
             accepted_state: StdRwLock::new(RepositoryState::default()),
             mutation_lock: Mutex::new(()),
             pending_payloads: StdMutex::new(Vec::new()),
+            payload_sections: StdRwLock::new(V2PayloadSectionCache::with_max_bytes(
+                payload_section_cache_max_bytes,
+            )),
         }
     }
 
@@ -351,6 +357,17 @@ where
             });
         };
 
+        let cache_key = V2PayloadSectionCacheKey {
+            commit_key: commit_key.clone(),
+            commit_version_id: commit_version_id.clone(),
+            body_digest,
+            offset,
+            length,
+        };
+        if let Some(payload) = self.cached_payload_section(&cache_key)? {
+            return open_payload_object(&keyring, &commit_key, payload, range);
+        }
+
         let commit = self
             .commit_store
             .read_commit_at(&commit_key, commit_version_id.as_ref())
@@ -360,6 +377,7 @@ where
             return Err(v2_repository_error(V2FormatError::BodyDigestMismatch));
         }
         let payload = commit_payload_section_bytes(&commit, offset, length)?;
+        self.cache_payload_section(cache_key, payload.clone())?;
         open_payload_object(&keyring, &commit_key, payload, range)
     }
 
@@ -668,6 +686,23 @@ where
         }
     }
 
+    fn cached_payload_section(&self, key: &V2PayloadSectionCacheKey) -> Result<Option<Bytes>> {
+        let mut cache = self
+            .payload_sections
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        Ok(cache.get(key))
+    }
+
+    fn cache_payload_section(&self, key: V2PayloadSectionCacheKey, payload: Bytes) -> Result<()> {
+        let mut cache = self
+            .payload_sections
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        cache.insert(key, payload);
+        Ok(())
+    }
+
     fn apply_commit_sections(
         &self,
         state: &mut RepositoryState,
@@ -764,6 +799,80 @@ where
         ))?;
         let keyring = self.repository.keyring()?;
         open_index_delta_object(&keyring, &object_id, &sealed_delta)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct V2PayloadSectionCacheKey {
+    commit_key: BackendObjectId,
+    commit_version_id: Option<BackendVersionId>,
+    body_digest: [u8; 32],
+    offset: u64,
+    length: u64,
+}
+
+#[derive(Debug)]
+struct V2PayloadSectionCache {
+    sections: BTreeMap<V2PayloadSectionCacheKey, Bytes>,
+    order: VecDeque<V2PayloadSectionCacheKey>,
+    max_entries: usize,
+    max_bytes: u64,
+    current_bytes: u64,
+}
+
+impl V2PayloadSectionCache {
+    fn with_max_bytes(max_bytes: u64) -> Self {
+        Self {
+            sections: BTreeMap::new(),
+            order: VecDeque::new(),
+            max_entries: 4096,
+            max_bytes,
+            current_bytes: 0,
+        }
+    }
+
+    fn get(&mut self, key: &V2PayloadSectionCacheKey) -> Option<Bytes> {
+        let payload = self.sections.get(key).cloned()?;
+        self.order.retain(|candidate| candidate != key);
+        self.order.push_back(key.clone());
+        Some(payload)
+    }
+
+    fn insert(&mut self, key: V2PayloadSectionCacheKey, payload: Bytes) {
+        let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        if self.max_bytes == 0 || bytes > self.max_bytes {
+            return;
+        }
+
+        match self.sections.entry(key.clone()) {
+            Entry::Occupied(mut entry) => {
+                let previous = u64::try_from(entry.get().len()).unwrap_or(u64::MAX);
+                self.current_bytes = self.current_bytes.saturating_sub(previous);
+                self.current_bytes = self.current_bytes.saturating_add(bytes);
+                entry.insert(payload);
+                self.order.retain(|candidate| candidate != &key);
+                self.order.push_back(key);
+            }
+            Entry::Vacant(entry) => {
+                self.current_bytes = self.current_bytes.saturating_add(bytes);
+                self.order.push_back(key);
+                entry.insert(payload);
+            }
+        }
+
+        self.evict_over_limits();
+    }
+
+    fn evict_over_limits(&mut self) {
+        while self.sections.len() > self.max_entries || self.current_bytes > self.max_bytes {
+            let Some(evicted_key) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(payload) = self.sections.remove(&evicted_key) {
+                let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+                self.current_bytes = self.current_bytes.saturating_sub(bytes);
+            }
+        }
     }
 }
 

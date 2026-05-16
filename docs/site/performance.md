@@ -135,6 +135,14 @@ The current writer default is adaptive: small objects keep 512 B segments,
 medium objects use 8 KiB segments, and larger objects use 64 KiB segments. The
 historical fixed-size matrix below still explains the byte/request tradeoff.
 
+For `v2-preview`, payload bytes live inside signed commit objects. Current
+gateway smoke runs on 2026-05-16 show the expected write request floor: one
+backend commit PUT per sequential write, with concurrent writes batched into
+fewer commit PUTs. Repeated reads of the same object are served from a verified
+payload-section cache after the first commit GET; the cache is bounded by the
+repository decrypted-segment cache budget and can be disabled by setting that
+budget to zero.
+
 ## Historical Segment-Size Finding
 
 The `many-small-files` profile is the current edge case because Kopia issued
