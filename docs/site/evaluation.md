@@ -12,7 +12,7 @@ storage behavior, and observability at the gateway boundary.
 The preview compatibility targets are Kopia and Velero with the Kopia uploader.
 Kopia defines the lower-level S3 behavior that matters first: `PUT`, `HEAD`,
 ranged `GET`, `LIST`, delete/tombstone behavior, and immediate
-read/list-after-write semantics. Velero proves the Kubernetes restore workflow
+read/list-after-write semantics. Velero exercises the Kubernetes restore workflow
 through that storage path.
 
 ## What rs3 Is Not
@@ -65,7 +65,7 @@ Evaluate the preview on three axes:
 
 ## Evaluation Standard
 
-A useful trial should prove all of the following:
+A useful trial should verify all of the following:
 
 - Kopia can create, snapshot, and restore through the gateway.
 - Restored bytes match the source workload.
