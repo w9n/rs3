@@ -2,22 +2,23 @@
 
 Repository-wide instructions. A deeper `AGENTS.md` overrides these.
 
-## Mission
+## Product Contract
 
-Build `rs3` as a path-private, tamper-evident, S3-compatible backup gateway for
-Kubernetes operators. Path privacy, rollback resistance, and restore correctness
-are product requirements.
+`rs3` is a path-private, tamper-evident, S3-compatible backup gateway for
+Kubernetes operators. Path privacy, rollback resistance, and restore
+correctness are product requirements.
 
-## Local Checks
+## Checks
 
-Use the Nix shell first:
+Use the Nix shell first; run `just check` before handoff when practical:
 
 ```sh
 nix develop
 just check
 ```
 
-Fallback when `just` is unavailable:
+For docs-only changes, prefer `just docs-check`. Fallback when `just` is
+unavailable:
 
 ```sh
 cargo fmt --all --check
@@ -26,24 +27,22 @@ cargo test --workspace
 mkdocs build --strict
 ```
 
-## Engineering Rules
+## Hard Rules
 
-- Preserve path privacy. Do not place plaintext paths, directory names,
-  Kubernetes object names, namespaces, or snapshot names in object-store keys,
-  unauthenticated metadata, logs, metrics labels, or errors.
-- Prefer typed identifiers in `rs3-types` over raw strings.
-- Keep cryptography behind `rs3-crypto`; do not scatter ad hoc hashing, MAC,
-  encryption, signing, or key-derivation logic across crates.
-- Model repository changes as append-friendly deltas plus signed checkpoints.
-  Avoid designs that rewrite many objects during normal operation.
-- Treat S3-compatible stores as eventually inconsistent unless a storage
-  implementation documents a stronger provider contract.
-- Treat Kopia/Velero as the first compatibility workload. Preserve prefix
-  listing, metadata-only `HEAD`, range `GET`, and read/list-after-write behavior.
+- Preserve path privacy: no plaintext paths, directory names, Kubernetes object
+  names, namespaces, or snapshot names in object-store keys, unauthenticated
+  metadata, logs, metrics labels, or errors.
+- Keep cryptography in `rs3-crypto`; prefer typed IDs in `rs3-types`.
+- Model repository changes as append-friendly deltas plus signed checkpoints;
+  avoid designs that rewrite many objects during normal operation.
+- Treat S3-compatible stores as eventually inconsistent unless documented
+  otherwise.
 - Kubernetes rollback anchors fail closed. If an anchor cannot be read or
-  advanced, do not accept newer-looking repository state silently.
-- Avoid `unsafe`. Avoid `unwrap`, `expect`, `todo`, and `dbg` in production
-  code. Tests may use `expect` when it improves failure clarity.
+  advanced, do not silently accept newer-looking repository state.
+- Preserve Kopia/Velero compatibility: prefix listing, metadata-only `HEAD`,
+  range `GET`, and read/list-after-write behavior.
+- Avoid `unsafe`, `unwrap`, `expect`, `todo`, and `dbg` in production code.
+  Tests may use `expect` when it improves failure clarity.
 - Keep public APIs small, documented, and preview-scoped unless deliberately
   stabilized.
 
@@ -59,36 +58,27 @@ mkdocs build --strict
 
 
 
+## Docs And Context
+
+- `docs/site/` is the public documentation source; keep behavior, security,
+  performance, operations, repository-format, and compatibility changes synced.
+- For each feature, know what the object store can observe: path hierarchy,
+  filename equality, object counts, file sizes, write cadence, tenant identity,
+  and Kubernetes resource names. Document necessary leakage in
+  `docs/site/security-model.md` and verify rollback behavior when the backend
+  can list, delete, delay, or replay objects.
+- Before architecture, security, repository-format, checkpointing, retention,
+  compatibility, or observability work, read:
+  `README.md`, `docs/site/index.md`, `docs/site/architecture.md`,
+  `docs/site/security-model.md`, `docs/site/reference/repository-format.md`.
 
 
-
-## Privacy Review
-
-For each feature, know what the object store can observe: path hierarchy,
-filename equality, object counts, file sizes, write cadence, tenant identity, or
-Kubernetes resource names. Document necessary leakage in
-`docs/site/security-model.md`, and verify rollback behavior when the backend can
-list, delete, delay, or replay objects.
-
-## Documentation Sync
-
-- `docs/site/` is the public documentation source.
-- Keep behavior, security, performance, operations, repository-format, and
-  compatibility changes synchronized with docs in the same commit.
-- Use `just docs-check` for docs-only changes and `just check` before handoff
-  when practical.
-
-## Agent Workflow
+## Workflow
 
 - Before non-trivial work, update the active plan with requirements,
   constraints, and intended verification.
-- When new user instructions arrive, compare them with the active plan and
-  prior requirements first. If they conflict, let the newest instruction steer
-  and update the plan before editing.
-- Before architecture/security/repository-format edits, read relevant current
-  docs: `README.md`, `docs/site/index.md`, `docs/site/architecture.md`,
-  `docs/site/security-model.md`, and
-  `docs/site/reference/repository-format.md`.
+- When new user instructions arrive, compare them with the active plan and let
+  the newest instruction steer if they conflict.
 - Keep patches small and behavior-focused. Add tests with code changes unless
   the change is docs-only.
 - Before committing, review `git status --short --ignored` and
