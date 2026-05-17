@@ -19,8 +19,19 @@ cargo run -p rs3-server -- doctor --profile production
 ```
 
 The production profile rejects memory anchors, retention-unsupported local
-backends, missing gateway credentials, and missing repository retention for
-mutation-capable serving.
+backends, plaintext S3-compatible backend endpoints, missing gateway
+credentials, and missing repository retention for mutation-capable serving.
+
+The gateway enforces finite data-plane limits from its own configuration:
+maximum `PutObject` body size, buffered-body threshold, backend multipart part
+size, in-flight upload body admission budget, open S3 connections, concurrently
+executing S3 operations, and per-process S3 operation rate. Align ingress,
+proxy, pod memory, and service mesh limits with the gateway values so oversized or
+excessive traffic is rejected before it consumes pod resources. Known-length
+`PutObject` bodies above the buffered threshold stream into backend multipart
+commit uploads when the backend supports multipart. Unknown-length or chunked
+uploads buffer only until the threshold is crossed, then continue through the
+same multipart commit path and remain bounded by `RS3_MAX_PUT_OBJECT_BYTES`.
 
 For serving:
 

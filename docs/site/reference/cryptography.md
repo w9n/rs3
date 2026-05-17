@@ -58,24 +58,28 @@ Payloads are split into independently encrypted segments. Each segment uses:
 - XChaCha20-Poly1305
 - a content key selected from the repository keyring
 - a 24-byte nonce made from a random per-object prefix plus a segment counter
-- associated data containing the payload domain, authenticated backend object
-  context, segment size, plaintext length, segment index, and final-segment
-  marker
+- associated data containing the payload domain, authenticated payload
+  identity, segment size, segment plaintext length, segment index, and
+  final-segment marker
 
 The associated data is authenticated but not encrypted. It is limited to public,
 path-free repository metadata.
 
 Payload authentication fails if a backend tampers with ciphertext, changes the
 segment context, or moves encrypted segment bytes into a different authenticated
-backend object context. For `v2-preview`, that context is the containing commit
-object.
+payload identity. For commit-embedded `v2-preview` payloads, the payload
+identity is derived from the signed commit key and payload ordinal; the bytes
+are physically stored inside the commit object.
 
 Segment size is recorded in each payload header and authenticated as segment
-associated data. The default writer chooses the segment size per object: small
-objects keep 512 B segments, medium objects use 8 KiB, and larger objects use
-64 KiB. This changes overhead and read granularity without changing the
-repository format because readers trust the authenticated header, not a global
-setting.
+associated data. For commit-embedded v2 payloads, the total plaintext length is
+authenticated by the signed index entry rather than repeated in every segment
+tag; readers verify that the signed length, payload header, and encrypted
+section length agree before serving ranges. The default writer chooses the
+segment size per object: small objects keep 512 B segments, medium objects use
+8 KiB, and larger objects use 64 KiB. This changes overhead and read
+granularity without changing the repository format because readers trust
+authenticated per-object metadata, not a global setting.
 
 The gateway may cache decrypted payload segments in memory. The default limit is
 256 MiB and can be disabled with

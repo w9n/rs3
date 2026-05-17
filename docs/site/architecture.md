@@ -3,23 +3,29 @@
 `rs3` is organized around a narrow gateway, a repository service, and a
 provider-neutral storage boundary.
 
-```text
-S3 client / backup tool
-        |
-        v
-rs3 gateway
-        |
-        +-- S3 compatibility layer
-        +-- path-private namespace mapping
-        +-- payload segment encryption
-        +-- encrypted index deltas
-        +-- signed v2 commit publication
-        |
-        +-------------------+-------------------+
-        |                                       |
-        v                                       v
-opaque object store                    external commit anchor
-```
+The overview below shows the three important boundaries. S3 backup clients call
+the gateway through the S3 API. Inside the trusted gateway process, the
+compatibility layer, namespace mapping, payload encryption, encrypted index
+state, signed v2 commit publication, and path-redacted admin facts stay under
+operator control. The gateway writes encrypted `format/`, `keyrings/`, and
+`commits/` objects to the backend and reads or advances a separate Kubernetes
+Lease anchor. `rs3-console` only reads path-redacted admin status.
+
+<figure class="rv-figure">
+  <a class="rv-lightbox" href="../assets/architecture-overview.png" aria-label="Enlarge rs3 architecture overview diagram" aria-haspopup="dialog" data-rv-title="Architecture overview">
+    <picture>
+      <source srcset="../assets/architecture-overview.webp" type="image/webp">
+      <img class="rv-diagram" src="../assets/architecture-overview.png" width="1672" height="941" loading="lazy" decoding="async" alt="Architecture overview showing S3 backup clients, the trusted rs3 gateway process, an opaque object store, an external Kubernetes Lease anchor, and the read-only console path.">
+    </picture>
+  </a>
+</figure>
+
+The gateway is the trusted data-plane boundary. The object store keeps opaque
+encrypted objects and can still observe operational signals such as object
+counts, sizes, timing, and broad object classes. The external anchor is a
+separate latest-state authority for the preview. The gateway must fail closed
+when the anchor cannot be read, advanced, or reconciled with verified commit
+state.
 
 ## Crate Boundaries
 
@@ -55,6 +61,24 @@ crash recovery a concrete boundary.
 chain. Concurrent PUTs can batch into one signed delta commit. Periodic index
 snapshot commits consolidate the live blinded namespace so cold-start replay
 walks only from the accepted anchor back to the nearest snapshot.
+
+The state-flow view below separates the normal write path from the restore read
+path. A normal write blinds the namespace lookup, encrypts payload segments,
+stages payload plus index-delta sections, publishes a signed v2 commit, advances
+the external anchor, and only then acknowledges the client write. A restore read
+starts from trusted anchor state, verifies the signed chain, loads the nearest
+snapshot and newer deltas, finds the encrypted payload reference, range-reads
+the exact retained version when required, verifies AEAD segments, and returns
+restored bytes.
+
+<figure class="rv-figure">
+  <a class="rv-lightbox" href="../assets/architecture-state-flow.png" aria-label="Enlarge rs3 write and restore state flow diagram" aria-haspopup="dialog" data-rv-title="Write and restore flow">
+    <picture>
+      <source srcset="../assets/architecture-state-flow.webp" type="image/webp">
+      <img class="rv-diagram" src="../assets/architecture-state-flow.png" width="1692" height="930" loading="lazy" decoding="async" alt="Write and restore flow showing committed writes through signed v2 commits and anchored restore reads through verified commit state.">
+    </picture>
+  </a>
+</figure>
 
 ## Path Privacy
 

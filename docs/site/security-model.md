@@ -179,8 +179,9 @@ single-writer compatibility probes, but it is not atomic and does not protect
 against a provider that races requests, serves stale state, or ignores conditional headers.
 
 `rs3 check-v2-provider` runs the selected v2 profile probes against the
-configured backend. Governance-retention deployments require an explicit
-operator review that gateway credentials cannot bypass retention.
+configured backend, including multipart upload behavior used by large
+streaming writes. Governance-retention deployments require an explicit operator
+review that gateway credentials cannot bypass retention.
 
 ## Operator Reporting Rule
 

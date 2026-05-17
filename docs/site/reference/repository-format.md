@@ -54,7 +54,28 @@ digest, canonical CBOR header, signed `self.commit_key`, Ed25519 signature,
 section layout, and body digest before trusting a commit.
 Current v2 writers pad the signed header span to 4 KiB, which gives readers a
 single bounded prefix read for commit-header fallback and a stable section
-region offset for hot-path payload refs.
+region offset for hot-path payload refs. This is commit-header padding, not
+per-file payload padding: small payloads still use the adaptive payload segment
+policy and are not expanded to 4 KiB.
+
+The layout below shows the physical commit object and the anchored range-read
+path. A v2 commit object starts with a 64-byte fixed header, followed by
+canonical CBOR header bytes. In the default multipart-padded upload mode, the
+signed header span is padded to 4 KiB so readers know where the section region
+begins. The section region contains encrypted `PAYLOAD` sections and either
+`INDEX_DELTA` or `INDEX_SNAPSHOT` sections. Range reads use trusted index refs,
+including signed content length and encrypted payload-section length, verify
+the commit header, read exact retained versions when required, authenticate
+payload segments, and return only verified plaintext bytes.
+
+<figure class="rv-figure">
+  <a class="rv-lightbox" href="../../assets/repository-v2-format-overview.png" aria-label="Enlarge v2 repository format overview diagram" aria-haspopup="dialog" data-rv-title="v2 repository format">
+    <picture>
+      <source srcset="../../assets/repository-v2-format-overview.webp" type="image/webp">
+      <img class="rv-diagram" src="../../assets/repository-v2-format-overview.png" width="1693" height="929" loading="lazy" decoding="async" alt="v2 commit object layout and anchored range-read flow. The trusted index entry supplies content length and payload-section length; payload sections live in the section region after multipart-only 4 KiB header padding.">
+    </picture>
+  </a>
+</figure>
 
 The retained-version/Object Lock provider profile does not require atomic
 `If-None-Match: *` support. It requires provider version IDs, exact-version
@@ -98,17 +119,18 @@ recreates it from a trusted bundle after verifying the named commit chain.
 `xtask v2 verify-bundle` performs the same format-root, keyring-envelope, and
 commit-chain verification as a no-write preflight.
 `rs3 check-v2-provider` runs the selected v2 provider-profile probes against the
-configured backend; retained governance profiles require an explicit operator
-review flag because gateway credentials must not be able to bypass retention.
+configured backend, including multipart upload behavior used by large streaming
+writes; retained governance profiles require an explicit operator review flag
+because gateway credentials must not be able to bypass retention.
 
 ## Payload Sections
 
-Payload sections are encrypted with XChaCha20-Poly1305 using the same payload
-envelope as earlier preview work, but the associated backend object ID is the
-payload identity recorded in the encrypted index entry, while the ciphertext
-bytes are stored inside the commit object. Segment associated data binds
-ciphertext to that payload identity, segment size, plaintext length, segment
-index, and final-segment marker.
+Payload sections are encrypted with XChaCha20-Poly1305. Commit-embedded v2
+payloads use a streamable segmented envelope: the payload header records the
+segment size, key ID, and nonce prefix, while the signed index entry records the
+total plaintext length and encrypted section length. Segment associated data
+binds ciphertext to the payload identity, segment size, segment index,
+segment-plaintext length, and final-segment marker.
 
 Segment size is recorded per payload section. The current writer default keeps
 small objects at 512 plaintext bytes per segment and uses larger segments for

@@ -82,13 +82,31 @@ See [Production Preview](production-preview.md) for the current release gates.
 Use the docs in this order when moving from interest to a controlled provider
 trial:
 
-| Step | Goal | Start With |
-| --- | --- | --- |
-| 1. Understand the boundary | Confirm the preview threat model, non-goals, and trust split. | [Production Preview](production-preview.md), [Security Model](security-model.md) |
-| 2. Build local evidence | Run the local gate and release integration gate before touching external infrastructure. | [Getting Started](getting-started.md), [Testing](testing.md) |
-| 3. Qualify the backend | Choose `atomic-create` or `retained-version`; use fresh prefixes and provider credentials scoped to the trial. | [Testing](testing.md#s3-provider-qualification), [Retention And Object Lock](runbooks/retention-and-object-lock.md) |
-| 4. Exercise Kubernetes restore | Run Kopia and Velero through the anchored gateway, including gateway restart. | [Testing](testing.md#important-lanes), [Operations](operations.md) |
-| 5. Rehearse recovery | Preserve a restore bundle outside the object-store account, then verify anchor import into a new cluster. | [Restore Under Attack](runbooks/restore-under-attack.md) |
+<div class="rv-steps" aria-label="Evaluation trial path">
+  <div class="rv-step">
+    <strong>1. Boundary</strong>
+    <span><a href="../production-preview/">Production Preview</a> and <a href="../security-model/">Security Model</a></span>
+  </div>
+  <div class="rv-step">
+    <strong>2. Local Evidence</strong>
+    <span><a href="../getting-started/">Getting Started</a> and <a href="../testing/">Testing</a></span>
+  </div>
+  <div class="rv-step">
+    <strong>3. Backend</strong>
+    <span><a href="../testing/#s3-provider-qualification">Provider qualification</a> and <a href="../runbooks/retention-and-object-lock/">retention</a></span>
+  </div>
+  <div class="rv-step">
+    <strong>4. Restore</strong>
+    <span><a href="../testing/#important-lanes">Kopia and Velero lanes</a> through the anchored gateway</span>
+  </div>
+  <div class="rv-step">
+    <strong>5. Recovery</strong>
+    <span><a href="../runbooks/restore-under-attack/">Restore bundle and anchor import</a></span>
+  </div>
+</div>
+
+The path starts with the threat model, then moves through local evidence,
+provider qualification, Kubernetes restore, and disaster-recovery rehearsal.
 
 Do not skip from a green local smoke to a production backup target. The preview
 needs backend qualification, retained-version or atomic-create evidence, and a

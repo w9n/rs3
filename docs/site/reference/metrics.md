@@ -35,7 +35,10 @@ bucket names, endpoints, prefixes, or repository IDs.
 ## Gateway Request Metrics
 
 The gateway records S3 request counts, response bytes, request body bytes,
-request duration, and request-body collection duration by operation and result.
+request duration, request-body collection duration, request admission
+rejections by reason, and connection admission rejections.
+Upload body budget rejections use the admission-rejection reason
+`body_budget`.
 
 These metrics are used to separate client request ingestion from repository
 work and backend provider cost.

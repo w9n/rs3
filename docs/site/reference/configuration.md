@@ -69,6 +69,22 @@ rotation, deployment, or storage-management API.
 | `RS3_STATIC_ACCESS_KEY_ID` | for serving | none | Static access key accepted by the gateway. Must be paired with the secret. |
 | `RS3_STATIC_SECRET_ACCESS_KEY` | for serving | none | Static secret key accepted by the gateway. Must be paired with the access key. |
 
+## Data Plane Hardening
+
+These limits are enforced inside the gateway process. Keep ingress or service
+mesh limits aligned with them so rejected traffic is shed before it consumes
+cluster resources.
+
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `RS3_MAX_PUT_OBJECT_BYTES` | no | `5368709120` | Maximum accepted single `PutObject` body. Requests with larger declared bodies fail before a repository commit is staged. |
+| `RS3_BUFFERED_PUT_OBJECT_BYTES` | no | `67108864` | Largest `PutObject` body buffered in process memory as a single repository write. Bodies above this threshold use backend multipart upload when supported; unknown-length bodies switch to streaming after the threshold is crossed. |
+| `RS3_BACKEND_MULTIPART_PART_BYTES` | no | `16777216` | Backend multipart part size for large `PutObject` writes. S3-compatible backends require at least `5242880` bytes. |
+| `RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES` | no | `536870912` | Admission budget for request body bytes held by in-flight upload operations. Buffered uploads reserve their full collected body; streaming uploads reserve a bounded working set, not a hard RSS cap for every HTTP chunk. Excess uploads fail with S3 `SlowDown`. |
+| `RS3_MAX_CONCURRENT_CONNECTIONS` | no | `1024` | Maximum simultaneously open S3 listener connections accepted by the process. Additional connections are dropped. |
+| `RS3_MAX_CONCURRENT_REQUESTS` | no | `256` | Maximum concurrently executing S3 operations. Additional operations fail with S3 `SlowDown`. |
+| `RS3_REQUEST_RATE_LIMIT_PER_SECOND` | no | `1024` | Per-process S3 operation admission rate. Bursts up to one second of capacity are allowed; excess operations fail with S3 `SlowDown`. |
+
 ## Backend Storage
 
 | Variable | Required | Default | Description |
@@ -163,8 +179,9 @@ cargo run -p rs3-server -- doctor --profile production
 
 The local profile validates runtime configuration and redacts secrets in debug
 output. The production profile also rejects memory anchors,
-retention-unsupported local backends, missing gateway credentials, and missing
-repository retention for mutation-capable serving.
+retention-unsupported local backends, plaintext S3-compatible backend
+endpoints, missing gateway credentials, and missing repository retention for
+mutation-capable serving.
 
 ## Helm Repository Keys
 

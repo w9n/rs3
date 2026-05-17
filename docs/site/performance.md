@@ -146,7 +146,20 @@ ciphertext span. Repeated or concurrent overlapping ranges reuse the decrypted
 segment cache behind a striped per-payload fill gate, so independent payloads
 can still fill in parallel. Full-file reads fetch the named payload section.
 Older refs still fall back to bounded commit-header and payload-header probes.
-The default partial commit-batch wait is now 25 ms.
+The default partial commit-batch wait is now 25 ms. A 2026-05-17 local gateway
+smoke recorded the current medium-object shape: sequential 256 KiB writes used
+1.0 backend requests per client write, parallel batched writes used 0.125
+requests per client write, full reads used 0.016 requests per client read after
+cache fill, and 4 KiB range reads used 0.063 requests per client read. Large
+67,108,865 B known-length and chunked unknown-length PUTs both used one commit
+PUT plus one retained-profile preflight `HEAD`; write-byte amplification was
+1.0004x. Eight 4 KiB ranges from a large object used one backend range `GET`
+after cache fill, with 2.0005x read-byte amplification from the 64 KiB adaptive
+payload segment. Artifacts:
+`.local/perf/`,
+`.local/perf/`,
+`.local/perf/`, and
+`.local/perf/`.
 
 A local Velero/Postgres smoke on 2026-05-16 exercised the concurrent restore
 path after v2 payload-section cache fills were coalesced. The gateway run

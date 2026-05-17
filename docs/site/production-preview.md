@@ -112,6 +112,11 @@ GitOps or a recovery bundle with the repository ID and anchor position. Do not
 make the gateway generate an undeclared salt on first normal startup; that makes
 disaster recovery dependent on a cluster Secret that may be gone.
 
+Bootstrap assumes a fresh, randomized backend prefix. The gateway probes the
+root and known v2 sub-prefixes before initializing, but provider `LIST`
+semantics are still part of the storage trust boundary. Do not bootstrap over an
+old or unknown prefix; recover or import the existing repository instead.
+
 For production-like Helm deployments, values remain declarative. The chart
 should consume an existing Secret or explicit values. It should not mutate Helm
 values after first run.
@@ -142,6 +147,11 @@ existed in storage, but by themselves they are not a latest-state authority
 because a malicious backend can hide newer valid commits or replay older valid
 commits.
 
+Recovery bundles are weak-subjectivity inputs. Importing an older valid bundle
+recreates the older anchor it names. Preserve fresh bundles outside the backend
+and compare the sequence and commit digest with an external record before
+anchor import.
+
 An external anchor can distribute trust outside the cluster. It should store
 or sign the accepted commit position, not the whole repository index. That
 position already commits to the signed commit chain and therefore to the
@@ -149,35 +159,51 @@ repository state reachable from it.
 
 ## Current Evidence
 
-Release evidence below is maintainer-run evidence for the `v0.1.0-preview.3`
-candidate as of 2026-05-16. Paths under `.local/` are workspace-local artifact
-locations; copy artifacts or checksums into release assets when independent
-public review needs to inspect them. Older rows are retained as background
-compatibility evidence; the current v2 preview gate and DR rows are the
-candidate evidence.
+Release evidence below is maintainer-run evidence for the current v2 preview
+line. Paths under `.local/` are workspace-local artifact locations; copy
+artifacts or checksums into release assets when independent public review needs
+to inspect them. Evidence rows are dated because the preview still changes. A
+release candidate should rerun the live provider gate after format, gateway, or
+streaming-write changes.
 
-Latest focused evidence:
+At a glance:
+
+- consolidated v2 live preview gate passed against the retained-version profile
+- live provider qualification covered exact-version reads and retention behavior
+- DR rehearsal verified bundle export, missing-Lease rejection without retention
+  context, and anchor import into a new cluster
+- 2026-05-17 local checks covered the streamable payload and unknown-length
+  gateway PUT changes; the live provider gate still needs a fresh rerun for a
+  release candidate built from this worktree
+- local performance and compatibility smokes remain release evidence, not a
+  provider certification
 
 | Evidence | Result |
 | --- | --- |
 | Live retained-backend v2 preview gate | Passed on 2026-05-16 with `just preview-gate-v2-live`. S3 gateway/tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes all passed under prefix base `isolated live prefix`; artifacts `.local/integration/` and `.local/integration/`. |
+| Live retained-backend v2 DR anchor import/export | Passed on 2026-05-16 against fresh v2 Velero dynamic-PVC gateway-restart output under backend prefix `isolated live prefix`; artifact `.local/integration/`. The source bundle was exported directly as JSON without filtering, verified 34 commits, a new kind cluster with a missing Lease rejected import when the retention context was omitted, import with governance retention recreated the Lease, and the recovered bundle verified the same anchor. |
+| Live retained-backend v2 provider conformance | Passed on 2026-05-16 with `rs3 check-v2-provider` for the retained-version/Object Lock profile, including exact-version `HEAD`, `GET`, range `GET`, overwrite version survival, retention extension, delete blocking, and the governance-bypass review marker; backend prefix `isolated live prefix`. |
+| Live retained-backend v2 Velero dynamic-PVC gateway-restart restore | Passed on 2026-05-16 with `just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live` against an Object Lock bucket with repository governance retention enabled; backup and restore completed, restored bytes matched, v2 Lease assertions passed after backup, after gateway restart, and after restore, and a backend key check found no obvious Velero/Kopia/workload names in 66 repository objects; artifact `.local/integration/`; backend prefix `isolated live prefix`. |
+| Live retained-backend v2 Velero/Postgres restore | Passed on 2026-05-16 with `just integration-velero-kopia-postgres-v2-live` against an Object Lock bucket with repository governance retention enabled; Postgres rows were backed up and restored, v2 Lease assertions passed after backup and after restore, and a backend key check found no obvious Velero/Kopia/Postgres/workload names in 68 repository objects; artifact `.local/integration/`; backend prefix `isolated live prefix`. |
+| Live retained-backend v2 Kopia gateway backup/restore | Passed on 2026-05-16 with `just integration-kopia-gateway-v2-live` against an Object Lock bucket with repository governance retention enabled; restored bytes matched, and a backend key check found no obvious Kopia/source/restore names in 45 repository objects; backend prefix `isolated live prefix`. |
+| Live retained-backend v2 gateway smoke | Passed on 2026-05-16 with `just integration-s3-gateway-v2-live` through the local gateway using `mc` and default `rclone lsf` for `PUT`, `HEAD`, `GET`, and prefix listing with governance retention; the xtask backend key check found no client-visible names in repository object keys; backend prefix `isolated live prefix`. |
+| v2 Kubernetes Lease gateway smoke | Passed on 2026-05-16 with `just integration-k8s-gateway-v2`; Helm deployed `RS3_REPOSITORY_FORMAT=v2-preview` with Kubernetes Lease anchoring, the S3 smoke passed, and the harness verified v2 Lease annotations. |
+| Local v2 streamable payload and unknown-length PUT checks | Passed on 2026-05-17 with focused repository and gateway tests plus `just check`, `just check-s3`, and `just docs-check`. These checks cover streamable commit-embedded payloads, signed payload-section length validation, known-length multipart PUT, and unknown-length multipart PUT. |
+| Local v2 Velero dynamic-PVC gateway-restart smoke | Passed on 2026-05-17 with `just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke --repository-format v2-preview` on a fresh kind cluster. Backup completed, the gateway deployment was restarted, restore completed, restored pod data was verified, and the cluster was deleted; artifact `.local/integration/`. |
 | Local v2 Velero/Postgres RustFS smoke | Passed on 2026-05-16 after v2 concurrent payload-section cache fills were coalesced; artifact `.local/integration/`. The gateway run completed backup and restore, wrote no backend `segments/` objects, read 29.0 MB versus 28.9 MB for direct RustFS baseline `.local/integration/`, and used 57 backend requests versus 708 for direct RustFS. |
 | Local v2 gateway perf baseline | Refreshed on 2026-05-16 with `just perf-s3-gateway --objects 16 --object-size 4096 --reads 16 --range-len 512 --commit-batch-items 8 --concurrency 8 --format jsonl`. Sequential writes emitted one backend commit PUT per client object, parallel writes batched to 2 PUTs for 16 objects, and repeated full/range reads of one object reused a verified payload-section cache after the first commit GET. |
 | Local v2 S3 and Kopia gateway smokes | Passed on 2026-05-16 with `just integration-s3-gateway --repository-format v2-preview` and `just integration-kopia-gateway --repository-format v2-preview` after the v2 read-cache and measurement-surface repairs. |
-| Live retained-backend v2 provider conformance | Passed on 2026-05-16 with `rs3 check-v2-provider` for the retained-version/Object Lock profile, including exact-version `HEAD`, `GET`, range `GET`, overwrite version survival, retention extension, delete blocking, and the governance-bypass review marker; backend prefix `isolated live prefix`. |
-| Live retained-backend v2 gateway smoke | Passed on 2026-05-16 with `just integration-s3-gateway-v2-live` through the local gateway using `mc` and default `rclone lsf` for `PUT`, `HEAD`, `GET`, and prefix listing with governance retention; the xtask backend key check found no client-visible names in repository object keys; backend prefix `isolated live prefix`. |
-| Live retained-backend v2 Kopia gateway backup/restore | Passed on 2026-05-16 with `just integration-kopia-gateway-v2-live` against an Object Lock bucket with repository governance retention enabled; restored bytes matched, and a backend key check found no obvious Kopia/source/restore names in 45 repository objects; backend prefix `isolated live prefix`. |
-| v2 Kubernetes Lease gateway smoke | Passed on 2026-05-16 with `just integration-k8s-gateway-v2`; Helm deployed `RS3_REPOSITORY_FORMAT=v2-preview` with Kubernetes Lease anchoring, the S3 smoke passed, and the harness verified v2 Lease annotations. |
-| Live retained-backend v2 Velero dynamic-PVC gateway-restart restore | Passed on 2026-05-16 with `just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live` against an Object Lock bucket with repository governance retention enabled; backup and restore completed, restored bytes matched, v2 Lease assertions passed after backup, after gateway restart, and after restore, and a backend key check found no obvious Velero/Kopia/workload names in 66 repository objects; artifact `.local/integration/`; backend prefix `isolated live prefix`. |
-| Live retained-backend v2 DR anchor import/export | Passed on 2026-05-16 against fresh v2 Velero dynamic-PVC gateway-restart output under backend prefix `isolated live prefix`; artifact `.local/integration/`. The source bundle was exported directly as JSON without filtering, verified 34 commits, a new kind cluster with a missing Lease rejected import when the retention context was omitted, import with governance retention recreated the Lease, and the recovered bundle verified the same anchor. |
-| Live retained-backend v2 Velero/Postgres restore | Passed on 2026-05-16 with `just integration-velero-kopia-postgres-v2-live` against an Object Lock bucket with repository governance retention enabled; Postgres rows were backed up and restored, v2 Lease assertions passed after backup and after restore, and a backend key check found no obvious Velero/Kopia/Postgres/workload names in 68 repository objects; artifact `.local/integration/`; backend prefix `isolated live prefix`. |
 | Live retained-backend retained-version S3 qualification | Passed on 2026-05-16 with `xtask integration s3-local --qualification-profile retained-version --object-lock`; Object Lock retention and legal hold checks passed with versioned delete blocking under backend prefix `isolated live prefix`. |
-| Live retained-backend Kopia gateway backup/restore | Passed on 2026-05-13 against an Object Lock bucket with repository governance retention enabled; backend prefix `isolated live prefix`. |
-| Live retained-backend Velero dynamic-PVC gateway-restart restore | Passed on 2026-05-13 against an Object Lock bucket with repository governance retention enabled; artifact `.local/integration/`; backend prefix `isolated live prefix`. |
-| Velero dynamic-PVC gateway-restart in `read-write` | Passed on 2026-05-12 with restore status `Completed`; artifact `.local/integration/`. |
-| Velero strict `restore-readonly` incident-restore smoke | Passed on 2026-05-12 with workload verification, expected restore-artifact write denial, and zero backend writes during restore; artifact `.local/integration/`. |
-| Velero/Postgres compatibility smoke | Passed on 2026-05-12; artifact `.local/integration/`. |
-| Larger Kopia restore matrix | Passed on 2026-05-13 with adaptive payload segment sizing, `regression_budgets=pass`, and `workload_consistency=pass`; artifact `.local/integration/`. |
+
+??? note "Background compatibility evidence"
+    | Evidence | Result |
+    | --- | --- |
+    | Live retained-backend Kopia gateway backup/restore | Passed on 2026-05-13 against an Object Lock bucket with repository governance retention enabled; backend prefix `isolated live prefix`. |
+    | Live retained-backend Velero dynamic-PVC gateway-restart restore | Passed on 2026-05-13 against an Object Lock bucket with repository governance retention enabled; artifact `.local/integration/`; backend prefix `isolated live prefix`. |
+    | Velero dynamic-PVC gateway-restart in `read-write` | Passed on 2026-05-12 with restore status `Completed`; artifact `.local/integration/`. |
+    | Velero strict `restore-readonly` incident-restore smoke | Passed on 2026-05-12 with workload verification, expected restore-artifact write denial, and zero backend writes during restore; artifact `.local/integration/`. |
+    | Velero/Postgres compatibility smoke | Passed on 2026-05-12; artifact `.local/integration/`. |
+    | Larger Kopia restore matrix | Passed on 2026-05-13 with adaptive payload segment sizing, `regression_budgets=pass`, and `workload_consistency=pass`; artifact `.local/integration/`. |
 
 The release evidence is local harness evidence, not a provider certification. A
 production-preview trial should still run the selected live S3-compatible
@@ -191,18 +217,19 @@ test does not replace that credential review.
 
 ## Release Candidate Note
 
-`v0.1.0-preview.3` is a production-preview candidate for evaluating `rs3` with
-Velero/Kopia on Kubernetes and a retained S3-compatible backend. The primary
-repository format for new evaluation repositories is `v2-preview`. The
-candidate includes the adaptive payload segment default, the decrypted-segment
-cache, retained-version restore checks, machine-readable CLI stdout/stderr
-separation, the live S3 provider qualification lane, and the refreshed retained-backend
+The current preview line is for evaluating `rs3` with Velero/Kopia on Kubernetes
+and a retained S3-compatible backend. The primary repository format for new
+evaluation repositories is `v2-preview`. The current work includes the adaptive
+payload segment default, the decrypted-segment cache, streamable commit-embedded
+payloads, retained-version restore checks, machine-readable CLI stdout/stderr
+separation, the live S3 provider qualification lane, and the retained-backend
 backup/restore and DR evidence above.
 
-Use this candidate for controlled evaluation, not for a stable repository-format
-commitment. The durable format remains preview-scoped, governance-bypass IAM
-review remains operator-owned, and public security claims need
-separate review.
+Use a release candidate built from this line for controlled evaluation, not for
+a stable repository-format commitment. The durable format remains
+preview-scoped, governance-bypass IAM review remains operator-owned, live
+provider gates should be rerun after material changes, and public
+security claims need separate review.
 
 ## Non-Goals
 
@@ -254,6 +281,10 @@ For a production-preview deployment:
 - set a stable, operator-provided `repositoryKeys.saltHex`
 - configure gateway access credentials explicitly
 - configure repository retention when retention evidence is part of the trial
+- set gateway hardening limits for maximum `PutObject` size, buffered upload
+  threshold, backend multipart part size, in-flight upload body bytes, open
+  connections, concurrent requests, and request rate; align ingress limits with
+  them
 - use `gateway.mode=restore-readonly` for incident restore deployments
 - run `rs3-server doctor --profile production` before exposing the gateway
 - keep restore verification inputs outside the object-store trust boundary
