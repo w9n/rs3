@@ -11,6 +11,7 @@ use super::runtime_keyring::{
 use crate::config::KEYRING_WRAPPING_KEY_HEX_ENV;
 use crate::{BackendConfig, GatewayMode, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig};
 use bytes::Bytes;
+use futures_util::Stream;
 use rs3_crypto::{FormatEnvelope, KeyRing};
 use rs3_index::KeyringEnvelopeReference;
 use rs3_repository::v2::{
@@ -198,6 +199,59 @@ impl RuntimeV2Repository {
     ) -> Result<RepositoryObjectMetadata, RepositoryError> {
         self.coordinator
             .put_committed(key, body, options)
+            .await
+            .map(|committed| committed.metadata)
+    }
+
+    pub(super) fn supports_streaming_put(&self) -> bool {
+        self.repository
+            .commit_store()
+            .store()
+            .supports_multipart_upload()
+    }
+
+    pub(super) async fn put_committed_streaming_known_len<St>(
+        &self,
+        key: LogicalPath,
+        plaintext_len: u64,
+        stream: St,
+        options: RepositoryPutOptions,
+        multipart_part_size: usize,
+    ) -> Result<RepositoryObjectMetadata, RepositoryError>
+    where
+        St: Stream<Item = Result<Bytes, RepositoryError>> + Unpin + Send,
+    {
+        self.coordinator
+            .put_committed_streaming_known_len(
+                key,
+                plaintext_len,
+                stream,
+                options,
+                multipart_part_size,
+            )
+            .await
+            .map(|committed| committed.metadata)
+    }
+
+    pub(super) async fn put_committed_streaming_unknown_len<St>(
+        &self,
+        key: LogicalPath,
+        stream: St,
+        options: RepositoryPutOptions,
+        multipart_part_size: usize,
+        max_plaintext_len: u64,
+    ) -> Result<RepositoryObjectMetadata, RepositoryError>
+    where
+        St: Stream<Item = Result<Bytes, RepositoryError>> + Unpin + Send,
+    {
+        self.coordinator
+            .put_committed_streaming_unknown_len(
+                key,
+                stream,
+                options,
+                multipart_part_size,
+                max_plaintext_len,
+            )
             .await
             .map(|committed| committed.metadata)
     }
@@ -637,14 +691,19 @@ async fn reject_v2_bootstrap_with_foreign_objects(
     store: &RuntimeStore,
     allowed_keyring: Option<&BackendObjectId>,
 ) -> Result<(), S3BoundaryError> {
-    let objects = store.list_prefix("").await.map_err(repository_init)?;
-    let has_foreign_object = objects
-        .iter()
-        .any(|metadata| Some(&metadata.object_id) != allowed_keyring);
-    if has_foreign_object {
-        return Err(repository_init(
-            "v2-preview bootstrap requires an empty repository prefix except for the configured keyring envelope",
-        ));
+    const BOOTSTRAP_EMPTY_CHECK_PREFIXES: &[&str] =
+        &["", "format/", "commits/", "keyrings/", "checkpoints/"];
+
+    for prefix in BOOTSTRAP_EMPTY_CHECK_PREFIXES {
+        let objects = store.list_prefix(prefix).await.map_err(repository_init)?;
+        let has_foreign_object = objects
+            .iter()
+            .any(|metadata| Some(&metadata.object_id) != allowed_keyring);
+        if has_foreign_object {
+            return Err(repository_init(
+                "v2-preview bootstrap requires an empty repository prefix except for the configured keyring envelope",
+            ));
+        }
     }
     Ok(())
 }

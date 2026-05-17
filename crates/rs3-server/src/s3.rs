@@ -48,7 +48,7 @@ pub(super) fn repository_init(error: impl ToString) -> S3BoundaryError {
 pub(super) mod test_support {
     use crate::GatewayMode;
     use crate::{
-        AnchorConfig, BackendConfig, BatchConfig, MetricsConfig, RepositoryConfig,
+        AnchorConfig, BackendConfig, BatchConfig, HardeningConfig, MetricsConfig, RepositoryConfig,
         RepositoryKeysConfig, RuntimeConfig, SecretString,
     };
     use rs3_types::{PublicBucket, RepositoryId};
@@ -68,6 +68,7 @@ pub(super) mod test_support {
             mode: GatewayMode::ReadWrite,
             bind,
             metrics: MetricsConfig { bind: None },
+            hardening: HardeningConfig::default(),
             public_bucket,
             backend: BackendConfig {
                 endpoint: "memory://local".to_owned(),

@@ -8,6 +8,9 @@ use rs3_types::{BackendObjectId, KeyId};
 
 const PAYLOAD_OBJECT_DOMAIN: &[u8] = b"rs3:payload-object:v2-segmented\n";
 const PAYLOAD_SEGMENT_AAD_DOMAIN: &[u8] = b"rs3:payload-segment-associated-data:v2\n";
+const STREAMABLE_PAYLOAD_OBJECT_DOMAIN: &[u8] = b"rs3:payload-object:v2-streamable\n";
+const STREAMABLE_PAYLOAD_SEGMENT_AAD_DOMAIN: &[u8] =
+    b"rs3:payload-segment-associated-data:v2-streamable\n";
 pub(crate) const PAYLOAD_HEADER_PROBE_LEN: u64 = 128;
 /// Default plaintext bytes per independently encrypted payload segment.
 pub const DEFAULT_PAYLOAD_SEGMENT_SIZE: usize = 512;
@@ -33,11 +36,118 @@ pub(crate) enum PayloadHeaderProbe {
 /// Parsed v2 segmented payload header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SegmentedPayloadHeader {
+    pub(crate) format: SegmentedPayloadFormat,
     pub(crate) chunk_size: u64,
     pub(crate) plaintext_len: u64,
     pub(crate) key_id: KeyId,
     pub(crate) nonce_prefix: [u8; NONCE_PREFIX_LEN],
     pub(crate) header_len: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SegmentedPayloadFormat {
+    LengthBearing,
+    Streamable,
+}
+
+/// Streaming sealer for a streamable segmented payload object.
+#[derive(Clone, Debug)]
+pub(crate) struct SegmentedPayloadSealer {
+    chunk_size: u64,
+    key_id: KeyId,
+    nonce_prefix: [u8; NONCE_PREFIX_LEN],
+    header: Bytes,
+}
+
+impl SegmentedPayloadSealer {
+    pub(crate) fn new(keyring: &KeyRing, chunk_size: usize) -> Result<Self> {
+        if chunk_size == 0 {
+            return Err(StorageError::Provider(
+                "payload chunk size must be greater than zero".to_owned(),
+            )
+            .into());
+        }
+        let chunk_size = u64::try_from(chunk_size).map_err(|_| {
+            StorageError::Provider("payload chunk size does not fit in u64".to_owned())
+        })?;
+        let key_id = keyring.primary_content_key_id()?;
+        let nonce_prefix = random_nonce_prefix()?;
+        let header = Bytes::from(streamable_segmented_payload_header_bytes(
+            chunk_size,
+            &key_id,
+            &nonce_prefix,
+        ));
+        Ok(Self {
+            chunk_size,
+            key_id,
+            nonce_prefix,
+            header,
+        })
+    }
+
+    pub(crate) fn header(&self) -> Bytes {
+        self.header.clone()
+    }
+
+    pub(crate) fn header_reference(&self, plaintext_len: u64) -> Result<SegmentedPayloadHeader> {
+        Ok(SegmentedPayloadHeader {
+            format: SegmentedPayloadFormat::Streamable,
+            chunk_size: self.chunk_size,
+            plaintext_len,
+            key_id: self.key_id.clone(),
+            nonce_prefix: self.nonce_prefix,
+            header_len: self.header.len(),
+        })
+    }
+
+    pub(crate) fn sealed_len_for_plaintext_len(&self, plaintext_len: u64) -> Result<u64> {
+        let segment_count = segment_count_for_len(plaintext_len, self.chunk_size)?;
+        let ciphertext_len = plaintext_len
+            .checked_add(
+                segment_count
+                    .checked_mul(AEAD_TAG_LEN)
+                    .ok_or(StorageError::InvalidRange)?,
+            )
+            .ok_or(StorageError::InvalidRange)?;
+        u64::try_from(self.header.len())
+            .map_err(|_| StorageError::InvalidRange)?
+            .checked_add(ciphertext_len)
+            .ok_or_else(|| StorageError::InvalidRange.into())
+    }
+
+    pub(crate) fn seal_segment(
+        &self,
+        keyring: &KeyRing,
+        object_id: &BackendObjectId,
+        segment_index: usize,
+        plaintext: &[u8],
+        is_final: bool,
+    ) -> Result<Bytes> {
+        let segment_index_u64 =
+            u64::try_from(segment_index).map_err(|_| StorageError::InvalidRange)?;
+        let segment_plaintext_len =
+            u64::try_from(plaintext.len()).map_err(|_| StorageError::InvalidRange)?;
+        if segment_plaintext_len > self.chunk_size
+            || (!is_final && segment_plaintext_len != self.chunk_size)
+        {
+            return Err(invalid_payload_object(object_id));
+        }
+        let nonce = segment_nonce(&self.nonce_prefix, segment_index_u64, is_final)?;
+        let mut associated_data = Vec::with_capacity(segment_associated_data_capacity(object_id));
+        write_streamable_segment_associated_data(
+            &mut associated_data,
+            object_id,
+            self.chunk_size,
+            segment_index_u64,
+            is_final,
+            segment_plaintext_len,
+        );
+        let seal = keyring.seal_payload_with_nonce(&associated_data, plaintext, &nonce)?;
+        if seal.key_id != self.key_id {
+            return Err(invalid_payload_object(object_id));
+        }
+        Ok(seal.ciphertext.into())
+    }
 }
 
 /// Contiguous ciphertext span covering one or more selected segments.
@@ -73,6 +183,16 @@ pub(crate) fn seal_payload_object(
     seal_segmented_payload_object(keyring, object_id, plaintext, chunk_size)
 }
 
+/// Encrypts plaintext into the streamable v2 commit-embedded payload format.
+pub(crate) fn seal_streamable_payload_object(
+    keyring: &KeyRing,
+    object_id: &BackendObjectId,
+    plaintext: &[u8],
+    chunk_size: usize,
+) -> Result<Bytes> {
+    seal_streamable_segmented_payload_object(keyring, object_id, plaintext, chunk_size)
+}
+
 /// Selects an adaptive payload segment size for a plaintext object.
 pub(crate) fn adaptive_payload_segment_size(
     plaintext_len: usize,
@@ -104,12 +224,15 @@ pub(crate) fn probe_payload_header(
     object_id: &BackendObjectId,
     body: &[u8],
 ) -> Result<PayloadHeaderProbe> {
-    if !body.starts_with(PAYLOAD_OBJECT_DOMAIN) {
+    let Some(format) = probe_payload_format(body) else {
         return Err(invalid_payload_object(object_id));
-    }
+    };
 
-    let domain_len = PAYLOAD_OBJECT_DOMAIN.len();
-    let preamble_len = domain_len + U64_LEN + U64_LEN + U64_LEN;
+    let domain_len = format.domain().len();
+    let preamble_len = match format {
+        SegmentedPayloadFormat::LengthBearing => domain_len + U64_LEN + U64_LEN + U64_LEN,
+        SegmentedPayloadFormat::Streamable => domain_len + U64_LEN + U64_LEN,
+    };
     if body.len() < preamble_len {
         return Ok(PayloadHeaderProbe::NeedMore {
             len: u64::try_from(preamble_len).unwrap_or(u64::MAX),
@@ -118,7 +241,9 @@ pub(crate) fn probe_payload_header(
 
     let mut cursor = &body[domain_len..];
     let _chunk_size = read_u64(object_id, &mut cursor)?;
-    let _plaintext_len = read_u64(object_id, &mut cursor)?;
+    if format == SegmentedPayloadFormat::LengthBearing {
+        let _plaintext_len = read_u64(object_id, &mut cursor)?;
+    }
     let key_id_len = read_u64(object_id, &mut cursor)?;
     let key_id_len = usize::try_from(key_id_len).map_err(|_| invalid_payload_object(object_id))?;
     let header_len = preamble_len
@@ -143,9 +268,12 @@ pub(crate) fn parse_segmented_payload_header(
     else {
         return Err(invalid_payload_object(object_id));
     };
+    let Some(format) = probe_payload_format(body) else {
+        return Err(invalid_payload_object(object_id));
+    };
     let Some(mut cursor) = body
-        .get(PAYLOAD_OBJECT_DOMAIN.len()..header_len)
-        .filter(|_| body.starts_with(PAYLOAD_OBJECT_DOMAIN))
+        .get(format.domain().len()..header_len)
+        .filter(|_| body.starts_with(format.domain()))
     else {
         return Err(invalid_payload_object(object_id));
     };
@@ -154,7 +282,12 @@ pub(crate) fn parse_segmented_payload_header(
     if chunk_size == 0 {
         return Err(invalid_payload_object(object_id));
     }
-    let plaintext_len = read_u64(object_id, &mut cursor)?;
+    let plaintext_len = match format {
+        SegmentedPayloadFormat::LengthBearing => read_u64(object_id, &mut cursor)?,
+        SegmentedPayloadFormat::Streamable => {
+            streamable_plaintext_len_from_body(object_id, body, header_len, chunk_size)?
+        }
+    };
     let key_id = read_len_prefixed(object_id, &mut cursor)?;
     let key_id = std::str::from_utf8(key_id)
         .map_err(|_| invalid_payload_object(object_id))
@@ -169,6 +302,7 @@ pub(crate) fn parse_segmented_payload_header(
     let mut prefix = [0_u8; NONCE_PREFIX_LEN];
     prefix.copy_from_slice(nonce_prefix);
     Ok(SegmentedPayloadHeader {
+        format,
         chunk_size,
         plaintext_len,
         key_id,
@@ -383,6 +517,34 @@ fn seal_segmented_payload_object(
     Ok(Bytes::from(body))
 }
 
+fn seal_streamable_segmented_payload_object(
+    keyring: &KeyRing,
+    object_id: &BackendObjectId,
+    plaintext: &[u8],
+    chunk_size: usize,
+) -> Result<Bytes> {
+    let sealer = SegmentedPayloadSealer::new(keyring, chunk_size)?;
+    let mut body = Vec::with_capacity(
+        usize::try_from(
+            sealer
+                .sealed_len_for_plaintext_len(u64::try_from(plaintext.len()).map_err(|_| {
+                    StorageError::Provider("payload length does not fit in u64".to_owned())
+                })?)
+                .map_err(|_| StorageError::Provider("segmented payload too large".to_owned()))?,
+        )
+        .map_err(|_| StorageError::Provider("segmented payload too large".to_owned()))?,
+    );
+    body.extend_from_slice(&sealer.header());
+    let segment_count = plaintext.chunks(chunk_size).count();
+    for (segment_index, segment) in plaintext.chunks(chunk_size).enumerate() {
+        let is_final = segment_index + 1 == segment_count;
+        let ciphertext =
+            sealer.seal_segment(keyring, object_id, segment_index, segment, is_final)?;
+        body.extend_from_slice(&ciphertext);
+    }
+    Ok(Bytes::from(body))
+}
+
 fn segmented_payload_header_bytes(
     chunk_size: u64,
     plaintext_len: u64,
@@ -396,6 +558,27 @@ fn segmented_payload_header_bytes(
     body.extend_from_slice(PAYLOAD_OBJECT_DOMAIN);
     body.extend_from_slice(&chunk_size.to_be_bytes());
     body.extend_from_slice(&plaintext_len.to_be_bytes());
+    push_u64_len(&mut body, key_id.len());
+    body.extend_from_slice(key_id);
+    body.extend_from_slice(nonce_prefix);
+    body
+}
+
+fn streamable_segmented_payload_header_bytes(
+    chunk_size: u64,
+    key_id: &KeyId,
+    nonce_prefix: &[u8; NONCE_PREFIX_LEN],
+) -> Vec<u8> {
+    let key_id = key_id.as_str().as_bytes();
+    let mut body = Vec::with_capacity(
+        STREAMABLE_PAYLOAD_OBJECT_DOMAIN.len()
+            + U64_LEN
+            + U64_LEN
+            + key_id.len()
+            + NONCE_PREFIX_LEN,
+    );
+    body.extend_from_slice(STREAMABLE_PAYLOAD_OBJECT_DOMAIN);
+    body.extend_from_slice(&chunk_size.to_be_bytes());
     push_u64_len(&mut body, key_id.len());
     body.extend_from_slice(key_id);
     body.extend_from_slice(nonce_prefix);
@@ -440,18 +623,33 @@ fn open_segment(
 ) -> Result<Vec<u8>> {
     let segment_index_u64 = u64::try_from(segment_index).map_err(|_| StorageError::InvalidRange)?;
     let is_final = final_segment_index(header)? == segment_index;
+    let segment_plaintext_len = segment_plaintext_len(header, segment_index)?;
     let nonce = segment_nonce(&header.nonce_prefix, segment_index_u64, is_final)?;
-    write_segment_associated_data(
-        associated_data,
-        object_id,
-        header.chunk_size,
-        header.plaintext_len,
-        segment_index_u64,
-        is_final,
-    );
-    keyring
+    match header.format {
+        SegmentedPayloadFormat::LengthBearing => write_segment_associated_data(
+            associated_data,
+            object_id,
+            header.chunk_size,
+            header.plaintext_len,
+            segment_index_u64,
+            is_final,
+        ),
+        SegmentedPayloadFormat::Streamable => write_streamable_segment_associated_data(
+            associated_data,
+            object_id,
+            header.chunk_size,
+            segment_index_u64,
+            is_final,
+            segment_plaintext_len,
+        ),
+    }
+    let plaintext = keyring
         .open_payload(&header.key_id, associated_data, &nonce, ciphertext)
-        .map_err(Into::into)
+        .map_err(RepositoryError::from)?;
+    if u64::try_from(plaintext.len()).ok() != Some(segment_plaintext_len) {
+        return Err(invalid_payload_object(object_id));
+    }
+    Ok(plaintext)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -648,6 +846,7 @@ fn segment_nonce(
 fn segment_associated_data_capacity(object_id: &BackendObjectId) -> usize {
     PAYLOAD_SEGMENT_AAD_DOMAIN
         .len()
+        .max(STREAMABLE_PAYLOAD_SEGMENT_AAD_DOMAIN.len())
         .saturating_add(object_id.as_str().len())
         .saturating_add(1)
         .saturating_add(U64_LEN * 3)
@@ -670,6 +869,86 @@ fn write_segment_associated_data(
     aad.extend_from_slice(&plaintext_len.to_be_bytes());
     aad.extend_from_slice(&segment_index.to_be_bytes());
     aad.push(u8::from(is_final));
+}
+
+fn write_streamable_segment_associated_data(
+    aad: &mut Vec<u8>,
+    object_id: &BackendObjectId,
+    chunk_size: u64,
+    segment_index: u64,
+    is_final: bool,
+    segment_plaintext_len: u64,
+) {
+    aad.clear();
+    aad.extend_from_slice(STREAMABLE_PAYLOAD_SEGMENT_AAD_DOMAIN);
+    aad.extend_from_slice(object_id.as_str().as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(&chunk_size.to_be_bytes());
+    aad.extend_from_slice(&segment_index.to_be_bytes());
+    aad.push(u8::from(is_final));
+    aad.extend_from_slice(&segment_plaintext_len.to_be_bytes());
+}
+
+fn probe_payload_format(body: &[u8]) -> Option<SegmentedPayloadFormat> {
+    if body.starts_with(PAYLOAD_OBJECT_DOMAIN) {
+        Some(SegmentedPayloadFormat::LengthBearing)
+    } else if body.starts_with(STREAMABLE_PAYLOAD_OBJECT_DOMAIN) {
+        Some(SegmentedPayloadFormat::Streamable)
+    } else {
+        None
+    }
+}
+
+impl SegmentedPayloadFormat {
+    fn domain(self) -> &'static [u8] {
+        match self {
+            Self::LengthBearing => PAYLOAD_OBJECT_DOMAIN,
+            Self::Streamable => STREAMABLE_PAYLOAD_OBJECT_DOMAIN,
+        }
+    }
+}
+
+fn streamable_plaintext_len_from_body(
+    object_id: &BackendObjectId,
+    body: &[u8],
+    header_len: usize,
+    chunk_size: u64,
+) -> Result<u64> {
+    if body.len() < header_len {
+        return Err(invalid_payload_object(object_id));
+    }
+    let ciphertext_len =
+        u64::try_from(body.len() - header_len).map_err(|_| invalid_payload_object(object_id))?;
+    if ciphertext_len == 0 {
+        return Ok(0);
+    }
+    let full_ciphertext_segment_len = chunk_size
+        .checked_add(AEAD_TAG_LEN)
+        .ok_or(StorageError::InvalidRange)?;
+    let segment_count = ciphertext_len.div_ceil(full_ciphertext_segment_len);
+    let tag_bytes = segment_count
+        .checked_mul(AEAD_TAG_LEN)
+        .ok_or(StorageError::InvalidRange)?;
+    let plaintext_len = ciphertext_len
+        .checked_sub(tag_bytes)
+        .ok_or_else(|| invalid_payload_object(object_id))?;
+    let max_plaintext_len = segment_count
+        .checked_mul(chunk_size)
+        .ok_or(StorageError::InvalidRange)?;
+    if plaintext_len == 0 || plaintext_len > max_plaintext_len {
+        return Err(invalid_payload_object(object_id));
+    }
+    Ok(plaintext_len)
+}
+
+fn segment_count_for_len(plaintext_len: u64, chunk_size: u64) -> Result<u64> {
+    if chunk_size == 0 {
+        return Err(StorageError::InvalidRange.into());
+    }
+    if plaintext_len == 0 {
+        return Ok(0);
+    }
+    Ok(plaintext_len.div_ceil(chunk_size))
 }
 
 fn push_u64_len(body: &mut Vec<u8>, len: usize) {
@@ -716,9 +995,10 @@ mod tests {
     use super::{
         DEFAULT_PAYLOAD_SEGMENT_SIZE, PayloadHeaderProbe, open_payload_object,
         parse_segmented_payload_header, probe_payload_header, seal_payload_object,
-        segmented_ciphertext_span,
+        seal_streamable_payload_object, segmented_ciphertext_span,
     };
     use crate::tests::{backend_object_id, signing_keyring, wrong_content_keyring};
+    use bytes::Bytes;
     use rs3_storage::ByteRange;
 
     #[test]
@@ -752,6 +1032,72 @@ mod tests {
             probe_payload_header(&object_id, &body),
             Ok(PayloadHeaderProbe::Segmented { .. })
         ));
+    }
+
+    #[test]
+    fn streamable_payload_round_trips_exact_segment_and_supports_ranges() {
+        let keyring = signing_keyring();
+        let object_id = backend_object_id("v2-payload/exact");
+        let plaintext = vec![9_u8; DEFAULT_PAYLOAD_SEGMENT_SIZE];
+        let body = seal_streamable_payload_object(
+            &keyring,
+            &object_id,
+            &plaintext,
+            DEFAULT_PAYLOAD_SEGMENT_SIZE,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let header = parse_segmented_payload_header(&object_id, &body)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let range = open_payload_object(
+            &keyring,
+            &object_id,
+            body.clone(),
+            ByteRange::Slice { offset: 7, len: 11 },
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let full = open_payload_object(&keyring, &object_id, body, ByteRange::Full)
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(header.plaintext_len, DEFAULT_PAYLOAD_SEGMENT_SIZE as u64);
+        assert_eq!(range, Bytes::from(vec![9_u8; 11]));
+        assert_eq!(full, plaintext);
+    }
+
+    #[test]
+    fn streamable_payload_rejects_wrong_object_id() {
+        let keyring = signing_keyring();
+        let object_id = backend_object_id("v2-payload/object");
+        let other_id = backend_object_id("v2-payload/other");
+        let body = seal_streamable_payload_object(
+            &keyring,
+            &object_id,
+            b"authenticated identity",
+            DEFAULT_PAYLOAD_SEGMENT_SIZE,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        let opened = open_payload_object(&keyring, &other_id, body, ByteRange::Full);
+
+        assert!(opened.is_err());
+    }
+
+    #[test]
+    fn streamable_payload_rejects_truncated_ciphertext() {
+        let keyring = signing_keyring();
+        let object_id = backend_object_id("v2-payload/truncated");
+        let mut body = seal_streamable_payload_object(
+            &keyring,
+            &object_id,
+            b"truncated ciphertext",
+            DEFAULT_PAYLOAD_SEGMENT_SIZE,
+        )
+        .unwrap_or_else(|error| panic!("{error}"))
+        .to_vec();
+        body.truncate(body.len().saturating_sub(1));
+
+        let opened = open_payload_object(&keyring, &object_id, Bytes::from(body), ByteRange::Full);
+
+        assert!(opened.is_err());
     }
 
     #[test]

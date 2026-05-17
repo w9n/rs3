@@ -10,6 +10,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use rs3_storage::BlobOperationCounts;
 use serde_json::Value;
+use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
@@ -116,8 +117,11 @@ async fn gateway_write_committed(
         let operation_started = Instant::now();
         gateway_put_object(
             client,
+            gateway.addr,
+            &gateway.region,
             format!("perf/write-committed/object-{index:08}"),
             body.clone(),
+            args.gateway_unknown_length_put,
         )
         .await
         .with_context(|| format!("gateway PutObject failed for object {index}"))?;
@@ -128,7 +132,11 @@ async fn gateway_write_committed(
     let counts = gateway.backend_operation_counts().await?;
     gateway_write_report(
         args,
-        "write-committed",
+        if args.gateway_unknown_length_put {
+            "write-committed-unknown-length"
+        } else {
+            "write-committed"
+        },
         args.objects,
         args.objects,
         latencies,
@@ -144,6 +152,9 @@ async fn gateway_write_committed_parallel(
 ) -> Result<PerfReport> {
     let body = body(args.object_size);
     let parallelism = concurrency(args);
+    let unknown_length = args.gateway_unknown_length_put;
+    let gateway_addr = gateway.addr;
+    let gateway_region = gateway.region.clone();
     let mut latencies = Vec::with_capacity(args.objects);
     gateway.reset_captured_metrics().await?;
     let started = Instant::now();
@@ -155,12 +166,16 @@ async fn gateway_write_committed_parallel(
         for index in next..end {
             let client = client.clone();
             let body = body.clone();
+            let gateway_region = gateway_region.clone();
             handles.push(tokio::spawn(async move {
                 let operation_started = Instant::now();
                 gateway_put_object(
                     &client,
+                    gateway_addr,
+                    &gateway_region,
                     format!("perf/write-committed-parallel/object-{index:08}"),
                     body,
+                    unknown_length,
                 )
                 .await
                 .with_context(|| format!("gateway PutObject failed for object {index}"))?;
@@ -180,7 +195,11 @@ async fn gateway_write_committed_parallel(
     let counts = gateway.backend_operation_counts().await?;
     gateway_write_report(
         args,
-        "write-committed-parallel",
+        if args.gateway_unknown_length_put {
+            "write-committed-parallel-unknown-length"
+        } else {
+            "write-committed-parallel"
+        },
         args.objects,
         args.objects,
         latencies,
@@ -195,9 +214,16 @@ async fn gateway_full_read(
     gateway: &RunningPerfGateway,
 ) -> Result<PerfReport> {
     let key = "perf/read/full-object";
-    gateway_put_object(client, key, body(args.object_size))
-        .await
-        .context("failed to prepare gateway full-read object")?;
+    gateway_put_object(
+        client,
+        gateway.addr,
+        &gateway.region,
+        key,
+        body(args.object_size),
+        false,
+    )
+    .await
+    .context("failed to prepare gateway full-read object")?;
     gateway.reset_captured_metrics().await?;
 
     let mut latencies = Vec::with_capacity(args.reads);
@@ -251,9 +277,16 @@ async fn gateway_range_read(
     }
 
     let key = "perf/read/range-object";
-    gateway_put_object(client, key, body(args.object_size))
-        .await
-        .context("failed to prepare gateway range-read object")?;
+    gateway_put_object(
+        client,
+        gateway.addr,
+        &gateway.region,
+        key,
+        body(args.object_size),
+        false,
+    )
+    .await
+    .context("failed to prepare gateway range-read object")?;
     gateway.reset_captured_metrics().await?;
 
     let offset_window = args.object_size.saturating_sub(range_len);
@@ -335,18 +368,92 @@ fn gateway_write_report(
 
 async fn gateway_put_object(
     client: &aws_sdk_s3::Client,
+    gateway_addr: SocketAddr,
+    gateway_region: &str,
     key: impl Into<String>,
     body: Bytes,
+    unknown_length: bool,
 ) -> Result<()> {
+    let key = key.into();
+    if unknown_length {
+        let gateway_region = gateway_region.to_owned();
+        tokio::task::spawn_blocking(move || {
+            gateway_put_object_unknown_len_with_curl(gateway_addr, &gateway_region, key, body)
+        })
+        .await
+        .context("unknown-length gateway PutObject task did not complete")??;
+        return Ok(());
+    }
+
     client
         .put_object()
         .bucket(GATEWAY_PUBLIC_BUCKET)
-        .key(key.into())
+        .key(key)
         .body(ByteStream::from(body))
         .send()
         .await
         .context("gateway PutObject request failed")?;
     Ok(())
+}
+
+fn gateway_put_object_unknown_len_with_curl(
+    gateway_addr: SocketAddr,
+    gateway_region: &str,
+    key: String,
+    body: Bytes,
+) -> Result<()> {
+    let url = format!("http://{gateway_addr}/{GATEWAY_PUBLIC_BUCKET}/{key}");
+    let sigv4 = format!("aws:amz:{gateway_region}:s3");
+    let user = format!("{GATEWAY_ACCESS_KEY_ID}:{GATEWAY_SECRET_ACCESS_KEY}");
+    let mut child = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--http1.1",
+            "--aws-sigv4",
+            &sigv4,
+            "--user",
+            &user,
+            "--upload-file",
+            "-",
+            "--header",
+            "x-amz-content-sha256: UNSIGNED-PAYLOAD",
+            "--header",
+            "Transfer-Encoding: chunked",
+            "--header",
+            "Content-Length:",
+            "--output",
+            "/dev/null",
+            "--write-out",
+            "%{http_code}",
+            &url,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start curl for unknown-length gateway PutObject")?;
+    let mut stdin = child.stdin.take().context("curl stdin was not captured")?;
+    stdin
+        .write_all(&body)
+        .context("failed to stream unknown-length body to curl")?;
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for curl unknown-length PutObject")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() && stdout.trim() == "200" {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::bail!(
+        "curl unknown-length PutObject failed with status {} stdout {:?} stderr {:?}",
+        output.status,
+        stdout.trim(),
+        stderr.trim()
+    );
 }
 
 async fn gateway_get_object(
@@ -376,6 +483,7 @@ async fn gateway_get_object(
 
 struct RunningPerfGateway {
     addr: SocketAddr,
+    region: String,
     child: Child,
     logs: Arc<Mutex<Vec<String>>>,
     readers: Vec<JoinHandle<()>>,
@@ -479,6 +587,7 @@ impl RunningPerfGateway {
 
         let mut gateway = Self {
             addr,
+            region: backend.region.clone(),
             child,
             logs,
             readers,

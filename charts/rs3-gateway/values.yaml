@@ -12,6 +12,15 @@ service:
 gateway:
   mode: read-write
 
+hardening:
+  maxPutObjectBytes: 5368709120
+  bufferedPutObjectBytes: 67108864
+  backendMultipartPartBytes: 16777216
+  maxInFlightUploadBodyBytes: 536870912
+  maxConcurrentConnections: 1024
+  maxConcurrentRequests: 256
+  requestRateLimitPerSecond: 1024
+
 publicBucket: client-bucket
 
 backend:

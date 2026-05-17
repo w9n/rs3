@@ -18,8 +18,8 @@ pub use admin_http::{
     AdminHttpServerError, AdminHttpService,
 };
 pub use config::{
-    AnchorConfig, BackendConfig, BatchConfig, ConfigError, GatewayMode, MetricsConfig,
-    RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig,
+    AnchorConfig, BackendConfig, BatchConfig, ConfigError, GatewayMode, HardeningConfig,
+    MetricsConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig,
 };
 pub use identity::{
     AuthError, Authorizer, Identity, IdentityProvider, RequestAction, StaticCredentialProvider,

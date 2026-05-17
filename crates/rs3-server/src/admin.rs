@@ -132,6 +132,20 @@ pub struct AdminSecuritySummary {
     pub path_browsing_enabled: bool,
     /// Whether report responses include configured secret material.
     pub secrets_exposed: bool,
+    /// Maximum accepted `PutObject` request body size.
+    pub max_put_object_bytes: u64,
+    /// Largest `PutObject` body buffered as a single repository write.
+    pub buffered_put_object_bytes: u64,
+    /// Provider multipart part size for large streaming `PutObject` writes.
+    pub backend_multipart_part_bytes: u64,
+    /// Admission budget for request body bytes held by in-flight upload operations.
+    pub max_in_flight_upload_body_bytes: u64,
+    /// Maximum simultaneously open S3 listener connections.
+    pub max_concurrent_connections: usize,
+    /// Maximum concurrently executing S3 operations.
+    pub max_concurrent_requests: usize,
+    /// Per-process S3 operation admission limit per second.
+    pub request_rate_limit_per_second: u64,
     /// Core report action posture.
     pub action_posture: &'static str,
 }
@@ -264,6 +278,13 @@ pub async fn admin_status_report(
         security: AdminSecuritySummary {
             path_browsing_enabled: false,
             secrets_exposed: false,
+            max_put_object_bytes: config.hardening.max_put_object_bytes,
+            buffered_put_object_bytes: config.hardening.buffered_put_object_bytes,
+            backend_multipart_part_bytes: config.hardening.backend_multipart_part_bytes,
+            max_in_flight_upload_body_bytes: config.hardening.max_in_flight_upload_body_bytes,
+            max_concurrent_connections: config.hardening.max_concurrent_connections,
+            max_concurrent_requests: config.hardening.max_concurrent_requests,
+            request_rate_limit_per_second: config.hardening.request_rate_limit_per_second,
             action_posture: "report-only",
         },
         restore,
@@ -312,6 +333,13 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         )),
         "s3-compatible" => {}
         _ => {}
+    }
+
+    if config.backend.endpoint.starts_with("http://") {
+        findings.push(AdminFinding::error(
+            "backend.plain-http",
+            "production profile requires TLS for S3-compatible backend endpoints",
+        ));
     }
 
     if config.static_credentials.is_none() {
@@ -455,6 +483,14 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
         .unwrap_or(0)
         .to_string();
     let static_credentials = config.static_credentials.is_some().to_string();
+    let max_put_object_bytes = config.hardening.max_put_object_bytes.to_string();
+    let buffered_put_object_bytes = config.hardening.buffered_put_object_bytes.to_string();
+    let backend_multipart_part_bytes = config.hardening.backend_multipart_part_bytes.to_string();
+    let max_in_flight_upload_body_bytes =
+        config.hardening.max_in_flight_upload_body_bytes.to_string();
+    let max_concurrent_connections = config.hardening.max_concurrent_connections.to_string();
+    let max_concurrent_requests = config.hardening.max_concurrent_requests.to_string();
+    let request_rate_limit_per_second = config.hardening.request_rate_limit_per_second.to_string();
     let fields = [
         anchor.as_bytes(),
         gateway_mode.as_bytes(),
@@ -470,6 +506,13 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
         retention_mode.as_bytes(),
         retention_days.as_bytes(),
         static_credentials.as_bytes(),
+        max_put_object_bytes.as_bytes(),
+        buffered_put_object_bytes.as_bytes(),
+        backend_multipart_part_bytes.as_bytes(),
+        max_in_flight_upload_body_bytes.as_bytes(),
+        max_concurrent_connections.as_bytes(),
+        max_concurrent_requests.as_bytes(),
+        request_rate_limit_per_second.as_bytes(),
     ];
 
     derive_public_fingerprint(b"rs3:server-runtime-config-profile:v1", &fields)
@@ -490,8 +533,9 @@ mod tests {
         runtime_config_profile,
     };
     use crate::{
-        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig, RepositoryConfig,
-        RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
+        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
+        RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, SecretString,
+        StaticCredentials,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use std::time::Duration;
@@ -503,6 +547,7 @@ mod tests {
                 .parse()
                 .unwrap_or_else(|error| panic!("{error}")),
             metrics: MetricsConfig { bind: None },
+            hardening: HardeningConfig::default(),
             public_bucket: PublicBucket::new("client-private-bucket")
                 .unwrap_or_else(|error| panic!("{error}")),
             backend: BackendConfig {
@@ -572,6 +617,29 @@ mod tests {
         assert!(codes.contains(&"retention.missing"));
         assert!(codes.contains(&"backend.memory"));
         assert!(codes.contains(&"auth.static-credentials"));
+    }
+
+    #[test]
+    fn production_doctor_rejects_plain_http_backend_endpoint() {
+        let mut config = runtime_config();
+        config.backend.endpoint = "http://storage.example".to_owned();
+        config.anchor = AnchorConfig::KubernetesLease {
+            namespace: "backup".to_owned(),
+            name: "v2-anchor".to_owned(),
+            field_manager: "rs3-server".to_owned(),
+        };
+        config.static_credentials = Some(StaticCredentials {
+            access_key_id: "access".to_owned(),
+            secret_access_key: SecretString::from("secret"),
+        });
+
+        let findings = doctor_findings(&config, AdminReportProfile::Production);
+        let codes = findings
+            .iter()
+            .map(|finding| finding.code)
+            .collect::<Vec<_>>();
+
+        assert!(codes.contains(&"backend.plain-http"));
     }
 
     #[test]

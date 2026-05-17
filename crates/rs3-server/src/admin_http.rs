@@ -356,9 +356,9 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 mod tests {
     use super::{AdminBearerToken, AdminHttpAuth, AdminHttpService};
     use crate::{
-        AdminReportProfile, AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig,
-        RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, SecretString,
-        StaticCredentials,
+        AdminReportProfile, AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig,
+        MetricsConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig,
+        SecretString, StaticCredentials,
     };
     use bytes::Bytes;
     use http::header::AUTHORIZATION;
@@ -381,6 +381,7 @@ mod tests {
             mode: GatewayMode::ReadWrite,
             bind,
             metrics: MetricsConfig { bind: None },
+            hardening: HardeningConfig::default(),
             public_bucket,
             backend: BackendConfig {
                 endpoint: "memory://local".to_owned(),

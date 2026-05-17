@@ -79,6 +79,15 @@ pub enum V2FormatError {
     /// Section offsets, lengths, or physical coverage were invalid.
     #[error("invalid v2 commit section layout")]
     SectionBounds,
+    /// A streamed object exceeded the configured maximum plaintext length.
+    #[error("v2 streamed object exceeds configured maximum size")]
+    ObjectTooLarge,
+    /// A streamed object body did not match its declared plaintext length.
+    #[error("v2 streamed object length did not match the declared size")]
+    ObjectLengthMismatch,
+    /// A streamed object body could not be read from the caller.
+    #[error("v2 streamed object body read failed")]
+    ObjectBodyReadFailed,
     /// A section marked must-understand is not supported by this reader.
     #[error("unsupported v2 commit section")]
     UnsupportedSection,
@@ -133,7 +142,10 @@ impl V2FormatError {
     /// Returns the operator-facing class for this error.
     pub const fn class(&self) -> V2ErrorClass {
         match self {
-            Self::RandomnessUnavailable => V2ErrorClass::RetryableClient,
+            Self::RandomnessUnavailable
+            | Self::ObjectTooLarge
+            | Self::ObjectLengthMismatch
+            | Self::ObjectBodyReadFailed => V2ErrorClass::RetryableClient,
             Self::ProviderProfileFailed => V2ErrorClass::ProviderConformance,
             Self::RecoveryBundleRequired => V2ErrorClass::OperatorActionRequired,
             Self::RollbackUnsafeDr => V2ErrorClass::RollbackUnsafeDr,

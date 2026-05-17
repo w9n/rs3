@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use rs3_repository::v2::{V2AnchorState, V2CommitAnchor, V2Result};
-use rs3_storage::{BlobMetadata, BlobStore, ByteRange, PutOptions};
+use rs3_storage::{BlobMetadata, BlobMultipartUpload, BlobStore, ByteRange, PutOptions};
 use std::sync::Arc;
 
 pub(super) type RuntimeStore = DynBlobStore;
@@ -28,6 +28,18 @@ impl BlobStore for DynBlobStore {
         options: PutOptions,
     ) -> rs3_storage::Result<BlobMetadata> {
         self.inner.put(object_id, body, options).await
+    }
+
+    fn supports_multipart_upload(&self) -> bool {
+        self.inner.supports_multipart_upload()
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        options: PutOptions,
+    ) -> rs3_storage::Result<Box<dyn BlobMultipartUpload>> {
+        self.inner.create_multipart_upload(object_id, options).await
     }
 
     async fn get_range(

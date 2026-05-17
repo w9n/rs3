@@ -6,6 +6,8 @@ use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
 use serde::{Deserialize, Serialize};
 
+const S3_MIN_MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
+
 /// v2 storage-provider profile selected for a repository.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum V2ProviderProfile {
@@ -144,6 +146,7 @@ where
 {
     let mut checks = Vec::new();
     run_basic_surface_checks(store, options, &mut checks).await?;
+    run_multipart_checks(store, options, &mut checks).await?;
 
     match options.profile {
         V2ProviderProfile::Dev => {}
@@ -159,6 +162,273 @@ where
         profile: options.profile,
         checks,
     })
+}
+
+async fn run_multipart_checks<S>(
+    store: &S,
+    options: &V2ProviderConformanceOptions,
+    checks: &mut Vec<V2ProviderConformanceCheck>,
+) -> V2Result<()>
+where
+    S: BlobStore,
+{
+    if !store.supports_multipart_upload() {
+        checks.push(V2ProviderConformanceCheck::failed(
+            "multipart-supported",
+            "multipart upload unsupported",
+        ));
+        return Ok(());
+    }
+    checks.push(V2ProviderConformanceCheck::passed("multipart-supported"));
+
+    let object_id = probe_object_id(options, "multipart")?;
+    let first_part = Bytes::from(vec![b'a'; S3_MIN_MULTIPART_PART_BYTES]);
+    let second_part = Bytes::from_static(b"tail-conformance");
+    let content_len = u64::try_from(first_part.len() + second_part.len())
+        .map_err(|_| V2FormatError::SectionBounds)?;
+
+    let mut upload = match store
+        .create_multipart_upload(
+            &object_id,
+            PutOptions {
+                retention: retention_for_profile(options),
+                legal_hold: None,
+                content_type: Some("application/octet-stream".to_owned()),
+                do_not_recreate: options.profile == V2ProviderProfile::AtomicCreate,
+            },
+        )
+        .await
+    {
+        Ok(upload) => {
+            checks.push(V2ProviderConformanceCheck::passed("multipart-create"));
+            upload
+        }
+        Err(_) => {
+            checks.push(V2ProviderConformanceCheck::failed(
+                "multipart-create",
+                "create multipart upload failed",
+            ));
+            return Ok(());
+        }
+    };
+
+    if upload.put_part(0, first_part.clone()).await.is_err()
+        || upload.put_part(1, second_part.clone()).await.is_err()
+    {
+        let _ = upload.abort().await;
+        checks.push(V2ProviderConformanceCheck::failed(
+            "multipart-put-part",
+            "part upload failed",
+        ));
+        return Ok(());
+    }
+    checks.push(V2ProviderConformanceCheck::passed("multipart-put-part"));
+
+    let metadata = match upload.complete().await {
+        Ok(metadata) if metadata.content_len == content_len => {
+            checks.push(V2ProviderConformanceCheck::passed("multipart-complete"));
+            metadata
+        }
+        Ok(_) => {
+            checks.push(V2ProviderConformanceCheck::failed(
+                "multipart-complete",
+                "metadata mismatch",
+            ));
+            return Ok(());
+        }
+        Err(_) => {
+            checks.push(V2ProviderConformanceCheck::failed(
+                "multipart-complete",
+                "complete failed",
+            ));
+            return Ok(());
+        }
+    };
+
+    match store.head(&object_id).await {
+        Ok(head) if head.content_len == content_len => {
+            checks.push(V2ProviderConformanceCheck::passed("multipart-head"));
+        }
+        Ok(_) => checks.push(V2ProviderConformanceCheck::failed(
+            "multipart-head",
+            "metadata mismatch",
+        )),
+        Err(_) => checks.push(V2ProviderConformanceCheck::failed(
+            "multipart-head",
+            "head failed",
+        )),
+    }
+
+    match store
+        .get_range_at(
+            &object_id,
+            metadata.version_id.as_ref(),
+            ByteRange::Slice {
+                offset: u64::try_from(S3_MIN_MULTIPART_PART_BYTES - 4)
+                    .map_err(|_| V2FormatError::SectionBounds)?,
+                len: 8,
+            },
+        )
+        .await
+    {
+        Ok(read) if read == Bytes::from_static(b"aaaatail") => {
+            checks.push(V2ProviderConformanceCheck::passed(
+                "multipart-boundary-range-get",
+            ));
+        }
+        Ok(_) => checks.push(V2ProviderConformanceCheck::failed(
+            "multipart-boundary-range-get",
+            "range mismatch",
+        )),
+        Err(_) => checks.push(V2ProviderConformanceCheck::failed(
+            "multipart-boundary-range-get",
+            "range get failed",
+        )),
+    }
+
+    if options.profile == V2ProviderProfile::RetainedVersionObjectLock {
+        match metadata.version_id.as_ref() {
+            Some(version_id) => {
+                checks.push(V2ProviderConformanceCheck::passed(
+                    "multipart-retained-version-id",
+                ));
+                match store.head_at(&object_id, Some(version_id)).await {
+                    Ok(head)
+                        if retention_satisfies(head.retention.as_ref(), &options.retention) =>
+                    {
+                        checks.push(V2ProviderConformanceCheck::passed(
+                            "multipart-retained-exact-head",
+                        ));
+                    }
+                    Ok(_) => checks.push(V2ProviderConformanceCheck::failed(
+                        "multipart-retained-exact-head",
+                        "retention metadata mismatch",
+                    )),
+                    Err(_) => checks.push(V2ProviderConformanceCheck::failed(
+                        "multipart-retained-exact-head",
+                        "exact head failed",
+                    )),
+                }
+            }
+            None => checks.push(V2ProviderConformanceCheck::failed(
+                "multipart-retained-version-id",
+                "missing version id",
+            )),
+        }
+    }
+
+    if options.profile == V2ProviderProfile::AtomicCreate {
+        run_multipart_atomic_complete_check(store, options, checks).await?;
+    }
+
+    Ok(())
+}
+
+async fn run_multipart_atomic_complete_check<S>(
+    store: &S,
+    options: &V2ProviderConformanceOptions,
+    checks: &mut Vec<V2ProviderConformanceCheck>,
+) -> V2Result<()>
+where
+    S: BlobStore,
+{
+    let object_id = probe_object_id(options, "multipart-atomic-complete")?;
+    let original = Bytes::from_static(b"v2-multipart-atomic-original");
+    let mut upload = match store
+        .create_multipart_upload(
+            &object_id,
+            PutOptions {
+                retention: None,
+                legal_hold: None,
+                content_type: None,
+                do_not_recreate: true,
+            },
+        )
+        .await
+    {
+        Ok(upload) => upload,
+        Err(_) => {
+            checks.push(V2ProviderConformanceCheck::failed(
+                "multipart-atomic-open-before-race",
+                "create multipart upload failed",
+            ));
+            return Ok(());
+        }
+    };
+    checks.push(V2ProviderConformanceCheck::passed(
+        "multipart-atomic-open-before-race",
+    ));
+
+    if store
+        .put(
+            &object_id,
+            original.clone(),
+            PutOptions {
+                retention: None,
+                legal_hold: None,
+                content_type: None,
+                do_not_recreate: true,
+            },
+        )
+        .await
+        .is_err()
+    {
+        let _ = upload.abort().await;
+        checks.push(V2ProviderConformanceCheck::failed(
+            "multipart-atomic-racing-put",
+            "racing put failed",
+        ));
+        return Ok(());
+    }
+    checks.push(V2ProviderConformanceCheck::passed(
+        "multipart-atomic-racing-put",
+    ));
+
+    if upload
+        .put_part(0, Bytes::from(vec![b'z'; S3_MIN_MULTIPART_PART_BYTES]))
+        .await
+        .is_err()
+    {
+        let _ = upload.abort().await;
+        checks.push(V2ProviderConformanceCheck::failed(
+            "multipart-atomic-put-part",
+            "part upload failed",
+        ));
+        return Ok(());
+    }
+    checks.push(V2ProviderConformanceCheck::passed(
+        "multipart-atomic-put-part",
+    ));
+
+    match upload.complete().await {
+        Err(StorageError::AlreadyExists(_)) => checks.push(V2ProviderConformanceCheck::passed(
+            "multipart-atomic-complete-rejected",
+        )),
+        Ok(_) => checks.push(V2ProviderConformanceCheck::failed(
+            "multipart-atomic-complete-rejected",
+            "complete accepted after racing create",
+        )),
+        Err(_) => checks.push(V2ProviderConformanceCheck::failed(
+            "multipart-atomic-complete-rejected",
+            "unexpected complete error",
+        )),
+    }
+
+    match store.get_range(&object_id, ByteRange::Full).await {
+        Ok(read) if read == original => checks.push(V2ProviderConformanceCheck::passed(
+            "multipart-atomic-preserves-existing",
+        )),
+        Ok(_) => checks.push(V2ProviderConformanceCheck::failed(
+            "multipart-atomic-preserves-existing",
+            "existing bytes changed",
+        )),
+        Err(_) => checks.push(V2ProviderConformanceCheck::failed(
+            "multipart-atomic-preserves-existing",
+            "read failed",
+        )),
+    }
+
+    Ok(())
 }
 
 async fn run_basic_surface_checks<S>(
@@ -642,6 +912,10 @@ fn probe_object_id(
         options.probe_prefix.trim_end_matches('/')
     ))
     .map_err(Into::into)
+}
+
+fn retention_for_profile(options: &V2ProviderConformanceOptions) -> Option<RetentionPolicy> {
+    (options.profile == V2ProviderProfile::RetainedVersionObjectLock).then_some(options.retention)
 }
 
 fn retention_satisfies(actual: Option<&RetentionPolicy>, requested: &RetentionPolicy) -> bool {

@@ -14,6 +14,7 @@ pub(super) fn storage_error_result(error: &StorageError) -> &'static str {
         StorageError::MissingVersionId(_) => "missing_version_id",
         StorageError::LegalHoldBlocked => "legal_hold_blocked",
         StorageError::LegalHoldUnsupported => "legal_hold_unsupported",
+        StorageError::MultipartUnsupported => "multipart_unsupported",
         StorageError::Provider(_) => "error",
     }
 }

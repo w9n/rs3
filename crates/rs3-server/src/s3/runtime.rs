@@ -3,6 +3,7 @@
 use super::S3BoundaryError;
 use crate::{GatewayMode, RuntimeConfig};
 use bytes::Bytes;
+use futures_util::Stream;
 use rs3_repository::{
     DeleteOutcome, RepositoryError, RepositoryListEntry, RepositoryObjectMetadata,
     RepositoryPutOptions,
@@ -52,6 +53,56 @@ impl RuntimeRepository {
     ) -> Result<RuntimeCommittedPut, RepositoryError> {
         self.inner
             .put_committed(key, body, options)
+            .await
+            .map(|metadata| RuntimeCommittedPut { metadata })
+    }
+
+    pub(super) fn supports_streaming_put(&self) -> bool {
+        self.inner.supports_streaming_put()
+    }
+
+    pub(super) async fn put_committed_streaming_known_len<St>(
+        &self,
+        key: LogicalPath,
+        plaintext_len: u64,
+        stream: St,
+        options: RepositoryPutOptions,
+        multipart_part_size: usize,
+    ) -> Result<RuntimeCommittedPut, RepositoryError>
+    where
+        St: Stream<Item = Result<Bytes, RepositoryError>> + Unpin + Send,
+    {
+        self.inner
+            .put_committed_streaming_known_len(
+                key,
+                plaintext_len,
+                stream,
+                options,
+                multipart_part_size,
+            )
+            .await
+            .map(|metadata| RuntimeCommittedPut { metadata })
+    }
+
+    pub(super) async fn put_committed_streaming_unknown_len<St>(
+        &self,
+        key: LogicalPath,
+        stream: St,
+        options: RepositoryPutOptions,
+        multipart_part_size: usize,
+        max_plaintext_len: u64,
+    ) -> Result<RuntimeCommittedPut, RepositoryError>
+    where
+        St: Stream<Item = Result<Bytes, RepositoryError>> + Unpin + Send,
+    {
+        self.inner
+            .put_committed_streaming_unknown_len(
+                key,
+                stream,
+                options,
+                multipart_part_size,
+                max_plaintext_len,
+            )
             .await
             .map(|metadata| RuntimeCommittedPut { metadata })
     }

@@ -2,8 +2,8 @@
 
 use rs3_server::{
     AnchorConfig, BackendConfig, BatchConfig, GatewayMode, GatewayServer, GatewayServerError,
-    MetricsConfig, RepositoryConfig, RepositoryKeysConfig, RuntimeConfig, SecretString,
-    StaticCredentials,
+    HardeningConfig, MetricsConfig, RepositoryConfig, RepositoryKeysConfig, RuntimeConfig,
+    SecretString, StaticCredentials,
 };
 use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
 use std::net::SocketAddr;
@@ -110,6 +110,7 @@ fn runtime_config() -> RuntimeConfig {
         mode: GatewayMode::ReadWrite,
         bind,
         metrics: MetricsConfig { bind: None },
+        hardening: HardeningConfig::default(),
         public_bucket,
         backend: BackendConfig {
             endpoint: "memory://local".to_owned(),

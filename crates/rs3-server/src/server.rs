@@ -6,9 +6,11 @@ use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -72,12 +74,17 @@ impl GatewayServer {
         F: Future<Output = ()>,
     {
         let GatewayServer {
-            boundary, listener, ..
+            config,
+            boundary,
+            listener,
+            ..
         } = self;
         let service = boundary.into_service();
         let connection_builder = ConnectionBuilder::new(TokioExecutor::new());
         let graceful = GracefulShutdown::new();
         let mut shutdown = std::pin::pin!(shutdown);
+        let connection_slots =
+            Arc::new(Semaphore::new(config.hardening.max_concurrent_connections));
 
         loop {
             let (stream, remote_addr) = tokio::select! {
@@ -89,11 +96,23 @@ impl GatewayServer {
                 }
             };
 
+            let connection_permit = match connection_slots.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_error) => {
+                    record_s3_connection_rejection();
+                    tracing::debug!(
+                        %remote_addr,
+                        "S3 HTTP connection rejected by configured connection limit",
+                    );
+                    continue;
+                }
+            };
             let connection =
                 connection_builder.serve_connection(TokioIo::new(stream), service.clone());
             let connection = graceful.watch(connection.into_owned());
 
             tokio::spawn(async move {
+                let _connection_permit = connection_permit;
                 if let Err(error) = connection.await {
                     tracing::debug!(
                         %remote_addr,
@@ -113,6 +132,10 @@ impl GatewayServer {
             }
         }
     }
+}
+
+fn record_s3_connection_rejection() {
+    metrics::counter!("rs3_s3_connection_admission_rejections_total").increment(1);
 }
 
 /// Server binding and serving errors.
@@ -146,6 +169,7 @@ pub enum GatewayServerError {
 #[cfg(test)]
 mod tests {
     use super::{GatewayServer, GatewayServerError};
+    use crate::HardeningConfig;
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig, RepositoryConfig,
         RepositoryKeysConfig, RuntimeConfig, SecretString,
@@ -167,6 +191,7 @@ mod tests {
             mode: GatewayMode::ReadWrite,
             bind,
             metrics: MetricsConfig { bind: None },
+            hardening: HardeningConfig::default(),
             public_bucket,
             backend: BackendConfig {
                 endpoint: "memory://local".to_owned(),

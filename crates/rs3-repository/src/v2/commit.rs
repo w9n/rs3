@@ -330,6 +330,14 @@ impl V2CommitHeader {
         span.extend_from_slice(section_region);
         Ok(Bytes::from(span))
     }
+
+    /// Encodes only the signed fixed/header span for multipart assembly.
+    pub(crate) fn encode_header_span(&self, upload_mode: V2UploadMode) -> V2Result<Bytes> {
+        let mut span = header_span(self, upload_mode, SignatureMode::Actual)?;
+        let digest = Sha256::digest(&span);
+        span[HEADER_DIGEST_START..HEADER_DIGEST_END].copy_from_slice(&digest);
+        Ok(Bytes::from(span))
+    }
 }
 
 /// Parsed v2 commit header plus fixed-header metadata.

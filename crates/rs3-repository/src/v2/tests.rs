@@ -322,6 +322,14 @@ impl SlowCommitGetStore {
         *guard = Some(object_id);
     }
 
+    fn clear_corruption(&self) {
+        let mut guard = self
+            .corrupt_ranged_commit_gets_for
+            .lock()
+            .expect("corruption target lock should not be poisoned");
+        *guard = None;
+    }
+
     fn maybe_corrupt_commit_range(
         &self,
         object_id: &BackendObjectId,
@@ -710,6 +718,26 @@ async fn dev_provider_conformance_passes_on_memory_store() {
     let report = must_v2(check_v2_provider_conformance(&store, &options).await);
 
     assert!(report.passed());
+    assert!(report.checks.iter().any(|check| {
+        check.name == "multipart-complete" && check.status == V2ProviderCheckStatus::Passed
+    }));
+}
+
+#[tokio::test]
+async fn atomic_provider_conformance_checks_multipart_create_only() {
+    let store = MemoryBlobStore::new();
+    let options = V2ProviderConformanceOptions::new(
+        V2ProviderProfile::AtomicCreate,
+        "v2-provider/atomic-reviewed",
+    );
+
+    let report = must_v2(check_v2_provider_conformance(&store, &options).await);
+
+    assert!(report.passed());
+    assert!(report.checks.iter().any(|check| {
+        check.name == "multipart-atomic-complete-rejected"
+            && check.status == V2ProviderCheckStatus::Passed
+    }));
 }
 
 #[tokio::test]
@@ -744,6 +772,10 @@ async fn retained_provider_conformance_passes_on_memory_store_with_review_flag()
     let report = must_v2(check_v2_provider_conformance(&store, &options).await);
 
     assert!(report.passed());
+    assert!(report.checks.iter().any(|check| {
+        check.name == "multipart-retained-exact-head"
+            && check.status == V2ProviderCheckStatus::Passed
+    }));
 }
 
 #[tokio::test]
@@ -1160,6 +1192,124 @@ async fn v2_repository_range_read_rejects_corrupted_payload_ciphertext() {
         .await;
 
     assert!(matches!(error, Err(RepositoryError::Crypto(_))));
+}
+
+#[tokio::test]
+async fn v2_repository_full_read_does_not_cache_unauthenticated_payload_section() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    );
+    let anchor = V2MemoryAnchor::new();
+    let key =
+        LogicalPath::new("snapshots/v2-corrupt-full.bin").unwrap_or_else(|error| panic!("{error}"));
+    let body = Bytes::from(vec![17_u8; 2048]);
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                key.clone(),
+                body.clone(),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    let accepted = must_v2(anchor.read_v2().await).expect("v2 anchor should exist");
+    store.corrupt_ranged_commit_gets_for(accepted.commit_key);
+
+    let corrupted = repository.get_range(&key, ByteRange::Full).await;
+    assert!(matches!(corrupted, Err(RepositoryError::Crypto(_))));
+
+    store.clear_corruption();
+    let repaired = must_repo(repository.get_range(&key, ByteRange::Full).await);
+    assert_eq!(repaired, body);
+}
+
+#[tokio::test]
+async fn v2_repository_range_read_rejects_payload_length_metadata_mismatch() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let anchor = V2MemoryAnchor::new();
+    let key = LogicalPath::new("snapshots/v2-length-mismatch.bin")
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                key.clone(),
+                Bytes::from(vec![21_u8; 2048]),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+
+    must_repo(repository.shorten_accepted_payload_section_for_tests(2048));
+
+    let error = repository
+        .get_range(&key, ByteRange::Slice { offset: 0, len: 64 })
+        .await;
+
+    assert!(matches!(
+        error,
+        Err(RepositoryError::InvalidObjectFormat { .. })
+    ));
+}
+
+#[tokio::test]
+async fn v2_repository_range_read_rejects_payload_plaintext_length_metadata_mismatch() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let anchor = V2MemoryAnchor::new();
+    let key = LogicalPath::new("snapshots/v2-plaintext-length-mismatch.bin")
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                key.clone(),
+                Bytes::from(vec![22_u8; 2048]),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+
+    must_repo(repository.shorten_accepted_content_len_for_tests(2048));
+
+    let error = repository
+        .get_range(&key, ByteRange::Slice { offset: 0, len: 64 })
+        .await;
+
+    assert!(matches!(
+        error,
+        Err(RepositoryError::InvalidObjectFormat { .. })
+    ));
 }
 
 #[tokio::test]

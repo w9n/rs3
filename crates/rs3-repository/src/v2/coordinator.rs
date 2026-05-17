@@ -6,6 +6,7 @@ use crate::commit::CommitCoordinatorOptions;
 use crate::error::{RepositoryError, Result};
 use crate::model::{DeleteOutcome, RepositoryObjectMetadata, RepositoryPutOptions};
 use bytes::Bytes;
+use futures_util::Stream;
 use rs3_storage::BlobStore;
 use rs3_types::{LegalHoldStatus, LogicalPath};
 use std::sync::Arc;
@@ -200,6 +201,80 @@ where
         })
     }
 
+    /// Writes one known-length streamed object after flushing pending batches.
+    pub async fn put_committed_streaming_known_len<St>(
+        &self,
+        key: LogicalPath,
+        plaintext_len: u64,
+        stream: St,
+        options: RepositoryPutOptions,
+        multipart_part_size: usize,
+    ) -> Result<V2CommittedPut>
+    where
+        St: Stream<Item = Result<Bytes>> + Unpin + Send,
+    {
+        let _stage = self.stage_lock.lock().await;
+        self.publish_locked_batch().await?;
+        let metadata = self
+            .repository
+            .put_committed_streaming_known_len(
+                self.anchor.as_ref(),
+                key,
+                plaintext_len,
+                stream,
+                options,
+                multipart_part_size,
+            )
+            .await?;
+        let anchor_state = self
+            .anchor
+            .read_v2()
+            .await
+            .map_err(v2_commit_error)?
+            .ok_or_else(|| commit_failed("v2 anchor is missing after streamed commit"))?;
+        Ok(V2CommittedPut {
+            metadata,
+            anchor_state,
+        })
+    }
+
+    /// Writes one unknown-length streamed object after flushing pending batches.
+    pub async fn put_committed_streaming_unknown_len<St>(
+        &self,
+        key: LogicalPath,
+        stream: St,
+        options: RepositoryPutOptions,
+        multipart_part_size: usize,
+        max_plaintext_len: u64,
+    ) -> Result<V2CommittedPut>
+    where
+        St: Stream<Item = Result<Bytes>> + Unpin + Send,
+    {
+        let _stage = self.stage_lock.lock().await;
+        self.publish_locked_batch().await?;
+        let metadata = self
+            .repository
+            .put_committed_streaming_unknown_len(
+                self.anchor.as_ref(),
+                key,
+                stream,
+                options,
+                multipart_part_size,
+                max_plaintext_len,
+            )
+            .await?;
+        let anchor_state = self
+            .anchor
+            .read_v2()
+            .await
+            .map_err(v2_commit_error)?
+            .ok_or_else(|| commit_failed("v2 anchor is missing after streamed commit"))?;
+        Ok(V2CommittedPut {
+            metadata,
+            anchor_state,
+        })
+    }
+
     /// Deletes an object after flushing any pending staged v2 write batch.
     pub async fn delete_committed(&self, key: LogicalPath) -> Result<DeleteOutcome> {
         let _stage = self.stage_lock.lock().await;
@@ -384,6 +459,12 @@ where
 fn commit_failed(reason: &str) -> RepositoryError {
     RepositoryError::CommitFailed {
         reason: reason.to_owned(),
+    }
+}
+
+fn v2_commit_error(error: super::error::V2FormatError) -> RepositoryError {
+    RepositoryError::CommitFailed {
+        reason: error.to_string(),
     }
 }
 

@@ -874,8 +874,9 @@ mod tests {
         parse_restore_bundle_json, recovery_bundle_from_import_args, runtime_config_profile,
     };
     use rs3_server::{
-        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig, RepositoryConfig,
-        RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
+        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
+        RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, SecretString,
+        StaticCredentials,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use std::time::Duration;
@@ -898,6 +899,7 @@ mod tests {
             mode: GatewayMode::ReadWrite,
             bind,
             metrics: MetricsConfig { bind: None },
+            hardening: HardeningConfig::default(),
             public_bucket,
             backend: BackendConfig {
                 endpoint: "https://storage.example".to_owned(),

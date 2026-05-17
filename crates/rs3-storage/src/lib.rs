@@ -97,10 +97,29 @@ pub enum StorageError {
     /// The provider cannot apply legal hold for an existing object version.
     #[error("legal hold is unsupported")]
     LegalHoldUnsupported,
+    /// Multipart upload is unsupported for this provider or option set.
+    #[error("multipart upload is unsupported")]
+    MultipartUnsupported,
 }
 
 /// Convenient result alias for storage operations.
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+/// Provider-neutral multipart upload session.
+#[async_trait]
+pub trait BlobMultipartUpload: Send {
+    /// Uploads one zero-based part. Parts may be uploaded out of order.
+    async fn put_part(&mut self, part_index: usize, body: Bytes) -> Result<()>;
+
+    /// Completes the upload and returns final object metadata.
+    ///
+    /// Implementations should release provider-side temporary parts if complete
+    /// fails after parts were uploaded.
+    async fn complete(self: Box<Self>) -> Result<BlobMetadata>;
+
+    /// Aborts the upload and releases provider-side temporary parts when possible.
+    async fn abort(self: Box<Self>) -> Result<()>;
+}
 
 /// Minimal object-store contract needed by repository code.
 #[async_trait]
@@ -112,6 +131,22 @@ pub trait BlobStore: Send + Sync {
         body: Bytes,
         options: PutOptions,
     ) -> Result<BlobMetadata>;
+
+    /// Returns whether this store can create provider-side multipart uploads.
+    fn supports_multipart_upload(&self) -> bool {
+        false
+    }
+
+    /// Starts a provider-side multipart upload for one final object.
+    async fn create_multipart_upload(
+        &self,
+        object_id: &BackendObjectId,
+        options: PutOptions,
+    ) -> Result<Box<dyn BlobMultipartUpload>> {
+        let _ = object_id;
+        let _ = options;
+        Err(StorageError::MultipartUnsupported)
+    }
 
     /// Reads an object or byte range.
     ///
@@ -220,6 +255,8 @@ pub struct BlobOperationCounts {
     pub set_legal_hold: u64,
     /// Number of cache flush calls.
     pub flush: u64,
+    /// Number of completed multipart upload calls.
+    pub multipart_put: u64,
     /// Bytes accepted by successful PUT calls.
     pub bytes_written: u64,
     /// Bytes returned by successful GET calls.
@@ -294,6 +331,25 @@ where
             counts.bytes_written = counts.bytes_written.saturating_add(metadata.content_len);
         })?;
         Ok(metadata)
+    }
+
+    fn supports_multipart_upload(&self) -> bool {
+        self.inner.supports_multipart_upload()
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        object_id: &BackendObjectId,
+        options: PutOptions,
+    ) -> Result<Box<dyn BlobMultipartUpload>> {
+        let upload = self
+            .inner
+            .create_multipart_upload(object_id, options)
+            .await?;
+        Ok(Box::new(CountingMultipartUpload {
+            inner: upload,
+            counts: Arc::clone(&self.counts),
+        }))
     }
 
     async fn get_range(&self, object_id: &BackendObjectId, range: ByteRange) -> Result<Bytes> {
@@ -420,6 +476,34 @@ where
     }
 }
 
+struct CountingMultipartUpload {
+    inner: Box<dyn BlobMultipartUpload>,
+    counts: Arc<RwLock<BlobOperationCounts>>,
+}
+
+#[async_trait]
+impl BlobMultipartUpload for CountingMultipartUpload {
+    async fn put_part(&mut self, part_index: usize, body: Bytes) -> Result<()> {
+        self.inner.put_part(part_index, body).await
+    }
+
+    async fn complete(self: Box<Self>) -> Result<BlobMetadata> {
+        let Self { inner, counts } = *self;
+        let metadata = inner.complete().await?;
+        let mut counts = counts
+            .write()
+            .map_err(|_| StorageError::Provider("counting blob store lock poisoned".to_owned()))?;
+        counts.multipart_put = counts.multipart_put.saturating_add(1);
+        counts.bytes_written = counts.bytes_written.saturating_add(metadata.content_len);
+        Ok(metadata)
+    }
+
+    async fn abort(self: Box<Self>) -> Result<()> {
+        let Self { inner, .. } = *self;
+        inner.abort().await
+    }
+}
+
 /// In-memory `BlobStore` implementation used for contract tests and local prototypes.
 #[derive(Clone, Debug)]
 pub struct MemoryBlobStore {
@@ -503,6 +587,49 @@ impl Default for MemoryBlobStore {
     }
 }
 
+struct MemoryMultipartUpload {
+    store: MemoryBlobStore,
+    object_id: BackendObjectId,
+    options: PutOptions,
+    parts: BTreeMap<usize, Bytes>,
+}
+
+#[async_trait]
+impl BlobMultipartUpload for MemoryMultipartUpload {
+    async fn put_part(&mut self, part_index: usize, body: Bytes) -> Result<()> {
+        if self.parts.insert(part_index, body).is_some() {
+            return Err(StorageError::Provider(
+                "multipart part was uploaded twice".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn complete(self: Box<Self>) -> Result<BlobMetadata> {
+        let Self {
+            store,
+            object_id,
+            options,
+            parts,
+        } = *self;
+        let mut body = Vec::new();
+        for expected in 0..parts.len() {
+            let part = parts.get(&expected).ok_or_else(|| {
+                StorageError::Provider("multipart upload has missing parts".to_owned())
+            })?;
+            body.extend_from_slice(part);
+        }
+        let metadata = store.put(&object_id, Bytes::from(body), options).await?;
+        let mut state = store.write_state()?;
+        state.counts.multipart_put = state.counts.multipart_put.saturating_add(1);
+        Ok(metadata)
+    }
+
+    async fn abort(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl BlobStore for MemoryBlobStore {
     async fn put(
@@ -566,6 +693,23 @@ impl BlobStore for MemoryBlobStore {
             started.elapsed(),
         );
         Ok(metadata)
+    }
+
+    fn supports_multipart_upload(&self) -> bool {
+        true
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        object_id: &BackendObjectId,
+        options: PutOptions,
+    ) -> Result<Box<dyn BlobMultipartUpload>> {
+        Ok(Box::new(MemoryMultipartUpload {
+            store: self.clone(),
+            object_id: object_id.clone(),
+            options,
+            parts: BTreeMap::new(),
+        }))
     }
 
     async fn get_range(&self, object_id: &BackendObjectId, range: ByteRange) -> Result<Bytes> {

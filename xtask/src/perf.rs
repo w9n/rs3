@@ -70,6 +70,9 @@ pub(crate) struct PerfArgs {
     /// Gateway process build profile used by gateway-backed scenarios.
     #[arg(long, value_enum, default_value_t = GatewayBuildProfile::Dev)]
     gateway_build_profile: GatewayBuildProfile,
+    /// Send gateway write-scenario PUT bodies without a known Content-Length.
+    #[arg(long)]
+    gateway_unknown_length_put: bool,
     /// Filesystem backend root used with `--backend filesystem`.
     #[arg(long)]
     backend_dir: Option<PathBuf>,
@@ -351,6 +354,9 @@ fn add_perf_args(
         "--gateway-build-profile",
         args.gateway_build_profile.as_cli_value(),
     ]);
+    if args.gateway_unknown_length_put {
+        command.arg("--gateway-unknown-length-put");
+    }
     command.args(["--commit-batch-items", &args.commit_batch_items.to_string()]);
     command.args([
         "--commit-batch-delay-ms",

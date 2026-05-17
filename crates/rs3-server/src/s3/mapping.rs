@@ -26,7 +26,16 @@ enum ListItem {
     CommonPrefix(CommonPrefix),
 }
 
-pub(super) async fn collect_body(body: Option<StreamingBlob>) -> S3Result<Bytes> {
+#[cfg(test)]
+pub(super) async fn collect_body(body: Option<StreamingBlob>, max_bytes: u64) -> S3Result<Bytes> {
+    collect_body_reserving(body, max_bytes, |_| Ok(())).await
+}
+
+pub(super) async fn collect_body_reserving(
+    body: Option<StreamingBlob>,
+    max_bytes: u64,
+    mut reserve_for_len: impl FnMut(usize) -> S3Result<()>,
+) -> S3Result<Bytes> {
     let Some(mut body) = body else {
         return Ok(Bytes::new());
     };
@@ -41,13 +50,26 @@ pub(super) async fn collect_body(body: Option<StreamingBlob>) -> S3Result<Bytes>
                 return Err(s3_error);
             }
         };
+        let next_len = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
+            s3s::s3_error!(
+                EntityTooLarge,
+                "PutObject body exceeds the configured maximum size"
+            )
+        })?;
+        if u64::try_from(next_len).unwrap_or(u64::MAX) > max_bytes {
+            return Err(s3s::s3_error!(
+                EntityTooLarge,
+                "PutObject body exceeds the configured maximum size"
+            ));
+        }
+        reserve_for_len(next_len)?;
         bytes.extend_from_slice(&chunk);
     }
 
     Ok(bytes.freeze())
 }
 
-pub(super) fn validate_put_object_request(input: &PutObjectInput) -> S3Result<()> {
+pub(super) fn validate_put_object_request(input: &PutObjectInput, max_bytes: u64) -> S3Result<()> {
     if input.if_match.is_some() {
         return Err(s3s::s3_error!(
             InvalidRequest,
@@ -59,6 +81,20 @@ pub(super) fn validate_put_object_request(input: &PutObjectInput) -> S3Result<()
             NotImplemented,
             "append-style PutObject is not supported"
         ));
+    }
+    if let Some(content_length) = input.content_length {
+        let content_length = u64::try_from(content_length).map_err(|_| {
+            s3s::s3_error!(
+                InvalidRequest,
+                "Content-Length must be a non-negative integer"
+            )
+        })?;
+        if content_length > max_bytes {
+            return Err(s3s::s3_error!(
+                EntityTooLarge,
+                "PutObject body exceeds the configured maximum size"
+            ));
+        }
     }
     Ok(())
 }
@@ -390,6 +426,19 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
         RepositoryError::CommitBackpressure => {
             s3s::s3_error!(ServiceUnavailable, "commit coordinator is overloaded")
         }
+        RepositoryError::ObjectTooLarge => s3s::s3_error!(
+            EntityTooLarge,
+            "PutObject body exceeds the configured maximum size"
+        ),
+        RepositoryError::ObjectLengthMismatch => {
+            s3s::s3_error!(
+                IncompleteBody,
+                "request body length did not match Content-Length"
+            )
+        }
+        RepositoryError::ObjectBodyReadFailed => {
+            s3s::s3_error!(IncompleteBody, "failed to read request body")
+        }
         RepositoryError::UnsupportedRepositoryFormat { .. } => s3s::s3_error!(
             NotImplemented,
             "repository format is not supported by this operation"
@@ -409,6 +458,12 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
         }
         RepositoryError::Storage(StorageError::VersionUnsupported) => {
             s3s::s3_error!(NotImplemented, "object version reads are not supported")
+        }
+        RepositoryError::Storage(StorageError::MultipartUnsupported) => {
+            s3s::s3_error!(
+                NotImplemented,
+                "multipart upload is not supported by this backend"
+            )
         }
         RepositoryError::Storage(StorageError::MissingVersionId(_)) => s3s::s3_error!(
             InternalError,

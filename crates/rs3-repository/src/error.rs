@@ -24,6 +24,15 @@ pub enum RepositoryError {
         /// Repository format spelling.
         format: &'static str,
     },
+    /// The object exceeds a configured size limit.
+    #[error("object exceeds configured maximum size")]
+    ObjectTooLarge,
+    /// The object body did not match a declared size.
+    #[error("object body length does not match declared size")]
+    ObjectLengthMismatch,
+    /// The object body stream failed before it could be fully read.
+    #[error("object body stream could not be read")]
+    ObjectBodyReadFailed,
     /// Repository sequence allocation overflowed.
     #[error("repository sequence overflow")]
     SequenceOverflow,

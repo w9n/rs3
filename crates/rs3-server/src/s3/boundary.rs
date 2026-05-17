@@ -79,7 +79,7 @@ impl GatewayS3Boundary {
         self.service
     }
 
-    /// Returns the controls that still need to surround the S3 HTTP service.
+    /// Returns the controls enforced by or around the S3 HTTP service.
     pub fn hardening(&self) -> S3Hardening {
         self.hardening
     }
@@ -92,7 +92,7 @@ pub struct S3Hardening {
     pub operation_body_limits: bool,
     /// Enforce admission control before accepting more client work.
     pub backpressure: bool,
-    /// Enforce request rate limits at the HTTP/S3 boundary.
+    /// Enforce request rate limits at the S3 operation boundary.
     pub rate_limiting: bool,
     /// Attach request traces and structured fields before repository calls.
     pub request_tracing: bool,

@@ -1,12 +1,14 @@
 //! S3-compatible `BlobStore` implementation.
 
 use crate::{
-    BlobMetadata, BlobStore, ByteRange, PutOptions, Result, StorageError, object_kind, prefix_kind,
-    record_blob_delete, record_blob_extend_retention, record_blob_get, record_blob_head,
-    record_blob_list, record_blob_put, record_blob_set_legal_hold,
+    BlobMetadata, BlobMultipartUpload, BlobStore, ByteRange, PutOptions, Result, StorageError,
+    object_kind, prefix_kind, record_blob_delete, record_blob_extend_retention, record_blob_get,
+    record_blob_head, record_blob_list, record_blob_put, record_blob_set_legal_hold,
 };
 use async_trait::async_trait;
 use aws_sdk_s3::Client as SdkS3Client;
+use aws_sdk_s3::primitives::ByteStream as SdkByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
 use object_store::aws::AmazonS3;
 use object_store::list::{PaginatedListOptions, PaginatedListStore};
@@ -38,7 +40,8 @@ use errors::{
 };
 use metrics::S3ProviderOperation;
 use object_lock::{
-    legal_hold_blocks_delete, provider_legal_hold, retention_blocks_delete, retention_is_active,
+    legal_hold_blocks_delete, provider_legal_hold, retain_until_date, retention_blocks_delete,
+    retention_is_active, sdk_legal_hold_status, sdk_object_lock_mode,
 };
 use requests::{object_get_options, object_path, object_put_options, sdk_range_header};
 
@@ -125,6 +128,152 @@ impl S3BlobStore {
 
     fn object_path(&self, object_id: &BackendObjectId) -> Result<ObjectPath> {
         object_path(&self.config.object_key(object_id))
+    }
+}
+
+struct S3MultipartUpload {
+    store: S3BlobStore,
+    client: SdkS3Client,
+    object_id: BackendObjectId,
+    key: String,
+    upload_id: String,
+    options: PutOptions,
+    parts: Vec<Option<CompletedPart>>,
+    content_len: u64,
+    started: Instant,
+}
+
+#[async_trait]
+impl BlobMultipartUpload for S3MultipartUpload {
+    async fn put_part(&mut self, part_index: usize, body: Bytes) -> Result<()> {
+        let part_number = i32::try_from(part_index.saturating_add(1)).map_err(|_| {
+            StorageError::Provider("multipart part number is out of range".to_owned())
+        })?;
+        let len = u64::try_from(body.len()).map_err(|_| {
+            StorageError::Provider("multipart part length is out of range".to_owned())
+        })?;
+        let output = self
+            .client
+            .upload_part()
+            .bucket(self.store.config.bucket.as_str())
+            .key(self.key.as_str())
+            .upload_id(self.upload_id.as_str())
+            .part_number(part_number)
+            .body(SdkByteStream::from(body))
+            .send()
+            .await
+            .map_err(|error| {
+                StorageError::Provider(format!("failed to upload multipart part: {error}"))
+            })?;
+        let completed = CompletedPart::builder()
+            .part_number(part_number)
+            .set_e_tag(output.e_tag().map(str::to_owned))
+            .build();
+        if self.parts.len() <= part_index {
+            self.parts
+                .resize_with(part_index.saturating_add(1), || None);
+        }
+        if self.parts[part_index].replace(completed).is_some() {
+            return Err(StorageError::Provider(
+                "multipart part was uploaded twice".to_owned(),
+            ));
+        }
+        self.content_len = self.content_len.saturating_add(len);
+        Ok(())
+    }
+
+    async fn complete(self: Box<Self>) -> Result<BlobMetadata> {
+        let Self {
+            store,
+            client,
+            object_id,
+            key,
+            upload_id,
+            options,
+            parts,
+            content_len,
+            started,
+        } = *self;
+        let mut completed = Vec::with_capacity(parts.len());
+        for part in parts {
+            completed.push(part.ok_or_else(|| {
+                StorageError::Provider("multipart upload has missing parts".to_owned())
+            })?);
+        }
+        let multipart = CompletedMultipartUpload::builder()
+            .set_parts(Some(completed))
+            .build();
+        let abort_key = key.clone();
+        let abort_upload_id = upload_id.clone();
+        let mut request = client
+            .complete_multipart_upload()
+            .bucket(store.config.bucket.as_str())
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(multipart);
+        if options.do_not_recreate {
+            request = request.if_none_match("*");
+        }
+        let output = match request.send().await {
+            Ok(output) => output,
+            Err(error) => {
+                let mapped = errors::map_sdk_put_error(error, &object_id);
+                let _ = client
+                    .abort_multipart_upload()
+                    .bucket(store.config.bucket.as_str())
+                    .key(abort_key)
+                    .upload_id(abort_upload_id)
+                    .send()
+                    .await;
+                return Err(mapped);
+            }
+        };
+        let version_id = output
+            .version_id()
+            .map(errors::backend_version_id_from_str)
+            .transpose()?;
+        let mut metadata = store.head_with_sdk(&object_id, version_id.as_ref()).await?;
+        metadata.content_len = content_len;
+        metadata.etag = output.e_tag().map(str::to_owned).or(metadata.etag);
+        metadata.version_id = version_id.or(metadata.version_id);
+        let object_kind = object_kind(&object_id);
+        store.record_provider_operation(
+            S3ProviderOperation::Put,
+            object_kind,
+            "ok",
+            content_len,
+            0,
+            started.elapsed(),
+        )?;
+        record_blob_put(
+            object_kind,
+            usize::try_from(content_len).unwrap_or(usize::MAX),
+            options.retention.is_some(),
+            "ok",
+            started.elapsed(),
+        );
+        Ok(metadata)
+    }
+
+    async fn abort(self: Box<Self>) -> Result<()> {
+        let Self {
+            store,
+            client,
+            key,
+            upload_id,
+            ..
+        } = *self;
+        client
+            .abort_multipart_upload()
+            .bucket(store.config.bucket.as_str())
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(|error| {
+                StorageError::Provider(format!("failed to abort multipart upload: {error}"))
+            })?;
+        Ok(())
     }
 }
 
@@ -217,6 +366,69 @@ impl BlobStore for S3BlobStore {
                 Err(map_put_error(error, object_id))
             }
         }
+    }
+
+    fn supports_multipart_upload(&self) -> bool {
+        self.sdk_client.is_some()
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        object_id: &BackendObjectId,
+        options: PutOptions,
+    ) -> Result<Box<dyn BlobMultipartUpload>> {
+        let client = self
+            .sdk_client
+            .clone()
+            .ok_or(StorageError::MultipartUnsupported)?;
+        if options.do_not_recreate {
+            match self.head(object_id).await {
+                Ok(_) => return Err(StorageError::AlreadyExists(object_id.clone())),
+                Err(StorageError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let key = self.config.object_key(object_id);
+        let retention = options
+            .retention
+            .as_ref()
+            .filter(|policy| retention_is_active(policy));
+        let legal_hold = provider_legal_hold(options.legal_hold);
+        let mut request = client
+            .create_multipart_upload()
+            .bucket(self.config.bucket.as_str())
+            .key(key.clone());
+        if let Some(content_type) = options.content_type.as_deref() {
+            request = request.content_type(content_type);
+        }
+        if let Some(retention) = retention {
+            request = request
+                .object_lock_mode(sdk_object_lock_mode(retention)?)
+                .object_lock_retain_until_date(retain_until_date(retention)?);
+        }
+        if let Some(legal_hold) = legal_hold {
+            request = request.object_lock_legal_hold_status(sdk_legal_hold_status(legal_hold));
+        }
+
+        let output = request.send().await.map_err(|error| {
+            StorageError::Provider(format!("failed to create multipart upload: {error}"))
+        })?;
+        let upload_id = output.upload_id().ok_or_else(|| {
+            StorageError::Provider("S3 CreateMultipartUpload omitted upload id".to_owned())
+        })?;
+
+        Ok(Box::new(S3MultipartUpload {
+            store: self.clone(),
+            client,
+            object_id: object_id.clone(),
+            key,
+            upload_id: upload_id.to_owned(),
+            options,
+            parts: Vec::new(),
+            content_len: 0,
+            started: Instant::now(),
+        }))
     }
 
     async fn get_range(&self, object_id: &BackendObjectId, range: ByteRange) -> Result<Bytes> {
