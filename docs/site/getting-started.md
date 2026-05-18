@@ -65,6 +65,7 @@ RS3_BACKEND_ENDPOINT=file:///tmp/rs3-backend \
 RS3_BACKEND_BUCKET=repo \
 RS3_ANCHOR_MODE=memory \
 RS3_ALLOW_MEMORY_ANCHOR=true \
+RS3_ALLOW_REPOSITORY_INIT=true \
 RS3_REPOSITORY_ID=local-dev \
 RS3_REPOSITORY_SALT_HEX=2222222222222222222222222222222222222222222222222222222222222222 \
 RS3_KEYRING_WRAPPING_KEY_HEX=3333333333333333333333333333333333333333333333333333333333333333 \
@@ -73,9 +74,11 @@ RS3_STATIC_SECRET_ACCESS_KEY=local-secret \
 cargo run -p rs3-server -- serve --bind 127.0.0.1:9080
 ```
 
-On first start with an empty backend prefix, the gateway writes an encrypted
-keyring envelope under `keyrings/` and uses `v2-preview` by default. The memory
-anchor is only for local development; it is not a production rollback boundary.
+On first start with an empty backend prefix, `RS3_ALLOW_REPOSITORY_INIT=true`
+lets the gateway write an encrypted keyring envelope under `keyrings/` and use
+`v2-preview` by default. Leave that switch unset for existing repositories and
+recover a missing anchor from a trusted bundle instead. The memory anchor is
+only for local development; it is not a production rollback boundary.
 
 ## Run S3 Contract Checks
 
@@ -92,6 +95,7 @@ Live provider checks require an existing S3-compatible endpoint and credentials:
 export AWS_ACCESS_KEY_ID=<access-key-id>
 export AWS_SECRET_ACCESS_KEY=<secret-access-key>
 export AWS_REGION=<region>
+export RS3_GOVERNANCE_BYPASS_REVIEWED=true # after IAM or bucket-policy review
 just preview-gate-v2-live <bucket> <endpoint> <region>
 ```
 

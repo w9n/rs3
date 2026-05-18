@@ -128,7 +128,7 @@ impl ConsoleHttpService {
         if let Some(response) = ui_asset_response(&parts.method, path) {
             return response;
         }
-        if path == "/api/status" {
+        if path == "/api/status" || path == "/api/posture" {
             if !self.auth.authorize(&parts.headers) {
                 return unauthorized_response();
             }
@@ -143,6 +143,9 @@ impl ConsoleHttpService {
                     }),
                 );
             }
+            if path == "/api/posture" {
+                return self.posture_response().await;
+            }
             return self.status_response().await;
         }
         json_response(
@@ -154,6 +157,13 @@ impl ConsoleHttpService {
     async fn status_response(&self) -> Response<Full<Bytes>> {
         match self.admin_client.fetch_status().await {
             Ok(status) => json_response(StatusCode::OK, status),
+            Err(error) => gateway_error_response(&error),
+        }
+    }
+
+    async fn posture_response(&self) -> Response<Full<Bytes>> {
+        match self.admin_client.fetch_posture().await {
+            Ok(posture) => json_response(StatusCode::OK, posture),
             Err(error) => gateway_error_response(&error),
         }
     }
@@ -394,11 +404,16 @@ mod tests {
     }
 
     async fn service() -> (ConsoleHttpService, tokio::task::JoinHandle<String>) {
-        let (addr, request) = MockAdmin::start(
-            StatusCode::OK,
+        service_with_gateway_body(
             r#"{"schema":"rs3.admin-status.preview.v1","runtime":{"gateway_mode":"read-write"},"security":{"secrets_exposed":false}}"#,
         )
-        .await;
+        .await
+    }
+
+    async fn service_with_gateway_body(
+        body: &'static str,
+    ) -> (ConsoleHttpService, tokio::task::JoinHandle<String>) {
+        let (addr, request) = MockAdmin::start(StatusCode::OK, body).await;
         let endpoint = GatewayAdminEndpoint::parse(&format!("http://{addr}"))
             .unwrap_or_else(|error| panic!("{error}"));
         let token = GatewayAdminBearerToken::new("gateway-admin-token-12345")
@@ -456,6 +471,29 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer gateway-admin-token-12345")
         );
+    }
+
+    #[tokio::test]
+    async fn api_posture_fetches_gateway_admin_posture() {
+        let (service, request) = service_with_gateway_body(
+            r#"{"schema":"rs3.admin-posture.preview.v1","runtime":{"gateway_mode":"read-write"}}"#,
+        )
+        .await;
+        let response = service
+            .handle(
+                Request::builder()
+                    .uri("/api/posture")
+                    .header(AUTHORIZATION, "Bearer console-token-12345")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap_or_else(|error| panic!("{error}")),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["schema"], "rs3.admin-posture.preview.v1");
+        let request = request.await.unwrap_or_else(|error| panic!("{error}"));
+        assert!(request.contains("GET /admin/posture HTTP/1.1"));
     }
 
     #[tokio::test]

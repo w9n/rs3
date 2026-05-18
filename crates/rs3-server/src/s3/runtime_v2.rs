@@ -511,14 +511,14 @@ async fn bootstrap_v2_repository(
             "restore-readonly gateway mode requires an accepted v2 commit anchor; run explicit anchor recovery before serving restore",
         ));
     }
+    if !config.repository.allow_init {
+        return Err(repository_init(
+            "v2 repository initialization requires RS3_ALLOW_REPOSITORY_INIT=true; use explicit anchor recovery for existing repositories",
+        ));
+    }
 
-    let loaded_keyring = unanchored_gateway_keyring(
-        store,
-        keys,
-        config.repository.retention,
-        config.mode.allows_bootstrap(),
-    )
-    .await?;
+    let loaded_keyring =
+        unanchored_gateway_keyring(store, keys, config.repository.retention, true).await?;
     reject_v2_bootstrap_with_foreign_objects(
         store,
         loaded_keyring

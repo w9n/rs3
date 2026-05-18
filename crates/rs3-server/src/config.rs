@@ -7,6 +7,7 @@ use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, Rete
 use secrecy::{ExposeSecret, SecretString};
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -22,6 +23,7 @@ const DEFAULT_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 256;
 const DEFAULT_REQUEST_RATE_LIMIT_PER_SECOND: u64 = 1024;
+const DEFAULT_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 const MIN_BACKEND_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024;
 const REDACTED_SECRET_VALUE: &str = "<redacted>";
 const MIN_REPOSITORY_KEY_HEX_LEN: usize = SecretBytes::MIN_LEN * 2;
@@ -29,6 +31,9 @@ const MIN_REPOSITORY_SALT_HEX_LEN: usize = MIN_REPOSITORY_SALT_LEN * 2;
 const REPOSITORY_RETENTION_MODE_ENV: &str = "RS3_REPOSITORY_RETENTION_MODE";
 const REPOSITORY_RETENTION_DAYS_ENV: &str = "RS3_REPOSITORY_RETENTION_DAYS";
 const REPOSITORY_FORMAT_ENV: &str = "RS3_REPOSITORY_FORMAT";
+const ALLOW_REPOSITORY_INIT_ENV: &str = "RS3_ALLOW_REPOSITORY_INIT";
+const PROVIDER_CONFORMANCE_REPORT_FILE_ENV: &str = "RS3_PROVIDER_CONFORMANCE_REPORT_FILE";
+const PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV: &str = "RS3_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS";
 const DEFAULT_REPOSITORY_FORMAT: RepositoryFormat = RepositoryFormat::V2Preview;
 
 pub(crate) const REPOSITORY_SALT_HEX_ENV: &str = "RS3_REPOSITORY_SALT_HEX";
@@ -59,6 +64,8 @@ pub struct RuntimeConfig {
     pub batching: BatchConfig,
     /// Repository object layout settings.
     pub repository: RepositoryConfig,
+    /// Last provider-conformance evidence settings.
+    pub provider_conformance: ProviderConformanceConfig,
     /// Repository cryptographic key material.
     pub repository_keys: RepositoryKeysConfig,
     /// Optional static credentials accepted by the server.
@@ -85,10 +92,6 @@ impl GatewayMode {
 
     /// Returns whether this mode accepts client-visible repository mutations.
     pub const fn allows_mutation(self) -> bool {
-        matches!(self, Self::ReadWrite)
-    }
-
-    pub(crate) const fn allows_bootstrap(self) -> bool {
         matches!(self, Self::ReadWrite)
     }
 
@@ -188,6 +191,26 @@ pub struct RepositoryConfig {
     pub decrypted_segment_cache_max_bytes: u64,
     /// Default provider retention policy for repository-owned objects.
     pub retention: Option<RetentionPolicy>,
+    /// Allows first-run repository initialization when the configured anchor is missing.
+    pub allow_init: bool,
+}
+
+/// Provider-conformance evidence settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderConformanceConfig {
+    /// Optional JSON report emitted by `rs3 check-v2-provider`.
+    pub report_file: Option<PathBuf>,
+    /// Maximum accepted report age before status marks the evidence stale.
+    pub max_age: Duration,
+}
+
+impl Default for ProviderConformanceConfig {
+    fn default() -> Self {
+        Self {
+            report_file: None,
+            max_age: Duration::from_secs(DEFAULT_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS),
+        }
+    }
 }
 
 /// Durable repository format selected by this runtime.
@@ -303,6 +326,7 @@ impl RuntimeConfig {
         let anchor = parse_anchor_config(source)?;
         let batching = parse_batch_config(source)?;
         let repository = parse_repository_config(source)?;
+        let provider_conformance = parse_provider_conformance_config(source)?;
         let repository_keys = parse_repository_keys_config(source)?;
         let static_credentials = parse_static_credentials(source)?;
 
@@ -316,6 +340,7 @@ impl RuntimeConfig {
             anchor,
             batching,
             repository,
+            provider_conformance,
             repository_keys,
             static_credentials,
         })
@@ -478,6 +503,11 @@ fn parse_repository_config(source: &impl ConfigSource) -> Result<RepositoryConfi
         rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
     )?;
     let retention = parse_retention_policy(source)?;
+    let allow_init = parse_bool(
+        ALLOW_REPOSITORY_INIT_ENV,
+        source.value(ALLOW_REPOSITORY_INIT_ENV),
+        false,
+    )?;
 
     Ok(RepositoryConfig {
         format,
@@ -485,6 +515,23 @@ fn parse_repository_config(source: &impl ConfigSource) -> Result<RepositoryConfi
         adaptive_payload_segment_size,
         decrypted_segment_cache_max_bytes,
         retention,
+        allow_init,
+    })
+}
+
+fn parse_provider_conformance_config(
+    source: &impl ConfigSource,
+) -> Result<ProviderConformanceConfig, ConfigError> {
+    let report_file =
+        optional_value(source, PROVIDER_CONFORMANCE_REPORT_FILE_ENV).map(PathBuf::from);
+    let max_age_seconds = parse_positive_u64(
+        PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV,
+        source.value(PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV),
+        DEFAULT_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS,
+    )?;
+    Ok(ProviderConformanceConfig {
+        report_file,
+        max_age: Duration::from_secs(max_age_seconds),
     })
 }
 
@@ -919,7 +966,12 @@ mod tests {
                 decrypted_segment_cache_max_bytes:
                     rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
                 retention: None,
+                allow_init: false,
             }
+        );
+        assert_eq!(
+            config.provider_conformance,
+            super::ProviderConformanceConfig::default()
         );
         assert_eq!(config.repository_keys, repository_keys_config());
         assert!(config.static_credentials.is_none());
@@ -1076,6 +1128,7 @@ mod tests {
                 decrypted_segment_cache_max_bytes:
                     rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
                 retention: None,
+                allow_init: false,
             })
         );
     }
@@ -1106,6 +1159,37 @@ mod tests {
                 rs3_types::RetentionMode::Compliance,
                 30
             )))
+        );
+    }
+
+    #[test]
+    fn parses_explicit_repository_init_gate() {
+        let source = minimal_source().with(super::ALLOW_REPOSITORY_INIT_ENV, "true");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert_eq!(config.map(|config| config.repository.allow_init), Ok(true));
+    }
+
+    #[test]
+    fn parses_provider_conformance_evidence_config() {
+        let source = minimal_source()
+            .with(
+                super::PROVIDER_CONFORMANCE_REPORT_FILE_ENV,
+                "/var/lib/rs3/provider-report.json",
+            )
+            .with(super::PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV, "3600");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        let config = config.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            config.provider_conformance.report_file.as_deref(),
+            Some(std::path::Path::new("/var/lib/rs3/provider-report.json"))
+        );
+        assert_eq!(
+            config.provider_conformance.max_age,
+            Duration::from_secs(3600)
         );
     }
 

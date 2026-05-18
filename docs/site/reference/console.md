@@ -8,8 +8,8 @@ management system.
 
 ```text
 Browser
-  -> rs3-console GET /api/status
-      -> rs3-server admin listener GET /admin/status
+  -> rs3-console GET /api/posture or /api/status
+      -> rs3-server admin listener GET /admin/posture or /admin/status
 ```
 
 The browser authenticates to the console with `RS3_CONSOLE_BEARER_TOKEN`. The
@@ -22,6 +22,7 @@ calls the gateway admin listener.
 | --- | --- |
 | `GET /healthz` | Health check for the console process. |
 | `GET /` and `/ui/*` | Static UI assets. |
+| `GET /api/posture` | Returns the cheap gateway admin posture report after console bearer authentication. |
 | `GET /api/status` | Returns the gateway admin status report after console bearer authentication. |
 
 The console has no persistent state and no mutating routes.

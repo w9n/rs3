@@ -9,8 +9,9 @@ mod server;
 
 pub use admin::{
     AdminAnchorSummary, AdminBackendSummary, AdminFinding, AdminMaintenanceSummary,
-    AdminReportProfile, AdminRepositorySummary, AdminRestoreSummary, AdminRuntimeSummary,
-    AdminSecuritySummary, AdminStatusReport, AdminV2MaintenanceSummary, AdminV2RestoreSummary,
+    AdminPostureReport, AdminProviderConformanceSummary, AdminProviderSummary, AdminReportProfile,
+    AdminRepositorySummary, AdminRestoreSummary, AdminRuntimeSummary, AdminSecuritySummary,
+    AdminStatusReport, AdminV2MaintenanceSummary, AdminV2RestoreSummary, admin_posture_report,
     admin_status_report, backend_kind, doctor_findings, runtime_config_profile,
 };
 pub use admin_http::{
@@ -19,7 +20,8 @@ pub use admin_http::{
 };
 pub use config::{
     AnchorConfig, BackendConfig, BatchConfig, ConfigError, GatewayMode, HardeningConfig,
-    MetricsConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig,
+    MetricsConfig, ProviderConformanceConfig, RepositoryConfig, RepositoryFormat,
+    RepositoryKeysConfig, RuntimeConfig,
 };
 pub use identity::{
     AuthError, Authorizer, Identity, IdentityProvider, RequestAction, StaticCredentialProvider,

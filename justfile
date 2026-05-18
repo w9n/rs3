@@ -50,12 +50,41 @@ preview-gate-v2-live BACKEND_BUCKET ENDPOINT_URL REGION:
     set -euo pipefail
     timestamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
     base="isolated live prefix${timestamp}"
+    mkdir -p .local/integration
     echo "v2 live gate prefix base: ${base}"
+    just check-v2-provider-v2-live "{{BACKEND_BUCKET}}" "{{ENDPOINT_URL}}" "{{REGION}}" "${base}/provider-conformance" > ".local/integration/${timestamp}.json"
     just integration-s3-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/s3-gateway"
     just integration-kopia-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/kopia-gateway"
     just integration-k8s-gateway-v2 --wait-secs 240
     just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/velero-dynamic-pvc"
     just integration-velero-kopia-postgres-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/velero-postgres"
+
+check-v2-provider-v2-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${RS3_GOVERNANCE_BYPASS_REVIEWED:?set RS3_GOVERNANCE_BYPASS_REVIEWED=true after reviewing that gateway credentials cannot bypass governance retention}"
+    if [[ "${RS3_GOVERNANCE_BYPASS_REVIEWED}" != "true" ]]; then
+      echo "RS3_GOVERNANCE_BYPASS_REVIEWED must be true after operator IAM review" >&2
+      exit 2
+    fi
+    RS3_PUBLIC_BUCKET=client-bucket \
+    RS3_BACKEND_ENDPOINT="{{ENDPOINT_URL}}" \
+    RS3_BACKEND_BUCKET="{{BACKEND_BUCKET}}" \
+    RS3_BACKEND_PREFIX="{{BACKEND_PREFIX}}" \
+    AWS_DEFAULT_REGION="{{REGION}}" \
+    RS3_REPOSITORY_FORMAT=v2-preview \
+    RS3_REPOSITORY_RETENTION_MODE=governance \
+    RS3_REPOSITORY_RETENTION_DAYS=1 \
+    RS3_ANCHOR_MODE=memory \
+    RS3_ALLOW_MEMORY_ANCHOR=true \
+    RS3_REPOSITORY_ID=rs3-provider-conformance \
+    RS3_REPOSITORY_SALT_HEX=2222222222222222222222222222222222222222222222222222222222222222 \
+    RS3_KEYRING_WRAPPING_KEY_HEX=3333333333333333333333333333333333333333333333333333333333333333 \
+      cargo run -p rs3-server --features s3 -- check-v2-provider \
+        --probe-prefix "{{BACKEND_PREFIX}}/probes" \
+        --legal-hold \
+        --governance-bypass-reviewed \
+        --format json
 
 integration-s3:
     cargo test -p rs3-storage --features s3 --test s3_live -- --ignored --nocapture

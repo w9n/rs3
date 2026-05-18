@@ -1,6 +1,6 @@
 //! Authenticated HTTP listener for path-redacted gateway admin facts.
 
-use crate::{AdminReportProfile, RuntimeConfig, admin_status_report};
+use crate::{AdminReportProfile, RuntimeConfig, admin_posture_report, admin_status_report};
 use bytes::Bytes;
 use http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, WWW_AUTHENTICATE};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
@@ -160,6 +160,10 @@ impl AdminHttpService {
         }
 
         match (parts.method, parts.uri.path()) {
+            (Method::GET, "/admin/posture") => {
+                let report = admin_posture_report(&self.config, self.profile);
+                json_response(StatusCode::OK, report)
+            }
             (Method::GET, "/admin/status") => {
                 let report = admin_status_report(&self.config, self.profile).await;
                 json_response(StatusCode::OK, report)
@@ -357,8 +361,8 @@ mod tests {
     use super::{AdminBearerToken, AdminHttpAuth, AdminHttpService};
     use crate::{
         AdminReportProfile, AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig,
-        MetricsConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig,
-        SecretString, StaticCredentials,
+        MetricsConfig, ProviderConformanceConfig, RepositoryConfig, RepositoryFormat,
+        RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
     };
     use bytes::Bytes;
     use http::header::AUTHORIZATION;
@@ -401,7 +405,9 @@ mod tests {
                 decrypted_segment_cache_max_bytes:
                     rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
                 retention: None,
+                allow_init: true,
             },
+            provider_conformance: ProviderConformanceConfig::default(),
             repository_keys: RepositoryKeysConfig {
                 repository_id: RepositoryId::new("test-repository")
                     .unwrap_or_else(|error| panic!("{error}")),
@@ -481,6 +487,28 @@ mod tests {
         assert!(!body.contains("repo-prefix"));
         assert!(!body.contains("test-repository"));
         assert!(!body.contains("client-secret"));
+    }
+
+    #[tokio::test]
+    async fn admin_posture_returns_path_redacted_cheap_report() {
+        let response = service()
+            .handle(
+                Request::builder()
+                    .uri("/admin/posture")
+                    .header(AUTHORIZATION, "Bearer admin-token-12345")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap_or_else(|error| panic!("{error}")),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        assert!(body.contains("rs3.admin-posture.preview.v1"));
+        assert!(!body.contains("\"restore\""));
+        assert!(!body.contains("\"maintenance\""));
+        assert!(!body.contains("backend-bucket"));
+        assert!(!body.contains("repo-prefix"));
+        assert!(!body.contains("test-repository"));
     }
 
     #[tokio::test]

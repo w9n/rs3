@@ -42,6 +42,7 @@ fn run_provider_report(args: &[&str]) -> CliOutput {
         .env("RS3_BACKEND_BUCKET", "backend-bucket")
         .env("RS3_ANCHOR_MODE", "memory")
         .env("RS3_ALLOW_MEMORY_ANCHOR", "true")
+        .env("RS3_ALLOW_REPOSITORY_INIT", "true")
         .env("RS3_REPOSITORY_ID", "cli-output-repository")
         .env(
             "RS3_REPOSITORY_SALT_HEX",

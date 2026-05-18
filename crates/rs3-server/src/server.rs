@@ -171,8 +171,9 @@ mod tests {
     use super::{GatewayServer, GatewayServerError};
     use crate::HardeningConfig;
     use crate::{
-        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig, RepositoryConfig,
-        RepositoryKeysConfig, RuntimeConfig, SecretString,
+        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig,
+        ProviderConformanceConfig, RepositoryConfig, RepositoryKeysConfig, RuntimeConfig,
+        SecretString,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
     use std::time::Duration;
@@ -211,7 +212,9 @@ mod tests {
                 decrypted_segment_cache_max_bytes:
                     rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
                 retention: None,
+                allow_init: true,
             },
+            provider_conformance: ProviderConformanceConfig::default(),
             repository_keys: RepositoryKeysConfig {
                 repository_id: RepositoryId::new("test-repository")
                     .unwrap_or_else(|error| panic!("{error}")),

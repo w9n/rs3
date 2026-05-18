@@ -49,6 +49,7 @@ commit:
 repository:
   format: v2-preview
   id: rs3-repository
+  allowInit: false
   # Leave unset to use adaptive per-object segment sizing. Set a positive value
   # only for fixed-size compatibility or performance sweeps.
   payloadSegmentSizeBytes: null
@@ -96,3 +97,6 @@ rbac:
   existing: false
 
 resources: {}
+
+updateStrategy:
+  type: Recreate

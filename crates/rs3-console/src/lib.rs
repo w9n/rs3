@@ -2,8 +2,8 @@
 //!
 //! The console is intentionally separate from the S3 data plane. It keeps the
 //! gateway admin bearer token server-side, serves a small browser UI, and
-//! exposes only a read-only status API backed by the gateway's path-redacted
-//! `GET /admin/status` report.
+//! exposes only read-only posture/status APIs backed by the gateway's
+//! path-redacted admin reports.
 
 mod admin_client;
 mod http;

@@ -2,8 +2,8 @@
 
 use rs3_server::{
     AnchorConfig, BackendConfig, BatchConfig, GatewayMode, GatewayServer, GatewayServerError,
-    HardeningConfig, MetricsConfig, RepositoryConfig, RepositoryKeysConfig, RuntimeConfig,
-    SecretString, StaticCredentials,
+    HardeningConfig, MetricsConfig, ProviderConformanceConfig, RepositoryConfig,
+    RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
 };
 use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
 use std::net::SocketAddr;
@@ -130,7 +130,9 @@ fn runtime_config() -> RuntimeConfig {
             decrypted_segment_cache_max_bytes:
                 rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
             retention: None,
+            allow_init: true,
         },
+        provider_conformance: ProviderConformanceConfig::default(),
         repository_keys: RepositoryKeysConfig {
             repository_id: RepositoryId::new("test-repository")
                 .unwrap_or_else(|error| panic!("{error}")),

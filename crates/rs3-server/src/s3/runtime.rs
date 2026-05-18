@@ -311,6 +311,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_factory_requires_explicit_repository_init() {
+        let mut config = runtime_config(true);
+        config.repository.allow_init = false;
+
+        let runtime = RuntimeRepository::from_config(&config).await;
+
+        assert!(
+            matches!(runtime, Err(S3BoundaryError::RepositoryInit { reason }) if reason.contains("RS3_ALLOW_REPOSITORY_INIT=true"))
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_factory_rejects_missing_keyring_envelope_when_repository_is_not_empty() {
         let dir = TestDir::new();
         let mut config = runtime_config(true);

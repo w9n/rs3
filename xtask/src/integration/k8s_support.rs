@@ -119,6 +119,8 @@ pub(crate) fn helm_install_gateway(
             &helm_set_string("logging.rustLog", values.rust_log),
             "--set-string",
             &helm_set_string("repository.format", values.repository_format),
+            "--set",
+            "repository.allowInit=true",
             "--set-string",
             &helm_set_string("repository.payloadSegmentSizeBytes", &payload_segment_size),
             "--set-string",

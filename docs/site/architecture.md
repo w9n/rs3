@@ -9,7 +9,7 @@ compatibility layer, namespace mapping, payload encryption, encrypted index
 state, signed v2 commit publication, and path-redacted admin facts stay under
 operator control. The gateway writes encrypted `format/`, `keyrings/`, and
 `commits/` objects to the backend and reads or advances a separate Kubernetes
-Lease anchor. `rs3-console` only reads path-redacted admin status.
+Lease anchor. `rs3-console` only reads path-redacted admin posture and status.
 
 <figure class="rv-figure">
   <a class="rv-lightbox" href="../assets/architecture-overview.png" aria-label="Enlarge rs3 architecture overview diagram" aria-haspopup="dialog" data-rv-title="Architecture overview">
@@ -128,11 +128,12 @@ The first gateway surface focuses on the operations backup clients need:
 - provider version IDs and exact-version reads for retained/Object Lock
   repositories
 
-There are two production-capable storage profiles. The atomic-create profile
-requires native `PutObject` with `If-None-Match: *`. The retained-version
-profile requires Object Lock, provider version IDs for all restore-critical
-writes, and exact-version reads after a newer latest version exists. Non-atomic
-`HEAD` before `PUT` is not a security-equivalent fallback for either profile.
+There are two preview-qualified storage safety profiles. The atomic-create
+profile requires native `PutObject` with `If-None-Match: *`. The
+retained-version profile requires Object Lock, provider version IDs for all
+restore-critical writes, and exact-version reads after a newer latest version
+exists. Non-atomic `HEAD` before `PUT` is not a security-equivalent fallback for
+either profile.
 
 The preview compatibility workloads are Kopia and Velero with the Kopia
 uploader. Kopia drives the lower-level S3 behavior; Velero exercises the
@@ -155,9 +156,9 @@ The report shape is a preview fact contract, not a complete workflow API: fleet
 inventory, multi-management workflows, policy workflows, rotation workflows, approvals,
 auditing, and recovery orchestration require their own authorization, audit, and stabilization decision.
 
-`rs3-console` is the narrow single-gateway UI for this report. It serves a
-browser interface and proxies `GET /api/status` to the gateway admin listener's
-`GET /admin/status`. The browser authenticates to the console; the gateway
+`rs3-console` is the narrow single-gateway UI for these reports. It serves a
+browser interface and proxies `GET /api/posture` or `GET /api/status` to the
+gateway admin listener. The browser authenticates to the console; the gateway
 admin token remains server-side. The console has no repository browser,
 database, scheduler, work queue, or mutating recovery/key-management routes.
 

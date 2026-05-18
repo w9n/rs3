@@ -82,7 +82,7 @@ one. The backend can still deny service by hiding required objects.
 
 | Situation | Preview behavior |
 | --- | --- |
-| Empty backend prefix and no anchor | Startup may initialize one generated keyring envelope using the supplied repository ID, salt, and wrapping-key source. An envelope object ID is optional override state, not normal Helm state. |
+| Empty backend prefix and no anchor | Startup may initialize one generated keyring envelope only when repository initialization is explicitly enabled using the supplied repository ID, salt, and wrapping-key source. An envelope object ID is optional override state, not normal Helm state. |
 | Existing backend prefix and matching anchor | Open after signed commit-chain, format-root, and envelope validation. |
 | Backend serves an older commit than the Lease anchor | Fail closed as rollback. |
 | Backend hides the commit named by the Lease anchor | Fail closed as unavailable or tampered. |
@@ -160,7 +160,8 @@ repository state reachable from it.
 ## Current Evidence
 
 Release evidence below is maintainer-run evidence for the current v2 preview
-line. Paths under `.local/` are workspace-local artifact locations; copy
+line. Treat the bullets as the current summary and the table as the detailed
+ledger. Paths under `.local/` are workspace-local artifact locations; copy
 artifacts or checksums into release assets when independent public review needs
 to inspect them. Evidence rows are dated because the preview still changes. A
 release candidate should rerun the live provider gate after format, gateway, or
@@ -171,6 +172,8 @@ At a glance:
 - consolidated v2 live preview gate passed against the retained-version profile
 - live provider qualification covered exact-version reads, retained multipart
   completion, and retention behavior
+- provider conformance can be preserved as JSON and surfaced through admin
+  posture without rerunning live probes from status
 - DR rehearsal verified bundle export, missing-Lease rejection without retention
   context, and anchor import into a new cluster
 - 2026-05-18 live checks reran the retained-version gate after adding
@@ -277,10 +280,16 @@ For a production-preview deployment:
 
 - use `RS3_ANCHOR_MODE=kubernetes-lease`
 - use `repositoryKeys.create=true` or `repositoryKeys.existingSecret` in Helm
+- set `repository.allowInit=true` only for deliberate first initialization on a
+  fresh backend prefix; turn it off for normal existing-repository serving
+- keep Helm `updateStrategy.type=Recreate` for `read-write` gateways so rollouts
+  do not overlap two writers
 - set a stable `repository.id`
 - set a stable, operator-provided `repositoryKeys.saltHex`
 - configure gateway access credentials explicitly
 - configure repository retention when retention evidence is part of the trial
+- preserve `rs3 check-v2-provider --format json` output and configure
+  `RS3_PROVIDER_CONFORMANCE_REPORT_FILE` when exposing admin posture
 - set gateway hardening limits for maximum `PutObject` size, buffered upload
   threshold, backend multipart part size, in-flight upload body bytes, open
   connections, concurrent requests, and request rate; align ingress limits with

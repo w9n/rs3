@@ -48,8 +48,9 @@ pub(super) fn repository_init(error: impl ToString) -> S3BoundaryError {
 pub(super) mod test_support {
     use crate::GatewayMode;
     use crate::{
-        AnchorConfig, BackendConfig, BatchConfig, HardeningConfig, MetricsConfig, RepositoryConfig,
-        RepositoryKeysConfig, RuntimeConfig, SecretString,
+        AnchorConfig, BackendConfig, BatchConfig, HardeningConfig, MetricsConfig,
+        ProviderConformanceConfig, RepositoryConfig, RepositoryKeysConfig, RuntimeConfig,
+        SecretString,
     };
     use rs3_types::{PublicBucket, RepositoryId};
     use std::time::Duration;
@@ -88,7 +89,9 @@ pub(super) mod test_support {
                 decrypted_segment_cache_max_bytes:
                     rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
                 retention: None,
+                allow_init: true,
             },
+            provider_conformance: ProviderConformanceConfig::default(),
             repository_keys: RepositoryKeysConfig {
                 repository_id: RepositoryId::new("test-repository")
                     .unwrap_or_else(|error| panic!("{error}")),

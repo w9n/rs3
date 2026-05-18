@@ -61,6 +61,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and (ne .Values.gateway.mode "read-write") (ne .Values.gateway.mode "restore-readonly") -}}
 {{- fail "gateway.mode must be read-write or restore-readonly" -}}
 {{- end -}}
+{{- if and (ne .Values.updateStrategy.type "Recreate") (eq .Values.gateway.mode "read-write") -}}
+{{- fail "gateway.mode=read-write requires updateStrategy.type=Recreate to avoid overlapping writers during rollouts" -}}
+{{- end -}}
 {{- if and (eq .Values.gateway.mode "read-write") (gt (int .Values.replicaCount) 1) -}}
 {{- fail "gateway.mode=read-write currently supports replicaCount=1; use restore-readonly for scaled restore readers" -}}
 {{- end -}}

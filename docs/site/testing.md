@@ -22,7 +22,8 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | Storage S3 | `just integration-s3-local --mode container` | Storage contract against a disposable S3-compatible provider. |
 | Gateway S3 | `just integration-s3-gateway` | Gateway S3 operations through the repository path. |
 | Local v2 nightly gate | `just preview-gate-v2-nightly` | Scheduled or release-candidate gate: S3 feature checks plus v2 S3 tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes against disposable local backends. |
-| Live v2 preview gate | `just preview-gate-v2-live <bucket> <endpoint> <region>` | Consolidated retained-backend gate. Generates fresh sub-prefixes and runs v2 Gateway S3, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes. |
+| Live v2 preview gate | `just preview-gate-v2-live <bucket> <endpoint> <region>` | Consolidated retained-backend gate. Generates fresh sub-prefixes and runs v2 provider conformance, Gateway S3, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes. |
+| Live v2 provider conformance | `just check-v2-provider-v2-live <bucket> <endpoint> <region> <fresh-prefix>` | Runs `rs3 check-v2-provider` for the retained-version/Object Lock profile and emits JSON evidence for admin posture or release artifacts. |
 | Live v2 Gateway S3 | `just integration-s3-gateway-v2-live --backend-bucket <bucket> --endpoint-url <endpoint> --region <region> --backend-prefix <fresh-prefix>` | v2-preview gateway smoke against an existing retained S3-compatible backend, including `mc`, default `rclone lsf`, and backend key privacy checks. |
 | Kopia | `just integration-kopia-gateway` | Real Kopia create, snapshot, and restore through the gateway. |
 | Live v2 Kopia | `just integration-kopia-gateway-v2-live --backend-bucket <bucket> --endpoint-url <endpoint> --region <region> --backend-prefix <fresh-prefix>` | Real Kopia create, snapshot, and restore through a v2-preview gateway against an existing retained backend. |
@@ -72,8 +73,14 @@ it runs:
 export AWS_ACCESS_KEY_ID=<access-key-id>
 export AWS_SECRET_ACCESS_KEY=<secret-access-key>
 export AWS_REGION=<region>
+export RS3_GOVERNANCE_BYPASS_REVIEWED=true
 just preview-gate-v2-live <bucket> <endpoint> <region>
 ```
+
+`RS3_GOVERNANCE_BYPASS_REVIEWED=true` is an operator assertion that normal
+gateway credentials cannot bypass governance retention after IAM or bucket
+policy review. The gate writes provider-conformance JSON under
+`.local/integration/`.
 
 For governance mode, also review IAM or bucket policy so normal gateway
 credentials cannot bypass governance retention. The live retained-version test

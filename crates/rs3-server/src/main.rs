@@ -18,6 +18,7 @@ use std::io::{self, Read};
 use std::net::SocketAddr;
 #[cfg(any(feature = "s3", feature = "k8s"))]
 use std::sync::Once;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
@@ -525,6 +526,7 @@ fn print_v2_provider_conformance_report(
                 .collect::<Vec<_>>();
             let report_json = serde_json::json!({
                 "schema": "rs3.v2-provider-conformance.v1",
+                "generated_at_ms": current_time_ms().unwrap_or(0),
                 "profile": provider_profile_name(report.profile),
                 "passed": report.passed(),
                 "checks": checks,
@@ -533,6 +535,7 @@ fn print_v2_provider_conformance_report(
         }
         RecoveryReportFormat::Text => {
             println!("schema=rs3.v2-provider-conformance.v1");
+            println!("generated_at_ms={}", current_time_ms().unwrap_or(0));
             println!("profile={}", provider_profile_name(report.profile));
             println!("passed={}", report.passed());
             for check in &report.checks {
@@ -777,6 +780,14 @@ fn provider_check_status_name(status: V2ProviderCheckStatus) -> &'static str {
     }
 }
 
+fn current_time_ms() -> Option<i64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    i64::try_from(millis).ok()
+}
+
 impl DoctorProfile {
     fn as_str(self) -> &'static str {
         match self {
@@ -875,8 +886,8 @@ mod tests {
     };
     use rs3_server::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
-        RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, SecretString,
-        StaticCredentials,
+        ProviderConformanceConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig,
+        RuntimeConfig, SecretString, StaticCredentials,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use std::time::Duration;
@@ -919,7 +930,9 @@ mod tests {
                 decrypted_segment_cache_max_bytes:
                     rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
                 retention: None,
+                allow_init: true,
             },
+            provider_conformance: ProviderConformanceConfig::default(),
             repository_keys: RepositoryKeysConfig {
                 repository_id,
                 repository_salt_hex:

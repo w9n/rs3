@@ -12,6 +12,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 const ADMIN_STATUS_SCHEMA: &str = "rs3.admin-status.preview.v1";
+const ADMIN_POSTURE_SCHEMA: &str = "rs3.admin-posture.preview.v1";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 512 * 1024;
 
@@ -61,10 +62,18 @@ impl GatewayAdminEndpoint {
     }
 
     fn status_uri(&self) -> Result<Uri, GatewayAdminClientError> {
+        self.admin_uri("/admin/status")
+    }
+
+    fn posture_uri(&self) -> Result<Uri, GatewayAdminClientError> {
+        self.admin_uri("/admin/posture")
+    }
+
+    fn admin_uri(&self, path: &'static str) -> Result<Uri, GatewayAdminClientError> {
         Uri::builder()
             .scheme("http")
             .authority(self.authority())
-            .path_and_query("/admin/status")
+            .path_and_query(path)
             .build()
             .map_err(GatewayAdminClientError::RequestBuild)
     }
@@ -228,9 +237,29 @@ impl GatewayAdminClient {
     /// Returns an error when the gateway admin listener is unavailable, rejects
     /// the request, returns too much data, or returns an unexpected JSON shape.
     pub async fn fetch_status(&self) -> Result<Value, GatewayAdminClientError> {
+        self.fetch_report(self.config.endpoint.status_uri()?, ADMIN_STATUS_SCHEMA)
+            .await
+    }
+
+    /// Fetches and validates the cheap gateway admin posture report.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the gateway admin listener is unavailable, rejects
+    /// the request, returns too much data, or returns an unexpected JSON shape.
+    pub async fn fetch_posture(&self) -> Result<Value, GatewayAdminClientError> {
+        self.fetch_report(self.config.endpoint.posture_uri()?, ADMIN_POSTURE_SCHEMA)
+            .await
+    }
+
+    async fn fetch_report(
+        &self,
+        uri: Uri,
+        expected_schema: &'static str,
+    ) -> Result<Value, GatewayAdminClientError> {
         let request = Request::builder()
             .method("GET")
-            .uri(self.config.endpoint.status_uri()?)
+            .uri(uri)
             .header(ACCEPT, "application/json")
             .header(AUTHORIZATION, self.config.token.authorization_header()?)
             .body(Empty::<Bytes>::new())
@@ -261,7 +290,7 @@ impl GatewayAdminClient {
             });
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(GatewayAdminClientError::Json)?;
-        if value.get("schema").and_then(Value::as_str) != Some(ADMIN_STATUS_SCHEMA) {
+        if value.get("schema").and_then(Value::as_str) != Some(expected_schema) {
             return Err(GatewayAdminClientError::InvalidSchema);
         }
         Ok(value)
@@ -394,6 +423,29 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer gateway-admin-token-12345")
         );
+    }
+
+    #[tokio::test]
+    async fn client_fetches_path_redacted_posture_json() {
+        let (addr, request) = MockAdmin::start(
+            StatusCode::OK,
+            r#"{"schema":"rs3.admin-posture.preview.v1","runtime":{"gateway_mode":"read-write"}}"#,
+        )
+        .await;
+        let endpoint = GatewayAdminEndpoint::parse(&format!("http://{addr}"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let token = GatewayAdminBearerToken::new("gateway-admin-token-12345")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let client = GatewayAdminClient::new(GatewayAdminClientConfig::new(endpoint, token));
+
+        let posture = client
+            .fetch_posture()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(posture["schema"], "rs3.admin-posture.preview.v1");
+        let request = request.await.unwrap_or_else(|error| panic!("{error}"));
+        assert!(request.contains("GET /admin/posture HTTP/1.1"));
     }
 
     #[tokio::test]

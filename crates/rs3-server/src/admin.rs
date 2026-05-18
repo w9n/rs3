@@ -5,13 +5,15 @@
 //! orchestration, approvals, management workflows, multi-management workflows, and audit model
 //! require a separate documented authorization and audit design and stabilization decision.
 
-use crate::{AnchorConfig, BackendConfig, RuntimeConfig};
+use crate::{AnchorConfig, BackendConfig, ProviderConformanceConfig, RuntimeConfig};
 use rs3_crypto::derive_public_fingerprint;
 use rs3_types::RetentionMode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ADMIN_STATUS_SCHEMA: &str = "rs3.admin-status.preview.v1";
+const ADMIN_POSTURE_SCHEMA: &str = "rs3.admin-posture.preview.v1";
 
 /// Admin report profile.
 #[non_exhaustive]
@@ -50,6 +52,8 @@ pub struct AdminStatusReport {
     pub runtime: AdminRuntimeSummary,
     /// Backend posture summary.
     pub backend: AdminBackendSummary,
+    /// Provider conformance posture summary.
+    pub provider: AdminProviderSummary,
     /// Anchor posture summary.
     pub anchor: AdminAnchorSummary,
     /// Repository behavior summary.
@@ -60,6 +64,35 @@ pub struct AdminStatusReport {
     pub restore: AdminRestoreSummary,
     /// Read-only maintenance summary.
     pub maintenance: AdminMaintenanceSummary,
+    /// Profile findings. Empty means the selected profile passed.
+    pub findings: Vec<AdminFinding>,
+}
+
+/// Cheap path-redacted operator posture report.
+///
+/// Unlike [`AdminStatusReport`], this report does not verify repository state
+/// and is suitable for frequent polling.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AdminPostureReport {
+    /// Report schema marker.
+    pub schema: &'static str,
+    /// Report profile used for posture checks.
+    pub profile: &'static str,
+    /// Report generation timestamp in milliseconds since the Unix epoch.
+    pub generated_at_ms: i64,
+    /// Runtime posture summary.
+    pub runtime: AdminRuntimeSummary,
+    /// Backend posture summary.
+    pub backend: AdminBackendSummary,
+    /// Provider conformance posture summary.
+    pub provider: AdminProviderSummary,
+    /// Anchor posture summary.
+    pub anchor: AdminAnchorSummary,
+    /// Repository behavior summary.
+    pub repository: AdminRepositorySummary,
+    /// Security boundary summary.
+    pub security: AdminSecuritySummary,
     /// Profile findings. Empty means the selected profile passed.
     pub findings: Vec<AdminFinding>,
 }
@@ -88,6 +121,38 @@ pub struct AdminBackendSummary {
     pub durable: bool,
     /// Provider retention capability from the runtime configuration shape.
     pub retention_capability: &'static str,
+}
+
+/// Provider conformance fields that avoid configured provider names and paths.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AdminProviderSummary {
+    /// Provider profile selected from runtime configuration.
+    pub selected_profile: &'static str,
+    /// Last persisted conformance evidence, when configured.
+    pub conformance: AdminProviderConformanceSummary,
+}
+
+/// Redacted provider-conformance evidence summary.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AdminProviderConformanceSummary {
+    /// Evidence state: `passed`, `failed`, `missing`, `stale`, or `invalid`.
+    pub state: &'static str,
+    /// Machine-readable reason for unavailable or invalid evidence.
+    pub reason_code: Option<&'static str>,
+    /// Provider profile named by the evidence file.
+    pub profile: Option<String>,
+    /// Evidence report generation timestamp in milliseconds.
+    pub generated_at_ms: Option<i64>,
+    /// Total number of checks in the evidence file.
+    pub check_count: usize,
+    /// Number of failed checks in the evidence file.
+    pub failed_check_count: usize,
+    /// Whether legal-hold checks are present in the evidence file.
+    pub legal_hold_checked: bool,
+    /// Whether governance-bypass review is present and passed in the evidence file.
+    pub governance_bypass_reviewed: bool,
 }
 
 /// Anchor posture fields that avoid Kubernetes object names.
@@ -122,6 +187,8 @@ pub struct AdminRepositorySummary {
     pub retention_mode: &'static str,
     /// Configured default retention duration in days.
     pub retention_days: u32,
+    /// Whether first-run initialization is allowed when the anchor is missing.
+    pub allow_init: bool,
 }
 
 /// Security boundary fields for operator reports.
@@ -256,6 +323,7 @@ pub async fn admin_status_report(
             durable: backend_is_durable(&config.backend),
             retention_capability: retention_capability(&config.backend),
         },
+        provider: provider_summary(config),
         anchor: AdminAnchorSummary {
             kind: anchor_kind(&config.anchor),
             external: !matches!(config.anchor, AnchorConfig::Memory),
@@ -274,6 +342,7 @@ pub async fn admin_status_report(
                 .retention
                 .map(|policy| policy.retain_days)
                 .unwrap_or(0),
+            allow_init: config.repository.allow_init,
         },
         security: AdminSecuritySummary {
             path_browsing_enabled: false,
@@ -289,6 +358,63 @@ pub async fn admin_status_report(
         },
         restore,
         maintenance,
+        findings: doctor_findings(config, profile),
+    }
+}
+
+/// Builds the cheap path-redacted status report that does not verify repository state.
+pub fn admin_posture_report(
+    config: &RuntimeConfig,
+    profile: AdminReportProfile,
+) -> AdminPostureReport {
+    AdminPostureReport {
+        schema: ADMIN_POSTURE_SCHEMA,
+        profile: profile.as_str(),
+        generated_at_ms: current_time_ms().unwrap_or(0),
+        runtime: AdminRuntimeSummary {
+            gateway_mode: config.mode.as_str(),
+            config_profile: runtime_config_profile(config),
+            static_credentials_configured: config.static_credentials.is_some(),
+            metrics_configured: config.metrics.bind.is_some(),
+        },
+        backend: AdminBackendSummary {
+            kind: backend_kind(&config.backend.endpoint),
+            durable: backend_is_durable(&config.backend),
+            retention_capability: retention_capability(&config.backend),
+        },
+        provider: provider_summary(config),
+        anchor: AdminAnchorSummary {
+            kind: anchor_kind(&config.anchor),
+            external: !matches!(config.anchor, AnchorConfig::Memory),
+        },
+        repository: AdminRepositorySummary {
+            format: config.repository.format.as_str(),
+            payload_segment_size_bytes: config.repository.payload_segment_size,
+            adaptive_payload_segment_size: config.repository.adaptive_payload_segment_size,
+            decrypted_segment_cache_max_bytes: config.repository.decrypted_segment_cache_max_bytes,
+            commit_max_batch_items: config.batching.max_items,
+            commit_max_batch_delay_ms: config.batching.max_delay.as_millis(),
+            commit_max_pending_items: config.batching.max_pending_items,
+            retention_mode: retention_mode(config),
+            retention_days: config
+                .repository
+                .retention
+                .map(|policy| policy.retain_days)
+                .unwrap_or(0),
+            allow_init: config.repository.allow_init,
+        },
+        security: AdminSecuritySummary {
+            path_browsing_enabled: false,
+            secrets_exposed: false,
+            max_put_object_bytes: config.hardening.max_put_object_bytes,
+            buffered_put_object_bytes: config.hardening.buffered_put_object_bytes,
+            backend_multipart_part_bytes: config.hardening.backend_multipart_part_bytes,
+            max_in_flight_upload_body_bytes: config.hardening.max_in_flight_upload_body_bytes,
+            max_concurrent_connections: config.hardening.max_concurrent_connections,
+            max_concurrent_requests: config.hardening.max_concurrent_requests,
+            request_rate_limit_per_second: config.hardening.request_rate_limit_per_second,
+            action_posture: "report-only",
+        },
         findings: doctor_findings(config, profile),
     }
 }
@@ -350,6 +476,132 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
     }
 
     findings
+}
+
+fn provider_summary(config: &RuntimeConfig) -> AdminProviderSummary {
+    AdminProviderSummary {
+        selected_profile: selected_provider_profile(config),
+        conformance: provider_conformance_summary(
+            &config.provider_conformance,
+            selected_provider_profile(config),
+        ),
+    }
+}
+
+fn selected_provider_profile(config: &RuntimeConfig) -> &'static str {
+    if config
+        .repository
+        .retention
+        .is_some_and(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
+    {
+        "retained-version-object-lock"
+    } else if backend_kind(&config.backend.endpoint) == "s3-compatible" {
+        "atomic-create"
+    } else {
+        "dev"
+    }
+}
+
+fn provider_conformance_summary(
+    config: &ProviderConformanceConfig,
+    selected_profile: &'static str,
+) -> AdminProviderConformanceSummary {
+    let Some(path) = config.report_file.as_ref() else {
+        return provider_conformance_unavailable("missing", "provider-conformance.not-configured");
+    };
+    let Ok(body) = fs::read_to_string(path) else {
+        return provider_conformance_unavailable("missing", "provider-conformance.unreadable");
+    };
+    let Ok(report) = serde_json::from_str::<ProviderConformanceReportJson>(&body) else {
+        return provider_conformance_unavailable("invalid", "provider-conformance.invalid-json");
+    };
+    if report.schema != "rs3.v2-provider-conformance.v1" {
+        return provider_conformance_unavailable("invalid", "provider-conformance.schema");
+    }
+    let failed_check_count = report
+        .checks
+        .iter()
+        .filter(|check| check.status != "passed")
+        .count();
+    let legal_hold_checked = report
+        .checks
+        .iter()
+        .any(|check| check.name.starts_with("legal-hold-"));
+    let governance_bypass_reviewed = report
+        .checks
+        .iter()
+        .any(|check| check.name == "retained-governance-bypass-review" && check.status == "passed");
+    let mut state = if report.passed && failed_check_count == 0 {
+        "passed"
+    } else {
+        "failed"
+    };
+    let mut reason_code = None;
+
+    if report.profile != selected_profile {
+        state = "invalid";
+        reason_code = Some("provider-conformance.profile-mismatch");
+    } else if state == "passed" && provider_conformance_is_stale(report.generated_at_ms, config) {
+        state = "stale";
+        reason_code = Some("provider-conformance.stale");
+    }
+
+    AdminProviderConformanceSummary {
+        state,
+        reason_code,
+        profile: Some(report.profile),
+        generated_at_ms: report.generated_at_ms,
+        check_count: report.checks.len(),
+        failed_check_count,
+        legal_hold_checked,
+        governance_bypass_reviewed,
+    }
+}
+
+fn provider_conformance_is_stale(
+    generated_at_ms: Option<i64>,
+    config: &ProviderConformanceConfig,
+) -> bool {
+    let Some(generated_at_ms) = generated_at_ms else {
+        return true;
+    };
+    let Some(now_ms) = current_time_ms() else {
+        return false;
+    };
+    let max_age_ms = i64::try_from(config.max_age.as_millis()).unwrap_or(i64::MAX);
+    now_ms.saturating_sub(generated_at_ms) > max_age_ms
+}
+
+fn provider_conformance_unavailable(
+    state: &'static str,
+    reason_code: &'static str,
+) -> AdminProviderConformanceSummary {
+    AdminProviderConformanceSummary {
+        state,
+        reason_code: Some(reason_code),
+        profile: None,
+        generated_at_ms: None,
+        check_count: 0,
+        failed_check_count: 0,
+        legal_hold_checked: false,
+        governance_bypass_reviewed: false,
+    }
+}
+
+#[derive(Deserialize)]
+struct ProviderConformanceReportJson {
+    schema: String,
+    profile: String,
+    passed: bool,
+    #[serde(default)]
+    generated_at_ms: Option<i64>,
+    checks: Vec<ProviderConformanceCheckJson>,
+}
+
+#[derive(Deserialize)]
+struct ProviderConformanceCheckJson {
+    name: String,
+    status: String,
 }
 
 async fn restore_summary(config: &RuntimeConfig) -> AdminRestoreSummary {
@@ -482,6 +734,14 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
         .map(|policy| policy.retain_days)
         .unwrap_or(0)
         .to_string();
+    let allow_repository_init = config.repository.allow_init.to_string();
+    let provider_conformance_report_configured = config
+        .provider_conformance
+        .report_file
+        .is_some()
+        .to_string();
+    let provider_conformance_max_age_seconds =
+        config.provider_conformance.max_age.as_secs().to_string();
     let static_credentials = config.static_credentials.is_some().to_string();
     let max_put_object_bytes = config.hardening.max_put_object_bytes.to_string();
     let buffered_put_object_bytes = config.hardening.buffered_put_object_bytes.to_string();
@@ -505,6 +765,9 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
         decrypted_segment_cache_max_bytes.as_bytes(),
         retention_mode.as_bytes(),
         retention_days.as_bytes(),
+        allow_repository_init.as_bytes(),
+        provider_conformance_report_configured.as_bytes(),
+        provider_conformance_max_age_seconds.as_bytes(),
         static_credentials.as_bytes(),
         max_put_object_bytes.as_bytes(),
         buffered_put_object_bytes.as_bytes(),
@@ -529,15 +792,16 @@ fn current_time_ms() -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdminReportProfile, admin_status_report, backend_kind, doctor_findings,
-        runtime_config_profile,
+        AdminReportProfile, admin_posture_report, admin_status_report, backend_kind,
+        current_time_ms, doctor_findings, runtime_config_profile,
     };
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
-        RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, SecretString,
-        StaticCredentials,
+        ProviderConformanceConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig,
+        RuntimeConfig, SecretString, StaticCredentials,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
+    use std::fs;
     use std::time::Duration;
 
     fn runtime_config() -> RuntimeConfig {
@@ -571,7 +835,9 @@ mod tests {
                     mode: RetentionMode::Compliance,
                     retain_days: 30,
                 }),
+                allow_init: true,
             },
+            provider_conformance: ProviderConformanceConfig::default(),
             repository_keys: RepositoryKeysConfig {
                 repository_id: RepositoryId::new("repo-secret-id")
                     .unwrap_or_else(|error| panic!("{error}")),
@@ -703,5 +969,50 @@ mod tests {
         assert!(!json.contains("backend-secret-bucket"));
         assert!(!json.contains("tenant/private/prefix"));
         assert!(!json.contains("repo-secret-id"));
+    }
+
+    #[test]
+    fn admin_posture_reports_redacted_provider_conformance_evidence() {
+        let mut config = runtime_config();
+        config.backend.endpoint = "https://storage.example".to_owned();
+        config.provider_conformance.report_file = Some(provider_report_file(
+            r#"{
+              "schema": "rs3.v2-provider-conformance.v1",
+              "generated_at_ms": 9999999999999,
+              "profile": "retained-version-object-lock",
+              "passed": true,
+              "checks": [
+                {"name": "basic-put", "status": "passed", "reason": null},
+                {"name": "legal-hold-verifiable", "status": "passed", "reason": null},
+                {"name": "retained-governance-bypass-review", "status": "passed", "reason": null}
+              ]
+            }"#,
+        ));
+
+        let report = admin_posture_report(&config, AdminReportProfile::Production);
+        let json = serde_json::to_string(&report).unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(report.schema, "rs3.admin-posture.preview.v1");
+        assert_eq!(
+            report.provider.selected_profile,
+            "retained-version-object-lock"
+        );
+        assert_eq!(report.provider.conformance.state, "passed");
+        assert_eq!(report.provider.conformance.check_count, 3);
+        assert!(report.provider.conformance.legal_hold_checked);
+        assert!(report.provider.conformance.governance_bypass_reviewed);
+        assert!(!json.contains("storage.example"));
+        assert!(!json.contains("backend-secret-bucket"));
+        assert!(!json.contains("tenant/private/prefix"));
+    }
+
+    fn provider_report_file(body: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rs3-provider-report-{}-{}.json",
+            std::process::id(),
+            current_time_ms().unwrap_or(0)
+        ));
+        fs::write(&path, body).unwrap_or_else(|error| panic!("{error}"));
+        path
     }
 }

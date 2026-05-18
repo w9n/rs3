@@ -39,12 +39,14 @@ For serving:
 cargo run -p rs3-server -- serve --bind 127.0.0.1:9080
 ```
 
-The core server library also exposes a path-redacted admin report model for
-operator tooling. It reports runtime posture, profile findings, backend and
-anchor kind, retention settings, and restore-trust status without exposing a
-path browser, configured bucket names, backend prefixes, repository IDs,
-client-visible object paths, or secret material. Treat this report as a preview
-fact model, not as a stable workflow API.
+The core server library also exposes path-redacted admin reports for operator
+tooling. `GET /admin/posture` is cheap enough for routine polling and reports
+runtime posture, profile findings, backend and anchor kind, retention settings,
+and last persisted provider-conformance evidence. `GET /admin/status` adds
+restore-trust and maintenance verification and may touch repository state.
+Neither report exposes a path browser, configured bucket names, backend
+prefixes, repository IDs, client-visible object paths, or secret material. Treat
+these reports as preview fact models, not as stable workflow APIs.
 
 To expose those facts over HTTP for local diagnostics or a tightly controlled
 cluster integration, run a separate authenticated admin listener:
@@ -55,7 +57,8 @@ RS3_ADMIN_BEARER_TOKEN=<admin-token> \
 cargo run -p rs3-server -- serve --bind 127.0.0.1:9080
 ```
 
-Then read `GET /admin/status` with a bearer token. Do not reuse Velero/Kopia S3
+Then read `GET /admin/posture` for frequent polling and `GET /admin/status`
+for deeper verification with a bearer token. Do not reuse Velero/Kopia S3
 credentials or backend S3 credentials for this admin channel.
 
 Run the read-only single-gateway console when an operator needs a browser view
@@ -71,8 +74,9 @@ cargo run -p rs3-console
 
 Open `http://127.0.0.1:9083/` and enter the console token. The browser calls the
 console, not the gateway admin listener; the gateway admin bearer token remains
-server-side. The console is read-only and does not execute recovery, key
-rotation, deployment, or cleanup workflows.
+server-side. The console can proxy both `/api/posture` and `/api/status`, stays
+read-only, and does not execute recovery, key rotation, deployment, or cleanup
+workflows.
 
 See [Configuration](reference/configuration.md) for the environment variable
 reference.
@@ -125,6 +129,10 @@ In Helm, set `repositoryKeys.create=true` or provide
 `wrapping-key-hex`; `wrapping-key-id` is optional and defaults to `wrap-v1`;
 `envelope-object-id` is an optional override. Helm values stay declarative; the
 gateway writes the encrypted envelope object, not mutated chart state.
+
+Set `repository.allowInit=true` only for deliberate first initialization on a
+fresh backend prefix. Leave it false for normal serving of an existing
+repository and recover a missing anchor from a trusted restore bundle.
 
 Inspect an existing envelope when auditing key lifecycle state:
 
@@ -282,9 +290,9 @@ Startup logs include a path-safe `config_profile` fingerprint over operational
 knobs. They do not log configured bucket names, backend prefixes, repository
 IDs, or secret material.
 
-The admin status API uses the same `config_profile` fingerprint and keeps the
-same redaction boundary as logs and metrics. Treat it as an operator control
-surface, not a backup data browser.
+The admin posture and status APIs use the same `config_profile` fingerprint and
+keep the same redaction boundary as logs and metrics. Treat them as operator
+control surfaces, not backup data browsers.
 
 ## Restore Posture
 
