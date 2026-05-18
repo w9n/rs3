@@ -131,6 +131,12 @@ write does not return a version ID, startup or write flow must fail closed;
 otherwise a malicious backend could append a newer object version and make
 restore follow mutable latest state.
 
+For multipart writes, `rs3` verifies Object Lock on the completed provider
+version before accepting the write. Providers that do not carry retention or
+legal-hold headers from multipart creation must support applying and verifying
+the protection on the returned version immediately after completion. Missing
+version IDs or failed protection verification fail closed.
+
 A retained-version provider may accept a second same-key write instead of
 rejecting `If-None-Match: *`. That is acceptable only for retained/Object Lock
 repository objects when the new write returns a distinct version ID and old

@@ -48,7 +48,8 @@ trial must choose and verify one storage safety profile:
   current object must fail instead of creating a new version.
 - `retained-version`: Object Lock/versioning must return provider version IDs
   for retained writes, block version deletion before expiry, and support
-  exact-version reads after a newer latest version exists.
+  exact-version reads after a newer latest version exists. Retained multipart
+  completion must also return a protected exact version.
 
 `HEAD` before `PUT` is not the production fallback for create-only writes. It is
 non-atomic and only useful for a deliberately degraded compatibility mode, which

@@ -14,6 +14,8 @@ use std::env;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const S3_MIN_MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
+
 #[tokio::test]
 #[ignore = "requires RS3_TEST_S3_BUCKET and S3-compatible credentials"]
 async fn live_s3_backend_satisfies_core_blob_store_contract() {
@@ -179,6 +181,91 @@ async fn live_s3_object_lock_retention_round_trips_and_blocks_version_delete() {
     assert!(
         matches!(delete, Err(ref error) if retention_delete_blocked(error)),
         "version delete was not blocked by Object Lock: {delete:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires RS3_TEST_S3_OBJECT_LOCK=true and an Object Lock-enabled bucket"]
+async fn live_s3_object_lock_retained_multipart_round_trips_and_blocks_version_delete() {
+    if !env_bool("RS3_TEST_S3_OBJECT_LOCK").unwrap_or(false) {
+        eprintln!("skipping live S3 Object Lock test: RS3_TEST_S3_OBJECT_LOCK is not true");
+        return;
+    }
+    let Some(target) = live_target() else {
+        eprintln!("skipping live S3 Object Lock test: RS3_TEST_S3_BUCKET is not set");
+        return;
+    };
+    let retain_days = env_u32("RS3_TEST_S3_RETENTION_DAYS").unwrap_or(1);
+    let policy = RetentionPolicy::new(RetentionMode::Governance, retain_days);
+    let object_id = BackendObjectId::new("retention/live-retained-multipart-object".to_owned())
+        .unwrap_or_else(|error| panic!("test object id: {error}"));
+    let object_key = backend_key(&target.config, &object_id);
+    let store = S3BlobStore::from_environment(target.config.clone())
+        .await
+        .unwrap_or_else(|error| panic!("build S3 blob store: {error}"));
+
+    store
+        .validate_retention_support(Some(&policy))
+        .await
+        .unwrap_or_else(|error| panic!("validate Object Lock support: {error}"));
+    let mut upload = store
+        .create_multipart_upload(
+            &object_id,
+            PutOptions {
+                retention: Some(policy),
+                legal_hold: None,
+                content_type: Some("application/octet-stream".to_owned()),
+                do_not_recreate: false,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("create retained multipart upload: {error}"));
+    upload
+        .put_part(0, Bytes::from(vec![b'a'; S3_MIN_MULTIPART_PART_BYTES]))
+        .await
+        .unwrap_or_else(|error| panic!("upload retained multipart first part: {error}"));
+    upload
+        .put_part(1, Bytes::from_static(b"tail-conformance"))
+        .await
+        .unwrap_or_else(|error| panic!("upload retained multipart final part: {error}"));
+    let metadata = upload
+        .complete()
+        .await
+        .unwrap_or_else(|error| panic!("complete retained multipart upload: {error}"));
+    assert!(retention_satisfies(metadata.retention.as_ref(), &policy));
+    let version_id = metadata
+        .version_id
+        .clone()
+        .unwrap_or_else(|| panic!("retained multipart upload did not return a version id"));
+
+    let head = store
+        .head_at(&object_id, Some(&version_id))
+        .await
+        .unwrap_or_else(|error| panic!("head retained multipart object: {error}"));
+    assert!(retention_satisfies(head.retention.as_ref(), &policy));
+    let offset = u64::try_from(S3_MIN_MULTIPART_PART_BYTES - 4)
+        .unwrap_or_else(|error| panic!("multipart boundary offset conversion failed: {error}"));
+    let boundary = store
+        .get_range_at(
+            &object_id,
+            Some(&version_id),
+            ByteRange::Slice { offset, len: 8 },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("read retained multipart boundary range: {error}"));
+    assert_eq!(boundary, Bytes::from_static(b"aaaatail"));
+
+    let client = sdk_client(&target.config).await;
+    let delete = client
+        .delete_object()
+        .bucket(target.config.bucket.as_str())
+        .key(object_key)
+        .version_id(version_id.as_str())
+        .send()
+        .await;
+    assert!(
+        matches!(delete, Err(ref error) if retention_delete_blocked(error)),
+        "multipart version delete was not blocked by Object Lock: {delete:?}"
     );
 }
 

@@ -41,7 +41,8 @@ use errors::{
 use metrics::S3ProviderOperation;
 use object_lock::{
     legal_hold_blocks_delete, provider_legal_hold, retain_until_date, retention_blocks_delete,
-    retention_is_active, sdk_legal_hold_status, sdk_object_lock_mode,
+    retention_is_active, retention_satisfies, sdk_legal_hold_status, sdk_object_lock_mode,
+    verify_legal_hold, verify_retention,
 };
 use requests::{object_get_options, object_path, object_put_options, sdk_range_header};
 
@@ -232,7 +233,31 @@ impl BlobMultipartUpload for S3MultipartUpload {
             .version_id()
             .map(errors::backend_version_id_from_str)
             .transpose()?;
+        let requested_retention = options.retention.filter(retention_is_active);
+        let requested_legal_hold = provider_legal_hold(options.legal_hold);
+        if (requested_retention.is_some() || requested_legal_hold.is_some()) && version_id.is_none()
+        {
+            return Err(StorageError::MissingVersionId(object_id.clone()));
+        }
         let mut metadata = store.head_with_sdk(&object_id, version_id.as_ref()).await?;
+        if let Some(retention) = requested_retention {
+            if !retention_satisfies(metadata.retention.as_ref(), &retention) {
+                store
+                    .extend_s3_retention(&object_id, version_id.as_ref(), &retention)
+                    .await?;
+                metadata = store.head_with_sdk(&object_id, version_id.as_ref()).await?;
+            }
+            verify_retention(metadata.retention.as_ref(), &retention)?;
+        }
+        if let Some(legal_hold) = requested_legal_hold {
+            if metadata.legal_hold != Some(legal_hold) {
+                store
+                    .set_s3_legal_hold(&object_id, version_id.as_ref(), legal_hold)
+                    .await?;
+                metadata = store.head_with_sdk(&object_id, version_id.as_ref()).await?;
+            }
+            verify_legal_hold(metadata.legal_hold, legal_hold)?;
+        }
         metadata.content_len = content_len;
         metadata.etag = output.e_tag().map(str::to_owned).or(metadata.etag);
         metadata.version_id = version_id.or(metadata.version_id);

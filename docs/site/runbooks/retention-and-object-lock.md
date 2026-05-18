@@ -63,6 +63,8 @@ A provider must verify:
 - retained writes return provider version IDs
 - exact-version reads return the requested retained version after a newer
   latest version exists
+- retained multipart completion protects the returned version before the write
+  is accepted
 - normal credentials cannot bypass governance
 
 Native conditional create remains the preferred qualification profile when the
