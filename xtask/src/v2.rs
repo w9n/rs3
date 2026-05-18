@@ -722,8 +722,7 @@ fn retention_mode_name(mode: RetentionMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        BundleJson, V2VerifyBundleInput, parse_recovery_bundle_json, secret_from_hex,
-        verify_bundle_with_store,
+        V2VerifyBundleInput, parse_recovery_bundle_json, secret_from_hex, verify_bundle_with_store,
     };
     use bytes::Bytes;
     use rs3_crypto::{FormatEnvelope, KeyRing, RepositoryKeyContext};
@@ -886,7 +885,4 @@ mod tests {
             version_id: metadata.version_id,
         }
     }
-
-    #[allow(dead_code)]
-    fn _bundle_json_type_check(_: BundleJson) {}
 }
