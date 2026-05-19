@@ -125,8 +125,8 @@ retained/Object Lock repositories should contain them.
 
 When the old Lease is gone and no trusted v2 bundle exists, do not promote
 backend state by listing storage. A malicious backend can hide newer valid
-commits. Escalate to an operator-held authority, offline audit trail, or future
-HSM/KMS-backed anchor record before recreating the Lease.
+commits. Escalate to an operator-held authority, offline audit trail, or
+external anchor record before recreating the Lease.
 
 ## 5. Verify Before Restore
 

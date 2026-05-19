@@ -100,6 +100,15 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and (not .Values.repositoryKeys.create) (not .Values.repositoryKeys.existingSecret) -}}
 {{- fail "repositoryKeys.create=true or repositoryKeys.existingSecret is required" -}}
 {{- end -}}
+{{- if and (not .Values.credentials.create) (not .Values.credentials.existingSecret) -}}
+{{- fail "credentials.create=true or credentials.existingSecret is required" -}}
+{{- end -}}
+{{- if and .Values.credentials.create (not .Values.credentials.accessKeyId) -}}
+{{- fail "credentials.accessKeyId is required when credentials.create=true" -}}
+{{- end -}}
+{{- if and .Values.credentials.create (not .Values.credentials.secretAccessKey) -}}
+{{- fail "credentials.secretAccessKey is required when credentials.create=true" -}}
+{{- end -}}
 {{- if and .Values.repositoryKeys.create (not .Values.repositoryKeys.saltHex) -}}
 {{- fail "repositoryKeys.saltHex is required when repositoryKeys.create=true" -}}
 {{- end -}}

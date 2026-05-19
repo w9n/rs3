@@ -182,7 +182,8 @@ S3-compatible providers qualify through one of two profiles:
 
 `HEAD` before `PUT` is not a security-equivalent fallback. It can improve UX for
 single-writer compatibility probes, but it is not atomic and does not protect
-against a provider that races requests, serves stale state, or ignores conditional headers.
+against a provider that races requests, serves stale state, or ignores
+conditional headers.
 
 `rs3 check-v2-provider` runs the selected v2 profile probes against the
 configured backend, including multipart upload behavior used by large

@@ -140,6 +140,9 @@ integration-velero-kopia-postgres-v2-live *ARGS:
 
 helm-lint:
     helm lint charts/rs3-gateway \
+        --set credentials.create=true \
+        --set-string credentials.accessKeyId=fixture-access-key \
+        --set-string credentials.secretAccessKey=fixture-secret-key \
         --set repositoryKeys.create=true \
         --set-string repositoryKeys.saltHex=1111111111111111111111111111111111111111111111111111111111111111 \
         --set-string repositoryKeys.wrappingKeyHex=2222222222222222222222222222222222222222222222222222222222222222

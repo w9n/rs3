@@ -52,7 +52,6 @@ the repository-state transition model.
 | Keys | Encrypted keyring envelope |
 | Gateway modes | `read-write` for backups and routine restores, `restore-readonly` for incident restore |
 | Retention | Provider retention/Object Lock capability checked where configured |
-| External trust sources | external anchor/key-provider source, not a preview blocker |
 
 ## Trust Model
 
@@ -140,21 +139,19 @@ A new cluster needs more than backend credentials:
 - trusted v2 anchor position: sequence, commit key, commit object version ID
   when available, commit body digest, signing key ID, and format-root reference
 
-The trusted anchor position can come from a recovery bundle, audited export, or
-trusted external anchor. Retained backend versions can help establish what
-existed in storage, but by themselves they are not a latest-state authority
-because a malicious backend can hide newer valid commits or replay older valid
-commits.
+The trusted anchor position can come from a recovery bundle or audited export.
+Retained backend versions can help establish what existed in storage, but by
+themselves they are not a latest-state authority because a malicious backend
+can hide newer valid commits or replay older valid commits.
 
 Recovery bundles are weak-subjectivity inputs. Importing an older valid bundle
 recreates the older anchor it names. Preserve fresh bundles outside the backend
 and compare the sequence and commit digest with an external record before
 anchor import.
 
-An external anchor can distribute trust outside the cluster. It should store
-or sign the accepted commit position, not the whole repository index. That
-position already commits to the signed commit chain and therefore to the
-repository state reachable from it.
+Any external anchor should store or sign the accepted commit position, not the
+whole repository index. That position already commits to the signed commit
+chain and therefore to the repository state reachable from it.
 
 ## Current Evidence
 
@@ -231,8 +228,8 @@ backup/restore and DR evidence above.
 Use a release candidate built from this line for controlled evaluation, not for
 a stable repository-format commitment. The durable format remains
 preview-scoped, governance-bypass IAM review remains operator-owned, live
-provider gates should be rerun after material changes, and public
-security claims need separate review.
+provider gates should be rerun after material changes, and public security
+claims need separate review.
 
 ## Non-Goals
 

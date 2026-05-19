@@ -3,8 +3,8 @@
 This directory is reserved for integration harness assets that are too broad
 for default Cargo tests.
 
-See [../TEST_LANES.md](../TEST_LANES.md) for the current lane map and planned
-restore coverage.
+See [../TEST_LANES.md](../TEST_LANES.md) for the current lane map and restore
+coverage.
 
 Current entrypoint:
 

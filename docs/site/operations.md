@@ -226,9 +226,9 @@ If S3 serves an older valid commit, hides the commit named by the Lease, or
 contains commits newer than the Lease, the gateway should stop or require a
 trusted recovery bundle rather than silently choosing storage state.
 
-A trusted external anchor can distribute trust outside the cluster by
-storing or signing the accepted commit position: sequence, commit key, commit
-object version ID when available, commit digest, signing key ID, and format-root
+An external anchor can distribute trust outside the cluster by storing or
+signing the accepted commit position: sequence, commit key, commit object
+version ID when available, commit digest, signing key ID, and format-root
 reference. It does not need to store the whole repository index.
 
 In Helm deployments, keep `rbac.create=true` unless equivalent Lease
