@@ -46,17 +46,6 @@ mkdocs build --strict
 - Keep public APIs small, documented, and preview-scoped unless deliberately
   stabilized.
 
-
-
-
-
-
-
-
-
-
-
-
 ## Docs And Context
 
 - `docs/site/` is the public documentation source; keep behavior, security,
