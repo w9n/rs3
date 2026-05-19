@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
 pub(crate) const PUBLIC_BUCKET: &str = "client-bucket";
-pub(crate) const ACCESS_KEY_ID: &str = "access";
-pub(crate) const SECRET_ACCESS_KEY: &str = "secretsecret";
+pub(crate) const ACCESS_KEY_ID: &str = "rs3-fixture-access-key";
+pub(crate) const SECRET_ACCESS_KEY: &str = "rs3-fixture-secret-key";
 const KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.json";
 const KEYRING_WRAPPING_KEY_HEX: &str =
     "3333333333333333333333333333333333333333333333333333333333333333";

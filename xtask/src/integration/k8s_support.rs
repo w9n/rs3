@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 
-pub(crate) const ACCESS_KEY_ID: &str = "access";
+pub(crate) const ACCESS_KEY_ID: &str = "rs3-fixture-access-key";
 pub(crate) const CHART_NAME: &str = "rs3-gateway";
 pub(crate) const CHART_PATH: &str = "charts/rs3-gateway";
 pub(crate) const DEFAULT_PUBLIC_BUCKET: &str = "client-bucket";
@@ -20,7 +20,7 @@ pub(crate) const KEYRING_WRAPPING_KEY_ID: &str = "wrap-integration";
 pub(crate) const REPOSITORY_ID: &str = "rs3-integration-repository";
 pub(crate) const REPOSITORY_SALT_HEX: &str =
     "2222222222222222222222222222222222222222222222222222222222222222";
-pub(crate) const SECRET_ACCESS_KEY: &str = "secret";
+pub(crate) const SECRET_ACCESS_KEY: &str = "rs3-fixture-secret-key";
 
 pub(crate) struct GatewayChartValues<'a> {
     pub(crate) release_name: &'a str,

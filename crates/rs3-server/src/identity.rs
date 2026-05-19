@@ -188,8 +188,8 @@ mod tests {
     fn provider() -> StaticCredentialProvider {
         StaticCredentialProvider::new(
             StaticCredentials {
-                access_key_id: "access".to_owned(),
-                secret_access_key: SecretString::from("secret"),
+                access_key_id: "rs3-fixture-access-key".to_owned(),
+                secret_access_key: SecretString::from("rs3-fixture-secret-key"),
             },
             bucket("backups"),
         )
@@ -199,12 +199,12 @@ mod tests {
     fn authenticates_static_credentials() {
         let provider = provider();
 
-        let identity = provider.authenticate("access", "secret");
+        let identity = provider.authenticate("rs3-fixture-access-key", "rs3-fixture-secret-key");
 
         assert_eq!(
             identity,
             Ok(super::Identity {
-                subject: "access".to_owned(),
+                subject: "rs3-fixture-access-key".to_owned(),
             })
         );
     }
@@ -213,7 +213,7 @@ mod tests {
     fn rejects_invalid_static_secret() {
         let provider = provider();
 
-        let identity = provider.authenticate("access", "wrong");
+        let identity = provider.authenticate("rs3-fixture-access-key", "wrong");
 
         assert_eq!(identity, Err(AuthError::InvalidCredentials));
     }
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn authorizes_only_configured_bucket() {
         let provider = provider();
-        let identity = provider.authenticate("access", "secret");
+        let identity = provider.authenticate("rs3-fixture-access-key", "rs3-fixture-secret-key");
         let identity = match identity {
             Ok(identity) => identity,
             Err(error) => panic!("{error}"),
@@ -243,13 +243,13 @@ mod tests {
     #[test]
     fn secret_debug_output_is_redacted() {
         let credentials = StaticCredentials {
-            access_key_id: "access".to_owned(),
+            access_key_id: "rs3-fixture-access-key".to_owned(),
             secret_access_key: SecretString::from("top-secret-token"),
         };
 
         let debug = format!("{credentials:?}");
 
-        assert!(debug.contains("access"));
+        assert!(debug.contains("rs3-fixture-access-key"));
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("top-secret-token"));
     }

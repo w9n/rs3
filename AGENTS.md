@@ -33,8 +33,9 @@ mkdocs build --strict
   names, namespaces, or snapshot names in object-store keys, unauthenticated
   metadata, logs, metrics labels, or errors.
 - Keep cryptography in `rs3-crypto`; prefer typed IDs in `rs3-types`.
-- Model repository changes as append-friendly deltas plus signed checkpoints;
-  avoid designs that rewrite many objects during normal operation.
+- Model repository changes as append-friendly deltas plus signed commits and
+  external anchors; avoid designs that rewrite many objects during normal
+  operation.
 - Treat S3-compatible stores as eventually inconsistent unless documented
   otherwise.
 - Kubernetes rollback anchors fail closed. If an anchor cannot be read or
@@ -55,7 +56,7 @@ mkdocs build --strict
   and Kubernetes resource names. Document necessary leakage in
   `docs/site/security-model.md` and verify rollback behavior when the backend
   can list, delete, delay, or replay objects.
-- Before architecture, security, repository-format, checkpointing, retention,
+- Before architecture, security, repository-format, anchoring, retention,
   compatibility, or observability work, read:
   `README.md`, `docs/site/index.md`, `docs/site/architecture.md`,
   `docs/site/security-model.md`, `docs/site/reference/repository-format.md`.
@@ -73,7 +74,7 @@ mkdocs build --strict
 
 ## Design Biases
 
-- Favor explicit manifests and signed checkpoints over implicit latest objects.
+- Favor explicit manifests and signed commits over implicit latest objects.
 - Favor bounded batch reads over one-read-per-file listings.
 - Favor provider-neutral semantics first; add S3-specific acceleration behind
   feature flags.

@@ -1363,7 +1363,7 @@ mod tests {
 
     #[test]
     fn rejects_partial_static_credentials() {
-        let source = minimal_source().with("RS3_STATIC_ACCESS_KEY_ID", "access");
+        let source = minimal_source().with("RS3_STATIC_ACCESS_KEY_ID", "rs3-fixture-access-key");
 
         let config = RuntimeConfig::from_source(&source);
 
@@ -1398,7 +1398,7 @@ mod tests {
     #[test]
     fn static_secret_is_redacted_in_debug_output() {
         let source = minimal_source()
-            .with("RS3_STATIC_ACCESS_KEY_ID", "access")
+            .with("RS3_STATIC_ACCESS_KEY_ID", "rs3-fixture-access-key")
             .with("RS3_STATIC_SECRET_ACCESS_KEY", "super-secret");
 
         let config = RuntimeConfig::from_source(&source);
@@ -1407,7 +1407,7 @@ mod tests {
             Err(error) => panic!("{error}"),
         };
 
-        assert!(debug.contains("access"));
+        assert!(debug.contains("rs3-fixture-access-key"));
         assert!(!debug.contains("super-secret"));
         assert!(!debug.contains("test-repository"));
         assert!(!debug.contains(REPOSITORY_SALT_HEX));

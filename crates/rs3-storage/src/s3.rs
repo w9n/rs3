@@ -1035,8 +1035,8 @@ mod tests {
             .with_bucket_name("bucket")
             .with_endpoint("http://127.0.0.1:9")
             .with_allow_http(true)
-            .with_access_key_id("access")
-            .with_secret_access_key("secret")
+            .with_access_key_id("rs3-fixture-access-key")
+            .with_secret_access_key("rs3-fixture-secret-key")
             .build()
             .unwrap_or_else(|error| panic!("{error}"));
         let store = S3BlobStore::from_store(object_store, config);

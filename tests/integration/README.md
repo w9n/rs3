@@ -66,11 +66,11 @@ clusters unless the job explicitly owns cleanup.
 
 The Velero Kopia smoke extends the Kubernetes path by installing a small
 S3-compatible backend behind the gateway, deploying the gateway with a
-Kubernetes Lease checkpoint anchor, installing Velero with the node-agent,
+Kubernetes Lease anchor, installing Velero with the node-agent,
 pointing its S3 backup location at the gateway service, backing up a pod volume,
 restoring it, and checking the restored file content. The gateway has no durable
 local state in these lanes; object data lives in the backend service and current
-checkpoint state lives in the Lease.
+accepted state lives in the Lease.
 
 ```sh
 cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-smoke
@@ -79,7 +79,7 @@ cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-smoke
 The local-PV variant adds static PV data-restore coverage without deploying a
 dynamic storage provider. It keeps the PV/PVC bound, removes the original file,
 deletes the pod, restores the pod, and verifies that Velero repopulates the
-volume through Kopia..
+volume through Kopia.
 
 ```sh
 cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-local-pv-smoke
@@ -88,7 +88,7 @@ cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-local-
 The dynamic-PVC variant installs OpenEBS LocalPV Hostpath through its pinned Helm
 chart, creates a PVC from that StorageClass, deletes the workload namespace after
 backup, restores it, and verifies the restored file bytes. This is the first
-kind-friendly disaster-restore lane..
+kind-friendly disaster-restore lane.
 
 ```sh
 cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke
@@ -98,7 +98,7 @@ The gateway-restart variant restarts the stateless gateway after backup and
 before restore, keeps the gateway in `read-write`, and expects Velero to report
 the restore as `Completed`. This is the primary Velero UX path because Velero
 writes restore result artifacts after data restore and those artifacts should be
-checkpointed repository state when the repository is healthy.
+committed repository state when the repository is healthy.
 
 ```sh
 cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke
@@ -131,16 +131,17 @@ then verifies live SQL state and the dump file after restore.
 cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke
 ```
 
-That Postgres smoke verifies only the gateway and Velero/Kopia compatibility path for a small
+That Postgres smoke is not the production database backup design. The cluster
+smoke verifies only the gateway and Velero/Kopia compatibility path for a small
 stateful workload. Database-native backup systems still need their own
 consistency and restore validation.
 
 Velero lanes collect artifacts under `.local/integration` unless
 `--skip-artifacts` is passed. Use `--artifact-dir` to pin the output path. The
-artifact set includes gateway logs, Kubernetes Lease checkpoint snapshots,
+artifact set includes gateway logs, Kubernetes Lease anchor snapshots,
 parsed backend operation counts, amplification ratios, Velero CRs, PVC/PV state,
 pod events, and relevant controller logs. Restart lanes also capture gateway
-logs and anchor state before and after the restart so checkpoint reload is
+logs and anchor state before and after the restart so anchored reload is
 visible without manual `kubectl` inspection.
 
 The Velero lanes load the Velero server and AWS plugin images from the local

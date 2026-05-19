@@ -104,8 +104,8 @@ pub(super) mod test_support {
                 ),
             },
             static_credentials: static_credentials.then(|| crate::StaticCredentials {
-                access_key_id: "access".to_owned(),
-                secret_access_key: SecretString::from("secret"),
+                access_key_id: "rs3-fixture-access-key".to_owned(),
+                secret_access_key: SecretString::from("rs3-fixture-secret-key"),
             }),
         }
     }

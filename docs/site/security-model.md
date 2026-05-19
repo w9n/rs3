@@ -60,7 +60,7 @@ The default design accepts specific backend-visible leakage:
 | Retention mode | Provider retention APIs expose mode and retain-until behavior. | Treat retention mode as policy metadata, not tenant identity. |
 | Source network metadata | The provider sees the gateway's network identity. | Deploy through controlled egress where required. |
 | Broad object class | Class prefixes support lifecycle and operations. | Keep class names generic and path-free; revisit in a new format if needed. |
-| Deterministic metadata equality | Stable metadata sealing can produce identical sealed bytes for identical metadata under identical associated data. | Use object-type-specific associated data and signed reachability; revisit before stable-format. |
+| Deterministic metadata equality | Stable metadata sealing can produce identical sealed bytes for identical metadata under identical associated data. | Use object-type-specific associated data and signed reachability; revisit before stable-format claims. |
 | Prefix-token structure | Current prefix tokens reveal token count and shared-token relationships. | Document as an open privacy risk; redesign index compaction before stable-format claims. |
 
 Optional mitigations include padding, pack-size normalization, commit batching,
