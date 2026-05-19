@@ -1,9 +1,8 @@
 //! Path-redacted operator report facts.
 //!
-//! These reports are preview-scoped facts for local tooling and external
-//! management integrations. They are intentionally not a complete workflow API:
-//! orchestration, approvals, management workflows, multi-management workflows, and audit model
-//! require a separate documented authorization and audit design and stabilization decision.
+//! These reports are preview-scoped facts for local tooling and management
+//! integrations. They are intentionally not a complete workflow API; mutating
+//! workflows require a separate authorization and audit model.
 
 use crate::{AnchorConfig, BackendConfig, ProviderConformanceConfig, RuntimeConfig};
 use rs3_crypto::derive_public_fingerprint;
