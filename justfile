@@ -49,15 +49,16 @@ preview-gate-v2-live BACKEND_BUCKET ENDPOINT_URL REGION:
     #!/usr/bin/env bash
     set -euo pipefail
     timestamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-    base="isolated live prefix${timestamp}"
+    base="${RS3_LIVE_BACKEND_PREFIX_BASE:-rs3-live/${timestamp}}"
     mkdir -p .local/integration
-    echo "v2 live gate prefix base: ${base}"
-    just check-v2-provider-v2-live "{{BACKEND_BUCKET}}" "{{ENDPOINT_URL}}" "{{REGION}}" "${base}/provider-conformance" > ".local/integration/${timestamp}.json"
-    just integration-s3-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/s3-gateway"
-    just integration-kopia-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/kopia-gateway"
+    printf '%s\n' "${base}" > ".local/integration/${timestamp}.txt"
+    echo "v2 live gate using a fresh backend prefix; exact value is in the local artifact directory"
+    just check-v2-provider-v2-live "{{BACKEND_BUCKET}}" "{{ENDPOINT_URL}}" "{{REGION}}" "${base}/a" > ".local/integration/${timestamp}.json"
+    just integration-s3-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/b"
+    just integration-kopia-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/c"
     just integration-k8s-gateway-v2 --wait-secs 240
-    just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/velero-dynamic-pvc"
-    just integration-velero-kopia-postgres-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/velero-postgres"
+    just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/d"
+    just integration-velero-kopia-postgres-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/e"
 
 check-v2-provider-v2-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
     #!/usr/bin/env bash
@@ -81,7 +82,7 @@ check-v2-provider-v2-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
     RS3_REPOSITORY_SALT_HEX=2222222222222222222222222222222222222222222222222222222222222222 \
     RS3_KEYRING_WRAPPING_KEY_HEX=3333333333333333333333333333333333333333333333333333333333333333 \
       cargo run -p rs3-server --features s3 -- check-v2-provider \
-        --probe-prefix "{{BACKEND_PREFIX}}/probes" \
+        --probe-prefix "{{BACKEND_PREFIX}}/p" \
         --legal-hold \
         --governance-bypass-reviewed \
         --format json

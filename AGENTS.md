@@ -57,7 +57,6 @@ mkdocs build --strict
 
 
 
-
 ## Docs And Context
 
 - `docs/site/` is the public documentation source; keep behavior, security,
@@ -71,7 +70,6 @@ mkdocs build --strict
   compatibility, or observability work, read:
   `README.md`, `docs/site/index.md`, `docs/site/architecture.md`,
   `docs/site/security-model.md`, `docs/site/reference/repository-format.md`.
-
 
 ## Workflow
 

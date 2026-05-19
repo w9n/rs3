@@ -53,7 +53,8 @@ just docs-build
 just docs-serve
 ```
 
-The public docs source lives under `docs/site/`.
+The public docs source lives under `docs/site/`. Keep working notes and
+uncurated design material out of the tracked documentation tree.
 
 For faster local feedback, use `just nextest` when standard Cargo test output is
 not required. Use `cargo build --timings` when investigating compile-time

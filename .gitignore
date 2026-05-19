@@ -3,6 +3,9 @@
 /.env
 /.idea/
 /.vscode/
+/.agents/
+/.backlog/
+/.cursor/
 *.swp
 *.swo
 *.tmp

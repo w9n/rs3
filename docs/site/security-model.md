@@ -191,7 +191,8 @@ review that gateway credentials cannot bypass retention.
 
 ## Operator Reporting Rule
 
-The core admin report model is path-redacted. Any operator UI or management integration built on it is not a repository browser. It may show profile
+The core admin report model is path-redacted. Any operator UI or management
+plane built on it is not a repository browser. It may show profile
 findings, backend kind, anchor kind, commit sequence, commit key, commit digest,
 retention posture, and path-safe fingerprints. It must not
 show client-visible paths, Kubernetes object names, tenant names, configured
@@ -204,9 +205,8 @@ S3 data plane and currently exposes path-redacted facts at `GET /admin/posture`
 and `GET /admin/status`; it must use an admin bearer token that is separate from
 backup-client S3 credentials and backend S3 credentials. Mutating recovery and
 maintenance actions need explicit authorization and audit controls before they
-belong in an admin interface. Operator reports should stay fact-only; approval
-workflows, fleet state, policy workflows, key-rotation workflows, and audit
-storage require a separate documented authorization and audit design.
+belong in an admin interface. Operator reports should stay fact-only until a
+separate authorization and audit design exists.
 
 Do not reuse backup-client S3 credentials as admin credentials. S3 client IAM
 controls backup-tool operations on the data plane; admin/operator identity is a

@@ -146,15 +146,15 @@ privacy invariants.
 Core code owns the path-redacted admin report model used by doctor checks,
 runtime status, backend and anchor posture, retention settings, and
 restore-trust summaries. That keeps the S3 data plane independent from
-operator UX, management integrations, and management authorization.
+operator UX and broader management concerns.
 
 In `rs3-server`, `src/admin.rs` contains only the shared report builders and
 serializable summaries. A separate operator UI or platform integration should
-consume those summaries through an explicit admin boundary instead of
-sharing backup-client S3 credentials or browsing repository objects directly.
-The report shape is a preview fact contract, not a complete workflow API: fleet
-inventory, multi-management workflows, policy workflows, rotation workflows, approvals,
-auditing, and recovery orchestration require their own authorization, audit, and stabilization decision.
+consume those summaries through an explicit admin boundary instead
+of sharing backup-client S3 credentials or browsing repository objects
+directly. The report shape is a preview fact contract, not a complete workflow
+API. Mutating workflows require their own authorization, audit, and
+stabilization decision.
 
 `rs3-console` is the narrow single-gateway UI for these reports. It serves a
 browser interface and proxies `GET /api/posture` or `GET /api/status` to the

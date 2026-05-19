@@ -55,8 +55,7 @@ adaptive writer default. Workload set: `larger-restores`. Each row is the
 average of three direct/gateway run pairs. The direct baseline is the straight
 RustFS measurement proxy.
 
-Artifact:
-`.local/integration/`.
+Raw artifact: retained as ignored local release evidence.
 
 `workload_consistency` passed for every profile and `regression_budgets` passed.
 
@@ -92,8 +91,7 @@ Run date: 2026-05-04. Gateway profile: release. One direct/gateway run pair per
 profile, so this historical artifact validated shape and budget wiring before
 the five-profile release matrix above.
 
-Artifact:
-`.local/integration/`.
+Raw artifact: retained as ignored local release evidence.
 
 `workload_consistency` passed for every profile, and `regression_budgets`
 passed.
@@ -155,21 +153,16 @@ cache fill, and 4 KiB range reads used 0.063 requests per client read. Large
 PUT plus one retained-profile preflight `HEAD`; write-byte amplification was
 1.0004x. Eight 4 KiB ranges from a large object used one backend range `GET`
 after cache fill, with 2.0005x read-byte amplification from the 64 KiB adaptive
-payload segment. Artifacts:
-`.local/perf/`,
-`.local/perf/`,
-`.local/perf/`, and
-`.local/perf/`.
+payload segment. The raw JSONL artifacts are retained as ignored local release
+evidence and should be copied to release assets only after review.
 
 A local Velero/Postgres smoke on 2026-05-16 exercised the concurrent restore
 path after v2 payload-section cache fills were coalesced. The gateway run
 completed backup and restore with `v2-preview`, emitted no backend `segments/`
 objects, and read 29.0 MB from the backend versus 28.9 MB for the direct RustFS
 baseline. Backend request count was lower through the gateway in that smoke:
-57 requests versus 708 for direct RustFS. Artifact:
-`.local/integration/`; direct
-baseline:
-`.local/integration/`.
+57 requests versus 708 for direct RustFS. Raw local summaries remain ignored
+workspace evidence unless deliberately promoted to a release asset.
 Treat this as Velero smoke evidence. The broader release-profile ratios still
 come from the Kopia measured matrix above until that matrix is refreshed after
 the v2 range-read change.
@@ -230,4 +223,4 @@ and host load can dominate.
 - Reduce commit stage-lock and commit-wait time without allowing commits to
   race writes whose sequence state is not yet indexed.
 - Add provider matrix runs for additional S3-compatible stores after the
-  retained-backend retained-version lane remains repeatable.
+  retained-version lane remains repeatable.

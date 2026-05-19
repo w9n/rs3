@@ -87,12 +87,12 @@ which is too environment-sensitive for a hard gate in this local harness.
 Run date: 2026-05-03. Payload segment lane: fixed 512 B. Each row is the
 average of three direct/gateway run pairs.
 
-| Profile | Artifact | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend writes | Backend reads |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| small-smoke | `.local/integration/` | 1.66 s | 1.28 s | 0.78x | 0.81x | 1.14x | 1.02x |
-| changed-snapshot | `.local/integration/` | 2.02 s | 1.58 s | 0.78x | 0.82x | 1.08x | 1.02x |
-| many-small-files | `.local/integration/` | 3.01 s | 1.30 s | 0.43x | 0.31x | 2.04x | 1.72x |
-| medium-restore | `.local/integration/` | 2.66 s | 2.75 s | 1.03x | 0.89x | 1.03x | 1.03x |
+| Profile | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend writes | Backend reads |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| small-smoke | 1.66 s | 1.28 s | 0.78x | 0.81x | 1.14x | 1.02x |
+| changed-snapshot | 2.02 s | 1.58 s | 0.78x | 0.82x | 1.08x | 1.02x |
+| many-small-files | 3.01 s | 1.30 s | 0.43x | 0.31x | 2.04x | 1.72x |
+| medium-restore | 2.66 s | 2.75 s | 1.03x | 0.89x | 1.03x | 1.03x |
 
 ## Reading The Numbers
 
@@ -123,8 +123,7 @@ Per-profile values come from
 `summary.json.profiles`; the top-level aggregate intentionally mixes profiles
 and should only be used as a smoke signal for the whole set.
 
-Artifact:
-`.local/integration/`.
+Raw artifact: retained as ignored local release evidence.
 
 `workload_consistency` passed for every profile and `regression_budgets`
 reported `status: "pass"`.
@@ -174,8 +173,7 @@ Run date: 2026-05-04. Workload set: `larger-restores`. This older artifact used
 one direct/gateway run pair per profile. It validated expanded workload shape
 and budget wiring before the five-profile three-run matrix above.
 
-Artifact:
-`.local/integration/`.
+Raw artifact: retained as ignored local release evidence.
 
 `workload_consistency` passed for every profile and `regression_budgets`
 reported `status: "pass"`.
@@ -202,8 +200,7 @@ cargo run -p xtask --bin xtask --features containers -- integration kopia-measur
   --enforce-regression-budgets
 ```
 
-Validation artifact:
-`.local/integration/`.
+Validation artifact: retained as ignored local release evidence.
 
 The current built-in budgets check backend request, read-byte, and write-byte
 ratios for the small and larger profiles. The fixed 512 B `many-small-files`
@@ -229,16 +226,16 @@ cargo run -p xtask --bin xtask --features containers -- integration kopia-measur
   --payload-segment-size <bytes>
 ```
 
-| Gateway segment size | Artifact | Direct read | Gateway read | Read ratio | Request ratio | Write ratio | Elapsed ratio |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 512 B | `.local/integration/` | 72.81 KB | 124.93 KB | 1.72x | 0.31x | 2.04x | 0.43x |
-| 1 KiB | `.local/integration/` | 72.81 KB | 127.97 KB | 1.76x | 0.21x | 2.02x | 0.43x |
-| 2 KiB | `.local/integration/` | 72.81 KB | 132.32 KB | 1.82x | 0.16x | 2.01x | 0.45x |
-| 4 KiB | `.local/integration/` | 72.81 KB | 143.65 KB | 1.97x | 0.14x | 2.01x | 0.43x |
-| 8 KiB | `.local/integration/` | 72.81 KB | 166.69 KB | 2.29x | 0.12x | 2.01x | 0.43x |
-| 16 KiB | `.local/integration/` | 72.81 KB | 188.32 KB | 2.59x | 0.11x | 2.00x | 0.43x |
-| 32 KiB | `.local/integration/` | 72.81 KB | 291.93 KB | 4.01x | 0.11x | 2.01x | 0.44x |
-| 256 KiB | `.local/integration/` | 72.81 KB | 396.20 KB | 5.44x | 0.11x | 2.00x | 0.44x |
+| Gateway segment size | Direct read | Gateway read | Read ratio | Request ratio | Write ratio | Elapsed ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 B | 72.81 KB | 124.93 KB | 1.72x | 0.31x | 2.04x | 0.43x |
+| 1 KiB | 72.81 KB | 127.97 KB | 1.76x | 0.21x | 2.02x | 0.43x |
+| 2 KiB | 72.81 KB | 132.32 KB | 1.82x | 0.16x | 2.01x | 0.45x |
+| 4 KiB | 72.81 KB | 143.65 KB | 1.97x | 0.14x | 2.01x | 0.43x |
+| 8 KiB | 72.81 KB | 166.69 KB | 2.29x | 0.12x | 2.01x | 0.43x |
+| 16 KiB | 72.81 KB | 188.32 KB | 2.59x | 0.11x | 2.00x | 0.43x |
+| 32 KiB | 72.81 KB | 291.93 KB | 4.01x | 0.11x | 2.01x | 0.44x |
+| 256 KiB | 72.81 KB | 396.20 KB | 5.44x | 0.11x | 2.00x | 0.44x |
 
 Interpretation:
 
@@ -269,7 +266,7 @@ Interpretation:
 Run date: 2026-05-05. This is a command-level smoke for
 `just perf-s3-gateway`, not a replacement for the larger Kopia matrix above.
 
-Artifact: `.local/perf/`.
+Raw artifact: retained as ignored local evidence.
 
 Command:
 

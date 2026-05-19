@@ -56,8 +56,8 @@ trial must choose and verify one storage safety profile:
 non-atomic and only useful for a deliberately degraded compatibility mode, which
 is not part of the production-preview contract.
 
-Use `--qualification-profile retained-version --object-lock` for providers such
-as retained-backend where retained version IDs are the safety primitive. The command
+Use `--qualification-profile retained-version --object-lock` for providers
+where retained version IDs are the safety primitive. The command
 rejects `retained-version` without `--object-lock` because the profile is only
 meaningful when the retention and exact-version checks run:
 
