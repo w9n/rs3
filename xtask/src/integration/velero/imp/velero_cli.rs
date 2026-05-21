@@ -111,20 +111,7 @@ pub(super) fn install_velero(
         ],
     )
     .context("Velero node-agent did not become ready")?;
-    kubectl(
-        &args.kubectl_bin,
-        kubeconfig_path,
-        &[
-            "-n",
-            &args.velero_namespace,
-            "wait",
-            "--for=jsonpath={.status.phase}=Available",
-            "backupstoragelocations.velero.io/default",
-            "--timeout",
-            timeout.as_str(),
-        ],
-    )
-    .context("Velero backup storage location did not become available")
+    wait_backup_storage_location_available(args, kubeconfig_path)
 }
 
 pub(super) fn create_backup(
@@ -157,6 +144,7 @@ pub(super) fn create_restore(
     backup_name: &str,
     restore_name: &str,
 ) -> Result<()> {
+    wait_backup_storage_location_available(args, kubeconfig_path)?;
     velero(
         &args.velero_bin,
         kubeconfig_path,
@@ -195,6 +183,14 @@ pub(super) fn set_backup_storage_location_access_mode(
     )
     .with_context(|| format!("failed to set Velero backup storage location {access_mode}"))?;
 
+    wait_backup_storage_location_available(args, kubeconfig_path)
+        .context("Velero backup storage location did not become available after access-mode change")
+}
+
+pub(super) fn wait_backup_storage_location_available(
+    args: &VeleroKopiaSmokeArgs,
+    kubeconfig_path: &Path,
+) -> Result<()> {
     let timeout = timeout_arg(args.wait_secs);
     kubectl(
         &args.kubectl_bin,
@@ -209,7 +205,7 @@ pub(super) fn set_backup_storage_location_access_mode(
             timeout.as_str(),
         ],
     )
-    .context("Velero backup storage location did not become available after access-mode change")
+    .context("Velero backup storage location did not become available")
 }
 
 pub(super) fn assert_pod_volume_backup_completed(
