@@ -32,6 +32,8 @@ pub struct V2OrphanCandidate {
     pub same_sequence_as_anchor: bool,
     /// Provider retention policy visible in listing, when available.
     pub retention: Option<RetentionPolicy>,
+    /// Provider retain-until timestamp in milliseconds since the Unix epoch, when available.
+    pub retain_until_ms: Option<i64>,
     /// True when known retention should block deletion.
     pub delete_blocked_by_retention: bool,
     /// True when known legal hold should block deletion.
@@ -368,10 +370,12 @@ where
                 .map_err(|_| V2FormatError::StorageOperationFailed)?
         };
         let mut candidates = Vec::new();
+        let now_ms = current_time_ms();
         for mut metadata in listed {
             let exact_reachable = reachability
                 .reachable_versions
                 .contains(&(metadata.object_id.clone(), metadata.version_id.clone()));
+            let mut exact_protection_checked = !retained_profile;
             if retained_profile {
                 if exact_reachable {
                     continue;
@@ -383,15 +387,15 @@ where
                         .await
                 {
                     metadata = head;
+                    exact_protection_checked = true;
                 }
             } else if reachability.reachable.contains(&metadata.object_id) {
                 continue;
             }
             let parsed_key = V2CommitKey::parse(&metadata.object_id).ok();
             let sequence = parsed_key.as_ref().map(|key| key.sequence);
-            let delete_blocked_by_unknown_protection = retained_profile
-                && (metadata.version_id.is_none()
-                    || (metadata.retention.is_none() && metadata.legal_hold.is_none()));
+            let delete_blocked_by_unknown_protection =
+                retained_profile && (metadata.version_id.is_none() || !exact_protection_checked);
             candidates.push(V2OrphanCandidate {
                 object_id: metadata.object_id,
                 version_id: metadata.version_id,
@@ -402,7 +406,12 @@ where
                     .zip(anchor_sequence)
                     .is_some_and(|(left, right)| left == right),
                 retention: metadata.retention,
-                delete_blocked_by_retention: retention_blocks_delete(metadata.retention.as_ref()),
+                retain_until_ms: metadata.retain_until_ms,
+                delete_blocked_by_retention: retention_blocks_delete(
+                    metadata.retention.as_ref(),
+                    metadata.retain_until_ms,
+                    now_ms,
+                ),
                 delete_blocked_by_legal_hold: metadata.legal_hold == Some(LegalHoldStatus::On),
                 delete_blocked_by_unknown_protection,
             });
@@ -903,10 +912,16 @@ fn retention_mode_strength(mode: RetentionMode) -> u8 {
     }
 }
 
-fn retention_blocks_delete(policy: Option<&RetentionPolicy>) -> bool {
+fn retention_blocks_delete(
+    policy: Option<&RetentionPolicy>,
+    retain_until_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
     match policy {
-        Some(policy) => policy.mode != RetentionMode::None && policy.retain_days > 0,
-        None => false,
+        Some(policy) if policy.mode != RetentionMode::None && policy.retain_days > 0 => {
+            retain_until_ms.is_none_or(|retain_until_ms| retain_until_ms > now_ms)
+        }
+        Some(_) | None => false,
     }
 }
 

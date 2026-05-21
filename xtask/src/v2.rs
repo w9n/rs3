@@ -1,12 +1,21 @@
 //! v2 repository operations that are safe to run outside the gateway.
 
 use anyhow::{Context, Result, bail};
+#[cfg(feature = "s3")]
+use bytes::Bytes;
 use clap::{Args, Subcommand, ValueEnum};
 use rs3_crypto::{FormatEnvelope, KeyRing, KeyringEnvelope, RepositoryKeyContext, SecretBytes};
 use rs3_repository::v2::{
     V2AnchorState, V2CommitChain, V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot,
     V2KeyringEnvelopeRootRef, V2ProviderProfile, V2RecoveryBundle,
 };
+#[cfg(feature = "s3")]
+use rs3_repository::v2::{
+    V2FullGcApplyOptions, V2FullGcDryRunOptions, V2KeyringEnvelopeRef, V2MaintenanceBudgets,
+    V2OrphanGcOptions, V2QuiescedMaintenanceGuard, generate_v2_commit_key,
+};
+#[cfg(feature = "s3")]
+use rs3_storage::PutOptions;
 use rs3_storage::{BlobStore, ByteRange, FilesystemBlobStore};
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
@@ -33,6 +42,8 @@ pub(crate) struct V2Args {
 enum V2Command {
     /// Verify a trusted v2 restore bundle without writing an anchor.
     VerifyBundle(Box<V2VerifyBundleArgs>),
+    /// Rehearse retained-profile v2 orphan GC against a fresh backend prefix.
+    GcRehearsal(Box<V2GcRehearsalArgs>),
 }
 
 #[derive(Args)]
@@ -58,6 +69,25 @@ struct V2VerifyBundleArgs {
     /// Backend object-store target.
     #[command(flatten)]
     backend: V2BackendArgs,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = V2ReportFormat::Json)]
+    format: V2ReportFormat,
+}
+
+#[derive(Args)]
+struct V2GcRehearsalArgs {
+    /// Backend object-store target.
+    #[command(flatten)]
+    backend: V2BackendArgs,
+    /// Retention mode used for the protected rehearsal orphan.
+    #[arg(long, value_enum, default_value_t = V2RetentionModeArg::Governance)]
+    retention_mode: V2RetentionModeArg,
+    /// Retention duration for protected rehearsal objects.
+    #[arg(long, default_value_t = 1)]
+    retention_days: u32,
+    /// Confirm retained-version provider conformance passed for this backend profile.
+    #[arg(long, default_value_t = false)]
+    retained_provider_conformance_passed: bool,
     /// Output format.
     #[arg(long, value_enum, default_value_t = V2ReportFormat::Json)]
     format: V2ReportFormat,
@@ -112,6 +142,14 @@ enum V2ReportFormat {
     Json,
     /// Human-readable key-value lines.
     Text,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum V2RetentionModeArg {
+    /// Governance retention.
+    Governance,
+    /// Compliance retention.
+    Compliance,
 }
 
 #[derive(Clone)]
@@ -208,8 +246,189 @@ async fn run_async(args: V2Args) -> Result<()> {
             let report = verify_bundle(*args).await?;
             report.print(format)?;
         }
+        V2Command::GcRehearsal(args) => {
+            let format = args.format;
+            let report = gc_rehearsal(*args).await?;
+            print_gc_rehearsal_report(&report, format)?;
+        }
     }
     Ok(())
+}
+
+async fn gc_rehearsal(args: V2GcRehearsalArgs) -> Result<serde_json::Value> {
+    if !args.retained_provider_conformance_passed {
+        bail!("--retained-provider-conformance-passed is required for retained GC rehearsal");
+    }
+    match args.backend.backend {
+        V2Backend::Filesystem => bail!("retained GC rehearsal requires --backend s3"),
+        #[cfg(feature = "s3")]
+        V2Backend::S3 => {
+            let prefix = args.backend.s3_prefix.clone();
+            let store = s3_store(&args.backend).await?;
+            gc_rehearsal_with_store(store, args, prefix).await
+        }
+    }
+}
+
+#[cfg(feature = "s3")]
+async fn gc_rehearsal_with_store<S>(
+    store: S,
+    args: V2GcRehearsalArgs,
+    backend_prefix: Option<String>,
+) -> Result<serde_json::Value>
+where
+    S: BlobStore + Clone,
+{
+    let retention = RetentionPolicy::new(retention_mode(args.retention_mode), args.retention_days);
+    let keyring = KeyRing::generate_random().context("failed to generate rehearsal keyring")?;
+    let commit_options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::RetainedVersionObjectLock,
+        rehearsal_keyring_ref()?,
+        rehearsal_format_ref()?,
+    )
+    .with_retention(Some(retention));
+    let repository = V2CommitStore::new(store.clone(), keyring, commit_options);
+    let anchor = rs3_repository::v2::V2MemoryAnchor::new();
+
+    let genesis = repository
+        .write_genesis_snapshot(&anchor)
+        .await
+        .context("failed to write retained rehearsal genesis")?;
+    let unprotected_key = generate_v2_commit_key(Sequence::new(99))
+        .context("failed to generate unprotected orphan key")?
+        .object_id;
+    let protected_key = generate_v2_commit_key(Sequence::new(100))
+        .context("failed to generate protected orphan key")?
+        .object_id;
+
+    let unprotected_metadata = store
+        .put(
+            &unprotected_key,
+            Bytes::from_static(b"rs3-v2-gc-rehearsal-unprotected"),
+            PutOptions::default(),
+        )
+        .await
+        .context("failed to write unprotected exact-version orphan")?;
+    let protected_metadata = store
+        .put(
+            &protected_key,
+            Bytes::from_static(b"rs3-v2-gc-rehearsal-protected"),
+            PutOptions {
+                retention: Some(retention),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .context("failed to write retained exact-version orphan")?;
+
+    let dry_run_options = V2FullGcDryRunOptions {
+        budgets: V2MaintenanceBudgets {
+            max_delete_count: Some(1),
+            max_retention_extend_count: Some(0),
+            ..V2MaintenanceBudgets::default()
+        },
+        retention_renewal_horizon: std::time::Duration::ZERO,
+        ..V2FullGcDryRunOptions::default()
+    };
+    let before = repository
+        .full_gc_dry_run(&anchor, dry_run_options.clone())
+        .await
+        .context("failed to dry-run retained GC rehearsal")?;
+    if !before.fits_budgets {
+        bail!("retained GC rehearsal dry run exceeded its safety budget");
+    }
+    if before.fully_dead_commit_count != 1 || before.planned_cost.delete_count != 1 {
+        bail!(
+            "retained GC rehearsal expected one unprotected exact-version delete candidate, got {} candidates and {} planned deletes",
+            before.fully_dead_commit_count,
+            before.planned_cost.delete_count
+        );
+    }
+    if before.retention_blocked_bytes == 0 {
+        bail!("retained GC rehearsal expected a retention-blocked protected candidate");
+    }
+
+    let apply = repository
+        .apply_fully_dead_orphans(
+            &anchor,
+            &V2QuiescedMaintenanceGuard,
+            V2FullGcApplyOptions {
+                dry_run: dry_run_options,
+                orphan_gc: V2OrphanGcOptions::new(std::time::Duration::ZERO),
+                retained_provider_conformance_passed: true,
+            },
+        )
+        .await
+        .context("failed to apply retained GC rehearsal")?;
+    if apply.orphan_gc.deleted_count != 1 || apply.orphan_gc.protected_count != 1 {
+        bail!(
+            "retained GC rehearsal expected one delete and one protected candidate, got {} deletes and {} protected",
+            apply.orphan_gc.deleted_count,
+            apply.orphan_gc.protected_count
+        );
+    }
+
+    let after = repository
+        .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
+        .await
+        .context("failed to dry-run after retained GC rehearsal apply")?;
+    if after.fully_dead_commit_count != 0 || after.retention_blocked_bytes == 0 {
+        bail!("retained GC rehearsal post-apply state did not preserve only protected candidates");
+    }
+
+    let verified = repository
+        .load_chain_from_anchor(&anchor)
+        .await
+        .context("failed to verify anchor chain after retained GC rehearsal")?
+        .map(|chain| chain.commits_newest_first.len())
+        .unwrap_or_default();
+
+    Ok(serde_json::json!({
+        "schema": "rs3.xtask.v2-gc-rehearsal.v1",
+        "passed": true,
+        "backend": {
+            "kind": "s3",
+            "prefix": backend_prefix,
+        },
+        "retention": {
+            "mode": retention_mode_name(retention.mode),
+            "days": retention.retain_days,
+        },
+        "anchor": {
+            "sequence": genesis.anchor_state.sequence.get(),
+            "commit_key": genesis.anchor_state.commit_key.as_str(),
+            "version_id": genesis.anchor_state.version_id.as_ref().map(BackendVersionId::as_str),
+        },
+        "probe_objects": {
+            "unprotected_version_id": unprotected_metadata.version_id.as_ref().map(BackendVersionId::as_str),
+            "protected_version_id": protected_metadata.version_id.as_ref().map(BackendVersionId::as_str),
+        },
+        "dry_run_before": {
+            "candidate_commit_count": before.candidate_commit_count,
+            "fully_dead_commit_count": before.fully_dead_commit_count,
+            "retention_blocked_bytes": before.retention_blocked_bytes,
+            "unknown_protection_blocked_bytes": before.unknown_protection_blocked_bytes,
+            "planned_delete_count": before.planned_cost.delete_count,
+            "planned_request_count": before.planned_cost.request_count,
+            "fits_budgets": before.fits_budgets,
+            "exact_version_apply_ready": before.exact_version_apply_ready,
+        },
+        "apply": {
+            "scanned_count": apply.orphan_gc.scanned_count,
+            "deleted_count": apply.orphan_gc.deleted_count,
+            "protected_count": apply.orphan_gc.protected_count,
+            "failed_delete_count": apply.orphan_gc.failed_delete_count,
+        },
+        "dry_run_after": {
+            "candidate_commit_count": after.candidate_commit_count,
+            "fully_dead_commit_count": after.fully_dead_commit_count,
+            "retention_blocked_bytes": after.retention_blocked_bytes,
+            "planned_delete_count": after.planned_cost.delete_count,
+        },
+        "verification": {
+            "verified_commit_count": verified,
+        },
+    }))
 }
 
 async fn verify_bundle(args: V2VerifyBundleArgs) -> Result<V2VerifyBundleReport> {
@@ -224,6 +443,99 @@ async fn verify_bundle(args: V2VerifyBundleArgs) -> Result<V2VerifyBundleReport>
             verify_bundle_with_selected_store(args, store).await
         }
     }
+}
+
+#[cfg(feature = "s3")]
+fn rehearsal_keyring_ref() -> Result<V2KeyringEnvelopeRef> {
+    Ok(V2KeyringEnvelopeRef {
+        object_id: BackendObjectId::new("keyrings/gc-rehearsal-envelope".to_owned())?,
+        digest: [0x11; 32],
+    })
+}
+
+#[cfg(feature = "s3")]
+fn rehearsal_format_ref() -> Result<V2FormatRef> {
+    Ok(V2FormatRef {
+        generation: 1,
+        digest: "22".repeat(32),
+        object_id: BackendObjectId::new("format/00000000000000000001/gc-rehearsal".to_owned())?,
+        version_id: None,
+    })
+}
+
+#[cfg(feature = "s3")]
+fn retention_mode(mode: V2RetentionModeArg) -> RetentionMode {
+    match mode {
+        V2RetentionModeArg::Governance => RetentionMode::Governance,
+        V2RetentionModeArg::Compliance => RetentionMode::Compliance,
+    }
+}
+
+fn print_gc_rehearsal_report(report: &serde_json::Value, format: V2ReportFormat) -> Result<()> {
+    match format {
+        V2ReportFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(report)?);
+        }
+        V2ReportFormat::Text => {
+            println!("schema={}", report["schema"].as_str().unwrap_or_default());
+            println!("passed={}", report["passed"].as_bool().unwrap_or(false));
+            println!(
+                "backend_prefix={}",
+                report["backend"]["prefix"].as_str().unwrap_or_default()
+            );
+            println!(
+                "retention_mode={}",
+                report["retention"]["mode"].as_str().unwrap_or_default()
+            );
+            println!(
+                "retention_days={}",
+                report["retention"]["days"].as_u64().unwrap_or_default()
+            );
+            println!(
+                "dry_run_before_candidates={}",
+                report["dry_run_before"]["candidate_commit_count"]
+                    .as_u64()
+                    .unwrap_or_default()
+            );
+            println!(
+                "dry_run_before_fully_dead={}",
+                report["dry_run_before"]["fully_dead_commit_count"]
+                    .as_u64()
+                    .unwrap_or_default()
+            );
+            println!(
+                "dry_run_before_retention_blocked_bytes={}",
+                report["dry_run_before"]["retention_blocked_bytes"]
+                    .as_u64()
+                    .unwrap_or_default()
+            );
+            println!(
+                "apply_deleted_count={}",
+                report["apply"]["deleted_count"]
+                    .as_u64()
+                    .unwrap_or_default()
+            );
+            println!(
+                "apply_protected_count={}",
+                report["apply"]["protected_count"]
+                    .as_u64()
+                    .unwrap_or_default()
+            );
+            println!(
+                "dry_run_after_candidates={}",
+                report["dry_run_after"]["candidate_commit_count"]
+                    .as_u64()
+                    .unwrap_or_default()
+            );
+            println!(
+                "verified_commit_count={}",
+                report["verification"]["verified_commit_count"]
+                    .as_u64()
+                    .unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn verify_bundle_with_selected_store<S>(

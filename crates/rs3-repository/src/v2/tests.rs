@@ -3,7 +3,7 @@ use super::{
     V2FormatError, V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRef, V2KeyringEnvelopeRootRef,
     V2ProviderCheckStatus, V2ProviderConformanceOptions, V2ProviderProfile, V2SectionDescriptor,
     V2SectionType, V2UploadMode, body_digest_for_v2_sections, check_v2_provider_conformance,
-    parse_v2_commit_object,
+    generate_v2_commit_key, parse_v2_commit_object,
 };
 use super::{
     V2AnchorState, V2CommitAnchor, V2CommitCoordinator, V2CommitSection, V2CommitStore,
@@ -2623,6 +2623,58 @@ async fn retained_v2_full_gc_apply_requires_provider_conformance() {
         .await;
 
     assert_eq!(apply, Err(V2FormatError::ProviderProfileFailed));
+}
+
+#[tokio::test]
+async fn retained_v2_full_gc_apply_deletes_unprotected_exact_version_after_conformance() {
+    let store = MemoryBlobStore::new();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::RetainedVersionObjectLock,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    )
+    .with_retention(Some(RetentionPolicy::new(RetentionMode::Compliance, 30)));
+    let repository = V2CommitStore::new(store.clone(), signing_keyring(), options);
+    let anchor = V2MemoryAnchor::new();
+
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let unprotected_key = must_v2(generate_v2_commit_key(Sequence::new(99))).object_id;
+    store
+        .put(
+            &unprotected_key,
+            Bytes::from_static(b"unprotected-exact-version-orphan"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("put unprotected orphan: {error}"));
+
+    let dry_run = must_v2(
+        repository
+            .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
+            .await,
+    );
+    let apply = must_v2(
+        repository
+            .apply_fully_dead_orphans(
+                &anchor,
+                &V2QuiescedMaintenanceGuard,
+                V2FullGcApplyOptions {
+                    dry_run: V2FullGcDryRunOptions::default(),
+                    orphan_gc: V2OrphanGcOptions::new(Duration::ZERO),
+                    retained_provider_conformance_passed: true,
+                },
+            )
+            .await,
+    );
+    let after = must_v2(repository.report_orphans(&anchor).await);
+
+    assert_eq!(dry_run.candidate_commit_count, 1);
+    assert_eq!(dry_run.fully_dead_commit_count, 1);
+    assert_eq!(dry_run.unknown_protection_blocked_bytes, 0);
+    assert_eq!(dry_run.planned_cost.delete_count, 1);
+    assert!(dry_run.exact_version_apply_ready);
+    assert_eq!(apply.orphan_gc.deleted_count, 1);
+    assert_eq!(after.candidates.len(), 0);
 }
 
 #[tokio::test]

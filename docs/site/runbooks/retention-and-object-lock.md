@@ -100,6 +100,18 @@ evidence. Run with `--require-provider-delete-protection` for protected
 restores, and use S3 CLI probes to confirm provider behavior before trusting a
 new backend.
 
+Before enabling destructive v2 maintenance for a retained backend, run a GC
+rehearsal against a fresh prefix after retained-provider conformance has passed:
+
+```sh
+just v2-gc-rehearsal-live "$BACKEND_BUCKET" "$ENDPOINT_URL" "$REGION" "$BACKEND_PREFIX"
+```
+
+The rehearsal writes a retained anchor, one protected orphan, and one
+unprotected exact-version orphan. It dry-runs with a one-delete budget, applies
+only the unprotected exact-version delete, verifies the protected candidate
+remains blocked, and reloads the anchor-selected chain.
+
 ## Incident Rules
 
 - Do not delete retained objects during cleanup.
