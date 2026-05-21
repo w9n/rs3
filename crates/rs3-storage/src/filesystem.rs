@@ -329,6 +329,7 @@ fn blob_metadata(object_id: BackendObjectId, metadata: fs::Metadata) -> BlobMeta
         etag: modified_at_ms.map(|modified| format!("fs-{modified:x}-{:x}", metadata.len())),
         version_id: None,
         retention: None,
+        retain_until_ms: None,
         legal_hold: None,
     }
 }

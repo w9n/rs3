@@ -4,9 +4,9 @@ use super::errors::{
 };
 use super::object_lock::{
     legal_hold_from_s3_head, legal_hold_from_s3_legal_hold, retain_until_date,
-    retention_from_s3_head, retention_is_active, retention_mode_label, retention_satisfies,
-    sdk_legal_hold_status, sdk_object_lock_mode, sdk_object_lock_retention_mode, verify_legal_hold,
-    verify_retention,
+    retain_until_ms_from_s3_head, retention_from_s3_head, retention_is_active,
+    retention_mode_label, retention_satisfies, sdk_legal_hold_status, sdk_object_lock_mode,
+    sdk_object_lock_retention_mode, verify_legal_hold, verify_retention,
 };
 use crate::{BlobMetadata, PutOptions, Result, StorageError};
 use aws_sdk_s3::primitives::ByteStream as SdkByteStream;
@@ -182,6 +182,7 @@ impl S3BlobStore {
             output.object_lock_mode(),
             output.object_lock_retain_until_date(),
         )?;
+        let retain_until_ms = retain_until_ms_from_s3_head(output.object_lock_retain_until_date())?;
         let legal_hold = legal_hold_from_s3_head(output.object_lock_legal_hold_status())?;
 
         Ok(BlobMetadata {
@@ -194,6 +195,7 @@ impl S3BlobStore {
                 .map(backend_version_id_from_str)
                 .transpose()?,
             retention,
+            retain_until_ms,
             legal_hold,
         })
     }

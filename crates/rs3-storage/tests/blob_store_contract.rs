@@ -2,8 +2,10 @@
 
 mod common;
 
+use bytes::Bytes;
 use common::assert_core_blob_store_contract_with_create_only;
-use rs3_storage::{FilesystemBlobStore, MemoryBlobStore};
+use rs3_storage::{BlobStore, FilesystemBlobStore, MemoryBlobStore, PutOptions, StorageError};
+use rs3_types::{LegalHoldStatus, RetentionMode, RetentionPolicy};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +22,108 @@ async fn filesystem_store_satisfies_core_contract() {
     let store = FilesystemBlobStore::new(dir.path()).unwrap_or_else(|error| panic!("{error}"));
 
     assert_core_blob_store_contract_with_create_only(&store, "filesystem", true).await;
+}
+
+#[tokio::test]
+async fn memory_store_lists_and_deletes_exact_versions() {
+    let store = MemoryBlobStore::new();
+    let object_id = common::object_id("memory-versioned/object");
+
+    let first = store
+        .put(
+            &object_id,
+            Bytes::from_static(b"first-version"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("put first version: {error}"));
+    let second = store
+        .put(
+            &object_id,
+            Bytes::from_static(b"second-version"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("put second version: {error}"));
+
+    let versions = store
+        .list_prefix_versions("memory-versioned/")
+        .await
+        .unwrap_or_else(|error| panic!("list exact versions: {error}"));
+    let listed_versions = versions
+        .iter()
+        .map(|metadata| metadata.version_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed_versions,
+        vec![first.version_id.clone(), second.version_id.clone()]
+    );
+
+    store
+        .delete_at(&object_id, first.version_id.as_ref())
+        .await
+        .unwrap_or_else(|error| panic!("delete first exact version: {error}"));
+    assert!(matches!(
+        store.head_at(&object_id, first.version_id.as_ref()).await,
+        Err(StorageError::NotFound(_))
+    ));
+    let latest = store
+        .get_range(&object_id, rs3_storage::ByteRange::Full)
+        .await
+        .unwrap_or_else(|error| panic!("read latest after exact delete: {error}"));
+    assert_eq!(latest, Bytes::from_static(b"second-version"));
+}
+
+#[tokio::test]
+async fn memory_store_blocks_exact_version_delete_when_protected() {
+    let store = MemoryBlobStore::new();
+    let retained = common::object_id("memory-versioned/retained");
+    let held = common::object_id("memory-versioned/held");
+
+    let retained_put = store
+        .put(
+            &retained,
+            Bytes::from_static(b"retained"),
+            PutOptions {
+                retention: Some(RetentionPolicy::new(RetentionMode::Governance, 1)),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("put retained version: {error}"));
+    let held_put = store
+        .put(
+            &held,
+            Bytes::from_static(b"held"),
+            PutOptions {
+                legal_hold: Some(LegalHoldStatus::On),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("put held version: {error}"));
+
+    assert_eq!(
+        store
+            .delete_at(&retained, retained_put.version_id.as_ref())
+            .await,
+        Err(StorageError::RetentionBlocked)
+    );
+    assert_eq!(
+        store.delete_at(&held, held_put.version_id.as_ref()).await,
+        Err(StorageError::LegalHoldBlocked)
+    );
+}
+
+#[tokio::test]
+async fn filesystem_store_rejects_exact_version_inventory() {
+    let dir = TestDir::new("filesystem-version-contract");
+    let store = FilesystemBlobStore::new(dir.path()).unwrap_or_else(|error| panic!("{error}"));
+
+    assert_eq!(
+        store.list_prefix_versions("anything/").await,
+        Err(StorageError::VersionUnsupported)
+    );
 }
 
 struct TestDir {

@@ -78,8 +78,20 @@ impl BlobStore for DynBlobStore {
         self.inner.list_prefix(prefix).await
     }
 
+    async fn list_prefix_versions(&self, prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
+        self.inner.list_prefix_versions(prefix).await
+    }
+
     async fn delete(&self, object_id: &rs3_types::BackendObjectId) -> rs3_storage::Result<()> {
         self.inner.delete(object_id).await
+    }
+
+    async fn delete_at(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        version_id: Option<&rs3_types::BackendVersionId>,
+    ) -> rs3_storage::Result<()> {
+        self.inner.delete_at(object_id, version_id).await
     }
 
     async fn extend_retention(

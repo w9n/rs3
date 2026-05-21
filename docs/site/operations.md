@@ -43,7 +43,12 @@ The core server library also exposes path-redacted admin reports for operator
 tooling. `GET /admin/posture` is cheap enough for routine polling and reports
 runtime posture, profile findings, backend and anchor kind, retention settings,
 and last persisted provider-conformance evidence. `GET /admin/status` adds
-restore-trust and maintenance verification and may touch repository state.
+restore-trust and maintenance verification and may touch repository state. For
+v2 repositories, status includes verified commit-chain counts, orphan counts,
+and commit-retention renewal counts using the built-in seven-day renewal
+horizon. Full-maintenance dry runs can also include explicit protected
+historical roots; those roots block orphan deletion until the operator
+deliberately discards them from the maintenance plan.
 Neither report exposes a path browser, configured bucket names, backend
 prefixes, repository IDs, client-visible object paths, or secret material. Treat
 these reports as preview fact models, not as stable workflow APIs.

@@ -94,6 +94,15 @@ pub(super) fn retention_from_s3_head(
     Ok(Some(RetentionPolicy::new(mode, retain_days)))
 }
 
+pub(super) fn retain_until_ms_from_s3_head(
+    retain_until_date: Option<&SdkDateTime>,
+) -> Result<Option<i64>> {
+    retain_until_date
+        .map(|retain_until_date| retain_until_date.to_millis())
+        .transpose()
+        .map_err(|error| StorageError::Provider(error.to_string()))
+}
+
 pub(super) fn legal_hold_from_s3_head(
     status: Option<&SdkObjectLockLegalHoldStatus>,
 ) -> Result<Option<LegalHoldStatus>> {

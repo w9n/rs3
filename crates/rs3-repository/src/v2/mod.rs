@@ -10,6 +10,7 @@ mod commit;
 mod coordinator;
 mod error;
 mod format;
+mod maintenance;
 mod provider;
 mod repository;
 mod service;
@@ -31,13 +32,18 @@ pub use error::{V2ErrorClass, V2FormatError, V2Result};
 pub use format::{
     V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef, V2MaintenanceConfig, v2_format_object_id,
 };
+pub use maintenance::{
+    V2FullGcApplyOptions, V2FullGcApplyReport, V2FullGcDryRunOptions, V2FullGcDryRunReport,
+    V2MaintenanceBudgets, V2MaintenanceGuard, V2MaintenancePlanCost, V2MaintenanceReport,
+    V2OrphanCandidate, V2OrphanGcOptions, V2OrphanGcReport, V2OrphanReport,
+    V2QuiescedMaintenanceGuard,
+};
 pub use provider::{
     V2ProviderCheckStatus, V2ProviderConformanceCheck, V2ProviderConformanceOptions,
     V2ProviderConformanceReport, V2ProviderProfile, check_v2_provider_conformance,
 };
 pub use repository::{
     V2AnchorState, V2CommitAnchor, V2CommitChain, V2CommitSection, V2CommitStore,
-    V2CommitStoreOptions, V2CommitWrite, V2MaintenanceReport, V2MemoryAnchor, V2OrphanCandidate,
-    V2OrphanGcOptions, V2OrphanGcReport, V2OrphanReport, V2RecoveryBundle, V2StoredCommit,
+    V2CommitStoreOptions, V2CommitWrite, V2MemoryAnchor, V2RecoveryBundle, V2StoredCommit,
 };
 pub use service::V2Repository;

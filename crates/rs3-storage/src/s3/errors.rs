@@ -33,6 +33,7 @@ pub(super) fn metadata_from_object_meta(
             .map(backend_version_id_from_string)
             .transpose()?,
         retention: None,
+        retain_until_ms: None,
         legal_hold: None,
     })
 }

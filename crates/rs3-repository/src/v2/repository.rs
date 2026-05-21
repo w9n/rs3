@@ -333,99 +333,6 @@ impl V2RecoveryBundle {
     }
 }
 
-/// Unanchored v2 commit object discovered by orphan reporting.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct V2OrphanCandidate {
-    /// Opaque backend object ID.
-    pub object_id: BackendObjectId,
-    /// Provider version ID visible in listing, when available.
-    pub version_id: Option<BackendVersionId>,
-    /// Listed object length.
-    pub content_len: u64,
-    /// Provider modification timestamp in milliseconds since the Unix epoch.
-    pub modified_at_ms: Option<i64>,
-    /// Parsed sequence when the object key has a valid v2 commit shape.
-    pub sequence: Option<Sequence>,
-    /// True when the candidate has the same sequence as the anchor head.
-    pub same_sequence_as_anchor: bool,
-    /// Provider retention policy visible in listing, when available.
-    pub retention: Option<RetentionPolicy>,
-    /// True when known retention should block deletion.
-    pub delete_blocked_by_retention: bool,
-    /// True when known legal hold should block deletion.
-    pub delete_blocked_by_legal_hold: bool,
-    /// True when the selected provider profile requires protection metadata but it was not visible.
-    pub delete_blocked_by_unknown_protection: bool,
-}
-
-/// Redacted v2 orphan report.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct V2OrphanReport {
-    /// Reachable commit object count in the verified anchor chain.
-    pub reachable_commit_count: usize,
-    /// Candidate commits under `commits/v01/` that are not anchor-reachable.
-    pub candidates: Vec<V2OrphanCandidate>,
-}
-
-/// Conservative v2 orphan garbage-collection policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct V2OrphanGcOptions {
-    /// Minimum provider-observed age before an unanchored commit may be deleted.
-    pub min_age: Duration,
-    /// Whether same-sequence candidates may be deleted after normal checks pass.
-    pub delete_same_sequence: bool,
-}
-
-impl V2OrphanGcOptions {
-    /// Creates conservative orphan-GC options.
-    pub const fn new(min_age: Duration) -> Self {
-        Self {
-            min_age,
-            delete_same_sequence: false,
-        }
-    }
-
-    /// Allows deletion of same-sequence candidates after age/protection checks.
-    pub const fn with_same_sequence_deletion(mut self, enabled: bool) -> Self {
-        self.delete_same_sequence = enabled;
-        self
-    }
-}
-
-/// Result of one conservative v2 orphan garbage-collection pass.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct V2OrphanGcReport {
-    /// Orphan candidates inspected.
-    pub scanned_count: usize,
-    /// Candidates deleted by this pass.
-    pub deleted_count: usize,
-    /// Candidates already gone before deletion.
-    pub already_gone_count: usize,
-    /// Candidates skipped because provider retention or legal hold was visible.
-    pub protected_count: usize,
-    /// Candidates skipped because they were too young or had no usable age.
-    pub age_skipped_count: usize,
-    /// Same-sequence candidates skipped by conservative default policy.
-    pub same_sequence_skipped_count: usize,
-    /// Delete calls that failed for reasons other than known protection or not found.
-    pub failed_delete_count: usize,
-}
-
-/// Redacted v2 quick-maintenance report.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct V2MaintenanceReport {
-    /// True when an anchor was present.
-    pub anchor_present: bool,
-    /// Verified commit count in the anchor-selected chain.
-    pub verified_commit_count: usize,
-    /// Orphan candidate count under the v2 commit prefix.
-    pub orphan_candidate_count: usize,
-    /// Orphan candidates blocked by retention or legal hold.
-    pub protected_orphan_candidate_count: usize,
-    /// Oldest visible orphan age in milliseconds, when provider timestamps exist.
-    pub oldest_orphan_age_ms: Option<u128>,
-}
-
 /// Preview v2 commit store over a `BlobStore`.
 pub struct V2CommitStore<S> {
     store: S,
@@ -449,6 +356,21 @@ where
     /// Returns the backing store.
     pub fn store(&self) -> &S {
         &self.store
+    }
+
+    /// Returns the configured provider profile.
+    pub(super) const fn provider_profile(&self) -> V2ProviderProfile {
+        self.options.provider_profile
+    }
+
+    /// Returns the configured commit retention policy.
+    pub(super) const fn retention_policy(&self) -> Option<RetentionPolicy> {
+        self.options.retention
+    }
+
+    /// Returns the configured commit-store options.
+    pub(super) const fn options(&self) -> &V2CommitStoreOptions {
+        &self.options
     }
 
     /// Writes and anchors the required genesis snapshot commit.
@@ -820,150 +742,6 @@ where
             .compare_and_advance_v2(None, bundle.anchor.clone())
             .await?;
         Ok(chain)
-    }
-
-    /// Reports unanchored commit objects without deleting anything.
-    pub async fn report_orphans<A>(&self, anchor: &A) -> V2Result<V2OrphanReport>
-    where
-        A: V2CommitAnchor,
-    {
-        let anchor_state = anchor.read_v2().await?;
-        let mut reachable = BTreeSet::new();
-        let mut anchor_sequence = None;
-        if let Some(state) = anchor_state.as_ref() {
-            anchor_sequence = Some(state.sequence);
-            let chain = self.load_chain_from_state(state).await?;
-            for commit in &chain.commits_newest_first {
-                reachable.insert(commit.parsed_header.header.self_ref.commit_key.clone());
-            }
-        }
-
-        let listed = self
-            .store
-            .list_prefix("commits/v01/")
-            .await
-            .map_err(|_| V2FormatError::StorageOperationFailed)?;
-        let mut candidates = Vec::new();
-        for metadata in listed {
-            if reachable.contains(&metadata.object_id) {
-                continue;
-            }
-            let parsed_key = V2CommitKey::parse(&metadata.object_id).ok();
-            let sequence = parsed_key.as_ref().map(|key| key.sequence);
-            let delete_blocked_by_unknown_protection = self.options.provider_profile
-                == V2ProviderProfile::RetainedVersionObjectLock
-                && (metadata.retention.is_none() || metadata.legal_hold.is_none());
-            candidates.push(V2OrphanCandidate {
-                object_id: metadata.object_id,
-                version_id: metadata.version_id,
-                content_len: metadata.content_len,
-                modified_at_ms: metadata.modified_at_ms,
-                sequence,
-                same_sequence_as_anchor: sequence
-                    .zip(anchor_sequence)
-                    .is_some_and(|(left, right)| left == right),
-                retention: metadata.retention,
-                delete_blocked_by_retention: retention_blocks_delete(metadata.retention.as_ref()),
-                delete_blocked_by_legal_hold: metadata.legal_hold == Some(LegalHoldStatus::On),
-                delete_blocked_by_unknown_protection,
-            });
-        }
-
-        Ok(V2OrphanReport {
-            reachable_commit_count: reachable.len(),
-            candidates,
-        })
-    }
-
-    /// Deletes expired, unprotected v2 orphan commits.
-    ///
-    /// This pass is intentionally conservative: reachable commits are discovered
-    /// from the anchor-selected chain, retained or legally held objects are
-    /// skipped, candidates without a usable provider timestamp are skipped, and
-    /// same-sequence candidates are skipped unless explicitly enabled.
-    pub async fn delete_expired_orphans<A>(
-        &self,
-        anchor: &A,
-        options: V2OrphanGcOptions,
-    ) -> V2Result<V2OrphanGcReport>
-    where
-        A: V2CommitAnchor,
-    {
-        let report = self.report_orphans(anchor).await?;
-        let now_ms = current_time_ms();
-        let min_age_ms = options.min_age.as_millis();
-        let mut gc = V2OrphanGcReport {
-            scanned_count: report.candidates.len(),
-            ..V2OrphanGcReport::default()
-        };
-
-        for candidate in report.candidates {
-            if candidate.delete_blocked_by_retention
-                || candidate.delete_blocked_by_legal_hold
-                || candidate.delete_blocked_by_unknown_protection
-            {
-                gc.protected_count += 1;
-                continue;
-            }
-            if candidate.same_sequence_as_anchor && !options.delete_same_sequence {
-                gc.same_sequence_skipped_count += 1;
-                continue;
-            }
-            let Some(age_ms) = candidate_age_ms(now_ms, candidate.modified_at_ms) else {
-                gc.age_skipped_count += 1;
-                continue;
-            };
-            if age_ms < min_age_ms {
-                gc.age_skipped_count += 1;
-                continue;
-            }
-
-            match self.store.delete(&candidate.object_id).await {
-                Ok(()) => gc.deleted_count += 1,
-                Err(StorageError::NotFound(_)) => gc.already_gone_count += 1,
-                Err(StorageError::RetentionBlocked | StorageError::LegalHoldBlocked) => {
-                    gc.protected_count += 1;
-                }
-                Err(_) => gc.failed_delete_count += 1,
-            }
-        }
-
-        Ok(gc)
-    }
-
-    /// Runs read-only quick maintenance checks.
-    pub async fn quick_maintenance<A>(&self, anchor: &A) -> V2Result<V2MaintenanceReport>
-    where
-        A: V2CommitAnchor,
-    {
-        let chain = self.load_chain_from_anchor(anchor).await?;
-        let verified_commit_count = chain
-            .as_ref()
-            .map(|chain| chain.commits_newest_first.len())
-            .unwrap_or_default();
-        let orphans = self.report_orphans(anchor).await?;
-        let protected_orphan_candidate_count = orphans
-            .candidates
-            .iter()
-            .filter(|candidate| {
-                candidate.delete_blocked_by_retention
-                    || candidate.delete_blocked_by_legal_hold
-                    || candidate.delete_blocked_by_unknown_protection
-            })
-            .count();
-        let now_ms = current_time_ms();
-        let oldest_orphan_age_ms = orphans
-            .candidates
-            .iter()
-            .filter_map(|candidate| candidate_age_ms(now_ms, candidate.modified_at_ms))
-            .max();
-        Ok(V2MaintenanceReport {
-            anchor_present: chain.is_some(),
-            verified_commit_count,
-            orphan_candidate_count: orphans.candidates.len(),
-            protected_orphan_candidate_count,
-            oldest_orphan_age_ms,
-        })
     }
 
     async fn write_commit_with_expected_anchor<A>(
@@ -1724,25 +1502,12 @@ fn current_time_ms() -> i64 {
     i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
-fn candidate_age_ms(now_ms: i64, modified_at_ms: Option<i64>) -> Option<u128> {
-    let modified_at_ms = modified_at_ms?;
-    let age_ms = now_ms.checked_sub(modified_at_ms)?;
-    u128::try_from(age_ms).ok()
-}
-
 fn retention_satisfies(actual: Option<&RetentionPolicy>, requested: &RetentionPolicy) -> bool {
     let Some(actual) = actual else {
         return false;
     };
     retention_mode_strength(actual.mode) >= retention_mode_strength(requested.mode)
         && actual.retain_days >= requested.retain_days
-}
-
-fn retention_blocks_delete(policy: Option<&RetentionPolicy>) -> bool {
-    match policy {
-        Some(policy) => policy.mode != rs3_types::RetentionMode::None && policy.retain_days > 0,
-        None => false,
-    }
 }
 
 fn retention_mode_strength(mode: rs3_types::RetentionMode) -> u8 {

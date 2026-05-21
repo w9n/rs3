@@ -136,6 +136,12 @@ pub enum V2FormatError {
     /// The requested operation is only available as explicit rollback-unsafe DR.
     #[error("v2 rollback-unsafe disaster recovery mode is required")]
     RollbackUnsafeDr,
+    /// Destructive maintenance requires a fenced lease or explicit quiesced mode.
+    #[error("v2 maintenance access guard is required")]
+    MaintenanceAccessRequired,
+    /// Destructive maintenance plan exceeds an operator-supplied budget.
+    #[error("v2 maintenance budget exceeded")]
+    MaintenanceBudgetExceeded,
 }
 
 impl V2FormatError {
@@ -149,6 +155,9 @@ impl V2FormatError {
             Self::ProviderProfileFailed => V2ErrorClass::ProviderConformance,
             Self::RecoveryBundleRequired => V2ErrorClass::OperatorActionRequired,
             Self::RollbackUnsafeDr => V2ErrorClass::RollbackUnsafeDr,
+            Self::MaintenanceAccessRequired | Self::MaintenanceBudgetExceeded => {
+                V2ErrorClass::OperatorActionRequired
+            }
             Self::InvalidCommitKey
             | Self::TruncatedHeader
             | Self::TruncatedBody

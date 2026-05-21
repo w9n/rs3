@@ -11,7 +11,7 @@ use rs3_types::{
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub use filesystem::FilesystemBlobStore;
@@ -33,6 +33,8 @@ pub struct BlobMetadata {
     pub version_id: Option<BackendVersionId>,
     /// Provider retention policy for this object version, when known.
     pub retention: Option<RetentionPolicy>,
+    /// Absolute provider retain-until timestamp in milliseconds since the Unix epoch.
+    pub retain_until_ms: Option<i64>,
     /// Provider legal-hold status for this object version, when known.
     pub legal_hold: Option<LegalHoldStatus>,
 }
@@ -189,8 +191,34 @@ pub trait BlobStore: Send + Sync {
     /// required by common object-storage client contracts.
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobMetadata>>;
 
+    /// Lists exact object versions under an opaque prefix.
+    ///
+    /// Retention-aware maintenance uses this to build an exact-version
+    /// inventory before destructive apply. Providers that cannot enumerate
+    /// versions must fail closed with [`StorageError::VersionUnsupported`].
+    async fn list_prefix_versions(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
+        let _ = prefix;
+        Err(StorageError::VersionUnsupported)
+    }
+
     /// Deletes an object or writes a provider-specific delete marker.
     async fn delete(&self, object_id: &BackendObjectId) -> Result<()>;
+
+    /// Deletes a specific object version when `version_id` is supplied.
+    ///
+    /// Passing `None` keeps the historical `delete` behavior. Retained-version
+    /// maintenance should pass a concrete version and must not fall back to an
+    /// unversioned delete.
+    async fn delete_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> Result<()> {
+        if version_id.is_some() {
+            return Err(StorageError::VersionUnsupported);
+        }
+        self.delete(object_id).await
+    }
 
     /// Extends retention for an existing object version.
     async fn extend_retention(
@@ -411,11 +439,29 @@ where
         self.inner.list_prefix(prefix).await
     }
 
+    async fn list_prefix_versions(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
+        self.mutate_counts(|counts| {
+            counts.list = counts.list.saturating_add(1);
+        })?;
+        self.inner.list_prefix_versions(prefix).await
+    }
+
     async fn delete(&self, object_id: &BackendObjectId) -> Result<()> {
         self.mutate_counts(|counts| {
             counts.delete = counts.delete.saturating_add(1);
         })?;
         self.inner.delete(object_id).await
+    }
+
+    async fn delete_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> Result<()> {
+        self.mutate_counts(|counts| {
+            counts.delete = counts.delete.saturating_add(1);
+        })?;
+        self.inner.delete_at(object_id, version_id).await
     }
 
     async fn extend_retention(
@@ -672,6 +718,7 @@ impl BlobStore for MemoryBlobStore {
                     .map_err(|error| StorageError::Provider(error.to_string()))?,
             ),
             retention: options.retention,
+            retain_until_ms: retain_until_ms(options.retention),
             legal_hold,
         };
         state.counts.bytes_written = state.counts.bytes_written.saturating_add(content_len);
@@ -843,6 +890,28 @@ impl BlobStore for MemoryBlobStore {
         Ok(entries)
     }
 
+    async fn list_prefix_versions(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
+        let started = Instant::now();
+        let object_kind = prefix_kind(prefix);
+        let mut state = self.write_state()?;
+        state.counts.list = state.counts.list.saturating_add(1);
+
+        let mut entries = state
+            .objects
+            .iter()
+            .filter(|(object_id, _)| object_id.as_str().starts_with(prefix))
+            .flat_map(|(_, versions)| versions.iter().map(|object| object.metadata.clone()))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.object_id
+                .cmp(&right.object_id)
+                .then_with(|| left.version_id.cmp(&right.version_id))
+        });
+        record_blob_list(object_kind, entries.len(), "ok", started.elapsed());
+
+        Ok(entries)
+    }
+
     async fn delete(&self, object_id: &BackendObjectId) -> Result<()> {
         let started = Instant::now();
         let object_kind = object_kind(object_id);
@@ -872,6 +941,50 @@ impl BlobStore for MemoryBlobStore {
         Ok(())
     }
 
+    async fn delete_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> Result<()> {
+        let Some(version_id) = version_id else {
+            return self.delete(object_id).await;
+        };
+
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
+        let mut state = self.write_state()?;
+        state.counts.delete = state.counts.delete.saturating_add(1);
+
+        let Some(versions) = state.objects.get_mut(object_id) else {
+            record_blob_delete(object_kind, "not_found", started.elapsed());
+            return Err(StorageError::NotFound(object_id.clone()));
+        };
+        let Some(index) = versions
+            .iter()
+            .position(|object| object.metadata.version_id.as_ref() == Some(version_id))
+        else {
+            record_blob_delete(object_kind, "not_found", started.elapsed());
+            return Err(StorageError::NotFound(object_id.clone()));
+        };
+
+        let metadata = &versions[index].metadata;
+        if retention_blocks_delete(metadata.retention.as_ref()) {
+            record_blob_delete(object_kind, "retention_blocked", started.elapsed());
+            return Err(StorageError::RetentionBlocked);
+        }
+        if legal_hold_blocks_delete(metadata.legal_hold) {
+            record_blob_delete(object_kind, "legal_hold_blocked", started.elapsed());
+            return Err(StorageError::LegalHoldBlocked);
+        }
+
+        versions.remove(index);
+        if versions.is_empty() {
+            state.objects.remove(object_id);
+        }
+        record_blob_delete(object_kind, "ok", started.elapsed());
+        Ok(())
+    }
+
     async fn extend_retention(
         &self,
         object_id: &BackendObjectId,
@@ -893,6 +1006,10 @@ impl BlobStore for MemoryBlobStore {
 
         object.metadata.retention =
             Some(merge_retention(object.metadata.retention.as_ref(), policy));
+        object.metadata.retain_until_ms = merge_retain_until(
+            object.metadata.retain_until_ms,
+            retain_until_ms(Some(policy)),
+        );
 
         record_blob_extend_retention(object_kind, "ok", started.elapsed());
         Ok(())
@@ -920,6 +1037,10 @@ impl BlobStore for MemoryBlobStore {
 
         object.metadata.retention =
             Some(merge_retention(object.metadata.retention.as_ref(), policy));
+        object.metadata.retain_until_ms = merge_retain_until(
+            object.metadata.retain_until_ms,
+            retain_until_ms(Some(policy)),
+        );
 
         record_blob_extend_retention(object_kind, "ok", started.elapsed());
         Ok(())
@@ -1127,6 +1248,27 @@ fn retention_blocks_delete(policy: Option<&RetentionPolicy>) -> bool {
 
 fn legal_hold_blocks_delete(status: Option<LegalHoldStatus>) -> bool {
     status == Some(LegalHoldStatus::On)
+}
+
+fn retain_until_ms(policy: Option<RetentionPolicy>) -> Option<i64> {
+    let policy = policy?;
+    if policy.mode == RetentionMode::None || policy.retain_days == 0 {
+        return None;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())?;
+    let retain_ms = i64::from(policy.retain_days).checked_mul(86_400_000)?;
+    now_ms.checked_add(retain_ms)
+}
+
+fn merge_retain_until(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 fn merge_retention(existing: Option<&RetentionPolicy>, next: RetentionPolicy) -> RetentionPolicy {

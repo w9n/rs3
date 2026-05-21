@@ -254,6 +254,14 @@ pub struct AdminV2MaintenanceSummary {
     pub protected_orphan_candidate_count: usize,
     /// Oldest visible orphan age in milliseconds, when provider timestamps exist.
     pub oldest_orphan_age_ms: Option<u128>,
+    /// Live commit versions that should have retention extended within the default renewal horizon.
+    pub retention_renewal_commit_count: usize,
+    /// Live commit bytes covered by planned retention renewal.
+    pub retention_renewal_bytes: u64,
+    /// Live commit versions whose renewal could not be planned from available metadata.
+    pub retention_renewal_blocked_count: usize,
+    /// Live commit bytes whose renewal could not be planned from available metadata.
+    pub retention_renewal_blocked_bytes: u64,
 }
 
 /// Accepted v2 anchor summary.
@@ -640,6 +648,10 @@ async fn maintenance_summary(config: &RuntimeConfig) -> AdminMaintenanceSummary 
                 orphan_candidate_count: report.orphan_candidate_count,
                 protected_orphan_candidate_count: report.protected_orphan_candidate_count,
                 oldest_orphan_age_ms: report.oldest_orphan_age_ms,
+                retention_renewal_commit_count: report.retention_renewal_commit_count,
+                retention_renewal_bytes: report.retention_renewal_bytes,
+                retention_renewal_blocked_count: report.retention_renewal_blocked_count,
+                retention_renewal_blocked_bytes: report.retention_renewal_blocked_bytes,
             }),
         },
         Err(error) => AdminMaintenanceSummary {

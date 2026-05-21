@@ -34,9 +34,9 @@ use client::{
     sdk_client_from_static_environment,
 };
 use errors::{
-    backend_version_id_from_string, common_error_result, get_error_result, map_common_error,
-    map_get_error, map_put_error, map_sdk_common_error, metadata_from_object_meta, provider_error,
-    put_error_result, storage_error_result,
+    backend_version_id_from_str, backend_version_id_from_string, common_error_result,
+    get_error_result, map_common_error, map_get_error, map_put_error, map_sdk_common_error,
+    metadata_from_object_meta, provider_error, put_error_result, storage_error_result,
 };
 use metrics::S3ProviderOperation;
 use object_lock::{
@@ -374,6 +374,7 @@ impl BlobStore for S3BlobStore {
                         .map(backend_version_id_from_string)
                         .transpose()?,
                     retention: None,
+                    retain_until_ms: None,
                     legal_hold: None,
                 })
             }
@@ -770,6 +771,106 @@ impl BlobStore for S3BlobStore {
         Ok(entries)
     }
 
+    async fn list_prefix_versions(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
+        let started = Instant::now();
+        let object_kind = prefix_kind(prefix);
+        let client = self
+            .sdk_client
+            .as_ref()
+            .ok_or(StorageError::VersionUnsupported)?;
+        let key_prefix = self.config.list_key_prefix(prefix);
+        let mut key_marker = None;
+        let mut version_id_marker = None;
+        let mut entries = Vec::new();
+
+        loop {
+            let mut request = client
+                .list_object_versions()
+                .bucket(self.config.bucket.as_str());
+            if !key_prefix.is_empty() {
+                request = request.prefix(key_prefix.as_str());
+            }
+            if let Some(marker) = key_marker.as_deref() {
+                request = request.key_marker(marker);
+            }
+            if let Some(marker) = version_id_marker.as_deref() {
+                request = request.version_id_marker(marker);
+            }
+
+            let output = match request.send().await {
+                Ok(output) => output,
+                Err(error) => {
+                    let storage_error =
+                        StorageError::Provider(format!("failed to list object versions: {error}"));
+                    let result = storage_error_result(&storage_error);
+                    self.record_provider_operation(
+                        S3ProviderOperation::List,
+                        object_kind,
+                        result,
+                        0,
+                        0,
+                        started.elapsed(),
+                    )?;
+                    record_blob_list(object_kind, entries.len(), result, started.elapsed());
+                    return Err(storage_error);
+                }
+            };
+            self.record_provider_operation(
+                S3ProviderOperation::List,
+                object_kind,
+                "ok",
+                0,
+                0,
+                started.elapsed(),
+            )?;
+
+            for version in output.versions() {
+                let Some(key) = version.key() else {
+                    continue;
+                };
+                let Some(object_id) = self.config.object_id_from_key(key)? else {
+                    continue;
+                };
+                let Some(version_id) = version.version_id() else {
+                    continue;
+                };
+                let content_len = version
+                    .size()
+                    .and_then(|size| u64::try_from(size).ok())
+                    .unwrap_or_default();
+                let modified_at_ms = version
+                    .last_modified()
+                    .map(|modified_at| modified_at.to_millis())
+                    .transpose()
+                    .map_err(provider_error)?;
+                entries.push(BlobMetadata {
+                    object_id,
+                    content_len,
+                    modified_at_ms,
+                    etag: version.e_tag().map(str::to_owned),
+                    version_id: Some(backend_version_id_from_str(version_id)?),
+                    retention: None,
+                    retain_until_ms: None,
+                    legal_hold: None,
+                });
+            }
+
+            key_marker = output.next_key_marker().map(str::to_owned);
+            version_id_marker = output.next_version_id_marker().map(str::to_owned);
+            if key_marker.is_none() && version_id_marker.is_none() {
+                break;
+            }
+        }
+
+        entries.sort_by(|left, right| {
+            left.object_id
+                .cmp(&right.object_id)
+                .then_with(|| left.version_id.cmp(&right.version_id))
+        });
+        record_blob_list(object_kind, entries.len(), "ok", started.elapsed());
+        Ok(entries)
+    }
+
     async fn delete(&self, object_id: &BackendObjectId) -> Result<()> {
         let started = Instant::now();
         let object_kind = object_kind(object_id);
@@ -880,6 +981,72 @@ impl BlobStore for S3BlobStore {
                 Err(map_common_error(error, object_id))
             }
         }
+    }
+
+    async fn delete_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> Result<()> {
+        let Some(version_id) = version_id else {
+            return self.delete(object_id).await;
+        };
+
+        let started = Instant::now();
+        let object_kind = object_kind(object_id);
+        let client = self
+            .sdk_client
+            .as_ref()
+            .ok_or(StorageError::VersionUnsupported)?;
+
+        let metadata = self.head_with_sdk(object_id, Some(version_id)).await?;
+        if retention_blocks_delete(metadata.retention.as_ref()) {
+            self.record_provider_operation(
+                S3ProviderOperation::Head,
+                object_kind,
+                "retention_blocked",
+                0,
+                0,
+                started.elapsed(),
+            )?;
+            record_blob_delete(object_kind, "retention_blocked", started.elapsed());
+            return Err(StorageError::RetentionBlocked);
+        }
+        if legal_hold_blocks_delete(metadata.legal_hold) {
+            self.record_provider_operation(
+                S3ProviderOperation::Head,
+                object_kind,
+                "legal_hold_blocked",
+                0,
+                0,
+                started.elapsed(),
+            )?;
+            record_blob_delete(object_kind, "legal_hold_blocked", started.elapsed());
+            return Err(StorageError::LegalHoldBlocked);
+        }
+
+        let result = client
+            .delete_object()
+            .bucket(self.config.bucket.as_str())
+            .key(self.config.object_key(object_id))
+            .version_id(version_id.as_str())
+            .send()
+            .await
+            .map_err(|error| map_sdk_common_error(error, object_id));
+        let result_label = match &result {
+            Ok(_) => "ok",
+            Err(error) => storage_error_result(error),
+        };
+        self.record_provider_operation(
+            S3ProviderOperation::Delete,
+            object_kind,
+            result_label,
+            0,
+            0,
+            started.elapsed(),
+        )?;
+        record_blob_delete(object_kind, result_label, started.elapsed());
+        result.map(|_| ())
     }
 
     async fn extend_retention(

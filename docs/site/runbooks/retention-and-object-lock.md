@@ -38,6 +38,18 @@ Needed: A retain until at least Day 50
 The gateway must extend reused objects and must never shorten retention. If the
 provider cannot extend retention, protected writes fail.
 
+v2 maintenance now reports when current or protected historical-root commit
+versions should have retention renewed soon. That renewal is still a planned
+operator fact, not an automatic mutating maintenance action. Keep object-store
+retention windows long enough to cover the operational gap until mutating
+renewal is implemented.
+
+v2 compaction can rewrite the current live namespace into a protected snapshot
+commit after verifying that snapshot with a fresh reader. Old source commits are
+not force-deleted by compaction; they remain subject to exact-version orphan GC,
+provider retention, legal hold, operator budgets, and any protected historical
+roots that have not been explicitly discarded.
+
 ## Cluster Takeover
 
 If an attacker controls Kubernetes but not object-store retention, they may

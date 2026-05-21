@@ -7,8 +7,9 @@ use super::{
 };
 use super::{
     V2AnchorState, V2CommitAnchor, V2CommitCoordinator, V2CommitSection, V2CommitStore,
-    V2CommitStoreOptions, V2CommitWrite, V2MemoryAnchor, V2OrphanGcOptions, V2RecoveryBundle,
-    V2Repository,
+    V2CommitStoreOptions, V2CommitWrite, V2FullGcApplyOptions, V2FullGcDryRunOptions,
+    V2MaintenanceBudgets, V2MaintenanceGuard, V2MemoryAnchor, V2OrphanGcOptions,
+    V2QuiescedMaintenanceGuard, V2RecoveryBundle, V2Repository,
 };
 use crate::{CommitCoordinatorOptions, RepositoryError, RepositoryOptions, RepositoryPutOptions};
 use bytes::Bytes;
@@ -216,6 +217,18 @@ impl V2CommitAnchor for FailOnceV2Anchor {
             return Err(V2FormatError::AnchorAdvanceFailed);
         }
         self.inner.compare_and_advance_v2(expected, next).await
+    }
+}
+
+struct RejectingMaintenanceGuard;
+
+#[async_trait::async_trait]
+impl V2MaintenanceGuard for RejectingMaintenanceGuard {
+    async fn verify_v2_maintenance(
+        &self,
+        _base_anchor: Option<&V2AnchorState>,
+    ) -> super::V2Result<()> {
+        Err(V2FormatError::MaintenanceAccessRequired)
     }
 }
 
@@ -429,8 +442,20 @@ impl BlobStore for SlowCommitGetStore {
         self.inner.list_prefix(prefix).await
     }
 
+    async fn list_prefix_versions(&self, prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
+        self.inner.list_prefix_versions(prefix).await
+    }
+
     async fn delete(&self, object_id: &BackendObjectId) -> rs3_storage::Result<()> {
         self.inner.delete(object_id).await
+    }
+
+    async fn delete_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> rs3_storage::Result<()> {
+        self.inner.delete_at(object_id, version_id).await
     }
 
     async fn extend_retention(
@@ -707,6 +732,10 @@ fn error_taxonomy_marks_format_failures_as_fail_closed() {
         V2FormatError::RecoveryBundleRequired.class(),
         V2ErrorClass::OperatorActionRequired
     );
+    assert_eq!(
+        V2FormatError::MaintenanceBudgetExceeded.class(),
+        V2ErrorClass::OperatorActionRequired
+    );
 }
 
 #[tokio::test]
@@ -774,6 +803,18 @@ async fn retained_provider_conformance_passes_on_memory_store_with_review_flag()
     assert!(report.passed());
     assert!(report.checks.iter().any(|check| {
         check.name == "multipart-retained-exact-head"
+            && check.status == V2ProviderCheckStatus::Passed
+    }));
+    assert!(report.checks.iter().any(|check| {
+        check.name == "retained-exact-version-inventory"
+            && check.status == V2ProviderCheckStatus::Passed
+    }));
+    assert!(report.checks.iter().any(|check| {
+        check.name == "retained-active-exact-delete-blocked"
+            && check.status == V2ProviderCheckStatus::Passed
+    }));
+    assert!(report.checks.iter().any(|check| {
+        check.name == "retained-unprotected-exact-delete"
             && check.status == V2ProviderCheckStatus::Passed
     }));
 }
@@ -2176,6 +2217,563 @@ async fn v2_orphan_gc_skips_retained_or_held_candidates() {
     assert_eq!(held_gc.protected_count, 1);
     assert_eq!(held_gc.deleted_count, 0);
     assert_eq!(held_after.candidates.len(), 1);
+}
+
+#[tokio::test]
+async fn v2_full_gc_dry_run_reports_unanchored_commit_budget() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2CommitStore::new(store, keyring, options);
+    let anchor = V2MemoryAnchor::new();
+
+    let genesis = must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let failed = repository
+        .write_child_commit(
+            &FailOnceV2Anchor::new(anchor.clone()),
+            V2CommitWrite::delta(vec![V2CommitSection::new(
+                V2SectionType::IndexDelta,
+                0,
+                Bytes::from_static(b"dry-run-orphan"),
+            )]),
+        )
+        .await;
+    let report = must_v2(
+        repository
+            .full_gc_dry_run(
+                &anchor,
+                V2FullGcDryRunOptions {
+                    budgets: V2MaintenanceBudgets {
+                        max_delete_count: Some(0),
+                        ..V2MaintenanceBudgets::default()
+                    },
+                    ..V2FullGcDryRunOptions::default()
+                },
+            )
+            .await,
+    );
+
+    assert!(matches!(failed, Err(V2FormatError::AnchorAdvanceFailed)));
+    assert_eq!(report.base_sequence, Some(genesis.anchor_state.sequence));
+    assert_eq!(report.chain_live_commit_count, 1);
+    assert_eq!(report.candidate_commit_count, 1);
+    assert_eq!(report.fully_dead_commit_count, 1);
+    assert_eq!(report.mixed_commit_count, 0);
+    assert!(report.dead_bytes_reclaimable > 0);
+    assert_eq!(report.planned_cost.delete_count, 1);
+    assert!(!report.fits_budgets);
+    assert!(report.exact_version_apply_ready);
+}
+
+#[tokio::test]
+async fn retained_v2_full_gc_dry_run_reports_version_inventory_and_blocked_bytes() {
+    let store = MemoryBlobStore::new();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::RetainedVersionObjectLock,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    )
+    .with_retention(Some(RetentionPolicy::new(RetentionMode::Compliance, 30)));
+    let repository = V2CommitStore::new(store, signing_keyring(), options);
+    let anchor = V2MemoryAnchor::new();
+
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let failed = repository
+        .write_child_commit(
+            &FailOnceV2Anchor::new(anchor.clone()),
+            V2CommitWrite::delta(vec![V2CommitSection::new(
+                V2SectionType::IndexDelta,
+                0,
+                Bytes::from_static(b"retained-dry-run-orphan"),
+            )]),
+        )
+        .await;
+    let report = must_v2(
+        repository
+            .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
+            .await,
+    );
+
+    assert!(matches!(failed, Err(V2FormatError::AnchorAdvanceFailed)));
+    assert_eq!(report.candidate_commit_count, 1);
+    assert_eq!(report.fully_dead_commit_count, 0);
+    assert_eq!(report.dead_bytes_reclaimable, 0);
+    assert!(report.retention_blocked_bytes > 0);
+    assert_eq!(report.planned_cost.version_list_count, 1);
+    assert_eq!(report.planned_cost.head_count, 2);
+    assert_eq!(report.planned_cost.delete_count, 0);
+    assert_eq!(report.planned_cost.retention_extend_count, 0);
+    assert!(report.fits_budgets);
+    assert!(report.exact_version_apply_ready);
+}
+
+#[tokio::test]
+async fn retained_v2_full_gc_dry_run_plans_live_commit_retention_renewal() {
+    let store = MemoryBlobStore::new();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::RetainedVersionObjectLock,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    )
+    .with_retention(Some(RetentionPolicy::new(RetentionMode::Compliance, 30)));
+    let repository = V2CommitStore::new(store, signing_keyring(), options);
+    let anchor = V2MemoryAnchor::new();
+
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    must_v2(
+        repository
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::delta(vec![V2CommitSection::new(
+                    V2SectionType::IndexDelta,
+                    0,
+                    Bytes::from_static(b"retention-renewal-live-commit"),
+                )]),
+            )
+            .await,
+    );
+
+    let default_report = must_v2(
+        repository
+            .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
+            .await,
+    );
+    let renewal_report = must_v2(
+        repository
+            .full_gc_dry_run(
+                &anchor,
+                V2FullGcDryRunOptions {
+                    budgets: V2MaintenanceBudgets {
+                        max_retention_extend_count: Some(1),
+                        ..V2MaintenanceBudgets::default()
+                    },
+                    retention_renewal_horizon: Duration::from_secs(31 * 24 * 60 * 60),
+                    ..V2FullGcDryRunOptions::default()
+                },
+            )
+            .await,
+    );
+
+    assert_eq!(default_report.retention_renewal_commit_count, 0);
+    assert_eq!(default_report.planned_cost.retention_extend_count, 0);
+    assert_eq!(renewal_report.chain_live_commit_count, 2);
+    assert_eq!(renewal_report.retention_renewal_commit_count, 2);
+    assert!(renewal_report.retention_renewal_bytes > 0);
+    assert_eq!(renewal_report.retention_renewal_blocked_count, 0);
+    assert_eq!(renewal_report.planned_cost.retention_extend_count, 2);
+    assert_eq!(renewal_report.planned_cost.head_count, 2);
+    assert!(!renewal_report.fits_budgets);
+}
+
+#[tokio::test]
+async fn retained_v2_full_gc_dry_run_plans_protected_root_retention_renewal() {
+    let store = MemoryBlobStore::new();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::RetainedVersionObjectLock,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    )
+    .with_retention(Some(RetentionPolicy::new(RetentionMode::Compliance, 30)));
+    let repository = V2CommitStore::new(store, signing_keyring(), options);
+    let anchor = V2MemoryAnchor::new();
+
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    must_v2(
+        repository
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::delta(vec![V2CommitSection::new(
+                    V2SectionType::IndexDelta,
+                    0,
+                    Bytes::from_static(b"retained-historical-root-delta"),
+                )]),
+            )
+            .await,
+    );
+    let historical_root =
+        must_v2(anchor.read_v2().await).expect("retained historical root should exist");
+    must_v2(
+        repository
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::snapshot(vec![V2CommitSection::new(
+                    V2SectionType::IndexSnapshot,
+                    0,
+                    Bytes::new(),
+                )]),
+            )
+            .await,
+    );
+
+    let report = must_v2(
+        repository
+            .full_gc_dry_run(
+                &anchor,
+                V2FullGcDryRunOptions {
+                    retention_renewal_horizon: Duration::from_secs(31 * 24 * 60 * 60),
+                    protected_roots: vec![historical_root],
+                    ..V2FullGcDryRunOptions::default()
+                },
+            )
+            .await,
+    );
+
+    assert_eq!(report.chain_live_commit_count, 1);
+    assert_eq!(report.protected_root_count, 1);
+    assert_eq!(report.protected_commit_count, 2);
+    assert_eq!(report.candidate_commit_count, 0);
+    assert_eq!(report.retention_renewal_commit_count, 3);
+    assert_eq!(report.planned_cost.head_count, 3);
+    assert_eq!(report.planned_cost.retention_extend_count, 3);
+}
+
+#[tokio::test]
+async fn v2_full_gc_apply_requires_maintenance_guard() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2CommitStore::new(store, keyring, options);
+    let anchor = V2MemoryAnchor::new();
+
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let failed = repository
+        .write_child_commit(
+            &FailOnceV2Anchor::new(anchor.clone()),
+            V2CommitWrite::delta(vec![V2CommitSection::new(
+                V2SectionType::IndexDelta,
+                0,
+                Bytes::from_static(b"guarded-orphan"),
+            )]),
+        )
+        .await;
+    let apply = repository
+        .apply_fully_dead_orphans(
+            &anchor,
+            &RejectingMaintenanceGuard,
+            V2FullGcApplyOptions {
+                dry_run: V2FullGcDryRunOptions::default(),
+                orphan_gc: V2OrphanGcOptions::new(Duration::ZERO),
+                retained_provider_conformance_passed: false,
+            },
+        )
+        .await;
+    let after = must_v2(repository.report_orphans(&anchor).await);
+
+    assert!(matches!(failed, Err(V2FormatError::AnchorAdvanceFailed)));
+    assert_eq!(apply, Err(V2FormatError::MaintenanceAccessRequired));
+    assert_eq!(after.candidates.len(), 1);
+}
+
+#[tokio::test]
+async fn v2_full_gc_apply_deletes_only_fully_dead_orphans_after_dry_run() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2CommitStore::new(store, keyring, options);
+    let anchor = V2MemoryAnchor::new();
+
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let failed = repository
+        .write_child_commit(
+            &FailOnceV2Anchor::new(anchor.clone()),
+            V2CommitWrite::delta(vec![V2CommitSection::new(
+                V2SectionType::IndexDelta,
+                0,
+                Bytes::from_static(b"apply-orphan"),
+            )]),
+        )
+        .await;
+    let apply = must_v2(
+        repository
+            .apply_fully_dead_orphans(
+                &anchor,
+                &V2QuiescedMaintenanceGuard,
+                V2FullGcApplyOptions {
+                    dry_run: V2FullGcDryRunOptions::default(),
+                    orphan_gc: V2OrphanGcOptions::new(Duration::ZERO),
+                    retained_provider_conformance_passed: false,
+                },
+            )
+            .await,
+    );
+    let after = must_v2(repository.report_orphans(&anchor).await);
+
+    assert!(matches!(failed, Err(V2FormatError::AnchorAdvanceFailed)));
+    assert_eq!(apply.dry_run.fully_dead_commit_count, 1);
+    assert_eq!(apply.orphan_gc.deleted_count, 1);
+    assert_eq!(after.candidates.len(), 0);
+}
+
+#[tokio::test]
+async fn v2_full_gc_apply_preserves_supplied_historical_roots() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2CommitStore::new(store, keyring, options);
+    let anchor = V2MemoryAnchor::new();
+
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    must_v2(
+        repository
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::delta(vec![V2CommitSection::new(
+                    V2SectionType::IndexDelta,
+                    0,
+                    Bytes::from_static(b"historical-root-delta"),
+                )]),
+            )
+            .await,
+    );
+    let historical_root = must_v2(anchor.read_v2().await).expect("historical root should exist");
+    must_v2(
+        repository
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::snapshot(vec![V2CommitSection::new(
+                    V2SectionType::IndexSnapshot,
+                    0,
+                    Bytes::new(),
+                )]),
+            )
+            .await,
+    );
+
+    let unprotected = must_v2(repository.report_orphans(&anchor).await);
+    let protected = must_v2(
+        repository
+            .report_orphans_with_protected_roots(&anchor, std::slice::from_ref(&historical_root))
+            .await,
+    );
+    let dry_run = must_v2(
+        repository
+            .full_gc_dry_run(
+                &anchor,
+                V2FullGcDryRunOptions {
+                    protected_roots: vec![historical_root.clone()],
+                    ..V2FullGcDryRunOptions::default()
+                },
+            )
+            .await,
+    );
+    let apply = must_v2(
+        repository
+            .apply_fully_dead_orphans(
+                &anchor,
+                &V2QuiescedMaintenanceGuard,
+                V2FullGcApplyOptions {
+                    dry_run: V2FullGcDryRunOptions {
+                        protected_roots: vec![historical_root],
+                        ..V2FullGcDryRunOptions::default()
+                    },
+                    orphan_gc: V2OrphanGcOptions::new(Duration::ZERO),
+                    retained_provider_conformance_passed: false,
+                },
+            )
+            .await,
+    );
+
+    assert_eq!(unprotected.candidates.len(), 2);
+    assert_eq!(protected.candidates.len(), 0);
+    assert_eq!(dry_run.protected_root_count, 1);
+    assert_eq!(dry_run.protected_commit_count, 2);
+    assert_eq!(dry_run.candidate_commit_count, 0);
+    assert_eq!(apply.orphan_gc.deleted_count, 0);
+}
+
+#[tokio::test]
+async fn retained_v2_full_gc_apply_requires_provider_conformance() {
+    let store = MemoryBlobStore::new();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::RetainedVersionObjectLock,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    )
+    .with_retention(Some(RetentionPolicy::new(RetentionMode::Compliance, 30)));
+    let repository = V2CommitStore::new(store, signing_keyring(), options);
+    let anchor = V2MemoryAnchor::new();
+
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let apply = repository
+        .apply_fully_dead_orphans(
+            &anchor,
+            &V2QuiescedMaintenanceGuard,
+            V2FullGcApplyOptions {
+                dry_run: V2FullGcDryRunOptions::default(),
+                orphan_gc: V2OrphanGcOptions::new(Duration::ZERO),
+                retained_provider_conformance_passed: false,
+            },
+        )
+        .await;
+
+    assert_eq!(apply, Err(V2FormatError::ProviderProfileFailed));
+}
+
+#[tokio::test]
+async fn v2_repository_full_gc_dry_run_reports_mixed_commit_payload_bytes() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let anchor = V2MemoryAnchor::new();
+    let live_key = must_type(LogicalPath::new("snapshots/live-after-delete.bin"));
+    let deleted_key = must_type(LogicalPath::new("snapshots/deleted-from-mixed.bin"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .stage_put(
+                live_key.clone(),
+                Bytes::from(vec![1_u8; 2048]),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(
+        repository
+            .stage_put(
+                deleted_key.clone(),
+                Bytes::from(vec![2_u8; 4096]),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(repository.publish_pending_index_delta(&anchor).await);
+    must_repo(repository.delete_committed(&anchor, deleted_key).await);
+
+    let report = must_repo(
+        repository
+            .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
+            .await,
+    );
+
+    assert_eq!(report.mixed_commit_count, 1);
+    assert!(report.live_bytes_to_copy > 0);
+    assert!(report.mixed_dead_bytes_repackable > report.live_bytes_to_copy);
+    assert_eq!(report.fully_dead_commit_count, 0);
+}
+
+#[tokio::test]
+async fn v2_compaction_snapshot_rewrites_live_refs_and_gc_removes_old_commits() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    let live_key = must_type(LogicalPath::new("snapshots/live-after-compaction.bin"));
+    let deleted_key = must_type(LogicalPath::new("snapshots/deleted-before-compaction.bin"));
+    let live_body = Bytes::from(vec![7_u8; 2048]);
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .stage_put(
+                live_key.clone(),
+                live_body.clone(),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(
+        repository
+            .stage_put(
+                deleted_key.clone(),
+                Bytes::from(vec![8_u8; 4096]),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(repository.publish_pending_index_delta(&anchor).await);
+    must_repo(
+        repository
+            .delete_committed(&anchor, deleted_key.clone())
+            .await,
+    );
+
+    let before = must_repo(
+        repository
+            .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
+            .await,
+    );
+    let compacted = must_repo(
+        repository
+            .write_compaction_snapshot(
+                &anchor,
+                &V2QuiescedMaintenanceGuard,
+                V2FullGcDryRunOptions::default(),
+                false,
+            )
+            .await,
+    );
+    let after = must_repo(
+        repository
+            .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
+            .await,
+    );
+    let gc = must_v2(
+        repository
+            .commit_store()
+            .apply_fully_dead_orphans(
+                &anchor,
+                &V2QuiescedMaintenanceGuard,
+                V2FullGcApplyOptions {
+                    dry_run: V2FullGcDryRunOptions::default(),
+                    orphan_gc: V2OrphanGcOptions::new(Duration::ZERO),
+                    retained_provider_conformance_passed: false,
+                },
+            )
+            .await,
+    );
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    let restored = must_repo(fresh.get_range(&live_key, ByteRange::Full).await);
+    let deleted = fresh.head(&deleted_key);
+    let post_gc_orphans = must_v2(repository.commit_store().report_orphans(&anchor).await);
+    let expected_sequence = before
+        .base_sequence
+        .expect("compaction dry run should have a base anchor")
+        .checked_next()
+        .expect("compaction sequence should not overflow");
+
+    assert_eq!(before.mixed_commit_count, 1);
+    assert!(before.live_bytes_to_copy > 0);
+    assert_eq!(compacted.anchor_state.sequence, expected_sequence);
+    assert_eq!(after.mixed_commit_count, 0);
+    assert!(after.candidate_commit_count > 0);
+    assert!(gc.orphan_gc.deleted_count > 0);
+    assert_eq!(post_gc_orphans.candidates.len(), 0);
+    assert_eq!(restored, live_body);
+    assert!(matches!(deleted, Err(RepositoryError::NotFound(_))));
 }
 
 #[tokio::test]

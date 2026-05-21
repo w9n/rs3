@@ -767,6 +767,47 @@ where
         )),
     }
 
+    match store.list_prefix_versions(&options.probe_prefix).await {
+        Ok(versions)
+            if versions
+                .iter()
+                .any(|metadata| metadata.version_id.as_ref() == Some(&first_version))
+                && versions
+                    .iter()
+                    .any(|metadata| metadata.version_id.as_ref() == second.version_id.as_ref()) =>
+        {
+            checks.push(V2ProviderConformanceCheck::passed(
+                "retained-exact-version-inventory",
+            ));
+        }
+        Ok(_) => checks.push(V2ProviderConformanceCheck::failed(
+            "retained-exact-version-inventory",
+            "expected versions missing",
+        )),
+        Err(_) => checks.push(V2ProviderConformanceCheck::failed(
+            "retained-exact-version-inventory",
+            "version inventory failed",
+        )),
+    }
+
+    match store.delete_at(&object_id, Some(&first_version)).await {
+        Err(StorageError::RetentionBlocked | StorageError::LegalHoldBlocked) => {
+            checks.push(V2ProviderConformanceCheck::passed(
+                "retained-active-exact-delete-blocked",
+            ));
+        }
+        Ok(()) => checks.push(V2ProviderConformanceCheck::failed(
+            "retained-active-exact-delete-blocked",
+            "exact delete succeeded",
+        )),
+        Err(_) => checks.push(V2ProviderConformanceCheck::failed(
+            "retained-active-exact-delete-blocked",
+            "unexpected exact delete error",
+        )),
+    }
+
+    run_unprotected_exact_delete_check(store, options, checks).await?;
+
     let extended = RetentionPolicy::new(options.retention.mode, options.retention.retain_days + 1);
     match store
         .extend_retention_at(&object_id, Some(&first_version), extended)
@@ -826,6 +867,65 @@ where
         checks.push(V2ProviderConformanceCheck::passed(
             "retained-governance-bypass-review",
         ));
+    }
+
+    Ok(())
+}
+
+async fn run_unprotected_exact_delete_check<S>(
+    store: &S,
+    options: &V2ProviderConformanceOptions,
+    checks: &mut Vec<V2ProviderConformanceCheck>,
+) -> V2Result<()>
+where
+    S: BlobStore,
+{
+    let object_id = probe_object_id(options, "retained-unprotected-delete")?;
+    let put = store
+        .put(
+            &object_id,
+            Bytes::from_static(b"v2-retained-unprotected-delete"),
+            PutOptions {
+                retention: None,
+                legal_hold: None,
+                content_type: None,
+                do_not_recreate: false,
+            },
+        )
+        .await;
+    let Ok(put) = put else {
+        checks.push(V2ProviderConformanceCheck::failed(
+            "retained-unprotected-exact-delete",
+            "unprotected put failed",
+        ));
+        return Ok(());
+    };
+    let Some(version_id) = put.version_id.clone() else {
+        checks.push(V2ProviderConformanceCheck::failed(
+            "retained-unprotected-exact-delete",
+            "missing version id",
+        ));
+        return Ok(());
+    };
+
+    match store.delete_at(&object_id, Some(&version_id)).await {
+        Ok(()) => match store.head_at(&object_id, Some(&version_id)).await {
+            Err(StorageError::NotFound(_)) => checks.push(V2ProviderConformanceCheck::passed(
+                "retained-unprotected-exact-delete",
+            )),
+            Ok(_) => checks.push(V2ProviderConformanceCheck::failed(
+                "retained-unprotected-exact-delete",
+                "version still visible",
+            )),
+            Err(_) => checks.push(V2ProviderConformanceCheck::failed(
+                "retained-unprotected-exact-delete",
+                "head after delete failed unexpectedly",
+            )),
+        },
+        Err(_) => checks.push(V2ProviderConformanceCheck::failed(
+            "retained-unprotected-exact-delete",
+            "exact delete failed",
+        )),
     }
 
     Ok(())

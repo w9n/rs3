@@ -47,6 +47,8 @@ use std::sync::{Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
+mod compaction;
+
 const V2_PAYLOAD_FILL_LOCK_STRIPES: usize = 64;
 
 /// Preview v2 repository service.

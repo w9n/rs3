@@ -105,12 +105,16 @@ snapshot writer first flushes any pending client-write batch so the snapshot
 chains from an accepted state. Operators can force this maintenance action with
 `rs3 write-index-snapshot` on `v2-preview` repositories.
 
-v2 quick maintenance verifies the anchor-selected commit chain and reports
-path-redacted orphan counts. Conservative orphan GC can delete unanchored
-commit candidates only after reachability, visible retention, legal-hold, age,
-and same-sequence safety checks pass. Retained or legally held candidates are
-reported and skipped; retained-profile candidates with missing protection
-metadata are also skipped.
+v2 quick maintenance verifies the anchor-selected commit chain, reports
+path-redacted orphan counts, and reports live commit versions whose provider
+retention should be renewed soon. Full GC dry runs add request and byte budgets,
+fully dead orphan bytes, retention/legal-hold blocked bytes, mixed accepted
+commit bytes that compaction can reclaim, compaction write-byte estimates, and
+retention-renewal request estimates. Conservative orphan GC can delete
+unanchored commit candidates only after reachability, visible retention,
+legal-hold, age, and same-sequence safety checks pass. Retained or legally held
+candidates are reported and skipped; retained-profile candidates with missing
+protection metadata are also skipped.
 
 `rs3 export-restore-bundle` is format-aware: for `v2-preview` it verifies the
 anchor-selected commit chain and exports the anchor state as the normal DR
@@ -213,9 +217,20 @@ moving the wrapping-key source or retiring a clean wrapping key, but it is not
 recovery from exposure of an old wrapping key plus the old envelope bytes.
 
 Repository-local orphan cleanup is reachability and retention aware. It derives
-candidates from an accepted commit chain, skips objects with known retention or
-legal hold, and treats provider retention or legal-hold delete failures as
-blocked cleanup rather than as successful deletion.
+candidates from the accepted commit chain plus any operator-supplied protected
+historical roots, skips objects with known retention or legal hold, and treats
+provider retention or legal-hold delete failures as blocked cleanup rather than
+as successful deletion. Historical roots are explicit inputs to maintenance:
+without an explicit discard, their reachable commits remain protected from
+orphan deletion.
+
+Retention renewal is currently planned, not applied, by v2 full-maintenance dry
+runs. The planner inspects current and protected-root commit versions and
+includes needed retention-extension calls in the reported budgets. Compaction
+apply writes a new snapshot commit through a temporary anchor, verifies it with
+a fresh reader, then adopts that exact commit into the real anchor and leaves
+old source commits for retention-aware orphan GC. Replacement-root rewriting
+remains intentionally deferred.
 
 Initial empty repositories are initialized by writing an encrypted keyring
 envelope, an encrypted format root, and a genesis commit. Existing anchored
