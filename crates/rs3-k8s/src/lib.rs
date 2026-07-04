@@ -83,13 +83,12 @@ impl CheckpointAnchor for KubernetesLeaseAnchor {
         for _attempt in 0..MAX_ADVANCE_ATTEMPTS {
             match api.get(&self.settings.name).await {
                 Ok(lease) => {
-                    if let Ok(current) = anchor_state_from_lease(&lease) {
-                        if next == current {
-                            return Ok(current);
-                        }
-                        if next.sequence <= current.sequence {
-                            return Err(AnchorError::StaleSequence);
-                        }
+                    let current = anchor_state_from_lease(&lease)?;
+                    if next == current {
+                        return Ok(current);
+                    }
+                    if next.sequence <= current.sequence {
+                        return Err(AnchorError::StaleSequence);
                     }
 
                     let updated = lease_with_state(lease, &next, &self.settings.field_manager);
@@ -435,13 +434,23 @@ fn anchor_backend(error: impl ToString) -> AnchorError {
 mod tests {
     use super::{
         CHECKPOINT_DIGEST_ANNOTATION, CHECKPOINT_ID_ANNOTATION, CHECKPOINT_SEQUENCE_ANNOTATION,
-        CHECKPOINT_VERSION_ID_ANNOTATION, V2_FORMAT_VERSION_ID_ANNOTATION, anchor_state_from_lease,
-        lease_with_state, v2_anchor_state_from_lease, v2_lease_with_state,
+        CHECKPOINT_VERSION_ID_ANNOTATION, KubernetesLeaseAnchor, LeaseSettings,
+        V2_FORMAT_VERSION_ID_ANNOTATION, anchor_state_from_lease, lease_with_state,
+        v2_anchor_state_from_lease, v2_lease_with_state,
     };
+    use http::{Method, Request, Response, StatusCode};
     use k8s_openapi::api::coordination::v1::Lease;
-    use rs3_anchor::{AnchorError, AnchorState};
+    use kube::Client;
+    use kube::client::Body;
+    use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor};
     use rs3_repository::v2::{V2AnchorState, V2FormatError, V2FormatRef};
     use rs3_types::{BackendObjectId, BackendVersionId, CheckpointId, KeyId, Sequence};
+    use std::convert::Infallible;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tower::service_fn;
 
     fn state(sequence: u64, checkpoint_id: &str) -> AnchorState {
         AnchorState {
@@ -525,6 +534,47 @@ mod tests {
         let actual = anchor_state_from_lease(&lease);
 
         assert!(matches!(actual, Err(AnchorError::MissingAnchor)));
+    }
+
+    #[tokio::test]
+    async fn compare_and_advance_fails_closed_when_v1_annotations_are_missing() {
+        let mut lease = lease_with_state(Lease::default(), &state(1, "checkpoint-1"), "rs3-test");
+        lease
+            .metadata
+            .annotations
+            .as_mut()
+            .expect("annotations exist")
+            .remove(CHECKPOINT_DIGEST_ANNOTATION);
+        let response_body = serde_json::to_vec(&lease).expect("lease serializes");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service_calls = Arc::clone(&calls);
+        let service = service_fn(move |request: Request<Body>| {
+            let response_body = response_body.clone();
+            let service_calls = Arc::clone(&service_calls);
+            async move {
+                service_calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(request.method(), Method::GET);
+                let response = Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(response_body))
+                    .expect("response builds");
+                Ok::<_, Infallible>(response)
+            }
+        });
+        let anchor = KubernetesLeaseAnchor {
+            settings: LeaseSettings {
+                namespace: "rs3-test".to_owned(),
+                name: "rs3-anchor".to_owned(),
+                field_manager: "rs3-test".to_owned(),
+            },
+            client: tokio::sync::OnceCell::new(),
+        };
+        assert!(anchor.client.set(Client::new(service, "rs3-test")).is_ok());
+
+        let actual = anchor.compare_and_advance(state(2, "checkpoint-2")).await;
+
+        assert!(matches!(actual, Err(AnchorError::MissingAnchor)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

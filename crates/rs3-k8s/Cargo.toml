@@ -19,7 +19,10 @@ rs3-types.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+http.workspace = true
+serde_json.workspace = true
 k8s-openapi = { workspace = true, features = ["v1_35"] }
+tower = { version = "0.5.3", features = ["util"] }
 
 [lints]
 workspace = true
