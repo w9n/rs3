@@ -96,6 +96,33 @@ one. The backend can still deny service by hiding required objects.
 | Lease and backend are both compromised | Online protection is exhausted; recovery needs offline or externally protected authority. |
 | Wrapping key and old envelope are both exposed | Rewrap protects only future envelope handling; historical data under that keyring is treated as exposed. |
 
+## Incomplete Multipart Cleanup
+
+Production-preview retained S3-compatible buckets MUST configure a lifecycle
+rule that aborts incomplete multipart uploads. Client disconnects, pod crashes,
+or provider-side abort failures can leave temporary multipart parts that are
+not committed repository objects, so rs3 repository GC cannot discover or clean
+them.
+
+Example lifecycle shape, adapting the prefix syntax to the selected provider:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "abort-incomplete-rs3-multipart-uploads",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "<backend-prefix>/"
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 1
+      }
+    }
+  ]
+}
+```
+
 ## Bootstrap UX
 
 The preview bootstrap path is declarative:

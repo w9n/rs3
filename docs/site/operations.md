@@ -32,6 +32,29 @@ excessive traffic is rejected before it consumes pod resources. Known-length
 commit uploads when the backend supports multipart. Unknown-length or chunked
 uploads buffer only until the threshold is crossed, then continue through the
 same multipart commit path and remain bounded by `RS3_MAX_PUT_OBJECT_BYTES`.
+Operators MUST configure a backend lifecycle rule that aborts incomplete
+multipart uploads, because client disconnects and crashes can leave provider
+temporary parts that repository GC cannot see.
+
+Example S3 lifecycle shape, adapting the prefix syntax to the selected
+provider:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "abort-incomplete-rs3-multipart-uploads",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "<backend-prefix>/"
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 1
+      }
+    }
+  ]
+}
+```
 
 For serving:
 

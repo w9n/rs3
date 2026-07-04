@@ -16,7 +16,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use rs3_crypto::KeyRing;
-use rs3_storage::{BlobMetadata, BlobStore, ByteRange, PutOptions, StorageError};
+use rs3_storage::{
+    BlobMetadata, BlobMultipartUpload, BlobStore, ByteRange, PutOptions, StorageError,
+};
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyId, LegalHoldStatus, RepositoryId, RetentionPolicy,
     Sequence,
@@ -982,7 +984,7 @@ where
             .await
             .is_err()
         {
-            let _ = multipart.abort().await;
+            abort_v2_commit_multipart(multipart, "payload_header").await;
             return Err(V2FormatError::StorageOperationFailed);
         }
 
@@ -1004,7 +1006,7 @@ where
             {
                 Ok(next_chunk) => next_chunk,
                 Err(_elapsed) => {
-                    let _ = multipart.abort().await;
+                    abort_v2_commit_multipart(multipart, "stream_timeout").await;
                     return Err(V2FormatError::ObjectBodyReadFailed);
                 }
             };
@@ -1014,11 +1016,11 @@ where
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(crate::RepositoryError::ObjectBodyReadFailed) => {
-                    let _ = multipart.abort().await;
+                    abort_v2_commit_multipart(multipart, "stream_read").await;
                     return Err(V2FormatError::ObjectBodyReadFailed);
                 }
                 Err(_error) => {
-                    let _ = multipart.abort().await;
+                    abort_v2_commit_multipart(multipart, "stream_read").await;
                     return Err(V2FormatError::StorageOperationFailed);
                 }
             };
@@ -1029,13 +1031,13 @@ where
             if let Some(max_plaintext_len) = write.max_plaintext_len
                 && plaintext_seen > max_plaintext_len
             {
-                let _ = multipart.abort().await;
+                abort_v2_commit_multipart(multipart, "plaintext_limit").await;
                 return Err(V2FormatError::ObjectTooLarge);
             }
             if let Some(expected_plaintext_len) = write.expected_plaintext_len
                 && plaintext_seen > expected_plaintext_len
             {
-                let _ = multipart.abort().await;
+                abort_v2_commit_multipart(multipart, "plaintext_length").await;
                 return Err(V2FormatError::ObjectLengthMismatch);
             }
             let mut remaining = chunk.as_ref();
@@ -1063,14 +1065,14 @@ where
                             .is_err()
                         }
                     {
-                        let _ = multipart.abort().await;
+                        abort_v2_commit_multipart(multipart, "payload_segment").await;
                         return Err(V2FormatError::StorageOperationFailed);
                     }
                     pending_segment = Some((next_segment_index, std::mem::take(&mut segment)));
                     next_segment_index = match next_segment_index.checked_add(1) {
                         Some(next_segment_index) => next_segment_index,
                         None => {
-                            let _ = multipart.abort().await;
+                            abort_v2_commit_multipart(multipart, "segment_index").await;
                             return Err(V2FormatError::SectionBounds);
                         }
                     };
@@ -1081,7 +1083,7 @@ where
         if let Some(expected_plaintext_len) = write.expected_plaintext_len
             && plaintext_seen != expected_plaintext_len
         {
-            let _ = multipart.abort().await;
+            abort_v2_commit_multipart(multipart, "plaintext_length").await;
             return Err(V2FormatError::ObjectLengthMismatch);
         }
         if !segment.is_empty() {
@@ -1103,7 +1105,7 @@ where
                     .is_err()
                 }
             {
-                let _ = multipart.abort().await;
+                abort_v2_commit_multipart(multipart, "payload_segment").await;
                 return Err(V2FormatError::StorageOperationFailed);
             }
             let final_segment_failed = {
@@ -1123,7 +1125,7 @@ where
                 .is_err()
             };
             if final_segment_failed {
-                let _ = multipart.abort().await;
+                abort_v2_commit_multipart(multipart, "payload_segment").await;
                 return Err(V2FormatError::StorageOperationFailed);
             }
         } else if let Some((ready_index, ready_segment)) = pending_segment.take()
@@ -1144,7 +1146,7 @@ where
                 .is_err()
             }
         {
-            let _ = multipart.abort().await;
+            abort_v2_commit_multipart(multipart, "payload_segment").await;
             return Err(V2FormatError::StorageOperationFailed);
         }
 
@@ -1163,7 +1165,7 @@ where
         }) {
             Ok(finalized) => finalized,
             Err(error) => {
-                let _ = multipart.abort().await;
+                abort_v2_commit_multipart(multipart, "finalize").await;
                 return Err(error);
             }
         };
@@ -1190,7 +1192,7 @@ where
             .await
             .is_err()
         {
-            let _ = multipart.abort().await;
+            abort_v2_commit_multipart(multipart, "index_delta").await;
             return Err(V2FormatError::StorageOperationFailed);
         }
         let body_digest = body_digest.finalize().into();
@@ -1205,14 +1207,14 @@ where
         ) {
             Ok(header) => header,
             Err(error) => {
-                let _ = multipart.abort().await;
+                abort_v2_commit_multipart(multipart, "header").await;
                 return Err(error);
             }
         };
         let header_span = match header.encode_header_span(self.options.upload_mode) {
             Ok(header_span) => header_span,
             Err(error) => {
-                let _ = multipart.abort().await;
+                abort_v2_commit_multipart(multipart, "header").await;
                 return Err(error);
             }
         };
@@ -1385,6 +1387,42 @@ fn build_section_region(
     Ok((section_index, Bytes::from(region)))
 }
 
+async fn abort_v2_commit_multipart(multipart: Box<dyn BlobMultipartUpload>, phase: &'static str) {
+    if let Err(error) = multipart.abort().await {
+        let error_class = storage_error_class(&error);
+        metrics::counter!(
+            "rs3_repository_v2_multipart_abort_failures_total",
+            "phase" => phase,
+            "error_class" => error_class,
+        )
+        .increment(1);
+        tracing::warn!(
+            target: "rs3_repository",
+            operation = "v2_multipart_abort",
+            phase,
+            error_class,
+            result = "failed",
+            "failed to abort incomplete v2 multipart upload",
+        );
+    }
+}
+
+fn storage_error_class(error: &StorageError) -> &'static str {
+    match error {
+        StorageError::NotFound(_) => "not_found",
+        StorageError::AlreadyExists(_) => "already_exists",
+        StorageError::InvalidRange => "invalid_range",
+        StorageError::Provider(_) => "provider",
+        StorageError::RetentionBlocked => "retention_blocked",
+        StorageError::RetentionExtensionUnsupported => "retention_extension_unsupported",
+        StorageError::VersionUnsupported => "version_unsupported",
+        StorageError::MissingVersionId(_) => "missing_version_id",
+        StorageError::LegalHoldBlocked => "legal_hold_blocked",
+        StorageError::LegalHoldUnsupported => "legal_hold_unsupported",
+        StorageError::MultipartUnsupported => "multipart_unsupported",
+    }
+}
+
 fn storage_to_v2(_error: StorageError) -> V2FormatError {
     V2FormatError::StorageOperationFailed
 }
@@ -1492,7 +1530,7 @@ impl MultipartCommitAssembler {
         first_part.extend_from_slice(&header_span);
         first_part.extend_from_slice(&self.first_section_bytes);
         if let Err(error) = upload.put_part(0, Bytes::from(first_part)).await {
-            let _ = upload.abort().await;
+            abort_v2_commit_multipart(upload, "assembler_first_part").await;
             return Err(error);
         }
         if !self.current_part.is_empty()
@@ -1500,7 +1538,7 @@ impl MultipartCommitAssembler {
                 .put_part(self.current_part_index, Bytes::from(self.current_part))
                 .await
         {
-            let _ = upload.abort().await;
+            abort_v2_commit_multipart(upload, "assembler_final_part").await;
             return Err(error);
         }
         upload.complete().await

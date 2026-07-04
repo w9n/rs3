@@ -219,13 +219,17 @@ impl BlobMultipartUpload for S3MultipartUpload {
             Ok(output) => output,
             Err(error) => {
                 let mapped = errors::map_sdk_put_error(error, &object_id);
-                let _ = client
+                if client
                     .abort_multipart_upload()
                     .bucket(store.config.bucket.as_str())
                     .key(abort_key)
                     .upload_id(abort_upload_id)
                     .send()
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    record_s3_multipart_abort_failure("complete_failed", "provider");
+                }
                 return Err(mapped);
             }
         };
@@ -300,6 +304,24 @@ impl BlobMultipartUpload for S3MultipartUpload {
             })?;
         Ok(())
     }
+}
+
+fn record_s3_multipart_abort_failure(phase: &'static str, error_class: &'static str) {
+    metrics::counter!(
+        "rs3_storage_s3_multipart_abort_failures_total",
+        "phase" => phase,
+        "error_class" => error_class,
+    )
+    .increment(1);
+    tracing::warn!(
+        target: "rs3_storage",
+        provider = "s3",
+        operation = "abort_multipart_upload",
+        phase,
+        error_class,
+        result = "failed",
+        "failed to abort incomplete S3 multipart upload",
+    );
 }
 
 #[async_trait]
