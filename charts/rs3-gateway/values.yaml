@@ -1,18 +1,27 @@
+# Run one read-write gateway pod per repository. Scale-out restore readers
+# should use restore-readonly mode with separate coordination.
 replicaCount: 1
 
+# Gateway container image. Override repository/tag for published images or
+# integration-test images built by xtask.
 image:
   repository: rs3-server
   tag: ci
   pullPolicy: IfNotPresent
 
+# Cluster-internal S3-compatible listener.
 service:
   type: ClusterIP
   port: 9080
 
+# read-write accepts repository mutations; restore-readonly rejects them.
+# writerGuard=required enforces Kubernetes Lease coordination for read-write.
 gateway:
   mode: read-write
   writerGuard: required
 
+# Resource and request-admission limits. Increase multipart part size only after
+# checking backend compatibility and memory budgets.
 hardening:
   maxPutObjectBytes: 5368709120
   bufferedPutObjectBytes: 67108864
@@ -22,31 +31,41 @@ hardening:
   maxConcurrentRequests: 256
   requestRateLimitPerSecond: 1024
 
+# Public S3 bucket name presented to backup clients. This is not the backend
+# object-store bucket.
 publicBucket: client-bucket
 
+# Backend object store. file:// is for local/dev PVC-backed smoke tests; use an
+# S3-compatible endpoint for production-like deployments.
 backend:
   endpoint: file:///data
   bucket: backend
   prefix: repository
   region: us-east-1
 
+# Credentials for the backend object store. Prefer existingSecret in production.
 backendCredentials:
   create: false
   existingSecret: ""
   accessKeyId: ""
   secretAccessKey: ""
 
+# Static S3 credentials accepted from backup clients. Prefer existingSecret in
+# production and rotate credentials outside Helm history when possible.
 credentials:
   create: false
   existingSecret: ""
   accessKeyId: ""
   secretAccessKey: ""
 
+# Commit batching trades write latency for fewer repository commits.
 commit:
   maxBatchItems: 8
   maxBatchDelayMs: 5
   maxPendingItems: 8
 
+# Repository identity and format settings. allowInit should only be true for a
+# new, empty repository prefix under operator control.
 repository:
   format: v2-preview
   id: rs3-repository
@@ -58,6 +77,8 @@ repository:
     mode: ""
     days: 0
 
+# Repository key material and encrypted keyring envelope settings. Prefer
+# existingSecret or an external secret operator for production deployments.
 repositoryKeys:
   create: false
   existingSecret: ""
@@ -66,6 +87,8 @@ repositoryKeys:
   wrappingKeyId: wrap-v1
   wrappingKeyHex: ""
 
+# Rollback anchor coordination. Kubernetes Lease anchoring is the production
+# preview default; memory anchors are local-development only.
 anchor:
   mode: kubernetes-lease
   allowMemory: false
@@ -73,31 +96,39 @@ anchor:
   name: v2-anchor
   fieldManager: rs3-server
 
+# plain logs are human-readable; json logs are structured for collectors.
 logging:
   format: plain
   rustLog: info
 
+# Enable only for file:// backend smoke tests or other explicitly local storage.
 persistence:
   enabled: false
   mountPath: /data
   storageClassName: ""
   size: 1Gi
 
+# Default restricted pod security context for the gateway container.
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532
   runAsGroup: 65532
   fsGroup: 65532
 
+# Service account used by the gateway pod and Lease RBAC.
 serviceAccount:
   create: true
   name: ""
 
+# Lease RBAC. Set existing=true only when equivalent permissions are managed
+# outside this chart.
 rbac:
   create: true
   existing: false
 
+# Optional Kubernetes resource requests and limits.
 resources: {}
 
+# Recreate avoids two read-write gateway pods briefly racing on the same anchor.
 updateStrategy:
   type: Recreate
