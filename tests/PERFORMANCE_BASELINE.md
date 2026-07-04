@@ -265,6 +265,10 @@ Interpretation:
 
 Run date: 2026-05-05. This is a command-level smoke for
 `just perf-s3-gateway`, not a replacement for the larger Kopia matrix above.
+Older in-process committed-write measurements used the removed v1 repository
+stack and are historical only. After the perf harness port to v2, refresh
+`just perf-commit` and `just perf-commit-parallel` before using those local
+lanes as a baseline.
 
 Raw artifact: retained as ignored local evidence.
 

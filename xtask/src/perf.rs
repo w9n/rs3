@@ -8,11 +8,13 @@ use crate::integration::{S3ContainerProvider, s3_container};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::{Args, ValueEnum};
-use rs3_anchor::MemoryCheckpointAnchor;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
+use rs3_repository::v2::{
+    V2CommitCoordinator, V2CommitStoreOptions, V2FormatRef, V2KeyringEnvelopeRef, V2MemoryAnchor,
+    V2ProviderProfile, V2Repository,
+};
 use rs3_repository::{
-    CommitCoordinator, CommitCoordinatorOptions, DEFAULT_PAYLOAD_SEGMENT_SIZE, Repository,
-    RepositoryOptions, RepositoryPutOptions,
+    CommitCoordinatorOptions, DEFAULT_PAYLOAD_SEGMENT_SIZE, RepositoryOptions, RepositoryPutOptions,
 };
 use rs3_storage::{
     BlobOperationCounts, BlobStore, ByteRange, CountingBlobStore, FilesystemBlobStore,
@@ -20,7 +22,9 @@ use rs3_storage::{
 };
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
-use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath};
+use rs3_types::{
+    BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath,
+};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "containers")]
 use std::process::Command;
@@ -408,28 +412,49 @@ async fn write_batch_with_store<S>(
     store: CountingBlobStore<S>,
 ) -> Result<PerfReport>
 where
-    S: BlobStore + Clone,
+    S: BlobStore + Clone + Send + Sync + 'static,
 {
-    let repo = repository_with_store(args, store.clone())?;
-    let anchor = MemoryCheckpointAnchor::new();
+    let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
+    let batch_items = args.objects.max(1);
+    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+        repo,
+        anchor,
+        CommitCoordinatorOptions::new(
+            batch_items,
+            Duration::from_millis(args.commit_batch_delay_ms),
+        )
+        .with_max_pending_items(batch_items),
+    ));
+    store
+        .reset_operation_counts()
+        .context("failed to reset operation counts")?;
     let body = body(args.object_size);
     let mut latencies = Vec::with_capacity(args.objects);
     let started = Instant::now();
 
+    let mut handles = Vec::with_capacity(args.objects);
     for index in 0..args.objects {
-        let operation_started = Instant::now();
-        repo.put(
-            path(&format!("perf/write-batch/object-{index:08}"))?,
-            body.clone(),
-            RepositoryPutOptions::default(),
-        )
-        .await
-        .with_context(|| format!("failed to write object {index}"))?;
-        latencies.push(operation_started.elapsed());
+        let coordinator = Arc::clone(&coordinator);
+        let body = body.clone();
+        handles.push(tokio::spawn(async move {
+            let operation_started = Instant::now();
+            coordinator
+                .put_committed(
+                    path(&format!("perf/write-batch/object-{index:08}"))?,
+                    body,
+                    RepositoryPutOptions::default(),
+                )
+                .await
+                .with_context(|| format!("failed to write object {index}"))?;
+            Ok::<Duration, anyhow::Error>(operation_started.elapsed())
+        }));
     }
-    repo.publish_checkpoint(&anchor)
-        .await
-        .context("failed to publish checkpoint")?;
+    for handle in handles {
+        let latency = handle
+            .await
+            .context("batched v2 write task did not complete")??;
+        latencies.push(latency);
+    }
 
     let elapsed = started.elapsed();
     let counts = store
@@ -438,15 +463,15 @@ where
     Ok(PerfReport {
         scenario: "write-batch",
         backend: args.backend,
-        repository_format: None,
+        repository_format: Some(PerfRepositoryFormat::V2Preview),
         objects: args.objects,
         object_size: args.object_size,
         operations: args.objects,
         requested_plaintext_write_bytes: checked_mul(args.objects, args.object_size)?,
         requested_plaintext_read_bytes: 0,
-        commit_batch_items: commit_batch_items(args),
+        commit_batch_items: batch_items,
         commit_batch_delay_ms: args.commit_batch_delay_ms,
-        commit_max_pending_items: commit_max_pending_items(args),
+        commit_max_pending_items: batch_items,
         payload_segment_size: args.payload_segment_size,
         adaptive_payload_segment_size: adaptive_payload_segment_size(args),
         concurrency: concurrency(args),
@@ -479,9 +504,11 @@ async fn write_committed_with_store<S>(
 where
     S: BlobStore + Clone + 'static,
 {
-    let repo = Arc::new(repository_with_store(args, store.clone())?);
-    let anchor = MemoryCheckpointAnchor::new();
-    let coordinator = CommitCoordinator::with_options(repo, anchor, commit_options(args));
+    let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
+    let coordinator = V2CommitCoordinator::with_options(repo, anchor, commit_options(args));
+    store
+        .reset_operation_counts()
+        .context("failed to reset operation counts")?;
     let body = body(args.object_size);
     let mut latencies = Vec::with_capacity(args.objects);
     let started = Instant::now();
@@ -506,7 +533,7 @@ where
     Ok(PerfReport {
         scenario: "write-committed",
         backend: args.backend,
-        repository_format: None,
+        repository_format: Some(PerfRepositoryFormat::V2Preview),
         objects: args.objects,
         object_size: args.object_size,
         operations: args.objects,
@@ -547,13 +574,15 @@ async fn write_committed_parallel_with_store<S>(
 where
     S: BlobStore + Clone + Send + Sync + 'static,
 {
-    let repo = Arc::new(repository_with_store(args, store.clone())?);
-    let anchor = MemoryCheckpointAnchor::new();
-    let coordinator = Arc::new(CommitCoordinator::with_options(
+    let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
+    let coordinator = Arc::new(V2CommitCoordinator::with_options(
         repo,
         anchor,
         commit_options(args),
     ));
+    store
+        .reset_operation_counts()
+        .context("failed to reset operation counts")?;
     let body = body(args.object_size);
     let parallelism = concurrency(args);
     let mut latencies = Vec::with_capacity(args.objects);
@@ -595,7 +624,7 @@ where
     Ok(PerfReport {
         scenario: "write-committed-parallel",
         backend: args.backend,
-        repository_format: None,
+        repository_format: Some(PerfRepositoryFormat::V2Preview),
         objects: args.objects,
         object_size: args.object_size,
         operations: args.objects,
@@ -633,10 +662,10 @@ async fn full_read_with_store<S>(args: &PerfArgs, store: CountingBlobStore<S>) -
 where
     S: BlobStore + Clone,
 {
-    let repo = repository_with_store(args, store.clone())?;
+    let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
     let key = path("perf/read/full-object")?;
     let body = body(args.object_size);
-    repo.put(key.clone(), body, RepositoryPutOptions::default())
+    repo.put_committed(&anchor, key.clone(), body, RepositoryPutOptions::default())
         .await
         .context("failed to prepare full-read object")?;
     store
@@ -660,7 +689,7 @@ where
     Ok(PerfReport {
         scenario: "full-read",
         backend: args.backend,
-        repository_format: None,
+        repository_format: Some(PerfRepositoryFormat::V2Preview),
         objects: 1,
         object_size: args.object_size,
         operations: args.reads,
@@ -701,10 +730,10 @@ async fn range_read_with_store<S>(
 where
     S: BlobStore + Clone,
 {
-    let repo = repository_with_store(args, store.clone())?;
+    let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
     let key = path("perf/read/range-object")?;
     let body = body(args.object_size);
-    repo.put(key.clone(), body, RepositoryPutOptions::default())
+    repo.put_committed(&anchor, key.clone(), body, RepositoryPutOptions::default())
         .await
         .context("failed to prepare range-read object")?;
     store
@@ -741,7 +770,7 @@ where
     Ok(PerfReport {
         scenario: "range-read",
         backend: args.backend,
-        repository_format: None,
+        repository_format: Some(PerfRepositoryFormat::V2Preview),
         objects: 1,
         object_size: args.object_size,
         operations: args.reads,
@@ -987,14 +1016,17 @@ fn memory_store() -> CountingBlobStore<MemoryBlobStore> {
     CountingBlobStore::new(MemoryBlobStore::new())
 }
 
-fn repository_with_store<S>(args: &PerfArgs, store: S) -> Result<Repository<S>>
+async fn v2_repository_with_store<S>(
+    args: &PerfArgs,
+    store: CountingBlobStore<S>,
+) -> Result<(Arc<V2Repository<CountingBlobStore<S>>>, V2MemoryAnchor)>
 where
-    S: BlobStore,
+    S: BlobStore + Clone,
 {
     if args.payload_segment_size == Some(0) {
         anyhow::bail!("--payload-segment-size must be greater than zero");
     }
-    Ok(Repository::with_keyring_and_options(
+    let repository = Arc::new(V2Repository::new(
         store,
         keyring()?,
         RepositoryOptions {
@@ -1004,7 +1036,18 @@ where
                 rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
             default_retention: None,
         },
-    ))
+        V2CommitStoreOptions::for_profile(
+            V2ProviderProfile::Dev,
+            perf_keyring_envelope_ref()?,
+            perf_format_ref()?,
+        ),
+    ));
+    let anchor = V2MemoryAnchor::new();
+    repository
+        .write_genesis_snapshot(&anchor)
+        .await
+        .context("failed to write v2 genesis snapshot")?;
+    Ok((repository, anchor))
 }
 
 fn adaptive_payload_segment_size(args: &PerfArgs) -> bool {
@@ -1100,6 +1143,31 @@ fn body(size: usize) -> Bytes {
 
 fn path(value: &str) -> Result<LogicalPath> {
     LogicalPath::new(value.to_owned()).map_err(Into::into)
+}
+
+fn perf_keyring_envelope_ref() -> Result<V2KeyringEnvelopeRef> {
+    Ok(V2KeyringEnvelopeRef {
+        object_id: BackendObjectId::new("keyrings/perf-bootstrap")
+            .context("invalid perf keyring envelope object id")?,
+        digest: [6_u8; 32],
+    })
+}
+
+fn perf_format_ref() -> Result<V2FormatRef> {
+    Ok(V2FormatRef {
+        generation: 1,
+        digest: hex::encode([7_u8; 32]),
+        object_id: BackendObjectId::new(format!(
+            "format/{:020}-{}",
+            1_u64,
+            hex::encode([7_u8; 32])
+        ))
+        .context("invalid perf format object id")?,
+        version_id: Some(
+            BackendVersionId::new("perf-format-version-1")
+                .context("invalid perf format version id")?,
+        ),
+    })
 }
 
 fn commit_options(args: &PerfArgs) -> CommitCoordinatorOptions {
