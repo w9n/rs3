@@ -533,7 +533,7 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
 
     if config.static_credentials.is_none() {
         findings.push(AdminFinding::error(
-            "auth.static-credentials",
+            "auth.credentials-missing",
             "production profile requires configured gateway credentials",
         ));
     }
@@ -970,7 +970,7 @@ mod tests {
         assert!(codes.contains(&"anchor.memory"));
         assert!(codes.contains(&"retention.missing"));
         assert!(codes.contains(&"backend.memory"));
-        assert!(codes.contains(&"auth.static-credentials"));
+        assert!(codes.contains(&"auth.credentials-missing"));
         assert!(codes.contains(&"recovery.public-key"));
         assert!(codes.contains(&"repository.init-enabled"));
     }

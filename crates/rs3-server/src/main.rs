@@ -1196,7 +1196,7 @@ mod tests {
 
         assert!(codes.contains(&"anchor.memory"));
         assert!(codes.contains(&"retention.missing"));
-        assert!(codes.contains(&"auth.static-credentials"));
+        assert!(codes.contains(&"auth.credentials-missing"));
         assert!(codes.contains(&"recovery.public-key"));
         assert!(codes.contains(&"repository.init-enabled"));
     }
