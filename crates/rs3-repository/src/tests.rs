@@ -7,8 +7,8 @@ use crate::checkpoint::{
 use crate::namespace::{indexed_list_prefix, indexed_list_prefix_mode, prefix_tokens_for_key};
 use crate::payload::PAYLOAD_HEADER_PROBE_LEN;
 use crate::{
-    CheckpointPosition, CommitCoordinator, CommitCoordinatorOptions, PhysicalDeleteOutcome,
-    Repository, RepositoryError, RepositoryOptions, RepositoryPutOptions,
+    CheckpointPosition, PhysicalDeleteOutcome, Repository, RepositoryError, RepositoryOptions,
+    RepositoryPutOptions,
 };
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, CheckpointAnchor, MemoryCheckpointAnchor};
@@ -20,11 +20,9 @@ use rs3_storage::{
 use rs3_types::{
     KeyPurpose, KeyStatus, LegalHoldStatus, RepositoryId, RetentionMode, RetentionPolicy, Sequence,
 };
-use std::sync::Arc;
 
 mod basic_io;
 mod checkpoint;
-mod commit_coordinator;
 mod immutability;
 mod keys;
 mod namespace_privacy;

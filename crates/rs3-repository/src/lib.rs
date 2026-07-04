@@ -1,7 +1,7 @@
 //! Trusted repository workflow above storage and namespace indexes.
 
 mod checkpoint;
-mod commit;
+mod commit_options;
 mod error;
 mod keyring_envelope;
 mod model;
@@ -14,7 +14,7 @@ pub mod v2;
 #[cfg(test)]
 mod tests;
 
-pub use commit::{CommitCoordinator, CommitCoordinatorOptions};
+pub use commit_options::CommitCoordinatorOptions;
 pub use error::{RepositoryError, Result};
 pub use keyring_envelope::{KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE, store_keyring_envelope};
 pub use model::{

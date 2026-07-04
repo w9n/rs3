@@ -2,7 +2,7 @@
 
 use super::repository::{V2AnchorState, V2CommitAnchor};
 use super::service::{V2Repository, V2RepositorySnapshot};
-use crate::commit::CommitCoordinatorOptions;
+use crate::CommitCoordinatorOptions;
 use crate::error::{RepositoryError, Result};
 use crate::model::{DeleteOutcome, RepositoryObjectMetadata, RepositoryPutOptions};
 use bytes::Bytes;
