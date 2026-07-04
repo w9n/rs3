@@ -105,6 +105,11 @@ Expected Secret keys are:
 - `metrics.enabled=true` exposes the gateway metrics listener through the main
   Service. `metrics.serviceMonitor.enabled=true` also renders a Prometheus
   Operator `ServiceMonitor`.
+- The container runs with privilege escalation disabled, a read-only root
+  filesystem, all Linux capabilities dropped, and a RuntimeDefault seccomp
+  profile. The chart mounts an emptyDir at `/tmp` for scratch space.
+- Default resources request 512Mi/250m and limit memory to 1536Mi. There is no
+  CPU limit by default.
 - Use `gateway.mode=restore-readonly` for restore readers that must not mutate
   repository state.
 - Do not use `anchor.allowMemory=true` outside local development.

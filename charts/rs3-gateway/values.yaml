@@ -133,6 +133,17 @@ podSecurityContext:
   runAsGroup: 65532
   fsGroup: 65532
 
+# Default restricted container security context. `/tmp` is mounted as an
+# emptyDir because the root filesystem is read-only.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
 # Service account used by the gateway pod and Lease RBAC.
 serviceAccount:
   create: true
@@ -144,8 +155,15 @@ rbac:
   create: true
   existing: false
 
-# Optional Kubernetes resource requests and limits.
-resources: {}
+# Kubernetes resource requests and limits. The memory limit leaves headroom
+# above the measured roughly 790 MiB RSS in tests/PERFORMANCE_BASELINE.md; keep
+# CPU as a request, not a limit, so crypto and compression can burst.
+resources:
+  requests:
+    memory: 512Mi
+    cpu: 250m
+  limits:
+    memory: 1536Mi
 
 # Recreate avoids two read-write gateway pods briefly racing on the same anchor.
 updateStrategy:

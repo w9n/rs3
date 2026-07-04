@@ -26,6 +26,8 @@ spec:
         - name: gateway
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           args:
             - serve
           ports:
@@ -188,6 +190,8 @@ spec:
           volumeMounts:
             - name: repository-data
               mountPath: {{ .Values.persistence.mountPath | quote }}
+            - name: tmp
+              mountPath: /tmp
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
@@ -198,3 +202,5 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        - name: tmp
+          emptyDir: {}
