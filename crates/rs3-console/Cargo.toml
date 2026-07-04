@@ -13,6 +13,7 @@ bytes.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
+hyper-rustls.workspace = true
 hyper-util.workspace = true
 rs3-crypto.workspace = true
 secrecy.workspace = true

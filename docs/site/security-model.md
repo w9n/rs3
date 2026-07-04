@@ -200,14 +200,15 @@ show client-visible paths, Kubernetes object names, tenant names, configured
 backend bucket names, backend prefixes, repository IDs, access keys, wrapping
 keys, or raw backend object IDs.
 
-Expose the admin listener only on localhost, a protected cluster-only address,
-or behind an authenticated internal ingress. The listener is separate from the
-S3 data plane and currently exposes path-redacted facts at `GET /admin/posture`
-and `GET /admin/status`; it must use an admin bearer token that is separate from
-backup-client S3 credentials and backend S3 credentials. Mutating recovery and
-maintenance actions need explicit authorization and audit controls before they
-belong in an admin interface. Operator reports should stay fact-only until a
-separate authorization and audit design exists.
+The current S3, admin, and console listeners do not terminate TLS themselves.
+Expose them only behind TLS termination or on cluster-local networks protected
+by NetworkPolicy or equivalent controls. The admin listener is separate from
+the S3 data plane and currently exposes path-redacted facts at `GET
+/admin/posture` and `GET /admin/status`; it must use an admin bearer token that
+is separate from backup-client S3 credentials and backend S3 credentials.
+Mutating recovery and maintenance actions need explicit authorization and audit
+controls before they belong in an admin interface. Operator reports should stay
+fact-only until a separate authorization and audit design exists.
 
 Do not reuse backup-client S3 credentials as admin credentials. S3 client IAM
 controls backup-tool operations on the data plane; admin/operator identity is a
@@ -218,7 +219,9 @@ gateway admin report in a browser, but it must keep the gateway admin bearer
 token server-side, require a separate console bearer token for `GET
 /api/posture` and `GET /api/status`, and stay read-only. It must not add object
 browsing, workflow execution, recovery mutation, key rotation, or backend-object
-inspection.
+inspection. The console-to-gateway admin hop carries the gateway admin bearer
+token, so use `https://` for that hop unless it is restricted to a protected
+cluster-local network.
 
 ## Key Compromise Rule
 

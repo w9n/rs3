@@ -460,6 +460,7 @@ mod tests {
         let token = GatewayAdminBearerToken::new("gateway-admin-token-12345")
             .unwrap_or_else(|error| panic!("{error}"));
         GatewayAdminClient::new(GatewayAdminClientConfig::new(endpoint, token))
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 
     async fn assert_peer_closes(stream: &mut TcpStream) {
@@ -490,7 +491,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         let token = GatewayAdminBearerToken::new("gateway-admin-token-12345")
             .unwrap_or_else(|error| panic!("{error}"));
-        let client = GatewayAdminClient::new(GatewayAdminClientConfig::new(endpoint, token));
+        let client = GatewayAdminClient::new(GatewayAdminClientConfig::new(endpoint, token))
+            .unwrap_or_else(|error| panic!("{error}"));
 
         (ConsoleHttpService::new(client, auth()), request)
     }

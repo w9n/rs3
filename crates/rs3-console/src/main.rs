@@ -11,7 +11,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     init_tracing();
 
     let config = ConsoleRuntimeConfig::from_env()?;
-    let admin_client = GatewayAdminClient::new(config.gateway_admin.clone());
+    let admin_client = GatewayAdminClient::new(config.gateway_admin.clone())?;
     let service = ConsoleHttpService::new(admin_client, config.auth.clone());
     let server = ConsoleHttpServer::bind_service(config.bind, service).await?;
 

@@ -2,6 +2,7 @@ use bytes::Bytes;
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH};
 use http::{HeaderValue, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Empty};
+use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -20,6 +21,7 @@ const DEFAULT_MAX_RESPONSE_BYTES: usize = 512 * 1024;
 /// Parsed gateway admin endpoint for the single-gateway console.
 #[derive(Clone, PartialEq, Eq)]
 pub struct GatewayAdminEndpoint {
+    scheme: GatewayAdminScheme,
     host: String,
     port: u16,
 }
@@ -27,22 +29,22 @@ pub struct GatewayAdminEndpoint {
 impl GatewayAdminEndpoint {
     /// Parses a gateway admin endpoint.
     ///
-    /// Only `http://` origins are accepted. The console is intended to run next
-    /// to the gateway or behind a separately protected cluster-local path, so
-    /// TLS termination belongs outside this preview client.
+    /// `http://` and `https://` origins are accepted. Plain HTTP is intended
+    /// only for cluster-local or otherwise isolated console-to-gateway hops.
     ///
     /// # Errors
     ///
-    /// Returns an error when the endpoint is malformed, is not `http://`, uses
-    /// credentials, or includes a path/query.
+    /// Returns an error when the endpoint is malformed, is not `http://` or
+    /// `https://`, uses credentials, or includes a path/query.
     pub fn parse(value: &str) -> Result<Self, GatewayAdminEndpointError> {
         let uri: Uri = value
             .parse()
             .map_err(|_source| GatewayAdminEndpointError::InvalidUri)?;
-        match uri.scheme_str() {
-            Some("http") => {}
+        let scheme = match uri.scheme_str() {
+            Some("http") => GatewayAdminScheme::Http,
+            Some("https") => GatewayAdminScheme::Https,
             _ => return Err(GatewayAdminEndpointError::UnsupportedScheme),
-        }
+        };
         let authority = uri
             .authority()
             .ok_or(GatewayAdminEndpointError::MissingAuthority)?;
@@ -57,9 +59,9 @@ impl GatewayAdminEndpoint {
             .host()
             .ok_or(GatewayAdminEndpointError::MissingAuthority)?
             .to_owned();
-        let port = uri.port_u16().unwrap_or(80);
+        let port = uri.port_u16().unwrap_or_else(|| scheme.default_port());
 
-        Ok(Self { host, port })
+        Ok(Self { scheme, host, port })
     }
 
     fn status_uri(&self) -> Result<Uri, GatewayAdminClientError> {
@@ -72,7 +74,7 @@ impl GatewayAdminEndpoint {
 
     fn admin_uri(&self, path: &'static str) -> Result<Uri, GatewayAdminClientError> {
         Uri::builder()
-            .scheme("http")
+            .scheme(self.scheme.as_str())
             .authority(self.authority())
             .path_and_query(path)
             .build()
@@ -98,14 +100,36 @@ impl fmt::Debug for GatewayAdminEndpoint {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GatewayAdminScheme {
+    Http,
+    Https,
+}
+
+impl GatewayAdminScheme {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+
+    const fn default_port(self) -> u16 {
+        match self {
+            Self::Http => 80,
+            Self::Https => 443,
+        }
+    }
+}
+
 /// Gateway admin endpoint parsing errors.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum GatewayAdminEndpointError {
     /// Endpoint URI is malformed.
-    #[error("gateway admin URL must be a valid http origin")]
+    #[error("gateway admin URL must be a valid http or https origin")]
     InvalidUri,
     /// Endpoint does not use the supported scheme.
-    #[error("gateway admin URL must use http")]
+    #[error("gateway admin URL must use http or https")]
     UnsupportedScheme,
     /// Endpoint does not include host information.
     #[error("gateway admin URL must include a host")]
@@ -219,16 +243,26 @@ impl fmt::Debug for GatewayAdminClientConfig {
 #[derive(Clone)]
 pub struct GatewayAdminClient {
     config: GatewayAdminClientConfig,
-    client: Client<HttpConnector, Empty<Bytes>>,
+    client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
 }
 
 impl GatewayAdminClient {
     /// Creates a gateway admin client.
-    pub fn new(config: GatewayAdminClientConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when native TLS root configuration fails.
+    pub fn new(config: GatewayAdminClientConfig) -> Result<Self, GatewayAdminClientError> {
         let mut connector = HttpConnector::new();
-        connector.enforce_http(true);
+        connector.enforce_http(false);
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .map_err(GatewayAdminClientError::TlsConfig)?
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(connector);
         let client = Client::builder(TokioExecutor::new()).build(connector);
-        Self { config, client }
+        Ok(Self { config, client })
     }
 
     /// Fetches and validates the gateway admin status report.
@@ -322,6 +356,9 @@ pub enum GatewayAdminClientError {
     /// HTTP request construction failed.
     #[error("failed to build gateway admin request")]
     RequestBuild(#[source] http::Error),
+    /// TLS connector configuration failed.
+    #[error("failed to configure gateway admin TLS roots")]
+    TlsConfig(#[source] std::io::Error),
     /// Gateway admin request failed.
     #[error("gateway admin request failed")]
     Request(#[source] hyper_util::client::legacy::Error),
@@ -367,12 +404,16 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
-    fn endpoint_accepts_http_origin_only() {
+    fn endpoint_accepts_http_and_https_origins() {
         let endpoint = GatewayAdminEndpoint::parse("http://127.0.0.1:9082")
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(endpoint.authority(), "127.0.0.1:9082");
 
-        let error = match GatewayAdminEndpoint::parse("https://127.0.0.1:9082") {
+        let endpoint = GatewayAdminEndpoint::parse("https://admin.example")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(endpoint.authority(), "admin.example:443");
+
+        let error = match GatewayAdminEndpoint::parse("ftp://127.0.0.1:9082") {
             Ok(endpoint) => panic!("unexpected endpoint: {endpoint:?}"),
             Err(error) => error,
         };
@@ -396,7 +437,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         let token = GatewayAdminBearerToken::new("gateway-admin-token-12345")
             .unwrap_or_else(|error| panic!("{error}"));
-        let client = GatewayAdminClient::new(GatewayAdminClientConfig::new(endpoint, token));
+        let client = GatewayAdminClient::new(GatewayAdminClientConfig::new(endpoint, token))
+            .unwrap_or_else(|error| panic!("{error}"));
 
         let status = client
             .fetch_status()
@@ -424,7 +466,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         let token = GatewayAdminBearerToken::new("gateway-admin-token-12345")
             .unwrap_or_else(|error| panic!("{error}"));
-        let client = GatewayAdminClient::new(GatewayAdminClientConfig::new(endpoint, token));
+        let client = GatewayAdminClient::new(GatewayAdminClientConfig::new(endpoint, token))
+            .unwrap_or_else(|error| panic!("{error}"));
 
         let posture = client
             .fetch_posture()
@@ -443,7 +486,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         let token = GatewayAdminBearerToken::new("gateway-admin-token-12345")
             .unwrap_or_else(|error| panic!("{error}"));
-        let client = GatewayAdminClient::new(GatewayAdminClientConfig::new(endpoint, token));
+        let client = GatewayAdminClient::new(GatewayAdminClientConfig::new(endpoint, token))
+            .unwrap_or_else(|error| panic!("{error}"));
 
         let error = match client.fetch_status().await {
             Ok(status) => panic!("unexpected status: {status:?}"),

@@ -168,19 +168,17 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_rejects_https_gateway_admin_url() {
-        let error = match ConsoleRuntimeConfig::from_env_values(
+    fn runtime_config_accepts_https_gateway_admin_url_and_redacts_debug() {
+        let config = ConsoleRuntimeConfig::from_env_values(
             Some("127.0.0.1:0"),
             Some("console-token-12345"),
             Some("https://127.0.0.1:9082"),
             Some("gateway-admin-token-12345"),
-        ) {
-            Ok(config) => panic!("unexpected config: {config:?}"),
-            Err(error) => error,
-        };
-        let encoded = error.to_string();
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let encoded = format!("{config:?}");
 
         assert!(!encoded.contains("127.0.0.1:9082"));
-        assert!(encoded.contains("http"));
+        assert!(!encoded.contains("gateway-admin-token"));
     }
 }
