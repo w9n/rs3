@@ -399,15 +399,25 @@ function yesNo(value) {
 }
 
 function bytes(value) {
-  if (typeof value !== "number") {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
     return "unknown";
   }
-  return `${value} B`;
+  const units = ["B", "KiB", "MiB", "GiB"];
+  let scaled = value;
+  let unitIndex = 0;
+  while (scaled >= 1024 && unitIndex < units.length - 1) {
+    scaled /= 1024;
+    unitIndex += 1;
+  }
+  return `${scaled.toFixed(1)} ${units[unitIndex]}`;
 }
 
 function millis(value) {
-  if (typeof value !== "number") {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
     return "unknown";
+  }
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(1)} s`;
   }
   return `${value} ms`;
 }
