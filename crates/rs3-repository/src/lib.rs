@@ -3,6 +3,7 @@
 mod checkpoint;
 mod commit;
 mod error;
+mod keyring_envelope;
 mod maintenance;
 mod model;
 mod namespace;
@@ -16,6 +17,7 @@ mod tests;
 
 pub use commit::{CommitCoordinator, CommitCoordinatorOptions};
 pub use error::{RepositoryError, Result};
+pub use keyring_envelope::{KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE, store_keyring_envelope};
 pub use model::{
     BackendObjectReferenceKind, CheckpointPosition, CommittedPut, DeleteOutcome,
     PhysicalDeleteOutcome, ReachableBackendObject, RepositoryListEntry, RepositoryObjectMetadata,

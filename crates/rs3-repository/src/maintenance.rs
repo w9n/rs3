@@ -1,11 +1,12 @@
 //! Dry-run repository maintenance reports.
 
 use crate::checkpoint::{
-    CHECKPOINT_EVIDENCE_PREFIX, CHECKPOINT_OBJECT_PREFIX, KEYRING_ENVELOPE_OBJECT_PREFIX,
-    checkpoint_evidence_object_id, checkpoint_object_id, open_index_delta_object,
-    open_manifest_record, validate_checkpoint_published_at,
+    CHECKPOINT_EVIDENCE_PREFIX, CHECKPOINT_OBJECT_PREFIX, checkpoint_evidence_object_id,
+    checkpoint_object_id, open_index_delta_object, open_manifest_record,
+    validate_checkpoint_published_at,
 };
 use crate::error::{RepositoryError, Result};
+use crate::keyring_envelope::KEYRING_ENVELOPE_OBJECT_PREFIX;
 use crate::model::{
     BackendObjectReferenceKind, CheckpointPosition, ReachableBackendObject,
     RepositoryOrphanCandidate, RepositoryOrphanDeleteReport, RepositoryOrphanReport,

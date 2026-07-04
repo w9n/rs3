@@ -26,10 +26,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const CHECKPOINT_OBJECT_PREFIX: &str = "checkpoints/";
 pub(crate) const CHECKPOINT_EVIDENCE_PREFIX: &str = "evidence/";
-pub(crate) const KEYRING_ENVELOPE_OBJECT_PREFIX: &str = "keyrings/";
 const CHECKPOINT_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.checkpoint+json";
 const CHECKPOINT_EVIDENCE_CONTENT_TYPE: &str = "application/vnd.rs3.checkpoint-evidence+json";
-const KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.keyring-envelope+json";
 const INDEX_DELTA_ASSOCIATED_DATA: &[u8] = b"rs3:index-delta-object:v1";
 
 pub(crate) struct CheckpointChainEntry {
@@ -246,62 +244,6 @@ where
         Ok(loaded)
     }
 
-    /// Stores an encrypted keyring envelope and records its reference for new checkpoints.
-    pub async fn store_keyring_envelope(
-        &self,
-        envelope: &KeyringEnvelope,
-    ) -> Result<KeyringEnvelopeReference> {
-        let digest = envelope.digest()?;
-        let object_id = keyring_envelope_object_id(envelope.generation, &digest)?;
-        let body = Bytes::from(envelope.to_object_bytes()?);
-        let retention = self.checkpoint_retention_policy()?;
-        let legal_hold = self.checkpoint_legal_hold()?;
-        let put = self
-            .store
-            .put(
-                &object_id,
-                body.clone(),
-                PutOptions {
-                    retention,
-                    legal_hold,
-                    content_type: Some(KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE.to_owned()),
-                    do_not_recreate: true,
-                },
-            )
-            .await;
-
-        let version_id = match put {
-            Ok(metadata) => {
-                require_version_for_retained_write(&object_id, &metadata, retention, legal_hold)?
-            }
-            Err(StorageError::AlreadyExists(_)) => {
-                let existing_metadata = self.store.head(&object_id).await?;
-                let existing = self.store.get_range(&object_id, ByteRange::Full).await?;
-                if existing != body {
-                    return Err(crate::RepositoryError::KeyringEnvelopeObjectConflict {
-                        object_id,
-                    });
-                }
-                require_version_for_retained_write(
-                    &object_id,
-                    &existing_metadata,
-                    retention,
-                    legal_hold,
-                )?
-            }
-            Err(error) => return Err(error.into()),
-        };
-
-        let reference = KeyringEnvelopeReference {
-            generation: envelope.generation,
-            digest,
-            object_id,
-            version_id,
-        };
-        self.set_keyring_envelope_reference(Some(reference.clone()))?;
-        Ok(reference)
-    }
-
     /// Stores a new encrypted keyring envelope and stages a metadata-only checkpoint.
     ///
     /// This is used for key lifecycle updates that change checkpoint metadata
@@ -418,7 +360,7 @@ where
         }
     }
 
-    fn checkpoint_retention_policy(&self) -> Result<Option<rs3_types::RetentionPolicy>> {
+    pub(crate) fn checkpoint_retention_policy(&self) -> Result<Option<rs3_types::RetentionPolicy>> {
         let state = self.read_state()?;
         let mut retention = self.options.default_retention;
         for delta in &state.pending_index_deltas {
@@ -429,7 +371,7 @@ where
         Ok(retention)
     }
 
-    fn checkpoint_legal_hold(&self) -> Result<Option<rs3_types::LegalHoldStatus>> {
+    pub(crate) fn checkpoint_legal_hold(&self) -> Result<Option<rs3_types::LegalHoldStatus>> {
         let state = self.read_state()?;
         Ok(state
             .pending_index_deltas
@@ -624,13 +566,6 @@ pub(crate) fn checkpoint_evidence_object_id(
         "{CHECKPOINT_EVIDENCE_PREFIX}{:020}/{}",
         position.sequence.get(),
         position.checkpoint_id.as_str()
-    ))
-    .map_err(Into::into)
-}
-
-pub(crate) fn keyring_envelope_object_id(generation: u64, digest: &str) -> Result<BackendObjectId> {
-    BackendObjectId::new(format!(
-        "{KEYRING_ENVELOPE_OBJECT_PREFIX}{generation:020}-{digest}.json"
     ))
     .map_err(Into::into)
 }

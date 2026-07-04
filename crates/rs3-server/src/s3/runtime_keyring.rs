@@ -5,12 +5,10 @@ use crate::config::{KEYRING_WRAPPING_KEY_HEX_ENV, REPOSITORY_SALT_HEX_ENV};
 use bytes::Bytes;
 use rs3_crypto::{KeyRing, KeyringEnvelope, RepositoryKeyContext, SecretBytes};
 use rs3_index::KeyringEnvelopeReference;
-use rs3_repository::{Repository, RepositoryOptions};
+use rs3_repository::{KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE, store_keyring_envelope};
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
-
-const KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.keyring-envelope+json";
 
 pub(super) async fn unanchored_gateway_keyring(
     store: &RuntimeStore,
@@ -163,16 +161,7 @@ async fn bootstrap_missing_keyring_envelope(
     let reference = if let Some(object_id) = configured_object_id {
         store_configured_keyring_envelope(store, &object_id, &envelope, retention).await?
     } else {
-        let repository = Repository::with_keyring_and_options(
-            store.clone(),
-            keyring.clone(),
-            RepositoryOptions {
-                default_retention: retention,
-                ..RepositoryOptions::default()
-            },
-        );
-        repository
-            .store_keyring_envelope(&envelope)
+        store_keyring_envelope(store, &envelope, retention, None)
             .await
             .map_err(repository_init)?
     };
