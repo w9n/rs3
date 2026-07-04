@@ -1093,7 +1093,7 @@ impl S3 for GatewayS3Service {
                 .map_err(repository_error)?;
 
             Ok(S3Response::new(DeleteObjectOutput {
-                delete_marker: Some(true),
+                delete_marker: Some(false),
                 ..DeleteObjectOutput::default()
             }))
         }
@@ -1497,7 +1497,8 @@ mod tests {
                 ..DeleteObjectInput::default()
             }))
             .await;
-        assert!(delete.is_ok());
+        let delete = delete.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(delete.output.delete_marker, Some(false));
 
         assert_eq!(accepted_v2_sequence(&service).await, 3);
 
