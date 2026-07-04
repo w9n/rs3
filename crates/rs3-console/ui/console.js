@@ -7,7 +7,9 @@ const CHECKPOINT_BAD_AGE_MS = 24 * 60 * 60 * 1000;
 const state = {
   token: sessionStorage.getItem(tokenKey) || "",
   status: null,
+  posture: null,
   lastError: null,
+  postureError: null,
   autoRefresh: null,
 };
 
@@ -36,6 +38,8 @@ const nodes = {
   storageDetail: document.getElementById("storage-detail"),
   securityDetail: document.getElementById("security-detail"),
   findingsTable: document.getElementById("findings-table"),
+  postureState: document.getElementById("posture-state"),
+  postureTable: document.getElementById("posture-table"),
 };
 
 nodes.tokenInput.value = state.token;
@@ -51,7 +55,9 @@ nodes.refreshButton.addEventListener("click", () => refreshStatus());
 nodes.clearTokenButton.addEventListener("click", () => {
   state.token = "";
   state.status = null;
+  state.posture = null;
   sessionStorage.removeItem(tokenKey);
+  state.postureError = null;
   nodes.tokenInput.value = "";
   setConnection("Disconnected", "neutral");
   render();
@@ -75,24 +81,25 @@ async function refreshStatus(options = {}) {
   if (!options.silent) {
     setConnection("Refreshing", "neutral");
   }
-  try {
-    const response = await fetch("/api/status", {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${state.token}`,
-      },
-      cache: "no-store",
-    });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(body?.error?.message || `HTTP ${response.status}`);
-    }
-    state.status = body;
+
+  const [statusResult, postureResult] = await Promise.allSettled([
+    fetchConsoleReport("/api/status"),
+    fetchConsoleReport("/api/posture"),
+  ]);
+
+  if (postureResult.status === "fulfilled") {
+    state.posture = postureResult.value;
+    state.postureError = null;
+  } else {
+    state.postureError = errorMessage(postureResult.reason, "Posture refresh failed");
+  }
+
+  if (statusResult.status === "fulfilled") {
+    state.status = statusResult.value;
     state.lastError = null;
     setConnection("Connected", "good");
-  } catch (error) {
-    state.lastError = error instanceof Error ? error.message : "Refresh failed";
+  } else {
+    state.lastError = errorMessage(statusResult.reason, "Refresh failed");
     setConnection("Error", "bad");
   }
   render();
@@ -105,6 +112,7 @@ function render() {
   renderSummary(status, findings);
   renderDetails(status);
   renderFindings(findings);
+  renderPosture(state.posture);
   nodes.lastRefresh.textContent = state.lastError
     ? state.lastError
     : status
@@ -252,15 +260,30 @@ function displayFindings(status) {
 }
 
 function renderFindings(findings) {
-  clear(nodes.findingsTable);
-  if (findings.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "empty-state";
-    empty.textContent = "No findings";
-    nodes.findingsTable.append(empty);
+  renderFindingTable(nodes.findingsTable, findings);
+}
+
+function renderPosture(posture) {
+  if (state.postureError) {
+    nodes.postureState.textContent = "Error";
+    renderPanelMessage(nodes.postureTable, state.postureError, "error-state");
     return;
   }
+  if (!posture) {
+    nodes.postureState.textContent = "Not loaded";
+    renderPanelMessage(nodes.postureTable, "Posture not loaded", "empty-state");
+    return;
+  }
+  nodes.postureState.textContent = `${posture.profile || "unknown"} profile`;
+  renderFindingTable(nodes.postureTable, displayFindings(posture));
+}
 
+function renderFindingTable(node, rows) {
+  clear(node);
+  if (rows.length === 0) {
+    renderPanelMessage(node, "No findings", "empty-state");
+    return;
+  }
   const table = document.createElement("table");
   const thead = document.createElement("thead");
   const tbody = document.createElement("tbody");
@@ -271,7 +294,7 @@ function renderFindings(findings) {
     header.append(th);
   });
   thead.append(header);
-  findings.forEach((finding) => {
+  rows.forEach((finding) => {
     const row = document.createElement("tr");
     [finding.severity, finding.code, finding.message].forEach((value) => {
       const td = document.createElement("td");
@@ -281,7 +304,15 @@ function renderFindings(findings) {
     tbody.append(row);
   });
   table.append(thead, tbody);
-  nodes.findingsTable.append(table);
+  node.append(table);
+}
+
+function renderPanelMessage(node, message, className) {
+  clear(node);
+  const empty = document.createElement("div");
+  empty.className = className;
+  empty.textContent = message;
+  node.append(empty);
 }
 
 function replaceDetails(node, rows) {
@@ -309,6 +340,26 @@ function clear(node) {
 function setConnection(text, kind) {
   nodes.connectionState.textContent = text;
   nodes.connectionState.className = `state-pill state-${kind}`;
+}
+
+async function fetchConsoleReport(path) {
+  const response = await fetch(path, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${state.token}`,
+    },
+    cache: "no-store",
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(body?.error?.message || `HTTP ${response.status}`);
+  }
+  return body;
+}
+
+function errorMessage(error, fallback) {
+  return error instanceof Error ? error.message : fallback;
 }
 
 function restorePillClass(value) {

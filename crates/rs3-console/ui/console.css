@@ -314,7 +314,8 @@ input:focus-visible {
   line-height: 1.25;
 }
 
-.findings-panel {
+.findings-panel,
+.posture-panel {
   margin-top: 12px;
 }
 
@@ -355,6 +356,11 @@ td {
 .empty-state {
   padding: 14px 12px;
   color: var(--muted);
+}
+
+.error-state {
+  padding: 14px 12px;
+  color: var(--bad);
 }
 
 @media (max-width: 880px) {
