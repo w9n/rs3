@@ -78,12 +78,17 @@ Export a new bundle after each successful backup window or at least before
 declaring a repository trial ready for incident restore. The bundle contains
 public but integrity-sensitive restore metadata, not wrapping-key material.
 Store it outside the object-store account and outside the cluster whose Lease it
-may need to recreate. Verify the preserved bundle before anchor import:
+may need to recreate. Export prints `offline_signature_payload_hex`; sign those
+canonical bytes with an offline Ed25519 recovery key and store the resulting hex
+signature in `offline_signature` before production import. Verify the preserved
+bundle before anchor import:
 
 ```sh
 cargo run -p xtask --features s3 -- v2 verify-bundle \
   --bundle-file rs3-restore-bundle.json \
+  --min-sequence <external-floor-sequence> \
   --repository-salt-hex <repository-salt-hex> \
+  --recovery-public-key ed25519:<recovery-public-key-hex> \
   --wrapping-key-hex-file <wrapping-key-hex-file> \
   --backend s3 \
   --s3-bucket <bucket> \
@@ -95,7 +100,9 @@ after configuring the same repository ID, salt, wrapping-key source, backend,
 and retention settings.
 
 ```sh
-cargo run -p rs3-server -- import-v2-anchor --bundle-file rs3-restore-bundle.json
+cargo run -p rs3-server -- import-v2-anchor \
+  --bundle-file rs3-restore-bundle.json \
+  --min-sequence <external-floor-sequence>
 ```
 
 If the incident workflow cannot pass the bundle file, import the same trusted
@@ -112,14 +119,17 @@ cargo run -p rs3-server -- import-v2-anchor \
   --format-digest <bundle-format-digest> \
   --format-object-id <bundle-format-object-id> \
   --format-version-id <bundle-format-version-id> \
-  --weak-subjectivity-floor-sequence <bundle-floor-sequence>
+  --offline-signature <bundle-offline-signature> \
+  --min-sequence <external-floor-sequence>
 ```
 
 `verify-bundle` does not write storage or anchors. `import-v2-anchor` repeats
 the named signed commit-chain, format-root, and keyring-envelope checks before
 writing the missing anchor. Do not mix `--bundle-file` and explicit anchor
 fields. Omit version IDs only for a trusted bundle that does not contain them;
-retained/Object Lock repositories should contain them.
+retained/Object Lock repositories should contain them. Production import also
+requires `RS3_RECOVERY_PUBLIC_KEY` and refuses a bundle whose anchor sequence is
+below the operator-supplied `--min-sequence`.
 
 ## 4. If No Bundle Exists, Stop
 

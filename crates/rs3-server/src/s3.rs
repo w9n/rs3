@@ -12,9 +12,10 @@ mod runtime_v2;
 pub use boundary::{GatewayS3Boundary, S3Hardening};
 pub(crate) use runtime_v2::v2_quick_maintenance_from_config;
 pub use runtime_v2::{
-    RuntimeV2ProviderConformanceOptions, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportReport,
-    check_v2_provider_conformance_from_config, export_v2_recovery_bundle_from_config,
-    import_v2_anchor_from_config, write_v2_index_snapshot_from_config,
+    RuntimeV2ProviderConformanceOptions, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions,
+    V2AnchorImportReport, check_v2_provider_conformance_from_config,
+    export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
+    write_v2_index_snapshot_from_config,
 };
 use thiserror::Error;
 
@@ -49,7 +50,8 @@ pub(super) mod test_support {
     use crate::GatewayMode;
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, HardeningConfig, MetricsConfig,
-        ProviderConformanceConfig, RepositoryConfig, RepositoryKeysConfig, RuntimeConfig,
+        ProviderConformanceConfig, RecoveryConfig, RepositoryConfig, RepositoryKeysConfig,
+        RuntimeConfig,
     };
     use rs3_types::{PublicBucket, RepositoryId};
     use secrecy::SecretString;
@@ -92,6 +94,7 @@ pub(super) mod test_support {
                 allow_init: true,
             },
             provider_conformance: ProviderConformanceConfig::default(),
+            recovery: RecoveryConfig::default(),
             repository_keys: RepositoryKeysConfig {
                 repository_id: RepositoryId::new("test-repository")
                     .unwrap_or_else(|error| panic!("{error}")),

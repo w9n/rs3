@@ -14,7 +14,7 @@ mod secret;
 
 pub use checkpoint::{
     CheckpointSignature, derive_checkpoint_id, derive_checkpoint_payload_digest,
-    derive_index_delta_object_id,
+    derive_index_delta_object_id, validate_recovery_public_key, verify_recovery_signature,
 };
 pub use constant_time::ct_eq;
 pub use derive::{

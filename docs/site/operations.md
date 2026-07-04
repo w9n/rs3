@@ -398,7 +398,9 @@ Verify the preserved bundle without writing a new anchor:
 ```sh
 cargo run -p xtask --features s3 -- v2 verify-bundle \
   --bundle-file rs3-restore-bundle.json \
+  --min-sequence <external-floor-sequence> \
   --repository-salt-hex <repository-salt-hex> \
+  --recovery-public-key ed25519:<recovery-public-key-hex> \
   --wrapping-key-hex-file <wrapping-key-hex-file> \
   --backend s3 \
   --s3-bucket <bucket> \
@@ -408,17 +410,22 @@ cargo run -p xtask --features s3 -- v2 verify-bundle \
 The bundle contains public repository restore metadata: repository ID, accepted
 commit sequence, commit key, commit object version ID when available, commit
 body digest, signing key ID, format-root reference, and weak-subjectivity floor.
-It does not contain wrapping-key material. The verifier opens the encrypted
-format root and keyring envelope, then verifies the anchor-selected signed
-commit chain to the nearest snapshot without mutating storage or the external
-anchor.
+It does not contain wrapping-key material. Export also prints
+`offline_signature_payload_hex`; sign those canonical bytes with an offline
+Ed25519 recovery key and store the resulting hex signature in
+`offline_signature` before production import. The verifier opens the encrypted
+format root and keyring envelope, checks `RS3_RECOVERY_PUBLIC_KEY`, then
+verifies the anchor-selected signed commit chain to the nearest snapshot
+without mutating storage or the external anchor.
 
 On a new cluster with a missing anchor, import the trusted v2 anchor from that
 bundle after configuring the same repository ID, salt, wrapping-key source,
 backend, and retention settings:
 
 ```sh
-cargo run -p rs3-server -- import-v2-anchor --bundle-file rs3-restore-bundle.json
+cargo run -p rs3-server -- import-v2-anchor \
+  --bundle-file rs3-restore-bundle.json \
+  --min-sequence <external-floor-sequence>
 ```
 
 The import path also accepts explicit fields when a workflow cannot pass the
@@ -435,13 +442,16 @@ cargo run -p rs3-server -- import-v2-anchor \
   --format-digest <bundle-format-digest> \
   --format-object-id <bundle-format-object-id> \
   --format-version-id <bundle-format-version-id> \
-  --weak-subjectivity-floor-sequence <bundle-floor-sequence>
+  --offline-signature <bundle-offline-signature> \
+  --min-sequence <external-floor-sequence>
 ```
 
 Do not mix `--bundle-file` and explicit anchor fields. Omit version IDs only
 when the trusted bundle has none. Retained/Object Lock repositories should have
 commit and format version IDs. The import verifies the named signed commit
-chain, format root, and keyring envelope before writing the missing anchor.
+chain, format root, recovery signature, and keyring envelope before writing the
+missing anchor. Production import requires `RS3_RECOVERY_PUBLIC_KEY` and refuses
+an anchor sequence below the operator-supplied `--min-sequence`.
 
 Verify a trusted anchor position before relying on it for restore. For v2, the
 offline verifier and anchor import path both verify the named signed commit

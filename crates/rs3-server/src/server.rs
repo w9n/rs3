@@ -172,7 +172,8 @@ mod tests {
     use crate::HardeningConfig;
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig,
-        ProviderConformanceConfig, RepositoryConfig, RepositoryKeysConfig, RuntimeConfig,
+        ProviderConformanceConfig, RecoveryConfig, RepositoryConfig, RepositoryKeysConfig,
+        RuntimeConfig,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
     use secrecy::SecretString;
@@ -215,6 +216,7 @@ mod tests {
                 allow_init: true,
             },
             provider_conformance: ProviderConformanceConfig::default(),
+            recovery: RecoveryConfig::default(),
             repository_keys: RepositoryKeysConfig {
                 repository_id: RepositoryId::new("test-repository")
                     .unwrap_or_else(|error| panic!("{error}")),

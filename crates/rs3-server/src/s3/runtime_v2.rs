@@ -31,6 +31,7 @@ use rs3_storage::S3BlobStore;
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{
     BackendObjectId, KeyPurpose, LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy,
+    Sequence,
 };
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -48,6 +49,13 @@ pub struct V2AnchorImportReport {
     pub applied: bool,
     /// Number of commits verified from the imported anchor to the nearest snapshot.
     pub verified_commit_count: usize,
+}
+
+/// Operator-provided options for v2 anchor import.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V2AnchorImportOptions {
+    /// External weak-subjectivity floor that the imported anchor must satisfy.
+    pub min_sequence: Sequence,
 }
 
 /// Runtime options for v2 provider conformance probes.
@@ -406,6 +414,7 @@ pub async fn write_v2_index_snapshot_from_config(
 pub async fn import_v2_anchor_from_config(
     config: &RuntimeConfig,
     bundle: V2RecoveryBundle,
+    options: V2AnchorImportOptions,
 ) -> Result<V2AnchorImportReport, S3BoundaryError> {
     if config.repository.format != RepositoryFormat::V2Preview {
         return Err(repository_init(
@@ -416,6 +425,12 @@ pub async fn import_v2_anchor_from_config(
     let anchor = build_v2_anchor(&config.anchor)?;
     let anchor_handle = anchor.handle().clone();
     let provider_profile = v2_provider_profile(&config.backend, config.repository.retention);
+    verify_recovery_bundle_trust(
+        &bundle,
+        provider_profile,
+        options.min_sequence,
+        config.recovery.public_key.as_deref(),
+    )?;
     let loaded = load_existing_v2_repository(
         store.handle(),
         &config.repository_keys,
@@ -447,7 +462,7 @@ pub async fn import_v2_anchor_from_config(
     }
 
     let chain = commit_store
-        .recreate_anchor_from_recovery_bundle(&anchor_handle, &bundle)
+        .recreate_anchor_from_recovery_bundle(&anchor_handle, &bundle, options.min_sequence)
         .await
         .map_err(repository_init)?;
     Ok(V2AnchorImportReport {
@@ -455,6 +470,37 @@ pub async fn import_v2_anchor_from_config(
         applied: true,
         verified_commit_count: chain.commits_newest_first.len(),
     })
+}
+
+fn verify_recovery_bundle_trust(
+    bundle: &V2RecoveryBundle,
+    provider_profile: V2ProviderProfile,
+    min_sequence: Sequence,
+    recovery_public_key: Option<&str>,
+) -> Result<(), S3BoundaryError> {
+    if bundle.anchor.sequence < min_sequence {
+        return Err(repository_init(
+            "trusted v2 restore bundle anchor sequence is below --min-sequence",
+        ));
+    }
+
+    if provider_profile != V2ProviderProfile::Dev && bundle.offline_signature.is_none() {
+        return Err(repository_init(
+            "production v2 anchor import requires an offline bundle signature",
+        ));
+    }
+
+    match recovery_public_key {
+        Some(public_key) => bundle
+            .verify_offline_signature(public_key)
+            .map_err(repository_init),
+        None if provider_profile == V2ProviderProfile::Dev => Ok(()),
+        None => Err(repository_init(
+            "production v2 anchor import requires RS3_RECOVERY_PUBLIC_KEY",
+        )),
+    }?;
+
+    Ok(())
 }
 
 /// Runs v2 provider conformance checks for the configured backend/profile.
@@ -753,4 +799,143 @@ fn default_v2_provider_probe_prefix() -> String {
         .unwrap_or(Duration::ZERO)
         .as_millis();
     format!("v2-provider/{millis}-{}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{V2ProviderProfile, V2RecoveryBundle, verify_recovery_bundle_trust};
+    use rs3_crypto::KeyRing;
+    use rs3_repository::v2::{V2AnchorState, V2FormatRef};
+    use rs3_types::{BackendObjectId, BackendVersionId, KeyId, KeyPurpose, RepositoryId, Sequence};
+
+    #[test]
+    fn recovery_trust_rejects_bundle_below_external_floor() {
+        let bundle = sample_bundle();
+
+        let error = match verify_recovery_bundle_trust(
+            &bundle,
+            V2ProviderProfile::Dev,
+            Sequence::new(8),
+            None,
+        ) {
+            Ok(_) => panic!("below-floor recovery bundle should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("below --min-sequence"));
+    }
+
+    #[test]
+    fn production_recovery_trust_rejects_absent_signature() {
+        let bundle = sample_bundle();
+
+        let error = match verify_recovery_bundle_trust(
+            &bundle,
+            V2ProviderProfile::AtomicCreate,
+            Sequence::new(7),
+            Some(&recovery_public_key()),
+        ) {
+            Ok(_) => panic!("production recovery bundle without signature should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("offline bundle signature"));
+    }
+
+    #[test]
+    fn production_recovery_trust_rejects_bad_signature() {
+        let mut bundle = sample_bundle();
+        let public_key = sign_bundle(&mut bundle);
+        if let Some(signature) = bundle.offline_signature.as_mut() {
+            signature[0] ^= 0x80;
+        }
+
+        let error = match verify_recovery_bundle_trust(
+            &bundle,
+            V2ProviderProfile::AtomicCreate,
+            Sequence::new(7),
+            Some(&public_key),
+        ) {
+            Ok(_) => panic!("production recovery bundle with bad signature should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("signature"));
+    }
+
+    #[test]
+    fn production_recovery_trust_accepts_current_valid_signature() {
+        let mut bundle = sample_bundle();
+        let public_key = sign_bundle(&mut bundle);
+
+        verify_recovery_bundle_trust(
+            &bundle,
+            V2ProviderProfile::AtomicCreate,
+            Sequence::new(7),
+            Some(&public_key),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    fn sample_bundle() -> V2RecoveryBundle {
+        V2RecoveryBundle {
+            repository_id: Some(
+                RepositoryId::new("test-repository").unwrap_or_else(|error| panic!("{error}")),
+            ),
+            repository_salt_digest: None,
+            anchor: V2AnchorState {
+                sequence: Sequence::new(7),
+                commit_key: BackendObjectId::new(
+                    "commits/v01/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                )
+                .unwrap_or_else(|error| panic!("{error}")),
+                body_digest: [0x11; 32],
+                version_id: Some(
+                    BackendVersionId::new("commit-version-a")
+                        .unwrap_or_else(|error| panic!("{error}")),
+                ),
+                signing_key_id: KeyId::new("checkpoint-v1")
+                    .unwrap_or_else(|error| panic!("{error}")),
+                format_ref: V2FormatRef {
+                    generation: 1,
+                    digest: "2222222222222222222222222222222222222222222222222222222222222222"
+                        .to_owned(),
+                    object_id: BackendObjectId::new("format/00000000000000000001/root")
+                        .unwrap_or_else(|error| panic!("{error}")),
+                    version_id: Some(
+                        BackendVersionId::new("format-version-a")
+                            .unwrap_or_else(|error| panic!("{error}")),
+                    ),
+                },
+            },
+            format_digest: Some([0x22; 32]),
+            format_generation: Some(1),
+            weak_subjectivity_floor_sequence: Sequence::new(7),
+            exported_at_ms: 42,
+            offline_signature: None,
+        }
+    }
+
+    fn sign_bundle(bundle: &mut V2RecoveryBundle) -> String {
+        let keyring = KeyRing::generate_random().unwrap_or_else(|error| panic!("{error}"));
+        let payload = bundle
+            .offline_signature_payload()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let signature = keyring
+            .sign_checkpoint_payload(&payload)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let public_key = keyring
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.purpose == KeyPurpose::CheckpointSigning)
+            .and_then(|descriptor| descriptor.public_key)
+            .unwrap_or_else(|| panic!("missing recovery public key"));
+        bundle.offline_signature = Some(signature.signature);
+        public_key
+    }
+
+    fn recovery_public_key() -> String {
+        let mut bundle = sample_bundle();
+        sign_bundle(&mut bundle)
+    }
 }

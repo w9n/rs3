@@ -10,7 +10,7 @@ use rs3_repository::v2::{
 use rs3_server::{
     AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReportProfile,
     AnchorConfig, GatewayMode, GatewayServer, RuntimeConfig, RuntimeV2ProviderConformanceOptions,
-    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportReport, backend_kind,
+    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport, backend_kind,
     check_v2_provider_conformance_from_config, doctor_findings,
     export_v2_recovery_bundle_from_config, import_v2_anchor_from_config, runtime_config_profile,
     write_v2_index_snapshot_from_config,
@@ -90,6 +90,9 @@ struct ImportV2AnchorArgs {
     /// JSON bundle from `export-restore-bundle`; use `-` for stdin.
     #[arg(long)]
     bundle_file: Option<String>,
+    /// External weak-subjectivity floor accepted by the operator.
+    #[arg(long)]
+    min_sequence: u64,
     /// Accepted anchor sequence from a trusted bundle.
     #[arg(long)]
     anchor_sequence: Option<u64>,
@@ -120,6 +123,9 @@ struct ImportV2AnchorArgs {
     /// Weak-subjectivity floor sequence. Defaults to `--anchor-sequence`.
     #[arg(long)]
     weak_subjectivity_floor_sequence: Option<u64>,
+    /// Offline recovery signature from a trusted bundle, as hex.
+    #[arg(long)]
+    offline_signature: Option<String>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
     format: RecoveryReportFormat,
@@ -231,8 +237,8 @@ async fn main() -> Result<()> {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
             let format = args.format;
-            let bundle = recovery_bundle_from_import_args(&config, *args)?;
-            let report = import_v2_anchor_from_config(&config, bundle).await?;
+            let (bundle, options) = recovery_bundle_from_import_args(&config, *args)?;
+            let report = import_v2_anchor_from_config(&config, bundle, options).await?;
             print_v2_anchor_import_report(&report, format)?;
         }
     }
@@ -284,7 +290,7 @@ struct RestoreBundleFormatJson {
 fn recovery_bundle_from_import_args(
     config: &RuntimeConfig,
     args: ImportV2AnchorArgs,
-) -> Result<V2RecoveryBundle> {
+) -> Result<(V2RecoveryBundle, V2AnchorImportOptions)> {
     let explicit_field_count = usize::from(args.anchor_sequence.is_some())
         + usize::from(args.anchor_commit_key.is_some())
         + usize::from(args.anchor_body_digest.is_some())
@@ -294,16 +300,21 @@ fn recovery_bundle_from_import_args(
         + usize::from(args.format_object_id.is_some())
         + usize::from(args.weak_subjectivity_floor_sequence.is_some())
         + usize::from(args.anchor_version_id.is_some())
-        + usize::from(args.format_version_id.is_some());
-    match args.bundle_file {
+        + usize::from(args.format_version_id.is_some())
+        + usize::from(args.offline_signature.is_some());
+    let options = V2AnchorImportOptions {
+        min_sequence: Sequence::new(args.min_sequence),
+    };
+    let bundle = match args.bundle_file.clone() {
         Some(path) => {
             if explicit_field_count > 0 {
                 bail!("--bundle-file cannot be combined with explicit anchor fields");
             }
-            read_restore_bundle_json(&path, config)
+            read_restore_bundle_json(&path, config)?
         }
-        None => recovery_bundle_from_explicit_args(config, args),
-    }
+        None => recovery_bundle_from_explicit_args(config, args)?,
+    };
+    Ok((bundle, options))
 }
 
 fn recovery_bundle_from_explicit_args(
@@ -354,7 +365,12 @@ fn recovery_bundle_from_explicit_args(
         anchor,
         weak_subjectivity_floor_sequence: floor_sequence,
         exported_at_ms: 0,
-        offline_signature: None,
+        offline_signature: args
+            .offline_signature
+            .map(|signature| {
+                hex::decode(signature).context("offline signature must be hex encoded")
+            })
+            .transpose()?,
     })
 }
 
@@ -570,6 +586,7 @@ fn print_v2_restore_bundle(bundle: &V2RecoveryBundle, format: RecoveryReportForm
                 })
             });
             let offline_signature = bundle.offline_signature.as_ref().map(hex::encode);
+            let offline_signature_payload_hex = hex::encode(bundle.offline_signature_payload()?);
             let bundle_json = serde_json::json!({
                 "schema": V2_RESTORE_BUNDLE_SCHEMA,
                 "repository": repository,
@@ -590,6 +607,7 @@ fn print_v2_restore_bundle(bundle: &V2RecoveryBundle, format: RecoveryReportForm
                 "format_digest": bundle.format_digest.map(hex::encode),
                 "format_generation": bundle.format_generation,
                 "exported_at_ms": bundle.exported_at_ms,
+                "offline_signature_payload_hex": offline_signature_payload_hex,
                 "offline_signature": offline_signature,
             });
             println!("{}", serde_json::to_string_pretty(&bundle_json)?);
@@ -623,6 +641,10 @@ fn print_v2_restore_bundle(bundle: &V2RecoveryBundle, format: RecoveryReportForm
                 bundle.weak_subjectivity_floor_sequence.get()
             );
             println!("exported_at_ms={}", bundle.exported_at_ms);
+            println!(
+                "offline_signature_payload_hex={}",
+                hex::encode(bundle.offline_signature_payload()?)
+            );
             if let Some(signature) = bundle.offline_signature.as_ref() {
                 println!("offline_signature={}", hex::encode(signature));
             }
@@ -889,8 +911,8 @@ mod tests {
     };
     use rs3_server::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
-        ProviderConformanceConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig,
-        RuntimeConfig, StaticCredentials,
+        ProviderConformanceConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
+        RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
@@ -937,6 +959,7 @@ mod tests {
                 allow_init: true,
             },
             provider_conformance: ProviderConformanceConfig::default(),
+            recovery: RecoveryConfig::default(),
             repository_keys: RepositoryKeysConfig {
                 repository_id,
                 repository_salt_hex:
@@ -1015,6 +1038,7 @@ mod tests {
         assert!(codes.contains(&"anchor.memory"));
         assert!(codes.contains(&"retention.missing"));
         assert!(codes.contains(&"auth.static-credentials"));
+        assert!(codes.contains(&"recovery.public-key"));
     }
 
     #[test]
@@ -1030,6 +1054,9 @@ mod tests {
             access_key_id: "rs3-fixture-access-key".to_owned(),
             secret_access_key: SecretString::from("rs3-fixture-secret-key"),
         });
+        config.recovery.public_key = Some(
+            "ed25519:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+        );
 
         let findings = doctor_findings(&config, DoctorProfile::Production.into());
         let codes = findings
@@ -1053,6 +1080,9 @@ mod tests {
             access_key_id: "rs3-fixture-access-key".to_owned(),
             secret_access_key: SecretString::from("rs3-fixture-secret-key"),
         });
+        config.recovery.public_key = Some(
+            "ed25519:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+        );
 
         let findings = doctor_findings(&config, DoctorProfile::Production.into());
 
@@ -1143,6 +1173,7 @@ mod tests {
         let config = runtime_config();
         let args = ImportV2AnchorArgs {
             bundle_file: Some("bundle.json".to_owned()),
+            min_sequence: 1,
             anchor_sequence: Some(1),
             anchor_commit_key: None,
             anchor_version_id: None,
@@ -1153,6 +1184,7 @@ mod tests {
             format_object_id: None,
             format_version_id: None,
             weak_subjectivity_floor_sequence: None,
+            offline_signature: None,
             format: RecoveryReportFormat::Json,
         };
 

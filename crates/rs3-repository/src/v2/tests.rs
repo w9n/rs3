@@ -3257,13 +3257,39 @@ async fn v2_recovery_bundle_recreates_missing_anchor_after_chain_verification() 
 
     let chain = must_v2(
         repository
-            .recreate_anchor_from_recovery_bundle(&recovered_anchor, &bundle)
+            .recreate_anchor_from_recovery_bundle(&recovered_anchor, &bundle, Sequence::new(1))
             .await,
     );
     let recovered_head = must_v2(repository.read_anchor_head(&recovered_anchor).await);
 
     assert_eq!(chain.commits_newest_first.len(), 1);
     assert!(recovered_head.is_some());
+}
+
+#[tokio::test]
+async fn v2_recovery_bundle_rejects_anchor_below_external_floor() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2CommitStore::new(store, keyring, options);
+    let anchor = V2MemoryAnchor::new();
+
+    let genesis = must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let bundle = V2RecoveryBundle::from_anchor(genesis.anchor_state, Sequence::new(1));
+    let recovered_anchor = V2MemoryAnchor::new();
+    let error = match repository
+        .recreate_anchor_from_recovery_bundle(&recovered_anchor, &bundle, Sequence::new(2))
+        .await
+    {
+        Ok(_) => panic!("below-floor recovery bundle should be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error, V2FormatError::RecoveryBundleRequired);
 }
 
 #[tokio::test]

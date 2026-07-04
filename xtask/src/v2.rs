@@ -51,9 +51,15 @@ struct V2VerifyBundleArgs {
     /// JSON bundle from `rs3-server export-restore-bundle`; use `-` for stdin.
     #[arg(long)]
     bundle_file: String,
+    /// External weak-subjectivity floor accepted by the operator.
+    #[arg(long)]
+    min_sequence: u64,
     /// Stable repository identifier. Defaults to the repository ID inside the bundle.
     #[arg(long, env = "RS3_REPOSITORY_ID")]
     repository_id: Option<String>,
+    /// Operator-controlled public key used to verify recovery bundle signatures.
+    #[arg(long, env = "RS3_RECOVERY_PUBLIC_KEY")]
+    recovery_public_key: Option<String>,
     /// Hex-encoded public repository salt bound into the v2 format root.
     #[arg(long, env = "RS3_REPOSITORY_SALT_HEX")]
     repository_salt_hex: String,
@@ -156,6 +162,8 @@ enum V2RetentionModeArg {
 struct V2VerifyBundleInput {
     bundle: V2RecoveryBundle,
     repository_id: RepositoryId,
+    min_sequence: Sequence,
+    recovery_public_key: Option<String>,
     repository_salt_hex: String,
     wrapping_key_id: String,
     wrapping_key: SecretBytes,
@@ -559,6 +567,10 @@ where
     let parsed = read_recovery_bundle_json(&args.bundle_file)?;
     let repository_id =
         resolve_repository_id(args.repository_id, parsed.bundle.repository_id.as_ref())?;
+    let mut bundle = parsed.bundle;
+    if bundle.repository_id.is_none() {
+        bundle.repository_id = Some(repository_id.clone());
+    }
     let wrapping_key = secret_input(
         args.wrapping_key_hex,
         args.wrapping_key_hex_file.as_deref(),
@@ -566,8 +578,10 @@ where
         "--wrapping-key-hex-file",
     )?;
     let input = V2VerifyBundleInput {
-        bundle: parsed.bundle,
+        bundle,
         repository_id,
+        min_sequence: Sequence::new(args.min_sequence),
+        recovery_public_key: args.recovery_public_key,
         repository_salt_hex: args.repository_salt_hex,
         wrapping_key_id: args.wrapping_key_id,
         wrapping_key,
@@ -584,6 +598,9 @@ where
 {
     if input.bundle.anchor.sequence < input.bundle.weak_subjectivity_floor_sequence {
         bail!("bundle anchor sequence is below the weak-subjectivity floor");
+    }
+    if input.bundle.anchor.sequence < input.min_sequence {
+        bail!("bundle anchor sequence is below --min-sequence");
     }
     if let Some(bundle_repository_id) = input.bundle.repository_id.as_ref()
         && bundle_repository_id != &input.repository_id
@@ -605,6 +622,11 @@ where
     {
         bail!("v2 format root does not match the trusted bundle context");
     }
+    verify_recovery_bundle_signature(
+        &input.bundle,
+        format_root.provider_profile,
+        input.recovery_public_key.as_deref(),
+    )?;
 
     let keyring = open_keyring_envelope(
         &store,
@@ -631,6 +653,24 @@ where
         .context("failed to verify v2 commit chain from bundle anchor")?;
 
     Ok(report_from_verified_bundle(&input, &format_root, &chain))
+}
+
+fn verify_recovery_bundle_signature(
+    bundle: &V2RecoveryBundle,
+    provider_profile: V2ProviderProfile,
+    recovery_public_key: Option<&str>,
+) -> Result<()> {
+    if provider_profile != V2ProviderProfile::Dev && bundle.offline_signature.is_none() {
+        bail!("production v2 bundle verification requires an offline bundle signature");
+    }
+
+    match recovery_public_key {
+        Some(public_key) => bundle
+            .verify_offline_signature(public_key)
+            .context("failed to verify v2 recovery bundle offline signature"),
+        None if provider_profile == V2ProviderProfile::Dev => Ok(()),
+        None => bail!("production v2 bundle verification requires RS3_RECOVERY_PUBLIC_KEY"),
+    }
 }
 
 fn report_from_verified_bundle(
@@ -1142,6 +1182,8 @@ mod tests {
         let input = V2VerifyBundleInput {
             bundle,
             repository_id,
+            min_sequence: Sequence::new(1),
+            recovery_public_key: None,
             repository_salt_hex: SALT_HEX.to_owned(),
             wrapping_key_id: "wrap-v1".to_owned(),
             wrapping_key,
@@ -1154,6 +1196,115 @@ mod tests {
         assert_eq!(report.verified_commit_count, 1);
         assert_eq!(report.snapshot_sequence, 1);
         assert_eq!(report.provider_profile, V2ProviderProfile::Dev);
+    }
+
+    #[tokio::test]
+    async fn verify_bundle_rejects_anchor_below_external_floor() {
+        let (store, repository_id, wrapping_key, bundle) =
+            fixture_bundle(V2ProviderProfile::Dev).await;
+        let input = V2VerifyBundleInput {
+            bundle,
+            repository_id,
+            min_sequence: Sequence::new(2),
+            recovery_public_key: None,
+            repository_salt_hex: SALT_HEX.to_owned(),
+            wrapping_key_id: "wrap-v1".to_owned(),
+            wrapping_key,
+        };
+
+        let error = match verify_bundle_with_store(input, store).await {
+            Ok(_) => panic!("below-floor bundle should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("--min-sequence"));
+    }
+
+    #[tokio::test]
+    async fn verify_bundle_accepts_production_profile_with_valid_signature() {
+        let (store, repository_id, wrapping_key, mut bundle) =
+            fixture_bundle(V2ProviderProfile::AtomicCreate).await;
+        let recovery_public_key = sign_bundle(&mut bundle);
+        let input = V2VerifyBundleInput {
+            bundle,
+            repository_id,
+            min_sequence: Sequence::new(1),
+            recovery_public_key: Some(recovery_public_key),
+            repository_salt_hex: SALT_HEX.to_owned(),
+            wrapping_key_id: "wrap-v1".to_owned(),
+            wrapping_key,
+        };
+
+        let report = verify_bundle_with_store(input, store)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(report.provider_profile, V2ProviderProfile::AtomicCreate);
+        assert!(report.offline_signature_present);
+    }
+
+    async fn fixture_bundle(
+        provider_profile: V2ProviderProfile,
+    ) -> (
+        MemoryBlobStore,
+        RepositoryId,
+        rs3_crypto::SecretBytes,
+        V2RecoveryBundle,
+    ) {
+        let store = MemoryBlobStore::new();
+        let repository_id = RepositoryId::new("repo-a").unwrap_or_else(|error| panic!("{error}"));
+        let salt = hex::decode(SALT_HEX).unwrap_or_else(|error| panic!("{error}"));
+        let context = RepositoryKeyContext::new(repository_id.clone(), salt)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let wrapping_key = secret_from_hex("--wrapping-key-hex", WRAP_HEX)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let keyring = KeyRing::generate_random().unwrap_or_else(|error| panic!("{error}"));
+        let keyring_ref = store_keyring_envelope(&store, &keyring, &context, &wrapping_key).await;
+        let signing_key_id = keyring
+            .primary_key_id(KeyPurpose::CheckpointSigning)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let format_root = V2FormatRoot::new(
+            repository_id.clone(),
+            keyring_ref,
+            signing_key_id,
+            provider_profile,
+            None,
+        );
+        let format_ref = store_format_root(&store, &context, &wrapping_key, &format_root).await;
+        let commit_ref = format_root
+            .active_keyring_envelope_ref
+            .commit_ref()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let commit_options =
+            V2CommitStoreOptions::for_profile(provider_profile, commit_ref, format_ref);
+        let commit_store = V2CommitStore::new(store.clone(), keyring, commit_options);
+        let anchor = V2MemoryAnchor::new();
+        let genesis = commit_store
+            .write_genesis_snapshot(&anchor)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut bundle = V2RecoveryBundle::from_anchor(genesis.anchor_state, Sequence::new(1));
+        bundle.repository_id = Some(repository_id.clone());
+        bundle.exported_at_ms = 42;
+        (store, repository_id, wrapping_key, bundle)
+    }
+
+    fn sign_bundle(bundle: &mut V2RecoveryBundle) -> String {
+        let keyring = KeyRing::generate_random().unwrap_or_else(|error| panic!("{error}"));
+        let payload = bundle
+            .offline_signature_payload()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let signature = keyring
+            .sign_checkpoint_payload(&payload)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let public_key = keyring
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.purpose == KeyPurpose::CheckpointSigning)
+            .and_then(|descriptor| descriptor.public_key)
+            .unwrap_or_else(|| panic!("missing recovery public key"));
+        bundle.offline_signature = Some(signature.signature);
+        public_key
     }
 
     async fn store_keyring_envelope(

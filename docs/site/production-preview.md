@@ -171,10 +171,12 @@ Retained backend versions can help establish what existed in storage, but by
 themselves they are not a latest-state authority because a malicious backend
 can hide newer valid commits or replay older valid commits.
 
-Recovery bundles are weak-subjectivity inputs. Importing an older valid bundle
-recreates the older anchor it names. Preserve fresh bundles outside the backend
-and compare the sequence and commit digest with an external record before
-anchor import.
+Recovery bundles are weak-subjectivity inputs. Import requires an
+operator-supplied `--min-sequence` floor external to the bundle and refuses
+older valid bundles below that floor. Production recovery also requires an
+offline Ed25519 bundle signature verified by `RS3_RECOVERY_PUBLIC_KEY`.
+Preserve fresh signed bundles outside the backend and compare the sequence and
+commit digest with an external record before anchor import.
 
 Any external anchor should store or sign the accepted commit position, not the
 whole repository index. That position already commits to the signed commit

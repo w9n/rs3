@@ -52,6 +52,23 @@ impl KeyRing {
     }
 }
 
+/// Verifies an offline recovery signature with an `ed25519:<hex-public-key>` descriptor.
+pub fn verify_recovery_signature(
+    public_key: &str,
+    canonical_payload: &[u8],
+    signature: &[u8],
+) -> Result<(), CryptoError> {
+    let public_key = recovery_public_key_bytes(public_key)?;
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(canonical_payload, signature)
+        .map_err(|_| CryptoError::SignatureMismatch)
+}
+
+/// Validates an `ed25519:<hex-public-key>` recovery verification key.
+pub fn validate_recovery_public_key(public_key: &str) -> Result<(), CryptoError> {
+    recovery_public_key_bytes(public_key).map(|_| ())
+}
+
 /// Derives the public Ed25519 checkpoint verification key for a secret key.
 pub(crate) fn derive_checkpoint_public_key(secret: &SecretBytes) -> Result<Vec<u8>, CryptoError> {
     Ok(checkpoint_signing_key(secret)?
@@ -77,13 +94,23 @@ fn checkpoint_signing_key(secret: &SecretBytes) -> Result<Ed25519KeyPair, Crypto
 }
 
 fn checkpoint_public_key_bytes(public_key: &str) -> Result<Vec<u8>, CryptoError> {
+    prefixed_ed25519_public_key_bytes(public_key)
+        .map_err(|_| CryptoError::CheckpointPublicKeyMalformed)
+}
+
+fn recovery_public_key_bytes(public_key: &str) -> Result<Vec<u8>, CryptoError> {
+    prefixed_ed25519_public_key_bytes(public_key)
+        .map_err(|_| CryptoError::RecoveryPublicKeyMalformed)
+}
+
+fn prefixed_ed25519_public_key_bytes(public_key: &str) -> Result<Vec<u8>, ()> {
     let Some(hex_key) = public_key.strip_prefix(CHECKPOINT_PUBLIC_KEY_PREFIX) else {
-        return Err(CryptoError::CheckpointPublicKeyMalformed);
+        return Err(());
     };
     if hex_key.len() != CHECKPOINT_PUBLIC_KEY_HEX_LEN {
-        return Err(CryptoError::CheckpointPublicKeyMalformed);
+        return Err(());
     }
-    hex::decode(hex_key).map_err(|_| CryptoError::CheckpointPublicKeyMalformed)
+    hex::decode(hex_key).map_err(|_| ())
 }
 
 /// Derives a stable checkpoint identifier from signed checkpoint bytes.
@@ -123,6 +150,7 @@ pub fn derive_index_delta_object_id(delta_object: &[u8]) -> Result<BackendObject
 mod tests {
     use super::{
         derive_checkpoint_id, derive_checkpoint_payload_digest, derive_index_delta_object_id,
+        validate_recovery_public_key, verify_recovery_signature,
     };
     use crate::{KeyMaterial, KeyRing, SecretBytes};
     use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus};
@@ -206,6 +234,42 @@ mod tests {
 
         assert!(verified.is_ok());
         assert_eq!(signature.signature.len(), 64);
+    }
+
+    #[test]
+    fn recovery_signatures_verify_with_public_descriptor() {
+        let keyring = match KeyRing::generate_random() {
+            Ok(keyring) => keyring,
+            Err(error) => panic!("{error}"),
+        };
+        let signature = match keyring.sign_checkpoint_payload(b"canonical recovery payload") {
+            Ok(signature) => signature,
+            Err(error) => panic!("{error}"),
+        };
+        let public_key = keyring
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == signature.key_id)
+            .and_then(|descriptor| descriptor.public_key)
+            .unwrap_or_else(|| panic!("missing recovery public key"));
+
+        validate_recovery_public_key(&public_key).unwrap_or_else(|error| panic!("{error}"));
+        verify_recovery_signature(
+            &public_key,
+            b"canonical recovery payload",
+            &signature.signature,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        let error = match verify_recovery_signature(
+            &public_key,
+            b"tampered recovery payload",
+            &signature.signature,
+        ) {
+            Ok(_) => panic!("tampered recovery payload should be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, crate::CryptoError::SignatureMismatch));
     }
 
     #[test]

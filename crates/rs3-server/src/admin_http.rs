@@ -349,8 +349,8 @@ mod tests {
     use super::{AdminBearerToken, AdminHttpAuth, AdminHttpService};
     use crate::{
         AdminReportProfile, AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig,
-        MetricsConfig, ProviderConformanceConfig, RepositoryConfig, RepositoryFormat,
-        RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
+        MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig,
+        RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
     };
     use bytes::Bytes;
     use http::header::AUTHORIZATION;
@@ -397,6 +397,7 @@ mod tests {
                 allow_init: true,
             },
             provider_conformance: ProviderConformanceConfig::default(),
+            recovery: RecoveryConfig::default(),
             repository_keys: RepositoryKeysConfig {
                 repository_id: RepositoryId::new("test-repository")
                     .unwrap_or_else(|error| panic!("{error}")),

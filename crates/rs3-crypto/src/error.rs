@@ -81,6 +81,9 @@ pub enum CryptoError {
     /// Checkpoint public verification key is malformed.
     #[error("checkpoint public verification key is malformed")]
     CheckpointPublicKeyMalformed,
+    /// Recovery public verification key is malformed.
+    #[error("recovery public verification key is malformed")]
+    RecoveryPublicKeyMalformed,
     /// Authenticated encryption or decryption failed.
     #[error("authenticated encryption operation failed")]
     AeadOperationFailed,

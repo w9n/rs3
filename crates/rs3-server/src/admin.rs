@@ -482,6 +482,13 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         ));
     }
 
+    if config.recovery.public_key.is_none() {
+        findings.push(AdminFinding::error(
+            "recovery.public-key",
+            "production profile requires RS3_RECOVERY_PUBLIC_KEY for signed restore bundles",
+        ));
+    }
+
     findings
 }
 
@@ -753,6 +760,7 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
         .to_string();
     let provider_conformance_max_age_seconds =
         config.provider_conformance.max_age.as_secs().to_string();
+    let recovery_public_key = config.recovery.public_key.is_some().to_string();
     let static_credentials = config.static_credentials.is_some().to_string();
     let max_put_object_bytes = config.hardening.max_put_object_bytes.to_string();
     let buffered_put_object_bytes = config.hardening.buffered_put_object_bytes.to_string();
@@ -779,6 +787,7 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
         allow_repository_init.as_bytes(),
         provider_conformance_report_configured.as_bytes(),
         provider_conformance_max_age_seconds.as_bytes(),
+        recovery_public_key.as_bytes(),
         static_credentials.as_bytes(),
         max_put_object_bytes.as_bytes(),
         buffered_put_object_bytes.as_bytes(),
@@ -808,8 +817,8 @@ mod tests {
     };
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
-        ProviderConformanceConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig,
-        RuntimeConfig, StaticCredentials,
+        ProviderConformanceConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
+        RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
@@ -850,6 +859,7 @@ mod tests {
                 allow_init: true,
             },
             provider_conformance: ProviderConformanceConfig::default(),
+            recovery: RecoveryConfig::default(),
             repository_keys: RepositoryKeysConfig {
                 repository_id: RepositoryId::new("repo-secret-id")
                     .unwrap_or_else(|error| panic!("{error}")),
@@ -895,6 +905,7 @@ mod tests {
         assert!(codes.contains(&"retention.missing"));
         assert!(codes.contains(&"backend.memory"));
         assert!(codes.contains(&"auth.static-credentials"));
+        assert!(codes.contains(&"recovery.public-key"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Preview v2 commit-store workflow.
 
+use super::cbor;
 use super::commit::{
     V2_COMMIT_CONTENT_TYPE, V2_HEADER_META_LEN, V2_MAX_HEADER_SIZE,
     V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitHeader, V2CommitKey, V2CommitParentRef,
@@ -344,6 +345,70 @@ impl V2RecoveryBundle {
             exported_at_ms: current_time_ms(),
             offline_signature: None,
         }
+    }
+
+    /// Returns the canonical bytes covered by the offline recovery signature.
+    pub fn offline_signature_payload(&self) -> V2Result<Vec<u8>> {
+        let repository_id = self
+            .repository_id
+            .as_ref()
+            .ok_or(V2FormatError::RecoveryBundleRequired)?;
+        Ok(canonical_recovery_signature_payload(
+            repository_id,
+            &self.anchor,
+        ))
+    }
+
+    /// Verifies the offline recovery signature with an operator recovery key.
+    pub fn verify_offline_signature(&self, public_key: &str) -> V2Result<()> {
+        let signature = self
+            .offline_signature
+            .as_deref()
+            .ok_or(V2FormatError::RecoveryBundleRequired)?;
+        rs3_crypto::verify_recovery_signature(
+            public_key,
+            &self.offline_signature_payload()?,
+            signature,
+        )
+        .map_err(|_| V2FormatError::SignatureVerification)
+    }
+}
+
+fn canonical_recovery_signature_payload(
+    repository_id: &RepositoryId,
+    anchor: &V2AnchorState,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    cbor::write_array_len(&mut out, 8);
+    cbor::write_text(&mut out, "rs3:v2-recovery-bundle-offline-signature:v1");
+    cbor::write_text(&mut out, repository_id.as_str());
+    cbor::write_u64(&mut out, anchor.sequence.get());
+    cbor::write_text(&mut out, anchor.commit_key.as_str());
+    write_optional_text(
+        &mut out,
+        anchor.version_id.as_ref().map(BackendVersionId::as_str),
+    );
+    cbor::write_bytes(&mut out, &anchor.body_digest);
+    cbor::write_text(&mut out, anchor.signing_key_id.as_str());
+    cbor::write_array_len(&mut out, 4);
+    cbor::write_u64(&mut out, anchor.format_ref.generation);
+    cbor::write_text(&mut out, &anchor.format_ref.digest);
+    cbor::write_text(&mut out, anchor.format_ref.object_id.as_str());
+    write_optional_text(
+        &mut out,
+        anchor
+            .format_ref
+            .version_id
+            .as_ref()
+            .map(BackendVersionId::as_str),
+    );
+    out
+}
+
+fn write_optional_text(out: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => cbor::write_text(out, value),
+        None => cbor::write_null(out),
     }
 }
 
@@ -745,11 +810,14 @@ where
         &self,
         anchor: &A,
         bundle: &V2RecoveryBundle,
+        min_sequence: Sequence,
     ) -> V2Result<V2CommitChain>
     where
         A: V2CommitAnchor,
     {
-        if bundle.anchor.sequence < bundle.weak_subjectivity_floor_sequence {
+        if bundle.anchor.sequence < bundle.weak_subjectivity_floor_sequence
+            || bundle.anchor.sequence < min_sequence
+        {
             return Err(V2FormatError::RecoveryBundleRequired);
         }
         if anchor.read_v2().await?.is_some() {

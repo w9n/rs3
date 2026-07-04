@@ -1,7 +1,7 @@
 //! Runtime configuration loaded from process environment.
 
 use crate::identity::StaticCredentials;
-use rs3_crypto::{MIN_REPOSITORY_SALT_LEN, SecretBytes, ct_eq};
+use rs3_crypto::{MIN_REPOSITORY_SALT_LEN, SecretBytes, ct_eq, validate_recovery_public_key};
 use rs3_repository::{DEFAULT_PAYLOAD_SEGMENT_SIZE, v2::DEFAULT_V2_STREAM_READ_STALL_TIMEOUT};
 use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
@@ -34,6 +34,7 @@ const REPOSITORY_FORMAT_ENV: &str = "RS3_REPOSITORY_FORMAT";
 const ALLOW_REPOSITORY_INIT_ENV: &str = "RS3_ALLOW_REPOSITORY_INIT";
 const PROVIDER_CONFORMANCE_REPORT_FILE_ENV: &str = "RS3_PROVIDER_CONFORMANCE_REPORT_FILE";
 const PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV: &str = "RS3_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS";
+pub(crate) const RECOVERY_PUBLIC_KEY_ENV: &str = "RS3_RECOVERY_PUBLIC_KEY";
 const DEFAULT_REPOSITORY_FORMAT: RepositoryFormat = RepositoryFormat::V2Preview;
 
 pub(crate) const REPOSITORY_SALT_HEX_ENV: &str = "RS3_REPOSITORY_SALT_HEX";
@@ -66,6 +67,8 @@ pub struct RuntimeConfig {
     pub repository: RepositoryConfig,
     /// Last provider-conformance evidence settings.
     pub provider_conformance: ProviderConformanceConfig,
+    /// Disaster-recovery trust settings.
+    pub recovery: RecoveryConfig,
     /// Repository cryptographic key material.
     pub repository_keys: RepositoryKeysConfig,
     /// Optional static credentials accepted by the server.
@@ -207,6 +210,13 @@ pub struct ProviderConformanceConfig {
     pub max_age: Duration,
 }
 
+/// Disaster-recovery trust settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryConfig {
+    /// Operator-controlled public key used to verify recovery bundle signatures.
+    pub public_key: Option<String>,
+}
+
 impl Default for ProviderConformanceConfig {
     fn default() -> Self {
         Self {
@@ -330,6 +340,7 @@ impl RuntimeConfig {
         let batching = parse_batch_config(source)?;
         let repository = parse_repository_config(source)?;
         let provider_conformance = parse_provider_conformance_config(source)?;
+        let recovery = parse_recovery_config(source)?;
         let repository_keys = parse_repository_keys_config(source)?;
         let static_credentials = parse_static_credentials(source)?;
 
@@ -344,6 +355,7 @@ impl RuntimeConfig {
             batching,
             repository,
             provider_conformance,
+            recovery,
             repository_keys,
             static_credentials,
         })
@@ -551,6 +563,20 @@ fn parse_provider_conformance_config(
         report_file,
         max_age: Duration::from_secs(max_age_seconds),
     })
+}
+
+fn parse_recovery_config(source: &impl ConfigSource) -> Result<RecoveryConfig, ConfigError> {
+    let public_key = optional_value(source, RECOVERY_PUBLIC_KEY_ENV)
+        .map(|value| {
+            validate_recovery_public_key(&value).map_err(|error| ConfigError::Invalid {
+                key: RECOVERY_PUBLIC_KEY_ENV,
+                value: value.clone(),
+                reason: error.to_string(),
+            })?;
+            Ok(value)
+        })
+        .transpose()?;
+    Ok(RecoveryConfig { public_key })
 }
 
 fn parse_repository_format(source: &impl ConfigSource) -> Result<RepositoryFormat, ConfigError> {
@@ -884,7 +910,8 @@ fn secret_string_eq(left: &SecretString, right: &SecretString) -> bool {
 mod tests {
     use super::{
         AnchorConfig, BatchConfig, ConfigError, ConfigSource, GatewayMode, HardeningConfig,
-        MetricsConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig,
+        MetricsConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig,
+        RuntimeConfig,
     };
     use secrecy::SecretString;
     use std::collections::BTreeMap;
@@ -979,6 +1006,7 @@ mod tests {
             config.provider_conformance,
             super::ProviderConformanceConfig::default()
         );
+        assert_eq!(config.recovery, RecoveryConfig::default());
         assert_eq!(config.repository_keys, repository_keys_config());
         assert!(config.static_credentials.is_none());
     }
@@ -1208,6 +1236,35 @@ mod tests {
         assert_eq!(
             config.provider_conformance.max_age,
             Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn parses_recovery_public_key_config() {
+        let source = minimal_source().with(
+            super::RECOVERY_PUBLIC_KEY_ENV,
+            "ed25519:1111111111111111111111111111111111111111111111111111111111111111",
+        );
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert_eq!(
+            config.map(|config| config.recovery.public_key),
+            Ok(Some(
+                "ed25519:1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_recovery_public_key() {
+        let source = minimal_source().with(super::RECOVERY_PUBLIC_KEY_ENV, "not-ed25519");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::RECOVERY_PUBLIC_KEY_ENV)
         );
     }
 

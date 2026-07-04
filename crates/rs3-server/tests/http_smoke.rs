@@ -2,7 +2,7 @@
 
 use rs3_server::{
     AnchorConfig, BackendConfig, BatchConfig, GatewayMode, GatewayServer, GatewayServerError,
-    HardeningConfig, MetricsConfig, ProviderConformanceConfig, RepositoryConfig,
+    HardeningConfig, MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig,
     RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
 };
 use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
@@ -134,6 +134,7 @@ fn runtime_config() -> RuntimeConfig {
             allow_init: true,
         },
         provider_conformance: ProviderConformanceConfig::default(),
+        recovery: RecoveryConfig::default(),
         repository_keys: RepositoryKeysConfig {
             repository_id: RepositoryId::new("test-repository")
                 .unwrap_or_else(|error| panic!("{error}")),

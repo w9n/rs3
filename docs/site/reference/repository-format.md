@@ -117,10 +117,13 @@ candidates are reported and skipped; retained-profile candidates with missing
 protection metadata are also skipped.
 
 `rs3 export-restore-bundle` is format-aware: for `v2-preview` it verifies the
-anchor-selected commit chain and exports the anchor state as the normal DR
-weak-subjectivity bundle. If the external anchor is lost, `rs3 import-v2-anchor`
-recreates it from a trusted bundle after verifying the named commit chain.
-`xtask v2 verify-bundle` performs the same format-root, keyring-envelope, and
+anchor-selected commit chain and exports the anchor state plus canonical
+offline-signature payload bytes as the normal DR weak-subjectivity bundle. If
+the external anchor is lost, `rs3 import-v2-anchor` recreates it from a trusted
+bundle only after checking an operator-supplied `--min-sequence` floor,
+verifying the offline Ed25519 signature when the selected provider profile is
+production, and verifying the named commit chain. `xtask v2 verify-bundle`
+performs the same floor, signature, format-root, keyring-envelope, and
 commit-chain verification as a no-write preflight.
 `rs3 check-v2-provider` runs the selected v2 provider-profile probes against the
 configured backend, including multipart upload behavior used by large streaming
@@ -185,9 +188,10 @@ state without the anchor.
 
 Anchors must fail closed. If the anchor cannot be read, cannot be advanced, or
 does not match the verified commit chain, the gateway must not silently accept
-newer-looking backend state. Disaster recovery uses a trusted v2 restore bundle
-containing the anchor state and weak-subjectivity floor, then verifies the named
-commit chain before recreating the anchor.
+newer-looking backend state. Disaster recovery uses a trusted v2 restore bundle,
+an external operator `--min-sequence` floor, and an offline recovery signature
+for production profiles, then verifies the named commit chain before recreating
+the anchor.
 
 ## Keyrings
 

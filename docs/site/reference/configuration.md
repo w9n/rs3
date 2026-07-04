@@ -13,6 +13,7 @@ flags may override selected listener and gateway-mode settings.
 | `RS3_ADMIN_BIND` | no | unset | Separate gateway admin listener for path-redacted facts. |
 | `RS3_ADMIN_BEARER_TOKEN` | with admin listener | none | Bearer token for admin routes. Must be at least 16 bytes and separate from backup-client S3 credentials. |
 | `RS3_ADMIN_PROFILE` | no | `production` | Admin status profile: `local` or `production`. |
+| `RS3_RECOVERY_PUBLIC_KEY` | production recovery | none | `ed25519:<hex-public-key>` used to verify signed v2 restore bundles during `import-v2-anchor` and `xtask v2 verify-bundle`. |
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
 | `RUST_LOG` | no | `info` | Standard tracing filter. |
 
@@ -21,7 +22,11 @@ same repository, backend, anchor, and keyring settings as `serve`. The exported
 bundle contains public but integrity-sensitive restore metadata; keep
 wrapping-key material in the configured secret source. Prefer
 `import-v2-anchor --bundle-file <json>` over manually transcribing anchor fields
-from the exported bundle.
+from the exported bundle. Production recovery requires an external
+`--min-sequence` floor and `RS3_RECOVERY_PUBLIC_KEY`. `export-restore-bundle`
+prints `offline_signature_payload_hex`; sign those canonical bytes offline with
+the matching Ed25519 recovery key and store the hex signature in
+`offline_signature` before import.
 Machine-readable command output is written to stdout; tracing logs are written
 to stderr for both `plain` and `json` log formats.
 
