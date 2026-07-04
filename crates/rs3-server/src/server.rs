@@ -1,6 +1,6 @@
 //! TCP listener and HTTP serving loop for the S3 boundary.
 
-use crate::{GatewayS3Boundary, RuntimeConfig, S3BoundaryError};
+use crate::{AdminRuntimeFactsSource, GatewayS3Boundary, RuntimeConfig, S3BoundaryError};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
@@ -65,6 +65,11 @@ impl GatewayServer {
     /// Returns the address actually bound by the listener.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Returns a live path-redacted admin facts source for this gateway.
+    pub fn admin_runtime_facts_source(&self) -> Arc<dyn AdminRuntimeFactsSource> {
+        self.boundary.admin_runtime_facts_source()
     }
 
     /// Serves connections until the provided shutdown future resolves.

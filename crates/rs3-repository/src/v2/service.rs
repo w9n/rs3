@@ -41,6 +41,8 @@ use rs3_types::{
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry};
 use std::marker::PhantomData;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -66,6 +68,8 @@ pub struct V2Repository<S> {
     payload_sections: StdRwLock<V2PayloadSectionCache>,
     commit_headers: StdRwLock<V2CommitHeaderCache>,
     payload_headers: StdRwLock<V2PayloadHeaderCache>,
+    #[cfg(test)]
+    fail_next_restore: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +144,8 @@ where
             )),
             commit_headers: StdRwLock::new(V2CommitHeaderCache::default()),
             payload_headers: StdRwLock::new(V2PayloadHeaderCache::default()),
+            #[cfg(test)]
+            fail_next_restore: AtomicBool::new(false),
         }
     }
 
@@ -1003,6 +1009,11 @@ where
         &self,
         mut snapshot: V2RepositorySnapshot,
     ) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_next_restore.swap(false, Ordering::SeqCst) {
+            return Err(RepositoryError::StatePoisoned);
+        }
+
         let mut state = self.repository.write_state()?;
         snapshot.state.next_sequence = snapshot.state.next_sequence.max(state.next_sequence);
         *state = snapshot.state;
@@ -1011,6 +1022,11 @@ where
             .lock()
             .map_err(|_| RepositoryError::StatePoisoned)? = snapshot.pending_payloads;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_restore_for_tests(&self) {
+        self.fail_next_restore.store(true, Ordering::SeqCst);
     }
 
     pub(crate) async fn publish_pending_index_delta<A>(

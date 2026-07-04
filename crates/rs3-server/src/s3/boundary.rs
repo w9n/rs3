@@ -2,7 +2,7 @@
 
 use super::S3BoundaryError;
 use super::adapter::GatewayS3Service;
-use crate::RuntimeConfig;
+use crate::{AdminRuntimeFactsSource, RuntimeConfig};
 use rs3_types::PublicBucket;
 use s3s::S3Result;
 use s3s::access::{S3Access, S3AccessContext};
@@ -23,6 +23,7 @@ pub struct GatewayS3Boundary {
     config: RuntimeConfig,
     service: S3Service,
     hardening: S3Hardening,
+    admin_runtime_facts: Arc<dyn AdminRuntimeFactsSource>,
 }
 
 impl GatewayS3Boundary {
@@ -42,6 +43,7 @@ impl GatewayS3Boundary {
             .ok_or(S3BoundaryError::MissingStaticCredentials)?;
 
         let adapter = GatewayS3Service::from_config(&config).await?;
+        let admin_runtime_facts = adapter.admin_runtime_facts_source();
         let mut builder = S3ServiceBuilder::new(adapter);
 
         let s3_config = Arc::new(S3Config::default());
@@ -56,6 +58,7 @@ impl GatewayS3Boundary {
             config,
             service: builder.build(),
             hardening: S3Hardening::required(),
+            admin_runtime_facts,
         })
     }
 
@@ -82,6 +85,11 @@ impl GatewayS3Boundary {
     /// Returns the controls enforced by or around the S3 HTTP service.
     pub fn hardening(&self) -> S3Hardening {
         self.hardening
+    }
+
+    /// Returns a live path-redacted admin facts source for this boundary.
+    pub fn admin_runtime_facts_source(&self) -> Arc<dyn AdminRuntimeFactsSource> {
+        Arc::clone(&self.admin_runtime_facts)
     }
 }
 

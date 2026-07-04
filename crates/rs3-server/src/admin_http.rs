@@ -1,6 +1,9 @@
 //! Authenticated HTTP listener for path-redacted gateway admin facts.
 
-use crate::{AdminReportProfile, RuntimeConfig, admin_posture_report, admin_status_report};
+use crate::{
+    AdminReportProfile, AdminRuntimeFacts, AdminRuntimeFactsSource, RuntimeConfig,
+    admin_posture_report_with_runtime_facts, admin_status_report_with_runtime_facts,
+};
 use bytes::Bytes;
 use http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, WWW_AUTHENTICATE};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
@@ -136,11 +139,12 @@ impl AdminHttpConfig {
 }
 
 /// Hyper-compatible service for gateway admin facts.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AdminHttpService {
     config: RuntimeConfig,
     auth: AdminHttpAuth,
     profile: AdminReportProfile,
+    runtime_facts: Option<Arc<dyn AdminRuntimeFactsSource>>,
 }
 
 impl AdminHttpService {
@@ -150,6 +154,22 @@ impl AdminHttpService {
             config,
             auth,
             profile,
+            runtime_facts: None,
+        }
+    }
+
+    /// Creates an admin service with live runtime facts attached to reports.
+    pub fn new_with_runtime_facts(
+        config: RuntimeConfig,
+        auth: AdminHttpAuth,
+        profile: AdminReportProfile,
+        runtime_facts: Arc<dyn AdminRuntimeFactsSource>,
+    ) -> Self {
+        Self {
+            config,
+            auth,
+            profile,
+            runtime_facts: Some(runtime_facts),
         }
     }
 
@@ -170,11 +190,22 @@ impl AdminHttpService {
 
         match (parts.method, parts.uri.path()) {
             (Method::GET, "/admin/posture") => {
-                let report = admin_posture_report(&self.config, self.profile);
+                let runtime_facts = self.runtime_facts();
+                let report = admin_posture_report_with_runtime_facts(
+                    &self.config,
+                    self.profile,
+                    &runtime_facts,
+                );
                 json_response(StatusCode::OK, report)
             }
             (Method::GET, "/admin/status") => {
-                let report = admin_status_report(&self.config, self.profile).await;
+                let runtime_facts = self.runtime_facts();
+                let report = admin_status_report_with_runtime_facts(
+                    &self.config,
+                    self.profile,
+                    &runtime_facts,
+                )
+                .await;
                 json_response(StatusCode::OK, report)
             }
             (Method::GET, _) => json_response(
@@ -186,6 +217,12 @@ impl AdminHttpService {
                 json!({ "error": { "code": "method-not-allowed", "message": "admin route method is not allowed" } }),
             ),
         }
+    }
+
+    fn runtime_facts(&self) -> AdminRuntimeFacts {
+        self.runtime_facts
+            .as_ref()
+            .map_or_else(AdminRuntimeFacts::default, |source| source.snapshot())
     }
 }
 
@@ -207,6 +244,28 @@ impl AdminHttpServer {
         config: RuntimeConfig,
         admin_config: AdminHttpConfig,
     ) -> Result<Self, AdminHttpServerError> {
+        Self::bind_inner(config, admin_config, None).await
+    }
+
+    /// Binds the gateway admin listener with live runtime facts attached to reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the listener cannot be bound or its local address
+    /// cannot be read.
+    pub async fn bind_with_runtime_facts(
+        config: RuntimeConfig,
+        admin_config: AdminHttpConfig,
+        runtime_facts: Arc<dyn AdminRuntimeFactsSource>,
+    ) -> Result<Self, AdminHttpServerError> {
+        Self::bind_inner(config, admin_config, Some(runtime_facts)).await
+    }
+
+    async fn bind_inner(
+        config: RuntimeConfig,
+        admin_config: AdminHttpConfig,
+        runtime_facts: Option<Arc<dyn AdminRuntimeFactsSource>>,
+    ) -> Result<Self, AdminHttpServerError> {
         let listener = TcpListener::bind(admin_config.bind)
             .await
             .map_err(|source| AdminHttpServerError::Bind {
@@ -216,7 +275,15 @@ impl AdminHttpServer {
         let local_addr = listener
             .local_addr()
             .map_err(AdminHttpServerError::LocalAddr)?;
-        let service = AdminHttpService::new(config, admin_config.auth, admin_config.profile);
+        let service = match runtime_facts {
+            Some(runtime_facts) => AdminHttpService::new_with_runtime_facts(
+                config,
+                admin_config.auth,
+                admin_config.profile,
+                runtime_facts,
+            ),
+            None => AdminHttpService::new(config, admin_config.auth, admin_config.profile),
+        };
 
         Ok(Self {
             service,

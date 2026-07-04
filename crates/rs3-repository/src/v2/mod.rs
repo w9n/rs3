@@ -27,7 +27,7 @@ pub use commit::{
     V2SectionDescriptor, V2SectionType, V2UploadMode, body_digest_for_v2_sections,
     generate_v2_commit_key, parse_v2_commit_header, parse_v2_commit_object,
 };
-pub use coordinator::{V2CommitCoordinator, V2CommittedPut};
+pub use coordinator::{V2CommitCoordinator, V2CommitCoordinatorStatus, V2CommittedPut};
 pub use error::{V2ErrorClass, V2FormatError, V2Result};
 pub use format::{
     V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef, V2MaintenanceConfig, v2_format_object_id,

@@ -1934,14 +1934,110 @@ async fn v2_commit_coordinator_rolls_back_batch_after_anchor_failure() {
     };
 
     let (first, second) = tokio::join!(first, second);
+    assert!(!coordinator.status().poisoned);
+
+    let later_key =
+        LogicalPath::new("snapshots/v2-later.bin").unwrap_or_else(|error| panic!("{error}"));
+    let later = must_repo(
+        coordinator
+            .put_committed(
+                later_key.clone(),
+                Bytes::from_static(b"later"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    let accepted = must_v2(anchor.read_v2().await).expect("v2 later anchor should be accepted");
+
+    assert!(matches!(
+        first,
+        Err(crate::RepositoryError::CommitFailed { .. })
+    ));
+    assert!(matches!(
+        second,
+        Err(crate::RepositoryError::CommitFailed { .. })
+    ));
+    assert_eq!(later.anchor_state, accepted);
+    assert_eq!(accepted.sequence, Sequence::new(2));
+    assert!(!coordinator.status().poisoned);
+    assert!(coordinator.status().poison_reason.is_none());
+    assert!(matches!(
+        repository.head(&first_key),
+        Err(crate::RepositoryError::NotFound(_))
+    ));
+    assert!(matches!(
+        repository.head(&second_key),
+        Err(crate::RepositoryError::NotFound(_))
+    ));
+    assert!(repository.head(&later_key).is_ok());
+}
+
+#[tokio::test]
+async fn v2_commit_coordinator_poisons_when_batch_rollback_fails() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store,
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    repository.fail_next_restore_for_tests();
+    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        FailOnceV2Anchor::new(anchor.clone()),
+        CommitCoordinatorOptions::new(2, Duration::from_secs(60)),
+    ));
+    let first_key =
+        LogicalPath::new("snapshots/v2-poison-a.bin").unwrap_or_else(|error| panic!("{error}"));
+    let second_key =
+        LogicalPath::new("snapshots/v2-poison-b.bin").unwrap_or_else(|error| panic!("{error}"));
+
+    let first = {
+        let coordinator = Arc::clone(&coordinator);
+        let key = first_key;
+        async move {
+            coordinator
+                .put_committed(
+                    key,
+                    Bytes::from_static(b"poison-a"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    };
+    let second = {
+        let coordinator = Arc::clone(&coordinator);
+        let key = second_key;
+        async move {
+            coordinator
+                .put_committed(
+                    key,
+                    Bytes::from_static(b"poison-b"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    };
+
+    let (first, second) = tokio::join!(first, second);
     let later = coordinator
         .put_committed(
-            LogicalPath::new("snapshots/v2-later.bin").unwrap_or_else(|error| panic!("{error}")),
-            Bytes::from_static(b"later"),
+            LogicalPath::new("snapshots/v2-poison-later.bin")
+                .unwrap_or_else(|error| panic!("{error}")),
+            Bytes::from_static(b"poison-later"),
             RepositoryPutOptions::default(),
         )
         .await;
     let accepted = must_v2(anchor.read_v2().await).expect("v2 genesis anchor should remain");
+    let status = coordinator.status();
 
     assert!(matches!(
         first,
@@ -1956,14 +2052,12 @@ async fn v2_commit_coordinator_rolls_back_batch_after_anchor_failure() {
         Err(crate::RepositoryError::CommitFailed { .. })
     ));
     assert_eq!(accepted.sequence, Sequence::new(1));
-    assert!(matches!(
-        repository.head(&first_key),
-        Err(crate::RepositoryError::NotFound(_))
-    ));
-    assert!(matches!(
-        repository.head(&second_key),
-        Err(crate::RepositoryError::NotFound(_))
-    ));
+    assert!(status.poisoned);
+    let poison_reason = status
+        .poison_reason
+        .unwrap_or_else(|| panic!("poison reason should be recorded"));
+    assert!(poison_reason.contains("rollback failed"));
+    assert!(poison_reason.contains("repository state lock poisoned"));
 }
 
 #[tokio::test]
@@ -1986,7 +2080,7 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
     let coordinator = Arc::new(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         anchor,
-        CommitCoordinatorOptions::new(8, Duration::from_millis(250)).with_max_pending_items(1),
+        CommitCoordinatorOptions::new(8, Duration::from_secs(60)).with_max_pending_items(1),
     ));
     let first_key = LogicalPath::new("snapshots/v2-backpressure-first.bin")
         .unwrap_or_else(|error| panic!("{error}"));
@@ -2026,6 +2120,7 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
             .await
             .map_err(|_| V2FormatError::StorageOperationFailed),
     );
+    must_repo(coordinator.write_index_snapshot().await);
     let first = tokio::time::timeout(Duration::from_secs(1), first).await;
 
     assert!(matches!(

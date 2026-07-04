@@ -184,7 +184,13 @@ async fn main() -> Result<()> {
             tracing::info!(bind = %server.local_addr(), "gateway S3 listener started");
             match admin_config {
                 Some(admin_config) => {
-                    let admin_server = AdminHttpServer::bind(config, admin_config).await?;
+                    let admin_runtime_facts = server.admin_runtime_facts_source();
+                    let admin_server = AdminHttpServer::bind_with_runtime_facts(
+                        config,
+                        admin_config,
+                        admin_runtime_facts,
+                    )
+                    .await?;
                     tracing::info!(
                         bind = %admin_server.local_addr(),
                         "gateway admin listener started",

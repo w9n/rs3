@@ -34,6 +34,28 @@ impl AdminReportProfile {
     }
 }
 
+/// Source of live in-process facts for path-redacted admin reports.
+pub trait AdminRuntimeFactsSource: Send + Sync {
+    /// Returns a current snapshot of live runtime facts.
+    fn snapshot(&self) -> AdminRuntimeFacts;
+}
+
+/// Live in-process facts attached to admin reports when a gateway is running.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdminRuntimeFacts {
+    /// Live repository facts.
+    pub repository: AdminRepositoryRuntimeFacts,
+}
+
+/// Live repository facts safe to surface through admin reports.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdminRepositoryRuntimeFacts {
+    /// Live v2 commit-coordinator status, when the report is attached to a running gateway.
+    pub v2_commit_coordinator: Option<AdminV2CommitCoordinatorSummary>,
+}
+
 /// Preview path-redacted operator status fact report.
 ///
 /// This is a low-level report for doctor-style checks and external control
@@ -188,6 +210,18 @@ pub struct AdminRepositorySummary {
     pub retention_days: u32,
     /// Whether first-run initialization is allowed when the anchor is missing.
     pub allow_init: bool,
+    /// Live v2 commit-coordinator status, when the report is attached to a running gateway.
+    pub v2_commit_coordinator: Option<AdminV2CommitCoordinatorSummary>,
+}
+
+/// Live v2 commit coordinator summary.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AdminV2CommitCoordinatorSummary {
+    /// Whether the coordinator is permanently refusing new writes.
+    pub poisoned: bool,
+    /// Path-redacted reason for a permanent poison state.
+    pub poison_reason: Option<String>,
 }
 
 /// Security boundary fields for operator reports.
@@ -315,6 +349,15 @@ pub async fn admin_status_report(
     config: &RuntimeConfig,
     profile: AdminReportProfile,
 ) -> AdminStatusReport {
+    admin_status_report_with_runtime_facts(config, profile, &AdminRuntimeFacts::default()).await
+}
+
+/// Builds a status report with live in-process runtime facts attached.
+pub async fn admin_status_report_with_runtime_facts(
+    config: &RuntimeConfig,
+    profile: AdminReportProfile,
+    runtime_facts: &AdminRuntimeFacts,
+) -> AdminStatusReport {
     let restore = restore_summary(config).await;
     let maintenance = maintenance_summary(config).await;
     AdminStatusReport {
@@ -337,22 +380,7 @@ pub async fn admin_status_report(
             kind: anchor_kind(&config.anchor),
             external: !matches!(config.anchor, AnchorConfig::Memory),
         },
-        repository: AdminRepositorySummary {
-            format: config.repository.format.as_str(),
-            payload_segment_size_bytes: config.repository.payload_segment_size,
-            adaptive_payload_segment_size: config.repository.adaptive_payload_segment_size,
-            decrypted_segment_cache_max_bytes: config.repository.decrypted_segment_cache_max_bytes,
-            commit_max_batch_items: config.batching.max_items,
-            commit_max_batch_delay_ms: config.batching.max_delay.as_millis(),
-            commit_max_pending_items: config.batching.max_pending_items,
-            retention_mode: retention_mode(config),
-            retention_days: config
-                .repository
-                .retention
-                .map(|policy| policy.retain_days)
-                .unwrap_or(0),
-            allow_init: config.repository.allow_init,
-        },
+        repository: repository_summary(config, runtime_facts),
         security: AdminSecuritySummary {
             path_browsing_enabled: false,
             secrets_exposed: false,
@@ -377,6 +405,15 @@ pub fn admin_posture_report(
     config: &RuntimeConfig,
     profile: AdminReportProfile,
 ) -> AdminPostureReport {
+    admin_posture_report_with_runtime_facts(config, profile, &AdminRuntimeFacts::default())
+}
+
+/// Builds a cheap posture report with live in-process runtime facts attached.
+pub fn admin_posture_report_with_runtime_facts(
+    config: &RuntimeConfig,
+    profile: AdminReportProfile,
+    runtime_facts: &AdminRuntimeFacts,
+) -> AdminPostureReport {
     AdminPostureReport {
         schema: ADMIN_POSTURE_SCHEMA,
         profile: profile.as_str(),
@@ -397,22 +434,7 @@ pub fn admin_posture_report(
             kind: anchor_kind(&config.anchor),
             external: !matches!(config.anchor, AnchorConfig::Memory),
         },
-        repository: AdminRepositorySummary {
-            format: config.repository.format.as_str(),
-            payload_segment_size_bytes: config.repository.payload_segment_size,
-            adaptive_payload_segment_size: config.repository.adaptive_payload_segment_size,
-            decrypted_segment_cache_max_bytes: config.repository.decrypted_segment_cache_max_bytes,
-            commit_max_batch_items: config.batching.max_items,
-            commit_max_batch_delay_ms: config.batching.max_delay.as_millis(),
-            commit_max_pending_items: config.batching.max_pending_items,
-            retention_mode: retention_mode(config),
-            retention_days: config
-                .repository
-                .retention
-                .map(|policy| policy.retain_days)
-                .unwrap_or(0),
-            allow_init: config.repository.allow_init,
-        },
+        repository: repository_summary(config, runtime_facts),
         security: AdminSecuritySummary {
             path_browsing_enabled: false,
             secrets_exposed: false,
@@ -427,6 +449,29 @@ pub fn admin_posture_report(
             action_posture: "report-only",
         },
         findings: doctor_findings(config, profile),
+    }
+}
+
+fn repository_summary(
+    config: &RuntimeConfig,
+    runtime_facts: &AdminRuntimeFacts,
+) -> AdminRepositorySummary {
+    AdminRepositorySummary {
+        format: config.repository.format.as_str(),
+        payload_segment_size_bytes: config.repository.payload_segment_size,
+        adaptive_payload_segment_size: config.repository.adaptive_payload_segment_size,
+        decrypted_segment_cache_max_bytes: config.repository.decrypted_segment_cache_max_bytes,
+        commit_max_batch_items: config.batching.max_items,
+        commit_max_batch_delay_ms: config.batching.max_delay.as_millis(),
+        commit_max_pending_items: config.batching.max_pending_items,
+        retention_mode: retention_mode(config),
+        retention_days: config
+            .repository
+            .retention
+            .map(|policy| policy.retain_days)
+            .unwrap_or(0),
+        allow_init: config.repository.allow_init,
+        v2_commit_coordinator: runtime_facts.repository.v2_commit_coordinator.clone(),
     }
 }
 
@@ -828,7 +873,9 @@ fn current_time_ms() -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdminReportProfile, admin_posture_report, admin_status_report, backend_kind,
+        AdminReportProfile, AdminRepositoryRuntimeFacts, AdminRuntimeFacts,
+        AdminV2CommitCoordinatorSummary, admin_posture_report,
+        admin_posture_report_with_runtime_facts, admin_status_report, backend_kind,
         current_time_ms, doctor_findings, runtime_config_profile,
     };
     use crate::{
@@ -1044,6 +1091,35 @@ mod tests {
         assert!(!json.contains("storage.example"));
         assert!(!json.contains("backend-secret-bucket"));
         assert!(!json.contains("tenant/private/prefix"));
+    }
+
+    #[test]
+    fn admin_posture_reports_live_commit_coordinator_poison_fact() {
+        let config = runtime_config();
+        let runtime_facts = AdminRuntimeFacts {
+            repository: AdminRepositoryRuntimeFacts {
+                v2_commit_coordinator: Some(AdminV2CommitCoordinatorSummary {
+                    poisoned: true,
+                    poison_reason: Some("v2 commit batch rollback failed".to_owned()),
+                }),
+            },
+        };
+
+        let report = admin_posture_report_with_runtime_facts(
+            &config,
+            AdminReportProfile::Production,
+            &runtime_facts,
+        );
+        let coordinator = report
+            .repository
+            .v2_commit_coordinator
+            .unwrap_or_else(|| panic!("coordinator fact should be attached"));
+
+        assert!(coordinator.poisoned);
+        assert_eq!(
+            coordinator.poison_reason.as_deref(),
+            Some("v2 commit batch rollback failed")
+        );
     }
 
     fn provider_report_file(body: &str) -> std::path::PathBuf {

@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures_util::Stream;
 use rs3_storage::BlobStore;
 use rs3_types::{LegalHoldStatus, LogicalPath};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::sleep;
@@ -30,6 +30,7 @@ pub struct V2CommitCoordinator<S, A> {
     options: CommitCoordinatorOptions,
     stage_lock: Arc<Mutex<()>>,
     batch: Arc<Mutex<PendingBatch>>,
+    status: Arc<CoordinatorStatus>,
 }
 
 #[derive(Default)]
@@ -43,6 +44,67 @@ struct PendingBatch {
 
 struct CommitWaiter {
     tx: oneshot::Sender<std::result::Result<V2AnchorState, String>>,
+}
+
+/// Live v2 commit coordinator state safe for path-redacted operator reports.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct V2CommitCoordinatorStatus {
+    /// Whether the coordinator is permanently refusing new writes.
+    pub poisoned: bool,
+    /// Path-redacted reason for a permanent poison state.
+    pub poison_reason: Option<String>,
+}
+
+#[derive(Default)]
+struct CoordinatorStatus {
+    state: RwLock<V2CommitCoordinatorStatus>,
+}
+
+impl CoordinatorStatus {
+    fn snapshot(&self) -> V2CommitCoordinatorStatus {
+        match self.state.read() {
+            Ok(state) => state.clone(),
+            Err(_error) => V2CommitCoordinatorStatus {
+                poisoned: true,
+                poison_reason: Some("v2 commit coordinator status lock poisoned".to_owned()),
+            },
+        }
+    }
+
+    fn set_healthy(&self) {
+        match self.state.write() {
+            Ok(mut state) => *state = V2CommitCoordinatorStatus::default(),
+            Err(error) => {
+                tracing::error!(
+                    target: "rs3_repository",
+                    operation = "v2_commit_coordinator_status",
+                    error = %error,
+                    "v2 commit coordinator could not clear status",
+                );
+            }
+        }
+        record_v2_commit_coordinator_poisoned(false);
+    }
+
+    fn set_poisoned(&self, reason: String) {
+        match self.state.write() {
+            Ok(mut state) => {
+                *state = V2CommitCoordinatorStatus {
+                    poisoned: true,
+                    poison_reason: Some(reason),
+                };
+            }
+            Err(error) => {
+                tracing::error!(
+                    target: "rs3_repository",
+                    operation = "v2_commit_coordinator_status",
+                    error = %error,
+                    "v2 commit coordinator could not record poisoned status",
+                );
+            }
+        }
+        record_v2_commit_coordinator_poisoned(true);
+    }
 }
 
 impl<S, A> V2CommitCoordinator<S, A>
@@ -61,12 +123,14 @@ where
         anchor: A,
         options: CommitCoordinatorOptions,
     ) -> Self {
+        record_v2_commit_coordinator_poisoned(false);
         Self {
             repository,
             anchor: Arc::new(anchor),
             options: options.normalized(),
             stage_lock: Arc::new(Mutex::new(())),
             batch: Arc::new(Mutex::new(PendingBatch::default())),
+            status: Arc::new(CoordinatorStatus::default()),
         }
     }
 
@@ -78,6 +142,11 @@ where
     /// Returns the v2 anchor used by this coordinator.
     pub fn anchor(&self) -> &Arc<A> {
         &self.anchor
+    }
+
+    /// Returns the live coordinator status for path-redacted operator reports.
+    pub fn status(&self) -> V2CommitCoordinatorStatus {
+        self.status.snapshot()
     }
 
     /// Writes an object and returns only after a covering v2 commit is accepted.
@@ -160,6 +229,7 @@ where
                     Arc::clone(&self.anchor),
                     Arc::clone(&self.stage_lock),
                     Arc::clone(&self.batch),
+                    Arc::clone(&self.status),
                     generation,
                     self.options.max_batch_delay,
                 );
@@ -175,6 +245,7 @@ where
                 Arc::clone(&self.anchor),
                 Arc::clone(&self.stage_lock),
                 Arc::clone(&self.batch),
+                Arc::clone(&self.status),
                 delayed_publish_generation,
             )
             .await;
@@ -334,10 +405,18 @@ where
         .await;
         let mut batch = self.batch.lock().await;
         batch.publishing = false;
-        if let Err(reason) = result {
-            batch.failed = Some(reason.clone());
-            return Err(RepositoryError::CommitFailed { reason });
+        if let Err(failure) = result {
+            if let Some(poison_reason) = failure.poison_reason.clone() {
+                batch.failed = Some(poison_reason.clone());
+                self.status.set_poisoned(poison_reason);
+            } else {
+                self.status.set_healthy();
+            }
+            return Err(RepositoryError::CommitFailed {
+                reason: failure.reason,
+            });
         }
+        self.status.set_healthy();
         Ok(())
     }
 }
@@ -352,6 +431,7 @@ fn spawn_delayed_v2_publish<S, A>(
     anchor: Arc<A>,
     stage_lock: Arc<Mutex<()>>,
     batch: Arc<Mutex<PendingBatch>>,
+    status: Arc<CoordinatorStatus>,
     generation: u64,
     delay: Duration,
 ) where
@@ -360,7 +440,15 @@ fn spawn_delayed_v2_publish<S, A>(
 {
     tokio::spawn(async move {
         sleep(delay).await;
-        publish_pending_v2_batch(repository, anchor, stage_lock, batch, Some(generation)).await;
+        publish_pending_v2_batch(
+            repository,
+            anchor,
+            stage_lock,
+            batch,
+            status,
+            Some(generation),
+        )
+        .await;
     });
 }
 
@@ -369,6 +457,7 @@ async fn publish_pending_v2_batch<S, A>(
     anchor: Arc<A>,
     stage_lock: Arc<Mutex<()>>,
     batch: Arc<Mutex<PendingBatch>>,
+    status: Arc<CoordinatorStatus>,
     expected_generation: Option<u64>,
 ) where
     S: BlobStore + Clone + 'static,
@@ -399,9 +488,22 @@ async fn publish_pending_v2_batch<S, A>(
     .await;
     let mut batch = batch.lock().await;
     batch.publishing = false;
-    if let Err(reason) = result {
-        batch.failed = Some(reason);
+    if let Err(failure) = result {
+        if let Some(poison_reason) = failure.poison_reason {
+            batch.failed = Some(poison_reason.clone());
+            status.set_poisoned(poison_reason);
+        } else {
+            status.set_healthy();
+        }
+    } else {
+        status.set_healthy();
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublishFailure {
+    reason: String,
+    poison_reason: Option<String>,
 }
 
 async fn publish_v2_waiters<S, A>(
@@ -409,7 +511,7 @@ async fn publish_v2_waiters<S, A>(
     anchor: &A,
     waiters: Vec<CommitWaiter>,
     rollback_snapshot: Option<V2RepositorySnapshot>,
-) -> std::result::Result<(), String>
+) -> std::result::Result<(), PublishFailure>
 where
     S: BlobStore + Clone + 'static,
     A: V2CommitAnchor + 'static,
@@ -433,15 +535,33 @@ where
         "v2 commit coordinator publish completed",
     );
 
-    let failure = result.as_ref().err().cloned();
+    let mut failure = result.as_ref().err().cloned().map(|reason| {
+        record_v2_commit_batch_publish_failure("publish");
+        PublishFailure {
+            reason,
+            poison_reason: None,
+        }
+    });
     if failure.is_some()
         && let Some(snapshot) = rollback_snapshot
         && let Err(error) = repository.restore_state_preserving_sequence(snapshot)
     {
+        let poison_reason = match failure.as_ref() {
+            Some(failure) => format!(
+                "v2 commit batch publish failed: {}; rollback failed: {}",
+                failure.reason, error
+            ),
+            None => format!("v2 commit batch rollback failed: {error}"),
+        };
+        if let Some(failure) = failure.as_mut() {
+            failure.poison_reason = Some(poison_reason.clone());
+        }
+        record_v2_commit_batch_publish_failure("rollback");
         tracing::error!(
             target: "rs3_repository",
             operation = "v2_commit_batch_rollback",
             error = %error,
+            reason = %poison_reason,
             "v2 commit coordinator failed to restore unaccepted state",
         );
     }
@@ -451,7 +571,7 @@ where
     }
 
     match failure {
-        Some(reason) => Err(reason),
+        Some(failure) => Err(failure),
         None => Ok(()),
     }
 }
@@ -498,6 +618,22 @@ fn record_v2_commit_batch_publish(waiter_count: usize, result: &'static str, ela
         "result" => result,
     )
     .record(elapsed.as_secs_f64());
+}
+
+fn record_v2_commit_batch_publish_failure(stage: &'static str) {
+    metrics::counter!(
+        "rs3_repository_v2_commit_batch_publish_failures_total",
+        "stage" => stage,
+    )
+    .increment(1);
+}
+
+fn record_v2_commit_coordinator_poisoned(poisoned: bool) {
+    metrics::gauge!("rs3_repository_v2_commit_coordinator_poisoned").set(if poisoned {
+        1.0
+    } else {
+        0.0
+    });
 }
 
 fn record_v2_commit_put_phase_duration(phase: &'static str, elapsed: Duration) {

@@ -8,6 +8,10 @@ use super::runtime_keyring::{
     open_gateway_keyring_reference, repository_key_context, retained_version_id,
     retained_version_required, secret_hex, unanchored_gateway_keyring,
 };
+use crate::admin::{
+    AdminRepositoryRuntimeFacts, AdminRuntimeFacts, AdminRuntimeFactsSource,
+    AdminV2CommitCoordinatorSummary,
+};
 use crate::config::KEYRING_WRAPPING_KEY_HEX_ENV;
 use crate::{BackendConfig, GatewayMode, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig};
 use bytes::Bytes;
@@ -83,6 +87,11 @@ pub(super) struct RuntimeRepository {
     memory_store: Option<MemoryBlobStore>,
     #[cfg(test)]
     memory_anchor: Option<rs3_repository::v2::V2MemoryAnchor>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeRepositoryAdminFacts {
+    repository: RuntimeRepository,
 }
 
 pub(super) struct RuntimeCommittedPut {
@@ -317,6 +326,12 @@ impl RuntimeRepository {
         self.coordinator.set_legal_hold_committed(key, status).await
     }
 
+    pub(super) fn admin_facts_source(&self) -> Arc<dyn AdminRuntimeFactsSource> {
+        Arc::new(RuntimeRepositoryAdminFacts {
+            repository: self.clone(),
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn memory_store(&self) -> Option<&MemoryBlobStore> {
         self.memory_store.as_ref()
@@ -325,6 +340,20 @@ impl RuntimeRepository {
     #[cfg(test)]
     pub(super) fn memory_v2_anchor(&self) -> Option<&rs3_repository::v2::V2MemoryAnchor> {
         self.memory_anchor.as_ref()
+    }
+}
+
+impl AdminRuntimeFactsSource for RuntimeRepositoryAdminFacts {
+    fn snapshot(&self) -> AdminRuntimeFacts {
+        let status = self.repository.coordinator.status();
+        AdminRuntimeFacts {
+            repository: AdminRepositoryRuntimeFacts {
+                v2_commit_coordinator: Some(AdminV2CommitCoordinatorSummary {
+                    poisoned: status.poisoned,
+                    poison_reason: status.poison_reason,
+                }),
+            },
+        }
     }
 }
 

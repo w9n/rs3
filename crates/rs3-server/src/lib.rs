@@ -10,9 +10,11 @@ mod server;
 pub use admin::{
     AdminAnchorSummary, AdminBackendSummary, AdminFinding, AdminMaintenanceSummary,
     AdminPostureReport, AdminProviderConformanceSummary, AdminProviderSummary, AdminReportProfile,
-    AdminRepositorySummary, AdminRestoreSummary, AdminRuntimeSummary, AdminSecuritySummary,
-    AdminStatusReport, AdminV2MaintenanceSummary, AdminV2RestoreSummary, admin_posture_report,
-    admin_status_report, backend_kind, doctor_findings, runtime_config_profile,
+    AdminRepositoryRuntimeFacts, AdminRepositorySummary, AdminRestoreSummary, AdminRuntimeFacts,
+    AdminRuntimeFactsSource, AdminRuntimeSummary, AdminSecuritySummary, AdminStatusReport,
+    AdminV2CommitCoordinatorSummary, AdminV2MaintenanceSummary, AdminV2RestoreSummary,
+    admin_posture_report, admin_posture_report_with_runtime_facts, admin_status_report,
+    admin_status_report_with_runtime_facts, backend_kind, doctor_findings, runtime_config_profile,
 };
 pub use admin_http::{
     AdminBearerToken, AdminHttpAuth, AdminHttpAuthError, AdminHttpConfig, AdminHttpServer,

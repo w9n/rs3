@@ -10,7 +10,7 @@ use super::mapping::{
     validate_get_object_request, validate_head_object_request, validate_put_object_request,
 };
 use super::runtime::RuntimeRepository;
-use crate::{GatewayMode, RuntimeConfig};
+use crate::{AdminRuntimeFactsSource, GatewayMode, RuntimeConfig};
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, stream};
 use rs3_repository::{RepositoryError, RepositoryPutOptions};
@@ -76,6 +76,10 @@ impl GatewayS3Service {
                 config.hardening.max_in_flight_download_body_bytes,
             ),
         })
+    }
+
+    pub(super) fn admin_runtime_facts_source(&self) -> Arc<dyn AdminRuntimeFactsSource> {
+        self.repository.admin_facts_source()
     }
 
     fn next_request_id(&self) -> u64 {
