@@ -271,7 +271,7 @@ function displayFindings(status) {
       message: "The gateway admin surface says client-visible path browsing is exposed.",
     });
   }
-  return findings;
+  return findings.sort(compareFindingSeverity);
 }
 
 function renderFindings(findings) {
@@ -311,8 +311,12 @@ function renderFindingTable(node, rows) {
   thead.append(header);
   rows.forEach((finding) => {
     const row = document.createElement("tr");
-    [finding.severity, finding.code, finding.message].forEach((value) => {
+    row.className = `severity-${severityClass(finding.severity)}`;
+    [finding.severity, finding.code, finding.message].forEach((value, index) => {
       const td = document.createElement("td");
+      if (index === 0) {
+        td.className = "severity-label";
+      }
       td.textContent = value || "unknown";
       row.append(td);
     });
@@ -375,6 +379,43 @@ async function fetchConsoleReport(path) {
 
 function errorMessage(error, fallback) {
   return error instanceof Error ? error.message : fallback;
+}
+
+function compareFindingSeverity(left, right) {
+  return severityRank(left.severity) - severityRank(right.severity);
+}
+
+function severityRank(severity) {
+  switch (severity) {
+    case "critical":
+    case "error":
+      return 0;
+    case "warn":
+    case "warning":
+    case "medium":
+      return 1;
+    case "info":
+      return 2;
+    default:
+      return 3;
+  }
+}
+
+function severityClass(severity) {
+  switch (severity) {
+    case "critical":
+    case "error":
+      return "critical";
+    case "warn":
+    case "warning":
+      return "warn";
+    case "medium":
+      return "medium";
+    case "info":
+      return "info";
+    default:
+      return "unknown";
+  }
 }
 
 function restorePillClass(value) {

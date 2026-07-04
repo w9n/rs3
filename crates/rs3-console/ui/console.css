@@ -353,6 +353,35 @@ td {
   overflow-wrap: anywhere;
 }
 
+tbody tr.severity-critical td:first-child {
+  border-left: 4px solid var(--bad);
+}
+
+tbody tr.severity-warn td:first-child,
+tbody tr.severity-medium td:first-child {
+  border-left: 4px solid var(--warn);
+}
+
+tbody tr.severity-info td:first-child {
+  border-left: 4px solid var(--good);
+}
+
+tr.severity-critical .severity-label {
+  color: var(--bad);
+  font-weight: 800;
+}
+
+tr.severity-warn .severity-label,
+tr.severity-medium .severity-label {
+  color: var(--warn);
+  font-weight: 800;
+}
+
+tr.severity-info .severity-label {
+  color: var(--good);
+  font-weight: 800;
+}
+
 .empty-state {
   padding: 14px 12px;
   color: var(--muted);
