@@ -250,6 +250,22 @@ input:focus-visible {
   font-size: 1.05rem;
 }
 
+.metric-detail {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.metric-panel.metric-warn {
+  border-left: 4px solid var(--warn);
+}
+
+.metric-panel.metric-bad {
+  border-left: 4px solid var(--bad);
+}
+
 .content-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

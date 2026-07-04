@@ -1,5 +1,9 @@
 const tokenKey = "rs3-console-token";
 
+// Checkpoint age drives the restore-trust summary before hard failures appear.
+const CHECKPOINT_WARN_AGE_MS = 2 * 60 * 60 * 1000;
+const CHECKPOINT_BAD_AGE_MS = 24 * 60 * 60 * 1000;
+
 const state = {
   token: sessionStorage.getItem(tokenKey) || "",
   status: null,
@@ -21,6 +25,7 @@ const nodes = {
     restore: document.getElementById("metric-restore"),
     mode: document.getElementById("metric-mode"),
     checkpoint: document.getElementById("metric-checkpoint"),
+    checkpointDetail: document.getElementById("metric-checkpoint-detail"),
     envelope: document.getElementById("metric-envelope"),
     retention: document.getElementById("metric-retention"),
     findings: document.getElementById("metric-findings"),
@@ -111,6 +116,8 @@ function renderSummary(status, findings) {
   const restore = status?.restore || {};
   const backend = status?.backend || {};
   const anchor = status?.anchor || {};
+  const checkpoint = restore.checkpoint;
+  const age = checkpointAge(checkpoint);
   let kind = "neutral";
   let primary = "Connect to a gateway to inspect restore trust.";
   let secondary = "The console is read-only and shows path-redacted admin facts.";
@@ -122,8 +129,8 @@ function renderSummary(status, findings) {
   } else if (status) {
     const restoreState = restore.state || "unknown";
     if (restoreState === "verified") {
-      kind = findings.length === 0 ? "good" : "warn";
-      primary = `Restore trust is verified at checkpoint ${restore.checkpoint?.sequence ?? "unknown"}.`;
+      kind = summaryKind(age, findings);
+      primary = `Restore trust is verified at checkpoint ${checkpoint?.sequence ?? "unknown"}, published ${age?.label || "unknown"}.`;
       secondary = findings.length === 0
         ? "No profile findings were reported by the gateway."
         : `${findings.length} profile finding${findings.length === 1 ? "" : "s"} need review.`;
@@ -146,12 +153,20 @@ function renderMetrics(status, findings) {
   const runtime = status?.runtime || {};
   const repository = status?.repository || {};
   const checkpoint = restore.checkpoint;
+  const age = checkpointAge(checkpoint);
   const envelope = restore.keyring_envelope;
   nodes.metrics.restore.textContent = restore.state || "unknown";
   nodes.metrics.mode.textContent = runtime.gateway_mode || "unknown";
-  nodes.metrics.checkpoint.textContent = checkpoint
-    ? `seq ${checkpoint.sequence}`
-    : "none";
+  nodes.metrics.checkpoint.textContent = checkpoint ? age?.label || "unknown" : "none";
+  nodes.metrics.checkpointDetail.textContent = checkpoint
+    ? `seq ${checkpoint.sequence}, ${age?.label || "unknown"}`
+    : "";
+  nodes.metrics.checkpoint
+    .closest(".metric-panel")
+    ?.classList.toggle("metric-warn", age?.kind === "warn");
+  nodes.metrics.checkpoint
+    .closest(".metric-panel")
+    ?.classList.toggle("metric-bad", age?.kind === "bad");
   nodes.metrics.envelope.textContent = envelope
     ? `gen ${envelope.generation}`
     : "none";
@@ -344,6 +359,46 @@ function millis(value) {
     return "unknown";
   }
   return `${value} ms`;
+}
+
+function checkpointAge(checkpoint) {
+  const publishedAt = checkpoint?.published_at_ms;
+  if (typeof publishedAt !== "number" || publishedAt <= 0) {
+    return null;
+  }
+  const ageMs = Math.max(0, Date.now() - publishedAt);
+  const kind = ageMs > CHECKPOINT_BAD_AGE_MS
+    ? "bad"
+    : ageMs > CHECKPOINT_WARN_AGE_MS
+      ? "warn"
+      : "good";
+  return { label: relativeAge(ageMs), kind };
+}
+
+function relativeAge(ageMs) {
+  const minute = 60 * 1000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  if (ageMs < minute) {
+    return "just now";
+  }
+  if (ageMs < hour) {
+    return `${Math.floor(ageMs / minute)} min ago`;
+  }
+  if (ageMs < day) {
+    return `${Math.floor(ageMs / hour)} h ago`;
+  }
+  return `${Math.floor(ageMs / day)} d ago`;
+}
+
+function summaryKind(age, findings) {
+  if (age?.kind === "bad") {
+    return "bad";
+  }
+  if (age?.kind === "warn" || findings.length > 0) {
+    return "warn";
+  }
+  return "good";
 }
 
 function formatTimestamp(value) {
