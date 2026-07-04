@@ -809,9 +809,10 @@ mod tests {
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
         ProviderConformanceConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig,
-        RuntimeConfig, SecretString, StaticCredentials,
+        RuntimeConfig, StaticCredentials,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
+    use secrecy::SecretString;
     use std::fs;
     use std::time::Duration;
 

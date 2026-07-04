@@ -27,15 +27,10 @@ pub use identity::{
     AuthError, Authorizer, Identity, IdentityProvider, RequestAction, StaticCredentialProvider,
     StaticCredentials,
 };
-pub use rs3_repository::v2::{
-    V2AnchorState, V2ProviderCheckStatus, V2ProviderConformanceCheck, V2ProviderConformanceReport,
-    V2ProviderProfile, V2RecoveryBundle,
-};
 pub use s3::{
     GatewayS3Boundary, RuntimeV2ProviderConformanceOptions, S3BoundaryError, S3Hardening,
     V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportReport, check_v2_provider_conformance_from_config,
     export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
     write_v2_index_snapshot_from_config,
 };
-pub use secrecy::SecretString;
 pub use server::{GatewayServer, GatewayServerError};

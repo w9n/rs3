@@ -3,11 +3,14 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
+use rs3_repository::v2::{
+    V2AnchorState, V2ProviderCheckStatus, V2ProviderConformanceReport, V2ProviderProfile,
+    V2RecoveryBundle,
+};
 use rs3_server::{
     AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReportProfile,
     AnchorConfig, GatewayMode, GatewayServer, RuntimeConfig, RuntimeV2ProviderConformanceOptions,
-    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportReport, V2AnchorState, V2ProviderCheckStatus,
-    V2ProviderConformanceReport, V2ProviderProfile, V2RecoveryBundle, backend_kind,
+    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportReport, backend_kind,
     check_v2_provider_conformance_from_config, doctor_findings,
     export_v2_recovery_bundle_from_config, import_v2_anchor_from_config, runtime_config_profile,
     write_v2_index_snapshot_from_config,
@@ -887,9 +890,10 @@ mod tests {
     use rs3_server::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
         ProviderConformanceConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig,
-        RuntimeConfig, SecretString, StaticCredentials,
+        RuntimeConfig, StaticCredentials,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
+    use secrecy::SecretString;
     use std::time::Duration;
 
     fn runtime_config() -> RuntimeConfig {

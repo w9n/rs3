@@ -3,9 +3,10 @@
 use rs3_server::{
     AnchorConfig, BackendConfig, BatchConfig, GatewayMode, GatewayServer, GatewayServerError,
     HardeningConfig, MetricsConfig, ProviderConformanceConfig, RepositoryConfig,
-    RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
+    RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
 };
 use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
+use secrecy::SecretString;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

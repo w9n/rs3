@@ -173,9 +173,9 @@ mod tests {
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig,
         ProviderConformanceConfig, RepositoryConfig, RepositoryKeysConfig, RuntimeConfig,
-        SecretString,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
+    use secrecy::SecretString;
     use std::time::Duration;
 
     fn runtime_config(static_credentials: bool) -> RuntimeConfig {

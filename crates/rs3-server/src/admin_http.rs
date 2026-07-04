@@ -350,13 +350,14 @@ mod tests {
     use crate::{
         AdminReportProfile, AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig,
         MetricsConfig, ProviderConformanceConfig, RepositoryConfig, RepositoryFormat,
-        RepositoryKeysConfig, RuntimeConfig, SecretString, StaticCredentials,
+        RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
     };
     use bytes::Bytes;
     use http::header::AUTHORIZATION;
     use http::{Request, StatusCode};
     use http_body_util::{BodyExt, Full};
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
+    use secrecy::SecretString;
     use std::time::Duration;
 
     fn runtime_config() -> RuntimeConfig {

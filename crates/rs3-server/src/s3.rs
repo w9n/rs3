@@ -50,9 +50,9 @@ pub(super) mod test_support {
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, HardeningConfig, MetricsConfig,
         ProviderConformanceConfig, RepositoryConfig, RepositoryKeysConfig, RuntimeConfig,
-        SecretString,
     };
     use rs3_types::{PublicBucket, RepositoryId};
+    use secrecy::SecretString;
     use std::time::Duration;
 
     pub(super) fn runtime_config(static_credentials: bool) -> RuntimeConfig {
