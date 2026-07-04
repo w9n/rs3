@@ -63,6 +63,7 @@ nav:
           - Retention And Object Lock: runbooks/retention-and-object-lock.md
           - Restore Under Attack: runbooks/restore-under-attack.md
   - Reference:
+      - Glossary: reference/glossary.md
       - Configuration: reference/configuration.md
       - Repository Format: reference/repository-format.md
       - Console: reference/console.md
