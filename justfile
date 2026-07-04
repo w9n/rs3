@@ -21,6 +21,7 @@ check:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
     just docs-check
+    just helm-lint
 
 # Run the S3 feature lint and tests.
 check-s3:
