@@ -312,13 +312,15 @@ impl Eq for RepositoryKeysConfig {}
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
     /// A required environment variable is missing or blank.
-    #[error("missing required environment variable: {key}")]
+    #[error(
+        "missing required environment variable: {key}; see docs/site/reference/configuration.md for expected rs3 environment configuration"
+    )]
     Missing {
         /// Environment variable name.
         key: &'static str,
     },
     /// An environment variable has an invalid value.
-    #[error("invalid environment variable {key}: {reason}")]
+    #[error("invalid environment variable {key}={value:?}: {reason}")]
     Invalid {
         /// Environment variable name.
         key: &'static str,
@@ -439,7 +441,7 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
         return Err(ConfigError::Invalid {
             key: "RS3_BACKEND_MULTIPART_PART_BYTES",
             value: backend_multipart_part_bytes.to_string(),
-            reason: "must be at least 5242880 bytes".to_owned(),
+            reason: "must be at least 5 MiB (5242880 bytes)".to_owned(),
         });
     }
     let max_multipart_object_bytes = backend_multipart_part_bytes.saturating_mul(10_000);
@@ -852,7 +854,7 @@ fn parse_socket_addr(key: &'static str, value: String) -> Result<SocketAddr, Con
     value.parse().map_err(|error| ConfigError::Invalid {
         key,
         value: value.clone(),
-        reason: format!("expected socket address: {error}"),
+        reason: format!("expected host:port, e.g. 0.0.0.0:9080: {error}"),
     })
 }
 
@@ -1144,9 +1146,17 @@ mod tests {
 
         let config = RuntimeConfig::from_source(&source);
 
-        assert!(
-            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == "RS3_METRICS_BIND")
-        );
+        let error = match config {
+            Ok(config) => panic!("unexpected config: {config:?}"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConfigError::Invalid { key, .. } if key == "RS3_METRICS_BIND"
+        ));
+        let message = error.to_string();
+        assert!(message.contains(r#"RS3_METRICS_BIND="nope""#));
+        assert!(message.contains("expected host:port, e.g. 0.0.0.0:9080"));
     }
 
     #[test]
@@ -1397,8 +1407,18 @@ mod tests {
 
         let config = RuntimeConfig::from_source(&source);
 
+        let error = match config {
+            Ok(config) => panic!("unexpected config: {config:?}"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConfigError::Missing { key } if key == super::REPOSITORY_ID_ENV
+        ));
         assert!(
-            matches!(config, Err(ConfigError::Missing { key }) if key == super::REPOSITORY_ID_ENV)
+            error
+                .to_string()
+                .contains("docs/site/reference/configuration.md")
         );
     }
 

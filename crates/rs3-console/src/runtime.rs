@@ -108,19 +108,19 @@ pub enum ConsoleRuntimeConfigError {
     #[error("RS3_CONSOLE_BEARER_TOKEN is required")]
     MissingConsoleBearerToken,
     /// Console bearer token is invalid.
-    #[error(transparent)]
+    #[error("invalid RS3_CONSOLE_BEARER_TOKEN: {0}")]
     InvalidConsoleBearerToken(ConsoleHttpAuthError),
     /// Gateway admin URL is missing.
     #[error("RS3_GATEWAY_ADMIN_URL is required")]
     MissingGatewayAdminUrl,
     /// Gateway admin URL is invalid.
-    #[error(transparent)]
+    #[error("invalid RS3_GATEWAY_ADMIN_URL: {0}")]
     InvalidGatewayAdminUrl(GatewayAdminEndpointError),
     /// Gateway admin bearer token is missing.
     #[error("RS3_GATEWAY_ADMIN_BEARER_TOKEN is required")]
     MissingGatewayAdminBearerToken,
     /// Gateway admin bearer token is invalid.
-    #[error(transparent)]
+    #[error("invalid RS3_GATEWAY_ADMIN_BEARER_TOKEN: {0}")]
     InvalidGatewayAdminBearerToken(crate::GatewayAdminClientError),
 }
 
@@ -165,6 +165,44 @@ mod tests {
             error,
             ConsoleRuntimeConfigError::MissingConsoleBearerToken
         ));
+    }
+
+    #[test]
+    fn runtime_config_errors_name_invalid_env_vars() {
+        let error = ConsoleRuntimeConfig::from_env_values(
+            None,
+            Some("short"),
+            Some("http://127.0.0.1:9082"),
+            Some("gateway-admin-token-12345"),
+        )
+        .expect_err("short console token should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid RS3_CONSOLE_BEARER_TOKEN")
+        );
+
+        let error = ConsoleRuntimeConfig::from_env_values(
+            None,
+            Some("console-token-12345"),
+            Some("ftp://127.0.0.1:9082"),
+            Some("gateway-admin-token-12345"),
+        )
+        .expect_err("non-http gateway admin URL should be rejected");
+        assert!(error.to_string().contains("invalid RS3_GATEWAY_ADMIN_URL"));
+
+        let error = ConsoleRuntimeConfig::from_env_values(
+            None,
+            Some("console-token-12345"),
+            Some("http://127.0.0.1:9082"),
+            Some("short"),
+        )
+        .expect_err("short gateway admin token should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid RS3_GATEWAY_ADMIN_BEARER_TOKEN")
+        );
     }
 
     #[test]
