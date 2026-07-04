@@ -311,6 +311,16 @@ impl Eq for RepositoryKeysConfig {}
 /// Runtime configuration errors.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
+    /// Multiple independent configuration errors were found.
+    #[error(
+        "runtime configuration has {count} errors:{messages}",
+        count = errors.len(),
+        messages = format_config_errors(errors)
+    )]
+    Multiple {
+        /// Collected configuration errors.
+        errors: Vec<ConfigError>,
+    },
     /// A required environment variable is missing or blank.
     #[error(
         "missing required environment variable: {key}; see docs/site/reference/configuration.md for expected rs3 environment configuration"
@@ -339,6 +349,22 @@ pub enum ConfigError {
     },
 }
 
+fn config_error_list(errors: Vec<ConfigError>) -> ConfigError {
+    match errors.as_slice() {
+        [error] => error.clone(),
+        _ => ConfigError::Multiple { errors },
+    }
+}
+
+fn format_config_errors(errors: &[ConfigError]) -> String {
+    let mut message = String::new();
+    for error in errors {
+        message.push_str("\n  - ");
+        message.push_str(&error.to_string());
+    }
+    message
+}
+
 impl RuntimeConfig {
     /// Loads runtime configuration from the current process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
@@ -346,50 +372,102 @@ impl RuntimeConfig {
     }
 
     fn from_source(source: &impl ConfigSource) -> Result<Self, ConfigError> {
-        let mode = parse_gateway_mode(source)?;
-        let bind = parse_socket_addr(
-            "RS3_BIND",
-            source
-                .value("RS3_BIND")
-                .unwrap_or_else(|| DEFAULT_BIND.to_owned()),
-        )?;
-        let metrics = parse_metrics_config(source)?;
-        let hardening = parse_hardening_config(source)?;
-        let public_bucket = parse_public_bucket(
-            "RS3_PUBLIC_BUCKET",
-            required_value(source, "RS3_PUBLIC_BUCKET")?,
-        )?;
-        let backend = BackendConfig {
-            endpoint: required_value(source, "RS3_BACKEND_ENDPOINT")?,
-            bucket: required_value(source, "RS3_BACKEND_BUCKET")?,
-            prefix: optional_value(source, "RS3_BACKEND_PREFIX"),
+        let mut errors = Vec::new();
+        let mode = collect_config_error(&mut errors, parse_gateway_mode(source));
+        let bind = collect_config_error(
+            &mut errors,
+            parse_socket_addr(
+                "RS3_BIND",
+                source
+                    .value("RS3_BIND")
+                    .unwrap_or_else(|| DEFAULT_BIND.to_owned()),
+            ),
+        );
+        let metrics = collect_config_error(&mut errors, parse_metrics_config(source));
+        let hardening = collect_config_error(&mut errors, parse_hardening_config(source));
+        let public_bucket_value =
+            collect_config_error(&mut errors, required_value(source, "RS3_PUBLIC_BUCKET"));
+        let public_bucket = public_bucket_value
+            .map(|value| {
+                collect_config_error(&mut errors, parse_public_bucket("RS3_PUBLIC_BUCKET", value))
+            })
+            .unwrap_or(None);
+        let backend_endpoint =
+            collect_config_error(&mut errors, required_value(source, "RS3_BACKEND_ENDPOINT"));
+        let backend_bucket =
+            collect_config_error(&mut errors, required_value(source, "RS3_BACKEND_BUCKET"));
+        let backend = match (backend_endpoint, backend_bucket) {
+            (Some(endpoint), Some(bucket)) => Some(BackendConfig {
+                endpoint,
+                bucket,
+                prefix: optional_value(source, "RS3_BACKEND_PREFIX"),
+            }),
+            _ => None,
         };
-        let anchor = parse_anchor_config(source)?;
-        let writer_guard = parse_writer_guard_config(source, &anchor)?;
-        let batching = parse_batch_config(source)?;
-        let repository = parse_repository_config(source)?;
-        let provider_conformance = parse_provider_conformance_config(source)?;
-        let recovery = parse_recovery_config(source)?;
-        let repository_keys = parse_repository_keys_config(source)?;
-        let static_credentials = parse_static_credentials(source)?;
+        let anchor = collect_config_error(&mut errors, parse_anchor_config(source));
+        let writer_guard = match anchor.as_ref() {
+            Some(anchor) => {
+                collect_config_error(&mut errors, parse_writer_guard_config(source, anchor))
+            }
+            None => collect_config_error(&mut errors, parse_writer_guard_value(source))
+                .map(|value| value.unwrap_or(WriterGuardConfig::Off)),
+        };
+        let batching = collect_config_error(&mut errors, parse_batch_config(source));
+        let repository = collect_config_error(&mut errors, parse_repository_config(source));
+        let provider_conformance =
+            collect_config_error(&mut errors, parse_provider_conformance_config(source));
+        let recovery = collect_config_error(&mut errors, parse_recovery_config(source));
+        let repository_keys =
+            collect_config_error(&mut errors, parse_repository_keys_config(source));
+        let static_credentials =
+            collect_config_error(&mut errors, parse_static_credentials(source));
+
+        if !errors.is_empty() {
+            return Err(config_error_list(errors));
+        }
 
         Ok(Self {
-            mode,
-            bind,
-            metrics,
-            hardening,
-            public_bucket,
-            backend,
-            anchor,
-            writer_guard,
-            batching,
-            repository,
-            provider_conformance,
-            recovery,
-            repository_keys,
-            static_credentials,
+            mode: require_collected_config(mode)?,
+            bind: require_collected_config(bind)?,
+            metrics: require_collected_config(metrics)?,
+            hardening: require_collected_config(hardening)?,
+            public_bucket: require_collected_config(public_bucket)?,
+            backend: require_collected_config(backend)?,
+            anchor: require_collected_config(anchor)?,
+            writer_guard: require_collected_config(writer_guard)?,
+            batching: require_collected_config(batching)?,
+            repository: require_collected_config(repository)?,
+            provider_conformance: require_collected_config(provider_conformance)?,
+            recovery: require_collected_config(recovery)?,
+            repository_keys: require_collected_config(repository_keys)?,
+            static_credentials: require_collected_config(static_credentials)?,
         })
     }
+}
+
+fn collect_config_error<T>(
+    errors: &mut Vec<ConfigError>,
+    result: Result<T, ConfigError>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(ConfigError::Multiple { errors: collected }) => {
+            errors.extend(collected);
+            None
+        }
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    }
+}
+
+fn require_collected_config<T>(value: Option<T>) -> Result<T, ConfigError> {
+    value.ok_or_else(|| ConfigError::Invalid {
+        key: "RS3_CONFIG",
+        value: REDACTED_SECRET_VALUE.to_owned(),
+        reason: "internal parser failed to collect a configuration error".to_owned(),
+    })
 }
 
 fn parse_gateway_mode(source: &impl ConfigSource) -> Result<GatewayMode, ConfigError> {
@@ -415,85 +493,129 @@ fn parse_metrics_config(source: &impl ConfigSource) -> Result<MetricsConfig, Con
 }
 
 fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig, ConfigError> {
-    let max_put_object_bytes = parse_positive_u64(
-        "RS3_MAX_PUT_OBJECT_BYTES",
-        source.value("RS3_MAX_PUT_OBJECT_BYTES"),
-        DEFAULT_MAX_PUT_OBJECT_BYTES,
-    )?;
-    let buffered_put_object_bytes = parse_positive_u64(
-        "RS3_BUFFERED_PUT_OBJECT_BYTES",
-        source.value("RS3_BUFFERED_PUT_OBJECT_BYTES"),
-        DEFAULT_BUFFERED_PUT_OBJECT_BYTES,
-    )?;
-    let backend_multipart_part_bytes = parse_positive_u64(
-        "RS3_BACKEND_MULTIPART_PART_BYTES",
-        source.value("RS3_BACKEND_MULTIPART_PART_BYTES"),
-        DEFAULT_BACKEND_MULTIPART_PART_BYTES,
-    )?;
-    if buffered_put_object_bytes > max_put_object_bytes {
-        return Err(ConfigError::Invalid {
+    let mut errors = Vec::new();
+    let max_put_object_bytes = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            "RS3_MAX_PUT_OBJECT_BYTES",
+            source.value("RS3_MAX_PUT_OBJECT_BYTES"),
+            DEFAULT_MAX_PUT_OBJECT_BYTES,
+        ),
+    );
+    let buffered_put_object_bytes = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            "RS3_BUFFERED_PUT_OBJECT_BYTES",
+            source.value("RS3_BUFFERED_PUT_OBJECT_BYTES"),
+            DEFAULT_BUFFERED_PUT_OBJECT_BYTES,
+        ),
+    );
+    let backend_multipart_part_bytes = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            "RS3_BACKEND_MULTIPART_PART_BYTES",
+            source.value("RS3_BACKEND_MULTIPART_PART_BYTES"),
+            DEFAULT_BACKEND_MULTIPART_PART_BYTES,
+        ),
+    );
+    if let (Some(buffered_put_object_bytes), Some(max_put_object_bytes)) =
+        (buffered_put_object_bytes, max_put_object_bytes)
+        && buffered_put_object_bytes > max_put_object_bytes
+    {
+        errors.push(ConfigError::Invalid {
             key: "RS3_BUFFERED_PUT_OBJECT_BYTES",
             value: buffered_put_object_bytes.to_string(),
             reason: "must be less than or equal to RS3_MAX_PUT_OBJECT_BYTES".to_owned(),
         });
     }
-    if backend_multipart_part_bytes < MIN_BACKEND_MULTIPART_PART_BYTES {
-        return Err(ConfigError::Invalid {
+    if let Some(backend_multipart_part_bytes) = backend_multipart_part_bytes
+        && backend_multipart_part_bytes < MIN_BACKEND_MULTIPART_PART_BYTES
+    {
+        errors.push(ConfigError::Invalid {
             key: "RS3_BACKEND_MULTIPART_PART_BYTES",
             value: backend_multipart_part_bytes.to_string(),
             reason: "must be at least 5 MiB (5242880 bytes)".to_owned(),
         });
     }
-    let max_multipart_object_bytes = backend_multipart_part_bytes.saturating_mul(10_000);
-    if max_put_object_bytes > max_multipart_object_bytes {
-        return Err(ConfigError::Invalid {
-            key: "RS3_MAX_PUT_OBJECT_BYTES",
-            value: max_put_object_bytes.to_string(),
-            reason: "must be less than or equal to 10000 * RS3_BACKEND_MULTIPART_PART_BYTES"
-                .to_owned(),
-        });
+    if let (Some(max_put_object_bytes), Some(backend_multipart_part_bytes)) =
+        (max_put_object_bytes, backend_multipart_part_bytes)
+    {
+        let max_multipart_object_bytes = backend_multipart_part_bytes.saturating_mul(10_000);
+        if max_put_object_bytes > max_multipart_object_bytes {
+            errors.push(ConfigError::Invalid {
+                key: "RS3_MAX_PUT_OBJECT_BYTES",
+                value: max_put_object_bytes.to_string(),
+                reason: "must be less than or equal to 10000 * RS3_BACKEND_MULTIPART_PART_BYTES"
+                    .to_owned(),
+            });
+        }
     }
-    let stream_read_stall_timeout = Duration::from_secs(parse_positive_u64(
-        "RS3_STREAM_READ_STALL_TIMEOUT_SECS",
-        source.value("RS3_STREAM_READ_STALL_TIMEOUT_SECS"),
-        DEFAULT_V2_STREAM_READ_STALL_TIMEOUT.as_secs(),
-    )?);
-    let max_in_flight_upload_body_bytes = parse_positive_u64(
-        "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES",
-        source.value("RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES"),
-        DEFAULT_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES,
-    )?;
-    let max_in_flight_download_body_bytes = parse_positive_u64(
-        "RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES",
-        source.value("RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES"),
-        DEFAULT_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES,
-    )?;
-    let max_concurrent_connections = parse_positive_usize(
-        "RS3_MAX_CONCURRENT_CONNECTIONS",
-        source.value("RS3_MAX_CONCURRENT_CONNECTIONS"),
-        DEFAULT_MAX_CONCURRENT_CONNECTIONS,
-    )?;
-    let max_concurrent_requests = parse_positive_usize(
-        "RS3_MAX_CONCURRENT_REQUESTS",
-        source.value("RS3_MAX_CONCURRENT_REQUESTS"),
-        DEFAULT_MAX_CONCURRENT_REQUESTS,
-    )?;
-    let request_rate_limit_per_second = parse_positive_u64(
-        "RS3_REQUEST_RATE_LIMIT_PER_SECOND",
-        source.value("RS3_REQUEST_RATE_LIMIT_PER_SECOND"),
-        DEFAULT_REQUEST_RATE_LIMIT_PER_SECOND,
-    )?;
+    let stream_read_stall_timeout = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            "RS3_STREAM_READ_STALL_TIMEOUT_SECS",
+            source.value("RS3_STREAM_READ_STALL_TIMEOUT_SECS"),
+            DEFAULT_V2_STREAM_READ_STALL_TIMEOUT.as_secs(),
+        ),
+    )
+    .map(Duration::from_secs);
+    let max_in_flight_upload_body_bytes = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES",
+            source.value("RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES"),
+            DEFAULT_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES,
+        ),
+    );
+    let max_in_flight_download_body_bytes = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            "RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES",
+            source.value("RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES"),
+            DEFAULT_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES,
+        ),
+    );
+    let max_concurrent_connections = collect_config_error(
+        &mut errors,
+        parse_positive_usize(
+            "RS3_MAX_CONCURRENT_CONNECTIONS",
+            source.value("RS3_MAX_CONCURRENT_CONNECTIONS"),
+            DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+        ),
+    );
+    let max_concurrent_requests = collect_config_error(
+        &mut errors,
+        parse_positive_usize(
+            "RS3_MAX_CONCURRENT_REQUESTS",
+            source.value("RS3_MAX_CONCURRENT_REQUESTS"),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
+        ),
+    );
+    let request_rate_limit_per_second = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            "RS3_REQUEST_RATE_LIMIT_PER_SECOND",
+            source.value("RS3_REQUEST_RATE_LIMIT_PER_SECOND"),
+            DEFAULT_REQUEST_RATE_LIMIT_PER_SECOND,
+        ),
+    );
+
+    if !errors.is_empty() {
+        return Err(config_error_list(errors));
+    }
 
     Ok(HardeningConfig {
-        max_put_object_bytes,
-        buffered_put_object_bytes,
-        backend_multipart_part_bytes,
-        stream_read_stall_timeout,
-        max_in_flight_upload_body_bytes,
-        max_in_flight_download_body_bytes,
-        max_concurrent_connections,
-        max_concurrent_requests,
-        request_rate_limit_per_second,
+        max_put_object_bytes: require_collected_config(max_put_object_bytes)?,
+        buffered_put_object_bytes: require_collected_config(buffered_put_object_bytes)?,
+        backend_multipart_part_bytes: require_collected_config(backend_multipart_part_bytes)?,
+        stream_read_stall_timeout: require_collected_config(stream_read_stall_timeout)?,
+        max_in_flight_upload_body_bytes: require_collected_config(max_in_flight_upload_body_bytes)?,
+        max_in_flight_download_body_bytes: require_collected_config(
+            max_in_flight_download_body_bytes,
+        )?,
+        max_concurrent_connections: require_collected_config(max_concurrent_connections)?,
+        max_concurrent_requests: require_collected_config(max_concurrent_requests)?,
+        request_rate_limit_per_second: require_collected_config(request_rate_limit_per_second)?,
     })
 }
 
@@ -516,12 +638,21 @@ fn parse_anchor_config(source: &impl ConfigSource) -> Result<AnchorConfig, Confi
                 })
             }
         }
-        "kubernetes-lease" => Ok(AnchorConfig::KubernetesLease {
-            namespace: required_value(source, "RS3_ANCHOR_NAMESPACE")?,
-            name: required_value(source, "RS3_ANCHOR_NAME")?,
-            field_manager: optional_value(source, "RS3_ANCHOR_FIELD_MANAGER")
-                .unwrap_or_else(|| DEFAULT_ANCHOR_FIELD_MANAGER.to_owned()),
-        }),
+        "kubernetes-lease" => {
+            let mut errors = Vec::new();
+            let namespace =
+                collect_config_error(&mut errors, required_value(source, "RS3_ANCHOR_NAMESPACE"));
+            let name = collect_config_error(&mut errors, required_value(source, "RS3_ANCHOR_NAME"));
+            if !errors.is_empty() {
+                return Err(config_error_list(errors));
+            }
+            Ok(AnchorConfig::KubernetesLease {
+                namespace: require_collected_config(namespace)?,
+                name: require_collected_config(name)?,
+                field_manager: optional_value(source, "RS3_ANCHOR_FIELD_MANAGER")
+                    .unwrap_or_else(|| DEFAULT_ANCHOR_FIELD_MANAGER.to_owned()),
+            })
+        }
         _ => Err(ConfigError::Invalid {
             key: "RS3_ANCHOR_MODE",
             value: mode,
@@ -534,29 +665,21 @@ fn parse_writer_guard_config(
     source: &impl ConfigSource,
     anchor: &AnchorConfig,
 ) -> Result<WriterGuardConfig, ConfigError> {
-    let value = optional_value(source, WRITER_GUARD_ENV);
-    let writer_guard = match value.as_deref() {
-        Some("required") => WriterGuardConfig::Required,
-        Some("off") => WriterGuardConfig::Off,
-        Some(_) => {
-            return Err(ConfigError::Invalid {
-                key: WRITER_GUARD_ENV,
-                value: value.unwrap_or_default(),
-                reason: "expected required or off".to_owned(),
-            });
-        }
-        None if matches!(anchor, AnchorConfig::KubernetesLease { .. }) => {
+    let value = parse_writer_guard_value(source)?;
+    let writer_guard = value.unwrap_or({
+        if matches!(anchor, AnchorConfig::KubernetesLease { .. }) {
             WriterGuardConfig::Required
+        } else {
+            WriterGuardConfig::Off
         }
-        None => WriterGuardConfig::Off,
-    };
+    });
 
     if writer_guard == WriterGuardConfig::Required
         && !matches!(anchor, AnchorConfig::KubernetesLease { .. })
     {
         return Err(ConfigError::Invalid {
             key: WRITER_GUARD_ENV,
-            value: value.unwrap_or_else(|| writer_guard.as_str().to_owned()),
+            value: writer_guard.as_str().to_owned(),
             reason: "required needs RS3_ANCHOR_MODE=kubernetes-lease".to_owned(),
         });
     }
@@ -564,58 +687,105 @@ fn parse_writer_guard_config(
     Ok(writer_guard)
 }
 
+fn parse_writer_guard_value(
+    source: &impl ConfigSource,
+) -> Result<Option<WriterGuardConfig>, ConfigError> {
+    let value = optional_value(source, WRITER_GUARD_ENV);
+    match value.as_deref() {
+        Some("required") => Ok(Some(WriterGuardConfig::Required)),
+        Some("off") => Ok(Some(WriterGuardConfig::Off)),
+        Some(_) => Err(ConfigError::Invalid {
+            key: WRITER_GUARD_ENV,
+            value: value.unwrap_or_default(),
+            reason: "expected required or off".to_owned(),
+        }),
+        None => Ok(None),
+    }
+}
+
 fn parse_batch_config(source: &impl ConfigSource) -> Result<BatchConfig, ConfigError> {
-    let max_items = parse_positive_usize(
-        "RS3_COMMIT_MAX_BATCH_ITEMS",
-        source.value("RS3_COMMIT_MAX_BATCH_ITEMS"),
-        DEFAULT_BATCH_ITEMS,
-    )?;
-    let max_pending_items = parse_positive_usize(
-        "RS3_COMMIT_MAX_PENDING_ITEMS",
-        source.value("RS3_COMMIT_MAX_PENDING_ITEMS"),
-        max_items,
-    )?;
-    let max_delay_ms = parse_u64(
-        "RS3_COMMIT_MAX_BATCH_DELAY_MS",
-        source.value("RS3_COMMIT_MAX_BATCH_DELAY_MS"),
-        DEFAULT_BATCH_DELAY_MS,
-    )?;
+    let mut errors = Vec::new();
+    let max_items = collect_config_error(
+        &mut errors,
+        parse_positive_usize(
+            "RS3_COMMIT_MAX_BATCH_ITEMS",
+            source.value("RS3_COMMIT_MAX_BATCH_ITEMS"),
+            DEFAULT_BATCH_ITEMS,
+        ),
+    );
+    let max_pending_items_default = max_items.unwrap_or(DEFAULT_BATCH_ITEMS);
+    let max_pending_items = collect_config_error(
+        &mut errors,
+        parse_positive_usize(
+            "RS3_COMMIT_MAX_PENDING_ITEMS",
+            source.value("RS3_COMMIT_MAX_PENDING_ITEMS"),
+            max_pending_items_default,
+        ),
+    );
+    let max_delay_ms = collect_config_error(
+        &mut errors,
+        parse_u64(
+            "RS3_COMMIT_MAX_BATCH_DELAY_MS",
+            source.value("RS3_COMMIT_MAX_BATCH_DELAY_MS"),
+            DEFAULT_BATCH_DELAY_MS,
+        ),
+    );
+
+    if !errors.is_empty() {
+        return Err(config_error_list(errors));
+    }
 
     Ok(BatchConfig {
-        max_items,
-        max_delay: Duration::from_millis(max_delay_ms),
-        max_pending_items,
+        max_items: require_collected_config(max_items)?,
+        max_delay: Duration::from_millis(require_collected_config(max_delay_ms)?),
+        max_pending_items: require_collected_config(max_pending_items)?,
     })
 }
 
 fn parse_repository_config(source: &impl ConfigSource) -> Result<RepositoryConfig, ConfigError> {
-    let format = parse_repository_format(source)?;
+    let mut errors = Vec::new();
+    let format = collect_config_error(&mut errors, parse_repository_format(source));
     let payload_segment_size_value = source.value("RS3_PAYLOAD_SEGMENT_SIZE_BYTES");
     let adaptive_payload_segment_size = payload_segment_size_value.is_none();
-    let payload_segment_size = parse_positive_usize(
-        "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
-        payload_segment_size_value,
-        DEFAULT_PAYLOAD_SEGMENT_SIZE,
-    )?;
-    let decrypted_segment_cache_max_bytes = parse_u64(
-        "RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES",
-        source.value("RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES"),
-        rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
-    )?;
-    let retention = parse_retention_policy(source)?;
-    let allow_init = parse_bool(
-        ALLOW_REPOSITORY_INIT_ENV,
-        source.value(ALLOW_REPOSITORY_INIT_ENV),
-        false,
-    )?;
+    let payload_segment_size = collect_config_error(
+        &mut errors,
+        parse_positive_usize(
+            "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
+            payload_segment_size_value,
+            DEFAULT_PAYLOAD_SEGMENT_SIZE,
+        ),
+    );
+    let decrypted_segment_cache_max_bytes = collect_config_error(
+        &mut errors,
+        parse_u64(
+            "RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES",
+            source.value("RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES"),
+            rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
+        ),
+    );
+    let retention = collect_config_error(&mut errors, parse_retention_policy(source));
+    let allow_init = collect_config_error(
+        &mut errors,
+        parse_bool(
+            ALLOW_REPOSITORY_INIT_ENV,
+            source.value(ALLOW_REPOSITORY_INIT_ENV),
+            false,
+        ),
+    );
+
+    if !errors.is_empty() {
+        return Err(config_error_list(errors));
+    }
 
     Ok(RepositoryConfig {
-        format,
-        payload_segment_size,
+        format: require_collected_config(format)?,
+        payload_segment_size: require_collected_config(payload_segment_size)?,
         adaptive_payload_segment_size,
-        decrypted_segment_cache_max_bytes,
-        retention,
-        allow_init,
+        decrypted_segment_cache_max_bytes: require_collected_config(
+            decrypted_segment_cache_max_bytes,
+        )?,
+        retention: require_collected_config(retention)?,
+        allow_init: require_collected_config(allow_init)?,
     })
 }
 
@@ -700,15 +870,40 @@ fn parse_retention_policy(
 fn parse_repository_keys_config(
     source: &impl ConfigSource,
 ) -> Result<RepositoryKeysConfig, ConfigError> {
+    let mut errors = Vec::new();
+    let repository_id_value =
+        collect_config_error(&mut errors, required_value(source, REPOSITORY_ID_ENV));
+    let repository_id = repository_id_value
+        .map(|value| collect_config_error(&mut errors, parse_repository_id(value)))
+        .unwrap_or(None);
+    let repository_salt_hex = collect_config_error(
+        &mut errors,
+        required_repository_salt_hex(source, REPOSITORY_SALT_HEX_ENV),
+    );
+    let envelope_object_id = match optional_value(source, KEYRING_ENVELOPE_OBJECT_ID_ENV) {
+        Some(value) => collect_config_error(
+            &mut errors,
+            parse_backend_object_id(KEYRING_ENVELOPE_OBJECT_ID_ENV, value),
+        )
+        .map(Some),
+        None => Some(None),
+    };
+    let wrapping_key_hex = collect_config_error(
+        &mut errors,
+        required_secret_hex(source, KEYRING_WRAPPING_KEY_HEX_ENV),
+    );
+
+    if !errors.is_empty() {
+        return Err(config_error_list(errors));
+    }
+
     Ok(RepositoryKeysConfig {
-        repository_id: parse_repository_id(required_value(source, REPOSITORY_ID_ENV)?)?,
-        repository_salt_hex: required_repository_salt_hex(source, REPOSITORY_SALT_HEX_ENV)?,
-        envelope_object_id: optional_value(source, KEYRING_ENVELOPE_OBJECT_ID_ENV)
-            .map(|value| parse_backend_object_id(KEYRING_ENVELOPE_OBJECT_ID_ENV, value))
-            .transpose()?,
+        repository_id: require_collected_config(repository_id)?,
+        repository_salt_hex: require_collected_config(repository_salt_hex)?,
+        envelope_object_id: require_collected_config(envelope_object_id)?,
         wrapping_key_id: optional_value(source, KEYRING_WRAPPING_KEY_ID_ENV)
             .unwrap_or_else(|| DEFAULT_KEYRING_WRAPPING_KEY_ID.to_owned()),
-        wrapping_key_hex: required_secret_hex(source, KEYRING_WRAPPING_KEY_HEX_ENV)?,
+        wrapping_key_hex: require_collected_config(wrapping_key_hex)?,
     })
 }
 
@@ -1033,6 +1228,17 @@ mod tests {
             envelope_object_id: None,
             wrapping_key_id: super::DEFAULT_KEYRING_WRAPPING_KEY_ID.to_owned(),
             wrapping_key_hex: SecretString::from(WRAPPING_KEY_HEX),
+        }
+    }
+
+    fn config_error_keys(error: &ConfigError) -> Vec<&'static str> {
+        match error {
+            ConfigError::Multiple { errors } => errors.iter().flat_map(config_error_keys).collect(),
+            ConfigError::Missing { key } | ConfigError::Invalid { key, .. } => vec![*key],
+            ConfigError::PartialStaticCredentials {
+                access_key_id,
+                secret_access_key,
+            } => vec![*access_key_id, *secret_access_key],
         }
     }
 
@@ -1633,5 +1839,49 @@ mod tests {
         assert!(!debug.contains(REPOSITORY_SALT_HEX));
         assert!(!debug.contains(WRAPPING_KEY_HEX));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn reports_multiple_config_errors_at_once() {
+        let source = minimal_source()
+            .without("RS3_BACKEND_BUCKET")
+            .without(super::REPOSITORY_ID_ENV)
+            .with("RS3_GATEWAY_MODE", "readonly")
+            .with("RS3_METRICS_BIND", "nope")
+            .with("RS3_MAX_CONCURRENT_REQUESTS", "0")
+            .with("RS3_COMMIT_MAX_BATCH_ITEMS", "0")
+            .with(super::REPOSITORY_FORMAT_ENV, "stable")
+            .with(super::KEYRING_WRAPPING_KEY_HEX_ENV, "not-hex")
+            .with("RS3_STATIC_ACCESS_KEY_ID", "rs3-fixture-access-key");
+
+        let error = RuntimeConfig::from_source(&source)
+            .expect_err("invalid source should report collected config errors");
+
+        let ConfigError::Multiple { errors } = &error else {
+            panic!("expected multiple errors, got {error:?}");
+        };
+        assert!(errors.len() >= 8);
+        let keys = config_error_keys(&error);
+        for key in [
+            "RS3_BACKEND_BUCKET",
+            super::REPOSITORY_ID_ENV,
+            "RS3_GATEWAY_MODE",
+            "RS3_METRICS_BIND",
+            "RS3_MAX_CONCURRENT_REQUESTS",
+            "RS3_COMMIT_MAX_BATCH_ITEMS",
+            super::REPOSITORY_FORMAT_ENV,
+            super::KEYRING_WRAPPING_KEY_HEX_ENV,
+            "RS3_STATIC_ACCESS_KEY_ID",
+            "RS3_STATIC_SECRET_ACCESS_KEY",
+        ] {
+            assert!(keys.contains(&key), "missing collected error for {key}");
+        }
+        let message = error.to_string();
+        assert!(message.contains("runtime configuration has"));
+        assert!(message.contains("RS3_METRICS_BIND=\"nope\""));
+        assert!(message.contains("RS3_GATEWAY_MODE=\"readonly\""));
+        assert!(message.contains(super::KEYRING_WRAPPING_KEY_HEX_ENV));
+        assert!(message.contains(super::REDACTED_SECRET_VALUE));
+        assert!(!message.contains("not-hex"));
     }
 }
