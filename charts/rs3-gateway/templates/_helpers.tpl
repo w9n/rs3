@@ -31,6 +31,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{- define "rs3-gateway.adminTokenSecretName" -}}
+{{- if .Values.admin.existingTokenSecret -}}
+{{- .Values.admin.existingTokenSecret -}}
+{{- else -}}
+{{- printf "%s-admin" (include "rs3-gateway.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "rs3-gateway.validateValues" -}}
 {{- if not .Values.repository.id -}}
 {{- fail "repository.id is required; use a stable value for keyring envelope binding" -}}
@@ -102,6 +110,17 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- if and (not .Values.repository.retention.mode) (gt (int .Values.repository.retention.days) 0) -}}
 {{- fail "repository.retention.mode is required when repository.retention.days is set" -}}
+{{- end -}}
+{{- if .Values.admin.enabled -}}
+{{- if not (gt (int .Values.admin.port) 0) -}}
+{{- fail "admin.port must be greater than zero when admin.enabled=true" -}}
+{{- end -}}
+{{- if and (not .Values.admin.createToken) (not .Values.admin.existingTokenSecret) -}}
+{{- fail "admin.createToken=true or admin.existingTokenSecret is required when admin.enabled=true" -}}
+{{- end -}}
+{{- if and .Values.admin.createToken (not .Values.admin.bearerToken) -}}
+{{- fail "admin.bearerToken is required when admin.createToken=true" -}}
+{{- end -}}
 {{- end -}}
 {{- if and (not .Values.repositoryKeys.create) (not .Values.repositoryKeys.existingSecret) -}}
 {{- fail "repositoryKeys.create=true or repositoryKeys.existingSecret is required" -}}

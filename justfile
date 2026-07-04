@@ -200,6 +200,8 @@ helm-lint:
         --set credentials.create=true \
         --set-string credentials.accessKeyId=fixture-access-key \
         --set-string credentials.secretAccessKey=fixture-secret-key \
+        --set admin.createToken=true \
+        --set-string admin.bearerToken=fixture-admin-token-12345 \
         --set repositoryKeys.create=true \
         --set-string repositoryKeys.saltHex=1111111111111111111111111111111111111111111111111111111111111111 \
         --set-string repositoryKeys.wrappingKeyHex=2222222222222222222222222222222222222222222222222222222222222222

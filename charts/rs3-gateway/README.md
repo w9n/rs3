@@ -10,6 +10,7 @@ deliberately.
 - A Kubernetes cluster with a namespace for the gateway.
 - An object-store backend or a local `file://` backend for development.
 - Static S3 credentials for backup clients.
+- A bearer token Secret for the admin listener health and operator-fact routes.
 - Repository ID, salt, and keyring wrapping key material.
 - Lease RBAC, either created by this chart or managed externally.
 
@@ -24,6 +25,8 @@ helm upgrade --install rs3 charts/rs3-gateway \
   --set credentials.create=true \
   --set-string credentials.accessKeyId=local \
   --set-string credentials.secretAccessKey=local-secret \
+  --set admin.createToken=true \
+  --set-string admin.bearerToken=local-admin-token-12345 \
   --set repositoryKeys.create=true \
   --set-string repositoryKeys.saltHex=1111111111111111111111111111111111111111111111111111111111111111 \
   --set-string repositoryKeys.wrappingKeyHex=2222222222222222222222222222222222222222222222222222222222222222 \
@@ -51,6 +54,10 @@ backendCredentials:
 credentials:
   existingSecret: rs3-client-credentials
 
+admin:
+  enabled: true
+  existingTokenSecret: rs3-admin-token
+
 repository:
   format: v2-preview
   id: tenant-a-repository
@@ -76,6 +83,7 @@ Expected Secret keys are:
 | --- | --- |
 | `backendCredentials.existingSecret` | `access-key-id`, `secret-access-key` |
 | `credentials.existingSecret` | `access-key-id`, `secret-access-key` |
+| `admin.existingTokenSecret` | `bearer-token` |
 | `repositoryKeys.existingSecret` | `salt-hex`, `envelope-object-id`, `wrapping-key-id`, `wrapping-key-hex` |
 
 `envelope-object-id` may be omitted to use the default envelope object.
@@ -86,6 +94,9 @@ Expected Secret keys are:
   briefly run two writers against the same repository.
 - Keep `gateway.writerGuard=required` with `anchor.mode=kubernetes-lease` for
   read-write deployments.
+- The chart enables the admin listener by default and uses unauthenticated
+  `/healthz` on the admin port for readiness and liveness probes. Admin fact
+  routes still require the configured bearer token.
 - Use `gateway.mode=restore-readonly` for restore readers that must not mutate
   repository state.
 - Do not use `anchor.allowMemory=true` outside local development.

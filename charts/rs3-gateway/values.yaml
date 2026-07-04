@@ -14,6 +14,16 @@ service:
   type: ClusterIP
   port: 9080
 
+# Gateway admin listener used for health probes and path-redacted operator
+# facts. Token material must come from an existing Secret or explicit fixture
+# values, never from chart defaults.
+admin:
+  enabled: true
+  port: 9081
+  createToken: false
+  existingTokenSecret: ""
+  bearerToken: ""
+
 # read-write accepts repository mutations; restore-readonly rejects them.
 # writerGuard=required enforces Kubernetes Lease coordination for read-write.
 gateway:

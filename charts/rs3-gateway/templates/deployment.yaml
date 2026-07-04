@@ -31,9 +31,22 @@ spec:
           ports:
             - name: s3
               containerPort: {{ .Values.service.port }}
+            {{- if .Values.admin.enabled }}
+            - name: admin
+              containerPort: {{ .Values.admin.port }}
+            {{- end }}
           env:
             - name: RS3_BIND
               value: "0.0.0.0:{{ .Values.service.port }}"
+            {{- if .Values.admin.enabled }}
+            - name: RS3_ADMIN_BIND
+              value: "0.0.0.0:{{ .Values.admin.port }}"
+            - name: RS3_ADMIN_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rs3-gateway.adminTokenSecretName" . }}
+                  key: bearer-token
+            {{- end }}
             - name: RS3_GATEWAY_MODE
               value: {{ .Values.gateway.mode | quote }}
             - name: RS3_MAX_PUT_OBJECT_BYTES
@@ -150,11 +163,20 @@ spec:
               value: {{ .Values.logging.format | quote }}
             - name: RUST_LOG
               value: {{ .Values.logging.rustLog | quote }}
+          {{- if .Values.admin.enabled }}
           readinessProbe:
-            tcpSocket:
-              port: s3
+            httpGet:
+              path: /healthz
+              port: admin
             periodSeconds: 1
             failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 10
+            failureThreshold: 3
+          {{- end }}
           volumeMounts:
             - name: repository-data
               mountPath: {{ .Values.persistence.mountPath | quote }}
