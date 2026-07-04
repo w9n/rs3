@@ -35,9 +35,17 @@ spec:
             - name: admin
               containerPort: {{ .Values.admin.port }}
             {{- end }}
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+            {{- end }}
           env:
             - name: RS3_BIND
               value: "0.0.0.0:{{ .Values.service.port }}"
+            {{- if .Values.metrics.enabled }}
+            - name: RS3_METRICS_BIND
+              value: "0.0.0.0:{{ .Values.metrics.port }}"
+            {{- end }}
             {{- if .Values.admin.enabled }}
             - name: RS3_ADMIN_BIND
               value: "0.0.0.0:{{ .Values.admin.port }}"

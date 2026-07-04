@@ -24,6 +24,14 @@ admin:
   existingTokenSecret: ""
   bearerToken: ""
 
+# Optional Prometheus metrics listener. Enable ServiceMonitor only in clusters
+# with the Prometheus Operator CRDs installed.
+metrics:
+  enabled: false
+  port: 9082
+  serviceMonitor:
+    enabled: false
+
 # read-write accepts repository mutations; restore-readonly rejects them.
 # writerGuard=required enforces Kubernetes Lease coordination for read-write.
 gateway:

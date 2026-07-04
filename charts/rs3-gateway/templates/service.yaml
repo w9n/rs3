@@ -12,3 +12,8 @@ spec:
     - name: s3
       port: {{ .Values.service.port }}
       targetPort: s3
+    {{- if .Values.metrics.enabled }}
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+    {{- end }}

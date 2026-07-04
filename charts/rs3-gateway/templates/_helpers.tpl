@@ -122,6 +122,11 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- fail "admin.bearerToken is required when admin.createToken=true" -}}
 {{- end -}}
 {{- end -}}
+{{- if .Values.metrics.enabled -}}
+{{- if not (gt (int .Values.metrics.port) 0) -}}
+{{- fail "metrics.port must be greater than zero when metrics.enabled=true" -}}
+{{- end -}}
+{{- end -}}
 {{- if and (not .Values.repositoryKeys.create) (not .Values.repositoryKeys.existingSecret) -}}
 {{- fail "repositoryKeys.create=true or repositoryKeys.existingSecret is required" -}}
 {{- end -}}

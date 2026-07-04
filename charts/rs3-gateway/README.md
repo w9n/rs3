@@ -58,6 +58,11 @@ admin:
   enabled: true
   existingTokenSecret: rs3-admin-token
 
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+
 repository:
   format: v2-preview
   id: tenant-a-repository
@@ -97,6 +102,9 @@ Expected Secret keys are:
 - The chart enables the admin listener by default and uses unauthenticated
   `/healthz` on the admin port for readiness and liveness probes. Admin fact
   routes still require the configured bearer token.
+- `metrics.enabled=true` exposes the gateway metrics listener through the main
+  Service. `metrics.serviceMonitor.enabled=true` also renders a Prometheus
+  Operator `ServiceMonitor`.
 - Use `gateway.mode=restore-readonly` for restore readers that must not mutate
   repository state.
 - Do not use `anchor.allowMemory=true` outside local development.
