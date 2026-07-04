@@ -477,18 +477,10 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
         | RepositoryError::Storage(StorageError::AlreadyExists(_))
         | RepositoryError::Storage(StorageError::NotFound(_))
         | RepositoryError::Storage(StorageError::Provider(_))
-        | RepositoryError::Anchor(_)
         | RepositoryError::CheckpointEncoding(_)
-        | RepositoryError::CheckpointIdMismatch
-        | RepositoryError::StaleCheckpoint { .. }
-        | RepositoryError::CheckpointConflict { .. }
-        | RepositoryError::CheckpointObjectConflict { .. }
-        | RepositoryError::CheckpointEvidenceObjectConflict { .. }
         | RepositoryError::KeyringEnvelopeObjectConflict { .. }
         | RepositoryError::IndexDeltaObjectConflict { .. }
-        | RepositoryError::InvalidObjectFormat { .. }
-        | RepositoryError::CheckpointParentMismatch
-        | RepositoryError::CheckpointPublishedAtDecreased { .. } => {
+        | RepositoryError::InvalidObjectFormat { .. } => {
             s3s::s3_error!(InternalError, "repository operation failed")
         }
     }

@@ -14,17 +14,6 @@ pub(crate) enum IndexedListPrefixMode {
     RootFallback,
 }
 
-impl IndexedListPrefixMode {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Root => "root",
-            Self::Delimiter => "delimiter",
-            Self::ParentDelimiterFallback => "parent_delimiter_fallback",
-            Self::RootFallback => "root_fallback",
-        }
-    }
-}
-
 /// Returns the first matching namespace entry for ordered blind-key candidates.
 pub(crate) fn first_namespace_entry<'a>(
     namespace: &'a NamespaceIndex,
@@ -90,5 +79,55 @@ pub(crate) fn indexed_list_prefix_mode(prefix: &str) -> IndexedListPrefixMode {
         IndexedListPrefixMode::ParentDelimiterFallback
     } else {
         IndexedListPrefixMode::RootFallback
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        IndexedListPrefixMode, indexed_list_prefix, indexed_list_prefix_mode, prefix_tokens_for_key,
+    };
+    use rs3_crypto::{KeyRing, SecretBytes};
+
+    fn secret() -> SecretBytes {
+        SecretBytes::new(vec![9; SecretBytes::MIN_LEN]).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[test]
+    fn prefix_tokens_include_root_and_delimiter_prefixes() {
+        let keyring = KeyRing::single_namespace(secret());
+        let key_id = keyring
+            .primary_namespace_key_id()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let tokens = prefix_tokens_for_key(&keyring, &key_id, "p/12/abcdef")
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(tokens.len(), 3);
+    }
+
+    #[test]
+    fn indexed_list_prefix_classifies_fallback_without_prefix_value() {
+        assert_eq!(indexed_list_prefix(""), "");
+        assert_eq!(indexed_list_prefix_mode(""), IndexedListPrefixMode::Root);
+        assert_eq!(indexed_list_prefix("p/12/"), "p/12/");
+        assert_eq!(
+            indexed_list_prefix_mode("p/12/"),
+            IndexedListPrefixMode::Delimiter
+        );
+        assert_eq!(indexed_list_prefix("p/12"), "p/");
+        assert_eq!(
+            indexed_list_prefix_mode("p/12"),
+            IndexedListPrefixMode::ParentDelimiterFallback
+        );
+        assert_eq!(indexed_list_prefix("p/12/abc"), "p/12/");
+        assert_eq!(
+            indexed_list_prefix_mode("p/12/abc"),
+            IndexedListPrefixMode::ParentDelimiterFallback
+        );
+        assert_eq!(indexed_list_prefix("p12"), "");
+        assert_eq!(
+            indexed_list_prefix_mode("p12"),
+            IndexedListPrefixMode::RootFallback
+        );
     }
 }

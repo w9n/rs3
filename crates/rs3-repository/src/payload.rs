@@ -174,6 +174,7 @@ pub(crate) struct OpenedSegmentedPayloadSpan {
 }
 
 /// Encrypts plaintext into a durable payload object body.
+#[cfg(test)]
 pub(crate) fn seal_payload_object(
     keyring: &KeyRing,
     object_id: &BackendObjectId,
@@ -456,6 +457,7 @@ pub(crate) fn open_segmented_payload_cached_segments(
     Ok(Bytes::from(output))
 }
 
+#[cfg(test)]
 fn seal_segmented_payload_object(
     keyring: &KeyRing,
     object_id: &BackendObjectId,
@@ -545,6 +547,7 @@ fn seal_streamable_segmented_payload_object(
     Ok(Bytes::from(body))
 }
 
+#[cfg(test)]
 fn segmented_payload_header_bytes(
     chunk_size: u64,
     plaintext_len: u64,
@@ -997,7 +1000,7 @@ mod tests {
         parse_segmented_payload_header, probe_payload_header, seal_payload_object,
         seal_streamable_payload_object, segmented_ciphertext_span,
     };
-    use crate::tests::{backend_object_id, signing_keyring, wrong_content_keyring};
+    use crate::test_support::{backend_object_id, signing_keyring, wrong_content_keyring};
     use bytes::Bytes;
     use rs3_storage::ByteRange;
 

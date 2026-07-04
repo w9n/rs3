@@ -5,16 +5,11 @@ use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::PostParams;
 use kube::{Api, Client};
-pub use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor};
 use rs3_repository::v2::{V2AnchorState, V2CommitAnchor, V2FormatError, V2FormatRef, V2Result};
-use rs3_types::{BackendObjectId, BackendVersionId, CheckpointId, KeyId, Sequence};
+use rs3_types::{BackendObjectId, BackendVersionId, KeyId, Sequence};
 use std::collections::BTreeMap;
 use tokio::sync::OnceCell;
 
-const CHECKPOINT_SEQUENCE_ANNOTATION: &str = "rs3.rs/checkpoint-sequence";
-const CHECKPOINT_ID_ANNOTATION: &str = "rs3.rs/checkpoint-id";
-const CHECKPOINT_DIGEST_ANNOTATION: &str = "rs3.rs/checkpoint-digest";
-const CHECKPOINT_VERSION_ID_ANNOTATION: &str = "rs3.rs/checkpoint-version-id";
 const V2_SEQUENCE_ANNOTATION: &str = "rs3.rs/v2-sequence";
 const V2_COMMIT_KEY_ANNOTATION: &str = "rs3.rs/v2-commit-key";
 const V2_BODY_DIGEST_ANNOTATION: &str = "rs3.rs/v2-body-digest";
@@ -56,76 +51,23 @@ impl KubernetesLeaseAnchor {
         }
     }
 
-    async fn api(&self) -> rs3_anchor::Result<Api<Lease>> {
+    async fn api(&self) -> V2Result<Api<Lease>> {
         let client = self
             .client
-            .get_or_try_init(|| async { Client::try_default().await.map_err(anchor_backend) })
+            .get_or_try_init(|| async {
+                Client::try_default()
+                    .await
+                    .map_err(|_| V2FormatError::AnchorReadFailed)
+            })
             .await?;
         Ok(Api::namespaced(client.clone(), &self.settings.namespace))
     }
 }
 
 #[async_trait]
-impl CheckpointAnchor for KubernetesLeaseAnchor {
-    async fn read(&self) -> rs3_anchor::Result<AnchorState> {
-        let api = self.api().await?;
-        let lease = match api.get(&self.settings.name).await {
-            Ok(lease) => lease,
-            Err(error) if is_kube_status(&error, 404) => return Err(AnchorError::MissingAnchor),
-            Err(error) => return Err(anchor_backend(error)),
-        };
-        anchor_state_from_lease(&lease)
-    }
-
-    async fn compare_and_advance(&self, next: AnchorState) -> rs3_anchor::Result<AnchorState> {
-        let api = self.api().await?;
-
-        for _attempt in 0..MAX_ADVANCE_ATTEMPTS {
-            match api.get(&self.settings.name).await {
-                Ok(lease) => {
-                    let current = anchor_state_from_lease(&lease)?;
-                    if next == current {
-                        return Ok(current);
-                    }
-                    if next.sequence <= current.sequence {
-                        return Err(AnchorError::StaleSequence);
-                    }
-
-                    let updated = lease_with_state(lease, &next, &self.settings.field_manager);
-                    match api
-                        .replace(&self.settings.name, &PostParams::default(), &updated)
-                        .await
-                    {
-                        Ok(lease) => return anchor_state_from_lease(&lease),
-                        Err(error) if is_kube_status(&error, 409) => continue,
-                        Err(error) => return Err(anchor_backend(error)),
-                    }
-                }
-                Err(error) if is_kube_status(&error, 404) => {
-                    let lease = new_lease(&self.settings.name, &next, &self.settings.field_manager);
-                    match api.create(&PostParams::default(), &lease).await {
-                        Ok(lease) => return anchor_state_from_lease(&lease),
-                        Err(error) if is_kube_status(&error, 409) => continue,
-                        Err(error) => return Err(anchor_backend(error)),
-                    }
-                }
-                Err(error) => return Err(anchor_backend(error)),
-            }
-        }
-
-        Err(AnchorError::Backend(
-            "checkpoint Lease update conflicted too many times".to_owned(),
-        ))
-    }
-}
-
-#[async_trait]
 impl V2CommitAnchor for KubernetesLeaseAnchor {
     async fn read_v2(&self) -> V2Result<Option<V2AnchorState>> {
-        let api = self
-            .api()
-            .await
-            .map_err(|_| V2FormatError::AnchorReadFailed)?;
+        let api = self.api().await?;
         let lease = match api.get(&self.settings.name).await {
             Ok(lease) => lease,
             Err(error) if is_kube_status(&error, 404) => return Ok(None),
@@ -186,88 +128,6 @@ impl V2CommitAnchor for KubernetesLeaseAnchor {
 
         Err(V2FormatError::AnchorAdvanceFailed)
     }
-}
-
-fn new_lease(name: &str, state: &AnchorState, field_manager: &str) -> Lease {
-    lease_with_state(
-        Lease {
-            metadata: ObjectMeta {
-                name: Some(name.to_owned()),
-                ..ObjectMeta::default()
-            },
-            spec: None,
-        },
-        state,
-        field_manager,
-    )
-}
-
-fn lease_with_state(mut lease: Lease, state: &AnchorState, field_manager: &str) -> Lease {
-    let annotations = lease.metadata.annotations.get_or_insert_with(BTreeMap::new);
-    annotations.insert(
-        CHECKPOINT_SEQUENCE_ANNOTATION.to_owned(),
-        state.sequence.get().to_string(),
-    );
-    annotations.insert(
-        CHECKPOINT_ID_ANNOTATION.to_owned(),
-        state.checkpoint_id.as_str().to_owned(),
-    );
-    annotations.insert(
-        CHECKPOINT_DIGEST_ANNOTATION.to_owned(),
-        state.checkpoint_digest.clone(),
-    );
-    match state.checkpoint_version_id.as_ref() {
-        Some(version_id) => {
-            annotations.insert(
-                CHECKPOINT_VERSION_ID_ANNOTATION.to_owned(),
-                version_id.as_str().to_owned(),
-            );
-        }
-        None => {
-            annotations.remove(CHECKPOINT_VERSION_ID_ANNOTATION);
-        }
-    }
-
-    let spec = lease.spec.get_or_insert_with(LeaseSpec::default);
-    spec.holder_identity = Some(format!(
-        "{field_manager}:{}:{}",
-        state.sequence.get(),
-        state.checkpoint_id.as_str()
-    ));
-    lease
-}
-
-fn anchor_state_from_lease(lease: &Lease) -> rs3_anchor::Result<AnchorState> {
-    let annotations = lease
-        .metadata
-        .annotations
-        .as_ref()
-        .ok_or(AnchorError::MissingAnchor)?;
-    let sequence = annotation(annotations, CHECKPOINT_SEQUENCE_ANNOTATION)?
-        .parse::<u64>()
-        .map_err(|error| {
-            AnchorError::Backend(format!("invalid checkpoint sequence in Lease: {error}"))
-        })?;
-    let checkpoint_id = CheckpointId::new(annotation(annotations, CHECKPOINT_ID_ANNOTATION)?)
-        .map_err(anchor_backend)?;
-    let checkpoint_digest = annotation(annotations, CHECKPOINT_DIGEST_ANNOTATION)?.to_owned();
-    let checkpoint_version_id = annotations
-        .get(CHECKPOINT_VERSION_ID_ANNOTATION)
-        .map(|value| rs3_types::BackendVersionId::new(value.to_owned()).map_err(anchor_backend))
-        .transpose()?;
-
-    if checkpoint_digest.is_empty() {
-        return Err(AnchorError::Backend(
-            "checkpoint digest annotation is empty".to_owned(),
-        ));
-    }
-
-    Ok(AnchorState {
-        sequence: Sequence::new(sequence),
-        checkpoint_id,
-        checkpoint_digest,
-        checkpoint_version_id,
-    })
 }
 
 fn new_v2_lease(name: &str, state: &V2AnchorState, field_manager: &str) -> Lease {
@@ -395,16 +255,6 @@ fn v2_anchor_state_from_lease(lease: &Lease) -> V2Result<V2AnchorState> {
     })
 }
 
-fn annotation<'a>(
-    annotations: &'a BTreeMap<String, String>,
-    key: &'static str,
-) -> rs3_anchor::Result<&'a str> {
-    annotations
-        .get(key)
-        .map(String::as_str)
-        .ok_or(AnchorError::MissingAnchor)
-}
-
 fn v2_annotation<'a>(
     annotations: &'a BTreeMap<String, String>,
     key: &'static str,
@@ -426,40 +276,12 @@ fn is_kube_status(error: &kube::Error, code: u16) -> bool {
     matches!(error, kube::Error::Api(api_error) if api_error.code == code)
 }
 
-fn anchor_backend(error: impl ToString) -> AnchorError {
-    AnchorError::Backend(error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        CHECKPOINT_DIGEST_ANNOTATION, CHECKPOINT_ID_ANNOTATION, CHECKPOINT_SEQUENCE_ANNOTATION,
-        CHECKPOINT_VERSION_ID_ANNOTATION, KubernetesLeaseAnchor, LeaseSettings,
-        V2_FORMAT_VERSION_ID_ANNOTATION, anchor_state_from_lease, lease_with_state,
-        v2_anchor_state_from_lease, v2_lease_with_state,
-    };
-    use http::{Method, Request, Response, StatusCode};
+    use super::{V2_FORMAT_VERSION_ID_ANNOTATION, v2_anchor_state_from_lease, v2_lease_with_state};
     use k8s_openapi::api::coordination::v1::Lease;
-    use kube::Client;
-    use kube::client::Body;
-    use rs3_anchor::{AnchorError, AnchorState, CheckpointAnchor};
     use rs3_repository::v2::{V2AnchorState, V2FormatError, V2FormatRef};
-    use rs3_types::{BackendObjectId, BackendVersionId, CheckpointId, KeyId, Sequence};
-    use std::convert::Infallible;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-    use tower::service_fn;
-
-    fn state(sequence: u64, checkpoint_id: &str) -> AnchorState {
-        AnchorState {
-            sequence: Sequence::new(sequence),
-            checkpoint_id: CheckpointId::new(checkpoint_id).expect("valid checkpoint id"),
-            checkpoint_digest: format!("digest-{checkpoint_id}"),
-            checkpoint_version_id: None,
-        }
-    }
+    use rs3_types::{BackendObjectId, BackendVersionId, KeyId, Sequence};
 
     fn v2_state(sequence: u64) -> V2AnchorState {
         V2AnchorState {
@@ -488,93 +310,6 @@ mod tests {
                 ),
             },
         }
-    }
-
-    #[test]
-    fn lease_annotations_round_trip_anchor_state() {
-        let expected = state(7, "checkpoint-7");
-        let lease = lease_with_state(Lease::default(), &expected, "rs3-test");
-
-        let actual = anchor_state_from_lease(&lease);
-
-        assert_eq!(actual.ok(), Some(expected));
-    }
-
-    #[test]
-    fn lease_annotations_round_trip_checkpoint_version() {
-        let mut expected = state(8, "checkpoint-8");
-        expected.checkpoint_version_id =
-            Some(rs3_types::BackendVersionId::new("version-8").expect("valid backend version id"));
-        let lease = lease_with_state(Lease::default(), &expected, "rs3-test");
-
-        assert_eq!(
-            lease
-                .metadata
-                .annotations
-                .as_ref()
-                .and_then(|annotations| annotations.get(CHECKPOINT_VERSION_ID_ANNOTATION))
-                .map(String::as_str),
-            Some("version-8")
-        );
-        assert_eq!(anchor_state_from_lease(&lease).ok(), Some(expected));
-    }
-
-    #[test]
-    fn lease_anchor_state_requires_all_annotations() {
-        let mut lease = lease_with_state(Lease::default(), &state(1, "checkpoint-1"), "rs3-test");
-        let annotations = lease
-            .metadata
-            .annotations
-            .as_mut()
-            .expect("annotations exist");
-        annotations.remove(CHECKPOINT_DIGEST_ANNOTATION);
-        assert!(annotations.contains_key(CHECKPOINT_SEQUENCE_ANNOTATION));
-        assert!(annotations.contains_key(CHECKPOINT_ID_ANNOTATION));
-
-        let actual = anchor_state_from_lease(&lease);
-
-        assert!(matches!(actual, Err(AnchorError::MissingAnchor)));
-    }
-
-    #[tokio::test]
-    async fn compare_and_advance_fails_closed_when_v1_annotations_are_missing() {
-        let mut lease = lease_with_state(Lease::default(), &state(1, "checkpoint-1"), "rs3-test");
-        lease
-            .metadata
-            .annotations
-            .as_mut()
-            .expect("annotations exist")
-            .remove(CHECKPOINT_DIGEST_ANNOTATION);
-        let response_body = serde_json::to_vec(&lease).expect("lease serializes");
-        let calls = Arc::new(AtomicUsize::new(0));
-        let service_calls = Arc::clone(&calls);
-        let service = service_fn(move |request: Request<Body>| {
-            let response_body = response_body.clone();
-            let service_calls = Arc::clone(&service_calls);
-            async move {
-                service_calls.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(request.method(), Method::GET);
-                let response = Response::builder()
-                    .status(StatusCode::OK)
-                    .body(Body::from(response_body))
-                    .expect("response builds");
-                Ok::<_, Infallible>(response)
-            }
-        });
-        let anchor = KubernetesLeaseAnchor {
-            settings: LeaseSettings {
-                namespace: "rs3-test".to_owned(),
-                name: "rs3-anchor".to_owned(),
-                field_manager: "rs3-test".to_owned(),
-            },
-            client: tokio::sync::OnceCell::new(),
-        };
-        assert!(anchor.client.set(Client::new(service, "rs3-test")).is_ok());
-
-        let actual = anchor.compare_and_advance(state(2, "checkpoint-2")).await;
-
-        assert!(matches!(actual, Err(AnchorError::MissingAnchor)));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

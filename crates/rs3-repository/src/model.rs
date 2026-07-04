@@ -1,8 +1,6 @@
 //! Public repository operation models.
 
-use rs3_types::{
-    BackendVersionId, CheckpointId, LegalHoldStatus, LogicalPath, RetentionPolicy, Sequence,
-};
+use rs3_types::{LegalHoldStatus, LogicalPath, RetentionPolicy};
 
 /// Options for a trusted repository PUT.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -28,15 +26,6 @@ pub struct RepositoryObjectMetadata {
     pub retention: Option<RetentionPolicy>,
     /// Effective legal-hold status, if known.
     pub legal_hold: Option<LegalHoldStatus>,
-}
-
-/// Result of a PUT that reached an accepted checkpoint.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommittedPut {
-    /// Client-visible metadata for the written object.
-    pub metadata: RepositoryObjectMetadata,
-    /// Checkpoint that made the write durable repository state.
-    pub checkpoint: CheckpointPosition,
 }
 
 /// Entry returned from trusted namespace listing.
@@ -66,40 +55,4 @@ pub enum PhysicalDeleteOutcome {
     Retained,
     /// The backend object was already gone.
     AlreadyGone,
-}
-
-/// Accepted checkpoint position used by monotonic validation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CheckpointPosition {
-    /// Accepted checkpoint sequence.
-    pub sequence: Sequence,
-    /// Accepted checkpoint ID.
-    pub checkpoint_id: CheckpointId,
-    /// Provider version identifier for the accepted checkpoint object, when available.
-    pub checkpoint_version_id: Option<BackendVersionId>,
-    /// Digest of the canonical checkpoint payload.
-    pub payload_digest: String,
-}
-
-impl CheckpointPosition {
-    /// Converts this position into an external anchor state.
-    pub fn into_anchor_state(self) -> rs3_anchor::AnchorState {
-        rs3_anchor::AnchorState {
-            sequence: self.sequence,
-            checkpoint_id: self.checkpoint_id,
-            checkpoint_digest: self.payload_digest,
-            checkpoint_version_id: self.checkpoint_version_id,
-        }
-    }
-}
-
-impl From<rs3_anchor::AnchorState> for CheckpointPosition {
-    fn from(value: rs3_anchor::AnchorState) -> Self {
-        Self {
-            sequence: value.sequence,
-            checkpoint_id: value.checkpoint_id,
-            checkpoint_version_id: value.checkpoint_version_id,
-            payload_digest: value.checkpoint_digest,
-        }
-    }
 }

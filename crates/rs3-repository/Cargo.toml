@@ -16,7 +16,6 @@ futures-util.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 metrics.workspace = true
-rs3-anchor.workspace = true
 rs3-crypto.workspace = true
 rs3-index.workspace = true
 rs3-storage.workspace = true

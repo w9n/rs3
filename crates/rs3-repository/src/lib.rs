@@ -12,14 +12,14 @@ mod state;
 pub mod v2;
 
 #[cfg(test)]
-mod tests;
+mod test_support;
 
 pub use commit_options::CommitCoordinatorOptions;
 pub use error::{RepositoryError, Result};
 pub use keyring_envelope::{KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE, store_keyring_envelope};
 pub use model::{
-    CheckpointPosition, CommittedPut, DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry,
-    RepositoryObjectMetadata, RepositoryPutOptions,
+    DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry, RepositoryObjectMetadata,
+    RepositoryPutOptions,
 };
 pub use payload::DEFAULT_PAYLOAD_SEGMENT_SIZE;
 pub use service::{DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES, Repository, RepositoryOptions};

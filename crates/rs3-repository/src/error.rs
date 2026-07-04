@@ -1,9 +1,8 @@
 //! Repository error types.
 
-use rs3_anchor::AnchorError;
 use rs3_crypto::CryptoError;
 use rs3_storage::StorageError;
-use rs3_types::{BackendObjectId, CheckpointId, LogicalPath, Sequence, TypeError};
+use rs3_types::{BackendObjectId, LogicalPath, TypeError};
 use thiserror::Error;
 
 /// Repository operation result.
@@ -48,9 +47,6 @@ pub enum RepositoryError {
     /// Storage operation failed.
     #[error(transparent)]
     Storage(#[from] StorageError),
-    /// Checkpoint anchor operation failed.
-    #[error(transparent)]
-    Anchor(#[from] AnchorError),
     /// Checkpoint canonical encoding failed.
     #[error(transparent)]
     CheckpointEncoding(#[from] serde_json::Error),
@@ -63,33 +59,6 @@ pub enum RepositoryError {
     /// Too many writes are waiting for coordinated commit.
     #[error("commit coordinator is overloaded")]
     CommitBackpressure,
-    /// The checkpoint ID does not match the signed payload.
-    #[error("checkpoint id mismatch")]
-    CheckpointIdMismatch,
-    /// The checkpoint is older than the accepted position.
-    #[error("stale checkpoint sequence: {sequence:?}")]
-    StaleCheckpoint {
-        /// Stale checkpoint sequence.
-        sequence: Sequence,
-    },
-    /// The checkpoint reuses an accepted sequence with different content.
-    #[error("checkpoint conflicts with accepted position: {checkpoint_id}")]
-    CheckpointConflict {
-        /// Conflicting checkpoint ID.
-        checkpoint_id: CheckpointId,
-    },
-    /// A stored checkpoint object has different content than expected.
-    #[error("checkpoint object conflicts with expected content: {object_id}")]
-    CheckpointObjectConflict {
-        /// Conflicting backend object ID.
-        object_id: BackendObjectId,
-    },
-    /// A stored checkpoint evidence object has different content than expected.
-    #[error("checkpoint evidence object conflicts with expected content: {object_id}")]
-    CheckpointEvidenceObjectConflict {
-        /// Conflicting backend object ID.
-        object_id: BackendObjectId,
-    },
     /// A stored keyring envelope object has different content than expected.
     #[error("keyring envelope object conflicts with expected content: {object_id}")]
     KeyringEnvelopeObjectConflict {
@@ -107,14 +76,5 @@ pub enum RepositoryError {
     InvalidObjectFormat {
         /// Invalid backend object ID.
         object_id: BackendObjectId,
-    },
-    /// The checkpoint does not chain from the accepted position.
-    #[error("checkpoint parent mismatch")]
-    CheckpointParentMismatch,
-    /// A checkpoint chain moves publish time backwards.
-    #[error("checkpoint published timestamp decreased: {checkpoint_id}")]
-    CheckpointPublishedAtDecreased {
-        /// Checkpoint whose publish timestamp moved backwards.
-        checkpoint_id: CheckpointId,
     },
 }
