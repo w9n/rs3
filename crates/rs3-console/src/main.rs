@@ -3,6 +3,7 @@
 use rs3_console::{
     ConsoleHttpServer, ConsoleHttpService, ConsoleRuntimeConfig, GatewayAdminClient,
 };
+use std::env::VarError;
 use std::error::Error;
 use std::ffi::OsStr;
 use tracing_subscriber::EnvFilter;
@@ -63,12 +64,28 @@ async fn shutdown_signal() {
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    if std::env::var("RS3_LOG_FORMAT").as_deref() == Ok("json") {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+    match std::env::var("RS3_LOG_FORMAT") {
+        Ok(value) if value == "json" => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .init();
+        }
+        Ok(value) => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+            if value != "plain" {
+                tracing::warn!(
+                    log_format = %value,
+                    "unrecognized RS3_LOG_FORMAT; defaulting to plain logs",
+                );
+            }
+        }
+        Err(VarError::NotPresent) => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+        Err(VarError::NotUnicode(_)) => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+            tracing::warn!("RS3_LOG_FORMAT is not valid Unicode; defaulting to plain logs");
+        }
     }
 }

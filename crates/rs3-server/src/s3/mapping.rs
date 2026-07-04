@@ -465,25 +465,51 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
                 "multipart upload is not supported by this backend"
             )
         }
-        RepositoryError::Storage(StorageError::MissingVersionId(_)) => s3s::s3_error!(
-            InternalError,
-            "retained repository object is missing provider version metadata"
-        ),
+        RepositoryError::Storage(StorageError::MissingVersionId(_)) => {
+            warn_repository_internal_error("Storage::MissingVersionId");
+            s3s::s3_error!(
+                InternalError,
+                "retained repository object is missing provider version metadata"
+            )
+        }
         RepositoryError::Type(_) => s3s::s3_error!(InvalidRequest, "invalid repository path"),
-        RepositoryError::CommitFailed { .. }
-        | RepositoryError::SequenceOverflow
-        | RepositoryError::StatePoisoned
-        | RepositoryError::Crypto(_)
-        | RepositoryError::Storage(StorageError::AlreadyExists(_))
-        | RepositoryError::Storage(StorageError::NotFound(_))
-        | RepositoryError::Storage(StorageError::Provider(_))
-        | RepositoryError::CheckpointEncoding(_)
-        | RepositoryError::KeyringEnvelopeObjectConflict { .. }
-        | RepositoryError::IndexDeltaObjectConflict { .. }
-        | RepositoryError::InvalidObjectFormat { .. } => {
-            s3s::s3_error!(InternalError, "repository operation failed")
+        RepositoryError::CommitFailed { .. } => repository_operation_failed("CommitFailed"),
+        RepositoryError::SequenceOverflow => repository_operation_failed("SequenceOverflow"),
+        RepositoryError::StatePoisoned => repository_operation_failed("StatePoisoned"),
+        RepositoryError::Crypto(_) => repository_operation_failed("Crypto"),
+        RepositoryError::Storage(StorageError::AlreadyExists(_)) => {
+            repository_operation_failed("Storage::AlreadyExists")
+        }
+        RepositoryError::Storage(StorageError::NotFound(_)) => {
+            repository_operation_failed("Storage::NotFound")
+        }
+        RepositoryError::Storage(StorageError::Provider(_)) => {
+            repository_operation_failed("Storage::Provider")
+        }
+        RepositoryError::CheckpointEncoding(_) => repository_operation_failed("CheckpointEncoding"),
+        RepositoryError::KeyringEnvelopeObjectConflict { .. } => {
+            repository_operation_failed("KeyringEnvelopeObjectConflict")
+        }
+        RepositoryError::IndexDeltaObjectConflict { .. } => {
+            repository_operation_failed("IndexDeltaObjectConflict")
+        }
+        RepositoryError::InvalidObjectFormat { .. } => {
+            repository_operation_failed("InvalidObjectFormat")
         }
     }
+}
+
+fn repository_operation_failed(error_kind: &'static str) -> s3s::S3Error {
+    warn_repository_internal_error(error_kind);
+    s3s::s3_error!(InternalError, "repository operation failed")
+}
+
+fn warn_repository_internal_error(error_kind: &'static str) {
+    tracing::warn!(
+        target: "rs3_server",
+        error_kind,
+        "repository error mapped to S3 InternalError",
+    );
 }
 
 #[cfg(test)]

@@ -124,7 +124,7 @@ impl GatewayS3Service {
             Ok(response) => {
                 let status = response.status.unwrap_or(default_success_status);
                 record_s3_request_metrics(operation, "ok", status, elapsed);
-                tracing::info!(
+                tracing::debug!(
                     target: "rs3_server",
                     operation,
                     request_id,
@@ -140,17 +140,31 @@ impl GatewayS3Service {
                     .status_code()
                     .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
                 record_s3_request_metrics(operation, "error", status, elapsed);
-                tracing::info!(
-                    target: "rs3_server",
-                    operation,
-                    request_id,
-                    bucket_scope,
-                    result = "error",
-                    status_code = status.as_u16(),
-                    error_code = error.code().as_str(),
-                    elapsed_us = elapsed_us(elapsed),
-                    "S3 request completed",
-                );
+                if status.is_server_error() {
+                    tracing::warn!(
+                        target: "rs3_server",
+                        operation,
+                        request_id,
+                        bucket_scope,
+                        result = "error",
+                        status_code = status.as_u16(),
+                        error_code = error.code().as_str(),
+                        elapsed_us = elapsed_us(elapsed),
+                        "S3 request completed",
+                    );
+                } else {
+                    tracing::info!(
+                        target: "rs3_server",
+                        operation,
+                        request_id,
+                        bucket_scope,
+                        result = "error",
+                        status_code = status.as_u16(),
+                        error_code = error.code().as_str(),
+                        elapsed_us = elapsed_us(elapsed),
+                        "S3 request completed",
+                    );
+                }
             }
         }
     }
