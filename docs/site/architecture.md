@@ -35,9 +35,8 @@ state.
 | `rs3-crypto` | Key derivation, encryption, metadata sealing, payload envelopes, and commit signatures. |
 | `rs3-storage` | Provider-neutral object-store trait, local stores, S3 adapter, retention contracts. |
 | `rs3-index` | Durable index and repository state model. |
-| `rs3-anchor` | External anchor contracts and in-memory test anchors. |
-| `rs3-repository` | Namespace, payload, v2 commit, replay, maintenance, and commit coordination. |
-| `rs3-k8s` | Kubernetes-facing anchor integration surface. |
+| `rs3-repository` | Namespace, payload, v2 anchor contracts, commit, replay, maintenance, and commit coordination. |
+| `rs3-k8s` | Kubernetes Lease anchor integration surface. |
 | `rs3-server` | Gateway process, configuration, identity, S3 boundary, core admin reports, metrics, and shutdown. |
 | `rs3-console` | Read-only single-gateway operations UI over the authenticated admin report. |
 | `xtask` | Integration, performance, and compatibility automation. |
@@ -56,6 +55,11 @@ Normal writes are append-friendly:
 
 This avoids rewriting many backend objects during normal operation and gives
 crash recovery a concrete boundary.
+
+The current gateway has one repository runtime: `v2-preview`. The older
+checkpoint/manifest repository stack is no longer part of the server runtime,
+so compatibility, maintenance, and recovery behavior are described in terms of
+the v2 signed commit chain.
 
 `v2-preview` stores payload and index-delta sections inside the signed commit
 chain. Concurrent PUTs can batch into one signed delta commit. Periodic index

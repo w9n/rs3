@@ -40,6 +40,10 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 
 Expensive lanes emit artifacts under `.local/integration/` by default.
 
+The current gateway no longer has a v1 repository runtime. Commands with `v2`
+in their names keep their existing harness names, but they exercise the only
+supported repository format.
+
 ## S3 Provider Qualification
 
 Do not infer production support from S3 compatibility alone. A live provider

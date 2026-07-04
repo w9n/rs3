@@ -56,6 +56,11 @@ adaptive writer default. Workload set: `larger-restores`. Each row is the
 average of three direct/gateway run pairs. The direct baseline is the straight
 RustFS measurement proxy.
 
+These measurements predate the removal of the v1 repository/runtime stack. No
+post-removal matrix has been recorded in this docs sync, so the dated ratios
+below remain the last recorded release artifacts rather than re-measured
+post-removal baselines.
+
 Raw artifact: retained as ignored local release evidence.
 
 `workload_consistency` passed for every profile and `regression_budgets` passed.

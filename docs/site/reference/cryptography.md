@@ -163,7 +163,7 @@ Before adding or changing crypto-sensitive code:
 ## Preview Limits
 
 The current design has not had an external cryptographic review. Before a stable
-format v1, the project still needs final review of:
+repository format, the project still needs final review of:
 
 - deterministic metadata sealing and accepted equality leakage
 - prefix-token structure and namespace-shape leakage

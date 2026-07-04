@@ -31,8 +31,8 @@ a future format version.
 
 ## v2 Preview
 
-`v2-preview` is the active preview format for new repositories. It is an
-evaluation format, not a stable compatibility target yet.
+`v2-preview` is the only repository format accepted by the current gateway. It
+is an evaluation format, not a stable compatibility target yet.
 
 Preview change control: after the current v2 preview evidence gate, changes to
 backend object classes, commit-key shape, signed header fields, section layout,
@@ -88,8 +88,8 @@ one encrypted `INDEX_DELTA` section. Snapshot commits contain an
 offsets and lengths inside the same commit; once the commit is accepted, the
 reference is resolved to the anchored commit key, provider version ID when
 available, and commit body digest. v2 does not write repository payloads to
-backend `segments/`, nor does it write backend `index/`, `manifests/`,
-`checkpoints/`, or `evidence/` objects.
+backend `segments/`, nor does the current runtime read or write the older
+checkpoint/manifest backend object stack.
 
 The gateway uses commit batching knobs for v2. The default partial-batch wait
 is 25 ms. Concurrent client PUTs can stage multiple encrypted payloads and
@@ -102,8 +102,9 @@ v2 snapshot commits consolidate the live blinded namespace into an encrypted
 `INDEX_SNAPSHOT` section. Readers walk the signed parent chain only until the
 nearest snapshot, apply that full state, then replay newer delta commits. A
 snapshot writer first flushes any pending client-write batch so the snapshot
-chains from an accepted state. Operators can force this maintenance action with
-`rs3 write-index-snapshot` on `v2-preview` repositories.
+chains from an accepted state. The explicit `rs3 write-index-snapshot` command
+writes a snapshot only when repository state satisfies its safety preconditions;
+otherwise it fails closed and reports the blocking condition.
 
 v2 quick maintenance verifies the anchor-selected commit chain, reports
 path-redacted orphan counts, and reports live commit versions whose provider
