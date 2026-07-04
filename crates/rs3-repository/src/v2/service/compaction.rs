@@ -83,9 +83,9 @@ where
         else {
             return Ok(report);
         };
-        self.replay_chain(&chain)?;
+        let state = self.replay_chain_to_state(&chain)?;
         let (mixed_count, live_bytes_to_copy, mixed_dead_bytes_repackable) =
-            self.current_head_mixed_payload_summary(&chain)?;
+            self.current_head_mixed_payload_summary(&state, &chain)?;
         report.mixed_commit_count = mixed_count;
         report.live_bytes_to_copy = live_bytes_to_copy;
         report.mixed_dead_bytes_repackable = mixed_dead_bytes_repackable;
@@ -204,9 +204,10 @@ where
 
     fn current_head_mixed_payload_summary(
         &self,
+        state: &crate::state::RepositoryState,
         chain: &V2CommitChain,
     ) -> Result<(usize, u64, u64)> {
-        let live_sections = self.current_live_payload_sections()?;
+        let live_sections = Self::live_payload_sections_from_state(state);
         let mut mixed_commit_count = 0_usize;
         let mut live_bytes_to_copy = 0_u64;
         let mut mixed_dead_bytes_repackable = 0_u64;
@@ -247,11 +248,9 @@ where
         ))
     }
 
-    fn current_live_payload_sections(&self) -> Result<BTreeSet<V2LivePayloadSectionKey>> {
-        let state = self
-            .accepted_state
-            .read()
-            .map_err(|_| RepositoryError::StatePoisoned)?;
+    fn live_payload_sections_from_state(
+        state: &crate::state::RepositoryState,
+    ) -> BTreeSet<V2LivePayloadSectionKey> {
         let mut sections = BTreeSet::new();
         for (entry, _) in state.namespace.live_entries_with_prefixes() {
             let Some(PayloadReference::V2Commit {
@@ -273,7 +272,7 @@ where
                 length,
             });
         }
-        Ok(sections)
+        sections
     }
 
     async fn compaction_snapshot_plan(&self) -> Result<V2CompactionSnapshotPlan> {

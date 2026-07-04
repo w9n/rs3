@@ -193,6 +193,18 @@ where
 
     /// Loads and replays a supplied v2 commit chain.
     pub fn replay_chain(&self, chain: &V2CommitChain) -> Result<()> {
+        let rebuilt = self.replay_chain_to_state(chain)?;
+        let accepted = rebuilt.clone();
+        let mut state = self.repository.write_state()?;
+        *state = rebuilt;
+        *self
+            .accepted_state
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? = accepted;
+        Ok(())
+    }
+
+    pub(crate) fn replay_chain_to_state(&self, chain: &V2CommitChain) -> Result<RepositoryState> {
         let mut rebuilt = RepositoryState::default();
         let mut previous_published_at_ms = None;
         for commit in chain.commits_newest_first.iter().rev() {
@@ -204,14 +216,7 @@ where
             self.apply_commit_sections(&mut rebuilt, commit)?;
         }
 
-        let accepted = rebuilt.clone();
-        let mut state = self.repository.write_state()?;
-        *state = rebuilt;
-        *self
-            .accepted_state
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = accepted;
-        Ok(())
+        Ok(rebuilt)
     }
 
     /// Writes an object and returns after the covering v2 commit is accepted.

@@ -2726,6 +2726,52 @@ async fn v2_repository_full_gc_dry_run_reports_mixed_commit_payload_bytes() {
 }
 
 #[tokio::test]
+async fn v2_full_gc_dry_run_does_not_discard_concurrent_staged_delta() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let anchor = V2MemoryAnchor::new();
+    let blocking_anchor = BlockingV2Anchor::new(anchor.clone());
+    let key = must_type(LogicalPath::new("snapshots/dry-run-race.bin"));
+    let body = Bytes::from_static(b"staged while dry run replays");
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+
+    let put = async {
+        repository
+            .put_committed(
+                &blocking_anchor,
+                key.clone(),
+                body.clone(),
+                RepositoryPutOptions::default(),
+            )
+            .await
+    };
+    let dry_run = async {
+        blocking_anchor.wait_until_blocked().await;
+        let report = repository
+            .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
+            .await;
+        blocking_anchor.release();
+        report
+    };
+
+    let (put_result, dry_run_result) = tokio::join!(put, dry_run);
+
+    must_repo(dry_run_result);
+    must_repo(put_result);
+    assert_eq!(
+        must_repo(repository.get_range(&key, ByteRange::Full).await),
+        body
+    );
+}
+
+#[tokio::test]
 async fn v2_compaction_snapshot_rewrites_live_refs_and_gc_removes_old_commits() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
