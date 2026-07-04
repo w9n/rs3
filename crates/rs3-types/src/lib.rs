@@ -49,7 +49,7 @@ impl fmt::Display for PublicBucket {
 }
 
 /// Plaintext logical path inside the trusted boundary.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LogicalPath(String);
 
 impl LogicalPath {
@@ -64,6 +64,13 @@ impl LogicalPath {
     }
 }
 
+impl fmt::Debug for LogicalPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LogicalPath(<redacted>)")
+    }
+}
+
+/// Displays the plaintext logical path for trusted internal use. Do not log it.
 impl fmt::Display for LogicalPath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
@@ -410,7 +417,7 @@ impl RetentionPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyId, KeyStatus, PrefixToken, PublicBucket, Sequence};
+    use super::{KeyId, KeyStatus, LogicalPath, PrefixToken, PublicBucket, Sequence};
 
     #[test]
     fn rejects_empty_bucket() {
@@ -420,6 +427,17 @@ mod tests {
     #[test]
     fn rejects_empty_prefix_token() {
         assert!(PrefixToken::new("   ").is_err());
+    }
+
+    #[test]
+    fn logical_path_debug_is_redacted() {
+        let path =
+            LogicalPath::new("namespace/snapshot/plaintext.tar").expect("valid logical path");
+        let debug = format!("{path:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("namespace"));
+        assert!(!debug.contains("plaintext"));
     }
 
     #[test]
