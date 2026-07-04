@@ -1973,6 +1973,72 @@ async fn v2_commit_coordinator_rolls_back_batch_after_anchor_failure() {
 }
 
 #[tokio::test]
+async fn v2_commit_coordinator_recovers_after_transient_publish_failure() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store,
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        FailOnceV2Anchor::new(anchor.clone()),
+        CommitCoordinatorOptions::new(1, Duration::from_secs(60)),
+    );
+    let failed_key = LogicalPath::new("snapshots/v2-transient-failed.bin")
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    let failed = coordinator
+        .put_committed(
+            failed_key.clone(),
+            Bytes::from_static(b"transient-failed"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    let failed_status = coordinator.status();
+
+    assert!(matches!(
+        failed,
+        Err(crate::RepositoryError::CommitFailed { .. })
+    ));
+    assert!(!failed_status.poisoned);
+    assert!(failed_status.poison_reason.is_none());
+    assert!(matches!(
+        repository.head(&failed_key),
+        Err(crate::RepositoryError::NotFound(_))
+    ));
+
+    let recovered_key = LogicalPath::new("snapshots/v2-transient-recovered.bin")
+        .unwrap_or_else(|error| panic!("{error}"));
+    let recovered = must_repo(
+        coordinator
+            .put_committed(
+                recovered_key.clone(),
+                Bytes::from_static(b"transient-recovered"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    let accepted = must_v2(anchor.read_v2().await).expect("v2 recovered anchor should be accepted");
+    let recovered_status = coordinator.status();
+
+    assert_eq!(recovered.anchor_state, accepted);
+    assert_eq!(accepted.sequence, Sequence::new(2));
+    assert!(!recovered_status.poisoned);
+    assert!(recovered_status.poison_reason.is_none());
+    assert!(repository.head(&recovered_key).is_ok());
+}
+
+#[tokio::test]
 async fn v2_commit_coordinator_poisons_when_batch_rollback_fails() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
