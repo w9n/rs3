@@ -402,6 +402,15 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
             reason: "must be at least 5242880 bytes".to_owned(),
         });
     }
+    let max_multipart_object_bytes = backend_multipart_part_bytes.saturating_mul(10_000);
+    if max_put_object_bytes > max_multipart_object_bytes {
+        return Err(ConfigError::Invalid {
+            key: "RS3_MAX_PUT_OBJECT_BYTES",
+            value: max_put_object_bytes.to_string(),
+            reason: "must be less than or equal to 10000 * RS3_BACKEND_MULTIPART_PART_BYTES"
+                .to_owned(),
+        });
+    }
     let stream_read_stall_timeout = Duration::from_secs(parse_positive_u64(
         "RS3_STREAM_READ_STALL_TIMEOUT_SECS",
         source.value("RS3_STREAM_READ_STALL_TIMEOUT_SECS"),
@@ -1110,6 +1119,15 @@ mod tests {
         );
         assert!(
             matches!(part, Err(ConfigError::Invalid { key, .. }) if key == "RS3_BACKEND_MULTIPART_PART_BYTES")
+        );
+
+        let max_put = RuntimeConfig::from_source(
+            &minimal_source()
+                .with("RS3_BACKEND_MULTIPART_PART_BYTES", "5242880")
+                .with("RS3_MAX_PUT_OBJECT_BYTES", "52428800001"),
+        );
+        assert!(
+            matches!(max_put, Err(ConfigError::Invalid { key, .. }) if key == "RS3_MAX_PUT_OBJECT_BYTES")
         );
     }
 

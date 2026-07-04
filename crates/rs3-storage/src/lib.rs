@@ -687,7 +687,8 @@ impl BlobStore for MemoryBlobStore {
         let started = Instant::now();
         let object_kind = object_kind(object_id);
         let requested_len = body.len();
-        let retained = options.retention.is_some();
+        let retention = options.retention.filter(retention_is_active);
+        let retained = retention.is_some();
         let legal_hold = options.legal_hold;
         let mut state = self.write_state()?;
         state.counts.put = state.counts.put.saturating_add(1);
@@ -708,6 +709,7 @@ impl BlobStore for MemoryBlobStore {
 
         let content_len = u64::try_from(body.len())
             .map_err(|_| StorageError::Provider("object length does not fit in u64".to_owned()))?;
+        let retain_until_ms = retain_until_ms(retention);
         let metadata = BlobMetadata {
             object_id: object_id.clone(),
             content_len,
@@ -717,8 +719,8 @@ impl BlobStore for MemoryBlobStore {
                 BackendVersionId::new(format!("mem-v{}", state.next_version))
                     .map_err(|error| StorageError::Provider(error.to_string()))?,
             ),
-            retention: options.retention,
-            retain_until_ms: retain_until_ms(options.retention),
+            retention,
+            retain_until_ms,
             legal_hold,
         };
         state.counts.bytes_written = state.counts.bytes_written.saturating_add(content_len);
@@ -1240,10 +1242,7 @@ pub(crate) fn read_range(body: &Bytes, range: ByteRange) -> Result<Bytes> {
 }
 
 fn retention_blocks_delete(policy: Option<&RetentionPolicy>) -> bool {
-    match policy {
-        Some(policy) => policy.mode != RetentionMode::None && policy.retain_days > 0,
-        None => false,
-    }
+    policy.is_some_and(retention_is_active)
 }
 
 fn legal_hold_blocks_delete(status: Option<LegalHoldStatus>) -> bool {
@@ -1252,7 +1251,7 @@ fn legal_hold_blocks_delete(status: Option<LegalHoldStatus>) -> bool {
 
 fn retain_until_ms(policy: Option<RetentionPolicy>) -> Option<i64> {
     let policy = policy?;
-    if policy.mode == RetentionMode::None || policy.retain_days == 0 {
+    if !retention_is_active(&policy) {
         return None;
     }
     let now_ms = SystemTime::now()
@@ -1261,6 +1260,10 @@ fn retain_until_ms(policy: Option<RetentionPolicy>) -> Option<i64> {
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())?;
     let retain_ms = i64::from(policy.retain_days).checked_mul(86_400_000)?;
     now_ms.checked_add(retain_ms)
+}
+
+fn retention_is_active(policy: &RetentionPolicy) -> bool {
+    policy.mode != RetentionMode::None && policy.retain_days > 0
 }
 
 fn merge_retain_until(left: Option<i64>, right: Option<i64>) -> Option<i64> {

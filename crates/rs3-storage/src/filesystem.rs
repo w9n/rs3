@@ -7,7 +7,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionPolicy};
+use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -57,7 +57,9 @@ impl BlobStore for FilesystemBlobStore {
         let started = Instant::now();
         let kind = object_kind(object_id);
         let requested_len = body.len();
-        let retained = options.retention.is_some();
+        let retained = options
+            .retention
+            .is_some_and(|policy| retention_is_active(&policy));
         let legal_hold_requested = options.legal_hold == Some(LegalHoldStatus::On);
 
         if retained || legal_hold_requested {
@@ -382,6 +384,10 @@ fn temp_file_name() -> String {
 fn system_time_millis(time: SystemTime) -> Option<i64> {
     let millis = time.duration_since(UNIX_EPOCH).ok()?.as_millis();
     i64::try_from(millis).ok()
+}
+
+fn retention_is_active(policy: &RetentionPolicy) -> bool {
+    policy.mode != RetentionMode::None && policy.retain_days > 0
 }
 
 fn map_read_error(path: &Path, error: std::io::Error) -> StorageError {

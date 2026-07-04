@@ -499,7 +499,7 @@ impl S3 for GatewayS3Service {
                 })?;
                 let streaming_budget = self
                     .backend_multipart_part_bytes
-                    .saturating_mul(2)
+                    .saturating_mul(3)
                     .saturating_add(4096);
                 let mut upload_body_reservation = self.upload_body_budget.reservation();
                 upload_body_reservation.reserve_until(OPERATION, streaming_budget)?;
@@ -580,7 +580,7 @@ impl S3 for GatewayS3Service {
 
                     let streaming_budget = self
                         .backend_multipart_part_bytes
-                        .saturating_mul(2)
+                        .saturating_mul(3)
                         .saturating_add(4096)
                         .saturating_add(u64::try_from(buffered.len()).unwrap_or(u64::MAX));
                     upload_body_reservation.reserve_until(OPERATION, streaming_budget)?;
