@@ -2,11 +2,16 @@
 
 use bytes::Bytes;
 use proptest::prelude::*;
-use rs3_anchor::MemoryCheckpointAnchor;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_repository::{Repository, RepositoryPutOptions};
+use rs3_repository::v2::{
+    V2CommitStoreOptions, V2FormatRef, V2KeyringEnvelopeRef, V2MemoryAnchor, V2ProviderProfile,
+    V2Repository,
+};
+use rs3_repository::{RepositoryOptions, RepositoryPutOptions};
 use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore};
-use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath};
+use rs3_types::{
+    BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath,
+};
 use tokio::runtime::{Builder, Runtime};
 
 proptest! {
@@ -29,16 +34,29 @@ proptest! {
 
 async fn check_committed_path(path: String) -> Result<(), String> {
     let store = MemoryBlobStore::new();
-    let repository = Repository::with_keyring(store.clone(), signing_keyring());
-    let anchor = MemoryCheckpointAnchor::new();
+    let repository = V2Repository::new(
+        store.clone(),
+        signing_keyring(),
+        RepositoryOptions::default(),
+        V2CommitStoreOptions::for_profile(
+            V2ProviderProfile::Dev,
+            sample_keyring_envelope_ref()?,
+            sample_format_ref()?,
+        ),
+    );
+    let anchor = V2MemoryAnchor::new();
     let logical_path = logical_path(path.clone())?;
 
     repository
+        .write_genesis_snapshot(&anchor)
+        .await
+        .map_err(|error| error.to_string())?;
+    repository
         .put_committed(
+            &anchor,
             logical_path,
             Bytes::from_static(b"constant test body"),
             RepositoryPutOptions::default(),
-            &anchor,
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -61,6 +79,7 @@ async fn check_committed_path(path: String) -> Result<(), String> {
 
         if object_id.starts_with("index/")
             || object_id.starts_with("checkpoints/")
+            || object_id.starts_with("commits/")
             || object_id.starts_with("evidence/")
         {
             let body = store
@@ -88,6 +107,28 @@ fn runtime() -> Runtime {
 
 fn logical_path(value: String) -> Result<LogicalPath, String> {
     LogicalPath::new(value).map_err(|error| error.to_string())
+}
+
+fn sample_keyring_envelope_ref() -> Result<V2KeyringEnvelopeRef, String> {
+    Ok(V2KeyringEnvelopeRef {
+        object_id: object_id("keyrings/00000000000000000001-bootstrap")?,
+        digest: [6_u8; 32],
+    })
+}
+
+fn sample_format_ref() -> Result<V2FormatRef, String> {
+    Ok(V2FormatRef {
+        generation: 1,
+        digest: hex::encode([7_u8; 32]),
+        object_id: object_id(&format!("format/{:020}-{}", 1_u64, hex::encode([7_u8; 32])))?,
+        version_id: Some(
+            BackendVersionId::new("format-version-1").map_err(|error| error.to_string())?,
+        ),
+    })
+}
+
+fn object_id(value: &str) -> Result<BackendObjectId, String> {
+    BackendObjectId::new(value).map_err(|error| error.to_string())
 }
 
 fn signing_keyring() -> KeyRing {
