@@ -1,16 +1,16 @@
-const tokenKey = "rs3-console-token";
-
 // Checkpoint age drives the restore-trust summary before hard failures appear.
 const CHECKPOINT_WARN_AGE_MS = 2 * 60 * 60 * 1000;
 const CHECKPOINT_BAD_AGE_MS = 24 * 60 * 60 * 1000;
+const AUTO_REFRESH_INTERVAL_MS = 30 * 1000;
 
 const state = {
-  token: sessionStorage.getItem(tokenKey) || "",
+  token: "",
   status: null,
   posture: null,
   lastError: null,
   lastSuccessAt: null,
   postureError: null,
+  refreshInFlight: false,
   autoRefresh: null,
 };
 
@@ -18,6 +18,7 @@ const nodes = {
   connectionState: document.getElementById("connection-state"),
   refreshButton: document.getElementById("refresh-button"),
   clearTokenButton: document.getElementById("clear-token-button"),
+  refreshCadence: document.getElementById("refresh-cadence"),
   authForm: document.getElementById("auth-form"),
   tokenInput: document.getElementById("console-token"),
   lastRefresh: document.getElementById("last-refresh"),
@@ -44,13 +45,11 @@ const nodes = {
   postureTable: document.getElementById("posture-table"),
 };
 
+nodes.refreshCadence.textContent = autoRefreshLabel(AUTO_REFRESH_INTERVAL_MS);
 nodes.tokenInput.value = state.token;
 nodes.authForm.addEventListener("submit", (event) => {
   event.preventDefault();
   state.token = String(new FormData(nodes.authForm).get("token") || "").trim();
-  if (state.token) {
-    sessionStorage.setItem(tokenKey, state.token);
-  }
   refreshStatus();
 });
 nodes.refreshButton.addEventListener("click", () => refreshStatus());
@@ -60,9 +59,9 @@ nodes.clearTokenButton.addEventListener("click", () => {
   state.posture = null;
   state.lastError = null;
   state.lastSuccessAt = null;
-  sessionStorage.removeItem(tokenKey);
   state.postureError = null;
   nodes.tokenInput.value = "";
+  setRefreshInFlight(false);
   setConnection("Disconnected", "neutral");
   render();
 });
@@ -75,21 +74,31 @@ state.autoRefresh = window.setInterval(() => {
   if (state.token) {
     refreshStatus({ silent: true });
   }
-}, 30000);
+}, AUTO_REFRESH_INTERVAL_MS);
 
 async function refreshStatus(options = {}) {
-  if (!state.token) {
+  const token = state.token;
+  if (!token) {
     setConnection("Token required", "warn");
     return;
   }
+  if (state.refreshInFlight) {
+    return;
+  }
+  setRefreshInFlight(true);
   if (!options.silent) {
     setConnection("Refreshing", "neutral");
   }
 
   const [statusResult, postureResult] = await Promise.allSettled([
-    fetchConsoleReport("/api/status"),
-    fetchConsoleReport("/api/posture"),
+    fetchConsoleReport("/api/status", token),
+    fetchConsoleReport("/api/posture", token),
   ]);
+
+  if (token !== state.token) {
+    setRefreshInFlight(false);
+    return;
+  }
 
   if (postureResult.status === "fulfilled") {
     state.posture = postureResult.value;
@@ -107,6 +116,7 @@ async function refreshStatus(options = {}) {
     state.lastError = errorMessage(statusResult.reason, "Refresh failed");
     setConnection("Error", "bad");
   }
+  setRefreshInFlight(false);
   render();
 }
 
@@ -361,12 +371,17 @@ function setConnection(text, kind) {
   nodes.connectionState.className = `state-pill state-${kind}`;
 }
 
-async function fetchConsoleReport(path) {
+function setRefreshInFlight(value) {
+  state.refreshInFlight = value;
+  nodes.refreshButton.disabled = value;
+}
+
+async function fetchConsoleReport(path, token) {
   const response = await fetch(path, {
     method: "GET",
     headers: {
       Accept: "application/json",
-      Authorization: `Bearer ${state.token}`,
+      Authorization: `Bearer ${token}`,
     },
     cache: "no-store",
   });
@@ -379,6 +394,10 @@ async function fetchConsoleReport(path) {
 
 function errorMessage(error, fallback) {
   return error instanceof Error ? error.message : fallback;
+}
+
+function autoRefreshLabel(intervalMs) {
+  return `auto-refresh ${Math.round(intervalMs / 1000)}s`;
 }
 
 function compareFindingSeverity(left, right) {

@@ -16,6 +16,7 @@
         </div>
         <div class="topbar-actions">
           <span id="connection-state" class="state-pill state-neutral">Disconnected</span>
+          <span id="refresh-cadence" class="muted refresh-cadence">auto-refresh 30s</span>
           <button id="refresh-button" class="button-primary" type="button">Refresh</button>
         </div>
       </header>
@@ -26,6 +27,7 @@
           <input id="console-token" name="token" type="password" autocomplete="off">
           <button type="submit">Connect</button>
         </form>
+        <p class="auth-hint">Token kept in memory for this tab.</p>
         <button id="clear-token-button" class="button-secondary" type="button">Forget</button>
       </section>
 

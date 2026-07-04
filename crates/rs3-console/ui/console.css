@@ -158,6 +158,11 @@ button {
   cursor: pointer;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.64;
+}
+
 button:focus-visible,
 input:focus-visible {
   outline: 3px solid var(--focus-ring);
@@ -179,6 +184,17 @@ input:focus-visible {
   border-color: var(--border);
   background: var(--surface-muted);
   color: var(--text);
+}
+
+.refresh-cadence {
+  white-space: nowrap;
+}
+
+.auth-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+  white-space: nowrap;
 }
 
 .state-pill {
