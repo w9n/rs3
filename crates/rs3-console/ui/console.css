@@ -8,10 +8,48 @@
   --muted: #60706c;
   --accent: #196f6a;
   --accent-strong: #10534f;
+  --on-accent: #ffffff;
   --good: #187447;
   --warn: #a05a00;
   --bad: #a63333;
+  --input-bg: #fbfcfc;
+  --detail-bg: #fbfcfc;
+  --focus-ring: rgba(25, 111, 106, 0.24);
+  --state-good-border: rgba(24, 116, 71, 0.32);
+  --state-good-bg: #eaf6ef;
+  --state-warn-border: rgba(160, 90, 0, 0.32);
+  --state-warn-bg: #fff4df;
+  --state-bad-border: rgba(166, 51, 51, 0.32);
+  --state-bad-bg: #fff0f0;
   --shadow: 0 10px 24px rgba(30, 42, 38, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #0f1514;
+    --surface: #17201e;
+    --surface-muted: #22302d;
+    --border: #334541;
+    --text: #edf5f2;
+    --muted: #9fb3ad;
+    --accent: #62c8bd;
+    --accent-strong: #8adbd2;
+    --on-accent: #061412;
+    --good: #74d89c;
+    --warn: #efbd68;
+    --bad: #ff9292;
+    --input-bg: #111a18;
+    --detail-bg: #111a18;
+    --focus-ring: rgba(98, 200, 189, 0.34);
+    --state-good-border: rgba(116, 216, 156, 0.45);
+    --state-good-bg: rgba(116, 216, 156, 0.12);
+    --state-warn-border: rgba(239, 189, 104, 0.5);
+    --state-warn-bg: rgba(239, 189, 104, 0.12);
+    --state-bad-border: rgba(255, 146, 146, 0.5);
+    --state-bad-bg: rgba(255, 146, 146, 0.12);
+    --shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+  }
 }
 
 * {
@@ -108,7 +146,7 @@ input {
   border-radius: 6px;
   padding: 7px 10px;
   color: var(--text);
-  background: #fbfcfc;
+  background: var(--input-bg);
 }
 
 button {
@@ -122,14 +160,14 @@ button {
 
 button:focus-visible,
 input:focus-visible {
-  outline: 3px solid rgba(25, 111, 106, 0.24);
+  outline: 3px solid var(--focus-ring);
   outline-offset: 1px;
 }
 
 .button-primary,
 .auth-form button {
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
 }
 
 .button-primary:hover,
@@ -157,21 +195,21 @@ input:focus-visible {
 }
 
 .state-good {
-  border-color: rgba(24, 116, 71, 0.32);
+  border-color: var(--state-good-border);
   color: var(--good);
-  background: #eaf6ef;
+  background: var(--state-good-bg);
 }
 
 .state-warn {
-  border-color: rgba(160, 90, 0, 0.32);
+  border-color: var(--state-warn-border);
   color: var(--warn);
-  background: #fff4df;
+  background: var(--state-warn-bg);
 }
 
 .state-bad {
-  border-color: rgba(166, 51, 51, 0.32);
+  border-color: var(--state-bad-border);
   color: var(--bad);
-  background: #fff0f0;
+  background: var(--state-bad-bg);
 }
 
 .state-neutral {
@@ -295,7 +333,7 @@ input:focus-visible {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 9px;
-  background: #fbfcfc;
+  background: var(--detail-bg);
 }
 
 .detail-item span {
