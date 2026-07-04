@@ -63,6 +63,23 @@ metrics:
   serviceMonitor:
     enabled: true
 
+networkPolicy:
+  enabled: true
+  ingress:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: backup-clients
+    podSelector: {}
+  egress:
+    backend:
+      to:
+        - ipBlock:
+            cidr: 10.20.0.0/16
+    kubeApi:
+      to:
+        - ipBlock:
+            cidr: 10.30.0.0/24
+
 repository:
   format: v2-preview
   id: tenant-a-repository
@@ -110,6 +127,10 @@ Expected Secret keys are:
   profile. The chart mounts an emptyDir at `/tmp` for scratch space.
 - Default resources request 512Mi/250m and limit memory to 1536Mi. There is no
   CPU limit by default.
+- `networkPolicy.enabled=true` renders a baseline policy that admits S3 traffic
+  from the configured namespace/pod selector and allows egress rules for the
+  backend endpoint and Kubernetes API. Keep those peers narrow for your cluster,
+  or replace the template with provider-specific policy such as Cilium CNP.
 - Use `gateway.mode=restore-readonly` for restore readers that must not mutate
   repository state.
 - Do not use `anchor.allowMemory=true` outside local development.
