@@ -97,6 +97,7 @@ impl KeyRing {
     }
 
     /// Creates a single-secret keyring for focused tests.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn single_namespace(secret: SecretBytes) -> Self {
         Self {
             keys: vec![
