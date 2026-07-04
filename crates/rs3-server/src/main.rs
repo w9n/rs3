@@ -35,9 +35,12 @@ static RUSTLS_PROVIDER: Once = Once::new();
 const WRITER_LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(feature = "k8s")]
 const WRITER_LEASE_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_GIT_SHA: Option<&str> = option_env!("RS3_BUILD_GIT_SHA");
 
 #[derive(Debug, Parser)]
 #[command(name = "rs3")]
+#[command(version)]
 #[command(about = "Path-private S3-compatible backup gateway")]
 struct Cli {
     #[arg(long, env = "RS3_LOG_FORMAT", default_value = "plain")]
@@ -1019,6 +1022,8 @@ fn log_runtime_config(config: &RuntimeConfig) {
     let config_profile = runtime_config_profile(config);
 
     tracing::info!(
+        version = VERSION,
+        build_git_sha = build_git_sha(),
         gateway_mode = config.mode.as_str(),
         writer_guard = config.writer_guard.as_str(),
         bind = %config.bind,
@@ -1036,6 +1041,10 @@ fn log_runtime_config(config: &RuntimeConfig) {
         config_profile,
         "gateway runtime configuration validated",
     );
+}
+
+fn build_git_sha() -> &'static str {
+    BUILD_GIT_SHA.unwrap_or("unknown")
 }
 
 fn init_tracing(format: LogFormat) {
