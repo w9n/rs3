@@ -15,9 +15,7 @@ use crate::model::{
     DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry, RepositoryObjectMetadata,
     RepositoryPutOptions,
 };
-use crate::namespace::{
-    existing_blind_keys, first_namespace_entry, indexed_list_prefix, prefix_tokens_for_key,
-};
+use crate::namespace::{existing_blind_keys, first_namespace_entry, prefix_tokens_for_key};
 use crate::payload::{
     PayloadHeaderProbe, SegmentedPayloadFormat, SegmentedPayloadHeader, SegmentedPayloadSealer,
     adaptive_payload_segment_size, open_payload_object, parse_segmented_payload_header,
@@ -582,7 +580,7 @@ where
         {
             let mut state = self.repository.write_state()?;
             for stale_blind_key in stale_blind_keys {
-                state.namespace.tombstone(stale_blind_key.clone(), sequence);
+                state.tombstone_namespace_entry(stale_blind_key.clone(), sequence);
                 state.pending_index_deltas.push(IndexDelta::Tombstone {
                     blind_key: stale_blind_key,
                     generation: sequence,
@@ -593,10 +591,10 @@ where
                 prefix_tokens: prefix_tokens.clone(),
                 sealed_manifest: Box::new(sealed_manifest),
             });
-            state.namespace.upsert(entry, prefix_tokens);
             state
                 .manifests
                 .insert(manifest_id.clone(), manifest.clone());
+            state.upsert_namespace_entry(entry, prefix_tokens);
         }
 
         tracing::info!(
@@ -928,41 +926,21 @@ where
 
     /// Lists client-visible entries for a prefix.
     pub fn list(&self, prefix: &str) -> Result<Vec<RepositoryListEntry>> {
-        let keyring = self.repository.keyring()?;
-        let prefix_tokens = keyring.derive_prefix_tokens_for_lookup(indexed_list_prefix(prefix))?;
+        self.list_page(prefix, None, usize::MAX)
+    }
+
+    /// Lists up to `limit + 1` client-visible entries after `start_after`.
+    pub fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RepositoryListEntry>> {
         let state = self
             .accepted_state
             .read()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        let mut entries_by_key = BTreeMap::new();
-
-        for prefix_token in prefix_tokens {
-            for entry in state.namespace.list_prefix(&prefix_token.prefix_token) {
-                let Some(manifest) = state.manifests.get(&entry.manifest_id) else {
-                    continue;
-                };
-                if !manifest.key.as_str().starts_with(prefix) {
-                    continue;
-                }
-                let list_entry = RepositoryListEntry {
-                    key: manifest.key.clone(),
-                    content_len: manifest.content_len,
-                    modified_at_ms: manifest.modified_at_ms,
-                };
-                match entries_by_key.entry(manifest.key.clone()) {
-                    Entry::Vacant(slot) => {
-                        slot.insert(list_entry);
-                    }
-                    Entry::Occupied(mut slot) => {
-                        if list_entry.modified_at_ms >= slot.get().modified_at_ms {
-                            slot.insert(list_entry);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(entries_by_key.into_values().collect())
+        Ok(state.list_page(prefix, start_after, limit))
     }
 
     /// Deletes a client-visible object after the tombstone commit is accepted.
@@ -1113,7 +1091,7 @@ where
                 });
             }
         }
-        state.namespace.upsert(entry, prefix_tokens);
+        state.replace_namespace_entry(entry, prefix_tokens);
         Ok(())
     }
 
@@ -1132,7 +1110,7 @@ where
             return Err(RepositoryError::StatePoisoned);
         };
         entry.content_len = entry.content_len.saturating_sub(1);
-        state.namespace.upsert(entry, prefix_tokens);
+        state.replace_namespace_entry(entry, prefix_tokens);
         Ok(())
     }
 
@@ -1267,7 +1245,7 @@ where
                 offset: location.offset,
                 length: location.length,
             });
-            state.namespace.upsert(entry, prefix_tokens);
+            state.replace_namespace_entry(entry, prefix_tokens);
             resolved_count = resolved_count.saturating_add(1);
         }
 

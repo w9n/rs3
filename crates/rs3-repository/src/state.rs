@@ -1,10 +1,13 @@
 //! In-memory trusted repository state.
 
 use crate::error::{RepositoryError, Result};
-use crate::model::RepositoryObjectMetadata;
-use rs3_index::{DurableManifest, IndexDelta, IndexDeltaObject, NamespaceIndex};
-use rs3_types::{LegalHoldStatus, LogicalPath, ManifestId, RetentionPolicy, Sequence};
+use crate::model::{RepositoryListEntry, RepositoryObjectMetadata};
+use rs3_index::{DurableManifest, IndexDelta, IndexDeltaObject, NamespaceEntry, NamespaceIndex};
+use rs3_types::{
+    BlindIndexKey, LegalHoldStatus, LogicalPath, ManifestId, PrefixToken, RetentionPolicy, Sequence,
+};
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 /// Trusted manifest metadata used by the current in-memory query model.
 #[derive(Clone, Debug)]
@@ -28,6 +31,8 @@ pub(crate) struct RepositoryState {
     pub(crate) namespace: NamespaceIndex,
     /// Trusted manifests keyed by opaque manifest ID.
     pub(crate) manifests: BTreeMap<ManifestId, TrustedManifest>,
+    /// Trusted list entries keyed by plaintext path inside the trusted boundary.
+    pub(crate) list_entries: BTreeMap<String, RepositoryListEntry>,
     /// Next logical sequence to allocate.
     pub(crate) next_sequence: Sequence,
     /// Durable index mutations not yet covered by an accepted checkpoint.
@@ -41,9 +46,112 @@ impl Default for RepositoryState {
         Self {
             namespace: NamespaceIndex::new(),
             manifests: BTreeMap::new(),
+            list_entries: BTreeMap::new(),
             next_sequence: Sequence::ZERO,
             pending_index_deltas: Vec::new(),
             pending_checkpoint_published_at_ms: None,
+        }
+    }
+}
+
+impl RepositoryState {
+    pub(crate) fn upsert_namespace_entry(
+        &mut self,
+        entry: NamespaceEntry,
+        prefix_tokens: Vec<PrefixToken>,
+    ) {
+        let affected_key = self
+            .manifests
+            .get(&entry.manifest_id)
+            .map(|manifest| manifest.key.clone());
+        self.namespace.upsert(entry, prefix_tokens);
+        if let Some(key) = affected_key {
+            self.refresh_list_entry(&key);
+        }
+    }
+
+    pub(crate) fn replace_namespace_entry(
+        &mut self,
+        entry: NamespaceEntry,
+        prefix_tokens: Vec<PrefixToken>,
+    ) {
+        self.namespace.upsert(entry, prefix_tokens);
+    }
+
+    pub(crate) fn tombstone_namespace_entry(
+        &mut self,
+        blind_key: BlindIndexKey,
+        generation: Sequence,
+    ) {
+        let affected_key = self
+            .namespace
+            .head(&blind_key)
+            .and_then(|entry| self.manifests.get(&entry.manifest_id))
+            .map(|manifest| manifest.key.clone());
+        self.namespace.tombstone(blind_key, generation);
+        if let Some(key) = affected_key {
+            self.refresh_list_entry(&key);
+        }
+    }
+
+    pub(crate) fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Vec<RepositoryListEntry> {
+        let page_len = limit.saturating_add(1);
+        let lower_bound = match start_after {
+            Some(start_after) if start_after >= prefix => Bound::Excluded(start_after.to_owned()),
+            _ => Bound::Included(prefix.to_owned()),
+        };
+        let mut entries = Vec::with_capacity(page_len.min(1024));
+
+        for (key, entry) in self.list_entries.range((lower_bound, Bound::Unbounded)) {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            entries.push(entry.clone());
+            if entries.len() == page_len {
+                break;
+            }
+        }
+
+        entries
+    }
+
+    fn refresh_list_entry(&mut self, key: &LogicalPath) {
+        let mut selected = None;
+        for (entry, _) in self.namespace.live_entries_with_prefixes() {
+            let Some(manifest) = self.manifests.get(&entry.manifest_id) else {
+                continue;
+            };
+            if manifest.key != *key {
+                continue;
+            }
+            let list_entry = RepositoryListEntry {
+                key: manifest.key.clone(),
+                content_len: manifest.content_len,
+                modified_at_ms: manifest.modified_at_ms,
+            };
+            if selected
+                .as_ref()
+                .is_none_or(|selected: &RepositoryListEntry| {
+                    list_entry.modified_at_ms >= selected.modified_at_ms
+                })
+            {
+                selected = Some(list_entry);
+            }
+        }
+
+        let key = key.as_str();
+        match selected {
+            Some(entry) => {
+                self.list_entries.insert(key.to_owned(), entry);
+            }
+            None => {
+                self.list_entries.remove(key);
+            }
         }
     }
 }
@@ -106,11 +214,11 @@ pub(crate) fn apply_index_delta_object(state: &mut RepositoryState, delta: Index
                 entry,
                 prefix_tokens,
                 sealed_manifest: _,
-            } => state.namespace.upsert(*entry, prefix_tokens),
+            } => state.upsert_namespace_entry(*entry, prefix_tokens),
             IndexDelta::Tombstone {
                 blind_key,
                 generation,
-            } => state.namespace.tombstone(blind_key, generation),
+            } => state.tombstone_namespace_entry(blind_key, generation),
         }
     }
 

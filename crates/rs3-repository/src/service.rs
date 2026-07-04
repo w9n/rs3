@@ -242,7 +242,7 @@ where
         let existing_blind_keys = existing_blind_keys(&state.namespace, &lookup_blind_keys);
         let sequence = next_sequence(&mut state)?;
         for blind_key in existing_blind_keys {
-            state.namespace.tombstone(blind_key.clone(), sequence);
+            state.tombstone_namespace_entry(blind_key.clone(), sequence);
             state.pending_index_deltas.push(IndexDelta::Tombstone {
                 blind_key,
                 generation: sequence,
@@ -311,8 +311,8 @@ where
             prefix_tokens: prefix_tokens.clone(),
             sealed_manifest: Box::new(sealed_manifest),
         });
-        state.namespace.upsert(updated.clone(), prefix_tokens);
         state.manifests.insert(manifest_id, manifest.clone());
+        state.upsert_namespace_entry(updated.clone(), prefix_tokens);
 
         Ok(manifest.into_metadata())
     }

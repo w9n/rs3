@@ -293,8 +293,13 @@ impl RuntimeRepository {
         self.repository.get_range(key, range).await
     }
 
-    pub(super) fn list(&self, prefix: &str) -> Result<Vec<RepositoryListEntry>, RepositoryError> {
-        self.repository.list(prefix)
+    pub(super) fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RepositoryListEntry>, RepositoryError> {
+        self.repository.list_page(prefix, start_after, limit)
     }
 
     pub(super) async fn delete_committed(
@@ -1006,7 +1011,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let list = runtime
-            .list("snapshots/")
+            .list_page("snapshots/", None, 1000)
             .unwrap_or_else(|error| panic!("{error}"));
         let commits = store
             .list_prefix("commits/v01/")

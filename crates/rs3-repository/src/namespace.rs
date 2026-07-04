@@ -5,15 +5,6 @@ use rs3_crypto::{KeyRing, NamespaceBlindKey};
 use rs3_index::{NamespaceEntry, NamespaceIndex};
 use rs3_types::{BlindIndexKey, KeyId, PrefixToken};
 
-/// Privacy-preserving class of a repository LIST lookup.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IndexedListPrefixMode {
-    Root,
-    Delimiter,
-    ParentDelimiterFallback,
-    RootFallback,
-}
-
 /// Returns the first matching namespace entry for ordered blind-key candidates.
 pub(crate) fn first_namespace_entry<'a>(
     namespace: &'a NamespaceIndex,
@@ -55,38 +46,9 @@ pub(crate) fn prefix_tokens_for_key(
     Ok(tokens)
 }
 
-/// Returns the indexed prefix used to collect trusted LIST candidates.
-pub(crate) fn indexed_list_prefix(prefix: &str) -> &str {
-    match indexed_list_prefix_mode(prefix) {
-        IndexedListPrefixMode::Root | IndexedListPrefixMode::Delimiter => prefix,
-        IndexedListPrefixMode::ParentDelimiterFallback => {
-            let Some(boundary) = prefix.rfind('/') else {
-                return "";
-            };
-            &prefix[..boundary + 1]
-        }
-        IndexedListPrefixMode::RootFallback => "",
-    }
-}
-
-/// Returns the privacy-preserving LIST lookup mode for tracing.
-pub(crate) fn indexed_list_prefix_mode(prefix: &str) -> IndexedListPrefixMode {
-    if prefix.is_empty() {
-        IndexedListPrefixMode::Root
-    } else if prefix.ends_with('/') {
-        IndexedListPrefixMode::Delimiter
-    } else if prefix.contains('/') {
-        IndexedListPrefixMode::ParentDelimiterFallback
-    } else {
-        IndexedListPrefixMode::RootFallback
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        IndexedListPrefixMode, indexed_list_prefix, indexed_list_prefix_mode, prefix_tokens_for_key,
-    };
+    use super::prefix_tokens_for_key;
     use rs3_crypto::{KeyRing, SecretBytes};
 
     fn secret() -> SecretBytes {
@@ -103,31 +65,5 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(tokens.len(), 3);
-    }
-
-    #[test]
-    fn indexed_list_prefix_classifies_fallback_without_prefix_value() {
-        assert_eq!(indexed_list_prefix(""), "");
-        assert_eq!(indexed_list_prefix_mode(""), IndexedListPrefixMode::Root);
-        assert_eq!(indexed_list_prefix("p/12/"), "p/12/");
-        assert_eq!(
-            indexed_list_prefix_mode("p/12/"),
-            IndexedListPrefixMode::Delimiter
-        );
-        assert_eq!(indexed_list_prefix("p/12"), "p/");
-        assert_eq!(
-            indexed_list_prefix_mode("p/12"),
-            IndexedListPrefixMode::ParentDelimiterFallback
-        );
-        assert_eq!(indexed_list_prefix("p/12/abc"), "p/12/");
-        assert_eq!(
-            indexed_list_prefix_mode("p/12/abc"),
-            IndexedListPrefixMode::ParentDelimiterFallback
-        );
-        assert_eq!(indexed_list_prefix("p12"), "");
-        assert_eq!(
-            indexed_list_prefix_mode("p12"),
-            IndexedListPrefixMode::RootFallback
-        );
     }
 }

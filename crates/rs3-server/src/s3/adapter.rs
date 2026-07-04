@@ -2,12 +2,12 @@
 
 use super::S3BoundaryError;
 use super::mapping::{
-    collect_body_reserving, content_range, etag, i64_len, legal_hold_header, legal_hold_output,
-    list_page, logical_path, max_keys, put_object_legal_hold_request_status,
-    put_object_legal_hold_status, put_object_retention_policy, repository_error, resolve_range,
-    retention_headers, timestamp, validate_delete_object_request,
-    validate_get_object_legal_hold_request, validate_get_object_request,
-    validate_head_object_request, validate_put_object_request,
+    ListPage, collect_body_reserving, content_range, etag, i64_len, legal_hold_header,
+    legal_hold_output, list_page as map_list_page, logical_path, max_keys,
+    put_object_legal_hold_request_status, put_object_legal_hold_status,
+    put_object_retention_policy, repository_error, resolve_range, retention_headers, timestamp,
+    validate_delete_object_request, validate_get_object_legal_hold_request,
+    validate_get_object_request, validate_head_object_request, validate_put_object_request,
 };
 use super::runtime::RuntimeRepository;
 use crate::{GatewayMode, RuntimeConfig};
@@ -194,6 +194,42 @@ impl GatewayS3Service {
         }
 
         Ok(permit)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        delimiter: Option<&str>,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> S3Result<ListPage> {
+        if max_keys == 0 {
+            return map_list_page(Vec::new(), prefix, delimiter, start_after, max_keys);
+        }
+
+        let mut entries = Vec::new();
+        let mut repository_start_after = start_after.map(ToOwned::to_owned);
+        loop {
+            let repository_entries = self
+                .repository
+                .list_page(prefix, repository_start_after.as_deref(), max_keys)
+                .map_err(repository_error)?;
+            let repository_has_more = repository_entries.len() > max_keys;
+            let next_repository_start_after = repository_entries
+                .last()
+                .map(|entry| entry.key.as_str().to_owned());
+            entries.extend(repository_entries);
+
+            let page = map_list_page(entries.clone(), prefix, delimiter, start_after, max_keys)?;
+            if page.next_continuation_token.is_some() || !repository_has_more {
+                return Ok(page);
+            }
+
+            let Some(next_repository_start_after) = next_repository_start_after else {
+                return Ok(page);
+            };
+            repository_start_after = Some(next_repository_start_after);
+        }
     }
 }
 
@@ -1092,14 +1128,8 @@ impl S3 for GatewayS3Service {
             let max_keys = max_keys(input.max_keys)?;
             let marker = input.marker;
             let delimiter = input.delimiter;
-            let entries = self.repository.list(&prefix).map_err(repository_error)?;
-            let page = list_page(
-                entries,
-                &prefix,
-                delimiter.as_deref(),
-                marker.as_deref(),
-                max_keys,
-            )?;
+            let page =
+                self.list_page(&prefix, delimiter.as_deref(), marker.as_deref(), max_keys)?;
 
             tracing::debug!(
                 target: "rs3_server",
@@ -1158,9 +1188,7 @@ impl S3 for GatewayS3Service {
             let max_keys = max_keys(input.max_keys)?;
             let start_after = input.continuation_token.or(input.start_after);
             let delimiter = input.delimiter;
-            let entries = self.repository.list(&prefix).map_err(repository_error)?;
-            let page = list_page(
-                entries,
+            let page = self.list_page(
                 &prefix,
                 delimiter.as_deref(),
                 start_after.as_deref(),
@@ -1674,6 +1702,71 @@ mod tests {
             .await
             .expect_err("deleted object should not be visible through HeadObject");
         assert_eq!(*missing.code(), s3s::S3ErrorCode::NoSuchKey);
+    }
+
+    #[tokio::test]
+    async fn list_objects_v2_paginates_common_prefixes_after_duplicate_prefix_entries() {
+        let service = gateway_service().await;
+
+        for key in ["snapshots/a/1", "snapshots/a/2", "snapshots/b/1"] {
+            service
+                .put_object(s3_request(PutObjectInput {
+                    bucket: "client-bucket".to_owned(),
+                    key: key.to_owned(),
+                    body: Some(StreamingBlob::from(Body::from(Bytes::from_static(b"body")))),
+                    ..PutObjectInput::default()
+                }))
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+
+        let first = service
+            .list_objects_v2(s3_request(ListObjectsV2Input {
+                bucket: "client-bucket".to_owned(),
+                prefix: Some("snapshots/".to_owned()),
+                delimiter: Some("/".to_owned()),
+                max_keys: Some(1),
+                ..ListObjectsV2Input::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(first.output.is_truncated, Some(true));
+        assert_eq!(
+            first.output.next_continuation_token.as_deref(),
+            Some("snapshots/a/")
+        );
+        assert_eq!(
+            first
+                .output
+                .common_prefixes
+                .as_deref()
+                .and_then(|prefixes| prefixes.first())
+                .and_then(|prefix| prefix.prefix.as_deref()),
+            Some("snapshots/a/")
+        );
+
+        let second = service
+            .list_objects_v2(s3_request(ListObjectsV2Input {
+                bucket: "client-bucket".to_owned(),
+                prefix: Some("snapshots/".to_owned()),
+                delimiter: Some("/".to_owned()),
+                continuation_token: first.output.next_continuation_token,
+                max_keys: Some(1),
+                ..ListObjectsV2Input::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(second.output.is_truncated, Some(false));
+        assert_eq!(second.output.next_continuation_token, None);
+        assert_eq!(
+            second
+                .output
+                .common_prefixes
+                .as_deref()
+                .and_then(|prefixes| prefixes.first())
+                .and_then(|prefix| prefix.prefix.as_deref()),
+            Some("snapshots/b/")
+        );
     }
 
     #[tokio::test]

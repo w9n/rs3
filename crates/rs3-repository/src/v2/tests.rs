@@ -962,6 +962,60 @@ async fn v2_repository_replays_committed_index_delta_after_reload() {
 }
 
 #[tokio::test]
+async fn v2_repository_list_page_returns_limit_plus_one_after_marker() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let anchor = V2MemoryAnchor::new();
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    for key in [
+        "snapshots/list-a.bin",
+        "snapshots/list-b.bin",
+        "snapshots/list-c.bin",
+    ] {
+        must_repo(
+            repository
+                .put_committed(
+                    &anchor,
+                    must_type(LogicalPath::new(key)),
+                    Bytes::from_static(b"body"),
+                    RepositoryPutOptions::default(),
+                )
+                .await,
+        );
+    }
+
+    let first_page = must_repo(repository.list_page("snapshots/", None, 2));
+    let second_page =
+        must_repo(repository.list_page("snapshots/", Some("snapshots/list-a.bin"), 1));
+
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "snapshots/list-a.bin",
+            "snapshots/list-b.bin",
+            "snapshots/list-c.bin"
+        ]
+    );
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["snapshots/list-b.bin", "snapshots/list-c.bin"]
+    );
+}
+
+#[tokio::test]
 async fn v2_repository_range_reads_cache_headers_without_full_commit_gets() {
     let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
     let keyring = must_crypto(KeyRing::generate_random());

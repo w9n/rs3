@@ -307,7 +307,7 @@ impl BlobMultipartUpload for S3MultipartUpload {
 }
 
 fn record_s3_multipart_abort_failure(phase: &'static str, error_class: &'static str) {
-    metrics::counter!(
+    ::metrics::counter!(
         "rs3_storage_s3_multipart_abort_failures_total",
         "phase" => phase,
         "error_class" => error_class,
