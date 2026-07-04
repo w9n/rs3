@@ -7,7 +7,7 @@ use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::body::Body;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
 use rs3_crypto::ct_eq;
@@ -18,11 +18,19 @@ use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_millis(20);
+const MAX_ADMIN_CONNECTION_LIFETIME: Duration = Duration::from_secs(60);
+const MAX_ADMIN_CONNECTIONS: usize = 64;
 const ADMIN_REALM: &str = "Bearer realm=\"rs3-admin\"";
 
 /// Redacted bearer token for the gateway admin listener.
@@ -235,9 +243,9 @@ impl AdminHttpServer {
         let Self {
             service, listener, ..
         } = self;
-        let connection_builder = ConnectionBuilder::new(TokioExecutor::new());
         let graceful = GracefulShutdown::new();
         let mut shutdown = std::pin::pin!(shutdown);
+        let connection_slots = Arc::new(Semaphore::new(MAX_ADMIN_CONNECTIONS));
 
         loop {
             let (stream, remote_addr) = tokio::select! {
@@ -249,23 +257,53 @@ impl AdminHttpServer {
                 }
             };
 
-            let service = service.clone();
-            let connection = connection_builder.serve_connection(
-                TokioIo::new(stream),
-                service_fn(move |request| {
-                    let service = service.clone();
-                    async move { Ok::<_, Infallible>(service.handle(request).await) }
-                }),
-            );
-            let connection = graceful.watch(connection.into_owned());
-
-            tokio::spawn(async move {
-                if let Err(error) = connection.await {
+            let connection_permit = match connection_slots.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_error) => {
                     tracing::debug!(
                         %remote_addr,
-                        %error,
-                        "admin HTTP connection ended with error",
+                        "admin HTTP connection rejected by connection limit",
                     );
+                    continue;
+                }
+            };
+            let service = service.clone();
+            let connection_watcher = graceful.watcher();
+
+            tokio::spawn(async move {
+                let _connection_permit = connection_permit;
+                if !wait_for_first_client_byte(&stream, remote_addr).await {
+                    return;
+                }
+                let mut connection_builder = ConnectionBuilder::new(TokioExecutor::new());
+                connection_builder
+                    .http1()
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(HTTP_HEADER_READ_TIMEOUT);
+                let connection = connection_builder.serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(move |request| {
+                        let service = service.clone();
+                        async move { Ok::<_, Infallible>(service.handle(request).await) }
+                    }),
+                );
+                let connection = connection_watcher.watch(connection.into_owned());
+                match tokio::time::timeout(MAX_ADMIN_CONNECTION_LIFETIME, connection).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::debug!(
+                            %remote_addr,
+                            %error,
+                            "admin HTTP connection ended with error",
+                        );
+                    }
+                    Err(_elapsed) => {
+                        tracing::debug!(
+                            %remote_addr,
+                            timeout_seconds = MAX_ADMIN_CONNECTION_LIFETIME.as_secs(),
+                            "admin HTTP connection exceeded maximum lifetime",
+                        );
+                    }
                 }
             });
         }
@@ -277,6 +315,30 @@ impl AdminHttpServer {
                     timeout: GRACEFUL_SHUTDOWN_TIMEOUT,
                 })
             }
+        }
+    }
+}
+
+async fn wait_for_first_client_byte(stream: &TcpStream, remote_addr: SocketAddr) -> bool {
+    let mut first_byte = [0_u8; 1];
+    match tokio::time::timeout(HTTP_HEADER_READ_TIMEOUT, stream.peek(&mut first_byte)).await {
+        Ok(Ok(0)) => false,
+        Ok(Ok(_read)) => true,
+        Ok(Err(error)) => {
+            tracing::debug!(
+                %remote_addr,
+                %error,
+                "admin HTTP connection ended before request bytes arrived",
+            );
+            false
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                %remote_addr,
+                timeout_ms = HTTP_HEADER_READ_TIMEOUT.as_millis(),
+                "admin HTTP connection closed after idle header timeout",
+            );
+            false
         }
     }
 }
@@ -346,7 +408,9 @@ fn json_response(body_status: StatusCode, body: impl Serialize) -> Response<Full
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminBearerToken, AdminHttpAuth, AdminHttpService};
+    use super::{
+        AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminHttpService,
+    };
     use crate::{
         AdminReportProfile, AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig,
         MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig,
@@ -358,7 +422,10 @@ mod tests {
     use http_body_util::{BodyExt, Full};
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
     use secrecy::SecretString;
+    use std::io::ErrorKind;
     use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpStream;
 
     fn runtime_config() -> RuntimeConfig {
         let bind = match "127.0.0.1:0".parse() {
@@ -419,12 +486,42 @@ mod tests {
         }
     }
 
+    fn admin_token() -> AdminBearerToken {
+        AdminBearerToken::new("admin-token-12345").unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn bind_addr() -> std::net::SocketAddr {
+        "127.0.0.1:0"
+            .parse()
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    async fn assert_peer_closes(stream: &mut TcpStream) {
+        let mut buffer = [0_u8; 1];
+        match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buffer)).await {
+            Ok(Ok(0)) => {}
+            Ok(Err(error)) if error.kind() == ErrorKind::ConnectionReset => {}
+            Ok(Ok(read)) => panic!("idle connection produced {read} bytes before closing"),
+            Ok(Err(error)) => panic!("{error}"),
+            Err(_elapsed) => panic!("idle connection did not close after header timeout"),
+        }
+    }
+
+    async fn admin_server() -> AdminHttpServer {
+        let admin_config = AdminHttpConfig::new(
+            bind_addr(),
+            AdminHttpAuth::bearer(admin_token()),
+            AdminReportProfile::Production,
+        );
+        AdminHttpServer::bind(runtime_config(), admin_config)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
     fn service() -> AdminHttpService {
-        let token =
-            AdminBearerToken::new("admin-token-12345").unwrap_or_else(|error| panic!("{error}"));
         AdminHttpService::new(
             runtime_config(),
-            AdminHttpAuth::bearer(token),
+            AdminHttpAuth::bearer(admin_token()),
             AdminReportProfile::Production,
         )
     }
@@ -513,5 +610,26 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn idle_admin_connection_is_closed_after_header_timeout() {
+        let server = admin_server().await;
+        let addr = server.local_addr();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(server.run_until_shutdown(async move {
+            let _ = shutdown_rx.await;
+        }));
+
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_peer_closes(&mut stream).await;
+
+        let _ = shutdown_tx.send(());
+        handle
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|error| panic!("{error}"));
     }
 }

@@ -1,7 +1,7 @@
 //! TCP listener and HTTP serving loop for the S3 boundary.
 
 use crate::{GatewayS3Boundary, RuntimeConfig, S3BoundaryError};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
 use std::future::Future;
@@ -9,10 +9,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_millis(20);
+// Long single PUTs are legitimate through the S3 data plane, but idle or stuck
+// client connections still need a hard upper bound.
+const MAX_S3_CONNECTION_LIFETIME: Duration = Duration::from_secs(60 * 60);
 
 /// Bound S3 server ready to accept client connections.
 pub struct GatewayServer {
@@ -80,7 +87,6 @@ impl GatewayServer {
             ..
         } = self;
         let service = boundary.into_service();
-        let connection_builder = ConnectionBuilder::new(TokioExecutor::new());
         let graceful = GracefulShutdown::new();
         let mut shutdown = std::pin::pin!(shutdown);
         let connection_slots =
@@ -107,18 +113,37 @@ impl GatewayServer {
                     continue;
                 }
             };
-            let connection =
-                connection_builder.serve_connection(TokioIo::new(stream), service.clone());
-            let connection = graceful.watch(connection.into_owned());
+            let connection_watcher = graceful.watcher();
+            let service = service.clone();
 
             tokio::spawn(async move {
                 let _connection_permit = connection_permit;
-                if let Err(error) = connection.await {
-                    tracing::debug!(
-                        %remote_addr,
-                        %error,
-                        "S3 HTTP connection ended with error",
-                    );
+                if !wait_for_first_client_byte(&stream, remote_addr).await {
+                    return;
+                }
+                let mut connection_builder = ConnectionBuilder::new(TokioExecutor::new());
+                connection_builder
+                    .http1()
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(HTTP_HEADER_READ_TIMEOUT);
+                let connection = connection_builder.serve_connection(TokioIo::new(stream), service);
+                let connection = connection_watcher.watch(connection.into_owned());
+                match tokio::time::timeout(MAX_S3_CONNECTION_LIFETIME, connection).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::debug!(
+                            %remote_addr,
+                            %error,
+                            "S3 HTTP connection ended with error",
+                        );
+                    }
+                    Err(_elapsed) => {
+                        tracing::debug!(
+                            %remote_addr,
+                            timeout_seconds = MAX_S3_CONNECTION_LIFETIME.as_secs(),
+                            "S3 HTTP connection exceeded maximum lifetime",
+                        );
+                    }
                 }
             });
         }
@@ -130,6 +155,30 @@ impl GatewayServer {
                     timeout: GRACEFUL_SHUTDOWN_TIMEOUT,
                 })
             }
+        }
+    }
+}
+
+async fn wait_for_first_client_byte(stream: &TcpStream, remote_addr: SocketAddr) -> bool {
+    let mut first_byte = [0_u8; 1];
+    match tokio::time::timeout(HTTP_HEADER_READ_TIMEOUT, stream.peek(&mut first_byte)).await {
+        Ok(Ok(0)) => false,
+        Ok(Ok(_read)) => true,
+        Ok(Err(error)) => {
+            tracing::debug!(
+                %remote_addr,
+                %error,
+                "S3 HTTP connection ended before request bytes arrived",
+            );
+            false
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                %remote_addr,
+                timeout_ms = HTTP_HEADER_READ_TIMEOUT.as_millis(),
+                "S3 HTTP connection closed after idle header timeout",
+            );
+            false
         }
     }
 }
@@ -177,7 +226,10 @@ mod tests {
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
     use secrecy::SecretString;
+    use std::io::ErrorKind;
     use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpStream;
 
     fn runtime_config(static_credentials: bool) -> RuntimeConfig {
         let bind = match "127.0.0.1:0".parse() {
@@ -265,5 +317,40 @@ mod tests {
         let result = server.run_until_shutdown(async {}).await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn idle_connection_is_closed_after_header_timeout() {
+        let server = match GatewayServer::bind(runtime_config(true)).await {
+            Ok(server) => server,
+            Err(error) => panic!("{error}"),
+        };
+        let addr = server.local_addr();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(server.run_until_shutdown(async move {
+            let _ = shutdown_rx.await;
+        }));
+
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_peer_closes(&mut stream).await;
+
+        let _ = shutdown_tx.send(());
+        handle
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    async fn assert_peer_closes(stream: &mut TcpStream) {
+        let mut buffer = [0_u8; 1];
+        match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buffer)).await {
+            Ok(Ok(0)) => {}
+            Ok(Err(error)) if error.kind() == ErrorKind::ConnectionReset => {}
+            Ok(Ok(read)) => panic!("idle connection produced {read} bytes before closing"),
+            Ok(Err(error)) => panic!("{error}"),
+            Err(_elapsed) => panic!("idle connection did not close after header timeout"),
+        }
     }
 }
