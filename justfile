@@ -1,16 +1,20 @@
 set dotenv-load := false
 
+# Show available recipes.
 default:
     just --list
 
+# Format Rust and TOML sources.
 fmt:
     cargo fmt --all
     taplo fmt
 
+# Check Rust and TOML formatting without writing changes.
 fmt-check:
     cargo fmt --all --check
     taplo fmt --check
 
+# Run formatting, lint, workspace tests, and docs checks.
 check:
     cargo fmt --all --check
     taplo fmt --check
@@ -18,6 +22,7 @@ check:
     cargo test --workspace
     just docs-check
 
+# Run the S3 feature lint and tests.
 check-s3:
     cargo clippy -p rs3-storage -p rs3-server -p xtask --features rs3-server/s3,xtask/s3 --all-targets -- -D warnings
     cargo test -p rs3-storage -p rs3-server -p xtask --features rs3-server/s3,xtask/s3
@@ -89,6 +94,7 @@ preview-gate-v2-live BACKEND_BUCKET ENDPOINT_URL REGION:
     just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/d"
     just integration-velero-kopia-postgres-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/e"
 
+# Check a live v2 backend for retained-version and object-lock behavior.
 check-v2-provider-v2-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -116,60 +122,79 @@ check-v2-provider-v2-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
         --governance-bypass-reviewed \
         --format json
 
+# Rehearse v2 garbage collection against a live backend.
 v2-gc-rehearsal-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
     cargo run -p xtask --bin xtask --features s3 -- v2 gc-rehearsal --backend s3 --s3-bucket "{{BACKEND_BUCKET}}" --s3-prefix "{{BACKEND_PREFIX}}" --s3-endpoint-url "{{ENDPOINT_URL}}" --s3-region "{{REGION}}" --retained-provider-conformance-passed --format json
 
+# Run live S3 storage contract tests against configured credentials.
 integration-s3:
     cargo test -p rs3-storage --features s3 --test s3_live -- --ignored --nocapture
 
+# Run the local S3 integration harness.
 integration-s3-local *ARGS:
     cargo run -p xtask --bin xtask -- integration s3-local {{ARGS}}
 
+# Run the local S3 integration harness in containers.
 integration-s3-container *ARGS:
     cargo run -p xtask --bin xtask --features containers -- integration s3-local --mode container {{ARGS}}
 
+# Run the S3 gateway integration harness.
 integration-s3-gateway *ARGS:
     cargo run -p xtask --bin xtask --features containers -- integration s3-gateway {{ARGS}}
 
+# Run the v2 live S3 gateway integration harness.
 integration-s3-gateway-v2-live *ARGS:
     cargo run -p xtask --bin xtask --features containers -- integration s3-gateway --mode provided --repository-format v2-preview --retention-mode governance --retention-days 1 --tooling-smoke {{ARGS}}
 
+# Run the Kopia gateway integration harness.
 integration-kopia-gateway *ARGS:
     cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway {{ARGS}}
 
+# Run the v2 live Kopia gateway integration harness.
 integration-kopia-gateway-v2-live *ARGS:
     cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway --mode provided --repository-format v2-preview --retention-mode governance --retention-days 1 {{ARGS}}
 
+# Run the Kubernetes gateway integration harness.
 integration-k8s-gateway *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway {{ARGS}}
 
+# Run the v2 Kubernetes gateway integration harness.
 integration-k8s-gateway-v2 *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway --repository-format v2-preview {{ARGS}}
 
+# Run the Velero Kopia smoke test.
 integration-velero-kopia-smoke *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-smoke {{ARGS}}
 
+# Run the Velero Kopia local-PV smoke test.
 integration-velero-kopia-local-pv-smoke *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-local-pv-smoke {{ARGS}}
 
+# Run the Velero Kopia dynamic-PVC smoke test.
 integration-velero-kopia-dynamic-pvc-smoke *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke {{ARGS}}
 
+# Run the Velero Kopia dynamic-PVC gateway-restart smoke test.
 integration-velero-kopia-dynamic-pvc-gateway-restart-smoke *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke {{ARGS}}
 
+# Run the v2 live dynamic-PVC gateway-restart smoke test.
 integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke --backend-mode provided --repository-format v2-preview --repository-retention-mode governance --repository-retention-days 1 {{ARGS}}
 
+# Run the Velero Kopia restore-readonly dynamic-PVC smoke test.
 integration-velero-kopia-dynamic-pvc-restore-readonly-smoke *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-restore-readonly-smoke {{ARGS}}
 
+# Run the Velero Kopia Postgres smoke test.
 integration-velero-kopia-postgres-smoke *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke {{ARGS}}
 
+# Run the v2 live Velero Kopia Postgres smoke test.
 integration-velero-kopia-postgres-v2-live *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke --backend-mode provided --repository-format v2-preview --repository-retention-mode governance --repository-retention-days 1 {{ARGS}}
 
+# Lint the Helm chart with required fixture values.
 helm-lint:
     helm lint charts/rs3-gateway \
         --set credentials.create=true \
@@ -179,48 +204,61 @@ helm-lint:
         --set-string repositoryKeys.saltHex=1111111111111111111111111111111111111111111111111111111111111111 \
         --set-string repositoryKeys.wrappingKeyHex=2222222222222222222222222222222222222222222222222222222222222222
 
+# Run the workspace test suite.
 test:
     cargo test --workspace
 
+# Run the performance harness.
 perf *ARGS:
     cargo run -p xtask --bin xtask -- perf {{ARGS}}
 
+# Run committed-write performance measurements.
 perf-commit *ARGS:
     cargo run -p xtask --bin xtask -- perf --scenario write-committed {{ARGS}}
 
+# Run parallel committed-write performance measurements.
 perf-commit-parallel *ARGS:
     cargo run -p xtask --bin xtask -- perf --scenario write-committed-parallel {{ARGS}}
 
+# Run performance measurements against an S3 backend.
 perf-s3 *ARGS:
     cargo run -p xtask --bin xtask --features s3 -- perf --backend s3 {{ARGS}}
 
+# Run performance measurements against a container S3 backend.
 perf-s3-container *ARGS:
     cargo run -p xtask --bin xtask --features containers -- perf --backend s3-container {{ARGS}}
 
+# Run performance measurements through a containerized gateway.
 perf-s3-gateway *ARGS:
     cargo run -p xtask --bin xtask --features containers -- perf --backend s3-gateway-container {{ARGS}}
 
+# Run the workspace suite with nextest.
 nextest:
     cargo nextest run --workspace
 
+# Run cargo-deny checks.
 deny:
     cargo deny check
 
+# Run cargo-deny checks with S3 feature metadata.
 deny-s3:
     cargo metadata --features xtask/s3 --format-version 1 > target/deny-s3-metadata.json
     cargo deny check --metadata-path target/deny-s3-metadata.json
 
+# Run cargo-audit.
 audit:
     cargo audit
 
+# Build Rust API documentation.
 doc:
     cargo doc --workspace --no-deps
 
-docs-build:
-    just docs-check
+alias docs-build := docs-check
 
+# Build the public documentation strictly.
 docs-check:
     mkdocs build --strict
 
+# Serve the public documentation locally.
 docs-serve *ARGS:
     mkdocs serve {{ARGS}}

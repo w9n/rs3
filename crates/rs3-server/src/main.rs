@@ -57,6 +57,7 @@ enum LogFormat {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Run the S3-compatible gateway and optional admin API.
     Serve {
         #[arg(long)]
         bind: Option<SocketAddr>,
@@ -71,18 +72,22 @@ enum Commands {
         #[arg(long, env = "RS3_ADMIN_PROFILE", value_enum, default_value_t = DoctorProfile::Production)]
         admin_profile: DoctorProfile,
     },
+    /// Validate runtime configuration against a local or production posture.
     Doctor {
         #[arg(long, env = "RS3_DOCTOR_PROFILE", value_enum, default_value_t = DoctorProfile::Local)]
         profile: DoctorProfile,
     },
+    /// Export a signed restore bundle for offline recovery.
     ExportRestoreBundle {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
+    /// Write a v2 index snapshot and report the accepted anchor state.
     WriteIndexSnapshot {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
+    /// Probe v2 object-store behavior required by the repository format.
     CheckV2Provider {
         #[arg(long)]
         probe_prefix: Option<String>,
@@ -93,6 +98,7 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
+    /// Import a trusted v2 anchor after operator recovery review.
     ImportV2Anchor(Box<ImportV2AnchorArgs>),
 }
 
