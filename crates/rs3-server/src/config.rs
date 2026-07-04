@@ -1,7 +1,7 @@
 //! Runtime configuration loaded from process environment.
 
 use crate::identity::StaticCredentials;
-use rs3_crypto::{MIN_REPOSITORY_SALT_LEN, SecretBytes};
+use rs3_crypto::{MIN_REPOSITORY_SALT_LEN, SecretBytes, ct_eq};
 use rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE;
 use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
@@ -856,22 +856,10 @@ fn parse_bool(
 }
 
 fn secret_string_eq(left: &SecretString, right: &SecretString) -> bool {
-    constant_time_eq(
+    ct_eq(
         left.expose_secret().as_bytes(),
         right.expose_secret().as_bytes(),
     )
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-
-    let diff = left
-        .iter()
-        .zip(right.iter())
-        .fold(0_u8, |diff, (left, right)| diff | (left ^ right));
-    diff == 0
 }
 
 #[cfg(test)]

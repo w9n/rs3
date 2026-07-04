@@ -3312,6 +3312,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rs3-crypto",
  "secrecy",
  "serde_json",
  "thiserror",
@@ -3334,6 +3335,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
  "thiserror",
  "zeroize",
 ]

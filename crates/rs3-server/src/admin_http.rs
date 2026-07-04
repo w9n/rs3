@@ -10,6 +10,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
+use rs3_crypto::ct_eq;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde_json::json;
@@ -51,7 +52,7 @@ impl AdminBearerToken {
     }
 
     fn matches_presented(&self, presented: &str) -> bool {
-        constant_time_eq(self.0.expose_secret().as_bytes(), presented.as_bytes())
+        ct_eq(self.0.expose_secret().as_bytes(), presented.as_bytes())
     }
 }
 
@@ -63,7 +64,7 @@ impl fmt::Debug for AdminBearerToken {
 
 impl PartialEq for AdminBearerToken {
     fn eq(&self, other: &Self) -> bool {
-        constant_time_eq(
+        ct_eq(
             self.0.expose_secret().as_bytes(),
             other.0.expose_secret().as_bytes(),
         )
@@ -341,19 +342,6 @@ fn json_response(body_status: StatusCode, body: impl Serialize) -> Response<Full
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut diff = left.len() ^ right.len();
-    let max_len = left.len().max(right.len());
-
-    for index in 0..max_len {
-        let left_byte = left.get(index).copied().unwrap_or(0);
-        let right_byte = right.get(index).copied().unwrap_or(0);
-        diff |= usize::from(left_byte ^ right_byte);
-    }
-
-    diff == 0
 }
 
 #[cfg(test)]

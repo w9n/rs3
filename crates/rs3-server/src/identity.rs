@@ -1,5 +1,6 @@
 //! Request identity and authorization contracts.
 
+use rs3_crypto::ct_eq;
 use rs3_types::PublicBucket;
 use secrecy::{ExposeSecret, SecretString};
 use std::fmt;
@@ -27,7 +28,7 @@ impl fmt::Debug for StaticCredentials {
 impl PartialEq for StaticCredentials {
     fn eq(&self, other: &Self) -> bool {
         self.access_key_id == other.access_key_id
-            && constant_time_eq(
+            && ct_eq(
                 self.secret_access_key.expose_secret().as_bytes(),
                 other.secret_access_key.expose_secret().as_bytes(),
             )
@@ -121,7 +122,7 @@ impl IdentityProvider for StaticCredentialProvider {
         secret_access_key: &str,
     ) -> Result<Identity, AuthError> {
         if self.credentials.access_key_id != access_key_id
-            || !constant_time_eq(
+            || !ct_eq(
                 self.credentials
                     .secret_access_key
                     .expose_secret()
@@ -154,19 +155,6 @@ impl Authorizer for StaticCredentialProvider {
 
         Ok(())
     }
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut diff = left.len() ^ right.len();
-    let max_len = left.len().max(right.len());
-
-    for index in 0..max_len {
-        let left_byte = left.get(index).copied().unwrap_or(0);
-        let right_byte = right.get(index).copied().unwrap_or(0);
-        diff |= usize::from(left_byte ^ right_byte);
-    }
-
-    diff == 0
 }
 
 #[cfg(test)]

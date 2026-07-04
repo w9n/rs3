@@ -5,6 +5,7 @@ use http_body_util::{BodyExt, Empty};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use rs3_crypto::ct_eq;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use std::fmt;
@@ -156,7 +157,7 @@ impl fmt::Debug for GatewayAdminBearerToken {
 
 impl PartialEq for GatewayAdminBearerToken {
     fn eq(&self, other: &Self) -> bool {
-        constant_time_eq(
+        ct_eq(
             self.0.expose_secret().as_bytes(),
             other.0.expose_secret().as_bytes(),
         )
@@ -353,19 +354,6 @@ fn content_length_exceeds(headers: &http::HeaderMap, limit: usize) -> bool {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok())
         .is_some_and(|length| length > limit)
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut diff = left.len() ^ right.len();
-    let max_len = left.len().max(right.len());
-
-    for index in 0..max_len {
-        let left_byte = left.get(index).copied().unwrap_or(0);
-        let right_byte = right.get(index).copied().unwrap_or(0);
-        diff |= usize::from(left_byte ^ right_byte);
-    }
-
-    diff == 0
 }
 
 #[cfg(test)]

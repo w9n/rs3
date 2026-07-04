@@ -1,6 +1,7 @@
 //! Cryptographic boundaries for repository privacy.
 
 mod checkpoint;
+mod constant_time;
 mod derive;
 mod envelope;
 mod error;
@@ -15,6 +16,7 @@ pub use checkpoint::{
     CheckpointSignature, derive_checkpoint_id, derive_checkpoint_payload_digest,
     derive_index_delta_object_id,
 };
+pub use constant_time::ct_eq;
 pub use derive::{
     NamespaceBlindKey, NamespacePrefixToken, derive_backend_object_id, derive_blind_index_key,
     derive_manifest_id, derive_prefix_token,
