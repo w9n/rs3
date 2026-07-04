@@ -22,6 +22,35 @@ check-s3:
     cargo clippy -p rs3-storage -p rs3-server -p xtask --features rs3-server/s3,xtask/s3 --all-targets -- -D warnings
     cargo test -p rs3-storage -p rs3-server -p xtask --features rs3-server/s3,xtask/s3
 
+# Run a local filesystem-backed gateway with fixture credentials.
+serve-local:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p /tmp/rs3-backend
+    RS3_PUBLIC_BUCKET=backup \
+    RS3_BACKEND_ENDPOINT=file:///tmp/rs3-backend \
+    RS3_BACKEND_BUCKET=repo \
+    RS3_ANCHOR_MODE=memory \
+    RS3_ALLOW_MEMORY_ANCHOR=true \
+    RS3_ALLOW_REPOSITORY_INIT=true \
+    RS3_REPOSITORY_ID=local-dev \
+    RS3_REPOSITORY_SALT_HEX=2222222222222222222222222222222222222222222222222222222222222222 \
+    RS3_KEYRING_WRAPPING_KEY_HEX=3333333333333333333333333333333333333333333333333333333333333333 \
+    RS3_STATIC_ACCESS_KEY_ID=local \
+    RS3_STATIC_SECRET_ACCESS_KEY=local-secret \
+        cargo run -p rs3-server -- serve \
+            --bind 127.0.0.1:9080 \
+            --admin-bind 127.0.0.1:9082 \
+            --admin-bearer-token local-admin-token-12345 \
+            --admin-profile local
+
+# Run the local console against `just serve-local`.
+console-local:
+    RS3_CONSOLE_BEARER_TOKEN=local-console-token-12345 \
+    RS3_GATEWAY_ADMIN_URL=http://127.0.0.1:9082 \
+    RS3_GATEWAY_ADMIN_BEARER_TOKEN=local-admin-token-12345 \
+        cargo run -p rs3-console
+
 # Cheap production-preview gate for local handoff.
 preview-gate-local:
     just check
