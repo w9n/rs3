@@ -155,6 +155,13 @@ under the default counted `keyrings/` object name. If
 bootstrap override. A missing anchor with committed repository objects is a
 recovery error, not an invitation to pick backend state.
 
+Before creating the v2 format root, startup performs a defensive repository
+inventory and rejects foreign objects. Retained-version object-lock profiles
+inventory object versions as well as current objects so data hidden behind
+provider versioning still blocks bootstrap. This LIST is a preflight guard, not
+the serialization boundary: S3-compatible listings can be stale, and the first
+commit's anchor compare-and-advance is the final bootstrap safety check.
+
 Minimal first-run settings:
 
 ```sh

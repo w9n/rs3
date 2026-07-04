@@ -621,6 +621,7 @@ async fn bootstrap_v2_repository(
         unanchored_gateway_keyring(store, keys, config.repository.retention, true).await?;
     reject_v2_bootstrap_with_foreign_objects(
         store,
+        provider_profile,
         loaded_keyring
             .envelope_reference
             .as_ref()
@@ -787,15 +788,29 @@ async fn open_format_root(
     V2FormatRoot::from_plaintext_bytes(&plaintext).map_err(repository_init)
 }
 
-async fn reject_v2_bootstrap_with_foreign_objects(
-    store: &RuntimeStore,
+async fn reject_v2_bootstrap_with_foreign_objects<S>(
+    store: &S,
+    provider_profile: V2ProviderProfile,
     allowed_keyring: Option<&BackendObjectId>,
-) -> Result<(), S3BoundaryError> {
+) -> Result<(), S3BoundaryError>
+where
+    S: BlobStore,
+{
     const BOOTSTRAP_EMPTY_CHECK_PREFIXES: &[&str] =
         &["", "format/", "commits/", "keyrings/", "checkpoints/"];
 
+    // This is an early hygiene check, not a synchronization primitive. The
+    // first commit's anchor compare-and-advance remains the bootstrap safety
+    // boundary on eventually consistent object stores.
     for prefix in BOOTSTRAP_EMPTY_CHECK_PREFIXES {
-        let objects = store.list_prefix(prefix).await.map_err(repository_init)?;
+        let objects = if provider_profile == V2ProviderProfile::RetainedVersionObjectLock {
+            store
+                .list_prefix_versions(prefix)
+                .await
+                .map_err(repository_init)?
+        } else {
+            store.list_prefix(prefix).await.map_err(repository_init)?
+        };
         let has_foreign_object = objects
             .iter()
             .any(|metadata| Some(&metadata.object_id) != allowed_keyring);
@@ -858,13 +873,22 @@ fn default_v2_provider_probe_prefix() -> String {
 mod tests {
     use super::{
         V2ProviderProfile, V2RecoveryBundle, reject_import_stranding_newer_commits,
-        verify_recovery_bundle_trust,
+        reject_v2_bootstrap_with_foreign_objects, verify_recovery_bundle_trust,
     };
     use bytes::Bytes;
     use rs3_crypto::KeyRing;
     use rs3_repository::v2::{V2AnchorState, V2FormatRef};
-    use rs3_storage::{BlobStore, MemoryBlobStore, PutOptions};
-    use rs3_types::{BackendObjectId, BackendVersionId, KeyId, KeyPurpose, RepositoryId, Sequence};
+    use rs3_storage::{
+        BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions, StorageError,
+    };
+    use rs3_types::{
+        BackendObjectId, BackendVersionId, KeyId, KeyPurpose, LegalHoldStatus, RepositoryId,
+        RetentionPolicy, Sequence,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn recovery_trust_rejects_bundle_below_external_floor() {
@@ -982,6 +1006,134 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_empty_check_uses_version_listing_for_retained_profile() {
+        let store = VersionOnlyListStore::new(commit_object_id(8));
+
+        let error = match reject_v2_bootstrap_with_foreign_objects(
+            &store,
+            V2ProviderProfile::RetainedVersionObjectLock,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("hidden commit version should block bootstrap"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("empty repository prefix"));
+        assert_eq!(store.current_list_count(), 0);
+        assert_eq!(store.version_list_count(), 1);
+    }
+
+    #[derive(Clone)]
+    struct VersionOnlyListStore {
+        object: BlobMetadata,
+        current_lists: Arc<AtomicUsize>,
+        version_lists: Arc<AtomicUsize>,
+    }
+
+    impl VersionOnlyListStore {
+        fn new(object_id: BackendObjectId) -> Self {
+            Self {
+                object: BlobMetadata {
+                    object_id,
+                    content_len: 1,
+                    modified_at_ms: Some(1),
+                    etag: None,
+                    version_id: Some(
+                        BackendVersionId::new("hidden-version")
+                            .unwrap_or_else(|error| panic!("{error}")),
+                    ),
+                    retention: None,
+                    retain_until_ms: None,
+                    legal_hold: None,
+                },
+                current_lists: Arc::new(AtomicUsize::new(0)),
+                version_lists: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn current_list_count(&self) -> usize {
+            self.current_lists.load(Ordering::SeqCst)
+        }
+
+        fn version_list_count(&self) -> usize {
+            self.version_lists.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for VersionOnlyListStore {
+        async fn put(
+            &self,
+            _object_id: &BackendObjectId,
+            _body: Bytes,
+            _options: PutOptions,
+        ) -> rs3_storage::Result<BlobMetadata> {
+            unsupported_store_operation()
+        }
+
+        async fn get_range(
+            &self,
+            _object_id: &BackendObjectId,
+            _range: ByteRange,
+        ) -> rs3_storage::Result<Bytes> {
+            unsupported_store_operation()
+        }
+
+        async fn head(&self, _object_id: &BackendObjectId) -> rs3_storage::Result<BlobMetadata> {
+            unsupported_store_operation()
+        }
+
+        async fn list_prefix(&self, _prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
+            self.current_lists.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        async fn list_prefix_versions(
+            &self,
+            prefix: &str,
+        ) -> rs3_storage::Result<Vec<BlobMetadata>> {
+            self.version_lists.fetch_add(1, Ordering::SeqCst);
+            if self.object.object_id.as_str().starts_with(prefix) {
+                Ok(vec![self.object.clone()])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn delete(&self, _object_id: &BackendObjectId) -> rs3_storage::Result<()> {
+            unsupported_store_operation()
+        }
+
+        async fn extend_retention(
+            &self,
+            _object_id: &BackendObjectId,
+            _policy: RetentionPolicy,
+        ) -> rs3_storage::Result<()> {
+            unsupported_store_operation()
+        }
+
+        async fn set_legal_hold(
+            &self,
+            _object_id: &BackendObjectId,
+            _status: LegalHoldStatus,
+        ) -> rs3_storage::Result<()> {
+            unsupported_store_operation()
+        }
+
+        async fn flush_caches(&self) -> rs3_storage::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn unsupported_store_operation<T>() -> rs3_storage::Result<T> {
+        Err(StorageError::Provider(
+            "version-only list store does not implement this operation".to_owned(),
+        ))
     }
 
     fn sample_bundle() -> V2RecoveryBundle {

@@ -451,6 +451,13 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         ));
     }
 
+    if config.repository.allow_init {
+        findings.push(AdminFinding::error(
+            "repository.init-enabled",
+            "production profile requires RS3_ALLOW_REPOSITORY_INIT=false outside deliberate bootstrap",
+        ));
+    }
+
     match backend_kind(&config.backend.endpoint) {
         "memory" => findings.push(AdminFinding::error(
             "backend.memory",
@@ -906,6 +913,7 @@ mod tests {
         assert!(codes.contains(&"backend.memory"));
         assert!(codes.contains(&"auth.static-credentials"));
         assert!(codes.contains(&"recovery.public-key"));
+        assert!(codes.contains(&"repository.init-enabled"));
     }
 
     #[test]

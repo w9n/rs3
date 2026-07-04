@@ -1043,6 +1043,7 @@ mod tests {
         assert!(codes.contains(&"retention.missing"));
         assert!(codes.contains(&"auth.static-credentials"));
         assert!(codes.contains(&"recovery.public-key"));
+        assert!(codes.contains(&"repository.init-enabled"));
     }
 
     #[test]
@@ -1080,6 +1081,7 @@ mod tests {
             field_manager: "rs3-server".to_owned(),
         };
         config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 30));
+        config.repository.allow_init = false;
         config.static_credentials = Some(StaticCredentials {
             access_key_id: "rs3-fixture-access-key".to_owned(),
             secret_access_key: SecretString::from("rs3-fixture-secret-key"),
