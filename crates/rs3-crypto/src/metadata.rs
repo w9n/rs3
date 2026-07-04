@@ -70,7 +70,7 @@ fn metadata_nonce(
     let material = nonce_material(associated_data, plaintext);
     let mut nonce = derive_hmac(secret, b"rs3:metadata-aead-nonce:v1", &material)?;
     nonce.truncate(METADATA_NONCE_LEN);
-    Ok(nonce)
+    Ok(nonce.to_vec())
 }
 
 fn encrypt_metadata_with_key(

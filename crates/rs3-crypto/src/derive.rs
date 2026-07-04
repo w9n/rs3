@@ -119,7 +119,7 @@ pub fn derive_blind_index_key(
         b"rs3:blind-index:v1",
         normalized_path.as_str().as_bytes(),
     )?;
-    BlindIndexKey::new(hex::encode(bytes)).map_err(CryptoError::from)
+    BlindIndexKey::new(hex::encode(bytes.as_slice())).map_err(CryptoError::from)
 }
 
 /// Derives a stable prefix-list token for a normalized client-visible prefix.
@@ -132,7 +132,7 @@ pub fn derive_prefix_token(
         b"rs3:prefix-token:v1",
         normalized_prefix.as_bytes(),
     )?;
-    PrefixToken::new(hex::encode(bytes)).map_err(CryptoError::from)
+    PrefixToken::new(hex::encode(bytes.as_slice())).map_err(CryptoError::from)
 }
 
 /// Derives an opaque backend object identifier for a durable object class.
@@ -142,7 +142,7 @@ pub fn derive_backend_object_id(
     material: &[u8],
 ) -> Result<BackendObjectId, CryptoError> {
     let bytes = derive_hmac(repository_secret, b"rs3:backend-object-id:v1", material)?;
-    BackendObjectId::new(format!("{object_class}/{}", hex::encode(bytes)))
+    BackendObjectId::new(format!("{object_class}/{}", hex::encode(bytes.as_slice())))
         .map_err(CryptoError::from)
 }
 
@@ -152,7 +152,7 @@ pub fn derive_manifest_id(
     material: &[u8],
 ) -> Result<ManifestId, CryptoError> {
     let bytes = derive_hmac(repository_secret, b"rs3:manifest-id:v1", material)?;
-    ManifestId::new(hex::encode(bytes)).map_err(CryptoError::from)
+    ManifestId::new(hex::encode(bytes.as_slice())).map_err(CryptoError::from)
 }
 
 #[cfg(test)]

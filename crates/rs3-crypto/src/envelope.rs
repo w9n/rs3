@@ -380,6 +380,12 @@ struct PlaintextKeyMaterial {
     secret_hex: String,
 }
 
+impl Drop for PlaintextKeyMaterial {
+    fn drop(&mut self) {
+        self.secret_hex.zeroize();
+    }
+}
+
 fn keyring_plaintext_bytes(keyring: &KeyRing) -> Result<Vec<u8>, CryptoError> {
     let mut keys = keyring
         .key_materials()
@@ -419,12 +425,19 @@ fn decode_keyring_plaintext(plaintext: &[u8]) -> Result<KeyRing, CryptoError> {
 
     let mut keys = Vec::with_capacity(plaintext.keys.len());
     for key in &mut plaintext.keys {
-        let secret = hex::decode(&key.secret_hex)
-            .map_err(|_| invalid_envelope("keyring plaintext contains non-hex secret material"))?;
+        let secret = match hex::decode(&key.secret_hex) {
+            Ok(secret) => Zeroizing::new(secret),
+            Err(_error) => {
+                key.secret_hex.zeroize();
+                return Err(invalid_envelope(
+                    "keyring plaintext contains non-hex secret material",
+                ));
+            }
+        };
         key.secret_hex.zeroize();
         keys.push(KeyMaterial::new(
             key.descriptor.clone(),
-            SecretBytes::new(secret)?,
+            SecretBytes::from_zeroizing(secret)?,
         ));
     }
 
@@ -489,9 +502,13 @@ fn invalid_format_envelope(reason: &str) -> CryptoError {
 
 #[cfg(test)]
 mod tests {
-    use super::{FormatEnvelope, KEYRING_ENVELOPE_VERSION, KeyringEnvelope};
-    use crate::{KeyRing, RepositoryKeyContext, SecretBytes};
+    use super::{
+        ENVELOPE_PLAINTEXT_DOMAIN, FormatEnvelope, KEYRING_ENVELOPE_VERSION, KeyringEnvelope,
+        KeyringPlaintext, decode_keyring_plaintext, keyring_plaintext_bytes,
+    };
+    use crate::{CryptoError, KeyRing, RepositoryKeyContext, SecretBytes};
     use rs3_types::RepositoryId;
+    use zeroize::Zeroize;
 
     fn secret(byte: u8) -> SecretBytes {
         SecretBytes::new(vec![byte; SecretBytes::MIN_LEN]).unwrap_or_else(|error| panic!("{error}"))
@@ -611,6 +628,25 @@ mod tests {
         let opened = envelope.open(&context("repo-b", 2), "wrap-v1", &secret(9));
 
         assert!(opened.is_err());
+    }
+
+    #[test]
+    fn keyring_plaintext_rejects_short_decoded_secret() {
+        let plaintext =
+            keyring_plaintext_bytes(&keyring()).unwrap_or_else(|error| panic!("{error}"));
+        let json = plaintext
+            .strip_prefix(ENVELOPE_PLAINTEXT_DOMAIN)
+            .unwrap_or_else(|| panic!("plaintext should include domain"));
+        let mut decoded: KeyringPlaintext =
+            serde_json::from_slice(json).unwrap_or_else(|error| panic!("{error}"));
+        decoded.keys[0].secret_hex.zeroize();
+        decoded.keys[0].secret_hex = "00".to_owned();
+        let mut body = ENVELOPE_PLAINTEXT_DOMAIN.to_vec();
+        serde_json::to_writer(&mut body, &decoded).unwrap_or_else(|error| panic!("{error}"));
+
+        let result = decode_keyring_plaintext(&body);
+
+        assert!(matches!(result, Err(CryptoError::SecretTooShort { .. })));
     }
 
     #[test]

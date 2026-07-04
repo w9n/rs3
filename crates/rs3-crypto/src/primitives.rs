@@ -3,6 +3,7 @@
 use crate::{CryptoError, SecretBytes};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -14,11 +15,11 @@ pub(crate) fn derive_hmac(
     repository_secret: &SecretBytes,
     domain: &[u8],
     material: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let mut mac = HmacSha256::new_from_slice(repository_secret.expose())
         .map_err(|_| CryptoError::InvalidHmacKey)?;
     mac.update(domain);
     mac.update(&[0]);
     mac.update(material);
-    Ok(mac.finalize().into_bytes().to_vec())
+    Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
 }

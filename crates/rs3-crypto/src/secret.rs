@@ -14,13 +14,17 @@ impl SecretBytes {
 
     /// Creates a secret byte container.
     pub fn new(bytes: Vec<u8>) -> Result<Self, CryptoError> {
+        Self::from_zeroizing(Zeroizing::new(bytes))
+    }
+
+    pub(crate) fn from_zeroizing(bytes: Zeroizing<Vec<u8>>) -> Result<Self, CryptoError> {
         if bytes.len() < Self::MIN_LEN {
             return Err(CryptoError::SecretTooShort {
                 minimum_len: Self::MIN_LEN,
             });
         }
 
-        Ok(Self(Zeroizing::new(bytes)))
+        Ok(Self(bytes))
     }
 
     /// Exposes the secret to cryptographic code inside this crate.
