@@ -363,6 +363,14 @@ td {
   color: var(--bad);
 }
 
+.refresh-error {
+  border-bottom: 1px solid var(--border);
+  padding: 9px 12px;
+  color: var(--bad);
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
 @media (max-width: 880px) {
   .metric-grid,
   .content-grid {

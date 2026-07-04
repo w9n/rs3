@@ -9,6 +9,7 @@ const state = {
   status: null,
   posture: null,
   lastError: null,
+  lastSuccessAt: null,
   postureError: null,
   autoRefresh: null,
 };
@@ -20,6 +21,7 @@ const nodes = {
   authForm: document.getElementById("auth-form"),
   tokenInput: document.getElementById("console-token"),
   lastRefresh: document.getElementById("last-refresh"),
+  refreshError: document.getElementById("refresh-error"),
   summaryPrimary: document.getElementById("summary-primary"),
   summarySecondary: document.getElementById("summary-secondary"),
   statusSummary: document.querySelector(".status-summary"),
@@ -56,6 +58,8 @@ nodes.clearTokenButton.addEventListener("click", () => {
   state.token = "";
   state.status = null;
   state.posture = null;
+  state.lastError = null;
+  state.lastSuccessAt = null;
   sessionStorage.removeItem(tokenKey);
   state.postureError = null;
   nodes.tokenInput.value = "";
@@ -97,6 +101,7 @@ async function refreshStatus(options = {}) {
   if (statusResult.status === "fulfilled") {
     state.status = statusResult.value;
     state.lastError = null;
+    state.lastSuccessAt = new Date();
     setConnection("Connected", "good");
   } else {
     state.lastError = errorMessage(statusResult.reason, "Refresh failed");
@@ -113,11 +118,21 @@ function render() {
   renderDetails(status);
   renderFindings(findings);
   renderPosture(state.posture);
-  nodes.lastRefresh.textContent = state.lastError
-    ? state.lastError
-    : status
-      ? `Updated ${formatNow()}`
-      : "Never refreshed";
+  renderRefreshState(status);
+}
+
+function renderRefreshState(status) {
+  nodes.lastRefresh.textContent = state.lastSuccessAt
+    ? `Updated ${formatTime(state.lastSuccessAt)}`
+    : "Never refreshed";
+  nodes.refreshError.hidden = !state.lastError;
+  if (state.lastError) {
+    nodes.refreshError.textContent = status
+      ? `Refresh failed; showing stale data: ${state.lastError}`
+      : state.lastError;
+  } else {
+    nodes.refreshError.textContent = "";
+  }
 }
 
 function renderSummary(status, findings) {
@@ -469,6 +484,6 @@ function formatTimestamp(value) {
   return new Date(value).toLocaleString();
 }
 
-function formatNow() {
-  return new Date().toLocaleTimeString();
+function formatTime(value) {
+  return value.toLocaleTimeString();
 }
