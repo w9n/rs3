@@ -7,11 +7,10 @@ mod runtime;
 mod runtime_builders;
 mod runtime_handles;
 mod runtime_keyring;
-mod runtime_v2;
 
 pub use boundary::{GatewayS3Boundary, S3Hardening};
-pub(crate) use runtime_v2::v2_quick_maintenance_from_config;
-pub use runtime_v2::{
+pub(crate) use runtime::v2_quick_maintenance_from_config;
+pub use runtime::{
     RuntimeV2ProviderConformanceOptions, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions,
     V2AnchorImportReport, check_v2_provider_conformance_from_config,
     export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
