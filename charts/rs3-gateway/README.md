@@ -81,7 +81,6 @@ networkPolicy:
             cidr: 10.30.0.0/24
 
 repository:
-  format: v2-preview
   id: tenant-a-repository
   allowInit: false
   retention:

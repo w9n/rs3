@@ -45,21 +45,6 @@ enum S3GatewayMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum S3GatewayRepositoryFormat {
-    /// v2 production-preview repository format.
-    V2Preview,
-}
-
-#[cfg(feature = "containers")]
-impl S3GatewayRepositoryFormat {
-    const fn as_env(self) -> &'static str {
-        match self {
-            Self::V2Preview => "v2-preview",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum S3GatewayRetentionMode {
     Governance,
     Compliance,
@@ -95,9 +80,6 @@ pub(crate) struct S3GatewayArgs {
     /// Backend prefix for repository-owned objects.
     #[arg(long, env = "RS3_TEST_S3_PREFIX", default_value = "rs3-gateway")]
     backend_prefix: String,
-    /// Repository format used by the gateway process.
-    #[arg(long, env = "RS3_REPOSITORY_FORMAT", value_enum, default_value_t = S3GatewayRepositoryFormat::V2Preview)]
-    repository_format: S3GatewayRepositoryFormat,
     /// Repository retention mode for repository-owned backend objects.
     #[arg(long, env = "RS3_REPOSITORY_RETENTION_MODE", value_enum)]
     retention_mode: Option<S3GatewayRetentionMode>,
@@ -186,7 +168,6 @@ fn validate_gateway_args(args: &S3GatewayArgs) -> Result<()> {
 #[cfg(feature = "containers")]
 fn gateway_process_options(args: &S3GatewayArgs) -> GatewayProcessOptions {
     GatewayProcessOptions {
-        repository_format: Some(args.repository_format.as_env()),
         repository_retention_mode: args.retention_mode.map(S3GatewayRetentionMode::as_env),
         repository_retention_days: args.retention_days,
         ..GatewayProcessOptions::default()

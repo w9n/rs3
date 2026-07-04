@@ -3,8 +3,6 @@
 use anyhow::Result;
 use clap::Args;
 
-use super::GatewayRepositoryFormat;
-
 #[derive(Debug, Args)]
 pub(crate) struct K8sGatewayArgs {
     /// kind cluster name. Defaults to a unique disposable name.
@@ -25,9 +23,6 @@ pub(crate) struct K8sGatewayArgs {
     /// Force a fixed payload segment size. Omit to use adaptive per-object sizing.
     #[arg(long)]
     payload_segment_size: Option<usize>,
-    /// Repository format used by the deployed gateway.
-    #[arg(long, env = "RS3_REPOSITORY_FORMAT", value_enum, default_value_t = GatewayRepositoryFormat::V2Preview)]
-    repository_format: GatewayRepositoryFormat,
     /// kind executable.
     #[arg(long, env = "RS3_TEST_KIND_BIN", default_value = "kind")]
     kind_bin: String,
@@ -147,7 +142,6 @@ mod imp {
                 anchor_name: "checkpoint",
                 log_format: "plain",
                 rust_log: "info",
-                repository_format: args.repository_format.as_env(),
                 payload_segment_size: args.payload_segment_size,
                 retention_mode: None,
                 retention_days: None,

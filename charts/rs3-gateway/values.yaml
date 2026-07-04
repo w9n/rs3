@@ -102,10 +102,9 @@ commit:
   maxBatchDelayMs: 5
   maxPendingItems: 8
 
-# Repository identity and format settings. allowInit should only be true for a
-# new, empty repository prefix under operator control.
+# Repository identity settings. allowInit should only be true for a new, empty
+# repository prefix under operator control.
 repository:
-  format: v2-preview
   id: rs3-repository
   allowInit: false
   # Leave unset to use adaptive per-object segment sizing. Set a positive value

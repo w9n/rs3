@@ -362,7 +362,7 @@ pub(crate) async fn v2_quick_maintenance_from_config(
 ) -> Result<rs3_repository::v2::V2MaintenanceReport, S3BoundaryError> {
     if config.repository.format != RepositoryFormat::V2Preview {
         return Err(repository_init(
-            "v2 maintenance requires RS3_REPOSITORY_FORMAT=v2-preview",
+            "v2 maintenance requires the v2-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;
@@ -398,7 +398,7 @@ pub async fn export_v2_recovery_bundle_from_config(
 ) -> Result<V2RecoveryBundle, S3BoundaryError> {
     if config.repository.format != RepositoryFormat::V2Preview {
         return Err(repository_init(
-            "v2 recovery bundle export requires RS3_REPOSITORY_FORMAT=v2-preview",
+            "v2 recovery bundle export requires the v2-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;
@@ -438,7 +438,7 @@ pub async fn write_v2_index_snapshot_from_config(
 ) -> Result<V2AnchorState, S3BoundaryError> {
     if config.repository.format != RepositoryFormat::V2Preview {
         return Err(repository_init(
-            "v2 index snapshots require RS3_REPOSITORY_FORMAT=v2-preview",
+            "v2 index snapshots require the v2-preview repository format",
         ));
     }
     if config.mode == GatewayMode::RestoreReadOnly {
@@ -465,7 +465,7 @@ pub async fn import_v2_anchor_from_config(
 ) -> Result<V2AnchorImportReport, S3BoundaryError> {
     if config.repository.format != RepositoryFormat::V2Preview {
         return Err(repository_init(
-            "v2 anchor import requires RS3_REPOSITORY_FORMAT=v2-preview",
+            "v2 anchor import requires the v2-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;
@@ -608,7 +608,7 @@ pub async fn check_v2_provider_conformance_from_config(
 ) -> Result<V2ProviderConformanceReport, S3BoundaryError> {
     if config.repository.format != RepositoryFormat::V2Preview {
         return Err(repository_init(
-            "v2 provider conformance requires RS3_REPOSITORY_FORMAT=v2-preview",
+            "v2 provider conformance requires the v2-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;

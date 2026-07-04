@@ -73,11 +73,11 @@ preview-gate-release:
 # Expensive local v2 gate for scheduled CI or release-candidate hardening.
 preview-gate-v2-nightly:
     just check-s3
-    just integration-s3-gateway --repository-format v2-preview --tooling-smoke
-    just integration-kopia-gateway --repository-format v2-preview
+    just integration-s3-gateway --tooling-smoke
+    just integration-kopia-gateway
     just integration-k8s-gateway-v2 --wait-secs 240
-    just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke --repository-format v2-preview
-    just integration-velero-kopia-postgres-smoke --repository-format v2-preview
+    just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke
+    just integration-velero-kopia-postgres-smoke
 
 # Live retained-backend v2 gate. Credentials are read from the normal AWS/S3 env.
 preview-gate-v2-live BACKEND_BUCKET ENDPOINT_URL REGION:
@@ -109,7 +109,6 @@ check-v2-provider-v2-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
     RS3_BACKEND_BUCKET="{{BACKEND_BUCKET}}" \
     RS3_BACKEND_PREFIX="{{BACKEND_PREFIX}}" \
     AWS_DEFAULT_REGION="{{REGION}}" \
-    RS3_REPOSITORY_FORMAT=v2-preview \
     RS3_REPOSITORY_RETENTION_MODE=governance \
     RS3_REPOSITORY_RETENTION_DAYS=1 \
     RS3_ANCHOR_MODE=memory \
@@ -145,7 +144,7 @@ integration-s3-gateway *ARGS:
 
 # Run the v2 live S3 gateway integration harness.
 integration-s3-gateway-v2-live *ARGS:
-    cargo run -p xtask --bin xtask --features containers -- integration s3-gateway --mode provided --repository-format v2-preview --retention-mode governance --retention-days 1 --tooling-smoke {{ARGS}}
+    cargo run -p xtask --bin xtask --features containers -- integration s3-gateway --mode provided --retention-mode governance --retention-days 1 --tooling-smoke {{ARGS}}
 
 # Run the Kopia gateway integration harness.
 integration-kopia-gateway *ARGS:
@@ -153,7 +152,7 @@ integration-kopia-gateway *ARGS:
 
 # Run the v2 live Kopia gateway integration harness.
 integration-kopia-gateway-v2-live *ARGS:
-    cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway --mode provided --repository-format v2-preview --retention-mode governance --retention-days 1 {{ARGS}}
+    cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway --mode provided --retention-mode governance --retention-days 1 {{ARGS}}
 
 # Run the Kubernetes gateway integration harness.
 integration-k8s-gateway *ARGS:
@@ -161,7 +160,7 @@ integration-k8s-gateway *ARGS:
 
 # Run the v2 Kubernetes gateway integration harness.
 integration-k8s-gateway-v2 *ARGS:
-    cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway --repository-format v2-preview {{ARGS}}
+    cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway {{ARGS}}
 
 # Run the Velero Kopia smoke test.
 integration-velero-kopia-smoke *ARGS:
@@ -181,7 +180,7 @@ integration-velero-kopia-dynamic-pvc-gateway-restart-smoke *ARGS:
 
 # Run the v2 live dynamic-PVC gateway-restart smoke test.
 integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live *ARGS:
-    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke --backend-mode provided --repository-format v2-preview --repository-retention-mode governance --repository-retention-days 1 {{ARGS}}
+    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke --backend-mode provided --repository-retention-mode governance --repository-retention-days 1 {{ARGS}}
 
 # Run the Velero Kopia restore-readonly dynamic-PVC smoke test.
 integration-velero-kopia-dynamic-pvc-restore-readonly-smoke *ARGS:
@@ -193,7 +192,7 @@ integration-velero-kopia-postgres-smoke *ARGS:
 
 # Run the v2 live Velero Kopia Postgres smoke test.
 integration-velero-kopia-postgres-v2-live *ARGS:
-    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke --backend-mode provided --repository-format v2-preview --repository-retention-mode governance --repository-retention-days 1 {{ARGS}}
+    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke --backend-mode provided --repository-retention-mode governance --repository-retention-days 1 {{ARGS}}
 
 # Lint the Helm chart with required fixture values.
 helm-lint:

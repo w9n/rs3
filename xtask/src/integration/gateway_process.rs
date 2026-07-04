@@ -60,7 +60,6 @@ impl GatewayBuildProfile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GatewayProcessOptions {
     pub(crate) build_profile: GatewayBuildProfile,
-    pub(crate) repository_format: Option<&'static str>,
     pub(crate) repository_retention_mode: Option<&'static str>,
     pub(crate) repository_retention_days: Option<u32>,
     pub(crate) payload_segment_size: Option<usize>,
@@ -73,7 +72,6 @@ impl Default for GatewayProcessOptions {
     fn default() -> Self {
         Self {
             build_profile: GatewayBuildProfile::Dev,
-            repository_format: None,
             repository_retention_mode: None,
             repository_retention_days: None,
             payload_segment_size: None,
@@ -186,9 +184,6 @@ impl RunningGateway {
             });
         if let Some(rust_log) = rust_log {
             child.env("RUST_LOG", rust_log);
-        }
-        if let Some(repository_format) = options.repository_format {
-            child.env("RS3_REPOSITORY_FORMAT", repository_format);
         }
         if let Some(repository_retention_mode) = options.repository_retention_mode {
             child.env("RS3_REPOSITORY_RETENTION_MODE", repository_retention_mode);

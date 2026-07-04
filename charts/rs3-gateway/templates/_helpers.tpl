@@ -43,9 +43,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if not .Values.repository.id -}}
 {{- fail "repository.id is required; use a stable value for keyring envelope binding" -}}
 {{- end -}}
-{{- if ne .Values.repository.format "v2-preview" -}}
-{{- fail "repository.format must be v2-preview" -}}
-{{- end -}}
 {{- if and (ne .Values.anchor.mode "memory") (ne .Values.anchor.mode "kubernetes-lease") -}}
 {{- fail "anchor.mode must be memory or kubernetes-lease" -}}
 {{- end -}}

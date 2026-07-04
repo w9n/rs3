@@ -44,7 +44,7 @@ impl ArtifactCollector {
             json!({
                 "scenario": state.scenario_label,
                 "storage_path": state.storage_path.as_str(),
-                "repository_format": args.repository_format.as_env(),
+                "repository_format": "v2-preview",
                 "backup": state.backup_name,
                 "restore": state.restore_name,
                 "elapsed_ms": state.started.elapsed().as_millis(),

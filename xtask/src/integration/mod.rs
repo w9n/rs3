@@ -58,21 +58,6 @@ pub(crate) enum S3ContainerProvider {
     Minio,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum GatewayRepositoryFormat {
-    /// v2 production-preview repository format.
-    V2Preview,
-}
-
-#[cfg(feature = "k8s")]
-impl GatewayRepositoryFormat {
-    pub(crate) const fn as_env(self) -> &'static str {
-        match self {
-            Self::V2Preview => "v2-preview",
-        }
-    }
-}
-
 #[cfg(feature = "containers")]
 impl S3ContainerProvider {
     pub(crate) fn as_label(self) -> &'static str {

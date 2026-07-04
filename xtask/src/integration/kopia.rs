@@ -72,9 +72,6 @@ pub(crate) struct KopiaGatewayArgs {
     /// Kopia executable to run.
     #[arg(long, env = "RS3_TEST_KOPIA_BIN", default_value = "kopia")]
     kopia_bin: String,
-    /// Repository format used by the gateway process.
-    #[arg(long, env = "RS3_REPOSITORY_FORMAT", value_enum, default_value_t = KopiaGatewayRepositoryFormat::V2Preview)]
-    repository_format: KopiaGatewayRepositoryFormat,
     /// Repository retention mode for repository-owned backend objects.
     #[arg(long, env = "RS3_REPOSITORY_RETENTION_MODE", value_enum)]
     retention_mode: Option<KopiaGatewayRetentionMode>,
@@ -89,21 +86,6 @@ enum KopiaGatewayMode {
     Container,
     /// Use an already provisioned S3-compatible backend.
     Provided,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum KopiaGatewayRepositoryFormat {
-    /// v2 production-preview repository format.
-    V2Preview,
-}
-
-#[cfg(feature = "containers")]
-impl KopiaGatewayRepositoryFormat {
-    const fn as_env(self) -> &'static str {
-        match self {
-            Self::V2Preview => "v2-preview",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -326,7 +308,6 @@ fn validate_kopia_gateway_args(args: &KopiaGatewayArgs) -> Result<()> {
 #[cfg(feature = "containers")]
 fn kopia_gateway_process_options(args: &KopiaGatewayArgs) -> GatewayProcessOptions {
     GatewayProcessOptions {
-        repository_format: Some(args.repository_format.as_env()),
         repository_retention_mode: args.retention_mode.map(KopiaGatewayRetentionMode::as_env),
         repository_retention_days: args.retention_days,
         ..GatewayProcessOptions::default()

@@ -4,8 +4,6 @@ use anyhow::Result;
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
 
-use super::GatewayRepositoryFormat;
-
 #[derive(Debug, Args)]
 pub(crate) struct VeleroKopiaSmokeArgs {
     /// Backend mode used behind the gateway.
@@ -29,9 +27,6 @@ pub(crate) struct VeleroKopiaSmokeArgs {
     /// Retention duration in days when repository retention mode is set.
     #[arg(long, env = "RS3_REPOSITORY_RETENTION_DAYS")]
     repository_retention_days: Option<u32>,
-    /// Repository format used by the gateway-backed scenarios.
-    #[arg(long, env = "RS3_REPOSITORY_FORMAT", value_enum, default_value_t = GatewayRepositoryFormat::V2Preview)]
-    repository_format: GatewayRepositoryFormat,
     /// kind cluster name. Defaults to a unique disposable name.
     #[arg(long)]
     cluster_name: Option<String>,
@@ -598,7 +593,6 @@ mod imp {
                             anchor_name: &anchor_name,
                             log_format: "json",
                             rust_log: GATEWAY_RUST_LOG,
-                            repository_format: args.repository_format.as_env(),
                             payload_segment_size: args.payload_segment_size,
                             retention_mode: args.repository_retention_mode.as_deref(),
                             retention_days: args.repository_retention_days,

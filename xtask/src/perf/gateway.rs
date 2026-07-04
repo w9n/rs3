@@ -1,8 +1,9 @@
 //! Gateway-backed performance scenarios.
 
 use super::{
-    GatewayBuildProfile, OperationLatencyStats, PerfArgs, PerfReport, PerfScenario, ReportFormat,
-    body, checked_mul, commit_batch_items, commit_max_pending_items, concurrency, print_header,
+    GatewayBuildProfile, OperationLatencyStats, PERF_REPOSITORY_FORMAT, PerfArgs, PerfReport,
+    PerfScenario, ReportFormat, body, checked_mul, commit_batch_items, commit_max_pending_items,
+    concurrency, print_header,
 };
 use crate::integration::s3_container;
 use anyhow::{Context, Result};
@@ -248,7 +249,7 @@ async fn gateway_full_read(
     Ok(PerfReport {
         scenario: "full-read",
         backend: args.backend,
-        repository_format: Some(args.repository_format),
+        repository_format: PERF_REPOSITORY_FORMAT,
         objects: 1,
         object_size: args.object_size,
         operations: args.reads,
@@ -318,7 +319,7 @@ async fn gateway_range_read(
     Ok(PerfReport {
         scenario: "range-read",
         backend: args.backend,
-        repository_format: Some(args.repository_format),
+        repository_format: PERF_REPOSITORY_FORMAT,
         objects: 1,
         object_size: args.object_size,
         operations: args.reads,
@@ -348,7 +349,7 @@ fn gateway_write_report(
     Ok(PerfReport {
         scenario,
         backend: args.backend,
-        repository_format: Some(args.repository_format),
+        repository_format: PERF_REPOSITORY_FORMAT,
         objects,
         object_size: args.object_size,
         operations,
@@ -514,7 +515,6 @@ impl RunningPerfGateway {
             ])
             .env("RUST_LOG", "rs3_storage=debug,rs3_repository=info,info")
             .env("RS3_PUBLIC_BUCKET", GATEWAY_PUBLIC_BUCKET)
-            .env("RS3_REPOSITORY_FORMAT", args.repository_format.as_env())
             .env("RS3_BACKEND_ENDPOINT", &backend.endpoint_url)
             .env("RS3_BACKEND_BUCKET", &backend.bucket)
             .env("RS3_BACKEND_PREFIX", backend_prefix)

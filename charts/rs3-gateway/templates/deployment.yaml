@@ -113,8 +113,6 @@ spec:
               value: {{ .Values.commit.maxBatchDelayMs | quote }}
             - name: RS3_COMMIT_MAX_PENDING_ITEMS
               value: {{ .Values.commit.maxPendingItems | quote }}
-            - name: RS3_REPOSITORY_FORMAT
-              value: {{ .Values.repository.format | quote }}
             - name: RS3_REPOSITORY_ID
               value: {{ .Values.repository.id | quote }}
             - name: RS3_ALLOW_REPOSITORY_INIT

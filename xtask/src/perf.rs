@@ -32,6 +32,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
+pub(super) const PERF_REPOSITORY_FORMAT: &str = "v2-preview";
+
 /// Runs lightweight repository performance scenarios.
 #[derive(Debug, Args)]
 pub(crate) struct PerfArgs {
@@ -68,9 +70,6 @@ pub(crate) struct PerfArgs {
     /// Backend implementation used by the scenario.
     #[arg(long, value_enum, default_value_t = PerfBackend::Memory)]
     backend: PerfBackend,
-    /// Repository format used by gateway-backed scenarios.
-    #[arg(long, env = "RS3_REPOSITORY_FORMAT", value_enum, default_value_t = PerfRepositoryFormat::V2Preview)]
-    repository_format: PerfRepositoryFormat,
     /// Gateway process build profile used by gateway-backed scenarios.
     #[arg(long, value_enum, default_value_t = GatewayBuildProfile::Dev)]
     gateway_build_profile: GatewayBuildProfile,
@@ -172,21 +171,6 @@ impl PerfBackend {
             Self::S3Container => "s3-container",
             #[cfg(feature = "containers")]
             Self::S3GatewayContainer => "s3-gateway-container",
-        }
-    }
-}
-
-/// Repository format used by gateway-backed performance scenarios.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub(crate) enum PerfRepositoryFormat {
-    /// v2 preview repository format.
-    V2Preview,
-}
-
-impl PerfRepositoryFormat {
-    pub(crate) const fn as_env(self) -> &'static str {
-        match self {
-            Self::V2Preview => "v2-preview",
         }
     }
 }
@@ -353,7 +337,6 @@ fn add_perf_args(
     command.args(["--scenario", args.scenario.as_cli_value()]);
     command.args(["--objects", &args.objects.to_string()]);
     command.args(["--object-size", &args.object_size.to_string()]);
-    command.args(["--repository-format", args.repository_format.as_env()]);
     command.args([
         "--gateway-build-profile",
         args.gateway_build_profile.as_cli_value(),
@@ -463,7 +446,7 @@ where
     Ok(PerfReport {
         scenario: "write-batch",
         backend: args.backend,
-        repository_format: Some(PerfRepositoryFormat::V2Preview),
+        repository_format: PERF_REPOSITORY_FORMAT,
         objects: args.objects,
         object_size: args.object_size,
         operations: args.objects,
@@ -533,7 +516,7 @@ where
     Ok(PerfReport {
         scenario: "write-committed",
         backend: args.backend,
-        repository_format: Some(PerfRepositoryFormat::V2Preview),
+        repository_format: PERF_REPOSITORY_FORMAT,
         objects: args.objects,
         object_size: args.object_size,
         operations: args.objects,
@@ -624,7 +607,7 @@ where
     Ok(PerfReport {
         scenario: "write-committed-parallel",
         backend: args.backend,
-        repository_format: Some(PerfRepositoryFormat::V2Preview),
+        repository_format: PERF_REPOSITORY_FORMAT,
         objects: args.objects,
         object_size: args.object_size,
         operations: args.objects,
@@ -689,7 +672,7 @@ where
     Ok(PerfReport {
         scenario: "full-read",
         backend: args.backend,
-        repository_format: Some(PerfRepositoryFormat::V2Preview),
+        repository_format: PERF_REPOSITORY_FORMAT,
         objects: 1,
         object_size: args.object_size,
         operations: args.reads,
@@ -770,7 +753,7 @@ where
     Ok(PerfReport {
         scenario: "range-read",
         backend: args.backend,
-        repository_format: Some(PerfRepositoryFormat::V2Preview),
+        repository_format: PERF_REPOSITORY_FORMAT,
         objects: 1,
         object_size: args.object_size,
         operations: args.reads,
@@ -791,7 +774,7 @@ where
 struct PerfReport {
     scenario: &'static str,
     backend: PerfBackend,
-    repository_format: Option<PerfRepositoryFormat>,
+    repository_format: &'static str,
     objects: usize,
     object_size: usize,
     operations: usize,
@@ -876,7 +859,7 @@ impl PerfReport {
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.scenario,
             self.backend.as_str(),
-            repository_format_label(self.repository_format),
+            self.repository_format,
             self.objects,
             self.object_size,
             self.operations,
@@ -922,11 +905,10 @@ impl PerfReport {
         let requested_plaintext_bytes = self.requested_plaintext_bytes();
         let backend_bytes = self.backend_bytes();
         let backend_requests = self.backend_requests();
-        let repository_format = self.repository_format.map(PerfRepositoryFormat::as_env);
         let report = serde_json::json!({
             "scenario": self.scenario,
             "backend_name": self.backend.as_str(),
-            "repository_format": repository_format,
+            "repository_format": self.repository_format,
             "objects": self.objects,
             "object_size": self.object_size,
             "operations": self.operations,
@@ -1063,12 +1045,6 @@ fn payload_segment_size_label(payload_segment_size: Option<usize>) -> String {
     payload_segment_size
         .map(|value| value.to_string())
         .unwrap_or_else(|| "adaptive".to_owned())
-}
-
-fn repository_format_label(repository_format: Option<PerfRepositoryFormat>) -> &'static str {
-    repository_format
-        .map(PerfRepositoryFormat::as_env)
-        .unwrap_or("repository-core")
 }
 
 fn filesystem_store(

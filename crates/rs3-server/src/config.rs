@@ -36,7 +36,6 @@ const ALLOW_REPOSITORY_INIT_ENV: &str = "RS3_ALLOW_REPOSITORY_INIT";
 const PROVIDER_CONFORMANCE_REPORT_FILE_ENV: &str = "RS3_PROVIDER_CONFORMANCE_REPORT_FILE";
 const PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV: &str = "RS3_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS";
 pub(crate) const RECOVERY_PUBLIC_KEY_ENV: &str = "RS3_RECOVERY_PUBLIC_KEY";
-const DEFAULT_REPOSITORY_FORMAT: RepositoryFormat = RepositoryFormat::V2Preview;
 
 pub(crate) const REPOSITORY_SALT_HEX_ENV: &str = "RS3_REPOSITORY_SALT_HEX";
 pub(crate) const KEYRING_ENVELOPE_OBJECT_ID_ENV: &str = "RS3_KEYRING_ENVELOPE_OBJECT_ID";
@@ -820,14 +819,15 @@ fn parse_recovery_config(source: &impl ConfigSource) -> Result<RecoveryConfig, C
 }
 
 fn parse_repository_format(source: &impl ConfigSource) -> Result<RepositoryFormat, ConfigError> {
-    let value = optional_value(source, REPOSITORY_FORMAT_ENV)
-        .unwrap_or_else(|| DEFAULT_REPOSITORY_FORMAT.as_str().to_owned());
-    match value.as_str() {
-        "v2-preview" => Ok(RepositoryFormat::V2Preview),
-        _ => Err(ConfigError::Invalid {
+    match optional_value(source, REPOSITORY_FORMAT_ENV) {
+        None => Ok(RepositoryFormat::V2Preview),
+        Some(value) if value == RepositoryFormat::V2Preview.as_str() => {
+            Ok(RepositoryFormat::V2Preview)
+        }
+        Some(value) => Err(ConfigError::Invalid {
             key: REPOSITORY_FORMAT_ENV,
             value,
-            reason: "expected v2-preview".to_owned(),
+            reason: "omit this compatibility variable or set v2-preview".to_owned(),
         }),
     }
 }
@@ -1289,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_repository_format_v2_preview() {
+    fn accepts_legacy_repository_format_v2_preview() {
         let source = minimal_source().with(super::REPOSITORY_FORMAT_ENV, "v2-preview");
 
         let config = RuntimeConfig::from_source(&source);
