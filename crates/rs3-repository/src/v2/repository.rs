@@ -373,6 +373,10 @@ where
         &self.options
     }
 
+    pub(super) fn keyring(&self) -> &KeyRing {
+        &self.keyring
+    }
+
     /// Writes and anchors the required genesis snapshot commit.
     pub async fn write_genesis_snapshot<A>(&self, anchor: &A) -> V2Result<V2StoredCommit>
     where

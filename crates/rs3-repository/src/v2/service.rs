@@ -41,7 +41,7 @@ use rs3_types::{
     RetentionPolicy, Sequence,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry};
 use std::marker::PhantomData;
 use std::sync::{Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -168,6 +168,13 @@ where
     {
         let _guard = self.mutation_lock.lock().await;
         self.publish_pending_index_delta(anchor).await?;
+        let chain = self
+            .commit_store
+            .load_chain_from_anchor(anchor)
+            .await
+            .map_err(v2_repository_error)?
+            .ok_or_else(|| v2_repository_error(V2FormatError::MissingAnchor))?;
+        self.ensure_index_snapshot_payload_refs_are_chain_reachable(&chain)?;
         let section = self.index_snapshot_section()?;
         self.commit_store
             .write_child_commit(anchor, V2CommitWrite::snapshot(vec![section]))
@@ -1447,6 +1454,44 @@ where
             V2_SECTION_FLAG_MUST_UNDERSTAND,
             bytes,
         ))
+    }
+
+    fn ensure_index_snapshot_payload_refs_are_chain_reachable(
+        &self,
+        chain: &V2CommitChain,
+    ) -> Result<()> {
+        let reachable = chain
+            .commits_newest_first
+            .iter()
+            .map(|commit| {
+                (
+                    commit.parsed_header.header.self_ref.commit_key.clone(),
+                    commit.version_id.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let state = self
+            .accepted_state
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+
+        for (entry, _) in state.namespace.live_entries_with_prefixes() {
+            let Some(PayloadReference::V2Commit {
+                commit_key,
+                commit_version_id,
+                ..
+            }) = entry.payload_ref
+            else {
+                continue;
+            };
+            if !reachable.contains(&(commit_key, commit_version_id)) {
+                return Err(RepositoryError::CommitFailed {
+                    reason: "v2 index snapshot would preserve live payloads outside the snapshot chain; run v2 compaction snapshot instead".to_owned(),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     fn open_index_delta_section(

@@ -2040,6 +2040,127 @@ async fn v2_index_snapshot_bounds_replay_and_preserves_namespace() {
 }
 
 #[tokio::test]
+async fn v2_orphan_gc_keeps_live_payload_commits_referenced_by_index_snapshot() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    let first_key = must_type(LogicalPath::new("snapshots/gc-live-first.bin"));
+    let second_key = must_type(LogicalPath::new("snapshots/gc-live-second.bin"));
+    let first_body = Bytes::from_static(b"live payload before snapshot one");
+    let second_body = Bytes::from_static(b"live payload before snapshot two");
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                first_key.clone(),
+                first_body.clone(),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                second_key.clone(),
+                second_body.clone(),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    let before_snapshot = must_v2(
+        repository
+            .commit_store()
+            .load_chain_from_anchor(&anchor)
+            .await,
+    )
+    .expect("v2 chain should exist before snapshot");
+    let pre_snapshot_commits = before_snapshot
+        .commits_newest_first
+        .iter()
+        .map(|commit| commit.parsed_header.header.self_ref.commit_key.clone())
+        .collect::<Vec<_>>();
+
+    must_repo(repository.write_index_snapshot(&anchor).await);
+
+    let report = must_v2(repository.commit_store().report_orphans(&anchor).await);
+    let candidates = report
+        .candidates
+        .iter()
+        .map(|candidate| candidate.object_id.clone())
+        .collect::<Vec<_>>();
+    let gc = must_v2(
+        repository
+            .commit_store()
+            .delete_expired_orphans(&anchor, V2OrphanGcOptions::new(Duration::ZERO))
+            .await,
+    );
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+
+    for commit_key in pre_snapshot_commits {
+        assert!(!candidates.contains(&commit_key));
+    }
+    assert_eq!(gc.deleted_count, 0);
+    assert_eq!(
+        must_repo(fresh.get_range(&first_key, ByteRange::Full).await),
+        first_body
+    );
+    assert_eq!(
+        must_repo(fresh.get_range(&second_key, ByteRange::Full).await),
+        second_body
+    );
+}
+
+#[tokio::test]
+async fn v2_index_snapshot_refuses_existing_out_of_chain_live_payload_refs() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let anchor = V2MemoryAnchor::new();
+    let key = must_type(LogicalPath::new("snapshots/repeated-index-snapshot.bin"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                key,
+                Bytes::from_static(b"live payload before repeated snapshot"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(repository.write_index_snapshot(&anchor).await);
+
+    let repeated = repository.write_index_snapshot(&anchor).await;
+
+    assert!(matches!(
+        repeated,
+        Err(RepositoryError::CommitFailed { reason })
+            if reason.contains("compaction snapshot")
+    ));
+}
+
+#[tokio::test]
 async fn v2_commit_coordinator_flushes_before_index_snapshot() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());

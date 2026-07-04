@@ -1,10 +1,17 @@
 //! v2 maintenance planning and conservative apply paths.
 
-use super::commit::{V2CommitKey, V2ParsedCommit};
+use super::V2SectionType;
+use super::commit::{V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitKey, V2ParsedCommit};
 use super::error::{V2FormatError, V2Result};
 use super::provider::V2ProviderProfile;
 use super::repository::{V2AnchorState, V2CommitAnchor, V2CommitChain, V2CommitStore};
+use crate::checkpoint::open_index_delta_object;
+use crate::state::{RepositoryState, apply_index_delta_object};
 use async_trait::async_trait;
+use rs3_index::{
+    INDEX_DELTA_OBJECT_DOMAIN, IndexDelta, IndexDeltaObject, PayloadReference,
+    SealedIndexDeltaObject,
+};
 use rs3_storage::BlobMetadata;
 use rs3_storage::{BlobStore, StorageError};
 use rs3_types::{
@@ -533,15 +540,168 @@ where
         if let Some(state) = anchor_state.as_ref() {
             let chain = self.load_chain_from_state(state).await?;
             reachability.include_chain(&chain, false);
+            self.include_live_payload_roots(&mut reachability, &chain, false)
+                .await?;
             reachability.current_chain = Some(chain);
         }
 
         for protected_root in protected_roots {
             let chain = self.load_chain_from_state(protected_root).await?;
             reachability.include_chain(&chain, true);
+            self.include_live_payload_roots(&mut reachability, &chain, true)
+                .await?;
         }
 
         Ok(reachability)
+    }
+
+    async fn include_live_payload_roots(
+        &self,
+        reachability: &mut V2ReachabilityState,
+        chain: &V2CommitChain,
+        protected: bool,
+    ) -> V2Result<()> {
+        let mut pending = self.live_payload_roots_from_chain(chain)?;
+
+        while let Some(root) = pending.pop() {
+            let version_key = (root.commit_key.clone(), root.version_id.clone());
+            if reachability.reachable_versions.contains(&version_key) {
+                continue;
+            }
+
+            let chain = self.load_chain_from_state(&root).await?;
+            reachability.include_chain(&chain, protected);
+            pending.extend(self.live_payload_roots_from_chain(&chain)?);
+        }
+
+        Ok(())
+    }
+
+    fn live_payload_roots_from_chain(&self, chain: &V2CommitChain) -> V2Result<Vec<V2AnchorState>> {
+        let state = self.replay_chain_to_namespace_state(chain)?;
+        let signing_key_id = chain
+            .commits_newest_first
+            .first()
+            .ok_or(V2FormatError::InvalidHeaderField)?
+            .parsed_header
+            .header
+            .signing_key_id
+            .clone();
+        let mut roots = Vec::new();
+
+        for (entry, _) in state.namespace.live_entries_with_prefixes() {
+            let Some(PayloadReference::V2Commit {
+                commit_key,
+                commit_version_id,
+                body_digest,
+                ..
+            }) = entry.payload_ref
+            else {
+                continue;
+            };
+            let parsed_key = V2CommitKey::parse(&commit_key)?;
+            roots.push(V2AnchorState {
+                sequence: parsed_key.sequence,
+                commit_key,
+                body_digest,
+                version_id: commit_version_id,
+                signing_key_id: signing_key_id.clone(),
+                format_ref: self.options().format_ref.clone(),
+            });
+        }
+
+        Ok(roots)
+    }
+
+    fn replay_chain_to_namespace_state(&self, chain: &V2CommitChain) -> V2Result<RepositoryState> {
+        let mut state = RepositoryState::default();
+        let mut previous_published_at_ms = None;
+        for commit in chain.commits_newest_first.iter().rev() {
+            let published_at_ms = commit.parsed_header.header.publish_time_ms;
+            if previous_published_at_ms.is_some_and(|previous| published_at_ms < previous) {
+                return Err(V2FormatError::StaleAnchor);
+            }
+            previous_published_at_ms = Some(published_at_ms);
+            self.apply_commit_sections_to_namespace_state(&mut state, commit)?;
+        }
+        Ok(state)
+    }
+
+    fn apply_commit_sections_to_namespace_state(
+        &self,
+        state: &mut RepositoryState,
+        commit: &V2ParsedCommit,
+    ) -> V2Result<()> {
+        for (index, section) in commit.parsed_header.header.section_index.iter().enumerate() {
+            let section_bytes = commit_section_bytes(commit, index)?;
+            match section.section_type {
+                V2SectionType::IndexDelta => {
+                    let mut delta = self.open_index_delta_section(
+                        &commit.parsed_header.header.self_ref.commit_key,
+                        index,
+                        section_bytes,
+                        section.flags,
+                    )?;
+                    if let Some(delta) = delta.as_mut() {
+                        resolve_self_payload_refs(delta, commit)?;
+                    }
+                    if let Some(delta) = delta {
+                        apply_index_delta_object(state, delta);
+                    }
+                }
+                V2SectionType::IndexSnapshot if section_bytes.is_empty() => {
+                    *state = RepositoryState::default();
+                }
+                V2SectionType::IndexSnapshot => {
+                    let mut snapshot = self.open_index_delta_section(
+                        &commit.parsed_header.header.self_ref.commit_key,
+                        index,
+                        section_bytes,
+                        section.flags,
+                    )?;
+                    if let Some(snapshot) = snapshot.as_mut() {
+                        resolve_self_payload_refs(snapshot, commit)?;
+                    }
+                    if let Some(snapshot) = snapshot {
+                        *state = RepositoryState::default();
+                        apply_index_delta_object(state, snapshot);
+                    }
+                }
+                V2SectionType::Payload => {}
+                V2SectionType::Directives | V2SectionType::Unknown(_) => {
+                    if section.flags & V2_SECTION_FLAG_MUST_UNDERSTAND != 0 {
+                        return Err(V2FormatError::UnsupportedSection);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn open_index_delta_section(
+        &self,
+        commit_key: &BackendObjectId,
+        section_index: usize,
+        bytes: &[u8],
+        flags: u8,
+    ) -> V2Result<Option<IndexDeltaObject>> {
+        let Some(payload) = bytes.strip_prefix(INDEX_DELTA_OBJECT_DOMAIN) else {
+            return if flags & V2_SECTION_FLAG_MUST_UNDERSTAND != 0 {
+                Err(V2FormatError::InvalidHeaderField)
+            } else {
+                Ok(None)
+            };
+        };
+        let sealed_delta = serde_json::from_slice::<SealedIndexDeltaObject>(payload)
+            .map_err(|_| V2FormatError::InvalidHeaderField)?;
+        let object_id = BackendObjectId::new(format!(
+            "{}/index-delta-{section_index}",
+            commit_key.as_str()
+        ))
+        .map_err(|_| V2FormatError::TypeValidation)?;
+        open_index_delta_object(self.keyring(), &object_id, &sealed_delta)
+            .map_err(|_| V2FormatError::InvalidHeaderField)
+            .map(Some)
     }
 
     /// Runs read-only quick maintenance checks.
@@ -927,4 +1087,87 @@ fn retention_blocks_delete(
 
 fn duration_millis_i64_saturating(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn commit_section_bytes(commit: &V2ParsedCommit, index: usize) -> V2Result<&[u8]> {
+    let section = commit
+        .parsed_header
+        .header
+        .section_index
+        .get(index)
+        .ok_or(V2FormatError::SectionBounds)?;
+    let sections_start = u64::try_from(commit.parsed_header.sections_start)
+        .map_err(|_| V2FormatError::SectionBounds)?;
+    let start = sections_start
+        .checked_add(section.offset)
+        .ok_or(V2FormatError::SectionBounds)?;
+    let end = start
+        .checked_add(section.length)
+        .ok_or(V2FormatError::SectionBounds)?;
+    let start = usize::try_from(start).map_err(|_| V2FormatError::SectionBounds)?;
+    let end = usize::try_from(end).map_err(|_| V2FormatError::SectionBounds)?;
+    commit
+        .body
+        .get(start..end)
+        .ok_or(V2FormatError::SectionBounds)
+}
+
+fn resolve_self_payload_refs(
+    delta: &mut IndexDeltaObject,
+    commit: &V2ParsedCommit,
+) -> V2Result<()> {
+    for mutation in &mut delta.deltas {
+        let IndexDelta::Upsert { entry, .. } = mutation else {
+            continue;
+        };
+        let Some(PayloadReference::V2Self {
+            payload_id,
+            payload_header,
+            sections_start: _,
+            offset,
+            length,
+        }) = entry.payload_ref.clone()
+        else {
+            continue;
+        };
+        ensure_payload_section_declared(commit, offset, length)?;
+        let sections_start = u64::try_from(commit.parsed_header.sections_start)
+            .map_err(|_| V2FormatError::SectionBounds)?;
+        let commit_key = commit.parsed_header.header.self_ref.commit_key.clone();
+        entry.object_id = commit_key.clone();
+        entry.object_version_id = commit.version_id.clone();
+        entry.payload_ref = Some(PayloadReference::V2Commit {
+            commit_key,
+            commit_version_id: commit.version_id.clone(),
+            body_digest: commit.parsed_header.header.body_digest,
+            payload_id,
+            payload_header,
+            sections_start: Some(sections_start),
+            offset,
+            length,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_payload_section_declared(
+    commit: &V2ParsedCommit,
+    offset: u64,
+    length: u64,
+) -> V2Result<()> {
+    let found = commit
+        .parsed_header
+        .header
+        .section_index
+        .iter()
+        .any(|section| {
+            section.section_type == V2SectionType::Payload
+                && section.offset == offset
+                && section.length == length
+        });
+    if found {
+        Ok(())
+    } else {
+        Err(V2FormatError::SectionBounds)
+    }
 }
