@@ -12,7 +12,7 @@ use super::mapping::{
 use super::runtime::RuntimeRepository;
 use crate::{GatewayMode, RuntimeConfig};
 use bytes::{Bytes, BytesMut};
-use futures_util::{StreamExt, stream};
+use futures_util::{Stream, StreamExt, stream};
 use rs3_repository::{RepositoryError, RepositoryPutOptions};
 use rs3_storage::ByteRange;
 use rs3_types::{LegalHoldStatus, PublicBucket};
@@ -24,9 +24,12 @@ use s3s::dto::{
     ListObjectsV2Output, Owner, PutObjectInput, PutObjectLegalHoldInput, PutObjectLegalHoldOutput,
     PutObjectOutput, StreamingBlob,
 };
-use s3s::{Body, S3, S3Request, S3Response, S3Result};
+use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
+use s3s::{Body, S3, S3Request, S3Response, S3Result, StdError};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
@@ -43,6 +46,7 @@ pub(super) struct GatewayS3Service {
     request_slots: Arc<Semaphore>,
     request_rate_limiter: RequestRateLimiter,
     upload_body_budget: UploadBodyBudget,
+    download_body_budget: DownloadBodyBudget,
 }
 
 impl GatewayS3Service {
@@ -67,6 +71,9 @@ impl GatewayS3Service {
             ),
             upload_body_budget: UploadBodyBudget::new(
                 config.hardening.max_in_flight_upload_body_bytes,
+            ),
+            download_body_budget: DownloadBodyBudget::new(
+                config.hardening.max_in_flight_download_body_bytes,
             ),
         })
     }
@@ -297,6 +304,125 @@ impl Drop for UploadBodyReservation {
     fn drop(&mut self) {
         self.budget.release(self.reserved_bytes);
     }
+}
+
+#[derive(Clone)]
+struct DownloadBodyBudget {
+    max_bytes: u64,
+    state: Arc<Mutex<DownloadBodyBudgetState>>,
+}
+
+struct DownloadBodyBudgetState {
+    in_flight_bytes: u64,
+}
+
+impl DownloadBodyBudget {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            state: Arc::new(Mutex::new(DownloadBodyBudgetState { in_flight_bytes: 0 })),
+        }
+    }
+
+    fn reserve(&self, operation: &'static str, body_len: u64) -> S3Result<DownloadBodyReservation> {
+        if body_len == 0 {
+            return Ok(DownloadBodyReservation {
+                budget: self.clone(),
+                reserved_bytes: 0,
+            });
+        }
+
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_error) => {
+                record_s3_admission_rejection(operation, "body_budget");
+                return Err(s3s::s3_error!(
+                    SlowDown,
+                    "gateway download body budget is unavailable"
+                ));
+            }
+        };
+        let next_in_flight = state.in_flight_bytes.checked_add(body_len).ok_or_else(|| {
+            record_s3_admission_rejection(operation, "body_budget");
+            s3s::s3_error!(SlowDown, "gateway download body budget exceeded")
+        })?;
+        if next_in_flight > self.max_bytes {
+            record_s3_admission_rejection(operation, "body_budget");
+            return Err(s3s::s3_error!(
+                SlowDown,
+                "gateway download body budget exceeded"
+            ));
+        }
+        state.in_flight_bytes = next_in_flight;
+
+        Ok(DownloadBodyReservation {
+            budget: self.clone(),
+            reserved_bytes: body_len,
+        })
+    }
+
+    fn release(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.in_flight_bytes = state.in_flight_bytes.saturating_sub(bytes);
+        }
+    }
+
+    #[cfg(test)]
+    fn in_flight_bytes(&self) -> u64 {
+        match self.state.lock() {
+            Ok(state) => state.in_flight_bytes,
+            Err(_error) => 0,
+        }
+    }
+}
+
+struct DownloadBodyReservation {
+    budget: DownloadBodyBudget,
+    reserved_bytes: u64,
+}
+
+impl Drop for DownloadBodyReservation {
+    fn drop(&mut self) {
+        self.budget.release(self.reserved_bytes);
+    }
+}
+
+struct ReservedDownloadBody {
+    body: Option<Bytes>,
+    _reservation: DownloadBodyReservation,
+}
+
+impl Stream for ReservedDownloadBody {
+    type Item = Result<Bytes, StdError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let item = match self.body.take() {
+            Some(body) if !body.is_empty() => Some(Ok(body)),
+            Some(_) | None => None,
+        };
+        Poll::Ready(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.body.as_ref().map(Bytes::len).unwrap_or(0);
+        (len, Some(len))
+    }
+}
+
+impl ByteStream for ReservedDownloadBody {
+    fn remaining_length(&self) -> RemainingLength {
+        RemainingLength::new_exact(self.body.as_ref().map(Bytes::len).unwrap_or(0))
+    }
+}
+
+fn reserved_download_body(body: Bytes, reservation: DownloadBodyReservation) -> Body {
+    Body::from(Box::pin(ReservedDownloadBody {
+        body: Some(body),
+        _reservation: reservation,
+    }) as DynByteStream)
 }
 
 #[derive(Clone)]
@@ -743,6 +869,13 @@ impl S3 for GatewayS3Service {
             let key = logical_path(input.key)?;
             let metadata = self.repository.head(&key).map_err(repository_error)?;
             let resolved_range = resolve_range(input.range, metadata.content_len)?;
+            let response_body_len = match resolved_range.as_ref() {
+                Some(range) => range.end - range.start,
+                None => metadata.content_len,
+            };
+            let download_body_reservation = self
+                .download_body_budget
+                .reserve(OPERATION, response_body_len)?;
             let repository_range =
                 repository_read_range(resolved_range.as_ref(), metadata.content_len);
             let body = self
@@ -763,7 +896,10 @@ impl S3 for GatewayS3Service {
             let content_length = i64_len(body.len() as u64)?;
             let mut output = GetObjectOutput {
                 accept_ranges: Some("bytes".to_owned()),
-                body: Some(StreamingBlob::from(Body::from(body))),
+                body: Some(StreamingBlob::from(reserved_download_body(
+                    body,
+                    download_body_reservation,
+                ))),
                 content_length: Some(content_length),
                 content_type: Some("application/octet-stream".to_owned()),
                 e_tag: Some(etag(metadata.content_len, metadata.modified_at_ms)),
@@ -1184,7 +1320,7 @@ fn record_s3_response_body_bytes(operation: &'static str, len: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{GatewayS3Service, RequestRateLimiter, UploadBodyBudget};
+    use super::{DownloadBodyBudget, GatewayS3Service, RequestRateLimiter, UploadBodyBudget};
     use crate::GatewayMode;
     use crate::s3::mapping::collect_body;
     use crate::s3::test_support::runtime_config;
@@ -1256,6 +1392,18 @@ mod tests {
     ) -> GatewayS3Service {
         let mut config = runtime_config(true);
         config.hardening.max_in_flight_upload_body_bytes = max_in_flight_upload_body_bytes;
+        GatewayS3Service::from_config(&config)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{error}");
+            })
+    }
+
+    async fn gateway_service_with_max_in_flight_download_body_bytes(
+        max_in_flight_download_body_bytes: u64,
+    ) -> GatewayS3Service {
+        let mut config = runtime_config(true);
+        config.hardening.max_in_flight_download_body_bytes = max_in_flight_download_body_bytes;
         GatewayS3Service::from_config(&config)
             .await
             .unwrap_or_else(|error| {
@@ -1777,6 +1925,28 @@ mod tests {
         assert_eq!(budget.in_flight_bytes(), 0);
     }
 
+    #[test]
+    fn download_body_budget_rejects_above_limit_and_releases_on_drop() {
+        let budget = DownloadBodyBudget::new(3);
+        {
+            let _reservation = budget
+                .reserve("GetObject", 2)
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(budget.in_flight_bytes(), 2);
+
+            let error = match budget.reserve("GetObject", 2) {
+                Ok(_reservation) => {
+                    panic!("overlapping reservation above body budget should be rejected");
+                }
+                Err(error) => error,
+            };
+            assert_eq!(error.code().as_str(), "SlowDown");
+            assert_eq!(budget.in_flight_bytes(), 2);
+        }
+
+        assert_eq!(budget.in_flight_bytes(), 0);
+    }
+
     #[tokio::test]
     async fn put_object_rejects_declared_body_above_in_flight_body_budget() {
         let service = gateway_service_with_max_in_flight_upload_body_bytes(3).await;
@@ -1794,6 +1964,94 @@ mod tests {
 
         assert_eq!(error.code().as_str(), "SlowDown");
         assert_eq!(accepted_v2_sequence(&service).await, 1);
+    }
+
+    #[tokio::test]
+    async fn get_object_rejects_body_above_in_flight_body_budget() {
+        let service = gateway_service_with_max_in_flight_download_body_bytes(3).await;
+
+        service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/object.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(b"abcd")))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let error = service
+            .get_object(s3_request(GetObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/object.bin".to_owned(),
+                ..GetObjectInput::default()
+            }))
+            .await
+            .expect_err("GetObject above in-flight body budget should be rejected");
+
+        assert_eq!(error.code().as_str(), "SlowDown");
+        assert_eq!(service.download_body_budget.in_flight_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_object_reserves_resolved_range_until_body_consumed() {
+        let service = gateway_service_with_max_in_flight_download_body_bytes(3).await;
+
+        service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/object.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(b"abcd")))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let response = service
+            .get_object(s3_request(GetObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/object.bin".to_owned(),
+                range: Some(s3s::dto::Range::Int {
+                    first: 1,
+                    last: Some(3),
+                }),
+                ..GetObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(response.output.content_length, Some(3));
+        assert_eq!(service.download_body_budget.in_flight_bytes(), 3);
+        assert_eq!(response_body(response).await, Bytes::from_static(b"bcd"));
+        assert_eq!(service.download_body_budget.in_flight_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_object_releases_download_budget_when_response_body_is_dropped() {
+        let service = gateway_service_with_max_in_flight_download_body_bytes(4).await;
+
+        service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/object.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(b"abcd")))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let response = service
+            .get_object(s3_request(GetObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/object.bin".to_owned(),
+                ..GetObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(service.download_body_budget.in_flight_bytes(), 4);
+        drop(response);
+        assert_eq!(service.download_body_budget.in_flight_bytes(), 0);
     }
 
     #[tokio::test]

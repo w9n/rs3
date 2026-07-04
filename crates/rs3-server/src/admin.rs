@@ -206,6 +206,8 @@ pub struct AdminSecuritySummary {
     pub backend_multipart_part_bytes: u64,
     /// Admission budget for request body bytes held by in-flight upload operations.
     pub max_in_flight_upload_body_bytes: u64,
+    /// Admission budget for response body bytes held by in-flight download operations.
+    pub max_in_flight_download_body_bytes: u64,
     /// Maximum simultaneously open S3 listener connections.
     pub max_concurrent_connections: usize,
     /// Maximum concurrently executing S3 operations.
@@ -358,6 +360,7 @@ pub async fn admin_status_report(
             buffered_put_object_bytes: config.hardening.buffered_put_object_bytes,
             backend_multipart_part_bytes: config.hardening.backend_multipart_part_bytes,
             max_in_flight_upload_body_bytes: config.hardening.max_in_flight_upload_body_bytes,
+            max_in_flight_download_body_bytes: config.hardening.max_in_flight_download_body_bytes,
             max_concurrent_connections: config.hardening.max_concurrent_connections,
             max_concurrent_requests: config.hardening.max_concurrent_requests,
             request_rate_limit_per_second: config.hardening.request_rate_limit_per_second,
@@ -417,6 +420,7 @@ pub fn admin_posture_report(
             buffered_put_object_bytes: config.hardening.buffered_put_object_bytes,
             backend_multipart_part_bytes: config.hardening.backend_multipart_part_bytes,
             max_in_flight_upload_body_bytes: config.hardening.max_in_flight_upload_body_bytes,
+            max_in_flight_download_body_bytes: config.hardening.max_in_flight_download_body_bytes,
             max_concurrent_connections: config.hardening.max_concurrent_connections,
             max_concurrent_requests: config.hardening.max_concurrent_requests,
             request_rate_limit_per_second: config.hardening.request_rate_limit_per_second,
@@ -774,6 +778,10 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
     let backend_multipart_part_bytes = config.hardening.backend_multipart_part_bytes.to_string();
     let max_in_flight_upload_body_bytes =
         config.hardening.max_in_flight_upload_body_bytes.to_string();
+    let max_in_flight_download_body_bytes = config
+        .hardening
+        .max_in_flight_download_body_bytes
+        .to_string();
     let max_concurrent_connections = config.hardening.max_concurrent_connections.to_string();
     let max_concurrent_requests = config.hardening.max_concurrent_requests.to_string();
     let request_rate_limit_per_second = config.hardening.request_rate_limit_per_second.to_string();
@@ -800,6 +808,7 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
         buffered_put_object_bytes.as_bytes(),
         backend_multipart_part_bytes.as_bytes(),
         max_in_flight_upload_body_bytes.as_bytes(),
+        max_in_flight_download_body_bytes.as_bytes(),
         max_concurrent_connections.as_bytes(),
         max_concurrent_requests.as_bytes(),
         request_rate_limit_per_second.as_bytes(),

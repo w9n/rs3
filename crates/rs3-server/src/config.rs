@@ -20,6 +20,7 @@ const DEFAULT_MAX_PUT_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const DEFAULT_BUFFERED_PUT_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_BACKEND_MULTIPART_PART_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 256;
 const DEFAULT_REQUEST_RATE_LIMIT_PER_SECOND: u64 = 1024;
@@ -134,6 +135,8 @@ pub struct HardeningConfig {
     pub stream_read_stall_timeout: Duration,
     /// Admission budget for request body bytes held by in-flight upload operations.
     pub max_in_flight_upload_body_bytes: u64,
+    /// Admission budget for response body bytes held by in-flight download operations.
+    pub max_in_flight_download_body_bytes: u64,
     /// Maximum simultaneously open S3 listener connections.
     pub max_concurrent_connections: usize,
     /// Maximum concurrently executing S3 operations.
@@ -150,6 +153,7 @@ impl Default for HardeningConfig {
             backend_multipart_part_bytes: DEFAULT_BACKEND_MULTIPART_PART_BYTES,
             stream_read_stall_timeout: DEFAULT_V2_STREAM_READ_STALL_TIMEOUT,
             max_in_flight_upload_body_bytes: DEFAULT_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES,
+            max_in_flight_download_body_bytes: DEFAULT_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES,
             max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
             request_rate_limit_per_second: DEFAULT_REQUEST_RATE_LIMIT_PER_SECOND,
@@ -433,6 +437,11 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
         source.value("RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES"),
         DEFAULT_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES,
     )?;
+    let max_in_flight_download_body_bytes = parse_positive_u64(
+        "RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES",
+        source.value("RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES"),
+        DEFAULT_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES,
+    )?;
     let max_concurrent_connections = parse_positive_usize(
         "RS3_MAX_CONCURRENT_CONNECTIONS",
         source.value("RS3_MAX_CONCURRENT_CONNECTIONS"),
@@ -455,6 +464,7 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
         backend_multipart_part_bytes,
         stream_read_stall_timeout,
         max_in_flight_upload_body_bytes,
+        max_in_flight_download_body_bytes,
         max_concurrent_connections,
         max_concurrent_requests,
         request_rate_limit_per_second,
@@ -1088,6 +1098,7 @@ mod tests {
             .with("RS3_BACKEND_MULTIPART_PART_BYTES", "5242880")
             .with("RS3_STREAM_READ_STALL_TIMEOUT_SECS", "2")
             .with("RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES", "2097152")
+            .with("RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES", "3145728")
             .with("RS3_MAX_CONCURRENT_CONNECTIONS", "32")
             .with("RS3_MAX_CONCURRENT_REQUESTS", "16")
             .with("RS3_REQUEST_RATE_LIMIT_PER_SECOND", "128");
@@ -1102,6 +1113,7 @@ mod tests {
                 backend_multipart_part_bytes: 5_242_880,
                 stream_read_stall_timeout: Duration::from_secs(2),
                 max_in_flight_upload_body_bytes: 2_097_152,
+                max_in_flight_download_body_bytes: 3_145_728,
                 max_concurrent_connections: 32,
                 max_concurrent_requests: 16,
                 request_rate_limit_per_second: 128,
@@ -1117,6 +1129,7 @@ mod tests {
             "RS3_BACKEND_MULTIPART_PART_BYTES",
             "RS3_STREAM_READ_STALL_TIMEOUT_SECS",
             "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES",
+            "RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES",
             "RS3_MAX_CONCURRENT_CONNECTIONS",
             "RS3_MAX_CONCURRENT_REQUESTS",
             "RS3_REQUEST_RATE_LIMIT_PER_SECOND",
