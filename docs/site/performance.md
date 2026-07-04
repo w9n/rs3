@@ -145,6 +145,10 @@ ciphertext span. Repeated or concurrent overlapping ranges reuse the decrypted
 segment cache behind a striped per-payload fill gate, so independent payloads
 can still fill in parallel. Full-file reads fetch the named payload section.
 Older refs still fall back to bounded commit-header and payload-header probes.
+Large streaming PUTs serialize writes while the gateway reads the request body
+into the signed multipart commit. `RS3_STREAM_READ_STALL_TIMEOUT_SECS` bounds
+how long one stalled client body can hold that write path before the request
+fails as incomplete.
 The default partial commit-batch wait is now 25 ms. A 2026-05-17 local gateway
 smoke recorded the current medium-object shape: sequential 256 KiB writes used
 1.0 backend requests per client write, parallel batched writes used 0.125

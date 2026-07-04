@@ -1236,6 +1236,21 @@ mod tests {
             })
     }
 
+    async fn gateway_service_with_stream_read_stall_timeout(
+        stream_read_stall_timeout: Duration,
+    ) -> GatewayS3Service {
+        let mut config = runtime_config(true);
+        config.hardening.max_put_object_bytes = 64;
+        config.hardening.buffered_put_object_bytes = 3;
+        config.hardening.backend_multipart_part_bytes = 5 * 1024 * 1024;
+        config.hardening.stream_read_stall_timeout = stream_read_stall_timeout;
+        GatewayS3Service::from_config(&config)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{error}");
+            })
+    }
+
     async fn gateway_service_with_max_in_flight_upload_body_bytes(
         max_in_flight_upload_body_bytes: u64,
     ) -> GatewayS3Service {
@@ -1627,6 +1642,27 @@ mod tests {
             }))
             .await
             .expect_err("streaming PutObject read error should be rejected");
+
+        assert_eq!(error.code().as_str(), "IncompleteBody");
+        assert_eq!(accepted_v2_sequence(&service).await, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn put_object_rejects_stalled_streaming_body_for_declared_length() {
+        let service = gateway_service_with_stream_read_stall_timeout(Duration::from_secs(1)).await;
+        let body =
+            StreamingBlob::wrap(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+
+        let error = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/stalled-streamed.bin".to_owned(),
+                content_length: Some(4),
+                body: Some(body),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect_err("stalled streaming PutObject body should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
         assert_eq!(accepted_v2_sequence(&service).await, 1);

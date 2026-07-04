@@ -98,7 +98,8 @@ impl RuntimeV2Repository {
         let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
         let commit_options =
             V2CommitStoreOptions::for_profile(provider_profile, commit_ref, loaded.format_ref)
-                .with_retention(config.repository.retention);
+                .with_retention(config.repository.retention)
+                .with_stream_read_stall_timeout(config.hardening.stream_read_stall_timeout);
         let repository = Arc::new(V2Repository::new(
             store_handle.clone(),
             loaded.keyring,

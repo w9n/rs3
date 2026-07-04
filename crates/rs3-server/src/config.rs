@@ -2,7 +2,7 @@
 
 use crate::identity::StaticCredentials;
 use rs3_crypto::{MIN_REPOSITORY_SALT_LEN, SecretBytes, ct_eq};
-use rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE;
+use rs3_repository::{DEFAULT_PAYLOAD_SEGMENT_SIZE, v2::DEFAULT_V2_STREAM_READ_STALL_TIMEOUT};
 use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
 use std::fmt;
@@ -127,6 +127,8 @@ pub struct HardeningConfig {
     pub buffered_put_object_bytes: u64,
     /// Provider multipart part size for large streaming `PutObject` writes.
     pub backend_multipart_part_bytes: u64,
+    /// Maximum idle time between streamed request-body chunks.
+    pub stream_read_stall_timeout: Duration,
     /// Admission budget for request body bytes held by in-flight upload operations.
     pub max_in_flight_upload_body_bytes: u64,
     /// Maximum simultaneously open S3 listener connections.
@@ -143,6 +145,7 @@ impl Default for HardeningConfig {
             max_put_object_bytes: DEFAULT_MAX_PUT_OBJECT_BYTES,
             buffered_put_object_bytes: DEFAULT_BUFFERED_PUT_OBJECT_BYTES,
             backend_multipart_part_bytes: DEFAULT_BACKEND_MULTIPART_PART_BYTES,
+            stream_read_stall_timeout: DEFAULT_V2_STREAM_READ_STALL_TIMEOUT,
             max_in_flight_upload_body_bytes: DEFAULT_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES,
             max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
@@ -399,6 +402,11 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
             reason: "must be at least 5242880 bytes".to_owned(),
         });
     }
+    let stream_read_stall_timeout = Duration::from_secs(parse_positive_u64(
+        "RS3_STREAM_READ_STALL_TIMEOUT_SECS",
+        source.value("RS3_STREAM_READ_STALL_TIMEOUT_SECS"),
+        DEFAULT_V2_STREAM_READ_STALL_TIMEOUT.as_secs(),
+    )?);
     let max_in_flight_upload_body_bytes = parse_positive_u64(
         "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES",
         source.value("RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES"),
@@ -424,6 +432,7 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
         max_put_object_bytes,
         buffered_put_object_bytes,
         backend_multipart_part_bytes,
+        stream_read_stall_timeout,
         max_in_flight_upload_body_bytes,
         max_concurrent_connections,
         max_concurrent_requests,
@@ -1040,6 +1049,7 @@ mod tests {
             .with("RS3_MAX_PUT_OBJECT_BYTES", "8388608")
             .with("RS3_BUFFERED_PUT_OBJECT_BYTES", "1048576")
             .with("RS3_BACKEND_MULTIPART_PART_BYTES", "5242880")
+            .with("RS3_STREAM_READ_STALL_TIMEOUT_SECS", "2")
             .with("RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES", "2097152")
             .with("RS3_MAX_CONCURRENT_CONNECTIONS", "32")
             .with("RS3_MAX_CONCURRENT_REQUESTS", "16")
@@ -1053,6 +1063,7 @@ mod tests {
                 max_put_object_bytes: 8_388_608,
                 buffered_put_object_bytes: 1_048_576,
                 backend_multipart_part_bytes: 5_242_880,
+                stream_read_stall_timeout: Duration::from_secs(2),
                 max_in_flight_upload_body_bytes: 2_097_152,
                 max_concurrent_connections: 32,
                 max_concurrent_requests: 16,
@@ -1067,6 +1078,7 @@ mod tests {
             "RS3_MAX_PUT_OBJECT_BYTES",
             "RS3_BUFFERED_PUT_OBJECT_BYTES",
             "RS3_BACKEND_MULTIPART_PART_BYTES",
+            "RS3_STREAM_READ_STALL_TIMEOUT_SECS",
             "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES",
             "RS3_MAX_CONCURRENT_CONNECTIONS",
             "RS3_MAX_CONCURRENT_REQUESTS",

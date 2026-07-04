@@ -29,6 +29,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_RANDOM_KEY_ATTEMPTS: usize = 3;
 
+/// Default idle time allowed between streaming request-body chunks.
+pub const DEFAULT_V2_STREAM_READ_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Accepted v2 commit anchor state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V2AnchorState {
@@ -118,6 +121,8 @@ pub struct V2CommitStoreOptions {
     pub upload_mode: V2UploadMode,
     /// Provider profile selected for post-write checks.
     pub provider_profile: V2ProviderProfile,
+    /// Maximum idle time allowed while reading streamed payload chunks.
+    pub stream_read_stall_timeout: Duration,
     /// Retention requested for commit objects.
     pub retention: Option<RetentionPolicy>,
     /// Legal hold requested for commit objects.
@@ -138,6 +143,7 @@ impl V2CommitStoreOptions {
         Self {
             upload_mode: V2UploadMode::MultipartPadded,
             provider_profile: profile,
+            stream_read_stall_timeout: DEFAULT_V2_STREAM_READ_STALL_TIMEOUT,
             retention: match profile {
                 V2ProviderProfile::RetainedVersionObjectLock => Some(RetentionPolicy::new(
                     rs3_types::RetentionMode::Governance,
@@ -154,6 +160,12 @@ impl V2CommitStoreOptions {
     /// Uses a specific upload mode for new commits.
     pub const fn with_upload_mode(mut self, upload_mode: V2UploadMode) -> Self {
         self.upload_mode = upload_mode;
+        self
+    }
+
+    /// Uses a specific idle timeout for streamed request-body reads.
+    pub const fn with_stream_read_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_read_stall_timeout = timeout;
         self
     }
 
@@ -983,7 +995,22 @@ where
             payload_sealer: &write.payload_sealer,
             payload_id: &write.payload_id,
         };
-        while let Some(chunk) = write.stream.next().await {
+        loop {
+            let next_chunk = match tokio::time::timeout(
+                self.options.stream_read_stall_timeout,
+                write.stream.next(),
+            )
+            .await
+            {
+                Ok(next_chunk) => next_chunk,
+                Err(_elapsed) => {
+                    let _ = multipart.abort().await;
+                    return Err(V2FormatError::ObjectBodyReadFailed);
+                }
+            };
+            let Some(chunk) = next_chunk else {
+                break;
+            };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(crate::RepositoryError::ObjectBodyReadFailed) => {

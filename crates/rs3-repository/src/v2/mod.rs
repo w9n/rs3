@@ -43,7 +43,8 @@ pub use provider::{
     V2ProviderConformanceReport, V2ProviderProfile, check_v2_provider_conformance,
 };
 pub use repository::{
-    V2AnchorState, V2CommitAnchor, V2CommitChain, V2CommitSection, V2CommitStore,
-    V2CommitStoreOptions, V2CommitWrite, V2MemoryAnchor, V2RecoveryBundle, V2StoredCommit,
+    DEFAULT_V2_STREAM_READ_STALL_TIMEOUT, V2AnchorState, V2CommitAnchor, V2CommitChain,
+    V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite, V2MemoryAnchor,
+    V2RecoveryBundle, V2StoredCommit,
 };
 pub use service::V2Repository;
