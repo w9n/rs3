@@ -61,6 +61,12 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and (ne .Values.gateway.mode "read-write") (ne .Values.gateway.mode "restore-readonly") -}}
 {{- fail "gateway.mode must be read-write or restore-readonly" -}}
 {{- end -}}
+{{- if and (ne .Values.gateway.writerGuard "required") (ne .Values.gateway.writerGuard "off") -}}
+{{- fail "gateway.writerGuard must be required or off" -}}
+{{- end -}}
+{{- if and (eq .Values.gateway.writerGuard "required") (ne .Values.anchor.mode "kubernetes-lease") -}}
+{{- fail "gateway.writerGuard=required requires anchor.mode=kubernetes-lease" -}}
+{{- end -}}
 {{- if and (ne .Values.updateStrategy.type "Recreate") (eq .Values.gateway.mode "read-write") -}}
 {{- fail "gateway.mode=read-write requires updateStrategy.type=Recreate to avoid overlapping writers during rollouts" -}}
 {{- end -}}

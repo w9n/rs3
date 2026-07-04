@@ -88,7 +88,7 @@ one. The backend can still deny service by hiding required objects.
 | Backend overwrites format, keyring, commit, metadata, or payload bytes | Reject through native create-only write checks, signed/digested state, AEAD authentication, or retained-version exact reads. S3 providers qualify through either `atomic-create` or `retained-version`; `HEAD` before `PUT` is not a production fallback. |
 | Backend contains commits newer than the Lease anchor | Do not silently advance. Treat as ambiguous until explicit recovery validates a trusted bundle or a separately approved anchor decision. |
 | Lease missing but backend objects exist | Do not silently trust storage. Require a trusted v2 recovery bundle and verify the named commit chain before recreating the anchor. |
-| Multiple gateways serve the same repository as `read-write` | Unsupported. Run one writer per repository; use `restore-readonly` for scaled restore readers. |
+| Multiple gateways serve the same repository as `read-write` | Unsupported. With Kubernetes anchors, a read-write gateway acquires `<anchor-name>-writer` before serving and shuts down if renewal is no longer trustworthy. Run one writer per repository; use `restore-readonly` for scaled restore readers. |
 | Gateway started as `restore-readonly` without an accepted anchor | Fail closed. Run explicit anchor recovery first, then serve restore traffic. |
 | Healthy Velero restore through the primary path | Run through the single `read-write` gateway so Velero restore-result artifacts are committed and the restore can report `Completed`. |
 | Restore client attempts PUT, DELETE, or legal-hold mutation through `restore-readonly` | Reject the request instead of advancing repository state. |
@@ -309,6 +309,7 @@ and verify the recovered bundle with `xtask v2 verify-bundle`.
 For a production-preview deployment:
 
 - use `RS3_ANCHOR_MODE=kubernetes-lease`
+- leave `RS3_WRITER_GUARD=required` enabled for read-write gateways
 - use `repositoryKeys.create=true` or `repositoryKeys.existingSecret` in Helm
 - set `repository.allowInit=true` only for deliberate first initialization on a
   fresh backend prefix; turn it off for normal existing-repository serving

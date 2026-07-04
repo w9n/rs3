@@ -132,6 +132,8 @@ spec:
             {{- end }}
             - name: RS3_ANCHOR_MODE
               value: {{ .Values.anchor.mode | quote }}
+            - name: RS3_WRITER_GUARD
+              value: {{ .Values.gateway.writerGuard | quote }}
             {{- if and (eq .Values.anchor.mode "memory") .Values.anchor.allowMemory }}
             - name: RS3_ALLOW_MEMORY_ANCHOR
               value: "true"

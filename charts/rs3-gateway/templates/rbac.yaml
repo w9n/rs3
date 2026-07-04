@@ -13,6 +13,14 @@ rules:
       - leases
     verbs:
       - create
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    resourceNames:
+      - {{ .Values.anchor.name | quote }}
+      - {{ printf "%s-writer" .Values.anchor.name | quote }}
+    verbs:
       - get
       - update
 ---

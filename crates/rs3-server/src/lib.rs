@@ -23,7 +23,7 @@ pub use admin_http::{
 pub use config::{
     AnchorConfig, BackendConfig, BatchConfig, ConfigError, GatewayMode, HardeningConfig,
     MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
-    RepositoryKeysConfig, RuntimeConfig,
+    RepositoryKeysConfig, RuntimeConfig, WriterGuardConfig,
 };
 pub use identity::{
     AuthError, Authorizer, Identity, IdentityProvider, RequestAction, StaticCredentialProvider,

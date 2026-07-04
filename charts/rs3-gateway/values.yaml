@@ -11,6 +11,7 @@ service:
 
 gateway:
   mode: read-write
+  writerGuard: required
 
 hardening:
   maxPutObjectBytes: 5368709120

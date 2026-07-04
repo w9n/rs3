@@ -790,6 +790,7 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
     let anchor = anchor_kind(&config.anchor).to_owned();
     let metrics = config.metrics.bind.is_some().to_string();
     let gateway_mode = config.mode.as_str().to_owned();
+    let writer_guard = config.writer_guard.as_str().to_owned();
     let backend_kind = backend_kind(&config.backend.endpoint).to_owned();
     let repository_format = config.repository.format.as_str().to_owned();
     let batch_max_items = config.batching.max_items.to_string();
@@ -833,6 +834,7 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
     let fields = [
         anchor.as_bytes(),
         gateway_mode.as_bytes(),
+        writer_guard.as_bytes(),
         metrics.as_bytes(),
         backend_kind.as_bytes(),
         repository_format.as_bytes(),
@@ -881,7 +883,7 @@ mod tests {
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
         ProviderConformanceConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
-        RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
+        RepositoryKeysConfig, RuntimeConfig, StaticCredentials, WriterGuardConfig,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
@@ -904,6 +906,7 @@ mod tests {
                 prefix: Some("tenant/private/prefix".to_owned()),
             },
             anchor: AnchorConfig::Memory,
+            writer_guard: WriterGuardConfig::Off,
             batching: BatchConfig {
                 max_items: 64,
                 max_delay: Duration::from_millis(10),

@@ -128,6 +128,7 @@ provider evidence without running live probes from status.
 | `RS3_ANCHOR_NAMESPACE` | for Kubernetes | none | Kubernetes namespace for the Lease anchor. |
 | `RS3_ANCHOR_NAME` | for Kubernetes | none | Kubernetes Lease name. |
 | `RS3_ANCHOR_FIELD_MANAGER` | no | `rs3-server` | Server-side apply field manager. |
+| `RS3_WRITER_GUARD` | no | `required` with Kubernetes anchors, otherwise `off` | `required` or `off`. In `read-write` mode with Kubernetes anchors, `required` acquires `<RS3_ANCHOR_NAME>-writer` before serving and renews it while running. |
 
 Helm defaults to `anchor.mode=kubernetes-lease`. If `rbac.create=false`, set
 `rbac.existing=true` to document that equivalent Lease permissions are provided
@@ -228,7 +229,9 @@ repository key Secret with `repositoryKeys.create=true`, or reference one with
 For `gateway.mode=read-write`, the chart defaults to
 `updateStrategy.type=Recreate` and rejects rolling-update strategy values. This
 preserves the one-writer repository rule during upgrades. Use
-`restore-readonly` for scaled restore readers.
+`restore-readonly` for scaled restore readers. The chart also sets
+`gateway.writerGuard=required` by default so a read-write gateway holds the
+runtime writer Lease before accepting traffic.
 
 | Secret key | Meaning |
 | --- | --- |

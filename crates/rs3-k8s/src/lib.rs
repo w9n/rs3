@@ -1,5 +1,7 @@
 //! Kubernetes checkpoint anchoring integration.
 
+mod lease_guard;
+
 use async_trait::async_trait;
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -9,6 +11,10 @@ use rs3_repository::v2::{V2AnchorState, V2CommitAnchor, V2FormatError, V2FormatR
 use rs3_types::{BackendObjectId, BackendVersionId, KeyId, Sequence};
 use std::collections::BTreeMap;
 use tokio::sync::OnceCell;
+
+pub use lease_guard::{
+    KubernetesLeaseGuard, LeaseGuard, LeaseGuardApi, LeaseGuardError, LeaseGuardState,
+};
 
 const V2_SEQUENCE_ANNOTATION: &str = "rs3.rs/v2-sequence";
 const V2_COMMIT_KEY_ANNOTATION: &str = "rs3.rs/v2-commit-key";

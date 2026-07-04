@@ -3,7 +3,7 @@
 use rs3_server::{
     AnchorConfig, BackendConfig, BatchConfig, GatewayMode, GatewayServer, GatewayServerError,
     HardeningConfig, MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig,
-    RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
+    RepositoryKeysConfig, RuntimeConfig, StaticCredentials, WriterGuardConfig,
 };
 use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
 use secrecy::SecretString;
@@ -119,6 +119,7 @@ fn runtime_config() -> RuntimeConfig {
             prefix: Some("repo".to_owned()),
         },
         anchor: AnchorConfig::Memory,
+        writer_guard: WriterGuardConfig::Off,
         batching: BatchConfig {
             max_items: 64,
             max_delay: Duration::from_millis(10),

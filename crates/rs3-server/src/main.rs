@@ -10,8 +10,8 @@ use rs3_repository::v2::{
 use rs3_server::{
     AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReportProfile,
     AnchorConfig, GatewayMode, GatewayServer, RuntimeConfig, RuntimeV2ProviderConformanceOptions,
-    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport, backend_kind,
-    check_v2_provider_conformance_from_config, doctor_findings,
+    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport, WriterGuardConfig,
+    backend_kind, check_v2_provider_conformance_from_config, doctor_findings,
     export_v2_recovery_bundle_from_config, import_v2_anchor_from_config, runtime_config_profile,
     write_v2_index_snapshot_from_config,
 };
@@ -25,8 +25,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "k8s")]
+use rs3_k8s::{KubernetesLeaseGuard, LeaseGuardError, LeaseSettings};
+
 #[cfg(any(feature = "s3", feature = "k8s"))]
 static RUSTLS_PROVIDER: Once = Once::new();
+
+#[cfg(feature = "k8s")]
+const WRITER_LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(feature = "k8s")]
+const WRITER_LEASE_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
 #[command(name = "rs3")]
@@ -180,6 +188,7 @@ async fn main() -> Result<()> {
             let admin_config = admin_http_config(admin_bind, admin_bearer_token, admin_profile)?;
             install_metrics(config.metrics.bind)?;
             log_runtime_config(&config);
+            let writer_guard = start_writer_guard(&config).await?;
             let server = GatewayServer::bind(config.clone()).await?;
             tracing::info!(bind = %server.local_addr(), "gateway S3 listener started");
             match admin_config {
@@ -195,10 +204,14 @@ async fn main() -> Result<()> {
                         bind = %admin_server.local_addr(),
                         "gateway admin listener started",
                     );
-                    run_gateway_and_admin(server, admin_server).await?;
+                    run_gateway_and_admin(server, admin_server, writer_guard.shutdown()).await?;
                 }
                 None => {
-                    server.run_until_shutdown(shutdown_signal()).await?;
+                    server
+                        .run_until_shutdown(shutdown_signal_or_writer_guard(
+                            writer_guard.shutdown(),
+                        ))
+                        .await?;
                 }
             }
         }
@@ -744,10 +757,133 @@ fn admin_http_config(
     )))
 }
 
-async fn run_gateway_and_admin(gateway: GatewayServer, admin: AdminHttpServer) -> Result<()> {
+struct WriterGuardRuntime {
+    shutdown: Option<watch::Receiver<bool>>,
+    _renew_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl WriterGuardRuntime {
+    fn disabled() -> Self {
+        Self {
+            shutdown: None,
+            _renew_task: None,
+        }
+    }
+
+    fn shutdown(&self) -> Option<watch::Receiver<bool>> {
+        self.shutdown.clone()
+    }
+}
+
+async fn start_writer_guard(config: &RuntimeConfig) -> Result<WriterGuardRuntime> {
+    if !config.mode.allows_mutation() || config.writer_guard == WriterGuardConfig::Off {
+        return Ok(WriterGuardRuntime::disabled());
+    }
+
+    let AnchorConfig::KubernetesLease {
+        namespace,
+        name,
+        field_manager,
+    } = &config.anchor
+    else {
+        bail!("RS3_WRITER_GUARD=required needs RS3_ANCHOR_MODE=kubernetes-lease");
+    };
+
+    #[cfg(feature = "k8s")]
+    {
+        let holder_identity = std::env::var("HOSTNAME")
+            .context("RS3_WRITER_GUARD=required needs HOSTNAME to identify this writer pod")?;
+        let writer_lease_name = format!("{name}-writer");
+        let lease_guard = KubernetesLeaseGuard::new(
+            LeaseSettings {
+                namespace: namespace.clone(),
+                name: writer_lease_name,
+                field_manager: field_manager.clone(),
+            },
+            holder_identity,
+            WRITER_LEASE_DURATION,
+        )
+        .context("failed to configure writer lease guard")?;
+
+        lease_guard
+            .acquire()
+            .await
+            .context("failed to acquire writer lease guard")?;
+        tracing::info!("writer lease guard acquired");
+
+        let lease_guard = std::sync::Arc::new(lease_guard);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let renew_task = tokio::spawn(renew_writer_guard(lease_guard, shutdown_tx));
+
+        Ok(WriterGuardRuntime {
+            shutdown: Some(shutdown_rx),
+            _renew_task: Some(renew_task),
+        })
+    }
+
+    #[cfg(not(feature = "k8s"))]
+    {
+        let _ = namespace;
+        let _ = name;
+        let _ = field_manager;
+        bail!("RS3_WRITER_GUARD=required needs the k8s feature");
+    }
+}
+
+#[cfg(feature = "k8s")]
+async fn renew_writer_guard(
+    lease_guard: std::sync::Arc<KubernetesLeaseGuard>,
+    shutdown_tx: watch::Sender<bool>,
+) {
+    let mut last_success = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(WRITER_LEASE_RENEW_INTERVAL).await;
+        match lease_guard.renew().await {
+            Ok(_) => {
+                last_success = std::time::Instant::now();
+            }
+            Err(error) => {
+                let elapsed = last_success.elapsed();
+                tracing::warn!(
+                    %error,
+                    elapsed_ms = elapsed.as_millis(),
+                    "writer lease renewal failed",
+                );
+                if matches!(error, LeaseGuardError::HeldByOther) {
+                    tracing::error!(
+                        "writer lease is held by another live identity; initiating graceful shutdown",
+                    );
+                    let _ = shutdown_tx.send(true);
+                    break;
+                }
+                if elapsed >= WRITER_LEASE_DURATION {
+                    tracing::error!(
+                        "writer lease renewal failed past the lease duration; initiating graceful shutdown",
+                    );
+                    let _ = shutdown_tx.send(true);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn run_gateway_and_admin(
+    gateway: GatewayServer,
+    admin: AdminHttpServer,
+    writer_guard_shutdown: Option<watch::Receiver<bool>>,
+) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let gateway_shutdown = shutdown_rx.clone();
     let admin_shutdown = shutdown_rx;
+
+    if let Some(writer_guard_shutdown) = writer_guard_shutdown {
+        let writer_guard_shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown(writer_guard_shutdown).await;
+            let _ = writer_guard_shutdown_tx.send(true);
+        });
+    }
 
     tokio::spawn(async move {
         shutdown_signal().await;
@@ -779,6 +915,17 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
         if *shutdown.borrow() {
             break;
         }
+    }
+}
+
+async fn shutdown_signal_or_writer_guard(writer_guard_shutdown: Option<watch::Receiver<bool>>) {
+    let Some(writer_guard_shutdown) = writer_guard_shutdown else {
+        shutdown_signal().await;
+        return;
+    };
+    tokio::select! {
+        _ = shutdown_signal() => {}
+        _ = wait_for_shutdown(writer_guard_shutdown) => {}
     }
 }
 
@@ -873,6 +1020,7 @@ fn log_runtime_config(config: &RuntimeConfig) {
 
     tracing::info!(
         gateway_mode = config.mode.as_str(),
+        writer_guard = config.writer_guard.as_str(),
         bind = %config.bind,
         metrics_bind = ?config.metrics.bind,
         backend_kind,
@@ -922,7 +1070,7 @@ mod tests {
     use rs3_server::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
         ProviderConformanceConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
-        RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
+        RepositoryKeysConfig, RuntimeConfig, StaticCredentials, WriterGuardConfig,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
@@ -954,6 +1102,7 @@ mod tests {
                 prefix: Some("tenant/prefix".to_owned()),
             },
             anchor: AnchorConfig::Memory,
+            writer_guard: WriterGuardConfig::Off,
             batching: BatchConfig {
                 max_items: 64,
                 max_delay: Duration::from_millis(10),

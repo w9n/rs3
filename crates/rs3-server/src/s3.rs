@@ -50,7 +50,7 @@ pub(super) mod test_support {
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, HardeningConfig, MetricsConfig,
         ProviderConformanceConfig, RecoveryConfig, RepositoryConfig, RepositoryKeysConfig,
-        RuntimeConfig,
+        RuntimeConfig, WriterGuardConfig,
     };
     use rs3_types::{PublicBucket, RepositoryId};
     use secrecy::SecretString;
@@ -78,6 +78,7 @@ pub(super) mod test_support {
                 prefix: Some("repo".to_owned()),
             },
             anchor: AnchorConfig::Memory,
+            writer_guard: WriterGuardConfig::Off,
             batching: BatchConfig {
                 max_items: 64,
                 max_delay: Duration::from_millis(10),

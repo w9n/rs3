@@ -482,6 +482,7 @@ mod tests {
         AdminReportProfile, AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig,
         MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig,
         RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
+        WriterGuardConfig,
     };
     use bytes::Bytes;
     use http::header::AUTHORIZATION;
@@ -516,6 +517,7 @@ mod tests {
                 prefix: Some("repo-prefix".to_owned()),
             },
             anchor: AnchorConfig::Memory,
+            writer_guard: WriterGuardConfig::Off,
             batching: BatchConfig {
                 max_items: 64,
                 max_delay: Duration::from_millis(10),

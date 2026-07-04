@@ -44,6 +44,7 @@ pub(crate) const KEYRING_WRAPPING_KEY_HEX_ENV: &str = "RS3_KEYRING_WRAPPING_KEY_
 pub(crate) const KEYRING_WRAPPING_KEY_ID_ENV: &str = "RS3_KEYRING_WRAPPING_KEY_ID";
 const REPOSITORY_ID_ENV: &str = "RS3_REPOSITORY_ID";
 const ALLOW_MEMORY_ANCHOR_ENV: &str = "RS3_ALLOW_MEMORY_ANCHOR";
+const WRITER_GUARD_ENV: &str = "RS3_WRITER_GUARD";
 
 /// Complete runtime configuration for the gateway process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +63,8 @@ pub struct RuntimeConfig {
     pub backend: BackendConfig,
     /// Checkpoint anchor settings.
     pub anchor: AnchorConfig,
+    /// Single-writer guard settings.
+    pub writer_guard: WriterGuardConfig,
     /// Coordinated commit batching settings.
     pub batching: BatchConfig,
     /// Repository object layout settings.
@@ -101,6 +104,25 @@ impl GatewayMode {
 
     pub(crate) const fn requires_anchor(self) -> bool {
         matches!(self, Self::RestoreReadOnly)
+    }
+}
+
+/// Single-writer runtime guard posture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriterGuardConfig {
+    /// Acquire and renew a Kubernetes writer Lease before serving writes.
+    Required,
+    /// Do not acquire a writer Lease.
+    Off,
+}
+
+impl WriterGuardConfig {
+    /// Returns the environment/configuration spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Off => "off",
+        }
     }
 }
 
@@ -341,6 +363,7 @@ impl RuntimeConfig {
             prefix: optional_value(source, "RS3_BACKEND_PREFIX"),
         };
         let anchor = parse_anchor_config(source)?;
+        let writer_guard = parse_writer_guard_config(source, &anchor)?;
         let batching = parse_batch_config(source)?;
         let repository = parse_repository_config(source)?;
         let provider_conformance = parse_provider_conformance_config(source)?;
@@ -356,6 +379,7 @@ impl RuntimeConfig {
             public_bucket,
             backend,
             anchor,
+            writer_guard,
             batching,
             repository,
             provider_conformance,
@@ -502,6 +526,40 @@ fn parse_anchor_config(source: &impl ConfigSource) -> Result<AnchorConfig, Confi
             reason: "expected memory or kubernetes-lease".to_owned(),
         }),
     }
+}
+
+fn parse_writer_guard_config(
+    source: &impl ConfigSource,
+    anchor: &AnchorConfig,
+) -> Result<WriterGuardConfig, ConfigError> {
+    let value = optional_value(source, WRITER_GUARD_ENV);
+    let writer_guard = match value.as_deref() {
+        Some("required") => WriterGuardConfig::Required,
+        Some("off") => WriterGuardConfig::Off,
+        Some(_) => {
+            return Err(ConfigError::Invalid {
+                key: WRITER_GUARD_ENV,
+                value: value.unwrap_or_default(),
+                reason: "expected required or off".to_owned(),
+            });
+        }
+        None if matches!(anchor, AnchorConfig::KubernetesLease { .. }) => {
+            WriterGuardConfig::Required
+        }
+        None => WriterGuardConfig::Off,
+    };
+
+    if writer_guard == WriterGuardConfig::Required
+        && !matches!(anchor, AnchorConfig::KubernetesLease { .. })
+    {
+        return Err(ConfigError::Invalid {
+            key: WRITER_GUARD_ENV,
+            value: value.unwrap_or_else(|| writer_guard.as_str().to_owned()),
+            reason: "required needs RS3_ANCHOR_MODE=kubernetes-lease".to_owned(),
+        });
+    }
+
+    Ok(writer_guard)
 }
 
 fn parse_batch_config(source: &impl ConfigSource) -> Result<BatchConfig, ConfigError> {
@@ -921,7 +979,7 @@ mod tests {
     use super::{
         AnchorConfig, BatchConfig, ConfigError, ConfigSource, GatewayMode, HardeningConfig,
         MetricsConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig,
-        RuntimeConfig,
+        RuntimeConfig, WriterGuardConfig,
     };
     use secrecy::SecretString;
     use std::collections::BTreeMap;
@@ -992,6 +1050,7 @@ mod tests {
         assert_eq!(config.backend.endpoint, "https://object.example");
         assert_eq!(config.backend.bucket, "backend-bucket");
         assert_eq!(config.anchor, AnchorConfig::Memory);
+        assert_eq!(config.writer_guard, WriterGuardConfig::Off);
         assert_eq!(
             config.batching,
             BatchConfig {
@@ -1415,6 +1474,59 @@ mod tests {
                 name: "v2-anchor".to_owned(),
                 field_manager: "rs3-controller".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn defaults_writer_guard_required_for_kubernetes_anchor() {
+        let source = minimal_source()
+            .with("RS3_ANCHOR_MODE", "kubernetes-lease")
+            .with("RS3_ANCHOR_NAMESPACE", "backup")
+            .with("RS3_ANCHOR_NAME", "v2-anchor");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert_eq!(
+            config.map(|config| config.writer_guard),
+            Ok(WriterGuardConfig::Required)
+        );
+    }
+
+    #[test]
+    fn parses_writer_guard_off_for_kubernetes_anchor() {
+        let source = minimal_source()
+            .with("RS3_ANCHOR_MODE", "kubernetes-lease")
+            .with("RS3_ANCHOR_NAMESPACE", "backup")
+            .with("RS3_ANCHOR_NAME", "v2-anchor")
+            .with(super::WRITER_GUARD_ENV, "off");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert_eq!(
+            config.map(|config| config.writer_guard),
+            Ok(WriterGuardConfig::Off)
+        );
+    }
+
+    #[test]
+    fn rejects_required_writer_guard_without_kubernetes_anchor() {
+        let source = minimal_source().with(super::WRITER_GUARD_ENV, "required");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::WRITER_GUARD_ENV)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_writer_guard_config() {
+        let source = minimal_source().with(super::WRITER_GUARD_ENV, "mandatory");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::WRITER_GUARD_ENV)
         );
     }
 
