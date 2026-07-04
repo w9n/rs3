@@ -105,7 +105,6 @@ async fn metadata_key_rotation_replays_old_and_new_checkpoint_state() {
     let loaded = must(fresh.load_checkpoint_position(&latest).await);
     let old_body = fresh.get_range(&old_key, ByteRange::Full).await;
     let new_body = fresh.get_range(&new_key, ByteRange::Full).await;
-    let restore = must(fresh.verify_restore(&latest).await);
 
     assert_eq!(loaded, latest);
     assert_eq!(
@@ -114,8 +113,6 @@ async fn metadata_key_rotation_replays_old_and_new_checkpoint_state() {
     );
     assert_eq!(must(old_body), Bytes::from_static(b"old"));
     assert_eq!(must(new_body), Bytes::from_static(b"new"));
-    assert!(restore.required_key_ids.contains(&key_id("metadata")));
-    assert!(restore.required_key_ids.contains(&key_id("metadata-v2")));
 }
 
 #[tokio::test]
@@ -165,12 +162,9 @@ async fn checkpoint_signing_rotation_verifies_mixed_signing_chain() {
 
     let fresh = Repository::with_keyring(store.clone(), rotated_keyring);
     let loaded = must(fresh.load_checkpoint_position(&latest).await);
-    let restore = must(fresh.verify_restore(&latest).await);
 
     assert_eq!(loaded, latest);
     assert_eq!(latest_checkpoint.signature_key_id, key_id("signing-v2"));
-    assert!(restore.required_key_ids.contains(&key_id("signing")));
-    assert!(restore.required_key_ids.contains(&key_id("signing-v2")));
 }
 
 #[tokio::test]

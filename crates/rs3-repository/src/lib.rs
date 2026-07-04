@@ -4,7 +4,6 @@ mod checkpoint;
 mod commit;
 mod error;
 mod keyring_envelope;
-mod maintenance;
 mod model;
 mod namespace;
 mod payload;
@@ -19,10 +18,8 @@ pub use commit::{CommitCoordinator, CommitCoordinatorOptions};
 pub use error::{RepositoryError, Result};
 pub use keyring_envelope::{KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE, store_keyring_envelope};
 pub use model::{
-    BackendObjectReferenceKind, CheckpointPosition, CommittedPut, DeleteOutcome,
-    PhysicalDeleteOutcome, ReachableBackendObject, RepositoryListEntry, RepositoryObjectMetadata,
-    RepositoryOrphanCandidate, RepositoryOrphanDeleteReport, RepositoryOrphanReport,
-    RepositoryPutOptions, RestoreProtectionSummary, RestoreVerificationReport,
+    CheckpointPosition, CommittedPut, DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry,
+    RepositoryObjectMetadata, RepositoryPutOptions,
 };
 pub use payload::DEFAULT_PAYLOAD_SEGMENT_SIZE;
 pub use service::{DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES, Repository, RepositoryOptions};

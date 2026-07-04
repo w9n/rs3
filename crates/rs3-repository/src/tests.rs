@@ -7,9 +7,8 @@ use crate::checkpoint::{
 use crate::namespace::{indexed_list_prefix, indexed_list_prefix_mode, prefix_tokens_for_key};
 use crate::payload::PAYLOAD_HEADER_PROBE_LEN;
 use crate::{
-    BackendObjectReferenceKind, CheckpointPosition, CommitCoordinator, CommitCoordinatorOptions,
-    PhysicalDeleteOutcome, Repository, RepositoryError, RepositoryOptions,
-    RepositoryOrphanCandidate, RepositoryPutOptions,
+    CheckpointPosition, CommitCoordinator, CommitCoordinatorOptions, PhysicalDeleteOutcome,
+    Repository, RepositoryError, RepositoryOptions, RepositoryPutOptions,
 };
 use bytes::Bytes;
 use rs3_anchor::{AnchorError, CheckpointAnchor, MemoryCheckpointAnchor};
@@ -29,9 +28,7 @@ mod commit_coordinator;
 mod immutability;
 mod keys;
 mod namespace_privacy;
-mod orphans;
 mod payload;
-mod restore_verification;
 mod support;
 use support::*;
 pub(crate) use support::{backend_object_id, signing_keyring, wrong_content_keyring};
