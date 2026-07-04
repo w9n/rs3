@@ -80,6 +80,33 @@ lets the gateway write an encrypted keyring envelope under `keyrings/` and use
 recover a missing anchor from a trusted bundle instead. The memory anchor is
 only for local development; it is not a production rollback boundary.
 
+With the gateway still running, use a second shell to write and list an object
+through the S3 API:
+
+```sh
+printf 'hello rs3\n' >/tmp/rs3-smoke.txt
+
+AWS_ACCESS_KEY_ID=local \
+AWS_SECRET_ACCESS_KEY=local-secret \
+AWS_DEFAULT_REGION=us-east-1 \
+aws --endpoint-url http://127.0.0.1:9080 \
+  s3 cp /tmp/rs3-smoke.txt s3://backup/smoke/hello.txt
+
+AWS_ACCESS_KEY_ID=local \
+AWS_SECRET_ACCESS_KEY=local-secret \
+AWS_DEFAULT_REGION=us-east-1 \
+aws --endpoint-url http://127.0.0.1:9080 \
+  s3 ls s3://backup/smoke/
+```
+
+The same round trip with `mc` is:
+
+```sh
+mc alias set rs3-local http://127.0.0.1:9080 local local-secret
+mc cp /tmp/rs3-smoke.txt rs3-local/backup/smoke/hello.txt
+mc ls rs3-local/backup/smoke/
+```
+
 ## Run S3 Contract Checks
 
 Local S3-compatible checks are opt-in:
