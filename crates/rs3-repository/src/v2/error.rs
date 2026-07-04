@@ -23,7 +23,7 @@ pub enum V2ErrorClass {
 pub type V2Result<T> = std::result::Result<T, V2FormatError>;
 
 /// Errors returned by v2 commit-format and protocol-boundary checks.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum V2FormatError {
     /// A random commit key did not have the required shape.
     #[error("invalid v2 commit key")]
@@ -142,6 +142,9 @@ pub enum V2FormatError {
     /// Destructive maintenance plan exceeds an operator-supplied budget.
     #[error("v2 maintenance budget exceeded")]
     MaintenanceBudgetExceeded,
+    /// Destructive orphan GC requires a safer minimum age.
+    #[error("v2 orphan GC minimum age is below the production floor")]
+    OrphanGcMinAgeTooLow,
 }
 
 impl V2FormatError {
@@ -155,9 +158,9 @@ impl V2FormatError {
             Self::ProviderProfileFailed => V2ErrorClass::ProviderConformance,
             Self::RecoveryBundleRequired => V2ErrorClass::OperatorActionRequired,
             Self::RollbackUnsafeDr => V2ErrorClass::RollbackUnsafeDr,
-            Self::MaintenanceAccessRequired | Self::MaintenanceBudgetExceeded => {
-                V2ErrorClass::OperatorActionRequired
-            }
+            Self::MaintenanceAccessRequired
+            | Self::MaintenanceBudgetExceeded
+            | Self::OrphanGcMinAgeTooLow => V2ErrorClass::OperatorActionRequired,
             Self::InvalidCommitKey
             | Self::TruncatedHeader
             | Self::TruncatedBody

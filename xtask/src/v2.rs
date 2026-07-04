@@ -5,14 +5,14 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::{Args, Subcommand, ValueEnum};
 use rs3_crypto::{FormatEnvelope, KeyRing, KeyringEnvelope, RepositoryKeyContext, SecretBytes};
+#[cfg(feature = "s3")]
+use rs3_repository::v2::{
+    UnenforcedQuiescedMaintenanceGuard, V2FullGcApplyOptions, V2FullGcDryRunOptions,
+    V2KeyringEnvelopeRef, V2MaintenanceBudgets, V2OrphanGcOptions, generate_v2_commit_key,
+};
 use rs3_repository::v2::{
     V2AnchorState, V2CommitChain, V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot,
     V2KeyringEnvelopeRootRef, V2ProviderProfile, V2RecoveryBundle,
-};
-#[cfg(feature = "s3")]
-use rs3_repository::v2::{
-    V2FullGcApplyOptions, V2FullGcDryRunOptions, V2KeyringEnvelopeRef, V2MaintenanceBudgets,
-    V2OrphanGcOptions, V2QuiescedMaintenanceGuard, generate_v2_commit_key,
 };
 #[cfg(feature = "s3")]
 use rs3_storage::PutOptions;
@@ -290,6 +290,14 @@ where
     let repository = V2CommitStore::new(store.clone(), keyring, commit_options);
     let anchor = rs3_repository::v2::V2MemoryAnchor::new();
 
+    let existing_commits = store
+        .list_prefix("commits/v01/")
+        .await
+        .context("failed to inspect retained GC rehearsal target prefix")?;
+    if !existing_commits.is_empty() {
+        bail!("retained GC rehearsal refuses to run when commits/v01/ is not empty");
+    }
+
     let genesis = repository
         .write_genesis_snapshot(&anchor)
         .await
@@ -351,15 +359,18 @@ where
     let apply = repository
         .apply_fully_dead_orphans(
             &anchor,
-            &V2QuiescedMaintenanceGuard,
+            &UnenforcedQuiescedMaintenanceGuard,
             V2FullGcApplyOptions {
                 dry_run: dry_run_options,
-                orphan_gc: V2OrphanGcOptions::new(std::time::Duration::ZERO),
+                orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(std::time::Duration::ZERO),
                 retained_provider_conformance_passed: true,
             },
         )
         .await
         .context("failed to apply retained GC rehearsal")?;
+    if let Some(error) = apply.orphan_gc.aborted {
+        bail!("retained GC rehearsal apply aborted before completion: {error}");
+    }
     if apply.orphan_gc.deleted_count != 1 || apply.orphan_gc.protected_count != 1 {
         bail!(
             "retained GC rehearsal expected one delete and one protected candidate, got {} deletes and {} protected",

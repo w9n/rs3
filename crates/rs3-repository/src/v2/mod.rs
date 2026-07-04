@@ -33,10 +33,10 @@ pub use format::{
     V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef, V2MaintenanceConfig, v2_format_object_id,
 };
 pub use maintenance::{
-    V2FullGcApplyOptions, V2FullGcApplyReport, V2FullGcDryRunOptions, V2FullGcDryRunReport,
-    V2MaintenanceBudgets, V2MaintenanceGuard, V2MaintenancePlanCost, V2MaintenanceReport,
-    V2OrphanCandidate, V2OrphanGcOptions, V2OrphanGcReport, V2OrphanReport,
-    V2QuiescedMaintenanceGuard,
+    UnenforcedQuiescedMaintenanceGuard, V2FullGcApplyOptions, V2FullGcApplyReport,
+    V2FullGcDryRunOptions, V2FullGcDryRunReport, V2MaintenanceBudgets, V2MaintenanceGuard,
+    V2MaintenancePlanCost, V2MaintenanceReport, V2OrphanCandidate, V2OrphanGcOptions,
+    V2OrphanGcReport, V2OrphanReport,
 };
 pub use provider::{
     V2ProviderCheckStatus, V2ProviderConformanceCheck, V2ProviderConformanceOptions,

@@ -21,6 +21,7 @@ use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_RETENTION_RENEWAL_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const MIN_ORPHAN_GC_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Unanchored v2 commit object discovered by orphan reporting.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,7 +70,21 @@ pub struct V2OrphanGcOptions {
 
 impl V2OrphanGcOptions {
     /// Creates conservative orphan-GC options.
-    pub const fn new(min_age: Duration) -> Self {
+    pub fn new(min_age: Duration) -> V2Result<Self> {
+        if min_age < MIN_ORPHAN_GC_AGE {
+            return Err(V2FormatError::OrphanGcMinAgeTooLow);
+        }
+        Ok(Self {
+            min_age,
+            delete_same_sequence: false,
+        })
+    }
+
+    /// Creates orphan-GC options without the production age floor.
+    ///
+    /// This is only for deterministic tests and isolated rehearsal harnesses
+    /// that create disposable objects inside an empty target prefix.
+    pub const fn new_for_test_rehearsal(min_age: Duration) -> Self {
         Self {
             min_age,
             delete_same_sequence: false,
@@ -100,6 +115,8 @@ pub struct V2OrphanGcReport {
     pub same_sequence_skipped_count: usize,
     /// Delete calls that failed for reasons other than known protection or not found.
     pub failed_delete_count: usize,
+    /// Mid-pass abort reason after a partial destructive pass.
+    pub aborted: Option<V2FormatError>,
 }
 
 /// Redacted v2 quick-maintenance report.
@@ -252,12 +269,15 @@ pub trait V2MaintenanceGuard: Send + Sync {
     async fn verify_v2_maintenance(&self, base_anchor: Option<&V2AnchorState>) -> V2Result<()>;
 }
 
-/// Explicit guard for operator-quiesced maintenance windows.
+/// Unenforced guard for externally quiesced maintenance windows.
+///
+/// This is an honor-system escape hatch for tests and isolated rehearsals until
+/// the Lease-backed guard ships. Production operators must supply a real guard.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct V2QuiescedMaintenanceGuard;
+pub struct UnenforcedQuiescedMaintenanceGuard;
 
 #[async_trait]
-impl V2MaintenanceGuard for V2QuiescedMaintenanceGuard {
+impl V2MaintenanceGuard for UnenforcedQuiescedMaintenanceGuard {
     async fn verify_v2_maintenance(&self, _base_anchor: Option<&V2AnchorState>) -> V2Result<()> {
         Ok(())
     }
@@ -439,42 +459,74 @@ where
     pub async fn delete_expired_orphans<A>(
         &self,
         anchor: &A,
+        guard: &impl V2MaintenanceGuard,
         options: V2OrphanGcOptions,
     ) -> V2Result<V2OrphanGcReport>
     where
         A: V2CommitAnchor,
     {
+        guard.verify_v2_maintenance(None).await?;
+        let base_anchor = anchor.read_v2().await?;
+        guard.verify_v2_maintenance(base_anchor.as_ref()).await?;
         let report = self.report_orphans(anchor).await?;
-        self.delete_expired_orphan_candidates(report, options).await
+        self.delete_expired_orphan_candidates(
+            anchor,
+            guard,
+            base_anchor.as_ref(),
+            report,
+            options,
+            None,
+        )
+        .await
     }
 
     /// Deletes expired orphan commits while preserving supplied historical roots.
     pub async fn delete_expired_orphans_with_protected_roots<A>(
         &self,
         anchor: &A,
+        guard: &impl V2MaintenanceGuard,
         protected_roots: &[V2AnchorState],
         options: V2OrphanGcOptions,
     ) -> V2Result<V2OrphanGcReport>
     where
         A: V2CommitAnchor,
     {
+        guard.verify_v2_maintenance(None).await?;
+        let base_anchor = anchor.read_v2().await?;
+        guard.verify_v2_maintenance(base_anchor.as_ref()).await?;
         let report = self
             .report_orphans_with_protected_roots(anchor, protected_roots)
             .await?;
-        self.delete_expired_orphan_candidates(report, options).await
+        self.delete_expired_orphan_candidates(
+            anchor,
+            guard,
+            base_anchor.as_ref(),
+            report,
+            options,
+            None,
+        )
+        .await
     }
 
-    async fn delete_expired_orphan_candidates(
+    async fn delete_expired_orphan_candidates<A>(
         &self,
+        anchor: &A,
+        guard: &impl V2MaintenanceGuard,
+        base_anchor: Option<&V2AnchorState>,
         report: V2OrphanReport,
         options: V2OrphanGcOptions,
-    ) -> V2Result<V2OrphanGcReport> {
+        max_delete_count: Option<u64>,
+    ) -> V2Result<V2OrphanGcReport>
+    where
+        A: V2CommitAnchor,
+    {
         let now_ms = current_time_ms();
         let min_age_ms = options.min_age.as_millis();
         let mut gc = V2OrphanGcReport {
             scanned_count: report.candidates.len(),
             ..V2OrphanGcReport::default()
         };
+        let mut delete_attempt_count = 0_u64;
 
         for candidate in report.candidates {
             if candidate.delete_blocked_by_retention
@@ -496,6 +548,17 @@ where
                 gc.age_skipped_count += 1;
                 continue;
             }
+            if max_delete_count.is_some_and(|max| delete_attempt_count >= max) {
+                break;
+            }
+            if let Err(error) = guard.verify_v2_maintenance(base_anchor).await {
+                gc.aborted = Some(error);
+                return Ok(gc);
+            }
+            if anchor.read_v2().await? != base_anchor.cloned() {
+                gc.aborted = Some(V2FormatError::StaleAnchor);
+                return Ok(gc);
+            }
 
             let delete = if self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock
             {
@@ -509,6 +572,7 @@ where
             } else {
                 self.store().delete(&candidate.object_id).await
             };
+            delete_attempt_count = delete_attempt_count.saturating_add(1);
 
             match delete {
                 Ok(()) => gc.deleted_count += 1,
@@ -910,61 +974,16 @@ where
         let orphans = self
             .report_orphans_with_protected_roots(anchor, &options.dry_run.protected_roots)
             .await?;
-        let now_ms = current_time_ms();
-        let min_age_ms = options.orphan_gc.min_age.as_millis();
-        let mut gc = V2OrphanGcReport {
-            scanned_count: orphans.candidates.len(),
-            ..V2OrphanGcReport::default()
-        };
-
-        for candidate in orphans.candidates {
-            if candidate.delete_blocked_by_retention
-                || candidate.delete_blocked_by_legal_hold
-                || candidate.delete_blocked_by_unknown_protection
-            {
-                gc.protected_count += 1;
-                continue;
-            }
-            if candidate.same_sequence_as_anchor && !options.orphan_gc.delete_same_sequence {
-                gc.same_sequence_skipped_count += 1;
-                continue;
-            }
-            let Some(age_ms) = candidate_age_ms(now_ms, candidate.modified_at_ms) else {
-                gc.age_skipped_count += 1;
-                continue;
-            };
-            if age_ms < min_age_ms {
-                gc.age_skipped_count += 1;
-                continue;
-            }
-
-            guard.verify_v2_maintenance(base_anchor.as_ref()).await?;
-            if anchor.read_v2().await? != base_anchor {
-                return Err(V2FormatError::StaleAnchor);
-            }
-
-            let delete = if self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock
-            {
-                let Some(version_id) = candidate.version_id.as_ref() else {
-                    gc.protected_count += 1;
-                    continue;
-                };
-                self.store()
-                    .delete_at(&candidate.object_id, Some(version_id))
-                    .await
-            } else {
-                self.store().delete(&candidate.object_id).await
-            };
-
-            match delete {
-                Ok(()) => gc.deleted_count += 1,
-                Err(StorageError::NotFound(_)) => gc.already_gone_count += 1,
-                Err(StorageError::RetentionBlocked | StorageError::LegalHoldBlocked) => {
-                    gc.protected_count += 1;
-                }
-                Err(_) => gc.failed_delete_count += 1,
-            }
-        }
+        let gc = self
+            .delete_expired_orphan_candidates(
+                anchor,
+                guard,
+                base_anchor.as_ref(),
+                orphans,
+                options.orphan_gc,
+                Some(dry_run.planned_cost.delete_count),
+            )
+            .await?;
 
         Ok(V2FullGcApplyReport {
             dry_run,

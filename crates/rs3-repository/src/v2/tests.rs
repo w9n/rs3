@@ -1,15 +1,15 @@
 use super::{
+    UnenforcedQuiescedMaintenanceGuard, V2AnchorState, V2CommitAnchor, V2CommitCoordinator,
+    V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite, V2FullGcApplyOptions,
+    V2FullGcDryRunOptions, V2MaintenanceBudgets, V2MaintenanceGuard, V2MemoryAnchor,
+    V2OrphanGcOptions, V2RecoveryBundle, V2Repository,
+};
+use super::{
     V2Algorithms, V2CommitHeader, V2CommitKey, V2CommitParentRef, V2CommitSelfRef, V2ErrorClass,
     V2FormatError, V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRef, V2KeyringEnvelopeRootRef,
     V2ProviderCheckStatus, V2ProviderConformanceOptions, V2ProviderProfile, V2SectionDescriptor,
     V2SectionType, V2UploadMode, body_digest_for_v2_sections, check_v2_provider_conformance,
     generate_v2_commit_key, parse_v2_commit_object,
-};
-use super::{
-    V2AnchorState, V2CommitAnchor, V2CommitCoordinator, V2CommitSection, V2CommitStore,
-    V2CommitStoreOptions, V2CommitWrite, V2FullGcApplyOptions, V2FullGcDryRunOptions,
-    V2MaintenanceBudgets, V2MaintenanceGuard, V2MemoryAnchor, V2OrphanGcOptions,
-    V2QuiescedMaintenanceGuard, V2RecoveryBundle, V2Repository,
 };
 use crate::{CommitCoordinatorOptions, RepositoryError, RepositoryOptions, RepositoryPutOptions};
 use bytes::Bytes;
@@ -229,6 +229,38 @@ impl V2MaintenanceGuard for RejectingMaintenanceGuard {
         _base_anchor: Option<&V2AnchorState>,
     ) -> super::V2Result<()> {
         Err(V2FormatError::MaintenanceAccessRequired)
+    }
+}
+
+struct FailsAfterMaintenanceGuard {
+    remaining_successes: AtomicUsize,
+}
+
+impl FailsAfterMaintenanceGuard {
+    fn new(remaining_successes: usize) -> Self {
+        Self {
+            remaining_successes: AtomicUsize::new(remaining_successes),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl V2MaintenanceGuard for FailsAfterMaintenanceGuard {
+    async fn verify_v2_maintenance(
+        &self,
+        _base_anchor: Option<&V2AnchorState>,
+    ) -> super::V2Result<()> {
+        if self
+            .remaining_successes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            Ok(())
+        } else {
+            Err(V2FormatError::MaintenanceAccessRequired)
+        }
     }
 }
 
@@ -2105,7 +2137,11 @@ async fn v2_orphan_gc_keeps_live_payload_commits_referenced_by_index_snapshot() 
     let gc = must_v2(
         repository
             .commit_store()
-            .delete_expired_orphans(&anchor, V2OrphanGcOptions::new(Duration::ZERO))
+            .delete_expired_orphans(
+                &anchor,
+                &UnenforcedQuiescedMaintenanceGuard,
+                V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+            )
             .await,
     );
     let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
@@ -2248,7 +2284,11 @@ async fn v2_orphan_gc_deletes_expired_unprotected_commit() {
     let before = must_v2(repository.report_orphans(&anchor).await);
     let gc = must_v2(
         repository
-            .delete_expired_orphans(&anchor, V2OrphanGcOptions::new(Duration::ZERO))
+            .delete_expired_orphans(
+                &anchor,
+                &UnenforcedQuiescedMaintenanceGuard,
+                V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+            )
             .await,
     );
     let after = must_v2(repository.report_orphans(&anchor).await);
@@ -2258,6 +2298,18 @@ async fn v2_orphan_gc_deletes_expired_unprotected_commit() {
     assert_eq!(gc.scanned_count, 1);
     assert_eq!(gc.deleted_count, 1);
     assert_eq!(after.candidates.len(), 0);
+}
+
+#[test]
+fn v2_orphan_gc_options_rejects_sub_hour_production_min_age() {
+    assert_eq!(
+        V2OrphanGcOptions::new(Duration::ZERO),
+        Err(V2FormatError::OrphanGcMinAgeTooLow)
+    );
+    assert!(matches!(
+        V2OrphanGcOptions::new(Duration::from_secs(60 * 60)),
+        Ok(options) if options.min_age == Duration::from_secs(60 * 60)
+    ));
 }
 
 #[tokio::test]
@@ -2287,7 +2339,9 @@ async fn v2_orphan_gc_skips_retained_or_held_candidates() {
         retained
             .delete_expired_orphans(
                 &retained_anchor,
-                V2OrphanGcOptions::new(Duration::ZERO).with_same_sequence_deletion(true),
+                &UnenforcedQuiescedMaintenanceGuard,
+                V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO)
+                    .with_same_sequence_deletion(true),
             )
             .await,
     );
@@ -2325,7 +2379,9 @@ async fn v2_orphan_gc_skips_retained_or_held_candidates() {
     let held_gc = must_v2(
         held.delete_expired_orphans(
             &held_anchor,
-            V2OrphanGcOptions::new(Duration::ZERO).with_same_sequence_deletion(true),
+            &UnenforcedQuiescedMaintenanceGuard,
+            V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO)
+                .with_same_sequence_deletion(true),
         )
         .await,
     );
@@ -2581,7 +2637,7 @@ async fn v2_full_gc_apply_requires_maintenance_guard() {
             &RejectingMaintenanceGuard,
             V2FullGcApplyOptions {
                 dry_run: V2FullGcDryRunOptions::default(),
-                orphan_gc: V2OrphanGcOptions::new(Duration::ZERO),
+                orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                 retained_provider_conformance_passed: false,
             },
         )
@@ -2620,10 +2676,10 @@ async fn v2_full_gc_apply_deletes_only_fully_dead_orphans_after_dry_run() {
         repository
             .apply_fully_dead_orphans(
                 &anchor,
-                &V2QuiescedMaintenanceGuard,
+                &UnenforcedQuiescedMaintenanceGuard,
                 V2FullGcApplyOptions {
                     dry_run: V2FullGcDryRunOptions::default(),
-                    orphan_gc: V2OrphanGcOptions::new(Duration::ZERO),
+                    orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance_passed: false,
                 },
             )
@@ -2635,6 +2691,73 @@ async fn v2_full_gc_apply_deletes_only_fully_dead_orphans_after_dry_run() {
     assert_eq!(apply.dry_run.fully_dead_commit_count, 1);
     assert_eq!(apply.orphan_gc.deleted_count, 1);
     assert_eq!(after.candidates.len(), 0);
+}
+
+#[tokio::test]
+async fn v2_full_gc_apply_returns_partial_report_on_mid_pass_guard_abort() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2CommitStore::new(store, keyring, options);
+    let anchor = V2MemoryAnchor::new();
+
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let first_failed = repository
+        .write_child_commit(
+            &FailOnceV2Anchor::new(anchor.clone()),
+            V2CommitWrite::delta(vec![V2CommitSection::new(
+                V2SectionType::IndexDelta,
+                0,
+                Bytes::from_static(b"partial-apply-orphan-one"),
+            )]),
+        )
+        .await;
+    let second_failed = repository
+        .write_child_commit(
+            &FailOnceV2Anchor::new(anchor.clone()),
+            V2CommitWrite::delta(vec![V2CommitSection::new(
+                V2SectionType::IndexDelta,
+                0,
+                Bytes::from_static(b"partial-apply-orphan-two"),
+            )]),
+        )
+        .await;
+    let guard = FailsAfterMaintenanceGuard::new(3);
+
+    let apply = must_v2(
+        repository
+            .apply_fully_dead_orphans(
+                &anchor,
+                &guard,
+                V2FullGcApplyOptions {
+                    dry_run: V2FullGcDryRunOptions::default(),
+                    orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+                    retained_provider_conformance_passed: false,
+                },
+            )
+            .await,
+    );
+    let after = must_v2(repository.report_orphans(&anchor).await);
+
+    assert!(matches!(
+        first_failed,
+        Err(V2FormatError::AnchorAdvanceFailed)
+    ));
+    assert!(matches!(
+        second_failed,
+        Err(V2FormatError::AnchorAdvanceFailed)
+    ));
+    assert_eq!(apply.dry_run.fully_dead_commit_count, 2);
+    assert_eq!(apply.orphan_gc.deleted_count, 1);
+    assert_eq!(
+        apply.orphan_gc.aborted,
+        Some(V2FormatError::MaintenanceAccessRequired)
+    );
+    assert_eq!(after.candidates.len(), 1);
 }
 
 #[tokio::test]
@@ -2697,13 +2820,13 @@ async fn v2_full_gc_apply_preserves_supplied_historical_roots() {
         repository
             .apply_fully_dead_orphans(
                 &anchor,
-                &V2QuiescedMaintenanceGuard,
+                &UnenforcedQuiescedMaintenanceGuard,
                 V2FullGcApplyOptions {
                     dry_run: V2FullGcDryRunOptions {
                         protected_roots: vec![historical_root],
                         ..V2FullGcDryRunOptions::default()
                     },
-                    orphan_gc: V2OrphanGcOptions::new(Duration::ZERO),
+                    orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance_passed: false,
                 },
             )
@@ -2734,10 +2857,10 @@ async fn retained_v2_full_gc_apply_requires_provider_conformance() {
     let apply = repository
         .apply_fully_dead_orphans(
             &anchor,
-            &V2QuiescedMaintenanceGuard,
+            &UnenforcedQuiescedMaintenanceGuard,
             V2FullGcApplyOptions {
                 dry_run: V2FullGcDryRunOptions::default(),
-                orphan_gc: V2OrphanGcOptions::new(Duration::ZERO),
+                orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                 retained_provider_conformance_passed: false,
             },
         )
@@ -2778,10 +2901,10 @@ async fn retained_v2_full_gc_apply_deletes_unprotected_exact_version_after_confo
         repository
             .apply_fully_dead_orphans(
                 &anchor,
-                &V2QuiescedMaintenanceGuard,
+                &UnenforcedQuiescedMaintenanceGuard,
                 V2FullGcApplyOptions {
                     dry_run: V2FullGcDryRunOptions::default(),
-                    orphan_gc: V2OrphanGcOptions::new(Duration::ZERO),
+                    orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance_passed: true,
                 },
             )
@@ -2947,7 +3070,7 @@ async fn v2_compaction_snapshot_rewrites_live_refs_and_gc_removes_old_commits() 
         repository
             .write_compaction_snapshot(
                 &anchor,
-                &V2QuiescedMaintenanceGuard,
+                &UnenforcedQuiescedMaintenanceGuard,
                 V2FullGcDryRunOptions::default(),
                 false,
             )
@@ -2963,10 +3086,10 @@ async fn v2_compaction_snapshot_rewrites_live_refs_and_gc_removes_old_commits() 
             .commit_store()
             .apply_fully_dead_orphans(
                 &anchor,
-                &V2QuiescedMaintenanceGuard,
+                &UnenforcedQuiescedMaintenanceGuard,
                 V2FullGcApplyOptions {
                     dry_run: V2FullGcDryRunOptions::default(),
-                    orphan_gc: V2OrphanGcOptions::new(Duration::ZERO),
+                    orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance_passed: false,
                 },
             )
