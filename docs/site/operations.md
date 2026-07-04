@@ -452,6 +452,9 @@ commit and format version IDs. The import verifies the named signed commit
 chain, format root, recovery signature, and keyring envelope before writing the
 missing anchor. Production import requires `RS3_RECOVERY_PUBLIC_KEY` and refuses
 an anchor sequence below the operator-supplied `--min-sequence`.
+It also lists stored v2 commits and refuses to import when it sees a higher
+commit sequence than the bundle names. Use `--force-rollback` only after an
+explicit rollback review accepts stranding those newer commits.
 
 Verify a trusted anchor position before relying on it for restore. For v2, the
 offline verifier and anchor import path both verify the named signed commit

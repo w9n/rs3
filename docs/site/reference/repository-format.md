@@ -122,9 +122,10 @@ offline-signature payload bytes as the normal DR weak-subjectivity bundle. If
 the external anchor is lost, `rs3 import-v2-anchor` recreates it from a trusted
 bundle only after checking an operator-supplied `--min-sequence` floor,
 verifying the offline Ed25519 signature when the selected provider profile is
-production, and verifying the named commit chain. `xtask v2 verify-bundle`
-performs the same floor, signature, format-root, keyring-envelope, and
-commit-chain verification as a no-write preflight.
+production, refusing stored commit sequences newer than the imported anchor
+unless `--force-rollback` is explicit, and verifying the named commit chain.
+`xtask v2 verify-bundle` performs the same floor, signature, format-root,
+keyring-envelope, and commit-chain verification as a no-write preflight.
 `rs3 check-v2-provider` runs the selected v2 provider-profile probes against the
 configured backend, including multipart upload behavior used by large streaming
 writes; retained governance profiles require an explicit operator review flag

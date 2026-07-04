@@ -130,6 +130,9 @@ fields. Omit version IDs only for a trusted bundle that does not contain them;
 retained/Object Lock repositories should contain them. Production import also
 requires `RS3_RECOVERY_PUBLIC_KEY` and refuses a bundle whose anchor sequence is
 below the operator-supplied `--min-sequence`.
+It also lists stored v2 commits and refuses to import when it sees a higher
+commit sequence than the bundle names. Use `--force-rollback` only after an
+explicit rollback review accepts stranding those newer commits.
 
 ## 4. If No Bundle Exists, Stop
 

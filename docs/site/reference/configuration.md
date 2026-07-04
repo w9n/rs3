@@ -26,7 +26,9 @@ from the exported bundle. Production recovery requires an external
 `--min-sequence` floor and `RS3_RECOVERY_PUBLIC_KEY`. `export-restore-bundle`
 prints `offline_signature_payload_hex`; sign those canonical bytes offline with
 the matching Ed25519 recovery key and store the hex signature in
-`offline_signature` before import.
+`offline_signature` before import. `import-v2-anchor` also refuses when stored
+commit keys contain a sequence higher than the imported anchor; `--force-rollback`
+is an explicit rollback override for that condition.
 Machine-readable command output is written to stdout; tracing logs are written
 to stderr for both `plain` and `json` log formats.
 

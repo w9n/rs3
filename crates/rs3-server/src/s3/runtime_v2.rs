@@ -15,10 +15,10 @@ use futures_util::Stream;
 use rs3_crypto::{FormatEnvelope, KeyRing};
 use rs3_index::KeyringEnvelopeReference;
 use rs3_repository::v2::{
-    V2AnchorState, V2CommitAnchor, V2CommitCoordinator, V2CommitStore, V2CommitStoreOptions,
-    V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef, V2ProviderConformanceOptions,
-    V2ProviderConformanceReport, V2ProviderProfile, V2RecoveryBundle, V2Repository,
-    check_v2_provider_conformance, v2_format_object_id,
+    V2AnchorState, V2CommitAnchor, V2CommitCoordinator, V2CommitKey, V2CommitStore,
+    V2CommitStoreOptions, V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef,
+    V2ProviderConformanceOptions, V2ProviderConformanceReport, V2ProviderProfile, V2RecoveryBundle,
+    V2Repository, check_v2_provider_conformance, v2_format_object_id,
 };
 use rs3_repository::{
     DeleteOutcome, RepositoryError, RepositoryListEntry, RepositoryObjectMetadata,
@@ -56,6 +56,8 @@ pub struct V2AnchorImportReport {
 pub struct V2AnchorImportOptions {
     /// External weak-subjectivity floor that the imported anchor must satisfy.
     pub min_sequence: Sequence,
+    /// Allow importing an anchor below newer commit objects seen in storage.
+    pub force_rollback: bool,
 }
 
 /// Runtime options for v2 provider conformance probes.
@@ -431,6 +433,13 @@ pub async fn import_v2_anchor_from_config(
         options.min_sequence,
         config.recovery.public_key.as_deref(),
     )?;
+    reject_import_stranding_newer_commits(
+        store.handle(),
+        provider_profile,
+        bundle.anchor.sequence,
+        options.force_rollback,
+    )
+    .await?;
     let loaded = load_existing_v2_repository(
         store.handle(),
         &config.repository_keys,
@@ -499,6 +508,50 @@ fn verify_recovery_bundle_trust(
             "production v2 anchor import requires RS3_RECOVERY_PUBLIC_KEY",
         )),
     }?;
+
+    Ok(())
+}
+
+async fn reject_import_stranding_newer_commits<S>(
+    store: &S,
+    provider_profile: V2ProviderProfile,
+    import_sequence: Sequence,
+    force_rollback: bool,
+) -> Result<(), S3BoundaryError>
+where
+    S: BlobStore,
+{
+    let listed = if provider_profile == V2ProviderProfile::RetainedVersionObjectLock {
+        store
+            .list_prefix_versions("commits/v01/")
+            .await
+            .map_err(repository_init)?
+    } else {
+        store
+            .list_prefix("commits/v01/")
+            .await
+            .map_err(repository_init)?
+    };
+    let highest_seen = listed
+        .iter()
+        .filter_map(|metadata| V2CommitKey::parse(&metadata.object_id).ok())
+        .map(|commit_key| commit_key.sequence)
+        .max();
+    if let Some(highest_seen) = highest_seen
+        && highest_seen > import_sequence
+    {
+        tracing::warn!(
+            highest_seen_sequence = highest_seen.get(),
+            import_sequence = import_sequence.get(),
+            force_rollback,
+            "v2 anchor import observed newer commit objects than the trusted bundle"
+        );
+        if !force_rollback {
+            return Err(repository_init(
+                "v2 anchor import would strand newer commit objects; pass --force-rollback only after rollback review",
+            ));
+        }
+    }
 
     Ok(())
 }
@@ -803,9 +856,14 @@ fn default_v2_provider_probe_prefix() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{V2ProviderProfile, V2RecoveryBundle, verify_recovery_bundle_trust};
+    use super::{
+        V2ProviderProfile, V2RecoveryBundle, reject_import_stranding_newer_commits,
+        verify_recovery_bundle_trust,
+    };
+    use bytes::Bytes;
     use rs3_crypto::KeyRing;
     use rs3_repository::v2::{V2AnchorState, V2FormatRef};
+    use rs3_storage::{BlobStore, MemoryBlobStore, PutOptions};
     use rs3_types::{BackendObjectId, BackendVersionId, KeyId, KeyPurpose, RepositoryId, Sequence};
 
     #[test]
@@ -877,6 +935,55 @@ mod tests {
         .unwrap_or_else(|error| panic!("{error}"));
     }
 
+    #[tokio::test]
+    async fn import_newer_commit_scan_rejects_higher_sequence() {
+        let store = MemoryBlobStore::new();
+        store
+            .put(
+                &commit_object_id(8),
+                Bytes::from_static(b"newer-commit-placeholder"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let error = match reject_import_stranding_newer_commits(
+            &store,
+            V2ProviderProfile::Dev,
+            Sequence::new(7),
+            false,
+        )
+        .await
+        {
+            Ok(_) => panic!("newer commit sequence should block import"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("strand newer commit"));
+    }
+
+    #[tokio::test]
+    async fn import_newer_commit_scan_allows_explicit_force_rollback() {
+        let store = MemoryBlobStore::new();
+        store
+            .put(
+                &commit_object_id(8),
+                Bytes::from_static(b"newer-commit-placeholder"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        reject_import_stranding_newer_commits(
+            &store,
+            V2ProviderProfile::RetainedVersionObjectLock,
+            Sequence::new(7),
+            true,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    }
+
     fn sample_bundle() -> V2RecoveryBundle {
         V2RecoveryBundle {
             repository_id: Some(
@@ -937,5 +1044,12 @@ mod tests {
     fn recovery_public_key() -> String {
         let mut bundle = sample_bundle();
         sign_bundle(&mut bundle)
+    }
+
+    fn commit_object_id(sequence: u64) -> BackendObjectId {
+        BackendObjectId::new(format!(
+            "commits/v01/{sequence:020}/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ))
+        .unwrap_or_else(|error| panic!("{error}"))
     }
 }

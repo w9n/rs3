@@ -175,6 +175,9 @@ Recovery bundles are weak-subjectivity inputs. Import requires an
 operator-supplied `--min-sequence` floor external to the bundle and refuses
 older valid bundles below that floor. Production recovery also requires an
 offline Ed25519 bundle signature verified by `RS3_RECOVERY_PUBLIC_KEY`.
+Import scans stored v2 commits and refuses to strand higher commit sequences
+unless the operator passes the explicit `--force-rollback` override after
+rollback review.
 Preserve fresh signed bundles outside the backend and compare the sequence and
 commit digest with an external record before anchor import.
 

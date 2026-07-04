@@ -126,6 +126,9 @@ struct ImportV2AnchorArgs {
     /// Offline recovery signature from a trusted bundle, as hex.
     #[arg(long)]
     offline_signature: Option<String>,
+    /// Allow importing an anchor below newer commit objects seen in storage.
+    #[arg(long, default_value_t = false)]
+    force_rollback: bool,
     /// Output format.
     #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
     format: RecoveryReportFormat,
@@ -304,6 +307,7 @@ fn recovery_bundle_from_import_args(
         + usize::from(args.offline_signature.is_some());
     let options = V2AnchorImportOptions {
         min_sequence: Sequence::new(args.min_sequence),
+        force_rollback: args.force_rollback,
     };
     let bundle = match args.bundle_file.clone() {
         Some(path) => {
@@ -1185,6 +1189,7 @@ mod tests {
             format_version_id: None,
             weak_subjectivity_floor_sequence: None,
             offline_signature: None,
+            force_rollback: false,
             format: RecoveryReportFormat::Json,
         };
 
