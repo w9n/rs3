@@ -57,6 +57,17 @@ pub struct V2AnchorImportReport {
     pub verified_commit_count: usize,
 }
 
+/// Result of one-shot v2 repository initialization or verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V2RepositoryInitReport {
+    /// Anchor state verified after initialization.
+    pub anchor: V2AnchorState,
+    /// True when this run created the initial anchor and genesis commit.
+    pub initialized: bool,
+    /// Number of commits verified from the anchor to the nearest snapshot.
+    pub verified_commit_count: usize,
+}
+
 /// Operator-provided options for v2 anchor import.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V2AnchorImportOptions {
@@ -82,6 +93,7 @@ pub(super) struct RuntimeRepository {
     repository: Arc<V2Repository<RuntimeStore>>,
     coordinator: Arc<V2CommitCoordinator<RuntimeStore, RuntimeV2Anchor>>,
     anchor: RuntimeV2Anchor,
+    initialized: bool,
     require_anchor_version: bool,
     #[cfg(feature = "s3")]
     s3_store: Option<S3BlobStore>,
@@ -122,6 +134,7 @@ impl RuntimeRepository {
             provider_profile,
         )
         .await?;
+        let initialized = !loaded.anchor_present;
         let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
         let commit_options =
             V2CommitStoreOptions::for_profile(provider_profile, commit_ref, loaded.format_ref)
@@ -169,6 +182,7 @@ impl RuntimeRepository {
             repository,
             coordinator,
             anchor: anchor_handle,
+            initialized,
             require_anchor_version: retained_version_required(config.repository.retention, None),
             #[cfg(feature = "s3")]
             s3_store,
@@ -360,6 +374,36 @@ impl AdminRuntimeFactsSource for RuntimeRepositoryAdminFacts {
             },
         }
     }
+}
+
+/// Initializes a v2 repository when missing, then verifies the accepted chain and exits.
+pub async fn init_v2_repository_from_config(
+    config: &RuntimeConfig,
+) -> Result<V2RepositoryInitReport, S3BoundaryError> {
+    if config.repository.format != RepositoryFormat::V2Preview {
+        return Err(repository_init(
+            "v2 repository initialization requires the v2-preview repository format",
+        ));
+    }
+    let runtime = RuntimeRepository::from_config(config).await?;
+    let Some(anchor) = runtime.anchor.read_v2().await.map_err(repository_init)? else {
+        return Err(repository_init(
+            "v2 repository initialization did not produce an accepted anchor",
+        ));
+    };
+    let chain = runtime
+        .repository
+        .load_chain_from_anchor(&runtime.anchor)
+        .await
+        .map_err(repository_init)?
+        .ok_or_else(|| {
+            repository_init("v2 repository initialization could not verify the accepted anchor")
+        })?;
+    Ok(V2RepositoryInitReport {
+        anchor,
+        initialized: runtime.initialized,
+        verified_commit_count: chain.commits_newest_first.len(),
+    })
 }
 
 pub(crate) async fn v2_quick_maintenance_from_config(
@@ -943,7 +987,7 @@ mod tests {
     use super::super::runtime_handles::RuntimeStore;
     use super::super::runtime_keyring::unanchored_gateway_keyring;
     use super::{
-        RuntimeRepository, V2ProviderProfile, V2RecoveryBundle,
+        RuntimeRepository, V2ProviderProfile, V2RecoveryBundle, init_v2_repository_from_config,
         reject_import_stranding_newer_commits, reject_v2_bootstrap_with_foreign_objects,
         verify_recovery_bundle_trust,
     };
@@ -1008,6 +1052,19 @@ mod tests {
 
         assert!(runtime.memory_store().is_some());
         assert!(runtime.memory_v2_anchor().is_some());
+    }
+
+    #[tokio::test]
+    async fn init_command_initializes_and_verifies_without_static_credentials() {
+        let config = runtime_config(false);
+
+        let report = init_v2_repository_from_config(&config)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(report.initialized);
+        assert_eq!(report.anchor.sequence, Sequence::new(1));
+        assert_eq!(report.verified_commit_count, 1);
     }
 
     #[tokio::test]

@@ -161,6 +161,15 @@ gateway writes the encrypted envelope object, not mutated chart state.
 Set `repository.allowInit=true` only for deliberate first initialization on a
 fresh backend prefix. Leave it false for normal serving of an existing
 repository and recover a missing anchor from a trusted restore bundle.
+For a one-shot bootstrap, run the configured binary with initialization enabled:
+
+```sh
+RS3_ALLOW_REPOSITORY_INIT=true cargo run -p rs3-server -- init --format json
+```
+
+The command writes the initial keyring, format root, genesis commit, and anchor,
+then reloads the accepted chain before exiting. Keep `repository.allowInit=false`
+for normal gateway serving after bootstrap.
 
 Inspect an existing envelope when auditing key lifecycle state:
 

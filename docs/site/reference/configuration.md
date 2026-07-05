@@ -17,8 +17,9 @@ flags may override selected listener and gateway-mode settings.
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
 | `RUST_LOG` | no | `info` | Standard tracing filter. |
 
-`export-restore-bundle`, `import-v2-anchor`, and `write-index-snapshot` use the
-same repository, backend, anchor, and keyring settings as `serve`.
+`init`, `export-restore-bundle`, `import-v2-anchor`, and
+`write-index-snapshot` use the same repository, backend, anchor, and keyring
+settings as `serve`.
 `verify-bundle` and `keyring inspect`/`keyring rewrap` use the same repository
 and backend settings, but take wrapping-key material from their own flags or
 environment. The exported bundle contains public but integrity-sensitive
@@ -140,7 +141,7 @@ outside the chart. If `serviceAccount.create=false`, set `serviceAccount.name`.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `RS3_ALLOW_REPOSITORY_INIT` | no | `false` | Allows first-run initialization when the configured anchor is missing. Set only for deliberate new-repository bootstrap on a fresh prefix; leave unset for existing repositories and use anchor import for recovery. |
+| `RS3_ALLOW_REPOSITORY_INIT` | no | `false` | Allows first-run initialization when the configured anchor is missing. Set only for deliberate new-repository bootstrap on a fresh prefix, preferably with `rs3 init`; leave unset for existing repositories and use anchor import for recovery. |
 | `RS3_REPOSITORY_ID` | yes | none | Stable repository context. Keep it with trusted restore metadata. |
 | `RS3_REPOSITORY_SALT_HEX` | yes | none | Stable operator-provided 32-byte public salt, hex-encoded. Generate once per repository and keep with trusted public restore metadata. |
 | `RS3_KEYRING_ENVELOPE_OBJECT_ID` | no | unset | Bootstrap or recovery override for a specific encrypted keyring envelope object. Existing anchored repositories use the envelope reference bound through the v2 format root. |

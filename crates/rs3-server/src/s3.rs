@@ -21,9 +21,10 @@ pub use recovery_tools::{
 pub(crate) use runtime::v2_quick_maintenance_from_config;
 pub use runtime::{
     RuntimeV2ProviderConformanceOptions, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions,
-    V2AnchorImportReport, check_v2_provider_conformance_from_config,
+    V2AnchorImportReport, V2RepositoryInitReport, check_v2_provider_conformance_from_config,
     check_v2_provider_conformance_from_provider_config, export_v2_recovery_bundle_from_config,
-    import_v2_anchor_from_config, write_v2_index_snapshot_from_config,
+    import_v2_anchor_from_config, init_v2_repository_from_config,
+    write_v2_index_snapshot_from_config,
 };
 use thiserror::Error;
 

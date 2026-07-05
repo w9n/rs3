@@ -13,12 +13,12 @@ use rs3_server::{
     AnchorConfig, GatewayMode, GatewayServer, RepositoryToolConfig, RuntimeConfig,
     RuntimeV2ProviderConformanceOptions, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions,
     V2AnchorImportReport, V2ProviderCheckConfig, V2RecoveryBundleVerificationOptions,
-    V2RecoveryBundleVerificationReport, WriterGuardConfig, backend_kind,
+    V2RecoveryBundleVerificationReport, V2RepositoryInitReport, WriterGuardConfig, backend_kind,
     check_v2_provider_conformance_from_provider_config, doctor_findings,
     export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
-    inspect_keyring_envelope_from_tool_config, rewrap_keyring_envelope_from_tool_config,
-    runtime_config_profile, verify_v2_recovery_bundle_from_tool_config,
-    write_v2_index_snapshot_from_config,
+    init_v2_repository_from_config, inspect_keyring_envelope_from_tool_config,
+    rewrap_keyring_envelope_from_tool_config, runtime_config_profile,
+    verify_v2_recovery_bundle_from_tool_config, write_v2_index_snapshot_from_config,
 };
 use rs3_server::{
     KeyringEnvelopeInspectOptions, KeyringEnvelopeInspectReport, KeyringEnvelopeRewrapOptions,
@@ -97,6 +97,11 @@ enum Commands {
     VerifyBundle(Box<VerifyBundleArgs>),
     /// Inspect or rewrap encrypted repository keyring envelopes.
     Keyring(Box<KeyringArgs>),
+    /// Initialize a missing v2 repository, verify it, then exit.
+    Init {
+        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
+        format: RecoveryReportFormat,
+    },
     /// Write a v2 index snapshot and report the accepted anchor state.
     WriteIndexSnapshot {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
@@ -356,6 +361,12 @@ async fn main() -> Result<()> {
         }
         Commands::Keyring(args) => {
             run_keyring_command(*args).await?;
+        }
+        Commands::Init { format } => {
+            let config = RuntimeConfig::from_env()?;
+            log_runtime_config(&config);
+            let report = init_v2_repository_from_config(&config).await?;
+            print_v2_repository_init_report(&report, format)?;
         }
         Commands::WriteIndexSnapshot { format } => {
             let config = RuntimeConfig::from_env()?;
@@ -657,6 +668,30 @@ fn print_v2_anchor_import_report(
         RecoveryReportFormat::Text => {
             println!("schema=rs3.v2-anchor-import.v1");
             println!("applied={}", report.applied);
+            println!("verified_commit_count={}", report.verified_commit_count);
+            print_v2_anchor_text(&report.anchor);
+        }
+    }
+    Ok(())
+}
+
+fn print_v2_repository_init_report(
+    report: &V2RepositoryInitReport,
+    format: RecoveryReportFormat,
+) -> Result<()> {
+    match format {
+        RecoveryReportFormat::Json => {
+            let report_json = serde_json::json!({
+                "schema": "rs3.v2-init.v1",
+                "initialized": report.initialized,
+                "verified_commit_count": report.verified_commit_count,
+                "anchor": serde_json::to_value(&report.anchor)?,
+            });
+            println!("{}", serde_json::to_string_pretty(&report_json)?);
+        }
+        RecoveryReportFormat::Text => {
+            println!("schema=rs3.v2-init.v1");
+            println!("initialized={}", report.initialized);
             println!("verified_commit_count={}", report.verified_commit_count);
             print_v2_anchor_text(&report.anchor);
         }
