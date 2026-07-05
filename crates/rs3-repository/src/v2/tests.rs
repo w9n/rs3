@@ -5,11 +5,12 @@ use super::{
     V2OrphanGcOptions, V2RecoveryBundle, V2Repository,
 };
 use super::{
-    V2Algorithms, V2CommitHeader, V2CommitKey, V2CommitParentRef, V2CommitSelfRef, V2ErrorClass,
-    V2FormatError, V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRef, V2KeyringEnvelopeRootRef,
-    V2ProviderCheckStatus, V2ProviderConformanceOptions, V2ProviderProfile, V2SectionDescriptor,
-    V2SectionType, V2UploadMode, body_digest_for_v2_sections, check_v2_provider_conformance,
-    generate_v2_commit_key, parse_v2_commit_object,
+    V2_RESTORE_BUNDLE_SCHEMA, V2Algorithms, V2CommitHeader, V2CommitKey, V2CommitParentRef,
+    V2CommitSelfRef, V2ErrorClass, V2FormatError, V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRef,
+    V2KeyringEnvelopeRootRef, V2ProviderCheckStatus, V2ProviderConformanceOptions,
+    V2ProviderProfile, V2SectionDescriptor, V2SectionType, V2UploadMode,
+    body_digest_for_v2_sections, check_v2_provider_conformance, generate_v2_commit_key,
+    parse_v2_commit_object,
 };
 use crate::{CommitCoordinatorOptions, RepositoryError, RepositoryOptions, RepositoryPutOptions};
 use bytes::Bytes;
@@ -17,7 +18,7 @@ use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions};
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
-    LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy, Sequence,
+    LegalHoldStatus, LogicalPath, RepositoryId, RetentionMode, RetentionPolicy, Sequence,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -180,6 +181,71 @@ fn sample_format_ref() -> V2FormatRef {
         object_id: object_id(&format!("format/{:020}-{}", 1_u64, hex::encode([7_u8; 32]))),
         version_id: Some(must_type(BackendVersionId::new("format-version-1"))),
     }
+}
+
+#[test]
+fn recovery_bundle_json_round_trips_shared_wire_shape() {
+    let anchor = V2AnchorState {
+        sequence: Sequence::new(7),
+        commit_key: sample_commit_key().object_id,
+        body_digest: [8_u8; 32],
+        version_id: Some(must_type(BackendVersionId::new("commit-version-1"))),
+        signing_key_id: key_id("signing"),
+        format_ref: sample_format_ref(),
+    };
+    let mut bundle = V2RecoveryBundle::from_anchor(anchor, Sequence::new(7));
+    bundle.repository_id = Some(must_type(RepositoryId::new("repo-a")));
+    bundle.repository_salt_digest = Some([3_u8; 32]);
+    bundle.exported_at_ms = 42;
+    bundle.offline_signature = Some(vec![4_u8; 64]);
+
+    let value = serde_json::to_value(&bundle).unwrap_or_else(|error| panic!("{error}"));
+
+    assert_eq!(value["schema"], V2_RESTORE_BUNDLE_SCHEMA);
+    assert_eq!(value["repository"]["id"], "repo-a");
+    assert_eq!(value["repository"]["salt_digest"], hex::encode([3_u8; 32]));
+    assert_eq!(value["anchor"]["body_digest"], hex::encode([8_u8; 32]));
+    assert!(value["offline_signature_payload_hex"].as_str().is_some());
+    assert_eq!(value["offline_signature"], hex::encode([4_u8; 64]));
+
+    let decoded: V2RecoveryBundle =
+        serde_json::from_value(value).unwrap_or_else(|error| panic!("{error}"));
+
+    assert_eq!(decoded, bundle);
+}
+
+#[test]
+fn recovery_bundle_json_accepts_root_repository_salt_digest() {
+    let input = serde_json::json!({
+        "schema": V2_RESTORE_BUNDLE_SCHEMA,
+        "repository": {
+            "id": "repo-a"
+        },
+        "repository_salt_digest": "03".repeat(32),
+        "anchor": {
+            "sequence": 7,
+            "commit_key": sample_commit_key().object_id.as_str(),
+            "body_digest": "08".repeat(32),
+            "version_id": "commit-version-1",
+            "signing_key_id": "signing",
+            "format": {
+                "generation": 1,
+                "digest": "07".repeat(32),
+                "object_id": "format/00000000000000000001/legacy",
+                "version_id": "format-version-1"
+            }
+        },
+        "weak_subjectivity_floor_sequence": 7,
+        "format_digest": "07".repeat(32),
+        "format_generation": 1,
+        "exported_at_ms": 42,
+        "offline_signature": null
+    });
+
+    let decoded: V2RecoveryBundle =
+        serde_json::from_value(input).unwrap_or_else(|error| panic!("{error}"));
+
+    assert_eq!(decoded.repository_salt_digest, Some([3_u8; 32]));
 }
 
 struct FailOnceV2Anchor {

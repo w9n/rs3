@@ -24,6 +24,7 @@ use rs3_types::{
     BackendObjectId, BackendVersionId, KeyId, LegalHoldStatus, RepositoryId, RetentionPolicy,
     Sequence,
 };
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
@@ -31,6 +32,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_RANDOM_KEY_ATTEMPTS: usize = 3;
+
+/// Schema marker for trusted v2 recovery bundles.
+pub const V2_RESTORE_BUNDLE_SCHEMA: &str = "rs3.restore-bundle.v2-preview.v1";
 
 /// Default idle time allowed between streaming request-body chunks.
 pub const DEFAULT_V2_STREAM_READ_STALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -50,6 +54,112 @@ pub struct V2AnchorState {
     pub signing_key_id: KeyId,
     /// Active encrypted format-root reference for this accepted head.
     pub format_ref: V2FormatRef,
+}
+
+impl Serialize for V2AnchorState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        V2AnchorStateWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for V2AnchorState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        V2AnchorStateWire::deserialize(deserializer)?
+            .try_into()
+            .map_err(de::Error::custom)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct V2AnchorStateWire {
+    sequence: u64,
+    commit_key: String,
+    body_digest: String,
+    #[serde(default)]
+    version_id: Option<String>,
+    signing_key_id: String,
+    format: V2FormatRefWire,
+}
+
+impl From<&V2AnchorState> for V2AnchorStateWire {
+    fn from(anchor: &V2AnchorState) -> Self {
+        Self {
+            sequence: anchor.sequence.get(),
+            commit_key: anchor.commit_key.as_str().to_owned(),
+            body_digest: encode_digest_32(anchor.body_digest),
+            version_id: anchor
+                .version_id
+                .as_ref()
+                .map(|version_id| version_id.as_str().to_owned()),
+            signing_key_id: anchor.signing_key_id.as_str().to_owned(),
+            format: V2FormatRefWire::from(&anchor.format_ref),
+        }
+    }
+}
+
+impl TryFrom<V2AnchorStateWire> for V2AnchorState {
+    type Error = de::value::Error;
+
+    fn try_from(wire: V2AnchorStateWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            sequence: Sequence::new(wire.sequence),
+            commit_key: BackendObjectId::new(wire.commit_key).map_err(de::Error::custom)?,
+            body_digest: decode_digest_32("anchor body digest", &wire.body_digest)?,
+            version_id: wire
+                .version_id
+                .map(BackendVersionId::new)
+                .transpose()
+                .map_err(de::Error::custom)?,
+            signing_key_id: KeyId::new(wire.signing_key_id).map_err(de::Error::custom)?,
+            format_ref: wire.format.try_into()?,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct V2FormatRefWire {
+    generation: u64,
+    digest: String,
+    object_id: String,
+    #[serde(default)]
+    version_id: Option<String>,
+}
+
+impl From<&V2FormatRef> for V2FormatRefWire {
+    fn from(format_ref: &V2FormatRef) -> Self {
+        Self {
+            generation: format_ref.generation,
+            digest: format_ref.digest.clone(),
+            object_id: format_ref.object_id.as_str().to_owned(),
+            version_id: format_ref
+                .version_id
+                .as_ref()
+                .map(|version_id| version_id.as_str().to_owned()),
+        }
+    }
+}
+
+impl TryFrom<V2FormatRefWire> for V2FormatRef {
+    type Error = de::value::Error;
+
+    fn try_from(wire: V2FormatRefWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            generation: wire.generation,
+            digest: wire.digest,
+            object_id: BackendObjectId::new(wire.object_id).map_err(de::Error::custom)?,
+            version_id: wire
+                .version_id
+                .map(BackendVersionId::new)
+                .transpose()
+                .map_err(de::Error::custom)?,
+        })
+    }
 }
 
 /// Compare-and-swap anchor used by v2 writers.
@@ -328,6 +438,145 @@ pub struct V2RecoveryBundle {
     pub offline_signature: Option<Vec<u8>>,
 }
 
+impl Serialize for V2RecoveryBundle {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let offline_signature_payload_hex = if self.repository_id.is_some() {
+            Some(hex::encode(
+                self.offline_signature_payload()
+                    .map_err(serde::ser::Error::custom)?,
+            ))
+        } else {
+            None
+        };
+        let repository =
+            self.repository_id
+                .as_ref()
+                .map(|repository_id| V2RecoveryBundleRepositoryWire {
+                    id: repository_id.as_str().to_owned(),
+                    salt_digest: self.repository_salt_digest.map(encode_digest_32),
+                });
+        let repository_salt_digest = if repository.is_none() {
+            self.repository_salt_digest.map(encode_digest_32)
+        } else {
+            None
+        };
+        let wire = V2RecoveryBundleWire {
+            schema: V2_RESTORE_BUNDLE_SCHEMA.to_owned(),
+            repository,
+            anchor: V2AnchorStateWire::from(&self.anchor),
+            weak_subjectivity_floor_sequence: self.weak_subjectivity_floor_sequence.get(),
+            format_digest: self.format_digest.map(encode_digest_32),
+            format_generation: self.format_generation,
+            exported_at_ms: self.exported_at_ms,
+            offline_signature_payload_hex,
+            offline_signature: self.offline_signature.as_ref().map(hex::encode),
+            repository_salt_digest,
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for V2RecoveryBundle {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = V2RecoveryBundleWire::deserialize(deserializer)?;
+        if wire.schema != V2_RESTORE_BUNDLE_SCHEMA {
+            return Err(de::Error::custom(format!(
+                "unsupported restore bundle schema {}",
+                wire.schema
+            )));
+        }
+
+        let repository_id = wire
+            .repository
+            .as_ref()
+            .map(|repository| RepositoryId::new(repository.id.clone()))
+            .transpose()
+            .map_err(de::Error::custom)?;
+        let repository_salt_digest = wire
+            .repository_salt_digest
+            .as_deref()
+            .or_else(|| {
+                wire.repository
+                    .as_ref()
+                    .and_then(|repository| repository.salt_digest.as_deref())
+            })
+            .map(|digest| decode_digest_32("repository salt digest", digest))
+            .transpose()?;
+        let anchor: V2AnchorState = wire.anchor.try_into().map_err(de::Error::custom)?;
+        if let Some(format_generation) = wire.format_generation
+            && format_generation != anchor.format_ref.generation
+        {
+            return Err(de::Error::custom(
+                "bundle format_generation does not match anchor format generation",
+            ));
+        }
+        if let Some(format_digest) = wire.format_digest.as_ref()
+            && format_digest != &anchor.format_ref.digest
+        {
+            return Err(de::Error::custom(
+                "bundle format_digest does not match anchor format digest",
+            ));
+        }
+        let format_digest = wire
+            .format_digest
+            .as_deref()
+            .map(|digest| decode_digest_32("format digest", digest))
+            .transpose()?;
+        let offline_signature = wire
+            .offline_signature
+            .as_deref()
+            .map(|signature| {
+                hex::decode(signature)
+                    .map_err(|_| de::Error::custom("offline signature must be hex encoded"))
+            })
+            .transpose()?;
+
+        Ok(Self {
+            repository_id,
+            repository_salt_digest,
+            anchor,
+            format_digest,
+            format_generation: wire.format_generation,
+            weak_subjectivity_floor_sequence: Sequence::new(wire.weak_subjectivity_floor_sequence),
+            exported_at_ms: wire.exported_at_ms,
+            offline_signature,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct V2RecoveryBundleWire {
+    schema: String,
+    #[serde(default)]
+    repository: Option<V2RecoveryBundleRepositoryWire>,
+    anchor: V2AnchorStateWire,
+    weak_subjectivity_floor_sequence: u64,
+    #[serde(default)]
+    format_digest: Option<String>,
+    #[serde(default)]
+    format_generation: Option<u64>,
+    exported_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    offline_signature_payload_hex: Option<String>,
+    #[serde(default)]
+    offline_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository_salt_digest: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct V2RecoveryBundleRepositoryWire {
+    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    salt_digest: Option<String>,
+}
+
 impl V2RecoveryBundle {
     /// Creates a recovery bundle from an accepted anchor state.
     pub fn from_anchor(anchor: V2AnchorState, floor: Sequence) -> Self {
@@ -410,6 +659,24 @@ fn write_optional_text(out: &mut Vec<u8>, value: Option<&str>) {
         Some(value) => cbor::write_text(out, value),
         None => cbor::write_null(out),
     }
+}
+
+fn encode_digest_32(digest: [u8; 32]) -> String {
+    hex::encode(digest)
+}
+
+fn decode_digest_32<E>(label: &str, value: &str) -> Result<[u8; 32], E>
+where
+    E: de::Error,
+{
+    let bytes =
+        hex::decode(value).map_err(|_| E::custom(format!("{label} must be hex encoded")))?;
+    if bytes.len() != 32 {
+        return Err(E::custom(format!("{label} must be exactly 32 bytes")));
+    }
+    let mut digest = [0_u8; 32];
+    digest.copy_from_slice(&bytes);
+    Ok(digest)
 }
 
 /// Preview v2 commit store over a `BlobStore`.

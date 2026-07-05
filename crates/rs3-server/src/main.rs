@@ -15,8 +15,7 @@ use rs3_server::{
     export_v2_recovery_bundle_from_config, import_v2_anchor_from_config, runtime_config_profile,
     write_v2_index_snapshot_from_config,
 };
-use rs3_types::{BackendObjectId, BackendVersionId, KeyId, RetentionMode, Sequence};
-use serde::Deserialize;
+use rs3_types::{RetentionMode, Sequence};
 use std::io::{self, Read};
 use std::net::SocketAddr;
 #[cfg(any(feature = "s3", feature = "k8s"))]
@@ -244,47 +243,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct RestoreBundleJson {
-    schema: String,
-    #[serde(default)]
-    repository: Option<RestoreBundleRepositoryJson>,
-    anchor: RestoreBundleAnchorJson,
-    weak_subjectivity_floor_sequence: u64,
-    #[serde(default)]
-    format_digest: Option<String>,
-    #[serde(default)]
-    format_generation: Option<u64>,
-    exported_at_ms: i64,
-    #[serde(default)]
-    offline_signature: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RestoreBundleRepositoryJson {
-    id: String,
-}
-
-#[derive(Deserialize)]
-struct RestoreBundleAnchorJson {
-    sequence: u64,
-    commit_key: String,
-    body_digest: String,
-    #[serde(default)]
-    version_id: Option<String>,
-    signing_key_id: String,
-    format: RestoreBundleFormatJson,
-}
-
-#[derive(Deserialize)]
-struct RestoreBundleFormatJson {
-    generation: u64,
-    digest: String,
-    object_id: String,
-    #[serde(default)]
-    version_id: Option<String>,
-}
-
 fn recovery_bundle_from_import_args(
     config: &RuntimeConfig,
     args: ImportV2AnchorArgs,
@@ -311,74 +269,17 @@ fn read_restore_bundle_json(path: &str, config: &RuntimeConfig) -> Result<V2Reco
 }
 
 fn parse_restore_bundle_json(input: &str, config: &RuntimeConfig) -> Result<V2RecoveryBundle> {
-    let decoded: RestoreBundleJson =
+    let mut bundle: V2RecoveryBundle =
         serde_json::from_str(input).context("failed to parse v2 restore bundle JSON")?;
-    if decoded.schema != V2_RESTORE_BUNDLE_SCHEMA {
-        bail!("unsupported restore bundle schema {}", decoded.schema);
-    }
-    let repository_id = decoded
-        .repository
-        .as_ref()
-        .map(|repository| rs3_types::RepositoryId::new(repository.id.clone()))
-        .transpose()?;
-    if let Some(repository_id) = repository_id.as_ref()
+    if let Some(repository_id) = bundle.repository_id.as_ref()
         && repository_id != &config.repository_keys.repository_id
     {
         bail!("restore bundle repository ID does not match configured repository ID");
     }
-    let format_ref = rs3_repository::v2::V2FormatRef {
-        generation: decoded.anchor.format.generation,
-        digest: decoded.anchor.format.digest,
-        object_id: BackendObjectId::new(decoded.anchor.format.object_id)?,
-        version_id: decoded
-            .anchor
-            .format
-            .version_id
-            .map(BackendVersionId::new)
-            .transpose()?,
-    };
-    if let Some(format_generation) = decoded.format_generation
-        && format_generation != format_ref.generation
-    {
-        bail!("bundle format_generation does not match anchor format generation");
+    if bundle.repository_id.is_none() {
+        bundle.repository_id = Some(config.repository_keys.repository_id.clone());
     }
-    if let Some(format_digest) = decoded.format_digest.as_ref()
-        && format_digest != &format_ref.digest
-    {
-        bail!("bundle format_digest does not match anchor format digest");
-    }
-    let anchor = V2AnchorState {
-        sequence: Sequence::new(decoded.anchor.sequence),
-        commit_key: BackendObjectId::new(decoded.anchor.commit_key)?,
-        body_digest: decode_sha256_hex(&decoded.anchor.body_digest)?,
-        version_id: decoded
-            .anchor
-            .version_id
-            .map(BackendVersionId::new)
-            .transpose()?,
-        signing_key_id: KeyId::new(decoded.anchor.signing_key_id)?,
-        format_ref,
-    };
-    let offline_signature = decoded
-        .offline_signature
-        .map(|signature| hex::decode(signature).context("offline signature must be hex encoded"))
-        .transpose()?;
-
-    Ok(V2RecoveryBundle {
-        repository_id: Some(
-            repository_id.unwrap_or_else(|| config.repository_keys.repository_id.clone()),
-        ),
-        repository_salt_digest: None,
-        format_digest: decoded
-            .format_digest
-            .map(|digest| decode_sha256_hex(&digest))
-            .transpose()?,
-        format_generation: decoded.format_generation,
-        anchor,
-        weak_subjectivity_floor_sequence: Sequence::new(decoded.weak_subjectivity_floor_sequence),
-        exported_at_ms: decoded.exported_at_ms,
-        offline_signature,
-    })
+    Ok(bundle)
 }
 
 #[cfg(any(feature = "s3", feature = "k8s"))]
@@ -401,19 +302,7 @@ fn print_v2_anchor_import_report(
                 "schema": "rs3.v2-anchor-import.v1",
                 "applied": report.applied,
                 "verified_commit_count": report.verified_commit_count,
-                "anchor": {
-                    "sequence": report.anchor.sequence.get(),
-                    "commit_key": report.anchor.commit_key.as_str(),
-                    "body_digest": hex::encode(report.anchor.body_digest),
-                    "version_id": report.anchor.version_id.as_ref().map(|version_id| version_id.as_str()),
-                    "signing_key_id": report.anchor.signing_key_id.as_str(),
-                    "format": {
-                        "generation": report.anchor.format_ref.generation,
-                        "digest": report.anchor.format_ref.digest,
-                        "object_id": report.anchor.format_ref.object_id.as_str(),
-                        "version_id": report.anchor.format_ref.version_id.as_ref().map(|version_id| version_id.as_str()),
-                    },
-                },
+                "anchor": serde_json::to_value(&report.anchor)?,
             });
             println!("{}", serde_json::to_string_pretty(&report_json)?);
         }
@@ -421,25 +310,7 @@ fn print_v2_anchor_import_report(
             println!("schema=rs3.v2-anchor-import.v1");
             println!("applied={}", report.applied);
             println!("verified_commit_count={}", report.verified_commit_count);
-            println!("anchor_sequence={}", report.anchor.sequence.get());
-            println!("anchor_commit_key={}", report.anchor.commit_key.as_str());
-            println!(
-                "anchor_body_digest={}",
-                hex::encode(report.anchor.body_digest)
-            );
-            if let Some(version_id) = report.anchor.version_id.as_ref() {
-                println!("anchor_version_id={}", version_id.as_str());
-            }
-            println!("signing_key_id={}", report.anchor.signing_key_id.as_str());
-            println!("format_generation={}", report.anchor.format_ref.generation);
-            println!("format_digest={}", report.anchor.format_ref.digest);
-            println!(
-                "format_object_id={}",
-                report.anchor.format_ref.object_id.as_str()
-            );
-            if let Some(version_id) = report.anchor.format_ref.version_id.as_ref() {
-                println!("format_version_id={}", version_id.as_str());
-            }
+            print_v2_anchor_text(&report.anchor);
         }
     }
     Ok(())
@@ -499,62 +370,14 @@ fn print_v2_provider_conformance_report(
 fn print_v2_restore_bundle(bundle: &V2RecoveryBundle, format: RecoveryReportFormat) -> Result<()> {
     match format {
         RecoveryReportFormat::Json => {
-            let repository = bundle.repository_id.as_ref().map(|repository_id| {
-                serde_json::json!({
-                    "id": repository_id.as_str(),
-                })
-            });
-            let offline_signature = bundle.offline_signature.as_ref().map(hex::encode);
-            let offline_signature_payload_hex = hex::encode(bundle.offline_signature_payload()?);
-            let bundle_json = serde_json::json!({
-                "schema": V2_RESTORE_BUNDLE_SCHEMA,
-                "repository": repository,
-                "anchor": {
-                    "sequence": bundle.anchor.sequence.get(),
-                    "commit_key": bundle.anchor.commit_key.as_str(),
-                    "body_digest": hex::encode(bundle.anchor.body_digest),
-                    "version_id": bundle.anchor.version_id.as_ref().map(|version_id| version_id.as_str()),
-                    "signing_key_id": bundle.anchor.signing_key_id.as_str(),
-                    "format": {
-                        "generation": bundle.anchor.format_ref.generation,
-                        "digest": bundle.anchor.format_ref.digest,
-                        "object_id": bundle.anchor.format_ref.object_id.as_str(),
-                        "version_id": bundle.anchor.format_ref.version_id.as_ref().map(|version_id| version_id.as_str()),
-                    },
-                },
-                "weak_subjectivity_floor_sequence": bundle.weak_subjectivity_floor_sequence.get(),
-                "format_digest": bundle.format_digest.map(hex::encode),
-                "format_generation": bundle.format_generation,
-                "exported_at_ms": bundle.exported_at_ms,
-                "offline_signature_payload_hex": offline_signature_payload_hex,
-                "offline_signature": offline_signature,
-            });
-            println!("{}", serde_json::to_string_pretty(&bundle_json)?);
+            println!("{}", serde_json::to_string_pretty(bundle)?);
         }
         RecoveryReportFormat::Text => {
             println!("schema={V2_RESTORE_BUNDLE_SCHEMA}");
             if let Some(repository_id) = bundle.repository_id.as_ref() {
                 println!("repository_id={}", repository_id.as_str());
             }
-            println!("anchor_sequence={}", bundle.anchor.sequence.get());
-            println!("anchor_commit_key={}", bundle.anchor.commit_key.as_str());
-            println!(
-                "anchor_body_digest={}",
-                hex::encode(bundle.anchor.body_digest)
-            );
-            if let Some(version_id) = bundle.anchor.version_id.as_ref() {
-                println!("anchor_version_id={}", version_id.as_str());
-            }
-            println!("signing_key_id={}", bundle.anchor.signing_key_id.as_str());
-            println!("format_generation={}", bundle.anchor.format_ref.generation);
-            println!("format_digest={}", bundle.anchor.format_ref.digest);
-            println!(
-                "format_object_id={}",
-                bundle.anchor.format_ref.object_id.as_str()
-            );
-            if let Some(version_id) = bundle.anchor.format_ref.version_id.as_ref() {
-                println!("format_version_id={}", version_id.as_str());
-            }
+            print_v2_anchor_text(&bundle.anchor);
             println!(
                 "weak_subjectivity_floor_sequence={}",
                 bundle.weak_subjectivity_floor_sequence.get()
@@ -581,40 +404,32 @@ fn print_v2_anchor_state(
         RecoveryReportFormat::Json => {
             let report = serde_json::json!({
                 "schema": schema,
-                "anchor": {
-                    "sequence": anchor.sequence.get(),
-                    "commit_key": anchor.commit_key.as_str(),
-                    "body_digest": hex::encode(anchor.body_digest),
-                    "version_id": anchor.version_id.as_ref().map(|version_id| version_id.as_str()),
-                    "signing_key_id": anchor.signing_key_id.as_str(),
-                    "format": {
-                        "generation": anchor.format_ref.generation,
-                        "digest": anchor.format_ref.digest,
-                        "object_id": anchor.format_ref.object_id.as_str(),
-                        "version_id": anchor.format_ref.version_id.as_ref().map(|version_id| version_id.as_str()),
-                    },
-                },
+                "anchor": serde_json::to_value(anchor)?,
             });
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         RecoveryReportFormat::Text => {
             println!("schema={schema}");
-            println!("anchor_sequence={}", anchor.sequence.get());
-            println!("anchor_commit_key={}", anchor.commit_key.as_str());
-            println!("anchor_body_digest={}", hex::encode(anchor.body_digest));
-            if let Some(version_id) = anchor.version_id.as_ref() {
-                println!("anchor_version_id={}", version_id.as_str());
-            }
-            println!("signing_key_id={}", anchor.signing_key_id.as_str());
-            println!("format_generation={}", anchor.format_ref.generation);
-            println!("format_digest={}", anchor.format_ref.digest);
-            println!("format_object_id={}", anchor.format_ref.object_id.as_str());
-            if let Some(version_id) = anchor.format_ref.version_id.as_ref() {
-                println!("format_version_id={}", version_id.as_str());
-            }
+            print_v2_anchor_text(anchor);
         }
     }
     Ok(())
+}
+
+fn print_v2_anchor_text(anchor: &V2AnchorState) {
+    println!("anchor_sequence={}", anchor.sequence.get());
+    println!("anchor_commit_key={}", anchor.commit_key.as_str());
+    println!("anchor_body_digest={}", hex::encode(anchor.body_digest));
+    if let Some(version_id) = anchor.version_id.as_ref() {
+        println!("anchor_version_id={}", version_id.as_str());
+    }
+    println!("signing_key_id={}", anchor.signing_key_id.as_str());
+    println!("format_generation={}", anchor.format_ref.generation);
+    println!("format_digest={}", anchor.format_ref.digest);
+    println!("format_object_id={}", anchor.format_ref.object_id.as_str());
+    if let Some(version_id) = anchor.format_ref.version_id.as_ref() {
+        println!("format_version_id={}", version_id.as_str());
+    }
 }
 
 fn run_doctor(config: &RuntimeConfig, profile: DoctorProfile) -> Result<()> {
@@ -956,13 +771,6 @@ fn init_tracing(format: LogFormat) {
     }
 }
 
-fn decode_sha256_hex(value: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(value)?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("expected a 32-byte hex digest"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1158,7 +966,8 @@ mod tests {
         let input = serde_json::json!({
             "schema": "rs3.restore-bundle.v2-preview.v1",
             "repository": {
-                "id": "tenant-repository"
+                "id": "tenant-repository",
+                "salt_digest": "33".repeat(32)
             },
             "anchor": {
                 "sequence": 7,
@@ -1194,6 +1003,7 @@ mod tests {
             bundle.anchor.version_id.as_ref().map(|id| id.as_str()),
             Some("version-a")
         );
+        assert_eq!(bundle.repository_salt_digest, Some([0x33; 32]));
     }
 
     #[test]

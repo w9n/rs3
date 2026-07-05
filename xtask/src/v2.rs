@@ -11,7 +11,7 @@ use rs3_repository::v2::{
     V2KeyringEnvelopeRef, V2MaintenanceBudgets, V2OrphanGcOptions, generate_v2_commit_key,
 };
 use rs3_repository::v2::{
-    V2AnchorState, V2CommitChain, V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot,
+    V2CommitChain, V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot,
     V2KeyringEnvelopeRootRef, V2ProviderProfile, V2RecoveryBundle,
 };
 #[cfg(feature = "s3")]
@@ -19,16 +19,13 @@ use rs3_storage::PutOptions;
 use rs3_storage::{BlobStore, ByteRange, FilesystemBlobStore};
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
-use rs3_types::{
-    BackendObjectId, BackendVersionId, KeyId, RepositoryId, RetentionMode, RetentionPolicy,
-    Sequence,
-};
-use serde::Deserialize;
+#[cfg(feature = "s3")]
+use rs3_types::{BackendObjectId, BackendVersionId};
+use rs3_types::{RepositoryId, RetentionMode, RetentionPolicy, Sequence};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-const V2_RESTORE_BUNDLE_SCHEMA: &str = "rs3.restore-bundle.v2-preview.v1";
 const V2_VERIFY_BUNDLE_SCHEMA: &str = "rs3.xtask.v2-verify-bundle.v1";
 
 /// v2 repository automation.
@@ -192,51 +189,6 @@ struct V2VerifyBundleReport {
     retention: Option<RetentionPolicy>,
     exported_at_ms: i64,
     offline_signature_present: bool,
-}
-
-#[derive(Deserialize)]
-struct BundleJson {
-    schema: String,
-    #[serde(default)]
-    repository: Option<BundleRepositoryJson>,
-    anchor: BundleAnchorJson,
-    weak_subjectivity_floor_sequence: u64,
-    #[serde(default)]
-    format_digest: Option<String>,
-    #[serde(default)]
-    format_generation: Option<u64>,
-    exported_at_ms: i64,
-    #[serde(default)]
-    offline_signature: Option<String>,
-    #[serde(default)]
-    repository_salt_digest: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct BundleRepositoryJson {
-    id: String,
-    #[serde(default)]
-    salt_digest: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct BundleAnchorJson {
-    sequence: u64,
-    commit_key: String,
-    body_digest: String,
-    #[serde(default)]
-    version_id: Option<String>,
-    signing_key_id: String,
-    format: BundleFormatJson,
-}
-
-#[derive(Deserialize)]
-struct BundleFormatJson {
-    generation: u64,
-    digest: String,
-    object_id: String,
-    #[serde(default)]
-    version_id: Option<String>,
 }
 
 pub(crate) fn run(args: V2Args) -> Result<()> {
@@ -802,82 +754,9 @@ fn read_recovery_bundle_json(path: &str) -> Result<ParsedRecoveryBundle> {
 }
 
 fn parse_recovery_bundle_json(input: &str) -> Result<ParsedRecoveryBundle> {
-    let decoded: BundleJson =
+    let bundle: V2RecoveryBundle =
         serde_json::from_str(input).context("failed to parse v2 restore bundle JSON")?;
-    if decoded.schema != V2_RESTORE_BUNDLE_SCHEMA {
-        bail!("unsupported restore bundle schema {}", decoded.schema);
-    }
-
-    let repository_id = decoded
-        .repository
-        .as_ref()
-        .map(|repository| RepositoryId::new(repository.id.clone()))
-        .transpose()?;
-    let repository_salt_digest = decoded
-        .repository_salt_digest
-        .or_else(|| {
-            decoded
-                .repository
-                .as_ref()
-                .and_then(|repository| repository.salt_digest.clone())
-        })
-        .map(|digest| decode_digest_32("repository salt digest", &digest))
-        .transpose()?;
-    let format_ref = V2FormatRef {
-        generation: decoded.anchor.format.generation,
-        digest: decoded.anchor.format.digest,
-        object_id: BackendObjectId::new(decoded.anchor.format.object_id)?,
-        version_id: decoded
-            .anchor
-            .format
-            .version_id
-            .map(BackendVersionId::new)
-            .transpose()?,
-    };
-    if let Some(format_generation) = decoded.format_generation
-        && format_generation != format_ref.generation
-    {
-        bail!("bundle format_generation does not match anchor format generation");
-    }
-    if let Some(format_digest) = decoded.format_digest.as_ref()
-        && format_digest != &format_ref.digest
-    {
-        bail!("bundle format_digest does not match anchor format digest");
-    }
-    let anchor = V2AnchorState {
-        sequence: Sequence::new(decoded.anchor.sequence),
-        commit_key: BackendObjectId::new(decoded.anchor.commit_key)?,
-        body_digest: decode_digest_32("anchor body digest", &decoded.anchor.body_digest)?,
-        version_id: decoded
-            .anchor
-            .version_id
-            .map(BackendVersionId::new)
-            .transpose()?,
-        signing_key_id: KeyId::new(decoded.anchor.signing_key_id)?,
-        format_ref,
-    };
-    let offline_signature = decoded
-        .offline_signature
-        .map(|signature| hex::decode(signature).context("offline signature must be hex encoded"))
-        .transpose()?;
-
-    Ok(ParsedRecoveryBundle {
-        bundle: V2RecoveryBundle {
-            repository_id,
-            repository_salt_digest,
-            anchor,
-            format_digest: decoded
-                .format_digest
-                .map(|digest| decode_digest_32("format digest", &digest))
-                .transpose()?,
-            format_generation: decoded.format_generation,
-            weak_subjectivity_floor_sequence: Sequence::new(
-                decoded.weak_subjectivity_floor_sequence,
-            ),
-            exported_at_ms: decoded.exported_at_ms,
-            offline_signature,
-        },
-    })
+    Ok(ParsedRecoveryBundle { bundle })
 }
 
 fn resolve_repository_id(
@@ -904,13 +783,6 @@ fn repository_context(
 ) -> Result<RepositoryKeyContext> {
     let salt = hex::decode(repository_salt_hex).context("repository salt must be hex encoded")?;
     RepositoryKeyContext::new(repository_id, salt).map_err(Into::into)
-}
-
-fn decode_digest_32(label: &str, value: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(value).with_context(|| format!("{label} must be hex encoded"))?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("{label} must be exactly 32 bytes"))
 }
 
 fn secret_input(
@@ -1107,6 +979,7 @@ mod tests {
             "repository": {
                 "id": "repo-a"
             },
+            "repository_salt_digest": "33".repeat(32),
             "anchor": {
                 "sequence": 7,
                 "commit_key": "commits/v01/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -1139,6 +1012,7 @@ mod tests {
                 .map(RepositoryId::as_str),
             Some("repo-a")
         );
+        assert_eq!(parsed.bundle.repository_salt_digest, Some([0x33; 32]));
         assert_eq!(parsed.bundle.format_generation, Some(1));
     }
 

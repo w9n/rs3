@@ -18,6 +18,7 @@ use bytes::Bytes;
 use futures_util::Stream;
 use rs3_crypto::{FormatEnvelope, KeyRing};
 use rs3_index::KeyringEnvelopeReference;
+pub use rs3_repository::v2::V2_RESTORE_BUNDLE_SCHEMA;
 use rs3_repository::v2::{
     V2AnchorState, V2CommitAnchor, V2CommitCoordinator, V2CommitKey, V2CommitStore,
     V2CommitStoreOptions, V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef,
@@ -41,8 +42,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const V2_FORMAT_ENVELOPE_CONTENT_TYPE: &str = "application/vnd.rs3.v2-format-envelope+json";
-/// Schema marker printed with trusted v2 recovery bundles.
-pub const V2_RESTORE_BUNDLE_SCHEMA: &str = "rs3.restore-bundle.v2-preview.v1";
 
 /// Result of importing a trusted v2 anchor bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
