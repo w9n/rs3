@@ -112,6 +112,20 @@ struct StreamingV2PutFinalized {
     location: PendingV2PayloadLocation,
 }
 
+/// Client-visible object resolved against an accepted v2 namespace state.
+#[derive(Clone, Debug)]
+pub struct V2ResolvedObject {
+    metadata: RepositoryObjectMetadata,
+    entry: NamespaceEntry,
+}
+
+impl V2ResolvedObject {
+    /// Trusted metadata for the resolved client-visible object.
+    pub fn metadata(&self) -> &RepositoryObjectMetadata {
+        &self.metadata
+    }
+}
+
 impl<S> V2Repository<S>
 where
     S: BlobStore + Clone,
@@ -638,15 +652,20 @@ where
 
     /// Reads trusted metadata for a client-visible object.
     pub fn head(&self, key: &LogicalPath) -> Result<RepositoryObjectMetadata> {
+        Ok(self.resolve_object(key)?.metadata)
+    }
+
+    /// Resolves trusted metadata and the accepted namespace entry once.
+    pub fn resolve_object(&self, key: &LogicalPath) -> Result<V2ResolvedObject> {
         let keyring = self.repository.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
         let state = self
             .accepted_state
             .read()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        let Some(entry) = first_namespace_entry(&state.namespace, &lookup_blind_keys) else {
-            return Err(RepositoryError::NotFound(key.clone()));
-        };
+        let entry = first_namespace_entry(&state.namespace, &lookup_blind_keys)
+            .cloned()
+            .ok_or_else(|| RepositoryError::NotFound(key.clone()))?;
         let manifest = state
             .manifests
             .get(&entry.manifest_id)
@@ -658,22 +677,26 @@ where
                 retention: entry.retention,
                 legal_hold: entry.legal_hold,
             });
-        Ok(manifest.into_metadata())
+        Ok(V2ResolvedObject {
+            metadata: manifest.into_metadata(),
+            entry,
+        })
     }
 
     /// Reads a client-visible object or byte range.
     pub async fn get_range(&self, key: &LogicalPath, range: ByteRange) -> Result<Bytes> {
+        let resolved = self.resolve_object(key)?;
+        self.get_resolved_range(&resolved, range).await
+    }
+
+    /// Reads a previously resolved client-visible object or byte range.
+    pub async fn get_resolved_range(
+        &self,
+        resolved: &V2ResolvedObject,
+        range: ByteRange,
+    ) -> Result<Bytes> {
         let keyring = self.repository.keyring()?;
-        let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
-        let entry = {
-            let state = self
-                .accepted_state
-                .read()
-                .map_err(|_| RepositoryError::StatePoisoned)?;
-            first_namespace_entry(&state.namespace, &lookup_blind_keys)
-                .cloned()
-                .ok_or_else(|| RepositoryError::NotFound(key.clone()))?
-        };
+        let entry = resolved.entry.clone();
         let content_len = entry.content_len;
         let Some(PayloadReference::V2Commit {
             commit_key,

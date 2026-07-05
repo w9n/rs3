@@ -20,7 +20,7 @@ use rs3_types::{
     RetentionMode, RetentionPolicy,
 };
 use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default maximum plaintext bytes retained in the decrypted segment LRU cache.
@@ -29,7 +29,7 @@ pub const DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// Trusted repository service.
 pub struct Repository<S> {
     pub(crate) store: S,
-    pub(crate) keyring: RwLock<KeyRing>,
+    pub(crate) keyring: RwLock<Arc<KeyRing>>,
     pub(crate) keyring_envelope: RwLock<Option<KeyringEnvelopeReference>>,
     pub(crate) state: RwLock<RepositoryState>,
     pub(crate) options: RepositoryOptions,
@@ -79,7 +79,7 @@ where
     ) -> Self {
         Self {
             store,
-            keyring: RwLock::new(keyring),
+            keyring: RwLock::new(Arc::new(keyring)),
             keyring_envelope: RwLock::new(None),
             state: RwLock::new(RepositoryState::default()),
             options,
@@ -95,7 +95,7 @@ where
             .keyring
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        *active = keyring;
+        *active = Arc::new(keyring);
         Ok(())
     }
 
@@ -331,12 +331,12 @@ where
             .ok_or_else(|| RepositoryError::NotFound(key.clone()))
     }
 
-    /// Returns a cloned active keyring.
-    pub(crate) fn keyring(&self) -> Result<KeyRing> {
+    /// Returns the active keyring.
+    pub(crate) fn keyring(&self) -> Result<Arc<KeyRing>> {
         self.keyring
             .read()
             .map_err(|_| RepositoryError::StatePoisoned)
-            .map(|keyring| keyring.clone())
+            .map(|keyring| Arc::clone(&*keyring))
     }
 
     /// Replaces the keyring envelope reference recorded in future checkpoints.

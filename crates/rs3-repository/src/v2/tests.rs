@@ -1028,6 +1028,43 @@ async fn v2_repository_replays_committed_index_delta_after_reload() {
 }
 
 #[tokio::test]
+async fn v2_repository_reads_previously_resolved_object_range() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let anchor = V2MemoryAnchor::new();
+    let key = LogicalPath::new("snapshots/v2-resolved-range.bin")
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                key.clone(),
+                Bytes::from_static(b"resolved-body"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+
+    let resolved = must_repo(repository.resolve_object(&key));
+    let read = must_repo(
+        repository
+            .get_resolved_range(&resolved, ByteRange::Slice { offset: 9, len: 4 })
+            .await,
+    );
+
+    assert_eq!(resolved.metadata().content_len, 13);
+    assert_eq!(read, Bytes::from_static(b"body"));
+}
+
+#[tokio::test]
 async fn v2_repository_list_page_returns_limit_plus_one_after_marker() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());

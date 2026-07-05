@@ -26,7 +26,7 @@ use rs3_repository::v2::{
     V2AnchorState, V2CommitAnchor, V2CommitCoordinator, V2CommitKey, V2CommitStore,
     V2CommitStoreOptions, V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef,
     V2ProviderConformanceOptions, V2ProviderConformanceReport, V2ProviderProfile, V2RecoveryBundle,
-    V2Repository, check_v2_provider_conformance, v2_format_object_id,
+    V2Repository, V2ResolvedObject, check_v2_provider_conformance, v2_format_object_id,
 };
 use rs3_repository::{
     DeleteOutcome, RepositoryError, RepositoryListEntry, RepositoryObjectMetadata,
@@ -171,6 +171,16 @@ pub(crate) struct RuntimeRepositoryAdminFacts {
 
 pub(super) struct RuntimeCommittedPut {
     pub(super) metadata: RepositoryObjectMetadata,
+}
+
+pub(super) struct RuntimeResolvedObject {
+    inner: V2ResolvedObject,
+}
+
+impl RuntimeResolvedObject {
+    pub(super) fn metadata(&self) -> &RepositoryObjectMetadata {
+        self.inner.metadata()
+    }
 }
 
 struct LoadedV2Repository {
@@ -371,12 +381,32 @@ impl RuntimeRepository {
         self.repository.head(key)
     }
 
+    pub(super) fn resolve_object(
+        &self,
+        key: &LogicalPath,
+    ) -> Result<RuntimeResolvedObject, RepositoryError> {
+        self.repository
+            .resolve_object(key)
+            .map(|inner| RuntimeResolvedObject { inner })
+    }
+
+    #[cfg(test)]
     pub(super) async fn get_range(
         &self,
         key: &LogicalPath,
         range: ByteRange,
     ) -> Result<Bytes, RepositoryError> {
         self.repository.get_range(key, range).await
+    }
+
+    pub(super) async fn get_resolved_range(
+        &self,
+        resolved: &RuntimeResolvedObject,
+        range: ByteRange,
+    ) -> Result<Bytes, RepositoryError> {
+        self.repository
+            .get_resolved_range(&resolved.inner, range)
+            .await
     }
 
     pub(super) fn list_page(

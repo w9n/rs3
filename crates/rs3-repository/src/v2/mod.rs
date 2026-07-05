@@ -47,4 +47,4 @@ pub use repository::{
     V2CommitChain, V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite,
     V2MemoryAnchor, V2RecoveryBundle, V2StoredCommit,
 };
-pub use service::V2Repository;
+pub use service::{V2Repository, V2ResolvedObject};

@@ -464,7 +464,7 @@ where
     {
         let fresh = V2Repository::new(
             self.commit_store.store().clone(),
-            self.repository.keyring()?,
+            self.repository.keyring()?.as_ref().clone(),
             self.repository.options,
             self.commit_store.options().clone(),
         );

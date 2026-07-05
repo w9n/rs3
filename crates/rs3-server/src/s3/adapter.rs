@@ -937,7 +937,11 @@ impl S3 for GatewayS3Service {
 
             let requested_range = input.range.is_some();
             let key = logical_path(input.key)?;
-            let metadata = self.repository.head(&key).map_err(repository_error)?;
+            let resolved = self
+                .repository
+                .resolve_object(&key)
+                .map_err(repository_error)?;
+            let metadata = resolved.metadata().clone();
             let resolved_range = resolve_range(input.range, metadata.content_len)?;
             let response_body_len = match resolved_range.as_ref() {
                 Some(range) => range.end - range.start,
@@ -950,7 +954,7 @@ impl S3 for GatewayS3Service {
                 repository_read_range(resolved_range.as_ref(), metadata.content_len);
             let body = self
                 .repository
-                .get_range(&key, repository_range)
+                .get_resolved_range(&resolved, repository_range)
                 .await
                 .map_err(repository_error)?;
             record_s3_response_body_bytes(OPERATION, body.len());
