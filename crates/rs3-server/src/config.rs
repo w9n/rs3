@@ -78,6 +78,27 @@ pub struct RuntimeConfig {
     pub static_credentials: Option<StaticCredentials>,
 }
 
+/// Minimal configuration needed to probe v2 provider behavior.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V2ProviderCheckConfig {
+    /// Backend object-store settings.
+    pub backend: BackendConfig,
+    /// Durable repository format selected for the provider check.
+    pub repository_format: RepositoryFormat,
+    /// Default provider retention policy for repository-owned objects.
+    pub repository_retention: Option<RetentionPolicy>,
+}
+
+impl From<&RuntimeConfig> for V2ProviderCheckConfig {
+    fn from(config: &RuntimeConfig) -> Self {
+        Self {
+            backend: config.backend.clone(),
+            repository_format: config.repository.format,
+            repository_retention: config.repository.retention,
+        }
+    }
+}
+
 /// Gateway mutation posture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayMode {
@@ -391,18 +412,7 @@ impl RuntimeConfig {
                 collect_config_error(&mut errors, parse_public_bucket("RS3_PUBLIC_BUCKET", value))
             })
             .unwrap_or(None);
-        let backend_endpoint =
-            collect_config_error(&mut errors, required_value(source, "RS3_BACKEND_ENDPOINT"));
-        let backend_bucket =
-            collect_config_error(&mut errors, required_value(source, "RS3_BACKEND_BUCKET"));
-        let backend = match (backend_endpoint, backend_bucket) {
-            (Some(endpoint), Some(bucket)) => Some(BackendConfig {
-                endpoint,
-                bucket,
-                prefix: optional_value(source, "RS3_BACKEND_PREFIX"),
-            }),
-            _ => None,
-        };
+        let backend = collect_config_error(&mut errors, parse_backend_config(source));
         let anchor = collect_config_error(&mut errors, parse_anchor_config(source));
         let writer_guard = match anchor.as_ref() {
             Some(anchor) => {
@@ -444,6 +454,31 @@ impl RuntimeConfig {
     }
 }
 
+impl V2ProviderCheckConfig {
+    /// Loads v2 provider check configuration from the current process environment.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_source(&ProcessEnv)
+    }
+
+    fn from_source(source: &impl ConfigSource) -> Result<Self, ConfigError> {
+        let mut errors = Vec::new();
+        let backend = collect_config_error(&mut errors, parse_backend_config(source));
+        let repository_format = collect_config_error(&mut errors, parse_repository_format(source));
+        let repository_retention =
+            collect_config_error(&mut errors, parse_retention_policy(source));
+
+        if !errors.is_empty() {
+            return Err(config_error_list(errors));
+        }
+
+        Ok(Self {
+            backend: require_collected_config(backend)?,
+            repository_format: require_collected_config(repository_format)?,
+            repository_retention: require_collected_config(repository_retention)?,
+        })
+    }
+}
+
 fn collect_config_error<T>(
     errors: &mut Vec<ConfigError>,
     result: Result<T, ConfigError>,
@@ -466,6 +501,23 @@ fn require_collected_config<T>(value: Option<T>) -> Result<T, ConfigError> {
         key: "RS3_CONFIG",
         value: REDACTED_SECRET_VALUE.to_owned(),
         reason: "internal parser failed to collect a configuration error".to_owned(),
+    })
+}
+
+fn parse_backend_config(source: &impl ConfigSource) -> Result<BackendConfig, ConfigError> {
+    let mut errors = Vec::new();
+    let endpoint =
+        collect_config_error(&mut errors, required_value(source, "RS3_BACKEND_ENDPOINT"));
+    let bucket = collect_config_error(&mut errors, required_value(source, "RS3_BACKEND_BUCKET"));
+
+    if !errors.is_empty() {
+        return Err(config_error_list(errors));
+    }
+
+    Ok(BackendConfig {
+        endpoint: require_collected_config(endpoint)?,
+        bucket: require_collected_config(bucket)?,
+        prefix: optional_value(source, "RS3_BACKEND_PREFIX"),
     })
 }
 
@@ -1142,8 +1194,9 @@ mod tests {
     use super::{
         AnchorConfig, BatchConfig, ConfigError, ConfigSource, GatewayMode, HardeningConfig,
         MetricsConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig,
-        RuntimeConfig, WriterGuardConfig,
+        RuntimeConfig, V2ProviderCheckConfig, WriterGuardConfig,
     };
+    use rs3_types::{RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -1252,6 +1305,39 @@ mod tests {
         assert_eq!(config.recovery, RecoveryConfig::default());
         assert_eq!(config.repository_keys, repository_keys_config());
         assert!(config.static_credentials.is_none());
+    }
+
+    #[test]
+    fn provider_check_config_requires_only_backend_and_retention() {
+        let source = TestSource::default()
+            .with("RS3_BACKEND_ENDPOINT", "https://object.example")
+            .with("RS3_BACKEND_BUCKET", "backend-bucket")
+            .with("RS3_BACKEND_PREFIX", "provider-check")
+            .with(super::REPOSITORY_RETENTION_MODE_ENV, "governance")
+            .with(super::REPOSITORY_RETENTION_DAYS_ENV, "7");
+
+        let config =
+            V2ProviderCheckConfig::from_source(&source).unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(config.backend.endpoint, "https://object.example");
+        assert_eq!(config.backend.bucket, "backend-bucket");
+        assert_eq!(config.backend.prefix.as_deref(), Some("provider-check"));
+        assert_eq!(config.repository_format, RepositoryFormat::V2Preview);
+        assert_eq!(
+            config.repository_retention,
+            Some(RetentionPolicy::new(RetentionMode::Governance, 7))
+        );
+    }
+
+    #[test]
+    fn provider_check_config_still_requires_backend() {
+        let error = V2ProviderCheckConfig::from_source(&TestSource::default())
+            .expect_err("provider check needs a backend to probe");
+
+        assert_eq!(
+            config_error_keys(&error),
+            vec!["RS3_BACKEND_ENDPOINT", "RS3_BACKEND_BUCKET"]
+        );
     }
 
     #[test]

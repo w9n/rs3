@@ -3,14 +3,14 @@
 use serde_json::Value;
 use std::process::{Command, Output};
 
-const RUNTIME_LOG_MESSAGE: &str = "gateway runtime configuration validated";
+const PROVIDER_CHECK_LOG_MESSAGE: &str = "v2 provider check configuration validated";
 
 #[test]
 fn json_reports_are_not_polluted_by_plain_tracing_logs() {
     let output = run_provider_report(&["check-v2-provider", "--format", "json"]);
     assert_provider_report_stdout(&output.stdout);
-    assert!(!output.stdout.contains(RUNTIME_LOG_MESSAGE));
-    assert!(output.stderr.contains(RUNTIME_LOG_MESSAGE));
+    assert!(!output.stdout.contains(PROVIDER_CHECK_LOG_MESSAGE));
+    assert!(output.stderr.contains(PROVIDER_CHECK_LOG_MESSAGE));
 }
 
 #[test]
@@ -23,8 +23,8 @@ fn json_reports_are_not_polluted_by_json_tracing_logs() {
         "json",
     ]);
     assert_provider_report_stdout(&output.stdout);
-    assert!(!output.stdout.contains(RUNTIME_LOG_MESSAGE));
-    assert!(output.stderr.contains(RUNTIME_LOG_MESSAGE));
+    assert!(!output.stdout.contains(PROVIDER_CHECK_LOG_MESSAGE));
+    assert!(output.stderr.contains(PROVIDER_CHECK_LOG_MESSAGE));
 }
 
 struct CliOutput {
@@ -37,21 +37,8 @@ fn run_provider_report(args: &[&str]) -> CliOutput {
         .args(args)
         .env_clear()
         .env("RUST_LOG", "info")
-        .env("RS3_PUBLIC_BUCKET", "client-bucket")
         .env("RS3_BACKEND_ENDPOINT", "memory://local")
         .env("RS3_BACKEND_BUCKET", "backend-bucket")
-        .env("RS3_ANCHOR_MODE", "memory")
-        .env("RS3_ALLOW_MEMORY_ANCHOR", "true")
-        .env("RS3_ALLOW_REPOSITORY_INIT", "true")
-        .env("RS3_REPOSITORY_ID", "cli-output-repository")
-        .env(
-            "RS3_REPOSITORY_SALT_HEX",
-            "2222222222222222222222222222222222222222222222222222222222222222",
-        )
-        .env(
-            "RS3_KEYRING_WRAPPING_KEY_HEX",
-            "3333333333333333333333333333333333333333333333333333333333333333",
-        )
         .output()
         .unwrap_or_else(|error| panic!("failed to run rs3-server: {error}"));
 

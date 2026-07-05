@@ -13,7 +13,10 @@ use crate::admin::{
     AdminV2CommitCoordinatorSummary,
 };
 use crate::config::KEYRING_WRAPPING_KEY_HEX_ENV;
-use crate::{BackendConfig, GatewayMode, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig};
+use crate::{
+    BackendConfig, GatewayMode, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig,
+    V2ProviderCheckConfig,
+};
 use bytes::Bytes;
 use futures_util::Stream;
 use rs3_crypto::{FormatEnvelope, KeyRing};
@@ -608,13 +611,25 @@ pub async fn check_v2_provider_conformance_from_config(
     config: &RuntimeConfig,
     options: RuntimeV2ProviderConformanceOptions,
 ) -> Result<V2ProviderConformanceReport, S3BoundaryError> {
-    if config.repository.format != RepositoryFormat::V2Preview {
+    check_v2_provider_conformance_from_provider_config(
+        &V2ProviderCheckConfig::from(config),
+        options,
+    )
+    .await
+}
+
+/// Runs v2 provider conformance checks without requiring full gateway config.
+pub async fn check_v2_provider_conformance_from_provider_config(
+    config: &V2ProviderCheckConfig,
+    options: RuntimeV2ProviderConformanceOptions,
+) -> Result<V2ProviderConformanceReport, S3BoundaryError> {
+    if config.repository_format != RepositoryFormat::V2Preview {
         return Err(repository_init(
             "v2 provider conformance requires the v2-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;
-    let profile = v2_provider_profile(&config.backend, config.repository.retention);
+    let profile = v2_provider_profile(&config.backend, config.repository_retention);
     let mut conformance = V2ProviderConformanceOptions::new(
         profile,
         options
@@ -623,7 +638,7 @@ pub async fn check_v2_provider_conformance_from_config(
     )
     .with_legal_hold(options.legal_hold)
     .with_governance_bypass_reviewed(options.governance_bypass_reviewed);
-    if let Some(retention) = config.repository.retention {
+    if let Some(retention) = config.repository_retention {
         conformance = conformance.with_retention(retention);
     }
     check_v2_provider_conformance(store.handle(), &conformance)

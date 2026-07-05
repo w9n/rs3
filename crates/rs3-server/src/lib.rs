@@ -23,7 +23,7 @@ pub use admin_http::{
 pub use config::{
     AnchorConfig, BackendConfig, BatchConfig, ConfigError, GatewayMode, HardeningConfig,
     MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
-    RepositoryKeysConfig, RuntimeConfig, WriterGuardConfig,
+    RepositoryKeysConfig, RuntimeConfig, V2ProviderCheckConfig, WriterGuardConfig,
 };
 pub use identity::{
     AuthError, Authorizer, Identity, IdentityProvider, RequestAction, StaticCredentialProvider,
@@ -32,7 +32,8 @@ pub use identity::{
 pub use s3::{
     GatewayS3Boundary, RuntimeV2ProviderConformanceOptions, S3BoundaryError, S3Hardening,
     V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport,
-    check_v2_provider_conformance_from_config, export_v2_recovery_bundle_from_config,
-    import_v2_anchor_from_config, write_v2_index_snapshot_from_config,
+    check_v2_provider_conformance_from_config, check_v2_provider_conformance_from_provider_config,
+    export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
+    write_v2_index_snapshot_from_config,
 };
 pub use server::{GatewayServer, GatewayServerError};

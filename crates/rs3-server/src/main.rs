@@ -10,10 +10,10 @@ use rs3_repository::v2::{
 use rs3_server::{
     AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReportProfile,
     AnchorConfig, GatewayMode, GatewayServer, RuntimeConfig, RuntimeV2ProviderConformanceOptions,
-    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport, WriterGuardConfig,
-    backend_kind, check_v2_provider_conformance_from_config, doctor_findings,
-    export_v2_recovery_bundle_from_config, import_v2_anchor_from_config, runtime_config_profile,
-    write_v2_index_snapshot_from_config,
+    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport, V2ProviderCheckConfig,
+    WriterGuardConfig, backend_kind, check_v2_provider_conformance_from_provider_config,
+    doctor_findings, export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
+    runtime_config_profile, write_v2_index_snapshot_from_config,
 };
 use rs3_types::{RetentionMode, Sequence};
 use std::io::{self, Read};
@@ -213,9 +213,9 @@ async fn main() -> Result<()> {
             governance_bypass_reviewed,
             format,
         } => {
-            let config = RuntimeConfig::from_env()?;
-            log_runtime_config(&config);
-            let report = check_v2_provider_conformance_from_config(
+            let config = V2ProviderCheckConfig::from_env()?;
+            log_v2_provider_check_config(&config);
+            let report = check_v2_provider_conformance_from_provider_config(
                 &config,
                 RuntimeV2ProviderConformanceOptions {
                     probe_prefix,
@@ -748,6 +748,31 @@ fn log_runtime_config(config: &RuntimeConfig) {
         static_credentials = config.static_credentials.is_some(),
         config_profile,
         "gateway runtime configuration validated",
+    );
+}
+
+fn log_v2_provider_check_config(config: &V2ProviderCheckConfig) {
+    let backend_kind = backend_kind(&config.backend.endpoint);
+    let repository_retention_mode = config
+        .repository_retention
+        .map(|policy| match policy.mode {
+            RetentionMode::None => "none",
+            RetentionMode::Governance => "governance",
+            RetentionMode::Compliance => "compliance",
+        })
+        .unwrap_or("none");
+    let repository_retention_days = config
+        .repository_retention
+        .map(|policy| policy.retain_days)
+        .unwrap_or(0);
+
+    tracing::info!(
+        version = VERSION,
+        build_git_sha = build_git_sha(),
+        backend_kind,
+        repository_retention_mode,
+        repository_retention_days,
+        "v2 provider check configuration validated",
     );
 }
 

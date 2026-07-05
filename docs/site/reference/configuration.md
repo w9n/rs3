@@ -110,6 +110,9 @@ Run `rs3 check-v2-provider --format json` against the selected backend/profile
 and preserve the JSON report outside the backend. Mount that report into the
 gateway and configure the path below so admin reports can show last-known
 provider evidence without running live probes from status.
+The check command loads only backend and repository-retention settings; it does
+not require repository identity, anchor, keyring, public bucket, or gateway
+credential variables.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
