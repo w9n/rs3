@@ -903,7 +903,7 @@ fn keyring_reference_from_v2(reference: &V2KeyringEnvelopeRootRef) -> KeyringEnv
     }
 }
 
-fn v2_provider_profile(
+pub(super) fn v2_provider_profile(
     backend: &BackendConfig,
     retention: Option<RetentionPolicy>,
 ) -> V2ProviderProfile {

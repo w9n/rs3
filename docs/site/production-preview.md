@@ -302,7 +302,7 @@ For disaster-recovery evidence, export a trusted restore bundle with
 `rs3-server import-v2-anchor` in a new cluster. For retained-version
 repositories, first verify that the same bundle is rejected when the matching
 retention context is omitted, then import with the configured retention mode
-and verify the recovered bundle with `xtask v2 verify-bundle`.
+and verify the recovered bundle with `rs3 verify-bundle`.
 
 ## Configuration Checklist
 

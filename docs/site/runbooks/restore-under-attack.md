@@ -84,15 +84,16 @@ signature in `offline_signature` before production import. Verify the preserved
 bundle before anchor import:
 
 ```sh
-cargo run -p xtask --features s3 -- v2 verify-bundle \
+RS3_BACKEND_ENDPOINT=s3 \
+RS3_BACKEND_BUCKET=<bucket> \
+RS3_BACKEND_PREFIX=<repository-prefix> \
+RS3_REPOSITORY_ID=<repository-id> \
+RS3_REPOSITORY_SALT_HEX=<repository-salt-hex> \
+RS3_RECOVERY_PUBLIC_KEY=ed25519:<recovery-public-key-hex> \
+cargo run -p rs3-server -- verify-bundle \
   --bundle-file rs3-restore-bundle.json \
   --min-sequence <external-floor-sequence> \
-  --repository-salt-hex <repository-salt-hex> \
-  --recovery-public-key ed25519:<recovery-public-key-hex> \
-  --wrapping-key-hex-file <wrapping-key-hex-file> \
-  --backend s3 \
-  --s3-bucket <bucket> \
-  --s3-prefix <repository-prefix>
+  --wrapping-key-hex-file <wrapping-key-hex-file>
 ```
 
 If a fresh cluster is missing the Kubernetes Lease, import the trusted v2 anchor
@@ -125,7 +126,7 @@ external anchor record before recreating the Lease.
 ## 5. Verify Before Restore
 
 Verify the trusted v2 anchor before using it for restore. The
-`xtask v2 verify-bundle` command and the import path check the signed commit
+`rs3 verify-bundle` command and the import path check the signed commit
 chain, format root, and keyring envelope. After the gateway starts from the
 recovered anchor, run the restore client and verify restored application bytes
 before declaring the incident restore successful.

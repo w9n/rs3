@@ -3,26 +3,38 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
+use rs3_crypto::SecretBytes;
 use rs3_repository::v2::{
     V2AnchorState, V2ProviderCheckStatus, V2ProviderConformanceReport, V2ProviderProfile,
     V2RecoveryBundle,
 };
 use rs3_server::{
     AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReportProfile,
-    AnchorConfig, GatewayMode, GatewayServer, RuntimeConfig, RuntimeV2ProviderConformanceOptions,
-    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport, V2ProviderCheckConfig,
-    WriterGuardConfig, backend_kind, check_v2_provider_conformance_from_provider_config,
-    doctor_findings, export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
-    runtime_config_profile, write_v2_index_snapshot_from_config,
+    AnchorConfig, GatewayMode, GatewayServer, RepositoryToolConfig, RuntimeConfig,
+    RuntimeV2ProviderConformanceOptions, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions,
+    V2AnchorImportReport, V2ProviderCheckConfig, V2RecoveryBundleVerificationOptions,
+    V2RecoveryBundleVerificationReport, WriterGuardConfig, backend_kind,
+    check_v2_provider_conformance_from_provider_config, doctor_findings,
+    export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
+    inspect_keyring_envelope_from_tool_config, rewrap_keyring_envelope_from_tool_config,
+    runtime_config_profile, verify_v2_recovery_bundle_from_tool_config,
+    write_v2_index_snapshot_from_config,
 };
-use rs3_types::{RetentionMode, Sequence};
+use rs3_server::{
+    KeyringEnvelopeInspectOptions, KeyringEnvelopeInspectReport, KeyringEnvelopeRewrapOptions,
+    KeyringEnvelopeRewrapReport,
+};
+use rs3_types::{BackendObjectId, KeyDescriptor, KeyPurpose, KeyStatus, RetentionMode, Sequence};
+use secrecy::{ExposeSecret, SecretString};
 use std::io::{self, Read};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 #[cfg(any(feature = "s3", feature = "k8s"))]
 use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 #[cfg(feature = "k8s")]
 use rs3_k8s::{KubernetesLeaseGuard, LeaseGuardError, LeaseSettings};
@@ -81,6 +93,10 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
+    /// Verify a trusted v2 restore bundle without writing an anchor.
+    VerifyBundle(Box<VerifyBundleArgs>),
+    /// Inspect or rewrap encrypted repository keyring envelopes.
+    Keyring(Box<KeyringArgs>),
     /// Write a v2 index snapshot and report the accepted anchor state.
     WriteIndexSnapshot {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
@@ -117,6 +133,96 @@ struct ImportV2AnchorArgs {
     format: RecoveryReportFormat,
 }
 
+#[derive(Debug, Args)]
+struct VerifyBundleArgs {
+    /// JSON bundle from `export-restore-bundle`; use `-` for stdin.
+    #[arg(long)]
+    bundle_file: String,
+    /// External weak-subjectivity floor accepted by the operator.
+    #[arg(long)]
+    min_sequence: u64,
+    /// Wrapping key identifier recorded in the format root and keyring envelope.
+    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_ID")]
+    wrapping_key_id: Option<String>,
+    /// Hex-encoded wrapping key.
+    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_HEX", hide_env_values = true)]
+    wrapping_key_hex: Option<String>,
+    /// File containing the hex-encoded wrapping key.
+    #[arg(long)]
+    wrapping_key_hex_file: Option<PathBuf>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
+    format: RecoveryReportFormat,
+}
+
+/// Repository keyring envelope maintenance commands.
+#[derive(Debug, Args)]
+struct KeyringArgs {
+    #[command(subcommand)]
+    command: KeyringCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyringCommand {
+    /// Open an existing keyring envelope and print public key descriptors.
+    Inspect(Box<KeyringInspectArgs>),
+    /// Re-encrypt an existing keyring envelope with a new wrapping key.
+    Rewrap(Box<KeyringRewrapArgs>),
+}
+
+#[derive(Debug, Args)]
+struct KeyringInspectArgs {
+    /// Existing envelope object identifier.
+    #[arg(long, env = "RS3_KEYRING_ENVELOPE_OBJECT_ID")]
+    envelope_object_id: Option<String>,
+    /// Wrapping key identifier recorded in the envelope.
+    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_ID")]
+    wrapping_key_id: Option<String>,
+    /// Hex-encoded wrapping key.
+    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_HEX", hide_env_values = true)]
+    wrapping_key_hex: Option<String>,
+    /// File containing the hex-encoded wrapping key.
+    #[arg(long)]
+    wrapping_key_hex_file: Option<PathBuf>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = KeyringInspectFormat::Json)]
+    format: KeyringInspectFormat,
+}
+
+#[derive(Debug, Args)]
+struct KeyringRewrapArgs {
+    /// Existing envelope object identifier.
+    #[arg(long, env = "RS3_KEYRING_ENVELOPE_OBJECT_ID")]
+    envelope_object_id: Option<String>,
+    /// Current wrapping key identifier.
+    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_ID")]
+    old_wrapping_key_id: Option<String>,
+    /// Hex-encoded current wrapping key.
+    #[arg(long, env = "RS3_KEYRING_WRAPPING_KEY_HEX", hide_env_values = true)]
+    old_wrapping_key_hex: Option<String>,
+    /// File containing the hex-encoded current wrapping key.
+    #[arg(long)]
+    old_wrapping_key_hex_file: Option<PathBuf>,
+    /// New operator-visible wrapping key identifier.
+    #[arg(long)]
+    new_wrapping_key_id: String,
+    /// Hex-encoded new high-entropy wrapping key.
+    #[arg(long, hide_env_values = true)]
+    new_wrapping_key_hex: Option<String>,
+    /// File containing the hex-encoded new high-entropy wrapping key.
+    #[arg(long)]
+    new_wrapping_key_hex_file: Option<PathBuf>,
+    /// Generate and print a new high-entropy wrapping key.
+    #[arg(long, default_value_t = false)]
+    generate_new_wrapping_key: bool,
+    /// New monotonic envelope generation. Defaults to existing generation + 1.
+    #[arg(long)]
+    new_generation: Option<u64>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = KeyringReportFormat::Json)]
+    format: KeyringReportFormat,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum GatewayModeArg {
     ReadWrite,
@@ -131,6 +237,18 @@ enum DoctorProfile {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum RecoveryReportFormat {
+    Json,
+    Text,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum KeyringReportFormat {
+    Json,
+    Env,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum KeyringInspectFormat {
     Json,
     Text,
 }
@@ -201,6 +319,44 @@ async fn main() -> Result<()> {
             let bundle = export_v2_recovery_bundle_from_config(&config).await?;
             print_v2_restore_bundle(&bundle, format)?;
         }
+        Commands::VerifyBundle(args) => {
+            let VerifyBundleArgs {
+                bundle_file,
+                min_sequence,
+                wrapping_key_id,
+                wrapping_key_hex,
+                wrapping_key_hex_file,
+                format,
+            } = *args;
+            let mut config = RepositoryToolConfig::from_env()?;
+            if let Some(wrapping_key_id) = wrapping_key_id.as_ref() {
+                config
+                    .repository_keys
+                    .wrapping_key_id
+                    .clone_from(wrapping_key_id);
+            }
+            log_repository_tool_config(&config);
+            let bundle = read_v2_recovery_bundle_json(&bundle_file)?;
+            let wrapping_key = required_wrapping_key_input(
+                wrapping_key_hex,
+                wrapping_key_hex_file.as_deref(),
+                "--wrapping-key-hex",
+                "--wrapping-key-hex-file",
+            )?;
+            let report = verify_v2_recovery_bundle_from_tool_config(
+                &config,
+                bundle,
+                V2RecoveryBundleVerificationOptions {
+                    min_sequence: Sequence::new(min_sequence),
+                    wrapping_key,
+                },
+            )
+            .await?;
+            print_v2_recovery_bundle_verification_report(&report, format)?;
+        }
+        Commands::Keyring(args) => {
+            run_keyring_command(*args).await?;
+        }
         Commands::WriteIndexSnapshot { format } => {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
@@ -243,6 +399,96 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn run_keyring_command(args: KeyringArgs) -> Result<()> {
+    match args.command {
+        KeyringCommand::Inspect(args) => {
+            let KeyringInspectArgs {
+                envelope_object_id,
+                wrapping_key_id,
+                wrapping_key_hex,
+                wrapping_key_hex_file,
+                format,
+            } = *args;
+            let mut config = RepositoryToolConfig::from_env()?;
+            if let Some(wrapping_key_id) = wrapping_key_id.as_ref() {
+                config
+                    .repository_keys
+                    .wrapping_key_id
+                    .clone_from(wrapping_key_id);
+            }
+            log_repository_tool_config(&config);
+            let envelope_object_id =
+                optional_backend_object_id("--envelope-object-id", envelope_object_id)?;
+            let wrapping_key = required_wrapping_key_input(
+                wrapping_key_hex,
+                wrapping_key_hex_file.as_deref(),
+                "--wrapping-key-hex",
+                "--wrapping-key-hex-file",
+            )?;
+            let report = inspect_keyring_envelope_from_tool_config(
+                &config,
+                KeyringEnvelopeInspectOptions {
+                    envelope_object_id,
+                    wrapping_key,
+                },
+            )
+            .await?;
+            print_keyring_inspect_report(&report, format)?;
+        }
+        KeyringCommand::Rewrap(args) => {
+            let KeyringRewrapArgs {
+                envelope_object_id,
+                old_wrapping_key_id,
+                old_wrapping_key_hex,
+                old_wrapping_key_hex_file,
+                new_wrapping_key_id,
+                new_wrapping_key_hex,
+                new_wrapping_key_hex_file,
+                generate_new_wrapping_key,
+                new_generation,
+                format,
+            } = *args;
+            let mut config = RepositoryToolConfig::from_env()?;
+            if let Some(wrapping_key_id) = old_wrapping_key_id.as_ref() {
+                config
+                    .repository_keys
+                    .wrapping_key_id
+                    .clone_from(wrapping_key_id);
+            }
+            log_repository_tool_config(&config);
+            let envelope_object_id =
+                optional_backend_object_id("--envelope-object-id", envelope_object_id)?;
+            let old_wrapping_key = required_wrapping_key_input(
+                old_wrapping_key_hex,
+                old_wrapping_key_hex_file.as_deref(),
+                "--old-wrapping-key-hex",
+                "--old-wrapping-key-hex-file",
+            )?;
+            let new_wrapping_key = wrapping_key_input(
+                new_wrapping_key_hex,
+                new_wrapping_key_hex_file.as_deref(),
+                generate_new_wrapping_key,
+                "--new-wrapping-key-hex",
+                "--new-wrapping-key-hex-file",
+                "--generate-new-wrapping-key",
+            )?;
+            let report = rewrap_keyring_envelope_from_tool_config(
+                &config,
+                KeyringEnvelopeRewrapOptions {
+                    envelope_object_id,
+                    old_wrapping_key,
+                    new_wrapping_key_id,
+                    new_wrapping_key: new_wrapping_key.secret,
+                    new_generation,
+                },
+            )
+            .await?;
+            print_keyring_rewrap_report(&report, new_wrapping_key.generated_hex, format)?;
+        }
+    }
+    Ok(())
+}
+
 fn recovery_bundle_from_import_args(
     config: &RuntimeConfig,
     args: ImportV2AnchorArgs,
@@ -268,6 +514,19 @@ fn read_restore_bundle_json(path: &str, config: &RuntimeConfig) -> Result<V2Reco
     parse_restore_bundle_json(&input, config)
 }
 
+fn read_v2_recovery_bundle_json(path: &str) -> Result<V2RecoveryBundle> {
+    let mut input = String::new();
+    if path == "-" {
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .context("failed to read restore bundle from stdin")?;
+    } else {
+        input = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read restore bundle {path}"))?;
+    }
+    serde_json::from_str(&input).context("failed to parse v2 restore bundle JSON")
+}
+
 fn parse_restore_bundle_json(input: &str, config: &RuntimeConfig) -> Result<V2RecoveryBundle> {
     let mut bundle: V2RecoveryBundle =
         serde_json::from_str(input).context("failed to parse v2 restore bundle JSON")?;
@@ -280,6 +539,95 @@ fn parse_restore_bundle_json(input: &str, config: &RuntimeConfig) -> Result<V2Re
         bundle.repository_id = Some(config.repository_keys.repository_id.clone());
     }
     Ok(bundle)
+}
+
+fn optional_backend_object_id(
+    label: &'static str,
+    value: Option<String>,
+) -> Result<Option<BackendObjectId>> {
+    value
+        .map(|value| {
+            BackendObjectId::new(value)
+                .with_context(|| format!("{label} must be a valid backend object identifier"))
+        })
+        .transpose()
+}
+
+struct WrappingKeyInput {
+    secret: SecretBytes,
+    generated_hex: Option<String>,
+}
+
+fn wrapping_key_input(
+    provided_hex: Option<String>,
+    provided_file: Option<&Path>,
+    generate: bool,
+    provided_flag: &'static str,
+    file_flag: &'static str,
+    generate_flag: &'static str,
+) -> Result<WrappingKeyInput> {
+    let input_count = usize::from(provided_hex.is_some())
+        + usize::from(provided_file.is_some())
+        + usize::from(generate);
+    if input_count != 1 {
+        bail!("exactly one of {provided_flag}, {file_flag}, or {generate_flag} is required");
+    }
+
+    if let Some(hex) = provided_hex {
+        Ok(WrappingKeyInput {
+            secret: secret_from_hex(provided_flag, SecretString::from(hex))?,
+            generated_hex: None,
+        })
+    } else if let Some(path) = provided_file {
+        Ok(WrappingKeyInput {
+            secret: secret_from_hex(file_flag, read_secret_hex_file(file_flag, path)?)?,
+            generated_hex: None,
+        })
+    } else {
+        if !generate {
+            bail!("{generate_flag} was not selected");
+        }
+        let hex = random_hex(SecretBytes::MIN_LEN)?;
+        Ok(WrappingKeyInput {
+            secret: secret_from_hex(generate_flag, SecretString::from(hex.clone()))?,
+            generated_hex: Some(hex),
+        })
+    }
+}
+
+fn required_wrapping_key_input(
+    provided_hex: Option<String>,
+    provided_file: Option<&Path>,
+    provided_flag: &'static str,
+    file_flag: &'static str,
+) -> Result<SecretBytes> {
+    match (provided_hex, provided_file) {
+        (Some(_), Some(_)) => {
+            bail!("exactly one of {provided_flag} or {file_flag} is required")
+        }
+        (Some(hex), None) => secret_from_hex(provided_flag, SecretString::from(hex)),
+        (None, Some(path)) => secret_from_hex(file_flag, read_secret_hex_file(file_flag, path)?),
+        (None, None) => bail!("one of {provided_flag} or {file_flag} is required"),
+    }
+}
+
+fn read_secret_hex_file(label: &'static str, path: &Path) -> Result<SecretString> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {label} {}", path.display()))?;
+    Ok(SecretString::from(contents.trim().to_owned()))
+}
+
+fn secret_from_hex(label: &'static str, value: SecretString) -> Result<SecretBytes> {
+    let bytes = hex::decode(value.expose_secret())
+        .with_context(|| format!("{label} must be hex encoded"))?;
+    SecretBytes::new(bytes).with_context(|| format!("{label} is not usable"))
+}
+
+fn random_hex(len: usize) -> Result<String> {
+    let mut bytes = Zeroizing::new(vec![0_u8; len]);
+    getrandom::fill(bytes.as_mut_slice())
+        .map_err(|error| anyhow::anyhow!("failed to read random bytes: {error}"))?;
+    Ok(hex::encode(bytes.as_slice()))
 }
 
 #[cfg(any(feature = "s3", feature = "k8s"))]
@@ -311,6 +659,189 @@ fn print_v2_anchor_import_report(
             println!("applied={}", report.applied);
             println!("verified_commit_count={}", report.verified_commit_count);
             print_v2_anchor_text(&report.anchor);
+        }
+    }
+    Ok(())
+}
+
+fn print_v2_recovery_bundle_verification_report(
+    report: &V2RecoveryBundleVerificationReport,
+    format: RecoveryReportFormat,
+) -> Result<()> {
+    match format {
+        RecoveryReportFormat::Json => {
+            let report_json = serde_json::json!({
+                "schema": "rs3.v2-verify-bundle.v1",
+                "verified": true,
+                "repository": {
+                    "id": report.repository_id.as_str(),
+                },
+                "anchor": {
+                    "sequence": report.anchor.sequence.get(),
+                    "commit_key": report.anchor.commit_key.as_str(),
+                    "version_id": report.anchor.version_id.as_ref().map(|version_id| version_id.as_str()),
+                    "body_digest": hex::encode(report.anchor.body_digest),
+                    "signing_key_id": report.anchor.signing_key_id.as_str(),
+                    "format": {
+                        "generation": report.anchor.format_ref.generation,
+                        "digest": report.anchor.format_ref.digest,
+                        "object_id": report.anchor.format_ref.object_id.as_str(),
+                        "version_id": report.anchor.format_ref.version_id.as_ref().map(|version_id| version_id.as_str()),
+                    },
+                },
+                "restore": {
+                    "weak_subjectivity_floor_sequence": report.weak_subjectivity_floor_sequence.get(),
+                    "verified_commit_count": report.verified_commit_count,
+                    "snapshot_sequence": report.snapshot_sequence.get(),
+                    "exported_at_ms": report.exported_at_ms,
+                    "offline_signature_present": report.offline_signature_present,
+                },
+                "format_root": {
+                    "provider_profile": provider_profile_name(report.provider_profile),
+                    "retention": report.retention.map(retention_json),
+                    "keyring_envelope": {
+                        "generation": report.keyring_envelope_ref.generation,
+                        "digest": report.keyring_envelope_ref.digest,
+                        "object_id": report.keyring_envelope_ref.object_id.as_str(),
+                        "version_id": report.keyring_envelope_ref.version_id.as_ref().map(|version_id| version_id.as_str()),
+                    },
+                },
+            });
+            println!("{}", serde_json::to_string_pretty(&report_json)?);
+        }
+        RecoveryReportFormat::Text => {
+            println!("schema=rs3.v2-verify-bundle.v1");
+            println!("verified=true");
+            println!("repository_id={}", report.repository_id.as_str());
+            print_v2_anchor_text(&report.anchor);
+            println!(
+                "weak_subjectivity_floor_sequence={}",
+                report.weak_subjectivity_floor_sequence.get()
+            );
+            println!("verified_commit_count={}", report.verified_commit_count);
+            println!("snapshot_sequence={}", report.snapshot_sequence.get());
+            println!(
+                "provider_profile={}",
+                provider_profile_name(report.provider_profile)
+            );
+            if let Some(retention) = report.retention {
+                println!("retention_mode={}", retention_mode_name(retention.mode));
+                println!("retention_days={}", retention.retain_days);
+            }
+            println!(
+                "keyring_generation={}",
+                report.keyring_envelope_ref.generation
+            );
+            println!("keyring_digest={}", report.keyring_envelope_ref.digest);
+            println!(
+                "keyring_object_id={}",
+                report.keyring_envelope_ref.object_id.as_str()
+            );
+            if let Some(version_id) = report.keyring_envelope_ref.version_id.as_ref() {
+                println!("keyring_version_id={}", version_id.as_str());
+            }
+            println!("exported_at_ms={}", report.exported_at_ms);
+            println!(
+                "offline_signature_present={}",
+                report.offline_signature_present
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_keyring_inspect_report(
+    report: &KeyringEnvelopeInspectReport,
+    format: KeyringInspectFormat,
+) -> Result<()> {
+    match format {
+        KeyringInspectFormat::Json => {
+            let report_json = serde_json::json!({
+                "repository_id": report.repository_id.as_str(),
+                "repository_salt_hex": report.repository_salt_hex,
+                "keyring_envelope": {
+                    "object_id": report.envelope_object_id.as_str(),
+                    "digest": report.envelope_digest,
+                    "generation": report.generation,
+                },
+                "wrapping_key": {
+                    "id": report.wrapping_key_id,
+                },
+                "keys": report.keys.iter().map(key_descriptor_json).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&report_json)?);
+        }
+        KeyringInspectFormat::Text => {
+            println!("repository_id={}", report.repository_id.as_str());
+            println!("repository_salt_hex={}", report.repository_salt_hex);
+            println!(
+                "keyring_envelope_object_id={}",
+                report.envelope_object_id.as_str()
+            );
+            println!("keyring_envelope_digest={}", report.envelope_digest);
+            println!("keyring_envelope_generation={}", report.generation);
+            println!("wrapping_key_id={}", report.wrapping_key_id);
+            for key in &report.keys {
+                println!(
+                    "key id={} purpose={} status={} algorithm={}",
+                    key.id.as_str(),
+                    key_purpose_name(key.purpose),
+                    key_status_name(key.status),
+                    key.algorithm
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_keyring_rewrap_report(
+    report: &KeyringEnvelopeRewrapReport,
+    generated_wrapping_key_hex: Option<String>,
+    format: KeyringReportFormat,
+) -> Result<()> {
+    match format {
+        KeyringReportFormat::Json => {
+            let server_env = keyring_server_env(report, generated_wrapping_key_hex.as_deref());
+            let report_json = serde_json::json!({
+                "repository_id": report.repository_id.as_str(),
+                "repository_salt_hex": report.repository_salt_hex,
+                "keyring_envelope": {
+                    "object_id": report.envelope_object_id.as_str(),
+                    "digest": report.envelope_digest,
+                    "generation": report.generation,
+                    "retention": report.envelope_retention.map(retention_json),
+                },
+                "wrapping_key": {
+                    "id": report.wrapping_key_id,
+                    "generated_key_hex": generated_wrapping_key_hex,
+                },
+                "server_env": server_env,
+            });
+            println!("{}", serde_json::to_string_pretty(&report_json)?);
+        }
+        KeyringReportFormat::Env => {
+            println!(
+                "RS3_REPOSITORY_ID={}",
+                shell_quote(report.repository_id.as_str())
+            );
+            println!(
+                "RS3_REPOSITORY_SALT_HEX={}",
+                shell_quote(&report.repository_salt_hex)
+            );
+            println!(
+                "RS3_KEYRING_ENVELOPE_OBJECT_ID={}",
+                shell_quote(report.envelope_object_id.as_str())
+            );
+            println!(
+                "RS3_KEYRING_WRAPPING_KEY_ID={}",
+                shell_quote(&report.wrapping_key_id)
+            );
+            if let Some(secret) = generated_wrapping_key_hex.as_ref() {
+                println!("RS3_KEYRING_WRAPPING_KEY_HEX={}", shell_quote(secret));
+            } else {
+                println!("RS3_KEYRING_WRAPPING_KEY_HEX=<external-secret>");
+            }
         }
     }
     Ok(())
@@ -430,6 +961,75 @@ fn print_v2_anchor_text(anchor: &V2AnchorState) {
     if let Some(version_id) = anchor.format_ref.version_id.as_ref() {
         println!("format_version_id={}", version_id.as_str());
     }
+}
+
+fn keyring_server_env(
+    report: &KeyringEnvelopeRewrapReport,
+    generated_wrapping_key_hex: Option<&str>,
+) -> serde_json::Value {
+    let mut env = serde_json::Map::new();
+    env.insert(
+        "RS3_REPOSITORY_ID".to_owned(),
+        serde_json::Value::String(report.repository_id.as_str().to_owned()),
+    );
+    env.insert(
+        "RS3_REPOSITORY_SALT_HEX".to_owned(),
+        serde_json::Value::String(report.repository_salt_hex.clone()),
+    );
+    env.insert(
+        "RS3_KEYRING_ENVELOPE_OBJECT_ID".to_owned(),
+        serde_json::Value::String(report.envelope_object_id.as_str().to_owned()),
+    );
+    env.insert(
+        "RS3_KEYRING_WRAPPING_KEY_ID".to_owned(),
+        serde_json::Value::String(report.wrapping_key_id.clone()),
+    );
+    if let Some(secret) = generated_wrapping_key_hex {
+        env.insert(
+            "RS3_KEYRING_WRAPPING_KEY_HEX".to_owned(),
+            serde_json::Value::String(secret.to_owned()),
+        );
+    }
+    serde_json::Value::Object(env)
+}
+
+fn key_descriptor_json(descriptor: &KeyDescriptor) -> serde_json::Value {
+    serde_json::json!({
+        "id": descriptor.id.as_str(),
+        "purpose": key_purpose_name(descriptor.purpose),
+        "algorithm": descriptor.algorithm.as_str(),
+        "status": key_status_name(descriptor.status),
+        "created_at_ms": descriptor.created_at_ms,
+        "not_before_ms": descriptor.not_before_ms,
+        "not_after_ms": descriptor.not_after_ms,
+        "public_key": descriptor.public_key.as_deref(),
+        "external_kms_uri": descriptor.external_kms_uri.as_deref(),
+    })
+}
+
+fn key_purpose_name(purpose: KeyPurpose) -> &'static str {
+    match purpose {
+        KeyPurpose::Namespace => "namespace",
+        KeyPurpose::Content => "content",
+        KeyPurpose::Metadata => "metadata",
+        KeyPurpose::CheckpointSigning => "checkpoint",
+    }
+}
+
+fn key_status_name(status: KeyStatus) -> &'static str {
+    match status {
+        KeyStatus::Primary => "primary",
+        KeyStatus::Enabled => "enabled",
+        KeyStatus::Disabled => "disabled",
+        KeyStatus::Retired => "retired",
+    }
+}
+
+fn retention_json(retention: rs3_types::RetentionPolicy) -> serde_json::Value {
+    serde_json::json!({
+        "mode": retention_mode_name(retention.mode),
+        "days": retention.retain_days,
+    })
 }
 
 fn run_doctor(config: &RuntimeConfig, profile: DoctorProfile) -> Result<()> {
@@ -666,6 +1266,14 @@ fn provider_profile_name(profile: V2ProviderProfile) -> &'static str {
     }
 }
 
+fn retention_mode_name(mode: RetentionMode) -> &'static str {
+    match mode {
+        RetentionMode::None => "none",
+        RetentionMode::Governance => "governance",
+        RetentionMode::Compliance => "compliance",
+    }
+}
+
 fn provider_check_status_name(status: V2ProviderCheckStatus) -> &'static str {
     match status {
         V2ProviderCheckStatus::Passed => "passed",
@@ -679,6 +1287,10 @@ fn current_time_ms() -> Option<i64> {
         .ok()?
         .as_millis();
     i64::try_from(millis).ok()
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 impl DoctorProfile {
@@ -773,6 +1385,30 @@ fn log_v2_provider_check_config(config: &V2ProviderCheckConfig) {
         repository_retention_mode,
         repository_retention_days,
         "v2 provider check configuration validated",
+    );
+}
+
+fn log_repository_tool_config(config: &RepositoryToolConfig) {
+    let backend_kind = backend_kind(&config.backend.endpoint);
+    let repository_retention_mode = config
+        .repository_retention
+        .map(|policy| retention_mode_name(policy.mode))
+        .unwrap_or("none");
+    let repository_retention_days = config
+        .repository_retention
+        .map(|policy| policy.retain_days)
+        .unwrap_or(0);
+
+    tracing::info!(
+        version = VERSION,
+        build_git_sha = build_git_sha(),
+        backend_kind,
+        repository_format = config.repository_format.as_str(),
+        repository_retention_mode,
+        repository_retention_days,
+        recovery_public_key = config.recovery.public_key.is_some(),
+        keyring_envelope_object_id = config.repository_keys.envelope_object_id.is_some(),
+        "repository tool configuration validated",
     );
 }
 

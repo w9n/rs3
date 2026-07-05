@@ -89,12 +89,63 @@ pub struct V2ProviderCheckConfig {
     pub repository_retention: Option<RetentionPolicy>,
 }
 
+/// Minimal repository context needed by operator maintenance tools.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryToolConfig {
+    /// Backend object-store settings.
+    pub backend: BackendConfig,
+    /// Durable repository format selected for the tool operation.
+    pub repository_format: RepositoryFormat,
+    /// Default provider retention policy for repository-owned objects.
+    pub repository_retention: Option<RetentionPolicy>,
+    /// Disaster-recovery trust settings.
+    pub recovery: RecoveryConfig,
+    /// Repository key context without the wrapping-key secret.
+    pub repository_keys: RepositoryKeyContextConfig,
+}
+
+/// Repository key context used by commands that read wrapping-key material separately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryKeyContextConfig {
+    /// Stable repository derivation context.
+    pub repository_id: RepositoryId,
+    /// Stable public salt used with the repository ID when opening envelopes.
+    pub repository_salt_hex: String,
+    /// Optional bootstrap or recovery override for an encrypted keyring envelope object.
+    pub envelope_object_id: Option<BackendObjectId>,
+    /// Operator-visible wrapping key identifier.
+    pub wrapping_key_id: String,
+}
+
 impl From<&RuntimeConfig> for V2ProviderCheckConfig {
     fn from(config: &RuntimeConfig) -> Self {
         Self {
             backend: config.backend.clone(),
             repository_format: config.repository.format,
             repository_retention: config.repository.retention,
+        }
+    }
+}
+
+impl From<&RuntimeConfig> for RepositoryToolConfig {
+    fn from(config: &RuntimeConfig) -> Self {
+        Self {
+            backend: config.backend.clone(),
+            repository_format: config.repository.format,
+            repository_retention: config.repository.retention,
+            recovery: config.recovery.clone(),
+            repository_keys: RepositoryKeyContextConfig::from(&config.repository_keys),
+        }
+    }
+}
+
+impl From<&RepositoryKeysConfig> for RepositoryKeyContextConfig {
+    fn from(config: &RepositoryKeysConfig) -> Self {
+        Self {
+            repository_id: config.repository_id.clone(),
+            repository_salt_hex: config.repository_salt_hex.clone(),
+            envelope_object_id: config.envelope_object_id.clone(),
+            wrapping_key_id: config.wrapping_key_id.clone(),
         }
     }
 }
@@ -475,6 +526,36 @@ impl V2ProviderCheckConfig {
             backend: require_collected_config(backend)?,
             repository_format: require_collected_config(repository_format)?,
             repository_retention: require_collected_config(repository_retention)?,
+        })
+    }
+}
+
+impl RepositoryToolConfig {
+    /// Loads repository maintenance tool configuration from the current process environment.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_source(&ProcessEnv)
+    }
+
+    fn from_source(source: &impl ConfigSource) -> Result<Self, ConfigError> {
+        let mut errors = Vec::new();
+        let backend = collect_config_error(&mut errors, parse_backend_config(source));
+        let repository_format = collect_config_error(&mut errors, parse_repository_format(source));
+        let repository_retention =
+            collect_config_error(&mut errors, parse_retention_policy(source));
+        let recovery = collect_config_error(&mut errors, parse_recovery_config(source));
+        let repository_keys =
+            collect_config_error(&mut errors, parse_repository_key_context_config(source));
+
+        if !errors.is_empty() {
+            return Err(config_error_list(errors));
+        }
+
+        Ok(Self {
+            backend: require_collected_config(backend)?,
+            repository_format: require_collected_config(repository_format)?,
+            repository_retention: require_collected_config(repository_retention)?,
+            recovery: require_collected_config(recovery)?,
+            repository_keys: require_collected_config(repository_keys)?,
         })
     }
 }
@@ -889,6 +970,30 @@ fn parse_repository_keys_config(
     source: &impl ConfigSource,
 ) -> Result<RepositoryKeysConfig, ConfigError> {
     let mut errors = Vec::new();
+    let context = collect_config_error(&mut errors, parse_repository_key_context_config(source));
+    let wrapping_key_hex = collect_config_error(
+        &mut errors,
+        required_secret_hex(source, KEYRING_WRAPPING_KEY_HEX_ENV),
+    );
+
+    if !errors.is_empty() {
+        return Err(config_error_list(errors));
+    }
+
+    let context = require_collected_config(context)?;
+    Ok(RepositoryKeysConfig {
+        repository_id: context.repository_id,
+        repository_salt_hex: context.repository_salt_hex,
+        envelope_object_id: context.envelope_object_id,
+        wrapping_key_id: context.wrapping_key_id,
+        wrapping_key_hex: require_collected_config(wrapping_key_hex)?,
+    })
+}
+
+fn parse_repository_key_context_config(
+    source: &impl ConfigSource,
+) -> Result<RepositoryKeyContextConfig, ConfigError> {
+    let mut errors = Vec::new();
     let repository_id_value =
         collect_config_error(&mut errors, required_value(source, REPOSITORY_ID_ENV));
     let repository_id = repository_id_value
@@ -906,22 +1011,17 @@ fn parse_repository_keys_config(
         .map(Some),
         None => Some(None),
     };
-    let wrapping_key_hex = collect_config_error(
-        &mut errors,
-        required_secret_hex(source, KEYRING_WRAPPING_KEY_HEX_ENV),
-    );
 
     if !errors.is_empty() {
         return Err(config_error_list(errors));
     }
 
-    Ok(RepositoryKeysConfig {
+    Ok(RepositoryKeyContextConfig {
         repository_id: require_collected_config(repository_id)?,
         repository_salt_hex: require_collected_config(repository_salt_hex)?,
         envelope_object_id: require_collected_config(envelope_object_id)?,
         wrapping_key_id: optional_value(source, KEYRING_WRAPPING_KEY_ID_ENV)
             .unwrap_or_else(|| DEFAULT_KEYRING_WRAPPING_KEY_ID.to_owned()),
-        wrapping_key_hex: require_collected_config(wrapping_key_hex)?,
     })
 }
 
@@ -1193,8 +1293,9 @@ fn secret_string_eq(left: &SecretString, right: &SecretString) -> bool {
 mod tests {
     use super::{
         AnchorConfig, BatchConfig, ConfigError, ConfigSource, GatewayMode, HardeningConfig,
-        MetricsConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat, RepositoryKeysConfig,
-        RuntimeConfig, V2ProviderCheckConfig, WriterGuardConfig,
+        MetricsConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
+        RepositoryKeyContextConfig, RepositoryKeysConfig, RepositoryToolConfig, RuntimeConfig,
+        V2ProviderCheckConfig, WriterGuardConfig,
     };
     use rs3_types::{RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
@@ -1337,6 +1438,72 @@ mod tests {
         assert_eq!(
             config_error_keys(&error),
             vec!["RS3_BACKEND_ENDPOINT", "RS3_BACKEND_BUCKET"]
+        );
+    }
+
+    #[test]
+    fn repository_tool_config_requires_only_backend_and_repository_context() {
+        let source = TestSource::default()
+            .with("RS3_BACKEND_ENDPOINT", "https://object.example")
+            .with("RS3_BACKEND_BUCKET", "backend-bucket")
+            .with("RS3_BACKEND_PREFIX", "repository")
+            .with(super::REPOSITORY_ID_ENV, "test-repository")
+            .with(super::REPOSITORY_SALT_HEX_ENV, REPOSITORY_SALT_HEX)
+            .with(
+                super::KEYRING_ENVELOPE_OBJECT_ID_ENV,
+                "keyrings/bootstrap-envelope.json",
+            )
+            .with(super::KEYRING_WRAPPING_KEY_ID_ENV, "wrap-custom")
+            .with(super::REPOSITORY_RETENTION_MODE_ENV, "compliance")
+            .with(super::REPOSITORY_RETENTION_DAYS_ENV, "30")
+            .with(
+                super::RECOVERY_PUBLIC_KEY_ENV,
+                "ed25519:1111111111111111111111111111111111111111111111111111111111111111",
+            );
+
+        let config =
+            RepositoryToolConfig::from_source(&source).unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(config.backend.endpoint, "https://object.example");
+        assert_eq!(config.backend.bucket, "backend-bucket");
+        assert_eq!(config.backend.prefix.as_deref(), Some("repository"));
+        assert_eq!(config.repository_format, RepositoryFormat::V2Preview);
+        assert_eq!(
+            config.repository_retention,
+            Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
+        );
+        assert_eq!(
+            config.recovery.public_key.as_deref(),
+            Some("ed25519:1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            config.repository_keys,
+            RepositoryKeyContextConfig {
+                repository_id: rs3_types::RepositoryId::new("test-repository")
+                    .unwrap_or_else(|error| panic!("{error}")),
+                repository_salt_hex: REPOSITORY_SALT_HEX.to_owned(),
+                envelope_object_id: Some(
+                    rs3_types::BackendObjectId::new("keyrings/bootstrap-envelope.json")
+                        .unwrap_or_else(|error| panic!("{error}")),
+                ),
+                wrapping_key_id: "wrap-custom".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn repository_tool_config_still_requires_backend_and_repository_context() {
+        let error = RepositoryToolConfig::from_source(&TestSource::default())
+            .expect_err("repository tools need backend and repository context");
+
+        assert_eq!(
+            config_error_keys(&error),
+            vec![
+                "RS3_BACKEND_ENDPOINT",
+                "RS3_BACKEND_BUCKET",
+                super::REPOSITORY_ID_ENV,
+                super::REPOSITORY_SALT_HEX_ENV,
+            ]
         );
     }
 

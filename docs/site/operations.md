@@ -165,35 +165,29 @@ repository and recover a missing anchor from a trusted restore bundle.
 Inspect an existing envelope when auditing key lifecycle state:
 
 ```sh
-cargo run -p xtask --bin xtask -- keyring inspect \
-  --repository-id prod-backups \
-  --repository-salt-hex <salt-hex> \
+cargo run -p rs3-server -- keyring inspect \
   --envelope-object-id <format-bound-envelope-object-id> \
   --wrapping-key-id wrap-2026-05 \
-  --wrapping-key-hex-file /run/secrets/rs3-wrap.hex \
-  --backend filesystem \
-  --backend-dir /var/lib/rs3/backend
+  --wrapping-key-hex-file /run/secrets/rs3-wrap.hex
 ```
 
 This opens the envelope and prints public key descriptors only. It does not
-print repository data keys or wrapping-key material.
+print repository data keys or wrapping-key material. The command uses the
+normal `RS3_BACKEND_*`, `RS3_REPOSITORY_ID`, and `RS3_REPOSITORY_SALT_HEX`
+configuration.
 
 Rewrap the keyring envelope with a new wrapping key without rewriting backup
 data:
 
 ```sh
-cargo run -p xtask --bin xtask -- keyring rewrap \
-  --repository-id prod-backups \
-  --repository-salt-hex <salt-hex> \
+RS3_REPOSITORY_RETENTION_MODE=compliance \
+RS3_REPOSITORY_RETENTION_DAYS=30 \
+cargo run -p rs3-server -- keyring rewrap \
   --envelope-object-id <current-envelope-object-id> \
   --old-wrapping-key-id wrap-2026-05 \
   --old-wrapping-key-hex-file /run/secrets/rs3-wrap-v1.hex \
   --new-wrapping-key-id wrap-2026-06 \
-  --generate-new-wrapping-key \
-  --envelope-retention-mode compliance \
-  --envelope-retention-days 30 \
-  --backend filesystem \
-  --backend-dir /var/lib/rs3/backend
+  --generate-new-wrapping-key
 ```
 
 Rewrap is an operational hygiene step, not compromise recovery. It keeps the
@@ -209,9 +203,9 @@ format roots or commits bound to the old envelope. A newly written rewrapped
 envelope only becomes active repository state after a later accepted format or
 keyring update binds it.
 When writing envelopes outside the gateway, set envelope retention deliberately
-with `--envelope-retention-mode` and `--envelope-retention-days`; retention
-protects restore metadata from deletion but does not make a leaked old envelope
-safe.
+with `RS3_REPOSITORY_RETENTION_MODE` and `RS3_REPOSITORY_RETENTION_DAYS`;
+retention protects restore metadata from deletion but does not make a leaked
+old envelope safe.
 
 Purpose-specific v2 data-key rotation is not exposed as a production-preview
 CLI command yet. Do not use older rotation workflows against a
@@ -219,7 +213,7 @@ v2 repository. Until v2 rotation is implemented, keep historical keys enabled
 and treat wrapping-key rewrap as envelope hygiene only.
 
 Before disabling or retiring a historical key, first verify the trusted anchored
-commit chain with `xtask v2 verify-bundle`. That verifies the preserved bundle,
+commit chain with `rs3 verify-bundle`. That verifies the preserved bundle,
 format root, keyring envelope, and reachable commit chain are still usable, but
 it is not a data-key retirement decision. v2-aware retirement tooling is not
 part of the current production-preview CLI, so keep historical data keys for at
@@ -396,15 +390,16 @@ write logs to stderr. Do not redirect stderr into preserved JSON artifacts.
 Verify the preserved bundle without writing a new anchor:
 
 ```sh
-cargo run -p xtask --features s3 -- v2 verify-bundle \
+RS3_BACKEND_ENDPOINT=s3 \
+RS3_BACKEND_BUCKET=<bucket> \
+RS3_BACKEND_PREFIX=<repository-prefix> \
+RS3_REPOSITORY_ID=<repository-id> \
+RS3_REPOSITORY_SALT_HEX=<repository-salt-hex> \
+RS3_RECOVERY_PUBLIC_KEY=ed25519:<recovery-public-key-hex> \
+cargo run -p rs3-server -- verify-bundle \
   --bundle-file rs3-restore-bundle.json \
   --min-sequence <external-floor-sequence> \
-  --repository-salt-hex <repository-salt-hex> \
-  --recovery-public-key ed25519:<recovery-public-key-hex> \
-  --wrapping-key-hex-file <wrapping-key-hex-file> \
-  --backend s3 \
-  --s3-bucket <bucket> \
-  --s3-prefix <repository-prefix>
+  --wrapping-key-hex-file <wrapping-key-hex-file>
 ```
 
 The bundle contains public repository restore metadata: repository ID, accepted

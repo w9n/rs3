@@ -3,12 +3,21 @@
 mod adapter;
 mod boundary;
 mod mapping;
+mod recovery_tools;
 mod runtime;
 mod runtime_builders;
 mod runtime_handles;
 mod runtime_keyring;
 
 pub use boundary::{GatewayS3Boundary, S3Hardening};
+pub use recovery_tools::{
+    KeyringEnvelopeInspectOptions, KeyringEnvelopeInspectReport, KeyringEnvelopeRewrapOptions,
+    KeyringEnvelopeRewrapReport, V2RecoveryBundleVerificationOptions,
+    V2RecoveryBundleVerificationReport, inspect_keyring_envelope_from_tool_config,
+    inspect_keyring_envelope_with_store, rewrap_keyring_envelope_from_tool_config,
+    rewrap_keyring_envelope_with_store, verify_v2_recovery_bundle_from_tool_config,
+    verify_v2_recovery_bundle_with_store,
+};
 pub(crate) use runtime::v2_quick_maintenance_from_config;
 pub use runtime::{
     RuntimeV2ProviderConformanceOptions, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions,
