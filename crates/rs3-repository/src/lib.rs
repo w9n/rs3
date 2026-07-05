@@ -4,6 +4,7 @@ mod checkpoint;
 mod commit_options;
 mod error;
 mod keyring_envelope;
+mod lru;
 mod model;
 mod namespace;
 mod payload;

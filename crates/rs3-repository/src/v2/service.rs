@@ -11,6 +11,7 @@ use super::{
 };
 use crate::checkpoint::{open_index_delta_object, seal_index_delta_object, seal_manifest_record};
 use crate::error::{RepositoryError, Result};
+use crate::lru::LruCache;
 use crate::model::{
     DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry, RepositoryObjectMetadata,
     RepositoryPutOptions,
@@ -39,7 +40,7 @@ use rs3_types::{
     RetentionPolicy, Sequence,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry};
+use std::collections::BTreeSet;
 use std::marker::PhantomData;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1319,11 +1320,17 @@ where
     }
 
     fn cached_payload_section(&self, key: &V2PayloadSectionCacheKey) -> Result<Option<Bytes>> {
-        let mut cache = self
+        let payload = self
             .payload_sections
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)?;
-        Ok(cache.get(key))
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .peek(key);
+        if payload.is_some()
+            && let Ok(mut cache) = self.payload_sections.try_write()
+        {
+            cache.touch(key);
+        }
+        Ok(payload)
     }
 
     fn cache_payload_section(&self, key: V2PayloadSectionCacheKey, payload: Bytes) -> Result<()> {
@@ -1339,11 +1346,17 @@ where
         &self,
         key: &V2CommitHeaderCacheKey,
     ) -> Result<Option<V2ParsedCommitHeader>> {
-        let mut cache = self
+        let header = self
             .commit_headers
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)?;
-        Ok(cache.get(key))
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .peek(key);
+        if header.is_some()
+            && let Ok(mut cache) = self.commit_headers.try_write()
+        {
+            cache.touch(key);
+        }
+        Ok(header)
     }
 
     fn cache_commit_header(
@@ -1372,11 +1385,17 @@ where
         &self,
         key: &V2PayloadSectionCacheKey,
     ) -> Result<Option<SegmentedPayloadHeader>> {
-        let mut cache = self
+        let header = self
             .payload_headers
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)?;
-        Ok(cache.get(key))
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .peek(key);
+        if header.is_some()
+            && let Ok(mut cache) = self.payload_headers.try_write()
+        {
+            cache.touch(key);
+        }
+        Ok(header)
     }
 
     fn cache_payload_header(
@@ -1565,7 +1584,7 @@ fn payload_fill_lock_index(payload_id: &BackendObjectId, start_segment: usize) -
     (u64::from_be_bytes(prefix) % V2_PAYLOAD_FILL_LOCK_STRIPES as u64) as usize
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct V2CommitHeaderCacheKey {
     commit_key: BackendObjectId,
     commit_version_id: Option<BackendVersionId>,
@@ -1585,7 +1604,7 @@ struct V2CommitPayloadRead {
     content_len: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct V2PayloadSectionCacheKey {
     commit_key: BackendObjectId,
     commit_version_id: Option<BackendVersionId>,
@@ -1597,8 +1616,7 @@ struct V2PayloadSectionCacheKey {
 
 #[derive(Debug)]
 struct V2PayloadSectionCache {
-    sections: BTreeMap<V2PayloadSectionCacheKey, Bytes>,
-    order: VecDeque<V2PayloadSectionCacheKey>,
+    sections: LruCache<V2PayloadSectionCacheKey, Bytes>,
     max_entries: usize,
     max_bytes: u64,
     current_bytes: u64,
@@ -1607,19 +1625,19 @@ struct V2PayloadSectionCache {
 impl V2PayloadSectionCache {
     fn with_max_bytes(max_bytes: u64) -> Self {
         Self {
-            sections: BTreeMap::new(),
-            order: VecDeque::new(),
+            sections: LruCache::new(),
             max_entries: 4096,
             max_bytes,
             current_bytes: 0,
         }
     }
 
-    fn get(&mut self, key: &V2PayloadSectionCacheKey) -> Option<Bytes> {
-        let payload = self.sections.get(key).cloned()?;
-        self.order.retain(|candidate| candidate != key);
-        self.order.push_back(key.clone());
-        Some(payload)
+    fn peek(&self, key: &V2PayloadSectionCacheKey) -> Option<Bytes> {
+        self.sections.peek_cloned(key)
+    }
+
+    fn touch(&mut self, key: &V2PayloadSectionCacheKey) {
+        self.sections.touch(key);
     }
 
     fn insert(&mut self, key: V2PayloadSectionCacheKey, payload: Bytes) {
@@ -1628,19 +1646,14 @@ impl V2PayloadSectionCache {
             return;
         }
 
-        match self.sections.entry(key.clone()) {
-            Entry::Occupied(mut entry) => {
-                let previous = u64::try_from(entry.get().len()).unwrap_or(u64::MAX);
+        match self.sections.insert(key, payload) {
+            Some(previous) => {
+                let previous = u64::try_from(previous.len()).unwrap_or(u64::MAX);
                 self.current_bytes = self.current_bytes.saturating_sub(previous);
                 self.current_bytes = self.current_bytes.saturating_add(bytes);
-                entry.insert(payload);
-                self.order.retain(|candidate| candidate != &key);
-                self.order.push_back(key);
             }
-            Entry::Vacant(entry) => {
+            None => {
                 self.current_bytes = self.current_bytes.saturating_add(bytes);
-                self.order.push_back(key);
-                entry.insert(payload);
             }
         }
 
@@ -1649,107 +1662,81 @@ impl V2PayloadSectionCache {
 
     fn evict_over_limits(&mut self) {
         while self.sections.len() > self.max_entries || self.current_bytes > self.max_bytes {
-            let Some(evicted_key) = self.order.pop_front() else {
+            let Some((_evicted_key, payload)) = self.sections.pop_lru() else {
                 break;
             };
-            if let Some(payload) = self.sections.remove(&evicted_key) {
-                let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-                self.current_bytes = self.current_bytes.saturating_sub(bytes);
-            }
+            let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+            self.current_bytes = self.current_bytes.saturating_sub(bytes);
         }
     }
 }
 
 #[derive(Debug)]
 struct V2CommitHeaderCache {
-    headers: BTreeMap<V2CommitHeaderCacheKey, V2ParsedCommitHeader>,
-    order: VecDeque<V2CommitHeaderCacheKey>,
+    headers: LruCache<V2CommitHeaderCacheKey, V2ParsedCommitHeader>,
     max_entries: usize,
 }
 
 impl Default for V2CommitHeaderCache {
     fn default() -> Self {
         Self {
-            headers: BTreeMap::new(),
-            order: VecDeque::new(),
+            headers: LruCache::new(),
             max_entries: 4096,
         }
     }
 }
 
 impl V2CommitHeaderCache {
-    fn get(&mut self, key: &V2CommitHeaderCacheKey) -> Option<V2ParsedCommitHeader> {
-        let header = self.headers.get(key).cloned()?;
-        self.order.retain(|candidate| candidate != key);
-        self.order.push_back(key.clone());
-        Some(header)
+    fn peek(&self, key: &V2CommitHeaderCacheKey) -> Option<V2ParsedCommitHeader> {
+        self.headers.peek_cloned(key)
+    }
+
+    fn touch(&mut self, key: &V2CommitHeaderCacheKey) {
+        self.headers.touch(key);
     }
 
     fn insert(&mut self, key: V2CommitHeaderCacheKey, header: V2ParsedCommitHeader) {
-        match self.headers.entry(key.clone()) {
-            Entry::Occupied(mut entry) => {
-                entry.insert(header);
-                self.order.retain(|candidate| candidate != &key);
-                self.order.push_back(key);
-            }
-            Entry::Vacant(entry) => {
-                self.order.push_back(key);
-                entry.insert(header);
-            }
-        }
+        self.headers.insert(key, header);
 
         while self.headers.len() > self.max_entries {
-            let Some(evicted_key) = self.order.pop_front() else {
+            if self.headers.pop_lru().is_none() {
                 break;
             };
-            self.headers.remove(&evicted_key);
         }
     }
 }
 
 #[derive(Debug)]
 struct V2PayloadHeaderCache {
-    headers: BTreeMap<V2PayloadSectionCacheKey, SegmentedPayloadHeader>,
-    order: VecDeque<V2PayloadSectionCacheKey>,
+    headers: LruCache<V2PayloadSectionCacheKey, SegmentedPayloadHeader>,
     max_entries: usize,
 }
 
 impl Default for V2PayloadHeaderCache {
     fn default() -> Self {
         Self {
-            headers: BTreeMap::new(),
-            order: VecDeque::new(),
+            headers: LruCache::new(),
             max_entries: 4096,
         }
     }
 }
 
 impl V2PayloadHeaderCache {
-    fn get(&mut self, key: &V2PayloadSectionCacheKey) -> Option<SegmentedPayloadHeader> {
-        let header = self.headers.get(key).cloned()?;
-        self.order.retain(|candidate| candidate != key);
-        self.order.push_back(key.clone());
-        Some(header)
+    fn peek(&self, key: &V2PayloadSectionCacheKey) -> Option<SegmentedPayloadHeader> {
+        self.headers.peek_cloned(key)
+    }
+
+    fn touch(&mut self, key: &V2PayloadSectionCacheKey) {
+        self.headers.touch(key);
     }
 
     fn insert(&mut self, key: V2PayloadSectionCacheKey, header: SegmentedPayloadHeader) {
-        match self.headers.entry(key.clone()) {
-            Entry::Occupied(mut entry) => {
-                entry.insert(header);
-                self.order.retain(|candidate| candidate != &key);
-                self.order.push_back(key);
-            }
-            Entry::Vacant(entry) => {
-                self.order.push_back(key);
-                entry.insert(header);
-            }
-        }
+        self.headers.insert(key, header);
 
         while self.headers.len() > self.max_entries {
-            let Some(evicted_key) = self.order.pop_front() else {
+            if self.headers.pop_lru().is_none() {
                 break;
             };
-            self.headers.remove(&evicted_key);
         }
     }
 }

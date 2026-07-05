@@ -2,6 +2,7 @@
 
 use crate::checkpoint::seal_manifest_record;
 use crate::error::{RepositoryError, Result};
+use crate::lru::LruCache;
 use crate::model::RepositoryObjectMetadata;
 use crate::namespace::{existing_blind_keys, first_namespace_entry, prefix_tokens_for_key};
 use crate::payload::{
@@ -19,7 +20,6 @@ use rs3_types::{
     BackendObjectId, BackendObjectRef, BackendVersionId, LegalHoldStatus, LogicalPath,
     RetentionMode, RetentionPolicy,
 };
-use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -165,32 +165,47 @@ where
             });
         }
 
-        let mut cache = self
-            .decrypted_segments
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)?;
         let mut segments = Vec::with_capacity(selection.segment_count);
         let mut bytes = 0_u64;
         let mut missing_segments = 0_u64;
         let mut missing_bytes = 0_u64;
-        for relative_index in 0..selection.segment_count {
-            let Some(segment_index) = selection.start_segment.checked_add(relative_index) else {
-                return Err(StorageError::InvalidRange.into());
-            };
-            match cache.get(object_ref, segment_index) {
-                Some(segment) => {
-                    bytes = bytes.saturating_add(u64::try_from(segment.len()).unwrap_or(u64::MAX));
-                    segments.push(segment);
-                }
-                None => {
-                    missing_segments = missing_segments.saturating_add(1);
-                    missing_bytes = missing_bytes
-                        .saturating_add(segmented_plaintext_segment_len(header, segment_index)?);
+
+        {
+            let cache = self
+                .decrypted_segments
+                .read()
+                .map_err(|_| RepositoryError::StatePoisoned)?;
+            for relative_index in 0..selection.segment_count {
+                let Some(segment_index) = selection.start_segment.checked_add(relative_index)
+                else {
+                    return Err(StorageError::InvalidRange.into());
+                };
+                match cache.peek(object_ref, segment_index) {
+                    Some(segment) => {
+                        bytes =
+                            bytes.saturating_add(u64::try_from(segment.len()).unwrap_or(u64::MAX));
+                        segments.push(segment);
+                    }
+                    None => {
+                        missing_segments = missing_segments.saturating_add(1);
+                        missing_bytes = missing_bytes.saturating_add(
+                            segmented_plaintext_segment_len(header, segment_index)?,
+                        );
+                    }
                 }
             }
         }
 
         if missing_segments == 0 {
+            if let Ok(mut cache) = self.decrypted_segments.try_write() {
+                for relative_index in 0..selection.segment_count {
+                    let Some(segment_index) = selection.start_segment.checked_add(relative_index)
+                    else {
+                        return Err(StorageError::InvalidRange.into());
+                    };
+                    cache.touch(object_ref, segment_index);
+                }
+            }
             Ok(DecryptedSegmentLookup::Hit { segments, bytes })
         } else {
             Ok(DecryptedSegmentLookup::Miss {
@@ -383,7 +398,7 @@ enum DecryptedSegmentLookup {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct PayloadCacheObjectKey {
     object_id: BackendObjectId,
     version_id: Option<BackendVersionId>,
@@ -398,7 +413,7 @@ impl From<&BackendObjectRef> for PayloadCacheObjectKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct DecryptedSegmentCacheKey {
     object: PayloadCacheObjectKey,
     segment_index: usize,
@@ -415,8 +430,7 @@ impl DecryptedSegmentCacheKey {
 
 #[derive(Debug)]
 struct DecryptedSegmentCache {
-    segments: BTreeMap<DecryptedSegmentCacheKey, Bytes>,
-    order: VecDeque<DecryptedSegmentCacheKey>,
+    segments: LruCache<DecryptedSegmentCacheKey, Bytes>,
     max_entries: usize,
     max_bytes: u64,
     current_bytes: u64,
@@ -431,19 +445,21 @@ impl Default for DecryptedSegmentCache {
 impl DecryptedSegmentCache {
     fn with_max_bytes(max_bytes: u64) -> Self {
         Self {
-            segments: BTreeMap::new(),
-            order: VecDeque::new(),
+            segments: LruCache::new(),
             max_entries: 65_536,
             max_bytes,
             current_bytes: 0,
         }
     }
 
-    fn get(&mut self, object_ref: &BackendObjectRef, segment_index: usize) -> Option<Bytes> {
+    fn peek(&self, object_ref: &BackendObjectRef, segment_index: usize) -> Option<Bytes> {
         let key = DecryptedSegmentCacheKey::new(object_ref, segment_index);
-        let segment = self.segments.get(&key).cloned()?;
-        self.touch(&key);
-        Some(segment)
+        self.segments.peek_cloned(&key)
+    }
+
+    fn touch(&mut self, object_ref: &BackendObjectRef, segment_index: usize) {
+        let key = DecryptedSegmentCacheKey::new(object_ref, segment_index);
+        self.segments.touch(&key);
     }
 
     fn insert(
@@ -458,18 +474,14 @@ impl DecryptedSegmentCache {
         }
 
         let key = DecryptedSegmentCacheKey::new(&object_ref, segment_index);
-        match self.segments.entry(key.clone()) {
-            Entry::Occupied(mut entry) => {
-                let previous = u64::try_from(entry.get().len()).unwrap_or(u64::MAX);
+        match self.segments.insert(key, plaintext) {
+            Some(previous) => {
+                let previous = u64::try_from(previous.len()).unwrap_or(u64::MAX);
                 self.current_bytes = self.current_bytes.saturating_sub(previous);
                 self.current_bytes = self.current_bytes.saturating_add(bytes);
-                entry.insert(plaintext);
-                self.touch(&key);
             }
-            Entry::Vacant(entry) => {
+            None => {
                 self.current_bytes = self.current_bytes.saturating_add(bytes);
-                self.order.push_back(key);
-                entry.insert(plaintext);
             }
         }
         let evicted = self.evict_over_limits();
@@ -480,25 +492,16 @@ impl DecryptedSegmentCache {
         }
     }
 
-    fn touch(&mut self, key: &DecryptedSegmentCacheKey) {
-        if let Some(position) = self.order.iter().position(|candidate| candidate == key) {
-            self.order.remove(position);
-        }
-        self.order.push_back(key.clone());
-    }
-
     fn evict_over_limits(&mut self) -> DecryptedSegmentCacheEviction {
         let mut evicted = DecryptedSegmentCacheEviction::default();
         while self.segments.len() > self.max_entries || self.current_bytes > self.max_bytes {
-            let Some(evicted_key) = self.order.pop_front() else {
+            let Some((_evicted_key, plaintext)) = self.segments.pop_lru() else {
                 break;
             };
-            if let Some(plaintext) = self.segments.remove(&evicted_key) {
-                let bytes = u64::try_from(plaintext.len()).unwrap_or(u64::MAX);
-                self.current_bytes = self.current_bytes.saturating_sub(bytes);
-                evicted.entries = evicted.entries.saturating_add(1);
-                evicted.bytes = evicted.bytes.saturating_add(bytes);
-            }
+            let bytes = u64::try_from(plaintext.len()).unwrap_or(u64::MAX);
+            self.current_bytes = self.current_bytes.saturating_sub(bytes);
+            evicted.entries = evicted.entries.saturating_add(1);
+            evicted.bytes = evicted.bytes.saturating_add(bytes);
         }
         evicted
     }
@@ -607,7 +610,6 @@ mod tests {
     use super::{DecryptedSegmentCache, DecryptedSegmentCacheInsert};
     use bytes::Bytes;
     use rs3_types::{BackendObjectId, BackendObjectRef};
-    use std::collections::{BTreeMap, VecDeque};
 
     fn object_id(value: &str) -> BackendObjectId {
         match BackendObjectId::new(value.to_owned()) {
@@ -617,13 +619,9 @@ mod tests {
     }
 
     fn decrypted_cache(max_entries: usize, max_bytes: u64) -> DecryptedSegmentCache {
-        DecryptedSegmentCache {
-            segments: BTreeMap::new(),
-            order: VecDeque::new(),
-            max_entries,
-            max_bytes,
-            current_bytes: 0,
-        }
+        let mut cache = DecryptedSegmentCache::with_max_bytes(max_bytes);
+        cache.max_entries = max_entries;
+        cache
     }
 
     fn decrypted_inserted(outcome: DecryptedSegmentCacheInsert) -> (u64, u64, u64) {
@@ -659,16 +657,17 @@ mod tests {
             decrypted_inserted(cache.insert(object.clone(), 1, Bytes::from_static(b"bbbb"))),
             (4, 0, 0)
         );
-        assert_eq!(cache.get(&object, 0), Some(Bytes::from_static(b"aaaa")));
+        assert_eq!(cache.peek(&object, 0), Some(Bytes::from_static(b"aaaa")));
+        cache.touch(&object, 0);
         assert_eq!(
             decrypted_inserted(cache.insert(object.clone(), 2, Bytes::from_static(b"cccc"))),
             (4, 1, 4)
         );
 
-        assert_eq!(cache.get(&object, 0), Some(Bytes::from_static(b"aaaa")));
-        assert!(cache.get(&object, 1).is_none());
-        assert_eq!(cache.get(&object, 2), Some(Bytes::from_static(b"cccc")));
-        assert!(cache.get(&other_version, 0).is_none());
+        assert_eq!(cache.peek(&object, 0), Some(Bytes::from_static(b"aaaa")));
+        assert!(cache.peek(&object, 1).is_none());
+        assert_eq!(cache.peek(&object, 2), Some(Bytes::from_static(b"cccc")));
+        assert!(cache.peek(&other_version, 0).is_none());
         assert_eq!(cache.current_bytes, 8);
     }
 
@@ -683,7 +682,7 @@ mod tests {
                 panic!("disabled decrypted segment cache inserted plaintext")
             }
         }
-        assert!(cache.get(&object, 0).is_none());
+        assert!(cache.peek(&object, 0).is_none());
         assert_eq!(cache.current_bytes, 0);
     }
 }
