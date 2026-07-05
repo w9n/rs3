@@ -28,6 +28,7 @@
             cargo
             cargo-audit
             cargo-deny
+            cargo-fuzz
             cargo-nextest
             clippy
             docker-client

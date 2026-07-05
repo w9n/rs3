@@ -11,3 +11,6 @@ result
 result-*
 /.local/
 /scratch/
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/target/

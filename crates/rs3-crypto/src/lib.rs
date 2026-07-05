@@ -6,6 +6,8 @@ mod derive;
 mod envelope;
 mod error;
 mod fingerprint;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 mod keyring;
 mod metadata;
 mod payload;

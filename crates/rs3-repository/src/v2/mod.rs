@@ -10,6 +10,8 @@ mod commit;
 mod coordinator;
 mod error;
 mod format;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 mod maintenance;
 mod provider;
 mod repository;

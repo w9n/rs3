@@ -211,3 +211,71 @@ impl<'a> Reader<'a> {
         Ok(bytes)
     }
 }
+
+#[cfg(feature = "fuzzing")]
+pub(super) fn fuzz_decode_one(input: &[u8]) -> CborResult<()> {
+    const MAX_DEPTH: usize = 16;
+
+    let mut reader = Reader::new(input);
+    fuzz_read_value(&mut reader, 0, MAX_DEPTH)?;
+    if reader.is_finished() {
+        Ok(())
+    } else {
+        Err(CborError::Invalid)
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_read_value(reader: &mut Reader<'_>, depth: usize, max_depth: usize) -> CborResult<()> {
+    const MAX_CONTAINER_ITEMS: usize = 1024;
+
+    if depth > max_depth {
+        return Err(CborError::Invalid);
+    }
+
+    let (major, additional) = reader.read_initial()?;
+    match major {
+        0 | 1 => reader.read_len(additional).map(|_| ()),
+        2 => {
+            let len =
+                usize::try_from(reader.read_len(additional)?).map_err(|_| CborError::Invalid)?;
+            reader.take(len).map(|_| ())
+        }
+        3 => {
+            let len =
+                usize::try_from(reader.read_len(additional)?).map_err(|_| CborError::Invalid)?;
+            let bytes = reader.take(len)?;
+            std::str::from_utf8(bytes)
+                .map(|_| ())
+                .map_err(|_| CborError::Invalid)
+        }
+        4 => {
+            let len =
+                usize::try_from(reader.read_len(additional)?).map_err(|_| CborError::Invalid)?;
+            if len > MAX_CONTAINER_ITEMS {
+                return Err(CborError::Invalid);
+            }
+            for _ in 0..len {
+                fuzz_read_value(reader, depth + 1, max_depth)?;
+            }
+            Ok(())
+        }
+        5 => {
+            let len =
+                usize::try_from(reader.read_len(additional)?).map_err(|_| CborError::Invalid)?;
+            if len > MAX_CONTAINER_ITEMS {
+                return Err(CborError::Invalid);
+            }
+            for _ in 0..len {
+                fuzz_read_value(reader, depth + 1, max_depth)?;
+                fuzz_read_value(reader, depth + 1, max_depth)?;
+            }
+            Ok(())
+        }
+        7 => match additional {
+            20..=22 => Ok(()),
+            _ => Err(CborError::Invalid),
+        },
+        _ => Err(CborError::Invalid),
+    }
+}

@@ -413,7 +413,7 @@ fn keyring_plaintext_bytes(keyring: &KeyRing) -> Result<Vec<u8>, CryptoError> {
     Ok(bytes)
 }
 
-fn decode_keyring_plaintext(plaintext: &[u8]) -> Result<KeyRing, CryptoError> {
+pub(crate) fn decode_keyring_plaintext(plaintext: &[u8]) -> Result<KeyRing, CryptoError> {
     let Some(json) = plaintext.strip_prefix(ENVELOPE_PLAINTEXT_DOMAIN) else {
         return Err(invalid_envelope("missing keyring plaintext domain"));
     };

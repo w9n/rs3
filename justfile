@@ -28,6 +28,33 @@ check-s3:
     cargo clippy -p rs3-storage -p rs3-server -p xtask --features rs3-server/s3,xtask/s3 --all-targets -- -D warnings
     cargo test -p rs3-storage -p rs3-server -p xtask --features rs3-server/s3,xtask/s3
 
+# Run backend-parser fuzz targets briefly for scheduled hardening.
+fuzz-smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    seconds="${RS3_FUZZ_SMOKE_SECONDS:-60}"
+    rss_limit_mb="${RS3_FUZZ_RSS_LIMIT_MB:-512}"
+    tmpdir="$(mktemp -d)"
+    trap 'rm -rf "${tmpdir}"' EXIT
+    RUSTC_BOOTSTRAP=1 cargo fuzz build --sanitizer none
+    pids=()
+    for target in v2_commit v2_cbor index_delta keyring_envelope restore_bundle; do
+      corpus="${tmpdir}/${target}"
+      mkdir -p "${corpus}"
+      if [[ -d "fuzz/corpus/${target}" ]]; then
+        cp -R "fuzz/corpus/${target}/." "${corpus}/"
+      fi
+      RUSTC_BOOTSTRAP=1 cargo fuzz run --sanitizer none "${target}" "${corpus}" -- -max_total_time="${seconds}" -rss_limit_mb="${rss_limit_mb}" &
+      pids+=("$!")
+    done
+    status=0
+    for pid in "${pids[@]}"; do
+      if ! wait "${pid}"; then
+        status=1
+      fi
+    done
+    exit "${status}"
+
 # Run a local filesystem-backed gateway with fixture credentials.
 serve-local:
     #!/usr/bin/env bash
@@ -73,6 +100,7 @@ preview-gate-release:
 # Expensive local v2 gate for scheduled CI or release-candidate hardening.
 preview-gate-v2-nightly:
     just check-s3
+    just fuzz-smoke
     just integration-s3-gateway --tooling-smoke
     just integration-kopia-gateway
     just integration-k8s-gateway-v2 --wait-secs 240

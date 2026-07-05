@@ -1,0 +1,25 @@
+{
+  "schema": "rs3.restore-bundle.v2-preview.v1",
+  "repository": {
+    "id": "repo-a",
+    "salt_digest": "0303030303030303030303030303030303030303030303030303030303030303"
+  },
+  "anchor": {
+    "sequence": 7,
+    "commit_key": "commits/v01/00000000000000000007/fuzz-seed",
+    "body_digest": "0808080808080808080808080808080808080808080808080808080808080808",
+    "version_id": "commit-version-1",
+    "signing_key_id": "signing",
+    "format": {
+      "generation": 1,
+      "digest": "0707070707070707070707070707070707070707070707070707070707070707",
+      "object_id": "format/00000000000000000001-fuzz",
+      "version_id": "format-version-1"
+    }
+  },
+  "weak_subjectivity_floor_sequence": 7,
+  "format_digest": "0707070707070707070707070707070707070707070707070707070707070707",
+  "format_generation": 1,
+  "exported_at_ms": 42,
+  "offline_signature": null
+}
