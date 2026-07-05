@@ -81,23 +81,11 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if not (gt (int64 .Values.hardening.maxPutObjectBytes) 0) -}}
 {{- fail "hardening.maxPutObjectBytes must be greater than zero" -}}
 {{- end -}}
-{{- if not (gt (int64 .Values.hardening.bufferedPutObjectBytes) 0) -}}
-{{- fail "hardening.bufferedPutObjectBytes must be greater than zero" -}}
-{{- end -}}
-{{- if gt (int64 .Values.hardening.bufferedPutObjectBytes) (int64 .Values.hardening.maxPutObjectBytes) -}}
-{{- fail "hardening.bufferedPutObjectBytes must be less than or equal to hardening.maxPutObjectBytes" -}}
-{{- end -}}
 {{- if lt (int64 .Values.hardening.backendMultipartPartBytes) 5242880 -}}
 {{- fail "hardening.backendMultipartPartBytes must be at least 5242880 bytes" -}}
 {{- end -}}
 {{- if not (gt (int64 .Values.hardening.maxInFlightUploadBodyBytes) 0) -}}
 {{- fail "hardening.maxInFlightUploadBodyBytes must be greater than zero" -}}
-{{- end -}}
-{{- if not (gt (int .Values.hardening.maxConcurrentConnections) 0) -}}
-{{- fail "hardening.maxConcurrentConnections must be greater than zero" -}}
-{{- end -}}
-{{- if not (gt (int .Values.hardening.maxConcurrentRequests) 0) -}}
-{{- fail "hardening.maxConcurrentRequests must be greater than zero" -}}
 {{- end -}}
 {{- if not (gt (int .Values.hardening.requestRateLimitPerSecond) 0) -}}
 {{- fail "hardening.requestRateLimitPerSecond must be greater than zero" -}}

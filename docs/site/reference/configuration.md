@@ -90,13 +90,10 @@ cluster resources.
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `RS3_MAX_PUT_OBJECT_BYTES` | no | `5368709120` | Maximum accepted single `PutObject` body. Requests with larger declared bodies fail before a repository commit is staged. |
-| `RS3_BUFFERED_PUT_OBJECT_BYTES` | no | `67108864` | Largest `PutObject` body buffered in process memory as a single repository write. Bodies above this threshold use backend multipart upload when supported; unknown-length bodies switch to streaming after the threshold is crossed. |
 | `RS3_BACKEND_MULTIPART_PART_BYTES` | no | `16777216` | Backend multipart part size for large `PutObject` writes. S3-compatible backends require at least `5242880` bytes. |
 | `RS3_STREAM_READ_STALL_TIMEOUT_SECS` | no | `30` | Maximum idle time between chunks while the gateway streams a large `PutObject` request body into a backend multipart commit. Stalled streams fail as incomplete request bodies. |
 | `RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES` | no | `536870912` | Admission budget for request body bytes held by in-flight upload operations. Buffered uploads reserve their full collected body; streaming uploads reserve a bounded working set, not a hard RSS cap for every HTTP chunk. Excess uploads fail with S3 `SlowDown`. |
 | `RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES` | no | `536870912` | Admission budget for response body bytes held by in-flight download operations. Full-object and ranged `GetObject` responses reserve their resolved response length until the response body is dropped. Excess downloads fail with S3 `SlowDown`. |
-| `RS3_MAX_CONCURRENT_CONNECTIONS` | no | `1024` | Maximum simultaneously open S3 listener connections accepted by the process. Additional connections are dropped. |
-| `RS3_MAX_CONCURRENT_REQUESTS` | no | `256` | Maximum concurrently executing S3 operations. Additional operations fail with S3 `SlowDown`. |
 | `RS3_REQUEST_RATE_LIMIT_PER_SECOND` | no | `1024` | Per-process S3 operation admission rate. Bursts up to one second of capacity are allowed; excess operations fail with S3 `SlowDown`. |
 
 ## Backend Storage

@@ -501,14 +501,6 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
             DEFAULT_MAX_PUT_OBJECT_BYTES,
         ),
     );
-    let buffered_put_object_bytes = collect_config_error(
-        &mut errors,
-        parse_positive_u64(
-            "RS3_BUFFERED_PUT_OBJECT_BYTES",
-            source.value("RS3_BUFFERED_PUT_OBJECT_BYTES"),
-            DEFAULT_BUFFERED_PUT_OBJECT_BYTES,
-        ),
-    );
     let backend_multipart_part_bytes = collect_config_error(
         &mut errors,
         parse_positive_u64(
@@ -517,16 +509,6 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
             DEFAULT_BACKEND_MULTIPART_PART_BYTES,
         ),
     );
-    if let (Some(buffered_put_object_bytes), Some(max_put_object_bytes)) =
-        (buffered_put_object_bytes, max_put_object_bytes)
-        && buffered_put_object_bytes > max_put_object_bytes
-    {
-        errors.push(ConfigError::Invalid {
-            key: "RS3_BUFFERED_PUT_OBJECT_BYTES",
-            value: buffered_put_object_bytes.to_string(),
-            reason: "must be less than or equal to RS3_MAX_PUT_OBJECT_BYTES".to_owned(),
-        });
-    }
     if let Some(backend_multipart_part_bytes) = backend_multipart_part_bytes
         && backend_multipart_part_bytes < MIN_BACKEND_MULTIPART_PART_BYTES
     {
@@ -574,22 +556,6 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
             DEFAULT_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES,
         ),
     );
-    let max_concurrent_connections = collect_config_error(
-        &mut errors,
-        parse_positive_usize(
-            "RS3_MAX_CONCURRENT_CONNECTIONS",
-            source.value("RS3_MAX_CONCURRENT_CONNECTIONS"),
-            DEFAULT_MAX_CONCURRENT_CONNECTIONS,
-        ),
-    );
-    let max_concurrent_requests = collect_config_error(
-        &mut errors,
-        parse_positive_usize(
-            "RS3_MAX_CONCURRENT_REQUESTS",
-            source.value("RS3_MAX_CONCURRENT_REQUESTS"),
-            DEFAULT_MAX_CONCURRENT_REQUESTS,
-        ),
-    );
     let request_rate_limit_per_second = collect_config_error(
         &mut errors,
         parse_positive_u64(
@@ -605,15 +571,15 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
 
     Ok(HardeningConfig {
         max_put_object_bytes: require_collected_config(max_put_object_bytes)?,
-        buffered_put_object_bytes: require_collected_config(buffered_put_object_bytes)?,
+        buffered_put_object_bytes: DEFAULT_BUFFERED_PUT_OBJECT_BYTES,
         backend_multipart_part_bytes: require_collected_config(backend_multipart_part_bytes)?,
         stream_read_stall_timeout: require_collected_config(stream_read_stall_timeout)?,
         max_in_flight_upload_body_bytes: require_collected_config(max_in_flight_upload_body_bytes)?,
         max_in_flight_download_body_bytes: require_collected_config(
             max_in_flight_download_body_bytes,
         )?,
-        max_concurrent_connections: require_collected_config(max_concurrent_connections)?,
-        max_concurrent_requests: require_collected_config(max_concurrent_requests)?,
+        max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+        max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
         request_rate_limit_per_second: require_collected_config(request_rate_limit_per_second)?,
     })
 }
@@ -1369,13 +1335,10 @@ mod tests {
     fn parses_hardening_limits() {
         let source = minimal_source()
             .with("RS3_MAX_PUT_OBJECT_BYTES", "8388608")
-            .with("RS3_BUFFERED_PUT_OBJECT_BYTES", "1048576")
             .with("RS3_BACKEND_MULTIPART_PART_BYTES", "5242880")
             .with("RS3_STREAM_READ_STALL_TIMEOUT_SECS", "2")
             .with("RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES", "2097152")
             .with("RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES", "3145728")
-            .with("RS3_MAX_CONCURRENT_CONNECTIONS", "32")
-            .with("RS3_MAX_CONCURRENT_REQUESTS", "16")
             .with("RS3_REQUEST_RATE_LIMIT_PER_SECOND", "128");
 
         let config = RuntimeConfig::from_source(&source);
@@ -1384,13 +1347,13 @@ mod tests {
             config.map(|config| config.hardening),
             Ok(HardeningConfig {
                 max_put_object_bytes: 8_388_608,
-                buffered_put_object_bytes: 1_048_576,
+                buffered_put_object_bytes: super::DEFAULT_BUFFERED_PUT_OBJECT_BYTES,
                 backend_multipart_part_bytes: 5_242_880,
                 stream_read_stall_timeout: Duration::from_secs(2),
                 max_in_flight_upload_body_bytes: 2_097_152,
                 max_in_flight_download_body_bytes: 3_145_728,
-                max_concurrent_connections: 32,
-                max_concurrent_requests: 16,
+                max_concurrent_connections: super::DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+                max_concurrent_requests: super::DEFAULT_MAX_CONCURRENT_REQUESTS,
                 request_rate_limit_per_second: 128,
             })
         );
@@ -1400,13 +1363,10 @@ mod tests {
     fn rejects_zero_hardening_limits() {
         for key in [
             "RS3_MAX_PUT_OBJECT_BYTES",
-            "RS3_BUFFERED_PUT_OBJECT_BYTES",
             "RS3_BACKEND_MULTIPART_PART_BYTES",
             "RS3_STREAM_READ_STALL_TIMEOUT_SECS",
             "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES",
             "RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES",
-            "RS3_MAX_CONCURRENT_CONNECTIONS",
-            "RS3_MAX_CONCURRENT_REQUESTS",
             "RS3_REQUEST_RATE_LIMIT_PER_SECOND",
         ] {
             let source = minimal_source().with(key, "0");
@@ -1421,15 +1381,6 @@ mod tests {
 
     #[test]
     fn rejects_invalid_hardening_relationships() {
-        let buffered = RuntimeConfig::from_source(
-            &minimal_source()
-                .with("RS3_MAX_PUT_OBJECT_BYTES", "1024")
-                .with("RS3_BUFFERED_PUT_OBJECT_BYTES", "2048"),
-        );
-        assert!(
-            matches!(buffered, Err(ConfigError::Invalid { key, .. }) if key == "RS3_BUFFERED_PUT_OBJECT_BYTES")
-        );
-
         let part = RuntimeConfig::from_source(
             &minimal_source().with("RS3_BACKEND_MULTIPART_PART_BYTES", "1048576"),
         );
@@ -1848,7 +1799,7 @@ mod tests {
             .without(super::REPOSITORY_ID_ENV)
             .with("RS3_GATEWAY_MODE", "readonly")
             .with("RS3_METRICS_BIND", "nope")
-            .with("RS3_MAX_CONCURRENT_REQUESTS", "0")
+            .with("RS3_REQUEST_RATE_LIMIT_PER_SECOND", "0")
             .with("RS3_COMMIT_MAX_BATCH_ITEMS", "0")
             .with(super::REPOSITORY_FORMAT_ENV, "stable")
             .with(super::KEYRING_WRAPPING_KEY_HEX_ENV, "not-hex")
@@ -1867,7 +1818,7 @@ mod tests {
             super::REPOSITORY_ID_ENV,
             "RS3_GATEWAY_MODE",
             "RS3_METRICS_BIND",
-            "RS3_MAX_CONCURRENT_REQUESTS",
+            "RS3_REQUEST_RATE_LIMIT_PER_SECOND",
             "RS3_COMMIT_MAX_BATCH_ITEMS",
             super::REPOSITORY_FORMAT_ENV,
             super::KEYRING_WRAPPING_KEY_HEX_ENV,

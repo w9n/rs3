@@ -61,16 +61,10 @@ spec:
               value: {{ .Values.gateway.mode | quote }}
             - name: RS3_MAX_PUT_OBJECT_BYTES
               value: {{ printf "%d" (int64 .Values.hardening.maxPutObjectBytes) | quote }}
-            - name: RS3_BUFFERED_PUT_OBJECT_BYTES
-              value: {{ printf "%d" (int64 .Values.hardening.bufferedPutObjectBytes) | quote }}
             - name: RS3_BACKEND_MULTIPART_PART_BYTES
               value: {{ printf "%d" (int64 .Values.hardening.backendMultipartPartBytes) | quote }}
             - name: RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES
               value: {{ printf "%d" (int64 .Values.hardening.maxInFlightUploadBodyBytes) | quote }}
-            - name: RS3_MAX_CONCURRENT_CONNECTIONS
-              value: {{ .Values.hardening.maxConcurrentConnections | quote }}
-            - name: RS3_MAX_CONCURRENT_REQUESTS
-              value: {{ .Values.hardening.maxConcurrentRequests | quote }}
             - name: RS3_REQUEST_RATE_LIMIT_PER_SECOND
               value: {{ .Values.hardening.requestRateLimitPerSecond | quote }}
             - name: RS3_PUBLIC_BUCKET

@@ -62,11 +62,8 @@ gateway:
 # checking backend compatibility and memory budgets.
 hardening:
   maxPutObjectBytes: 5368709120
-  bufferedPutObjectBytes: 67108864
   backendMultipartPartBytes: 16777216
   maxInFlightUploadBodyBytes: 536870912
-  maxConcurrentConnections: 1024
-  maxConcurrentRequests: 256
   requestRateLimitPerSecond: 1024
 
 # Public S3 bucket name presented to backup clients. This is not the backend
