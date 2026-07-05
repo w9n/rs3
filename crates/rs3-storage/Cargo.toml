@@ -10,6 +10,7 @@ description = "Object-store abstraction for rs3"
 
 [features]
 default = []
+test-util = []
 s3 = [
   "dep:aws-config",
   "dep:aws-sdk-s3",

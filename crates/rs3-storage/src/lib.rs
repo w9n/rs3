@@ -1,5 +1,7 @@
 //! Provider-neutral object-store abstractions.
 
+#[cfg(feature = "test-util")]
+mod fault;
 mod filesystem;
 #[cfg(feature = "s3")]
 mod s3;
@@ -14,6 +16,11 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+#[cfg(feature = "test-util")]
+pub use fault::{
+    FaultAction, FaultCrashHook, FaultEvent, FaultInjectingBlobStore, FaultMatcher,
+    FaultOperationKind, FaultRule,
+};
 pub use filesystem::FilesystemBlobStore;
 #[cfg(feature = "s3")]
 pub use s3::{S3BlobStore, S3BlobStoreConfig, S3ProviderMetrics, S3ProviderOperationMetrics};

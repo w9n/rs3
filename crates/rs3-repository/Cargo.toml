@@ -35,6 +35,7 @@ tracing.workspace = true
 async-trait.workspace = true
 proptest.workspace = true
 rs3-crypto = { workspace = true, features = ["test-util"] }
+rs3-storage = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

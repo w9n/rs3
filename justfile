@@ -55,6 +55,10 @@ fuzz-smoke:
     done
     exit "${status}"
 
+# Run the full deterministic storage fault-injection sweep.
+fault-injection-sweep:
+    RS3_FAULT_INJECTION_FULL_SWEEP=1 cargo test -p rs3-repository --test fault_injection
+
 # Run a local filesystem-backed gateway with fixture credentials.
 serve-local:
     #!/usr/bin/env bash
@@ -101,6 +105,7 @@ preview-gate-release:
 preview-gate-v2-nightly:
     just check-s3
     just fuzz-smoke
+    just fault-injection-sweep
     just integration-s3-gateway --tooling-smoke
     just integration-kopia-gateway
     just integration-k8s-gateway-v2 --wait-secs 240
