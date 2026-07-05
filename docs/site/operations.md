@@ -18,9 +18,19 @@ For production posture checks:
 cargo run -p rs3-server -- doctor --profile production
 ```
 
+To also check live dependencies, opt into probes:
+
+```sh
+cargo run -p rs3-server -- doctor --profile production --probe
+```
+
 The production profile rejects memory anchors, retention-unsupported local
 backends, plaintext S3-compatible backend endpoints, missing gateway
 credentials, and missing repository retention for mutation-capable serving.
+Every finding includes a remediation hint. Probe mode additionally checks
+backend reachability, v2 anchor readability (including Kubernetes Lease access
+when configured), and keyring envelope readability without printing backend
+object names or configured Kubernetes object names.
 
 The gateway enforces finite data-plane limits from its own configuration:
 maximum `PutObject` body size, buffered-body threshold, backend multipart part

@@ -218,13 +218,16 @@ Use:
 ```sh
 cargo run -p rs3-server -- doctor
 cargo run -p rs3-server -- doctor --profile production
+cargo run -p rs3-server -- doctor --profile production --probe
 ```
 
 The local profile validates runtime configuration and redacts secrets in debug
 output. The production profile also rejects memory anchors,
 retention-unsupported local backends, plaintext S3-compatible backend
 endpoints, missing gateway credentials, and missing repository retention for
-mutation-capable serving.
+mutation-capable serving. Findings include remediation hints. The opt-in
+`--probe` mode also checks backend reachability, v2 anchor readability, and
+keyring envelope readability.
 
 ## Helm Repository Keys
 

@@ -14,7 +14,7 @@ use rs3_server::{
     RuntimeV2ProviderConformanceOptions, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions,
     V2AnchorImportReport, V2ProviderCheckConfig, V2RecoveryBundleVerificationOptions,
     V2RecoveryBundleVerificationReport, V2RepositoryInitReport, WriterGuardConfig, backend_kind,
-    check_v2_provider_conformance_from_provider_config, doctor_findings,
+    check_v2_provider_conformance_from_provider_config, doctor_findings, doctor_probe_from_config,
     export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
     init_v2_repository_from_config, inspect_keyring_envelope_from_tool_config,
     rewrap_keyring_envelope_from_tool_config, runtime_config_profile,
@@ -87,6 +87,9 @@ enum Commands {
     Doctor {
         #[arg(long, env = "RS3_DOCTOR_PROFILE", value_enum, default_value_t = DoctorProfile::Local)]
         profile: DoctorProfile,
+        /// Also probe live backend, anchor, and keyring-envelope dependencies.
+        #[arg(long)]
+        probe: bool,
     },
     /// Export a signed restore bundle for offline recovery.
     ExportRestoreBundle {
@@ -313,10 +316,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Doctor { profile } => {
+        Commands::Doctor { profile, probe } => {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
-            run_doctor(&config, profile)?;
+            run_doctor(&config, profile, probe).await?;
         }
         Commands::ExportRestoreBundle { format } => {
             let config = RuntimeConfig::from_env()?;
@@ -1067,20 +1070,47 @@ fn retention_json(retention: rs3_types::RetentionPolicy) -> serde_json::Value {
     })
 }
 
-fn run_doctor(config: &RuntimeConfig, profile: DoctorProfile) -> Result<()> {
+async fn run_doctor(config: &RuntimeConfig, profile: DoctorProfile, probe: bool) -> Result<()> {
     let findings = doctor_findings(config, profile.into());
-    if findings.is_empty() {
+    let probe_report = if probe {
+        Some(doctor_probe_from_config(config).await)
+    } else {
+        None
+    };
+
+    for finding in &findings {
+        eprintln!(
+            "rs3 doctor [{}]: {}; remediation: {}",
+            finding.code, finding.message, finding.remediation
+        );
+    }
+
+    if let Some(probe_report) = &probe_report {
+        for check in &probe_report.checks {
+            if check.is_passed() {
+                println!("rs3 doctor probe [{}]: ok", check.code);
+            } else {
+                eprintln!(
+                    "rs3 doctor probe [{}]: {}; remediation: {}",
+                    check.code, check.message, check.remediation
+                );
+            }
+        }
+    }
+
+    let probe_failure_count = probe_report
+        .as_ref()
+        .map_or(0, |probe_report| probe_report.failed_count());
+    let finding_count = findings.len() + probe_failure_count;
+    if finding_count == 0 {
         println!("rs3 doctor: {} profile ok", profile.as_str());
         return Ok(());
     }
 
-    for finding in &findings {
-        eprintln!("rs3 doctor [{}]: {}", finding.code, finding.message);
-    }
     anyhow::bail!(
         "rs3 doctor: {} profile failed with {} finding(s)",
         profile.as_str(),
-        findings.len()
+        finding_count
     )
 }
 

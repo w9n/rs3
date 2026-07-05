@@ -68,6 +68,66 @@ pub struct V2RepositoryInitReport {
     pub verified_commit_count: usize,
 }
 
+/// Result of an opt-in live doctor probe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DoctorProbeReport {
+    /// Individual path-redacted probe checks.
+    pub checks: Vec<DoctorProbeCheck>,
+}
+
+impl DoctorProbeReport {
+    /// True when every probe passed.
+    pub fn passed(&self) -> bool {
+        self.checks.iter().all(DoctorProbeCheck::is_passed)
+    }
+
+    /// Count of failed probe checks.
+    pub fn failed_count(&self) -> usize {
+        self.checks
+            .iter()
+            .filter(|check| !check.is_passed())
+            .count()
+    }
+}
+
+/// Single path-redacted doctor probe result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DoctorProbeCheck {
+    /// Stable probe code.
+    pub code: &'static str,
+    /// True when the live check succeeded.
+    pub passed: bool,
+    /// Operator-facing probe message.
+    pub message: &'static str,
+    /// Operator-facing remediation hint for failed probes.
+    pub remediation: &'static str,
+}
+
+impl DoctorProbeCheck {
+    fn ok(code: &'static str, message: &'static str) -> Self {
+        Self {
+            code,
+            passed: true,
+            message,
+            remediation: "",
+        }
+    }
+
+    fn failed(code: &'static str, message: &'static str, remediation: &'static str) -> Self {
+        Self {
+            code,
+            passed: false,
+            message,
+            remediation,
+        }
+    }
+
+    /// True when the probe passed.
+    pub fn is_passed(&self) -> bool {
+        self.passed
+    }
+}
+
 /// Operator-provided options for v2 anchor import.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V2AnchorImportOptions {
@@ -404,6 +464,106 @@ pub async fn init_v2_repository_from_config(
         initialized: runtime.initialized,
         verified_commit_count: chain.commits_newest_first.len(),
     })
+}
+
+/// Runs opt-in live doctor probes against configured runtime dependencies.
+pub async fn doctor_probe_from_config(config: &RuntimeConfig) -> DoctorProbeReport {
+    let mut checks = Vec::new();
+
+    let store = match build_store(&config.backend).await {
+        Ok(store) => match store.handle().list_prefix("").await {
+            Ok(_) => {
+                checks.push(DoctorProbeCheck::ok(
+                    "probe.backend-reachable",
+                    "backend reachability probe passed",
+                ));
+                Some(store)
+            }
+            Err(_) => {
+                checks.push(DoctorProbeCheck::failed(
+                    "probe.backend-reachable",
+                    "backend reachability probe failed",
+                    "check backend endpoint, credentials, bucket, and network access, then rerun rs3 doctor --probe",
+                ));
+                None
+            }
+        },
+        Err(_) => {
+            checks.push(DoctorProbeCheck::failed(
+                "probe.backend-reachable",
+                "backend reachability probe failed",
+                "check backend endpoint, credentials, bucket, and network access, then rerun rs3 doctor --probe",
+            ));
+            None
+        }
+    };
+
+    let mut anchor_was_read = false;
+    let anchor_state = match build_v2_anchor(&config.anchor) {
+        Ok(anchor) => match anchor.handle().read_v2().await {
+            Ok(state) => {
+                anchor_was_read = true;
+                checks.push(DoctorProbeCheck::ok(
+                    "probe.anchor-readable",
+                    "v2 anchor read probe passed",
+                ));
+                state
+            }
+            Err(_) => {
+                checks.push(DoctorProbeCheck::failed(
+                    "probe.anchor-readable",
+                    "v2 anchor read probe failed",
+                    "check Kubernetes Lease access and anchor configuration, then rerun rs3 doctor --probe",
+                ));
+                None
+            }
+        },
+        Err(_) => {
+            checks.push(DoctorProbeCheck::failed(
+                "probe.anchor-readable",
+                "v2 anchor read probe failed",
+                "check Kubernetes Lease access and anchor configuration, then rerun rs3 doctor --probe",
+            ));
+            None
+        }
+    };
+
+    let keyring_result = match store.as_ref() {
+        Some(store) if anchor_was_read => match anchor_state.as_ref() {
+            Some(anchor_state) => load_existing_v2_repository(
+                store.handle(),
+                &config.repository_keys,
+                anchor_state,
+                config,
+            )
+            .await
+            .map(|_| ()),
+            None => unanchored_gateway_keyring(
+                store.handle(),
+                &config.repository_keys,
+                config.repository.retention,
+                false,
+            )
+            .await
+            .map(|_| ()),
+        },
+        _ => Err(repository_init(
+            "keyring envelope probe requires readable backend and anchor dependencies",
+        )),
+    };
+    match keyring_result {
+        Ok(()) => checks.push(DoctorProbeCheck::ok(
+            "probe.keyring-readable",
+            "keyring envelope readability probe passed",
+        )),
+        Err(_) => checks.push(DoctorProbeCheck::failed(
+            "probe.keyring-readable",
+            "keyring envelope readability probe failed",
+            "check repository ID, salt, wrapping key ID, wrapping key material, accepted anchor, and keyring envelope object configuration",
+        )),
+    }
+
+    DoctorProbeReport { checks }
 }
 
 pub(crate) async fn v2_quick_maintenance_from_config(
@@ -987,9 +1147,9 @@ mod tests {
     use super::super::runtime_handles::RuntimeStore;
     use super::super::runtime_keyring::unanchored_gateway_keyring;
     use super::{
-        RuntimeRepository, V2ProviderProfile, V2RecoveryBundle, init_v2_repository_from_config,
-        reject_import_stranding_newer_commits, reject_v2_bootstrap_with_foreign_objects,
-        verify_recovery_bundle_trust,
+        RuntimeRepository, V2ProviderProfile, V2RecoveryBundle, doctor_probe_from_config,
+        init_v2_repository_from_config, reject_import_stranding_newer_commits,
+        reject_v2_bootstrap_with_foreign_objects, verify_recovery_bundle_trust,
     };
     #[cfg(not(feature = "k8s"))]
     use crate::AnchorConfig;
@@ -1065,6 +1225,32 @@ mod tests {
         assert!(report.initialized);
         assert_eq!(report.anchor.sequence, Sequence::new(1));
         assert_eq!(report.verified_commit_count, 1);
+    }
+
+    #[tokio::test]
+    async fn doctor_probe_checks_backend_anchor_and_keyring_readability() {
+        let report = doctor_probe_from_config(&runtime_config(false)).await;
+        let backend = report
+            .checks
+            .iter()
+            .find(|check| check.code == "probe.backend-reachable")
+            .unwrap_or_else(|| panic!("missing backend probe"));
+        let anchor = report
+            .checks
+            .iter()
+            .find(|check| check.code == "probe.anchor-readable")
+            .unwrap_or_else(|| panic!("missing anchor probe"));
+        let keyring = report
+            .checks
+            .iter()
+            .find(|check| check.code == "probe.keyring-readable")
+            .unwrap_or_else(|| panic!("missing keyring probe"));
+
+        assert!(backend.is_passed());
+        assert!(anchor.is_passed());
+        assert!(!keyring.is_passed());
+        assert!(!keyring.remediation.is_empty());
+        assert_eq!(report.failed_count(), 1);
     }
 
     #[tokio::test]

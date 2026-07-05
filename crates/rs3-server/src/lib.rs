@@ -31,16 +31,16 @@ pub use identity::{
     StaticCredentials,
 };
 pub use s3::{
-    GatewayS3Boundary, KeyringEnvelopeInspectOptions, KeyringEnvelopeInspectReport,
-    KeyringEnvelopeRewrapOptions, KeyringEnvelopeRewrapReport, RuntimeV2ProviderConformanceOptions,
-    S3BoundaryError, S3Hardening, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions,
-    V2AnchorImportReport, V2RecoveryBundleVerificationOptions, V2RecoveryBundleVerificationReport,
-    V2RepositoryInitReport, check_v2_provider_conformance_from_config,
-    check_v2_provider_conformance_from_provider_config, export_v2_recovery_bundle_from_config,
-    import_v2_anchor_from_config, init_v2_repository_from_config,
-    inspect_keyring_envelope_from_tool_config, inspect_keyring_envelope_with_store,
-    rewrap_keyring_envelope_from_tool_config, rewrap_keyring_envelope_with_store,
-    verify_v2_recovery_bundle_from_tool_config, verify_v2_recovery_bundle_with_store,
-    write_v2_index_snapshot_from_config,
+    DoctorProbeCheck, DoctorProbeReport, GatewayS3Boundary, KeyringEnvelopeInspectOptions,
+    KeyringEnvelopeInspectReport, KeyringEnvelopeRewrapOptions, KeyringEnvelopeRewrapReport,
+    RuntimeV2ProviderConformanceOptions, S3BoundaryError, S3Hardening, V2_RESTORE_BUNDLE_SCHEMA,
+    V2AnchorImportOptions, V2AnchorImportReport, V2RecoveryBundleVerificationOptions,
+    V2RecoveryBundleVerificationReport, V2RepositoryInitReport,
+    check_v2_provider_conformance_from_config, check_v2_provider_conformance_from_provider_config,
+    doctor_probe_from_config, export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
+    init_v2_repository_from_config, inspect_keyring_envelope_from_tool_config,
+    inspect_keyring_envelope_with_store, rewrap_keyring_envelope_from_tool_config,
+    rewrap_keyring_envelope_with_store, verify_v2_recovery_bundle_from_tool_config,
+    verify_v2_recovery_bundle_with_store, write_v2_index_snapshot_from_config,
 };
 pub use server::{GatewayServer, GatewayServerError};

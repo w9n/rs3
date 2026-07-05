@@ -329,7 +329,8 @@ For a production-preview deployment:
   connections, concurrent requests, and request rate; align ingress limits with
   them
 - use `gateway.mode=restore-readonly` for incident restore deployments
-- run `rs3-server doctor --profile production` before exposing the gateway
+- run `rs3-server doctor --profile production --probe` before exposing the
+  gateway
 - keep restore verification inputs outside the object-store trust boundary
 - collect metrics and logs with path-safe labels only
 - treat wrapping-key rewrap as hygiene, not as recovery from a leaked wrapping

@@ -340,14 +340,17 @@ pub struct AdminFinding {
     pub code: &'static str,
     /// Operator-facing finding message.
     pub message: &'static str,
+    /// Operator-facing remediation hint.
+    pub remediation: &'static str,
 }
 
 impl AdminFinding {
-    fn error(code: &'static str, message: &'static str) -> Self {
+    fn error(code: &'static str, message: &'static str, remediation: &'static str) -> Self {
         Self {
             severity: "error",
             code,
             message,
+            remediation,
         }
     }
 }
@@ -558,6 +561,7 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         findings.push(AdminFinding::error(
             "anchor.memory",
             "production profile requires a durable external v2 commit anchor",
+            "configure RS3_ANCHOR_MODE=kubernetes-lease before exposing the gateway",
         ));
     }
 
@@ -565,6 +569,7 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         findings.push(AdminFinding::error(
             "retention.missing",
             "production profile requires repository retention",
+            "set RS3_REPOSITORY_RETENTION_MODE and RS3_REPOSITORY_RETENTION_DAYS for mutation-capable production serving",
         ));
     }
 
@@ -572,6 +577,7 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         findings.push(AdminFinding::error(
             "repository.init-enabled",
             "production profile requires RS3_ALLOW_REPOSITORY_INIT=false outside deliberate bootstrap",
+            "run rs3 init for bootstrap, then set RS3_ALLOW_REPOSITORY_INIT=false before serving",
         ));
     }
 
@@ -579,14 +585,17 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         "memory" => findings.push(AdminFinding::error(
             "backend.memory",
             "production profile requires a durable object-store backend",
+            "set RS3_BACKEND_ENDPOINT to a durable S3-compatible backend",
         )),
         "filesystem" => findings.push(AdminFinding::error(
             "retention.backend-unsupported",
             "filesystem backend cannot enforce provider retention",
+            "use an S3-compatible backend with object-lock retention for production evidence",
         )),
         "unknown" => findings.push(AdminFinding::error(
             "backend.unknown",
             "configured backend is not supported by the gateway runtime",
+            "set RS3_BACKEND_ENDPOINT to memory://local, file://..., s3://aws, or an HTTPS S3-compatible endpoint",
         )),
         "s3-compatible" => {}
         _ => {}
@@ -596,6 +605,7 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         findings.push(AdminFinding::error(
             "backend.plain-http",
             "production profile requires TLS for S3-compatible backend endpoints",
+            "use an HTTPS S3-compatible backend endpoint",
         ));
     }
 
@@ -603,6 +613,7 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         findings.push(AdminFinding::error(
             "auth.credentials-missing",
             "production profile requires configured gateway credentials",
+            "set RS3_STATIC_ACCESS_KEY_ID and RS3_STATIC_SECRET_ACCESS_KEY before serving S3",
         ));
     }
 
@@ -610,6 +621,7 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         findings.push(AdminFinding::error(
             "recovery.public-key",
             "production profile requires RS3_RECOVERY_PUBLIC_KEY for signed restore bundles",
+            "configure RS3_RECOVERY_PUBLIC_KEY with the trusted offline signing key before production restore workflows",
         ));
     }
 
@@ -1071,6 +1083,11 @@ mod tests {
         assert!(codes.contains(&"auth.credentials-missing"));
         assert!(codes.contains(&"recovery.public-key"));
         assert!(codes.contains(&"repository.init-enabled"));
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.remediation.is_empty())
+        );
     }
 
     #[test]
