@@ -1,8 +1,11 @@
 //! Authenticated HTTP listener for path-redacted gateway admin facts.
 
+use crate::admin::{
+    admin_maintenance_summary, admin_status_report_with_runtime_facts_and_maintenance,
+};
 use crate::{
-    AdminReportProfile, AdminRuntimeFacts, AdminRuntimeFactsSource, RuntimeConfig,
-    admin_posture_report_with_runtime_facts, admin_status_report_with_runtime_facts,
+    AdminMaintenanceSummary, AdminReportProfile, AdminRuntimeFacts, AdminRuntimeFactsSource,
+    RuntimeConfig, admin_posture_report_with_runtime_facts,
 };
 use bytes::Bytes;
 use http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, WWW_AUTHENTICATE};
@@ -22,10 +25,10 @@ use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
@@ -33,6 +36,7 @@ const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_millis(20);
 const MAX_ADMIN_CONNECTION_LIFETIME: Duration = Duration::from_secs(60);
+const MAINTENANCE_SUMMARY_TTL: Duration = Duration::from_secs(60);
 const MAX_ADMIN_CONNECTIONS: usize = 64;
 const ADMIN_REALM: &str = "Bearer realm=\"rs3-admin\"";
 
@@ -145,6 +149,8 @@ pub struct AdminHttpService {
     auth: AdminHttpAuth,
     profile: AdminReportProfile,
     runtime_facts: Option<Arc<dyn AdminRuntimeFactsSource>>,
+    process_started_at_ms: i64,
+    maintenance_cache: Arc<Mutex<Option<AdminMaintenanceSummary>>>,
 }
 
 impl AdminHttpService {
@@ -155,6 +161,8 @@ impl AdminHttpService {
             auth,
             profile,
             runtime_facts: None,
+            process_started_at_ms: current_time_ms(),
+            maintenance_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -170,6 +178,8 @@ impl AdminHttpService {
             auth,
             profile,
             runtime_facts: Some(runtime_facts),
+            process_started_at_ms: current_time_ms(),
+            maintenance_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -200,10 +210,12 @@ impl AdminHttpService {
             }
             (Method::GET, "/admin/status") => {
                 let runtime_facts = self.runtime_facts();
-                let report = admin_status_report_with_runtime_facts(
+                let maintenance = self.cached_maintenance_summary().await;
+                let report = admin_status_report_with_runtime_facts_and_maintenance(
                     &self.config,
                     self.profile,
                     &runtime_facts,
+                    maintenance,
                 )
                 .await;
                 json_response(StatusCode::OK, report)
@@ -220,9 +232,27 @@ impl AdminHttpService {
     }
 
     fn runtime_facts(&self) -> AdminRuntimeFacts {
-        self.runtime_facts
+        let mut facts = self
+            .runtime_facts
             .as_ref()
-            .map_or_else(AdminRuntimeFacts::default, |source| source.snapshot())
+            .map_or_else(AdminRuntimeFacts::default, |source| source.snapshot());
+        if facts.process_started_at_ms.is_none() {
+            facts.process_started_at_ms = Some(self.process_started_at_ms);
+        }
+        facts
+    }
+
+    async fn cached_maintenance_summary(&self) -> AdminMaintenanceSummary {
+        let now_ms = current_time_ms();
+        let mut cache = self.maintenance_cache.lock().await;
+        if let Some(summary) = cache.as_ref()
+            && maintenance_summary_is_fresh(summary.computed_at_ms, now_ms)
+        {
+            return summary.clone();
+        }
+        let summary = admin_maintenance_summary(&self.config).await;
+        *cache = Some(summary.clone());
+        summary
     }
 }
 
@@ -473,6 +503,19 @@ fn json_response(body_status: StatusCode, body: impl Serialize) -> Response<Full
     response
 }
 
+fn maintenance_summary_is_fresh(computed_at_ms: i64, now_ms: i64) -> bool {
+    let ttl_ms = i64::try_from(MAINTENANCE_SUMMARY_TTL.as_millis()).unwrap_or(i64::MAX);
+    now_ms.saturating_sub(computed_at_ms) <= ttl_ms
+}
+
+fn current_time_ms() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -643,6 +686,44 @@ mod tests {
         assert!(!body.contains("repo-prefix"));
         assert!(!body.contains("test-repository"));
         assert!(!body.contains("client-secret"));
+    }
+
+    #[tokio::test]
+    async fn admin_status_reuses_cached_maintenance_summary_inside_ttl() {
+        let service = service();
+        let first = service
+            .handle(
+                Request::builder()
+                    .uri("/admin/status")
+                    .header(AUTHORIZATION, "Bearer admin-token-12345")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap_or_else(|error| panic!("{error}")),
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = service
+            .handle(
+                Request::builder()
+                    .uri("/admin/status")
+                    .header(AUTHORIZATION, "Bearer admin-token-12345")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap_or_else(|error| panic!("{error}")),
+            )
+            .await;
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        let first: serde_json::Value = serde_json::from_str(&body_string(first).await)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let second: serde_json::Value = serde_json::from_str(&body_string(second).await)
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(
+            first["maintenance"]["computed_at_ms"],
+            second["maintenance"]["computed_at_ms"]
+        );
+        assert_eq!(first["runtime"]["build_version"], env!("CARGO_PKG_VERSION"));
+        assert!(first["runtime"]["process_started_at_ms"].as_i64().is_some());
     }
 
     #[tokio::test]

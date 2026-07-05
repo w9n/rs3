@@ -44,6 +44,8 @@ pub trait AdminRuntimeFactsSource: Send + Sync {
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AdminRuntimeFacts {
+    /// Process start time in milliseconds since the Unix epoch, when known.
+    pub process_started_at_ms: Option<i64>,
     /// Live repository facts.
     pub repository: AdminRepositoryRuntimeFacts,
 }
@@ -122,6 +124,10 @@ pub struct AdminPostureReport {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AdminRuntimeSummary {
+    /// Build version of the reporting binary.
+    pub build_version: &'static str,
+    /// Process start time in milliseconds since the Unix epoch, when known.
+    pub process_started_at_ms: Option<i64>,
     /// Gateway mutation mode.
     pub gateway_mode: &'static str,
     /// Path-safe runtime configuration fingerprint.
@@ -270,6 +276,8 @@ pub struct AdminRestoreSummary {
 pub struct AdminMaintenanceSummary {
     /// Maintenance trust state: `verified`, `unavailable`, or `not-applicable`.
     pub state: &'static str,
+    /// Maintenance summary computation timestamp in milliseconds since the Unix epoch.
+    pub computed_at_ms: i64,
     /// Machine-readable reason code when maintenance facts are unavailable.
     pub reason_code: Option<&'static str>,
     /// v2 maintenance facts, when the configured repository format is v2.
@@ -284,8 +292,12 @@ pub struct AdminV2MaintenanceSummary {
     pub anchor_present: bool,
     /// Verified commit count in the anchor-selected chain.
     pub verified_commit_count: usize,
+    /// Age of the accepted chain head in milliseconds.
+    pub last_anchored_commit_age_ms: Option<u128>,
     /// Unanchored v2 commit candidates observed under the commit prefix.
     pub orphan_candidate_count: usize,
+    /// Total bytes held by unanchored v2 commit candidates.
+    pub orphan_candidate_bytes: u64,
     /// Orphan candidates blocked by retention or legal hold.
     pub protected_orphan_candidate_count: usize,
     /// Oldest visible orphan age in milliseconds, when provider timestamps exist.
@@ -358,8 +370,23 @@ pub async fn admin_status_report_with_runtime_facts(
     profile: AdminReportProfile,
     runtime_facts: &AdminRuntimeFacts,
 ) -> AdminStatusReport {
-    let restore = restore_summary(config).await;
     let maintenance = maintenance_summary(config).await;
+    admin_status_report_with_runtime_facts_and_maintenance(
+        config,
+        profile,
+        runtime_facts,
+        maintenance,
+    )
+    .await
+}
+
+pub(crate) async fn admin_status_report_with_runtime_facts_and_maintenance(
+    config: &RuntimeConfig,
+    profile: AdminReportProfile,
+    runtime_facts: &AdminRuntimeFacts,
+    maintenance: AdminMaintenanceSummary,
+) -> AdminStatusReport {
+    let restore = restore_summary(config).await;
     admin_report_builder(config, profile, runtime_facts).status(restore, maintenance)
 }
 
@@ -438,7 +465,7 @@ fn admin_report_builder(
     AdminReportBuilder {
         profile: profile.as_str(),
         generated_at_ms: current_time_ms().unwrap_or(0),
-        runtime: runtime_summary(config),
+        runtime: runtime_summary(config, runtime_facts),
         backend: backend_summary(&config.backend),
         provider: provider_summary(config),
         anchor: anchor_summary(&config.anchor),
@@ -448,8 +475,13 @@ fn admin_report_builder(
     }
 }
 
-fn runtime_summary(config: &RuntimeConfig) -> AdminRuntimeSummary {
+fn runtime_summary(
+    config: &RuntimeConfig,
+    runtime_facts: &AdminRuntimeFacts,
+) -> AdminRuntimeSummary {
     AdminRuntimeSummary {
+        build_version: env!("CARGO_PKG_VERSION"),
+        process_started_at_ms: runtime_facts.process_started_at_ms,
         gateway_mode: config.mode.as_str(),
         config_profile: runtime_config_profile(config),
         static_credentials_configured: config.static_credentials.is_some(),
@@ -736,15 +768,23 @@ async fn restore_summary_v2(config: &RuntimeConfig) -> AdminRestoreSummary {
     }
 }
 
+pub(crate) async fn admin_maintenance_summary(config: &RuntimeConfig) -> AdminMaintenanceSummary {
+    maintenance_summary(config).await
+}
+
 async fn maintenance_summary(config: &RuntimeConfig) -> AdminMaintenanceSummary {
+    let computed_at_ms = current_time_ms().unwrap_or(0);
     match crate::s3::v2_quick_maintenance_from_config(config).await {
         Ok(report) => AdminMaintenanceSummary {
             state: "verified",
+            computed_at_ms,
             reason_code: None,
             v2: Some(AdminV2MaintenanceSummary {
                 anchor_present: report.anchor_present,
                 verified_commit_count: report.verified_commit_count,
+                last_anchored_commit_age_ms: report.last_anchored_commit_age_ms,
                 orphan_candidate_count: report.orphan_candidate_count,
+                orphan_candidate_bytes: report.orphan_candidate_bytes,
                 protected_orphan_candidate_count: report.protected_orphan_candidate_count,
                 oldest_orphan_age_ms: report.oldest_orphan_age_ms,
                 retention_renewal_commit_count: report.retention_renewal_commit_count,
@@ -755,6 +795,7 @@ async fn maintenance_summary(config: &RuntimeConfig) -> AdminMaintenanceSummary 
         },
         Err(error) => AdminMaintenanceSummary {
             state: "unavailable",
+            computed_at_ms,
             reason_code: Some(runtime_error_code(&error)),
             v2: None,
         },
@@ -766,7 +807,27 @@ fn runtime_error_code(error: &crate::S3BoundaryError) -> &'static str {
         crate::S3BoundaryError::MissingStaticCredentials => "runtime.missing-static-credentials",
         crate::S3BoundaryError::UnsupportedAnchorMode => "runtime.unsupported-anchor-mode",
         crate::S3BoundaryError::UnsupportedBackendMode => "runtime.unsupported-backend-mode",
-        crate::S3BoundaryError::RepositoryInit { .. } => "runtime.repository-init",
+        crate::S3BoundaryError::RepositoryInit { reason } => repository_init_error_code(reason),
+    }
+}
+
+fn repository_init_error_code(reason: &str) -> &'static str {
+    if reason.contains("requires an accepted anchor")
+        || reason.contains("v2 commit anchor is missing")
+    {
+        "runtime.anchor-missing"
+    } else if reason.contains("storage operation failed")
+        || reason.contains("failed to create S3 backend")
+    {
+        "runtime.backend-unreachable"
+    } else if reason.contains("v2 commit")
+        || reason.contains("v2 format root")
+        || reason.contains("stale v2 anchor")
+        || reason.contains("signature verification failed")
+    {
+        "runtime.chain-verification"
+    } else {
+        "runtime.repository-init"
     }
 }
 
@@ -915,7 +976,7 @@ mod tests {
         AdminV2CommitCoordinatorSummary, admin_posture_report,
         admin_posture_report_with_runtime_facts, admin_status_report,
         admin_status_report_with_runtime_facts, backend_kind, current_time_ms, doctor_findings,
-        runtime_config_profile,
+        runtime_config_profile, runtime_error_code,
     };
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
@@ -1036,6 +1097,28 @@ mod tests {
     }
 
     #[test]
+    fn runtime_error_code_splits_repository_init_failures() {
+        assert_eq!(
+            runtime_error_code(&crate::S3BoundaryError::RepositoryInit {
+                reason: "v2-preview maintenance requires an accepted anchor".to_owned(),
+            }),
+            "runtime.anchor-missing"
+        );
+        assert_eq!(
+            runtime_error_code(&crate::S3BoundaryError::RepositoryInit {
+                reason: "v2 storage operation failed".to_owned(),
+            }),
+            "runtime.backend-unreachable"
+        );
+        assert_eq!(
+            runtime_error_code(&crate::S3BoundaryError::RepositoryInit {
+                reason: "v2 commit body digest mismatch".to_owned(),
+            }),
+            "runtime.chain-verification"
+        );
+    }
+
+    #[test]
     fn config_profile_ignores_configured_names() {
         let mut first = runtime_config();
         let mut second = runtime_config();
@@ -1082,6 +1165,7 @@ mod tests {
     async fn admin_status_and_posture_share_common_builder_fields() {
         let config = runtime_config();
         let runtime_facts = AdminRuntimeFacts {
+            process_started_at_ms: Some(123),
             repository: AdminRepositoryRuntimeFacts {
                 v2_commit_coordinator: Some(AdminV2CommitCoordinatorSummary {
                     poisoned: true,
@@ -1104,6 +1188,7 @@ mod tests {
 
         assert_eq!(status.profile, posture.profile);
         assert_eq!(status.runtime, posture.runtime);
+        assert_eq!(status.runtime.process_started_at_ms, Some(123));
         assert_eq!(status.backend, posture.backend);
         assert_eq!(status.provider, posture.provider);
         assert_eq!(status.anchor, posture.anchor);
@@ -1121,9 +1206,9 @@ mod tests {
         assert_eq!(report.maintenance.state, "unavailable");
         assert_eq!(
             report.maintenance.reason_code,
-            Some("runtime.repository-init")
+            Some("runtime.anchor-missing")
         );
-        assert_eq!(report.restore.reason_code, Some("runtime.repository-init"));
+        assert_eq!(report.restore.reason_code, Some("runtime.anchor-missing"));
         assert!(report.restore.v2_anchor.is_none());
         assert!(report.maintenance.v2.is_none());
         assert!(!json.contains("client-private-bucket"));
@@ -1171,6 +1256,7 @@ mod tests {
     fn admin_posture_reports_live_commit_coordinator_poison_fact() {
         let config = runtime_config();
         let runtime_facts = AdminRuntimeFacts {
+            process_started_at_ms: Some(123),
             repository: AdminRepositoryRuntimeFacts {
                 v2_commit_coordinator: Some(AdminV2CommitCoordinatorSummary {
                     poisoned: true,

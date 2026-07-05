@@ -126,8 +126,12 @@ pub struct V2MaintenanceReport {
     pub anchor_present: bool,
     /// Verified commit count in the anchor-selected chain.
     pub verified_commit_count: usize,
+    /// Age of the accepted chain head in milliseconds.
+    pub last_anchored_commit_age_ms: Option<u128>,
     /// Orphan candidate count under the v2 commit prefix.
     pub orphan_candidate_count: usize,
+    /// Total bytes held by orphan candidates under the v2 commit prefix.
+    pub orphan_candidate_bytes: u64,
     /// Orphan candidates blocked by retention or legal hold.
     pub protected_orphan_candidate_count: usize,
     /// Oldest visible orphan age in milliseconds, when provider timestamps exist.
@@ -540,7 +544,7 @@ where
                 gc.same_sequence_skipped_count += 1;
                 continue;
             }
-            let Some(age_ms) = candidate_age_ms(now_ms, candidate.modified_at_ms) else {
+            let Some(age_ms) = age_since_ms(now_ms, candidate.modified_at_ms) else {
                 gc.age_skipped_count += 1;
                 continue;
             };
@@ -778,7 +782,17 @@ where
             .as_ref()
             .map(|chain| chain.commits_newest_first.len())
             .unwrap_or_default();
+        let now_ms = current_time_ms();
+        let last_anchored_commit_age_ms = chain
+            .as_ref()
+            .and_then(|chain| chain.commits_newest_first.first())
+            .and_then(|commit| {
+                age_since_ms(now_ms, Some(commit.parsed_header.header.publish_time_ms))
+            });
         let orphans = self.report_orphans(anchor).await?;
+        let orphan_candidate_bytes = orphans.candidates.iter().fold(0_u64, |total, candidate| {
+            total.saturating_add(candidate.content_len)
+        });
         let protected_orphan_candidate_count = orphans
             .candidates
             .iter()
@@ -788,11 +802,10 @@ where
                     || candidate.delete_blocked_by_unknown_protection
             })
             .count();
-        let now_ms = current_time_ms();
         let oldest_orphan_age_ms = orphans
             .candidates
             .iter()
-            .filter_map(|candidate| candidate_age_ms(now_ms, candidate.modified_at_ms))
+            .filter_map(|candidate| age_since_ms(now_ms, candidate.modified_at_ms))
             .max();
         let retention_renewal = if let Some(chain) = chain.as_ref() {
             self.plan_retention_renewal(
@@ -806,7 +819,9 @@ where
         Ok(V2MaintenanceReport {
             anchor_present: chain.is_some(),
             verified_commit_count,
+            last_anchored_commit_age_ms,
             orphan_candidate_count: orphans.candidates.len(),
+            orphan_candidate_bytes,
             protected_orphan_candidate_count,
             oldest_orphan_age_ms,
             retention_renewal_commit_count: retention_renewal.commit_count,
@@ -1046,9 +1061,9 @@ fn current_time_ms() -> i64 {
     i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
-fn candidate_age_ms(now_ms: i64, modified_at_ms: Option<i64>) -> Option<u128> {
-    let modified_at_ms = modified_at_ms?;
-    let age_ms = now_ms.checked_sub(modified_at_ms)?;
+fn age_since_ms(now_ms: i64, timestamp_ms: Option<i64>) -> Option<u128> {
+    let timestamp_ms = timestamp_ms?;
+    let age_ms = now_ms.checked_sub(timestamp_ms)?;
     u128::try_from(age_ms).ok()
 }
 

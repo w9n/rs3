@@ -91,6 +91,7 @@ pub(super) struct RuntimeRepository {
 #[derive(Clone)]
 pub(crate) struct RuntimeRepositoryAdminFacts {
     repository: RuntimeRepository,
+    process_started_at_ms: i64,
 }
 
 pub(super) struct RuntimeCommittedPut {
@@ -328,6 +329,7 @@ impl RuntimeRepository {
     pub(super) fn admin_facts_source(&self) -> Arc<dyn AdminRuntimeFactsSource> {
         Arc::new(RuntimeRepositoryAdminFacts {
             repository: self.clone(),
+            process_started_at_ms: current_time_ms(),
         })
     }
 
@@ -346,6 +348,7 @@ impl AdminRuntimeFactsSource for RuntimeRepositoryAdminFacts {
     fn snapshot(&self) -> AdminRuntimeFacts {
         let status = self.repository.coordinator.status();
         AdminRuntimeFacts {
+            process_started_at_ms: Some(self.process_started_at_ms),
             repository: AdminRepositoryRuntimeFacts {
                 v2_commit_coordinator: Some(AdminV2CommitCoordinatorSummary {
                     poisoned: status.poisoned,
@@ -906,11 +909,16 @@ fn is_s3_backend(config: &BackendConfig) -> bool {
 }
 
 fn default_v2_provider_probe_prefix() -> String {
+    let millis = current_time_ms();
+    format!("v2-provider/{millis}-{}", std::process::id())
+}
+
+fn current_time_ms() -> i64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_millis();
-    format!("v2-provider/{millis}-{}", std::process::id())
+    i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
