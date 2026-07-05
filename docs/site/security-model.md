@@ -60,11 +60,17 @@ The default design accepts specific backend-visible leakage:
 | Retention mode | Provider retention APIs expose mode and retain-until behavior. | Treat retention mode as policy metadata, not tenant identity. |
 | Source network metadata | The provider sees the gateway's network identity. | Deploy through controlled egress where required. |
 | Broad object class | Class prefixes support lifecycle and operations. | Keep class names generic and path-free; revisit in a new format if needed. |
+| Transient v2 staging identifier | In-process namespace state temporarily uses `v2-pending/<sequence>` before the final accepted commit key is known. | The placeholder is rewritten before durable index deltas are sealed and is not a backend object class; keep it out of logs, metrics, and errors. |
 | Deterministic metadata equality | Stable metadata sealing can produce identical sealed bytes for identical metadata under identical associated data. | Use object-type-specific associated data and signed reachability; revisit before stable-format claims. |
 | Prefix-token structure | Current prefix tokens reveal token count and shared-token relationships. | Document as an open privacy risk; redesign index compaction before stable-format claims. |
 
 Optional mitigations include padding, pack-size normalization, commit batching,
 compaction jitter, and stricter telemetry redaction.
+
+Current backend-visible object key classes are `format/`, `keyrings/`, and
+`commits/v01/<sequence>/<random-id>`. The `v2-pending/<sequence>` shape is a
+trusted-process placeholder used only while a write is unaccepted; it should not
+become a persisted backend key or telemetry label.
 
 ## Control Map
 
@@ -83,6 +89,7 @@ compaction jitter, and stricter telemetry redaction.
 | v2 replay cost is bounded by signed snapshots | v2 readers walk the signed parent chain to the nearest encrypted index snapshot, then replay newer deltas. | v2 snapshot replay tests and format vectors. |
 | Create-only writes are not silently downgraded | Atomic-create providers must honor `PutObject` with `If-None-Match: *`; non-atomic `HEAD` before `PUT` is not treated as production create-only. | Storage contract tests and opt-in live S3 tests. |
 | Retained restore reads do not trust mutable latest objects | Retained-version providers must return version IDs for restore-critical writes; anchors bind commit versions and restore reads exact versions. | Memory version-addressed storage tests, v2 retained commit tests, and opt-in live S3 Object Lock tests. |
+| Single-writer read-write serving is guarded in Kubernetes deployments | `RS3_WRITER_GUARD=required` acquires a companion Kubernetes Lease before serving and renews it while running. | Lease guard tests, runtime startup guard, and configuration tests. |
 | Incident restore does not advance repository state | `restore-readonly` mode requires an accepted anchor and rejects supported mutations. | Gateway mode config, startup, and S3 adapter tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
@@ -106,6 +113,13 @@ The Kubernetes Lease is the production-preview authority. Retained commit
 versions are useful history, not latest-state authority. A missing, older, or
 newer-looking backend commit is not a reason to trust storage; it is a reason to
 stop and recover from an explicitly trusted anchor bundle.
+
+For read-write Kubernetes deployments, the writer guard acquires a separate
+Lease named from the anchor as `<anchor-name>-writer` before serving and renews
+it while the process runs. If another live holder owns that Lease, or renewal
+fails past the lease duration, the gateway shuts down instead of continuing as
+a possible split-brain writer. This guard is runtime coordination, not a
+replacement for signed commits or the external v2 anchor.
 
 For `v2-preview`, the external anchor names the accepted commit key, body
 digest, provider version ID when required, signing key ID, and format-root
@@ -200,12 +214,12 @@ show client-visible paths, Kubernetes object names, tenant names, configured
 backend bucket names, backend prefixes, repository IDs, access keys, wrapping
 keys, or raw backend object IDs.
 
-The current S3, admin, and console listeners do not terminate TLS themselves.
-Expose them only behind TLS termination or on cluster-local networks protected
-by NetworkPolicy or equivalent controls. The admin listener is separate from
-the S3 data plane and currently exposes path-redacted facts at `GET
-/admin/posture` and `GET /admin/status`; it must use an admin bearer token that
-is separate from backup-client S3 credentials and backend S3 credentials.
+The current S3, admin, metrics, and console listeners do not terminate TLS
+themselves. Expose them only behind TLS termination or on cluster-local
+networks protected by NetworkPolicy or equivalent controls. The admin listener
+is separate from the S3 data plane and currently exposes path-redacted facts at
+`GET /admin/posture` and `GET /admin/status`; it must use an admin bearer token
+that is separate from backup-client S3 credentials and backend S3 credentials.
 Mutating recovery and maintenance actions need explicit authorization and audit
 controls before they belong in an admin interface. Operator reports should stay
 fact-only until a separate authorization and audit design exists.
