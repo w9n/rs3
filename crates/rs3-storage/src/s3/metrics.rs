@@ -1,5 +1,6 @@
 use super::S3BlobStore;
-use crate::{Result, StorageError};
+use crate::Result;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Metrics captured at the S3 provider boundary.
@@ -63,6 +64,111 @@ impl S3ProviderOperation {
     }
 }
 
+#[derive(Debug, Default)]
+pub(super) struct S3ProviderMetricCounters {
+    put: S3ProviderOperationCounters,
+    get: S3ProviderOperationCounters,
+    head: S3ProviderOperationCounters,
+    list: S3ProviderOperationCounters,
+    delete: S3ProviderOperationCounters,
+    extend_retention: S3ProviderOperationCounters,
+    set_legal_hold: S3ProviderOperationCounters,
+}
+
+impl S3ProviderMetricCounters {
+    pub(super) fn record(
+        &self,
+        operation: S3ProviderOperation,
+        result: &str,
+        bytes_sent: u64,
+        bytes_received: u64,
+        elapsed: Duration,
+    ) {
+        let operation_metrics = match operation {
+            S3ProviderOperation::Put => &self.put,
+            S3ProviderOperation::Get => &self.get,
+            S3ProviderOperation::Head => &self.head,
+            S3ProviderOperation::List => &self.list,
+            S3ProviderOperation::Delete => &self.delete,
+            S3ProviderOperation::ExtendRetention => &self.extend_retention,
+            S3ProviderOperation::SetLegalHold => &self.set_legal_hold,
+        };
+        operation_metrics.record(result, bytes_sent, bytes_received, elapsed);
+    }
+
+    pub(super) fn snapshot(&self) -> S3ProviderMetrics {
+        S3ProviderMetrics {
+            put: self.put.snapshot(),
+            get: self.get.snapshot(),
+            head: self.head.snapshot(),
+            list: self.list.snapshot(),
+            delete: self.delete.snapshot(),
+            extend_retention: self.extend_retention.snapshot(),
+            set_legal_hold: self.set_legal_hold.snapshot(),
+        }
+    }
+
+    pub(super) fn reset(&self) {
+        self.put.reset();
+        self.get.reset();
+        self.head.reset();
+        self.list.reset();
+        self.delete.reset();
+        self.extend_retention.reset();
+        self.set_legal_hold.reset();
+    }
+}
+
+#[derive(Debug, Default)]
+struct S3ProviderOperationCounters {
+    requests: AtomicU64,
+    successes: AtomicU64,
+    failures: AtomicU64,
+    bytes_sent: AtomicU64,
+    bytes_received: AtomicU64,
+    elapsed_us: AtomicU64,
+}
+
+impl S3ProviderOperationCounters {
+    fn record(&self, result: &str, bytes_sent: u64, bytes_received: u64, elapsed: Duration) {
+        saturating_fetch_add(&self.requests, 1);
+        if result == "ok" {
+            saturating_fetch_add(&self.successes, 1);
+            saturating_fetch_add(&self.bytes_sent, bytes_sent);
+            saturating_fetch_add(&self.bytes_received, bytes_received);
+        } else {
+            saturating_fetch_add(&self.failures, 1);
+        }
+        saturating_fetch_add(&self.elapsed_us, crate::elapsed_us(elapsed));
+    }
+
+    fn snapshot(&self) -> S3ProviderOperationMetrics {
+        S3ProviderOperationMetrics {
+            requests: self.requests.load(Ordering::Relaxed),
+            successes: self.successes.load(Ordering::Relaxed),
+            failures: self.failures.load(Ordering::Relaxed),
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+            bytes_received: self.bytes_received.load(Ordering::Relaxed),
+            elapsed_us: self.elapsed_us.load(Ordering::Relaxed),
+        }
+    }
+
+    fn reset(&self) {
+        self.requests.store(0, Ordering::Relaxed);
+        self.successes.store(0, Ordering::Relaxed);
+        self.failures.store(0, Ordering::Relaxed);
+        self.bytes_sent.store(0, Ordering::Relaxed);
+        self.bytes_received.store(0, Ordering::Relaxed);
+        self.elapsed_us.store(0, Ordering::Relaxed);
+    }
+}
+
+fn saturating_fetch_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
+}
+
 impl S3BlobStore {
     pub(super) fn record_provider_operation(
         &self,
@@ -73,32 +179,8 @@ impl S3BlobStore {
         bytes_received: u64,
         elapsed: Duration,
     ) -> Result<()> {
-        let mut metrics = self
-            .metrics
-            .write()
-            .map_err(|_| StorageError::Provider("S3 metrics lock poisoned".to_owned()))?;
-        let operation_metrics = match operation {
-            S3ProviderOperation::Put => &mut metrics.put,
-            S3ProviderOperation::Get => &mut metrics.get,
-            S3ProviderOperation::Head => &mut metrics.head,
-            S3ProviderOperation::List => &mut metrics.list,
-            S3ProviderOperation::Delete => &mut metrics.delete,
-            S3ProviderOperation::ExtendRetention => &mut metrics.extend_retention,
-            S3ProviderOperation::SetLegalHold => &mut metrics.set_legal_hold,
-        };
-        operation_metrics.requests = operation_metrics.requests.saturating_add(1);
-        if result == "ok" {
-            operation_metrics.successes = operation_metrics.successes.saturating_add(1);
-            operation_metrics.bytes_sent = operation_metrics.bytes_sent.saturating_add(bytes_sent);
-            operation_metrics.bytes_received = operation_metrics
-                .bytes_received
-                .saturating_add(bytes_received);
-        } else {
-            operation_metrics.failures = operation_metrics.failures.saturating_add(1);
-        }
-        operation_metrics.elapsed_us = operation_metrics
-            .elapsed_us
-            .saturating_add(crate::elapsed_us(elapsed));
+        self.metrics
+            .record(operation, result, bytes_sent, bytes_received, elapsed);
         record_s3_provider_metrics(
             operation.as_str(),
             object_kind,
@@ -164,5 +246,42 @@ fn record_s3_provider_metrics(
             "object_kind" => object_kind.to_owned(),
         )
         .increment(bytes_received);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{S3ProviderMetricCounters, S3ProviderOperation};
+    use std::time::Duration;
+
+    #[test]
+    fn provider_metric_counters_snapshot_and_reset_without_locks() {
+        let metrics = S3ProviderMetricCounters::default();
+
+        metrics.record(
+            S3ProviderOperation::Put,
+            "ok",
+            7,
+            11,
+            Duration::from_micros(13),
+        );
+        metrics.record(
+            S3ProviderOperation::Put,
+            "error",
+            17,
+            19,
+            Duration::from_micros(23),
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.put.requests, 2);
+        assert_eq!(snapshot.put.successes, 1);
+        assert_eq!(snapshot.put.failures, 1);
+        assert_eq!(snapshot.put.bytes_sent, 7);
+        assert_eq!(snapshot.put.bytes_received, 11);
+        assert_eq!(snapshot.put.elapsed_us, 36);
+
+        metrics.reset();
+        assert_eq!(metrics.snapshot().put.requests, 0);
     }
 }

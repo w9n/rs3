@@ -1379,12 +1379,12 @@ fn record_s3_request_metrics(
     status: http::StatusCode,
     elapsed: Duration,
 ) {
-    let status_code = status.as_u16().to_string();
+    let status_code = status_code_label(status);
     metrics::counter!(
         "rs3_s3_requests_total",
         "operation" => operation,
         "result" => result,
-        "status_code" => status_code.clone(),
+        "status_code" => status_code,
     )
     .increment(1);
     metrics::histogram!(
@@ -1394,6 +1394,26 @@ fn record_s3_request_metrics(
         "status_code" => status_code,
     )
     .record(elapsed.as_secs_f64());
+}
+
+fn status_code_label(status: http::StatusCode) -> &'static str {
+    match status.as_u16() {
+        200 => "200",
+        206 => "206",
+        400 => "400",
+        401 => "401",
+        403 => "403",
+        404 => "404",
+        405 => "405",
+        409 => "409",
+        411 => "411",
+        412 => "412",
+        416 => "416",
+        500 => "500",
+        501 => "501",
+        503 => "503",
+        _ => "unknown",
+    }
 }
 
 fn record_s3_admission_rejection(operation: &'static str, reason: &'static str) {
@@ -1442,7 +1462,10 @@ fn record_s3_response_body_bytes(operation: &'static str, len: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DownloadBodyBudget, GatewayS3Service, RequestRateLimiter, UploadBodyBudget};
+    use super::{
+        DownloadBodyBudget, GatewayS3Service, RequestRateLimiter, UploadBodyBudget,
+        status_code_label,
+    };
     use crate::GatewayMode;
     use crate::s3::mapping::collect_body;
     use crate::s3::test_support::runtime_config;
@@ -1466,6 +1489,21 @@ mod tests {
             .unwrap_or_else(|error| {
                 panic!("{error}");
             })
+    }
+
+    #[test]
+    fn status_code_metric_labels_are_static_for_known_s3_statuses() {
+        assert_eq!(status_code_label(http::StatusCode::OK), "200");
+        assert_eq!(status_code_label(http::StatusCode::PARTIAL_CONTENT), "206");
+        assert_eq!(
+            status_code_label(http::StatusCode::PRECONDITION_FAILED),
+            "412"
+        );
+        assert_eq!(
+            status_code_label(http::StatusCode::SERVICE_UNAVAILABLE),
+            "503"
+        );
+        assert_eq!(status_code_label(http::StatusCode::IM_A_TEAPOT), "unknown");
     }
 
     async fn gateway_service_with_max_put_object_bytes(

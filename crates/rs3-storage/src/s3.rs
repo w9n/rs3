@@ -15,7 +15,7 @@ use object_store::list::{PaginatedListOptions, PaginatedListStore};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use rs3_types::{BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionPolicy};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 mod client;
@@ -38,7 +38,7 @@ use errors::{
     get_error_result, map_common_error, map_get_error, map_put_error, map_sdk_common_error,
     metadata_from_object_meta, provider_error, put_error_result, storage_error_result,
 };
-use metrics::S3ProviderOperation;
+use metrics::{S3ProviderMetricCounters, S3ProviderOperation};
 use object_lock::{
     legal_hold_blocks_delete, provider_legal_hold, retain_until_date, retention_blocks_delete,
     retention_is_active, retention_satisfies, sdk_legal_hold_status, sdk_object_lock_mode,
@@ -52,7 +52,7 @@ pub struct S3BlobStore {
     store: AmazonS3,
     sdk_client: Option<SdkS3Client>,
     config: S3BlobStoreConfig,
-    metrics: Arc<RwLock<S3ProviderMetrics>>,
+    metrics: Arc<S3ProviderMetricCounters>,
 }
 
 impl S3BlobStore {
@@ -69,7 +69,7 @@ impl S3BlobStore {
             store,
             sdk_client,
             config,
-            metrics: Arc::new(RwLock::new(S3ProviderMetrics::default())),
+            metrics: Arc::new(S3ProviderMetricCounters::default()),
         })
     }
 
@@ -90,7 +90,7 @@ impl S3BlobStore {
             store,
             sdk_client,
             config,
-            metrics: Arc::new(RwLock::new(S3ProviderMetrics::default())),
+            metrics: Arc::new(S3ProviderMetricCounters::default()),
         })
     }
 
@@ -100,7 +100,7 @@ impl S3BlobStore {
             store,
             sdk_client: None,
             config,
-            metrics: Arc::new(RwLock::new(S3ProviderMetrics::default())),
+            metrics: Arc::new(S3ProviderMetricCounters::default()),
         }
     }
 
@@ -111,19 +111,12 @@ impl S3BlobStore {
 
     /// Returns a snapshot of S3 provider metrics.
     pub fn provider_metrics(&self) -> Result<S3ProviderMetrics> {
-        self.metrics
-            .read()
-            .map(|metrics| metrics.clone())
-            .map_err(|_| StorageError::Provider("S3 metrics lock poisoned".to_owned()))
+        Ok(self.metrics.snapshot())
     }
 
     /// Resets S3 provider metrics without changing stored objects.
     pub fn reset_provider_metrics(&self) -> Result<()> {
-        let mut metrics = self
-            .metrics
-            .write()
-            .map_err(|_| StorageError::Provider("S3 metrics lock poisoned".to_owned()))?;
-        *metrics = S3ProviderMetrics::default();
+        self.metrics.reset();
         Ok(())
     }
 
