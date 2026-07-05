@@ -105,29 +105,10 @@ cargo run -p rs3-server -- import-v2-anchor \
   --min-sequence <external-floor-sequence>
 ```
 
-If the incident workflow cannot pass the bundle file, import the same trusted
-anchor with explicit fields:
-
-```sh
-cargo run -p rs3-server -- import-v2-anchor \
-  --anchor-sequence <bundle-anchor-sequence> \
-  --anchor-commit-key <bundle-anchor-commit-key> \
-  --anchor-version-id <bundle-anchor-version-id> \
-  --anchor-body-digest <bundle-anchor-body-digest> \
-  --signing-key-id <bundle-signing-key-id> \
-  --format-generation <bundle-format-generation> \
-  --format-digest <bundle-format-digest> \
-  --format-object-id <bundle-format-object-id> \
-  --format-version-id <bundle-format-version-id> \
-  --offline-signature <bundle-offline-signature> \
-  --min-sequence <external-floor-sequence>
-```
-
 `verify-bundle` does not write storage or anchors. `import-v2-anchor` repeats
 the named signed commit-chain, format-root, and keyring-envelope checks before
-writing the missing anchor. Do not mix `--bundle-file` and explicit anchor
-fields. Omit version IDs only for a trusted bundle that does not contain them;
-retained/Object Lock repositories should contain them. Production import also
+writing the missing anchor. Anchor import reads repository, anchor, format-root,
+and recovery-signature fields only from `--bundle-file`. Production import also
 requires `RS3_RECOVERY_PUBLIC_KEY` and refuses a bundle whose anchor sequence is
 below the operator-supplied `--min-sequence`.
 It also lists stored v2 commits and refuses to import when it sees a higher

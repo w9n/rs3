@@ -106,43 +106,10 @@ enum Commands {
 struct ImportV2AnchorArgs {
     /// JSON bundle from `export-restore-bundle`; use `-` for stdin.
     #[arg(long)]
-    bundle_file: Option<String>,
+    bundle_file: String,
     /// External weak-subjectivity floor accepted by the operator.
     #[arg(long)]
     min_sequence: u64,
-    /// Accepted anchor sequence from a trusted bundle.
-    #[arg(long)]
-    anchor_sequence: Option<u64>,
-    /// Accepted commit key from a trusted bundle.
-    #[arg(long)]
-    anchor_commit_key: Option<String>,
-    /// Provider version identifier for the accepted commit object, when available.
-    #[arg(long)]
-    anchor_version_id: Option<String>,
-    /// Accepted commit body digest from a trusted bundle.
-    #[arg(long)]
-    anchor_body_digest: Option<String>,
-    /// Commit-signing key ID from a trusted bundle.
-    #[arg(long)]
-    signing_key_id: Option<String>,
-    /// Format-root generation from a trusted bundle.
-    #[arg(long)]
-    format_generation: Option<u64>,
-    /// Format-root digest from a trusted bundle.
-    #[arg(long)]
-    format_digest: Option<String>,
-    /// Format-root object ID from a trusted bundle.
-    #[arg(long)]
-    format_object_id: Option<String>,
-    /// Format-root version ID from a trusted bundle, when available.
-    #[arg(long)]
-    format_version_id: Option<String>,
-    /// Weak-subjectivity floor sequence. Defaults to `--anchor-sequence`.
-    #[arg(long)]
-    weak_subjectivity_floor_sequence: Option<u64>,
-    /// Offline recovery signature from a trusted bundle, as hex.
-    #[arg(long)]
-    offline_signature: Option<String>,
     /// Allow importing an anchor below newer commit objects seen in storage.
     #[arg(long, default_value_t = false)]
     force_rollback: bool,
@@ -322,88 +289,12 @@ fn recovery_bundle_from_import_args(
     config: &RuntimeConfig,
     args: ImportV2AnchorArgs,
 ) -> Result<(V2RecoveryBundle, V2AnchorImportOptions)> {
-    let explicit_field_count = usize::from(args.anchor_sequence.is_some())
-        + usize::from(args.anchor_commit_key.is_some())
-        + usize::from(args.anchor_body_digest.is_some())
-        + usize::from(args.signing_key_id.is_some())
-        + usize::from(args.format_generation.is_some())
-        + usize::from(args.format_digest.is_some())
-        + usize::from(args.format_object_id.is_some())
-        + usize::from(args.weak_subjectivity_floor_sequence.is_some())
-        + usize::from(args.anchor_version_id.is_some())
-        + usize::from(args.format_version_id.is_some())
-        + usize::from(args.offline_signature.is_some());
     let options = V2AnchorImportOptions {
         min_sequence: Sequence::new(args.min_sequence),
         force_rollback: args.force_rollback,
     };
-    let bundle = match args.bundle_file.clone() {
-        Some(path) => {
-            if explicit_field_count > 0 {
-                bail!("--bundle-file cannot be combined with explicit anchor fields");
-            }
-            read_restore_bundle_json(&path, config)?
-        }
-        None => recovery_bundle_from_explicit_args(config, args)?,
-    };
+    let bundle = read_restore_bundle_json(&args.bundle_file, config)?;
     Ok((bundle, options))
-}
-
-fn recovery_bundle_from_explicit_args(
-    config: &RuntimeConfig,
-    args: ImportV2AnchorArgs,
-) -> Result<V2RecoveryBundle> {
-    let anchor_sequence = require_arg(args.anchor_sequence, "--anchor-sequence")?;
-    let anchor_sequence = Sequence::new(anchor_sequence);
-    let floor_sequence = Sequence::new(
-        args.weak_subjectivity_floor_sequence
-            .unwrap_or(anchor_sequence.get()),
-    );
-    let format_generation = require_arg(args.format_generation, "--format-generation")?;
-    let format_digest = require_arg(args.format_digest, "--format-digest")?;
-    let anchor = V2AnchorState {
-        sequence: anchor_sequence,
-        commit_key: BackendObjectId::new(require_arg(
-            args.anchor_commit_key,
-            "--anchor-commit-key",
-        )?)?,
-        body_digest: decode_sha256_hex(&require_arg(
-            args.anchor_body_digest,
-            "--anchor-body-digest",
-        )?)?,
-        version_id: args
-            .anchor_version_id
-            .map(BackendVersionId::new)
-            .transpose()?,
-        signing_key_id: KeyId::new(require_arg(args.signing_key_id, "--signing-key-id")?)?,
-        format_ref: rs3_repository::v2::V2FormatRef {
-            generation: format_generation,
-            digest: format_digest.clone(),
-            object_id: BackendObjectId::new(require_arg(
-                args.format_object_id,
-                "--format-object-id",
-            )?)?,
-            version_id: args
-                .format_version_id
-                .map(BackendVersionId::new)
-                .transpose()?,
-        },
-    };
-    Ok(V2RecoveryBundle {
-        repository_id: Some(config.repository_keys.repository_id.clone()),
-        repository_salt_digest: None,
-        format_digest: Some(decode_sha256_hex(&format_digest)?),
-        format_generation: Some(format_generation),
-        anchor,
-        weak_subjectivity_floor_sequence: floor_sequence,
-        exported_at_ms: 0,
-        offline_signature: args
-            .offline_signature
-            .map(|signature| {
-                hex::decode(signature).context("offline signature must be hex encoded")
-            })
-            .transpose()?,
-    })
 }
 
 fn read_restore_bundle_json(path: &str, config: &RuntimeConfig) -> Result<V2RecoveryBundle> {
@@ -488,10 +379,6 @@ fn parse_restore_bundle_json(input: &str, config: &RuntimeConfig) -> Result<V2Re
         exported_at_ms: decoded.exported_at_ms,
         offline_signature,
     })
-}
-
-fn require_arg<T>(value: Option<T>, flag: &'static str) -> Result<T> {
-    value.ok_or_else(|| anyhow::anyhow!("{flag} is required without --bundle-file"))
 }
 
 #[cfg(any(feature = "s3", feature = "k8s"))]
@@ -1345,31 +1232,53 @@ mod tests {
     }
 
     #[test]
-    fn import_v2_anchor_rejects_mixed_bundle_and_explicit_fields() {
+    fn import_v2_anchor_reads_bundle_file_and_preserves_operator_options() {
         let config = runtime_config();
+        let input = serde_json::json!({
+            "schema": "rs3.restore-bundle.v2-preview.v1",
+            "repository": {
+                "id": "tenant-repository"
+            },
+            "anchor": {
+                "sequence": 7,
+                "commit_key": "commits/v01/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "body_digest": "11".repeat(32),
+                "signing_key_id": "checkpoint-v1",
+                "format": {
+                    "generation": 1,
+                    "digest": "22".repeat(32),
+                    "object_id": "format/00000000000000000001/abc"
+                }
+            },
+            "weak_subjectivity_floor_sequence": 7,
+            "format_digest": "22".repeat(32),
+            "format_generation": 1,
+            "exported_at_ms": 42,
+            "offline_signature": null
+        })
+        .to_string();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rs3-import-v2-anchor-test-{}-{unique}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, input).unwrap_or_else(|error| panic!("{error}"));
         let args = ImportV2AnchorArgs {
-            bundle_file: Some("bundle.json".to_owned()),
-            min_sequence: 1,
-            anchor_sequence: Some(1),
-            anchor_commit_key: None,
-            anchor_version_id: None,
-            anchor_body_digest: None,
-            signing_key_id: None,
-            format_generation: None,
-            format_digest: None,
-            format_object_id: None,
-            format_version_id: None,
-            weak_subjectivity_floor_sequence: None,
-            offline_signature: None,
-            force_rollback: false,
+            bundle_file: path.to_string_lossy().into_owned(),
+            min_sequence: 5,
+            force_rollback: true,
             format: RecoveryReportFormat::Json,
         };
 
-        let error = match recovery_bundle_from_import_args(&config, args) {
-            Ok(_) => panic!("mixed bundle-file and explicit fields should be rejected"),
-            Err(error) => error,
-        };
+        let (bundle, options) = recovery_bundle_from_import_args(&config, args)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let _ = std::fs::remove_file(path);
 
-        assert!(error.to_string().contains("cannot be combined"));
+        assert_eq!(bundle.anchor.sequence.get(), 7);
+        assert_eq!(options.min_sequence.get(), 5);
+        assert!(options.force_rollback);
     }
 }
