@@ -360,44 +360,7 @@ pub async fn admin_status_report_with_runtime_facts(
 ) -> AdminStatusReport {
     let restore = restore_summary(config).await;
     let maintenance = maintenance_summary(config).await;
-    AdminStatusReport {
-        schema: ADMIN_STATUS_SCHEMA,
-        profile: profile.as_str(),
-        generated_at_ms: current_time_ms().unwrap_or(0),
-        runtime: AdminRuntimeSummary {
-            gateway_mode: config.mode.as_str(),
-            config_profile: runtime_config_profile(config),
-            static_credentials_configured: config.static_credentials.is_some(),
-            metrics_configured: config.metrics.bind.is_some(),
-        },
-        backend: AdminBackendSummary {
-            kind: backend_kind(&config.backend.endpoint),
-            durable: backend_is_durable(&config.backend),
-            retention_capability: retention_capability(&config.backend),
-        },
-        provider: provider_summary(config),
-        anchor: AdminAnchorSummary {
-            kind: anchor_kind(&config.anchor),
-            external: !matches!(config.anchor, AnchorConfig::Memory),
-        },
-        repository: repository_summary(config, runtime_facts),
-        security: AdminSecuritySummary {
-            path_browsing_enabled: false,
-            secrets_exposed: false,
-            max_put_object_bytes: config.hardening.max_put_object_bytes,
-            buffered_put_object_bytes: config.hardening.buffered_put_object_bytes,
-            backend_multipart_part_bytes: config.hardening.backend_multipart_part_bytes,
-            max_in_flight_upload_body_bytes: config.hardening.max_in_flight_upload_body_bytes,
-            max_in_flight_download_body_bytes: config.hardening.max_in_flight_download_body_bytes,
-            max_concurrent_connections: config.hardening.max_concurrent_connections,
-            max_concurrent_requests: config.hardening.max_concurrent_requests,
-            request_rate_limit_per_second: config.hardening.request_rate_limit_per_second,
-            action_posture: "report-only",
-        },
-        restore,
-        maintenance,
-        findings: doctor_findings(config, profile),
-    }
+    admin_report_builder(config, profile, runtime_facts).status(restore, maintenance)
 }
 
 /// Builds the cheap path-redacted status report that does not verify repository state.
@@ -414,41 +377,114 @@ pub fn admin_posture_report_with_runtime_facts(
     profile: AdminReportProfile,
     runtime_facts: &AdminRuntimeFacts,
 ) -> AdminPostureReport {
-    AdminPostureReport {
-        schema: ADMIN_POSTURE_SCHEMA,
+    admin_report_builder(config, profile, runtime_facts).posture()
+}
+
+struct AdminReportBuilder {
+    profile: &'static str,
+    generated_at_ms: i64,
+    runtime: AdminRuntimeSummary,
+    backend: AdminBackendSummary,
+    provider: AdminProviderSummary,
+    anchor: AdminAnchorSummary,
+    repository: AdminRepositorySummary,
+    security: AdminSecuritySummary,
+    findings: Vec<AdminFinding>,
+}
+
+impl AdminReportBuilder {
+    fn status(
+        self,
+        restore: AdminRestoreSummary,
+        maintenance: AdminMaintenanceSummary,
+    ) -> AdminStatusReport {
+        AdminStatusReport {
+            schema: ADMIN_STATUS_SCHEMA,
+            profile: self.profile,
+            generated_at_ms: self.generated_at_ms,
+            runtime: self.runtime,
+            backend: self.backend,
+            provider: self.provider,
+            anchor: self.anchor,
+            repository: self.repository,
+            security: self.security,
+            restore,
+            maintenance,
+            findings: self.findings,
+        }
+    }
+
+    fn posture(self) -> AdminPostureReport {
+        AdminPostureReport {
+            schema: ADMIN_POSTURE_SCHEMA,
+            profile: self.profile,
+            generated_at_ms: self.generated_at_ms,
+            runtime: self.runtime,
+            backend: self.backend,
+            provider: self.provider,
+            anchor: self.anchor,
+            repository: self.repository,
+            security: self.security,
+            findings: self.findings,
+        }
+    }
+}
+
+fn admin_report_builder(
+    config: &RuntimeConfig,
+    profile: AdminReportProfile,
+    runtime_facts: &AdminRuntimeFacts,
+) -> AdminReportBuilder {
+    AdminReportBuilder {
         profile: profile.as_str(),
         generated_at_ms: current_time_ms().unwrap_or(0),
-        runtime: AdminRuntimeSummary {
-            gateway_mode: config.mode.as_str(),
-            config_profile: runtime_config_profile(config),
-            static_credentials_configured: config.static_credentials.is_some(),
-            metrics_configured: config.metrics.bind.is_some(),
-        },
-        backend: AdminBackendSummary {
-            kind: backend_kind(&config.backend.endpoint),
-            durable: backend_is_durable(&config.backend),
-            retention_capability: retention_capability(&config.backend),
-        },
+        runtime: runtime_summary(config),
+        backend: backend_summary(&config.backend),
         provider: provider_summary(config),
-        anchor: AdminAnchorSummary {
-            kind: anchor_kind(&config.anchor),
-            external: !matches!(config.anchor, AnchorConfig::Memory),
-        },
+        anchor: anchor_summary(&config.anchor),
         repository: repository_summary(config, runtime_facts),
-        security: AdminSecuritySummary {
-            path_browsing_enabled: false,
-            secrets_exposed: false,
-            max_put_object_bytes: config.hardening.max_put_object_bytes,
-            buffered_put_object_bytes: config.hardening.buffered_put_object_bytes,
-            backend_multipart_part_bytes: config.hardening.backend_multipart_part_bytes,
-            max_in_flight_upload_body_bytes: config.hardening.max_in_flight_upload_body_bytes,
-            max_in_flight_download_body_bytes: config.hardening.max_in_flight_download_body_bytes,
-            max_concurrent_connections: config.hardening.max_concurrent_connections,
-            max_concurrent_requests: config.hardening.max_concurrent_requests,
-            request_rate_limit_per_second: config.hardening.request_rate_limit_per_second,
-            action_posture: "report-only",
-        },
+        security: security_summary(config),
         findings: doctor_findings(config, profile),
+    }
+}
+
+fn runtime_summary(config: &RuntimeConfig) -> AdminRuntimeSummary {
+    AdminRuntimeSummary {
+        gateway_mode: config.mode.as_str(),
+        config_profile: runtime_config_profile(config),
+        static_credentials_configured: config.static_credentials.is_some(),
+        metrics_configured: config.metrics.bind.is_some(),
+    }
+}
+
+fn backend_summary(backend: &BackendConfig) -> AdminBackendSummary {
+    AdminBackendSummary {
+        kind: backend_kind(&backend.endpoint),
+        durable: backend_is_durable(backend),
+        retention_capability: retention_capability(backend),
+    }
+}
+
+fn anchor_summary(anchor: &AnchorConfig) -> AdminAnchorSummary {
+    AdminAnchorSummary {
+        kind: anchor_kind(anchor),
+        external: !matches!(anchor, AnchorConfig::Memory),
+    }
+}
+
+fn security_summary(config: &RuntimeConfig) -> AdminSecuritySummary {
+    AdminSecuritySummary {
+        path_browsing_enabled: false,
+        secrets_exposed: false,
+        max_put_object_bytes: config.hardening.max_put_object_bytes,
+        buffered_put_object_bytes: config.hardening.buffered_put_object_bytes,
+        backend_multipart_part_bytes: config.hardening.backend_multipart_part_bytes,
+        max_in_flight_upload_body_bytes: config.hardening.max_in_flight_upload_body_bytes,
+        max_in_flight_download_body_bytes: config.hardening.max_in_flight_download_body_bytes,
+        max_concurrent_connections: config.hardening.max_concurrent_connections,
+        max_concurrent_requests: config.hardening.max_concurrent_requests,
+        request_rate_limit_per_second: config.hardening.request_rate_limit_per_second,
+        action_posture: "report-only",
     }
 }
 
@@ -877,8 +913,9 @@ mod tests {
     use super::{
         AdminReportProfile, AdminRepositoryRuntimeFacts, AdminRuntimeFacts,
         AdminV2CommitCoordinatorSummary, admin_posture_report,
-        admin_posture_report_with_runtime_facts, admin_status_report, backend_kind,
-        current_time_ms, doctor_findings, runtime_config_profile,
+        admin_posture_report_with_runtime_facts, admin_status_report,
+        admin_status_report_with_runtime_facts, backend_kind, current_time_ms, doctor_findings,
+        runtime_config_profile,
     };
     use crate::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
@@ -1039,6 +1076,40 @@ mod tests {
         assert!(report.restore.v2_anchor.is_none());
         assert_eq!(report.maintenance.state, "unavailable");
         assert!(report.maintenance.v2.is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_status_and_posture_share_common_builder_fields() {
+        let config = runtime_config();
+        let runtime_facts = AdminRuntimeFacts {
+            repository: AdminRepositoryRuntimeFacts {
+                v2_commit_coordinator: Some(AdminV2CommitCoordinatorSummary {
+                    poisoned: true,
+                    poison_reason: Some("test-poison".to_owned()),
+                }),
+            },
+        };
+
+        let status = admin_status_report_with_runtime_facts(
+            &config,
+            AdminReportProfile::Production,
+            &runtime_facts,
+        )
+        .await;
+        let posture = admin_posture_report_with_runtime_facts(
+            &config,
+            AdminReportProfile::Production,
+            &runtime_facts,
+        );
+
+        assert_eq!(status.profile, posture.profile);
+        assert_eq!(status.runtime, posture.runtime);
+        assert_eq!(status.backend, posture.backend);
+        assert_eq!(status.provider, posture.provider);
+        assert_eq!(status.anchor, posture.anchor);
+        assert_eq!(status.repository, posture.repository);
+        assert_eq!(status.security, posture.security);
+        assert_eq!(status.findings, posture.findings);
     }
 
     #[tokio::test]
