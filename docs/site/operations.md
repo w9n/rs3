@@ -315,6 +315,10 @@ Metrics should use operation classes, status, result, object class, sizes,
 counts, and durations. They must not use logical paths, Kubernetes names,
 tenant names, backend object IDs, or secrets as labels.
 
+Use [Alerting](reference/alerts.md) for starting Prometheus rules covering
+accepted-checkpoint freshness, commit publishing, anchor advance failures, and
+gateway probes.
+
 ## Logs And Traces
 
 Use JSON logs when collecting structured runtime evidence:

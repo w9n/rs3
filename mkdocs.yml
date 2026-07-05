@@ -70,5 +70,6 @@ nav:
       - Console: reference/console.md
       - Cryptography: reference/cryptography.md
       - Metrics: reference/metrics.md
+      - Alerts: reference/alerts.md
 
 strict: true
