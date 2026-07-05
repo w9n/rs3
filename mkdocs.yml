@@ -65,6 +65,7 @@ nav:
   - Reference:
       - Glossary: reference/glossary.md
       - Configuration: reference/configuration.md
+      - S3 Operations: reference/s3-operations.md
       - Repository Format: reference/repository-format.md
       - Console: reference/console.md
       - Cryptography: reference/cryptography.md

@@ -6,8 +6,9 @@ use super::mapping::{
     legal_hold_output, list_page as map_list_page, logical_path, max_keys,
     put_object_legal_hold_request_status, put_object_legal_hold_status,
     put_object_retention_policy, repository_error, resolve_range, retention_headers, timestamp,
-    validate_delete_object_request, validate_get_object_legal_hold_request,
-    validate_get_object_request, validate_head_object_request, validate_put_object_request,
+    validate_delete_object_request, validate_delete_objects_entry, validate_delete_objects_request,
+    validate_get_object_legal_hold_request, validate_get_object_request,
+    validate_head_object_request, validate_put_object_request,
 };
 use super::runtime::RuntimeRepository;
 use crate::{AdminRuntimeFactsSource, GatewayMode, RuntimeConfig};
@@ -17,12 +18,13 @@ use rs3_repository::{RepositoryError, RepositoryPutOptions};
 use rs3_storage::ByteRange;
 use rs3_types::{LegalHoldStatus, PublicBucket};
 use s3s::dto::{
-    Bucket, DeleteObjectInput, DeleteObjectOutput, GetBucketLocationInput, GetBucketLocationOutput,
+    Bucket, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
+    DeletedObject, Error as DeleteObjectError, GetBucketLocationInput, GetBucketLocationOutput,
     GetObjectInput, GetObjectLegalHoldInput, GetObjectLegalHoldOutput, GetObjectOutput,
     HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
     ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-    ListObjectsV2Output, Owner, PutObjectInput, PutObjectLegalHoldInput, PutObjectLegalHoldOutput,
-    PutObjectOutput, StreamingBlob,
+    ListObjectsV2Output, ObjectIdentifier, Owner, PutObjectInput, PutObjectLegalHoldInput,
+    PutObjectLegalHoldOutput, PutObjectOutput, StreamingBlob,
 };
 use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
 use s3s::{Body, S3, S3Request, S3Response, S3Result, StdError};
@@ -189,6 +191,20 @@ impl GatewayS3Service {
                 "restore-readonly gateway mode rejects repository mutations"
             ))
         }
+    }
+
+    async fn delete_committed_key(&self, key: String) -> S3Result<()> {
+        let key = logical_path(key)?;
+        self.repository
+            .delete_committed(key)
+            .await
+            .map(|_outcome| ())
+            .map_err(repository_error)
+    }
+
+    async fn delete_objects_entry(&self, object: ObjectIdentifier) -> S3Result<()> {
+        validate_delete_objects_entry(&object)?;
+        self.delete_committed_key(object.key).await
     }
 
     fn admit_request(&self, operation: &'static str) -> S3Result<OwnedSemaphorePermit> {
@@ -1268,11 +1284,7 @@ impl S3 for GatewayS3Service {
             self.check_mutation_allowed()?;
             validate_delete_object_request(&input)?;
 
-            let key = logical_path(input.key)?;
-            self.repository
-                .delete_committed(key)
-                .await
-                .map_err(repository_error)?;
+            self.delete_committed_key(input.key).await?;
 
             Ok(S3Response::new(DeleteObjectOutput {
                 delete_marker: Some(false),
@@ -1290,6 +1302,70 @@ impl S3 for GatewayS3Service {
             http::StatusCode::OK,
         );
         result
+    }
+
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        const OPERATION: &str = "DeleteObjects";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
+
+        let result = async {
+            let _admission = self.admit_request(OPERATION)?;
+            self.check_bucket(&input.bucket)?;
+            self.check_mutation_allowed()?;
+            validate_delete_objects_request(&input)?;
+
+            let quiet = input.delete.quiet.unwrap_or(false);
+            let mut deleted = Vec::new();
+            let mut errors = Vec::new();
+            for object in input.delete.objects {
+                let key = object.key.clone();
+                match self.delete_objects_entry(object).await {
+                    Ok(()) => {
+                        if !quiet {
+                            deleted.push(DeletedObject {
+                                delete_marker: Some(false),
+                                key: Some(key),
+                                ..DeletedObject::default()
+                            });
+                        }
+                    }
+                    Err(error) => errors.push(delete_objects_error(key, error)),
+                }
+            }
+
+            Ok(S3Response::new(DeleteObjectsOutput {
+                deleted: (!deleted.is_empty()).then_some(deleted),
+                errors: (!errors.is_empty()).then_some(errors),
+                ..DeleteObjectsOutput::default()
+            }))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
+    }
+}
+
+fn delete_objects_error(key: String, error: s3s::S3Error) -> DeleteObjectError {
+    DeleteObjectError {
+        code: Some(error.code().as_str().to_owned()),
+        key: Some(key),
+        message: error.message().map(str::to_owned),
+        ..DeleteObjectError::default()
     }
 }
 
@@ -1375,10 +1451,11 @@ mod tests {
     use rs3_storage::BlobStore;
     use rs3_types::{LegalHoldStatus, RetentionMode};
     use s3s::dto::{
-        DeleteObjectInput, GetBucketLocationInput, GetObjectInput, GetObjectLegalHoldInput,
-        HeadBucketInput, HeadObjectInput, ListBucketsInput, ListObjectsInput, ListObjectsV2Input,
-        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectInput,
-        PutObjectLegalHoldInput, StreamingBlob, Timestamp,
+        Delete, DeleteObjectInput, DeleteObjectsInput, GetBucketLocationInput, GetObjectInput,
+        GetObjectLegalHoldInput, HeadBucketInput, HeadObjectInput, ListBucketsInput,
+        ListObjectsInput, ListObjectsV2Input, ObjectIdentifier, ObjectLockLegalHold,
+        ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectInput, PutObjectLegalHoldInput,
+        StreamingBlob, Timestamp,
     };
     use s3s::{Body, S3, S3Request, S3Response};
     use std::time::{Duration, SystemTime};
@@ -1468,6 +1545,28 @@ mod tests {
             region: None,
             service: None,
             trailing_headers: None,
+        }
+    }
+
+    fn delete_objects_input(
+        objects: Vec<ObjectIdentifier>,
+        quiet: Option<bool>,
+    ) -> DeleteObjectsInput {
+        DeleteObjectsInput {
+            bucket: "client-bucket".to_owned(),
+            bypass_governance_retention: None,
+            checksum_algorithm: None,
+            delete: Delete { objects, quiet },
+            expected_bucket_owner: None,
+            mfa: None,
+            request_payer: None,
+        }
+    }
+
+    fn delete_object_identifier(key: &str) -> ObjectIdentifier {
+        ObjectIdentifier {
+            key: key.to_owned(),
+            ..ObjectIdentifier::default()
         }
     }
 
@@ -1720,6 +1819,127 @@ mod tests {
             .await
             .expect_err("deleted object should not be visible through HeadObject");
         assert_eq!(*missing.code(), s3s::S3ErrorCode::NoSuchKey);
+    }
+
+    #[tokio::test]
+    async fn delete_objects_returns_per_key_successes() {
+        let service = gateway_service().await;
+        for key in ["snapshots/batch-a.bin", "snapshots/batch-b.bin"] {
+            service
+                .put_object(s3_request(PutObjectInput {
+                    bucket: "client-bucket".to_owned(),
+                    key: key.to_owned(),
+                    body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                        b"delete me",
+                    )))),
+                    ..PutObjectInput::default()
+                }))
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+
+        let delete = service
+            .delete_objects(s3_request(delete_objects_input(
+                vec![
+                    delete_object_identifier("snapshots/batch-a.bin"),
+                    delete_object_identifier("snapshots/batch-b.bin"),
+                ],
+                None,
+            )))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let deleted = delete.output.deleted.unwrap_or_default();
+        assert_eq!(deleted.len(), 2);
+        assert_eq!(deleted[0].key.as_deref(), Some("snapshots/batch-a.bin"));
+        assert_eq!(deleted[0].delete_marker, Some(false));
+        assert_eq!(deleted[1].key.as_deref(), Some("snapshots/batch-b.bin"));
+        assert_eq!(deleted[1].delete_marker, Some(false));
+        assert!(delete.output.errors.is_none());
+
+        for key in ["snapshots/batch-a.bin", "snapshots/batch-b.bin"] {
+            let missing = service
+                .head_object(s3_request(HeadObjectInput {
+                    bucket: "client-bucket".to_owned(),
+                    key: key.to_owned(),
+                    ..HeadObjectInput::default()
+                }))
+                .await
+                .expect_err("batch-deleted object should be hidden");
+            assert_eq!(*missing.code(), s3s::S3ErrorCode::NoSuchKey);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_objects_quiet_mode_suppresses_success_entries() {
+        let service = gateway_service().await;
+        service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/quiet-delete.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"delete me quietly",
+                )))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let delete = service
+            .delete_objects(s3_request(delete_objects_input(
+                vec![delete_object_identifier("snapshots/quiet-delete.bin")],
+                Some(true),
+            )))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(delete.output.deleted.is_none());
+        assert!(delete.output.errors.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_objects_reports_per_key_errors() {
+        let service = gateway_service().await;
+        service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/batch-good.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"delete me",
+                )))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let mut unsupported = delete_object_identifier("snapshots/batch-versioned.bin");
+        unsupported.version_id = Some("versioned-delete".to_owned());
+        let delete = service
+            .delete_objects(s3_request(delete_objects_input(
+                vec![
+                    delete_object_identifier("snapshots/batch-good.bin"),
+                    unsupported,
+                ],
+                None,
+            )))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let deleted = delete.output.deleted.unwrap_or_default();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].key.as_deref(), Some("snapshots/batch-good.bin"));
+        let errors = delete.output.errors.unwrap_or_default();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].key.as_deref(),
+            Some("snapshots/batch-versioned.bin")
+        );
+        assert_eq!(errors[0].code.as_deref(), Some("NotImplemented"));
+        assert!(
+            errors[0].message.as_deref().is_some_and(|message| {
+                message.contains("conditional or versioned DeleteObjects")
+            })
+        );
     }
 
     #[tokio::test]
@@ -2309,6 +2529,15 @@ mod tests {
             .await
             .expect_err("restore-readonly mode should reject DeleteObject");
         assert_eq!(*delete.code(), s3s::S3ErrorCode::AccessDenied);
+
+        let delete_objects = service
+            .delete_objects(s3_request(delete_objects_input(
+                vec![delete_object_identifier("snapshots/restorable.bin")],
+                None,
+            )))
+            .await
+            .expect_err("restore-readonly mode should reject DeleteObjects");
+        assert_eq!(*delete_objects.code(), s3s::S3ErrorCode::AccessDenied);
 
         assert_eq!(accepted_v2_sequence(&service).await, 2);
     }

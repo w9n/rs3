@@ -7,9 +7,9 @@ use rs3_storage::StorageError;
 use rs3_types::{LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy};
 use s3s::S3Result;
 use s3s::dto::{
-    CommonPrefix, DeleteObjectInput, GetObjectInput, GetObjectLegalHoldInput, HeadObjectInput,
-    Object, ObjectLockLegalHold, ObjectLockLegalHoldStatus, PutObjectInput,
-    PutObjectLegalHoldInput, StreamingBlob, Timestamp,
+    CommonPrefix, DeleteObjectInput, DeleteObjectsInput, GetObjectInput, GetObjectLegalHoldInput,
+    HeadObjectInput, Object, ObjectIdentifier, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+    PutObjectInput, PutObjectLegalHoldInput, StreamingBlob, Timestamp,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -187,6 +187,36 @@ pub(super) fn validate_delete_object_request(input: &DeleteObjectInput) -> S3Res
         return Err(s3s::s3_error!(
             NotImplemented,
             "conditional or versioned DeleteObject is not supported"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_delete_objects_request(input: &DeleteObjectsInput) -> S3Result<()> {
+    if input.delete.objects.is_empty() {
+        return Err(s3s::s3_error!(
+            MalformedXML,
+            "DeleteObjects requires at least one object"
+        ));
+    }
+    if input.delete.objects.len() > 1000 {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "DeleteObjects supports at most 1000 objects"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_delete_objects_entry(input: &ObjectIdentifier) -> S3Result<()> {
+    if input.version_id.is_some()
+        || input.e_tag.is_some()
+        || input.last_modified_time.is_some()
+        || input.size.is_some()
+    {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "conditional or versioned DeleteObjects entries are not supported"
         ));
     }
     Ok(())
