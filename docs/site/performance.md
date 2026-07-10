@@ -93,23 +93,24 @@ now require a fresh repository reload, exact list cardinality, and full reads
 of the first, middle, and last object after every write run. The exact commands
 and amplification ratios are recorded in `tests/PERFORMANCE_BASELINE.md`.
 
-The 10k gate passes all three release-profile runs. Write elapsed time was
-521-537 ms, fresh reload was 420-433 ms, each run used 157 commit PUTs, and
-write amplification was 12.734-12.736x for 512 B objects. The 100k tier writes
-successfully but fresh reload fails closed with `v2 recovery replay budget
-exceeded`; the 1M tier reaches the same recovery failure. Consequently, 100k
-and 1M repository recovery remain production blockers. A successful write-only
-million-object run is not accepted as scale evidence.
+The transitional `commits/v02` 10k gate passes all three release-profile runs.
+Write elapsed time was 634-638 ms, fresh reload was 410-444 ms, each run used
+157 commit PUTs, and write amplification was 12.859-12.861x for 512 B objects.
+Every fresh reader listed exactly 10,000 objects and verified the first, middle,
+and last payload. The larger signed header raises small-object write
+amplification slightly while independent section digests remove payload scans
+from recovery.
 
-These measurements were collected against the now-removed `commits/v01`
-generation. The transitional `commits/v02` envelope now authenticates index
-sections independently and no longer scans payload ciphertext during recovery,
-but it retains the prototype delta/snapshot chain and fixed replay-depth budget.
-The 100k and 1M tiers must therefore be rerun and are not qualified by the
-generation change. Final `v02` qualification must use a fresh process and verify
-exact listing cardinality plus first, middle, and last object bytes. Its
-descriptor-first reader must retain no cumulative encrypted delta set, read no
-payload sections merely to rebuild the index, and use at most 1.25x the index
+The earlier 100k tier wrote successfully but fresh reload failed closed with
+`v2 recovery replay budget exceeded`; the 1M tier reached the same recovery
+failure. Those measurements used the removed `commits/v01` generation. The
+transitional v02 reader still has the prototype delta/snapshot chain and fixed
+replay-depth budget, so 100k and 1M remain production blockers and must be rerun
+after catalog recovery lands. A successful write-only million-object run is not
+accepted as scale evidence. Final `v02` qualification must use a fresh process
+and verify exact listing cardinality plus first, middle, and last object bytes.
+Its descriptor-first reader must retain no cumulative encrypted delta set, read
+no payload sections merely to rebuild the index, and use at most 1.25x the index
 material required by the accepted catalog. On the documented pinned 4-vCPU,
 16-GiB runner, the 1M filesystem recovery budget is 180 seconds and 4 GiB RSS.
 Correctness, request, byte, allocation, and amplification bounds apply on every
