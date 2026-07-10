@@ -17,6 +17,9 @@ spec:
       labels:
         {{- include "rs3-gateway.selectorLabels" . | nindent 8 }}
     spec:
+      # Only Lease-backed deployments need ambient Kubernetes API credentials.
+      automountServiceAccountToken: {{ eq .Values.anchor.mode "kubernetes-lease" }}
+      enableServiceLinks: false
       {{- if eq .Values.anchor.mode "kubernetes-lease" }}
       serviceAccountName: {{ include "rs3-gateway.serviceAccountName" . }}
       {{- end }}
@@ -24,7 +27,11 @@ spec:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: gateway
+          {{- if .Values.image.digest }}
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          {{- else }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          {{- end }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
@@ -145,6 +152,10 @@ spec:
                   name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
                   key: wrapping-key-hex
             {{- end }}
+            {{- if .Values.recovery.publicKey }}
+            - name: RS3_RECOVERY_PUBLIC_KEY
+              value: {{ .Values.recovery.publicKey | quote }}
+            {{- end }}
             - name: RS3_ANCHOR_MODE
               value: {{ .Values.anchor.mode | quote }}
             - name: RS3_WRITER_GUARD
@@ -163,15 +174,18 @@ spec:
             {{- end }}
             - name: RS3_LOG_FORMAT
               value: {{ .Values.logging.format | quote }}
+            - name: RS3_ADMIN_PROFILE
+              value: {{ .Values.admin.profile | quote }}
             - name: RUST_LOG
               value: {{ .Values.logging.rustLog | quote }}
           {{- if .Values.admin.enabled }}
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: admin
-            periodSeconds: 1
-            failureThreshold: 30
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /healthz

@@ -21,9 +21,9 @@ For docs-only changes, prefer `just docs-check`. Fallback when `just` is
 unavailable:
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 mkdocs build --strict
 ```
 

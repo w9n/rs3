@@ -7,6 +7,9 @@ replicaCount: 1
 image:
   repository: rs3-server
   tag: ci
+  # Production requires an immutable sha256 digest. When set, digest wins over
+  # tag while tag remains useful for local integration images.
+  digest: ""
   pullPolicy: IfNotPresent
 
 # Cluster-internal S3-compatible listener.
@@ -19,6 +22,10 @@ service:
 # values, never from chart defaults.
 admin:
   enabled: true
+  # production also requires an immutable image, HTTPS backend, external Secret
+  # references, readiness, and fenced Lease coordination for read-write mode.
+  # local is an explicit development escape hatch and must not be exposed.
+  profile: production
   port: 9081
   createToken: false
   existingTokenSecret: ""
@@ -111,8 +118,8 @@ repository:
     mode: ""
     days: 0
 
-# Repository key material and encrypted keyring envelope settings. Prefer
-# existingSecret or an external secret operator for production deployments.
+# Repository key material and encrypted keyring envelope settings. Production
+# requires existingSecret so secret bytes do not enter Helm release history.
 repositoryKeys:
   create: false
   existingSecret: ""
@@ -120,6 +127,11 @@ repositoryKeys:
   envelopeObjectId: ""
   wrappingKeyId: wrap-v1
   wrappingKeyHex: ""
+
+# Offline disaster-recovery verification key. This is public key material and
+# may be stored in Helm values; keep the corresponding signing key offline.
+recovery:
+  publicKey: ""
 
 # Rollback anchor coordination. Kubernetes Lease anchoring is the production
 # preview default; memory anchors are local-development only.

@@ -26,7 +26,8 @@ Current engineering priorities:
 - operational evidence for retention, tracing, and metrics
 
 See `docs/site/production-preview.md` for the preview contract and release
-gates.
+gates, and `docs/site/release-process.md` for the artifact and publication
+checklist.
 
 ## Development
 
@@ -40,9 +41,9 @@ just check
 Equivalent Cargo commands inside the shell:
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 mkdocs build --strict
 ```
 

@@ -6,20 +6,20 @@ default:
 
 # Format Rust and TOML sources.
 fmt:
-    cargo fmt --all
+    cargo fmt
     taplo fmt
 
 # Check Rust and TOML formatting without writing changes.
 fmt-check:
-    cargo fmt --all --check
+    cargo fmt --check
     taplo fmt --check
 
 # Run formatting, lint, workspace tests, and docs checks.
 check:
-    cargo fmt --all --check
+    cargo fmt --check
     taplo fmt --check
-    cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    cargo test --workspace --all-features
     just docs-check
     just helm-lint
 
@@ -227,9 +227,10 @@ integration-velero-kopia-postgres-smoke *ARGS:
 integration-velero-kopia-postgres-v2-live *ARGS:
     cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke --backend-mode provided --repository-retention-mode governance --repository-retention-days 1 {{ARGS}}
 
-# Lint the Helm chart with required fixture values.
+# Lint both the local fixture and fail-closed production value profiles.
 helm-lint:
     helm lint charts/rs3-gateway \
+        --set admin.profile=local \
         --set credentials.create=true \
         --set-string credentials.accessKeyId=fixture-access-key \
         --set-string credentials.secretAccessKey=fixture-secret-key \
@@ -238,6 +239,15 @@ helm-lint:
         --set repositoryKeys.create=true \
         --set-string repositoryKeys.saltHex=1111111111111111111111111111111111111111111111111111111111111111 \
         --set-string repositoryKeys.wrappingKeyHex=2222222222222222222222222222222222222222222222222222222222222222
+    helm lint charts/rs3-gateway \
+        --set-string image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+        --set-string backend.endpoint=https://s3.example.invalid \
+        --set credentials.existingSecret=fixture-client-credentials \
+        --set admin.existingTokenSecret=fixture-admin-token \
+        --set repositoryKeys.existingSecret=fixture-repository-keys \
+        --set repository.retention.mode=governance \
+        --set repository.retention.days=1 \
+        --set-string recovery.publicKey=ed25519:0000000000000000000000000000000000000000000000000000000000000000
 
 # Run the workspace test suite.
 test:

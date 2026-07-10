@@ -1,4 +1,6 @@
 /.git
+/.env
+/.env.*
 /.local
 /target
 /result
@@ -12,3 +14,8 @@
 /xtask/src/*
 !/xtask/src/bin
 !/xtask/src/bin/rs3-integration-storage-proxy.rs
+**/*.key
+**/*.kubeconfig
+**/*.p12
+**/*.pem
+**/*.pfx

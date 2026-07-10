@@ -40,6 +40,47 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- define "rs3-gateway.validateValues" -}}
+{{- if and (ne .Values.admin.profile "local") (ne .Values.admin.profile "production") -}}
+{{- fail "admin.profile must be local or production" -}}
+{{- end -}}
+{{- if and .Values.image.digest (not (regexMatch "^sha256:[a-f0-9]{64}$" .Values.image.digest)) -}}
+{{- fail "image.digest must be an immutable sha256:<64 lowercase hex characters> digest" -}}
+{{- end -}}
+{{- if and (not .Values.image.digest) (not .Values.image.tag) -}}
+{{- fail "image.tag is required when image.digest is empty" -}}
+{{- end -}}
+{{- if and (ne .Values.image.pullPolicy "Always") (and (ne .Values.image.pullPolicy "IfNotPresent") (ne .Values.image.pullPolicy "Never")) -}}
+{{- fail "image.pullPolicy must be Always, IfNotPresent, or Never" -}}
+{{- end -}}
+{{- if eq .Values.admin.profile "production" -}}
+{{- if not .Values.admin.enabled -}}
+{{- fail "admin.profile=production requires admin.enabled=true for readiness and path-redacted operator status" -}}
+{{- end -}}
+{{- if not .Values.image.digest -}}
+{{- fail "admin.profile=production requires image.digest; mutable image tags are local-development only" -}}
+{{- end -}}
+{{- if or .Values.credentials.create (or .Values.admin.createToken (or .Values.backendCredentials.create .Values.repositoryKeys.create)) -}}
+{{- fail "admin.profile=production forbids chart-created secret values because Helm stores them in release history; use existing Secret references" -}}
+{{- end -}}
+{{- if and (ne .Values.backend.endpoint "s3") (not (hasPrefix "https://" .Values.backend.endpoint)) -}}
+{{- fail "admin.profile=production requires backend.endpoint=s3 or an https:// endpoint" -}}
+{{- end -}}
+{{- if and (eq .Values.gateway.mode "read-write") (ne .Values.anchor.mode "kubernetes-lease") -}}
+{{- fail "admin.profile=production with gateway.mode=read-write requires anchor.mode=kubernetes-lease" -}}
+{{- end -}}
+{{- if and (eq .Values.gateway.mode "read-write") (ne .Values.gateway.writerGuard "required") -}}
+{{- fail "admin.profile=production with gateway.mode=read-write requires gateway.writerGuard=required" -}}
+{{- end -}}
+{{- if and (eq .Values.gateway.mode "read-write") (not .Values.repository.retention.mode) -}}
+{{- fail "admin.profile=production with gateway.mode=read-write requires repository retention" -}}
+{{- end -}}
+{{- if .Values.repository.allowInit -}}
+{{- fail "admin.profile=production requires repository.allowInit=false outside deliberate bootstrap" -}}
+{{- end -}}
+{{- if not (regexMatch "^ed25519:[a-fA-F0-9]{64}$" .Values.recovery.publicKey) -}}
+{{- fail "admin.profile=production requires recovery.publicKey as ed25519:<64 hex characters>" -}}
+{{- end -}}
+{{- end -}}
 {{- if not .Values.repository.id -}}
 {{- fail "repository.id is required; use a stable value for keyring envelope binding" -}}
 {{- end -}}

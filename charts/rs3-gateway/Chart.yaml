@@ -4,3 +4,11 @@ description: Path-private, tamper-evident S3-compatible backup gateway for Kuber
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
+home: https://github.com/w9n/rs3
+sources:
+  - https://github.com/w9n/rs3
+keywords:
+  - backup
+  - kubernetes
+  - s3
+  - security

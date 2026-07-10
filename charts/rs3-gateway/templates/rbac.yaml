@@ -19,7 +19,6 @@ rules:
       - leases
     resourceNames:
       - {{ .Values.anchor.name | quote }}
-      - {{ printf "%s-writer" .Values.anchor.name | quote }}
     verbs:
       - get
       - update

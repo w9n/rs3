@@ -50,6 +50,7 @@ nav:
   - Evaluate:
       - Evaluation: evaluation.md
       - Production Preview: production-preview.md
+      - Release Process: release-process.md
       - Getting Started: getting-started.md
       - Testing: testing.md
   - Understand:

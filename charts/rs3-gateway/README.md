@@ -21,6 +21,7 @@ values. This is not a production posture.
 
 ```sh
 helm upgrade --install rs3 charts/rs3-gateway \
+  --set admin.profile=local \
   --set persistence.enabled=true \
   --set credentials.create=true \
   --set-string credentials.accessKeyId=local \
@@ -42,6 +43,10 @@ Prefer externally managed Secrets so credentials and wrapping keys do not land i
 Helm release history:
 
 ```yaml
+image:
+  repository: registry.example.internal/backup/rs3-server
+  digest: sha256:<replace-with-the-published-64-character-digest>
+
 backend:
   endpoint: https://s3.example.internal
   bucket: rs3-backend
@@ -92,6 +97,10 @@ repositoryKeys:
   envelopeObjectId: ""
   wrappingKeyId: wrap-v1
 
+recovery:
+  # Public half of an offline Ed25519 recovery-signing key.
+  publicKey: ed25519:<replace-with-64-hex-character-public-key>
+
 anchor:
   mode: kubernetes-lease
   namespace: ""
@@ -111,19 +120,31 @@ Expected Secret keys are:
 
 ## Operational Notes
 
+- `admin.profile=production` makes chart rendering fail unless the image is
+  digest-pinned, the backend endpoint uses HTTPS (or the default AWS `s3`
+  endpoint), the admin readiness listener is enabled, and all secret material
+  comes from existing Secret references. Use `admin.profile=local` only for
+  disposable development fixtures.
 - Keep `updateStrategy.type=Recreate` for read-write gateways so rollouts do not
   briefly run two writers against the same repository.
 - Keep `gateway.writerGuard=required` with `anchor.mode=kubernetes-lease` for
   read-write deployments.
+- Lease fencing coordinates writers that share one Kubernetes apiserver and
+  anchor Lease. Disconnected read-write gateways that only share or synchronize
+  S3 storage remain unsupported: an eventually consistent or malicious backend
+  is not a safe lock service. Multiple disconnected `restore-readonly` readers
+  are supported when each can verify the accepted anchored state.
 - The chart enables the admin listener by default and uses unauthenticated
-  `/healthz` on the admin port for readiness and liveness probes. Admin fact
+  `/readyz` on the admin port for readiness and `/healthz` for liveness. Admin fact
   routes still require the configured bearer token.
 - `metrics.enabled=true` exposes the gateway metrics listener through the main
   Service. `metrics.serviceMonitor.enabled=true` also renders a Prometheus
   Operator `ServiceMonitor`.
 - The container runs with privilege escalation disabled, a read-only root
   filesystem, all Linux capabilities dropped, and a RuntimeDefault seccomp
-  profile. The chart mounts an emptyDir at `/tmp` for scratch space.
+  profile. The chart mounts an emptyDir at `/tmp` for scratch space, disables
+  Kubernetes service-link environment injection, and mounts a service-account
+  token only for Lease-backed deployments.
 - Default resources request 512Mi/250m and limit memory to 1536Mi. There is no
   CPU limit by default.
 - `networkPolicy.enabled=true` renders a baseline policy that admits S3 traffic
