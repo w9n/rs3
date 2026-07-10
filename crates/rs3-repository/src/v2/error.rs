@@ -40,7 +40,7 @@ pub enum V2FormatError {
     /// The commit requires a newer reader than this implementation.
     #[error("unsupported v2 commit reader version")]
     UnsupportedReaderVersion,
-    /// The commit uses capability bits outside the v01 mask.
+    /// The commit uses capability bits outside the v02 mask.
     #[error("unsupported v2 commit capability flags")]
     UnsupportedCapabilities,
     /// The fixed header declared an unknown upload mode.
@@ -49,13 +49,13 @@ pub enum V2FormatError {
     /// Reserved fixed-header bytes were nonzero.
     #[error("nonzero v2 commit reserved bytes")]
     NonzeroReserved,
-    /// The CBOR header is larger than v01 permits.
+    /// The CBOR header is larger than v02 permits.
     #[error("v2 commit header is too large")]
     HeaderTooLarge,
     /// The fixed header or CBOR header digest does not match.
     #[error("v2 commit header digest mismatch")]
     HeaderDigestMismatch,
-    /// The header CBOR could not be decoded as the v01 structure.
+    /// The header CBOR could not be decoded as the v02 structure.
     #[error("malformed v2 commit CBOR header")]
     MalformedCbor,
     /// The header CBOR decoded but was not canonical.
@@ -67,7 +67,7 @@ pub enum V2FormatError {
     /// A header field had an invalid type, length, or value.
     #[error("invalid v2 commit header field")]
     InvalidHeaderField,
-    /// The header algorithm identifiers do not exactly match v01.
+    /// The header algorithm identifiers do not exactly match v02.
     #[error("invalid v2 commit algorithm identifiers")]
     InvalidAlgorithms,
     /// The signed self commit key does not match the object key read.

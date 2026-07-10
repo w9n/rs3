@@ -382,7 +382,7 @@ mod tests {
         V2AnchorState {
             sequence: Sequence::new(sequence),
             commit_key: BackendObjectId::new(format!(
-                "commits/v01/{sequence:020}/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                "commits/v02/{sequence:020}/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
             ))
             .expect("valid backend object id"),
             body_digest: [sequence as u8; 32],

@@ -144,7 +144,7 @@ fn sample_header(upload_mode: V2UploadMode) -> (V2CommitKey, V2CommitHeader, Byt
         }),
         publish_time_ms: 1_765_000_000_000,
         is_snapshot: true,
-        algorithms: V2Algorithms::v01(),
+        algorithms: V2Algorithms::v02(),
         keyring_envelope_ref: V2KeyringEnvelopeRef {
             object_id: object_id("keyrings/00000000000000000001-deadbeef"),
             digest: [4_u8; 32],
@@ -652,7 +652,7 @@ fn commit_key_round_trips_and_rejects_non_v2_shapes() {
     let key = sample_commit_key();
     assert_eq!(
         key.object_id.as_str().len(),
-        "commits/v01/".len() + 20 + 1 + 43
+        "commits/v02/".len() + 20 + 1 + 43
     );
 
     let parsed = must_v2(V2CommitKey::parse(&key.object_id));
@@ -661,9 +661,9 @@ fn commit_key_round_trips_and_rejects_non_v2_shapes() {
 
     for invalid in [
         "checkpoints/not-v2",
-        "commits/v01/00000000000000000007/short",
-        "commits/v01/0000000000000000007/not-wide-enough",
-        "commits/v01/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "commits/v02/00000000000000000007/short",
+        "commits/v02/0000000000000000007/not-wide-enough",
+        "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
     ] {
         let object_id = object_id(invalid);
         assert!(matches!(
@@ -2273,7 +2273,7 @@ async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
     let listed = must_repo(fresh.list("snapshots/"));
     let commits = must_v2(
         store
-            .list_prefix("commits/v01/")
+            .list_prefix("commits/v02/")
             .await
             .map_err(|_| V2FormatError::StorageOperationFailed),
     );
@@ -2764,7 +2764,7 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
         .await;
     let commits_after_rejection = must_v2(
         store
-            .list_prefix("commits/v01/")
+            .list_prefix("commits/v02/")
             .await
             .map_err(|_| V2FormatError::StorageOperationFailed),
     );

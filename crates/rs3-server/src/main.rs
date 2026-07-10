@@ -1908,7 +1908,7 @@ mod tests {
             },
             "anchor": {
                 "sequence": 7,
-                "commit_key": "commits/v01/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "commit_key": "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 "body_digest": "11".repeat(32),
                 "version_id": "version-a",
                 "signing_key_id": "checkpoint-v1",
@@ -1953,7 +1953,7 @@ mod tests {
             },
             "anchor": {
                 "sequence": 7,
-                "commit_key": "commits/v01/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "commit_key": "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 "body_digest": "11".repeat(32),
                 "signing_key_id": "checkpoint-v1",
                 "format": {
@@ -1988,7 +1988,7 @@ mod tests {
             },
             "anchor": {
                 "sequence": 7,
-                "commit_key": "commits/v01/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "commit_key": "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 "body_digest": "11".repeat(32),
                 "signing_key_id": "checkpoint-v1",
                 "format": {

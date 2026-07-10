@@ -9,12 +9,13 @@ The preview defines the behavior to evaluate. It is not a stable
 repository-format promise.
 
 !!! danger "Repository release is currently blocked"
-    The implemented `commits/v01` preview generation is deprecated and has no
-    production repositories. The replacement `commits/v02` catalog-and-run
-    format is not implemented. Existing compatibility and provider results are
-    useful regression evidence for the gateway, but they do not qualify `v02`
-    or a production repository release. There will be no `v01` migration or
-    dual-reader requirement.
+    `commits/v01` has been removed and is unsupported; it had no production
+    repositories. The runtime now reads and writes a transitional
+    `commits/v02` envelope, but framed index runs, signed catalogs, compaction,
+    and bounded recovery remain unimplemented. Existing compatibility and
+    provider results are useful gateway regression evidence, but they do not
+    qualify the complete `v02` format or a production repository release. There
+    will be no `v01` migration or dual-reader requirement.
 
 ## Preview Scope
 
@@ -90,7 +91,7 @@ one. The backend can still deny service by hiding required objects.
 | --- | --- |
 | Empty backend prefix and no anchor | Startup may initialize one generated keyring envelope only when repository initialization is explicitly enabled using the supplied repository ID, salt, and wrapping-key source. An envelope object ID is optional override state, not normal Helm state. |
 | Existing backend prefix and matching anchor | Open after signed commit-chain, format-root, and envelope validation. |
-| Fresh initialization finds deprecated `commits/v01` objects or ambiguous existing state | Fail closed. `v02` initialization does not import, migrate, overwrite, or adopt the old generation. |
+| Fresh initialization finds unsupported `commits/v01` objects or ambiguous existing state | Fail closed. `v02` initialization does not import, migrate, overwrite, or adopt the old generation. |
 | Backend serves an older commit than the Lease anchor | Fail closed as rollback. |
 | Backend hides the commit named by the Lease anchor | Fail closed as unavailable or tampered. |
 | Backend adds unrelated objects | Ignore them unless signed and reachable from anchored state. |
@@ -207,12 +208,13 @@ chain and therefore to the repository state reachable from it.
 
 Release evidence below is maintainer-run evidence for the deprecated preview
 implementation. Treat it as compatibility, storage-contract, and gateway
-regression evidence only. It does not exercise `commits/v02`, standalone framed
-index runs, signed `INDEX_ROOT` catalogs, automatic checkpoint backpressure, or
-exact catalog-root GC. Exact backend prefixes and workspace-local artifact paths
-are not part of the public evidence record because they are operational
-identifiers. Preserve raw reports, checksums, and run logs in release assets or
-private evidence bundles when independent review needs them.
+regression evidence only. It predates the generation switch and does not
+exercise standalone framed index runs, signed `INDEX_ROOT` catalogs, automatic
+checkpoint backpressure, or exact catalog-root GC. Exact backend prefixes and
+workspace-local artifact paths are not part of the public evidence record
+because they are operational identifiers. Preserve raw reports, checksums, and
+run logs in release assets or private evidence bundles when independent review
+needs them.
 
 At a glance:
 
@@ -271,8 +273,8 @@ test does not replace that credential review.
 The current preview implementation remains useful for controlled Velero/Kopia,
 provider, and gateway evaluation. Do not initialize it for production data or
 present it as the new repository format. A repository release candidate is
-blocked until `commits/v02` is implemented and passes the format, recovery,
-checkpoint, retained-provider, GC, and scale gates.
+blocked until the complete `commits/v02` contract is implemented and passes the
+format, recovery, checkpoint, retained-provider, GC, and scale gates.
 
 Governance-bypass IAM review remains operator-owned, live provider gates must be
 rerun after the new run-object path lands, and public security claims need
@@ -290,8 +292,8 @@ The preview does not promise:
 
 ## Release Gates
 
-The commands below exercise the deprecated preview implementation and remain
-useful regression checks. They are not `v02` release gates.
+The commands below exercise the transitional preview implementation and remain
+useful regression checks. They do not qualify the complete `v02` contract.
 
 Run the cheap local regression gate first:
 

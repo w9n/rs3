@@ -68,17 +68,18 @@ The replacement `v02` design accepts specific backend-visible leakage:
 Optional mitigations include padding, pack-size normalization, commit batching,
 compaction jitter, and stricter telemetry redaction.
 
-The deprecated prototype currently uses `format/`, `keyrings/`, and
-`commits/v01/<sequence>/<random-id>`. Its durable prefix tokens and the trusted
-process's `v2-pending/<sequence>` placeholder are not part of `v02`. No
-production repository uses the deprecated generation, and no migration or dual
-reader is planned.
+The removed prototype used `format/`, `keyrings/`, and
+`commits/v01/<sequence>/<random-id>`. The transitional runtime now uses
+`commits/v02`, but still has prototype index sections and durable prefix-token
+semantics. No production repository used `v01`, and no migration or dual reader
+is planned.
 
 !!! warning "Security implementation status"
-    The `v02` controls below are requirements, not current evidence. The gateway
-    does not yet read or write `commits/v02` catalogs or `objects/v02` runs.
-    Security claims for that generation remain blocked on implementation,
-    hostile-input tests, scale recovery, and external cryptographic review.
+    The gateway reads and writes a transitional `v02` commit envelope, but does
+    not yet read or write `INDEX_ROOT` catalogs or `objects/v02` framed runs.
+    The controls below are requirements, not current evidence. Security claims
+    remain blocked on implementation, hostile-input tests, scale recovery, and
+    external cryptographic review.
 
 ## Control Map
 
@@ -185,7 +186,7 @@ anchor-bound versions remain exactly readable. The object key is then not the
 uniqueness authority; the signed commit, external anchor, object digest, and
 provider version ID are.
 
-In both the deprecated prototype and `v02`, commit keys include a random
+In both the removed prototype and transitional `v02`, commit keys include a random
 component. For retained-version
 providers that do not support atomic create, the writer performs a preflight
 `HEAD` and binds the accepted object version into the anchor. A same-sequence
@@ -284,15 +285,15 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
 
 ## Current Open Risks
 
-- `v02` is a design contract and is not implemented; the deprecated prototype
-  is not a production format.
+- The transitional `v02` envelope is implemented, but its catalog-and-run
+  security contract is not; the removed prototype was not a production format.
 - Durable format compatibility is not promised yet.
 - The cryptographic design has not had an external review.
 - Metadata sealing uses a standard misuse-resistant AEAD, but deterministic
   sealing leaks equality for identical metadata under identical associated data.
-- The deprecated generation's prefix tokens leak namespace structure through
-  token count and shared-token relationships. `v02` removes durable prefix
-  tokens, but that property still needs tests.
+- The transitional runtime's prefix tokens leak namespace structure through
+  token count and shared-token relationships. The completed `v02` design removes
+  durable prefix tokens, but that property still needs implementation and tests.
 - Catalog compaction, exact payload-root GC, and failure backpressure have not
   passed adversarial crash, replay, and stale-fence testing.
 - Retained backend history depends on provider retention or Object Lock to

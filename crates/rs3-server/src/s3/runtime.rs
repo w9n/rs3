@@ -864,12 +864,12 @@ where
 {
     let listed = if provider_profile == V2ProviderProfile::RetainedVersionObjectLock {
         store
-            .list_prefix_versions("commits/v01/")
+            .list_prefix_versions("commits/v02/")
             .await
             .map_err(repository_init)?
     } else {
         store
-            .list_prefix("commits/v01/")
+            .list_prefix("commits/v02/")
             .await
             .map_err(repository_init)?
     };
@@ -1386,7 +1386,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let commits = store
-            .list_prefix("commits/v01/")
+            .list_prefix("commits/v02/")
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let v2_anchor = runtime
@@ -1426,7 +1426,7 @@ mod tests {
             .list_page("snapshots/", None, 1000)
             .unwrap_or_else(|error| panic!("{error}"));
         let commits = store
-            .list_prefix("commits/v01/")
+            .list_prefix("commits/v02/")
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let backend_objects = store
@@ -1803,7 +1803,7 @@ mod tests {
             .join("backend-bucket")
             .join("repo")
             .join("commits")
-            .join("v01");
+            .join("v02");
 
         assert_eq!(head.content_len, 16);
         assert!(commits_root.is_dir());
@@ -2117,7 +2117,7 @@ mod tests {
             anchor: V2AnchorState {
                 sequence: Sequence::new(7),
                 commit_key: BackendObjectId::new(
-                    "commits/v01/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 )
                 .unwrap_or_else(|error| panic!("{error}")),
                 body_digest: [0x11; 32],
@@ -2172,7 +2172,7 @@ mod tests {
 
     fn commit_object_id(sequence: u64) -> BackendObjectId {
         BackendObjectId::new(format!(
-            "commits/v01/{sequence:020}/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "commits/v02/{sequence:020}/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         ))
         .unwrap_or_else(|error| panic!("{error}"))
     }

@@ -251,11 +251,11 @@ where
     let anchor = rs3_repository::v2::V2MemoryAnchor::new();
 
     let existing_commits = store
-        .list_prefix("commits/v01/")
+        .list_prefix("commits/v02/")
         .await
         .context("failed to inspect retained GC rehearsal target prefix")?;
     if !existing_commits.is_empty() {
-        bail!("retained GC rehearsal refuses to run when commits/v01/ is not empty");
+        bail!("retained GC rehearsal refuses to run when commits/v02/ is not empty");
     }
 
     let genesis = repository
@@ -982,7 +982,7 @@ mod tests {
             "repository_salt_digest": "33".repeat(32),
             "anchor": {
                 "sequence": 7,
-                "commit_key": "commits/v01/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "commit_key": "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 "body_digest": "11".repeat(32),
                 "version_id": "version-a",
                 "signing_key_id": "checkpoint-v1",

@@ -57,7 +57,7 @@ pub struct V2OrphanCandidate {
 pub struct V2OrphanReport {
     /// Reachable commit object count in the verified anchor chain.
     pub reachable_commit_count: usize,
-    /// Candidate commits under `commits/v01/` that are not anchor-reachable.
+    /// Candidate commits under `commits/v02/` that are not anchor-reachable.
     pub candidates: Vec<V2OrphanCandidate>,
 }
 
@@ -401,12 +401,12 @@ where
             self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock;
         let listed = if retained_profile {
             self.store()
-                .list_prefix_versions("commits/v01/")
+                .list_prefix_versions("commits/v02/")
                 .await
                 .map_err(|_| V2FormatError::StorageOperationFailed)?
         } else {
             self.store()
-                .list_prefix("commits/v01/")
+                .list_prefix("commits/v02/")
                 .await
                 .map_err(|_| V2FormatError::StorageOperationFailed)?
         };

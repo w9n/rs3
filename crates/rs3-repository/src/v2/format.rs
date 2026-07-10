@@ -98,7 +98,7 @@ impl V2FormatRoot {
         retention: Option<RetentionPolicy>,
     ) -> Self {
         Self {
-            format_version: 1,
+            format_version: 2,
             repository_id,
             active_keyring_envelope_ref,
             signing_key_id,
@@ -122,7 +122,7 @@ impl V2FormatRoot {
         };
         let root: Self =
             serde_json::from_slice(payload).map_err(|_| V2FormatError::FormatEncoding)?;
-        if root.format_version != 1 {
+        if root.format_version != 2 {
             return Err(V2FormatError::InvalidFormatRoot);
         }
         Ok(root)

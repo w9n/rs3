@@ -48,7 +48,7 @@ impl V2VectorFixture {
             }),
             publish_time_ms: 1_765_000_123_456,
             is_snapshot: true,
-            algorithms: V2Algorithms::v01(),
+            algorithms: V2Algorithms::v02(),
             keyring_envelope_ref: V2KeyringEnvelopeRef {
                 object_id: object_id("keyrings/00000000000000000042-vector"),
                 digest: [0x24; 32],

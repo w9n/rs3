@@ -48,10 +48,11 @@ not add ad hoc hashing, MAC, encryption, or key derivation logic.
 ## Repository State
 
 !!! warning "Format implementation status"
-    The implemented preview generation stores commits under `commits/v01/` and
-    is deprecated. It has no production repositories and will not gain a
-    migration path or dual reader. The `commits/v02` architecture below is the
-    replacement contract, not functionality available in the gateway yet.
+    `commits/v01` has been removed and is unsupported. It has no production
+    repositories and will not gain a migration path or dual reader. The runtime
+    now reads and writes a transitional `commits/v02` envelope, but the framed
+    runs, signed catalogs, compactor, and bounded recovery architecture below are
+    not implemented yet.
 
 Normal writes are append-friendly:
 
@@ -117,8 +118,8 @@ client paths as backend object keys.
 In `v02`, encrypted runs carry a blinded lookup projection and a plaintext-path
 listing projection inside authenticated ciphertext. Run keys, public metadata,
 and signed headers expose neither paths nor plaintext projection bounds. The
-deprecated preview's durable prefix-token representation is not carried into
-the replacement format.
+transitional runtime's durable prefix-token representation is not carried into
+the completed format.
 
 ## Rollback Resistance
 

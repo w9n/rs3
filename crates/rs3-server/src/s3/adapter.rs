@@ -1786,7 +1786,7 @@ mod tests {
             .repository
             .memory_store()
             .unwrap_or_else(|| panic!("missing memory store"))
-            .list_prefix("commits/v01/")
+            .list_prefix("commits/v02/")
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(backend_objects.len(), 2);

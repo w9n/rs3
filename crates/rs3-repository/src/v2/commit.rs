@@ -25,11 +25,11 @@ pub const V2_HEADER_META_LEN: usize = 64;
 pub const V2_MAX_HEADER_SIZE: usize = 4096;
 /// Magic bytes at the start of every v2 commit object.
 pub const V2_COMMIT_MAGIC: &[u8; 8] = b"rs3:cmt\n";
-/// v01 commit format version.
-pub const V2_FORMAT_VERSION: u32 = 1;
-/// v01 minimum reader version.
-pub const V2_MIN_READER_VERSION: u32 = 1;
-/// v01 capability mask. No optional capabilities are supported yet.
+/// v02 commit format version.
+pub const V2_FORMAT_VERSION: u32 = 2;
+/// v02 minimum reader version.
+pub const V2_MIN_READER_VERSION: u32 = 2;
+/// v02 capability mask. No optional capabilities are supported yet.
 pub const V2_SUPPORTED_CAPABILITY_FLAGS: u64 = 0;
 /// Section flag indicating the section type must be understood.
 pub const V2_SECTION_FLAG_MUST_UNDERSTAND: u8 = 0x01;
@@ -38,7 +38,7 @@ pub const V2_SECTION_FLAG_COMPRESSED: u8 = 0x02;
 /// Media type used for v2 commit objects.
 pub const V2_COMMIT_CONTENT_TYPE: &str = "application/vnd.rs3.commit.v2";
 
-const COMMIT_PREFIX: &str = "commits/v01/";
+const COMMIT_PREFIX: &str = "commits/v02/";
 const HEADER_DIGEST_START: usize = 32;
 const HEADER_DIGEST_END: usize = HEADER_DIGEST_START + V2_DIGEST_LEN;
 const HEADER_CBOR_START: usize = V2_HEADER_META_LEN;
@@ -71,7 +71,7 @@ impl V2UploadMode {
     }
 }
 
-/// v01 commit section type.
+/// v02 commit section type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum V2SectionType {
     /// Encrypted incremental namespace mutation section.
@@ -214,7 +214,7 @@ pub struct V2CommitParentRef {
     pub version_id: Option<BackendVersionId>,
 }
 
-/// v01 algorithm identifiers.
+/// v02 algorithm identifiers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V2Algorithms {
     /// Header signature algorithm identifier.
@@ -228,8 +228,8 @@ pub struct V2Algorithms {
 }
 
 impl V2Algorithms {
-    /// Returns the exact v01 primitive identifiers.
-    pub fn v01() -> Self {
+    /// Returns the exact v02 primitive identifiers.
+    pub fn v02() -> Self {
         Self {
             signature: "Ed25519".to_owned(),
             payload_aead: "XChaCha20-Poly1305".to_owned(),
@@ -241,7 +241,7 @@ impl V2Algorithms {
 
 impl Default for V2Algorithms {
     fn default() -> Self {
-        Self::v01()
+        Self::v02()
     }
 }
 
@@ -278,7 +278,7 @@ pub struct V2CommitHeader {
     pub publish_time_ms: i64,
     /// True when the commit contains a full namespace snapshot.
     pub is_snapshot: bool,
-    /// Exact v01 algorithm identifiers.
+    /// Exact v02 algorithm identifiers.
     pub algorithms: V2Algorithms,
     /// Active keyring envelope reference.
     pub keyring_envelope_ref: V2KeyringEnvelopeRef,
@@ -391,7 +391,7 @@ pub fn parse_v2_commit_header(
     if canonical != header_cbor {
         return Err(V2FormatError::NonCanonicalCbor);
     }
-    if header.algorithms != V2Algorithms::v01() {
+    if header.algorithms != V2Algorithms::v02() {
         return Err(V2FormatError::InvalidAlgorithms);
     }
     let commit_key = V2CommitKey::parse(&header.self_ref.commit_key)?;

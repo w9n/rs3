@@ -1,15 +1,17 @@
 # Repository Format Reference
 
-The repository format is draft. This page is the design contract for the next
-repository generation, `commits/v02`. It is not a compatibility promise and it
-does not describe a format that the gateway can read or write today.
+The repository format is draft. This page is the design contract for
+`commits/v02`. It is not a compatibility promise. The gateway now reads and
+writes a transitional `v02` commit envelope, but the catalog-and-run design on
+this page is not complete.
 
 !!! warning "Implementation status"
-    The current prototype stores signed commits under `commits/v01/` and is
-    deprecated. No production repository depends on it, so `rs3` will not add a
-    migration path or a dual reader. The `commits/v02` reader, writer, index
-    catalog, compactor, and recovery gates described here remain to be
-    implemented. Until those gates pass, the current runtime is evaluation-only.
+    `commits/v01` has been removed and is unsupported. No production repository
+    depends on it, so `rs3` will not add a migration path or a dual reader. The
+    current `v02` envelope still uses prototype `INDEX_DELTA` and
+    `INDEX_SNAPSHOT` sections. Framed `INDEX_RUN`, signed `INDEX_ROOT`,
+    compaction, automatic checkpointing, and the new recovery gates remain to be
+    implemented. Until those gates pass, the runtime is evaluation-only.
 
 ## Invariants
 
@@ -37,12 +39,12 @@ The existing prototype uses keys of this form:
 commits/v01/<20-digit-sequence>/<32-byte-random-id-base64url>
 ```
 
-That generation is deprecated and may be removed. It is not an input to the
-`v02` design, and initialization of a `v02` repository must fail if the chosen
-backend prefix is not demonstrably fresh. Importing or converting a `v01`
-repository is outside the product contract.
+That generation is removed and unsupported. It is not an input to the `v02`
+design, and initialization of a `v02` repository must fail if the chosen backend
+prefix is not demonstrably fresh. Importing or converting a `v01` repository is
+outside the product contract.
 
-New repositories will use a distinct generation:
+The transitional runtime and future catalog format use:
 
 ```text
 commits/v02/<20-digit-sequence>/<32-byte-random-id-base64url>
@@ -64,6 +66,11 @@ keyrings/
 These class names, object counts, ciphertext sizes, provider version IDs, and
 write/compaction timing are accepted leakage. Plaintext catalog bounds, run
 levels, logical object counts, paths, and payload identities remain encrypted.
+
+The transitional writer publishes `INDEX_DELTA` and `INDEX_SNAPSHOT` sections
+under this generation. Those section semantics are not the stable `v02`
+contract. Repositories created before `INDEX_RUN` and `INDEX_ROOT` land remain
+evaluation data and may need recreation.
 
 ## Signed Commits
 
@@ -321,7 +328,7 @@ mode, every restore-critical initialization write must return a provider version
 ID.
 
 Initialization is permitted only on a verified fresh prefix. Detection of
-deprecated `v01` objects, an existing anchor, an existing format root, or
+unsupported `v01` objects, an existing anchor, an existing format root, or
 ambiguous listing state fails closed. There is no automatic import, overwrite,
 or migration behavior.
 
@@ -331,7 +338,7 @@ prove that no protected root requires them.
 
 ## Implementation and Qualification Gates
 
-Before `commits/v02` can replace the deprecated prototype, implementation must
+Before `commits/v02` can qualify as the repository format, implementation must
 include:
 
 - canonical encoding, crypto, corruption, and cross-object transplant vectors;
@@ -353,8 +360,9 @@ allocation, request, byte, and amplification ceilings apply everywhere.
 
 ## Compatibility Promise
 
-There is no stable repository-format promise yet. `commits/v01` is deprecated
-without migration support. `commits/v02` is a fresh, currently unimplemented
-format target. Its wire details freeze only after the implementation,
-cryptographic review, scale gates, retained-provider evidence, and recovery
-runbooks all pass together.
+There is no stable repository-format promise yet. `commits/v01` is removed and
+unsupported without migration support. The gateway reads and writes a
+transitional `commits/v02` envelope, while its catalog, framed-run, compaction,
+and bounded-recovery contract remains incomplete. Wire details freeze only
+after the implementation, cryptographic review, scale gates, retained-provider
+evidence, and recovery runbooks all pass together.
