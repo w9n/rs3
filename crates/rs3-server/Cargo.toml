@@ -28,12 +28,12 @@ hyper-util.workspace = true
 k8s-openapi = { workspace = true, optional = true }
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
-rs3-crypto = { path = "../rs3-crypto" }
-rs3-index = { path = "../rs3-index" }
-rs3-k8s = { path = "../rs3-k8s", optional = true }
-rs3-repository = { path = "../rs3-repository" }
-rs3-storage = { path = "../rs3-storage" }
-rs3-types = { path = "../rs3-types" }
+rs3-crypto.workspace = true
+rs3-index.workspace = true
+rs3-k8s = { workspace = true, optional = true }
+rs3-repository.workspace = true
+rs3-storage.workspace = true
+rs3-types.workspace = true
 rustls = { version = "0.23", default-features = false, features = [
   "aws_lc_rs",
 ], optional = true }

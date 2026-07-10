@@ -21,7 +21,7 @@ repository = "https://github.com/w9n/rs3"
 authors = ["rs3 contributors"]
 
 [workspace.dependencies]
-anyhow = "1.0.98"
+anyhow = "1.0.103"
 async-trait = "0.1.88"
 base64 = "0.22.1"
 aes-gcm-siv = { version = "0.11.1", default-features = false, features = [
@@ -60,17 +60,14 @@ kube = { version = "3.1.0", default-features = false, features = [
   "client",
   "rustls-tls",
 ] }
-object_store = { version = "0.13.2", default-features = false, features = [
-  "aws",
-] }
-metrics = "0.24"
+metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 secrecy = "0.10.3"
 subtle = { version = "2", default-features = false }
-s3s = "0.13.0"
+s3s = "0.14.1"
 ring = "0.17.14"
 sha2 = "0.10.8"
 thiserror = "2.0.12"
@@ -89,12 +86,12 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 zeroize = "1.8.1"
 
-rs3-crypto = { path = "crates/rs3-crypto" }
-rs3-index = { path = "crates/rs3-index" }
-rs3-k8s = { path = "crates/rs3-k8s" }
-rs3-repository = { path = "crates/rs3-repository" }
-rs3-storage = { path = "crates/rs3-storage" }
-rs3-types = { path = "crates/rs3-types" }
+rs3-crypto = { version = "0.1.0", path = "crates/rs3-crypto" }
+rs3-index = { version = "0.1.0", path = "crates/rs3-index" }
+rs3-k8s = { version = "0.1.0", path = "crates/rs3-k8s" }
+rs3-repository = { version = "0.1.0", path = "crates/rs3-repository" }
+rs3-storage = { version = "0.1.0", path = "crates/rs3-storage" }
+rs3-types = { version = "0.1.0", path = "crates/rs3-types" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

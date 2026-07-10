@@ -56,6 +56,9 @@ exceptions = [
   { allow = [
     "ISC",
   ], name = "untrusted" },
+  { allow = [
+    "CDLA-Permissive-2.0",
+  ], name = "webpki-root-certs" },
 ]
 
 [bans]

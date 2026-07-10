@@ -256,7 +256,7 @@ impl GatewayAdminClient {
         let mut connector = HttpConnector::new();
         connector.enforce_http(false);
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
+            .with_provider_and_native_roots(rustls::crypto::aws_lc_rs::default_provider())
             .map_err(GatewayAdminClientError::TlsConfig)?
             .https_or_http()
             .enable_http1()
@@ -292,6 +292,19 @@ impl GatewayAdminClient {
         uri: Uri,
         expected_schema: &'static str,
     ) -> Result<Value, GatewayAdminClientError> {
+        tokio::time::timeout(
+            self.config.request_timeout,
+            self.fetch_report_before_deadline(uri, expected_schema),
+        )
+        .await
+        .map_err(|_elapsed| GatewayAdminClientError::RequestTimedOut)?
+    }
+
+    async fn fetch_report_before_deadline(
+        &self,
+        uri: Uri,
+        expected_schema: &'static str,
+    ) -> Result<Value, GatewayAdminClientError> {
         let request = Request::builder()
             .method("GET")
             .uri(uri)
@@ -299,11 +312,11 @@ impl GatewayAdminClient {
             .header(AUTHORIZATION, self.config.token.authorization_header()?)
             .body(Empty::<Bytes>::new())
             .map_err(GatewayAdminClientError::RequestBuild)?;
-        let response =
-            tokio::time::timeout(self.config.request_timeout, self.client.request(request))
-                .await
-                .map_err(|_elapsed| GatewayAdminClientError::RequestTimedOut)?
-                .map_err(GatewayAdminClientError::Request)?;
+        let response = self
+            .client
+            .request(request)
+            .await
+            .map_err(GatewayAdminClientError::Request)?;
         let status = response.status();
         if status != StatusCode::OK {
             return Err(GatewayAdminClientError::GatewayStatus(status));
@@ -313,16 +326,24 @@ impl GatewayAdminClient {
                 limit: self.config.max_response_bytes,
             });
         }
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(GatewayAdminClientError::Body)?
-            .to_bytes();
-        if bytes.len() > self.config.max_response_bytes {
-            return Err(GatewayAdminClientError::ResponseTooLarge {
-                limit: self.config.max_response_bytes,
-            });
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(GatewayAdminClientError::Body)?;
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            let Some(remaining) = self.config.max_response_bytes.checked_sub(bytes.len()) else {
+                return Err(GatewayAdminClientError::ResponseTooLarge {
+                    limit: self.config.max_response_bytes,
+                });
+            };
+            if data.len() > remaining {
+                return Err(GatewayAdminClientError::ResponseTooLarge {
+                    limit: self.config.max_response_bytes,
+                });
+            }
+            bytes.extend_from_slice(&data);
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(GatewayAdminClientError::Json)?;
         if value.get("schema").and_then(Value::as_str) != Some(expected_schema) {
@@ -397,9 +418,10 @@ fn content_length_exceeds(headers: &http::HeaderMap, limit: usize) -> bool {
 mod tests {
     use super::{
         GatewayAdminBearerToken, GatewayAdminClient, GatewayAdminClientConfig,
-        GatewayAdminEndpoint, GatewayAdminEndpointError,
+        GatewayAdminClientError, GatewayAdminEndpoint, GatewayAdminEndpointError,
     };
     use http::StatusCode;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -497,6 +519,46 @@ mod tests {
         assert!(error.to_string().contains("schema"));
     }
 
+    #[tokio::test]
+    async fn client_bounds_chunked_response_while_reading() {
+        let (addr, _request) = MockAdmin::start_chunked(&[b"12345678", b"9"]).await;
+        let endpoint = GatewayAdminEndpoint::parse(&format!("http://{addr}"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let token = GatewayAdminBearerToken::new("gateway-admin-token-12345")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let config = GatewayAdminClientConfig::new(endpoint, token).with_max_response_bytes(8);
+        let client = GatewayAdminClient::new(config).unwrap_or_else(|error| panic!("{error}"));
+
+        let error = client
+            .fetch_status()
+            .await
+            .expect_err("oversized chunked response should fail");
+
+        assert!(matches!(
+            error,
+            GatewayAdminClientError::ResponseTooLarge { limit: 8 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_times_out_while_reading_response_body() {
+        let (addr, _request) = MockAdmin::start_stalled_body().await;
+        let endpoint = GatewayAdminEndpoint::parse(&format!("http://{addr}"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let token = GatewayAdminBearerToken::new("gateway-admin-token-12345")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let config = GatewayAdminClientConfig::new(endpoint, token)
+            .with_request_timeout(Duration::from_millis(50));
+        let client = GatewayAdminClient::new(config).unwrap_or_else(|error| panic!("{error}"));
+
+        let error = client
+            .fetch_status()
+            .await
+            .expect_err("stalled response body should time out");
+
+        assert!(matches!(error, GatewayAdminClientError::RequestTimedOut));
+    }
+
     struct MockAdmin;
 
     impl MockAdmin {
@@ -515,21 +577,7 @@ mod tests {
                     .accept()
                     .await
                     .unwrap_or_else(|error| panic!("{error}"));
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 1024];
-                loop {
-                    let read = stream
-                        .read(&mut buffer)
-                        .await
-                        .unwrap_or_else(|error| panic!("{error}"));
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
+                let request = read_request_headers(&mut stream).await;
                 let response = format!(
                     "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     status.as_u16(),
@@ -541,9 +589,98 @@ mod tests {
                     .write_all(response.as_bytes())
                     .await
                     .unwrap_or_else(|error| panic!("{error}"));
-                String::from_utf8_lossy(&request).into_owned()
+                request
             });
             (addr, handle)
         }
+
+        async fn start_chunked(
+            chunks: &'static [&'static [u8]],
+        ) -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            let addr = listener
+                .local_addr()
+                .unwrap_or_else(|error| panic!("{error}"));
+            let handle = tokio::spawn(async move {
+                let (mut stream, _peer) = listener
+                    .accept()
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                let request = read_request_headers(&mut stream).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                for chunk in chunks {
+                    let encoded = format!("{:x}\r\n", chunk.len());
+                    stream
+                        .write_all(encoded.as_bytes())
+                        .await
+                        .unwrap_or_else(|error| panic!("{error}"));
+                    stream
+                        .write_all(chunk)
+                        .await
+                        .unwrap_or_else(|error| panic!("{error}"));
+                    stream
+                        .write_all(b"\r\n")
+                        .await
+                        .unwrap_or_else(|error| panic!("{error}"));
+                }
+                stream
+                    .write_all(b"0\r\n\r\n")
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                request
+            });
+            (addr, handle)
+        }
+
+        async fn start_stalled_body() -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            let addr = listener
+                .local_addr()
+                .unwrap_or_else(|error| panic!("{error}"));
+            let handle = tokio::spawn(async move {
+                let (mut stream, _peer) = listener
+                    .accept()
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                let request = read_request_headers(&mut stream).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{",
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                request
+            });
+            (addr, handle)
+        }
+    }
+
+    async fn read_request_headers(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
     }
 }

@@ -11,22 +11,16 @@ description = "Object-store abstraction for rs3"
 [features]
 default = []
 test-util = []
-s3 = [
-  "dep:aws-config",
-  "dep:aws-sdk-s3",
-  "dep:metrics",
-  "dep:object_store",
-  "dep:rustls",
-]
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:metrics", "dep:rustls"]
 
 [dependencies]
 async-trait.workspace = true
-aws-config = { version = "1", default-features = false, features = [
+aws-config = { version = "1.8.18", default-features = false, features = [
   "behavior-version-latest",
   "default-https-client",
   "rt-tokio",
 ], optional = true }
-aws-sdk-s3 = { version = "1", default-features = false, features = [
+aws-sdk-s3 = { version = "1.137.0", default-features = false, features = [
   "behavior-version-latest",
   "default-https-client",
   "http-1x",
@@ -35,7 +29,6 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 ], optional = true }
 bytes.workspace = true
 metrics = { workspace = true, optional = true }
-object_store = { workspace = true, optional = true }
 rs3-types.workspace = true
 rustls = { version = "0.23", default-features = false, features = [
   "aws_lc_rs",

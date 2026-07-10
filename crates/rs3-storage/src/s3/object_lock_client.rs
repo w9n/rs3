@@ -21,8 +21,8 @@ impl S3BlobStore {
     /// Validates that the configured bucket can enforce S3 Object Lock retention.
     ///
     /// This is intended for startup checks when repository-level retention is
-    /// enabled. It fails closed if the direct S3 SDK client is unavailable, if
-    /// bucket versioning is not enabled, or if Object Lock is not enabled.
+    /// enabled. It fails closed if bucket versioning is not enabled or if
+    /// Object Lock is not enabled.
     pub async fn validate_retention_support(
         &self,
         retention: Option<&RetentionPolicy>,
@@ -30,10 +30,7 @@ impl S3BlobStore {
         let Some(retention) = retention.filter(|policy| retention_is_active(policy)) else {
             return Ok(());
         };
-        let client = self
-            .sdk_client
-            .as_ref()
-            .ok_or(StorageError::RetentionExtensionUnsupported)?;
+        let client = &self.client;
 
         let versioning = client
             .get_bucket_versioning()
@@ -90,13 +87,7 @@ impl S3BlobStore {
         retention: Option<&RetentionPolicy>,
         legal_hold: Option<LegalHoldStatus>,
     ) -> Result<BlobMetadata> {
-        let client = self.sdk_client.as_ref().ok_or_else(|| {
-            if retention.is_some() {
-                StorageError::RetentionExtensionUnsupported
-            } else {
-                StorageError::LegalHoldUnsupported
-            }
-        })?;
+        let client = &self.client;
         let key = self.config.object_key(object_id);
         let content_len = u64::try_from(body.len())
             .map_err(|_| StorageError::Provider("object length does not fit in u64".to_owned()))?;
@@ -149,10 +140,7 @@ impl S3BlobStore {
         object_id: &BackendObjectId,
         version_id: Option<&BackendVersionId>,
     ) -> Result<BlobMetadata> {
-        let client = self
-            .sdk_client
-            .as_ref()
-            .ok_or(StorageError::RetentionExtensionUnsupported)?;
+        let client = &self.client;
         let mut request = client
             .head_object()
             .bucket(self.config.bucket.as_str())
@@ -209,10 +197,7 @@ impl S3BlobStore {
         if !retention_is_active(policy) {
             return Ok(());
         }
-        let client = self
-            .sdk_client
-            .as_ref()
-            .ok_or(StorageError::RetentionExtensionUnsupported)?;
+        let client = &self.client;
         let existing = self.head_with_sdk(object_id, version_id).await?;
         if retention_satisfies(existing.retention.as_ref(), policy) {
             return Ok(());
@@ -246,10 +231,7 @@ impl S3BlobStore {
         version_id: Option<&BackendVersionId>,
         status: LegalHoldStatus,
     ) -> Result<()> {
-        let client = self
-            .sdk_client
-            .as_ref()
-            .ok_or(StorageError::LegalHoldUnsupported)?;
+        let client = &self.client;
         let legal_hold = ObjectLockLegalHold::builder()
             .status(sdk_legal_hold_status(status))
             .build();

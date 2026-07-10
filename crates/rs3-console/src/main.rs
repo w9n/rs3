@@ -6,7 +6,9 @@ use rs3_console::{
 use std::env::VarError;
 use std::error::Error;
 use std::ffi::OsStr;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::{EnvFilter, FilterExt, filter_fn};
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_GIT_SHA: Option<&str> = option_env!("RS3_BUILD_GIT_SHA");
@@ -64,15 +66,19 @@ async fn shutdown_signal() {
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = filter.and(filter_fn(|metadata| {
+        is_path_safe_tracing_target(metadata.target())
+    }));
     match std::env::var("RS3_LOG_FORMAT") {
         Ok(value) if value == "json" => {
-            tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(filter)
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().json().with_filter(filter))
                 .init();
         }
         Ok(value) => {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_filter(filter))
+                .init();
             if value != "plain" {
                 tracing::warn!(
                     log_format = %value,
@@ -81,11 +87,39 @@ fn init_tracing() {
             }
         }
         Err(VarError::NotPresent) => {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_filter(filter))
+                .init();
         }
         Err(VarError::NotUnicode(_)) => {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_filter(filter))
+                .init();
             tracing::warn!("RS3_LOG_FORMAT is not valid Unicode; defaulting to plain logs");
         }
+    }
+}
+
+fn is_path_safe_tracing_target(target: &str) -> bool {
+    const ALLOWED_TARGETS: &[&str] = &["rs3_console", "rs3_crypto"];
+
+    ALLOWED_TARGETS.iter().any(|allowed| {
+        target == *allowed
+            || target
+                .strip_prefix(allowed)
+                .is_some_and(|suffix| suffix.starts_with("::"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_path_safe_tracing_target;
+
+    #[test]
+    fn tracing_filter_allows_console_targets_and_blocks_dependencies() {
+        assert!(is_path_safe_tracing_target("rs3_console"));
+        assert!(is_path_safe_tracing_target("rs3_console::http"));
+        assert!(!is_path_safe_tracing_target("hyper::client"));
+        assert!(!is_path_safe_tracing_target("rustls"));
     }
 }

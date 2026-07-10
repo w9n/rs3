@@ -10,10 +10,6 @@ use aws_sdk_s3::Client as SdkS3Client;
 use aws_sdk_s3::primitives::ByteStream as SdkByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
-use object_store::aws::AmazonS3;
-use object_store::list::{PaginatedListOptions, PaginatedListStore};
-use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt};
 use rs3_types::{BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionPolicy};
 use std::sync::Arc;
 use std::time::Instant;
@@ -30,13 +26,11 @@ pub use config::S3BlobStoreConfig;
 pub use metrics::{S3ProviderMetrics, S3ProviderOperationMetrics};
 
 use client::{
-    install_rustls_provider, object_store_from_environment, sdk_client_from_environment,
-    sdk_client_from_static_environment,
+    install_rustls_provider, sdk_client_from_environment, sdk_client_from_static_environment,
 };
 use errors::{
-    backend_version_id_from_str, backend_version_id_from_string, common_error_result,
-    get_error_result, map_common_error, map_get_error, map_put_error, map_sdk_common_error,
-    metadata_from_object_meta, provider_error, put_error_result, storage_error_result,
+    backend_version_id_from_str, map_sdk_common_error, map_sdk_get_error, map_sdk_put_error,
+    provider_error, storage_error_result,
 };
 use metrics::{S3ProviderMetricCounters, S3ProviderOperation};
 use object_lock::{
@@ -44,13 +38,45 @@ use object_lock::{
     retention_is_active, retention_satisfies, sdk_legal_hold_status, sdk_object_lock_mode,
     verify_legal_hold, verify_retention,
 };
-use requests::{object_get_options, object_path, object_put_options, sdk_range_header};
+use requests::sdk_range_header;
 
-/// S3-compatible `BlobStore` backed by the Apache Arrow `object_store` crate.
+async fn collect_get_body(mut body: SdkByteStream, range: ByteRange) -> Result<Bytes> {
+    let ByteRange::Slice { len, .. } = range else {
+        return body
+            .collect()
+            .await
+            .map_err(provider_error)
+            .map(|body| body.into_bytes());
+    };
+    let capacity = usize::try_from(len).map_err(|_| StorageError::InvalidRange)?;
+    let mut collected = Vec::with_capacity(capacity);
+    let mut received = 0_u64;
+    while let Some(chunk) = body.try_next().await.map_err(provider_error)? {
+        let chunk_len = u64::try_from(chunk.len()).map_err(|_| {
+            StorageError::Provider("S3 range response length is out of range".to_owned())
+        })?;
+        received = received.checked_add(chunk_len).ok_or_else(|| {
+            StorageError::Provider("S3 range response length is out of range".to_owned())
+        })?;
+        if received > len {
+            return Err(StorageError::Provider(
+                "S3 provider returned more bytes than the requested range".to_owned(),
+            ));
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    if received != len {
+        return Err(StorageError::Provider(
+            "S3 provider returned fewer bytes than the requested range".to_owned(),
+        ));
+    }
+    Ok(Bytes::from(collected))
+}
+
+/// S3-compatible `BlobStore` backed by the AWS SDK for Rust.
 #[derive(Clone, Debug)]
 pub struct S3BlobStore {
-    store: AmazonS3,
-    sdk_client: Option<SdkS3Client>,
+    client: SdkS3Client,
     config: S3BlobStoreConfig,
     metrics: Arc<S3ProviderMetricCounters>,
 }
@@ -63,11 +89,9 @@ impl S3BlobStore {
     /// Returns a provider error when configuration cannot be constructed.
     pub async fn from_environment(config: S3BlobStoreConfig) -> Result<Self> {
         install_rustls_provider();
-        let store = object_store_from_environment(&config)?;
-        let sdk_client = Some(sdk_client_from_environment(&config).await?);
+        let client = sdk_client_from_environment(&config).await?;
         Ok(Self {
-            store,
-            sdk_client,
+            client,
             config,
             metrics: Arc::new(S3ProviderMetricCounters::default()),
         })
@@ -75,30 +99,27 @@ impl S3BlobStore {
 
     /// Builds an S3 store synchronously from environment credentials.
     ///
-    /// This path only wires the direct SDK retention client when static
-    /// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` values are present. Use
-    /// [`Self::from_environment`] for the full AWS provider chain.
+    /// This path requires static `AWS_ACCESS_KEY_ID` and
+    /// `AWS_SECRET_ACCESS_KEY` values. Use [`Self::from_environment`] for the
+    /// full asynchronous AWS credential provider chain.
     ///
     /// # Errors
     ///
     /// Returns a provider error when configuration cannot be constructed.
     pub fn from_environment_sync(config: S3BlobStoreConfig) -> Result<Self> {
         install_rustls_provider();
-        let store = object_store_from_environment(&config)?;
-        let sdk_client = sdk_client_from_static_environment(&config)?;
+        let client = sdk_client_from_static_environment(&config)?;
         Ok(Self {
-            store,
-            sdk_client,
+            client,
             config,
             metrics: Arc::new(S3ProviderMetricCounters::default()),
         })
     }
 
-    /// Builds an S3 blob store from an existing `object_store` S3 client.
-    pub fn from_store(store: AmazonS3, config: S3BlobStoreConfig) -> Self {
+    /// Builds an S3 blob store from an existing AWS SDK client.
+    pub fn from_client(client: SdkS3Client, config: S3BlobStoreConfig) -> Self {
         Self {
-            store,
-            sdk_client: None,
+            client,
             config,
             metrics: Arc::new(S3ProviderMetricCounters::default()),
         }
@@ -118,10 +139,6 @@ impl S3BlobStore {
     pub fn reset_provider_metrics(&self) -> Result<()> {
         self.metrics.reset();
         Ok(())
-    }
-
-    fn object_path(&self, object_id: &BackendObjectId) -> Result<ObjectPath> {
-        object_path(&self.config.object_key(object_id))
     }
 }
 
@@ -362,13 +379,19 @@ impl BlobStore for S3BlobStore {
             return result;
         }
 
-        let path = self.object_path(object_id)?;
-        let request_options = object_put_options(&options);
-        match self
-            .store
-            .put_opts(&path, body.into(), request_options)
-            .await
-        {
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(self.config.bucket.as_str())
+            .key(self.config.object_key(object_id))
+            .body(SdkByteStream::from(body));
+        if options.do_not_recreate {
+            request = request.if_none_match("*");
+        }
+        if let Some(content_type) = options.content_type.as_deref() {
+            request = request.content_type(content_type);
+        }
+        match request.send().await {
             Ok(output) => {
                 self.record_provider_operation(
                     S3ProviderOperation::Put,
@@ -383,10 +406,10 @@ impl BlobStore for S3BlobStore {
                     object_id: object_id.clone(),
                     content_len: bytes_sent,
                     modified_at_ms: None,
-                    etag: output.e_tag,
+                    etag: output.e_tag().map(str::to_owned),
                     version_id: output
-                        .version
-                        .map(backend_version_id_from_string)
+                        .version_id()
+                        .map(backend_version_id_from_str)
                         .transpose()?,
                     retention: None,
                     retain_until_ms: None,
@@ -394,7 +417,8 @@ impl BlobStore for S3BlobStore {
                 })
             }
             Err(error) => {
-                let result = put_error_result(&error);
+                let storage_error = map_sdk_put_error(error, object_id);
+                let result = storage_error_result(&storage_error);
                 self.record_provider_operation(
                     S3ProviderOperation::Put,
                     object_kind,
@@ -404,13 +428,13 @@ impl BlobStore for S3BlobStore {
                     started.elapsed(),
                 )?;
                 record_blob_put(object_kind, requested_len, false, result, started.elapsed());
-                Err(map_put_error(error, object_id))
+                Err(storage_error)
             }
         }
     }
 
     fn supports_multipart_upload(&self) -> bool {
-        self.sdk_client.is_some()
+        true
     }
 
     async fn create_multipart_upload(
@@ -418,10 +442,7 @@ impl BlobStore for S3BlobStore {
         object_id: &BackendObjectId,
         options: PutOptions,
     ) -> Result<Box<dyn BlobMultipartUpload>> {
-        let client = self
-            .sdk_client
-            .clone()
-            .ok_or(StorageError::MultipartUnsupported)?;
+        let client = self.client.clone();
         if options.do_not_recreate {
             match self.head(object_id).await {
                 Ok(_) => return Err(StorageError::AlreadyExists(object_id.clone())),
@@ -475,13 +496,12 @@ impl BlobStore for S3BlobStore {
     async fn get_range(&self, object_id: &BackendObjectId, range: ByteRange) -> Result<Bytes> {
         let started = Instant::now();
         let object_kind = object_kind(object_id);
-        let path = self.object_path(object_id)?;
 
         if let ByteRange::Slice { offset, len: 0 } = range {
-            let metadata = match self.store.head(&path).await {
+            let metadata = match self.head_with_sdk(object_id, None).await {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    let result = common_error_result(&error);
+                    let result = storage_error_result(&error);
                     self.record_provider_operation(
                         S3ProviderOperation::Head,
                         object_kind,
@@ -491,10 +511,10 @@ impl BlobStore for S3BlobStore {
                         started.elapsed(),
                     )?;
                     record_blob_get(object_kind, range, 0, result, started.elapsed());
-                    return Err(map_common_error(error, object_id));
+                    return Err(error);
                 }
             };
-            if offset > metadata.size {
+            if offset > metadata.content_len {
                 self.record_provider_operation(
                     S3ProviderOperation::Head,
                     object_kind,
@@ -518,10 +538,17 @@ impl BlobStore for S3BlobStore {
             return Ok(Bytes::new());
         }
 
-        let request_options = object_get_options(range)?;
-        match self.store.get_opts(&path, request_options).await {
+        let mut request = self
+            .client
+            .get_object()
+            .bucket(self.config.bucket.as_str())
+            .key(self.config.object_key(object_id));
+        if let Some(range_header) = sdk_range_header(range)? {
+            request = request.range(range_header);
+        }
+        match request.send().await {
             Ok(output) => {
-                let body = output.bytes().await.map_err(provider_error)?;
+                let body = collect_get_body(output.body, range).await?;
                 let bytes_read = u64::try_from(body.len()).map_err(|_| {
                     StorageError::Provider("read length does not fit in u64".to_owned())
                 })?;
@@ -537,7 +564,8 @@ impl BlobStore for S3BlobStore {
                 Ok(body)
             }
             Err(error) => {
-                let result = get_error_result(&error);
+                let storage_error = map_sdk_get_error(error, object_id);
+                let result = storage_error_result(&storage_error);
                 self.record_provider_operation(
                     S3ProviderOperation::Get,
                     object_kind,
@@ -547,7 +575,7 @@ impl BlobStore for S3BlobStore {
                     started.elapsed(),
                 )?;
                 record_blob_get(object_kind, range, 0, result, started.elapsed());
-                Err(map_get_error(error, object_id))
+                Err(storage_error)
             }
         }
     }
@@ -564,11 +592,6 @@ impl BlobStore for S3BlobStore {
 
         let started = Instant::now();
         let object_kind = object_kind(object_id);
-        let client = self
-            .sdk_client
-            .as_ref()
-            .ok_or(StorageError::VersionUnsupported)?;
-
         if let ByteRange::Slice { offset, len: 0 } = range {
             let metadata = self.head_with_sdk(object_id, Some(version_id)).await?;
             if offset > metadata.content_len {
@@ -595,7 +618,8 @@ impl BlobStore for S3BlobStore {
             return Ok(Bytes::new());
         }
 
-        let mut request = client
+        let mut request = self
+            .client
             .get_object()
             .bucket(self.config.bucket.as_str())
             .key(self.config.object_key(object_id))
@@ -606,12 +630,7 @@ impl BlobStore for S3BlobStore {
 
         match request.send().await {
             Ok(output) => {
-                let body = output
-                    .body
-                    .collect()
-                    .await
-                    .map_err(provider_error)?
-                    .into_bytes();
+                let body = collect_get_body(output.body, range).await?;
                 let bytes_read = u64::try_from(body.len()).map_err(|_| {
                     StorageError::Provider("read length does not fit in u64".to_owned())
                 })?;
@@ -627,7 +646,7 @@ impl BlobStore for S3BlobStore {
                 Ok(body)
             }
             Err(error) => {
-                let storage_error = map_sdk_common_error(error, object_id);
+                let storage_error = map_sdk_get_error(error, object_id);
                 let result = storage_error_result(&storage_error);
                 self.record_provider_operation(
                     S3ProviderOperation::Get,
@@ -646,54 +665,21 @@ impl BlobStore for S3BlobStore {
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {
         let started = Instant::now();
         let object_kind = object_kind(object_id);
-
-        if self.sdk_client.is_some() {
-            let result = self.head_with_sdk(object_id, None).await;
-            let result_label = match &result {
-                Ok(_) => "ok",
-                Err(error) => storage_error_result(error),
-            };
-            self.record_provider_operation(
-                S3ProviderOperation::Head,
-                object_kind,
-                result_label,
-                0,
-                0,
-                started.elapsed(),
-            )?;
-            record_blob_head(object_kind, result_label, started.elapsed());
-            return result;
-        }
-
-        let path = self.object_path(object_id)?;
-
-        match self.store.head(&path).await {
-            Ok(metadata) => {
-                self.record_provider_operation(
-                    S3ProviderOperation::Head,
-                    object_kind,
-                    "ok",
-                    0,
-                    0,
-                    started.elapsed(),
-                )?;
-                record_blob_head(object_kind, "ok", started.elapsed());
-                metadata_from_object_meta(object_id.clone(), metadata)
-            }
-            Err(error) => {
-                let result = common_error_result(&error);
-                self.record_provider_operation(
-                    S3ProviderOperation::Head,
-                    object_kind,
-                    result,
-                    0,
-                    0,
-                    started.elapsed(),
-                )?;
-                record_blob_head(object_kind, result, started.elapsed());
-                Err(map_common_error(error, object_id))
-            }
-        }
+        let result = self.head_with_sdk(object_id, None).await;
+        let result_label = match &result {
+            Ok(_) => "ok",
+            Err(error) => storage_error_result(error),
+        };
+        self.record_provider_operation(
+            S3ProviderOperation::Head,
+            object_kind,
+            result_label,
+            0,
+            0,
+            started.elapsed(),
+        )?;
+        record_blob_head(object_kind, result_label, started.elapsed());
+        result
     }
 
     async fn head_at(
@@ -728,20 +714,21 @@ impl BlobStore for S3BlobStore {
         let started = Instant::now();
         let object_kind = prefix_kind(prefix);
         let key_prefix = self.config.list_key_prefix(prefix);
-        let list_prefix = if key_prefix.is_empty() {
-            None
-        } else {
-            Some(key_prefix.as_str())
-        };
-        let mut options = PaginatedListOptions::default();
+        let mut continuation_token = None;
         let mut entries = Vec::new();
 
         loop {
-            match self
-                .store
-                .list_paginated(list_prefix, options.clone())
-                .await
-            {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(self.config.bucket.as_str());
+            if !key_prefix.is_empty() {
+                request = request.prefix(key_prefix.as_str());
+            }
+            if let Some(token) = continuation_token.as_deref() {
+                request = request.continuation_token(token);
+            }
+            match request.send().await {
                 Ok(page) => {
                     self.record_provider_operation(
                         S3ProviderOperation::List,
@@ -751,22 +738,50 @@ impl BlobStore for S3BlobStore {
                         0,
                         started.elapsed(),
                     )?;
-                    for object in page.result.objects {
-                        let Some(object_id) =
-                            self.config.object_id_from_key(object.location.as_ref())?
-                        else {
+                    for object in page.contents() {
+                        let Some(key) = object.key() else {
                             continue;
                         };
-                        entries.push(metadata_from_object_meta(object_id, object)?);
+                        let Some(object_id) = self.config.object_id_from_key(key)? else {
+                            continue;
+                        };
+                        let content_len = object
+                            .size()
+                            .and_then(|size| u64::try_from(size).ok())
+                            .unwrap_or_default();
+                        let modified_at_ms = object
+                            .last_modified()
+                            .map(|modified_at| modified_at.to_millis())
+                            .transpose()
+                            .map_err(provider_error)?;
+                        entries.push(BlobMetadata {
+                            object_id,
+                            content_len,
+                            modified_at_ms,
+                            etag: object.e_tag().map(str::to_owned),
+                            version_id: None,
+                            retention: None,
+                            retain_until_ms: None,
+                            legal_hold: None,
+                        });
                     }
 
-                    let Some(page_token) = page.page_token else {
+                    if !page.is_truncated().unwrap_or(false) {
                         break;
-                    };
-                    options.page_token = Some(page_token);
+                    }
+                    continuation_token = page.next_continuation_token().map(str::to_owned);
+                    if continuation_token.is_none() {
+                        let error = StorageError::Provider(
+                            "S3 truncated LIST response omitted the continuation token".to_owned(),
+                        );
+                        let result = storage_error_result(&error);
+                        record_blob_list(object_kind, entries.len(), result, started.elapsed());
+                        return Err(error);
+                    }
                 }
                 Err(error) => {
-                    let result = common_error_result(&error);
+                    let storage_error = StorageError::Provider(error.to_string());
+                    let result = storage_error_result(&storage_error);
                     self.record_provider_operation(
                         S3ProviderOperation::List,
                         object_kind,
@@ -776,7 +791,7 @@ impl BlobStore for S3BlobStore {
                         started.elapsed(),
                     )?;
                     record_blob_list(object_kind, entries.len(), result, started.elapsed());
-                    return Err(provider_error(error));
+                    return Err(storage_error);
                 }
             }
         }
@@ -789,17 +804,14 @@ impl BlobStore for S3BlobStore {
     async fn list_prefix_versions(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
         let started = Instant::now();
         let object_kind = prefix_kind(prefix);
-        let client = self
-            .sdk_client
-            .as_ref()
-            .ok_or(StorageError::VersionUnsupported)?;
         let key_prefix = self.config.list_key_prefix(prefix);
         let mut key_marker = None;
         let mut version_id_marker = None;
         let mut entries = Vec::new();
 
         loop {
-            let mut request = client
+            let mut request = self
+                .client
                 .list_object_versions()
                 .bucket(self.config.bucket.as_str());
             if !key_prefix.is_empty() {
@@ -889,88 +901,65 @@ impl BlobStore for S3BlobStore {
     async fn delete(&self, object_id: &BackendObjectId) -> Result<()> {
         let started = Instant::now();
         let object_kind = object_kind(object_id);
-        let path = self.object_path(object_id)?;
-
-        if self.sdk_client.is_some() {
-            match self.head_with_sdk(object_id, None).await {
-                Ok(metadata) if retention_blocks_delete(metadata.retention.as_ref()) => {
-                    self.record_provider_operation(
-                        S3ProviderOperation::Head,
-                        object_kind,
-                        "retention_blocked",
-                        0,
-                        0,
-                        started.elapsed(),
-                    )?;
-                    record_blob_delete(object_kind, "retention_blocked", started.elapsed());
-                    return Err(StorageError::RetentionBlocked);
-                }
-                Ok(metadata) if legal_hold_blocks_delete(metadata.legal_hold) => {
-                    self.record_provider_operation(
-                        S3ProviderOperation::Head,
-                        object_kind,
-                        "legal_hold_blocked",
-                        0,
-                        0,
-                        started.elapsed(),
-                    )?;
-                    record_blob_delete(object_kind, "legal_hold_blocked", started.elapsed());
-                    return Err(StorageError::LegalHoldBlocked);
-                }
-                Ok(_) => {
-                    self.record_provider_operation(
-                        S3ProviderOperation::Head,
-                        object_kind,
-                        "ok",
-                        0,
-                        0,
-                        started.elapsed(),
-                    )?;
-                }
-                Err(error) => {
-                    let result = storage_error_result(&error);
-                    self.record_provider_operation(
-                        S3ProviderOperation::Head,
-                        object_kind,
-                        result,
-                        0,
-                        0,
-                        started.elapsed(),
-                    )?;
-                    record_blob_delete(object_kind, result, started.elapsed());
-                    return Err(error);
-                }
+        match self.head_with_sdk(object_id, None).await {
+            Ok(metadata) if retention_blocks_delete(metadata.retention.as_ref()) => {
+                self.record_provider_operation(
+                    S3ProviderOperation::Head,
+                    object_kind,
+                    "retention_blocked",
+                    0,
+                    0,
+                    started.elapsed(),
+                )?;
+                record_blob_delete(object_kind, "retention_blocked", started.elapsed());
+                return Err(StorageError::RetentionBlocked);
             }
-        } else {
-            match self.store.head(&path).await {
-                Ok(_) => {
-                    self.record_provider_operation(
-                        S3ProviderOperation::Head,
-                        object_kind,
-                        "ok",
-                        0,
-                        0,
-                        started.elapsed(),
-                    )?;
-                }
-                Err(error) => {
-                    let result = common_error_result(&error);
-                    self.record_provider_operation(
-                        S3ProviderOperation::Head,
-                        object_kind,
-                        result,
-                        0,
-                        0,
-                        started.elapsed(),
-                    )?;
-                    record_blob_delete(object_kind, result, started.elapsed());
-                    return Err(map_common_error(error, object_id));
-                }
+            Ok(metadata) if legal_hold_blocks_delete(metadata.legal_hold) => {
+                self.record_provider_operation(
+                    S3ProviderOperation::Head,
+                    object_kind,
+                    "legal_hold_blocked",
+                    0,
+                    0,
+                    started.elapsed(),
+                )?;
+                record_blob_delete(object_kind, "legal_hold_blocked", started.elapsed());
+                return Err(StorageError::LegalHoldBlocked);
+            }
+            Ok(_) => {
+                self.record_provider_operation(
+                    S3ProviderOperation::Head,
+                    object_kind,
+                    "ok",
+                    0,
+                    0,
+                    started.elapsed(),
+                )?;
+            }
+            Err(error) => {
+                let result = storage_error_result(&error);
+                self.record_provider_operation(
+                    S3ProviderOperation::Head,
+                    object_kind,
+                    result,
+                    0,
+                    0,
+                    started.elapsed(),
+                )?;
+                record_blob_delete(object_kind, result, started.elapsed());
+                return Err(error);
             }
         }
 
-        match self.store.delete(&path).await {
-            Ok(()) => {
+        match self
+            .client
+            .delete_object()
+            .bucket(self.config.bucket.as_str())
+            .key(self.config.object_key(object_id))
+            .send()
+            .await
+        {
+            Ok(_) => {
                 self.record_provider_operation(
                     S3ProviderOperation::Delete,
                     object_kind,
@@ -983,7 +972,8 @@ impl BlobStore for S3BlobStore {
                 Ok(())
             }
             Err(error) => {
-                let result = common_error_result(&error);
+                let storage_error = map_sdk_common_error(error, object_id);
+                let result = storage_error_result(&storage_error);
                 self.record_provider_operation(
                     S3ProviderOperation::Delete,
                     object_kind,
@@ -993,7 +983,7 @@ impl BlobStore for S3BlobStore {
                     started.elapsed(),
                 )?;
                 record_blob_delete(object_kind, result, started.elapsed());
-                Err(map_common_error(error, object_id))
+                Err(storage_error)
             }
         }
     }
@@ -1009,11 +999,6 @@ impl BlobStore for S3BlobStore {
 
         let started = Instant::now();
         let object_kind = object_kind(object_id);
-        let client = self
-            .sdk_client
-            .as_ref()
-            .ok_or(StorageError::VersionUnsupported)?;
-
         let metadata = self.head_with_sdk(object_id, Some(version_id)).await?;
         if retention_blocks_delete(metadata.retention.as_ref()) {
             self.record_provider_operation(
@@ -1040,7 +1025,8 @@ impl BlobStore for S3BlobStore {
             return Err(StorageError::LegalHoldBlocked);
         }
 
-        let result = client
+        let result = self
+            .client
             .delete_object()
             .bucket(self.config.bucket.as_str())
             .key(self.config.object_key(object_id))
@@ -1171,12 +1157,14 @@ impl BlobStore for S3BlobStore {
 
 #[cfg(test)]
 mod tests {
-    use super::requests::object_get_options;
-    use super::{S3BlobStore, S3BlobStoreConfig};
+    use super::requests::sdk_range_header;
+    use super::{S3BlobStore, S3BlobStoreConfig, collect_get_body};
     use crate::{ByteRange, StorageError};
-    use object_store::aws::AmazonS3Builder;
+    use aws_sdk_s3::Client;
+    use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+    use aws_sdk_s3::primitives::ByteStream;
+    use bytes::Bytes;
     use rs3_types::BackendObjectId;
-    use rs3_types::{RetentionMode, RetentionPolicy};
 
     fn object_id(value: &str) -> BackendObjectId {
         BackendObjectId::new(value).unwrap_or_else(|error| panic!("{error}"))
@@ -1202,31 +1190,66 @@ mod tests {
     #[test]
     fn bounded_range_rejects_zero_length_requests() {
         assert_eq!(
-            object_get_options(ByteRange::Slice { offset: 10, len: 0 }).map(|_| ()),
+            sdk_range_header(ByteRange::Slice { offset: 10, len: 0 }).map(|_| ()),
             Err(StorageError::InvalidRange)
         );
     }
 
     #[tokio::test]
-    async fn retention_validation_fails_without_sdk_client() {
+    async fn bounded_range_collector_accepts_exact_response_length() {
+        let body = collect_get_body(
+            ByteStream::from(Bytes::from_static(b"exact")),
+            ByteRange::Slice { offset: 7, len: 5 },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(body, Bytes::from_static(b"exact"));
+    }
+
+    #[tokio::test]
+    async fn bounded_range_collector_rejects_provider_overrun() {
+        let result = collect_get_body(
+            ByteStream::from(Bytes::from_static(b"too long")),
+            ByteRange::Slice { offset: 0, len: 3 },
+        )
+        .await;
+
+        assert!(matches!(result, Err(StorageError::Provider(_))));
+    }
+
+    #[tokio::test]
+    async fn bounded_range_collector_rejects_truncated_response() {
+        let result = collect_get_body(
+            ByteStream::from(Bytes::from_static(b"short")),
+            ByteRange::Slice { offset: 0, len: 8 },
+        )
+        .await;
+
+        assert!(matches!(result, Err(StorageError::Provider(_))));
+    }
+
+    #[test]
+    fn existing_sdk_client_preserves_store_configuration() {
         let config = S3BlobStoreConfig::new("bucket")
             .unwrap_or_else(|error| panic!("{error}"))
             .with_endpoint_url(Some("http://127.0.0.1:9".to_owned()))
             .with_allow_http(true);
-        let object_store = AmazonS3Builder::new()
-            .with_bucket_name("bucket")
-            .with_endpoint("http://127.0.0.1:9")
-            .with_allow_http(true)
-            .with_access_key_id("rs3-fixture-access-key")
-            .with_secret_access_key("rs3-fixture-secret-key")
-            .build()
-            .unwrap_or_else(|error| panic!("{error}"));
-        let store = S3BlobStore::from_store(object_store, config);
+        let sdk_config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url("http://127.0.0.1:9")
+            .force_path_style(true)
+            .credentials_provider(Credentials::new(
+                "rs3-fixture-access-key",
+                "rs3-fixture-secret-key",
+                None,
+                None,
+                "rs3-storage-test",
+            ))
+            .build();
+        let store = S3BlobStore::from_client(Client::from_conf(sdk_config), config);
 
-        let result = store
-            .validate_retention_support(Some(&RetentionPolicy::new(RetentionMode::Compliance, 30)))
-            .await;
-
-        assert_eq!(result, Err(StorageError::RetentionExtensionUnsupported));
+        assert_eq!(store.bucket(), "bucket");
     }
 }
