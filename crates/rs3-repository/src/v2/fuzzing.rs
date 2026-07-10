@@ -2,7 +2,10 @@
 
 use crate::checkpoint::open_index_delta_object;
 use crate::v2::{
-    V2CommitKey, V2FormatError, V2Result, parse_v2_commit_header, parse_v2_commit_object,
+    V2_SECTION_FLAG_MUST_UNDERSTAND, V2Algorithms, V2CommitHeader, V2CommitKey, V2CommitKind,
+    V2CommitParentRef, V2CommitSelfRef, V2FormatError, V2KeyringEnvelopeRef, V2Result,
+    V2SectionDescriptor, V2SectionType, V2UploadMode, body_digest_for_v2_sections,
+    digest_v2_section, parse_v2_commit_header, parse_v2_commit_object,
 };
 use bytes::Bytes;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
@@ -59,6 +62,90 @@ pub fn parse_v2_commit_object_bytes(input: &[u8]) {
     assert_eq!(encoded, parsed.body);
 }
 
+/// Builds a bounded signed commit from fuzz bytes and exercises the reachable parser path.
+pub fn round_trip_v2_commit_structure(input: &[u8]) {
+    if input.len() > MAX_FUZZ_INPUT_LEN {
+        return;
+    }
+    let selector = input.first().copied().unwrap_or(0);
+    let section_region = input.get(1..).unwrap_or_default();
+    let kind = if selector & 1 == 0 {
+        V2CommitKind::Root
+    } else {
+        V2CommitKind::Delta
+    };
+    let upload_mode = if selector & 2 == 0 {
+        V2UploadMode::SinglePut
+    } else {
+        V2UploadMode::MultipartPadded
+    };
+    let commit_key = commit_object_key();
+    let parent_key = V2CommitKey::from_parts(Sequence::new(41), [0x41; 32])
+        .unwrap_or_else(|error| panic!("{error}"));
+    let sections = if kind == V2CommitKind::Root {
+        vec![V2SectionDescriptor {
+            section_type: V2SectionType::IndexSnapshot,
+            offset: 0,
+            length: section_region.len() as u64,
+            flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+            digest: digest_v2_section(section_region),
+        }]
+    } else {
+        let payload_len = section_region.len() / 2;
+        vec![
+            V2SectionDescriptor {
+                section_type: V2SectionType::Payload,
+                offset: 0,
+                length: payload_len as u64,
+                flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                digest: digest_v2_section(&section_region[..payload_len]),
+            },
+            V2SectionDescriptor {
+                section_type: V2SectionType::IndexDelta,
+                offset: payload_len as u64,
+                length: (section_region.len() - payload_len) as u64,
+                flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                digest: digest_v2_section(&section_region[payload_len..]),
+            },
+        ]
+    };
+    let body_digest = body_digest_for_v2_sections(&sections, section_region)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let keyring = signing_keyring();
+    let header = V2CommitHeader {
+        self_ref: V2CommitSelfRef {
+            sequence: commit_key.sequence,
+            commit_key: commit_key.object_id.clone(),
+        },
+        parent: (kind == V2CommitKind::Delta).then_some(V2CommitParentRef {
+            sequence: parent_key.sequence,
+            commit_key: parent_key.object_id,
+            body_digest: [0x41; 32],
+            version_id: None,
+        }),
+        publish_time_ms: 0,
+        kind,
+        algorithms: V2Algorithms::v02(),
+        keyring_envelope_ref: V2KeyringEnvelopeRef {
+            object_id: object_id("keyrings/fuzz"),
+            digest: [0x24; 32],
+        },
+        section_index: sections,
+        body_digest,
+        signature: [0; 64],
+        signing_key_id: key_id("signing"),
+    }
+    .sign_with_keyring(&keyring, upload_mode)
+    .unwrap_or_else(|error| panic!("{error}"));
+    let encoded = header
+        .encode_object(upload_mode, section_region)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let parsed = parse_v2_commit_object(&commit_key.object_id, encoded.clone(), &keyring)
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(parsed.body, encoded);
+    assert_eq!(parsed.parsed_header.header, header);
+}
+
 /// Decodes one canonical CBOR value with the same primitive reader used by commits.
 pub fn decode_canonical_cbor(input: &[u8]) -> V2Result<()> {
     super::cbor::fuzz_decode_one(input).map_err(|_| V2FormatError::MalformedCbor)
@@ -77,9 +164,11 @@ pub fn decode_index_delta_object(input: &[u8]) {
 }
 
 fn commit_object_id() -> BackendObjectId {
-    V2CommitKey::from_parts(Sequence::new(42), [0x42; 32])
-        .unwrap_or_else(|error| panic!("{error}"))
-        .object_id
+    commit_object_key().object_id
+}
+
+fn commit_object_key() -> V2CommitKey {
+    V2CommitKey::from_parts(Sequence::new(42), [0x42; 32]).unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn object_id(value: &str) -> BackendObjectId {

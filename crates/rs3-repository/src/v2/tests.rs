@@ -5,12 +5,12 @@ use super::{
     V2OrphanGcOptions, V2RecoveryBundle, V2ReplayLimits, V2Repository,
 };
 use super::{
-    V2_RESTORE_BUNDLE_SCHEMA, V2Algorithms, V2CommitHeader, V2CommitKey, V2CommitParentRef,
-    V2CommitSelfRef, V2ErrorClass, V2FormatError, V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRef,
-    V2KeyringEnvelopeRootRef, V2ProviderCheckStatus, V2ProviderConformanceOptions,
-    V2ProviderProfile, V2SectionDescriptor, V2SectionType, V2UploadMode,
-    body_digest_for_v2_sections, check_v2_provider_conformance, generate_v2_commit_key,
-    parse_v2_commit_object,
+    V2_RESTORE_BUNDLE_SCHEMA, V2_SECTION_FLAG_MUST_UNDERSTAND, V2Algorithms, V2CommitHeader,
+    V2CommitKey, V2CommitKind, V2CommitParentRef, V2CommitSelfRef, V2ErrorClass, V2FormatError,
+    V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRef, V2KeyringEnvelopeRootRef,
+    V2ProviderCheckStatus, V2ProviderConformanceOptions, V2ProviderProfile, V2SectionDescriptor,
+    V2SectionType, V2UploadMode, body_digest_for_v2_sections, check_v2_provider_conformance,
+    digest_v2_section, generate_v2_commit_key, parse_v2_commit_object,
 };
 use crate::{CommitCoordinatorOptions, RepositoryError, RepositoryOptions, RepositoryPutOptions};
 use bytes::Bytes;
@@ -118,6 +118,7 @@ fn sample_sections() -> (Vec<V2SectionDescriptor>, Bytes, [u8; 32]) {
         offset: 0,
         length: section_region.len() as u64,
         flags: super::commit::V2_SECTION_FLAG_MUST_UNDERSTAND,
+        digest: digest_v2_section(&section_region),
     }];
     let digest = must_v2(body_digest_for_v2_sections(
         &section_index,
@@ -143,7 +144,7 @@ fn sample_header(upload_mode: V2UploadMode) -> (V2CommitKey, V2CommitHeader, Byt
             version_id: Some(must_type(BackendVersionId::new("version-1"))),
         }),
         publish_time_ms: 1_765_000_000_000,
-        is_snapshot: true,
+        kind: V2CommitKind::Root,
         algorithms: V2Algorithms::v02(),
         keyring_envelope_ref: V2KeyringEnvelopeRef {
             object_id: object_id("keyrings/00000000000000000001-deadbeef"),
@@ -716,6 +717,25 @@ fn multipart_commit_round_trips_with_padded_header() {
 }
 
 #[test]
+fn v02_wire_codes_and_required_capabilities_are_closed() {
+    assert_eq!(V2CommitKind::Delta.to_wire(), 1);
+    assert_eq!(V2CommitKind::Root.to_wire(), 2);
+    assert_eq!(V2SectionType::IndexDelta.to_wire(), 1);
+    assert_eq!(V2SectionType::IndexSnapshot.to_wire(), 2);
+    assert_eq!(V2SectionType::Payload.to_wire(), 3);
+    assert_eq!(V2SectionType::Directives.to_wire(), 4);
+
+    let keyring = signing_keyring();
+    let (commit_key, _, body) = sample_object(V2UploadMode::SinglePut);
+    for capability_flags in [0_u8, 2, 3, 0x81] {
+        let mut tampered = body.to_vec();
+        tampered[23] = capability_flags;
+        let error = parse_v2_commit_object(&commit_key.object_id, Bytes::from(tampered), &keyring);
+        assert!(matches!(error, Err(V2FormatError::UnsupportedCapabilities)));
+    }
+}
+
+#[test]
 fn copied_commit_under_a_different_key_is_rejected() {
     let keyring = signing_keyring();
     let (_, _, body) = sample_object(V2UploadMode::SinglePut);
@@ -748,7 +768,7 @@ fn signature_tampering_is_rejected_with_valid_header_digest() {
 }
 
 #[test]
-fn body_digest_tampering_is_rejected_after_header_verification() {
+fn section_digest_tampering_is_rejected_after_header_verification() {
     let keyring = signing_keyring();
     let (commit_key, _, body) = sample_object(V2UploadMode::SinglePut);
     let mut tampered = body.to_vec();
@@ -756,7 +776,80 @@ fn body_digest_tampering_is_rejected_after_header_verification() {
     tampered[last] ^= 0x80;
 
     let error = parse_v2_commit_object(&commit_key.object_id, Bytes::from(tampered), &keyring);
+    assert!(matches!(error, Err(V2FormatError::SectionDigestMismatch)));
+}
+
+#[test]
+fn signed_body_digest_must_match_authenticated_sections() {
+    let keyring = signing_keyring();
+    let (commit_key, mut header, section_region) = sample_header(V2UploadMode::SinglePut);
+    header.body_digest[0] ^= 0x80;
+    header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::SinglePut));
+    let mut body = must_v2(header.encode_header_span(V2UploadMode::SinglePut)).to_vec();
+    body.extend_from_slice(&section_region);
+
+    let error = parse_v2_commit_object(&commit_key.object_id, Bytes::from(body), &keyring);
     assert!(matches!(error, Err(V2FormatError::BodyDigestMismatch)));
+}
+
+#[test]
+fn signed_section_digest_must_match_stored_section() {
+    let keyring = signing_keyring();
+    let (commit_key, mut header, section_region) = sample_header(V2UploadMode::SinglePut);
+    header.section_index[0].digest[0] ^= 0x80;
+    header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::SinglePut));
+    let mut body = must_v2(header.encode_header_span(V2UploadMode::SinglePut)).to_vec();
+    body.extend_from_slice(&section_region);
+
+    let error = parse_v2_commit_object(&commit_key.object_id, Bytes::from(body), &keyring);
+    assert!(matches!(error, Err(V2FormatError::SectionDigestMismatch)));
+}
+
+#[test]
+fn maximum_section_batch_fits_bounded_header() {
+    let keyring = signing_keyring();
+    let (commit_key, mut header, _) = sample_header(V2UploadMode::MultipartPadded);
+    let empty_digest = digest_v2_section(&[]);
+    header.section_index = (0..64)
+        .map(|_| V2SectionDescriptor {
+            section_type: V2SectionType::Payload,
+            offset: 0,
+            length: 0,
+            flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+            digest: empty_digest,
+        })
+        .chain(std::iter::once(V2SectionDescriptor {
+            section_type: V2SectionType::IndexSnapshot,
+            offset: 0,
+            length: 0,
+            flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+            digest: empty_digest,
+        }))
+        .collect();
+    header.body_digest = digest_v2_section(&[]);
+    header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::MultipartPadded));
+    let body = must_v2(header.encode_object(V2UploadMode::MultipartPadded, &[]));
+    let parsed = must_v2(parse_v2_commit_object(
+        &commit_key.object_id,
+        body,
+        &keyring,
+    ));
+    assert_eq!(parsed.parsed_header.header.section_index.len(), 65);
+
+    header.section_index.insert(
+        0,
+        V2SectionDescriptor {
+            section_type: V2SectionType::Payload,
+            offset: 0,
+            length: 0,
+            flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+            digest: empty_digest,
+        },
+    );
+    assert!(matches!(
+        body_digest_for_v2_sections(&header.section_index, &[]),
+        Err(V2FormatError::InvalidHeaderField)
+    ));
 }
 
 #[test]
@@ -767,6 +860,7 @@ fn section_layout_rejects_reserved_flags_and_unauthenticated_gaps() {
         offset: 0,
         length: 6,
         flags: 0x04,
+        digest: digest_v2_section(&section_region),
     }];
     assert!(matches!(
         body_digest_for_v2_sections(&reserved, section_region.as_ref()),
@@ -778,6 +872,7 @@ fn section_layout_rejects_reserved_flags_and_unauthenticated_gaps() {
         offset: 1,
         length: 5,
         flags: 0,
+        digest: digest_v2_section(&section_region[1..]),
     }];
     assert!(matches!(
         body_digest_for_v2_sections(&gap, section_region.as_ref()),
@@ -788,12 +883,10 @@ fn section_layout_rejects_reserved_flags_and_unauthenticated_gaps() {
 #[test]
 fn commit_rejects_snapshot_section_mismatch() {
     let keyring = signing_keyring();
-    let (commit_key, mut header, section_region) = sample_header(V2UploadMode::SinglePut);
-    header.is_snapshot = false;
+    let (_commit_key, mut header, section_region) = sample_header(V2UploadMode::SinglePut);
+    header.kind = V2CommitKind::Delta;
     header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::SinglePut));
-    let body = must_v2(header.encode_object(V2UploadMode::SinglePut, section_region.as_ref()));
-
-    let error = parse_v2_commit_object(&commit_key.object_id, body, &keyring);
+    let error = header.encode_object(V2UploadMode::SinglePut, section_region.as_ref());
 
     assert!(matches!(error, Err(V2FormatError::InvalidHeaderField)));
 }
@@ -970,17 +1063,13 @@ async fn v2_commit_store_writes_genesis_child_and_loads_chain() {
         panic!("chain should exist after genesis");
     };
     assert_eq!(chain.commits_newest_first.len(), 2);
-    assert!(
-        !chain.commits_newest_first[0]
-            .parsed_header
-            .header
-            .is_snapshot
+    assert_eq!(
+        chain.commits_newest_first[0].parsed_header.header.kind,
+        V2CommitKind::Delta
     );
-    assert!(
-        chain.commits_newest_first[1]
-            .parsed_header
-            .header
-            .is_snapshot
+    assert_eq!(
+        chain.commits_newest_first[1].parsed_header.header.kind,
+        V2CommitKind::Root
     );
 }
 
@@ -1029,12 +1118,93 @@ async fn bounded_replay_uses_only_fixed_size_range_reads() {
 
     assert_eq!(chain.commits_newest_first.len(), 2);
     assert_eq!(store.full_commit_get_count(), 0);
-    assert!(store.ranged_commit_get_count() > 64);
+    let ranged_gets = store.ranged_commit_get_count();
+    assert!((2..=4).contains(&ranged_gets), "ranged gets: {ranged_gets}");
     assert_eq!(
         chain.commits_newest_first[0].retained_sections[1].as_deref(),
         Some(b"bounded-index".as_slice())
     );
     assert!(chain.commits_newest_first[0].retained_sections[0].is_none());
+}
+
+#[tokio::test]
+async fn replay_skips_tampered_payload_but_adoption_verifies_it() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2CommitStore::new(store.clone(), keyring.clone(), options);
+    let anchor = V2MemoryAnchor::new();
+    let genesis = must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let child = must_v2(
+        repository
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::delta(vec![
+                    V2CommitSection::new(
+                        V2SectionType::Payload,
+                        0,
+                        Bytes::from_static(b"payload-ciphertext"),
+                    ),
+                    V2CommitSection::new(
+                        V2SectionType::IndexDelta,
+                        0,
+                        Bytes::from_static(b"authenticated-index"),
+                    ),
+                ]),
+            )
+            .await,
+    );
+    let body = must_v2(
+        store
+            .get_range(&child.commit_key.object_id, ByteRange::Full)
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed),
+    );
+    let parsed = must_v2(parse_v2_commit_object(
+        &child.commit_key.object_id,
+        body.clone(),
+        &keyring,
+    ));
+    let payload = &parsed.parsed_header.header.section_index[0];
+    let payload_offset = parsed
+        .parsed_header
+        .sections_start
+        .checked_add(usize::try_from(payload.offset).unwrap_or_else(|error| panic!("{error}")))
+        .unwrap_or_else(|| panic!("payload offset overflow"));
+    let mut corrupted = body.to_vec();
+    corrupted[payload_offset] ^= 0x80;
+    must_v2(
+        store
+            .put(
+                &child.commit_key.object_id,
+                Bytes::from(corrupted),
+                PutOptions::default(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|_| V2FormatError::StorageOperationFailed),
+    );
+
+    let chain = must_v2(repository.load_replay_chain_from_anchor(&anchor).await)
+        .unwrap_or_else(|| panic!("anchored chain should remain replayable"));
+    assert_eq!(chain.commits_newest_first.len(), 2);
+
+    let adoption_anchor = V2MemoryAnchor::new();
+    must_v2(
+        adoption_anchor
+            .compare_and_advance_v2(None, genesis.anchor_state)
+            .await,
+    );
+    assert_eq!(
+        repository
+            .adopt_unanchored_child(&adoption_anchor, &child.commit_key.object_id, None)
+            .await,
+        Err(V2FormatError::SectionDigestMismatch)
+    );
 }
 
 #[tokio::test]
@@ -1448,7 +1618,8 @@ async fn v2_repository_startup_replay_never_fetches_full_commit_objects() {
         .unwrap_or_else(|| panic!("startup replay should find an anchor"));
 
     assert_eq!(store.full_commit_get_count(), 0);
-    assert!(store.ranged_commit_get_count() > 64);
+    let ranged_gets = store.ranged_commit_get_count();
+    assert!((2..=4).contains(&ranged_gets), "ranged gets: {ranged_gets}");
     assert_eq!(must_repo(fresh.head(&key)).content_len, 256 * 1024);
 }
 
@@ -2899,17 +3070,13 @@ async fn v2_index_snapshot_bounds_replay_and_preserves_namespace() {
     let third_body = must_repo(fresh.get_range(&third_key, ByteRange::Full).await);
 
     assert_eq!(chain.commits_newest_first.len(), 2);
-    assert!(
-        !chain.commits_newest_first[0]
-            .parsed_header
-            .header
-            .is_snapshot
+    assert_eq!(
+        chain.commits_newest_first[0].parsed_header.header.kind,
+        V2CommitKind::Delta
     );
-    assert!(
-        chain.commits_newest_first[1]
-            .parsed_header
-            .header
-            .is_snapshot
+    assert_eq!(
+        chain.commits_newest_first[1].parsed_header.header.kind,
+        V2CommitKind::Root
     );
     assert_eq!(third_body, Bytes::from_static(b"third"));
     assert_eq!(
@@ -3099,11 +3266,9 @@ async fn v2_commit_coordinator_flushes_before_index_snapshot() {
     }
     assert_eq!(snapshot.sequence, Sequence::new(3));
     assert_eq!(chain.commits_newest_first.len(), 1);
-    assert!(
-        chain.commits_newest_first[0]
-            .parsed_header
-            .header
-            .is_snapshot
+    assert_eq!(
+        chain.commits_newest_first[0].parsed_header.header.kind,
+        V2CommitKind::Root
     );
     assert_eq!(body, Bytes::from_static(b"pending"));
 }

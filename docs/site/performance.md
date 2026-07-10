@@ -102,16 +102,18 @@ and 1M repository recovery remain production blockers. A successful write-only
 million-object run is not accepted as scale evidence.
 
 These measurements were collected against the now-removed `commits/v01`
-generation. The transitional `commits/v02` envelope retains the same prototype
-replay architecture, so it must be rerun and is not qualified by the mechanical
+generation. The transitional `commits/v02` envelope now authenticates index
+sections independently and no longer scans payload ciphertext during recovery,
+but it retains the prototype delta/snapshot chain and fixed replay-depth budget.
+The 100k and 1M tiers must therefore be rerun and are not qualified by the
 generation change. Final `v02` qualification must use a fresh process and verify
 exact listing cardinality plus first, middle, and last object bytes. Its
 descriptor-first reader must retain no cumulative encrypted delta set, read no
 payload sections merely to rebuild the index, and use at most 1.25x the index
-material required by the accepted catalog. On the documented pinned
-4-vCPU, 16-GiB runner, the 1M filesystem recovery budget is 180 seconds and
-4 GiB RSS. Correctness, request, byte, allocation, and amplification bounds apply
-on every runner; absolute time gates apply only to pinned runners.
+material required by the accepted catalog. On the documented pinned 4-vCPU,
+16-GiB runner, the 1M filesystem recovery budget is 180 seconds and 4 GiB RSS.
+Correctness, request, byte, allocation, and amplification bounds apply on every
+runner; absolute time gates apply only to pinned runners.
 
 ## Current Release Matrix
 

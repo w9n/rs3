@@ -100,6 +100,9 @@ pub enum V2FormatError {
     /// The declared body digest does not match the declared sections.
     #[error("v2 commit body digest mismatch")]
     BodyDigestMismatch,
+    /// A section's stored bytes do not match its signed descriptor digest.
+    #[error("v2 commit section digest mismatch")]
+    SectionDigestMismatch,
     /// A cryptographic operation other than verification failed.
     #[error("v2 cryptographic operation failed")]
     CryptoOperation,
@@ -186,6 +189,7 @@ impl V2FormatError {
             | Self::UnsupportedSection
             | Self::ReservedSectionFlags
             | Self::BodyDigestMismatch
+            | Self::SectionDigestMismatch
             | Self::CryptoOperation
             | Self::TypeValidation
             | Self::AnchorReadFailed

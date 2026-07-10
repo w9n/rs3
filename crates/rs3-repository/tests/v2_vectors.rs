@@ -4,9 +4,9 @@ use bytes::Bytes;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_repository::v2::{
     V2_HEADER_META_LEN, V2_SECTION_FLAG_MUST_UNDERSTAND, V2Algorithms, V2CommitHeader, V2CommitKey,
-    V2CommitParentRef, V2CommitSelfRef, V2ErrorClass, V2FormatError, V2KeyringEnvelopeRef,
-    V2SectionDescriptor, V2SectionType, V2UploadMode, body_digest_for_v2_sections,
-    parse_v2_commit_object,
+    V2CommitKind, V2CommitParentRef, V2CommitSelfRef, V2ErrorClass, V2FormatError,
+    V2KeyringEnvelopeRef, V2SectionDescriptor, V2SectionType, V2UploadMode,
+    body_digest_for_v2_sections, digest_v2_section, parse_v2_commit_object,
 };
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, Sequence,
@@ -30,6 +30,7 @@ impl V2VectorFixture {
             offset: 0,
             length: section_region.len() as u64,
             flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+            digest: digest_v2_section(&section_region),
         }];
         let body_digest = must_v2(body_digest_for_v2_sections(
             &section_index,
@@ -47,7 +48,7 @@ impl V2VectorFixture {
                 version_id: Some(must_type(BackendVersionId::new("vector-parent-version"))),
             }),
             publish_time_ms: 1_765_000_123_456,
-            is_snapshot: true,
+            kind: V2CommitKind::Root,
             algorithms: V2Algorithms::v02(),
             keyring_envelope_ref: V2KeyringEnvelopeRef {
                 object_id: object_id("keyrings/00000000000000000042-vector"),
@@ -119,6 +120,7 @@ fn vector_invalid_cases_have_expected_classes() {
         invalid_case_bad_signature(),
         invalid_case_bad_body_digest(),
         invalid_case_bad_algorithm(),
+        invalid_case_missing_required_capability(),
         invalid_case_unsupported_capability(),
         invalid_case_reserved_fixed_header(),
     ];
@@ -187,11 +189,11 @@ fn invalid_case_bad_body_digest() -> InvalidVectorCase {
     let last = body.len() - 1;
     body[last] ^= 0x01;
     InvalidVectorCase {
-        name: "bad-body-digest",
+        name: "bad-section-digest",
         keyring: fixture.keyring,
         object_id: fixture.commit_key.object_id,
         body: Bytes::from(body),
-        expected_error: V2FormatError::BodyDigestMismatch,
+        expected_error: V2FormatError::SectionDigestMismatch,
     }
 }
 
@@ -216,9 +218,22 @@ fn invalid_case_bad_algorithm() -> InvalidVectorCase {
 fn invalid_case_unsupported_capability() -> InvalidVectorCase {
     let fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
     let mut body = fixture.encode(V2UploadMode::SinglePut).to_vec();
-    body[23] = 1;
+    body[23] = 3;
     InvalidVectorCase {
         name: "unsupported-capability",
+        keyring: fixture.keyring,
+        object_id: fixture.commit_key.object_id,
+        body: Bytes::from(body),
+        expected_error: V2FormatError::UnsupportedCapabilities,
+    }
+}
+
+fn invalid_case_missing_required_capability() -> InvalidVectorCase {
+    let fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
+    let mut body = fixture.encode(V2UploadMode::SinglePut).to_vec();
+    body[23] = 0;
+    InvalidVectorCase {
+        name: "missing-required-capability",
         keyring: fixture.keyring,
         object_id: fixture.commit_key.object_id,
         body: Bytes::from(body),

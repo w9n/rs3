@@ -22,15 +22,23 @@ pub const V2_SIGNATURE_LEN: usize = 64;
 /// Fixed v2 commit header prefix length.
 pub const V2_HEADER_META_LEN: usize = 64;
 /// Maximum complete v2 commit header span.
-pub const V2_MAX_HEADER_SIZE: usize = 4096;
+pub const V2_MAX_HEADER_SIZE: usize = 8192;
+/// Maximum number of physical sections in one v02 commit.
+pub const V2_MAX_COMMIT_SECTIONS: usize = 65;
 /// Magic bytes at the start of every v2 commit object.
 pub const V2_COMMIT_MAGIC: &[u8; 8] = b"rs3:cmt\n";
 /// v02 commit format version.
 pub const V2_FORMAT_VERSION: u32 = 2;
 /// v02 minimum reader version.
 pub const V2_MIN_READER_VERSION: u32 = 2;
-/// v02 capability mask. No optional capabilities are supported yet.
-pub const V2_SUPPORTED_CAPABILITY_FLAGS: u64 = 0;
+/// Commit sections carry signed digests over their exact stored bytes.
+pub const V2_CAPABILITY_SIGNED_SECTION_DIGESTS: u64 = 1 << 0;
+/// Commit index sections use the framed v02 run/catalog encoding.
+pub const V2_CAPABILITY_FRAMED_INDEX: u64 = 1 << 1;
+/// v02 capabilities understood by this transitional reader.
+pub const V2_SUPPORTED_CAPABILITY_FLAGS: u64 = V2_CAPABILITY_SIGNED_SECTION_DIGESTS;
+/// Capabilities required on every commit written or accepted by this reader.
+pub const V2_REQUIRED_CAPABILITY_FLAGS: u64 = V2_CAPABILITY_SIGNED_SECTION_DIGESTS;
 /// Section flag indicating the section type must be understood.
 pub const V2_SECTION_FLAG_MUST_UNDERSTAND: u8 = 0x01;
 /// Section flag indicating compressed section bytes.
@@ -49,7 +57,7 @@ const MAX_HEADER_CBOR_LEN: usize = V2_MAX_HEADER_SIZE - V2_HEADER_META_LEN;
 pub enum V2UploadMode {
     /// Header is immediately followed by sections.
     SinglePut,
-    /// Header is padded to 4 KiB for multipart assembly.
+    /// Header is padded to the fixed v02 header span for multipart assembly.
     MultipartPadded,
 }
 
@@ -67,6 +75,33 @@ impl V2UploadMode {
             0 => Ok(Self::SinglePut),
             1 => Ok(Self::MultipartPadded),
             _ => Err(V2FormatError::UnsupportedUploadMode),
+        }
+    }
+}
+
+/// Semantic role of a v02 commit in the authenticated history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum V2CommitKind {
+    /// An incremental mutation commit that links to a parent.
+    Delta,
+    /// A self-contained repository root used for genesis or checkpoints.
+    Root,
+}
+
+impl V2CommitKind {
+    /// Returns the canonical wire value for this commit kind.
+    pub const fn to_wire(self) -> u8 {
+        match self {
+            Self::Delta => 1,
+            Self::Root => 2,
+        }
+    }
+
+    fn from_wire(value: u64) -> V2Result<Self> {
+        match value {
+            1 => Ok(Self::Delta),
+            2 => Ok(Self::Root),
+            _ => Err(V2FormatError::InvalidHeaderField),
         }
     }
 }
@@ -221,6 +256,8 @@ pub struct V2Algorithms {
     pub signature: String,
     /// Payload AEAD algorithm identifier.
     pub payload_aead: String,
+    /// Index metadata AEAD and deterministic nonce suite identifier.
+    pub index_aead: String,
     /// Digest algorithm identifier.
     pub digest: String,
     /// Key-derivation algorithm identifier.
@@ -233,6 +270,7 @@ impl V2Algorithms {
         Self {
             signature: "Ed25519".to_owned(),
             payload_aead: "XChaCha20-Poly1305".to_owned(),
+            index_aead: "AES-256-GCM-SIV-HMAC-SHA256-Nonce-v1".to_owned(),
             digest: "SHA-256".to_owned(),
             kdf: "HMAC-SHA256".to_owned(),
         }
@@ -265,6 +303,8 @@ pub struct V2SectionDescriptor {
     pub length: u64,
     /// Section flags.
     pub flags: u8,
+    /// SHA-256 digest over the section's exact stored bytes.
+    pub digest: [u8; V2_DIGEST_LEN],
 }
 
 /// Canonical v2 commit header.
@@ -276,8 +316,8 @@ pub struct V2CommitHeader {
     pub parent: Option<V2CommitParentRef>,
     /// Commit publish time in milliseconds since Unix epoch.
     pub publish_time_ms: i64,
-    /// True when the commit contains a full namespace snapshot.
-    pub is_snapshot: bool,
+    /// Semantic role of this commit in the authenticated history.
+    pub kind: V2CommitKind,
     /// Exact v02 algorithm identifiers.
     pub algorithms: V2Algorithms,
     /// Active keyring envelope reference.
@@ -319,6 +359,7 @@ impl V2CommitHeader {
         upload_mode: V2UploadMode,
         section_region: &[u8],
     ) -> V2Result<Bytes> {
+        validate_commit_section_semantics(self)?;
         let digest = body_digest_for_v2_sections(&self.section_index, section_region)?;
         if digest != self.body_digest {
             return Err(V2FormatError::BodyDigestMismatch);
@@ -333,6 +374,7 @@ impl V2CommitHeader {
 
     /// Encodes only the signed fixed/header span for multipart assembly.
     pub(crate) fn encode_header_span(&self, upload_mode: V2UploadMode) -> V2Result<Bytes> {
+        validate_commit_section_semantics(self)?;
         let mut span = header_span(self, upload_mode, SignatureMode::Actual)?;
         let digest = Sha256::digest(&span);
         span[HEADER_DIGEST_START..HEADER_DIGEST_END].copy_from_slice(&digest);
@@ -445,7 +487,9 @@ pub(crate) fn v2_commit_header_span_len(input: &[u8]) -> V2Result<usize> {
             .try_into()
             .map_err(|_| V2FormatError::TruncatedHeader)?,
     );
-    if capability_flags & !V2_SUPPORTED_CAPABILITY_FLAGS != 0 {
+    if capability_flags & !V2_SUPPORTED_CAPABILITY_FLAGS != 0
+        || capability_flags & V2_REQUIRED_CAPABILITY_FLAGS != V2_REQUIRED_CAPABILITY_FLAGS
+    {
         return Err(V2FormatError::UnsupportedCapabilities);
     }
     let upload_mode = V2UploadMode::from_wire(input[24])?;
@@ -507,9 +551,18 @@ pub fn body_digest_for_v2_sections(
         let end = start
             .checked_add(length)
             .ok_or(V2FormatError::SectionBounds)?;
-        digest.update(&section_region[start..end]);
+        let section_bytes = &section_region[start..end];
+        if digest_v2_section(section_bytes) != section.digest {
+            return Err(V2FormatError::SectionDigestMismatch);
+        }
+        digest.update(section_bytes);
     }
     Ok(digest.finalize().into())
+}
+
+/// Computes the digest authenticated by one v02 section descriptor.
+pub fn digest_v2_section(section_bytes: &[u8]) -> [u8; V2_DIGEST_LEN] {
+    Sha256::digest(section_bytes).into()
 }
 
 /// Validates the signed section layout against provider-reported object length.
@@ -571,7 +624,9 @@ fn parse_fixed_header(input: &[u8]) -> V2Result<FixedHeader> {
             .try_into()
             .map_err(|_| V2FormatError::TruncatedHeader)?,
     );
-    if capability_flags & !V2_SUPPORTED_CAPABILITY_FLAGS != 0 {
+    if capability_flags & !V2_SUPPORTED_CAPABILITY_FLAGS != 0
+        || capability_flags & V2_REQUIRED_CAPABILITY_FLAGS != V2_REQUIRED_CAPABILITY_FLAGS
+    {
         return Err(V2FormatError::UnsupportedCapabilities);
     }
     let upload_mode = V2UploadMode::from_wire(input[24])?;
@@ -634,7 +689,7 @@ fn header_span(
     out[..V2_COMMIT_MAGIC.len()].copy_from_slice(V2_COMMIT_MAGIC);
     out[8..12].copy_from_slice(&V2_FORMAT_VERSION.to_be_bytes());
     out[12..16].copy_from_slice(&V2_MIN_READER_VERSION.to_be_bytes());
-    out[16..24].copy_from_slice(&V2_SUPPORTED_CAPABILITY_FLAGS.to_be_bytes());
+    out[16..24].copy_from_slice(&V2_REQUIRED_CAPABILITY_FLAGS.to_be_bytes());
     out[24] = upload_mode.to_wire();
     out[28..32].copy_from_slice(&(cbor.len() as u32).to_be_bytes());
     out[HEADER_CBOR_START..HEADER_CBOR_START + cbor.len()].copy_from_slice(&cbor);
@@ -658,7 +713,7 @@ fn encode_header_cbor(header: &V2CommitHeader, signature_mode: SignatureMode) ->
     cbor::write_i64(&mut out, header.publish_time_ms);
 
     cbor::write_u64(&mut out, 4);
-    cbor::write_bool(&mut out, header.is_snapshot);
+    cbor::write_u64(&mut out, u64::from(header.kind.to_wire()));
 
     cbor::write_u64(&mut out, 5);
     encode_algorithms(&mut out, &header.algorithms);
@@ -711,14 +766,16 @@ fn encode_parent_ref(out: &mut Vec<u8>, parent: &V2CommitParentRef) {
 }
 
 fn encode_algorithms(out: &mut Vec<u8>, algorithms: &V2Algorithms) {
-    cbor::write_map_len(out, 4);
+    cbor::write_map_len(out, 5);
     cbor::write_u64(out, 1);
     cbor::write_text(out, &algorithms.signature);
     cbor::write_u64(out, 2);
     cbor::write_text(out, &algorithms.payload_aead);
     cbor::write_u64(out, 3);
-    cbor::write_text(out, &algorithms.digest);
+    cbor::write_text(out, &algorithms.index_aead);
     cbor::write_u64(out, 4);
+    cbor::write_text(out, &algorithms.digest);
+    cbor::write_u64(out, 5);
     cbor::write_text(out, &algorithms.kdf);
 }
 
@@ -731,7 +788,7 @@ fn encode_keyring_ref(out: &mut Vec<u8>, reference: &V2KeyringEnvelopeRef) {
 }
 
 fn encode_section(out: &mut Vec<u8>, section: &V2SectionDescriptor) {
-    cbor::write_map_len(out, 4);
+    cbor::write_map_len(out, 5);
     cbor::write_u64(out, 1);
     cbor::write_u64(out, u64::from(section.section_type.to_wire()));
     cbor::write_u64(out, 2);
@@ -740,6 +797,8 @@ fn encode_section(out: &mut Vec<u8>, section: &V2SectionDescriptor) {
     cbor::write_u64(out, section.length);
     cbor::write_u64(out, 4);
     cbor::write_u64(out, u64::from(section.flags));
+    cbor::write_u64(out, 5);
+    cbor::write_bytes(out, &section.digest);
 }
 
 fn decode_header_cbor(input: &[u8]) -> V2Result<V2CommitHeader> {
@@ -754,7 +813,7 @@ fn decode_header_cbor(input: &[u8]) -> V2Result<V2CommitHeader> {
     let mut self_ref = None;
     let mut parent = None;
     let mut publish_time_ms = None;
-    let mut is_snapshot = None;
+    let mut kind = None;
     let mut algorithms = None;
     let mut keyring_envelope_ref = None;
     let mut section_index = None;
@@ -785,11 +844,10 @@ fn decode_header_cbor(input: &[u8]) -> V2Result<V2CommitHeader> {
                 );
             }
             4 => {
-                is_snapshot = Some(
-                    reader
-                        .read_bool()
-                        .map_err(|_| V2FormatError::MalformedCbor)?,
-                );
+                let value = reader
+                    .read_u64()
+                    .map_err(|_| V2FormatError::MalformedCbor)?;
+                kind = Some(V2CommitKind::from_wire(value)?);
             }
             5 => algorithms = Some(decode_algorithms(&mut reader)?),
             6 => keyring_envelope_ref = Some(decode_keyring_ref(&mut reader)?),
@@ -809,7 +867,7 @@ fn decode_header_cbor(input: &[u8]) -> V2Result<V2CommitHeader> {
         self_ref: self_ref.ok_or(V2FormatError::MissingHeaderField)?,
         parent: parent.ok_or(V2FormatError::MissingHeaderField)?,
         publish_time_ms: publish_time_ms.ok_or(V2FormatError::MissingHeaderField)?,
-        is_snapshot: is_snapshot.ok_or(V2FormatError::MissingHeaderField)?,
+        kind: kind.ok_or(V2FormatError::MissingHeaderField)?,
         algorithms: algorithms.ok_or(V2FormatError::MissingHeaderField)?,
         keyring_envelope_ref: keyring_envelope_ref.ok_or(V2FormatError::MissingHeaderField)?,
         section_index: section_index.ok_or(V2FormatError::MissingHeaderField)?,
@@ -912,11 +970,12 @@ fn decode_algorithms(reader: &mut cbor::Reader<'_>) -> V2Result<V2Algorithms> {
     let len = reader
         .read_map_len()
         .map_err(|_| V2FormatError::MalformedCbor)?;
-    if len != 4 {
+    if len != 5 {
         return Err(V2FormatError::MissingHeaderField);
     }
     let mut signature = None;
     let mut payload_aead = None;
+    let mut index_aead = None;
     let mut digest = None;
     let mut kdf = None;
     let mut last_key = 0_u64;
@@ -928,14 +987,16 @@ fn decode_algorithms(reader: &mut cbor::Reader<'_>) -> V2Result<V2Algorithms> {
         match key {
             1 => signature = Some(value),
             2 => payload_aead = Some(value),
-            3 => digest = Some(value),
-            4 => kdf = Some(value),
+            3 => index_aead = Some(value),
+            4 => digest = Some(value),
+            5 => kdf = Some(value),
             _ => return Err(V2FormatError::InvalidHeaderField),
         }
     }
     Ok(V2Algorithms {
         signature: signature.ok_or(V2FormatError::MissingHeaderField)?,
         payload_aead: payload_aead.ok_or(V2FormatError::MissingHeaderField)?,
+        index_aead: index_aead.ok_or(V2FormatError::MissingHeaderField)?,
         digest: digest.ok_or(V2FormatError::MissingHeaderField)?,
         kdf: kdf.ok_or(V2FormatError::MissingHeaderField)?,
     })
@@ -974,6 +1035,9 @@ fn decode_sections(reader: &mut cbor::Reader<'_>) -> V2Result<Vec<V2SectionDescr
     let len = reader
         .read_array_len()
         .map_err(|_| V2FormatError::MalformedCbor)?;
+    if len > V2_MAX_COMMIT_SECTIONS {
+        return Err(V2FormatError::InvalidHeaderField);
+    }
     let mut sections = Vec::with_capacity(len);
     for _ in 0..len {
         sections.push(decode_section(reader)?);
@@ -985,13 +1049,14 @@ fn decode_section(reader: &mut cbor::Reader<'_>) -> V2Result<V2SectionDescriptor
     let len = reader
         .read_map_len()
         .map_err(|_| V2FormatError::MalformedCbor)?;
-    if len != 4 {
+    if len != 5 {
         return Err(V2FormatError::MissingHeaderField);
     }
     let mut section_type = None;
     let mut offset = None;
     let mut length = None;
     let mut flags = None;
+    let mut digest = None;
     let mut last_key = 0_u64;
     for _ in 0..len {
         let key = read_ordered_key(reader, &mut last_key)?;
@@ -1023,6 +1088,7 @@ fn decode_section(reader: &mut cbor::Reader<'_>) -> V2Result<V2SectionDescriptor
                     .map_err(|_| V2FormatError::MalformedCbor)?;
                 flags = Some(u8::try_from(value).map_err(|_| V2FormatError::InvalidHeaderField)?);
             }
+            5 => digest = Some(decode_digest(reader)?),
             _ => return Err(V2FormatError::InvalidHeaderField),
         }
     }
@@ -1031,6 +1097,7 @@ fn decode_section(reader: &mut cbor::Reader<'_>) -> V2Result<V2SectionDescriptor
         offset: offset.ok_or(V2FormatError::MissingHeaderField)?,
         length: length.ok_or(V2FormatError::MissingHeaderField)?,
         flags: flags.ok_or(V2FormatError::MissingHeaderField)?,
+        digest: digest.ok_or(V2FormatError::MissingHeaderField)?,
     })
 }
 
@@ -1080,7 +1147,10 @@ fn validate_section_layout(
     section_index: &[V2SectionDescriptor],
     section_region_len: u64,
 ) -> V2Result<()> {
-    let mut ranges = Vec::with_capacity(section_index.len());
+    if section_index.len() > V2_MAX_COMMIT_SECTIONS {
+        return Err(V2FormatError::InvalidHeaderField);
+    }
+    let mut next_start = 0_u64;
     for section in section_index {
         if section.flags & !(V2_SECTION_FLAG_MUST_UNDERSTAND | V2_SECTION_FLAG_COMPRESSED) != 0 {
             return Err(V2FormatError::ReservedSectionFlags);
@@ -1094,16 +1164,7 @@ fn validate_section_layout(
             .offset
             .checked_add(section.length)
             .ok_or(V2FormatError::SectionBounds)?;
-        if end > section_region_len {
-            return Err(V2FormatError::SectionBounds);
-        }
-        ranges.push((section.offset, end));
-    }
-
-    ranges.sort_unstable();
-    let mut next_start = 0_u64;
-    for (start, end) in ranges {
-        if start != next_start {
+        if section.offset != next_start || end > section_region_len {
             return Err(V2FormatError::SectionBounds);
         }
         next_start = end;
@@ -1115,21 +1176,54 @@ fn validate_section_layout(
     Ok(())
 }
 
-fn validate_commit_section_semantics(header: &V2CommitHeader) -> V2Result<()> {
-    let has_snapshot = header
+pub(crate) fn validate_commit_section_semantics(header: &V2CommitHeader) -> V2Result<()> {
+    let snapshot_count = header
         .section_index
         .iter()
-        .any(|section| section.section_type == V2SectionType::IndexSnapshot);
-    let has_delta = header
+        .filter(|section| section.section_type == V2SectionType::IndexSnapshot)
+        .count();
+    let delta_count = header
         .section_index
         .iter()
-        .any(|section| section.section_type == V2SectionType::IndexDelta);
+        .filter(|section| section.section_type == V2SectionType::IndexDelta)
+        .count();
 
-    if header.is_snapshot {
-        if !has_snapshot || has_delta {
+    for section in &header.section_index {
+        if matches!(
+            section.section_type,
+            V2SectionType::IndexDelta | V2SectionType::IndexSnapshot
+        ) && section.flags & V2_SECTION_FLAG_COMPRESSED != 0
+        {
             return Err(V2FormatError::InvalidHeaderField);
         }
-    } else if has_snapshot || !has_delta {
+    }
+
+    if header.kind == V2CommitKind::Root {
+        if snapshot_count != 1
+            || delta_count != 0
+            || header
+                .section_index
+                .last()
+                .map(|section| section.section_type)
+                != Some(V2SectionType::IndexSnapshot)
+            || header.section_index[..header.section_index.len().saturating_sub(1)]
+                .iter()
+                .any(|section| section.section_type != V2SectionType::Payload)
+        {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
+    } else if snapshot_count != 0
+        || delta_count != 1
+        || header.parent.is_none()
+        || header
+            .section_index
+            .last()
+            .map(|section| section.section_type)
+            != Some(V2SectionType::IndexDelta)
+        || header.section_index[..header.section_index.len().saturating_sub(1)]
+            .iter()
+            .any(|section| section.section_type != V2SectionType::Payload)
+    {
         return Err(V2FormatError::InvalidHeaderField);
     }
 

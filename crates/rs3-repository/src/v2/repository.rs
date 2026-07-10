@@ -3,11 +3,11 @@
 use super::cbor;
 use super::commit::{
     V2_COMMIT_CONTENT_TYPE, V2_HEADER_META_LEN, V2_MAX_HEADER_SIZE,
-    V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitHeader, V2CommitKey, V2CommitParentRef,
+    V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitHeader, V2CommitKey, V2CommitKind, V2CommitParentRef,
     V2CommitSelfRef, V2KeyringEnvelopeRef, V2ParsedCommit, V2ParsedCommitHeader,
     V2SectionDescriptor, V2SectionType, V2UploadMode, body_digest_for_v2_sections,
-    generate_v2_commit_key, parse_v2_commit_header, parse_v2_commit_object,
-    v2_commit_header_span_len, validate_v2_commit_object_len,
+    digest_v2_section, generate_v2_commit_key, parse_v2_commit_header, parse_v2_commit_object,
+    v2_commit_header_span_len, validate_commit_section_semantics, validate_v2_commit_object_len,
 };
 use super::error::{V2FormatError, V2Result};
 use super::format::V2FormatRef;
@@ -372,8 +372,8 @@ impl V2CommitSection {
 /// Request to write one v2 commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V2CommitWrite {
-    /// True when this commit is a namespace snapshot.
-    pub is_snapshot: bool,
+    /// Semantic role of this commit in authenticated history.
+    pub kind: V2CommitKind,
     /// Opaque sections to include in physical order.
     pub sections: Vec<V2CommitSection>,
     /// Retention required by objects represented in this commit.
@@ -386,7 +386,7 @@ impl V2CommitWrite {
     /// Creates a snapshot commit write request.
     pub fn snapshot(sections: Vec<V2CommitSection>) -> Self {
         Self {
-            is_snapshot: true,
+            kind: V2CommitKind::Root,
             sections,
             retention: None,
             legal_hold: None,
@@ -396,7 +396,7 @@ impl V2CommitWrite {
     /// Creates a delta commit write request.
     pub fn delta(sections: Vec<V2CommitSection>) -> Self {
         Self {
-            is_snapshot: false,
+            kind: V2CommitKind::Delta,
             sections,
             retention: None,
             legal_hold: None,
@@ -805,7 +805,7 @@ where
         }
         let write = V2CommitWrite::snapshot(vec![V2CommitSection::new(
             V2SectionType::IndexSnapshot,
-            0,
+            V2_SECTION_FLAG_MUST_UNDERSTAND,
             Bytes::new(),
         )]);
         self.write_commit_with_expected_anchor(anchor, None, Sequence::new(1), write)
@@ -961,10 +961,10 @@ where
             {
                 return Err(V2FormatError::BodyDigestMismatch);
             }
-            let is_snapshot = parsed.parsed_header.header.is_snapshot;
+            let is_root = parsed.parsed_header.header.kind == V2CommitKind::Root;
             let parent = parsed.parsed_header.header.parent.clone();
             commits.push(parsed);
-            if is_snapshot {
+            if is_root {
                 break;
             }
             let Some(parent) = parent else {
@@ -1073,7 +1073,7 @@ where
                     limits,
                 )
                 .await?;
-            let is_snapshot = parsed_header.header.is_snapshot;
+            let is_root = parsed_header.header.kind == V2CommitKind::Root;
             let parent = parsed_header.header.parent.clone();
             commits.push(V2ReplayCommit {
                 parsed_header,
@@ -1081,7 +1081,7 @@ where
                 object_len: metadata.content_len,
                 retained_sections,
             });
-            if is_snapshot {
+            if is_root {
                 break;
             }
             let Some(parent) = parent else {
@@ -1108,7 +1108,6 @@ where
     ) -> V2Result<Vec<Option<Bytes>>> {
         let sections_start = u64::try_from(parsed_header.sections_start)
             .map_err(|_| V2FormatError::SectionBounds)?;
-        let mut body_digest = Sha256::new();
         let mut retained_sections = vec![None; parsed_header.header.section_index.len()];
 
         for (index, section) in parsed_header.header.section_index.iter().enumerate() {
@@ -1116,17 +1115,17 @@ where
                 section.section_type,
                 V2SectionType::IndexDelta | V2SectionType::IndexSnapshot
             );
-            let mut retained = if retain {
-                *retained_bytes = retained_bytes
-                    .checked_add(section.length)
-                    .filter(|total| *total <= limits.max_retained_bytes)
-                    .ok_or(V2FormatError::ReplayBudgetExceeded)?;
-                let capacity = usize::try_from(section.length)
-                    .map_err(|_| V2FormatError::ReplayBudgetExceeded)?;
-                Some(Vec::with_capacity(capacity))
-            } else {
-                None
-            };
+            if !retain {
+                continue;
+            }
+            *retained_bytes = retained_bytes
+                .checked_add(section.length)
+                .filter(|total| *total <= limits.max_retained_bytes)
+                .ok_or(V2FormatError::ReplayBudgetExceeded)?;
+            let capacity =
+                usize::try_from(section.length).map_err(|_| V2FormatError::ReplayBudgetExceeded)?;
+            let mut retained = Vec::with_capacity(capacity);
+            let mut section_digest = Sha256::new();
             let mut offset = sections_start
                 .checked_add(section.offset)
                 .ok_or(V2FormatError::SectionBounds)?;
@@ -1147,18 +1146,68 @@ where
                 if u64::try_from(bytes.len()).ok() != Some(read_len) {
                     return Err(V2FormatError::TruncatedBody);
                 }
-                body_digest.update(&bytes);
-                if let Some(retained) = retained.as_mut() {
-                    retained.extend_from_slice(&bytes);
-                }
+                section_digest.update(&bytes);
+                retained.extend_from_slice(&bytes);
                 offset = offset
                     .checked_add(read_len)
                     .ok_or(V2FormatError::SectionBounds)?;
                 remaining -= read_len;
             }
 
-            if let Some(retained) = retained {
-                retained_sections[index] = Some(Bytes::from(retained));
+            let actual: [u8; 32] = section_digest.finalize().into();
+            if actual != section.digest {
+                return Err(V2FormatError::SectionDigestMismatch);
+            }
+            retained_sections[index] = Some(Bytes::from(retained));
+        }
+        Ok(retained_sections)
+    }
+
+    async fn verify_full_commit_sections(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        parsed_header: &V2ParsedCommitHeader,
+    ) -> V2Result<()> {
+        let chunk_len = self.options.replay_limits.read_chunk_bytes;
+        if chunk_len == 0 {
+            return Err(V2FormatError::ReplayBudgetExceeded);
+        }
+        let sections_start = u64::try_from(parsed_header.sections_start)
+            .map_err(|_| V2FormatError::SectionBounds)?;
+        let mut body_digest = Sha256::new();
+
+        for section in &parsed_header.header.section_index {
+            let mut section_digest = Sha256::new();
+            let mut offset = sections_start
+                .checked_add(section.offset)
+                .ok_or(V2FormatError::SectionBounds)?;
+            let mut remaining = section.length;
+            while remaining > 0 {
+                let read_len = remaining.min(chunk_len);
+                let bytes = self
+                    .read_commit_range_at(
+                        object_id,
+                        version_id,
+                        ByteRange::Slice {
+                            offset,
+                            len: read_len,
+                        },
+                    )
+                    .await?;
+                if u64::try_from(bytes.len()).ok() != Some(read_len) {
+                    return Err(V2FormatError::TruncatedBody);
+                }
+                section_digest.update(&bytes);
+                body_digest.update(&bytes);
+                offset = offset
+                    .checked_add(read_len)
+                    .ok_or(V2FormatError::SectionBounds)?;
+                remaining -= read_len;
+            }
+            let actual: [u8; 32] = section_digest.finalize().into();
+            if actual != section.digest {
+                return Err(V2FormatError::SectionDigestMismatch);
             }
         }
 
@@ -1166,7 +1215,7 @@ where
         if actual != parsed_header.header.body_digest {
             return Err(V2FormatError::BodyDigestMismatch);
         }
-        Ok(retained_sections)
+        Ok(())
     }
 
     /// Reads and verifies a single commit at a key and optional provider version.
@@ -1400,6 +1449,8 @@ where
             return Err(V2FormatError::MissingAnchor);
         };
         let parsed = self.read_replay_commit_at(object_id, version_id).await?;
+        self.verify_full_commit_sections(object_id, version_id, &parsed.parsed_header)
+            .await?;
         let header = &parsed.parsed_header.header;
         let Some(parent) = header.parent.as_ref() else {
             return Err(V2FormatError::InvalidHeaderField);
@@ -1642,7 +1693,7 @@ where
             },
             parent,
             publish_time_ms: current_time_ms(),
-            is_snapshot: write.is_snapshot,
+            kind: write.kind,
             algorithms: Default::default(),
             keyring_envelope_ref: self.options.keyring_envelope_ref.clone(),
             section_index,
@@ -1652,6 +1703,7 @@ where
                 .keyring
                 .primary_key_id(rs3_types::KeyPurpose::CheckpointSigning)?,
         };
+        validate_commit_section_semantics(&header)?;
         header.sign_with_keyring(&self.keyring, self.options.upload_mode)
     }
 
@@ -1678,8 +1730,10 @@ where
             .await
             .map_err(storage_to_v2)?;
         let mut body_digest = Sha256::new();
+        let mut payload_digest = Sha256::new();
         let payload_header = write.payload_sealer.header();
         body_digest.update(&payload_header);
+        payload_digest.update(&payload_header);
         if assembler
             .push_section_bytes(&mut multipart, &payload_header)
             .await
@@ -1752,6 +1806,7 @@ where
                         && {
                             let mut segment_writer = StreamingPayloadSegmentWriter {
                                 body_digest: &mut body_digest,
+                                payload_digest: &mut payload_digest,
                                 assembler: &mut assembler,
                                 multipart: &mut multipart,
                             };
@@ -1792,6 +1847,7 @@ where
                 && {
                     let mut segment_writer = StreamingPayloadSegmentWriter {
                         body_digest: &mut body_digest,
+                        payload_digest: &mut payload_digest,
                         assembler: &mut assembler,
                         multipart: &mut multipart,
                     };
@@ -1812,6 +1868,7 @@ where
             let final_segment_failed = {
                 let mut segment_writer = StreamingPayloadSegmentWriter {
                     body_digest: &mut body_digest,
+                    payload_digest: &mut payload_digest,
                     assembler: &mut assembler,
                     multipart: &mut multipart,
                 };
@@ -1833,6 +1890,7 @@ where
             && {
                 let mut segment_writer = StreamingPayloadSegmentWriter {
                     body_digest: &mut body_digest,
+                    payload_digest: &mut payload_digest,
                     assembler: &mut assembler,
                     multipart: &mut multipart,
                 };
@@ -1878,12 +1936,14 @@ where
                 offset: 0,
                 length: payload_len,
                 flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                digest: payload_digest.finalize().into(),
             },
             V2SectionDescriptor {
                 section_type: V2SectionType::IndexDelta,
                 offset: payload_len,
                 length: delta_len,
                 flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                digest: digest_v2_section(&finalized.index_delta),
             },
         ];
 
@@ -2083,6 +2143,7 @@ fn build_section_region(
             offset,
             length,
             flags: section.flags,
+            digest: digest_v2_section(&section.bytes),
         });
     }
     Ok((section_index, Bytes::from(region)))
@@ -2136,6 +2197,7 @@ struct StreamingPayloadSegmentAuth<'a> {
 
 struct StreamingPayloadSegmentWriter<'a> {
     body_digest: &'a mut Sha256,
+    payload_digest: &'a mut Sha256,
     assembler: &'a mut MultipartCommitAssembler,
     multipart: &'a mut Box<dyn rs3_storage::BlobMultipartUpload>,
 }
@@ -2158,6 +2220,7 @@ async fn push_streaming_payload_segment(
         )
         .map_err(|_| V2FormatError::StorageOperationFailed)?;
     writer.body_digest.update(&ciphertext);
+    writer.payload_digest.update(&ciphertext);
     writer
         .assembler
         .push_section_bytes(writer.multipart, &ciphertext)

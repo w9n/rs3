@@ -11,11 +11,12 @@ repository-format promise.
 !!! danger "Repository release is currently blocked"
     `commits/v01` has been removed and is unsupported; it had no production
     repositories. The runtime now reads and writes a transitional
-    `commits/v02` envelope, but framed index runs, signed catalogs, compaction,
-    and bounded recovery remain unimplemented. Existing compatibility and
-    provider results are useful gateway regression evidence, but they do not
-    qualify the complete `v02` format or a production repository release. There
-    will be no `v01` migration or dual-reader requirement.
+    `commits/v02` envelope with signed per-section digests and payload-skipping
+    replay, but framed index runs, signed catalogs, compaction, and bounded
+    catalog recovery remain unimplemented. Existing compatibility and provider
+    results are useful gateway regression evidence, but they do not qualify the
+    complete `v02` format or a production repository release. There will be no
+    `v01` migration or dual-reader requirement.
 
 ## Preview Scope
 

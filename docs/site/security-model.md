@@ -75,11 +75,12 @@ semantics. No production repository used `v01`, and no migration or dual reader
 is planned.
 
 !!! warning "Security implementation status"
-    The gateway reads and writes a transitional `v02` commit envelope, but does
-    not yet read or write `INDEX_ROOT` catalogs or `objects/v02` framed runs.
-    The controls below are requirements, not current evidence. Security claims
-    remain blocked on implementation, hostile-input tests, scale recovery, and
-    external cryptographic review.
+    The gateway reads and writes a transitional `v02` commit envelope with
+    signed per-section digests and payload-skipping index replay, but does not
+    yet read or write `INDEX_ROOT` catalogs or `objects/v02` framed runs. The
+    remaining controls below are requirements, not current evidence. Security
+    claims remain blocked on implementation, hostile-input tests, scale
+    recovery, and external cryptographic review.
 
 ## Control Map
 
@@ -95,14 +96,14 @@ is planned.
 | Writes are not acknowledged before commit acceptance | Commit coordinator waits for a covering signed commit and anchor advance. | v2 coordinator and commit tests. |
 | Storage rollback is not trusted as latest state | Ed25519 commit verification, Kubernetes Lease anchor, and retained exact-version commit reads. | v2 anchor, replay, recovery import, and orphan-report tests. |
 | v2 writes are not acknowledged before signed commit acceptance | The v2 commit coordinator batches staged writes into a signed commit and advances the external v2 anchor before returning success. | v2 coordinator batching, rollback, and snapshot tests. |
-| v2 replay cost is bounded by signed snapshots and fixed resource budgets | v2 readers walk the signed parent chain to the nearest encrypted index snapshot, range-hash payloads without retaining them, and fail closed at fixed commit, cumulative-I/O, or retained-index limits. | v2 bounded replay, snapshot replay, malformed-length, and range-tamper tests. |
+| Transitional v2 replay does not read payload ciphertext | Signed per-section digests let readers walk to the nearest encrypted index snapshot while range-reading only authenticated index sections. Fixed commit, cumulative-object, and retained-index budgets still fail closed. | v2 bounded replay, payload-independent request-count, malformed-length, and range-tamper tests. |
 | Create-only writes are not silently downgraded | Atomic-create providers must honor `PutObject` with `If-None-Match: *`; non-atomic `HEAD` before `PUT` is not treated as production create-only. | Storage contract tests and opt-in live S3 tests. |
 | Retained restore reads do not trust mutable latest objects | Retained-version providers must return version IDs for restore-critical writes; anchors bind commit versions and restore reads exact versions. | Memory version-addressed storage tests, v2 retained commit tests, and opt-in live S3 Object Lock tests. |
 | Single-writer read-write serving is guarded in Kubernetes deployments | `RS3_WRITER_GUARD=required` acquires a unique process identity and monotonic fencing token on the anchor Lease before serving. Every anchor advance verifies that live fence in the same resource-version CAS. | Lease skew, handoff, stale-writer, runtime startup guard, and configuration tests. |
 | Incident restore does not advance repository state | `restore-readonly` mode requires an accepted anchor and rejects supported mutations. | Gateway mode config, startup, and S3 adapter tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
-| v02 index frames cannot be transplanted or reordered | Frame AEAD binds format generation, exact object version, section ordinal, run identity, and frame ordinal; signed descriptors bind range digests. | Required for v02; not implemented. |
+| v02 index frames cannot be transplanted or reordered | Frame AEAD binds format generation, exact object key, section ordinal, run identity, and frame ordinal. The signed catalog separately binds the provider-returned exact version, length, and ciphertext digest. | Required for v02; signed section digests are implemented, framed-run binding is not. |
 | v02 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery applies one bounded authenticated frame at a time from an exact signed catalog. | Required for v02; 100k and 1M fresh-recovery gates currently block release. |
 | v02 checkpoint failure cannot anchor unrecoverable state | Fenced automatic checkpointing degrades, then pauses mutation before fixed tail-byte, commit, or run-count ceilings. | Required for v02; not implemented. |
 | v02 GC retains every live payload without retaining whole ancestry | Effective run records mark exact payload commit versions; full mark completes before exact-version sweep. | Required for v02; not implemented. |

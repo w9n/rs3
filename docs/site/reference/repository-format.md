@@ -8,10 +8,12 @@ this page is not complete.
 !!! warning "Implementation status"
     `commits/v01` has been removed and is unsupported. No production repository
     depends on it, so `rs3` will not add a migration path or a dual reader. The
-    current `v02` envelope still uses prototype `INDEX_DELTA` and
-    `INDEX_SNAPSHOT` sections. Framed `INDEX_RUN`, signed `INDEX_ROOT`,
-    compaction, automatic checkpointing, and the new recovery gates remain to be
-    implemented. Until those gates pass, the runtime is evaluation-only.
+    current `v02` envelope authenticates every stored section with a signed
+    digest and rebuilds namespace state without reading payload ciphertext, but
+    it still uses prototype `INDEX_DELTA` and `INDEX_SNAPSHOT` sections. Framed
+    `INDEX_RUN`, signed `INDEX_ROOT`, compaction, automatic checkpointing, and
+    the new recovery gates remain to be implemented. Until those gates pass,
+    the runtime is evaluation-only.
 
 ## Invariants
 
@@ -67,10 +69,12 @@ These class names, object counts, ciphertext sizes, provider version IDs, and
 write/compaction timing are accepted leakage. Plaintext catalog bounds, run
 levels, logical object counts, paths, and payload identities remain encrypted.
 
-The transitional writer publishes `INDEX_DELTA` and `INDEX_SNAPSHOT` sections
-under this generation. Those section semantics are not the stable `v02`
-contract. Repositories created before `INDEX_RUN` and `INDEX_ROOT` land remain
-evaluation data and may need recreation.
+The transitional writer publishes signed per-section digests with
+`INDEX_DELTA` and `INDEX_SNAPSHOT` sections under this generation. Its recovery
+path range-reads only those authenticated index sections. Those section
+semantics are not the stable `v02` contract. Repositories created before
+`INDEX_RUN` and `INDEX_ROOT` land remain evaluation data and may need
+recreation.
 
 ## Signed Commits
 
@@ -89,10 +93,17 @@ and encrypted sections. The signed header covers:
 - the complete commit-object length and body digest; and
 - the signing-key identifier and Ed25519 signature.
 
-The header has a fixed maximum size. Readers reject non-canonical encodings,
-unknown required capabilities, overlapping sections, arithmetic overflow,
-duplicate ordinals, lengths outside the object, and trailing data not covered
-by the signed layout.
+The complete header span is limited to 8 KiB and a commit carries at most 65
+sections (up to 64 payloads plus one index section). Multipart commits pad the
+header to that span; single-put commits use the canonical encoded length.
+Readers reject non-canonical encodings, unknown required capabilities,
+out-of-order or overlapping sections, arithmetic overflow, duplicate ordinals,
+lengths outside the object, and trailing data not covered by the signed layout.
+
+Capability bit `0x01` requires signed per-section digests and is implemented.
+Bit `0x02` identifies the framed index contract. It remains reserved and is
+rejected by the transitional reader until `INDEX_RUN` and `INDEX_ROOT` codecs
+land; the complete v02 reader and writer will require both bits.
 
 Normal commits contain zero or more encrypted `PAYLOAD` sections and one
 encrypted `INDEX_RUN` section. A catalog checkpoint commit contains an
@@ -158,8 +169,10 @@ format change.
 The first generation uses canonical length-delimited records and no
 compression. Each ciphertext frame and run has an explicit record and byte
 limit; the target maximum encrypted run object is 8 MiB. Index-frame associated
-data binds at least the format generation, exact containing object key and
-version, section ordinal, run identity, and frame ordinal. Reordering,
+data binds at least the format generation, exact containing object key, section
+ordinal, run identity, and frame ordinal. The provider version does not exist
+until after upload, so the accepted signed catalog binds that returned exact
+version together with object length and ciphertext digest. Reordering,
 duplicating, or transplanting frames must fail authentication.
 
 ## Small Signed Index Roots

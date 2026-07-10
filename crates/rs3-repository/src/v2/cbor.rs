@@ -37,10 +37,6 @@ pub(super) fn write_map_len(out: &mut Vec<u8>, len: usize) {
     write_type_len(out, 5, len as u64);
 }
 
-pub(super) fn write_bool(out: &mut Vec<u8>, value: bool) {
-    out.push(if value { 0xf5 } else { 0xf4 });
-}
-
 pub(super) fn write_null(out: &mut Vec<u8>) {
     out.push(0xf6);
 }
@@ -121,14 +117,6 @@ impl<'a> Reader<'a> {
 
     pub(super) fn read_map_len(&mut self) -> CborResult<usize> {
         self.read_len_for_major(5)
-    }
-
-    pub(super) fn read_bool(&mut self) -> CborResult<bool> {
-        match self.read_byte()? {
-            0xf4 => Ok(false),
-            0xf5 => Ok(true),
-            _ => Err(CborError::Invalid),
-        }
     }
 
     pub(super) fn read_null(&mut self) -> CborResult<()> {
