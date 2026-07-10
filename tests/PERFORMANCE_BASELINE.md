@@ -82,6 +82,92 @@ The matrix command also writes `regression_budgets`. Passing
 into a command failure. The budgets intentionally avoid wall-clock elapsed time,
 which is too environment-sensitive for a hard gate in this local harness.
 
+## July 2026 Lightweight Rerun
+
+Run date: 2026-07-10. These are single-run release-profile smoke measurements,
+not a replacement for the three-run Kopia matrix. They were rerun before and
+after the dependency remediations in this review; the current tree showed no
+material regression in the small in-memory lane.
+
+Command shape:
+
+```sh
+cargo run -p xtask --bin xtask --release -- perf \
+  --objects 16 --object-size 4096 --reads 16 --range-len 512 \
+  --commit-batch-items 8 --concurrency 8 --format jsonl
+```
+
+| Scenario | Elapsed | Backend requests/op | Byte amplification |
+| --- | ---: | ---: | ---: |
+| write batch | 3.482 ms | 0.0625 | 2.5086x write |
+| committed writes, sequential | 186.544 ms | 1.0000 | 3.5374x write |
+| committed writes, parallel | 3.628 ms | 0.1250 | 2.6162x write |
+| full reads | 0.704 ms | 0.0625 | 0.0656x read |
+| range reads | 0.147 ms | 0.5000 | 0.5156x read |
+
+The final release gateway smoke after the S3 client replacement recorded
+257.191 ms for sequential committed writes, 25.407 ms for parallel committed
+writes, 18.929 ms for full reads, and 30.722 ms for range reads. Request and
+byte ratios matched the in-memory lane closely. The gateway executable was
+built before the timed run; the current helper otherwise includes Cargo
+compilation in its readiness timeout on a cold tree.
+
+### Parallel Write Growth Remediation
+
+The release binary was swept with 512 B objects, a 64-item commit batch, and
+concurrency 64. Before the write-state remediation it measured:
+
+| Objects | Elapsed | Throughput | Average latency | p99 latency |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 69 ms | 3,705 ops/s | 10.8 ms | 22.7 ms |
+| 1,024 | 818 ms | 1,252 ops/s | 28.4 ms | 88.3 ms |
+| 4,096 | 19.61 s | 209 ops/s | 161.3 ms | 655.2 ms |
+
+This 16x object-count increase produced about 284x elapsed time. The write path
+was then changed to retain bounded per-mutation undo records, incrementally
+apply accepted state, target payload-reference resolution from the pending
+delta, and avoid a namespace scan for normal PUT list projection updates.
+
+The final current tree was measured three times with the same command shape.
+The table reports median elapsed and latency values:
+
+| Objects | Elapsed | Throughput | Average latency | p99 latency |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 17.0 ms | 15,019 ops/s | 3.68 ms | 5.38 ms |
+| 1,024 | 58.1 ms | 17,612 ops/s | 3.20 ms | 5.73 ms |
+| 4,096 | 210.0 ms | 19,507 ops/s | 2.89 ms | 3.75 ms |
+
+Elapsed ranges were 14.2-28.4 ms, 51.5-58.3 ms, and 209.4-219.4 ms
+respectively. The median 4,096-object lane is about 93.4x faster. A 16x
+object-count increase now takes 12.3x elapsed time rather than 284x, closing
+the observed near-quadratic hot-path blocker in this measured range. Add
+stable 10k, 100k, and 1M object scaling gates before treating the scaling
+envelope as production-qualified.
+
+## July 2026 Larger Restore Matrix
+
+Run date: 2026-07-10. Gateway profile: release. Payload segment lane: adaptive
+writer default. Workload set: `larger-restores`. Each row is the average of
+three direct/gateway run pairs. The raw summary is retained as ignored local
+release evidence.
+
+`workload_consistency` and `regression_budgets` both passed with no failures.
+
+| Profile | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend reads | Backend writes | Restore ratio | Gateway CPU | Gateway HWM RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| medium-restore | 2.93 s | 2.95 s | 1.01x | 0.51x | 1.01x | 1.00x | 0.63x | 0.81 s | 146.26 MiB |
+| kubernetes-objects | 9.81 s | 2.91 s | 0.30x | 0.03x | 1.02x | 1.01x | 0.12x | 0.83 s | 128.83 MiB |
+| kubernetes-objects-large | 34.16 s | 9.68 s | 0.28x | 0.02x | 1.01x | 1.00x | 0.19x | 2.33 s | 273.13 MiB |
+| postgres-pgdata | 2.81 s | 3.53 s | 1.26x | 0.75x | 1.04x | 1.00x | 0.65x | 2.22 s | 420.39 MiB |
+| postgres-pgdata-large | 3.87 s | 5.38 s | 1.39x | 0.83x | 1.04x | 1.00x | 0.57x | 4.20 s | 685.06 MiB |
+
+Backend request and byte budgets remain healthy in this local RustFS matrix.
+The Postgres-shaped profiles restore faster through the gateway but remain
+slower end to end because snapshot creation and commit publication dominate.
+Average commit wait rose from 53 ms in `medium-restore` to 383 ms in
+`postgres-pgdata-large`; average stage-lock wait rose from effectively zero to
+79 ms.
+
 ## Historical Small-Profile Results
 
 Run date: 2026-05-03. Payload segment lane: fixed 512 B. Each row is the
@@ -114,7 +200,7 @@ Wall-clock results are favorable for the gateway in this local setup, but they
 are less portable than request and byte ratios. Treat them as a regression
 signal for this harness, not as a general cloud-provider result.
 
-## Larger Restore Matrix
+## May 2026 Larger Restore Matrix
 
 Run date: 2026-05-13. Payload segment lane: adaptive writer default. Workload
 set: `larger-restores`. Each row is the average of three direct/gateway run

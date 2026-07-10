@@ -2,7 +2,7 @@ use super::{
     UnenforcedQuiescedMaintenanceGuard, V2AnchorState, V2CommitAnchor, V2CommitCoordinator,
     V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite, V2FullGcApplyOptions,
     V2FullGcDryRunOptions, V2MaintenanceBudgets, V2MaintenanceGuard, V2MemoryAnchor,
-    V2OrphanGcOptions, V2RecoveryBundle, V2Repository,
+    V2OrphanGcOptions, V2RecoveryBundle, V2ReplayLimits, V2Repository,
 };
 use super::{
     V2_RESTORE_BUNDLE_SCHEMA, V2Algorithms, V2CommitHeader, V2CommitKey, V2CommitParentRef,
@@ -985,6 +985,381 @@ async fn v2_commit_store_writes_genesis_child_and_loads_chain() {
 }
 
 #[tokio::test]
+async fn bounded_replay_uses_only_fixed_size_range_reads() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = signing_keyring();
+    let limits = V2ReplayLimits {
+        max_retained_bytes: 64,
+        read_chunk_bytes: 4 * 1024,
+        ..V2ReplayLimits::default()
+    };
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    )
+    .with_replay_limits(limits);
+    let repository = V2CommitStore::new(store.clone(), keyring, options);
+    let anchor = V2MemoryAnchor::new();
+
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    must_v2(
+        repository
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::delta(vec![
+                    V2CommitSection::new(
+                        V2SectionType::Payload,
+                        0,
+                        Bytes::from(vec![0x5a; 256 * 1024]),
+                    ),
+                    V2CommitSection::new(
+                        V2SectionType::IndexDelta,
+                        0,
+                        Bytes::from_static(b"bounded-index"),
+                    ),
+                ]),
+            )
+            .await,
+    );
+    store.reset_operation_counts();
+
+    let chain = must_v2(repository.load_replay_chain_from_anchor(&anchor).await)
+        .expect("bounded replay chain should exist");
+
+    assert_eq!(chain.commits_newest_first.len(), 2);
+    assert_eq!(store.full_commit_get_count(), 0);
+    assert!(store.ranged_commit_get_count() > 64);
+    assert_eq!(
+        chain.commits_newest_first[0].retained_sections[1].as_deref(),
+        Some(b"bounded-index".as_slice())
+    );
+    assert!(chain.commits_newest_first[0].retained_sections[0].is_none());
+}
+
+#[tokio::test]
+async fn bounded_replay_rejects_a_chain_deeper_than_its_commit_budget() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let writer = V2CommitStore::new(store.clone(), keyring.clone(), options.clone());
+    let anchor = V2MemoryAnchor::new();
+
+    must_v2(writer.write_genesis_snapshot(&anchor).await);
+    for byte in [1_u8, 2] {
+        must_v2(
+            writer
+                .write_child_commit(
+                    &anchor,
+                    V2CommitWrite::delta(vec![V2CommitSection::new(
+                        V2SectionType::IndexDelta,
+                        0,
+                        Bytes::from(vec![byte]),
+                    )]),
+                )
+                .await,
+        );
+    }
+
+    let reader = V2CommitStore::new(
+        store,
+        keyring,
+        options.with_replay_limits(V2ReplayLimits {
+            max_commits: 2,
+            ..V2ReplayLimits::default()
+        }),
+    );
+    assert_eq!(
+        reader.load_replay_chain_from_anchor(&anchor).await,
+        Err(V2FormatError::ReplayBudgetExceeded)
+    );
+}
+
+#[tokio::test]
+async fn bounded_replay_checks_total_bytes_before_reading_commit_bodies() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let writer = V2CommitStore::new(store.clone(), keyring.clone(), options.clone());
+    let anchor = V2MemoryAnchor::new();
+    let stored = must_v2(writer.write_genesis_snapshot(&anchor).await);
+    let object_len = must_v2(
+        store
+            .head(&stored.commit_key.object_id)
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed),
+    )
+    .content_len;
+    store.reset_operation_counts();
+
+    let reader = V2CommitStore::new(
+        store.clone(),
+        keyring,
+        options.with_replay_limits(V2ReplayLimits {
+            max_total_commit_bytes: object_len.saturating_sub(1),
+            ..V2ReplayLimits::default()
+        }),
+    );
+    assert_eq!(
+        reader.load_replay_chain_from_anchor(&anchor).await,
+        Err(V2FormatError::ReplayBudgetExceeded)
+    );
+    assert_eq!(store.full_commit_get_count(), 0);
+    assert_eq!(store.ranged_commit_get_count(), 0);
+}
+
+#[tokio::test]
+async fn bounded_replay_rejects_index_bytes_over_its_retention_budget() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let writer = V2CommitStore::new(store.clone(), keyring.clone(), options.clone());
+    let anchor = V2MemoryAnchor::new();
+    must_v2(writer.write_genesis_snapshot(&anchor).await);
+    must_v2(
+        writer
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::delta(vec![V2CommitSection::new(
+                    V2SectionType::IndexDelta,
+                    0,
+                    Bytes::from(vec![0x44; 65]),
+                )]),
+            )
+            .await,
+    );
+
+    let reader = V2CommitStore::new(
+        store,
+        keyring,
+        options.with_replay_limits(V2ReplayLimits {
+            max_retained_bytes: 64,
+            ..V2ReplayLimits::default()
+        }),
+    );
+    assert_eq!(
+        reader.load_replay_chain_from_anchor(&anchor).await,
+        Err(V2FormatError::ReplayBudgetExceeded)
+    );
+}
+
+#[tokio::test]
+async fn bounded_replay_rejects_provider_length_shorter_than_signed_layout() {
+    let store = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2CommitStore::new(store.clone(), keyring, options);
+    let anchor = V2MemoryAnchor::new();
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let stored = must_v2(
+        repository
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::delta(vec![V2CommitSection::new(
+                    V2SectionType::IndexDelta,
+                    0,
+                    Bytes::from_static(b"signed-layout"),
+                )]),
+            )
+            .await,
+    );
+    let body = must_v2(
+        store
+            .get_range(&stored.commit_key.object_id, ByteRange::Full)
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed),
+    );
+    let truncated = body.slice(..body.len() - 1);
+    must_v2(
+        store
+            .put(
+                &stored.commit_key.object_id,
+                truncated,
+                PutOptions::default(),
+            )
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed),
+    );
+    let mut unversioned_head = stored.anchor_state;
+    unversioned_head.version_id = None;
+
+    assert_eq!(
+        repository
+            .load_replay_chain_from_state(&unversioned_head)
+            .await,
+        Err(V2FormatError::SectionBounds)
+    );
+}
+
+#[tokio::test]
+async fn bounded_replay_rejects_range_tampering() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2CommitStore::new(store.clone(), keyring, options);
+    let anchor = V2MemoryAnchor::new();
+    let stored = must_v2(repository.write_genesis_snapshot(&anchor).await);
+    store.corrupt_ranged_commit_gets_for(stored.commit_key.object_id);
+
+    assert_eq!(
+        repository.load_replay_chain_from_anchor(&anchor).await,
+        Err(V2FormatError::HeaderDigestMismatch)
+    );
+}
+
+#[tokio::test]
+async fn legacy_full_commit_reader_checks_length_before_body_allocation() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let writer = V2CommitStore::new(store.clone(), keyring.clone(), options.clone());
+    let anchor = V2MemoryAnchor::new();
+    let stored = must_v2(writer.write_genesis_snapshot(&anchor).await);
+    let object_len = must_v2(
+        store
+            .head(&stored.commit_key.object_id)
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed),
+    )
+    .content_len;
+    store.reset_operation_counts();
+
+    let reader = V2CommitStore::new(
+        store.clone(),
+        keyring,
+        options.with_replay_limits(V2ReplayLimits {
+            max_full_commit_bytes: object_len.saturating_sub(1),
+            ..V2ReplayLimits::default()
+        }),
+    );
+
+    assert_eq!(
+        reader.load_chain_from_anchor(&anchor).await,
+        Err(V2FormatError::ReplayBudgetExceeded)
+    );
+    assert_eq!(store.full_commit_get_count(), 0);
+    assert_eq!(store.ranged_commit_get_count(), 0);
+}
+
+#[tokio::test]
+async fn legacy_full_chain_reader_checks_depth_before_next_object_read() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let writer = V2CommitStore::new(store.clone(), keyring.clone(), options.clone());
+    let anchor = V2MemoryAnchor::new();
+    must_v2(writer.write_genesis_snapshot(&anchor).await);
+    must_v2(
+        writer
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::delta(vec![V2CommitSection::new(
+                    V2SectionType::IndexDelta,
+                    0,
+                    Bytes::from_static(b"one-child"),
+                )]),
+            )
+            .await,
+    );
+    store.reset_operation_counts();
+
+    let reader = V2CommitStore::new(
+        store.clone(),
+        keyring,
+        options.with_replay_limits(V2ReplayLimits {
+            max_commits: 1,
+            ..V2ReplayLimits::default()
+        }),
+    );
+
+    assert_eq!(
+        reader.load_chain_from_anchor(&anchor).await,
+        Err(V2FormatError::ReplayBudgetExceeded)
+    );
+    assert_eq!(store.full_commit_get_count(), 0);
+    assert_eq!(store.operation_counts().head, 1);
+}
+
+#[tokio::test]
+async fn legacy_full_chain_reader_checks_cumulative_bytes_before_next_allocation() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = signing_keyring();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let writer = V2CommitStore::new(store.clone(), keyring.clone(), options.clone());
+    let anchor = V2MemoryAnchor::new();
+    must_v2(writer.write_genesis_snapshot(&anchor).await);
+    let child = must_v2(
+        writer
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::delta(vec![V2CommitSection::new(
+                    V2SectionType::IndexDelta,
+                    0,
+                    Bytes::from_static(b"one-child"),
+                )]),
+            )
+            .await,
+    );
+    let child_len = must_v2(
+        store
+            .head(&child.commit_key.object_id)
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed),
+    )
+    .content_len;
+    store.reset_operation_counts();
+
+    let reader = V2CommitStore::new(
+        store.clone(),
+        keyring,
+        options.with_replay_limits(V2ReplayLimits {
+            max_full_chain_bytes: child_len,
+            ..V2ReplayLimits::default()
+        }),
+    );
+
+    assert_eq!(
+        reader.load_chain_from_anchor(&anchor).await,
+        Err(V2FormatError::ReplayBudgetExceeded)
+    );
+    assert_eq!(store.full_commit_get_count(), 0);
+    assert_eq!(store.ranged_commit_get_count(), 1);
+    assert_eq!(store.operation_counts().head, 2);
+}
+
+#[tokio::test]
 async fn v2_repository_replays_committed_index_delta_after_reload() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
@@ -1025,6 +1400,56 @@ async fn v2_repository_replays_committed_index_delta_after_reload() {
     assert_eq!(body, Bytes::from_static(b"replayed-body"));
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].key, key);
+}
+
+#[tokio::test]
+async fn v2_repository_startup_replay_never_fetches_full_commit_objects() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    )
+    .with_replay_limits(V2ReplayLimits {
+        read_chunk_bytes: 4 * 1024,
+        ..V2ReplayLimits::default()
+    });
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    let key =
+        LogicalPath::new("snapshots/bounded-startup.bin").unwrap_or_else(|error| panic!("{error}"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                key.clone(),
+                Bytes::from(vec![0x7a; 256 * 1024]),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    store.reset_operation_counts();
+
+    let fresh = V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    );
+    must_repo(fresh.load_chain_from_anchor(&anchor).await)
+        .unwrap_or_else(|| panic!("startup replay should find an anchor"));
+
+    assert_eq!(store.full_commit_get_count(), 0);
+    assert!(store.ranged_commit_get_count() > 64);
+    assert_eq!(must_repo(fresh.head(&key)).content_len, 256 * 1024);
 }
 
 #[tokio::test]
@@ -2142,6 +2567,60 @@ async fn v2_commit_coordinator_recovers_after_transient_publish_failure() {
 }
 
 #[tokio::test]
+async fn v2_commit_coordinator_rollback_restores_overwritten_object() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store,
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let key = LogicalPath::new("snapshots/v2-overwrite-rollback.bin")
+        .unwrap_or_else(|error| panic!("{error}"));
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                key.clone(),
+                Bytes::from_static(b"accepted"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    let coordinator = V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        FailOnceV2Anchor::new(anchor.clone()),
+        CommitCoordinatorOptions::new(1, Duration::from_secs(1)),
+    );
+
+    let failed = coordinator
+        .put_committed(
+            key.clone(),
+            Bytes::from_static(b"unaccepted"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+
+    assert!(matches!(
+        failed,
+        Err(crate::RepositoryError::CommitFailed { .. })
+    ));
+    assert_eq!(
+        must_repo(repository.get_range(&key, ByteRange::Full).await),
+        Bytes::from_static(b"accepted")
+    );
+    assert_eq!(must_repo(repository.list("snapshots/")).len(), 1);
+}
+
+#[tokio::test]
 async fn v2_commit_coordinator_poisons_when_batch_rollback_fails() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
@@ -2301,6 +2780,59 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
         Ok(joined) => assert!(matches!(joined, Ok(Ok(_)))),
         Err(error) => panic!("{error}"),
     }
+}
+
+#[tokio::test]
+async fn v2_commit_coordinator_scales_without_full_state_clones() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store,
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        anchor,
+        CommitCoordinatorOptions::new(32, Duration::from_secs(1)),
+    ));
+
+    for batch in 0..4 {
+        let mut writes = tokio::task::JoinSet::new();
+        for item in 0..32 {
+            let coordinator = Arc::clone(&coordinator);
+            writes.spawn(async move {
+                let key = LogicalPath::new(format!("snapshots/scale-{batch:02}-{item:02}.bin"))
+                    .unwrap_or_else(|error| panic!("{error}"));
+                coordinator
+                    .put_committed(
+                        key,
+                        Bytes::from_static(b"x"),
+                        RepositoryPutOptions::default(),
+                    )
+                    .await
+            });
+        }
+        while let Some(result) = writes.join_next().await {
+            match result {
+                Ok(result) => {
+                    must_repo(result);
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+
+    assert_eq!(must_repo(repository.list("snapshots/")).len(), 128);
+    assert_eq!(repository.full_state_clone_count_for_tests(), 0);
 }
 
 #[tokio::test]

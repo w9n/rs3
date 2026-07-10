@@ -85,6 +85,9 @@ pub enum V2FormatError {
     /// A streamed object body did not match its declared plaintext length.
     #[error("v2 streamed object length did not match the declared size")]
     ObjectLengthMismatch,
+    /// Verified recovery would exceed a configured chain or byte budget.
+    #[error("v2 recovery replay budget exceeded")]
+    ReplayBudgetExceeded,
     /// A streamed object body could not be read from the caller.
     #[error("v2 streamed object body read failed")]
     ObjectBodyReadFailed,
@@ -160,7 +163,8 @@ impl V2FormatError {
             Self::RollbackUnsafeDr => V2ErrorClass::RollbackUnsafeDr,
             Self::MaintenanceAccessRequired
             | Self::MaintenanceBudgetExceeded
-            | Self::OrphanGcMinAgeTooLow => V2ErrorClass::OperatorActionRequired,
+            | Self::OrphanGcMinAgeTooLow
+            | Self::ReplayBudgetExceeded => V2ErrorClass::OperatorActionRequired,
             Self::InvalidCommitKey
             | Self::TruncatedHeader
             | Self::TruncatedBody

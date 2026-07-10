@@ -1,10 +1,12 @@
 //! v2 maintenance planning and conservative apply paths.
 
 use super::V2SectionType;
-use super::commit::{V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitKey, V2ParsedCommit};
+use super::commit::{V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitKey};
 use super::error::{V2FormatError, V2Result};
 use super::provider::V2ProviderProfile;
-use super::repository::{V2AnchorState, V2CommitAnchor, V2CommitChain, V2CommitStore};
+use super::repository::{
+    V2AnchorState, V2CommitAnchor, V2CommitStore, V2ReplayChain, V2ReplayCommit, V2ReplayLimits,
+};
 use crate::checkpoint::open_index_delta_object;
 use crate::state::{RepositoryState, apply_index_delta_object};
 use async_trait::async_trait;
@@ -320,25 +322,31 @@ struct V2RetentionRenewalPlan {
 #[derive(Clone, Debug, Default)]
 struct V2ReachabilityState {
     anchor_state: Option<V2AnchorState>,
-    current_chain: Option<V2CommitChain>,
+    current_chain: Option<V2ReplayChain>,
     reachable: BTreeSet<BackendObjectId>,
     reachable_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
-    renewal_commits: Vec<V2ParsedCommit>,
+    renewal_commits: Vec<V2ReplayCommit>,
     renewal_seen: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
     protected_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
     chain_get_count: u64,
     chain_read_bytes: u64,
+    chain_retained_bytes: u64,
 }
 
 impl V2ReachabilityState {
-    fn include_chain(&mut self, chain: &V2CommitChain, protected: bool) {
+    fn include_chain(&mut self, chain: &V2ReplayChain, protected: bool) {
         self.chain_get_count = self
             .chain_get_count
             .saturating_add(usize_to_u64(chain.commits_newest_first.len()));
         for commit in &chain.commits_newest_first {
-            self.chain_read_bytes = self
-                .chain_read_bytes
-                .saturating_add(usize_to_u64(commit.body.len()));
+            self.chain_read_bytes = self.chain_read_bytes.saturating_add(commit.object_len);
+            self.chain_retained_bytes = commit
+                .retained_sections
+                .iter()
+                .flatten()
+                .fold(self.chain_retained_bytes, |total, section| {
+                    total.saturating_add(usize_to_u64(section.len()))
+                });
             let object_id = commit.parsed_header.header.self_ref.commit_key.clone();
             let version_key = (object_id.clone(), commit.version_id.clone());
             self.reachable.insert(object_id);
@@ -374,7 +382,9 @@ where
     where
         A: V2CommitAnchor,
     {
-        let reachability = self.load_reachability(anchor, protected_roots).await?;
+        let reachability = self
+            .load_reachability(anchor, protected_roots, V2MaintenanceBudgets::default())
+            .await?;
         self.report_orphans_from_reachability(&reachability).await
     }
 
@@ -595,6 +605,7 @@ where
         &self,
         anchor: &A,
         protected_roots: &[V2AnchorState],
+        budgets: V2MaintenanceBudgets,
     ) -> V2Result<V2ReachabilityState>
     where
         A: V2CommitAnchor,
@@ -606,28 +617,85 @@ where
         };
 
         if let Some(state) = anchor_state.as_ref() {
-            let chain = self.load_chain_from_state(state).await?;
+            let chain = self
+                .load_maintenance_chain(state, &reachability, budgets)
+                .await?;
             reachability.include_chain(&chain, false);
-            self.include_live_payload_roots(&mut reachability, &chain, false)
+            self.include_live_payload_roots(&mut reachability, &chain, false, budgets)
                 .await?;
             reachability.current_chain = Some(chain);
         }
 
         for protected_root in protected_roots {
-            let chain = self.load_chain_from_state(protected_root).await?;
+            let chain = self
+                .load_maintenance_chain(protected_root, &reachability, budgets)
+                .await?;
             reachability.include_chain(&chain, true);
-            self.include_live_payload_roots(&mut reachability, &chain, true)
+            self.include_live_payload_roots(&mut reachability, &chain, true, budgets)
                 .await?;
         }
 
         Ok(reachability)
     }
 
+    async fn load_maintenance_chain(
+        &self,
+        root: &V2AnchorState,
+        reachability: &V2ReachabilityState,
+        budgets: V2MaintenanceBudgets,
+    ) -> V2Result<V2ReplayChain> {
+        let configured = self.options().replay_limits;
+        let used_commits = usize::try_from(reachability.chain_get_count)
+            .map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?;
+        let mut max_commits = configured
+            .max_commits
+            .checked_sub(used_commits)
+            .ok_or(V2FormatError::ReplayBudgetExceeded)?;
+        if let Some(max_requests) = budgets.max_request_count {
+            let remaining = max_requests
+                .checked_sub(reachability.chain_get_count)
+                .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
+            max_commits = max_commits.min(
+                usize::try_from(remaining).map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?,
+            );
+        }
+
+        let mut max_total_commit_bytes = configured
+            .max_total_commit_bytes
+            .checked_sub(reachability.chain_read_bytes)
+            .ok_or(V2FormatError::ReplayBudgetExceeded)?;
+        if let Some(max_bytes) = budgets.max_range_read_bytes {
+            let remaining = max_bytes
+                .checked_sub(reachability.chain_read_bytes)
+                .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
+            max_total_commit_bytes = max_total_commit_bytes.min(remaining);
+        }
+        let max_retained_bytes = configured
+            .max_retained_bytes
+            .checked_sub(reachability.chain_retained_bytes)
+            .ok_or(V2FormatError::ReplayBudgetExceeded)?;
+
+        if max_commits == 0 || max_total_commit_bytes == 0 || max_retained_bytes == 0 {
+            return Err(V2FormatError::MaintenanceBudgetExceeded);
+        }
+        self.load_replay_chain_from_state_with_limits(
+            root,
+            V2ReplayLimits {
+                max_commits,
+                max_total_commit_bytes,
+                max_retained_bytes,
+                ..configured
+            },
+        )
+        .await
+    }
+
     async fn include_live_payload_roots(
         &self,
         reachability: &mut V2ReachabilityState,
-        chain: &V2CommitChain,
+        chain: &V2ReplayChain,
         protected: bool,
+        budgets: V2MaintenanceBudgets,
     ) -> V2Result<()> {
         let mut pending = self.live_payload_roots_from_chain(chain)?;
 
@@ -637,7 +705,9 @@ where
                 continue;
             }
 
-            let chain = self.load_chain_from_state(&root).await?;
+            let chain = self
+                .load_maintenance_chain(&root, reachability, budgets)
+                .await?;
             reachability.include_chain(&chain, protected);
             pending.extend(self.live_payload_roots_from_chain(&chain)?);
         }
@@ -645,7 +715,7 @@ where
         Ok(())
     }
 
-    fn live_payload_roots_from_chain(&self, chain: &V2CommitChain) -> V2Result<Vec<V2AnchorState>> {
+    fn live_payload_roots_from_chain(&self, chain: &V2ReplayChain) -> V2Result<Vec<V2AnchorState>> {
         let state = self.replay_chain_to_namespace_state(chain)?;
         let signing_key_id = chain
             .commits_newest_first
@@ -681,7 +751,7 @@ where
         Ok(roots)
     }
 
-    fn replay_chain_to_namespace_state(&self, chain: &V2CommitChain) -> V2Result<RepositoryState> {
+    fn replay_chain_to_namespace_state(&self, chain: &V2ReplayChain) -> V2Result<RepositoryState> {
         let mut state = RepositoryState::default();
         let mut previous_published_at_ms = None;
         for commit in chain.commits_newest_first.iter().rev() {
@@ -698,12 +768,12 @@ where
     fn apply_commit_sections_to_namespace_state(
         &self,
         state: &mut RepositoryState,
-        commit: &V2ParsedCommit,
+        commit: &V2ReplayCommit,
     ) -> V2Result<()> {
         for (index, section) in commit.parsed_header.header.section_index.iter().enumerate() {
-            let section_bytes = commit_section_bytes(commit, index)?;
             match section.section_type {
                 V2SectionType::IndexDelta => {
+                    let section_bytes = commit_section_bytes(commit, index)?;
                     let mut delta = self.open_index_delta_section(
                         &commit.parsed_header.header.self_ref.commit_key,
                         index,
@@ -717,10 +787,12 @@ where
                         apply_index_delta_object(state, delta);
                     }
                 }
-                V2SectionType::IndexSnapshot if section_bytes.is_empty() => {
-                    *state = RepositoryState::default();
-                }
                 V2SectionType::IndexSnapshot => {
+                    let section_bytes = commit_section_bytes(commit, index)?;
+                    if section_bytes.is_empty() {
+                        *state = RepositoryState::default();
+                        continue;
+                    }
                     let mut snapshot = self.open_index_delta_section(
                         &commit.parsed_header.header.self_ref.commit_key,
                         index,
@@ -777,7 +849,7 @@ where
     where
         A: V2CommitAnchor,
     {
-        let chain = self.load_chain_from_anchor(anchor).await?;
+        let chain = self.load_replay_chain_from_anchor(anchor).await?;
         let verified_commit_count = chain
             .as_ref()
             .map(|chain| chain.commits_newest_first.len())
@@ -845,7 +917,7 @@ where
         A: V2CommitAnchor,
     {
         let reachability = self
-            .load_reachability(anchor, &options.protected_roots)
+            .load_reachability(anchor, &options.protected_roots, options.budgets)
             .await?;
         let chain_live_commit_count = reachability
             .current_chain
@@ -1008,7 +1080,7 @@ where
 
     async fn plan_retention_renewal(
         &self,
-        commits: &[V2ParsedCommit],
+        commits: &[V2ReplayCommit],
         horizon: Duration,
     ) -> V2Result<V2RetentionRenewalPlan> {
         let Some(policy) = active_retention(self.retention_policy()) else {
@@ -1028,9 +1100,7 @@ where
             let version_id = commit.version_id.as_ref();
             if retained_profile && version_id.is_none() {
                 plan.blocked_count = plan.blocked_count.saturating_add(1);
-                plan.blocked_bytes = plan
-                    .blocked_bytes
-                    .saturating_add(usize_to_u64(commit.body.len()));
+                plan.blocked_bytes = plan.blocked_bytes.saturating_add(commit.object_len);
                 continue;
             }
 
@@ -1123,32 +1193,17 @@ fn duration_millis_i64_saturating(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
-fn commit_section_bytes(commit: &V2ParsedCommit, index: usize) -> V2Result<&[u8]> {
-    let section = commit
-        .parsed_header
-        .header
-        .section_index
-        .get(index)
-        .ok_or(V2FormatError::SectionBounds)?;
-    let sections_start = u64::try_from(commit.parsed_header.sections_start)
-        .map_err(|_| V2FormatError::SectionBounds)?;
-    let start = sections_start
-        .checked_add(section.offset)
-        .ok_or(V2FormatError::SectionBounds)?;
-    let end = start
-        .checked_add(section.length)
-        .ok_or(V2FormatError::SectionBounds)?;
-    let start = usize::try_from(start).map_err(|_| V2FormatError::SectionBounds)?;
-    let end = usize::try_from(end).map_err(|_| V2FormatError::SectionBounds)?;
+fn commit_section_bytes(commit: &V2ReplayCommit, index: usize) -> V2Result<&[u8]> {
     commit
-        .body
-        .get(start..end)
+        .retained_sections
+        .get(index)
+        .and_then(Option::as_deref)
         .ok_or(V2FormatError::SectionBounds)
 }
 
 fn resolve_self_payload_refs(
     delta: &mut IndexDeltaObject,
-    commit: &V2ParsedCommit,
+    commit: &V2ReplayCommit,
 ) -> V2Result<()> {
     for mutation in &mut delta.deltas {
         let IndexDelta::Upsert { entry, .. } = mutation else {
@@ -1185,7 +1240,7 @@ fn resolve_self_payload_refs(
 }
 
 fn ensure_payload_section_declared(
-    commit: &V2ParsedCommit,
+    commit: &V2ReplayCommit,
     offset: u64,
     length: u64,
 ) -> V2Result<()> {

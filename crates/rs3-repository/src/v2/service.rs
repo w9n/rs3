@@ -4,7 +4,8 @@ use super::commit::{V2_SECTION_FLAG_COMPRESSED, V2_SECTION_FLAG_MUST_UNDERSTAND,
 use super::error::V2FormatError;
 use super::repository::{
     V2CommitAnchor, V2CommitChain, V2CommitSection, V2CommitStore, V2CommitStoreOptions,
-    V2CommitWrite, V2FinalizedStreamingPayloadWrite, V2StoredCommit, V2StreamingPayloadWrite,
+    V2CommitWrite, V2FinalizedStreamingPayloadWrite, V2ReplayChain, V2ReplayCommit, V2StoredCommit,
+    V2StreamingPayloadWrite,
 };
 use super::{
     V2_MAX_HEADER_SIZE, V2ParsedCommit, V2ParsedCommitHeader, V2SectionType, V2UploadMode,
@@ -20,12 +21,13 @@ use crate::namespace::{existing_blind_keys, first_namespace_entry, prefix_tokens
 use crate::payload::{
     PayloadHeaderProbe, SegmentedPayloadFormat, SegmentedPayloadHeader, SegmentedPayloadSealer,
     adaptive_payload_segment_size, open_payload_object, parse_segmented_payload_header,
-    probe_payload_header, seal_streamable_payload_object, segmented_ciphertext_span,
-    total_segmented_payload_len,
+    parse_segmented_payload_header_with_total_len, probe_payload_header,
+    seal_streamable_payload_object, segmented_ciphertext_span, total_segmented_payload_len,
 };
 use crate::service::{Repository, RepositoryOptions, strongest_retention_policy};
 use crate::state::{
-    RepositoryState, TrustedManifest, apply_index_delta_object, next_sequence, object_material,
+    RepositoryState, RepositoryStateRollback, TrustedManifest, apply_index_delta_object,
+    next_sequence, object_material,
 };
 use bytes::Bytes;
 use futures_util::Stream;
@@ -43,7 +45,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -51,6 +53,7 @@ use tokio::sync::Mutex;
 mod compaction;
 
 const V2_PAYLOAD_FILL_LOCK_STRIPES: usize = 64;
+const V2_MAX_PAYLOAD_HEADER_SIZE: u64 = 4 * 1024;
 
 /// Preview v2 repository service.
 ///
@@ -71,18 +74,20 @@ pub struct V2Repository<S> {
     payload_headers: StdRwLock<V2PayloadHeaderCache>,
     #[cfg(test)]
     fail_next_restore: AtomicBool,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct V2RepositorySnapshot {
-    state: RepositoryState,
-    pending_payloads: Vec<PendingV2Payload>,
+    #[cfg(test)]
+    full_state_clone_count: AtomicUsize,
 }
 
 #[derive(Clone, Debug)]
 struct PendingV2Payload {
     manifest_id: ManifestId,
     body: Bytes,
+}
+
+#[derive(Debug)]
+pub(crate) struct V2StagedPutRollback {
+    state: RepositoryStateRollback,
+    pending_payloads_len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +111,7 @@ struct StagedV2Put {
     metadata: RepositoryObjectMetadata,
     manifest_id: ManifestId,
     content_len: u64,
+    sequence: Sequence,
 }
 
 struct StreamingV2PutFinalized {
@@ -161,6 +167,8 @@ where
             payload_headers: StdRwLock::new(V2PayloadHeaderCache::default()),
             #[cfg(test)]
             fail_next_restore: AtomicBool::new(false),
+            #[cfg(test)]
+            full_state_clone_count: AtomicUsize::new(0),
         }
     }
 
@@ -189,7 +197,7 @@ where
         self.publish_pending_index_delta(anchor).await?;
         let chain = self
             .commit_store
-            .load_chain_from_anchor(anchor)
+            .load_replay_chain_from_anchor(anchor)
             .await
             .map_err(v2_repository_error)?
             .ok_or_else(|| v2_repository_error(V2FormatError::MissingAnchor))?;
@@ -202,19 +210,49 @@ where
     }
 
     /// Loads and replays the commit chain selected by the v2 anchor.
-    pub async fn load_chain_from_anchor<A>(&self, anchor: &A) -> Result<Option<V2CommitChain>>
+    pub async fn load_chain_from_anchor<A>(&self, anchor: &A) -> Result<Option<V2ReplayChain>>
     where
         A: V2CommitAnchor,
     {
         let chain = self
             .commit_store
-            .load_chain_from_anchor(anchor)
+            .load_replay_chain_from_anchor(anchor)
             .await
             .map_err(v2_repository_error)?;
         if let Some(chain) = chain.as_ref() {
-            self.replay_chain(chain)?;
+            self.replay_bounded_chain(chain).await?;
         }
         Ok(chain)
+    }
+
+    async fn replay_bounded_chain(&self, chain: &V2ReplayChain) -> Result<()> {
+        let rebuilt = self.replay_bounded_chain_to_state(chain).await?;
+        let accepted = rebuilt.clone();
+        let mut state = self.repository.write_state()?;
+        *state = rebuilt;
+        *self
+            .accepted_state
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? = accepted;
+        Ok(())
+    }
+
+    async fn replay_bounded_chain_to_state(
+        &self,
+        chain: &V2ReplayChain,
+    ) -> Result<RepositoryState> {
+        let mut rebuilt = RepositoryState::default();
+        let mut previous_published_at_ms = None;
+        for commit in chain.commits_newest_first.iter().rev() {
+            let published_at_ms = commit.parsed_header.header.publish_time_ms;
+            if previous_published_at_ms.is_some_and(|previous| published_at_ms < previous) {
+                return Err(v2_repository_error(V2FormatError::StaleAnchor));
+            }
+            previous_published_at_ms = Some(published_at_ms);
+            self.apply_replay_commit_sections(&mut rebuilt, commit)
+                .await?;
+        }
+        Ok(rebuilt)
     }
 
     /// Loads and replays a supplied v2 commit chain.
@@ -257,16 +295,9 @@ where
         A: V2CommitAnchor,
     {
         let _guard = self.mutation_lock.lock().await;
-        let before = self.snapshot_state()?;
-        let metadata = match self.stage_put(key, body, options).await {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                self.restore_state_preserving_sequence(before)?;
-                return Err(error);
-            }
-        };
+        let (metadata, rollback) = self.stage_put(key, body, options).await?;
         if let Err(error) = self.publish_pending_index_delta(anchor).await {
-            self.restore_state_preserving_sequence(before)?;
+            self.rollback_staged_puts(vec![rollback])?;
             return Err(error);
         }
         Ok(metadata)
@@ -287,14 +318,8 @@ where
         St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
         let _guard = self.mutation_lock.lock().await;
-        let before = self.snapshot_state()?;
-        let staged = match self.stage_put_metadata(key, plaintext_len, options).await {
-            Ok(staged) => staged,
-            Err(error) => {
-                self.restore_state_preserving_sequence(before)?;
-                return Err(error);
-            }
-        };
+        let (staged, rollback) =
+            self.stage_put_metadata_sync_with_rollback(key, plaintext_len, options)?;
         let keyring = self.repository.keyring()?;
         let staged_content_len = staged.content_len;
         let staged_manifest_id = staged.manifest_id.clone();
@@ -375,14 +400,12 @@ where
         let stored = match stored {
             Ok(stored) => stored,
             Err(error) => {
-                self.restore_state_preserving_sequence(before)?;
+                self.rollback_state_mutations(vec![rollback])?;
                 return Err(error);
             }
         };
         self.resolve_accepted_payload_refs(&stored.stored.anchor_state, &[stored.output])?;
-        self.repository
-            .mark_index_deltas_published(stored.stored.anchor_state.sequence)?;
-        self.accept_current_state()?;
+        self.accept_pending_state(staged.sequence)?;
         Ok(staged.metadata)
     }
 
@@ -401,11 +424,7 @@ where
         St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
         let _guard = self.mutation_lock.lock().await;
-        let before = self.snapshot_state()?;
-        if let Err(error) = self.ensure_put_create_allowed(&key, &options) {
-            self.restore_state_preserving_sequence(before)?;
-            return Err(error);
-        }
+        self.ensure_put_create_allowed(&key, &options)?;
         let keyring = self.repository.keyring()?;
         let payload_segment_size = self.payload_segment_size_for_object_len(max_plaintext_len)?;
         let upload_retention = strongest_retention_policy(
@@ -413,6 +432,7 @@ where
             options.retention,
         );
         let upload_legal_hold = options.legal_hold;
+        let staged_rollback = StdMutex::new(None);
         let stored = self
             .commit_store
             .write_child_commit_with_streaming_payload(anchor, |commit_key| {
@@ -425,14 +445,22 @@ where
                 let key = key.clone();
                 let options = options.clone();
                 let payload_id_for_location = payload_id.clone();
+                let staged_rollback = &staged_rollback;
                 let finalize =
                     move |input: super::repository::V2StreamingPayloadFinalizationInput| {
-                        let staged = self
-                            .stage_put_metadata_sync(key, input.plaintext_len, options)
+                        let (staged, rollback) = self
+                            .stage_put_metadata_sync_with_rollback(
+                                key,
+                                input.plaintext_len,
+                                options,
+                            )
                             .map_err(|error| match error {
                                 RepositoryError::ObjectTooLarge => V2FormatError::ObjectTooLarge,
                                 _ => V2FormatError::InvalidHeaderField,
                             })?;
+                        *staged_rollback
+                            .lock()
+                            .map_err(|_| V2FormatError::InvalidHeaderField)? = Some(rollback);
                         let payload_header = payload_header_reference(&input.payload_header)
                             .map_err(|_| V2FormatError::InvalidHeaderField)?;
                         if payload_header.plaintext_len != staged.content_len {
@@ -484,7 +512,13 @@ where
         let stored = match stored {
             Ok(stored) => stored,
             Err(error) => {
-                self.restore_state_preserving_sequence(before)?;
+                if let Some(rollback) = staged_rollback
+                    .lock()
+                    .map_err(|_| RepositoryError::StatePoisoned)?
+                    .take()
+                {
+                    self.rollback_state_mutations(vec![rollback])?;
+                }
                 return Err(error);
             }
         };
@@ -492,9 +526,7 @@ where
             &stored.stored.anchor_state,
             std::slice::from_ref(&stored.output.location),
         )?;
-        self.repository
-            .mark_index_deltas_published(stored.stored.anchor_state.sequence)?;
-        self.accept_current_state()?;
+        self.accept_pending_state(stored.output.staged.sequence)?;
         Ok(stored.output.staged.metadata)
     }
 
@@ -507,38 +539,40 @@ where
         key: LogicalPath,
         body: Bytes,
         options: RepositoryPutOptions,
-    ) -> Result<RepositoryObjectMetadata> {
+    ) -> Result<(RepositoryObjectMetadata, V2StagedPutRollback)> {
         let plaintext_len =
             u64::try_from(body.len()).map_err(|_| RepositoryError::CommitFailed {
                 reason: "payload length does not fit in u64".to_owned(),
             })?;
-        let staged = self.stage_put_metadata(key, plaintext_len, options).await?;
-        self.pending_payloads
+        // Acquire the payload lock before mutating namespace state so a
+        // poisoned lock cannot leave a half-staged write behind.
+        let mut pending_payloads = self
+            .pending_payloads
             .lock()
-            .map_err(|_| RepositoryError::StatePoisoned)?
-            .push(PendingV2Payload {
-                manifest_id: staged.manifest_id,
-                body,
-            });
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let pending_payloads_len = pending_payloads.len();
+        let (staged, state) =
+            self.stage_put_metadata_sync_with_rollback(key, plaintext_len, options)?;
+        pending_payloads.push(PendingV2Payload {
+            manifest_id: staged.manifest_id,
+            body,
+        });
 
-        Ok(staged.metadata)
+        Ok((
+            staged.metadata,
+            V2StagedPutRollback {
+                state,
+                pending_payloads_len,
+            },
+        ))
     }
 
-    async fn stage_put_metadata(
+    fn stage_put_metadata_sync_with_rollback(
         &self,
         key: LogicalPath,
         plaintext_len: u64,
         options: RepositoryPutOptions,
-    ) -> Result<StagedV2Put> {
-        self.stage_put_metadata_sync(key, plaintext_len, options)
-    }
-
-    fn stage_put_metadata_sync(
-        &self,
-        key: LogicalPath,
-        plaintext_len: u64,
-        options: RepositoryPutOptions,
-    ) -> Result<StagedV2Put> {
+    ) -> Result<(StagedV2Put, RepositoryStateRollback)> {
         let retention = strongest_retention_policy(
             self.repository.options.default_retention,
             options.retention,
@@ -570,6 +604,7 @@ where
         let pending_object_id = BackendObjectId::new(format!("v2-pending/{}", sequence.get()))?;
         let entry_payload_id = pending_object_id.clone();
         let modified_at_ms = current_time_ms();
+        let primary_blind_key_value = primary_blind_key.blind_key.clone();
         let entry = NamespaceEntry {
             namespace_key_id: primary_blind_key.key_id,
             blind_key: primary_blind_key.blind_key,
@@ -598,8 +633,17 @@ where
         };
         let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
 
-        {
+        let rollback = {
             let mut state = self.repository.write_state()?;
+            let rollback = RepositoryStateRollback::capture(
+                &state,
+                stale_blind_keys
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(primary_blind_key_value)),
+                manifest_id.clone(),
+                &key,
+            );
             for stale_blind_key in stale_blind_keys {
                 state.tombstone_namespace_entry(stale_blind_key.clone(), sequence);
                 state.pending_index_deltas.push(IndexDelta::Tombstone {
@@ -616,7 +660,8 @@ where
                 .manifests
                 .insert(manifest_id.clone(), manifest.clone());
             state.upsert_namespace_entry(entry, prefix_tokens);
-        }
+            rollback
+        };
 
         tracing::info!(
             target: "rs3_repository",
@@ -626,11 +671,15 @@ where
             result = "ok",
             "repository operation completed",
         );
-        Ok(StagedV2Put {
-            metadata: manifest.into_metadata(),
-            manifest_id,
-            content_len: plaintext_len,
-        })
+        Ok((
+            StagedV2Put {
+                metadata: manifest.into_metadata(),
+                manifest_id,
+                content_len: plaintext_len,
+                sequence,
+            },
+            rollback,
+        ))
     }
 
     fn ensure_put_create_allowed(
@@ -906,10 +955,13 @@ where
             )
             .await
             .map_err(v2_repository_error)?;
+        if u64::try_from(initial.len()).ok() != Some(initial_len) {
+            return Err(v2_repository_error(V2FormatError::TruncatedBody));
+        }
         let header_len = match probe_payload_header(&payload.payload_id, &initial)? {
             PayloadHeaderProbe::Segmented { header_len } => header_len,
             PayloadHeaderProbe::NeedMore { len } => {
-                if len > payload.length {
+                if len > payload.length || len > V2_MAX_PAYLOAD_HEADER_SIZE {
                     return Err(RepositoryError::InvalidObjectFormat {
                         object_id: payload.payload_id.clone(),
                     });
@@ -926,12 +978,28 @@ where
                     )
                     .await
                     .map_err(v2_repository_error)?;
-                let parsed = parse_segmented_payload_header(&payload.payload_id, &header)?;
+                if u64::try_from(header.len()).ok() != Some(len) {
+                    return Err(v2_repository_error(V2FormatError::TruncatedBody));
+                }
+                let parsed = parse_segmented_payload_header_with_total_len(
+                    &payload.payload_id,
+                    &header,
+                    payload.length,
+                )?;
                 self.cache_payload_header(cache_key.clone(), parsed.clone())?;
                 return Ok(parsed);
             }
         };
-        let parsed = parse_segmented_payload_header(&payload.payload_id, &initial[..header_len])?;
+        if u64::try_from(header_len).map_or(true, |len| len > V2_MAX_PAYLOAD_HEADER_SIZE) {
+            return Err(RepositoryError::InvalidObjectFormat {
+                object_id: payload.payload_id.clone(),
+            });
+        }
+        let parsed = parse_segmented_payload_header_with_total_len(
+            &payload.payload_id,
+            &initial[..header_len],
+            payload.length,
+        )?;
         self.cache_payload_header(cache_key.clone(), parsed.clone())?;
         Ok(parsed)
     }
@@ -979,10 +1047,9 @@ where
         A: V2CommitAnchor,
     {
         let _guard = self.mutation_lock.lock().await;
-        let before = self.snapshot_state()?;
-        self.repository.tombstone_namespace_for_delete(&key)?;
+        let (_object_id, rollback) = self.repository.tombstone_namespace_for_delete(&key)?;
         if let Err(error) = self.publish_pending_index_delta(anchor).await {
-            self.restore_state_preserving_sequence(before)?;
+            self.rollback_state_mutations(vec![rollback])?;
             return Err(error);
         }
         Ok(DeleteOutcome {
@@ -1001,56 +1068,51 @@ where
         A: V2CommitAnchor,
     {
         let _guard = self.mutation_lock.lock().await;
-        let before = self.snapshot_state()?;
-        let metadata = match self.repository.set_legal_hold(&key, status).await {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                self.restore_state_preserving_sequence(before)?;
-                return Err(error);
-            }
-        };
+        let (metadata, rollback) = self
+            .repository
+            .set_legal_hold_with_rollback(&key, status)
+            .await?;
         if let Err(error) = self.publish_pending_index_delta(anchor).await {
-            self.restore_state_preserving_sequence(before)?;
+            self.rollback_state_mutations(vec![rollback])?;
             return Err(error);
         }
         Ok(metadata)
     }
 
-    pub(crate) fn snapshot_state(&self) -> Result<V2RepositorySnapshot> {
-        let state = self.repository.read_state()?.clone();
-        let pending_payloads = self
-            .pending_payloads
-            .lock()
-            .map_err(|_| RepositoryError::StatePoisoned)?
-            .clone();
-        Ok(V2RepositorySnapshot {
-            state,
-            pending_payloads,
-        })
-    }
-
-    pub(crate) fn restore_state_preserving_sequence(
-        &self,
-        mut snapshot: V2RepositorySnapshot,
-    ) -> Result<()> {
+    pub(crate) fn rollback_staged_puts(&self, rollbacks: Vec<V2StagedPutRollback>) -> Result<()> {
         #[cfg(test)]
         if self.fail_next_restore.swap(false, Ordering::SeqCst) {
             return Err(RepositoryError::StatePoisoned);
         }
 
-        let mut state = self.repository.write_state()?;
-        snapshot.state.next_sequence = snapshot.state.next_sequence.max(state.next_sequence);
-        *state = snapshot.state;
-        *self
+        let mut pending_payloads = self
             .pending_payloads
             .lock()
-            .map_err(|_| RepositoryError::StatePoisoned)? = snapshot.pending_payloads;
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let mut state = self.repository.write_state()?;
+        for rollback in rollbacks.into_iter().rev() {
+            rollback.state.restore(&mut state);
+            pending_payloads.truncate(rollback.pending_payloads_len);
+        }
+        Ok(())
+    }
+
+    fn rollback_state_mutations(&self, rollbacks: Vec<RepositoryStateRollback>) -> Result<()> {
+        let mut state = self.repository.write_state()?;
+        for rollback in rollbacks.into_iter().rev() {
+            rollback.restore(&mut state);
+        }
         Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn fail_next_restore_for_tests(&self) {
         self.fail_next_restore.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_state_clone_count_for_tests(&self) -> usize {
+        self.full_state_clone_count.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn publish_pending_index_delta<A>(
@@ -1086,8 +1148,7 @@ where
         let locations = accepted_locations
             .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
         self.resolve_accepted_payload_refs(&stored.anchor_state, &locations)?;
-        self.repository.mark_index_deltas_published(sequence)?;
-        self.accept_current_state()?;
+        self.accept_pending_state(sequence)?;
         self.pending_payloads
             .lock()
             .map_err(|_| RepositoryError::StatePoisoned)?
@@ -1095,7 +1156,60 @@ where
         Ok(Some(stored))
     }
 
+    fn accept_pending_state(&self, sequence: Sequence) -> Result<()> {
+        let mut state = self.repository.write_state()?;
+        if state.next_sequence != sequence {
+            return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
+        }
+        let mut accepted = self
+            .accepted_state
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+
+        for delta in &state.pending_index_deltas {
+            match delta {
+                IndexDelta::Upsert {
+                    entry,
+                    prefix_tokens,
+                    ..
+                } => {
+                    let Some(manifest) = state.manifests.get(&entry.manifest_id) else {
+                        return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
+                    };
+                    accepted
+                        .manifests
+                        .insert(entry.manifest_id.clone(), manifest.clone());
+                    // A key may be overwritten more than once in one batch.
+                    // Only the final live entry belongs in the accepted view.
+                    let Some(live_entry) = state.namespace.head(&entry.blind_key) else {
+                        continue;
+                    };
+                    if live_entry.manifest_id != entry.manifest_id {
+                        continue;
+                    }
+                    accepted.upsert_namespace_entry(live_entry.clone(), prefix_tokens.clone());
+                }
+                IndexDelta::Tombstone {
+                    blind_key,
+                    generation,
+                } => accepted.tombstone_namespace_entry(blind_key.clone(), *generation),
+            }
+        }
+        accepted.next_sequence = accepted.next_sequence.max(sequence);
+        accepted.pending_index_deltas.clear();
+        accepted.pending_checkpoint_published_at_ms = None;
+        state.pending_index_deltas.clear();
+        state.pending_checkpoint_published_at_ms = None;
+        Ok(())
+    }
+
+    /// Replaces the accepted view after an out-of-band state rebuild.
+    ///
+    /// Normal commits use `accept_pending_state` so their cost is bounded by
+    /// the delta. Compaction is rare and replaces the full state by design.
     fn accept_current_state(&self) -> Result<()> {
+        #[cfg(test)]
+        self.full_state_clone_count.fetch_add(1, Ordering::SeqCst);
         let state = self.repository.read_state()?.clone();
         *self
             .accepted_state
@@ -1264,9 +1378,34 @@ where
         }
 
         let mut state = self.repository.write_state()?;
-        let live_entries = state.namespace.live_entries_with_prefixes();
+        let mut pending_upserts = state
+            .pending_index_deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                IndexDelta::Upsert {
+                    entry,
+                    prefix_tokens,
+                    ..
+                } => Some((entry.blind_key.clone(), prefix_tokens.clone())),
+                IndexDelta::Tombstone { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        if pending_upserts.is_empty() {
+            // Compaction rewrites live payloads without a pending delta. It is
+            // an explicit maintenance operation, so resolving its plan may
+            // scan the full namespace; normal commits stay delta-bounded.
+            pending_upserts = state
+                .namespace
+                .live_entries_with_prefixes()
+                .into_iter()
+                .map(|(entry, prefix_tokens)| (entry.blind_key, prefix_tokens))
+                .collect();
+        }
         let mut resolved_count = 0_usize;
-        for (mut entry, prefix_tokens) in live_entries {
+        for (blind_key, prefix_tokens) in &pending_upserts {
+            let Some(mut entry) = state.namespace.head(blind_key).cloned() else {
+                continue;
+            };
             let Some(location) = locations
                 .iter()
                 .find(|location| location.manifest_id == entry.manifest_id)
@@ -1285,15 +1424,15 @@ where
                 offset: location.offset,
                 length: location.length,
             });
-            state.replace_namespace_entry(entry, prefix_tokens);
+            state.replace_namespace_entry(entry, prefix_tokens.clone());
             resolved_count = resolved_count.saturating_add(1);
         }
 
-        let unresolved_live_self_refs = state
-            .namespace
-            .live_entries_with_prefixes()
-            .into_iter()
-            .any(|(entry, _)| matches!(entry.payload_ref, Some(PayloadReference::V2Self { .. })));
+        let unresolved_live_self_refs = pending_upserts.iter().any(|(blind_key, _)| {
+            state.namespace.head(blind_key).is_some_and(|entry| {
+                matches!(entry.payload_ref, Some(PayloadReference::V2Self { .. }))
+            })
+        });
         if resolved_count == 0 || unresolved_live_self_refs {
             return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
         }
@@ -1460,6 +1599,142 @@ where
         Ok(())
     }
 
+    async fn apply_replay_commit_sections(
+        &self,
+        state: &mut RepositoryState,
+        commit: &V2ReplayCommit,
+    ) -> Result<()> {
+        let cache_key = V2CommitHeaderCacheKey {
+            commit_key: commit.parsed_header.header.self_ref.commit_key.clone(),
+            commit_version_id: commit.version_id.clone(),
+            body_digest: commit.parsed_header.header.body_digest,
+        };
+        self.cache_commit_header(cache_key, commit.parsed_header.clone())?;
+
+        for (index, section) in commit.parsed_header.header.section_index.iter().enumerate() {
+            if section.flags & V2_SECTION_FLAG_COMPRESSED != 0 {
+                return Err(v2_repository_error(V2FormatError::UnsupportedSection));
+            }
+            match section.section_type {
+                V2SectionType::IndexDelta => {
+                    let section_bytes = replay_section_bytes(commit, index)?;
+                    let mut delta = self.open_index_delta_section(
+                        &commit.parsed_header.header.self_ref.commit_key,
+                        index,
+                        section_bytes,
+                    )?;
+                    self.resolve_replay_payload_refs(&mut delta, commit).await?;
+                    self.repository
+                        .load_embedded_manifest_records(state, &delta)?;
+                    apply_index_delta_object(state, delta);
+                }
+                V2SectionType::IndexSnapshot => {
+                    let section_bytes = replay_section_bytes(commit, index)?;
+                    *state = RepositoryState::default();
+                    if !section_bytes.is_empty() {
+                        let mut snapshot = self.open_index_delta_section(
+                            &commit.parsed_header.header.self_ref.commit_key,
+                            index,
+                            section_bytes,
+                        )?;
+                        self.resolve_replay_payload_refs(&mut snapshot, commit)
+                            .await?;
+                        self.repository
+                            .load_embedded_manifest_records(state, &snapshot)?;
+                        apply_index_delta_object(state, snapshot);
+                    }
+                }
+                V2SectionType::Payload => {}
+                V2SectionType::Directives | V2SectionType::Unknown(_) => {
+                    if section.flags & V2_SECTION_FLAG_MUST_UNDERSTAND != 0 {
+                        return Err(v2_repository_error(V2FormatError::UnsupportedSection));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn resolve_replay_payload_refs(
+        &self,
+        delta: &mut IndexDeltaObject,
+        commit: &V2ReplayCommit,
+    ) -> Result<()> {
+        for mutation in &mut delta.deltas {
+            let IndexDelta::Upsert { entry, .. } = mutation else {
+                continue;
+            };
+            let Some(PayloadReference::V2Self {
+                payload_id,
+                payload_header,
+                sections_start: _,
+                offset,
+                length,
+            }) = entry.payload_ref.clone()
+            else {
+                continue;
+            };
+            ensure_payload_section_declared_in_header(&commit.parsed_header, offset, length)?;
+            let payload_header = match payload_header {
+                Some(reference) => reference,
+                None => {
+                    let sections_start = u64::try_from(commit.parsed_header.sections_start)
+                        .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
+                    let payload_start = sections_start
+                        .checked_add(offset)
+                        .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?;
+                    let cache_key = V2PayloadSectionCacheKey {
+                        commit_key: commit.parsed_header.header.self_ref.commit_key.clone(),
+                        commit_version_id: commit.version_id.clone(),
+                        body_digest: commit.parsed_header.header.body_digest,
+                        payload_id: payload_id.clone(),
+                        offset,
+                        length,
+                    };
+                    let payload = V2CommitPayloadRead {
+                        commit_key: commit.parsed_header.header.self_ref.commit_key.clone(),
+                        commit_version_id: commit.version_id.clone(),
+                        body_digest: commit.parsed_header.header.body_digest,
+                        payload_id: payload_id.clone(),
+                        payload_header: None,
+                        sections_start: Some(sections_start),
+                        offset,
+                        length,
+                        content_len: entry.content_len,
+                    };
+                    let parsed = self
+                        .read_payload_header_from_commit(&payload, payload_start, &cache_key)
+                        .await?;
+                    payload_header_reference(&parsed)?
+                }
+            };
+            let parsed_payload_header = payload_header_from_reference(&payload_header)?;
+            if parsed_payload_header.plaintext_len != entry.content_len
+                || total_segmented_payload_len(&parsed_payload_header)? != length
+            {
+                return Err(RepositoryError::InvalidObjectFormat {
+                    object_id: payload_id,
+                });
+            }
+            let sections_start = u64::try_from(commit.parsed_header.sections_start)
+                .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
+            let commit_key = commit.parsed_header.header.self_ref.commit_key.clone();
+            entry.object_id = commit_key.clone();
+            entry.object_version_id = commit.version_id.clone();
+            entry.payload_ref = Some(PayloadReference::V2Commit {
+                commit_key,
+                commit_version_id: commit.version_id.clone(),
+                body_digest: commit.parsed_header.header.body_digest,
+                payload_id,
+                payload_header: Some(payload_header),
+                sections_start: Some(sections_start),
+                offset,
+                length,
+            });
+        }
+        Ok(())
+    }
+
     fn index_snapshot_section(&self) -> Result<V2CommitSection> {
         let keyring = self.repository.keyring()?;
         let snapshot = {
@@ -1494,7 +1769,7 @@ where
 
     fn ensure_index_snapshot_payload_refs_are_chain_reachable(
         &self,
-        chain: &V2CommitChain,
+        chain: &V2ReplayChain,
     ) -> Result<()> {
         let reachable = chain
             .commits_newest_first
@@ -1761,6 +2036,14 @@ fn commit_section_bytes(commit: &V2ParsedCommit, section_index: usize) -> Result
         .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?;
     section_region
         .get(start..end)
+        .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))
+}
+
+fn replay_section_bytes(commit: &V2ReplayCommit, section_index: usize) -> Result<&[u8]> {
+    commit
+        .retained_sections
+        .get(section_index)
+        .and_then(Option::as_deref)
         .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))
 }
 

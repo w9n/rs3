@@ -106,6 +106,28 @@ chains from an accepted state. The explicit `rs3 write-index-snapshot` command
 writes a snapshot only when repository state satisfies its safety preconditions;
 otherwise it fails closed and reports the blocking condition.
 
+Startup and disaster-recovery replay use a resource-bounded verifier. It reads
+the signed header by range, validates the provider-reported object length, and
+hashes every declared section in chunks of at most 8 MiB. Payload sections are
+verified but never retained by replay; only encrypted index delta or snapshot
+sections are kept long enough to rebuild namespace state. One replay fails
+closed before an over-budget allocation or body read when it would exceed any
+of these fixed preview limits:
+
+- 4,096 commits before the nearest snapshot
+- 1 TiB of cumulative provider-reported commit-object bytes
+- 64 MiB of encrypted index sections retained for replay
+
+The 1 TiB limit is an availability ceiling on cumulative verification I/O, not
+a memory allowance. The 8 MiB range chunk and 64 MiB retained-index limit are
+the memory bounds. These limits are deliberately fixed for the preview so an
+unsafe deployment value cannot silently weaken hostile-input handling.
+Maintenance reachability, retention planning, orphan analysis, and compaction
+planning consume this same sparse verified representation. Legacy APIs that
+explicitly request complete commit bodies are assembled from bounded ranges and
+fail closed before allocation above 64 MiB for one commit or 128 MiB for one
+materialized chain; production maintenance does not use those full-body APIs.
+
 v2 quick maintenance verifies the anchor-selected commit chain, reports
 path-redacted orphan counts, and reports live commit versions whose provider
 retention should be renewed soon. Full GC dry runs add request and byte budgets,

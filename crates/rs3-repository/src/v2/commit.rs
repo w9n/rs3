@@ -497,7 +497,9 @@ pub fn body_digest_for_v2_sections(
     section_index: &[V2SectionDescriptor],
     section_region: &[u8],
 ) -> V2Result<[u8; V2_DIGEST_LEN]> {
-    validate_section_layout(section_index, section_region.len())?;
+    let section_region_len =
+        u64::try_from(section_region.len()).map_err(|_| V2FormatError::SectionBounds)?;
+    validate_section_layout(section_index, section_region_len)?;
     let mut digest = Sha256::new();
     for section in section_index {
         let start = usize::try_from(section.offset).map_err(|_| V2FormatError::SectionBounds)?;
@@ -508,6 +510,23 @@ pub fn body_digest_for_v2_sections(
         digest.update(&section_region[start..end]);
     }
     Ok(digest.finalize().into())
+}
+
+/// Validates the signed section layout against provider-reported object length.
+///
+/// Bounded readers call this before issuing section range reads so hostile
+/// offsets and lengths cannot trigger oversized allocations or unbounded reads.
+pub(crate) fn validate_v2_commit_object_len(
+    parsed_header: &V2ParsedCommitHeader,
+    object_len: u64,
+) -> V2Result<()> {
+    let sections_start =
+        u64::try_from(parsed_header.sections_start).map_err(|_| V2FormatError::SectionBounds)?;
+    let section_region_len = object_len
+        .checked_sub(sections_start)
+        .ok_or(V2FormatError::TruncatedBody)?;
+    validate_section_layout(&parsed_header.header.section_index, section_region_len)?;
+    validate_commit_section_semantics(&parsed_header.header)
 }
 
 #[derive(Clone, Copy)]
@@ -1059,7 +1078,7 @@ fn read_ordered_key(reader: &mut cbor::Reader<'_>, last_key: &mut u64) -> V2Resu
 
 fn validate_section_layout(
     section_index: &[V2SectionDescriptor],
-    section_region_len: usize,
+    section_region_len: u64,
 ) -> V2Result<()> {
     let mut ranges = Vec::with_capacity(section_index.len());
     for section in section_index {
@@ -1071,19 +1090,18 @@ fn validate_section_layout(
         {
             return Err(V2FormatError::UnsupportedSection);
         }
-        let start = usize::try_from(section.offset).map_err(|_| V2FormatError::SectionBounds)?;
-        let length = usize::try_from(section.length).map_err(|_| V2FormatError::SectionBounds)?;
-        let end = start
-            .checked_add(length)
+        let end = section
+            .offset
+            .checked_add(section.length)
             .ok_or(V2FormatError::SectionBounds)?;
         if end > section_region_len {
             return Err(V2FormatError::SectionBounds);
         }
-        ranges.push((start, end));
+        ranges.push((section.offset, end));
     }
 
     ranges.sort_unstable();
-    let mut next_start = 0_usize;
+    let mut next_start = 0_u64;
     for (start, end) in ranges {
         if start != next_start {
             return Err(V2FormatError::SectionBounds);

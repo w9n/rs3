@@ -49,17 +49,55 @@ and promoted.
 The command prints a compact table by default; pass
 `--print-summary-json` when a caller needs the full JSON on stdout.
 
+## July 2026 Lightweight Rerun
+
+A 2026-07-10 release-profile smoke reran the lightweight in-memory,
+filesystem, and gateway paths after dependency remediation. The current tree
+showed no material regression in the 16-object lane. This was one run per lane,
+so it is a regression smoke rather than a release performance claim.
+
+The current in-memory lane recorded 186.544 ms for 16 sequential committed
+writes and 3.628 ms for the parallel batched form. Full reads took 0.704 ms and
+512 B range reads took 0.147 ms. The final release gateway lane after the S3
+client replacement recorded 257.191 ms, 25.407 ms, 18.929 ms, and 30.722 ms
+for those scenarios respectively. Request
+and byte ratios were consistent between the in-memory and gateway lanes.
+
+A parallel committed-write growth sweep exposed a release blocker. Before the
+write-state remediation, it measured:
+
+| Objects | Elapsed | Throughput | Average latency | p99 latency |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 69 ms | 3,705 ops/s | 10.8 ms | 22.7 ms |
+| 1,024 | 818 ms | 1,252 ops/s | 28.4 ms | 88.3 ms |
+| 4,096 | 19.61 s | 209 ops/s | 161.3 ms | 655.2 ms |
+
+A 16x object-count increase produced about 284x elapsed time. The write path
+was changed to retain bounded per-mutation undo records, apply accepted deltas
+incrementally, resolve newly accepted payloads from the pending delta, and
+update normal PUT list projections without a namespace scan. A final
+three-run release-binary sweep after all blocker remediations measured these
+medians:
+
+| Objects | Elapsed | Throughput | Average latency | p99 latency |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 17.0 ms | 15,019 ops/s | 3.68 ms | 5.38 ms |
+| 1,024 | 58.1 ms | 17,612 ops/s | 3.20 ms | 5.73 ms |
+| 4,096 | 210.0 ms | 19,507 ops/s | 2.89 ms | 3.75 ms |
+
+Elapsed ranges were 14.2-28.4 ms, 51.5-58.3 ms, and 209.4-219.4 ms
+respectively. The median 4,096-object lane is about 93.4x faster and the 16x
+object-count increase now takes 12.3x elapsed time. This closes the observed
+near-quadratic hot-path blocker in the measured range. Stable 10k, 100k, and
+1M object release gates are still required. The exact commands and
+amplification ratios are recorded in `tests/PERFORMANCE_BASELINE.md`.
+
 ## Current Release Matrix
 
-Run date: 2026-05-16. Gateway profile: release. Payload segment lane:
+Run date: 2026-07-10. Gateway profile: release. Payload segment lane:
 adaptive writer default. Workload set: `larger-restores`. Each row is the
 average of three direct/gateway run pairs. The direct baseline is the straight
 RustFS measurement proxy.
-
-These measurements predate the removal of the v1 repository/runtime stack. No
-post-removal matrix has been recorded in this docs sync, so the dated ratios
-below remain the last recorded release artifacts rather than re-measured
-post-removal baselines.
 
 Raw artifact: retained as ignored local release evidence.
 
@@ -67,11 +105,11 @@ Raw artifact: retained as ignored local release evidence.
 
 | Profile | Shape | Elapsed Ratio | Backend Requests | Backend Reads | Backend Writes | Gateway CPU | Gateway HWM RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `medium-restore` | one 64 MiB object | 1.05x | 0.51x | 1.01x | 1.00x | 0.77 s | 151.32 MiB |
-| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.24x | 0.03x | 1.02x | 1.01x | 0.69 s | 132.92 MiB |
-| `kubernetes-objects-large` | 6,144 manifests plus a 128 MiB fragment | 0.14x | 0.02x | 1.01x | 1.00x | 2.06 s | 324.56 MiB |
-| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.30x | 0.74x | 1.04x | 1.00x | 1.95 s | 437.90 MiB |
-| `postgres-pgdata-large` | larger relation/WAL/dump-shaped Postgres data directory | 1.44x | 0.83x | 1.04x | 1.00x | 3.83 s | 787.62 MiB |
+| `medium-restore` | one 64 MiB object | 1.01x | 0.51x | 1.01x | 1.00x | 0.81 s | 146.26 MiB |
+| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.30x | 0.03x | 1.02x | 1.01x | 0.83 s | 128.83 MiB |
+| `kubernetes-objects-large` | 6,144 manifests plus a 128 MiB fragment | 0.28x | 0.02x | 1.01x | 1.00x | 2.33 s | 273.13 MiB |
+| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.26x | 0.75x | 1.04x | 1.00x | 2.22 s | 420.39 MiB |
+| `postgres-pgdata-large` | larger relation/WAL/dump-shaped Postgres data directory | 1.39x | 0.83x | 1.04x | 1.00x | 4.20 s | 685.06 MiB |
 
 Interpretation:
 
@@ -89,7 +127,9 @@ Interpretation:
 - Postgres-shaped restore phases had shorter elapsed time than the direct path
   in this local harness, but full elapsed time is slower because commit
   publication and snapshot-create phases dominate the local run. Keep tracking
-  commit wait, stage-lock wait, and large PUT phases.
+  commit wait, stage-lock wait, and large PUT phases. Average commit wait rose
+  from 53 ms in `medium-restore` to 383 ms in `postgres-pgdata-large`; average
+  stage-lock wait rose from effectively zero to 79 ms.
 
 ## Expanded Sanity Run
 

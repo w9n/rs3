@@ -1,7 +1,7 @@
 //! Commit coordination for preview v2 repository writes.
 
 use super::repository::{V2AnchorState, V2CommitAnchor};
-use super::service::{V2Repository, V2RepositorySnapshot};
+use super::service::{V2Repository, V2StagedPutRollback};
 use crate::CommitCoordinatorOptions;
 use crate::error::{RepositoryError, Result};
 use crate::model::{DeleteOutcome, RepositoryObjectMetadata, RepositoryPutOptions};
@@ -36,7 +36,7 @@ pub struct V2CommitCoordinator<S, A> {
 #[derive(Default)]
 struct PendingBatch {
     waiters: Vec<CommitWaiter>,
-    rollback_snapshot: Option<V2RepositorySnapshot>,
+    rollback_log: Vec<V2StagedPutRollback>,
     publishing: bool,
     generation: u64,
     failed: Option<String>,
@@ -189,29 +189,21 @@ where
                 batch.waiters.is_empty()
             };
 
-            let stage_snapshot = self.repository.snapshot_state()?;
             let stage_write_started = Instant::now();
-            let metadata = self.repository.stage_put(key, body, options).await;
+            let staged = self.repository.stage_put(key, body, options).await;
             record_v2_commit_put_phase_duration("stage_write", stage_write_started.elapsed());
-            let metadata = match metadata {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    self.repository
-                        .restore_state_preserving_sequence(stage_snapshot)?;
-                    return Err(error);
-                }
-            };
+            let (metadata, rollback) = staged?;
             let (tx, rx) = oneshot::channel();
             let mut batch = self.batch.lock().await;
             let delayed_publish_generation = if should_start_timer {
                 batch.generation = batch.generation.wrapping_add(1);
-                batch.rollback_snapshot = Some(stage_snapshot);
                 Some(batch.generation)
             } else {
                 None
             };
 
             batch.waiters.push(CommitWaiter { tx });
+            batch.rollback_log.push(rollback);
             let should_publish_now = batch.waiters.len() >= self.options.max_batch_items;
             record_v2_commit_enqueue("ok", batch.waiters.len());
             tracing::debug!(
@@ -392,7 +384,7 @@ where
             batch.publishing = true;
             PendingPublish {
                 waiters: std::mem::take(&mut batch.waiters),
-                rollback_snapshot: batch.rollback_snapshot.take(),
+                rollback_log: std::mem::take(&mut batch.rollback_log),
             }
         };
 
@@ -400,7 +392,7 @@ where
             &self.repository,
             self.anchor.as_ref(),
             pending.waiters,
-            pending.rollback_snapshot,
+            pending.rollback_log,
         )
         .await;
         let mut batch = self.batch.lock().await;
@@ -423,7 +415,7 @@ where
 
 struct PendingPublish {
     waiters: Vec<CommitWaiter>,
-    rollback_snapshot: Option<V2RepositorySnapshot>,
+    rollback_log: Vec<V2StagedPutRollback>,
 }
 
 fn spawn_delayed_v2_publish<S, A>(
@@ -475,7 +467,7 @@ async fn publish_pending_v2_batch<S, A>(
         batch.publishing = true;
         PendingPublish {
             waiters: std::mem::take(&mut batch.waiters),
-            rollback_snapshot: batch.rollback_snapshot.take(),
+            rollback_log: std::mem::take(&mut batch.rollback_log),
         }
     };
 
@@ -483,7 +475,7 @@ async fn publish_pending_v2_batch<S, A>(
         &repository,
         anchor.as_ref(),
         pending.waiters,
-        pending.rollback_snapshot,
+        pending.rollback_log,
     )
     .await;
     let mut batch = batch.lock().await;
@@ -510,7 +502,7 @@ async fn publish_v2_waiters<S, A>(
     repository: &V2Repository<S>,
     anchor: &A,
     waiters: Vec<CommitWaiter>,
-    rollback_snapshot: Option<V2RepositorySnapshot>,
+    rollback_log: Vec<V2StagedPutRollback>,
 ) -> std::result::Result<(), PublishFailure>
 where
     S: BlobStore + Clone + 'static,
@@ -543,8 +535,7 @@ where
         }
     });
     if failure.is_some()
-        && let Some(snapshot) = rollback_snapshot
-        && let Err(error) = repository.restore_state_preserving_sequence(snapshot)
+        && let Err(error) = repository.rollback_staged_puts(rollback_log)
     {
         let poison_reason = match failure.as_ref() {
             Some(failure) => format!(

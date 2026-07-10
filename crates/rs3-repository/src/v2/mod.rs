@@ -45,8 +45,12 @@ pub use provider::{
     V2ProviderConformanceReport, V2ProviderProfile, check_v2_provider_conformance,
 };
 pub use repository::{
+    DEFAULT_V2_FULL_CHAIN_MAX_BYTES, DEFAULT_V2_FULL_COMMIT_MAX_BYTES,
+    DEFAULT_V2_REPLAY_MAX_COMMITS, DEFAULT_V2_REPLAY_MAX_RETAINED_BYTES,
+    DEFAULT_V2_REPLAY_MAX_TOTAL_COMMIT_BYTES, DEFAULT_V2_REPLAY_READ_CHUNK_BYTES,
     DEFAULT_V2_STREAM_READ_STALL_TIMEOUT, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorState, V2CommitAnchor,
     V2CommitChain, V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite,
-    V2MemoryAnchor, V2RecoveryBundle, V2StoredCommit,
+    V2MemoryAnchor, V2RecoveryBundle, V2ReplayChain, V2ReplayCommit, V2ReplayLimits,
+    V2StoredCommit,
 };
 pub use service::{V2Repository, V2ResolvedObject};

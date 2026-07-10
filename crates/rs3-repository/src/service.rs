@@ -246,7 +246,7 @@ where
     pub(crate) fn tombstone_namespace_for_delete(
         &self,
         key: &LogicalPath,
-    ) -> Result<BackendObjectId> {
+    ) -> Result<(BackendObjectId, crate::state::RepositoryStateRollback)> {
         let keyring = self.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
         let mut state = self.write_state()?;
@@ -256,6 +256,12 @@ where
         let object_id = entry.object_id.clone();
         let existing_blind_keys = existing_blind_keys(&state.namespace, &lookup_blind_keys);
         let sequence = next_sequence(&mut state)?;
+        let rollback = crate::state::RepositoryStateRollback::capture(
+            &state,
+            existing_blind_keys.iter().cloned(),
+            entry.manifest_id,
+            key,
+        );
         for blind_key in existing_blind_keys {
             state.tombstone_namespace_entry(blind_key.clone(), sequence);
             state.pending_index_deltas.push(IndexDelta::Tombstone {
@@ -264,7 +270,7 @@ where
             });
         }
 
-        Ok(object_id)
+        Ok((object_id, rollback))
     }
 
     /// Applies legal hold for a client-visible object and its backend payload.
@@ -273,6 +279,19 @@ where
         key: &LogicalPath,
         status: LegalHoldStatus,
     ) -> Result<RepositoryObjectMetadata> {
+        self.set_legal_hold_with_rollback(key, status)
+            .await
+            .map(|(metadata, _rollback)| metadata)
+    }
+
+    pub(crate) async fn set_legal_hold_with_rollback(
+        &self,
+        key: &LogicalPath,
+        status: LegalHoldStatus,
+    ) -> Result<(
+        RepositoryObjectMetadata,
+        crate::state::RepositoryStateRollback,
+    )> {
         let keyring = self.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
         let object_ref = self.object_ref_for_candidates(key, &lookup_blind_keys)?;
@@ -321,6 +340,12 @@ where
             legal_hold: updated.legal_hold,
         };
         let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
+        let rollback = crate::state::RepositoryStateRollback::capture(
+            &state,
+            std::iter::once(updated.blind_key.clone()),
+            manifest_id.clone(),
+            key,
+        );
         state.pending_index_deltas.push(IndexDelta::Upsert {
             entry: Box::new(updated.clone()),
             prefix_tokens: prefix_tokens.clone(),
@@ -329,7 +354,7 @@ where
         state.manifests.insert(manifest_id, manifest.clone());
         state.upsert_namespace_entry(updated.clone(), prefix_tokens);
 
-        Ok(manifest.into_metadata())
+        Ok((manifest.into_metadata(), rollback))
     }
 
     fn object_ref_for_candidates(

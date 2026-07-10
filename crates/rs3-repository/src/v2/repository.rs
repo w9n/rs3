@@ -7,7 +7,7 @@ use super::commit::{
     V2CommitSelfRef, V2KeyringEnvelopeRef, V2ParsedCommit, V2ParsedCommitHeader,
     V2SectionDescriptor, V2SectionType, V2UploadMode, body_digest_for_v2_sections,
     generate_v2_commit_key, parse_v2_commit_header, parse_v2_commit_object,
-    v2_commit_header_span_len,
+    v2_commit_header_span_len, validate_v2_commit_object_len,
 };
 use super::error::{V2FormatError, V2Result};
 use super::format::V2FormatRef;
@@ -32,6 +32,19 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_RANDOM_KEY_ATTEMPTS: usize = 3;
+
+/// Maximum commits traversed during one bounded recovery replay by default.
+pub const DEFAULT_V2_REPLAY_MAX_COMMITS: usize = 4_096;
+/// Maximum cumulative commit-object bytes verified during one recovery replay.
+pub const DEFAULT_V2_REPLAY_MAX_TOTAL_COMMIT_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+/// Maximum encrypted index bytes retained in memory during one recovery replay.
+pub const DEFAULT_V2_REPLAY_MAX_RETAINED_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum bytes held by one recovery range read.
+pub const DEFAULT_V2_REPLAY_READ_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum one complete commit body a legacy full-body reader may allocate.
+pub const DEFAULT_V2_FULL_COMMIT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum cumulative commit bodies a legacy full-chain reader may retain.
+pub const DEFAULT_V2_FULL_CHAIN_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Schema marker for trusted v2 recovery bundles.
 pub const V2_RESTORE_BUNDLE_SCHEMA: &str = "rs3.restore-bundle.v2-preview.v1";
@@ -244,6 +257,8 @@ pub struct V2CommitStoreOptions {
     pub keyring_envelope_ref: V2KeyringEnvelopeRef,
     /// Active encrypted format-root reference to bind into anchors.
     pub format_ref: V2FormatRef,
+    /// Resource budgets for startup and disaster-recovery replay.
+    pub replay_limits: V2ReplayLimits,
 }
 
 impl V2CommitStoreOptions {
@@ -267,6 +282,7 @@ impl V2CommitStoreOptions {
             legal_hold: None,
             keyring_envelope_ref,
             format_ref,
+            replay_limits: V2ReplayLimits::default(),
         }
     }
 
@@ -292,6 +308,42 @@ impl V2CommitStoreOptions {
     pub const fn with_legal_hold(mut self, legal_hold: Option<LegalHoldStatus>) -> Self {
         self.legal_hold = legal_hold;
         self
+    }
+
+    /// Uses explicit resource budgets for startup and disaster-recovery replay.
+    pub const fn with_replay_limits(mut self, replay_limits: V2ReplayLimits) -> Self {
+        self.replay_limits = replay_limits;
+        self
+    }
+}
+
+/// Resource budgets for verified startup and disaster-recovery replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V2ReplayLimits {
+    /// Maximum signed commits walked before reaching a snapshot.
+    pub max_commits: usize,
+    /// Maximum cumulative provider-reported commit-object bytes verified.
+    pub max_total_commit_bytes: u64,
+    /// Maximum encrypted index-section bytes retained for namespace replay.
+    pub max_retained_bytes: u64,
+    /// Maximum bytes requested and held by one body-verification range read.
+    pub read_chunk_bytes: u64,
+    /// Maximum one complete commit body a legacy full-body reader may allocate.
+    pub max_full_commit_bytes: u64,
+    /// Maximum cumulative commit bodies a legacy full-chain reader may retain.
+    pub max_full_chain_bytes: u64,
+}
+
+impl Default for V2ReplayLimits {
+    fn default() -> Self {
+        Self {
+            max_commits: DEFAULT_V2_REPLAY_MAX_COMMITS,
+            max_total_commit_bytes: DEFAULT_V2_REPLAY_MAX_TOTAL_COMMIT_BYTES,
+            max_retained_bytes: DEFAULT_V2_REPLAY_MAX_RETAINED_BYTES,
+            read_chunk_bytes: DEFAULT_V2_REPLAY_READ_CHUNK_BYTES,
+            max_full_commit_bytes: DEFAULT_V2_FULL_COMMIT_MAX_BYTES,
+            max_full_chain_bytes: DEFAULT_V2_FULL_CHAIN_MAX_BYTES,
+        }
     }
 }
 
@@ -415,6 +467,25 @@ pub(crate) struct V2StoredStreamingCommit<Output> {
 pub struct V2CommitChain {
     /// Verified commits, newest first, ending at the nearest snapshot or genesis.
     pub commits_newest_first: Vec<V2ParsedCommit>,
+}
+
+/// One fully verified commit retaining only sections needed for namespace replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V2ReplayCommit {
+    /// Decoded and cryptographically verified commit header.
+    pub parsed_header: V2ParsedCommitHeader,
+    /// Provider version identifier used for exact-version reads, when available.
+    pub version_id: Option<BackendVersionId>,
+    /// Provider-reported complete commit-object length verified by replay.
+    pub object_len: u64,
+    pub(crate) retained_sections: Vec<Option<Bytes>>,
+}
+
+/// Resource-bounded verified chain used by startup and recovery workflows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V2ReplayChain {
+    /// Verified commits, newest first, ending at the nearest snapshot or genesis.
+    pub commits_newest_first: Vec<V2ReplayCommit>,
 }
 
 /// Recovery bundle used as the weak-subjectivity floor for v2 DR.
@@ -816,7 +887,7 @@ where
     }
 
     /// Reads and verifies the commit currently selected by the anchor.
-    pub async fn read_anchor_head<A>(&self, anchor: &A) -> V2Result<Option<V2ParsedCommit>>
+    pub async fn read_anchor_head<A>(&self, anchor: &A) -> V2Result<Option<V2ReplayCommit>>
     where
         A: V2CommitAnchor,
     {
@@ -842,19 +913,43 @@ where
         &self,
         anchor_state: &V2AnchorState,
     ) -> V2Result<V2CommitChain> {
+        let limits = self.options.replay_limits;
+        if limits.max_commits == 0
+            || limits.read_chunk_bytes == 0
+            || limits.max_full_commit_bytes == 0
+            || limits.max_full_chain_bytes == 0
+        {
+            return Err(V2FormatError::ReplayBudgetExceeded);
+        }
         let mut commits = Vec::new();
         let mut next_key = anchor_state.commit_key.clone();
         let mut next_version = anchor_state.version_id.clone();
         let mut next_digest = Some(anchor_state.body_digest);
         let mut next_sequence = Some(anchor_state.sequence);
         let mut seen = BTreeSet::new();
+        let mut full_chain_bytes = 0_u64;
 
         loop {
+            if commits.len() >= limits.max_commits {
+                return Err(V2FormatError::ReplayBudgetExceeded);
+            }
             if !seen.insert(next_key.clone()) {
                 return Err(V2FormatError::StaleAnchor);
             }
+            let metadata = self
+                .store
+                .head_at(&next_key, next_version.as_ref())
+                .await
+                .map_err(|_| V2FormatError::StorageOperationFailed)?;
+            if metadata.content_len > limits.max_full_commit_bytes {
+                return Err(V2FormatError::ReplayBudgetExceeded);
+            }
+            full_chain_bytes = full_chain_bytes
+                .checked_add(metadata.content_len)
+                .filter(|total| *total <= limits.max_full_chain_bytes)
+                .ok_or(V2FormatError::ReplayBudgetExceeded)?;
             let parsed = self
-                .read_commit_at(&next_key, next_version.as_ref())
+                .read_commit_at_with_len(&next_key, next_version.as_ref(), metadata.content_len)
                 .await?;
             if let Some(expected_sequence) = next_sequence
                 && parsed.parsed_header.header.self_ref.sequence != expected_sequence
@@ -886,6 +981,194 @@ where
         })
     }
 
+    /// Range-verifies the anchor-selected chain while retaining only encrypted
+    /// index sections required to rebuild trusted namespace state.
+    pub async fn load_replay_chain_from_anchor<A>(
+        &self,
+        anchor: &A,
+    ) -> V2Result<Option<V2ReplayChain>>
+    where
+        A: V2CommitAnchor,
+    {
+        let Some(anchor_state) = anchor.read_v2().await? else {
+            return Ok(None);
+        };
+        self.load_replay_chain_from_state(&anchor_state)
+            .await
+            .map(Some)
+    }
+
+    /// Range-verifies a supplied anchor state under explicit recovery budgets.
+    pub async fn load_replay_chain_from_state(
+        &self,
+        anchor_state: &V2AnchorState,
+    ) -> V2Result<V2ReplayChain> {
+        self.load_replay_chain_from_state_with_limits(anchor_state, self.options.replay_limits)
+            .await
+    }
+
+    pub(crate) async fn load_replay_chain_from_state_with_limits(
+        &self,
+        anchor_state: &V2AnchorState,
+        limits: V2ReplayLimits,
+    ) -> V2Result<V2ReplayChain> {
+        if limits.max_commits == 0
+            || limits.max_total_commit_bytes == 0
+            || limits.max_retained_bytes == 0
+            || limits.read_chunk_bytes == 0
+            || limits.max_full_commit_bytes == 0
+            || limits.max_full_chain_bytes == 0
+        {
+            return Err(V2FormatError::ReplayBudgetExceeded);
+        }
+
+        let mut commits = Vec::new();
+        let mut next_key = anchor_state.commit_key.clone();
+        let mut next_version = anchor_state.version_id.clone();
+        let mut next_digest = Some(anchor_state.body_digest);
+        let mut next_sequence = Some(anchor_state.sequence);
+        let mut seen = BTreeSet::new();
+        let mut total_commit_bytes = 0_u64;
+        let mut retained_bytes = 0_u64;
+
+        loop {
+            if commits.len() >= limits.max_commits {
+                return Err(V2FormatError::ReplayBudgetExceeded);
+            }
+            if !seen.insert(next_key.clone()) {
+                return Err(V2FormatError::StaleAnchor);
+            }
+
+            let metadata = self
+                .store
+                .head_at(&next_key, next_version.as_ref())
+                .await
+                .map_err(|_| V2FormatError::StorageOperationFailed)?;
+            total_commit_bytes = total_commit_bytes
+                .checked_add(metadata.content_len)
+                .filter(|total| *total <= limits.max_total_commit_bytes)
+                .ok_or(V2FormatError::ReplayBudgetExceeded)?;
+
+            let parsed_header = self
+                .read_commit_header_at(&next_key, next_version.as_ref())
+                .await?;
+            if let Some(expected_sequence) = next_sequence
+                && parsed_header.header.self_ref.sequence != expected_sequence
+            {
+                return Err(V2FormatError::SelfKeyMismatch);
+            }
+            if let Some(expected_digest) = next_digest
+                && parsed_header.header.body_digest != expected_digest
+            {
+                return Err(V2FormatError::BodyDigestMismatch);
+            }
+            validate_v2_commit_object_len(&parsed_header, metadata.content_len)?;
+
+            let retained_sections = self
+                .verify_replay_sections(
+                    &next_key,
+                    next_version.as_ref(),
+                    &parsed_header,
+                    &mut retained_bytes,
+                    limits,
+                )
+                .await?;
+            let is_snapshot = parsed_header.header.is_snapshot;
+            let parent = parsed_header.header.parent.clone();
+            commits.push(V2ReplayCommit {
+                parsed_header,
+                version_id: next_version.clone(),
+                object_len: metadata.content_len,
+                retained_sections,
+            });
+            if is_snapshot {
+                break;
+            }
+            let Some(parent) = parent else {
+                return Err(V2FormatError::InvalidHeaderField);
+            };
+            next_key = parent.commit_key;
+            next_version = parent.version_id;
+            next_digest = Some(parent.body_digest);
+            next_sequence = Some(parent.sequence);
+        }
+
+        Ok(V2ReplayChain {
+            commits_newest_first: commits,
+        })
+    }
+
+    async fn verify_replay_sections(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        parsed_header: &V2ParsedCommitHeader,
+        retained_bytes: &mut u64,
+        limits: V2ReplayLimits,
+    ) -> V2Result<Vec<Option<Bytes>>> {
+        let sections_start = u64::try_from(parsed_header.sections_start)
+            .map_err(|_| V2FormatError::SectionBounds)?;
+        let mut body_digest = Sha256::new();
+        let mut retained_sections = vec![None; parsed_header.header.section_index.len()];
+
+        for (index, section) in parsed_header.header.section_index.iter().enumerate() {
+            let retain = matches!(
+                section.section_type,
+                V2SectionType::IndexDelta | V2SectionType::IndexSnapshot
+            );
+            let mut retained = if retain {
+                *retained_bytes = retained_bytes
+                    .checked_add(section.length)
+                    .filter(|total| *total <= limits.max_retained_bytes)
+                    .ok_or(V2FormatError::ReplayBudgetExceeded)?;
+                let capacity = usize::try_from(section.length)
+                    .map_err(|_| V2FormatError::ReplayBudgetExceeded)?;
+                Some(Vec::with_capacity(capacity))
+            } else {
+                None
+            };
+            let mut offset = sections_start
+                .checked_add(section.offset)
+                .ok_or(V2FormatError::SectionBounds)?;
+            let mut remaining = section.length;
+
+            while remaining > 0 {
+                let read_len = remaining.min(limits.read_chunk_bytes);
+                let bytes = self
+                    .read_commit_range_at(
+                        object_id,
+                        version_id,
+                        ByteRange::Slice {
+                            offset,
+                            len: read_len,
+                        },
+                    )
+                    .await?;
+                if u64::try_from(bytes.len()).ok() != Some(read_len) {
+                    return Err(V2FormatError::TruncatedBody);
+                }
+                body_digest.update(&bytes);
+                if let Some(retained) = retained.as_mut() {
+                    retained.extend_from_slice(&bytes);
+                }
+                offset = offset
+                    .checked_add(read_len)
+                    .ok_or(V2FormatError::SectionBounds)?;
+                remaining -= read_len;
+            }
+
+            if let Some(retained) = retained {
+                retained_sections[index] = Some(Bytes::from(retained));
+            }
+        }
+
+        let actual: [u8; 32] = body_digest.finalize().into();
+        if actual != parsed_header.header.body_digest {
+            return Err(V2FormatError::BodyDigestMismatch);
+        }
+        Ok(retained_sections)
+    }
+
     /// Reads and verifies a single commit at a key and optional provider version.
     pub async fn read_commit_at(
         &self,
@@ -897,17 +1180,100 @@ where
         {
             return Err(V2FormatError::InvalidHeaderField);
         }
-        let body = self
+        let content_len = self
             .store
-            .get_range_at(object_id, version_id, ByteRange::Full)
+            .head_at(object_id, version_id)
             .await
-            .map_err(|_| V2FormatError::StorageOperationFailed)?;
-        let mut parsed = parse_v2_commit_object(object_id, body, &self.keyring)?;
+            .map_err(|_| V2FormatError::StorageOperationFailed)?
+            .content_len;
+        if content_len > self.options.replay_limits.max_full_commit_bytes {
+            return Err(V2FormatError::ReplayBudgetExceeded);
+        }
+        self.read_commit_at_with_len(object_id, version_id, content_len)
+            .await
+    }
+
+    async fn read_commit_at_with_len(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        content_len: u64,
+    ) -> V2Result<V2ParsedCommit> {
+        if self.options.provider_profile == V2ProviderProfile::RetainedVersionObjectLock
+            && version_id.is_none()
+        {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
+        let chunk_len = self.options.replay_limits.read_chunk_bytes;
+        if chunk_len == 0 || content_len > self.options.replay_limits.max_full_commit_bytes {
+            return Err(V2FormatError::ReplayBudgetExceeded);
+        }
+        let capacity =
+            usize::try_from(content_len).map_err(|_| V2FormatError::ReplayBudgetExceeded)?;
+        let mut body = Vec::with_capacity(capacity);
+        let mut offset = 0_u64;
+        while offset < content_len {
+            let len = content_len.saturating_sub(offset).min(chunk_len);
+            let bytes = self
+                .read_commit_range_at(object_id, version_id, ByteRange::Slice { offset, len })
+                .await?;
+            if u64::try_from(bytes.len()).ok() != Some(len) {
+                return Err(V2FormatError::TruncatedBody);
+            }
+            body.extend_from_slice(&bytes);
+            offset = offset
+                .checked_add(len)
+                .ok_or(V2FormatError::SectionBounds)?;
+        }
+        let mut parsed = parse_v2_commit_object(object_id, Bytes::from(body), &self.keyring)?;
         if parsed.parsed_header.header.keyring_envelope_ref != self.options.keyring_envelope_ref {
             return Err(V2FormatError::InvalidHeaderField);
         }
         parsed.version_id = version_id.cloned();
         Ok(parsed)
+    }
+
+    async fn read_replay_commit_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> V2Result<V2ReplayCommit> {
+        let limits = self.options.replay_limits;
+        if limits.max_commits == 0
+            || limits.max_total_commit_bytes == 0
+            || limits.max_retained_bytes == 0
+            || limits.read_chunk_bytes == 0
+            || limits.max_full_commit_bytes == 0
+            || limits.max_full_chain_bytes == 0
+        {
+            return Err(V2FormatError::ReplayBudgetExceeded);
+        }
+        let metadata = self
+            .store
+            .head_at(object_id, version_id)
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed)?;
+        if metadata.content_len > limits.max_total_commit_bytes {
+            return Err(V2FormatError::ReplayBudgetExceeded);
+        }
+        let parsed_header = self.read_commit_header_at(object_id, version_id).await?;
+        validate_v2_commit_object_len(&parsed_header, metadata.content_len)?;
+        let mut retained_bytes = 0_u64;
+        let retained_sections = self
+            .verify_replay_sections(
+                object_id,
+                version_id,
+                &parsed_header,
+                &mut retained_bytes,
+                limits,
+            )
+            .await?;
+        Ok(V2ReplayCommit {
+            parsed_header,
+            version_id: version_id.cloned(),
+            object_len: metadata.content_len,
+            retained_sections,
+        })
     }
 
     /// Reads and verifies only the signed commit header at a key and version.
@@ -1006,9 +1372,9 @@ where
     async fn read_commit_from_anchor_state(
         &self,
         state: &V2AnchorState,
-    ) -> V2Result<V2ParsedCommit> {
+    ) -> V2Result<V2ReplayCommit> {
         let parsed = self
-            .read_commit_at(&state.commit_key, state.version_id.as_ref())
+            .read_replay_commit_at(&state.commit_key, state.version_id.as_ref())
             .await?;
         if parsed.parsed_header.header.self_ref.sequence != state.sequence {
             return Err(V2FormatError::SelfKeyMismatch);
@@ -1033,7 +1399,7 @@ where
         let Some(current) = anchor.read_v2().await? else {
             return Err(V2FormatError::MissingAnchor);
         };
-        let parsed = self.read_commit_at(object_id, version_id).await?;
+        let parsed = self.read_replay_commit_at(object_id, version_id).await?;
         let header = &parsed.parsed_header.header;
         let Some(parent) = header.parent.as_ref() else {
             return Err(V2FormatError::InvalidHeaderField);
@@ -1078,7 +1444,7 @@ where
         anchor: &A,
         bundle: &V2RecoveryBundle,
         min_sequence: Sequence,
-    ) -> V2Result<V2CommitChain>
+    ) -> V2Result<V2ReplayChain>
     where
         A: V2CommitAnchor,
     {
@@ -1090,7 +1456,7 @@ where
         if anchor.read_v2().await?.is_some() {
             return Err(V2FormatError::StaleAnchor);
         }
-        let chain = self.load_chain_from_state(&bundle.anchor).await?;
+        let chain = self.load_replay_chain_from_state(&bundle.anchor).await?;
         anchor
             .compare_and_advance_v2(None, bundle.anchor.clone())
             .await?;

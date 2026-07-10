@@ -394,6 +394,18 @@ pub struct NamespaceIndex {
     tombstones: BTreeMap<BlindIndexKey, NamespaceTombstone>,
 }
 
+/// Opaque snapshot of one namespace-index key for transactional rollback.
+///
+/// Capturing this value is proportional to the prefix membership of one
+/// entry, rather than the size of the complete namespace.
+#[derive(Debug)]
+pub struct NamespaceIndexKeySnapshot {
+    blind_key: BlindIndexKey,
+    entry: Option<NamespaceEntry>,
+    prefix_tokens: Vec<PrefixToken>,
+    tombstone: Option<NamespaceTombstone>,
+}
+
 impl NamespaceIndex {
     /// Creates an empty namespace index.
     pub fn new() -> Self {
@@ -421,6 +433,34 @@ impl NamespaceIndex {
     /// Looks up an entry by blind key.
     pub fn head(&self, blind_key: &BlindIndexKey) -> Option<&NamespaceEntry> {
         self.entries.get(blind_key)
+    }
+
+    /// Captures one key's live entry, prefix membership, and tombstone.
+    pub fn snapshot_key(&self, blind_key: &BlindIndexKey) -> NamespaceIndexKeySnapshot {
+        NamespaceIndexKeySnapshot {
+            blind_key: blind_key.clone(),
+            entry: self.entries.get(blind_key).cloned(),
+            prefix_tokens: self
+                .entry_prefixes
+                .get(blind_key)
+                .map(|tokens| tokens.iter().cloned().collect())
+                .unwrap_or_default(),
+            tombstone: self.tombstones.get(blind_key).cloned(),
+        }
+    }
+
+    /// Restores a key from a snapshot captured before a staged mutation.
+    pub fn restore_key(&mut self, snapshot: NamespaceIndexKeySnapshot) {
+        self.entries.remove(&snapshot.blind_key);
+        self.remove_prefix_membership(&snapshot.blind_key);
+        self.tombstones.remove(&snapshot.blind_key);
+
+        if let Some(entry) = snapshot.entry {
+            self.upsert(entry, snapshot.prefix_tokens);
+        }
+        if let Some(tombstone) = snapshot.tombstone {
+            self.tombstones.insert(snapshot.blind_key, tombstone);
+        }
     }
 
     /// Lists entries for a prefix token in stable blind-key order.
@@ -869,6 +909,37 @@ mod tests {
                 .map(|tombstone| tombstone.generation),
             Some(Sequence::new(2))
         );
+    }
+
+    #[test]
+    fn namespace_key_snapshot_restores_entry_prefixes_and_tombstone() {
+        let mut index = NamespaceIndex::new();
+        let blind_key = blind_key("blind-a");
+        let old_prefix = prefix_token("prefix-old");
+        let new_prefix = prefix_token("prefix-new");
+        let original_object = object_id("segments/opaque-original");
+        let snapshot = {
+            index.upsert(
+                entry(blind_key.clone(), original_object.clone()),
+                vec![old_prefix.clone()],
+            );
+            index.snapshot_key(&blind_key)
+        };
+
+        index.upsert(
+            entry(blind_key.clone(), object_id("segments/opaque-new")),
+            vec![new_prefix.clone()],
+        );
+        index.tombstone(blind_key.clone(), Sequence::new(9));
+        index.restore_key(snapshot);
+
+        assert_eq!(
+            index.head(&blind_key).map(|entry| &entry.object_id),
+            Some(&original_object)
+        );
+        assert_eq!(index.list_prefix(&old_prefix).len(), 1);
+        assert!(index.list_prefix(&new_prefix).is_empty());
+        assert!(index.tombstone_for(&blind_key).is_none());
     }
 
     #[test]

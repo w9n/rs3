@@ -3,7 +3,7 @@
 use super::super::commit::{V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitKey};
 use super::super::error::V2FormatError;
 use super::super::repository::{
-    V2CommitAnchor, V2CommitChain, V2CommitSection, V2CommitWrite, V2MemoryAnchor, V2StoredCommit,
+    V2CommitAnchor, V2CommitSection, V2CommitWrite, V2MemoryAnchor, V2ReplayChain, V2StoredCommit,
 };
 use super::super::{
     V2FullGcDryRunOptions, V2FullGcDryRunReport, V2MaintenanceGuard, V2ProviderProfile,
@@ -77,13 +77,13 @@ where
             .map_err(v2_repository_error)?;
         let Some(chain) = self
             .commit_store
-            .load_chain_from_anchor(anchor)
+            .load_replay_chain_from_anchor(anchor)
             .await
             .map_err(v2_repository_error)?
         else {
             return Ok(report);
         };
-        let state = self.replay_chain_to_state(&chain)?;
+        let state = self.replay_bounded_chain_to_state(&chain).await?;
         let (mixed_count, live_bytes_to_copy, mixed_dead_bytes_repackable) =
             self.current_head_mixed_payload_summary(&state, &chain)?;
         report.mixed_commit_count = mixed_count;
@@ -205,7 +205,7 @@ where
     fn current_head_mixed_payload_summary(
         &self,
         state: &crate::state::RepositoryState,
-        chain: &V2CommitChain,
+        chain: &V2ReplayChain,
     ) -> Result<(usize, u64, u64)> {
         let live_sections = Self::live_payload_sections_from_state(state);
         let mut mixed_commit_count = 0_usize;

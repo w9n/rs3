@@ -2,7 +2,10 @@
 
 use crate::error::{RepositoryError, Result};
 use crate::model::{RepositoryListEntry, RepositoryObjectMetadata};
-use rs3_index::{DurableManifest, IndexDelta, IndexDeltaObject, NamespaceEntry, NamespaceIndex};
+use rs3_index::{
+    DurableManifest, IndexDelta, IndexDeltaObject, NamespaceEntry, NamespaceIndex,
+    NamespaceIndexKeySnapshot,
+};
 use rs3_types::{
     BlindIndexKey, LegalHoldStatus, LogicalPath, ManifestId, PrefixToken, RetentionPolicy, Sequence,
 };
@@ -60,13 +63,20 @@ impl RepositoryState {
         entry: NamespaceEntry,
         prefix_tokens: Vec<PrefixToken>,
     ) {
-        let affected_key = self
-            .manifests
-            .get(&entry.manifest_id)
-            .map(|manifest| manifest.key.clone());
+        let affected_manifest = self.manifests.get(&entry.manifest_id).cloned();
         self.namespace.upsert(entry, prefix_tokens);
-        if let Some(key) = affected_key {
-            self.refresh_list_entry(&key);
+        if let Some(manifest) = affected_manifest {
+            // A logical path has one live namespace entry. Key rotation first
+            // tombstones historical blind keys, so the new entry can update
+            // the list projection directly without scanning the repository.
+            self.list_entries.insert(
+                manifest.key.as_str().to_owned(),
+                RepositoryListEntry {
+                    key: manifest.key,
+                    content_len: manifest.content_len,
+                    modified_at_ms: manifest.modified_at_ms,
+                },
+            );
         }
     }
 
@@ -151,6 +161,69 @@ impl RepositoryState {
             }
             None => {
                 self.list_entries.remove(key);
+            }
+        }
+    }
+}
+
+/// Undo information for one staged repository mutation.
+///
+/// Its size is bounded by the blind keys and prefix tokens affected by the
+/// mutation. Repository sequence allocation is deliberately not rolled back.
+#[derive(Debug)]
+pub(crate) struct RepositoryStateRollback {
+    namespace_keys: Vec<NamespaceIndexKeySnapshot>,
+    manifest_id: ManifestId,
+    previous_manifest: Option<TrustedManifest>,
+    list_key: String,
+    previous_list_entry: Option<RepositoryListEntry>,
+    pending_index_deltas_len: usize,
+}
+
+impl RepositoryStateRollback {
+    pub(crate) fn capture(
+        state: &RepositoryState,
+        blind_keys: impl IntoIterator<Item = BlindIndexKey>,
+        manifest_id: ManifestId,
+        logical_key: &LogicalPath,
+    ) -> Self {
+        let blind_keys = blind_keys
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        Self {
+            namespace_keys: blind_keys
+                .iter()
+                .map(|blind_key| state.namespace.snapshot_key(blind_key))
+                .collect(),
+            previous_manifest: state.manifests.get(&manifest_id).cloned(),
+            manifest_id,
+            list_key: logical_key.as_str().to_owned(),
+            previous_list_entry: state.list_entries.get(logical_key.as_str()).cloned(),
+            pending_index_deltas_len: state.pending_index_deltas.len(),
+        }
+    }
+
+    pub(crate) fn restore(self, state: &mut RepositoryState) {
+        state
+            .pending_index_deltas
+            .truncate(self.pending_index_deltas_len);
+        for snapshot in self.namespace_keys {
+            state.namespace.restore_key(snapshot);
+        }
+        match self.previous_manifest {
+            Some(manifest) => {
+                state.manifests.insert(self.manifest_id, manifest);
+            }
+            None => {
+                state.manifests.remove(&self.manifest_id);
+            }
+        }
+        match self.previous_list_entry {
+            Some(entry) => {
+                state.list_entries.insert(self.list_key, entry);
+            }
+            None => {
+                state.list_entries.remove(&self.list_key);
             }
         }
     }

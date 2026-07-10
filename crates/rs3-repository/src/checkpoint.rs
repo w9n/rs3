@@ -9,7 +9,7 @@ use rs3_index::{
     ManifestObject, SealedIndexDeltaObject, index_delta_plaintext_bytes, manifest_plaintext_bytes,
 };
 use rs3_storage::BlobStore;
-use rs3_types::{BackendObjectId, ManifestId, Sequence};
+use rs3_types::{BackendObjectId, ManifestId};
 
 const INDEX_DELTA_ASSOCIATED_DATA: &[u8] = b"rs3:index-delta-object:v1";
 
@@ -39,15 +39,6 @@ where
                     .filter(|status| *status == rs3_types::LegalHoldStatus::On),
                 IndexDelta::Tombstone { .. } => None,
             }))
-    }
-
-    pub(crate) fn mark_index_deltas_published(&self, sequence: Sequence) -> Result<()> {
-        let mut state = self.write_state()?;
-        if state.next_sequence == sequence {
-            state.pending_index_deltas.clear();
-            state.pending_checkpoint_published_at_ms = None;
-        }
-        Ok(())
     }
 
     pub(crate) fn load_embedded_manifest_records(

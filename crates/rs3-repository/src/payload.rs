@@ -265,6 +265,17 @@ pub(crate) fn parse_segmented_payload_header(
     object_id: &BackendObjectId,
     body: &[u8],
 ) -> Result<SegmentedPayloadHeader> {
+    let total_len = u64::try_from(body.len()).map_err(|_| invalid_payload_object(object_id))?;
+    parse_segmented_payload_header_with_total_len(object_id, body, total_len)
+}
+
+/// Parses a segmented payload header from bounded prefix bytes while using the
+/// signed payload-section length for streamable plaintext-length derivation.
+pub(crate) fn parse_segmented_payload_header_with_total_len(
+    object_id: &BackendObjectId,
+    body: &[u8],
+    total_len: u64,
+) -> Result<SegmentedPayloadHeader> {
     let PayloadHeaderProbe::Segmented { header_len } = probe_payload_header(object_id, body)?
     else {
         return Err(invalid_payload_object(object_id));
@@ -286,7 +297,7 @@ pub(crate) fn parse_segmented_payload_header(
     let plaintext_len = match format {
         SegmentedPayloadFormat::LengthBearing => read_u64(object_id, &mut cursor)?,
         SegmentedPayloadFormat::Streamable => {
-            streamable_plaintext_len_from_body(object_id, body, header_len, chunk_size)?
+            streamable_plaintext_len_from_total_len(object_id, total_len, header_len, chunk_size)?
         }
     };
     let key_id = read_len_prefixed(object_id, &mut cursor)?;
@@ -310,6 +321,19 @@ pub(crate) fn parse_segmented_payload_header(
         nonce_prefix: prefix,
         header_len,
     })
+}
+
+fn streamable_plaintext_len_from_total_len(
+    object_id: &BackendObjectId,
+    total_len: u64,
+    header_len: usize,
+    chunk_size: u64,
+) -> Result<u64> {
+    let header_len = u64::try_from(header_len).map_err(|_| invalid_payload_object(object_id))?;
+    let ciphertext_len = total_len
+        .checked_sub(header_len)
+        .ok_or_else(|| invalid_payload_object(object_id))?;
+    streamable_plaintext_len_from_ciphertext_len(object_id, ciphertext_len, chunk_size)
 }
 
 /// Returns the contiguous ciphertext span required for a requested plaintext range.
@@ -911,17 +935,11 @@ impl SegmentedPayloadFormat {
     }
 }
 
-fn streamable_plaintext_len_from_body(
+fn streamable_plaintext_len_from_ciphertext_len(
     object_id: &BackendObjectId,
-    body: &[u8],
-    header_len: usize,
+    ciphertext_len: u64,
     chunk_size: u64,
 ) -> Result<u64> {
-    if body.len() < header_len {
-        return Err(invalid_payload_object(object_id));
-    }
-    let ciphertext_len =
-        u64::try_from(body.len() - header_len).map_err(|_| invalid_payload_object(object_id))?;
     if ciphertext_len == 0 {
         return Ok(0);
     }
@@ -997,8 +1015,9 @@ fn invalid_payload_object(object_id: &BackendObjectId) -> RepositoryError {
 mod tests {
     use super::{
         DEFAULT_PAYLOAD_SEGMENT_SIZE, PayloadHeaderProbe, open_payload_object,
-        parse_segmented_payload_header, probe_payload_header, seal_payload_object,
-        seal_streamable_payload_object, segmented_ciphertext_span,
+        parse_segmented_payload_header, parse_segmented_payload_header_with_total_len,
+        probe_payload_header, seal_payload_object, seal_streamable_payload_object,
+        segmented_ciphertext_span,
     };
     use crate::test_support::{backend_object_id, signing_keyring, wrong_content_keyring};
     use bytes::Bytes;
@@ -1101,6 +1120,28 @@ mod tests {
         let opened = open_payload_object(&keyring, &object_id, Bytes::from(body), ByteRange::Full);
 
         assert!(opened.is_err());
+    }
+
+    #[test]
+    fn streamable_payload_header_parses_from_a_bounded_prefix_and_signed_total_len() {
+        let keyring = signing_keyring();
+        let object_id = backend_object_id("v2-payload/bounded-header");
+        let body = seal_streamable_payload_object(
+            &keyring,
+            &object_id,
+            &vec![7_u8; DEFAULT_PAYLOAD_SEGMENT_SIZE * 3 + 17],
+            DEFAULT_PAYLOAD_SEGMENT_SIZE,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let full = parse_segmented_payload_header(&object_id, &body)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let prefix = &body[..full.header_len];
+        let total_len = u64::try_from(body.len()).unwrap_or_else(|error| panic!("{error}"));
+
+        let bounded = parse_segmented_payload_header_with_total_len(&object_id, prefix, total_len)
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(bounded, full);
     }
 
     #[test]
