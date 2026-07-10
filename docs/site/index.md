@@ -59,6 +59,13 @@ encryption boundaries, Kubernetes Lease anchoring, signed v2 commit publishing,
 restore-bundle workflows, retention-aware storage contracts, metrics, tracing,
 and performance measurement against a straight proxy baseline.
 
+The implemented commit generation under `commits/v01/` is now deprecated and
+has no production repositories. The replacement `commits/v02` catalog-and-run
+format is a design contract and is not implemented. Existing gateway and
+provider results remain regression evidence, but a repository release is
+blocked until the new format passes recovery, checkpoint, GC, retained-provider,
+and 1M-object scale gates. No migration or dual reader is planned.
+
 Do not treat the current repository format, cryptographic formats, or runtime
 defaults as production-stable yet.
 

@@ -101,6 +101,16 @@ exceeded`; the 1M tier reaches the same recovery failure. Consequently, 100k
 and 1M repository recovery remain production blockers. A successful write-only
 million-object run is not accepted as scale evidence.
 
+These measurements exercise the deprecated `commits/v01` prototype generation,
+not the unimplemented `commits/v02` target. `v02` qualification must use a fresh
+process and verify exact listing cardinality plus first, middle, and last object
+bytes. Its descriptor-first reader must retain no cumulative encrypted delta
+set, read no payload sections merely to rebuild the index, and use at most 1.25x
+the index material required by the accepted catalog. On the documented pinned
+4-vCPU, 16-GiB runner, the 1M filesystem recovery budget is 180 seconds and
+4 GiB RSS. Correctness, request, byte, allocation, and amplification bounds apply
+on every runner; absolute time gates apply only to pinned runners.
+
 ## Current Release Matrix
 
 Run date: 2026-07-10. Gateway profile: release. Payload segment lane:

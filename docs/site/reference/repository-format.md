@@ -1,289 +1,360 @@
 # Repository Format Reference
 
-The repository format is draft. This page records the current intended shape,
-not a compatibility promise.
+The repository format is draft. This page is the design contract for the next
+repository generation, `commits/v02`. It is not a compatibility promise and it
+does not describe a format that the gateway can read or write today.
+
+!!! warning "Implementation status"
+    The current prototype stores signed commits under `commits/v01/` and is
+    deprecated. No production repository depends on it, so `rs3` will not add a
+    migration path or a dual reader. The `commits/v02` reader, writer, index
+    catalog, compactor, and recovery gates described here remain to be
+    implemented. Until those gates pass, the current runtime is evaluation-only.
 
 ## Invariants
 
-- Backend object names are opaque.
+- Backend object names are opaque and never derived from logical paths.
 - Plaintext logical paths and Kubernetes names do not appear in backend keys,
-  tags, unauthenticated metadata, commit headers, metrics, or logs.
+  tags, unauthenticated metadata, signed headers, metrics, logs, or errors.
 - Privacy-sensitive metadata is encrypted and authenticated.
-- Commits are signed, monotonic, and selected by an external anchor.
-- Old data remains readable while any protected anchored commit can reference it.
+- Every accepted repository transition is a signed, monotonic commit selected
+  by an external anchor.
+- S3 listing order and mutable latest-object state are never authoritative.
+- Every retained restore-critical reference includes the exact provider object
+  version when the backend supplies version IDs.
+- Normal writes append a small delta. They do not rewrite the live namespace.
+- Recovery and maintenance have fixed input, allocation, request, and byte
+  bounds and fail closed before exceeding them.
+- Every protected anchor root keeps its exact index, payload, keyring, and
+  format-root dependencies reachable.
 - Provider retention is never shortened by `rs3`.
-- Retained restore-critical references are bound to provider object versions
-  when the backend supports version IDs.
 
-## Backend Object Classes
+## Format Generations
 
-The design uses a small number of non-secret classes:
-
-```text
-format/
-keyrings/
-commits/
-```
-
-The class leaks broad object type. That is currently accepted because it helps
-operations, lifecycle policy, and debugging. Hiding class prefixes would require
-a future format version.
-
-## v2 Preview
-
-`v2-preview` is the only repository format accepted by the current gateway. It
-is an evaluation format, not a stable compatibility target yet.
-
-Preview change control: after the current v2 preview evidence gate, changes to
-backend object classes, commit-key shape, signed header fields, section layout,
-anchor fields, keyring/format-root references, or provider-profile semantics
-must update this reference, the rationale/runbook text, and focused test
-vectors before implementation is considered complete. Treat undocumented
-format drift as a release blocker.
-
-v2 commit objects use random, path-private keys:
+The existing prototype uses keys of this form:
 
 ```text
 commits/v01/<20-digit-sequence>/<32-byte-random-id-base64url>
 ```
 
-The sequence segment is for bounded listing only. The accepted head is the
-external anchor's full commit key, body digest, provider version ID when
-required, and signing key ID. A v2 reader verifies the fixed header, header
-digest, canonical CBOR header, signed `self.commit_key`, Ed25519 signature,
-section layout, and body digest before trusting a commit.
-Current v2 writers pad the signed header span to 4 KiB, which gives readers a
-single bounded prefix read for commit-header fallback and a stable section
-region offset for hot-path payload refs. This is commit-header padding, not
-per-file payload padding: small payloads still use the adaptive payload segment
-policy and are not expanded to 4 KiB.
+That generation is deprecated and may be removed. It is not an input to the
+`v02` design, and initialization of a `v02` repository must fail if the chosen
+backend prefix is not demonstrably fresh. Importing or converting a `v01`
+repository is outside the product contract.
 
-The layout below shows the physical commit object and the anchored range-read
-path. A v2 commit object starts with a 64-byte fixed header, followed by
-canonical CBOR header bytes. In the default multipart-padded upload mode, the
-signed header span is padded to 4 KiB so readers know where the section region
-begins. The section region contains encrypted `PAYLOAD` sections and either
-`INDEX_DELTA` or `INDEX_SNAPSHOT` sections. Range reads use trusted index refs,
-including signed content length and encrypted payload-section length, verify
-the commit header, read exact retained versions when required, authenticate
-payload segments, and return only verified plaintext bytes.
+New repositories will use a distinct generation:
 
-<figure class="rv-figure">
-  <a class="rv-lightbox" href="../../assets/repository-v2-format-overview.png" aria-label="Enlarge v2 repository format overview diagram" aria-haspopup="dialog" data-rv-title="v2 repository format">
-    <picture>
-      <source srcset="../../assets/repository-v2-format-overview.webp" type="image/webp">
-      <img class="rv-diagram" src="../../assets/repository-v2-format-overview.png" width="1693" height="929" loading="lazy" decoding="async" alt="v2 commit object layout and anchored range-read flow. The trusted index entry supplies content length and payload-section length; payload sections live in the section region after multipart-only 4 KiB header padding.">
-    </picture>
-  </a>
-</figure>
+```text
+commits/v02/<20-digit-sequence>/<32-byte-random-id-base64url>
+objects/v02/<32-byte-random-id-base64url>
+```
 
-The retained-version/Object Lock provider profile does not require atomic
-`If-None-Match: *` support. It requires provider version IDs, exact-version
-`HEAD`/`GET`/range `GET`, visible retention or legal-hold state, and preserved
-old versions after a newer latest version exists.
+The sequence component bounds commit discovery and operational analysis. The
+random component prevents paths, namespace equality, and content identity from
+appearing in keys. `objects/v02/` contains independently sealed compacted index
+runs. Its keys do not distinguish index levels, tenants, paths, or workloads.
 
-Normal v2 delta commits contain zero or more encrypted `PAYLOAD` sections and
-one encrypted `INDEX_DELTA` section. Snapshot commits contain an
-`INDEX_SNAPSHOT` section. The encrypted index entries reference payload section
-offsets and lengths inside the same commit; once the commit is accepted, the
-reference is resolved to the anchored commit key, provider version ID when
-available, and commit body digest. v2 does not write repository payloads to
-backend `segments/`, nor does the current runtime read or write the older
-checkpoint/manifest backend object stack.
+The other backend-visible classes remain generic:
 
-The gateway uses commit batching knobs for v2. The default partial-batch wait
-is 25 ms. Concurrent client PUTs can stage multiple encrypted payloads and
-publish one signed v2 delta commit that covers all pending index updates; if
-commit publication or anchor advancement fails, the unaccepted in-memory
-namespace state is rolled back while the failed logical payload sequences
-remain reserved.
+```text
+format/
+keyrings/
+```
 
-v2 snapshot commits consolidate the live blinded namespace into an encrypted
-`INDEX_SNAPSHOT` section. Readers walk the signed parent chain only until the
-nearest snapshot, apply that full state, then replay newer delta commits. A
-snapshot writer first flushes any pending client-write batch so the snapshot
-chains from an accepted state. The explicit `rs3 write-index-snapshot` command
-writes a snapshot only when repository state satisfies its safety preconditions;
-otherwise it fails closed and reports the blocking condition.
+These class names, object counts, ciphertext sizes, provider version IDs, and
+write/compaction timing are accepted leakage. Plaintext catalog bounds, run
+levels, logical object counts, paths, and payload identities remain encrypted.
 
-Startup and disaster-recovery replay use a resource-bounded verifier. It reads
-the signed header by range, validates the provider-reported object length, and
-hashes every declared section in chunks of at most 8 MiB. Payload sections are
-verified but never retained by replay; only encrypted index delta or snapshot
-sections are kept long enough to rebuild namespace state. One replay fails
-closed before an over-budget allocation or body read when it would exceed any
-of these fixed preview limits:
+## Signed Commits
 
-- 4,096 commits before the nearest snapshot
-- 1 TiB of cumulative provider-reported commit-object bytes
-- 64 MiB of encrypted index sections retained for replay
+The accepted head is the external anchor's exact commit key, body digest,
+provider version ID when required, signing key ID, and format-root reference.
+A newest-looking key returned by `LIST` has no authority.
 
-The 1 TiB limit is an availability ceiling on cumulative verification I/O, not
-a memory allowance. The 8 MiB range chunk and 64 MiB retained-index limit are
-the memory bounds. These limits are deliberately fixed for the preview so an
-unsafe deployment value cannot silently weaken hostile-input handling.
-Maintenance reachability, retention planning, orphan analysis, and compaction
-planning consume this same sparse verified representation. Legacy APIs that
-explicitly request complete commit bodies are assembled from bounded ranges and
-fail closed before allocation above 64 MiB for one commit or 128 MiB for one
-materialized chain; production maintenance does not use those full-body APIs.
+A `v02` commit has a bounded fixed prefix followed by a canonical signed header
+and encrypted sections. The signed header covers:
 
-v2 quick maintenance verifies the anchor-selected commit chain, reports
-path-redacted orphan counts, and reports live commit versions whose provider
-retention should be renewed soon. Full GC dry runs add request and byte budgets,
-fully dead orphan bytes, retention/legal-hold blocked bytes, mixed accepted
-commit bytes that compaction can reclaim, compaction write-byte estimates, and
-retention-renewal request estimates. Conservative orphan GC can delete
-unanchored commit candidates only after reachability, visible retention,
-legal-hold, age, and same-sequence safety checks pass. Retained or legally held
-candidates are reported and skipped; retained-profile candidates with missing
-protection metadata are also skipped.
+- the format generation and required reader capabilities;
+- the commit sequence and exact self key;
+- the exact parent commit reference;
+- the active format-root and keyring-envelope references;
+- each section's type, ordinal, offset, encrypted length, and digest;
+- the complete commit-object length and body digest; and
+- the signing-key identifier and Ed25519 signature.
 
-`rs3 export-restore-bundle` is format-aware: for `v2-preview` it verifies the
-anchor-selected commit chain and exports the anchor state plus canonical
-offline-signature payload bytes as the normal DR weak-subjectivity bundle. If
-the external anchor is lost, `rs3 import-v2-anchor` recreates it from a trusted
-bundle only after checking an operator-supplied `--min-sequence` floor,
-verifying the offline Ed25519 signature when the selected provider profile is
-production, refusing stored commit sequences newer than the imported anchor
-unless `--force-rollback` is explicit, and verifying the named commit chain.
-`rs3 verify-bundle` performs the same floor, signature, format-root,
-keyring-envelope, and commit-chain verification as a no-write preflight.
-`rs3 check-v2-provider` runs the selected v2 provider-profile probes against the
-configured backend, including multipart upload behavior used by large streaming
-writes; retained governance profiles require an explicit operator review flag
-because gateway credentials must not be able to bypass retention.
+The header has a fixed maximum size. Readers reject non-canonical encodings,
+unknown required capabilities, overlapping sections, arithmetic overflow,
+duplicate ordinals, lengths outside the object, and trailing data not covered
+by the signed layout.
+
+Normal commits contain zero or more encrypted `PAYLOAD` sections and one
+encrypted `INDEX_RUN` section. A catalog checkpoint commit contains an
+encrypted `INDEX_ROOT` section. A checkpoint may also cover a final bounded
+mutation batch, but the catalog must describe the exact resulting state.
+
+Signed per-section descriptors are required for descriptor-first recovery. A
+reader can authenticate an index range without downloading unrelated payload
+sections. Payload ciphertext is authenticated when the referenced object is
+read. The whole-object digest remains an identity and maintenance check, not a
+reason to read every payload during startup.
 
 ## Payload Sections
 
-Payload sections are encrypted with XChaCha20-Poly1305. Commit-embedded v2
-payloads use a streamable segmented envelope: the payload header records the
-segment size, key ID, and nonce prefix, while the signed index entry records the
-total plaintext length and encrypted section length. Segment associated data
-binds ciphertext to the payload identity, segment size, segment index,
-segment-plaintext length, and final-segment marker.
+Payload sections use a segmented authenticated envelope. The encrypted index
+record stores the exact commit key and provider version, commit digest, section
+ordinal, encrypted offset and length, plaintext length, payload identity, key
+identifier, segment size, and nonce/header facts needed for bounded full and
+range reads.
 
-Segment size is recorded per payload section. The current writer default keeps
-small objects at 512 plaintext bytes per segment and uses larger segments for
-medium and large objects. This is a tuning policy, not a permanent format
-guarantee. Current writers also record the parsed payload-header facts and the
-commit section-region offset inside the encrypted index payload reference.
-Readers can therefore plan range reads from trusted index state and fetch only
-the overlapping encrypted segments on the hot path. Older or incomplete refs
-fall back to verifying the commit header and probing the payload header. Full
-file reads fetch the payload section, not the whole commit body.
+Segment associated data binds ciphertext to the format generation, repository
+context, payload identity, section ordinal, segment index, plaintext length,
+and final-segment marker. Moving a segment to another commit, section, payload,
+or ordinal must fail authentication.
 
-## Index State
+Segment size remains a writer policy recorded in each payload. Readers follow
+the authenticated header rather than assuming the current default. Padding is
+not part of the first `v02` contract; adding it requires a new capability and
+new leakage and amplification evidence.
 
-Namespace index state maps blinded logical names and prefix tokens to encrypted
-metadata needed for `HEAD`, `GET`, and `LIST`.
+## Framed Index Runs
 
-Metadata records are sealed with AES-256-GCM-SIV under the repository metadata
-key. Associated data is object-type specific: manifest records bind to the
-manifest ID, and index sections bind to the v2 commit key and section index.
-Anchored signed commits decide which sealed metadata is reachable repository
-state.
+`INDEX_RUN` is the append-friendly unit for namespace mutations. Runs are
+immutable, sorted, encrypted, and divided into independently authenticated
+bounded frames. A normal commit embeds one recent run. Compaction may write a
+run as an exact-version `objects/v02/` object and later make it reachable from
+an accepted catalog.
 
-Namespace entries reference the accepted commit key, provider version ID when
-available, commit body digest, payload identity, and payload section
-offset/length. New v2 refs also carry the payload segment size, plaintext
-length, payload key ID, nonce prefix, payload-header length, and section-region
-offset needed for one-range restore reads. Retained/Object Lock repository
-operation requires the provider version ID so restore can read the exact
-retained commit version even if the backend later presents a different latest
-version.
+Each mutation carries a monotonic logical generation and is one of:
 
-For retained-version providers, a same-key write may create another retained
-version instead of failing as a duplicate. The format does not treat latest
-object state as authoritative in that profile; anchored commit keys, provider
-version IDs, and digests decide reachable state.
+- an upsert containing the complete trusted metadata and exact payload
+  reference; or
+- a tombstone containing the blinded lookup key, encrypted logical path, and
+  generation.
 
-Index changes are append-friendly deltas covered by signed commits. Snapshot
-commits compact live namespace state, but they must preserve rollback and
-retention rules.
+The highest generation wins. Two different records for the same key and
+generation are corruption, not a tie to resolve by object order, timestamp, or
+provider listing.
 
-## Anchors
+Runs contain two encrypted projections:
 
-The external v2 anchor records the accepted commit sequence, commit key, commit
-body digest, provider version ID when available, signing key ID, and format-root
-reference. It is the latest-state authority. A backend listing, a newest-looking
-commit key, or retained object history is never enough to advance repository
-state without the anchor.
+- a namespace projection sorted by the secret-derived lookup key for `HEAD`
+  and `GET`; and
+- a listing projection sorted by logical path for ordered prefix listing inside
+  the trusted gateway.
 
-Anchors must fail closed. If the anchor cannot be read, cannot be advanced, or
-does not match the verified commit chain, the gateway must not silently accept
-newer-looking backend state. Disaster recovery uses a trusted v2 restore bundle,
-an external operator `--min-sequence` floor, and an offline recovery signature
-for production profiles, then verifies the named commit chain before recreating
-the anchor.
+Logical paths and projection bounds exist only in authenticated ciphertext.
+`v02` does not persist prefix-token objects or path-shaped keys. A reader may
+initially materialize a compact in-memory state, but the durable layout must
+also permit a future bounded local cache and range-selected frames without a
+format change.
 
-## Keyrings
+The first generation uses canonical length-delimited records and no
+compression. Each ciphertext frame and run has an explicit record and byte
+limit; the target maximum encrypted run object is 8 MiB. Index-frame associated
+data binds at least the format generation, exact containing object key and
+version, section ordinal, run identity, and frame ordinal. Reordering,
+duplicating, or transplanting frames must fail authentication.
 
-The repository uses purpose-specific keys for:
+## Small Signed Index Roots
 
-- namespace PRF
-- content encryption
-- metadata and index encryption
-- Ed25519 commit signing
+An `INDEX_ROOT` is a small encrypted catalog, not a serialized copy of the live
+namespace. It records:
 
-New writes use primary keys. Reads and replay accept enabled historical keys
-until retention policy and repository reachability allow retirement. Data-key
-rotation adds a fresh primary key for one purpose and demotes the previous
-primary to enabled historical use.
+- the repository sequence covered by the catalog;
+- the expected logical-object count;
+- active immutable run references and their non-secret identities;
+- encrypted generation and projection bounds used by the reader;
+- run level and compaction generation;
+- each run's exact object key, provider version, length, digest, and section or
+  frame layout;
+- the active format-root and keyring-envelope references; and
+- required reader capabilities and absolute resource ceilings.
 
-The preferred bootstrap shape is to use an operator-provided repository ID and
-public salt, generate random purpose-specific data keys, and store them in an
-encrypted keyring envelope under a counted `keyrings/` object. The wrapping-key
-source, such as a KMS key or high-entropy wrapping key, stays outside the
-repository. The encrypted v2 format root binds the active envelope by
-generation, object ID, provider version ID when available, and digest so a
-backend cannot silently swap envelopes. The envelope is format-root-bound and
-commit-referenced, not embedded in every commit.
+Recent runs may be sections of exact accepted commit versions. Compacted runs
+are independently sealed `objects/v02/` versions. The catalog authenticates
+the complete active run set, so backend listing visibility and ordering are not
+part of recovery.
 
-Wrapping-key rewrap preserves the same repository data keys. It is useful for
-moving the wrapping-key source or retiring a clean wrapping key, but it is not
-recovery from exposure of an old wrapping key plus the old envelope bytes.
+Size-tiered compaction merges several similarly sized immutable runs into a
+bounded set of larger, sharded runs. This intentionally favors low write
+amplification for append-heavy backup ingestion over the lowest possible point
+read amplification. Compaction never rewrites payloads merely to consolidate
+the namespace.
 
-Repository-local orphan cleanup is reachability and retention aware. It derives
-candidates from the accepted commit chain plus any operator-supplied protected
-historical roots, skips objects with known retention or legal hold, and treats
-provider retention or legal-hold delete failures as blocked cleanup rather than
-as successful deletion. Historical roots are explicit inputs to maintenance:
-without an explicit discard, their reachable commits remain protected from
-orphan deletion.
+## Descriptor-First Recovery
 
-Retention renewal is currently planned, not applied, by v2 full-maintenance dry
-runs. The planner inspects current and protected-root commit versions and
-includes needed retention-extension calls in the reported budgets. Compaction
-apply writes a new snapshot commit through a temporary anchor, verifies it with
-a fresh reader, then adopts that exact commit into the real anchor and leaves
-old source commits for retention-aware orphan GC. Replacement-root rewriting
-remains intentionally deferred.
+Cold recovery starts only from the external anchor:
 
-Initial empty repositories are initialized by writing an encrypted keyring
-envelope, an encrypted format root, and a genesis commit. Existing anchored
-repositories open through the format-root and commit-chain references inside
-the accepted anchor, not through S3 listing order or a mutable latest pointer.
+1. Read and verify bounded signed commit headers from the anchored head back to
+   the newest accepted `INDEX_ROOT`.
+2. Retain compact descriptors, not commit bodies or cumulative encrypted index
+   sections.
+3. Open the catalog and every named run by exact key and provider version.
+4. Verify and apply one bounded frame at a time, resolving records by generation
+   into one accepted state.
+5. Replay post-catalog commit runs oldest to newest, again retaining at most one
+   bounded frame beyond the accepted state.
+6. Verify catalog cardinality and structural invariants, then sample exact
+   payload references as required by the recovery gate.
+7. Re-read the external anchor before installing the recovered state. If it
+   changed, discard the candidate and retry within a bounded policy.
 
-In retained/Object Lock mode, keyring envelopes, format roots, and commit
-objects must all return provider version IDs at write time. Missing version IDs
-are treated as provider capability failures, because retained restore cannot
-depend on mutable latest-object reads.
+Recovery does not read payload sections merely to rebuild the index. Missing
+versions, missing frames, malformed records, digest failures, AEAD failures,
+generation conflicts, catalog-count mismatches, resource-ceiling violations,
+or anchor drift all fail closed.
 
-Commit-signing descriptors include the Ed25519 public verification key so commit
-headers can be verified without exposing signing material.
+The runtime keeps one accepted compact state plus a bounded pending-mutation
+overlay. Unaccepted writes never mutate accepted state. Successful anchor
+publication applies the overlay once; failed publication discards it. Startup
+must not clone a second complete repository state.
 
-See [Cryptography](cryptography.md) for primitive choices, nonce rules, and
-known preview limits.
+## Automatic Catalog Checkpoints
+
+The writer must keep every accepted head inside its recoverable envelope.
+Checkpointing therefore runs automatically under the same live Kubernetes
+writer fence used for anchor advancement.
+
+Initial engineering watermarks are:
+
+| State | Commit tail after catalog | Encrypted tail index bytes |
+| --- | ---: | ---: |
+| Checkpoint requested | 1,000 | 32 MiB |
+| Operationally degraded | 2,000 | 48 MiB |
+| New mutations paused | 3,000 | 64 MiB |
+| Absolute verifier ceiling | 4,096 | 96 MiB |
+
+The active-run reference budget starts at 256 for checkpointing, 512 for
+degraded posture, 768 for write pause, and an absolute verifier ceiling of
+1,024. Measurements may lower the operational watermarks before format freeze;
+raising an absolute reader ceiling requires a format and hostile-input review.
+
+If checkpointing repeatedly fails, already accepted reads remain available.
+Writes may continue only until the pause watermark. At that point new mutations
+receive a path-safe service-unavailable response, readiness and admin posture
+report the write-blocked state, and the anchor is not advanced into an
+unrecoverable tail. Failure never silently raises a limit or accepts a
+newer-looking backend candidate.
+
+## Checkpoint Publication
+
+Compaction and catalog publication use this order:
+
+1. Capture the accepted anchor and live writer fence.
+2. Stream-merge selected runs with bounded buffers.
+3. Upload replacement runs under random opaque keys.
+4. Verify exact provider version, length, digest, retention, and legal-hold
+   posture for every candidate run.
+5. Write the signed catalog checkpoint commit.
+6. Open the candidate through a fresh reader and verify state cardinality and
+   selected payload reads.
+7. Recheck the writer fence and unchanged anchor.
+8. Advance the real anchor with one resource-version CAS that also checks the
+   fence identity and token.
+9. Install the accepted catalog and state.
+10. Leave replaced and failed candidate objects for conservative orphan GC.
+
+Uploading a run does not make it reachable. Only the fenced anchor CAS makes
+the signed catalog an accepted root. Delayed list visibility, duplicate
+versions, and abandoned uploads are therefore availability and cleanup
+concerns, not state-selection mechanisms.
+
+## Reachability, Retention, and GC
+
+The authoritative reachability graph starts from the current anchor and every
+explicitly protected historical anchor. For each root it includes:
+
+- the exact catalog and post-catalog commit versions;
+- the exact active index-run versions;
+- the exact payload commit versions selected by effective live index records;
+- the active format root and keyring envelopes; and
+- keys needed to authenticate or decrypt those objects.
+
+A live payload reference protects its exact containing commit version. It does
+not recursively protect every ancestor merely because the payload was first
+written in an old commit. GC resolves active runs by generation before deriving
+these exact payload roots. Conservative over-retention is permitted when a mark
+cannot be proven complete; deletion on an incomplete or ambiguous mark is not.
+
+GC must finish the whole mark phase before deleting, fail closed on missing or
+malformed reachable data, treat unknown retention or legal-hold state as
+protected, recheck the maintenance fence and anchor before every deletion, and
+delete exact versions only. Prepared but unaccepted objects remain protected
+until the configured orphan-age floor passes. Retention-renewal planning
+includes catalogs, runs, payload commits, format roots, and keyring envelopes.
+
+Payload repacking is a separate future operation. Index checkpointing and
+compaction must not copy every live payload.
+
+## Anchors and Writer Coordination
+
+The Kubernetes Lease remains the sole production writer-coordination and
+latest-state authority. Failover gateways in one apiserver coordination domain
+may acquire a new monotonic fence epoch. Every anchor advance verifies the
+current owner and fence token in the same Lease `resourceVersion` CAS.
+
+Disconnected or partitioned writers that only share S3 are unsupported. S3
+conditional object creation can prevent one key collision, but it cannot order
+repository-wide state, fence a stale writer, or safely merge two encrypted
+namespace histories. Object-store listing and timestamps cannot fill that gap.
+A future disconnected multi-writer mode would require explicit branches,
+authenticated merge semantics, deterministic conflict policy, and a different
+repository contract. `v02` has no such mode.
+
+Anchors fail closed. If an anchor cannot be read, renewed, advanced, or matched
+to the verified graph, the gateway must not accept newer-looking repository
+state. Disaster recovery requires a trusted bundle, an external minimum
+sequence floor, and offline authorization before recreating a missing anchor.
+
+## Keyrings and Initialization
+
+The repository uses separate namespace-PRF, content-encryption,
+metadata/index-encryption, and Ed25519 commit-signing keys. New writes use the
+primary key for each purpose. Reads accept enabled historical keys while any
+protected root requires them.
+
+Initialization creates random purpose-specific keys, seals them in a keyring
+envelope under an external high-entropy wrapping-key source, writes an encrypted
+`v02` format root, and publishes a genesis catalog commit. The format root binds
+the exact envelope generation, key, provider version, and digest. In retained
+mode, every restore-critical initialization write must return a provider version
+ID.
+
+Initialization is permitted only on a verified fresh prefix. Detection of
+deprecated `v01` objects, an existing anchor, an existing format root, or
+ambiguous listing state fails closed. There is no automatic import, overwrite,
+or migration behavior.
+
+Wrapping-key rewrap preserves repository data keys and is not compromise
+recovery. Historical keys may be retired only after reachability and retention
+prove that no protected root requires them.
+
+## Implementation and Qualification Gates
+
+Before `commits/v02` can replace the deprecated prototype, implementation must
+include:
+
+- canonical encoding, crypto, corruption, and cross-object transplant vectors;
+- descriptor and frame parsers with fixed hostile-input budgets and fuzzing;
+- fresh-process 10k, 100k, and 1M committed-write recovery gates that verify
+  exact cardinality plus first, middle, and last payload bytes;
+- a 1M filesystem recovery target of at most 180 seconds and 4 GiB RSS on the
+  documented 4-vCPU, 16-GiB runner;
+- no payload reads during normal index recovery and at most 1.25x index byte
+  read amplification;
+- checkpoint crash, stale-fence, delayed-read, replay, deletion, and exact
+  provider-version fault tests;
+- GC tests proving exact payload reachability across overlapping runs,
+  tombstones, protected roots, and failed compactions; and
+- a retained-provider restart and writer-handoff qualification run.
+
+Absolute time limits are enforced only on pinned runners. Correctness,
+allocation, request, byte, and amplification ceilings apply everywhere.
 
 ## Compatibility Promise
 
-There is no stable repository-format promise yet. The production-preview target
-is an evaluation contract, not a durable repository-format guarantee. Before a
-stable format, the project still needs final decisions for:
-
-- canonical metadata encoding
-- default segment-size policy
-- index compaction thresholds
-- padding policy
-- KMS/HSM/Vault wrapping-key integration workflow
+There is no stable repository-format promise yet. `commits/v01` is deprecated
+without migration support. `commits/v02` is a fresh, currently unimplemented
+format target. Its wire details freeze only after the implementation,
+cryptographic review, scale gates, retained-provider evidence, and recovery
+runbooks all pass together.

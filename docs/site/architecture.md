@@ -6,10 +6,11 @@ provider-neutral storage boundary.
 The overview below shows the three important boundaries. S3 backup clients call
 the gateway through the S3 API. Inside the trusted gateway process, the
 compatibility layer, namespace mapping, payload encryption, encrypted index
-state, signed v2 commit publication, and path-redacted admin facts stay under
-operator control. The gateway writes encrypted `format/`, `keyrings/`, and
-`commits/` objects to the backend and reads or advances a separate Kubernetes
-Lease anchor. `rs3-console` only reads path-redacted admin posture and status.
+state, signed commit publication, and path-redacted admin facts stay under
+operator control. The gateway writes encrypted `format/`, `keyrings/`,
+`commits/`, and compacted `objects/` to the backend and reads or advances a
+separate Kubernetes Lease anchor. `rs3-console` only reads path-redacted admin
+posture and status.
 
 <figure class="rv-figure">
   <a class="rv-lightbox" href="../assets/architecture-overview.png" aria-label="Enlarge rs3 architecture overview diagram" aria-haspopup="dialog" data-rv-title="Architecture overview">
@@ -35,7 +36,7 @@ state.
 | `rs3-crypto` | Key derivation, encryption, metadata sealing, payload envelopes, and commit signatures. |
 | `rs3-storage` | Provider-neutral object-store trait, local stores, S3 adapter, retention contracts. |
 | `rs3-index` | Durable index and repository state model. |
-| `rs3-repository` | Namespace, payload, v2 anchor contracts, commit, replay, maintenance, and commit coordination. |
+| `rs3-repository` | Namespace, payload, anchor contracts, commit, replay, maintenance, and commit coordination. |
 | `rs3-k8s` | Kubernetes Lease anchor integration surface. |
 | `rs3-server` | Gateway process, configuration, identity, S3 boundary, core admin reports, metrics, and shutdown. |
 | `rs3-console` | Read-only single-gateway operations UI over the authenticated admin report. |
@@ -46,34 +47,53 @@ not add ad hoc hashing, MAC, encryption, or key derivation logic.
 
 ## Repository State
 
+!!! warning "Format implementation status"
+    The implemented preview generation stores commits under `commits/v01/` and
+    is deprecated. It has no production repositories and will not gain a
+    migration path or dual reader. The `commits/v02` architecture below is the
+    replacement contract, not functionality available in the gateway yet.
+
 Normal writes are append-friendly:
 
-1. Stage encrypted payload and index delta sections.
-2. Publish a signed v2 commit under a random path-private key.
+1. Stage encrypted payload sections and one compact framed index run.
+2. Publish a signed `v02` commit under a random path-private key.
 3. Advance the external commit anchor.
 4. Acknowledge the client write only after the covering commit is accepted.
 
 This avoids rewriting many backend objects during normal operation and gives
 crash recovery a concrete boundary.
 
-The current gateway has one repository runtime: `v2-preview`. The older
-checkpoint/manifest repository stack is no longer part of the server runtime,
-so compatibility, maintenance, and recovery behavior are described in terms of
-the v2 signed commit chain.
+`v02` replaces monolithic index snapshots with an encrypted LSM-style index.
+Recent immutable runs live in exact accepted commit versions. Size-tiered
+compaction stream-merges runs into bounded, sharded objects under random
+`objects/v02/` keys. A small signed `INDEX_ROOT` catalog names the complete
+active run set. It does not serialize every live path and never copies payloads
+merely to checkpoint the index.
 
-`v2-preview` stores payload and index-delta sections inside the signed commit
-chain. Concurrent PUTs can batch into one signed delta commit. Periodic index
-snapshot commits consolidate the live blinded namespace so cold-start replay
-walks only from the accepted anchor back to the nearest snapshot.
+The runtime keeps one accepted compact state plus a bounded pending-mutation
+overlay. Publication failure discards that overlay instead of rolling back a
+second full state copy. This preserves commit atomicity without doubling
+steady-state namespace memory.
+
+Cold recovery is descriptor-first. It walks bounded signed headers from the
+anchor to the newest catalog, then verifies and applies one encrypted index
+frame at a time. Signed section descriptors let recovery authenticate index
+ranges without downloading unrelated payload sections. The recovered state is
+installed only after a final anchor recheck.
+
+Automatic checkpointing keeps the accepted commit tail, encrypted tail bytes,
+and active-run count below fixed verifier ceilings. If checkpointing cannot keep
+up, the gateway reports degraded posture and eventually pauses new mutations
+before it can anchor an unrecoverable state. Already accepted reads remain
+available.
 
 The state-flow view below separates the normal write path from the restore read
 path. A normal write blinds the namespace lookup, encrypts payload segments,
-stages payload plus index-delta sections, publishes a signed v2 commit, advances
-the external anchor, and only then acknowledges the client write. A restore read
-starts from trusted anchor state, verifies the signed chain, loads the nearest
-snapshot and newer deltas, finds the encrypted payload reference, range-reads
-the exact retained version when required, verifies AEAD segments, and returns
-restored bytes.
+stages payload plus an index run, publishes a signed commit, advances the
+external anchor, and only then acknowledges the client write. A restore read
+starts from trusted anchor state, verifies the signed catalog and runs, finds
+the exact encrypted payload reference, range-reads the retained version when
+required, verifies AEAD segments, and returns restored bytes.
 
 <figure class="rv-figure">
   <a class="rv-lightbox" href="../assets/architecture-state-flow.png" aria-label="Enlarge rs3 write and restore state flow diagram" aria-haspopup="dialog" data-rv-title="Write and restore flow">
@@ -94,13 +114,20 @@ Logical lookup uses secret-derived namespace tokens inside the trusted gateway.
 Directory listing is answered from repository index state, not by exposing
 client paths as backend object keys.
 
+In `v02`, encrypted runs carry a blinded lookup projection and a plaintext-path
+listing projection inside authenticated ciphertext. Run keys, public metadata,
+and signed headers expose neither paths nor plaintext projection bounds. The
+deprecated preview's durable prefix-token representation is not carried into
+the replacement format.
+
 ## Rollback Resistance
 
 The object store can preserve encrypted bytes, but it cannot establish that it
 served the latest valid commit. `rs3` therefore separates storage durability
 from latest-state authority:
 
-- Object store: encrypted keyring envelopes, format roots, and signed commits.
+- Object store: encrypted keyring envelopes, format roots, signed commits, and
+  independently sealed index runs.
 - External anchor: monotonic latest commit sequence and digest.
 - Gateway: verification, replay, and fail-closed behavior when the anchor
   cannot be trusted.
@@ -108,10 +135,31 @@ from latest-state authority:
 Provider retention and Object Lock are useful for preventing deletion of object
 versions. They do not replace commit signatures or external anchors.
 
-For `v2-preview`, the external anchor stores the accepted commit key, body
-digest, provider version ID when needed, signing key ID, and active format-root
-reference. Anchor import from a trusted v2 bundle verifies the signed chain
-before recreating a missing anchor.
+For `v02`, the external anchor stores the accepted commit key, body digest,
+provider version ID when needed, signing key ID, and active format-root
+reference. Recovery derives the exact catalog, run, and payload graph from that
+root. Anchor import from a trusted bundle verifies the graph before recreating
+a missing anchor.
+
+Catalogs and effective index records are exact reachability roots. Maintenance
+marks the exact catalog and run versions plus the exact payload commit versions
+selected by live records. A payload reference does not keep its commit's entire
+ancestry reachable. GC completes a fail-closed mark before any deletion and
+rechecks both the maintenance fence and anchor before deleting an exact version.
+
+## Writer Coordination
+
+Read-write failover is supported only inside one Kubernetes apiserver and Lease
+coordination domain. The writer owns a monotonic fence epoch on the anchor Lease,
+and the same resource-version CAS checks that fence when advancing the anchor.
+Checkpointing and compaction use the same authority.
+
+Disconnected writers that merely share S3 are unsupported. Conditional object
+creation can prevent a collision at one key, but it cannot fence a stale writer,
+order repository-wide state, or merge divergent encrypted namespace histories.
+S3 listing and timestamps are not coordination primitives. A future
+disconnected mode would need explicit branches, authenticated merge semantics,
+and deterministic conflict policy in a different repository contract.
 
 Payload segment size is per object. The default writer keeps small objects at
 512 B segments and raises medium and large objects to larger authenticated

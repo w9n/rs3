@@ -18,6 +18,7 @@ is untrusted or partially compromised.
   compromised.
 - Making S3 Object Lock behave like a repository-wide latest-state oracle.
 - Supporting every S3 operation in the first compatibility profile.
+- Coordinating or merging disconnected writers through S3 alone.
 
 ## Adversaries
 
@@ -50,7 +51,7 @@ labels, traces, commit headers, and error messages.
 
 ## Accepted Leakage
 
-The default design accepts specific backend-visible leakage:
+The replacement `v02` design accepts specific backend-visible leakage:
 
 | Leakage | Why It Exists | Current Mitigation |
 | --- | --- | --- |
@@ -59,18 +60,25 @@ The default design accepts specific backend-visible leakage:
 | Coarse write and restore timing | The provider sees requests arrive. | Avoid path labels in telemetry; future batching/jitter where useful. |
 | Retention mode | Provider retention APIs expose mode and retain-until behavior. | Treat retention mode as policy metadata, not tenant identity. |
 | Source network metadata | The provider sees the gateway's network identity. | Deploy through controlled egress where required. |
-| Broad object class | Class prefixes support lifecycle and operations. | Keep class names generic and path-free; revisit in a new format if needed. |
-| Transient v2 staging identifier | In-process namespace state temporarily uses `v2-pending/<sequence>` before the final accepted commit key is known. | The placeholder is rewritten before durable index deltas are sealed and is not a backend object class; keep it out of logs, metrics, and errors. |
-| Deterministic metadata equality | Stable metadata sealing can produce identical sealed bytes for identical metadata under identical associated data. | Use object-type-specific associated data and signed reachability; revisit before stable-format claims. |
-| Prefix-token structure | Current prefix tokens reveal token count and shared-token relationships. | Document as an open privacy risk; redesign index compaction before stable-format claims. |
+| Broad object class | `format/`, `keyrings/`, `commits/v02/`, and `objects/v02/` support lifecycle and operations. | Keep class names generic and path-free; standalone run keys do not reveal level, tenant, or workload. |
+| Commit sequence and run inventory | Sequence-bounded commit keys and immutable run objects expose commit and compaction activity. | Batch commits, use random object IDs, keep catalog counts, levels, and bounds encrypted. |
+| Compaction cadence | The provider sees standalone run writes and later cleanup. | Use bounded size tiers and optional compaction jitter; never include paths in scheduling telemetry. |
+| Deterministic metadata equality | Stable metadata sealing can produce identical sealed bytes for identical metadata under identical associated data. | Bind framed ciphertext to a unique run and frame context; complete equality analysis before format freeze. |
 
 Optional mitigations include padding, pack-size normalization, commit batching,
 compaction jitter, and stricter telemetry redaction.
 
-Current backend-visible object key classes are `format/`, `keyrings/`, and
-`commits/v01/<sequence>/<random-id>`. The `v2-pending/<sequence>` shape is a
-trusted-process placeholder used only while a write is unaccepted; it should not
-become a persisted backend key or telemetry label.
+The deprecated prototype currently uses `format/`, `keyrings/`, and
+`commits/v01/<sequence>/<random-id>`. Its durable prefix tokens and the trusted
+process's `v2-pending/<sequence>` placeholder are not part of `v02`. No
+production repository uses the deprecated generation, and no migration or dual
+reader is planned.
+
+!!! warning "Security implementation status"
+    The `v02` controls below are requirements, not current evidence. The gateway
+    does not yet read or write `commits/v02` catalogs or `objects/v02` runs.
+    Security claims for that generation remain blocked on implementation,
+    hostile-input tests, scale recovery, and external cryptographic review.
 
 ## Control Map
 
@@ -93,6 +101,10 @@ become a persisted backend key or telemetry label.
 | Incident restore does not advance repository state | `restore-readonly` mode requires an accepted anchor and rejects supported mutations. | Gateway mode config, startup, and S3 adapter tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
+| v02 index frames cannot be transplanted or reordered | Frame AEAD binds format generation, exact object version, section ordinal, run identity, and frame ordinal; signed descriptors bind range digests. | Required for v02; not implemented. |
+| v02 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery applies one bounded authenticated frame at a time from an exact signed catalog. | Required for v02; 100k and 1M fresh-recovery gates currently block release. |
+| v02 checkpoint failure cannot anchor unrecoverable state | Fenced automatic checkpointing degrades, then pauses mutation before fixed tail-byte, commit, or run-count ceilings. | Required for v02; not implemented. |
+| v02 GC retains every live payload without retaining whole ancestry | Effective run records mark exact payload commit versions; full mark completes before exact-version sweep. | Required for v02; not implemented. |
 
 ## Rollback Rule
 
@@ -102,7 +114,8 @@ A commit is acceptable only when:
 - its sequence is not lower than the locally trusted sequence
 - its body digest matches the external anchor when an anchor exists
 - its provider version matches the external anchor when the anchor carries one
-- its parent reference is valid or it is a trusted snapshot root
+- its parent reference is valid or its accepted `INDEX_ROOT` catalog covers the
+  declared sequence
 - its format-root and keyring-envelope references match the configured
   repository context
 
@@ -126,14 +139,20 @@ ownership changes or renewal is no longer trustworthy, the gateway shuts down.
 An orderly shutdown releases ownership with another Lease CAS so unfenced
 maintenance can run while no writer is active. Unfenced maintenance refuses to
 advance a Lease with an active writer epoch. This guard is runtime coordination,
-not a replacement for signed commits or the external v2 anchor.
+not a replacement for signed commits or the external anchor.
 
-For `v2-preview`, the external anchor names the accepted commit key, body
-digest, provider version ID when required, signing key ID, and format-root
-reference. Normal disaster recovery requires a trusted exported bundle;
-`import-v2-anchor` verifies the named signed chain to the nearest snapshot
-before recreating a missing anchor. Missing anchor plus missing trusted bundle
-is fail-closed for normal recovery.
+For `v02`, the external anchor names the accepted commit key, body digest,
+provider version ID when required, signing key ID, and format-root reference.
+The named commit authenticates the small index catalog, exact active run set,
+and exact live payload references. Descriptor-first recovery verifies that
+graph and rechecks the anchor before installing state. Missing anchor plus
+missing trusted bundle is fail-closed for normal recovery.
+
+S3 is not a writer lock. A conditional create can arbitrate one object key but
+cannot fence a stale gateway or establish an order between divergent repository
+roots. Read-write failover is supported only under one Kubernetes Lease
+coordination domain. Disconnected S3-only writers are rejected; safely adding
+them would require authenticated branches and merge semantics outside `v02`.
 
 ## Object Lock Rule
 
@@ -141,13 +160,14 @@ Object Lock protects object versions from deletion or overwrite before their
 retention deadline. It does not prevent a backend from presenting an older valid
 version as latest, and it does not make a latest pointer trustworthy by itself.
 
-Use Object Lock for retained commit objects, keyring envelopes, and format
-roots. Do not use it as the only anti-rollback mechanism.
+Use Object Lock for retained commit objects, standalone index runs, keyring
+envelopes, and format roots. Do not use it as the only anti-rollback mechanism.
 
 In retained/Object Lock mode, `rs3` requires the backend to return a provider
-version ID for restore-critical writes. The v2 anchor binds the accepted commit
-version and format-root version, and commit headers bind parent commit versions
-and keyring envelope versions. Restore reads exact versions. If a retained
+version ID for restore-critical writes. The anchor binds the accepted commit
+version and format-root version, while catalog and commit descriptors bind exact
+index-run, parent-commit, payload-commit, and keyring-envelope versions. Restore
+reads exact versions. If a retained
 write does not return a version ID, startup or write flow must fail closed;
 otherwise a malicious backend could append a newer object version and make
 restore follow mutable latest state.
@@ -165,7 +185,8 @@ anchor-bound versions remain exactly readable. The object key is then not the
 uniqueness authority; the signed commit, external anchor, object digest, and
 provider version ID are.
 
-In `v2-preview`, commit keys include a random component. For retained-version
+In both the deprecated prototype and `v02`, commit keys include a random
+component. For retained-version
 providers that do not support atomic create, the writer performs a preflight
 `HEAD` and binds the accepted object version into the anchor. A same-sequence
 or orphaned retained commit is reported and skipped by automatic GC until
@@ -206,10 +227,11 @@ single-writer compatibility probes, but it is not atomic and does not protect
 against a provider that races requests, serves stale state, or ignores
 conditional headers.
 
-`rs3 check-v2-provider` runs the selected v2 profile probes against the
+`rs3 check-v2-provider` currently runs the selected prototype profile probes against the
 configured backend, including multipart upload behavior used by large
 streaming writes. Governance-retention deployments require an explicit operator
-review that gateway credentials cannot bypass retention.
+review that gateway credentials cannot bypass retention. It must be extended to
+cover exact standalone run versions before it qualifies `v02`.
 
 ## Operator Reporting Rule
 
@@ -262,12 +284,17 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
 
 ## Current Open Risks
 
+- `v02` is a design contract and is not implemented; the deprecated prototype
+  is not a production format.
 - Durable format compatibility is not promised yet.
 - The cryptographic design has not had an external review.
 - Metadata sealing uses a standard misuse-resistant AEAD, but deterministic
   sealing leaks equality for identical metadata under identical associated data.
-- Prefix token shape currently prioritizes semantics and testability; it still
-  leaks namespace structure through token count and shared-token relationships.
+- The deprecated generation's prefix tokens leak namespace structure through
+  token count and shared-token relationships. `v02` removes durable prefix
+  tokens, but that property still needs tests.
+- Catalog compaction, exact payload-root GC, and failure backpressure have not
+  passed adversarial crash, replay, and stale-fence testing.
 - Retained backend history depends on provider retention or Object Lock to
   resist deletion by a storage administrator.
 - Key retirement remains retention-aware and must not remove material still

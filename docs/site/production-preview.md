@@ -1,4 +1,4 @@
-# V2 Production Preview
+# Production Preview
 
 The first release target is a production preview for Kubernetes operators who
 store backups on S3-compatible infrastructure they do not fully trust. The main
@@ -7,6 +7,14 @@ it is the compatibility substrate.
 
 The preview defines the behavior to evaluate. It is not a stable
 repository-format promise.
+
+!!! danger "Repository release is currently blocked"
+    The implemented `commits/v01` preview generation is deprecated and has no
+    production repositories. The replacement `commits/v02` catalog-and-run
+    format is not implemented. Existing compatibility and provider results are
+    useful regression evidence for the gateway, but they do not qualify `v02`
+    or a production repository release. There will be no `v01` migration or
+    dual-reader requirement.
 
 ## Preview Scope
 
@@ -82,12 +90,13 @@ one. The backend can still deny service by hiding required objects.
 | --- | --- |
 | Empty backend prefix and no anchor | Startup may initialize one generated keyring envelope only when repository initialization is explicitly enabled using the supplied repository ID, salt, and wrapping-key source. An envelope object ID is optional override state, not normal Helm state. |
 | Existing backend prefix and matching anchor | Open after signed commit-chain, format-root, and envelope validation. |
+| Fresh initialization finds deprecated `commits/v01` objects or ambiguous existing state | Fail closed. `v02` initialization does not import, migrate, overwrite, or adopt the old generation. |
 | Backend serves an older commit than the Lease anchor | Fail closed as rollback. |
 | Backend hides the commit named by the Lease anchor | Fail closed as unavailable or tampered. |
 | Backend adds unrelated objects | Ignore them unless signed and reachable from anchored state. |
 | Backend overwrites format, keyring, commit, metadata, or payload bytes | Reject through native create-only write checks, signed/digested state, AEAD authentication, or retained-version exact reads. S3 providers qualify through either `atomic-create` or `retained-version`; `HEAD` before `PUT` is not a production fallback. |
 | Backend contains commits newer than the Lease anchor | Do not silently advance. Treat as ambiguous until explicit recovery validates a trusted bundle or a separately approved anchor decision. |
-| Lease missing but backend objects exist | Do not silently trust storage. Require a trusted v2 recovery bundle and verify the named commit chain before recreating the anchor. |
+| Lease missing but backend objects exist | Do not silently trust storage. Require a trusted generation-matched recovery bundle and verify the exact catalog, run, and payload graph before recreating the anchor. |
 | Multiple gateways serve the same repository as `read-write` | Supported only as failover within one Kubernetes apiserver and anchor-Lease coordination domain. A gateway acquires a unique fenced writer epoch on the anchor Lease itself; every anchor advance verifies that epoch atomically, and the gateway shuts down if renewal is no longer trustworthy. Disconnected writers that only share S3 are unsupported. |
 | Gateway started as `restore-readonly` without an accepted anchor | Fail closed. Run explicit anchor recovery first, then serve restore traffic. |
 | Healthy Velero restore through the primary path | Run through the single `read-write` gateway so Velero restore-result artifacts are committed and the restore can report `Completed`. |
@@ -101,8 +110,9 @@ synchronization, conditional writes, Object Lock, or a newest-looking commit do
 not provide a safe writer lock under the malicious and eventually inconsistent
 backend threat model. Run disconnected gateways as `restore-readonly` readers;
 multiple such readers are supported when each can verify an accepted anchored
-state. A future disconnected multi-writer mode would need a separate trusted
-coordination authority and repository protocol, not an S3-sync switch.
+state. A future disconnected multi-writer mode would need authenticated
+branches, deterministic conflict handling, and a separate repository protocol,
+not an S3-sync switch.
 
 ## Incomplete Multipart Cleanup
 
@@ -195,14 +205,14 @@ chain and therefore to the repository state reachable from it.
 
 ## Current Evidence
 
-Release evidence below is maintainer-run evidence for the current v2 preview
-line. Treat the bullets as the current summary and the table as the detailed
-ledger. Exact backend prefixes and workspace-local artifact paths are not part
-of the public evidence record because they are operational identifiers. Preserve
-raw reports, checksums, and run logs in release assets or private evidence
-bundles when independent review needs them. Evidence rows are dated because the
-preview still changes. A release candidate should rerun the live provider gate
-after format, gateway, or streaming-write changes.
+Release evidence below is maintainer-run evidence for the deprecated preview
+implementation. Treat it as compatibility, storage-contract, and gateway
+regression evidence only. It does not exercise `commits/v02`, standalone framed
+index runs, signed `INDEX_ROOT` catalogs, automatic checkpoint backpressure, or
+exact catalog-root GC. Exact backend prefixes and workspace-local artifact paths
+are not part of the public evidence record because they are operational
+identifiers. Preserve raw reports, checksums, and run logs in release assets or
+private evidence bundles when independent review needs them.
 
 At a glance:
 
@@ -258,19 +268,15 @@ test does not replace that credential review.
 
 ## Release Candidate Note
 
-The current preview line is for evaluating `rs3` with Velero/Kopia on Kubernetes
-and a retained S3-compatible backend. The primary repository format for new
-evaluation repositories is `v2-preview`. The current work includes the adaptive
-payload segment default, the decrypted-segment cache, streamable commit-embedded
-payloads, retained-version restore checks, machine-readable CLI stdout/stderr
-separation, the live S3 provider qualification lane, and the live
-backup/restore and DR evidence above.
+The current preview implementation remains useful for controlled Velero/Kopia,
+provider, and gateway evaluation. Do not initialize it for production data or
+present it as the new repository format. A repository release candidate is
+blocked until `commits/v02` is implemented and passes the format, recovery,
+checkpoint, retained-provider, GC, and scale gates.
 
-Use a release candidate built from this line for controlled evaluation, not for
-a stable repository-format commitment. The durable format remains
-preview-scoped, governance-bypass IAM review remains operator-owned, live
-provider gates should be rerun after material changes, and public security
-claims need separate review.
+Governance-bypass IAM review remains operator-owned, live provider gates must be
+rerun after the new run-object path lands, and public security claims need
+separate external review.
 
 ## Non-Goals
 
@@ -284,7 +290,10 @@ The preview does not promise:
 
 ## Release Gates
 
-Run the cheap local gate first:
+The commands below exercise the deprecated preview implementation and remain
+useful regression checks. They are not `v02` release gates.
+
+Run the cheap local regression gate first:
 
 ```sh
 just preview-gate-local
@@ -296,13 +305,13 @@ Release candidates should also run the release integration gate:
 just preview-gate-release
 ```
 
-Scheduled or release-candidate hardening should run the local v2 nightly gate:
+Scheduled hardening may run the local prototype nightly gate:
 
 ```sh
 just preview-gate-v2-nightly
 ```
 
-For restore evidence, run restore traffic through the anchored v2 gateway and
+For gateway regression evidence, run restore traffic through the anchored gateway and
 verify the restored bytes against the application workload.
 
 For disaster-recovery evidence, export a trusted restore bundle with
@@ -314,7 +323,7 @@ and verify the recovered bundle with `rs3 verify-bundle`.
 
 ## Configuration Checklist
 
-For a production-preview deployment:
+For a controlled prototype deployment only:
 
 - use `RS3_ANCHOR_MODE=kubernetes-lease`
 - leave `RS3_WRITER_GUARD=required` enabled for read-write gateways
@@ -366,16 +375,24 @@ Preview evidence should show:
   baseline
 - accepted leakage is documented in the security model
 
-## Stable Format Blockers
+## `v02` Release Blockers
 
-A stable repository format needs more than the preview:
+The replacement repository generation must complete all of these together:
 
-- recovery that passes the committed-write 100k and 1M object scale gates;
-  both tiers currently fail closed at the fixed replay budget after writes
-  complete
-- explicit repository-format compatibility policy
-- broader provider matrix
-- chaos coverage for stale backend state, anchor unavailability, backend
-  injection, and retention failure
-- a finalized external anchor and key-provider interface
-- external security review for public guarantees
+- implement canonical framed `INDEX_RUN` objects and small signed `INDEX_ROOT`
+  catalogs under the new `commits/v02` generation;
+- replace cumulative delta retention with descriptor-first, one-frame-at-a-time
+  recovery;
+- keep one accepted repository state plus a bounded pending mutation overlay;
+- add fenced automatic checkpointing with degraded and write-paused failure
+  posture before absolute replay ceilings;
+- make maintenance mark exact catalog, run, and effective payload versions
+  without recursively retaining entire payload commit ancestry;
+- pass fresh-process committed-write recovery at 10k, 100k, and 1M objects,
+  including exact cardinality and first, middle, and last payload verification;
+- qualify exact standalone-run versions, restart, checkpoint crash, stale
+  fencing, delayed visibility, retention renewal, and writer handoff on a real
+  retained provider;
+- finalize canonical encoding, capability negotiation, key-provider, and
+  compatibility policy; and
+- complete external cryptographic and security review for public guarantees.
