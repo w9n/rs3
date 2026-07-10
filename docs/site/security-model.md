@@ -299,7 +299,8 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
   durable prefix tokens, but that property still needs implementation and tests.
 - Gateway-level deduplication is not part of the baseline format. A future mode
   must account for provider-visible equality through omitted writes and shared
-  liveness, not merely hide a content digest inside encrypted metadata.
+  liveness, not merely hide a content digest inside encrypted metadata. See the
+  [deduplication design note](reference/deduplication.md).
 - Payload-pack protection cohorts and cleaning have not passed retained-version,
   legal-hold, protected-root, or crash testing.
 - Catalog compaction, exact payload-root GC, and failure backpressure have not

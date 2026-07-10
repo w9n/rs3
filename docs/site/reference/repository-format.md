@@ -162,7 +162,8 @@ gateway-level deduplication, and compression are also outside the baseline
 format until their equality leakage, liveness, range-read, and amplification
 costs have explicit security modes and qualification evidence. Kopia already
 performs its own chunking and packing, so duplicating that work in the gateway
-is not a baseline optimization.
+is not a baseline optimization. The researched extension boundary is recorded
+in [Deduplication](deduplication.md).
 
 ## Framed Index Runs
 

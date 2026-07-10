@@ -68,6 +68,7 @@ nav:
       - Configuration: reference/configuration.md
       - S3 Operations: reference/s3-operations.md
       - Repository Format: reference/repository-format.md
+      - Deduplication: reference/deduplication.md
       - Console: reference/console.md
       - Cryptography: reference/cryptography.md
       - Metrics: reference/metrics.md
