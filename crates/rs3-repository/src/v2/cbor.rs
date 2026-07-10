@@ -100,15 +100,24 @@ impl<'a> Reader<'a> {
     }
 
     pub(super) fn read_bytes(&mut self) -> CborResult<Vec<u8>> {
-        let len = self.read_len_for_major(2)?;
+        self.read_bytes_bounded(usize::MAX)
+    }
+
+    pub(super) fn read_bytes_bounded(&mut self, max_len: usize) -> CborResult<Vec<u8>> {
+        let len = self.read_len_for_major_bounded(2, max_len)?;
         let bytes = self.take(len)?;
         Ok(bytes.to_vec())
     }
 
     pub(super) fn read_text(&mut self) -> CborResult<String> {
-        let len = self.read_len_for_major(3)?;
+        self.read_text_bounded(usize::MAX)
+    }
+
+    pub(super) fn read_text_bounded(&mut self, max_len: usize) -> CborResult<String> {
+        let len = self.read_len_for_major_bounded(3, max_len)?;
         let bytes = self.take(len)?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| CborError::Invalid)
+        let text = std::str::from_utf8(bytes).map_err(|_| CborError::Invalid)?;
+        Ok(text.to_owned())
     }
 
     pub(super) fn read_array_len(&mut self) -> CborResult<usize> {
@@ -136,6 +145,18 @@ impl<'a> Reader<'a> {
             return Err(CborError::Invalid);
         }
         usize::try_from(self.read_len(additional)?).map_err(|_| CborError::Invalid)
+    }
+
+    fn read_len_for_major_bounded(
+        &mut self,
+        expected_major: u8,
+        max_len: usize,
+    ) -> CborResult<usize> {
+        let len = self.read_len_for_major(expected_major)?;
+        if len > max_len {
+            return Err(CborError::Invalid);
+        }
+        Ok(len)
     }
 
     fn read_initial(&mut self) -> CborResult<(u8, u8)> {
@@ -265,5 +286,56 @@ fn fuzz_read_value(reader: &mut Reader<'_>, depth: usize, max_depth: usize) -> C
             _ => Err(CborError::Invalid),
         },
         _ => Err(CborError::Invalid),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::v2::cbor::{CborError, Reader};
+
+    #[test]
+    fn bounded_bytes_accept_exact_limit() {
+        let mut reader = Reader::new(&[0x43, 0x01, 0x02, 0x03]);
+
+        assert_eq!(reader.read_bytes_bounded(3), Ok(vec![0x01, 0x02, 0x03]));
+        assert!(reader.is_finished());
+    }
+
+    #[test]
+    fn bounded_bytes_reject_declared_length_over_limit() {
+        let mut reader = Reader::new(&[0x58, 0x18]);
+
+        assert_eq!(reader.read_bytes_bounded(23), Err(CborError::Invalid));
+    }
+
+    #[test]
+    fn bounded_text_accepts_exact_limit() {
+        let mut reader = Reader::new(&[0x63, b'r', b's', b'3']);
+
+        assert_eq!(reader.read_text_bounded(3), Ok(String::from("rs3")));
+        assert!(reader.is_finished());
+    }
+
+    #[test]
+    fn bounded_text_rejects_declared_length_over_limit() {
+        let mut reader = Reader::new(&[0x78, 0x18]);
+
+        assert_eq!(reader.read_text_bounded(23), Err(CborError::Invalid));
+    }
+
+    #[test]
+    fn bounded_reads_preserve_minimal_length_encoding() {
+        let mut bytes = Reader::new(&[0x58, 0x01, 0x00]);
+        let mut text = Reader::new(&[0x78, 0x01, b'a']);
+
+        assert_eq!(bytes.read_bytes_bounded(1), Err(CborError::Invalid));
+        assert_eq!(text.read_text_bounded(1), Err(CborError::Invalid));
+    }
+
+    #[test]
+    fn bounded_text_rejects_invalid_utf8() {
+        let mut reader = Reader::new(&[0x61, 0xff]);
+
+        assert_eq!(reader.read_text_bounded(1), Err(CborError::Invalid));
     }
 }
