@@ -264,6 +264,7 @@ async fn gateway_full_read(
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
+        reload_verification: None,
     })
 }
 
@@ -334,6 +335,7 @@ async fn gateway_range_read(
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
+        reload_verification: None,
     })
 }
 
@@ -364,6 +366,7 @@ fn gateway_write_report(
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
+        reload_verification: None,
     })
 }
 

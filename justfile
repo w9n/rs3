@@ -265,6 +265,40 @@ perf-commit *ARGS:
 perf-commit-parallel *ARGS:
     cargo run -p xtask --bin xtask -- perf --scenario write-committed-parallel {{ARGS}}
 
+# Run the fixed release-profile object-count scale tiers. Set
+# RS3_SCALE_GATE_RUNS to change the default three-run stability sample.
+[private]
+perf-scale-tier OBJECTS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    runs="${RS3_SCALE_GATE_RUNS:-3}"
+    if ! [[ "${runs}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "RS3_SCALE_GATE_RUNS must be a positive integer" >&2
+      exit 2
+    fi
+    cargo build --release -p xtask --bin xtask
+    for ((run = 1; run <= runs; run++)); do
+      echo "scale gate run ${run}/${runs}: {{OBJECTS}} objects" >&2
+      target/release/xtask perf \
+        --scenario write-committed-parallel \
+        --objects "{{OBJECTS}}" \
+        --object-size 512 \
+        --commit-batch-items 64 \
+        --commit-max-pending-items 64 \
+        --concurrency 64 \
+        --verify-reload \
+        --format jsonl
+    done
+
+# Fast scale gate for pull requests and local development.
+perf-scale-10k: (perf-scale-tier "10000")
+
+# Release-candidate scale gate.
+perf-scale-100k: (perf-scale-tier "100000")
+
+# Scheduled/manual high-capacity scale gate. This needs substantial memory.
+perf-scale-1m: (perf-scale-tier "1000000")
+
 # Run performance measurements against an S3 backend.
 perf-s3 *ARGS:
     cargo run -p xtask --bin xtask --features s3 -- perf --backend s3 {{ARGS}}

@@ -88,9 +88,18 @@ medians:
 Elapsed ranges were 14.2-28.4 ms, 51.5-58.3 ms, and 209.4-219.4 ms
 respectively. The median 4,096-object lane is about 93.4x faster and the 16x
 object-count increase now takes 12.3x elapsed time. This closes the observed
-near-quadratic hot-path blocker in the measured range. Stable 10k, 100k, and
-1M object release gates are still required. The exact commands and
-amplification ratios are recorded in `tests/PERFORMANCE_BASELINE.md`.
+near-quadratic hot-path blocker in the measured range. The stable scale recipes
+now require a fresh repository reload, exact list cardinality, and full reads
+of the first, middle, and last object after every write run. The exact commands
+and amplification ratios are recorded in `tests/PERFORMANCE_BASELINE.md`.
+
+The 10k gate passes all three release-profile runs. Write elapsed time was
+521-537 ms, fresh reload was 420-433 ms, each run used 157 commit PUTs, and
+write amplification was 12.734-12.736x for 512 B objects. The 100k tier writes
+successfully but fresh reload fails closed with `v2 recovery replay budget
+exceeded`; the 1M tier reaches the same recovery failure. Consequently, 100k
+and 1M repository recovery remain production blockers. A successful write-only
+million-object run is not accepted as scale evidence.
 
 ## Current Release Matrix
 

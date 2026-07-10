@@ -140,9 +140,38 @@ The table reports median elapsed and latency values:
 Elapsed ranges were 14.2-28.4 ms, 51.5-58.3 ms, and 209.4-219.4 ms
 respectively. The median 4,096-object lane is about 93.4x faster. A 16x
 object-count increase now takes 12.3x elapsed time rather than 284x, closing
-the observed near-quadratic hot-path blocker in this measured range. Add
-stable 10k, 100k, and 1M object scaling gates before treating the scaling
-envelope as production-qualified.
+the observed near-quadratic hot-path blocker in this measured range.
+
+### Stable Object-Count Gates
+
+The fixed scale recipes run the release binary three times by default. Each run
+writes through the commit coordinator, discards the writer-side repository,
+constructs a fresh repository instance over the same accepted store and anchor,
+checks exact prefix cardinality, and reads the first, middle, and last payload.
+This keeps a fast write path from masking an unrecoverable repository.
+
+```sh
+just perf-scale-10k
+just perf-scale-100k
+just perf-scale-1m
+```
+
+The July 10 rerun produced:
+
+| Tier | Result | Write elapsed | Reload elapsed | Commit PUTs | Write amplification |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 10k | Pass, 3/3 | 521-537 ms | 420-433 ms | 157 | 12.734-12.736x |
+| 100k | Fail closed, first run | write completed | replay budget exceeded | 1,563 in the write-only baseline | about 12.742x in the write-only baseline |
+| 1M | Fail closed, first run | write completed | replay budget exceeded | 15,625 in the write-only baseline | 12.748x in the write-only baseline |
+
+The write-only 100k sweep had previously completed in 6.14-6.28 s. The
+write-only 1M run completed in 79.39 s of harness time (88.01 s wall time) with
+an 11.35 GiB high-water RSS on the in-memory backend. Those are diagnostic
+measurements, not passing scale gates. The 100k recovery attempt reached about
+1.20 GiB high-water RSS before the fixed 64 MiB retained-index replay budget
+rejected it. The upper tiers require bounded streaming/sharded replay and an
+automatic snapshot or compaction cadence before the scaling envelope can be
+called production-qualified.
 
 ## July 2026 Larger Restore Matrix
 

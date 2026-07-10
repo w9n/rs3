@@ -58,6 +58,9 @@ pub(crate) struct PerfArgs {
     /// Parallel client writes used by parallel scenarios.
     #[arg(long, default_value_t = 8)]
     concurrency: usize,
+    /// Reload and verify parallel committed writes through a fresh repository instance.
+    #[arg(long)]
+    verify_reload: bool,
     /// Number of read operations in read scenarios.
     #[arg(long, default_value_t = 128)]
     reads: usize,
@@ -247,6 +250,21 @@ impl TraceFormat {
 }
 
 pub(crate) fn run(args: PerfArgs) -> Result<()> {
+    if args.verify_reload
+        && !matches!(
+            args.scenario,
+            PerfScenario::All | PerfScenario::WriteCommittedParallel
+        )
+    {
+        anyhow::bail!(
+            "--verify-reload requires --scenario write-committed-parallel (or --scenario all)"
+        );
+    }
+    #[cfg(feature = "containers")]
+    if args.verify_reload && args.backend == PerfBackend::S3GatewayContainer {
+        anyhow::bail!("--verify-reload is not supported by the gateway-backed perf harness");
+    }
+
     if args.trace {
         init_tracing(&args.trace_filter, args.trace_format)?;
     }
@@ -353,6 +371,9 @@ fn add_perf_args(
         command.args(["--commit-max-pending-items", &max_pending_items.to_string()]);
     }
     command.args(["--concurrency", &args.concurrency.to_string()]);
+    if args.verify_reload {
+        command.arg("--verify-reload");
+    }
     command.args(["--reads", &args.reads.to_string()]);
     command.args(["--range-len", &args.range_len.to_string()]);
     if let Some(payload_segment_size) = args.payload_segment_size {
@@ -461,6 +482,7 @@ where
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
+        reload_verification: None,
     })
 }
 
@@ -531,6 +553,7 @@ where
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
+        reload_verification: None,
     })
 }
 
@@ -558,6 +581,7 @@ where
     S: BlobStore + Clone + Send + Sync + 'static,
 {
     let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
+    let verification_anchor = anchor.clone();
     let coordinator = Arc::new(V2CommitCoordinator::with_options(
         repo,
         anchor,
@@ -604,6 +628,16 @@ where
     let counts = store
         .operation_counts()
         .context("failed to read operation counts")?;
+    drop(coordinator);
+    let reload_verification = if args.verify_reload {
+        Some(
+            verify_parallel_reload(args, store, &verification_anchor, &body)
+                .await
+                .context("fresh repository verification failed")?,
+        )
+    } else {
+        None
+    };
     Ok(PerfReport {
         scenario: "write-committed-parallel",
         backend: args.backend,
@@ -622,7 +656,66 @@ where
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
+        reload_verification,
     })
+}
+
+async fn verify_parallel_reload<S>(
+    args: &PerfArgs,
+    store: CountingBlobStore<S>,
+    anchor: &V2MemoryAnchor,
+    expected_body: &Bytes,
+) -> Result<ReloadVerification>
+where
+    S: BlobStore + Clone,
+{
+    let started = Instant::now();
+    let repository = v2_repository(args, store)?;
+    repository
+        .load_chain_from_anchor(anchor)
+        .await
+        .context("failed to reload the accepted commit chain")?
+        .context("the repository anchor did not select a commit chain")?;
+
+    let entries = repository
+        .list("perf/write-committed-parallel/")
+        .context("failed to list reloaded objects")?;
+    if entries.len() != args.objects {
+        anyhow::bail!(
+            "reloaded object count mismatch: expected {}, found {}",
+            args.objects,
+            entries.len()
+        );
+    }
+
+    let checked_indices = verification_indices(args.objects);
+    for index in &checked_indices {
+        let key = path(&format!("perf/write-committed-parallel/object-{index:08}"))?;
+        let actual = repository
+            .get_range(&key, ByteRange::Full)
+            .await
+            .with_context(|| format!("failed to read reloaded object {index}"))?;
+        if actual != *expected_body {
+            anyhow::bail!("reloaded object {index} did not match its written payload");
+        }
+    }
+
+    Ok(ReloadVerification {
+        elapsed: started.elapsed(),
+        expected_objects: args.objects,
+        listed_objects: entries.len(),
+        checked_objects: checked_indices.len(),
+    })
+}
+
+fn verification_indices(objects: usize) -> Vec<usize> {
+    if objects == 0 {
+        return Vec::new();
+    }
+    let mut indices = vec![0, objects / 2, objects - 1];
+    indices.sort_unstable();
+    indices.dedup();
+    indices
 }
 
 async fn full_read(args: &PerfArgs) -> Result<PerfReport> {
@@ -687,6 +780,7 @@ where
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
+        reload_verification: None,
     })
 }
 
@@ -768,6 +862,7 @@ where
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
+        reload_verification: None,
     })
 }
 
@@ -789,6 +884,36 @@ struct PerfReport {
     operation_latency: OperationLatencyStats,
     elapsed: Duration,
     counts: BlobOperationCounts,
+    reload_verification: Option<ReloadVerification>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReloadVerification {
+    elapsed: Duration,
+    expected_objects: usize,
+    listed_objects: usize,
+    checked_objects: usize,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct ReloadVerificationReport {
+    verified: bool,
+    elapsed_ms: f64,
+    expected_objects: usize,
+    listed_objects: usize,
+    checked_objects: usize,
+}
+
+impl ReloadVerification {
+    fn report(self) -> ReloadVerificationReport {
+        ReloadVerificationReport {
+            verified: true,
+            elapsed_ms: self.elapsed.as_secs_f64() * 1_000.0,
+            expected_objects: self.expected_objects,
+            listed_objects: self.listed_objects,
+            checked_objects: self.checked_objects,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -854,9 +979,10 @@ impl PerfReport {
         let backend_requests_per_operation =
             ratio_optional(backend_requests, self.operations as u64);
         let latency = self.operation_latency;
+        let reload_verification = self.reload_verification;
 
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}",
             self.scenario,
             self.backend.as_str(),
             self.repository_format,
@@ -898,6 +1024,13 @@ impl PerfReport {
             self.requested_plaintext_read_bytes,
             write_amplification,
             read_amplification,
+            reload_verification.is_some(),
+            reload_verification.map_or(0.0, |verification| {
+                verification.elapsed.as_secs_f64() * 1_000.0
+            }),
+            reload_verification.map_or(0, |verification| verification.expected_objects),
+            reload_verification.map_or(0, |verification| verification.listed_objects),
+            reload_verification.map_or(0, |verification| verification.checked_objects),
         );
     }
 
@@ -959,6 +1092,7 @@ impl PerfReport {
                 self.counts.bytes_read,
                 self.requested_plaintext_read_bytes as u64,
             ),
+            "reload_verification": self.reload_verification.map(ReloadVerification::report),
         });
         println!("{}", serde_json::to_string(&report)?);
         Ok(())
@@ -990,7 +1124,7 @@ impl PerfReport {
 
 fn print_header() {
     println!(
-        "scenario\tbackend\trepository_format\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tpayload_segment_size\tadaptive_payload_segment_size\tconcurrency\telapsed_ms\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tset_legal_hold\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp"
+        "scenario\tbackend\trepository_format\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tpayload_segment_size\tadaptive_payload_segment_size\tconcurrency\telapsed_ms\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tset_legal_hold\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp\treload_verified\treload_elapsed_ms\treload_expected_objects\treload_listed_objects\treload_checked_objects"
     );
 }
 
@@ -1005,10 +1139,26 @@ async fn v2_repository_with_store<S>(
 where
     S: BlobStore + Clone,
 {
+    let repository = v2_repository(args, store)?;
+    let anchor = V2MemoryAnchor::new();
+    repository
+        .write_genesis_snapshot(&anchor)
+        .await
+        .context("failed to write v2 genesis snapshot")?;
+    Ok((repository, anchor))
+}
+
+fn v2_repository<S>(
+    args: &PerfArgs,
+    store: CountingBlobStore<S>,
+) -> Result<Arc<V2Repository<CountingBlobStore<S>>>>
+where
+    S: BlobStore + Clone,
+{
     if args.payload_segment_size == Some(0) {
         anyhow::bail!("--payload-segment-size must be greater than zero");
     }
-    let repository = Arc::new(V2Repository::new(
+    Ok(Arc::new(V2Repository::new(
         store,
         keyring()?,
         RepositoryOptions {
@@ -1023,13 +1173,7 @@ where
             perf_keyring_envelope_ref()?,
             perf_format_ref()?,
         ),
-    ));
-    let anchor = V2MemoryAnchor::new();
-    repository
-        .write_genesis_snapshot(&anchor)
-        .await
-        .context("failed to write v2 genesis snapshot")?;
-    Ok((repository, anchor))
+    )))
 }
 
 fn adaptive_payload_segment_size(args: &PerfArgs) -> bool {
@@ -1289,4 +1433,17 @@ fn init_tracing(filter: &str, format: TraceFormat) -> Result<()> {
             .map_err(|error| anyhow::anyhow!("failed to initialize tracing subscriber: {error}"))?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verification_indices;
+
+    #[test]
+    fn reload_verification_checks_distinct_boundaries() {
+        assert_eq!(verification_indices(0), Vec::<usize>::new());
+        assert_eq!(verification_indices(1), vec![0]);
+        assert_eq!(verification_indices(2), vec![0, 1]);
+        assert_eq!(verification_indices(5), vec![0, 2, 4]);
+    }
 }

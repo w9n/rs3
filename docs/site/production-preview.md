@@ -370,6 +370,9 @@ Preview evidence should show:
 
 A stable repository format needs more than the preview:
 
+- recovery that passes the committed-write 100k and 1M object scale gates;
+  both tiers currently fail closed at the fixed replay budget after writes
+  complete
 - explicit repository-format compatibility policy
 - broader provider matrix
 - chaos coverage for stale backend state, anchor unavailability, backend
