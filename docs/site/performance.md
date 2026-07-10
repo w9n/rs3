@@ -93,13 +93,62 @@ now require a fresh repository reload, exact list cardinality, and full reads
 of the first, middle, and last object after every write run. The exact commands
 and amplification ratios are recorded in `tests/PERFORMANCE_BASELINE.md`.
 
-The transitional `commits/v02` 10k gate passes all three release-profile runs.
-Write elapsed time was 634-638 ms, fresh reload was 410-444 ms, each run used
-157 commit PUTs, and write amplification was 12.859-12.861x for 512 B objects.
-Every fresh reader listed exactly 10,000 objects and verified the first, middle,
-and last payload. The larger signed header raises small-object write
-amplification slightly while independent section digests remove payload scans
-from recovery.
+The transitional `commits/v02` 10k gate passed the correctness, recovery, and
+latency portions of all three release-profile runs, but failed the new
+small-object efficiency requirement badly. Write elapsed time was 634-638 ms,
+fresh reload was 410-444 ms, each run used 157 commit PUTs, and write
+amplification was 12.859-12.861x for 512 B objects. Every fresh reader listed
+exactly 10,000 objects and verified the first, middle, and last payload. This is
+diagnostic evidence, not a passing scale gate.
+
+Exact accounting of one representative 64-by-512 B batch found 420,919 backend
+bytes, or 12.845x:
+
+| Component | Bytes | Bytes per client object |
+| --- | ---: | ---: |
+| Padded commit header | 8,192 | 128 |
+| Encrypted payload sections | 38,400 | 600 |
+| Encrypted index section | 374,327 | 5,849 |
+
+The payload cryptography contributed 512 B ciphertext, one 16 B tag, and a
+72 B repeated header per object. The dominant failure was the index: its
+104,735 B encrypted content expanded into a 374,301 B outer JSON representation
+with decimal byte arrays, while each logical object repeated hex prefix tokens,
+blind and manifest IDs, full commit and payload identities, key identifiers,
+nonce facts, and a nested sealed manifest. Cryptography was not the source of
+the 12.8x amplification; the prototype representation was.
+
+The replacement is one value-separated `PAYLOAD_PACK` plus one compact binary
+`INDEX_RUN` per batch. For 64 512 B values, the irreducible ciphertext and tag
+cost is 33,792 B. A compact index and authentication envelope should keep the
+whole commit around 42-47 KiB, or roughly 1.3-1.45x. The first-principles floor
+for the measured path shape is about 1.2x, so a 4x budget would merely certify a
+broken format.
+
+Qualification must enforce, not merely report, these initial ceilings:
+
+| Workload | Required backend write bound |
+| --- | ---: |
+| 64 empty objects | 320 fixed bytes per object |
+| 64 objects of 512 B | 1.50x, with a 1.40x engineering target |
+| 64 objects of 4 KiB | 1.15x |
+| 64 objects of 256 KiB | 1.03x |
+| sequential committed 512 B objects | 3.0x |
+| forced index compaction, lifetime 512 B lane | provisional 3.5x |
+
+The harness must also vary logical path lengths across 32 B, 256 B, and
+1,024 B, and report payload amplification separately from fixed metadata bytes
+per object. Pack cleaning is measured separately because its unavoidable copy
+cost depends on pack live fraction.
+
+The raw-S3 scale lane and the client workload lane remain separate. A million
+512 B S3 objects is an adversarial namespace and recovery test. It is not a
+model for a million tiny Kopia source files: Kopia chunks, deduplicates, and
+combines its content into larger repository packs before issuing S3 requests.
+The real-client gate must therefore use unique tiny source files through
+Kopia/Velero, restart from a fresh process, restore verified bytes, record the
+client PUT-size histogram, and compare backend requests, bytes, RSS, and time
+against the direct path.
 
 The earlier 100k tier wrote successfully but fresh reload failed closed with
 `v2 recovery replay budget exceeded`; the 1M tier reached the same recovery

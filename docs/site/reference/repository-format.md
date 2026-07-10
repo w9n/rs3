@@ -56,7 +56,8 @@ objects/v02/<32-byte-random-id-base64url>
 The sequence component bounds commit discovery and operational analysis. The
 random component prevents paths, namespace equality, and content identity from
 appearing in keys. `objects/v02/` contains independently sealed compacted index
-runs. Its keys do not distinguish index levels, tenants, paths, or workloads.
+runs and payload packs created by later cleaning. Its keys do not distinguish
+object type, index level, tenant, path, or workload.
 
 The other backend-visible classes remain generic:
 
@@ -93,9 +94,13 @@ and encrypted sections. The signed header covers:
 - the complete commit-object length and body digest; and
 - the signing-key identifier and Ed25519 signature.
 
-The complete header span is limited to 8 KiB and a commit carries at most 65
-sections (up to 64 payloads plus one index section). Multipart commits pad the
-header to that span; single-put commits use the canonical encoded length.
+The complete header span is limited to 8 KiB and a reader accepts at most 65
+sections so the transitional envelope remains bounded. The completed normal
+writer emits at most one `PAYLOAD_PACK` and one `INDEX_RUN`; a combined catalog
+checkpoint may additionally carry one `INDEX_ROOT`. Multipart commits reserve
+the fixed header span only when the body is genuinely streamed. Bounded commits
+use one `PutObject` and the canonical encoded header length, without 8 KiB
+padding.
 Readers reject non-canonical encodings, unknown required capabilities,
 out-of-order or overlapping sections, arithmetic overflow, duplicate ordinals,
 lengths outside the object, and trailing data not covered by the signed layout.
@@ -105,10 +110,11 @@ Bit `0x02` identifies the framed index contract. It remains reserved and is
 rejected by the transitional reader until `INDEX_RUN` and `INDEX_ROOT` codecs
 land; the complete v02 reader and writer will require both bits.
 
-Normal commits contain zero or more encrypted `PAYLOAD` sections and one
-encrypted `INDEX_RUN` section. A catalog checkpoint commit contains an
-encrypted `INDEX_ROOT` section. A checkpoint may also cover a final bounded
-mutation batch, but the catalog must describe the exact resulting state.
+Normal commits contain one encrypted `INDEX_RUN` and at most one encrypted
+`PAYLOAD_PACK`; an all-delete or all-empty batch needs no payload pack. A
+catalog checkpoint commit contains an encrypted `INDEX_ROOT`. A checkpoint may
+also cover a final bounded mutation batch, but the catalog must describe the
+exact resulting state.
 
 Signed per-section descriptors are required for descriptor-first recovery. A
 reader can authenticate an index range without downloading unrelated payload
@@ -116,23 +122,47 @@ sections. Payload ciphertext is authenticated when the referenced object is
 read. The whole-object digest remains an identity and maintenance check, not a
 reason to read every payload during startup.
 
-## Payload Sections
+## Value-Separated Payload Packs
 
-Payload sections use a segmented authenticated envelope. The encrypted index
-record stores the exact commit key and provider version, commit digest, section
-ordinal, encrypted offset and length, plaintext length, payload identity, key
-identifier, segment size, and nonce/header facts needed for bounded full and
-range reads.
+`PAYLOAD_PACK` is an immutable value container, not an index level. A normal
+batch places its non-empty values into one pack and stores only compact pack
+pointers in `INDEX_RUN`. Empty objects are index-only. Index checkpointing and
+compaction never rewrite payload bytes.
 
-Segment associated data binds ciphertext to the format generation, repository
-context, payload identity, section ordinal, segment index, plaintext length,
-and final-segment marker. Moving a segment to another commit, section, payload,
-or ordinal must fail authentication.
+Each pack has a random 256-bit identity, one content-key identifier, a bounded
+encrypted directory, and records in randomized physical order. A small record
+is ciphertext followed by one 16-byte AEAD tag. Its nonce is derived through a
+keyed KDF from the pack identity, record ordinal, and authenticated plaintext
+digest, so the format does not store a nonce per record. Large records retain
+bounded segmented AEAD for efficient range reads. The cutoff and segment size
+are writer policy recorded in the pack; the first engineering cutoff is about
+64 KiB and is not a format invariant.
 
-Segment size remains a writer policy recorded in each payload. Readers follow
-the authenticated header rather than assuming the current default. Padding is
-not part of the first `v02` contract; adding it requires a new capability and
-new leakage and amplification evidence.
+The encrypted directory maps record ordinals to bounded ciphertext spans and
+authenticated plaintext lengths. An index payload pointer is a container-table
+ordinal plus record ordinal, rather than a repeated commit key, payload ID,
+key ID, nonce, offset, and digest. The signed containing-object descriptor and
+encrypted container table carry those shared facts once.
+
+Record associated data binds the format generation, repository context, exact
+containing object key, pack and section identities, record and segment
+ordinals, plaintext length, and final-segment marker. The provider version does
+not exist before upload; after publication the accepted signed reference binds
+the exact returned version, object length, and ciphertext digest. Moving a
+record to a different object, pack, section, or ordinal must fail
+authentication.
+
+Retention and legal hold apply to the physical containing object. Batches must
+therefore use one protection cohort, or be partitioned by retention mode,
+retain-until horizon, and legal-hold requirement. Reusing or repacking a value
+must never weaken the strongest logical protection that reaches it.
+
+Padding is not part of the first `v02` contract. Content-defined chunking,
+gateway-level deduplication, and compression are also outside the baseline
+format until their equality leakage, liveness, range-read, and amplification
+costs have explicit security modes and qualification evidence. Kopia already
+performs its own chunking and packing, so duplicating that work in the gateway
+is not a baseline optimization.
 
 ## Framed Index Runs
 
@@ -153,12 +183,22 @@ The highest generation wins. Two different records for the same key and
 generation are corruption, not a tie to resolve by object order, timestamp, or
 provider listing.
 
-Runs contain two encrypted projections:
+Runs contain two encrypted projections linked by mutation ordinal:
 
 - a namespace projection sorted by the secret-derived lookup key for `HEAD`
   and `GET`; and
 - a listing projection sorted by logical path for ordered prefix listing inside
   the trusted gateway.
+
+The namespace projection stores the raw 32-byte blinded key, generation,
+compact payload pointer, trusted `HEAD` metadata, and retention state. The
+listing projection stores the encrypted logical path once together with
+generation, size, and modification time. Frame-local container tables dedupe
+exact commit or standalone-object keys, provider versions, lengths, and
+digests. Canonical varints and fixed-width binary fields replace JSON, hex,
+decimal byte arrays, durable prefix tokens, nested sealed manifests, and
+repeated per-record identifiers. Projection record counts and mutation-ordinal
+pairing are authenticated and validated.
 
 Logical paths and projection bounds exist only in authenticated ciphertext.
 `v02` does not persist prefix-token objects or path-shaped keys. A reader may
@@ -195,7 +235,9 @@ are independently sealed `objects/v02/` versions. The catalog authenticates
 the complete active run set, so backend listing visibility and ordering are not
 part of recovery.
 
-Size-tiered compaction merges several similarly sized immutable runs into a
+`INDEX_ROOT` names index runs, not every payload pack. Effective highest-
+generation namespace records are the authoritative payload-pack reachability
+map. Size-tiered compaction merges several similarly sized immutable runs into a
 bounded set of larger, sharded runs. This intentionally favors low write
 amplification for append-heavy backup ingestion over the lowest possible point
 read amplification. Compaction never rewrites payloads merely to consolidate
@@ -286,7 +328,8 @@ explicitly protected historical anchor. For each root it includes:
 
 - the exact catalog and post-catalog commit versions;
 - the exact active index-run versions;
-- the exact payload commit versions selected by effective live index records;
+- the exact payload-containing object versions selected by effective live index
+  records;
 - the active format root and keyring envelopes; and
 - keys needed to authenticate or decrypt those objects.
 
@@ -303,8 +346,18 @@ delete exact versions only. Prepared but unaccepted objects remain protected
 until the configured orphan-age floor passes. Retention-renewal planning
 includes catalogs, runs, payload commits, format roots, and keyring envelopes.
 
-Payload repacking is a separate future operation. Index checkpointing and
-compaction must not copy every live payload.
+Payload-pack cleaning is a separate log-cleaning operation. A fully dead pack
+may be deleted only after the complete exact-root mark, orphan-age floor,
+protection checks, and maintenance-fence checks pass. A mixed pack is left in
+place until its dead fraction justifies cleaning. Cleaning re-encrypts its live
+records into a new random pack, publishes higher-generation physical
+references, and retains the old exact version while any current or protected
+historical root reaches it. Mutable reference counts are not authoritative.
+
+If a candidate pack has live fraction `l`, cleaning must copy at least
+`l / (1 - l)` bytes for every byte it can reclaim. The cleaner therefore uses
+an explicit utilization threshold and never runs on every checkpoint. Index
+checkpointing and compaction must not copy every live payload.
 
 ## Anchors and Writer Coordination
 
@@ -362,6 +415,17 @@ include:
   documented 4-vCPU, 16-GiB runner;
 - no payload reads during normal index recovery and at most 1.25x index byte
   read amplification;
+- enforced small-object write gates for a 64-object batch: at most 1.50x for
+  512 B values (target 1.40x), at most 1.15x for 4 KiB values, at most 1.03x
+  for 256 KiB values, and at most 320 fixed backend bytes per empty object;
+- a sequential 512 B committed-write gate of at most 3.0x plus a provisional
+  lifetime gate of at most 3.5x after forced index compaction;
+- amplification evidence at 32 B, 256 B, and 1,024 B logical path lengths that
+  reports payload amplification separately from fixed metadata bytes per
+  object;
+- separate adversarial raw-S3 and real Kopia/Velero tiny-source-file gates, so
+  a million 512 B S3 objects does not pretend to model a client that already
+  packs and deduplicates its repository blobs;
 - checkpoint crash, stale-fence, delayed-read, replay, deletion, and exact
   provider-version fault tests;
 - GC tests proving exact payload reachability across overlapping runs,

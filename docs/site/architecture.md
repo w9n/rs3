@@ -54,9 +54,10 @@ not add ad hoc hashing, MAC, encryption, or key derivation logic.
     runs, signed catalogs, compactor, and bounded recovery architecture below are
     not implemented yet.
 
-Normal writes are append-friendly:
+Normal writes are append-friendly and value-separated:
 
-1. Stage encrypted payload sections and one compact framed index run.
+1. Put every non-empty value in the batch into one encrypted payload pack and
+   stage one compact framed binary index run. Empty values are index-only.
 2. Publish a signed `v02` commit under a random path-private key.
 3. Advance the external commit anchor.
 4. Acknowledge the client write only after the covering commit is accepted.
@@ -64,12 +65,25 @@ Normal writes are append-friendly:
 This avoids rewriting many backend objects during normal operation and gives
 crash recovery a concrete boundary.
 
+The payload pack is an immutable value log. It carries shared encryption and
+container facts once, keeps small-record overhead to one AEAD tag, randomizes
+record order, and retains segmented AEAD for large range-readable values. The
+index stores compact container and record ordinals instead of repeating full
+payload references. Retention mode, expiry horizon, and legal-hold requirement
+define protection cohorts because the backend protects the containing object.
+
 `v02` replaces monolithic index snapshots with an encrypted LSM-style index.
 Recent immutable runs live in exact accepted commit versions. Size-tiered
 compaction stream-merges runs into bounded, sharded objects under random
 `objects/v02/` keys. A small signed `INDEX_ROOT` catalog names the complete
 active run set. It does not serialize every live path and never copies payloads
 merely to checkpoint the index.
+
+Runs contain two specialized encrypted binary projections linked by mutation
+ordinal. The blinded namespace projection answers `HEAD` and `GET`; the
+path-sorted listing projection answers prefix listings. Frame-local container
+tables share exact object references. Values never live in an index frame, so
+LSM compaction is metadata-only and cold recovery does not read user data.
 
 The runtime keeps one accepted compact state plus a bounded pending-mutation
 overlay. Publication failure discards that overlay instead of rolling back a
@@ -142,11 +156,19 @@ reference. Recovery derives the exact catalog, run, and payload graph from that
 root. Anchor import from a trusted bundle verifies the graph before recreating
 a missing anchor.
 
-Catalogs and effective index records are exact reachability roots. Maintenance
-marks the exact catalog and run versions plus the exact payload commit versions
-selected by live records. A payload reference does not keep its commit's entire
-ancestry reachable. GC completes a fail-closed mark before any deletion and
-rechecks both the maintenance fence and anchor before deleting an exact version.
+Catalogs and effective index records are exact reachability roots. `INDEX_ROOT`
+catalogs name index runs only; effective highest-generation records name the
+payload packs. Maintenance marks the exact catalog and run versions plus the
+exact payload-containing object versions selected by live records. A payload
+reference does not keep its commit's entire ancestry reachable. GC completes a
+fail-closed mark before any deletion and rechecks both the maintenance fence and
+anchor before deleting an exact version.
+
+Payload-pack cleaning is separate from index compaction. It rewrites live
+records from a sufficiently sparse pack into a new random pack, publishes new
+higher-generation physical references, and retains the old version until no
+current or protected historical root reaches it. It does not use mutable
+reference counts as deletion authority.
 
 ## Writer Coordination
 
@@ -162,10 +184,12 @@ S3 listing and timestamps are not coordination primitives. A future
 disconnected mode would need explicit branches, authenticated merge semantics,
 and deterministic conflict policy in a different repository contract.
 
-Payload segment size is per object. The default writer keeps small objects at
-512 B segments and raises medium and large objects to larger authenticated
-segments to reduce AEAD overhead. Reads still follow the authenticated payload
-header, so this is a writer policy, not a repository-format change.
+Payload segmentation is recorded per pack record. Small values use one AEAD
+record; medium and large values use larger authenticated segments for bounded
+range reads. Reads follow the authenticated pack directory, so thresholds are
+writer policy rather than repository-format constants. Bounded commits use one
+single-part upload with a compact header; only genuinely streaming commits pay
+the fixed multipart header reservation.
 
 ## S3 Compatibility
 

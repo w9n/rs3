@@ -384,6 +384,8 @@ The replacement repository generation must complete all of these together:
 
 - implement canonical framed `INDEX_RUN` objects and small signed `INDEX_ROOT`
   catalogs under the new `commits/v02` generation;
+- replace one payload section per object with immutable value-separated
+  `PAYLOAD_PACK` sections, compact record pointers, and protection cohorts;
 - replace cumulative delta retention with descriptor-first, one-frame-at-a-time
   recovery;
 - keep one accepted repository state plus a bounded pending mutation overlay;
@@ -393,6 +395,10 @@ The replacement repository generation must complete all of these together:
   without recursively retaining entire payload commit ancestry;
 - pass fresh-process committed-write recovery at 10k, 100k, and 1M objects,
   including exact cardinality and first, middle, and last payload verification;
+- enforce the small-object write-amplification ceilings in the performance
+  reference, including separate raw-S3 and real Kopia/Velero tiny-file lanes;
+- prove payload-pack reachability and cleaning across tombstones, protected
+  historical roots, retention, legal hold, and interrupted repacks;
 - qualify exact standalone-run versions, restart, checkpoint crash, stale
   fencing, delayed visibility, retention renewal, and writer handoff on a real
   retained provider;

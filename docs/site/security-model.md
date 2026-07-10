@@ -60,9 +60,10 @@ The replacement `v02` design accepts specific backend-visible leakage:
 | Coarse write and restore timing | The provider sees requests arrive. | Avoid path labels in telemetry; future batching/jitter where useful. |
 | Retention mode | Provider retention APIs expose mode and retain-until behavior. | Treat retention mode as policy metadata, not tenant identity. |
 | Source network metadata | The provider sees the gateway's network identity. | Deploy through controlled egress where required. |
-| Broad object class | `format/`, `keyrings/`, `commits/v02/`, and `objects/v02/` support lifecycle and operations. | Keep class names generic and path-free; standalone run keys do not reveal level, tenant, or workload. |
+| Broad object class | `format/`, `keyrings/`, `commits/v02/`, and `objects/v02/` support lifecycle and operations. | Keep class names generic and path-free; standalone run and cleaned-pack keys do not reveal object type, level, tenant, or workload. |
 | Commit sequence and run inventory | Sequence-bounded commit keys and immutable run objects expose commit and compaction activity. | Batch commits, use random object IDs, keep catalog counts, levels, and bounds encrypted. |
 | Compaction cadence | The provider sees standalone run writes and later cleanup. | Use bounded size tiers and optional compaction jitter; never include paths in scheduling telemetry. |
+| Payload-pack shape and access | A commit exposes aggregate pack size, and range reads can reveal record-size and access patterns. | Batch by bounded protection cohort, randomize record order, keep directories encrypted, and consider optional padding only with measured budgets. |
 | Deterministic metadata equality | Stable metadata sealing can produce identical sealed bytes for identical metadata under identical associated data. | Bind framed ciphertext to a unique run and frame context; complete equality analysis before format freeze. |
 
 Optional mitigations include padding, pack-size normalization, commit batching,
@@ -104,6 +105,7 @@ is planned.
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
 | v02 index frames cannot be transplanted or reordered | Frame AEAD binds format generation, exact object key, section ordinal, run identity, and frame ordinal. The signed catalog separately binds the provider-returned exact version, length, and ciphertext digest. | Required for v02; signed section digests are implemented, framed-run binding is not. |
+| v02 payload-pack records cannot be transplanted or downgraded | Record AEAD binds repository, exact object key, pack, section, record, segment, and length context. The accepted signed reference binds the returned exact version, length, and digest. Protection-cohort checks prevent reuse under weaker retention or legal hold. | Required for v02; compact payload packs are not implemented. |
 | v02 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery applies one bounded authenticated frame at a time from an exact signed catalog. | Required for v02; 100k and 1M fresh-recovery gates currently block release. |
 | v02 checkpoint failure cannot anchor unrecoverable state | Fenced automatic checkpointing degrades, then pauses mutation before fixed tail-byte, commit, or run-count ceilings. | Required for v02; not implemented. |
 | v02 GC retains every live payload without retaining whole ancestry | Effective run records mark exact payload commit versions; full mark completes before exact-version sweep. | Required for v02; not implemented. |
@@ -295,6 +297,11 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
 - The transitional runtime's prefix tokens leak namespace structure through
   token count and shared-token relationships. The completed `v02` design removes
   durable prefix tokens, but that property still needs implementation and tests.
+- Gateway-level deduplication is not part of the baseline format. A future mode
+  must account for provider-visible equality through omitted writes and shared
+  liveness, not merely hide a content digest inside encrypted metadata.
+- Payload-pack protection cohorts and cleaning have not passed retained-version,
+  legal-hold, protected-root, or crash testing.
 - Catalog compaction, exact payload-root GC, and failure backpressure have not
   passed adversarial crash, replay, and stale-fence testing.
 - Retained backend history depends on provider retention or Object Lock to
