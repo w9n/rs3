@@ -4,8 +4,8 @@ use crate::admin::{
     admin_maintenance_summary, admin_status_report_with_runtime_facts_and_maintenance,
 };
 use crate::{
-    AdminMaintenanceSummary, AdminReportProfile, AdminRuntimeFacts, AdminRuntimeFactsSource,
-    RuntimeConfig, admin_posture_report_with_runtime_facts,
+    AdminMaintenanceSummary, AdminReadinessSource, AdminReportProfile, AdminRuntimeFacts,
+    AdminRuntimeFactsSource, RuntimeConfig, admin_posture_report_with_runtime_facts,
 };
 use bytes::Bytes;
 use http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, WWW_AUTHENTICATE};
@@ -149,6 +149,7 @@ pub struct AdminHttpService {
     auth: AdminHttpAuth,
     profile: AdminReportProfile,
     runtime_facts: Option<Arc<dyn AdminRuntimeFactsSource>>,
+    readiness: Option<Arc<dyn AdminReadinessSource>>,
     process_started_at_ms: i64,
     maintenance_cache: Arc<Mutex<Option<AdminMaintenanceSummary>>>,
 }
@@ -161,23 +162,26 @@ impl AdminHttpService {
             auth,
             profile,
             runtime_facts: None,
+            readiness: None,
             process_started_at_ms: current_time_ms(),
             maintenance_cache: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Creates an admin service with live runtime facts attached to reports.
-    pub fn new_with_runtime_facts(
+    pub fn new_with_runtime_sources(
         config: RuntimeConfig,
         auth: AdminHttpAuth,
         profile: AdminReportProfile,
         runtime_facts: Arc<dyn AdminRuntimeFactsSource>,
+        readiness: Arc<dyn AdminReadinessSource>,
     ) -> Self {
         Self {
             config,
             auth,
             profile,
             runtime_facts: Some(runtime_facts),
+            readiness: Some(readiness),
             process_started_at_ms: current_time_ms(),
             maintenance_cache: Arc::new(Mutex::new(None)),
         }
@@ -192,6 +196,25 @@ impl AdminHttpService {
 
         if parts.method == Method::GET && parts.uri.path() == "/healthz" {
             return json_response(StatusCode::OK, json!({ "status": "ok" }));
+        }
+
+        if parts.method == Method::GET && parts.uri.path() == "/readyz" {
+            let readiness = match self.readiness.as_ref() {
+                Some(source) => source.check_readiness().await,
+                None => crate::AdminReadiness::unavailable("readiness.source-unavailable"),
+            };
+            let status = if readiness.ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            return json_response(
+                status,
+                json!({
+                    "status": if readiness.ready { "ready" } else { "not-ready" },
+                    "reason_code": readiness.reason_code,
+                }),
+            );
         }
 
         if !self.auth.authorize(&parts.headers) {
@@ -274,7 +297,7 @@ impl AdminHttpServer {
         config: RuntimeConfig,
         admin_config: AdminHttpConfig,
     ) -> Result<Self, AdminHttpServerError> {
-        Self::bind_inner(config, admin_config, None).await
+        Self::bind_inner(config, admin_config, None, None).await
     }
 
     /// Binds the gateway admin listener with live runtime facts attached to reports.
@@ -283,18 +306,20 @@ impl AdminHttpServer {
     ///
     /// Returns an error when the listener cannot be bound or its local address
     /// cannot be read.
-    pub async fn bind_with_runtime_facts(
+    pub async fn bind_with_runtime_sources(
         config: RuntimeConfig,
         admin_config: AdminHttpConfig,
         runtime_facts: Arc<dyn AdminRuntimeFactsSource>,
+        readiness: Arc<dyn AdminReadinessSource>,
     ) -> Result<Self, AdminHttpServerError> {
-        Self::bind_inner(config, admin_config, Some(runtime_facts)).await
+        Self::bind_inner(config, admin_config, Some(runtime_facts), Some(readiness)).await
     }
 
     async fn bind_inner(
         config: RuntimeConfig,
         admin_config: AdminHttpConfig,
         runtime_facts: Option<Arc<dyn AdminRuntimeFactsSource>>,
+        readiness: Option<Arc<dyn AdminReadinessSource>>,
     ) -> Result<Self, AdminHttpServerError> {
         let listener = TcpListener::bind(admin_config.bind)
             .await
@@ -305,14 +330,15 @@ impl AdminHttpServer {
         let local_addr = listener
             .local_addr()
             .map_err(AdminHttpServerError::LocalAddr)?;
-        let service = match runtime_facts {
-            Some(runtime_facts) => AdminHttpService::new_with_runtime_facts(
+        let service = match (runtime_facts, readiness) {
+            (Some(runtime_facts), Some(readiness)) => AdminHttpService::new_with_runtime_sources(
                 config,
                 admin_config.auth,
                 admin_config.profile,
                 runtime_facts,
+                readiness,
             ),
-            None => AdminHttpService::new(config, admin_config.auth, admin_config.profile),
+            _ => AdminHttpService::new(config, admin_config.auth, admin_config.profile),
         };
 
         Ok(Self {
@@ -522,9 +548,10 @@ mod tests {
         AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminHttpService,
     };
     use crate::{
-        AdminReportProfile, AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig,
-        MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig,
-        RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
+        AdminReadiness, AdminReadinessSource, AdminReportProfile, AdminRuntimeFacts,
+        AdminRuntimeFactsSource, AnchorConfig, BackendConfig, BatchConfig, GatewayMode,
+        HardeningConfig, MetricsConfig, ProviderConformanceConfig, RecoveryConfig,
+        RepositoryConfig, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
         WriterGuardConfig,
     };
     use bytes::Bytes;
@@ -534,6 +561,7 @@ mod tests {
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
     use secrecy::SecretString;
     use std::io::ErrorKind;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream;
@@ -635,6 +663,34 @@ mod tests {
             runtime_config(),
             AdminHttpAuth::bearer(admin_token()),
             AdminReportProfile::Production,
+        )
+    }
+
+    struct TestRuntimeSources {
+        readiness: AdminReadiness,
+    }
+
+    impl AdminRuntimeFactsSource for TestRuntimeSources {
+        fn snapshot(&self) -> AdminRuntimeFacts {
+            AdminRuntimeFacts::default()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AdminReadinessSource for TestRuntimeSources {
+        async fn check_readiness(&self) -> AdminReadiness {
+            self.readiness.clone()
+        }
+    }
+
+    fn service_with_readiness(readiness: AdminReadiness) -> AdminHttpService {
+        let sources = Arc::new(TestRuntimeSources { readiness });
+        AdminHttpService::new_with_runtime_sources(
+            runtime_config(),
+            AdminHttpAuth::bearer(admin_token()),
+            AdminReportProfile::Production,
+            sources.clone(),
+            sources,
         )
     }
 
@@ -760,6 +816,47 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_route_reflects_live_sources_without_authentication() {
+        let ready = service_with_readiness(AdminReadiness::ready())
+            .handle(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap_or_else(|error| panic!("{error}")),
+            )
+            .await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        assert!(body_string(ready).await.contains("\"status\":\"ready\""));
+
+        let unavailable = service_with_readiness(AdminReadiness::unavailable("anchor.unavailable"))
+            .handle(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap_or_else(|error| panic!("{error}")),
+            )
+            .await;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_string(unavailable).await;
+        assert!(body.contains("anchor.unavailable"));
+        assert!(!body.contains("backend-bucket"));
+    }
+
+    #[tokio::test]
+    async fn readiness_without_live_source_fails_closed() {
+        let response = service()
+            .handle(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap_or_else(|error| panic!("{error}")),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 mod lease_guard;
 
 use async_trait::async_trait;
-use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
+use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::PostParams;
 use kube::{Api, Client};
@@ -13,8 +13,9 @@ use std::collections::BTreeMap;
 use tokio::sync::OnceCell;
 
 pub use lease_guard::{
-    KubernetesLeaseGuard, LeaseGuard, LeaseGuardApi, LeaseGuardError, LeaseGuardState,
+    KubernetesLeaseGuard, LeaseGuard, LeaseGuardApi, LeaseGuardError, LeaseGuardState, WriterFence,
 };
+use lease_guard::{WriterFenceClaim, lease_has_writer_coordination, lease_holds_claim};
 
 const V2_SEQUENCE_ANNOTATION: &str = "rs3.rs/v2-sequence";
 const V2_COMMIT_KEY_ANNOTATION: &str = "rs3.rs/v2-commit-key";
@@ -45,6 +46,7 @@ pub struct LeaseSettings {
 /// retry on update conflicts instead of silently overwriting each other.
 pub struct KubernetesLeaseAnchor {
     settings: LeaseSettings,
+    writer_fence: Option<WriterFence>,
     client: OnceCell<Client>,
 }
 
@@ -53,6 +55,17 @@ impl KubernetesLeaseAnchor {
     pub fn new(settings: LeaseSettings) -> Self {
         Self {
             settings,
+            writer_fence: None,
+            client: OnceCell::new(),
+        }
+    }
+
+    /// Creates an anchor whose updates must prove ownership of the live writer
+    /// epoch stored on this same Lease object.
+    pub fn new_fenced(settings: LeaseSettings, writer_fence: WriterFence) -> Self {
+        Self {
+            settings,
+            writer_fence: Some(writer_fence),
             client: OnceCell::new(),
         }
     }
@@ -79,7 +92,7 @@ impl V2CommitAnchor for KubernetesLeaseAnchor {
             Err(error) if is_kube_status(&error, 404) => return Ok(None),
             Err(_) => return Err(V2FormatError::AnchorReadFailed),
         };
-        v2_anchor_state_from_lease(&lease).map(Some)
+        v2_anchor_state_from_lease_optional(&lease)
     }
 
     async fn compare_and_advance_v2(
@@ -95,18 +108,18 @@ impl V2CommitAnchor for KubernetesLeaseAnchor {
         for _attempt in 0..MAX_ADVANCE_ATTEMPTS {
             match api.get(&self.settings.name).await {
                 Ok(lease) => {
-                    let current = v2_anchor_state_from_lease(&lease)?;
-                    if expected != Some(&current) {
+                    let current = v2_anchor_state_from_lease_optional(&lease)?;
+                    if expected != current.as_ref() {
                         return Err(V2FormatError::StaleAnchor);
                     }
-                    if next == current {
-                        return Ok(current);
-                    }
-                    if next.sequence <= current.sequence {
+                    if current.as_ref().is_some_and(|current| {
+                        next != *current && next.sequence <= current.sequence
+                    }) {
                         return Err(V2FormatError::StaleAnchor);
                     }
 
-                    let updated = v2_lease_with_state(lease, &next, &self.settings.field_manager);
+                    let updated =
+                        v2_lease_for_anchor_advance(lease, &next, self.writer_fence.as_ref())?;
                     match api
                         .replace(&self.settings.name, &PostParams::default(), &updated)
                         .await
@@ -120,8 +133,10 @@ impl V2CommitAnchor for KubernetesLeaseAnchor {
                     if expected.is_some() {
                         return Err(V2FormatError::StaleAnchor);
                     }
-                    let lease =
-                        new_v2_lease(&self.settings.name, &next, &self.settings.field_manager);
+                    if self.writer_fence.is_some() {
+                        return Err(V2FormatError::AnchorAdvanceFailed);
+                    }
+                    let lease = new_v2_lease(&self.settings.name, &next);
                     match api.create(&PostParams::default(), &lease).await {
                         Ok(lease) => return v2_anchor_state_from_lease(&lease),
                         Err(error) if is_kube_status(&error, 409) => continue,
@@ -136,7 +151,7 @@ impl V2CommitAnchor for KubernetesLeaseAnchor {
     }
 }
 
-fn new_v2_lease(name: &str, state: &V2AnchorState, field_manager: &str) -> Lease {
+fn new_v2_lease(name: &str, state: &V2AnchorState) -> Lease {
     v2_lease_with_state(
         Lease {
             metadata: ObjectMeta {
@@ -146,11 +161,61 @@ fn new_v2_lease(name: &str, state: &V2AnchorState, field_manager: &str) -> Lease
             spec: None,
         },
         state,
-        field_manager,
     )
 }
 
-fn v2_lease_with_state(mut lease: Lease, state: &V2AnchorState, field_manager: &str) -> Lease {
+fn v2_lease_with_fenced_state(
+    lease: Lease,
+    state: &V2AnchorState,
+    fence: &WriterFence,
+) -> V2Result<Lease> {
+    let claim = fence
+        .live_claim()
+        .ok_or(V2FormatError::AnchorAdvanceFailed)?;
+    v2_lease_with_claim(lease, state, &claim)
+}
+
+fn v2_lease_for_anchor_advance(
+    lease: Lease,
+    state: &V2AnchorState,
+    writer_fence: Option<&WriterFence>,
+) -> V2Result<Lease> {
+    validate_writer_fence(&lease, writer_fence)?;
+    match writer_fence {
+        Some(fence) => v2_lease_with_fenced_state(lease, state, fence),
+        None => Ok(v2_lease_with_state(lease, state)),
+    }
+}
+
+fn validate_writer_fence(lease: &Lease, writer_fence: Option<&WriterFence>) -> V2Result<()> {
+    match writer_fence {
+        Some(fence) => {
+            let claim = fence
+                .live_claim()
+                .ok_or(V2FormatError::AnchorAdvanceFailed)?;
+            if lease_holds_claim(lease, &claim).map_err(|_| V2FormatError::AnchorAdvanceFailed)? {
+                Ok(())
+            } else {
+                Err(V2FormatError::AnchorAdvanceFailed)
+            }
+        }
+        None if lease_has_writer_coordination(lease) => Err(V2FormatError::AnchorAdvanceFailed),
+        None => Ok(()),
+    }
+}
+
+fn v2_lease_with_claim(
+    lease: Lease,
+    state: &V2AnchorState,
+    claim: &WriterFenceClaim,
+) -> V2Result<Lease> {
+    if !lease_holds_claim(&lease, claim).map_err(|_| V2FormatError::AnchorAdvanceFailed)? {
+        return Err(V2FormatError::AnchorAdvanceFailed);
+    }
+    Ok(v2_lease_with_state(lease, state))
+}
+
+fn v2_lease_with_state(mut lease: Lease, state: &V2AnchorState) -> Lease {
     let annotations = lease.metadata.annotations.get_or_insert_with(BTreeMap::new);
     annotations.insert(
         V2_SEQUENCE_ANNOTATION.to_owned(),
@@ -203,13 +268,31 @@ fn v2_lease_with_state(mut lease: Lease, state: &V2AnchorState, field_manager: &
         }
     }
 
-    let spec = lease.spec.get_or_insert_with(LeaseSpec::default);
-    spec.holder_identity = Some(format!(
-        "{field_manager}:v2:{}:{}",
-        state.sequence.get(),
-        state.format_ref.generation
-    ));
     lease
+}
+
+fn v2_anchor_state_from_lease_optional(lease: &Lease) -> V2Result<Option<V2AnchorState>> {
+    let Some(annotations) = lease.metadata.annotations.as_ref() else {
+        return Ok(None);
+    };
+    const ANCHOR_ANNOTATIONS: &[&str] = &[
+        V2_SEQUENCE_ANNOTATION,
+        V2_COMMIT_KEY_ANNOTATION,
+        V2_BODY_DIGEST_ANNOTATION,
+        V2_VERSION_ID_ANNOTATION,
+        V2_SIGNING_KEY_ID_ANNOTATION,
+        V2_FORMAT_GENERATION_ANNOTATION,
+        V2_FORMAT_DIGEST_ANNOTATION,
+        V2_FORMAT_OBJECT_ID_ANNOTATION,
+        V2_FORMAT_VERSION_ID_ANNOTATION,
+    ];
+    if !ANCHOR_ANNOTATIONS
+        .iter()
+        .any(|key| annotations.contains_key(*key))
+    {
+        return Ok(None);
+    }
+    v2_anchor_state_from_lease(lease).map(Some)
 }
 
 fn v2_anchor_state_from_lease(lease: &Lease) -> V2Result<V2AnchorState> {
@@ -284,8 +367,14 @@ fn is_kube_status(error: &kube::Error, code: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{V2_FORMAT_VERSION_ID_ANNOTATION, v2_anchor_state_from_lease, v2_lease_with_state};
+    use super::{
+        V2_FORMAT_VERSION_ID_ANNOTATION, WriterFenceClaim, lease_has_writer_coordination,
+        v2_anchor_state_from_lease, v2_anchor_state_from_lease_optional,
+        v2_lease_for_anchor_advance, v2_lease_with_claim, v2_lease_with_state,
+    };
+    use crate::lease_guard::lease_with_guard_state;
     use k8s_openapi::api::coordination::v1::Lease;
+    use k8s_openapi::jiff::Timestamp;
     use rs3_repository::v2::{V2AnchorState, V2FormatError, V2FormatRef};
     use rs3_types::{BackendObjectId, BackendVersionId, KeyId, Sequence};
 
@@ -321,7 +410,7 @@ mod tests {
     #[test]
     fn lease_annotations_round_trip_v2_anchor_state() {
         let expected = v2_state(7);
-        let lease = v2_lease_with_state(Lease::default(), &expected, "rs3-test");
+        let lease = v2_lease_with_state(Lease::default(), &expected);
 
         let actual = v2_anchor_state_from_lease(&lease);
 
@@ -331,7 +420,7 @@ mod tests {
     #[test]
     fn lease_annotations_round_trip_v2_format_version() {
         let expected = v2_state(8);
-        let lease = v2_lease_with_state(Lease::default(), &expected, "rs3-test");
+        let lease = v2_lease_with_state(Lease::default(), &expected);
 
         assert_eq!(
             lease
@@ -347,7 +436,7 @@ mod tests {
 
     #[test]
     fn v2_anchor_state_fails_closed_when_annotations_are_missing() {
-        let mut lease = v2_lease_with_state(Lease::default(), &v2_state(1), "rs3-test");
+        let mut lease = v2_lease_with_state(Lease::default(), &v2_state(1));
         lease
             .metadata
             .annotations
@@ -358,5 +447,95 @@ mod tests {
         let actual = v2_anchor_state_from_lease(&lease);
 
         assert!(matches!(actual, Err(V2FormatError::AnchorReadFailed)));
+    }
+
+    #[test]
+    fn coordination_only_lease_is_an_empty_anchor() {
+        let lease = lease_with_guard_state(
+            Lease::default(),
+            &WriterFenceClaim {
+                holder_identity: "pod-a/process-1".to_owned(),
+                token: 3,
+            },
+            9,
+            std::time::Duration::from_secs(30),
+            Timestamp::now(),
+            true,
+        )
+        .expect("valid guard lease");
+
+        assert_eq!(v2_anchor_state_from_lease_optional(&lease).ok(), Some(None));
+    }
+
+    #[test]
+    fn anchor_update_preserves_live_writer_coordination_state() {
+        let claim = WriterFenceClaim {
+            holder_identity: "pod-a/process-1".to_owned(),
+            token: 3,
+        };
+        let lease = lease_with_guard_state(
+            Lease::default(),
+            &claim,
+            9,
+            std::time::Duration::from_secs(30),
+            Timestamp::now(),
+            true,
+        )
+        .expect("valid guard lease");
+
+        let updated =
+            v2_lease_with_claim(lease, &v2_state(1), &claim).expect("live fence accepts update");
+        let spec = updated.spec.expect("coordination spec");
+        assert_eq!(spec.holder_identity.as_deref(), Some("pod-a/process-1"));
+        assert_eq!(spec.lease_duration_seconds, Some(30));
+    }
+
+    #[test]
+    fn stale_writer_fence_cannot_advance_anchor_after_handoff() {
+        let current_claim = WriterFenceClaim {
+            holder_identity: "pod-b/process-2".to_owned(),
+            token: 4,
+        };
+        let lease = lease_with_guard_state(
+            Lease::default(),
+            &current_claim,
+            12,
+            std::time::Duration::from_secs(30),
+            Timestamp::now(),
+            true,
+        )
+        .expect("valid guard lease");
+        let stale_claim = WriterFenceClaim {
+            holder_identity: "pod-a/process-1".to_owned(),
+            token: 3,
+        };
+
+        let result = v2_lease_with_claim(lease, &v2_state(2), &stale_claim);
+
+        assert!(matches!(result, Err(V2FormatError::AnchorAdvanceFailed)));
+    }
+
+    #[test]
+    fn unfenced_maintenance_detects_writer_coordination_state() {
+        let claim = WriterFenceClaim {
+            holder_identity: "pod-a/process-1".to_owned(),
+            token: 3,
+        };
+        let lease = lease_with_guard_state(
+            Lease::default(),
+            &claim,
+            9,
+            std::time::Duration::from_secs(30),
+            Timestamp::now(),
+            true,
+        )
+        .expect("valid guard lease");
+
+        assert!(lease_has_writer_coordination(&lease));
+        assert_eq!(v2_anchor_state_from_lease_optional(&lease).ok(), Some(None));
+        assert!(matches!(
+            v2_lease_for_anchor_advance(lease, &v2_state(1), None),
+            Err(V2FormatError::AnchorAdvanceFailed)
+        ));
     }
 }

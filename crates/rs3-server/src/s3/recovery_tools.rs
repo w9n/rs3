@@ -7,8 +7,8 @@ use crate::{RepositoryFormat, RepositoryKeyContextConfig, RepositoryToolConfig};
 use rs3_crypto::{FormatEnvelope, KeyRing, KeyringEnvelope, RepositoryKeyContext, SecretBytes};
 use rs3_repository::store_keyring_envelope;
 use rs3_repository::v2::{
-    V2AnchorState, V2CommitChain, V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot,
-    V2KeyringEnvelopeRootRef, V2ProviderProfile, V2RecoveryBundle,
+    V2AnchorState, V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot,
+    V2KeyringEnvelopeRootRef, V2ProviderProfile, V2RecoveryBundle, V2ReplayChain,
 };
 use rs3_storage::{BlobStore, ByteRange};
 use rs3_types::{BackendObjectId, KeyDescriptor, RepositoryId, RetentionPolicy, Sequence};
@@ -198,7 +198,7 @@ where
     .with_retention(format_root.retention);
     let commit_store = V2CommitStore::new(store, keyring, commit_options);
     let chain = commit_store
-        .load_chain_from_state(&bundle.anchor)
+        .load_replay_chain_from_state(&bundle.anchor)
         .await
         .map_err(repository_init)?;
 
@@ -363,7 +363,7 @@ fn verification_report(
     repository_id: RepositoryId,
     bundle: &V2RecoveryBundle,
     format_root: &V2FormatRoot,
-    chain: &V2CommitChain,
+    chain: &V2ReplayChain,
 ) -> V2RecoveryBundleVerificationReport {
     let snapshot_sequence = chain
         .commits_newest_first

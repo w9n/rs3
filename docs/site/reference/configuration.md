@@ -15,7 +15,7 @@ flags may override selected listener and gateway-mode settings.
 | `RS3_ADMIN_PROFILE` | no | `production` | Admin status profile: `local` or `production`. |
 | `RS3_RECOVERY_PUBLIC_KEY` | production recovery | none | `ed25519:<hex-public-key>` used to verify signed v2 restore bundles during `verify-bundle` and `import-v2-anchor`. |
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
-| `RUST_LOG` | no | `info` | Standard tracing filter. |
+| `RUST_LOG` | no | `info` | Tracing filter for `rs3` application targets. Dependency targets are always disabled because upstream HTTP and S3 traces can contain object paths or authentication headers. |
 
 `init`, `export-restore-bundle`, `import-v2-anchor`, and
 `write-index-snapshot` use the same repository, backend, anchor, and keyring
@@ -131,7 +131,7 @@ credential variables.
 | `RS3_ANCHOR_NAMESPACE` | for Kubernetes | none | Kubernetes namespace for the Lease anchor. |
 | `RS3_ANCHOR_NAME` | for Kubernetes | none | Kubernetes Lease name. |
 | `RS3_ANCHOR_FIELD_MANAGER` | no | `rs3-server` | Server-side apply field manager. |
-| `RS3_WRITER_GUARD` | no | `required` with Kubernetes anchors, otherwise `off` | `required` or `off`. In `read-write` mode with Kubernetes anchors, `required` acquires `<RS3_ANCHOR_NAME>-writer` before serving and renews it while running. |
+| `RS3_WRITER_GUARD` | no | `required` with Kubernetes anchors, otherwise `off` | `required` or `off`. In `read-write` mode with Kubernetes anchors, `required` acquires a fenced writer epoch on `RS3_ANCHOR_NAME` itself before serving and renews it while running. Anchor advances verify the live epoch in the same Lease CAS. |
 
 Helm defaults to `anchor.mode=kubernetes-lease`. If `rbac.create=false`, set
 `rbac.existing=true` to document that equivalent Lease permissions are provided
@@ -239,8 +239,8 @@ For `gateway.mode=read-write`, the chart defaults to
 `updateStrategy.type=Recreate` and rejects rolling-update strategy values. This
 preserves the one-writer repository rule during upgrades. Use
 `restore-readonly` for scaled restore readers. The chart also sets
-`gateway.writerGuard=required` by default so a read-write gateway holds the
-runtime writer Lease before accepting traffic.
+`gateway.writerGuard=required` by default so a read-write gateway holds a
+fenced writer epoch on the anchor Lease before accepting traffic.
 
 | Secret key | Meaning |
 | --- | --- |

@@ -2,6 +2,8 @@
 
 use super::S3BoundaryError;
 use super::repository_init;
+#[cfg(feature = "k8s")]
+use super::runtime_builders::build_v2_anchor_with_writer_fence;
 use super::runtime_builders::{build_store, build_v2_anchor, coordinator_options};
 use super::runtime_handles::{RuntimeStore, RuntimeV2Anchor};
 use super::runtime_keyring::{
@@ -9,8 +11,8 @@ use super::runtime_keyring::{
     retained_version_required, secret_hex, unanchored_gateway_keyring,
 };
 use crate::admin::{
-    AdminRepositoryRuntimeFacts, AdminRuntimeFacts, AdminRuntimeFactsSource,
-    AdminV2CommitCoordinatorSummary,
+    AdminReadiness, AdminReadinessSource, AdminRepositoryRuntimeFacts, AdminRuntimeFacts,
+    AdminRuntimeFactsSource, AdminV2CommitCoordinatorSummary,
 };
 use crate::config::KEYRING_WRAPPING_KEY_HEX_ENV;
 use crate::{
@@ -21,6 +23,8 @@ use bytes::Bytes;
 use futures_util::Stream;
 use rs3_crypto::{FormatEnvelope, KeyRing};
 use rs3_index::KeyringEnvelopeReference;
+#[cfg(feature = "k8s")]
+use rs3_k8s::WriterFence;
 pub use rs3_repository::v2::V2_RESTORE_BUNDLE_SCHEMA;
 use rs3_repository::v2::{
     V2AnchorState, V2CommitAnchor, V2CommitCoordinator, V2CommitKey, V2CommitStore,
@@ -150,6 +154,7 @@ pub struct RuntimeV2ProviderConformanceOptions {
 
 #[derive(Clone)]
 pub(super) struct RuntimeRepository {
+    store: RuntimeStore,
     repository: Arc<V2Repository<RuntimeStore>>,
     coordinator: Arc<V2CommitCoordinator<RuntimeStore, RuntimeV2Anchor>>,
     anchor: RuntimeV2Anchor,
@@ -192,7 +197,26 @@ struct LoadedV2Repository {
 
 impl RuntimeRepository {
     pub(super) async fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
+        Self::from_config_inner(config, None).await
+    }
+
+    #[cfg(feature = "k8s")]
+    pub(super) async fn from_config_with_writer_fence(
+        config: &RuntimeConfig,
+        writer_fence: WriterFence,
+    ) -> Result<Self, S3BoundaryError> {
+        Self::from_config_inner(config, Some(writer_fence)).await
+    }
+
+    async fn from_config_inner(
+        config: &RuntimeConfig,
+        #[cfg(feature = "k8s")] writer_fence: Option<WriterFence>,
+        #[cfg(not(feature = "k8s"))] _writer_fence: Option<()>,
+    ) -> Result<Self, S3BoundaryError> {
         let store = build_store(&config.backend).await?;
+        #[cfg(feature = "k8s")]
+        let anchor = build_v2_anchor_with_writer_fence(&config.anchor, writer_fence)?;
+        #[cfg(not(feature = "k8s"))]
         let anchor = build_v2_anchor(&config.anchor)?;
         let store_handle = store.handle().clone();
         let anchor_handle = anchor.handle().clone();
@@ -249,6 +273,7 @@ impl RuntimeRepository {
         let memory_anchor = anchor.memory_anchor().cloned();
 
         Ok(Self {
+            store: store_handle,
             repository,
             coordinator,
             anchor: anchor_handle,
@@ -275,15 +300,11 @@ impl RuntimeRepository {
                 "retained v2 repository anchor is missing the commit object version id",
             ));
         }
-        let chain = self
-            .repository
-            .commit_store()
-            .load_chain_from_state(&anchor_state)
-            .await
-            .map_err(repository_init)?;
         self.repository
-            .replay_chain(&chain)
-            .map_err(repository_init)?;
+            .load_chain_from_anchor(&self.anchor)
+            .await
+            .map_err(repository_init)?
+            .ok_or_else(|| repository_init("v2-preview repository anchor is missing"))?;
         Ok(())
     }
 
@@ -440,6 +461,13 @@ impl RuntimeRepository {
         })
     }
 
+    pub(super) fn admin_readiness_source(&self) -> Arc<dyn AdminReadinessSource> {
+        Arc::new(RuntimeRepositoryAdminFacts {
+            repository: self.clone(),
+            process_started_at_ms: current_time_ms(),
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn memory_store(&self) -> Option<&MemoryBlobStore> {
         self.memory_store.as_ref()
@@ -463,6 +491,35 @@ impl AdminRuntimeFactsSource for RuntimeRepositoryAdminFacts {
                 }),
             },
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl AdminReadinessSource for RuntimeRepositoryAdminFacts {
+    async fn check_readiness(&self) -> AdminReadiness {
+        if self.repository.coordinator.status().poisoned {
+            return AdminReadiness::unavailable("repository.coordinator-poisoned");
+        }
+
+        let anchor = match self.repository.anchor.read_v2().await {
+            Ok(Some(anchor)) => anchor,
+            Ok(None) => return AdminReadiness::unavailable("anchor.missing"),
+            Err(_) => return AdminReadiness::unavailable("anchor.unavailable"),
+        };
+        if self.repository.require_anchor_version && anchor.version_id.is_none() {
+            return AdminReadiness::unavailable("anchor.version-missing");
+        }
+        if self
+            .repository
+            .store
+            .head_at(&anchor.commit_key, anchor.version_id.as_ref())
+            .await
+            .is_err()
+        {
+            return AdminReadiness::unavailable("backend.anchor-head-unavailable");
+        }
+
+        AdminReadiness::ready()
     }
 }
 
@@ -662,7 +719,7 @@ pub async fn export_v2_recovery_bundle_from_config(
             .with_retention(config.repository.retention);
     let commit_store = V2CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
     commit_store
-        .load_chain_from_state(&anchor_state)
+        .load_replay_chain_from_state(&anchor_state)
         .await
         .map_err(repository_init)?;
 
@@ -744,7 +801,7 @@ pub async fn import_v2_anchor_from_config(
             ));
         }
         let chain = commit_store
-            .load_chain_from_state(&current)
+            .load_replay_chain_from_state(&current)
             .await
             .map_err(repository_init)?;
         return Ok(V2AnchorImportReport {
@@ -1242,6 +1299,37 @@ mod tests {
 
         assert!(runtime.memory_store().is_some());
         assert!(runtime.memory_v2_anchor().is_some());
+    }
+
+    #[tokio::test]
+    async fn runtime_readiness_checks_anchor_and_backend_head() {
+        let runtime = RuntimeRepository::from_config(&runtime_config(true))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let readiness = runtime.admin_readiness_source();
+
+        assert!(readiness.check_readiness().await.ready);
+
+        let anchor = runtime
+            .memory_v2_anchor()
+            .unwrap_or_else(|| panic!("memory anchor should exist"))
+            .read_v2()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("accepted anchor should exist"));
+        runtime
+            .memory_store()
+            .unwrap_or_else(|| panic!("memory store should exist"))
+            .delete(&anchor.commit_key)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let unavailable = readiness.check_readiness().await;
+        assert!(!unavailable.ready);
+        assert_eq!(
+            unavailable.reason_code,
+            Some("backend.anchor-head-unavailable")
+        );
     }
 
     #[tokio::test]

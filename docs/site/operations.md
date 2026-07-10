@@ -261,6 +261,18 @@ RS3_ANCHOR_FIELD_MANAGER=rs3-server
 If the configured anchor cannot be read or advanced, writes must fail closed.
 Do not silently fall back to a memory anchor.
 
+The read-write gateway coordinates ownership and accepted anchor state on this
+same Lease. Ownership takeover is based on an unchanged renewal counter observed
+for a full local monotonic lease duration, not on comparing pod wall clocks.
+Every transfer increments a fencing token, and each anchor advance verifies the
+live holder and token in the same `resourceVersion` update. Do not add a second
+TTL-style writer Lease or delete the coordination annotations to force a
+handoff. An orderly gateway shutdown releases its epoch with a final Lease CAS;
+unfenced maintenance commands fail closed while an active writer epoch remains.
+After an abrupt crash, let a replacement writer complete the monotonic takeover
+before shutting it down cleanly for offline maintenance. Use the documented
+recovery workflow when the anchor must be recreated.
+
 For the production preview, the Kubernetes Lease is the authority for latest
 accepted state. Retained commit versions are useful history, not the authority.
 If S3 serves an older valid commit, hides the commit named by the Lease, or
@@ -327,9 +339,11 @@ Use JSON logs when collecting structured runtime evidence:
 RS3_LOG_FORMAT=json
 ```
 
-Tracing filters use the standard `RUST_LOG` environment variable. Keep
-trace-level collection scoped and time-bounded because traces can be high
-volume even when labels are redacted.
+Tracing filters use the standard `RUST_LOG` environment variable for `rs3`
+application targets. The gateway and console always suppress dependency
+targets because upstream HTTP and S3 debug events can contain object paths or
+authentication headers. Keep trace-level collection scoped and time-bounded
+because traces can still be high volume.
 
 Startup logs include a path-safe `config_profile` fingerprint over operational
 knobs. They do not log configured bucket names, backend prefixes, repository

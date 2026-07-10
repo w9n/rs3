@@ -88,13 +88,21 @@ one. The backend can still deny service by hiding required objects.
 | Backend overwrites format, keyring, commit, metadata, or payload bytes | Reject through native create-only write checks, signed/digested state, AEAD authentication, or retained-version exact reads. S3 providers qualify through either `atomic-create` or `retained-version`; `HEAD` before `PUT` is not a production fallback. |
 | Backend contains commits newer than the Lease anchor | Do not silently advance. Treat as ambiguous until explicit recovery validates a trusted bundle or a separately approved anchor decision. |
 | Lease missing but backend objects exist | Do not silently trust storage. Require a trusted v2 recovery bundle and verify the named commit chain before recreating the anchor. |
-| Multiple gateways serve the same repository as `read-write` | Unsupported. With Kubernetes anchors, a read-write gateway acquires `<anchor-name>-writer` before serving and shuts down if renewal is no longer trustworthy. Run one writer per repository; use `restore-readonly` for scaled restore readers. |
+| Multiple gateways serve the same repository as `read-write` | Supported only as failover within one Kubernetes apiserver and anchor-Lease coordination domain. A gateway acquires a unique fenced writer epoch on the anchor Lease itself; every anchor advance verifies that epoch atomically, and the gateway shuts down if renewal is no longer trustworthy. Disconnected writers that only share S3 are unsupported. |
 | Gateway started as `restore-readonly` without an accepted anchor | Fail closed. Run explicit anchor recovery first, then serve restore traffic. |
 | Healthy Velero restore through the primary path | Run through the single `read-write` gateway so Velero restore-result artifacts are committed and the restore can report `Completed`. |
 | Restore client attempts PUT, DELETE, or legal-hold mutation through `restore-readonly` | Reject the request instead of advancing repository state. |
 | Velero restore reports `PartiallyFailed` only because restore-result artifact uploads were denied by `restore-readonly` | Accept only after verifying restored data, completed pod-volume restore, and zero backend writes during restore. Treat any other restore error as failure. |
 | Lease and backend are both compromised | Online protection is exhausted; recovery needs offline or externally protected authority. |
 | Wrapping key and old envelope are both exposed | Rewrap protects only future envelope handling; historical data under that keyring is treated as exposed. |
+
+Kubernetes Lease fencing is not a cross-cluster consensus protocol. S3 object
+synchronization, conditional writes, Object Lock, or a newest-looking commit do
+not provide a safe writer lock under the malicious and eventually inconsistent
+backend threat model. Run disconnected gateways as `restore-readonly` readers;
+multiple such readers are supported when each can verify an accepted anchored
+state. A future disconnected multi-writer mode would need a separate trusted
+coordination authority and repository protocol, not an S3-sync switch.
 
 ## Incomplete Multipart Cleanup
 

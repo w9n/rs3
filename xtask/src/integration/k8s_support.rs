@@ -84,6 +84,8 @@ pub(crate) fn helm_install_gateway(
             "--set-string",
             &helm_set_string("gateway.mode", values.gateway_mode),
             "--set-string",
+            &helm_set_string("admin.profile", "local"),
+            "--set-string",
             &format!("publicBucket={}", values.public_bucket),
             "--set",
             "credentials.create=true",

@@ -2,7 +2,7 @@
 
 use super::S3BoundaryError;
 use super::adapter::GatewayS3Service;
-use crate::{AdminRuntimeFactsSource, RuntimeConfig};
+use crate::{AdminReadinessSource, AdminRuntimeFactsSource, RuntimeConfig};
 use rs3_types::PublicBucket;
 use s3s::S3Result;
 use s3s::access::{S3Access, S3AccessContext};
@@ -24,6 +24,7 @@ pub struct GatewayS3Boundary {
     service: S3Service,
     hardening: S3Hardening,
     admin_runtime_facts: Arc<dyn AdminRuntimeFactsSource>,
+    admin_readiness: Arc<dyn AdminReadinessSource>,
 }
 
 impl GatewayS3Boundary {
@@ -37,13 +38,38 @@ impl GatewayS3Boundary {
     /// Returns [`S3BoundaryError::MissingStaticCredentials`] when no static
     /// credentials are configured for the process.
     pub async fn build(config: RuntimeConfig) -> Result<Self, S3BoundaryError> {
+        Self::build_inner(config, None).await
+    }
+
+    #[cfg(feature = "k8s")]
+    pub(crate) async fn build_with_writer_fence(
+        config: RuntimeConfig,
+        writer_fence: rs3_k8s::WriterFence,
+    ) -> Result<Self, S3BoundaryError> {
+        Self::build_inner(config, Some(writer_fence)).await
+    }
+
+    async fn build_inner(
+        config: RuntimeConfig,
+        #[cfg(feature = "k8s")] writer_fence: Option<rs3_k8s::WriterFence>,
+        #[cfg(not(feature = "k8s"))] _writer_fence: Option<()>,
+    ) -> Result<Self, S3BoundaryError> {
         let credentials = config
             .static_credentials
             .clone()
             .ok_or(S3BoundaryError::MissingStaticCredentials)?;
 
+        #[cfg(feature = "k8s")]
+        let adapter = match writer_fence {
+            Some(writer_fence) => {
+                GatewayS3Service::from_config_with_writer_fence(&config, writer_fence).await?
+            }
+            None => GatewayS3Service::from_config(&config).await?,
+        };
+        #[cfg(not(feature = "k8s"))]
         let adapter = GatewayS3Service::from_config(&config).await?;
         let admin_runtime_facts = adapter.admin_runtime_facts_source();
+        let admin_readiness = adapter.admin_readiness_source();
         let mut builder = S3ServiceBuilder::new(adapter);
 
         let s3_config = Arc::new(S3Config::default());
@@ -59,6 +85,7 @@ impl GatewayS3Boundary {
             service: builder.build(),
             hardening: S3Hardening::required(),
             admin_runtime_facts,
+            admin_readiness,
         })
     }
 
@@ -90,6 +117,11 @@ impl GatewayS3Boundary {
     /// Returns a live path-redacted admin facts source for this boundary.
     pub fn admin_runtime_facts_source(&self) -> Arc<dyn AdminRuntimeFactsSource> {
         Arc::clone(&self.admin_runtime_facts)
+    }
+
+    /// Returns live readiness checks for repository, anchor, and backend state.
+    pub fn admin_readiness_source(&self) -> Arc<dyn AdminReadinessSource> {
+        Arc::clone(&self.admin_readiness)
     }
 }
 

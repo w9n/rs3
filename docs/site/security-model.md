@@ -86,10 +86,10 @@ become a persisted backend key or telemetry label.
 | Writes are not acknowledged before commit acceptance | Commit coordinator waits for a covering signed commit and anchor advance. | v2 coordinator and commit tests. |
 | Storage rollback is not trusted as latest state | Ed25519 commit verification, Kubernetes Lease anchor, and retained exact-version commit reads. | v2 anchor, replay, recovery import, and orphan-report tests. |
 | v2 writes are not acknowledged before signed commit acceptance | The v2 commit coordinator batches staged writes into a signed commit and advances the external v2 anchor before returning success. | v2 coordinator batching, rollback, and snapshot tests. |
-| v2 replay cost is bounded by signed snapshots | v2 readers walk the signed parent chain to the nearest encrypted index snapshot, then replay newer deltas. | v2 snapshot replay tests and format vectors. |
+| v2 replay cost is bounded by signed snapshots and fixed resource budgets | v2 readers walk the signed parent chain to the nearest encrypted index snapshot, range-hash payloads without retaining them, and fail closed at fixed commit, cumulative-I/O, or retained-index limits. | v2 bounded replay, snapshot replay, malformed-length, and range-tamper tests. |
 | Create-only writes are not silently downgraded | Atomic-create providers must honor `PutObject` with `If-None-Match: *`; non-atomic `HEAD` before `PUT` is not treated as production create-only. | Storage contract tests and opt-in live S3 tests. |
 | Retained restore reads do not trust mutable latest objects | Retained-version providers must return version IDs for restore-critical writes; anchors bind commit versions and restore reads exact versions. | Memory version-addressed storage tests, v2 retained commit tests, and opt-in live S3 Object Lock tests. |
-| Single-writer read-write serving is guarded in Kubernetes deployments | `RS3_WRITER_GUARD=required` acquires a companion Kubernetes Lease before serving and renews it while running. | Lease guard tests, runtime startup guard, and configuration tests. |
+| Single-writer read-write serving is guarded in Kubernetes deployments | `RS3_WRITER_GUARD=required` acquires a unique process identity and monotonic fencing token on the anchor Lease before serving. Every anchor advance verifies that live fence in the same resource-version CAS. | Lease skew, handoff, stale-writer, runtime startup guard, and configuration tests. |
 | Incident restore does not advance repository state | `restore-readonly` mode requires an accepted anchor and rejects supported mutations. | Gateway mode config, startup, and S3 adapter tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
@@ -114,12 +114,19 @@ versions are useful history, not latest-state authority. A missing, older, or
 newer-looking backend commit is not a reason to trust storage; it is a reason to
 stop and recover from an explicitly trusted anchor bundle.
 
-For read-write Kubernetes deployments, the writer guard acquires a separate
-Lease named from the anchor as `<anchor-name>-writer` before serving and renews
-it while the process runs. If another live holder owns that Lease, or renewal
-fails past the lease duration, the gateway shuts down instead of continuing as
-a possible split-brain writer. This guard is runtime coordination, not a
-replacement for signed commits or the external v2 anchor.
+For read-write Kubernetes deployments, the writer guard records ownership on
+the anchor Lease itself before serving and renews it while the process runs.
+Each process identity is random-suffixed, every ownership transfer increments a
+monotonic fence token, and every anchor advance atomically checks that identity
+and token through the same Lease `resourceVersion` CAS. Takeover waits for an
+unchanged renewal counter for a full locally measured monotonic lease duration;
+wall-clock skew cannot make a competing Lease expire early. A process also
+refuses anchor advances once its own monotonic renewal deadline passes. If
+ownership changes or renewal is no longer trustworthy, the gateway shuts down.
+An orderly shutdown releases ownership with another Lease CAS so unfenced
+maintenance can run while no writer is active. Unfenced maintenance refuses to
+advance a Lease with an active writer epoch. This guard is runtime coordination,
+not a replacement for signed commits or the external v2 anchor.
 
 For `v2-preview`, the external anchor names the accepted commit key, body
 digest, provider version ID when required, signing key ID, and format-root

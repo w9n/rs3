@@ -154,6 +154,7 @@ impl RunningGateway {
             .env("RS3_BACKEND_PREFIX", backend_prefix)
             .env("RS3_ANCHOR_MODE", "memory")
             .env("RS3_ALLOW_MEMORY_ANCHOR", "true")
+            .env("RS3_ADMIN_PROFILE", "local")
             .env("RS3_ALLOW_REPOSITORY_INIT", "true")
             .env("RS3_REPOSITORY_ID", "rs3-integration-repository")
             .env("RS3_REPOSITORY_SALT_HEX", REPOSITORY_SALT_HEX)

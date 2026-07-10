@@ -11,7 +11,7 @@ use super::mapping::{
     validate_head_object_request, validate_put_object_request,
 };
 use super::runtime::RuntimeRepository;
-use crate::{AdminRuntimeFactsSource, GatewayMode, RuntimeConfig};
+use crate::{AdminReadinessSource, AdminRuntimeFactsSource, GatewayMode, RuntimeConfig};
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, stream};
 use rs3_repository::{RepositoryError, RepositoryPutOptions};
@@ -54,6 +54,23 @@ pub(super) struct GatewayS3Service {
 impl GatewayS3Service {
     pub(super) async fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
         let repository = RuntimeRepository::from_config(config).await?;
+        Self::from_repository(config, repository).await
+    }
+
+    #[cfg(feature = "k8s")]
+    pub(super) async fn from_config_with_writer_fence(
+        config: &RuntimeConfig,
+        writer_fence: rs3_k8s::WriterFence,
+    ) -> Result<Self, S3BoundaryError> {
+        let repository =
+            RuntimeRepository::from_config_with_writer_fence(config, writer_fence).await?;
+        Self::from_repository(config, repository).await
+    }
+
+    async fn from_repository(
+        config: &RuntimeConfig,
+        repository: RuntimeRepository,
+    ) -> Result<Self, S3BoundaryError> {
         repository
             .validate_backend_retention(config.repository.retention)
             .await?;
@@ -82,6 +99,10 @@ impl GatewayS3Service {
 
     pub(super) fn admin_runtime_facts_source(&self) -> Arc<dyn AdminRuntimeFactsSource> {
         self.repository.admin_facts_source()
+    }
+
+    pub(super) fn admin_readiness_source(&self) -> Arc<dyn AdminReadinessSource> {
+        self.repository.admin_readiness_source()
     }
 
     fn next_request_id(&self) -> u64 {

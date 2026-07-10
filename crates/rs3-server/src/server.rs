@@ -1,6 +1,9 @@
 //! TCP listener and HTTP serving loop for the S3 boundary.
 
-use crate::{AdminRuntimeFactsSource, GatewayS3Boundary, RuntimeConfig, S3BoundaryError};
+use crate::{
+    AdminReadinessSource, AdminRuntimeFactsSource, GatewayS3Boundary, RuntimeConfig,
+    S3BoundaryError,
+};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
@@ -38,6 +41,25 @@ impl GatewayServer {
     /// listener address cannot be read.
     pub async fn bind(config: RuntimeConfig) -> Result<Self, GatewayServerError> {
         let boundary = GatewayS3Boundary::build(config.clone()).await?;
+        Self::bind_with_boundary(config, boundary).await
+    }
+
+    /// Binds a gateway whose Kubernetes anchor updates are fenced by the
+    /// supplied live writer epoch.
+    #[cfg(feature = "k8s")]
+    pub async fn bind_with_writer_fence(
+        config: RuntimeConfig,
+        writer_fence: rs3_k8s::WriterFence,
+    ) -> Result<Self, GatewayServerError> {
+        let boundary =
+            GatewayS3Boundary::build_with_writer_fence(config.clone(), writer_fence).await?;
+        Self::bind_with_boundary(config, boundary).await
+    }
+
+    async fn bind_with_boundary(
+        config: RuntimeConfig,
+        boundary: GatewayS3Boundary,
+    ) -> Result<Self, GatewayServerError> {
         let listener =
             TcpListener::bind(config.bind)
                 .await
@@ -70,6 +92,11 @@ impl GatewayServer {
     /// Returns a live path-redacted admin facts source for this gateway.
     pub fn admin_runtime_facts_source(&self) -> Arc<dyn AdminRuntimeFactsSource> {
         self.boundary.admin_runtime_facts_source()
+    }
+
+    /// Returns live readiness checks for repository, anchor, and backend state.
+    pub fn admin_readiness_source(&self) -> Arc<dyn AdminReadinessSource> {
+        self.boundary.admin_readiness_source()
     }
 
     /// Serves connections until the provided shutdown future resolves.

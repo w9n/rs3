@@ -4,7 +4,10 @@
 //! integrations. They are intentionally not a complete workflow API; mutating
 //! workflows require a separate authorization and audit model.
 
-use crate::{AnchorConfig, BackendConfig, ProviderConformanceConfig, RuntimeConfig};
+use crate::{
+    AnchorConfig, BackendConfig, ProviderConformanceConfig, RuntimeConfig, WriterGuardConfig,
+};
+use async_trait::async_trait;
 use rs3_crypto::derive_public_fingerprint;
 use rs3_types::RetentionMode;
 use serde::{Deserialize, Serialize};
@@ -38,6 +41,40 @@ impl AdminReportProfile {
 pub trait AdminRuntimeFactsSource: Send + Sync {
     /// Returns a current snapshot of live runtime facts.
     fn snapshot(&self) -> AdminRuntimeFacts;
+}
+
+/// Live readiness probe source for the gateway admin listener.
+#[async_trait]
+pub trait AdminReadinessSource: Send + Sync {
+    /// Checks the dependencies required to serve correct S3 responses now.
+    async fn check_readiness(&self) -> AdminReadiness;
+}
+
+/// Path-safe result of a live gateway readiness check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminReadiness {
+    /// Whether the gateway can currently serve its configured mode safely.
+    pub ready: bool,
+    /// Stable path-safe reason when the gateway is not ready.
+    pub reason_code: Option<&'static str>,
+}
+
+impl AdminReadiness {
+    /// Returns a successful readiness result.
+    pub const fn ready() -> Self {
+        Self {
+            ready: true,
+            reason_code: None,
+        }
+    }
+
+    /// Returns a failed readiness result with a stable path-safe reason.
+    pub const fn unavailable(reason_code: &'static str) -> Self {
+        Self {
+            ready: false,
+            reason_code: Some(reason_code),
+        }
+    }
 }
 
 /// Live in-process facts attached to admin reports when a gateway is running.
@@ -573,6 +610,14 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         ));
     }
 
+    if config.mode.allows_mutation() && config.writer_guard != WriterGuardConfig::Required {
+        findings.push(AdminFinding::error(
+            "writer-guard.required",
+            "production read-write serving requires the Kubernetes writer guard",
+            "set RS3_WRITER_GUARD=required and use a Kubernetes Lease anchor before serving mutations",
+        ));
+    }
+
     if config.repository.allow_init {
         findings.push(AdminFinding::error(
             "repository.init-enabled",
@@ -1083,6 +1128,7 @@ mod tests {
         assert!(codes.contains(&"auth.credentials-missing"));
         assert!(codes.contains(&"recovery.public-key"));
         assert!(codes.contains(&"repository.init-enabled"));
+        assert!(codes.contains(&"writer-guard.required"));
         assert!(
             findings
                 .iter()

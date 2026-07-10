@@ -9,11 +9,12 @@ use rs3_repository::v2::{
     V2RecoveryBundle,
 };
 use rs3_server::{
-    AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReportProfile,
-    AnchorConfig, GatewayMode, GatewayServer, RepositoryToolConfig, RuntimeConfig,
-    RuntimeV2ProviderConformanceOptions, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions,
-    V2AnchorImportReport, V2ProviderCheckConfig, V2RecoveryBundleVerificationOptions,
-    V2RecoveryBundleVerificationReport, V2RepositoryInitReport, WriterGuardConfig, backend_kind,
+    AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReadiness,
+    AdminReadinessSource, AdminReportProfile, AnchorConfig, GatewayMode, GatewayServer,
+    RepositoryToolConfig, RuntimeConfig, RuntimeV2ProviderConformanceOptions,
+    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport, V2ProviderCheckConfig,
+    V2RecoveryBundleVerificationOptions, V2RecoveryBundleVerificationReport,
+    V2RepositoryInitReport, WriterGuardConfig, backend_kind,
     check_v2_provider_conformance_from_provider_config, doctor_findings, doctor_probe_from_config,
     export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
     init_v2_repository_from_config, inspect_keyring_envelope_from_tool_config,
@@ -33,11 +34,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::{EnvFilter, FilterExt, filter_fn};
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
 use zeroize::Zeroizing;
 
 #[cfg(feature = "k8s")]
-use rs3_k8s::{KubernetesLeaseGuard, LeaseGuardError, LeaseSettings};
+use rs3_k8s::{KubernetesLeaseGuard, LeaseGuardError, LeaseSettings, WriterFence};
 
 #[cfg(any(feature = "s3", feature = "k8s"))]
 static RUSTLS_PROVIDER: Once = Once::new();
@@ -287,34 +290,38 @@ async fn main() -> Result<()> {
                 config.mode = gateway_mode.into();
             }
             let admin_config = admin_http_config(admin_bind, admin_bearer_token, admin_profile)?;
+            enforce_serve_profile(&config, admin_profile, admin_config.is_some())?;
             install_metrics(config.metrics.bind)?;
             log_runtime_config(&config);
             let writer_guard = start_writer_guard(&config).await?;
-            let server = GatewayServer::bind(config.clone()).await?;
+            let server = bind_gateway(config.clone(), &writer_guard).await?;
             tracing::info!(bind = %server.local_addr(), "gateway S3 listener started");
-            match admin_config {
+            let run_result = match admin_config {
                 Some(admin_config) => {
                     let admin_runtime_facts = server.admin_runtime_facts_source();
-                    let admin_server = AdminHttpServer::bind_with_runtime_facts(
+                    let admin_readiness =
+                        writer_guard.readiness_source(server.admin_readiness_source());
+                    let admin_server = AdminHttpServer::bind_with_runtime_sources(
                         config,
                         admin_config,
                         admin_runtime_facts,
+                        admin_readiness,
                     )
                     .await?;
                     tracing::info!(
                         bind = %admin_server.local_addr(),
                         "gateway admin listener started",
                     );
-                    run_gateway_and_admin(server, admin_server, writer_guard.shutdown()).await?;
+                    run_gateway_and_admin(server, admin_server, writer_guard.shutdown()).await
                 }
-                None => {
-                    server
-                        .run_until_shutdown(shutdown_signal_or_writer_guard(
-                            writer_guard.shutdown(),
-                        ))
-                        .await?;
-                }
-            }
+                None => server
+                    .run_until_shutdown(shutdown_signal_or_writer_guard(writer_guard.shutdown()))
+                    .await
+                    .map_err(anyhow::Error::from),
+            };
+            let release_result = writer_guard.release().await;
+            run_result?;
+            release_result?;
         }
         Commands::Doctor { profile, probe } => {
             let config = RuntimeConfig::from_env()?;
@@ -1114,6 +1121,39 @@ async fn run_doctor(config: &RuntimeConfig, profile: DoctorProfile, probe: bool)
     )
 }
 
+fn enforce_serve_profile(
+    config: &RuntimeConfig,
+    profile: DoctorProfile,
+    admin_listener_configured: bool,
+) -> Result<()> {
+    if profile == DoctorProfile::Local {
+        tracing::warn!(
+            "local serve profile bypasses production posture enforcement; do not expose this listener",
+        );
+        return Ok(());
+    }
+
+    if !admin_listener_configured {
+        anyhow::bail!(
+            "production serve profile requires RS3_ADMIN_BIND and RS3_ADMIN_BEARER_TOKEN for readiness and operator status",
+        );
+    }
+
+    let findings = doctor_findings(config, AdminReportProfile::Production);
+    if findings.is_empty() {
+        return Ok(());
+    }
+
+    let codes = findings
+        .iter()
+        .map(|finding| finding.code)
+        .collect::<Vec<_>>()
+        .join(",");
+    anyhow::bail!(
+        "production serve posture failed ({codes}); run `rs3-server doctor --profile production` for remediation",
+    )
+}
+
 fn admin_http_config(
     bind: Option<SocketAddr>,
     bearer_token: Option<String>,
@@ -1135,19 +1175,110 @@ fn admin_http_config(
 
 struct WriterGuardRuntime {
     shutdown: Option<watch::Receiver<bool>>,
-    _renew_task: Option<tokio::task::JoinHandle<()>>,
+    held: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    required: bool,
+    #[cfg(feature = "k8s")]
+    writer_fence: Option<WriterFence>,
+    #[cfg(feature = "k8s")]
+    lease_guard: Option<std::sync::Arc<KubernetesLeaseGuard>>,
+    renew_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl WriterGuardRuntime {
     fn disabled() -> Self {
         Self {
             shutdown: None,
-            _renew_task: None,
+            held: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            required: false,
+            #[cfg(feature = "k8s")]
+            writer_fence: None,
+            #[cfg(feature = "k8s")]
+            lease_guard: None,
+            renew_task: None,
         }
     }
 
     fn shutdown(&self) -> Option<watch::Receiver<bool>> {
         self.shutdown.clone()
+    }
+
+    fn readiness_source(
+        &self,
+        repository: std::sync::Arc<dyn AdminReadinessSource>,
+    ) -> std::sync::Arc<dyn AdminReadinessSource> {
+        std::sync::Arc::new(ServeReadinessSource {
+            repository,
+            writer_guard_held: std::sync::Arc::clone(&self.held),
+            writer_guard_required: self.required,
+            #[cfg(feature = "k8s")]
+            writer_fence: self.writer_fence.clone(),
+        })
+    }
+
+    async fn release(&self) -> Result<()> {
+        if let Some(renew_task) = self.renew_task.as_ref() {
+            renew_task.abort();
+        }
+        #[cfg(feature = "k8s")]
+        if let Some(lease_guard) = self.lease_guard.as_ref() {
+            lease_guard
+                .release()
+                .await
+                .context("failed to release writer fence during orderly shutdown")?;
+        }
+        Ok(())
+    }
+}
+
+async fn bind_gateway(
+    config: RuntimeConfig,
+    _writer_guard: &WriterGuardRuntime,
+) -> Result<GatewayServer> {
+    #[cfg(feature = "k8s")]
+    if let Some(writer_fence) = _writer_guard.writer_fence.clone() {
+        return GatewayServer::bind_with_writer_fence(config, writer_fence)
+            .await
+            .map_err(anyhow::Error::from);
+    }
+    GatewayServer::bind(config)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+struct ServeReadinessSource {
+    repository: std::sync::Arc<dyn AdminReadinessSource>,
+    writer_guard_held: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    writer_guard_required: bool,
+    #[cfg(feature = "k8s")]
+    writer_fence: Option<WriterFence>,
+}
+
+#[async_trait::async_trait]
+impl AdminReadinessSource for ServeReadinessSource {
+    async fn check_readiness(&self) -> AdminReadiness {
+        if self.writer_guard_required
+            && (!self
+                .writer_guard_held
+                .load(std::sync::atomic::Ordering::Acquire)
+                || !writer_fence_is_live(self))
+        {
+            return AdminReadiness::unavailable("writer-guard.not-held");
+        }
+        self.repository.check_readiness().await
+    }
+}
+
+fn writer_fence_is_live(_readiness: &ServeReadinessSource) -> bool {
+    #[cfg(feature = "k8s")]
+    {
+        _readiness
+            .writer_fence
+            .as_ref()
+            .is_some_and(WriterFence::is_live)
+    }
+    #[cfg(not(feature = "k8s"))]
+    {
+        true
     }
 }
 
@@ -1167,13 +1298,13 @@ async fn start_writer_guard(config: &RuntimeConfig) -> Result<WriterGuardRuntime
 
     #[cfg(feature = "k8s")]
     {
-        let holder_identity = std::env::var("HOSTNAME")
+        let hostname = std::env::var("HOSTNAME")
             .context("RS3_WRITER_GUARD=required needs HOSTNAME to identify this writer pod")?;
-        let writer_lease_name = format!("{name}-writer");
+        let holder_identity = format!("{hostname}/{}", random_hex(16)?);
         let lease_guard = KubernetesLeaseGuard::new(
             LeaseSettings {
                 namespace: namespace.clone(),
-                name: writer_lease_name,
+                name: name.clone(),
                 field_manager: field_manager.clone(),
             },
             holder_identity,
@@ -1185,15 +1316,27 @@ async fn start_writer_guard(config: &RuntimeConfig) -> Result<WriterGuardRuntime
             .acquire()
             .await
             .context("failed to acquire writer lease guard")?;
+        let writer_fence = lease_guard
+            .writer_fence()
+            .context("failed to establish writer fencing token")?;
         tracing::info!("writer lease guard acquired");
 
         let lease_guard = std::sync::Arc::new(lease_guard);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let renew_task = tokio::spawn(renew_writer_guard(lease_guard, shutdown_tx));
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let renew_task = tokio::spawn(renew_writer_guard(
+            std::sync::Arc::clone(&lease_guard),
+            shutdown_tx,
+            std::sync::Arc::clone(&held),
+        ));
 
         Ok(WriterGuardRuntime {
             shutdown: Some(shutdown_rx),
-            _renew_task: Some(renew_task),
+            held,
+            required: true,
+            writer_fence: Some(writer_fence),
+            lease_guard: Some(lease_guard),
+            renew_task: Some(renew_task),
         })
     }
 
@@ -1210,6 +1353,7 @@ async fn start_writer_guard(config: &RuntimeConfig) -> Result<WriterGuardRuntime
 async fn renew_writer_guard(
     lease_guard: std::sync::Arc<KubernetesLeaseGuard>,
     shutdown_tx: watch::Sender<bool>,
+    held: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut last_success = std::time::Instant::now();
     loop {
@@ -1225,7 +1369,11 @@ async fn renew_writer_guard(
                     elapsed_ms = elapsed.as_millis(),
                     "writer lease renewal failed",
                 );
-                if matches!(error, LeaseGuardError::HeldByOther) {
+                if matches!(
+                    error,
+                    LeaseGuardError::HeldByOther | LeaseGuardError::LostLease
+                ) {
+                    held.store(false, std::sync::atomic::Ordering::Release);
                     tracing::error!(
                         "writer lease is held by another live identity; initiating graceful shutdown",
                     );
@@ -1233,6 +1381,7 @@ async fn renew_writer_guard(
                     break;
                 }
                 if elapsed >= WRITER_LEASE_DURATION {
+                    held.store(false, std::sync::atomic::Ordering::Release);
                     tracing::error!(
                         "writer lease renewal failed past the lease duration; initiating graceful shutdown",
                     );
@@ -1483,25 +1632,54 @@ fn build_git_sha() -> &'static str {
 
 fn init_tracing(format: LogFormat) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = filter.and(filter_fn(|metadata| {
+        is_path_safe_tracing_target(metadata.target())
+    }));
 
     match format {
-        LogFormat::Plain => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(io::stderr)
+        LogFormat::Plain => tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(io::stderr)
+                    .with_filter(filter),
+            )
             .init(),
-        LogFormat::Json => tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .with_writer(io::stderr)
+        LogFormat::Json => tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(io::stderr)
+                    .with_filter(filter),
+            )
             .init(),
     }
+}
+
+fn is_path_safe_tracing_target(target: &str) -> bool {
+    const ALLOWED_TARGETS: &[&str] = &[
+        "rs3_crypto",
+        "rs3_index",
+        "rs3_k8s",
+        "rs3_repository",
+        "rs3_server",
+        "rs3_storage",
+        "rs3_types",
+    ];
+
+    ALLOWED_TARGETS.iter().any(|allowed| {
+        target == *allowed
+            || target
+                .strip_prefix(allowed)
+                .is_some_and(|suffix| suffix.starts_with("::"))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         DoctorProfile, ImportV2AnchorArgs, RecoveryReportFormat, backend_kind, doctor_findings,
-        parse_restore_bundle_json, recovery_bundle_from_import_args, runtime_config_profile,
+        enforce_serve_profile, is_path_safe_tracing_target, parse_restore_bundle_json,
+        recovery_bundle_from_import_args, runtime_config_profile,
     };
     use rs3_server::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
@@ -1573,6 +1751,15 @@ mod tests {
     }
 
     #[test]
+    fn tracing_filter_allows_application_targets_and_blocks_dependencies() {
+        assert!(is_path_safe_tracing_target("rs3_server"));
+        assert!(is_path_safe_tracing_target("rs3_storage::s3"));
+        assert!(!is_path_safe_tracing_target("s3s::service"));
+        assert!(!is_path_safe_tracing_target("hyper::proto"));
+        assert!(!is_path_safe_tracing_target("aws_sdk_s3"));
+    }
+
+    #[test]
     fn backend_kind_redacts_endpoint_details() {
         assert_eq!(backend_kind("memory://local"), "memory");
         assert_eq!(backend_kind("file:///data/repo"), "filesystem");
@@ -1635,6 +1822,7 @@ mod tests {
         assert!(codes.contains(&"auth.credentials-missing"));
         assert!(codes.contains(&"recovery.public-key"));
         assert!(codes.contains(&"repository.init-enabled"));
+        assert!(codes.contains(&"writer-guard.required"));
     }
 
     #[test]
@@ -1673,6 +1861,7 @@ mod tests {
         };
         config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 30));
         config.repository.allow_init = false;
+        config.writer_guard = WriterGuardConfig::Required;
         config.static_credentials = Some(StaticCredentials {
             access_key_id: "rs3-fixture-access-key".to_owned(),
             secret_access_key: SecretString::from("rs3-fixture-secret-key"),
@@ -1684,6 +1873,28 @@ mod tests {
         let findings = doctor_findings(&config, DoctorProfile::Production.into());
 
         assert!(findings.is_empty());
+        assert!(enforce_serve_profile(&config, DoctorProfile::Production, true).is_ok());
+    }
+
+    #[test]
+    fn production_serve_rejects_findings_and_missing_admin_listener() {
+        let config = runtime_config();
+
+        let findings = enforce_serve_profile(&config, DoctorProfile::Production, true)
+            .expect_err("production serve should reject doctor findings")
+            .to_string();
+        assert!(findings.contains("anchor.memory"));
+        assert!(!findings.contains("tenant"));
+
+        let missing_admin = enforce_serve_profile(&config, DoctorProfile::Production, false)
+            .expect_err("production serve should require the admin listener")
+            .to_string();
+        assert!(missing_admin.contains("RS3_ADMIN_BIND"));
+    }
+
+    #[test]
+    fn local_serve_profile_is_explicit_escape_hatch() {
+        assert!(enforce_serve_profile(&runtime_config(), DoctorProfile::Local, false).is_ok());
     }
 
     #[test]
