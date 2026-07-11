@@ -296,6 +296,7 @@ perf-scale-tier OBJECTS:
         --verify-reload \
         --checkpoint-after-objects "${checkpoint_after}" \
         --max-elapsed-seconds 180 \
+        --max-reload-elapsed-seconds 30 \
         --max-peak-rss-bytes 4294967296 \
         --max-write-amp 1.65 \
         --max-cold-read-amp 1.04 \

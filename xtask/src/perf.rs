@@ -71,6 +71,9 @@ pub(crate) struct PerfArgs {
     /// Fail a scenario when its elapsed time exceeds this many seconds.
     #[arg(long)]
     max_elapsed_seconds: Option<f64>,
+    /// Fail reload verification when recovery exceeds this many seconds.
+    #[arg(long, requires = "verify_reload")]
+    max_reload_elapsed_seconds: Option<f64>,
     /// Fail a scenario when the harness process peak RSS exceeds this many bytes.
     #[arg(long)]
     max_peak_rss_bytes: Option<u64>,
@@ -274,8 +277,7 @@ impl TraceFormat {
 pub(crate) fn run(args: PerfArgs) -> Result<()> {
     let cold_read_limits_requested =
         args.max_cold_read_amp.is_some() || args.max_cold_read_requests_per_read.is_some();
-    let reload_limits_requested =
-        cold_read_limits_requested || args.max_active_index_runs.is_some();
+    let reload_limits_requested = reload_limits_requested(&args);
     if reload_limits_requested && !args.verify_reload {
         anyhow::bail!("reload limits require --verify-reload");
     }
@@ -306,6 +308,12 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
         .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
     {
         anyhow::bail!("--max-elapsed-seconds must be finite and greater than zero");
+    }
+    if args
+        .max_reload_elapsed_seconds
+        .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
+    {
+        anyhow::bail!("--max-reload-elapsed-seconds must be finite and greater than zero");
     }
     if args.max_peak_rss_bytes == Some(0) {
         anyhow::bail!("--max-peak-rss-bytes must be greater than zero");
@@ -356,6 +364,13 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
     runtime.block_on(run_async(args))
 }
 
+fn reload_limits_requested(args: &PerfArgs) -> bool {
+    args.max_reload_elapsed_seconds.is_some()
+        || args.max_cold_read_amp.is_some()
+        || args.max_cold_read_requests_per_read.is_some()
+        || args.max_active_index_runs.is_some()
+}
+
 async fn run_async(args: PerfArgs) -> Result<()> {
     let scenarios = match args.scenario {
         PerfScenario::All => vec![
@@ -371,10 +386,9 @@ async fn run_async(args: PerfArgs) -> Result<()> {
     if args.format == ReportFormat::Tsv {
         print_header();
     }
-    let reload_limits_requested = args.max_cold_read_amp.is_some()
-        || args.max_cold_read_requests_per_read.is_some()
-        || args.max_active_index_runs.is_some();
+    let reload_limits_requested = reload_limits_requested(&args);
     let mut reload_gate_evaluated = false;
+    let mut gate_failures = Vec::new();
     for scenario in scenarios {
         let report = match scenario {
             PerfScenario::All => unreachable!("expanded above"),
@@ -385,27 +399,56 @@ async fn run_async(args: PerfArgs) -> Result<()> {
             PerfScenario::RangeRead => range_read(&args).await?,
         };
         let peak_rss_bytes = process_peak_rss_bytes();
-        report.enforce_max_write_amplification(args.max_write_amp)?;
-        report.enforce_resource_limits(
-            args.max_elapsed_seconds,
-            args.max_peak_rss_bytes,
-            peak_rss_bytes,
-        )?;
+        record_gate_failure(
+            &mut gate_failures,
+            report.enforce_max_write_amplification(args.max_write_amp),
+        );
+        record_gate_failure(
+            &mut gate_failures,
+            report.enforce_resource_limits(args.max_elapsed_seconds, None, peak_rss_bytes),
+        );
+        record_gate_failure(
+            &mut gate_failures,
+            report.enforce_resource_limits(None, args.max_peak_rss_bytes, peak_rss_bytes),
+        );
         if report.reload_verification.is_some() {
-            report.enforce_cold_read_limits(
-                args.max_cold_read_amp,
-                args.max_cold_read_requests_per_read,
-            )?;
-            report.enforce_active_index_run_limit(args.max_active_index_runs)?;
+            record_gate_failure(
+                &mut gate_failures,
+                report.enforce_reload_elapsed_limit(args.max_reload_elapsed_seconds),
+            );
+            record_gate_failure(
+                &mut gate_failures,
+                report.enforce_cold_read_limits(args.max_cold_read_amp, None),
+            );
+            record_gate_failure(
+                &mut gate_failures,
+                report.enforce_cold_read_limits(None, args.max_cold_read_requests_per_read),
+            );
+            record_gate_failure(
+                &mut gate_failures,
+                report.enforce_active_index_run_limit(args.max_active_index_runs),
+            );
             reload_gate_evaluated = reload_limits_requested;
         }
         report.print_with_peak_rss(args.format, peak_rss_bytes)?;
     }
     if reload_limits_requested && !reload_gate_evaluated {
-        anyhow::bail!("reload limits did not receive verification evidence");
+        gate_failures.push("reload limits did not receive verification evidence".to_owned());
     }
+    finish_gate_failures(gate_failures)
+}
 
-    Ok(())
+fn record_gate_failure(failures: &mut Vec<String>, result: Result<()>) {
+    if let Err(error) = result {
+        failures.push(error.to_string());
+    }
+}
+
+fn finish_gate_failures(failures: Vec<String>) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!("performance gates failed:\n- {}", failures.join("\n- "))
 }
 
 #[cfg(feature = "containers")]
@@ -479,6 +522,9 @@ fn add_perf_args(
     if let Some(limit) = args.max_elapsed_seconds {
         command.args(["--max-elapsed-seconds", &limit.to_string()]);
     }
+    if let Some(limit) = args.max_reload_elapsed_seconds {
+        command.args(["--max-reload-elapsed-seconds", &limit.to_string()]);
+    }
     if let Some(limit) = args.max_peak_rss_bytes {
         command.args(["--max-peak-rss-bytes", &limit.to_string()]);
     }
@@ -546,7 +592,7 @@ where
                 Duration::from_millis(args.commit_batch_delay_ms),
             )
             .with_max_pending_items(batch_items),
-        )
+        )?
         .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard),
     );
     store
@@ -630,7 +676,7 @@ where
     S: BlobStore + Clone + 'static,
 {
     let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
-    let coordinator = V2CommitCoordinator::with_options(repo, anchor, commit_options(args))
+    let coordinator = V2CommitCoordinator::with_options(repo, anchor, commit_options(args))?
         .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard);
     store
         .reset_operation_counts()
@@ -704,7 +750,7 @@ where
     let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
     let verification_anchor = anchor.clone();
     let coordinator = Arc::new(
-        V2CommitCoordinator::with_options(repo, anchor, commit_options(args))
+        V2CommitCoordinator::with_options(repo, anchor, commit_options(args))?
             .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard),
     );
     store
@@ -1228,6 +1274,16 @@ impl PerfReport {
     ) -> Result<()> {
         enforce_max_elapsed_seconds(self.scenario, self.elapsed, max_elapsed_seconds)?;
         enforce_max_peak_rss_bytes(self.scenario, peak_rss_bytes, max_peak_rss_bytes)
+    }
+
+    fn enforce_reload_elapsed_limit(&self, limit: Option<f64>) -> Result<()> {
+        enforce_max_reload_elapsed_seconds(
+            self.scenario,
+            self.reload_verification
+                .as_ref()
+                .map(|verification| verification.elapsed),
+            limit,
+        )
     }
 
     fn enforce_cold_read_limits(
@@ -1853,6 +1909,18 @@ fn enforce_max_elapsed_seconds(
     Ok(())
 }
 
+fn enforce_max_reload_elapsed_seconds(
+    scenario: &str,
+    elapsed: Option<Duration>,
+    limit: Option<f64>,
+) -> Result<()> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let elapsed = elapsed.context("reload elapsed limit requires reload verification evidence")?;
+    enforce_max_elapsed_seconds(&format!("{scenario} reload"), elapsed, Some(limit))
+}
+
 fn enforce_max_peak_rss_bytes(
     scenario: &str,
     actual: Option<u64>,
@@ -1947,11 +2015,28 @@ fn init_tracing(filter: &str, format: TraceFormat) -> Result<()> {
 mod tests {
     use super::{
         backend_request_count, checkpoint_due, enforce_max_elapsed_seconds,
-        enforce_max_peak_rss_bytes, operation_counts_delta, parse_proc_status_peak_rss,
+        enforce_max_peak_rss_bytes, enforce_max_reload_elapsed_seconds, finish_gate_failures,
+        operation_counts_delta, parse_proc_status_peak_rss, record_gate_failure,
         validate_cold_read_counts, verification_indices,
     };
     use rs3_storage::BlobOperationCounts;
     use std::time::Duration;
+
+    #[test]
+    fn gate_failures_are_aggregated_in_evaluation_order() {
+        let mut failures = Vec::new();
+        record_gate_failure(&mut failures, Err(anyhow::anyhow!("write amplification")));
+        record_gate_failure(&mut failures, Ok(()));
+        record_gate_failure(&mut failures, Err(anyhow::anyhow!("peak RSS")));
+
+        let error = finish_gate_failures(failures).expect_err("gate failures must be returned");
+        assert_eq!(
+            error.to_string(),
+            "performance gates failed:\n- write amplification\n- peak RSS"
+        );
+        finish_gate_failures(Vec::new())
+            .unwrap_or_else(|error| panic!("empty gate failures should pass: {error}"));
+    }
 
     #[test]
     fn checkpoint_threshold_fires_once_at_the_first_completed_batch() {
@@ -2057,6 +2142,22 @@ mod tests {
             enforce_max_elapsed_seconds("scale", Duration::from_millis(180_001), Some(180.0))
                 .expect_err("elapsed time over the limit must fail");
         assert!(error.to_string().contains("180.001s exceeds 180.000s"));
+    }
+
+    #[test]
+    fn reload_elapsed_gate_requires_evidence_and_rejects_over_limit() {
+        enforce_max_reload_elapsed_seconds("scale", Some(Duration::from_secs(30)), Some(30.0))
+            .unwrap_or_else(|error| panic!("equal reload limit should pass: {error}"));
+        let error = enforce_max_reload_elapsed_seconds(
+            "scale",
+            Some(Duration::from_millis(30_001)),
+            Some(30.0),
+        )
+        .expect_err("reload above limit should fail");
+        assert!(error.to_string().contains("scale reload elapsed time"));
+        let missing = enforce_max_reload_elapsed_seconds("scale", None, Some(30.0))
+            .expect_err("missing reload evidence should fail");
+        assert!(missing.to_string().contains("requires reload verification"));
     }
 
     #[test]
