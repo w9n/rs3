@@ -125,8 +125,8 @@ pub struct IndexRunContainer {
     pub version_id: Option<BackendVersionId>,
     /// Stored object length used to constrain range reads.
     pub stored_len: u64,
-    /// Digest authenticating the exact stored object bytes.
-    pub object_digest: [u8; 32],
+    /// Signed commit body digest authenticating every declared section.
+    pub commit_body_digest: [u8; 32],
     /// Absolute byte offset of the payload-pack section in the stored object.
     pub pack_section_offset: u64,
     /// Section ordinal bound into payload-pack record and directory authentication.
@@ -581,7 +581,7 @@ pub fn encode_index_run_frames(
             }
         }
         record.u64(container.stored_len)?;
-        record.bytes(&container.object_digest)?;
+        record.bytes(&container.commit_body_digest)?;
         record.u32(container.pack_section_ordinal)?;
         record.u64(container.pack_section_offset)?;
         record.u64(container.pack_section_len)?;
@@ -1223,13 +1223,13 @@ fn decode_container(
         }
     };
     let stored_len = record.u64()?;
-    let mut object_digest = [0_u8; 32];
-    object_digest.copy_from_slice(record.bytes(32)?);
+    let mut commit_body_digest = [0_u8; 32];
+    commit_body_digest.copy_from_slice(record.bytes(32)?);
     let container = IndexRunContainer {
         object_id,
         version_id,
         stored_len,
-        object_digest,
+        commit_body_digest,
         pack_section_ordinal: record.u32()?,
         pack_section_offset: record.u64()?,
         pack_section_len: record.u64()?,
@@ -1982,7 +1982,7 @@ mod tests {
                 object_id: BackendObjectId::new("objects/pack-a").expect("object id"),
                 version_id: Some(BackendVersionId::new("version-3").expect("version id")),
                 stored_len: 4_096,
-                object_digest: [0x22; 32],
+                commit_body_digest: [0x22; 32],
                 pack_section_ordinal: 3,
                 pack_section_offset: 512,
                 pack_section_len: 2_048,
@@ -2164,7 +2164,7 @@ mod tests {
         let mut run = fixture();
         let mut duplicate = run.containers[0].clone();
         duplicate.stored_len = 8_192;
-        duplicate.object_digest = [0x55; 32];
+        duplicate.commit_body_digest = [0x55; 32];
         run.containers.push(duplicate);
         assert_eq!(
             encode_index_run(&run, &limits),

@@ -106,11 +106,12 @@ out-of-order or overlapping sections, arithmetic overflow, duplicate ordinals,
 lengths outside the object, and trailing data not covered by the signed layout.
 
 Capability bit `0x01` requires signed per-section digests and is implemented.
-Bit `0x02` identifies the framed index contract. The bounded `INDEX_RUN` codec
-is implemented, but the bit remains reserved and is rejected by the
-transitional commit reader until `INDEX_RUN` publication and `INDEX_ROOT`
-recovery are integrated. The complete v02 reader and writer will require both
-bits.
+Bit `0x02` identifies the complete framed index contract. Compact
+`PAYLOAD_PACK`/`INDEX_RUN` publication, range reads, and bounded run replay are
+implemented under the transitional capability set. Writers do not advertise
+bit `0x02` until `INDEX_ROOT` recovery is integrated, because advertising the
+complete contract before its recovery boundary exists would be dishonest. The
+complete v02 reader and writer will require both bits.
 
 Normal commits contain one encrypted `INDEX_RUN` and at most one encrypted
 `PAYLOAD_PACK`; an all-delete or all-empty batch needs no payload pack. A
@@ -149,13 +150,15 @@ ordinal plus record ordinal, rather than a repeated commit key, payload ID,
 key ID, nonce, offset, and digest. The signed containing-object descriptor and
 encrypted container table carry those shared facts once.
 
-Record associated data binds the format generation, repository context, exact
+Record associated data binds the immutable repository identity, the exact
+historical keyring-envelope reference signed by the containing commit, exact
 containing object key, pack and section identities, record and segment
 ordinals, plaintext length, and final-segment marker. The provider version does
 not exist before upload; after publication the accepted signed reference binds
-the exact returned version, object length, and ciphertext digest. Moving a
-record to a different object, pack, section, or ordinal must fail
-authentication.
+the exact returned version, object length, and commit-body digest. Moving a
+record to a different repository, object, pack, section, or ordinal must fail
+authentication. Keyring-envelope rotation remains readable because readers use
+the containing commit's historical reference, not the current writer option.
 
 Retention and legal hold apply to the physical containing object. Batches must
 therefore use one protection cohort, or be partitioned by retention mode,
@@ -215,11 +218,12 @@ format change.
 The first generation uses canonical length-delimited records and no
 compression. Each ciphertext frame and run has an explicit record and byte
 limit; the target maximum encrypted run object is 8 MiB. Index-frame associated
-data binds at least the format generation, exact containing object key, section
-ordinal, run identity, and frame ordinal. The provider version does not exist
-until after upload, so the accepted signed catalog binds that returned exact
-version together with object length and ciphertext digest. Reordering,
-duplicating, or transplanting frames must fail authentication.
+data binds at least the immutable repository identity, exact historical
+keyring-envelope reference, exact containing object key, section ordinal, run
+identity, and frame ordinal. The provider version does not exist until after
+upload, so the accepted signed catalog will bind that returned exact version
+together with object length and ciphertext digest. Reordering, duplicating, or
+transplanting frames must fail authentication.
 
 ## Small Signed Index Roots
 

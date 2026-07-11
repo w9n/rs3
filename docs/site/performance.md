@@ -136,6 +136,14 @@ Qualification must enforce, not merely report, these initial ceilings:
 | sequential committed 512 B objects | 3.0x |
 | forced index compaction, lifetime 512 B lane | provisional 3.5x |
 
+The repository integration suite now enforces the physical shape for a
+64-object batch (one single-PUT commit, one payload pack, and one index run) and
+the 1.50x hard ceiling for a 32-byte-path lane while the release harness is
+being rewired to measure the compact path. This prevents a return to the 12.8x
+prototype without pretending that a unit test is replacement benchmark
+evidence. The longer-path matrix and release-profile run remain separate scale
+gates.
+
 The harness must also vary logical path lengths across 32 B, 256 B, and
 1,024 B, and report payload amplification separately from fixed metadata bytes
 per object. Pack cleaning is measured separately because its unavoidable copy

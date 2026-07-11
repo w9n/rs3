@@ -230,10 +230,14 @@ impl RuntimeRepository {
         .await?;
         let initialized = !loaded.anchor_present;
         let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
-        let commit_options =
-            V2CommitStoreOptions::for_profile(provider_profile, commit_ref, loaded.format_ref)
-                .with_retention(config.repository.retention)
-                .with_stream_read_stall_timeout(config.hardening.stream_read_stall_timeout);
+        let commit_options = V2CommitStoreOptions::for_profile(
+            provider_profile,
+            config.repository_keys.repository_id.clone(),
+            commit_ref,
+            loaded.format_ref,
+        )
+        .with_retention(config.repository.retention)
+        .with_stream_read_stall_timeout(config.hardening.stream_read_stall_timeout);
         let repository = Arc::new(V2Repository::new(
             store_handle.clone(),
             loaded.keyring,
@@ -678,9 +682,13 @@ pub(crate) async fn v2_quick_maintenance_from_config(
     )
     .await?;
     let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
-    let commit_options =
-        V2CommitStoreOptions::for_profile(provider_profile, commit_ref, loaded.format_ref)
-            .with_retention(config.repository.retention);
+    let commit_options = V2CommitStoreOptions::for_profile(
+        provider_profile,
+        config.repository_keys.repository_id.clone(),
+        commit_ref,
+        loaded.format_ref,
+    )
+    .with_retention(config.repository.retention);
     let commit_store = V2CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
     commit_store
         .quick_maintenance(&anchor_handle)
@@ -714,9 +722,13 @@ pub async fn export_v2_recovery_bundle_from_config(
     )
     .await?;
     let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
-    let commit_options =
-        V2CommitStoreOptions::for_profile(provider_profile, commit_ref, loaded.format_ref)
-            .with_retention(config.repository.retention);
+    let commit_options = V2CommitStoreOptions::for_profile(
+        provider_profile,
+        config.repository_keys.repository_id.clone(),
+        commit_ref,
+        loaded.format_ref,
+    )
+    .with_retention(config.repository.retention);
     let commit_store = V2CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
     commit_store
         .load_replay_chain_from_state(&anchor_state)
@@ -768,6 +780,11 @@ pub async fn import_v2_anchor_from_config(
     let anchor = build_v2_anchor(&config.anchor)?;
     let anchor_handle = anchor.handle().clone();
     let provider_profile = v2_provider_profile(&config.backend, config.repository.retention);
+    if bundle.repository_id.as_ref() != Some(&config.repository_keys.repository_id) {
+        return Err(repository_init(
+            "trusted v2 restore bundle repository identity is missing or does not match configuration",
+        ));
+    }
     verify_recovery_bundle_trust(
         &bundle,
         provider_profile,
@@ -789,9 +806,13 @@ pub async fn import_v2_anchor_from_config(
     )
     .await?;
     let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
-    let commit_options =
-        V2CommitStoreOptions::for_profile(provider_profile, commit_ref, loaded.format_ref)
-            .with_retention(config.repository.retention);
+    let commit_options = V2CommitStoreOptions::for_profile(
+        provider_profile,
+        config.repository_keys.repository_id.clone(),
+        commit_ref,
+        loaded.format_ref,
+    )
+    .with_retention(config.repository.retention);
     let commit_store = V2CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
 
     if let Some(current) = anchor_handle.read_v2().await.map_err(repository_init)? {

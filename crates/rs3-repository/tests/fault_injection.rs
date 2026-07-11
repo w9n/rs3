@@ -448,6 +448,7 @@ where
 fn commit_options() -> V2CommitStoreOptions {
     V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         V2KeyringEnvelopeRef {
             object_id: object_id("keyrings/00000000000000000001-fault-test"),
             digest: [6_u8; 32],
@@ -459,6 +460,11 @@ fn commit_options() -> V2CommitStoreOptions {
             version_id: None,
         },
     )
+}
+
+fn sample_repository_id() -> rs3_types::RepositoryId {
+    rs3_types::RepositoryId::new("rs3-fault-injection-test")
+        .unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn sweep_len(default: u64, full: u64) -> u64 {

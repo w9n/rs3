@@ -8,7 +8,10 @@ use super::repository::{
     V2StreamingPayloadWrite,
 };
 use super::{
-    V2_MAX_HEADER_SIZE, V2ParsedCommit, V2ParsedCommitHeader, V2SectionType, V2UploadMode,
+    V2_MAX_HEADER_SIZE, V2_PAYLOAD_PACK_FIXED_HEADER_BYTES, V2ParsedCommit, V2ParsedCommitHeader,
+    V2PayloadPackDirectory, V2SectionType, V2UploadMode, open_v2_payload_pack_cached_record_span,
+    open_v2_payload_pack_directory, open_v2_payload_pack_record_span_with_segments,
+    plan_v2_payload_pack_record_range, probe_v2_payload_pack_header_len,
 };
 use crate::checkpoint::{open_index_delta_object, seal_index_delta_object, seal_manifest_record};
 use crate::error::{RepositoryError, Result};
@@ -36,7 +39,7 @@ use rs3_index::{
     INDEX_DELTA_OBJECT_DOMAIN, IndexDelta, IndexDeltaObject, NamespaceEntry,
     PayloadHeaderReference, PayloadReference, index_delta_object_bytes,
 };
-use rs3_storage::{BlobStore, ByteRange};
+use rs3_storage::{BlobStore, ByteRange, StorageError};
 use rs3_types::{
     BackendObjectId, BackendObjectRef, BackendVersionId, LegalHoldStatus, LogicalPath, ManifestId,
     RetentionPolicy, Sequence,
@@ -51,6 +54,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 mod compaction;
+pub(super) mod packed;
 
 const V2_PAYLOAD_FILL_LOCK_STRIPES: usize = 64;
 const V2_MAX_PAYLOAD_HEADER_SIZE: u64 = 4 * 1024;
@@ -72,6 +76,7 @@ pub struct V2Repository<S> {
     payload_sections: StdRwLock<V2PayloadSectionCache>,
     commit_headers: StdRwLock<V2CommitHeaderCache>,
     payload_headers: StdRwLock<V2PayloadHeaderCache>,
+    pack_directories: StdRwLock<V2PackDirectoryCache>,
     #[cfg(test)]
     fail_next_restore: AtomicBool,
     #[cfg(test)]
@@ -165,6 +170,7 @@ where
             )),
             commit_headers: StdRwLock::new(V2CommitHeaderCache::default()),
             payload_headers: StdRwLock::new(V2PayloadHeaderCache::default()),
+            pack_directories: StdRwLock::new(V2PackDirectoryCache::default()),
             #[cfg(test)]
             fail_next_restore: AtomicBool::new(false),
             #[cfg(test)]
@@ -201,7 +207,8 @@ where
             .await
             .map_err(v2_repository_error)?
             .ok_or_else(|| v2_repository_error(V2FormatError::MissingAnchor))?;
-        self.ensure_index_snapshot_payload_refs_are_chain_reachable(&chain)?;
+        self.ensure_index_snapshot_payload_refs_are_chain_reachable(&chain)
+            .await?;
         let section = self.index_snapshot_section()?;
         self.commit_store
             .write_child_commit(anchor, V2CommitWrite::snapshot(vec![section]))
@@ -583,7 +590,7 @@ where
         let prefix_tokens =
             prefix_tokens_for_key(&keyring, &primary_blind_key.key_id, key.as_str())?;
 
-        let (sequence, manifest_id, stale_blind_keys) = {
+        let (sequence, manifest_id, stale_tombstones) = {
             let mut state = self.repository.write_state()?;
             let existing_blind_keys = existing_blind_keys(&state.namespace, &lookup_blind_keys);
             if options.create_only && !existing_blind_keys.is_empty() {
@@ -593,12 +600,21 @@ where
             let sequence = next_sequence(&mut state)?;
             let material = object_material(key.as_str(), sequence);
             let manifest_id = keyring.derive_manifest_id(&material)?;
-            let stale_blind_keys = existing_blind_keys
+            let stale_tombstones = existing_blind_keys
                 .into_iter()
                 .filter(|blind_key| blind_key != &primary_blind_key.blind_key)
-                .collect::<Vec<_>>();
+                .map(|blind_key| {
+                    state
+                        .namespace
+                        .head(&blind_key)
+                        .map(|entry| (blind_key, entry.namespace_key_id.clone()))
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| RepositoryError::CommitFailed {
+                    reason: "namespace entry disappeared while staging overwrite".to_owned(),
+                })?;
 
-            (sequence, manifest_id, stale_blind_keys)
+            (sequence, manifest_id, stale_tombstones)
         };
 
         let pending_object_id = BackendObjectId::new(format!("v2-pending/{}", sequence.get()))?;
@@ -637,17 +653,19 @@ where
             let mut state = self.repository.write_state()?;
             let rollback = RepositoryStateRollback::capture(
                 &state,
-                stale_blind_keys
+                stale_tombstones
                     .iter()
-                    .cloned()
+                    .map(|(blind_key, _)| blind_key.clone())
                     .chain(std::iter::once(primary_blind_key_value)),
                 manifest_id.clone(),
                 &key,
             );
-            for stale_blind_key in stale_blind_keys {
+            for (stale_blind_key, namespace_key_id) in stale_tombstones {
                 state.tombstone_namespace_entry(stale_blind_key.clone(), sequence);
                 state.pending_index_deltas.push(IndexDelta::Tombstone {
+                    namespace_key_id,
                     blind_key: stale_blind_key,
+                    path: key.clone(),
                     generation: sequence,
                 });
             }
@@ -748,7 +766,49 @@ where
         let keyring = self.repository.keyring()?;
         let entry = resolved.entry.clone();
         let content_len = entry.content_len;
-        let Some(PayloadReference::V2Commit {
+        if content_len == 0 {
+            return match range {
+                ByteRange::Full | ByteRange::Slice { offset: 0, len: 0 } => Ok(Bytes::new()),
+                ByteRange::Slice { .. } => Err(StorageError::InvalidRange.into()),
+            };
+        }
+        let Some(payload_ref) = entry.payload_ref else {
+            return Err(RepositoryError::InvalidObjectFormat {
+                object_id: entry.object_id,
+            });
+        };
+        if let PayloadReference::V2Pack {
+            commit_key,
+            commit_version_id,
+            body_digest,
+            commit_stored_len,
+            pack_section_ordinal,
+            pack_offset,
+            length,
+            pack_record_count,
+            record_ordinal,
+        } = payload_ref
+        {
+            return self
+                .read_pack_range_from_commit(
+                    &keyring,
+                    V2CommitPackRead {
+                        commit_key,
+                        commit_version_id,
+                        body_digest,
+                        commit_stored_len,
+                        pack_section_ordinal,
+                        pack_offset,
+                        length,
+                        pack_record_count,
+                        record_ordinal,
+                        content_len,
+                    },
+                    range,
+                )
+                .await;
+        }
+        let PayloadReference::V2Commit {
             commit_key,
             commit_version_id,
             body_digest,
@@ -757,7 +817,7 @@ where
             sections_start,
             offset,
             length,
-        }) = entry.payload_ref
+        } = payload_ref
         else {
             return Err(RepositoryError::InvalidObjectFormat {
                 object_id: entry.object_id,
@@ -795,6 +855,209 @@ where
             cache_key,
         )
         .await
+    }
+
+    async fn read_pack_range_from_commit(
+        &self,
+        keyring: &KeyRing,
+        pack: V2CommitPackRead,
+        range: ByteRange,
+    ) -> Result<Bytes> {
+        if pack
+            .pack_offset
+            .checked_add(pack.length)
+            .is_none_or(|end| end > pack.commit_stored_len)
+        {
+            return Err(v2_repository_error(V2FormatError::SectionBounds));
+        }
+        let directory_cache_key = V2PackDirectoryCacheKey {
+            commit_key: pack.commit_key.clone(),
+            commit_version_id: pack.commit_version_id.clone(),
+            body_digest: pack.body_digest,
+            pack_section_ordinal: pack.pack_section_ordinal,
+            pack_offset: pack.pack_offset,
+            length: pack.length,
+        };
+        let (directory, context) =
+            if let Some(cached) = self.cached_pack_directory(&directory_cache_key)? {
+                (cached.directory, cached.repository_context)
+            } else {
+                let header_key = V2CommitHeaderCacheKey {
+                    commit_key: pack.commit_key.clone(),
+                    commit_version_id: pack.commit_version_id.clone(),
+                    body_digest: pack.body_digest,
+                };
+                let header = self.read_commit_header_for_payload(&header_key).await?;
+                let descriptor = header
+                    .header
+                    .section_index
+                    .get(
+                        usize::try_from(pack.pack_section_ordinal)
+                            .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+                    )
+                    .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?;
+                let declared_offset = u64::try_from(header.sections_start)
+                    .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?
+                    .checked_add(descriptor.offset)
+                    .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?;
+                if descriptor.section_type != V2SectionType::PayloadPack
+                    || declared_offset != pack.pack_offset
+                    || descriptor.length != pack.length
+                {
+                    return Err(v2_repository_error(V2FormatError::SectionBounds));
+                }
+                let context = packed::repository_context_from_refs(
+                    &self.commit_store.options().repository_id,
+                    &header.header.keyring_envelope_ref,
+                )?;
+                let initial_len = u64::try_from(V2_PAYLOAD_PACK_FIXED_HEADER_BYTES)
+                    .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
+                if pack.length < initial_len {
+                    return Err(v2_repository_error(V2FormatError::TruncatedHeader));
+                }
+                let fixed_header = self
+                    .commit_store
+                    .read_commit_range_at(
+                        &pack.commit_key,
+                        pack.commit_version_id.as_ref(),
+                        ByteRange::Slice {
+                            offset: pack.pack_offset,
+                            len: initial_len,
+                        },
+                    )
+                    .await
+                    .map_err(v2_repository_error)?;
+                let header_len =
+                    probe_v2_payload_pack_header_len(&fixed_header).map_err(v2_repository_error)?;
+                if header_len > pack.length {
+                    return Err(v2_repository_error(V2FormatError::TruncatedHeader));
+                }
+                let pack_header = if header_len == initial_len {
+                    fixed_header
+                } else {
+                    self.commit_store
+                        .read_commit_range_at(
+                            &pack.commit_key,
+                            pack.commit_version_id.as_ref(),
+                            ByteRange::Slice {
+                                offset: pack.pack_offset,
+                                len: header_len,
+                            },
+                        )
+                        .await
+                        .map_err(v2_repository_error)?
+                };
+                if u64::try_from(pack_header.len()).ok() != Some(header_len) {
+                    return Err(v2_repository_error(V2FormatError::TruncatedHeader));
+                }
+                let directory = open_v2_payload_pack_directory(
+                    keyring,
+                    &context,
+                    &pack.commit_key,
+                    pack.pack_section_ordinal,
+                    &pack_header,
+                    pack.length,
+                )
+                .map_err(v2_repository_error)?;
+                self.cache_pack_directory(directory_cache_key, directory.clone(), context.clone())?;
+                (directory, context)
+            };
+        if directory.records().len()
+            != usize::try_from(pack.pack_record_count)
+                .map_err(|_| v2_repository_error(V2FormatError::InvalidPayloadPack))?
+        {
+            return Err(v2_repository_error(V2FormatError::InvalidPayloadPack));
+        }
+        let record = directory
+            .record(pack.record_ordinal)
+            .ok_or_else(|| v2_repository_error(V2FormatError::InvalidPayloadPack))?;
+        if record.plaintext_len() != pack.content_len {
+            return Err(v2_repository_error(V2FormatError::InvalidPayloadPack));
+        }
+        let requested = match range {
+            ByteRange::Full => 0..pack.content_len,
+            ByteRange::Slice { offset, len } => {
+                if len == 0 {
+                    if offset <= pack.content_len {
+                        return Ok(Bytes::new());
+                    }
+                    return Err(StorageError::InvalidRange.into());
+                }
+                let end = offset
+                    .checked_add(len)
+                    .filter(|end| *end <= pack.content_len)
+                    .ok_or(StorageError::InvalidRange)?;
+                offset..end
+            }
+        };
+        let span = plan_v2_payload_pack_record_range(&directory, pack.record_ordinal, requested)
+            .map_err(v2_repository_error)?;
+        let payload_cache_ref = pack_payload_cache_ref(&pack, &directory)?;
+        let start_segment = usize::try_from(span.start_segment)
+            .map_err(|_| v2_repository_error(V2FormatError::InvalidPayloadPack))?;
+        let segment_count = usize::try_from(span.segment_count)
+            .map_err(|_| v2_repository_error(V2FormatError::InvalidPayloadPack))?;
+        if let Some(segments) = self.repository.cached_decrypted_segment_span(
+            &payload_cache_ref,
+            start_segment,
+            segment_count,
+        )? {
+            return open_v2_payload_pack_cached_record_span(&directory, &span, &segments)
+                .map_err(v2_repository_error);
+        }
+        let fill_lock_index = payload_fill_lock_index(
+            &payload_cache_ref.object_id,
+            usize::try_from(span.start_segment)
+                .map_err(|_| v2_repository_error(V2FormatError::InvalidPayloadPack))?,
+        );
+        let _fill_guard = self.payload_segment_fill_locks[fill_lock_index]
+            .lock()
+            .await;
+        if let Some(segments) = self.repository.cached_decrypted_segment_span(
+            &payload_cache_ref,
+            start_segment,
+            segment_count,
+        )? {
+            return open_v2_payload_pack_cached_record_span(&directory, &span, &segments)
+                .map_err(v2_repository_error);
+        }
+        let ciphertext = self
+            .commit_store
+            .read_commit_range_at(
+                &pack.commit_key,
+                pack.commit_version_id.as_ref(),
+                ByteRange::Slice {
+                    offset: pack
+                        .pack_offset
+                        .checked_add(span.offset)
+                        .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?,
+                    len: span.stored_len,
+                },
+            )
+            .await
+            .map_err(v2_repository_error)?;
+        let opened = open_v2_payload_pack_record_span_with_segments(
+            keyring,
+            &context,
+            &pack.commit_key,
+            pack.pack_section_ordinal,
+            &directory,
+            &span,
+            &ciphertext,
+        )
+        .map_err(v2_repository_error)?;
+        let segments = opened
+            .segments
+            .iter()
+            .map(|(ordinal, plaintext)| {
+                usize::try_from(*ordinal)
+                    .map(|ordinal| (ordinal, plaintext.clone()))
+                    .map_err(|_| v2_repository_error(V2FormatError::InvalidPayloadPack))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.repository
+            .cache_decrypted_segment_span(&payload_cache_ref, &segments)?;
+        Ok(opened.plaintext)
     }
 
     async fn read_payload_range_from_commit(
@@ -1131,9 +1394,22 @@ where
             .map_err(|_| RepositoryError::StatePoisoned)?
             .clone();
         let mut accepted_locations = None;
+        let mut accepted_pack_locations = None;
+        let mut accepted_pack_directory = None;
         let stored = self
             .commit_store
             .write_child_commit_with(anchor, |commit_key| {
+                if let Some(packed) = self
+                    .pending_packed_sections_for_commit(commit_key, &pending_payloads)
+                    .map_err(|_| V2FormatError::InvalidHeaderField)?
+                {
+                    accepted_pack_directory = packed.pack_directory;
+                    accepted_pack_locations = Some(packed.locations);
+                    let mut write =
+                        V2CommitWrite::delta(packed.sections).with_retention(packed.retention);
+                    write = write.with_legal_hold(packed.legal_hold);
+                    return Ok(write);
+                }
                 let pending = self
                     .pending_delta_sections_for_commit(commit_key, &pending_payloads)
                     .map_err(|_| V2FormatError::InvalidHeaderField)?;
@@ -1145,9 +1421,40 @@ where
             })
             .await
             .map_err(v2_repository_error)?;
-        let locations = accepted_locations
-            .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
-        self.resolve_accepted_payload_refs(&stored.anchor_state, &locations)?;
+        if let Some(locations) = accepted_pack_locations {
+            if let Some(directory) = accepted_pack_directory {
+                let location = locations
+                    .iter()
+                    .find(|location| location.pack_section_ordinal.is_some())
+                    .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
+                let pack_section_ordinal = location
+                    .pack_section_ordinal
+                    .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
+                self.cache_pack_directory(
+                    V2PackDirectoryCacheKey {
+                        commit_key: stored.anchor_state.commit_key.clone(),
+                        commit_version_id: stored.version_id.clone(),
+                        body_digest: stored.anchor_state.body_digest,
+                        pack_section_ordinal,
+                        pack_offset: stored
+                            .sections_start
+                            .checked_add(location.offset)
+                            .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?,
+                        length: location.length,
+                    },
+                    directory,
+                    packed::repository_context_from_refs(
+                        &self.commit_store.options().repository_id,
+                        &self.commit_store.options().keyring_envelope_ref,
+                    )?,
+                )?;
+            }
+            self.resolve_accepted_pack_refs(&stored, &locations)?;
+        } else {
+            let locations = accepted_locations
+                .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
+            self.resolve_accepted_payload_refs(&stored.anchor_state, &locations)?;
+        }
         self.accept_pending_state(sequence)?;
         self.pending_payloads
             .lock()
@@ -1192,6 +1499,7 @@ where
                 IndexDelta::Tombstone {
                     blind_key,
                     generation,
+                    ..
                 } => accepted.tombstone_namespace_entry(blind_key.clone(), *generation),
             }
         }
@@ -1237,6 +1545,9 @@ where
         };
         match entry.payload_ref.as_mut() {
             Some(PayloadReference::V2Commit { length, .. }) => {
+                *length = (*length).saturating_sub(1);
+            }
+            Some(PayloadReference::V2Pack { length, .. }) => {
                 *length = (*length).saturating_sub(1);
             }
             _ => {
@@ -1481,6 +1792,42 @@ where
         Ok(())
     }
 
+    fn cached_pack_directory(
+        &self,
+        key: &V2PackDirectoryCacheKey,
+    ) -> Result<Option<V2CachedPackDirectory>> {
+        let directory = self
+            .pack_directories
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .peek(key);
+        if directory.is_some()
+            && let Ok(mut cache) = self.pack_directories.try_write()
+        {
+            cache.touch(key);
+        }
+        Ok(directory)
+    }
+
+    fn cache_pack_directory(
+        &self,
+        key: V2PackDirectoryCacheKey,
+        directory: V2PayloadPackDirectory,
+        repository_context: Vec<u8>,
+    ) -> Result<()> {
+        self.pack_directories
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .insert(
+                key,
+                V2CachedPackDirectory {
+                    directory,
+                    repository_context,
+                },
+            );
+        Ok(())
+    }
+
     fn cached_commit_header(
         &self,
         key: &V2CommitHeaderCacheKey,
@@ -1589,7 +1936,27 @@ where
                     apply_index_delta_object(state, snapshot);
                 }
                 V2SectionType::Payload => {}
-                V2SectionType::Directives | V2SectionType::Unknown(_) => {
+                V2SectionType::PayloadPack => {}
+                V2SectionType::IndexRun => {
+                    let keyring = self.repository.keyring()?;
+                    packed::apply_packed_index_run(
+                        keyring.as_ref(),
+                        &self.commit_store.options().repository_id,
+                        state,
+                        packed::V2PackedIndexRunReplay {
+                            parsed_header: &commit.parsed_header,
+                            version_id: commit.version_id.as_ref(),
+                            object_len: u64::try_from(commit.body.len())
+                                .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+                            section_ordinal: u32::try_from(index)
+                                .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+                            stored_run: section_bytes,
+                        },
+                    )?;
+                }
+                V2SectionType::IndexRoot
+                | V2SectionType::Directives
+                | V2SectionType::Unknown(_) => {
                     if section.flags & V2_SECTION_FLAG_MUST_UNDERSTAND != 0 {
                         return Err(v2_repository_error(V2FormatError::UnsupportedSection));
                     }
@@ -1644,8 +2011,27 @@ where
                         apply_index_delta_object(state, snapshot);
                     }
                 }
-                V2SectionType::Payload => {}
-                V2SectionType::Directives | V2SectionType::Unknown(_) => {
+                V2SectionType::Payload | V2SectionType::PayloadPack => {}
+                V2SectionType::IndexRun => {
+                    let section_bytes = replay_section_bytes(commit, index)?;
+                    let keyring = self.repository.keyring()?;
+                    packed::apply_packed_index_run(
+                        keyring.as_ref(),
+                        &self.commit_store.options().repository_id,
+                        state,
+                        packed::V2PackedIndexRunReplay {
+                            parsed_header: &commit.parsed_header,
+                            version_id: commit.version_id.as_ref(),
+                            object_len: commit.object_len,
+                            section_ordinal: u32::try_from(index)
+                                .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+                            stored_run: section_bytes,
+                        },
+                    )?;
+                }
+                V2SectionType::IndexRoot
+                | V2SectionType::Directives
+                | V2SectionType::Unknown(_) => {
                     if section.flags & V2_SECTION_FLAG_MUST_UNDERSTAND != 0 {
                         return Err(v2_repository_error(V2FormatError::UnsupportedSection));
                     }
@@ -1767,7 +2153,7 @@ where
         ))
     }
 
-    fn ensure_index_snapshot_payload_refs_are_chain_reachable(
+    async fn ensure_index_snapshot_payload_refs_are_chain_reachable(
         &self,
         chain: &V2ReplayChain,
     ) -> Result<()> {
@@ -1781,25 +2167,53 @@ where
                 )
             })
             .collect::<BTreeSet<_>>();
-        let state = self
-            .accepted_state
-            .read()
-            .map_err(|_| RepositoryError::StatePoisoned)?;
-
-        for (entry, _) in state.namespace.live_entries_with_prefixes() {
-            let Some(PayloadReference::V2Commit {
-                commit_key,
-                commit_version_id,
-                ..
-            }) = entry.payload_ref
-            else {
-                continue;
-            };
-            if !reachable.contains(&(commit_key, commit_version_id)) {
-                return Err(RepositoryError::CommitFailed {
-                    reason: "v2 index snapshot would preserve live payloads outside the snapshot chain; run v2 compaction snapshot instead".to_owned(),
-                });
+        let pack_validation_keys = {
+            let state = self
+                .accepted_state
+                .read()
+                .map_err(|_| RepositoryError::StatePoisoned)?;
+            let mut pack_validation_keys = Vec::new();
+            for (entry, _) in state.namespace.live_entries_with_prefixes() {
+                let is_pack = matches!(
+                    entry.payload_ref.as_ref(),
+                    Some(PayloadReference::V2Pack { .. })
+                );
+                let (commit_key, commit_version_id) = match entry.payload_ref {
+                Some(PayloadReference::V2Commit {
+                    commit_key,
+                    commit_version_id,
+                    ..
+                })
+                | Some(PayloadReference::V2Pack {
+                    commit_key,
+                    commit_version_id,
+                    ..
+                }) => (commit_key, commit_version_id),
+                None => continue,
+                Some(PayloadReference::V2Self { .. } | PayloadReference::V2PackSelf { .. }) => {
+                    return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
+                }
+                };
+                if !reachable.contains(&(commit_key, commit_version_id)) {
+                    return Err(RepositoryError::CommitFailed {
+                        reason: "v2 index snapshot would preserve live payloads outside the snapshot chain; run v2 compaction snapshot instead".to_owned(),
+                    });
+                }
+                if is_pack {
+                    let manifest = state.manifests.get(&entry.manifest_id).ok_or_else(|| {
+                        RepositoryError::InvalidObjectFormat {
+                            object_id: entry.object_id.clone(),
+                        }
+                    })?;
+                    pack_validation_keys.push(manifest.key.clone());
+                }
             }
+            pack_validation_keys
+        };
+
+        for key in pack_validation_keys {
+            self.get_range(&key, ByteRange::Slice { offset: 0, len: 0 })
+                .await?;
         }
 
         Ok(())
@@ -1877,6 +2291,90 @@ struct V2CommitPayloadRead {
     offset: u64,
     length: u64,
     content_len: u64,
+}
+
+#[derive(Clone, Debug)]
+struct V2CommitPackRead {
+    commit_key: BackendObjectId,
+    commit_version_id: Option<BackendVersionId>,
+    body_digest: [u8; 32],
+    commit_stored_len: u64,
+    pack_section_ordinal: u32,
+    pack_offset: u64,
+    length: u64,
+    pack_record_count: u32,
+    record_ordinal: u32,
+    content_len: u64,
+}
+
+fn pack_payload_cache_ref(
+    pack: &V2CommitPackRead,
+    directory: &V2PayloadPackDirectory,
+) -> Result<BackendObjectRef> {
+    let mut digest = Sha256::new();
+    digest.update(b"rs3:v02-pack-segment-cache:v1\n");
+    digest.update(pack.commit_key.as_str().as_bytes());
+    digest.update(pack.body_digest);
+    digest.update(pack.pack_section_ordinal.to_be_bytes());
+    digest.update(directory.pack_id());
+    digest.update(pack.record_ordinal.to_be_bytes());
+    Ok(BackendObjectRef {
+        object_id: BackendObjectId::new(format!(
+            "v2-pack-cache/{}",
+            hex::encode(digest.finalize())
+        ))?,
+        version_id: pack.commit_version_id.clone(),
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct V2PackDirectoryCacheKey {
+    commit_key: BackendObjectId,
+    commit_version_id: Option<BackendVersionId>,
+    body_digest: [u8; 32],
+    pack_section_ordinal: u32,
+    pack_offset: u64,
+    length: u64,
+}
+
+#[derive(Clone, Debug)]
+struct V2CachedPackDirectory {
+    directory: V2PayloadPackDirectory,
+    repository_context: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct V2PackDirectoryCache {
+    directories: LruCache<V2PackDirectoryCacheKey, V2CachedPackDirectory>,
+    max_entries: usize,
+}
+
+impl Default for V2PackDirectoryCache {
+    fn default() -> Self {
+        Self {
+            directories: LruCache::new(),
+            max_entries: 4096,
+        }
+    }
+}
+
+impl V2PackDirectoryCache {
+    fn peek(&self, key: &V2PackDirectoryCacheKey) -> Option<V2CachedPackDirectory> {
+        self.directories.peek_cloned(key)
+    }
+
+    fn touch(&mut self, key: &V2PackDirectoryCacheKey) {
+        self.directories.touch(key);
+    }
+
+    fn insert(&mut self, key: V2PackDirectoryCacheKey, directory: V2CachedPackDirectory) {
+        self.directories.insert(key, directory);
+        while self.directories.len() > self.max_entries {
+            if self.directories.pop_lru().is_none() {
+                break;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

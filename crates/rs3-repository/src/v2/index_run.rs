@@ -1382,7 +1382,7 @@ mod tests {
                 object_id: object_id("objects/v02/pack-a"),
                 version_id: Some(must(BackendVersionId::new("version-3"))),
                 stored_len: 4_096,
-                object_digest: [0x22; 32],
+                commit_body_digest: [0x22; 32],
                 pack_section_ordinal: 1,
                 pack_section_offset: 512,
                 pack_section_len: 2_048,

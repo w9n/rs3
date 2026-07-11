@@ -243,6 +243,8 @@ impl V2CommitAnchor for V2MemoryAnchor {
 /// Runtime options for the preview v2 commit store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V2CommitStoreOptions {
+    /// Immutable repository identity bound into framed-section AEAD contexts.
+    pub repository_id: RepositoryId,
     /// Commit upload mode to use for new writes.
     pub upload_mode: V2UploadMode,
     /// Provider profile selected for post-write checks.
@@ -265,10 +267,12 @@ impl V2CommitStoreOptions {
     /// Creates default options for the selected provider profile.
     pub fn for_profile(
         profile: V2ProviderProfile,
+        repository_id: RepositoryId,
         keyring_envelope_ref: V2KeyringEnvelopeRef,
         format_ref: V2FormatRef,
     ) -> Self {
         Self {
+            repository_id,
             upload_mode: V2UploadMode::MultipartPadded,
             provider_profile: profile,
             stream_read_stall_timeout: DEFAULT_V2_STREAM_READ_STALL_TIMEOUT,
@@ -455,6 +459,10 @@ pub struct V2StoredCommit {
     pub commit_key: V2CommitKey,
     /// Provider version ID returned by the write.
     pub version_id: Option<BackendVersionId>,
+    /// Provider-reported complete commit-object length.
+    pub object_len: u64,
+    /// Absolute offset where the commit section region starts.
+    pub sections_start: u64,
 }
 
 pub(crate) struct V2StoredStreamingCommit<Output> {
@@ -1113,7 +1121,7 @@ where
         for (index, section) in parsed_header.header.section_index.iter().enumerate() {
             let retain = matches!(
                 section.section_type,
-                V2SectionType::IndexDelta | V2SectionType::IndexSnapshot
+                V2SectionType::IndexDelta | V2SectionType::IndexSnapshot | V2SectionType::IndexRun
             );
             if !retain {
                 continue;
@@ -1275,14 +1283,11 @@ where
                 .ok_or(V2FormatError::SectionBounds)?;
         }
         let mut parsed = parse_v2_commit_object(object_id, Bytes::from(body), &self.keyring)?;
-        if parsed.parsed_header.header.keyring_envelope_ref != self.options.keyring_envelope_ref {
-            return Err(V2FormatError::InvalidHeaderField);
-        }
         parsed.version_id = version_id.cloned();
         Ok(parsed)
     }
 
-    async fn read_replay_commit_at(
+    pub(super) async fn read_replay_commit_at(
         &self,
         object_id: &BackendObjectId,
         version_id: Option<&BackendVersionId>,
@@ -1336,27 +1341,9 @@ where
         {
             return Err(V2FormatError::InvalidHeaderField);
         }
-        if self.options.upload_mode == V2UploadMode::MultipartPadded {
-            let header_bytes = self
-                .store
-                .get_range_at(
-                    object_id,
-                    version_id,
-                    ByteRange::Slice {
-                        offset: 0,
-                        len: V2_MAX_HEADER_SIZE as u64,
-                    },
-                )
-                .await;
-            if let Ok(header_bytes) = header_bytes {
-                let parsed = parse_v2_commit_header(object_id, &header_bytes, &self.keyring)?;
-                if parsed.header.keyring_envelope_ref != self.options.keyring_envelope_ref {
-                    return Err(V2FormatError::InvalidHeaderField);
-                }
-                return Ok(parsed);
-            }
-        }
-
+        // The configured upload mode is a writer preference, not a promise
+        // about every historical object. Probe the authenticated fixed header
+        // first so compact single-PUT commits never incur a failed 64 KiB read.
         let prefix = self
             .store
             .get_range_at(
@@ -1393,11 +1380,7 @@ where
             bytes.extend_from_slice(&remaining);
             Bytes::from(bytes)
         };
-        let parsed = parse_v2_commit_header(object_id, &header_bytes, &self.keyring)?;
-        if parsed.header.keyring_envelope_ref != self.options.keyring_envelope_ref {
-            return Err(V2FormatError::InvalidHeaderField);
-        }
-        Ok(parsed)
+        parse_v2_commit_header(object_id, &header_bytes, &self.keyring)
     }
 
     /// Reads commit bytes from a key and version without requiring a full object read.
@@ -1470,6 +1453,9 @@ where
             .await?;
         let commit_key = V2CommitKey::parse(object_id)?;
         let version_id = version_id.cloned();
+        let object_len = parsed.object_len;
+        let sections_start = u64::try_from(parsed.parsed_header.sections_start)
+            .map_err(|_| V2FormatError::SectionBounds)?;
         let anchor_state = V2AnchorState {
             sequence: header.self_ref.sequence,
             commit_key: object_id.clone(),
@@ -1486,6 +1472,8 @@ where
             anchor_state,
             commit_key,
             version_id,
+            object_len,
+            sections_start,
         })
     }
 
@@ -1499,7 +1487,8 @@ where
     where
         A: V2CommitAnchor,
     {
-        if bundle.anchor.sequence < bundle.weak_subjectivity_floor_sequence
+        if bundle.repository_id.as_ref() != Some(&self.options.repository_id)
+            || bundle.anchor.sequence < bundle.weak_subjectivity_floor_sequence
             || bundle.anchor.sequence < min_sequence
         {
             return Err(V2FormatError::RecoveryBundleRequired);
@@ -1557,14 +1546,32 @@ where
             let commit_legal_hold = strongest_legal_hold(self.options.legal_hold, write.legal_hold);
             let (section_index, section_region) = build_section_region(&write.sections)?;
             let body_digest = body_digest_for_v2_sections(&section_index, &section_region)?;
+            let upload_mode = if write
+                .sections
+                .iter()
+                .any(|section| section.section_type == V2SectionType::IndexRun)
+            {
+                V2UploadMode::SinglePut
+            } else {
+                self.options.upload_mode
+            };
             let header = self.build_header(
                 &commit_key,
                 parent.clone(),
                 &write,
                 section_index.clone(),
                 body_digest,
+                upload_mode,
             )?;
-            let object_body = header.encode_object(self.options.upload_mode, &section_region)?;
+            let object_body = header.encode_object(upload_mode, &section_region)?;
+            let object_len =
+                u64::try_from(object_body.len()).map_err(|_| V2FormatError::SectionBounds)?;
+            let sections_start = object_len
+                .checked_sub(
+                    u64::try_from(section_region.len())
+                        .map_err(|_| V2FormatError::SectionBounds)?,
+                )
+                .ok_or(V2FormatError::SectionBounds)?;
             let put = self
                 .put_commit_object(
                     &commit_key.object_id,
@@ -1585,6 +1592,7 @@ where
                 .verify_commit_postconditions(
                     &commit_key.object_id,
                     &metadata,
+                    object_len,
                     commit_retention,
                     commit_legal_hold,
                 )
@@ -1604,6 +1612,8 @@ where
                 anchor_state,
                 commit_key,
                 version_id,
+                object_len,
+                sections_start,
             });
         }
 
@@ -1653,6 +1663,7 @@ where
             .verify_commit_postconditions(
                 &commit_key.object_id,
                 &written.metadata,
+                written.object_len,
                 commit_retention,
                 commit_legal_hold,
             )
@@ -1673,6 +1684,8 @@ where
                 anchor_state,
                 commit_key,
                 version_id,
+                object_len: written.object_len,
+                sections_start: V2_MAX_HEADER_SIZE as u64,
             },
             output,
         })
@@ -1685,6 +1698,7 @@ where
         write: &V2CommitWrite,
         section_index: Vec<V2SectionDescriptor>,
         body_digest: [u8; 32],
+        upload_mode: V2UploadMode,
     ) -> V2Result<V2CommitHeader> {
         let header = V2CommitHeader {
             self_ref: V2CommitSelfRef {
@@ -1704,7 +1718,7 @@ where
                 .primary_key_id(rs3_types::KeyPurpose::CheckpointSigning)?,
         };
         validate_commit_section_semantics(&header)?;
-        header.sign_with_keyring(&self.keyring, self.options.upload_mode)
+        header.sign_with_keyring(&self.keyring, upload_mode)
     }
 
     async fn put_streaming_payload_commit_object<St, Finalize, Output>(
@@ -1930,6 +1944,10 @@ where
         };
         let delta_len =
             u64::try_from(finalized.index_delta.len()).map_err(|_| V2FormatError::SectionBounds)?;
+        let object_len = (V2_MAX_HEADER_SIZE as u64)
+            .checked_add(payload_len)
+            .and_then(|length| length.checked_add(delta_len))
+            .ok_or(V2FormatError::SectionBounds)?;
         let section_index = vec![
             V2SectionDescriptor {
                 section_type: V2SectionType::Payload,
@@ -1965,6 +1983,7 @@ where
                 .with_legal_hold(write.legal_hold),
             section_index,
             body_digest,
+            self.options.upload_mode,
         ) {
             Ok(header) => header,
             Err(error) => {
@@ -1985,6 +2004,7 @@ where
             .map_err(|_| V2FormatError::StorageOperationFailed)?;
         Ok(V2StreamingCommitWriteResult {
             metadata,
+            object_len,
             body_digest,
             signing_key_id: header.signing_key_id,
             output: finalized.output,
@@ -2051,9 +2071,25 @@ where
         &self,
         object_id: &BackendObjectId,
         metadata: &BlobMetadata,
+        expected_object_len: u64,
         retention: Option<RetentionPolicy>,
         legal_hold: Option<LegalHoldStatus>,
     ) -> V2Result<Option<BackendVersionId>> {
+        if metadata.content_len != expected_object_len || expected_object_len == 0 {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        let visible = self
+            .store
+            .get_range_at(
+                object_id,
+                metadata.version_id.as_ref(),
+                ByteRange::Slice { offset: 0, len: 1 },
+            )
+            .await
+            .map_err(|_| V2FormatError::ProviderProfileFailed)?;
+        if visible.len() != 1 {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
         match self.options.provider_profile {
             V2ProviderProfile::Dev | V2ProviderProfile::AtomicCreate => {
                 Ok(metadata.version_id.clone())
@@ -2075,14 +2111,6 @@ where
                 {
                     return Err(V2FormatError::ProviderProfileFailed);
                 }
-                self.store
-                    .get_range_at(
-                        object_id,
-                        Some(&version_id),
-                        ByteRange::Slice { offset: 0, len: 1 },
-                    )
-                    .await
-                    .map_err(|_| V2FormatError::ProviderProfileFailed)?;
                 Ok(Some(version_id))
             }
         }
@@ -2230,6 +2258,7 @@ async fn push_streaming_payload_segment(
 
 struct V2StreamingCommitWriteResult<Output> {
     metadata: BlobMetadata,
+    object_len: u64,
     body_digest: [u8; 32],
     signing_key_id: KeyId,
     output: Output,

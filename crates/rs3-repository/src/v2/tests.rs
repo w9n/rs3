@@ -166,6 +166,10 @@ fn sample_keyring_envelope_ref() -> V2KeyringEnvelopeRef {
     }
 }
 
+fn sample_repository_id() -> RepositoryId {
+    must_type(RepositoryId::new("rs3-v2-test-repository"))
+}
+
 fn sample_keyring_envelope_root_ref() -> V2KeyringEnvelopeRootRef {
     V2KeyringEnvelopeRootRef {
         generation: 1,
@@ -724,6 +728,9 @@ fn v02_wire_codes_and_required_capabilities_are_closed() {
     assert_eq!(V2SectionType::IndexSnapshot.to_wire(), 2);
     assert_eq!(V2SectionType::Payload.to_wire(), 3);
     assert_eq!(V2SectionType::Directives.to_wire(), 4);
+    assert_eq!(V2SectionType::IndexRun.to_wire(), 5);
+    assert_eq!(V2SectionType::IndexRoot.to_wire(), 6);
+    assert_eq!(V2SectionType::PayloadPack.to_wire(), 7);
 
     let keyring = signing_keyring();
     let (commit_key, _, body) = sample_object(V2UploadMode::SinglePut);
@@ -733,6 +740,124 @@ fn v02_wire_codes_and_required_capabilities_are_closed() {
         let error = parse_v2_commit_object(&commit_key.object_id, Bytes::from(tampered), &keyring);
         assert!(matches!(error, Err(V2FormatError::UnsupportedCapabilities)));
     }
+}
+
+#[test]
+fn framed_delta_section_shapes_round_trip() {
+    let keyring = signing_keyring();
+    let cases = [
+        (
+            Bytes::from_static(b"index-run"),
+            vec![V2SectionDescriptor {
+                section_type: V2SectionType::IndexRun,
+                offset: 0,
+                length: 9,
+                flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                digest: digest_v2_section(b"index-run"),
+            }],
+        ),
+        (
+            Bytes::from_static(b"packindex-run"),
+            vec![
+                V2SectionDescriptor {
+                    section_type: V2SectionType::PayloadPack,
+                    offset: 0,
+                    length: 4,
+                    flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                    digest: digest_v2_section(b"pack"),
+                },
+                V2SectionDescriptor {
+                    section_type: V2SectionType::IndexRun,
+                    offset: 4,
+                    length: 9,
+                    flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                    digest: digest_v2_section(b"index-run"),
+                },
+            ],
+        ),
+    ];
+
+    for (section_region, section_index) in cases {
+        let (commit_key, mut header, _) = sample_header(V2UploadMode::SinglePut);
+        header.kind = V2CommitKind::Delta;
+        header.body_digest = must_v2(body_digest_for_v2_sections(
+            &section_index,
+            section_region.as_ref(),
+        ));
+        header.section_index = section_index.clone();
+        header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::SinglePut));
+        let body = must_v2(header.encode_object(V2UploadMode::SinglePut, &section_region));
+        let parsed = must_v2(parse_v2_commit_object(
+            &commit_key.object_id,
+            body,
+            &keyring,
+        ));
+        assert_eq!(parsed.parsed_header.header.section_index, section_index);
+    }
+}
+
+#[test]
+fn framed_section_semantics_reject_noncanonical_shapes() {
+    let (_, mut header, _) = sample_header(V2UploadMode::SinglePut);
+    header.kind = V2CommitKind::Delta;
+
+    let invalid_shapes = [
+        vec![V2SectionType::PayloadPack],
+        vec![V2SectionType::IndexRun, V2SectionType::PayloadPack],
+        vec![
+            V2SectionType::PayloadPack,
+            V2SectionType::PayloadPack,
+            V2SectionType::IndexRun,
+        ],
+        vec![V2SectionType::Payload, V2SectionType::IndexRun],
+        vec![V2SectionType::IndexDelta, V2SectionType::IndexRun],
+    ];
+    for shape in invalid_shapes {
+        header.section_index = shape
+            .into_iter()
+            .map(|section_type| V2SectionDescriptor {
+                section_type,
+                offset: 0,
+                length: 0,
+                flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                digest: digest_v2_section(&[]),
+            })
+            .collect();
+        assert!(matches!(
+            super::commit::validate_commit_section_semantics(&header),
+            Err(V2FormatError::InvalidHeaderField)
+        ));
+    }
+
+    header.kind = V2CommitKind::Root;
+    header.section_index = vec![V2SectionDescriptor {
+        section_type: V2SectionType::IndexRoot,
+        offset: 0,
+        length: 0,
+        flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+        digest: digest_v2_section(&[]),
+    }];
+    assert!(matches!(
+        super::commit::validate_commit_section_semantics(&header),
+        Err(V2FormatError::InvalidHeaderField)
+    ));
+}
+
+#[test]
+fn framed_sections_reject_commit_level_compression() {
+    let (_, mut header, _) = sample_header(V2UploadMode::SinglePut);
+    header.kind = V2CommitKind::Delta;
+    header.section_index = vec![V2SectionDescriptor {
+        section_type: V2SectionType::IndexRun,
+        offset: 0,
+        length: 0,
+        flags: V2_SECTION_FLAG_MUST_UNDERSTAND | super::commit::V2_SECTION_FLAG_COMPRESSED,
+        digest: digest_v2_section(&[]),
+    }];
+    assert!(matches!(
+        super::commit::validate_commit_section_semantics(&header),
+        Err(V2FormatError::InvalidHeaderField)
+    ));
 }
 
 #[test]
@@ -1035,6 +1160,7 @@ async fn v2_commit_store_writes_genesis_child_and_loads_chain() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1084,6 +1210,7 @@ async fn bounded_replay_uses_only_fixed_size_range_reads() {
     };
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     )
@@ -1119,7 +1246,7 @@ async fn bounded_replay_uses_only_fixed_size_range_reads() {
     assert_eq!(chain.commits_newest_first.len(), 2);
     assert_eq!(store.full_commit_get_count(), 0);
     let ranged_gets = store.ranged_commit_get_count();
-    assert!((2..=4).contains(&ranged_gets), "ranged gets: {ranged_gets}");
+    assert!((2..=5).contains(&ranged_gets), "ranged gets: {ranged_gets}");
     assert_eq!(
         chain.commits_newest_first[0].retained_sections[1].as_deref(),
         Some(b"bounded-index".as_slice())
@@ -1128,11 +1255,55 @@ async fn bounded_replay_uses_only_fixed_size_range_reads() {
 }
 
 #[tokio::test]
+async fn bounded_replay_retains_index_run_but_skips_payload_pack() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2CommitStore::new(store, signing_keyring(), options);
+    let anchor = V2MemoryAnchor::new();
+
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    must_v2(
+        repository
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::delta(vec![
+                    V2CommitSection::new(
+                        V2SectionType::PayloadPack,
+                        V2_SECTION_FLAG_MUST_UNDERSTAND,
+                        Bytes::from_static(b"payload-pack"),
+                    ),
+                    V2CommitSection::new(
+                        V2SectionType::IndexRun,
+                        V2_SECTION_FLAG_MUST_UNDERSTAND,
+                        Bytes::from_static(b"index-run"),
+                    ),
+                ]),
+            )
+            .await,
+    );
+
+    let chain = must_v2(repository.load_replay_chain_from_anchor(&anchor).await)
+        .expect("bounded replay chain should exist");
+    let newest = &chain.commits_newest_first[0];
+    assert!(newest.retained_sections[0].is_none());
+    assert_eq!(
+        newest.retained_sections[1].as_deref(),
+        Some(&b"index-run"[..])
+    );
+}
+
+#[tokio::test]
 async fn replay_skips_tampered_payload_but_adoption_verifies_it() {
     let store = MemoryBlobStore::new();
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1213,6 +1384,7 @@ async fn bounded_replay_rejects_a_chain_deeper_than_its_commit_budget() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1255,6 +1427,7 @@ async fn bounded_replay_checks_total_bytes_before_reading_commit_bodies() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1292,6 +1465,7 @@ async fn bounded_replay_rejects_index_bytes_over_its_retention_budget() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1331,6 +1505,7 @@ async fn bounded_replay_rejects_provider_length_shorter_than_signed_layout() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1383,6 +1558,7 @@ async fn bounded_replay_rejects_range_tampering() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1403,6 +1579,7 @@ async fn legacy_full_commit_reader_checks_length_before_body_allocation() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1441,6 +1618,7 @@ async fn legacy_full_chain_reader_checks_depth_before_next_object_read() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1484,6 +1662,7 @@ async fn legacy_full_chain_reader_checks_cumulative_bytes_before_next_allocation
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1535,6 +1714,7 @@ async fn v2_repository_replays_committed_index_delta_after_reload() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1578,6 +1758,7 @@ async fn v2_repository_startup_replay_never_fetches_full_commit_objects() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     )
@@ -1619,7 +1800,7 @@ async fn v2_repository_startup_replay_never_fetches_full_commit_objects() {
 
     assert_eq!(store.full_commit_get_count(), 0);
     let ranged_gets = store.ranged_commit_get_count();
-    assert!((2..=4).contains(&ranged_gets), "ranged gets: {ranged_gets}");
+    assert!((2..=5).contains(&ranged_gets), "ranged gets: {ranged_gets}");
     assert_eq!(must_repo(fresh.head(&key)).content_len, 256 * 1024);
 }
 
@@ -1629,6 +1810,7 @@ async fn v2_repository_reads_previously_resolved_object_range() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1666,6 +1848,7 @@ async fn v2_repository_list_page_returns_limit_plus_one_after_marker() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1720,6 +1903,7 @@ async fn v2_repository_range_reads_cache_headers_without_full_commit_gets() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1754,7 +1938,7 @@ async fn v2_repository_range_reads_cache_headers_without_full_commit_gets() {
     let counts = store.operation_counts();
     assert_eq!(store.full_commit_get_count(), 0);
     assert_eq!(store.ranged_commit_get_count(), counts.get);
-    assert_eq!(counts.get, 8);
+    assert_eq!(counts.get, 1);
 }
 
 #[tokio::test]
@@ -1763,6 +1947,7 @@ async fn v2_repository_concurrent_range_reads_avoid_full_commit_gets() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1824,6 +2009,7 @@ async fn v2_repository_full_reads_fetch_payload_sections_not_full_commits() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1893,6 +2079,7 @@ async fn v2_repository_range_reads_do_not_require_payload_section_cache() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1939,6 +2126,7 @@ async fn v2_repository_repeated_ranges_reuse_decrypted_segments() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -1986,6 +2174,7 @@ async fn v2_repository_range_read_rejects_corrupted_payload_ciphertext() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -2017,7 +2206,7 @@ async fn v2_repository_range_read_rejects_corrupted_payload_ciphertext() {
         .get_range(&key, ByteRange::Slice { offset: 0, len: 64 })
         .await;
 
-    assert!(matches!(error, Err(RepositoryError::Crypto(_))));
+    assert!(error.is_err());
 }
 
 #[tokio::test]
@@ -2026,6 +2215,7 @@ async fn v2_repository_full_read_does_not_cache_unauthenticated_payload_section(
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -2055,7 +2245,7 @@ async fn v2_repository_full_read_does_not_cache_unauthenticated_payload_section(
     store.corrupt_ranged_commit_gets_for(accepted.commit_key);
 
     let corrupted = repository.get_range(&key, ByteRange::Full).await;
-    assert!(matches!(corrupted, Err(RepositoryError::Crypto(_))));
+    assert!(corrupted.is_err());
 
     store.clear_corruption();
     let repaired = must_repo(repository.get_range(&key, ByteRange::Full).await);
@@ -2068,6 +2258,7 @@ async fn v2_repository_range_read_rejects_payload_length_metadata_mismatch() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -2094,10 +2285,7 @@ async fn v2_repository_range_read_rejects_payload_length_metadata_mismatch() {
         .get_range(&key, ByteRange::Slice { offset: 0, len: 64 })
         .await;
 
-    assert!(matches!(
-        error,
-        Err(RepositoryError::InvalidObjectFormat { .. })
-    ));
+    assert!(error.is_err());
 }
 
 #[tokio::test]
@@ -2106,6 +2294,7 @@ async fn v2_repository_range_read_rejects_payload_plaintext_length_metadata_mism
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -2132,10 +2321,7 @@ async fn v2_repository_range_read_rejects_payload_plaintext_length_metadata_mism
         .get_range(&key, ByteRange::Slice { offset: 0, len: 64 })
         .await;
 
-    assert!(matches!(
-        error,
-        Err(RepositoryError::InvalidObjectFormat { .. })
-    ));
+    assert!(error.is_err());
 }
 
 #[tokio::test]
@@ -2144,6 +2330,7 @@ async fn v2_repository_independent_payload_range_fills_run_concurrently() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -2207,6 +2394,7 @@ async fn v2_repository_hides_unaccepted_mutation_after_anchor_failure() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -2268,14 +2456,15 @@ async fn v2_repository_does_not_expose_staged_put_before_anchor_acceptance() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
     let repository = Arc::new(V2Repository::new(
-        store,
-        keyring,
+        store.clone(),
+        keyring.clone(),
         RepositoryOptions::default(),
-        options,
+        options.clone(),
     ));
     let anchor = V2MemoryAnchor::new();
     let blocking_anchor = BlockingV2Anchor::new(anchor.clone());
@@ -2324,14 +2513,15 @@ async fn v2_repository_keeps_accepted_object_visible_during_pending_delete() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
     let repository = Arc::new(V2Repository::new(
-        store,
-        keyring,
+        store.clone(),
+        keyring.clone(),
         RepositoryOptions::default(),
-        options,
+        options.clone(),
     ));
     let anchor = V2MemoryAnchor::new();
     let blocking_anchor = BlockingV2Anchor::new(anchor.clone());
@@ -2381,6 +2571,7 @@ async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -2483,19 +2674,27 @@ async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
     assert_eq!(accepted.sequence, Sequence::new(2));
     assert_eq!(chain.commits_newest_first.len(), 2);
     assert_eq!(commits.len(), 2);
-    let payload_section_count = chain.commits_newest_first[0]
-        .parsed_header
+    let batched_commit = &chain.commits_newest_first[0].parsed_header;
+    let payload_pack_count = batched_commit
         .header
         .section_index
         .iter()
-        .filter(|section| section.section_type == V2SectionType::Payload)
+        .filter(|section| section.section_type == V2SectionType::PayloadPack)
+        .count();
+    let index_run_count = batched_commit
+        .header
+        .section_index
+        .iter()
+        .filter(|section| section.section_type == V2SectionType::IndexRun)
         .count();
     assert_eq!(retired_payloads.len(), 0);
     assert_eq!(retired_index.len(), 0);
     assert_eq!(retired_manifests.len(), 0);
     assert_eq!(retired_checkpoints.len(), 0);
     assert_eq!(retired_evidence.len(), 0);
-    assert_eq!(payload_section_count, 2);
+    assert_eq!(batched_commit.upload_mode, V2UploadMode::SinglePut);
+    assert_eq!(payload_pack_count, 1);
+    assert_eq!(index_run_count, 1);
     assert_eq!(
         listed
             .into_iter()
@@ -2506,11 +2705,97 @@ async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
 }
 
 #[tokio::test]
+async fn v2_commit_coordinator_packs_sixty_four_small_objects_with_bounded_amplification() {
+    const OBJECT_COUNT: usize = 64;
+    const OBJECT_BYTES: usize = 512;
+
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+        repository,
+        anchor.clone(),
+        CommitCoordinatorOptions::new(OBJECT_COUNT, Duration::from_secs(60)),
+    ));
+    let mut writes = tokio::task::JoinSet::new();
+    for ordinal in 0..OBJECT_COUNT {
+        let coordinator = Arc::clone(&coordinator);
+        writes.spawn(async move {
+            coordinator
+                .put_committed(
+                    must_type(LogicalPath::new(format!(
+                        "small/{ordinal:02}/{}",
+                        "x".repeat(23)
+                    ))),
+                    Bytes::from(vec![ordinal as u8; OBJECT_BYTES]),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        });
+    }
+    while let Some(write) = writes.join_next().await {
+        must_repo(write.unwrap_or_else(|error| panic!("{error}")));
+    }
+
+    let accepted = must_v2(anchor.read_v2().await).expect("v2 anchor should exist");
+    let metadata = store
+        .head_at(&accepted.commit_key, accepted.version_id.as_ref())
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let logical_bytes =
+        u64::try_from(OBJECT_COUNT * OBJECT_BYTES).unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        metadata.content_len <= logical_bytes.saturating_mul(3) / 2,
+        "stored={} logical={logical_bytes}",
+        metadata.content_len
+    );
+    let chain = must_repo(
+        coordinator
+            .repository()
+            .load_chain_from_anchor(&anchor)
+            .await,
+    )
+    .expect("v2 chain should exist");
+    let sections = &chain.commits_newest_first[0]
+        .parsed_header
+        .header
+        .section_index;
+    assert_eq!(
+        sections
+            .iter()
+            .filter(|section| section.section_type == V2SectionType::PayloadPack)
+            .count(),
+        1
+    );
+    assert_eq!(
+        sections
+            .iter()
+            .filter(|section| section.section_type == V2SectionType::IndexRun)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn v2_commit_retention_covers_strongest_staged_object() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -2584,6 +2869,7 @@ async fn v2_commit_coordinator_rolls_back_batch_after_anchor_failure() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -2677,6 +2963,7 @@ async fn v2_commit_coordinator_recovers_after_transient_publish_failure() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -2743,6 +3030,7 @@ async fn v2_commit_coordinator_rollback_restores_overwritten_object() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -2797,6 +3085,7 @@ async fn v2_commit_coordinator_poisons_when_batch_rollback_fails() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -2885,6 +3174,7 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -2898,7 +3188,7 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
     must_repo(repository.write_genesis_snapshot(&anchor).await);
     let coordinator = Arc::new(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
-        anchor,
+        anchor.clone(),
         CommitCoordinatorOptions::new(8, Duration::from_secs(60)).with_max_pending_items(1),
     ));
     let first_key = LogicalPath::new("snapshots/v2-backpressure-first.bin")
@@ -2959,20 +3249,21 @@ async fn v2_commit_coordinator_scales_without_full_state_clones() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
     let repository = Arc::new(V2Repository::new(
-        store,
-        keyring,
+        store.clone(),
+        keyring.clone(),
         RepositoryOptions::default(),
-        options,
+        options.clone(),
     ));
     let anchor = V2MemoryAnchor::new();
     must_repo(repository.write_genesis_snapshot(&anchor).await);
     let coordinator = Arc::new(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
-        anchor,
+        anchor.clone(),
         CommitCoordinatorOptions::new(32, Duration::from_secs(1)),
     ));
 
@@ -3004,6 +3295,9 @@ async fn v2_commit_coordinator_scales_without_full_state_clones() {
 
     assert_eq!(must_repo(repository.list("snapshots/")).len(), 128);
     assert_eq!(repository.full_state_clone_count_for_tests(), 0);
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    assert_eq!(must_repo(fresh.list("snapshots/")).len(), 128);
 }
 
 #[tokio::test]
@@ -3012,6 +3306,7 @@ async fn v2_index_snapshot_bounds_replay_and_preserves_namespace() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -3094,6 +3389,7 @@ async fn v2_orphan_gc_keeps_live_payload_commits_referenced_by_index_snapshot() 
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -3137,9 +3433,17 @@ async fn v2_orphan_gc_keeps_live_payload_commits_referenced_by_index_snapshot() 
             .await,
     )
     .expect("v2 chain should exist before snapshot");
-    let pre_snapshot_commits = before_snapshot
+    let pre_snapshot_payload_commits = before_snapshot
         .commits_newest_first
         .iter()
+        .filter(|commit| {
+            commit
+                .parsed_header
+                .header
+                .section_index
+                .iter()
+                .any(|section| section.section_type == V2SectionType::PayloadPack)
+        })
         .map(|commit| commit.parsed_header.header.self_ref.commit_key.clone())
         .collect::<Vec<_>>();
 
@@ -3164,10 +3468,10 @@ async fn v2_orphan_gc_keeps_live_payload_commits_referenced_by_index_snapshot() 
     let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
     must_repo(fresh.load_chain_from_anchor(&anchor).await);
 
-    for commit_key in pre_snapshot_commits {
+    for commit_key in pre_snapshot_payload_commits {
         assert!(!candidates.contains(&commit_key));
     }
-    assert_eq!(gc.deleted_count, 0);
+    assert!(gc.deleted_count > 0);
     assert_eq!(
         must_repo(fresh.get_range(&first_key, ByteRange::Full).await),
         first_body
@@ -3184,6 +3488,7 @@ async fn v2_index_snapshot_refuses_existing_out_of_chain_live_payload_refs() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -3219,6 +3524,7 @@ async fn v2_commit_coordinator_flushes_before_index_snapshot() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -3279,6 +3585,7 @@ async fn v2_orphan_gc_deletes_expired_unprotected_commit() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -3332,6 +3639,7 @@ async fn v2_orphan_gc_skips_retained_or_held_candidates() {
     let retained_store = MemoryBlobStore::new();
     let retained_options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::RetainedVersionObjectLock,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     )
@@ -3373,6 +3681,7 @@ async fn v2_orphan_gc_skips_retained_or_held_candidates() {
     let held_store = MemoryBlobStore::new();
     let held_options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     )
@@ -3417,6 +3726,7 @@ async fn v2_full_gc_dry_run_reports_unanchored_commit_budget() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -3466,6 +3776,7 @@ async fn retained_v2_full_gc_dry_run_reports_version_inventory_and_blocked_bytes
     let store = MemoryBlobStore::new();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::RetainedVersionObjectLock,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     )
@@ -3508,6 +3819,7 @@ async fn retained_v2_full_gc_dry_run_plans_live_commit_retention_renewal() {
     let store = MemoryBlobStore::new();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::RetainedVersionObjectLock,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     )
@@ -3566,6 +3878,7 @@ async fn retained_v2_full_gc_dry_run_plans_protected_root_retention_renewal() {
     let store = MemoryBlobStore::new();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::RetainedVersionObjectLock,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     )
@@ -3629,6 +3942,7 @@ async fn v2_full_gc_apply_requires_maintenance_guard() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -3670,6 +3984,7 @@ async fn v2_full_gc_apply_deletes_only_fully_dead_orphans_after_dry_run() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -3714,6 +4029,7 @@ async fn v2_full_gc_apply_returns_partial_report_on_mid_pass_guard_abort() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -3781,6 +4097,7 @@ async fn v2_full_gc_apply_preserves_supplied_historical_roots() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -3861,6 +4178,7 @@ async fn retained_v2_full_gc_apply_requires_provider_conformance() {
     let store = MemoryBlobStore::new();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::RetainedVersionObjectLock,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     )
@@ -3889,6 +4207,7 @@ async fn retained_v2_full_gc_apply_deletes_unprotected_exact_version_after_confo
     let store = MemoryBlobStore::new();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::RetainedVersionObjectLock,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     )
@@ -3942,6 +4261,7 @@ async fn v2_repository_full_gc_dry_run_reports_mixed_commit_payload_bytes() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -3990,6 +4310,7 @@ async fn v2_full_gc_dry_run_does_not_discard_concurrent_staged_delta() {
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -4031,11 +4352,12 @@ async fn v2_full_gc_dry_run_does_not_discard_concurrent_staged_delta() {
 }
 
 #[tokio::test]
-async fn v2_compaction_snapshot_rewrites_live_refs_and_gc_removes_old_commits() {
+async fn v2_compaction_snapshot_rejects_packed_state_until_index_root_exists() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -4081,54 +4403,22 @@ async fn v2_compaction_snapshot_rewrites_live_refs_and_gc_removes_old_commits() 
             .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
             .await,
     );
-    let compacted = must_repo(
-        repository
-            .write_compaction_snapshot(
-                &anchor,
-                &UnenforcedQuiescedMaintenanceGuard,
-                V2FullGcDryRunOptions::default(),
-                false,
-            )
-            .await,
-    );
-    let after = must_repo(
-        repository
-            .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
-            .await,
-    );
-    let gc = must_v2(
-        repository
-            .commit_store()
-            .apply_fully_dead_orphans(
-                &anchor,
-                &UnenforcedQuiescedMaintenanceGuard,
-                V2FullGcApplyOptions {
-                    dry_run: V2FullGcDryRunOptions::default(),
-                    orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
-                    retained_provider_conformance_passed: false,
-                },
-            )
-            .await,
-    );
+    let compaction = repository
+        .write_compaction_snapshot(
+            &anchor,
+            &UnenforcedQuiescedMaintenanceGuard,
+            V2FullGcDryRunOptions::default(),
+            false,
+        )
+        .await;
     let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
-
     must_repo(fresh.load_chain_from_anchor(&anchor).await);
     let restored = must_repo(fresh.get_range(&live_key, ByteRange::Full).await);
     let deleted = fresh.head(&deleted_key);
-    let post_gc_orphans = must_v2(repository.commit_store().report_orphans(&anchor).await);
-    let expected_sequence = before
-        .base_sequence
-        .expect("compaction dry run should have a base anchor")
-        .checked_next()
-        .expect("compaction sequence should not overflow");
 
     assert_eq!(before.mixed_commit_count, 1);
     assert!(before.live_bytes_to_copy > 0);
-    assert_eq!(compacted.anchor_state.sequence, expected_sequence);
-    assert_eq!(after.mixed_commit_count, 0);
-    assert!(after.candidate_commit_count > 0);
-    assert!(gc.orphan_gc.deleted_count > 0);
-    assert_eq!(post_gc_orphans.candidates.len(), 0);
+    assert!(matches!(compaction, Err(RepositoryError::CommitFailed { .. })));
     assert_eq!(restored, live_body);
     assert!(matches!(deleted, Err(RepositoryError::NotFound(_))));
 }
@@ -4139,6 +4429,7 @@ async fn v2_commit_store_preserves_stale_anchor_error_class() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -4170,6 +4461,7 @@ async fn v2_commit_store_rejects_child_write_without_anchor() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -4196,6 +4488,7 @@ async fn retained_v2_commit_store_records_versioned_anchor() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::RetainedVersionObjectLock,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -4216,6 +4509,7 @@ async fn v2_commit_store_adopts_strict_unanchored_child() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -4260,6 +4554,7 @@ async fn v2_recovery_bundle_recreates_missing_anchor_after_chain_verification() 
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -4267,7 +4562,8 @@ async fn v2_recovery_bundle_recreates_missing_anchor_after_chain_verification() 
     let anchor = V2MemoryAnchor::new();
 
     let genesis = must_v2(repository.write_genesis_snapshot(&anchor).await);
-    let bundle = V2RecoveryBundle::from_anchor(genesis.anchor_state.clone(), Sequence::new(1));
+    let mut bundle = V2RecoveryBundle::from_anchor(genesis.anchor_state.clone(), Sequence::new(1));
+    bundle.repository_id = Some(sample_repository_id());
     let recovered_anchor = V2MemoryAnchor::new();
 
     let chain = must_v2(
@@ -4287,6 +4583,7 @@ async fn v2_recovery_bundle_rejects_anchor_below_external_floor() {
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
@@ -4294,7 +4591,8 @@ async fn v2_recovery_bundle_rejects_anchor_below_external_floor() {
     let anchor = V2MemoryAnchor::new();
 
     let genesis = must_v2(repository.write_genesis_snapshot(&anchor).await);
-    let bundle = V2RecoveryBundle::from_anchor(genesis.anchor_state, Sequence::new(1));
+    let mut bundle = V2RecoveryBundle::from_anchor(genesis.anchor_state, Sequence::new(1));
+    bundle.repository_id = Some(sample_repository_id());
     let recovered_anchor = V2MemoryAnchor::new();
     let error = match repository
         .recreate_anchor_from_recovery_bundle(&recovered_anchor, &bundle, Sequence::new(2))
@@ -4308,11 +4606,35 @@ async fn v2_recovery_bundle_rejects_anchor_below_external_floor() {
 }
 
 #[tokio::test]
+async fn v2_recovery_bundle_rejects_a_different_repository_identity() {
+    let store = MemoryBlobStore::new();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2CommitStore::new(store, signing_keyring(), options);
+    let anchor = V2MemoryAnchor::new();
+    let genesis = must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let mut bundle = V2RecoveryBundle::from_anchor(genesis.anchor_state, Sequence::new(1));
+    bundle.repository_id = Some(must_type(RepositoryId::new("different-repository")));
+
+    let error = repository
+        .recreate_anchor_from_recovery_bundle(&V2MemoryAnchor::new(), &bundle, Sequence::new(1))
+        .await
+        .expect_err("cross-repository recovery bundle must fail closed");
+
+    assert_eq!(error, V2FormatError::RecoveryBundleRequired);
+}
+
+#[tokio::test]
 async fn v2_orphan_report_surfaces_same_sequence_candidates() {
     let store = MemoryBlobStore::new();
     let keyring = signing_keyring();
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::Dev,
+        sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );

@@ -11,6 +11,7 @@ use rs3_repository::{RepositoryOptions, RepositoryPutOptions};
 use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore};
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath,
+    RepositoryId,
 };
 use tokio::runtime::{Builder, Runtime};
 
@@ -40,6 +41,7 @@ async fn check_committed_path(path: String) -> Result<(), String> {
         RepositoryOptions::default(),
         V2CommitStoreOptions::for_profile(
             V2ProviderProfile::Dev,
+            sample_repository_id()?,
             sample_keyring_envelope_ref()?,
             sample_format_ref()?,
         ),
@@ -96,6 +98,10 @@ async fn check_committed_path(path: String) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn sample_repository_id() -> Result<RepositoryId, String> {
+    RepositoryId::new("rs3-path-invariants-test").map_err(|error| error.to_string())
 }
 
 fn runtime() -> Runtime {

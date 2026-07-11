@@ -291,6 +291,7 @@ pub(crate) fn apply_index_delta_object(state: &mut RepositoryState, delta: Index
             IndexDelta::Tombstone {
                 blind_key,
                 generation,
+                ..
             } => state.tombstone_namespace_entry(blind_key, generation),
         }
     }

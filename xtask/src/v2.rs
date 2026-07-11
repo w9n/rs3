@@ -243,6 +243,7 @@ where
     let keyring = KeyRing::generate_random().context("failed to generate rehearsal keyring")?;
     let commit_options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::RetainedVersionObjectLock,
+        rehearsal_repository_id()?,
         rehearsal_keyring_ref()?,
         rehearsal_format_ref()?,
     )
@@ -414,6 +415,11 @@ async fn verify_bundle(args: V2VerifyBundleArgs) -> Result<V2VerifyBundleReport>
             verify_bundle_with_selected_store(args, store).await
         }
     }
+}
+
+#[cfg(feature = "s3")]
+fn rehearsal_repository_id() -> Result<RepositoryId> {
+    RepositoryId::new("rs3-xtask-gc-rehearsal").map_err(Into::into)
 }
 
 #[cfg(feature = "s3")]
@@ -594,6 +600,7 @@ where
         .context("invalid v2 keyring envelope reference")?;
     let commit_options = V2CommitStoreOptions::for_profile(
         format_root.provider_profile,
+        input.repository_id.clone(),
         commit_ref,
         input.bundle.anchor.format_ref.clone(),
     )
@@ -1042,8 +1049,12 @@ mod tests {
             .active_keyring_envelope_ref
             .commit_ref()
             .unwrap_or_else(|error| panic!("{error}"));
-        let commit_options =
-            V2CommitStoreOptions::for_profile(V2ProviderProfile::Dev, commit_ref, format_ref);
+        let commit_options = V2CommitStoreOptions::for_profile(
+            V2ProviderProfile::Dev,
+            repository_id.clone(),
+            commit_ref,
+            format_ref,
+        );
         let commit_store = V2CommitStore::new(store.clone(), keyring, commit_options);
         let anchor = V2MemoryAnchor::new();
         let genesis = commit_store
@@ -1149,8 +1160,12 @@ mod tests {
             .active_keyring_envelope_ref
             .commit_ref()
             .unwrap_or_else(|error| panic!("{error}"));
-        let commit_options =
-            V2CommitStoreOptions::for_profile(provider_profile, commit_ref, format_ref);
+        let commit_options = V2CommitStoreOptions::for_profile(
+            provider_profile,
+            repository_id.clone(),
+            commit_ref,
+            format_ref,
+        );
         let commit_store = V2CommitStore::new(store.clone(), keyring, commit_options);
         let anchor = V2MemoryAnchor::new();
         let genesis = commit_store

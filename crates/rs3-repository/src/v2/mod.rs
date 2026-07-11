@@ -53,12 +53,14 @@ pub use maintenance::{
     V2OrphanGcReport, V2OrphanReport,
 };
 pub use payload_pack::{
-    V2_PAYLOAD_PACK_MAX_BYTES, V2_PAYLOAD_PACK_MAX_HEADER_BYTES, V2_PAYLOAD_PACK_MAX_RECORDS,
-    V2_PAYLOAD_PACK_SEGMENT_BYTES, V2PayloadPackDirectory, V2PayloadPackRecord,
+    V2_PAYLOAD_PACK_FIXED_HEADER_BYTES, V2_PAYLOAD_PACK_MAX_BYTES,
+    V2_PAYLOAD_PACK_MAX_HEADER_BYTES, V2_PAYLOAD_PACK_MAX_RECORDS, V2_PAYLOAD_PACK_SEGMENT_BYTES,
+    V2OpenedPayloadPackRecordSpan, V2PayloadPackDirectory, V2PayloadPackRecord,
     V2PayloadPackRecordInput, V2PayloadPackRecordSpan, V2SealedPayloadPack, open_v2_payload_pack,
-    open_v2_payload_pack_directory, open_v2_payload_pack_record, open_v2_payload_pack_record_range,
-    open_v2_payload_pack_record_span, plan_v2_payload_pack_record_range,
-    probe_v2_payload_pack_header_len, seal_v2_payload_pack,
+    open_v2_payload_pack_cached_record_span, open_v2_payload_pack_directory,
+    open_v2_payload_pack_record, open_v2_payload_pack_record_range,
+    open_v2_payload_pack_record_span, open_v2_payload_pack_record_span_with_segments,
+    plan_v2_payload_pack_record_range, probe_v2_payload_pack_header_len, seal_v2_payload_pack,
 };
 pub use provider::{
     V2ProviderCheckStatus, V2ProviderConformanceCheck, V2ProviderConformanceOptions,

@@ -192,6 +192,7 @@ where
         .map_err(repository_init)?;
     let commit_options = V2CommitStoreOptions::for_profile(
         format_root.provider_profile,
+        repository_id.clone(),
         commit_ref,
         bundle.anchor.format_ref.clone(),
     )
@@ -592,8 +593,12 @@ mod tests {
             .active_keyring_envelope_ref
             .commit_ref()
             .unwrap_or_else(|error| panic!("{error}"));
-        let commit_options =
-            V2CommitStoreOptions::for_profile(V2ProviderProfile::Dev, commit_ref, format_ref);
+        let commit_options = V2CommitStoreOptions::for_profile(
+            V2ProviderProfile::Dev,
+            repository_id.clone(),
+            commit_ref,
+            format_ref,
+        );
         let commit_store = V2CommitStore::new(store.clone(), keyring, commit_options);
         let anchor = V2MemoryAnchor::new();
         let genesis = commit_store

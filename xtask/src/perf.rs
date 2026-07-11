@@ -24,6 +24,7 @@ use rs3_storage::{
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath,
+    RepositoryId,
 };
 use std::path::{Path, PathBuf};
 #[cfg(feature = "containers")]
@@ -1170,6 +1171,7 @@ where
         },
         V2CommitStoreOptions::for_profile(
             V2ProviderProfile::Dev,
+            perf_repository_id()?,
             perf_keyring_envelope_ref()?,
             perf_format_ref()?,
         ),
@@ -1263,6 +1265,10 @@ fn body(size: usize) -> Bytes {
 
 fn path(value: &str) -> Result<LogicalPath> {
     LogicalPath::new(value.to_owned()).map_err(Into::into)
+}
+
+fn perf_repository_id() -> Result<RepositoryId> {
+    RepositoryId::new("rs3-xtask-perf").map_err(Into::into)
 }
 
 fn perf_keyring_envelope_ref() -> Result<V2KeyringEnvelopeRef> {

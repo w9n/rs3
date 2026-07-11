@@ -4,11 +4,12 @@ pub mod run;
 
 use rs3_types::{
     BackendObjectId, BackendObjectRef, BackendVersionId, BlindIndexKey, CheckpointId,
-    KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LegalHoldStatus, ManifestId, PrefixToken,
-    RetentionPolicy, Sequence,
+    KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LegalHoldStatus, LogicalPath, ManifestId,
+    PrefixToken, RetentionPolicy, Sequence,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 /// Domain separator prepended to canonical checkpoint payload bytes.
 pub const CHECKPOINT_RECORD_DOMAIN: &[u8] = b"rs3:checkpoint-record:v1\n";
@@ -49,6 +50,37 @@ pub struct ObjectPointer {
 /// Payload location recorded inside encrypted namespace index state.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PayloadReference {
+    /// Compact payload-pack record in the current commit carrying this index run.
+    V2PackSelf {
+        /// Commit section ordinal containing the payload pack.
+        pack_section_ordinal: u32,
+        /// Authenticated number of logical records in the pack directory.
+        pack_record_count: u32,
+        /// Logical record ordinal in the pack directory.
+        record_ordinal: u32,
+    },
+    /// Compact payload-pack record in an accepted exact commit object.
+    V2Pack {
+        /// Commit object key containing the payload-pack section.
+        commit_key: BackendObjectId,
+        /// Provider version identifier for exact-version reads, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit_version_id: Option<BackendVersionId>,
+        /// Commit body digest from the signed header.
+        body_digest: [u8; 32],
+        /// Provider-reported complete commit-object length.
+        commit_stored_len: u64,
+        /// Commit section ordinal containing the payload pack.
+        pack_section_ordinal: u32,
+        /// Absolute byte offset of the payload-pack section in the commit object.
+        pack_offset: u64,
+        /// Encrypted payload-pack section byte length.
+        length: u64,
+        /// Authenticated number of logical records in the pack directory.
+        pack_record_count: u32,
+        /// Logical record ordinal in the pack directory.
+        record_ordinal: u32,
+    },
     /// Payload bytes are in the current commit that carries this index delta.
     V2Self {
         /// Opaque payload identity used as the AEAD associated-data object id.
@@ -104,7 +136,7 @@ pub struct PayloadHeaderReference {
 }
 
 /// A single index mutation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexDelta {
     /// Insert or replace a namespace entry for a blind key.
     Upsert {
@@ -117,11 +149,44 @@ pub enum IndexDelta {
     },
     /// Mark a blind key as deleted at a repository generation.
     Tombstone {
+        /// Namespace key that produced the blind key.
+        namespace_key_id: KeyId,
         /// Blind key being tombstoned.
         blind_key: BlindIndexKey,
+        /// Client-visible path needed to build the encrypted listing projection.
+        path: LogicalPath,
         /// Generation at which the tombstone was written.
         generation: Sequence,
     },
+}
+
+impl fmt::Debug for IndexDelta {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Upsert {
+                entry,
+                prefix_tokens,
+                sealed_manifest,
+            } => formatter
+                .debug_struct("Upsert")
+                .field("entry", entry)
+                .field("prefix_tokens", prefix_tokens)
+                .field("sealed_manifest", sealed_manifest)
+                .finish(),
+            Self::Tombstone {
+                namespace_key_id,
+                blind_key,
+                path: _,
+                generation,
+            } => formatter
+                .debug_struct("Tombstone")
+                .field("namespace_key_id", namespace_key_id)
+                .field("blind_key", blind_key)
+                .field("path", &"<redacted>")
+                .field("generation", generation)
+                .finish(),
+        }
+    }
 }
 
 /// Durable index delta object referenced by a checkpoint.
@@ -636,12 +701,22 @@ mod tests {
     fn tombstone_keeps_generation() {
         let blind_key = blind_key("abc");
         let delta = IndexDelta::Tombstone {
+            namespace_key_id: key_id("namespace-a"),
             blind_key,
+            path: logical_path("private/path"),
             generation: Sequence::new(7),
         };
 
+        assert!(!format!("{delta:?}").contains("private/path"));
         match delta {
-            IndexDelta::Tombstone { generation, .. } => {
+            IndexDelta::Tombstone {
+                namespace_key_id,
+                path,
+                generation,
+                ..
+            } => {
+                assert_eq!(namespace_key_id, key_id("namespace-a"));
+                assert_eq!(path, logical_path("private/path"));
                 assert_eq!(generation, Sequence::new(7));
             }
             IndexDelta::Upsert { .. } => panic!("unexpected upsert"),

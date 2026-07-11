@@ -14,6 +14,8 @@ pub const V2_PAYLOAD_PACK_MAX_RECORDS: usize = 64;
 pub const V2_PAYLOAD_PACK_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum encrypted pack-directory header bytes.
 pub const V2_PAYLOAD_PACK_MAX_HEADER_BYTES: usize = 64 * 1024;
+/// Fixed bytes needed to probe the encrypted pack-directory header length.
+pub const V2_PAYLOAD_PACK_FIXED_HEADER_BYTES: usize = PAYLOAD_PACK_FIXED_HEADER_LEN;
 /// Canonical maximum independently authenticated plaintext segment size.
 pub const V2_PAYLOAD_PACK_SEGMENT_BYTES: usize = 64 * 1024;
 
@@ -206,6 +208,15 @@ pub struct V2PayloadPackRecordSpan {
     pub segment_count: u32,
     record_ordinal: u32,
     requested: Range<u64>,
+}
+
+/// Authenticated plaintext range plus complete plaintext segments for caching.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V2OpenedPayloadPackRecordSpan {
+    /// Exact client-requested plaintext bytes.
+    pub plaintext: Bytes,
+    /// Complete authenticated segments, keyed by record-relative ordinal.
+    pub segments: Vec<(u32, Bytes)>,
 }
 
 #[derive(Clone, Copy)]
@@ -565,6 +576,29 @@ pub fn open_v2_payload_pack_record_span(
     span: &V2PayloadPackRecordSpan,
     ciphertext_span: &[u8],
 ) -> V2Result<Bytes> {
+    open_v2_payload_pack_record_span_with_segments(
+        keyring,
+        repository_context,
+        containing_object,
+        section_ordinal,
+        directory,
+        span,
+        ciphertext_span,
+    )
+    .map(|opened| opened.plaintext)
+}
+
+/// Authenticates an exact ciphertext span and retains complete plaintext
+/// segments so callers can populate a bounded decrypted-segment cache.
+pub fn open_v2_payload_pack_record_span_with_segments(
+    keyring: &KeyRing,
+    repository_context: &[u8],
+    containing_object: &BackendObjectId,
+    section_ordinal: u32,
+    directory: &V2PayloadPackDirectory,
+    span: &V2PayloadPackRecordSpan,
+    ciphertext_span: &[u8],
+) -> V2Result<V2OpenedPayloadPackRecordSpan> {
     validate_public_context(repository_context, containing_object)?;
     let context = PayloadPackContext {
         repository_context,
@@ -583,6 +617,9 @@ pub fn open_v2_payload_pack_record_span(
     let segment_count = u64::from(span.segment_count);
     let mut cursor = 0_usize;
     let mut selected_plaintext = Vec::new();
+    let mut segments = Vec::with_capacity(
+        usize::try_from(segment_count).map_err(|_| V2FormatError::InvalidPayloadPack)?,
+    );
     for relative_segment in 0..segment_count {
         let segment_ordinal = start_segment
             .checked_add(relative_segment)
@@ -614,6 +651,10 @@ pub fn open_v2_payload_pack_record_span(
             return Err(V2FormatError::InvalidPayloadPack);
         }
         selected_plaintext.extend_from_slice(&plaintext);
+        segments.push((
+            u32::try_from(segment_ordinal).map_err(|_| V2FormatError::InvalidPayloadPack)?,
+            Bytes::from(plaintext),
+        ));
         cursor = end;
     }
     if cursor != ciphertext_span.len() {
@@ -649,11 +690,75 @@ pub fn open_v2_payload_pack_record_span(
             return Err(V2FormatError::InvalidPayloadPack);
         }
     }
-    Ok(Bytes::copy_from_slice(
-        selected_plaintext
-            .get(trim_start..trim_end)
-            .ok_or(V2FormatError::InvalidPayloadPack)?,
-    ))
+    Ok(V2OpenedPayloadPackRecordSpan {
+        plaintext: Bytes::copy_from_slice(
+            selected_plaintext
+                .get(trim_start..trim_end)
+                .ok_or(V2FormatError::InvalidPayloadPack)?,
+        ),
+        segments,
+    })
+}
+
+/// Reassembles an exact planned range from already authenticated complete
+/// plaintext segments.
+pub fn open_v2_payload_pack_cached_record_span(
+    directory: &V2PayloadPackDirectory,
+    span: &V2PayloadPackRecordSpan,
+    plaintext_segments: &[Bytes],
+) -> V2Result<Bytes> {
+    let record = directory
+        .record(span.record_ordinal)
+        .ok_or(V2FormatError::InvalidPayloadPack)?;
+    if plaintext_segments.len()
+        != usize::try_from(span.segment_count).map_err(|_| V2FormatError::InvalidPayloadPack)?
+    {
+        return Err(V2FormatError::InvalidPayloadPack);
+    }
+    let start_segment = u64::from(span.start_segment);
+    let mut selected_plaintext = Vec::new();
+    for (relative_segment, plaintext) in plaintext_segments.iter().enumerate() {
+        let segment_ordinal = start_segment
+            .checked_add(
+                u64::try_from(relative_segment).map_err(|_| V2FormatError::InvalidPayloadPack)?,
+            )
+            .ok_or(V2FormatError::InvalidPayloadPack)?;
+        if u64::try_from(plaintext.len()).ok()
+            != Some(segment_plaintext_len(record, segment_ordinal)?)
+        {
+            return Err(V2FormatError::InvalidPayloadPack);
+        }
+        selected_plaintext.extend_from_slice(plaintext);
+    }
+    let selected_plaintext_start = start_segment
+        .checked_mul(u64::from(record.segment_size))
+        .ok_or(V2FormatError::InvalidPayloadPack)?;
+    let trim_start = span
+        .requested
+        .start
+        .checked_sub(selected_plaintext_start)
+        .ok_or(V2FormatError::InvalidPayloadPack)?;
+    let requested_len = span
+        .requested
+        .end
+        .checked_sub(span.requested.start)
+        .ok_or(V2FormatError::InvalidPayloadPack)?;
+    let trim_end = trim_start
+        .checked_add(requested_len)
+        .ok_or(V2FormatError::InvalidPayloadPack)?;
+    let trim_start = usize::try_from(trim_start).map_err(|_| V2FormatError::InvalidPayloadPack)?;
+    let trim_end = usize::try_from(trim_end).map_err(|_| V2FormatError::InvalidPayloadPack)?;
+    let requested = selected_plaintext
+        .get(trim_start..trim_end)
+        .ok_or(V2FormatError::InvalidPayloadPack)?;
+    if span.requested.start == 0 && span.requested.end == record.plaintext_len {
+        let digest = digest_payload_record(requested);
+        if !ct_eq(&digest, &record.plaintext_digest) {
+            selected_plaintext.fill(0);
+            return Err(V2FormatError::InvalidPayloadPack);
+        }
+    }
+    Ok(Bytes::copy_from_slice(requested))
 }
 
 /// Opens one plaintext range from complete pack bytes.

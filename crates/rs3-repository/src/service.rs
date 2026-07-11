@@ -99,6 +99,56 @@ where
         Ok(())
     }
 
+    pub(crate) fn cached_decrypted_segment_span(
+        &self,
+        object_ref: &BackendObjectRef,
+        start_segment: usize,
+        segment_count: usize,
+    ) -> Result<Option<Vec<Bytes>>> {
+        let mut segments = Vec::with_capacity(segment_count);
+        {
+            let cache = self
+                .decrypted_segments
+                .read()
+                .map_err(|_| RepositoryError::StatePoisoned)?;
+            for relative_index in 0..segment_count {
+                let segment_index = start_segment
+                    .checked_add(relative_index)
+                    .ok_or(StorageError::InvalidRange)?;
+                let Some(segment) = cache.peek(object_ref, segment_index) else {
+                    record_decrypted_segment_cache_many("miss", 1, 0);
+                    return Ok(None);
+                };
+                segments.push(segment);
+            }
+        }
+        if let Ok(mut cache) = self.decrypted_segments.try_write() {
+            for relative_index in 0..segment_count {
+                let segment_index = start_segment
+                    .checked_add(relative_index)
+                    .ok_or(StorageError::InvalidRange)?;
+                cache.touch(object_ref, segment_index);
+            }
+        }
+        let bytes = segments.iter().fold(0_u64, |total, segment| {
+            total.saturating_add(u64::try_from(segment.len()).unwrap_or(u64::MAX))
+        });
+        record_decrypted_segment_cache_many(
+            "hit",
+            u64::try_from(segment_count).unwrap_or(u64::MAX),
+            bytes,
+        );
+        Ok(Some(segments))
+    }
+
+    pub(crate) fn cache_decrypted_segment_span(
+        &self,
+        object_ref: &BackendObjectRef,
+        segments: &[(usize, Bytes)],
+    ) -> Result<()> {
+        self.cache_decrypted_segments(object_ref, segments)
+    }
+
     pub(crate) fn open_cached_decrypted_segments(
         &self,
         object_ref: &BackendObjectRef,
@@ -254,18 +304,33 @@ where
             .ok_or_else(|| RepositoryError::NotFound(key.clone()))?
             .clone();
         let object_id = entry.object_id.clone();
-        let existing_blind_keys = existing_blind_keys(&state.namespace, &lookup_blind_keys);
+        let existing_tombstones = existing_blind_keys(&state.namespace, &lookup_blind_keys)
+            .into_iter()
+            .map(|blind_key| {
+                state
+                    .namespace
+                    .head(&blind_key)
+                    .map(|entry| (blind_key, entry.namespace_key_id.clone()))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| RepositoryError::CommitFailed {
+                reason: "namespace entry disappeared while staging delete".to_owned(),
+            })?;
         let sequence = next_sequence(&mut state)?;
         let rollback = crate::state::RepositoryStateRollback::capture(
             &state,
-            existing_blind_keys.iter().cloned(),
+            existing_tombstones
+                .iter()
+                .map(|(blind_key, _)| blind_key.clone()),
             entry.manifest_id,
             key,
         );
-        for blind_key in existing_blind_keys {
+        for (blind_key, namespace_key_id) in existing_tombstones {
             state.tombstone_namespace_entry(blind_key.clone(), sequence);
             state.pending_index_deltas.push(IndexDelta::Tombstone {
+                namespace_key_id,
                 blind_key,
+                path: key.clone(),
                 generation: sequence,
             });
         }

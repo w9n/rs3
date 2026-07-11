@@ -77,11 +77,15 @@ is planned.
 
 !!! warning "Security implementation status"
     The gateway reads and writes a transitional `v02` commit envelope with
-    signed per-section digests and payload-skipping index replay, but does not
-    yet read or write `INDEX_ROOT` catalogs or `objects/v02` framed runs. The
-    remaining controls below are requirements, not current evidence. Security
-    claims remain blocked on implementation, hostile-input tests, scale
-    recovery, and external cryptographic review.
+    signed per-section digests. Bounded normal writes use encrypted payload
+    packs and framed index runs; recovery replays index runs without reading
+    payload bytes, and payload ranges authenticate only the required canonical
+    segments. Publication verifies the returned object length and immediate
+    exact-version visibility before advancing the external anchor. The gateway
+    does not yet read or write `INDEX_ROOT` catalogs or `objects/v02`
+    standalone runs. Production claims remain blocked on that recovery
+    boundary, hostile scale recovery, live-provider reruns, and external
+    cryptographic review.
 
 ## Control Map
 
@@ -104,8 +108,8 @@ is planned.
 | Incident restore does not advance repository state | `restore-readonly` mode requires an accepted anchor and rejects supported mutations. | Gateway mode config, startup, and S3 adapter tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
-| v02 index frames cannot be transplanted or reordered | Frame AEAD binds format generation, repository context, exact object key, section ordinal, run identity, authenticated directory digest, and complete frame descriptor. The signed catalog separately binds the provider-returned exact version, length, and ciphertext digest. | The bounded framed-run codec and corruption tests are implemented; commit publication, catalogs, and selected-projection replay remain release blockers. |
-| v02 payload-pack records cannot be transplanted or downgraded | Record AEAD binds repository, exact object key, pack, section, record, segment, key, layout, and length context. The accepted signed reference binds the returned exact version, length, and digest. Protection-cohort checks prevent reuse under weaker retention or legal hold. | The bounded compact-pack codec, canonical segmentation, and corruption tests are implemented; commit publication, protection-cohort partitioning, and cleaning remain release blockers. |
+| v02 index frames cannot be transplanted or reordered | Frame AEAD binds immutable repository identity, the historical keyring-envelope reference, exact object key, section ordinal, run identity, authenticated directory digest, and complete frame descriptor. A future signed catalog separately binds standalone provider versions and lengths. | The bounded framed-run codec, commit publication, bounded replay, and corruption tests are implemented; catalogs and selected-projection recovery remain release blockers. |
+| v02 payload-pack records cannot be transplanted or downgraded | Record AEAD binds immutable repository identity, historical keyring context, exact object key, pack, section, record, segment, layout, and length facts. The accepted signed reference binds the returned exact version, length, and commit-body digest. | The bounded compact-pack codec, canonical segmentation, publication, range-read, cache, replay, and corruption tests are implemented; protection-cohort partitioning and cleaning remain release blockers. |
 | v02 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery applies one bounded authenticated frame at a time from an exact signed catalog. | Required for v02; 100k and 1M fresh-recovery gates currently block release. |
 | v02 checkpoint failure cannot anchor unrecoverable state | Fenced automatic checkpointing degrades, then pauses mutation before fixed tail-byte, commit, or run-count ceilings. | Required for v02; not implemented. |
 | v02 GC retains every live payload without retaining whole ancestry | Effective run records mark exact payload commit versions; full mark completes before exact-version sweep. | Required for v02; not implemented. |

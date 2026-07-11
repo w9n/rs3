@@ -90,7 +90,7 @@ pub fn round_trip_v2_commit_structure(input: &[u8]) {
             flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
             digest: digest_v2_section(section_region),
         }]
-    } else {
+    } else if selector & 4 == 0 {
         let payload_len = section_region.len() / 2;
         vec![
             V2SectionDescriptor {
@@ -102,6 +102,32 @@ pub fn round_trip_v2_commit_structure(input: &[u8]) {
             },
             V2SectionDescriptor {
                 section_type: V2SectionType::IndexDelta,
+                offset: payload_len as u64,
+                length: (section_region.len() - payload_len) as u64,
+                flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                digest: digest_v2_section(&section_region[payload_len..]),
+            },
+        ]
+    } else if selector & 8 == 0 {
+        vec![V2SectionDescriptor {
+            section_type: V2SectionType::IndexRun,
+            offset: 0,
+            length: section_region.len() as u64,
+            flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+            digest: digest_v2_section(section_region),
+        }]
+    } else {
+        let payload_len = section_region.len() / 2;
+        vec![
+            V2SectionDescriptor {
+                section_type: V2SectionType::PayloadPack,
+                offset: 0,
+                length: payload_len as u64,
+                flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                digest: digest_v2_section(&section_region[..payload_len]),
+            },
+            V2SectionDescriptor {
+                section_type: V2SectionType::IndexRun,
                 offset: payload_len as u64,
                 length: (section_region.len() - payload_len) as u64,
                 flags: V2_SECTION_FLAG_MUST_UNDERSTAND,

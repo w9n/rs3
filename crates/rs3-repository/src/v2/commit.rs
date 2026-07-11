@@ -117,6 +117,12 @@ pub enum V2SectionType {
     Payload,
     /// Encrypted maintenance directive section.
     Directives,
+    /// Framed encrypted namespace mutation run.
+    IndexRun,
+    /// Encrypted catalog of the index runs that form a repository root.
+    IndexRoot,
+    /// Immutable encrypted value container referenced by an index run.
+    PayloadPack,
     /// Unknown section type preserved for validation decisions.
     Unknown(u16),
 }
@@ -129,6 +135,9 @@ impl V2SectionType {
             Self::IndexSnapshot => 0x0002,
             Self::Payload => 0x0003,
             Self::Directives => 0x0004,
+            Self::IndexRun => 0x0005,
+            Self::IndexRoot => 0x0006,
+            Self::PayloadPack => 0x0007,
             Self::Unknown(value) => value,
         }
     }
@@ -139,6 +148,9 @@ impl V2SectionType {
             0x0002 => Self::IndexSnapshot,
             0x0003 => Self::Payload,
             0x0004 => Self::Directives,
+            0x0005 => Self::IndexRun,
+            0x0006 => Self::IndexRoot,
+            0x0007 => Self::PayloadPack,
             other => Self::Unknown(other),
         }
     }
@@ -1191,7 +1203,11 @@ pub(crate) fn validate_commit_section_semantics(header: &V2CommitHeader) -> V2Re
     for section in &header.section_index {
         if matches!(
             section.section_type,
-            V2SectionType::IndexDelta | V2SectionType::IndexSnapshot
+            V2SectionType::IndexDelta
+                | V2SectionType::IndexSnapshot
+                | V2SectionType::IndexRun
+                | V2SectionType::IndexRoot
+                | V2SectionType::PayloadPack
         ) && section.flags & V2_SECTION_FLAG_COMPRESSED != 0
         {
             return Err(V2FormatError::InvalidHeaderField);
@@ -1212,19 +1228,36 @@ pub(crate) fn validate_commit_section_semantics(header: &V2CommitHeader) -> V2Re
         {
             return Err(V2FormatError::InvalidHeaderField);
         }
-    } else if snapshot_count != 0
-        || delta_count != 1
-        || header.parent.is_none()
-        || header
-            .section_index
-            .last()
-            .map(|section| section.section_type)
-            != Some(V2SectionType::IndexDelta)
-        || header.section_index[..header.section_index.len().saturating_sub(1)]
-            .iter()
-            .any(|section| section.section_type != V2SectionType::Payload)
-    {
-        return Err(V2FormatError::InvalidHeaderField);
+    } else {
+        let transitional_delta = snapshot_count == 0
+            && delta_count == 1
+            && header
+                .section_index
+                .last()
+                .map(|section| section.section_type)
+                == Some(V2SectionType::IndexDelta)
+            && header.section_index[..header.section_index.len().saturating_sub(1)]
+                .iter()
+                .all(|section| section.section_type == V2SectionType::Payload);
+        let framed_delta = matches!(
+            header.section_index.as_slice(),
+            [V2SectionDescriptor {
+                section_type: V2SectionType::IndexRun,
+                ..
+            }] | [
+                V2SectionDescriptor {
+                    section_type: V2SectionType::PayloadPack,
+                    ..
+                },
+                V2SectionDescriptor {
+                    section_type: V2SectionType::IndexRun,
+                    ..
+                }
+            ]
+        );
+        if header.parent.is_none() || (!transitional_delta && !framed_delta) {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
     }
 
     Ok(())

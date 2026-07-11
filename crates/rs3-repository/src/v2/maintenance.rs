@@ -7,6 +7,7 @@ use super::provider::V2ProviderProfile;
 use super::repository::{
     V2AnchorState, V2CommitAnchor, V2CommitStore, V2ReplayChain, V2ReplayCommit, V2ReplayLimits,
 };
+use super::service::packed::{V2PackedIndexRunReplay, apply_packed_index_run};
 use crate::checkpoint::open_index_delta_object;
 use crate::state::{RepositoryState, apply_index_delta_object};
 use async_trait::async_trait;
@@ -695,21 +696,28 @@ where
         reachability: &mut V2ReachabilityState,
         chain: &V2ReplayChain,
         protected: bool,
-        budgets: V2MaintenanceBudgets,
+        _budgets: V2MaintenanceBudgets,
     ) -> V2Result<()> {
-        let mut pending = self.live_payload_roots_from_chain(chain)?;
-
-        while let Some(root) = pending.pop() {
+        for root in self.live_payload_roots_from_chain(chain)? {
             let version_key = (root.commit_key.clone(), root.version_id.clone());
             if reachability.reachable_versions.contains(&version_key) {
                 continue;
             }
-
-            let chain = self
-                .load_maintenance_chain(&root, reachability, budgets)
+            let commit = self
+                .read_replay_commit_at(&root.commit_key, root.version_id.as_ref())
                 .await?;
-            reachability.include_chain(&chain, protected);
-            pending.extend(self.live_payload_roots_from_chain(&chain)?);
+            if commit.parsed_header.header.self_ref.sequence != root.sequence
+                || commit.parsed_header.header.body_digest != root.body_digest
+                || commit.version_id != root.version_id
+            {
+                return Err(V2FormatError::BodyDigestMismatch);
+            }
+            reachability.include_chain(
+                &V2ReplayChain {
+                    commits_newest_first: vec![commit],
+                },
+                protected,
+            );
         }
 
         Ok(())
@@ -728,14 +736,23 @@ where
         let mut roots = Vec::new();
 
         for (entry, _) in state.namespace.live_entries_with_prefixes() {
-            let Some(PayloadReference::V2Commit {
-                commit_key,
-                commit_version_id,
-                body_digest,
-                ..
-            }) = entry.payload_ref
-            else {
-                continue;
+            let (commit_key, commit_version_id, body_digest) = match entry.payload_ref {
+                Some(PayloadReference::V2Commit {
+                    commit_key,
+                    commit_version_id,
+                    body_digest,
+                    ..
+                })
+                | Some(PayloadReference::V2Pack {
+                    commit_key,
+                    commit_version_id,
+                    body_digest,
+                    ..
+                }) => (commit_key, commit_version_id, body_digest),
+                None => continue,
+                Some(PayloadReference::V2Self { .. } | PayloadReference::V2PackSelf { .. }) => {
+                    return Err(V2FormatError::InvalidHeaderField);
+                }
             };
             let parsed_key = V2CommitKey::parse(&commit_key)?;
             roots.push(V2AnchorState {
@@ -807,7 +824,27 @@ where
                         apply_index_delta_object(state, snapshot);
                     }
                 }
-                V2SectionType::Payload => {}
+                V2SectionType::Payload | V2SectionType::PayloadPack => {}
+                V2SectionType::IndexRun => {
+                    let section_bytes = commit_section_bytes(commit, index)?;
+                    apply_packed_index_run(
+                        self.keyring(),
+                        &self.options().repository_id,
+                        state,
+                        V2PackedIndexRunReplay {
+                            parsed_header: &commit.parsed_header,
+                            version_id: commit.version_id.as_ref(),
+                            object_len: commit.object_len,
+                            section_ordinal: u32::try_from(index)
+                                .map_err(|_| V2FormatError::SectionBounds)?,
+                            stored_run: section_bytes,
+                        },
+                    )
+                    .map_err(|_| V2FormatError::InvalidIndexRun)?;
+                }
+                V2SectionType::IndexRoot => {
+                    return Err(V2FormatError::UnsupportedSection);
+                }
                 V2SectionType::Directives | V2SectionType::Unknown(_) => {
                     if section.flags & V2_SECTION_FLAG_MUST_UNDERSTAND != 0 {
                         return Err(V2FormatError::UnsupportedSection);

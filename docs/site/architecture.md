@@ -50,9 +50,13 @@ not add ad hoc hashing, MAC, encryption, or key derivation logic.
 !!! warning "Format implementation status"
     `commits/v01` has been removed and is unsupported. It has no production
     repositories and will not gain a migration path or dual reader. The runtime
-    now reads and writes a transitional `commits/v02` envelope, but the framed
-    runs, signed catalogs, compactor, and bounded recovery architecture below are
-    not implemented yet.
+    now publishes bounded normal batches as one compact `PAYLOAD_PACK` plus one
+    framed `INDEX_RUN`, and bounded recovery replays those runs without reading
+    payload bytes. Signed `INDEX_ROOT` catalogs, standalone compacted runs, and
+    catalog-bounded recovery are not implemented yet. Packed-state compaction
+    fails closed until `INDEX_ROOT` replaces the old snapshot model; the
+    explicitly bounded legacy-only maintenance path remains for transitional
+    fixtures.
 
 Normal writes are append-friendly and value-separated:
 
