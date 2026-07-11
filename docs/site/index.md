@@ -64,11 +64,11 @@ repositories. The runtime now reads and writes bounded `commits/v02` payload
 packs, encrypted index runs, and signed index-root checkpoints. Packed reads
 resolve authenticated record descriptors from the encrypted index and fetch
 the exact payload ciphertext range without first reading pack metadata.
-Existing gateway and provider results remain regression evidence, but a
-repository release is blocked until guarded compaction and automatic watermarks
-pass the revised 1M and retained-provider gates, complete GC and
-protection-cohort behavior lands, and the fresh-process 1M-object scale gates
-pass. No `v01` migration or dual reader is planned.
+Existing gateway and provider results remain regression evidence. Guarded
+compaction and automatic watermarks now pass the in-memory 1M resource gate, but
+a repository release remains blocked on retained-provider restart/fault gates,
+complete GC and protection-cohort behavior, external review, and the pinned
+fresh-process 1M filesystem lane. No `v01` migration or dual reader is planned.
 
 Do not treat the current repository format, cryptographic formats, or runtime
 defaults as production-stable yet.

@@ -94,13 +94,8 @@ reads of the first, middle, and last object after every write run. The exact
 commands and amplification ratios are recorded in
 `tests/PERFORMANCE_BASELINE.md`.
 
-On 2026-07-11 the checkpoint-inclusive release-binary harness passed all three
-runs at 10k, 100k, and 1M objects with ciphertext-only packs and direct
-encrypted-index descriptors. The 10k lane retained the normal 64-item
-low-latency batch. The 100k and 1M lanes used the explicit 1,024-item bulk batch
-and kept each measured final catalog below its 1,024-run ceiling. These numbers
-predate automatic packed-run compaction and remain direct-descriptor regression
-evidence, not evidence for the current compaction schedule.
+Earlier 10k, 100k, and 1M release runs established the direct-descriptor
+baseline before automatic packed-run compaction:
 
 | Objects | Batch | Median elapsed | Median checkpoint | Median fresh reload | PUTs | Write amp |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -108,56 +103,29 @@ evidence, not evidence for the current compaction schedule.
 | 100,000 | 1,024 | 7.35 s | 2.169 s | 1.203 s | 99 | 1.39358x |
 | 1,000,000 | 1,024 | 92.48 s | 26.37 s | 15.55 s | 978 | 1.39342x |
 
-The main elapsed time and backend counters include writes, final checkpoint
-publication, and the checkpoint candidate's internal new-reader verification.
-The separately reported reload constructs another repository instance over the
-same in-memory store and anchor, and is excluded from those counters and from
-main elapsed time. It verifies exact list cardinality and reads the first,
-middle, and last payload. The 1M reload measured below the 180-second target,
-but this host is not the pinned runner, the harness does not record process RSS,
-and a same-process in-memory instance is not a fresh-process filesystem test.
-The 1M absolute time and 4 GiB RSS qualification gates therefore remain
-unverified.
+The current lane keeps one accepted state plus a bounded 1,024-mutation overlay,
+shares cloned identifier storage, uses canonical varints for v02 run generation
+and length fields, and validates catalog-only rewrites by reading back the exact
+signed root and new run bytes. It does not rebuild a second complete namespace
+to prove that an immutable catalog still names the same state.
 
-That historical 1M checkpoint cataloged about 977 runs, leaving only 47 run
-slots. Guarded metadata-only compaction and automatic watermarks are now
-implemented. The first automatic-compaction 1M attempt was stopped at the
-five-minute task limit without final evidence. It exposed an inefficient
-schedule that repeatedly merged the full active set every 256 runs. The revised
-schedule starts at 256 active runs but compacts at most the oldest 128 level-0
-runs per pass. Newer level-0 runs and existing level-1 shards are preserved
-instead of being rewritten. A missing guard or a fully validated bounded plan
-that cannot reduce run count may retry at later 64-run boundaries, and both
-pause writes at 896. Other compaction errors poison immediately.
+On 2026-07-11 the corrected automatic-compaction 1M lane passed three release
+runs with 512 B values, batch and concurrency 1,024, the 180-second elapsed
+gate, a 30-second same-process reload gate, and the 4 GiB process high-water
+gate:
 
-On 2026-07-11, a subsequent 270,000-object release lane crossed the 256-run
-request watermark and validated that bounded tier compaction completes without
-rewriting the whole catalog. It used 512 B values, a 1,024-item batch and
-concurrency of 1,024, and passed three times:
+| Run | Elapsed | Checkpoint | Fresh reload | Peak RSS | PUT | GET | HEAD | Active runs | Write amp | Cold read |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 44.806 s | 2.590 ms | 9.789 s | 2,809,933,824 B | 1,008 | 3,433 | 806 | 233 | 1.602591508x | 1 GET/read, 1.03125x |
+| 2 | 44.701 s | 2.045 ms | 10.354 s | 2,809,462,784 B | 1,008 | 3,433 | 806 | 233 | 1.602591508x | 1 GET/read, 1.03125x |
+| 3 | 46.019 s | 2.030 ms | 9.575 s | 2,809,634,816 B | 1,008 | 3,433 | 806 | 233 | 1.602591508x | 1 GET/read, 1.03125x |
 
-| Run | Elapsed | Checkpoint | Fresh reload | PUT | GET | HEAD | Active runs | Write amp | Cold read |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 29.799 s | 4.393 s | 3.102 s | 270 | 1,484 | 404 | 140 | 1.570052575x | 1 GET/read, 1.03125x |
-| 2 | 28.527 s | 4.229 s | 3.047 s | 270 | 1,484 | 404 | 140 | 1.570052575x | 1 GET/read, 1.03125x |
-| 3 | 30.012 s | 4.490 s | 3.073 s | 270 | 1,484 | 404 | 140 | 1.570052575x | 1 GET/read, 1.03125x |
-
-The backend counters include normal publication, bounded compaction, final
-checkpoint publication, and internal candidate verification. Cold-read counts
-are isolated after fresh recovery and are per sentinel read. The recovered
-140-run catalog passes the 255-run gate. This validates the bounded compaction
-watermark at 270k; the revised 1M lane still needs a complete rerun.
-
-After memory-path remediation, a final resource-gated 270k sample passed in
-27.325925 s with a 4.190111 s checkpoint, 3.019858 s reload, and process peak
-RSS of 4,042,354,688 B (3.765 GiB), below the 4 GiB gate. It retained the same
-1.570052575x write amplification, 140 active runs, and one exact cold `GET` per
-sentinel at 1.03125x. Two preceding resource-gated attempts correctly failed at
-5,409,140,736 B and 4,668,936,192 B instead of silently accepting the memory
-regression. Those failures led to removal of a full accepted-state clone, an
-accumulating replay scratch state, and a redundant recovered-state install,
-plus interning of shared exact container facts during compaction. The earlier
-three runs remain the timing-stability evidence; this final sample is the exact
-RSS-gated result. It does not close the 1M gap.
+Each run performed six bounded metadata-only compactions, reloaded exactly one
+million entries through a new repository instance, and verified the first,
+middle, and last payload. A final 270k preflight under the same code completed
+in 11.655 s at 758,521,856 B peak RSS, 1.505740509x amplification, and 140
+active runs. These same-process in-memory results close the automatic-compaction
+resource gate, but do not replace the pinned fresh-process filesystem lane.
 
 The current layout removes the pack directory:
 encrypted `INDEX_RUN` state authenticates the record's exact physical offset,
@@ -238,18 +206,18 @@ against the direct path.
 
 The earlier prototype 100k and 1M tiers failed closed at the replay budget.
 Those measurements used the removed `commits/v01` generation. The v02 reader's
-signed `INDEX_ROOT` path now has passing in-memory 100k and 1M evidence, but a
-successful same-process run is not final production qualification. The passing
-1M evidence also predates automatic compaction, and the revised automatic lane
-has not yet completed. Final `v02`
-qualification must use a fresh process and filesystem backend, and verify exact
+signed `INDEX_ROOT` path now has passing in-memory 100k and 1M evidence,
+including the current automatic-compaction schedule. A successful same-process
+run is not final production qualification. Final `v02` qualification must also
+use a fresh process and filesystem backend, and verify exact
 listing cardinality plus first, middle, and last object bytes.
 Its descriptor-first reader must retain no cumulative encrypted delta set, read
 no payload sections merely to rebuild the index, and use at most 1.25x the index
 material required by the accepted catalog. On the documented pinned 4-vCPU,
 16-GiB runner, the 1M filesystem recovery budget is 180 seconds and 4 GiB RSS.
 Correctness, request, byte, allocation, and amplification bounds apply on every
-runner; absolute time gates apply only to pinned runners.
+runner. The recipes apply generous elapsed and reload ceilings everywhere as
+regression tripwires; time results qualify a release only on pinned runners.
 
 ## Current Release Matrix
 

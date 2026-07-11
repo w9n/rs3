@@ -53,11 +53,13 @@ not add ad hoc hashing, MAC, encryption, or key derivation logic.
     now publishes bounded normal batches as one compact `PAYLOAD_PACK` plus one
     framed `INDEX_RUN`, and bounded recovery replays those runs without reading
     payload bytes. Signed `INDEX_ROOT` checkpoints catalog exact embedded run
-    sections, are reconstructed by a fresh reader before anchor adoption, and
-    drive exact maintenance reachability. Guarded metadata-only compaction and
+    sections; publication reads back and opens the exact signed root and every
+    new compacted run before anchor adoption. They also drive exact maintenance
+    reachability. Guarded metadata-only compaction and
     automatic active-run watermarks are implemented for packed runs. Framed
     streaming, payload protection cohorts, complete GC qualification, and the
-    revised 1M scale rerun remain release blockers.
+    pinned fresh-process filesystem lane remain release blockers. The current
+    automatic-compaction 1M in-memory gate passes.
 
 Normal writes are append-friendly and value-separated:
 
@@ -103,19 +105,25 @@ Runs contain two specialized encrypted binary projections linked by mutation
 ordinal. The blinded namespace projection answers `HEAD` and `GET`; the
 path-sorted listing projection answers prefix listings. Frame-local container
 tables share exact object references. Values never live in an index frame, so
-LSM compaction is metadata-only and cold recovery does not read user data.
+LSM compaction is metadata-only and cold recovery does not read user data. Run
+wire version 3 uses canonical bounded varints for generation and content length
+in both projections.
 
-The runtime keeps one accepted compact state plus a bounded pending-mutation
-overlay. Publication failure discards that overlay instead of rolling back a
-second full state copy. This preserves commit atomicity without doubling
-steady-state namespace memory.
+The runtime keeps one accepted compact state plus a hard-bounded 1,024-mutation
+overlay. An exclusive publication barrier freezes that overlay from pre-CAS
+validation through accepted-state installation. Publication failure discards
+the overlay instead of rolling back a second full state copy. This preserves
+commit atomicity without doubling steady-state namespace memory.
 
 The bounded compaction path follows the same memory invariant. It does not clone
 the full accepted state before planning, verifies each source run with
 short-lived scratch state instead of accumulating replay state across the
-window, avoids a redundant recovered-state installation, and interns shared
-exact container facts while selecting winners. The scale harness enforces
-process peak RSS so these are measured constraints rather than allocator lore.
+window, and interns shared exact container facts while selecting winners.
+Catalog checkpoints and metadata-only compaction validate exact read-back bytes
+without materializing another complete query state, then keep the accepted
+namespace in place and change only the run inventory and anchor. The scale
+harness enforces process peak RSS so these are measured constraints rather than
+allocator lore.
 
 Cold recovery is descriptor-first. It walks bounded signed headers from the
 anchor to the newest catalog, then verifies and applies one encrypted index
@@ -210,11 +218,20 @@ and the same resource-version CAS checks that fence when advancing the anchor.
 Checkpointing and compaction use the same authority. Compaction writes
 metadata-only delta-carrier commits and the candidate signed root as direct
 children of the same accepted base. The candidate runs are exact-referenced by
-the root and are not individually anchored. A fresh repository instance
-verifies the complete candidate state and lineage, then the writer rechecks the
-fence and base anchor before one CAS adopts the root. Recovery rejects a
+the root and are not individually anchored. The writer reads back and
+authenticates every new run plus the exact signed root, then rechecks the fence
+and base anchor before one CAS adopts the root. Recovery rejects a
 compacted carrier whose parent, sequence, level, or compaction generation does
 not match that sibling publication shape.
+
+Inside one gateway process, a repository instance admits exactly one mutation
+owner. A commit coordinator holds an RAII lease that is also retained by every
+delayed publisher task; direct mutation and maintenance entry points fail while
+that lease exists. This prevents a cancelled request or a second local API path
+from publishing and clearing another batch's speculative overlay. All semantic
+installation checks occur before anchor CAS. If the anchor advances but local
+lock installation fails, callers receive an explicit recovery-required error,
+new mutations stop, and the process must restart from the accepted anchor.
 
 Disconnected writers that merely share S3 are unsupported. Conditional object
 creation can prevent a collision at one key, but it cannot fence a stale writer,

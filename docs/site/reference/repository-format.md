@@ -126,6 +126,12 @@ catalog checkpoint commit contains an encrypted `INDEX_ROOT`. A checkpoint may
 also cover a final bounded mutation batch, but the catalog must describe the
 exact resulting state.
 
+The current framed index plaintext is wire version 3. Mutation ordinals,
+generations, content lengths, and bounded counts use canonical varints; readers
+reject overlong encodings. Generation and content length appear in both the
+namespace and listing projections because each projection must be independently
+validated before the two records are paired.
+
 Signed per-section descriptors are required for descriptor-first recovery. A
 reader can authenticate an index range without downloading unrelated payload
 sections. Payload ciphertext is authenticated when the referenced object is
@@ -307,10 +313,17 @@ versions, missing frames, malformed records, digest failures, AEAD failures,
 generation conflicts, catalog-count mismatches, resource-ceiling violations,
 or anchor drift all fail closed.
 
-The runtime keeps one accepted compact state plus a bounded pending-mutation
-overlay. Unaccepted writes never mutate accepted state. Successful anchor
-publication applies the overlay once; failed publication discards it. Startup
-must not clone a second complete repository state.
+The runtime keeps one accepted compact state plus a hard-bounded
+1,024-mutation overlay. Unaccepted writes never mutate accepted state. An
+exclusive publication barrier freezes the overlay from commit snapshot through
+the anchor CAS and local install. Successful anchor publication applies the
+validated overlay once; failed publication discards it. Startup must not clone
+a second complete repository state. One atomic RAII mutation lease owns this
+overlay per service instance; delayed publishers retain the lease, and direct
+mutation or maintenance APIs cannot bypass an active coordinator. Semantic
+installation checks complete before CAS. If local lock installation alone
+fails after CAS, the caller receives a recovery-required result and all further
+mutations fail until restart from the accepted anchor.
 
 ## Automatic Catalog Watermarks
 
@@ -367,12 +380,17 @@ Compaction and catalog publication use this order:
    that exact-references every new sibling carrier plus the preserved level-1
    inventory. New shards have level 1 and a compaction generation equal to the
    sibling commit sequence.
-5. Open the candidate root through a fresh reader and compare the complete
-   trusted namespace state and accepted run inventory.
+5. Read back the exact candidate root and every new sibling carrier, verify
+   their signed headers, section descriptors, lineage, authenticated framing,
+   and canonical decoded value, and require the opened root to equal the
+   constructed catalog exactly. Preserved run references must be byte-for-byte
+   unchanged.
 6. Recheck the writer fence and unchanged base anchor.
 7. Advance the real anchor to the root with one resource-version CAS that also
    checks the fence identity and token.
-8. Install the accepted catalog and state.
+8. Install the accepted catalog and anchor while keeping the already-accepted
+   logical namespace state in place. Metadata-only compaction changes no
+   client-visible record or payload reference.
 9. Leave replaced and failed candidate objects for conservative orphan GC.
 
 Uploading a carrier does not make it accepted. Only the fenced anchor CAS makes
@@ -508,8 +526,10 @@ include:
   tombstones, protected roots, and failed compactions; and
 - a retained-provider restart and writer-handoff qualification run.
 
-Absolute time limits are enforced only on pinned runners. Correctness,
-allocation, request, byte, and amplification ceilings apply everywhere.
+The local and CI recipes enforce generous elapsed-time regression ceilings on
+every runner, including a separate recovery ceiling. Time results qualify a
+release only on the pinned runner. Correctness, allocation, request, byte, and
+amplification ceilings apply everywhere.
 
 ## Compatibility Promise
 

@@ -36,10 +36,10 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | Velero strict restore-readonly | `just integration-velero-kopia-dynamic-pvc-restore-readonly-smoke` | Incident-restore behavior: restored bytes verify, Velero artifact writes are denied, and backend writes stay at zero during restore. |
 | Lightweight perf smoke | `just perf-s3-gateway --format jsonl` | Small gateway scenario metrics and amplification. |
 | Gateway perf smoke | `just perf-s3-gateway --objects 32 --object-size 262144 --reads 64 --range-len 4096 --commit-batch-items 8 --concurrency 8 --format jsonl` | Release-profile local gateway run for current v2 request cost, throughput, and amplification. |
-| 10k object scale gate | `just perf-scale-10k` | Three release-binary committed-write runs. Every run publishes a final signed checkpoint, discards writer state, reloads through a new repository instance, checks exact list cardinality, reads the first, middle, and last payload, and enforces the 1.65x lifetime write gate, 1.04x cold-read byte amplification, one backend request per sentinel read, and at most 255 recovered active index runs. Runs on every CI change. |
+| 10k object scale gate | `just perf-scale-10k` | Three release-binary committed-write runs. Every run publishes a final signed checkpoint, discards writer state, reloads through a new repository instance, checks exact list cardinality, reads the first, middle, and last payload, and enforces the 1.65x lifetime write gate, 30-second reload ceiling, 1.04x cold-read byte amplification, one backend request per sentinel read, and at most 255 recovered active index runs. Runs on every CI change. |
 | 100k object scale gate | `just perf-scale-100k` | Release-binary 1,024-item bulk tier with the same final-checkpoint, recovery, cardinality, amplification, direct cold-read, and active-run-count checks. |
-| 270k bounded-compaction evidence | `just perf-scale-tier 270000` | Crosses the 256-run watermark with the 1,024-item bulk tier and applies the lifetime amplification, 180-second elapsed, 4 GiB peak-RSS, recovery, cold-read, and active-run gates. Three release runs establish timing stability; the final memory-remediated gated sample recovered 140 active runs at 1.570052575x write amplification and 3.765 GiB peak RSS. |
-| 1M object scale gate | `just perf-scale-1m` | Manual in-memory high-capacity tier with the same checks. The revised automatic-compaction lane still needs a passing rerun. Final qualification also requires a fresh-process filesystem run with pinned-runner RSS/time measurement. |
+| 270k bounded-compaction evidence | `just perf-scale-tier 270000` | Crosses the 256-run watermark with the 1,024-item bulk tier and applies the lifetime amplification, 180-second elapsed, 4 GiB peak-RSS, recovery, cold-read, and active-run gates. The final post-remediation sample completed in 11.655 s at 758,521,856 B peak RSS, 1.505740509x amplification, and 140 recovered runs. |
+| 1M object scale gate | `just perf-scale-1m` | Manual in-memory high-capacity tier with the same checks. Three post-remediation release runs passed at 44.701-46.019 s, 2,809,462,784-2,809,933,824 B peak RSS, 1.602591508x amplification, and 233 recovered runs. Final qualification still requires a fresh-process filesystem run on the pinned runner. |
 | Kopia measured matrix | `cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix --runs 3 --profile-set larger-restores --gateway-build-profile release --enforce-regression-budgets` | Release-grade Kopia restore comparison against the straight RustFS proxy baseline with current gateway defaults. |
 
 Expensive lanes emit artifacts under `.local/integration/` by default.
@@ -50,10 +50,12 @@ alone is not a recovery or release result. The underlying harness options
 `--max-cold-read-amp` and `--max-cold-read-requests-per-read` require
 `--verify-reload`. The `--max-active-index-runs` option also requires reload
 verification and checks the authenticated recovered catalog, not writer memory.
-The scale recipes also enforce `--max-elapsed-seconds 180` and
-`--max-peak-rss-bytes 4294967296`. Peak RSS comes from the harness process high-
-water mark, so an over-budget attempt fails even when all correctness checks
-pass.
+The scale recipes also enforce `--max-elapsed-seconds 180`,
+`--max-reload-elapsed-seconds 30`, and `--max-peak-rss-bytes 4294967296`.
+Peak RSS comes from the harness process high-water mark, so an over-budget
+attempt fails even when all correctness checks pass. The harness prints the
+measurement before returning an aggregated gate error, so one expensive run
+retains every available failure and its JSON evidence.
 After recovery, the harness resets its observation window,
 reads the first, middle, and last object, and fails unless those reads use only
 the permitted exact range `GET` requests and bytes. JSONL and TSV output report
@@ -61,16 +63,14 @@ the cold-read counters separately from recovery.
 
 These lightweight lanes qualify write amplification, bounded recovery, direct
 cold sentinel reads, sentinel correctness, and the recovered active-run budget.
-The first automatic-compaction 1M attempt was stopped at the five-minute task
-limit before it produced final evidence. That run exposed a bad schedule that
-repeated a full active-set compaction every 256 runs. The schedule now performs
-bounded passes beginning at 256 active runs, each selecting at most the oldest
-128 level-0 runs while preserving newer level-0 and prior level-1 shards. A
-missing guard or fully validated nonreducing bounded plan may defer and retry at
-later 64-run boundaries before pausing at 896. The revised 1M lane still needs
-to be rerun. Configured-guard, corruption, storage, anchor, and other compaction
-errors poison immediately. These lanes also do not replace the fresh-process
-filesystem/RSS gate.
+Automatic compaction performs bounded passes beginning at 256 active runs,
+each selecting at most the oldest 128 level-0 runs while preserving newer
+level-0 and prior level-1 shards. A missing guard or fully validated
+nonreducing bounded plan may defer and retry at later 64-run boundaries before
+pausing at 896. Configured-guard, corruption, storage, anchor, and other
+compaction errors poison immediately. The three passing 1M runs cover six such
+passes and finish with 233 authenticated runs. These in-memory lanes do not
+replace the fresh-process filesystem/RSS gate.
 
 The current gateway no longer has a v1 repository runtime. Commands with `v2`
 in their names keep their existing harness names, but they exercise the only
