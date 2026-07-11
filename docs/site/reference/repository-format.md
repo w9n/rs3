@@ -139,8 +139,14 @@ KiB use canonical 64 KiB independently authenticated segments for efficient
 range reads; smaller records use one segment. Both writer and reader enforce
 that rule so a writer bug cannot create pathological one-byte segments or make
 a one-byte range request read an entire large record. The bounded in-memory
-normal-commit codec accepts at most 32 MiB per pack; larger values stay on the
-streaming payload path.
+normal-commit codec accepts at most 1,024 records, a 64 KiB encrypted
+directory, and 32 MiB per pack; larger values stay on the streaming payload
+path. The normal low-latency coordinator uses 64 records, while the
+release-binary bulk scale lane uses 1,024. These are writer policies inside the
+same bounded format, not different trust models. A cold small-record read from
+the bulk shape must first authenticate its roughly 62 KiB encrypted directory;
+cold-read amplification is therefore qualified separately from bulk write and
+recovery evidence.
 
 The encrypted directory maps record ordinals to bounded ciphertext spans and
 authenticated plaintext lengths. An index payload pointer is a container-table
@@ -328,6 +334,11 @@ Uploading a run does not make it reachable. Only the fenced anchor CAS makes
 the signed catalog an accepted root. Delayed list visibility, duplicate
 versions, and abandoned uploads are therefore availability and cleanup
 concerns, not state-selection mechanisms.
+
+The current writer refuses a compact mutation before it would create a 1,025th
+active run. This keeps exhaustion fail closed, but it is availability
+backpressure, not compaction. Packed-run compaction and an automatic watermark
+must land before sustained production writes can rely on this path.
 
 ## Reachability, Retention, and GC
 

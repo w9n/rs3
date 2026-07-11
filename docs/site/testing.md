@@ -36,16 +36,21 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | Velero strict restore-readonly | `just integration-velero-kopia-dynamic-pvc-restore-readonly-smoke` | Incident-restore behavior: restored bytes verify, Velero artifact writes are denied, and backend writes stay at zero during restore. |
 | Lightweight perf smoke | `just perf-s3-gateway --format jsonl` | Small gateway scenario metrics and amplification. |
 | Gateway perf smoke | `just perf-s3-gateway --objects 32 --object-size 262144 --reads 64 --range-len 4096 --commit-batch-items 8 --concurrency 8 --format jsonl` | Release-profile local gateway run for current v2 request cost, throughput, and amplification. |
-| 10k object scale gate | `just perf-scale-10k` | Three release-profile committed-write runs. Every run discards writer state, reloads through a fresh repository instance, checks exact list cardinality, and reads the first, middle, and last payload. Runs on every CI change. |
-| 100k object scale gate | `just perf-scale-100k` | Release-candidate recovery and object-cardinality tier. This currently fails closed at the bounded replay limit and remains a release blocker. |
-| 1M object scale gate | `just perf-scale-1m` | Manual high-capacity tier with the same recovery checks. It requires substantial memory and currently fails closed at the bounded replay limit. |
+| 10k object scale gate | `just perf-scale-10k` | Three release-binary committed-write runs. Every run publishes a final signed checkpoint, discards writer state, reloads through a new repository instance, checks exact list cardinality, reads the first, middle, and last payload, and enforces at most 1.50x write amplification. Runs on every CI change. |
+| 100k object scale gate | `just perf-scale-100k` | Release-binary 1,024-item bulk tier with the same final-checkpoint, recovery, cardinality, sentinel-read, and write-amplification checks. |
+| 1M object scale gate | `just perf-scale-1m` | Manual in-memory high-capacity tier with the same checks. Final qualification still requires a fresh-process filesystem run with pinned-runner RSS/time measurement. |
 | Kopia measured matrix | `cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix --runs 3 --profile-set larger-restores --gateway-build-profile release --enforce-regression-budgets` | Release-grade Kopia restore comparison against the straight RustFS proxy baseline with current gateway defaults. |
 
 Expensive lanes emit artifacts under `.local/integration/` by default.
 The scale recipes use three runs unless `RS3_SCALE_GATE_RUNS` is set to a
-different positive integer. A scale run is successful only after fresh reload,
-cardinality verification, and sentinel payload reads; write throughput alone is
-not a recovery or release result.
+different positive integer. A scale run is successful only after new-instance
+reload, cardinality verification, and sentinel payload reads; write throughput
+alone is not a recovery or release result.
+
+These lightweight lanes qualify write amplification, bounded recovery, and
+sentinel correctness. They do not qualify cold-read amplification or indefinite
+run-catalog growth. Packed-run compaction and its automatic watermark remain
+production blockers.
 
 The current gateway no longer has a v1 repository runtime. Commands with `v2`
 in their names keep their existing harness names, but they exercise the only

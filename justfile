@@ -277,16 +277,25 @@ perf-scale-tier OBJECTS:
       exit 2
     fi
     cargo build --release -p xtask --bin xtask
+    batch_items=64
+    concurrency=64
+    checkpoint_after={{OBJECTS}}
+    if (( checkpoint_after >= 100000 )); then
+      batch_items=1024
+      concurrency=1024
+    fi
     for ((run = 1; run <= runs; run++)); do
       echo "scale gate run ${run}/${runs}: {{OBJECTS}} objects" >&2
       target/release/xtask perf \
         --scenario write-committed-parallel \
         --objects "{{OBJECTS}}" \
         --object-size 512 \
-        --commit-batch-items 64 \
-        --commit-max-pending-items 64 \
-        --concurrency 64 \
+        --commit-batch-items "${batch_items}" \
+        --commit-max-pending-items "${batch_items}" \
+        --concurrency "${concurrency}" \
         --verify-reload \
+        --checkpoint-after-objects "${checkpoint_after}" \
+        --max-write-amp 1.50 \
         --format jsonl
     done
 

@@ -142,11 +142,11 @@ respectively. The median 4,096-object lane is about 93.4x faster. A 16x
 object-count increase now takes 12.3x elapsed time rather than 284x, closing
 the observed near-quadratic hot-path blocker in this measured range.
 
-### Stable Object-Count Gates
+### Object-Count Scale Evidence
 
 The fixed scale recipes run the release binary three times by default. Each run
 writes through the commit coordinator, discards the writer-side repository,
-constructs a fresh repository instance over the same accepted store and anchor,
+constructs a new repository instance over the same accepted store and anchor,
 checks exact prefix cardinality, and reads the first, middle, and last payload.
 This keeps a fast write path from masking an unrecoverable repository.
 
@@ -156,22 +156,53 @@ just perf-scale-100k
 just perf-scale-1m
 ```
 
-The July 10 rerun produced:
+The July 11 signed-root rerun produced three passing release runs per tier:
 
-| Tier | Result | Write elapsed | Reload elapsed | Commit PUTs | Write amplification |
-| ---: | --- | ---: | ---: | ---: | ---: |
-| 10k | Pass, 3/3 | 521-537 ms | 420-433 ms | 157 | 12.734-12.736x |
-| 100k | Fail closed, first run | write completed | replay budget exceeded | 1,563 in the write-only baseline | about 12.742x in the write-only baseline |
-| 1M | Fail closed, first run | write completed | replay budget exceeded | 15,625 in the write-only baseline | 12.748x in the write-only baseline |
+| Tier | Batch | Result | Elapsed range | Checkpoint range | Reload range | Commit PUTs | Write amplification |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 10k | 64 | Pass, 3/3 | 573-580 ms | 188-195 ms | 101-117 ms | 158 | 1.494895x |
+| 100k | 1,024 | Pass, 3/3 | 7.17-7.30 s | 2.116-2.126 s | 1.142-1.163 s | 99 | 1.442633x |
+| 1M | 1,024 | Pass, 3/3 | 90.62-91.22 s | 25.18-25.23 s | 14.99-15.05 s | 978 | 1.442480x |
 
-The write-only 100k sweep had previously completed in 6.14-6.28 s. The
-write-only 1M run completed in 79.39 s of harness time (88.01 s wall time) with
-an 11.35 GiB high-water RSS on the in-memory backend. Those are diagnostic
-measurements, not passing scale gates. The 100k recovery attempt reached about
-1.20 GiB high-water RSS before the fixed 64 MiB retained-index replay budget
-rejected it. The upper tiers require bounded streaming/sharded replay and an
-automatic snapshot or compaction cadence before the scaling envelope can be
-called production-qualified.
+The main backend counts and elapsed time include the signed checkpoint PUT and
+the checkpoint candidate's internal new-reader verification. The separately
+reported reload is excluded from those counts and time. It discards writer-side
+state, reloads from the accepted anchor through another same-process repository
+instance, verifies exact cardinality, and reads the first, middle, and last
+payload. The JSON/TSV artifact records both the requested and actual checkpoint
+position. The explicit 1,024-item bulk lane fits the same 64 KiB encrypted
+directory limit; the normal low-latency default remains 64. The recipes fail
+above 1.50x checkpoint-inclusive write amplification. The 1M reload was below
+the documented 180-second target, but this is not the pinned runner, the backend
+is in memory, and the lightweight harness does not record its own RSS. The
+absolute time and 4 GiB gates still require a fresh-process, filesystem-backed,
+process-instrumented pinned run.
+
+The final 1M root contains about 977 runs and leaves only 47 catalog slots.
+Publication now fails closed before a compact write would exceed the 1,024-run
+format bound. Checkpointing does not compact runs, however, so packed-run
+compaction plus an automatic checkpoint/compaction watermark remain production
+blockers. These runs also do not measure cold-read amplification: an uncached
+record in a 1,024-record pack first needs the roughly 62 KiB authenticated pack
+directory.
+
+### Payload-size evidence
+
+The same release binary, final signed checkpoint, new-instance reload, exact
+cardinality check, and sentinel reads were run three times for two additional
+payload sizes:
+
+| Objects | Object size | Batch | Result | Elapsed range | Checkpoint range | Reload range | PUTs | Write amplification |
+| ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 4 KiB | 64 | Pass, 3/3 | 766-803 ms | 181-206 ms | 93-110 ms | 158 | 1.061877x |
+| 1,024 | 256 KiB | 64 | Pass, 3/3 | 1.70-1.74 s | 9.7-18.5 ms | 8.8-9.1 ms | 17 | 1.001178x |
+
+Representative commands, repeated three times, were:
+
+```sh
+target/release/xtask perf --scenario write-committed-parallel --objects 10000 --object-size 4096 --commit-batch-items 64 --commit-max-pending-items 64 --concurrency 64 --verify-reload --checkpoint-after-objects 10000 --max-write-amp 1.15 --format jsonl
+target/release/xtask perf --scenario write-committed-parallel --objects 1024 --object-size 262144 --commit-batch-items 64 --commit-max-pending-items 64 --concurrency 64 --verify-reload --checkpoint-after-objects 1024 --max-write-amp 1.03 --format jsonl
+```
 
 ## July 2026 Larger Restore Matrix
 

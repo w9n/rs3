@@ -88,21 +88,47 @@ medians:
 Elapsed ranges were 14.2-28.4 ms, 51.5-58.3 ms, and 209.4-219.4 ms
 respectively. The median 4,096-object lane is about 93.4x faster and the 16x
 object-count increase now takes 12.3x elapsed time. This closes the observed
-near-quadratic hot-path blocker in the measured range. The stable scale recipes
-now require a fresh repository reload, exact list cardinality, and full reads
-of the first, middle, and last object after every write run. The exact commands
-and amplification ratios are recorded in `tests/PERFORMANCE_BASELINE.md`.
+near-quadratic hot-path blocker in the measured range. The lightweight scale
+recipes now require a new repository instance, exact list cardinality, and full
+reads of the first, middle, and last object after every write run. The exact
+commands and amplification ratios are recorded in
+`tests/PERFORMANCE_BASELINE.md`.
 
-The transitional `commits/v02` 10k gate passed the correctness, recovery, and
-latency portions of all three release-profile runs, but failed the new
-small-object efficiency requirement badly. Write elapsed time was 634-638 ms,
-fresh reload was 410-444 ms, each run used 157 commit PUTs, and write
-amplification was 12.859-12.861x for 512 B objects. Every fresh reader listed
-exactly 10,000 objects and verified the first, middle, and last payload. This is
-diagnostic evidence, not a passing scale gate.
+On 2026-07-11 the checkpoint-inclusive release-binary harness passed all three
+runs at 10k, 100k, and 1M objects. The 10k lane retains the normal 64-item
+low-latency batch. The 100k and 1M lanes use the explicit 1,024-item bulk batch,
+which fits the same 64 KiB authenticated pack-directory ceiling and keeps each
+measured final catalog below its 1,024-run ceiling.
 
-Exact accounting of one representative 64-by-512 B batch found 420,919 backend
-bytes, or 12.845x:
+| Objects | Batch | Median elapsed | Median checkpoint | Median fresh reload | PUTs | Write amp |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 64 | 579 ms | 191 ms | 105 ms | 158 | 1.49490x |
+| 100,000 | 1,024 | 7.23 s | 2.116 s | 1.155 s | 99 | 1.44263x |
+| 1,000,000 | 1,024 | 90.71 s | 25.22 s | 15.00 s | 978 | 1.44248x |
+
+The main elapsed time and backend counters include writes, final checkpoint
+publication, and the checkpoint candidate's internal new-reader verification.
+The separately reported reload constructs another repository instance over the
+same in-memory store and anchor, and is excluded from those counters and from
+main elapsed time. It verifies exact list cardinality and reads the first,
+middle, and last payload. The 1M reload measured below the 180-second target,
+but this host is not the pinned runner, the harness does not record process RSS,
+and a same-process in-memory instance is not a fresh-process filesystem test.
+The absolute time and 4 GiB RSS qualification gates therefore remain unverified.
+
+The 1M checkpoint catalogs about 977 runs, leaving only 47 run slots. The writer
+now stops before accepting a 1,025th compact run, so exhaustion fails closed,
+but checkpointing does not compact those runs. Packed-run compaction and an
+automatic checkpoint/compaction watermark remain production blockers. The
+bulk lane is qualified here for write amplification, bounded recovery, and
+sentinel correctness only. A cold 512 B read from an uncached 1,024-record pack
+first needs its roughly 62 KiB authenticated directory, so cold-read request and
+byte amplification still need a separate enforced gate.
+
+The removed prototype representation had previously failed the small-object
+efficiency gate at roughly 12.86x for the 10k lane. Exact accounting of one
+representative 64-by-512 B prototype batch found 420,919 backend bytes, or
+12.845x:
 
 | Component | Bytes | Bytes per client object |
 | --- | ---: | ---: |
@@ -119,11 +145,11 @@ nonce facts, and a nested sealed manifest. Cryptography was not the source of
 the 12.8x amplification; the prototype representation was.
 
 The replacement is one value-separated `PAYLOAD_PACK` plus one compact binary
-`INDEX_RUN` per batch. For 64 512 B values, the irreducible ciphertext and tag
-cost is 33,792 B. A compact index and authentication envelope should keep the
-whole commit around 42-47 KiB, or roughly 1.3-1.45x. The first-principles floor
-for the measured path shape is about 1.2x, so a 4x budget would merely certify a
-broken format.
+`INDEX_RUN` per batch. The release measurements, including one final signed
+catalog checkpoint, recorded 1.49490x for 10k 512 B objects, 1.06188x for 10k
+4 KiB objects, and 1.00118x for 1,024 256 KiB objects. The first-principles
+floor for the 512 B path is about 1.2x, so the remaining gap is fixed metadata
+and authenticated directory/index material, not payload copying.
 
 Qualification must enforce, not merely report, these initial ceilings:
 
@@ -136,13 +162,14 @@ Qualification must enforce, not merely report, these initial ceilings:
 | sequential committed 512 B objects | 3.0x |
 | forced index compaction, lifetime 512 B lane | provisional 3.5x |
 
-The repository integration suite now enforces the physical shape for a
-64-object batch (one single-PUT commit, one payload pack, and one index run) and
-the 1.50x hard ceiling for a 32-byte-path lane while the release harness is
-being rewired to measure the compact path. This prevents a return to the 12.8x
-prototype without pretending that a unit test is replacement benchmark
-evidence. The longer-path matrix and release-profile run remain separate scale
-gates.
+The repository integration suite enforces the physical shape for a 64-object
+batch (one single-PUT commit, one payload pack, and one index run) and the 1.50x
+hard ceiling for a 32-byte-path lane. The release-binary scale recipes now also
+publish a signed root, measure its elapsed time, reload through that root, and
+include its bytes in write amplification. The longer-path and cold-read
+matrices remain separate gates.
+The fixed scale recipes fail when checkpoint-inclusive write amplification
+exceeds 1.50x; they do not merely print the ratio.
 
 The harness must also vary logical path lengths across 32 B, 256 B, and
 1,024 B, and report payload amplification separately from fixed metadata bytes
@@ -158,14 +185,12 @@ Kopia/Velero, restart from a fresh process, restore verified bytes, record the
 client PUT-size histogram, and compare backend requests, bytes, RSS, and time
 against the direct path.
 
-The earlier 100k tier wrote successfully but fresh reload failed closed with
-`v2 recovery replay budget exceeded`; the 1M tier reached the same recovery
-failure. Those measurements used the removed `commits/v01` generation. The v02
-reader now checkpoints bounded embedded runs through signed `INDEX_ROOT`
-catalogs, but the 100k and 1M gates remain production blockers and must be rerun
-against that path. A successful write-only million-object run is not accepted
-as scale evidence. Final `v02` qualification must use a fresh process
-and verify exact listing cardinality plus first, middle, and last object bytes.
+The earlier prototype 100k and 1M tiers failed closed at the replay budget.
+Those measurements used the removed `commits/v01` generation. The v02 reader's
+signed `INDEX_ROOT` path now has passing in-memory 100k and 1M evidence, but a
+successful same-process run is not final production qualification. Final `v02`
+qualification must use a fresh process and filesystem backend, and verify exact
+listing cardinality plus first, middle, and last object bytes.
 Its descriptor-first reader must retain no cumulative encrypted delta set, read
 no payload sections merely to rebuild the index, and use at most 1.25x the index
 material required by the accepted catalog. On the documented pinned 4-vCPU,

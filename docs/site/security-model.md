@@ -113,8 +113,8 @@ is planned.
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
 | v02 index frames cannot be transplanted or reordered | Frame AEAD binds immutable repository identity, the historical keyring-envelope reference, exact object key, section ordinal, run identity, authenticated directory digest, and complete frame descriptor. The signed catalog binds exact embedded commit version, length, body digest, layout, and run facts. | Framed-run and root codecs, exact catalog recovery, publication, bounded replay, and corruption tests. Standalone compacted runs remain blocked. |
 | v02 payload-pack records cannot be transplanted or downgraded | Record AEAD binds immutable repository identity, historical keyring context, exact object key, pack, section, record, segment, layout, and length facts. The accepted signed reference binds the returned exact version, length, and commit-body digest. | The bounded compact-pack codec, canonical segmentation, publication, range-read, cache, replay, and corruption tests are implemented; protection-cohort partitioning and cleaning remain release blockers. |
-| v02 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery verifies exact bounded run sections sequentially from a signed catalog under count and byte ceilings. | Implemented for embedded runs; 100k and 1M fresh-recovery gates still block release. |
-| v02 checkpoint failure cannot anchor unrecoverable state | Fenced automatic checkpointing degrades, then pauses mutation before fixed tail-byte, commit, or run-count ceilings. | Required for v02; not implemented. |
+| v02 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery verifies exact bounded run sections sequentially from a signed catalog under count and byte ceilings. | Implemented for embedded runs; same-process in-memory 100k and 1M evidence passes, while fresh-process filesystem and pinned RSS gates remain. |
+| v02 checkpoint failure cannot anchor unrecoverable state | The compact writer fails closed before accepting a 1,025th active run. Fenced automatic checkpointing must degrade and compact before that hard ceiling. | Hard-ceiling backpressure is implemented; packed-run compaction, automatic watermarks, and adversarial pause/resume testing remain required. |
 | v02 GC retains every live payload without retaining whole ancestry | Effective run records mark exact payload commit versions; catalog-named run commits and protected roots are marked before exact-version sweep. | Implemented for embedded catalog runs; standalone run inventory and cleaning remain blocked. |
 
 ## Rollback Rule
@@ -295,8 +295,9 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
 
 ## Current Open Risks
 
-- The transitional `v02` envelope is implemented, but its catalog-and-run
-  security contract is not; the removed prototype was not a production format.
+- The `v02` embedded catalog-and-run path remains preview-scoped. Standalone
+  compacted runs, durable format freeze, and external cryptographic review are
+  still outstanding.
 - Durable format compatibility is not promised yet.
 - The cryptographic design has not had an external review.
 - Metadata sealing uses a standard misuse-resistant AEAD, but deterministic
@@ -310,8 +311,9 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
   [deduplication design note](reference/deduplication.md).
 - Payload-pack protection cohorts and cleaning have not passed retained-version,
   legal-hold, protected-root, or crash testing.
-- Catalog compaction, exact payload-root GC, and failure backpressure have not
-  passed adversarial crash, replay, and stale-fence testing.
+- Packed-run catalog compaction, exact payload-root GC, and automatic
+  pre-ceiling backpressure have not passed adversarial crash, replay, and
+  stale-fence testing. The hard 1,024-run stop is implemented and fails closed.
 - Retained backend history depends on provider retention or Object Lock to
   resist deletion by a storage administrator.
 - Key retirement remains retention-aware and must not remove material still

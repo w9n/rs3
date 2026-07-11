@@ -8,8 +8,12 @@ use rs3_types::{BackendObjectId, KeyId, KeyPurpose};
 use std::fmt;
 use std::ops::Range;
 
-/// Maximum logical records in one normal v02 payload pack.
-pub const V2_PAYLOAD_PACK_MAX_RECORDS: usize = 64;
+/// Maximum logical records in one v02 payload pack.
+///
+/// This admits an explicit bulk-ingest mode while the normal low-latency
+/// coordinator remains configured for 64 records. The encrypted directory is
+/// independently bounded to 64 KiB.
+pub const V2_PAYLOAD_PACK_MAX_RECORDS: usize = 1_024;
 /// Maximum complete pack bytes accepted by the bounded in-memory codec.
 pub const V2_PAYLOAD_PACK_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum encrypted pack-directory header bytes.
@@ -1585,7 +1589,7 @@ mod tests {
 
     #[test]
     fn sixty_four_small_values_have_compact_fixed_overhead() {
-        let records = (0..V2_PAYLOAD_PACK_MAX_RECORDS)
+        let records = (0..64)
             .map(|ordinal| V2PayloadPackRecordInput {
                 plaintext: Bytes::from(vec![ordinal as u8; 512]),
             })
@@ -1605,6 +1609,53 @@ mod tests {
     }
 
     #[test]
+    fn bulk_pack_accepts_the_bounded_record_ceiling() {
+        let keyring = keyring();
+        let containing_object = object_id("commits/opaque-commit");
+        let records = (0..V2_PAYLOAD_PACK_MAX_RECORDS)
+            .map(|ordinal| V2PayloadPackRecordInput {
+                plaintext: Bytes::from(vec![ordinal as u8]),
+            })
+            .collect::<Vec<_>>();
+        let pack = must_v2(seal_v2_payload_pack(
+            &keyring,
+            b"repository-format-root-generation-4",
+            &containing_object,
+            2,
+            &records,
+        ));
+        let reopened = must_v2(open_v2_payload_pack(
+            &keyring,
+            b"repository-format-root-generation-4",
+            &containing_object,
+            2,
+            pack.bytes(),
+        ));
+        assert_eq!(reopened.records().len(), V2_PAYLOAD_PACK_MAX_RECORDS);
+        for ordinal in [
+            0,
+            V2_PAYLOAD_PACK_MAX_RECORDS / 2,
+            V2_PAYLOAD_PACK_MAX_RECORDS - 1,
+        ] {
+            assert_eq!(
+                must_v2(open_v2_payload_pack_record(
+                    &keyring,
+                    b"repository-format-root-generation-4",
+                    &containing_object,
+                    2,
+                    pack.bytes(),
+                    ordinal as u32,
+                )),
+                records[ordinal].plaintext
+            );
+        }
+        assert!(
+            must_v2(probe_v2_payload_pack_header_len(pack.bytes()))
+                <= V2_PAYLOAD_PACK_MAX_HEADER_BYTES as u64
+        );
+    }
+
+    #[test]
     fn invalid_ranges_and_record_counts_are_rejected() {
         let pack = sample_pack();
         assert!(plan_v2_payload_pack_record_range(pack.directory(), 0, 4..4).is_err());
@@ -1618,6 +1669,22 @@ mod tests {
                 &[],
                 [0_u8; PAYLOAD_PACK_ID_LEN],
                 &[],
+            )
+            .is_err()
+        );
+        let too_many = vec![
+            V2PayloadPackRecordInput {
+                plaintext: Bytes::new(),
+            };
+            V2_PAYLOAD_PACK_MAX_RECORDS + 1
+        ];
+        assert!(
+            seal_v2_payload_pack(
+                &keyring(),
+                b"repository-format-root-generation-4",
+                &object_id("commits/opaque-commit"),
+                2,
+                &too_many,
             )
             .is_err()
         );

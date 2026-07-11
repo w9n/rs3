@@ -59,9 +59,15 @@ pub(crate) struct PerfArgs {
     /// Parallel client writes used by parallel scenarios.
     #[arg(long, default_value_t = 8)]
     concurrency: usize,
-    /// Reload and verify parallel committed writes through a fresh repository instance.
+    /// Reload and verify parallel committed writes through a new repository instance.
     #[arg(long)]
     verify_reload: bool,
+    /// Publish one signed index-root checkpoint after at least this many writes.
+    #[arg(long, requires = "verify_reload")]
+    checkpoint_after_objects: Option<usize>,
+    /// Fail a write scenario when backend bytes exceed this plaintext ratio.
+    #[arg(long)]
+    max_write_amp: Option<f64>,
     /// Number of read operations in read scenarios.
     #[arg(long, default_value_t = 128)]
     reads: usize,
@@ -261,6 +267,18 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
             "--verify-reload requires --scenario write-committed-parallel (or --scenario all)"
         );
     }
+    if args
+        .checkpoint_after_objects
+        .is_some_and(|objects| objects == 0 || objects > args.objects)
+    {
+        anyhow::bail!("--checkpoint-after-objects must be between 1 and --objects");
+    }
+    if args
+        .max_write_amp
+        .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
+    {
+        anyhow::bail!("--max-write-amp must be finite and greater than zero");
+    }
     #[cfg(feature = "containers")]
     if args.verify_reload && args.backend == PerfBackend::S3GatewayContainer {
         anyhow::bail!("--verify-reload is not supported by the gateway-backed perf harness");
@@ -310,6 +328,7 @@ async fn run_async(args: PerfArgs) -> Result<()> {
             PerfScenario::FullRead => full_read(&args).await?,
             PerfScenario::RangeRead => range_read(&args).await?,
         };
+        report.enforce_max_write_amplification(args.max_write_amp)?;
         report.print(args.format)?;
     }
 
@@ -374,6 +393,15 @@ fn add_perf_args(
     command.args(["--concurrency", &args.concurrency.to_string()]);
     if args.verify_reload {
         command.arg("--verify-reload");
+    }
+    if let Some(checkpoint_after_objects) = args.checkpoint_after_objects {
+        command.args([
+            "--checkpoint-after-objects",
+            &checkpoint_after_objects.to_string(),
+        ]);
+    }
+    if let Some(max_write_amp) = args.max_write_amp {
+        command.args(["--max-write-amp", &max_write_amp.to_string()]);
     }
     command.args(["--reads", &args.reads.to_string()]);
     command.args(["--range-len", &args.range_len.to_string()]);
@@ -595,6 +623,7 @@ where
     let parallelism = concurrency(args);
     let mut latencies = Vec::with_capacity(args.objects);
     let started = Instant::now();
+    let mut checkpoint = None;
 
     let mut next = 0;
     while next < args.objects {
@@ -623,6 +652,20 @@ where
             latencies.push(latency);
         }
         next = end;
+        if let Some(requested_after_objects) =
+            checkpoint_due(args.checkpoint_after_objects, checkpoint.is_some(), next)
+        {
+            let checkpoint_started = Instant::now();
+            coordinator
+                .write_index_snapshot()
+                .await
+                .context("failed to publish the scale-gate index root")?;
+            checkpoint = Some(CheckpointMeasurement {
+                requested_after_objects,
+                actual_after_objects: next,
+                elapsed: checkpoint_started.elapsed(),
+            });
+        }
     }
 
     let elapsed = started.elapsed();
@@ -632,9 +675,9 @@ where
     drop(coordinator);
     let reload_verification = if args.verify_reload {
         Some(
-            verify_parallel_reload(args, store, &verification_anchor, &body)
+            verify_parallel_reload(args, store, &verification_anchor, &body, checkpoint)
                 .await
-                .context("fresh repository verification failed")?,
+                .context("new repository instance verification failed")?,
         )
     } else {
         None
@@ -666,6 +709,7 @@ async fn verify_parallel_reload<S>(
     store: CountingBlobStore<S>,
     anchor: &V2MemoryAnchor,
     expected_body: &Bytes,
+    checkpoint: Option<CheckpointMeasurement>,
 ) -> Result<ReloadVerification>
 where
     S: BlobStore + Clone,
@@ -702,11 +746,23 @@ where
     }
 
     Ok(ReloadVerification {
+        checkpoint,
         elapsed: started.elapsed(),
         expected_objects: args.objects,
         listed_objects: entries.len(),
         checked_objects: checked_indices.len(),
     })
+}
+
+fn checkpoint_due(
+    requested_after_objects: Option<usize>,
+    already_published: bool,
+    completed_objects: usize,
+) -> Option<usize> {
+    if already_published {
+        return None;
+    }
+    requested_after_objects.filter(|requested| completed_objects >= *requested)
 }
 
 fn verification_indices(objects: usize) -> Vec<usize> {
@@ -890,29 +946,56 @@ struct PerfReport {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReloadVerification {
+    checkpoint: Option<CheckpointMeasurement>,
     elapsed: Duration,
     expected_objects: usize,
     listed_objects: usize,
     checked_objects: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CheckpointMeasurement {
+    requested_after_objects: usize,
+    actual_after_objects: usize,
+    elapsed: Duration,
+}
+
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 struct ReloadVerificationReport {
     verified: bool,
+    checkpoint: Option<CheckpointMeasurementReport>,
     elapsed_ms: f64,
     expected_objects: usize,
     listed_objects: usize,
     checked_objects: usize,
 }
 
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct CheckpointMeasurementReport {
+    requested_after_objects: usize,
+    actual_after_objects: usize,
+    elapsed_ms: f64,
+}
+
 impl ReloadVerification {
     fn report(self) -> ReloadVerificationReport {
         ReloadVerificationReport {
             verified: true,
+            checkpoint: self.checkpoint.map(CheckpointMeasurement::report),
             elapsed_ms: self.elapsed.as_secs_f64() * 1_000.0,
             expected_objects: self.expected_objects,
             listed_objects: self.listed_objects,
             checked_objects: self.checked_objects,
+        }
+    }
+}
+
+impl CheckpointMeasurement {
+    fn report(self) -> CheckpointMeasurementReport {
+        CheckpointMeasurementReport {
+            requested_after_objects: self.requested_after_objects,
+            actual_after_objects: self.actual_after_objects,
+            elapsed_ms: self.elapsed.as_secs_f64() * 1_000.0,
         }
     }
 }
@@ -951,6 +1034,25 @@ impl OperationLatencyStats {
 }
 
 impl PerfReport {
+    fn enforce_max_write_amplification(&self, limit: Option<f64>) -> Result<()> {
+        let Some(limit) = limit else {
+            return Ok(());
+        };
+        let Some(actual) = ratio_optional(
+            self.counts.bytes_written,
+            self.requested_plaintext_write_bytes as u64,
+        ) else {
+            return Ok(());
+        };
+        if actual > limit {
+            anyhow::bail!(
+                "{} write amplification {actual:.6}x exceeds {limit:.6}x",
+                self.scenario
+            );
+        }
+        Ok(())
+    }
+
     fn print(&self, format: ReportFormat) -> Result<()> {
         match format {
             ReportFormat::Tsv => {
@@ -981,9 +1083,10 @@ impl PerfReport {
             ratio_optional(backend_requests, self.operations as u64);
         let latency = self.operation_latency;
         let reload_verification = self.reload_verification;
+        let checkpoint = reload_verification.and_then(|verification| verification.checkpoint);
 
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{:.3}",
             self.scenario,
             self.backend.as_str(),
             self.repository_format,
@@ -1032,6 +1135,11 @@ impl PerfReport {
             reload_verification.map_or(0, |verification| verification.expected_objects),
             reload_verification.map_or(0, |verification| verification.listed_objects),
             reload_verification.map_or(0, |verification| verification.checked_objects),
+            checkpoint.map_or(0, |measurement| measurement.requested_after_objects),
+            checkpoint.map_or(0, |measurement| measurement.actual_after_objects),
+            checkpoint.map_or(0.0, |measurement| {
+                measurement.elapsed.as_secs_f64() * 1_000.0
+            }),
         );
     }
 
@@ -1125,7 +1233,7 @@ impl PerfReport {
 
 fn print_header() {
     println!(
-        "scenario\tbackend\trepository_format\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tpayload_segment_size\tadaptive_payload_segment_size\tconcurrency\telapsed_ms\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tset_legal_hold\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp\treload_verified\treload_elapsed_ms\treload_expected_objects\treload_listed_objects\treload_checked_objects"
+        "scenario\tbackend\trepository_format\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tpayload_segment_size\tadaptive_payload_segment_size\tconcurrency\telapsed_ms\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tset_legal_hold\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp\treload_verified\treload_elapsed_ms\treload_expected_objects\treload_listed_objects\treload_checked_objects\tcheckpoint_requested_after_objects\tcheckpoint_actual_after_objects\tcheckpoint_elapsed_ms"
     );
 }
 
@@ -1443,7 +1551,15 @@ fn init_tracing(filter: &str, format: TraceFormat) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::verification_indices;
+    use super::{checkpoint_due, verification_indices};
+
+    #[test]
+    fn checkpoint_threshold_fires_once_at_the_first_completed_batch() {
+        assert_eq!(checkpoint_due(None, false, 64), None);
+        assert_eq!(checkpoint_due(Some(100), false, 64), None);
+        assert_eq!(checkpoint_due(Some(100), false, 128), Some(100));
+        assert_eq!(checkpoint_due(Some(100), true, 192), None);
+    }
 
     #[test]
     fn reload_verification_checks_distinct_boundaries() {

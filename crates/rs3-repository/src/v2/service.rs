@@ -8,11 +8,12 @@ use super::repository::{
     V2StoredCommit, V2StreamingPayloadWrite,
 };
 use super::{
-    V2_MAX_HEADER_SIZE, V2_PAYLOAD_PACK_FIXED_HEADER_BYTES, V2EmbeddedIndexRunLocation,
-    V2IndexRoot, V2IndexRootRunRef, V2ParsedCommit, V2ParsedCommitHeader, V2PayloadPackDirectory,
-    V2SectionType, V2UploadMode, open_v2_payload_pack_cached_record_span,
-    open_v2_payload_pack_directory, open_v2_payload_pack_record_span_with_segments,
-    plan_v2_payload_pack_record_range, probe_v2_payload_pack_header_len, seal_v2_index_root,
+    V2_INDEX_ROOT_MAX_RUNS, V2_MAX_HEADER_SIZE, V2_PAYLOAD_PACK_FIXED_HEADER_BYTES,
+    V2EmbeddedIndexRunLocation, V2IndexRoot, V2IndexRootRunRef, V2ParsedCommit,
+    V2ParsedCommitHeader, V2PayloadPackDirectory, V2SectionType, V2UploadMode,
+    open_v2_payload_pack_cached_record_span, open_v2_payload_pack_directory,
+    open_v2_payload_pack_record_span_with_segments, plan_v2_payload_pack_record_range,
+    probe_v2_payload_pack_header_len, seal_v2_index_root,
 };
 use crate::checkpoint::{open_index_delta_object, seal_index_delta_object, seal_manifest_record};
 use crate::error::{RepositoryError, Result};
@@ -1553,6 +1554,17 @@ where
         self.full_state_clone_count.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
+    pub(crate) fn fill_accepted_run_catalog_for_tests(&self) -> Result<()> {
+        let mut runs = self
+            .accepted_runs
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let run = runs.last().cloned().ok_or(RepositoryError::StatePoisoned)?;
+        runs.resize(V2_INDEX_ROOT_MAX_RUNS, run);
+        Ok(())
+    }
+
     pub(crate) async fn publish_pending_index_delta<A>(
         &self,
         anchor: &A,
@@ -1624,15 +1636,20 @@ where
                 section_digest: run.section_digest,
             },
         });
-        if let Some(run) = accepted_run.as_ref()
-            && self
+        if let Some(run) = accepted_run.as_ref() {
+            let accepted_runs = self
                 .accepted_runs
                 .read()
-                .map_err(|_| RepositoryError::StatePoisoned)?
+                .map_err(|_| RepositoryError::StatePoisoned)?;
+            if accepted_runs.len() >= V2_INDEX_ROOT_MAX_RUNS {
+                return Err(v2_repository_error(V2FormatError::IndexRootLimitExceeded));
+            }
+            if accepted_runs
                 .last()
                 .is_some_and(|previous| previous.maximum_generation >= run.minimum_generation)
-        {
-            return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+            {
+                return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+            }
         }
         let stored = self
             .commit_store

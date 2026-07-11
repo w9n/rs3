@@ -3569,6 +3569,59 @@ async fn v2_index_snapshot_allows_repeated_exact_catalog_checkpoints() {
 }
 
 #[tokio::test]
+async fn v2_writer_stops_before_the_run_catalog_becomes_uncheckpointable() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let anchor = V2MemoryAnchor::new();
+    let accepted_key = must_type(LogicalPath::new("catalog/accepted"));
+    let rejected_key = must_type(LogicalPath::new("catalog/rejected"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                accepted_key.clone(),
+                Bytes::from_static(b"accepted"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(repository.fill_accepted_run_catalog_for_tests());
+    let accepted_anchor = must_v2(anchor.read_v2().await);
+
+    let rejected = repository
+        .put_committed(
+            &anchor,
+            rejected_key,
+            Bytes::from_static(b"rejected"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+
+    assert!(matches!(
+        rejected,
+        Err(RepositoryError::CommitFailed { reason })
+            if reason.contains("index root limit exceeded")
+    ));
+    assert_eq!(must_v2(anchor.read_v2().await), accepted_anchor);
+    assert_eq!(
+        must_repo(repository.list("catalog/"))
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>(),
+        vec![accepted_key]
+    );
+}
+
+#[tokio::test]
 async fn v2_concurrent_writers_cas_without_losing_the_winner() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
