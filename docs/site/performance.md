@@ -98,7 +98,9 @@ On 2026-07-11 the checkpoint-inclusive release-binary harness passed all three
 runs at 10k, 100k, and 1M objects with ciphertext-only packs and direct
 encrypted-index descriptors. The 10k lane retained the normal 64-item
 low-latency batch. The 100k and 1M lanes used the explicit 1,024-item bulk batch
-and kept each measured final catalog below its 1,024-run ceiling.
+and kept each measured final catalog below its 1,024-run ceiling. These numbers
+predate automatic packed-run compaction and remain direct-descriptor regression
+evidence, not evidence for the current compaction schedule.
 
 | Objects | Batch | Median elapsed | Median checkpoint | Median fresh reload | PUTs | Write amp |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -114,14 +116,50 @@ main elapsed time. It verifies exact list cardinality and reads the first,
 middle, and last payload. The 1M reload measured below the 180-second target,
 but this host is not the pinned runner, the harness does not record process RSS,
 and a same-process in-memory instance is not a fresh-process filesystem test.
-The absolute time and 4 GiB RSS qualification gates therefore remain unverified.
+The 1M absolute time and 4 GiB RSS qualification gates therefore remain
+unverified.
 
-The 1M checkpoint catalogs about 977 runs, leaving only 47 run slots. The writer
-now stops before accepting a 1,025th compact run, so exhaustion fails closed,
-but checkpointing does not compact those runs. Packed-run compaction and an
-automatic checkpoint/compaction watermark remain production blockers. The
-recorded bulk lane is qualified here for write amplification, bounded recovery,
-and sentinel correctness only. The current layout removes the pack directory:
+That historical 1M checkpoint cataloged about 977 runs, leaving only 47 run
+slots. Guarded metadata-only compaction and automatic watermarks are now
+implemented. The first automatic-compaction 1M attempt was stopped at the
+five-minute task limit without final evidence. It exposed an inefficient
+schedule that repeatedly merged the full active set every 256 runs. The revised
+schedule starts at 256 active runs but compacts at most the oldest 128 level-0
+runs per pass. Newer level-0 runs and existing level-1 shards are preserved
+instead of being rewritten. A missing guard or a fully validated bounded plan
+that cannot reduce run count may retry at later 64-run boundaries, and both
+pause writes at 896. Other compaction errors poison immediately.
+
+On 2026-07-11, a subsequent 270,000-object release lane crossed the 256-run
+request watermark and validated that bounded tier compaction completes without
+rewriting the whole catalog. It used 512 B values, a 1,024-item batch and
+concurrency of 1,024, and passed three times:
+
+| Run | Elapsed | Checkpoint | Fresh reload | PUT | GET | HEAD | Active runs | Write amp | Cold read |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 29.799 s | 4.393 s | 3.102 s | 270 | 1,484 | 404 | 140 | 1.570052575x | 1 GET/read, 1.03125x |
+| 2 | 28.527 s | 4.229 s | 3.047 s | 270 | 1,484 | 404 | 140 | 1.570052575x | 1 GET/read, 1.03125x |
+| 3 | 30.012 s | 4.490 s | 3.073 s | 270 | 1,484 | 404 | 140 | 1.570052575x | 1 GET/read, 1.03125x |
+
+The backend counters include normal publication, bounded compaction, final
+checkpoint publication, and internal candidate verification. Cold-read counts
+are isolated after fresh recovery and are per sentinel read. The recovered
+140-run catalog passes the 255-run gate. This validates the bounded compaction
+watermark at 270k; the revised 1M lane still needs a complete rerun.
+
+After memory-path remediation, a final resource-gated 270k sample passed in
+27.325925 s with a 4.190111 s checkpoint, 3.019858 s reload, and process peak
+RSS of 4,042,354,688 B (3.765 GiB), below the 4 GiB gate. It retained the same
+1.570052575x write amplification, 140 active runs, and one exact cold `GET` per
+sentinel at 1.03125x. Two preceding resource-gated attempts correctly failed at
+5,409,140,736 B and 4,668,936,192 B instead of silently accepting the memory
+regression. Those failures led to removal of a full accepted-state clone, an
+accumulating replay scratch state, and a redundant recovered-state install,
+plus interning of shared exact container facts during compaction. The earlier
+three runs remain the timing-stability evidence; this final sample is the exact
+RSS-gated result. It does not close the 1M gap.
+
+The current layout removes the pack directory:
 encrypted `INDEX_RUN` state authenticates the record's exact physical offset,
 length, digest, pack facts, and historical keyring-envelope reference. After a
 fresh recovery, each measured 512 B sentinel read used one exact range
@@ -166,7 +204,7 @@ Qualification must enforce, not merely report, these initial ceilings:
 | 64 objects of 4 KiB | 1.15x |
 | 64 objects of 256 KiB | 1.03x |
 | sequential committed 512 B objects | 3.0x |
-| forced index compaction, lifetime 512 B lane | provisional 3.5x |
+| checkpoint-and-compaction-inclusive lifetime 512 B lane | 1.65x |
 
 The repository integration suite enforces the physical shape for a 64-object
 batch (one single-PUT commit, one payload pack, and one index run) and the 1.50x
@@ -176,9 +214,13 @@ include its bytes in write amplification. After reload they isolate the first,
 middle, and last reads from recovery counters, require one exact range `GET`
 per object, and enforce at most 1.04x cold-read byte amplification. The
 longer-path matrix remains a separate gate.
-The fixed scale recipes fail when checkpoint-inclusive write amplification
-exceeds 1.50x, cold-read byte amplification exceeds 1.04x, or a sentinel read
-uses more than one backend request; they do not merely print the ratios.
+The 1.50x bound remains the one-batch physical-shape gate. It was not a valid
+lifetime scale ceiling because it excluded automatic maintenance; the lifetime
+512 B scale gate is 1.65x.
+The fixed scale recipes fail when checkpoint-and-compaction-inclusive write
+amplification exceeds 1.65x, cold-read byte amplification exceeds 1.04x, or a
+sentinel read uses more than one backend request, or fresh recovery reports more
+than 255 active index runs; they do not merely print the ratios.
 
 The harness must also vary logical path lengths across 32 B, 256 B, and
 1,024 B, and report payload amplification separately from fixed metadata bytes
@@ -197,7 +239,9 @@ against the direct path.
 The earlier prototype 100k and 1M tiers failed closed at the replay budget.
 Those measurements used the removed `commits/v01` generation. The v02 reader's
 signed `INDEX_ROOT` path now has passing in-memory 100k and 1M evidence, but a
-successful same-process run is not final production qualification. Final `v02`
+successful same-process run is not final production qualification. The passing
+1M evidence also predates automatic compaction, and the revised automatic lane
+has not yet completed. Final `v02`
 qualification must use a fresh process and filesystem backend, and verify exact
 listing cardinality plus first, middle, and last object bytes.
 Its descriptor-first reader must retain no cumulative encrypted delta set, read

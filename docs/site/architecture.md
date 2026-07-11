@@ -8,7 +8,7 @@ the gateway through the S3 API. Inside the trusted gateway process, the
 compatibility layer, namespace mapping, payload encryption, encrypted index
 state, signed commit publication, and path-redacted admin facts stay under
 operator control. The gateway writes encrypted `format/`, `keyrings/`,
-`commits/`, and compacted `objects/` to the backend and reads or advances a
+`commits/`, and opaque repository `objects/` to the backend and reads or advances a
 separate Kubernetes Lease anchor. `rs3-console` only reads path-redacted admin
 posture and status.
 
@@ -54,11 +54,10 @@ not add ad hoc hashing, MAC, encryption, or key derivation logic.
     framed `INDEX_RUN`, and bounded recovery replays those runs without reading
     payload bytes. Signed `INDEX_ROOT` checkpoints catalog exact embedded run
     sections, are reconstructed by a fresh reader before anchor adoption, and
-    drive exact maintenance reachability. Standalone compacted runs, automatic
-    checkpoint watermarks, and framed streaming are not implemented yet.
-    Packed-state compaction remains fail-closed until the standalone-run path
-    lands; the explicitly bounded legacy-only compaction path remains for
-    transitional fixtures.
+    drive exact maintenance reachability. Guarded metadata-only compaction and
+    automatic active-run watermarks are implemented for packed runs. Framed
+    streaming, payload protection cohorts, complete GC qualification, and the
+    revised 1M scale rerun remain release blockers.
 
 Normal writes are append-friendly and value-separated:
 
@@ -83,11 +82,22 @@ directory first. Retention mode, expiry horizon, and legal-hold requirement
 define protection cohorts because the backend protects the containing object.
 
 `v02` replaces monolithic index snapshots with an encrypted LSM-style index.
-Recent immutable runs live in exact accepted commit versions. Size-tiered
-compaction stream-merges runs into bounded, sharded objects under random
-`objects/v02/` keys. A small signed `INDEX_ROOT` catalog names the complete
-active run set. It does not serialize every live path and never copies payloads
-merely to checkpoint the index.
+Recent immutable foreground runs are level 0. Each compaction selects at most
+the oldest 128 level-0 runs, merges that bounded window newest-wins, retains
+tombstones, and emits fewer bounded level-1 generation-range shards. Newer
+level-0 runs and existing level-1 shards remain exact-referenced and are not
+rewritten. Level is a storage tier, never a compaction epoch. The preview
+format accepts only level 0 and level 1, rejecting higher values until a future
+capability explicitly defines another tier. Equal-generation mutations remain
+indivisible so a root cannot
+publish half of one logical generation. Pointers to packs embedded beside a
+source run are normalized to exact external historical commit and
+keyring-envelope references before source boundaries are discarded. A retained
+level-1 tombstone masks older records in earlier level-1 shards. Reclaiming
+those bottom-tier tombstones and the records they mask remains future guarded
+or offline maintenance. A small signed `INDEX_ROOT` catalog names the complete
+active run set. It does not serialize every live path, and compaction never
+reads or rewrites payload ciphertext.
 
 Runs contain two specialized encrypted binary projections linked by mutation
 ordinal. The blinded namespace projection answers `HEAD` and `GET`; the
@@ -100,16 +110,28 @@ overlay. Publication failure discards that overlay instead of rolling back a
 second full state copy. This preserves commit atomicity without doubling
 steady-state namespace memory.
 
+The bounded compaction path follows the same memory invariant. It does not clone
+the full accepted state before planning, verifies each source run with
+short-lived scratch state instead of accumulating replay state across the
+window, avoids a redundant recovered-state installation, and interns shared
+exact container facts while selecting winners. The scale harness enforces
+process peak RSS so these are measured constraints rather than allocator lore.
+
 Cold recovery is descriptor-first. It walks bounded signed headers from the
 anchor to the newest catalog, then verifies and applies one encrypted index
 frame at a time. Signed section descriptors let recovery authenticate index
 ranges without downloading unrelated payload sections. The recovered state is
 installed only after a final anchor recheck.
 
-Automatic checkpointing keeps the accepted commit tail, encrypted tail bytes,
-and active-run count below fixed verifier ceilings. If checkpointing cannot keep
-up, the gateway reports degraded posture and eventually pauses new mutations
-before it can anchor an unrecoverable state. Already accepted reads remain
+Automatic maintenance starts requesting packed-run compaction at 256 active
+runs. With no configured guard it degrades and retries at each additional
+64-run boundary, then pauses new mutations at 896. The immutable format ceiling
+remains 1,024 active runs. Compaction requires the same live Kubernetes
+`WriterFence` used for anchor advancement. A fully validated bounded plan that
+cannot reduce run count may also defer below 896 and retry later. A configured
+guard rejection, corruption, storage or anchor failure, and every other
+compaction error poisons the coordinator immediately instead of allowing writes
+to run past an uncertain maintenance failure. Already accepted reads remain
 available.
 
 The state-flow view below separates the normal write path from the restore read
@@ -185,7 +207,14 @@ reference counts as deletion authority.
 Read-write failover is supported only inside one Kubernetes apiserver and Lease
 coordination domain. The writer owns a monotonic fence epoch on the anchor Lease,
 and the same resource-version CAS checks that fence when advancing the anchor.
-Checkpointing and compaction use the same authority.
+Checkpointing and compaction use the same authority. Compaction writes
+metadata-only delta-carrier commits and the candidate signed root as direct
+children of the same accepted base. The candidate runs are exact-referenced by
+the root and are not individually anchored. A fresh repository instance
+verifies the complete candidate state and lineage, then the writer rechecks the
+fence and base anchor before one CAS adopts the root. Recovery rejects a
+compacted carrier whose parent, sequence, level, or compaction generation does
+not match that sibling publication shape.
 
 Disconnected writers that merely share S3 are unsupported. Conditional object
 creation can prevent a collision at one key, but it cannot fence a stale writer,

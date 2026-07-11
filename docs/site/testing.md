@@ -36,9 +36,10 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | Velero strict restore-readonly | `just integration-velero-kopia-dynamic-pvc-restore-readonly-smoke` | Incident-restore behavior: restored bytes verify, Velero artifact writes are denied, and backend writes stay at zero during restore. |
 | Lightweight perf smoke | `just perf-s3-gateway --format jsonl` | Small gateway scenario metrics and amplification. |
 | Gateway perf smoke | `just perf-s3-gateway --objects 32 --object-size 262144 --reads 64 --range-len 4096 --commit-batch-items 8 --concurrency 8 --format jsonl` | Release-profile local gateway run for current v2 request cost, throughput, and amplification. |
-| 10k object scale gate | `just perf-scale-10k` | Three release-binary committed-write runs. Every run publishes a final signed checkpoint, discards writer state, reloads through a new repository instance, checks exact list cardinality, reads the first, middle, and last payload, and enforces at most 1.50x write amplification, 1.04x cold-read byte amplification, and one backend request per sentinel read. Runs on every CI change. |
-| 100k object scale gate | `just perf-scale-100k` | Release-binary 1,024-item bulk tier with the same final-checkpoint, recovery, cardinality, write-amplification, and direct cold-read checks. |
-| 1M object scale gate | `just perf-scale-1m` | Manual in-memory high-capacity tier with the same checks. Final qualification still requires a fresh-process filesystem run with pinned-runner RSS/time measurement. |
+| 10k object scale gate | `just perf-scale-10k` | Three release-binary committed-write runs. Every run publishes a final signed checkpoint, discards writer state, reloads through a new repository instance, checks exact list cardinality, reads the first, middle, and last payload, and enforces the 1.65x lifetime write gate, 1.04x cold-read byte amplification, one backend request per sentinel read, and at most 255 recovered active index runs. Runs on every CI change. |
+| 100k object scale gate | `just perf-scale-100k` | Release-binary 1,024-item bulk tier with the same final-checkpoint, recovery, cardinality, amplification, direct cold-read, and active-run-count checks. |
+| 270k bounded-compaction evidence | `just perf-scale-tier 270000` | Crosses the 256-run watermark with the 1,024-item bulk tier and applies the lifetime amplification, 180-second elapsed, 4 GiB peak-RSS, recovery, cold-read, and active-run gates. Three release runs establish timing stability; the final memory-remediated gated sample recovered 140 active runs at 1.570052575x write amplification and 3.765 GiB peak RSS. |
+| 1M object scale gate | `just perf-scale-1m` | Manual in-memory high-capacity tier with the same checks. The revised automatic-compaction lane still needs a passing rerun. Final qualification also requires a fresh-process filesystem run with pinned-runner RSS/time measurement. |
 | Kopia measured matrix | `cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix --runs 3 --profile-set larger-restores --gateway-build-profile release --enforce-regression-budgets` | Release-grade Kopia restore comparison against the straight RustFS proxy baseline with current gateway defaults. |
 
 Expensive lanes emit artifacts under `.local/integration/` by default.
@@ -47,15 +48,29 @@ different positive integer. A scale run is successful only after new-instance
 reload, cardinality verification, and sentinel payload reads; write throughput
 alone is not a recovery or release result. The underlying harness options
 `--max-cold-read-amp` and `--max-cold-read-requests-per-read` require
-`--verify-reload`. After recovery, the harness resets its observation window,
+`--verify-reload`. The `--max-active-index-runs` option also requires reload
+verification and checks the authenticated recovered catalog, not writer memory.
+The scale recipes also enforce `--max-elapsed-seconds 180` and
+`--max-peak-rss-bytes 4294967296`. Peak RSS comes from the harness process high-
+water mark, so an over-budget attempt fails even when all correctness checks
+pass.
+After recovery, the harness resets its observation window,
 reads the first, middle, and last object, and fails unless those reads use only
 the permitted exact range `GET` requests and bytes. JSONL and TSV output report
 the cold-read counters separately from recovery.
 
 These lightweight lanes qualify write amplification, bounded recovery, direct
-cold sentinel reads, and sentinel correctness. They do not qualify indefinite
-run-catalog growth or replace the fresh-process filesystem/RSS gate. Packed-run
-compaction and its automatic watermark remain production blockers.
+cold sentinel reads, sentinel correctness, and the recovered active-run budget.
+The first automatic-compaction 1M attempt was stopped at the five-minute task
+limit before it produced final evidence. That run exposed a bad schedule that
+repeated a full active-set compaction every 256 runs. The schedule now performs
+bounded passes beginning at 256 active runs, each selecting at most the oldest
+128 level-0 runs while preserving newer level-0 and prior level-1 shards. A
+missing guard or fully validated nonreducing bounded plan may defer and retry at
+later 64-run boundaries before pausing at 896. The revised 1M lane still needs
+to be rerun. Configured-guard, corruption, storage, anchor, and other compaction
+errors poison immediately. These lanes also do not replace the fresh-process
+filesystem/RSS gate.
 
 The current gateway no longer has a v1 repository runtime. Commands with `v2`
 in their names keep their existing harness names, but they exercise the only

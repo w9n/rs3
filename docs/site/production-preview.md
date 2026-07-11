@@ -11,12 +11,14 @@ repository-format promise.
 !!! danger "Repository release is currently blocked"
     `commits/v01` has been removed and is unsupported; it had no production
     repositories. The runtime now reads and writes a transitional
-    `commits/v02` envelope with signed per-section digests and payload-skipping
-    replay, but framed index runs, signed catalogs, compaction, and bounded
-    catalog recovery remain unimplemented. Existing compatibility and provider
-    results are useful gateway regression evidence, but they do not qualify the
-    complete `v02` format or a production repository release. There will be no
-    `v01` migration or dual-reader requirement.
+    `commits/v02` envelope with framed index runs, signed catalogs,
+    payload-skipping replay, guarded metadata-only packed-run compaction, and
+    automatic active-run watermarks. Existing compatibility and provider
+    results are useful gateway regression evidence, but protection cohorts,
+    complete GC, framed streaming, the revised 1M scale lane, retained-provider
+    reruns, and external review still block the complete `v02` format and a
+    production repository release. There will be no `v01` migration or
+    dual-reader requirement.
 
 ## Preview Scope
 
@@ -207,11 +209,12 @@ chain and therefore to the repository state reachable from it.
 
 ## Current Evidence
 
-Release evidence below is maintainer-run evidence for the deprecated preview
-implementation. Treat it as compatibility, storage-contract, and gateway
-regression evidence only. It predates the generation switch and does not
-exercise standalone framed index runs, signed `INDEX_ROOT` catalogs, automatic
-checkpoint backpressure, or exact catalog-root GC. Exact backend prefixes and
+Release evidence below is maintainer-run evidence. Unless a row explicitly
+identifies the current `v02` format, treat it as compatibility,
+storage-contract, and gateway regression evidence for the deprecated preview
+implementation. Those historical rows predate the generation switch and do not
+exercise the current packed-run compaction schedule, automatic watermark
+backpressure, or exact catalog-root GC. Exact backend prefixes and
 workspace-local artifact paths are not part of the public evidence record
 because they are operational identifiers. Preserve raw reports, checksums, and
 run logs in release assets or private evidence bundles when independent review
@@ -233,6 +236,7 @@ At a glance:
 
 | Evidence | Result |
 | --- | --- |
+| Current v02 bounded-compaction scale lane | Passed three release runs on 2026-07-11 with 270,000 512 B objects, batch and concurrency 1,024. Elapsed was 29.799 s, 28.527 s, and 30.012 s; checkpoint time was 4.393 s, 4.229 s, and 4.490 s; reload time was 3.102 s, 3.047 s, and 3.073 s. Every run recorded 270 PUTs, 1,484 GETs, 404 HEADs, 1.570052575x write amplification, 140 recovered active runs, and one exact `GET` at 1.03125x per cold sentinel. After memory remediation, a final gated sample passed in 27.325925 s at 4,042,354,688 B peak RSS, with a 4.190111 s checkpoint and 3.019858 s reload. Two earlier resource-gated attempts correctly failed at 5,409,140,736 B and 4,668,936,192 B. This crosses the 256-run watermark and validates bounded tier compaction under 4 GiB, but is not the missing 1M rerun. |
 | Live retained-backend v2 preview gate | Passed on 2026-05-18 with `just preview-gate-v2-live`. S3 gateway/tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes all passed against fresh opaque backend prefixes. |
 | Live retained-backend v2 GC rehearsal | Passed on 2026-05-21 with `just v2-gc-rehearsal-live` against a fresh Object Lock prefix. The dry run found two orphan candidates, planned one exact-version delete, treated the retained orphan as protected, applied one unprotected exact-version delete, left the protected candidate blocked, and reloaded the anchor-selected chain. |
 | Live retained-backend v2 DR anchor import/export | Passed on 2026-05-18 against fresh v2 Velero dynamic-PVC gateway-restart output. The source backup/restore lane passed, the source bundle verified 34 commits, a new kind cluster with a missing Lease rejected import when the retention context was omitted, import with governance retention recreated the Lease, and the recovered bundle verified the same anchor. |
@@ -382,25 +386,37 @@ Preview evidence should show:
 
 The replacement repository generation must complete all of these together:
 
+The first 1M automatic-compaction run was stopped at the five-minute task limit
+without final evidence. The original schedule repeatedly compacted the full
+active set every 256 runs. The replacement starts at 256 active runs but each
+pass selects at most the oldest 128 level-0 runs and preserves newer level-0
+and existing level-1 shards. A missing guard or fully validated nonreducing
+bounded plan may defer and retry at later 64-run boundaries; both block writes
+at 896. Configured-guard, corruption, storage, anchor, and other compaction
+errors poison immediately. The 270k bounded lane passes, but the revised 1M
+lane has not yet passed.
+
 - finish qualification of the integrated canonical `INDEX_RUN` codec and small
   signed `INDEX_ROOT` catalogs under `commits/v02`;
 - finish protection-cohort behavior for the integrated ciphertext-only
   `PAYLOAD_PACK` codec and authenticated direct record descriptors;
-- extend descriptor-first bounded recovery from embedded runs to the complete
-  standalone compaction path;
+- qualify descriptor-first bounded recovery across the guarded compacted-run
+  sibling publication path;
 - keep one accepted repository state plus a bounded pending mutation overlay;
-- add fenced automatic checkpointing with degraded and write-paused failure
-  posture before absolute replay ceilings;
+- qualify bounded fenced automatic compaction from the 256-run request
+  watermark through missing-guard 64-run retries and the 896-run pause, before
+  the 1,024-run ceiling;
 - make maintenance mark exact catalog, run, and effective payload versions
   without recursively retaining entire payload commit ancestry;
 - pass fresh-process committed-write recovery at 10k, 100k, and 1M objects,
-  including exact cardinality and first, middle, and last payload verification;
+  including exact cardinality, at most 255 recovered active runs after the
+  final checkpoint, and first, middle, and last payload verification;
 - enforce the small-object write-amplification ceilings in the performance
   reference, enforce one-request direct cold reads and their byte ceiling, and
   keep separate raw-S3 and real Kopia/Velero tiny-file lanes;
 - prove payload-pack reachability and cleaning across tombstones, protected
   historical roots, retention, legal hold, and interrupted repacks;
-- qualify exact standalone-run versions, restart, checkpoint crash, stale
+- qualify exact compacted sibling-carrier versions, restart, checkpoint crash, stale
   fencing, delayed visibility, retention renewal, and writer handoff on a real
   retained provider;
 - finalize canonical encoding, capability negotiation, key-provider, and

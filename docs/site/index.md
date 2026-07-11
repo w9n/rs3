@@ -65,10 +65,10 @@ packs, encrypted index runs, and signed index-root checkpoints. Packed reads
 resolve authenticated record descriptors from the encrypted index and fetch
 the exact payload ciphertext range without first reading pack metadata.
 Existing gateway and provider results remain regression evidence, but a
-repository release is blocked until compaction, automatic watermarks, complete
-GC and protection-cohort behavior, retained-provider qualification, and the
-fresh-process 1M-object scale gates pass. No `v01` migration or dual reader is
-planned.
+repository release is blocked until guarded compaction and automatic watermarks
+pass the revised 1M and retained-provider gates, complete GC and
+protection-cohort behavior lands, and the fresh-process 1M-object scale gates
+pass. No `v01` migration or dual reader is planned.
 
 Do not treat the current repository format, cryptographic formats, or runtime
 defaults as production-stable yet.

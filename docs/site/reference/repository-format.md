@@ -2,9 +2,9 @@
 
 The repository format is draft. This page is the design contract for
 `commits/v02`. It is not a compatibility promise. The gateway reads and writes
-bounded payload packs, encrypted index runs, and signed index-root checkpoints,
-but compaction, automatic watermarks, protection cohorts, and final
-qualification are not complete.
+bounded payload packs, encrypted index runs, signed index-root checkpoints, and
+guarded metadata-only packed-run compaction. Protection cohorts, complete GC,
+framed streaming, and final qualification are not complete.
 
 !!! warning "Implementation status"
     `commits/v01` has been removed and is unsupported. No production repository
@@ -13,8 +13,9 @@ qualification are not complete.
     digest. Bounded normal writes use ciphertext-only `PAYLOAD_PACK` sections,
     authenticated `INDEX_RUN` record descriptors, and signed `INDEX_ROOT`
     checkpoints; recovery rebuilds namespace state without reading payload
-    ciphertext. Compaction, automatic checkpointing watermarks, framed
-    streaming, protection cohorts, and final recovery qualification remain.
+    ciphertext. Guarded compaction and automatic active-run watermarks are
+    implemented. Framed streaming, protection cohorts, complete GC, and final
+    recovery qualification remain.
     Until those gates pass, the runtime is evaluation-only.
 
 ## Invariants
@@ -57,9 +58,11 @@ objects/v02/<32-byte-random-id-base64url>
 
 The sequence component bounds commit discovery and operational analysis. The
 random component prevents paths, namespace equality, and content identity from
-appearing in keys. `objects/v02/` contains independently sealed compacted index
-runs and payload packs created by later cleaning. Its keys do not distinguish
-object type, index level, tenant, path, or workload.
+appearing in keys. The current compactor stores index shards in sibling
+`commits/v02/` delta carriers so the existing signed commit and exact-version
+machinery authenticates them. `objects/v02/` is reserved for independently
+sealed objects such as payload packs created by later cleaning. Its keys do not
+distinguish object type, index level, tenant, path, or workload.
 
 The other backend-visible classes remain generic:
 
@@ -108,10 +111,14 @@ out-of-order or overlapping sections, arithmetic overflow, duplicate ordinals,
 lengths outside the object, and trailing data not covered by the signed layout.
 
 Capability bit `0x01` requires signed per-section digests. Bit `0x02` identifies
-framed index sections. The fixed header advertises `0x01` for transitional
-delta/snapshot commits and `0x03` whenever a commit contains `PAYLOAD_PACK`,
-`INDEX_RUN`, or `INDEX_ROOT`; the signed section shape must agree with those
-bits. Readers support both shapes during the preview transition.
+framed index sections. Bit `0x04` requires compacted-run root semantics,
+including authenticated run level and compaction generation. This preview
+capability accepts only tier 0 and tier 1; higher level values fail closed until
+a future capability defines their semantics. The fixed header
+advertises `0x01` for transitional delta/snapshot commits, `0x03` for framed
+payload-pack or index-run carriers, and `0x07` for `INDEX_ROOT` commits; the
+signed section shape must agree with those bits. Readers support these shapes
+during the preview transition and fail closed on unknown required capabilities.
 
 Normal commits contain one encrypted `INDEX_RUN` and at most one encrypted
 `PAYLOAD_PACK`; an all-delete or all-empty batch needs no payload pack. A
@@ -250,18 +257,32 @@ namespace. It records:
 - the active format-root and keyring-envelope references; and
 - required reader capabilities and absolute resource ceilings.
 
-Recent runs may be sections of exact accepted commit versions. Compacted runs
-are independently sealed `objects/v02/` versions. The catalog authenticates
-the complete active run set, so backend listing visibility and ordering are not
-part of recovery.
+Recent runs may be sections of exact accepted commit versions. Current
+compacted runs are sealed sections in exact sibling `commits/v02/` delta-carrier
+versions. The catalog authenticates the complete active run set, so backend
+listing visibility and ordering are not part of recovery.
 
 `INDEX_ROOT` names index runs, not every payload pack. Effective highest-
 generation namespace records are the authoritative payload-pack reachability
-map. Size-tiered compaction merges several similarly sized immutable runs into a
-bounded set of larger, sharded runs. This intentionally favors low write
-amplification for append-heavy backup ingestion over the lowest possible point
-read amplification. Compaction never rewrites payloads merely to consolidate
-the namespace.
+map. Foreground runs are level 0. The current packed-run compactor selects at
+most the oldest 128 level-0 runs, chooses the newest mutation for each blinded
+key in that bounded window, and retains a winning tombstone just like a winning
+upsert. Newer level-0 runs and every existing level-1 shard remain
+exact-referenced and unchanged. Level is a storage tier, never a compaction
+epoch; every foreground compaction emits level 1 instead of incrementing a
+level counter. The decoder accepts only levels 0 and 1. Supporting another tier
+requires an explicit future capability and hostile-input review. Different
+mutations for the same key and generation are
+corruption. Source-relative self-pack pointers are normalized to exact external
+historical commit, version, pack, and keyring-envelope facts before source-run
+boundaries disappear. The result is split into the fewest bounded
+generation-range shards the canonical run codec accepts. Every equal-generation
+group stays indivisible, even when that means rejecting an oversized generation
+instead of partially publishing it. A level-1 tombstone continues to mask older
+values in preserved level-1 shards. Reclaiming bottom-tier tombstones and
+records they mask requires a separate future guarded or offline merge with
+protected-root and GC proof. Foreground compaction is metadata-only and never
+reads, decrypts, or rewrites payload ciphertext.
 
 ## Descriptor-First Recovery
 
@@ -291,11 +312,13 @@ overlay. Unaccepted writes never mutate accepted state. Successful anchor
 publication applies the overlay once; failed publication discards it. Startup
 must not clone a second complete repository state.
 
-## Automatic Catalog Checkpoints
+## Automatic Catalog Watermarks
 
 The writer must keep every accepted head inside its recoverable envelope.
-Checkpointing therefore runs automatically under the same live Kubernetes
-writer fence used for anchor advancement.
+Active-run compaction therefore runs automatically under the same live
+Kubernetes writer fence used for anchor advancement. Commit-tail and encrypted
+tail-byte posture remains part of the release design, but is not yet an
+equivalent automatic runtime gate.
 
 Initial engineering watermarks are:
 
@@ -306,45 +329,68 @@ Initial engineering watermarks are:
 | New mutations paused | 3,000 | 64 MiB |
 | Absolute verifier ceiling | 4,096 | 96 MiB |
 
-The active-run reference budget starts at 256 for checkpointing, 512 for
-degraded posture, 768 for write pause, and an absolute verifier ceiling of
-1,024. Measurements may lower the operational watermarks before format freeze;
-raising an absolute reader ceiling requires a format and hostile-input review.
+For active runs, a coordinator requests compaction at 256. If no maintenance
+guard is configured, it degrades and retries at each additional 64-run boundary,
+then pauses before staging another mutation at 896. The absolute verifier
+ceiling is 1,024. The release scale recipes
+require at most 255 active authenticated runs after the final checkpoint and
+fresh recovery. Measurements may lower the operational watermarks before format
+freeze; raising an absolute reader ceiling requires a format and hostile-input
+review.
 
-If checkpointing repeatedly fails, already accepted reads remain available.
-Writes may continue only until the pause watermark. At that point new mutations
-receive a path-safe service-unavailable response, readiness and admin posture
-report the write-blocked state, and the anchor is not advanced into an
-unrecoverable tail. Failure never silently raises a limit or accepts a
-newer-looking backend candidate.
+If the maintenance guard is not configured, already accepted reads remain
+available and writes may continue only until the pause watermark. A fully
+validated bounded plan that cannot reduce its source-run count may also defer
+below that watermark and retry later. A configured guard rejection, corruption,
+storage or anchor failure, and every other compaction error poisons the
+coordinator immediately. At the pause watermark, a still-missing guard or a
+still-nonreducing plan blocks new mutations with a
+path-safe service-unavailable response. Readiness and admin posture report the
+write-blocked state, and the anchor is not advanced into an unrecoverable tail.
+Failure never silently raises a limit or accepts a newer-looking backend
+candidate.
 
 ## Checkpoint Publication
 
 Compaction and catalog publication use this order:
 
-1. Capture the accepted anchor and live writer fence.
-2. Stream-merge selected runs with bounded buffers.
-3. Upload replacement runs under random opaque keys.
-4. Verify exact provider version, length, digest, retention, and legal-hold
-   posture for every candidate run.
-5. Write the signed catalog checkpoint commit.
-6. Open the candidate through a fresh reader and compare the complete trusted
-   namespace state and accepted run lineage.
-7. Recheck the writer fence and unchanged anchor.
-8. Advance the real anchor with one resource-version CAS that also checks the
-   fence identity and token.
-9. Install the accepted catalog and state.
-10. Leave replaced and failed candidate objects for conservative orphan GC.
+1. Capture the accepted anchor and live Kubernetes `WriterFence` with no
+   pending mutations.
+2. Select and verify at most the oldest 128 level-0 runs, then merge that
+   bounded foreground window newest-wins while retaining tombstones and
+   normalizing self-pack references. Preserve newer level-0 and every existing
+   level-1 reference unchanged.
+3. Shard the result on generation boundaries and write each metadata-only run
+   in an unanchored delta-carrier commit that is a direct child of the captured
+   base.
+4. Write an unanchored signed `INDEX_ROOT`, also a direct child of that base,
+   that exact-references every new sibling carrier plus the preserved level-1
+   inventory. New shards have level 1 and a compaction generation equal to the
+   sibling commit sequence.
+5. Open the candidate root through a fresh reader and compare the complete
+   trusted namespace state and accepted run inventory.
+6. Recheck the writer fence and unchanged base anchor.
+7. Advance the real anchor to the root with one resource-version CAS that also
+   checks the fence identity and token.
+8. Install the accepted catalog and state.
+9. Leave replaced and failed candidate objects for conservative orphan GC.
 
-Uploading a run does not make it reachable. Only the fenced anchor CAS makes
-the signed catalog an accepted root. Delayed list visibility, duplicate
-versions, and abandoned uploads are therefore availability and cleanup
-concerns, not state-selection mechanisms.
+Uploading a carrier does not make it accepted. Only the fenced anchor CAS makes
+the signed catalog an accepted root. Recovery requires exact carrier versions
+and validates the compacted sibling's parent, sequence, section position,
+level, and compaction generation. Delayed list visibility, duplicate versions,
+and abandoned uploads are therefore availability and cleanup concerns, not
+state-selection mechanisms.
 
-The current writer refuses a compact mutation before it would create a 1,025th
-active run. This keeps exhaustion fail closed, but it is availability
-backpressure, not compaction. Packed-run compaction and an automatic watermark
-must land before sustained production writes can rely on this path.
+The coordinator requests compaction at 256 active runs. A missing maintenance
+guard degrades and retries at subsequent 64-run boundaries below 896. A fully
+validated bounded plan that cannot reduce run count may likewise defer and
+retry below 896. Both fail closed at that pause watermark. A configured guard
+rejection, corruption, storage or anchor failure, and every other compaction
+error poisons immediately. The writer also refuses a compact mutation before it
+would create a 1,025th active run. These are distinct defenses: operational
+backpressure acts early, while the immutable format ceiling remains the final
+fail-closed bound.
 
 ## Reachability, Retention, and GC
 
@@ -390,6 +436,8 @@ The Kubernetes Lease remains the sole production writer-coordination and
 latest-state authority. Failover gateways in one apiserver coordination domain
 may acquire a new monotonic fence epoch. Every anchor advance verifies the
 current owner and fence token in the same Lease `resourceVersion` CAS.
+Metadata-only compaction uses that live `WriterFence` as its maintenance guard
+and rechecks it before adopting a candidate root.
 
 Disconnected or partitioned writers that only share S3 are unsupported. S3
 conditional object creation can prevent one key collision, but it cannot order
@@ -446,8 +494,8 @@ include:
 - enforced small-object write gates for a 64-object batch: at most 1.50x for
   512 B values (target 1.40x), at most 1.15x for 4 KiB values, at most 1.03x
   for 256 KiB values, and at most 320 fixed backend bytes per empty object;
-- a sequential 512 B committed-write gate of at most 3.0x plus a provisional
-  lifetime gate of at most 3.5x after forced index compaction;
+- a sequential 512 B committed-write gate of at most 3.0x plus a
+  checkpoint-and-compaction-inclusive lifetime gate of at most 1.65x;
 - amplification evidence at 32 B, 256 B, and 1,024 B logical path lengths that
   reports payload amplification separately from fixed metadata bytes per
   object;
@@ -467,7 +515,9 @@ allocation, request, byte, and amplification ceilings apply everywhere.
 
 There is no stable repository-format promise yet. `commits/v01` is removed and
 unsupported without migration support. The gateway reads and writes a
-transitional `commits/v02` envelope, while its catalog, framed-run, compaction,
-and bounded-recovery contract remains incomplete. Wire details freeze only
+transitional `commits/v02` envelope. Its catalog, direct-descriptor, and guarded
+packed-run compaction paths are integrated, while framed streaming, protection
+cohorts, complete GC, and final bounded-recovery qualification remain
+incomplete. Wire details freeze only
 after the implementation, cryptographic review, scale gates, retained-provider
 evidence, and recovery runbooks all pass together.

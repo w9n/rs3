@@ -157,7 +157,9 @@ just perf-scale-1m
 ```
 
 The July 11 ciphertext-only-pack and direct-descriptor rerun produced three
-passing release runs per tier:
+passing release runs per tier. These numbers predate automatic packed-run
+compaction and remain direct-descriptor regression evidence, not evidence for
+the current compaction schedule:
 
 | Tier | Batch | Result | Elapsed range | Checkpoint range | Reload range | Commit PUTs | Write amplification |
 | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
@@ -172,20 +174,60 @@ state, reloads from the accepted anchor through another same-process repository
 instance, verifies exact cardinality, and reads the first, middle, and last
 payload. The JSON/TSV artifact records both the requested and actual checkpoint
 position. The explicit 1,024-item bulk lane uses the same ciphertext-only pack
-format; the normal low-latency default remains 64. The recipes fail above 1.50x
-checkpoint-inclusive write amplification, 1.04x cold-read byte amplification,
-or one backend request per cold sentinel. Every run measured exactly three
-range `GET`s for three sentinel reads and 1.03125x cold-read byte amplification.
+format; the normal low-latency default remains 64. These pre-maintenance runs
+were below the former 1.50x checkpoint-only ceiling. That ceiling was not a
+valid lifetime gate once automatic compaction landed; current scale recipes use
+1.65x for checkpoint-and-compaction-inclusive 512 B writes. They also fail above
+1.04x cold-read byte amplification or one backend request per cold sentinel.
+Every run measured exactly three range `GET`s for three sentinel reads and
+1.03125x cold-read byte amplification.
 The 1M reload was below the documented 180-second target, but this is not the
 pinned runner, the backend is in memory, and the lightweight harness does not
 record its own RSS. The absolute time and 4 GiB gates still require a
 fresh-process, filesystem-backed, process-instrumented pinned run.
 
-The final 1M root contains about 977 runs and leaves only 47 catalog slots.
-Publication now fails closed before a compact write would exceed the 1,024-run
-format bound. Checkpointing does not compact runs, however, so packed-run
-compaction plus an automatic checkpoint/compaction watermark remain production
-blockers.
+That historical final 1M root contained about 977 runs and left only 47 catalog
+slots. Guarded metadata-only compaction and automatic watermarks are now
+implemented. The first automatic-compaction 1M attempt was stopped at the
+five-minute task limit and produced no final result. Its schedule repeatedly
+merged the full active set every 256 runs, which was clearly the wrong cost
+shape. The revised schedule starts at 256 active runs but selects at most the
+oldest 128 level-0 runs per pass. Newer level-0 and existing level-1 shards stay
+referenced. A missing guard or fully validated nonreducing bounded plan may
+retry at later 64-run boundaries before pausing at 896. Configured-guard,
+corruption, storage, anchor,
+and other compaction errors poison immediately. It still needs a complete 1M
+rerun. Scale reports now include `active_index_runs` after fresh recovery and
+fail above 255 after the final checkpoint.
+
+On 2026-07-11, the bounded policy was exercised with 270,000 512 B objects,
+batch and concurrency 1,024. This crosses the 256-run request watermark,
+compacts at most the oldest 128 level-0 runs, and preserves every other catalog
+reference. All three release runs passed the 1.65x lifetime write gate:
+
+| Run | Elapsed | Checkpoint | Reload | PUT | GET | HEAD | Active runs | Write amplification | Cold read |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 29.799 s | 4.393 s | 3.102 s | 270 | 1,484 | 404 | 140 | 1.570052575x | 1 GET/read, 1.03125x |
+| 2 | 28.527 s | 4.229 s | 3.047 s | 270 | 1,484 | 404 | 140 | 1.570052575x | 1 GET/read, 1.03125x |
+| 3 | 30.012 s | 4.490 s | 3.073 s | 270 | 1,484 | 404 | 140 | 1.570052575x | 1 GET/read, 1.03125x |
+
+PUT, GET, and HEAD are whole measured-run backend counts. Cold-read counts are
+isolated after fresh recovery. Recovering 140 authenticated active runs passes
+the 255-run catalog gate and demonstrates bounded tier compaction at this scale.
+The revised 1M lane has not been rerun.
+
+After the memory fixes, one final 270k sample passed the complete resource gate:
+
+| Elapsed | Peak RSS | Checkpoint | Reload | Write amplification | Active runs | Cold read |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 27.325925 s | 4,042,354,688 B (3.765 GiB) | 4.190111 s | 3.019858 s | 1.570052575x | 140 | 1 GET/read, 1.03125x |
+
+The peak is below the 4 GiB gate. Two preceding resource-gated attempts failed
+as intended at 5,409,140,736 B and 4,668,936,192 B. They prompted removal of a
+full accepted-state clone, accumulating replay scratch, and a redundant
+recovered-state install, plus shared exact-container interning during
+compaction. The three-run table remains timing-stability evidence; the final
+sample is the exact memory-gated result. The revised 1M lane remains open.
 
 ### Payload-size evidence
 

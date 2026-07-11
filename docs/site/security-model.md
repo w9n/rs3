@@ -60,9 +60,9 @@ The replacement `v02` design accepts specific backend-visible leakage:
 | Coarse write and restore timing | The provider sees requests arrive. | Avoid path labels in telemetry; future batching/jitter where useful. |
 | Retention mode | Provider retention APIs expose mode and retain-until behavior. | Treat retention mode as policy metadata, not tenant identity. |
 | Source network metadata | The provider sees the gateway's network identity. | Deploy through controlled egress where required. |
-| Broad object class | `format/`, `keyrings/`, `commits/v02/`, and `objects/v02/` support lifecycle and operations. | Keep class names generic and path-free; standalone run and cleaned-pack keys do not reveal object type, level, tenant, or workload. |
+| Broad object class | `format/`, `keyrings/`, `commits/v02/`, and `objects/v02/` support lifecycle and operations. | Keep class names generic and path-free; compacted sibling carriers and cleaned-pack keys do not reveal tenant, path, or workload. |
 | Commit sequence and run inventory | Sequence-bounded commit keys and immutable run objects expose commit and compaction activity. | Batch commits, use random object IDs, keep catalog counts, levels, and bounds encrypted. |
-| Compaction cadence | The provider sees standalone run writes and later cleanup. | Use bounded size tiers and optional compaction jitter; never include paths in scheduling telemetry. |
+| Compaction cadence | The provider sees sibling delta-carrier and root writes, plus later cleanup. | Compact at bounded active-run watermarks and consider optional jitter; never include paths in scheduling telemetry. |
 | Payload-pack shape and access | A commit exposes aggregate pack size, and exact range reads reveal ciphertext span and access patterns. | Batch by bounded protection cohort, randomize record order, keep record descriptors inside encrypted authenticated index runs, and consider optional padding only with measured budgets. |
 | Deterministic metadata equality | Stable metadata sealing can produce identical sealed bytes for identical metadata under identical associated data. | Bind framed ciphertext to a unique run and frame context; complete equality analysis before format freeze. |
 
@@ -87,10 +87,11 @@ repository used `v01`, and no migration or dual reader is planned.
     writes signed `INDEX_ROOT` catalogs of exact embedded run sections.
     Candidate checkpoints are reconstructed by a fresh reader before anchor
     adoption, and maintenance derives exact run and live-payload reachability
-    from the same verified catalog. Standalone compacted runs are not
-    implemented. Production claims remain blocked on automatic checkpoint
-    watermarks, framed streaming, hostile scale recovery, live-provider reruns,
-    and external cryptographic review.
+    from the same verified catalog. Guarded metadata-only packed-run compaction
+    and automatic active-run watermarks are implemented. Production claims
+    remain blocked on framed streaming, protection-cohort and GC qualification,
+    the revised 1M scale rerun, live-provider reruns, and external cryptographic
+    review.
 
 ## Control Map
 
@@ -113,12 +114,13 @@ repository used `v01`, and no migration or dual reader is planned.
 | Incident restore does not advance repository state | `restore-readonly` mode requires an accepted anchor and rejects supported mutations. | Gateway mode config, startup, and S3 adapter tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
-| v02 index frames cannot be transplanted or reordered | Frame AEAD binds immutable repository identity, the historical keyring-envelope reference, exact object key, section ordinal, run identity, and complete frame descriptor. The signed catalog binds exact embedded commit version, length, body digest, layout, and run facts. | Framed-run and root codecs, exact catalog recovery, publication, bounded replay, and corruption tests. Standalone compacted runs remain blocked. |
+| v02 index frames cannot be transplanted or reordered | Frame AEAD binds immutable repository identity, the historical keyring-envelope reference, exact object key, section ordinal, run identity, and complete frame descriptor. The signed catalog binds exact embedded commit version, length, body digest, layout, level, and compaction generation. Compacted carriers must be direct siblings of their root with the exact parent and sequence relation. | Framed-run and root codecs, guarded sibling publication, fresh-reader candidate verification, exact catalog recovery, bounded replay, and corruption tests. Retained-provider restart and fault qualification remain. |
 | v02 payload-pack records cannot be transplanted or downgraded | Record AEAD binds immutable repository identity, historical keyring context, exact object key, pack, section, record, segment, layout, and length facts. Encrypted `INDEX_RUN` descriptors bind the pack identity, content-key ID, historical envelope object and digest, ordinal, offset, length, and plaintext digest. The accepted signed reference binds the returned exact version, length, and commit-body digest. | The bounded ciphertext-only pack codec, canonical segmentation, publication, direct cold range-read, replay, and corruption tests are implemented; protection-cohort partitioning and cleaning remain release blockers. |
 | Cold packed reads do not fetch unrelated records or metadata | Recovery materializes authenticated direct record descriptors from encrypted runs. A fresh post-recovery read uses one exact backend range `GET`; a 512 B record fetches 528 B including its AEAD tag, for 1.03125x ciphertext-byte amplification. | Direct cold-read request-count and exact-range repository test; the scale harness enforces configurable request and byte-amplification ceilings during sentinel reads. |
-| v02 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery verifies exact bounded run sections sequentially from a signed catalog under count and byte ceilings. | Implemented for embedded runs; same-process in-memory 100k and 1M evidence passes, while fresh-process filesystem and pinned RSS gates remain. |
-| v02 checkpoint failure cannot anchor unrecoverable state | The compact writer fails closed before accepting a 1,025th active run. Fenced automatic checkpointing must degrade and compact before that hard ceiling. | Hard-ceiling backpressure is implemented; packed-run compaction, automatic watermarks, and adversarial pause/resume testing remain required. |
-| v02 GC retains every live payload without retaining whole ancestry | Effective run records mark exact payload commit versions; catalog-named run commits and protected roots are marked before exact-version sweep. | Implemented for embedded catalog runs; standalone run inventory and cleaning remain blocked. |
+| v02 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery verifies exact bounded run sections sequentially from a signed catalog under count and byte ceilings. Compaction uses per-run scratch state and shared exact-container interning instead of a cumulative replay scratch. | Embedded and compacted recovery tests pass. A memory-remediated 270k bounded-compaction sample passed at 4,042,354,688 B peak RSS; the revised fresh-process filesystem 1M gate remains. |
+| v02 checkpoint failure cannot anchor unrecoverable state | A coordinator requests metadata-only compaction at 256 active runs. A missing guard or a fully validated nonreducing bounded plan may defer below 896 and retry at later 64-run boundaries; both fail closed at 896. Configured-guard, corruption, storage, anchor, and other compaction errors poison immediately. The hard 1,024-run verifier ceiling remains. | Automatic success, missing-guard and nonreducing-plan retry and pause, configured-guard failure, hard-ceiling, and exact recovered-run-count tests. Three 270k release runs crossed the watermark and recovered 140 active runs; adversarial restart and retained-provider qualification remain. |
+| v02 compaction cannot publish a partial or payload-rewriting merge | At most the oldest 128 foreground level-0 runs are merged newest-wins including tombstones; newer level-0 and existing level-1 shards remain exact-referenced; self-pack references become exact historical external references; equal-generation groups are indivisible; candidate carriers and root are siblings verified by a fresh reader before one fenced CAS. Level denotes tier, not epoch, and the preview decoder rejects levels above 1. | Pure planner, bounded-window selection, historical-envelope, no-payload-write, guard-loss, publication-lineage, fresh-recovery, invalid-tier, and automatic-watermark tests. Bottom-tier tombstone reclamation remains future guarded or offline work. |
+| v02 GC retains every live payload without retaining whole ancestry | Effective run records mark exact payload commit versions; catalog-named run commits and protected roots are marked before exact-version sweep. | Implemented for embedded and compacted catalog runs; payload-pack cleaning remains blocked. |
 
 ## Rollback Rule
 
@@ -174,8 +176,9 @@ Object Lock protects object versions from deletion or overwrite before their
 retention deadline. It does not prevent a backend from presenting an older valid
 version as latest, and it does not make a latest pointer trustworthy by itself.
 
-Use Object Lock for retained commit objects, standalone index runs, keyring
-envelopes, and format roots. Do not use it as the only anti-rollback mechanism.
+Use Object Lock for retained commit objects, including compacted-run carriers,
+plus keyring envelopes and format roots. Do not use it as the only anti-rollback
+mechanism.
 
 In retained/Object Lock mode, `rs3` requires the backend to return a provider
 version ID for restore-critical writes. The anchor binds the accepted commit
@@ -245,7 +248,7 @@ conditional headers.
 configured backend, including multipart upload behavior used by large
 streaming writes. Governance-retention deployments require an explicit operator
 review that gateway credentials cannot bypass retention. It must be extended to
-cover exact standalone run versions before it qualifies `v02`.
+cover exact compacted sibling-carrier versions before it qualifies `v02`.
 
 ## Operator Reporting Rule
 
@@ -298,9 +301,9 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
 
 ## Current Open Risks
 
-- The `v02` embedded catalog-and-run path remains preview-scoped. Standalone
-  compacted runs, durable format freeze, and external cryptographic review are
-  still outstanding.
+- The `v02` catalog, packed-run compaction, and automatic watermark paths remain
+  preview-scoped. Durable format freeze, retained-provider qualification, and
+  external cryptographic review are still outstanding.
 - Durable format compatibility is not promised yet.
 - The cryptographic design has not had an external review.
 - Metadata sealing uses a standard misuse-resistant AEAD, but deterministic
@@ -314,9 +317,13 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
   [deduplication design note](reference/deduplication.md).
 - Payload-pack protection cohorts and cleaning have not passed retained-version,
   legal-hold, protected-root, or crash testing.
-- Packed-run catalog compaction, exact payload-root GC, and automatic
-  pre-ceiling backpressure have not passed adversarial crash, replay, and
-  stale-fence testing. The hard 1,024-run stop is implemented and fails closed.
+- Packed-run catalog compaction and automatic pre-ceiling backpressure are
+  implemented, but have not passed the revised 1M lane, retained-provider
+  restart, or the full adversarial crash and delayed-visibility matrix. Exact
+  payload-root GC and cleaning also remain incomplete. Level-1 tombstones are
+  retained to mask older shards; safe bottom-tier tombstone reclamation remains
+  future guarded or offline work. The hard 1,024-run stop is implemented and
+  fails closed.
 - Retained backend history depends on provider retention or Object Lock to
   resist deletion by a storage administrator.
 - Key retirement remains retention-aware and must not remove material still
