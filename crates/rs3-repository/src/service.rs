@@ -4,7 +4,7 @@ use crate::checkpoint::seal_manifest_record;
 use crate::error::{RepositoryError, Result};
 use crate::lru::LruCache;
 use crate::model::RepositoryObjectMetadata;
-use crate::namespace::{existing_blind_keys, first_namespace_entry, prefix_tokens_for_key};
+use crate::namespace::{first_namespace_entry, prefix_tokens_for_key};
 use crate::payload::{
     DEFAULT_PAYLOAD_SEGMENT_SIZE, SegmentCiphertextSpan, SegmentPlaintextSelection,
     SegmentedPayloadHeader, open_segmented_payload_cached_segments,
@@ -293,70 +293,12 @@ where
         Ok(())
     }
 
-    pub(crate) fn tombstone_namespace_for_delete(
-        &self,
-        key: &LogicalPath,
-    ) -> Result<(BackendObjectId, crate::state::RepositoryStateRollback)> {
-        let keyring = self.keyring()?;
-        let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
-        let mut state = self.write_state()?;
-        let entry = first_namespace_entry(&state.namespace, &lookup_blind_keys)
-            .ok_or_else(|| RepositoryError::NotFound(key.clone()))?
-            .clone();
-        let object_id = entry.object_id.clone();
-        let existing_tombstones = existing_blind_keys(&state.namespace, &lookup_blind_keys)
-            .into_iter()
-            .map(|blind_key| {
-                state
-                    .namespace
-                    .head(&blind_key)
-                    .map(|entry| (blind_key, entry.namespace_key_id.clone()))
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| RepositoryError::CommitFailed {
-                reason: "namespace entry disappeared while staging delete".to_owned(),
-            })?;
-        let sequence = next_sequence(&mut state)?;
-        let rollback = crate::state::RepositoryStateRollback::capture(
-            &state,
-            existing_tombstones
-                .iter()
-                .map(|(blind_key, _)| blind_key.clone()),
-            entry.manifest_id,
-            key,
-        );
-        for (blind_key, namespace_key_id) in existing_tombstones {
-            state.tombstone_namespace_entry(blind_key.clone(), sequence);
-            state.pending_index_deltas.push(IndexDelta::Tombstone {
-                namespace_key_id,
-                blind_key,
-                path: key.clone(),
-                generation: sequence,
-            });
-        }
-
-        Ok((object_id, rollback))
-    }
-
     /// Applies legal hold for a client-visible object and its backend payload.
     pub async fn set_legal_hold(
         &self,
         key: &LogicalPath,
         status: LegalHoldStatus,
     ) -> Result<RepositoryObjectMetadata> {
-        self.set_legal_hold_with_rollback(key, status)
-            .await
-            .map(|(metadata, _rollback)| metadata)
-    }
-
-    pub(crate) async fn set_legal_hold_with_rollback(
-        &self,
-        key: &LogicalPath,
-        status: LegalHoldStatus,
-    ) -> Result<(
-        RepositoryObjectMetadata,
-        crate::state::RepositoryStateRollback,
-    )> {
         let keyring = self.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
         let object_ref = self.object_ref_for_candidates(key, &lookup_blind_keys)?;
@@ -405,12 +347,6 @@ where
             legal_hold: updated.legal_hold,
         };
         let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
-        let rollback = crate::state::RepositoryStateRollback::capture(
-            &state,
-            std::iter::once(updated.blind_key.clone()),
-            manifest_id.clone(),
-            key,
-        );
         state.pending_index_deltas.push(IndexDelta::Upsert {
             entry: Box::new(updated.clone()),
             prefix_tokens: prefix_tokens.clone(),
@@ -419,7 +355,7 @@ where
         state.manifests.insert(manifest_id, manifest.clone());
         state.upsert_namespace_entry(updated.clone(), prefix_tokens);
 
-        Ok((manifest.into_metadata(), rollback))
+        Ok(manifest.into_metadata())
     }
 
     fn object_ref_for_candidates(

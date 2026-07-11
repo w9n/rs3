@@ -1,7 +1,9 @@
 //! Commit coordination for preview v2 repository writes.
 
-use super::repository::{V2AnchorState, V2CommitAnchor};
-use super::service::{V2Repository, V2StagedPutRollback};
+use super::repository::{V2AnchorState, V2CommitAnchor, V2ReplayChain};
+use super::service::{
+    V2CoordinatedMutation, V2CoordinatorLease, V2Repository, V2StagedPutRollback,
+};
 use super::{V2FormatError, V2MaintenanceGuard};
 use crate::CommitCoordinatorOptions;
 use crate::error::{RepositoryError, Result};
@@ -38,6 +40,7 @@ pub struct V2CommitCoordinator<S, A> {
     stage_lock: Arc<Mutex<()>>,
     batch: Arc<Mutex<PendingBatch>>,
     status: Arc<CoordinatorStatus>,
+    lease: Arc<V2CoordinatorLease>,
     maintenance_guard: Option<Arc<dyn V2MaintenanceGuard>>,
 }
 
@@ -51,7 +54,29 @@ struct PendingBatch {
 }
 
 struct CommitWaiter {
-    tx: oneshot::Sender<std::result::Result<V2AnchorState, String>>,
+    tx: oneshot::Sender<std::result::Result<V2AnchorState, CommitWaiterError>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CommitWaiterError {
+    Failed(String),
+    AcceptedRecoveryRequired,
+}
+
+impl CommitWaiterError {
+    fn into_repository_error(self) -> RepositoryError {
+        match self {
+            Self::Failed(reason) => RepositoryError::CommitFailed { reason },
+            Self::AcceptedRecoveryRequired => RepositoryError::AcceptedRecoveryRequired,
+        }
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            Self::Failed(reason) => reason.clone(),
+            Self::AcceptedRecoveryRequired => RepositoryError::AcceptedRecoveryRequired.to_string(),
+        }
+    }
 }
 
 /// Live v2 commit coordinator state safe for path-redacted operator reports.
@@ -121,7 +146,7 @@ where
     A: V2CommitAnchor + 'static,
 {
     /// Creates a v2 commit coordinator for a repository and anchor.
-    pub fn new(repository: Arc<V2Repository<S>>, anchor: A) -> Self {
+    pub fn new(repository: Arc<V2Repository<S>>, anchor: A) -> Result<Self> {
         Self::with_options(repository, anchor, CommitCoordinatorOptions::default())
     }
 
@@ -130,17 +155,19 @@ where
         repository: Arc<V2Repository<S>>,
         anchor: A,
         options: CommitCoordinatorOptions,
-    ) -> Self {
+    ) -> Result<Self> {
+        let lease = repository.claim_commit_coordinator()?;
         record_v2_commit_coordinator_poisoned(false);
-        Self {
+        Ok(Self {
             repository,
             anchor: Arc::new(anchor),
             options: options.normalized(),
             stage_lock: Arc::new(Mutex::new(())),
             batch: Arc::new(Mutex::new(PendingBatch::default())),
             status: Arc::new(CoordinatorStatus::default()),
+            lease,
             maintenance_guard: None,
-        }
+        })
     }
 
     /// Enables automatic metadata-only index compaction at catalog watermarks.
@@ -236,11 +263,14 @@ where
 
             if let Some(generation) = delayed_publish_generation.filter(|_| !should_publish_now) {
                 spawn_delayed_v2_publish(
-                    Arc::clone(&self.repository),
-                    Arc::clone(&self.anchor),
-                    Arc::clone(&self.stage_lock),
-                    Arc::clone(&self.batch),
-                    Arc::clone(&self.status),
+                    DelayedPublishContext {
+                        repository: Arc::clone(&self.repository),
+                        anchor: Arc::clone(&self.anchor),
+                        stage_lock: Arc::clone(&self.stage_lock),
+                        batch: Arc::clone(&self.batch),
+                        status: Arc::clone(&self.status),
+                        lease: Arc::clone(&self.lease),
+                    },
                     generation,
                     self.options.max_batch_delay,
                 );
@@ -267,9 +297,9 @@ where
                 record_v2_commit_put_phase_duration("commit_wait", commit_wait_started.elapsed());
                 anchor_state
             }
-            Ok(Err(reason)) => {
+            Ok(Err(error)) => {
                 record_v2_commit_put_phase_duration("commit_wait", commit_wait_started.elapsed());
-                return Err(RepositoryError::CommitFailed { reason });
+                return Err(error.into_repository_error());
             }
             Err(_) => {
                 record_v2_commit_put_phase_duration("commit_wait", commit_wait_started.elapsed());
@@ -300,8 +330,8 @@ where
         self.prepare_index_catalog_for_growth_locked().await?;
         let metadata = self
             .repository
-            .put_committed_streaming_known_len(
-                self.anchor.as_ref(),
+            .put_committed_streaming_known_len_coordinated(
+                V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref()),
                 key,
                 plaintext_len,
                 stream,
@@ -338,8 +368,8 @@ where
         self.prepare_index_catalog_for_growth_locked().await?;
         let metadata = self
             .repository
-            .put_committed_streaming_unknown_len(
-                self.anchor.as_ref(),
+            .put_committed_streaming_unknown_len_coordinated(
+                V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref()),
                 key,
                 stream,
                 options,
@@ -365,7 +395,10 @@ where
         self.publish_locked_batch().await?;
         self.prepare_index_catalog_for_growth_locked().await?;
         self.repository
-            .delete_committed(self.anchor.as_ref(), key)
+            .delete_committed_coordinated(
+                V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref()),
+                key,
+            )
             .await
     }
 
@@ -379,7 +412,11 @@ where
         self.publish_locked_batch().await?;
         self.prepare_index_catalog_for_growth_locked().await?;
         self.repository
-            .set_legal_hold_committed(self.anchor.as_ref(), key, status)
+            .set_legal_hold_committed_coordinated(
+                V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref()),
+                key,
+                status,
+            )
             .await
     }
 
@@ -396,9 +433,24 @@ where
                 .ok_or_else(|| commit_failed("v2 anchor is missing after index compaction"));
         }
         self.repository
-            .write_index_snapshot(self.anchor.as_ref())
+            .write_index_snapshot_coordinated(V2CoordinatedMutation::new(
+                &self.lease,
+                self.anchor.as_ref(),
+            ))
             .await
             .map(|stored| stored.anchor_state)
+    }
+
+    /// Flushes pending writes and reloads accepted state from the external anchor.
+    pub async fn reload_from_anchor(&self) -> Result<Option<V2ReplayChain>> {
+        let _stage = self.stage_lock.lock().await;
+        self.publish_locked_batch().await?;
+        self.repository
+            .load_chain_from_anchor_coordinated(V2CoordinatedMutation::new(
+                &self.lease,
+                self.anchor.as_ref(),
+            ))
+            .await
     }
 
     async fn publish_locked_batch(&self) -> Result<()> {
@@ -471,7 +523,10 @@ where
         if let Some(guard) = self.maintenance_guard.as_deref() {
             match self
                 .repository
-                .compact_packed_index_runs(self.anchor.as_ref(), guard)
+                .compact_packed_index_runs_coordinated(
+                    V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref()),
+                    guard,
+                )
                 .await
             {
                 Ok(_) => return Ok(true),
@@ -522,12 +577,17 @@ struct PendingPublish {
     rollback_log: Vec<V2StagedPutRollback>,
 }
 
-fn spawn_delayed_v2_publish<S, A>(
+struct DelayedPublishContext<S, A> {
     repository: Arc<V2Repository<S>>,
     anchor: Arc<A>,
     stage_lock: Arc<Mutex<()>>,
     batch: Arc<Mutex<PendingBatch>>,
     status: Arc<CoordinatorStatus>,
+    lease: Arc<V2CoordinatorLease>,
+}
+
+fn spawn_delayed_v2_publish<S, A>(
+    context: DelayedPublishContext<S, A>,
     generation: u64,
     delay: Duration,
 ) where
@@ -535,13 +595,14 @@ fn spawn_delayed_v2_publish<S, A>(
     A: V2CommitAnchor + 'static,
 {
     tokio::spawn(async move {
+        let _lease = context.lease;
         sleep(delay).await;
         publish_pending_v2_batch(
-            repository,
-            anchor,
-            stage_lock,
-            batch,
-            status,
+            context.repository,
+            context.anchor,
+            context.stage_lock,
+            context.batch,
+            context.status,
             Some(generation),
         )
         .await;
@@ -614,10 +675,18 @@ where
 {
     let waiter_count = waiters.len();
     let started = Instant::now();
-    let result = match repository.publish_pending_index_delta(anchor).await {
+    let published = repository.publish_pending_index_delta(anchor).await;
+    let accepted_recovery_required =
+        matches!(&published, Err(RepositoryError::AcceptedRecoveryRequired));
+    let result = match published {
         Ok(Some(stored)) => Ok(stored.anchor_state),
-        Ok(None) => Err("v2 commit batch had no pending index delta".to_owned()),
-        Err(error) => Err(error.to_string()),
+        Ok(None) => Err(CommitWaiterError::Failed(
+            "v2 commit batch had no pending index delta".to_owned(),
+        )),
+        Err(RepositoryError::AcceptedRecoveryRequired) => {
+            Err(CommitWaiterError::AcceptedRecoveryRequired)
+        }
+        Err(error) => Err(CommitWaiterError::Failed(error.to_string())),
     };
     let result_label = if result.is_ok() { "ok" } else { "error" };
     record_v2_commit_batch_publish(waiter_count, result_label, started.elapsed());
@@ -631,14 +700,24 @@ where
         "v2 commit coordinator publish completed",
     );
 
-    let mut failure = result.as_ref().err().cloned().map(|reason| {
+    let mut failure = result.as_ref().err().map(|error| {
+        let reason = error.reason();
         record_v2_commit_batch_publish_failure("publish");
         PublishFailure {
             reason,
             poison_reason: None,
         }
     });
-    if failure.is_some()
+    if accepted_recovery_required {
+        let reason = "v2 commit was accepted but local state recovery is required".to_owned();
+        record_v2_commit_batch_publish_failure("local_install");
+        failure = Some(PublishFailure {
+            reason: reason.clone(),
+            poison_reason: Some(reason),
+        });
+    }
+    if result.is_err()
+        && !accepted_recovery_required
         && let Err(error) = repository.rollback_staged_puts(rollback_log)
     {
         let poison_reason = match failure.as_ref() {

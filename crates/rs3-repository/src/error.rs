@@ -56,6 +56,9 @@ pub enum RepositoryError {
         /// Failure reason.
         reason: String,
     },
+    /// The external anchor accepted a mutation, but local state installation failed.
+    #[error("repository mutation was accepted but local recovery is required")]
+    AcceptedRecoveryRequired,
     /// A validated maintenance candidate would not reduce repository metadata.
     #[error("repository maintenance candidate is not reducing")]
     MaintenanceNotBeneficial,

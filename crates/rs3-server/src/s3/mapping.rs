@@ -504,6 +504,9 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
         }
         RepositoryError::Type(_) => s3s::s3_error!(InvalidRequest, "invalid repository path"),
         RepositoryError::CommitFailed { .. } => repository_operation_failed("CommitFailed"),
+        RepositoryError::AcceptedRecoveryRequired => {
+            repository_operation_failed("AcceptedRecoveryRequired")
+        }
         RepositoryError::MaintenanceNotBeneficial => {
             repository_operation_failed("MaintenanceNotBeneficial")
         }

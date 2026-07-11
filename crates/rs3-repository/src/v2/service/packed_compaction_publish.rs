@@ -4,15 +4,15 @@ use super::packed::{
     V2PackedIndexRunReplay, apply_packed_index_run, index_run_bounds, repository_context_from_refs,
 };
 use super::packed_compaction::{PackedCompactionSourceRun, plan_packed_run_compaction};
-use super::{V2Repository, v2_repository_error};
+use super::{V2CoordinatedMutation, V2Repository, v2_repository_error};
 use crate::error::{RepositoryError, Result};
 use crate::service::strongest_retention_policy;
 use crate::state::RepositoryState;
 use crate::v2::{
-    V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitAnchor, V2CommitSection, V2CommitWrite,
-    V2EmbeddedIndexRunLocation, V2FormatError, V2IndexRoot, V2IndexRootRunRef, V2MaintenanceGuard,
-    V2MemoryAnchor, V2SectionType, V2StoredCommit, digest_v2_section, open_v2_index_run,
-    probe_v2_index_run_header, seal_v2_index_root, seal_v2_index_run,
+    V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitAnchor, V2CommitParentRef, V2CommitSection,
+    V2CommitWrite, V2EmbeddedIndexRunLocation, V2FormatError, V2IndexRoot, V2IndexRootRunRef,
+    V2MaintenanceGuard, V2MemoryAnchor, V2SectionType, V2StoredCommit, digest_v2_section,
+    open_v2_index_run, probe_v2_index_run_header, seal_v2_index_root, seal_v2_index_run,
 };
 use rs3_index::run::{IndexRun, IndexRunContainer, IndexRunKeyringRef, IndexRunLimits};
 use rs3_storage::BlobStore;
@@ -27,7 +27,7 @@ where
     /// Replaces a bounded oldest window of foreground runs with fewer metadata-only runs.
     ///
     /// Candidate run commits and the candidate root are direct siblings of the
-    /// accepted base. A fresh reader verifies the complete candidate graph
+    /// accepted base. Exact read-back authenticates every new run and the root
     /// before one compare-and-swap advances the real anchor to the root.
     pub async fn compact_packed_index_runs<A, G>(
         &self,
@@ -38,7 +38,35 @@ where
         A: V2CommitAnchor,
         G: V2MaintenanceGuard + ?Sized,
     {
+        let _mutation_lease = self.claim_direct_mutation()?;
+        self.compact_packed_index_runs_inner(anchor, guard).await
+    }
+
+    pub(in crate::v2) async fn compact_packed_index_runs_coordinated<A, G>(
+        &self,
+        mutation: V2CoordinatedMutation<'_, A>,
+        guard: &G,
+    ) -> Result<V2StoredCommit>
+    where
+        A: V2CommitAnchor,
+        G: V2MaintenanceGuard + ?Sized,
+    {
+        self.validate_coordinator_lease(mutation.lease)?;
+        self.compact_packed_index_runs_inner(mutation.anchor, guard)
+            .await
+    }
+
+    async fn compact_packed_index_runs_inner<A, G>(
+        &self,
+        anchor: &A,
+        guard: &G,
+    ) -> Result<V2StoredCommit>
+    where
+        A: V2CommitAnchor,
+        G: V2MaintenanceGuard + ?Sized,
+    {
         let _mutation_guard = self.mutation_lock.lock().await;
+        let _publication_guard = self.publication_lock.write().await;
         if self.pending_index_delta_sequence()?.is_some() {
             return Err(RepositoryError::CommitFailed {
                 reason: "packed index compaction requires no pending mutations".to_owned(),
@@ -56,23 +84,25 @@ where
             .map_err(v2_repository_error)?;
 
         let (covered_generation, expected_live_object_count, protection) = {
-            let state = self
-                .accepted_state
+            let accepted = self
+                .accepted
                 .read()
                 .map_err(|_| RepositoryError::StatePoisoned)?;
+            let state = &accepted.repository;
             (
                 state.next_sequence,
                 u64::try_from(state.list_entries.len())
                     .map_err(|_| v2_repository_error(V2FormatError::IndexRootLimitExceeded))?,
-                represented_state_protection(&state),
+                represented_state_protection(state),
             )
         };
         let accepted_refs = self
-            .accepted_runs
+            .accepted
             .read()
             .map_err(|_| RepositoryError::StatePoisoned)?
+            .runs
             .clone();
-        let mut ordered_refs = accepted_refs;
+        let mut ordered_refs = accepted_refs.clone();
         ordered_refs.sort_by_key(|run| (run.minimum_generation, run.run_sequence, run.run_id));
         let mut source_refs = Vec::with_capacity(V2_PACKED_COMPACTION_MAX_SOURCE_RUNS);
         let mut retained_refs = Vec::new();
@@ -112,6 +142,12 @@ where
             &self.commit_store.options().repository_id,
             &self.commit_store.options().keyring_envelope_ref,
         )?;
+        let expected_parent = V2CommitParentRef {
+            sequence: base_anchor.sequence,
+            commit_key: base_anchor.commit_key.clone(),
+            body_digest: base_anchor.body_digest,
+            version_id: base_anchor.version_id.clone(),
+        };
 
         let mut compacted_refs = Vec::with_capacity(output_runs.len());
         for run in output_runs {
@@ -152,6 +188,46 @@ where
                 .map_err(v2_repository_error)?;
             let (run_id, frame_count, bounds, section_len, section_digest) =
                 sealed_facts.ok_or_else(|| v2_repository_error(V2FormatError::InvalidIndexRun))?;
+            let replay = self
+                .commit_store
+                .read_replay_commit_at(
+                    &uploaded.anchor_state.commit_key,
+                    uploaded.version_id.as_ref(),
+                )
+                .await
+                .map_err(v2_repository_error)?;
+            let [descriptor] = replay.parsed_header.header.section_index.as_slice() else {
+                return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+            };
+            let stored_run = replay
+                .retained_sections
+                .first()
+                .and_then(Option::as_deref)
+                .ok_or_else(|| v2_repository_error(V2FormatError::InvalidIndexRun))?;
+            if replay.version_id != uploaded.version_id
+                || replay.object_len != uploaded.object_len
+                || replay.parsed_header.header.self_ref.sequence != compaction_generation
+                || replay.parsed_header.header.parent.as_ref() != Some(&expected_parent)
+                || descriptor.section_type != V2SectionType::IndexRun
+                || descriptor.flags != V2_SECTION_FLAG_MUST_UNDERSTAND
+                || descriptor.offset != 0
+                || descriptor.length != section_len
+                || descriptor.digest != section_digest
+            {
+                return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+            }
+            let verified_run = open_v2_index_run(
+                keyring.as_ref(),
+                &context,
+                &uploaded.anchor_state.commit_key,
+                0,
+                stored_run,
+                &IndexRunLimits::default(),
+            )
+            .map_err(v2_repository_error)?;
+            if verified_run != run {
+                return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+            }
             compacted_refs.push(V2IndexRootRunRef {
                 run_id,
                 run_sequence: run.sequence,
@@ -167,7 +243,7 @@ where
                 keyring_envelope_ref: self.commit_store.options().keyring_envelope_ref.clone(),
                 location: V2EmbeddedIndexRunLocation {
                     commit_key: uploaded.anchor_state.commit_key.clone(),
-                    version_id: uploaded.version_id,
+                    version_id: uploaded.version_id.clone(),
                     commit_stored_len: uploaded.object_len,
                     commit_body_digest: uploaded.anchor_state.body_digest,
                     sections_start: uploaded.sections_start,
@@ -212,40 +288,32 @@ where
             .await
             .map_err(v2_repository_error)?;
 
-        let fresh = V2Repository::new(
-            self.commit_store.store().clone(),
-            keyring.as_ref().clone(),
-            self.repository.options,
-            self.commit_store.options().clone(),
-        );
         let candidate_anchor = root_anchor
             .read_v2()
             .await
             .map_err(v2_repository_error)?
             .ok_or_else(|| v2_repository_error(V2FormatError::MissingAnchor))?;
-        let candidate_chain = fresh
+        let candidate_chain = self
             .commit_store
             .load_replay_chain_from_state(&candidate_anchor)
             .await
             .map_err(v2_repository_error)?;
-        let (compacted_state, recovered_refs) = fresh
-            .replay_bounded_chain_to_state_and_runs(&candidate_chain)
-            .await?;
+        self.verify_exact_index_root(&candidate_chain, &root)?;
         if root_anchor.read_v2().await.map_err(v2_repository_error)? != Some(candidate_anchor) {
             return Err(v2_repository_error(V2FormatError::StaleAnchor));
         }
         candidate_refs.sort_by_key(|run| (run.minimum_generation, run.run_sequence, run.run_id));
-        let state_matches = {
-            let expected_state = self
-                .accepted_state
+        {
+            let accepted = self
+                .accepted
                 .read()
                 .map_err(|_| RepositoryError::StatePoisoned)?;
-            compaction_states_equivalent(&compacted_state, &expected_state)
-        };
-        if !state_matches || recovered_refs != candidate_refs {
-            return Err(v2_repository_error(V2FormatError::InvalidIndexRoot));
+            if accepted.repository.next_sequence != covered_generation
+                || accepted.runs != accepted_refs
+            {
+                return Err(v2_repository_error(V2FormatError::StaleAnchor));
+            }
         }
-
         guard
             .verify_v2_maintenance(Some(&base_anchor))
             .await
@@ -262,19 +330,22 @@ where
             )
             .await
             .map_err(v2_repository_error)?;
-        *self.repository.write_state()? = compacted_state.clone();
-        *self
-            .accepted_state
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = compacted_state;
-        *self
-            .accepted_runs
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = recovered_refs;
-        *self
-            .accepted_anchor
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = Some(adopted.anchor_state.clone());
+        match self.accepted.write() {
+            Ok(mut accepted) => {
+                accepted.runs = candidate_refs;
+                accepted.anchor = Some(adopted.anchor_state.clone());
+            }
+            Err(error) => {
+                self.mark_local_recovery_required();
+                tracing::error!(
+                    target: "rs3_repository",
+                    operation = "v2_install_packed_compaction",
+                    error = %error,
+                    "v2 compaction anchor advanced but local state installation failed; restart is required",
+                );
+                return Err(RepositoryError::AcceptedRecoveryRequired);
+            }
+        }
         Ok(adopted)
     }
 
@@ -361,23 +432,6 @@ where
     }
 }
 
-fn compaction_states_equivalent(left: &RepositoryState, right: &RepositoryState) -> bool {
-    if left.namespace != right.namespace
-        || left.list_entries != right.list_entries
-        || left.next_sequence != right.next_sequence
-        || !left.pending_index_deltas.is_empty()
-        || !right.pending_index_deltas.is_empty()
-    {
-        return false;
-    }
-    left.namespace
-        .live_entries_with_prefixes()
-        .into_iter()
-        .all(|(entry, _)| {
-            left.manifests.get(&entry.manifest_id) == right.manifests.get(&entry.manifest_id)
-        })
-}
-
 fn source_self_pack_container(
     run: &IndexRun,
     replay: &crate::v2::repository::V2ReplayCommit,
@@ -434,9 +488,8 @@ fn represented_state_protection(
 ) -> (Option<RetentionPolicy>, Option<LegalHoldStatus>) {
     state
         .namespace
-        .live_entries_with_prefixes()
-        .into_iter()
-        .fold((None, None), |(retention, legal_hold), (entry, _)| {
+        .live_entries()
+        .fold((None, None), |(retention, legal_hold), entry| {
             (
                 strongest_retention_policy(retention, entry.retention),
                 if entry.legal_hold == Some(LegalHoldStatus::On) {

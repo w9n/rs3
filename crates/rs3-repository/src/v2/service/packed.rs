@@ -1,7 +1,7 @@
 //! Compact payload-pack and framed index-run publication for bounded v02 batches.
 
-use super::{PendingV2Payload, V2Repository, commit_protection_for_deltas, v2_repository_error};
-use crate::error::Result;
+use super::{PendingV2Snapshot, V2Repository, commit_protection_for_deltas, v2_repository_error};
+use crate::error::{RepositoryError, Result};
 use crate::namespace::prefix_tokens_for_key;
 use crate::state::{RepositoryState, TrustedManifest, object_material};
 use rs3_index::run::{
@@ -69,11 +69,14 @@ where
     pub(super) fn pending_packed_sections_for_commit(
         &self,
         commit_key: &V2CommitKey,
-        pending_payloads: &[PendingV2Payload],
+        pending: &PendingV2Snapshot,
     ) -> Result<Option<PendingV2PackedCommitSections>> {
         let keyring = self.repository.keyring()?;
-        let state = self.repository.read_state()?;
-        let pending_deltas = &state.pending_index_deltas;
+        let accepted = self
+            .accepted
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let pending_deltas = pending.deltas();
         let (retention, legal_hold) = commit_protection_for_deltas(pending_deltas);
         let mut last_by_blind_key = BTreeMap::new();
         for (index, delta) in pending_deltas.iter().enumerate() {
@@ -104,13 +107,13 @@ where
 
         let mut record_ordinals = BTreeMap::new();
         let mut pack_inputs = Vec::new();
-        for pending in pending_payloads {
-            if !live_manifests.contains(&pending.manifest_id) {
+        for payload in pending.payloads() {
+            if !live_manifests.contains(&payload.manifest_id) {
                 continue;
             }
-            if pending.body.is_empty() {
+            if payload.body.is_empty() {
                 if record_ordinals
-                    .insert(pending.manifest_id.clone(), None)
+                    .insert(payload.manifest_id.clone(), None)
                     .is_some()
                 {
                     return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
@@ -120,13 +123,13 @@ where
             let ordinal = u32::try_from(pack_inputs.len())
                 .map_err(|_| v2_repository_error(V2FormatError::PayloadPackLimitExceeded))?;
             if record_ordinals
-                .insert(pending.manifest_id.clone(), Some(ordinal))
+                .insert(payload.manifest_id.clone(), Some(ordinal))
                 .is_some()
             {
                 return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
             }
             pack_inputs.push(V2PayloadPackRecordInput {
-                plaintext: pending.body.clone(),
+                plaintext: payload.body.clone(),
             });
         }
         let pack_section_ordinal = (!pack_inputs.is_empty()).then_some(0_u32);
@@ -207,9 +210,8 @@ where
                 .map_err(|_| v2_repository_error(V2FormatError::IndexRunLimitExceeded))?;
             match *delta {
                 IndexDelta::Upsert { entry, .. } => {
-                    let manifest = state
-                        .manifests
-                        .get(&entry.manifest_id)
+                    let manifest = pending
+                        .manifest(&accepted.repository, &entry.manifest_id)
                         .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
                     let payload = if entry.content_len == 0 {
                         IndexPayloadPointer::Empty
@@ -310,7 +312,7 @@ where
                 })),
             }
         }
-        drop(state);
+        drop(accepted);
 
         let mut sections = Vec::with_capacity(2);
         let mut locations = Vec::with_capacity(pack_inputs.len());
@@ -347,8 +349,8 @@ where
                 });
             }
         }
-        let run_sequence = self
-            .pending_index_delta_sequence()?
+        let run_sequence = pending
+            .commit_sequence()
             .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
         let bounds = index_run_bounds(&mutations)?;
         let mutation_count = u32::try_from(mutations.len())
@@ -408,32 +410,15 @@ where
         }))
     }
 
-    pub(super) fn resolve_accepted_pack_refs(
+    pub(super) fn resolve_pending_pack_refs(
         &self,
+        pending: &mut PendingV2Snapshot,
         stored: &V2StoredCommit,
         locations: &[PendingV2PackRecordLocation],
     ) -> Result<()> {
-        if locations.is_empty() {
-            return Ok(());
-        }
-        let mut state = self.repository.write_state()?;
-        let pending = state
-            .pending_index_deltas
-            .iter()
-            .filter_map(|delta| match delta {
-                IndexDelta::Upsert {
-                    entry,
-                    prefix_tokens,
-                    ..
-                } => Some((entry.blind_key.clone(), prefix_tokens.clone())),
-                IndexDelta::Tombstone { .. } => None,
-            })
-            .collect::<BTreeMap<_, _>>()
-            .into_iter()
-            .collect::<Vec<_>>();
         let mut resolved_count = 0_usize;
-        for (blind_key, prefix_tokens) in &pending {
-            let Some(mut entry) = state.namespace.head(blind_key).cloned() else {
+        for delta in pending.deltas_mut() {
+            let IndexDelta::Upsert { entry, .. } = delta else {
                 continue;
             };
             let Some(location) = locations
@@ -483,13 +468,14 @@ where
                 (None, None, None) if entry.content_len == 0 => None,
                 _ => return Err(v2_repository_error(V2FormatError::InvalidHeaderField)),
             };
-            state.replace_namespace_entry(entry, prefix_tokens.clone());
             resolved_count = resolved_count.saturating_add(1);
         }
-        let unresolved = pending.iter().any(|(blind_key, _)| {
-            state.namespace.head(blind_key).is_some_and(|entry| {
-                matches!(entry.payload_ref, Some(PayloadReference::V2Self { .. }))
-            })
+        let unresolved = pending.deltas().iter().any(|delta| {
+            matches!(
+                delta,
+                IndexDelta::Upsert { entry, .. }
+                    if matches!(entry.payload_ref, Some(PayloadReference::V2Self { .. }))
+            )
         });
         if resolved_count != locations.len() || unresolved {
             return Err(v2_repository_error(V2FormatError::InvalidHeaderField));

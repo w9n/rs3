@@ -3,7 +3,7 @@
 use crate::error::Result;
 use rs3_crypto::{KeyRing, NamespaceBlindKey};
 use rs3_index::{NamespaceEntry, NamespaceIndex};
-use rs3_types::{BlindIndexKey, KeyId, PrefixToken};
+use rs3_types::{KeyId, PrefixToken};
 
 /// Returns the first matching namespace entry for ordered blind-key candidates.
 pub(crate) fn first_namespace_entry<'a>(
@@ -13,18 +13,6 @@ pub(crate) fn first_namespace_entry<'a>(
     lookup_blind_keys
         .iter()
         .find_map(|candidate| namespace.head(&candidate.blind_key))
-}
-
-/// Returns every existing blind key among lookup candidates.
-pub(crate) fn existing_blind_keys(
-    namespace: &NamespaceIndex,
-    lookup_blind_keys: &[NamespaceBlindKey],
-) -> Vec<BlindIndexKey> {
-    lookup_blind_keys
-        .iter()
-        .filter(|candidate| namespace.head(&candidate.blind_key).is_some())
-        .map(|candidate| candidate.blind_key.clone())
-        .collect()
 }
 
 /// Derives the prefix tokens needed to index delimiter-aligned list prefixes.

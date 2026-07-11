@@ -22,7 +22,7 @@ use crate::model::{
     DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry, RepositoryObjectMetadata,
     RepositoryPutOptions,
 };
-use crate::namespace::{existing_blind_keys, first_namespace_entry, prefix_tokens_for_key};
+use crate::namespace::{first_namespace_entry, prefix_tokens_for_key};
 use crate::payload::{
     PayloadHeaderProbe, SegmentedPayloadFormat, SegmentedPayloadHeader, SegmentedPayloadSealer,
     adaptive_payload_segment_size, open_payload_object, parse_segmented_payload_header,
@@ -30,10 +30,7 @@ use crate::payload::{
     seal_streamable_payload_object, segmented_ciphertext_span, total_segmented_payload_len,
 };
 use crate::service::{Repository, RepositoryOptions, strongest_retention_policy};
-use crate::state::{
-    RepositoryState, RepositoryStateRollback, TrustedManifest, apply_index_delta_object,
-    next_sequence, object_material,
-};
+use crate::state::{RepositoryState, TrustedManifest, apply_index_delta_object, object_material};
 use bytes::Bytes;
 use futures_util::Stream;
 use rs3_crypto::KeyRing;
@@ -44,20 +41,23 @@ use rs3_index::{
 use rs3_storage::{BlobStore, ByteRange, StorageError};
 use rs3_types::{
     BackendObjectId, BackendObjectRef, BackendVersionId, LegalHoldStatus, LogicalPath, ManifestId,
-    RetentionPolicy, Sequence,
+    PrefixToken, RetentionPolicy, Sequence,
 };
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex as StdMutex, RwLock as StdRwLock};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock as TokioRwLock};
 
 mod compaction;
 pub(super) mod packed;
 mod packed_compaction;
 mod packed_compaction_publish;
+mod staging;
+
+use staging::{PendingV2Checkpoint, PendingV2Snapshot, PendingV2State};
 
 const V2_PAYLOAD_FILL_LOCK_STRIPES: usize = 64;
 const V2_MAX_PAYLOAD_HEADER_SIZE: u64 = 4 * 1024;
@@ -72,19 +72,80 @@ pub struct V2Repository<S> {
     repository: Repository<S>,
     commit_store: V2CommitStore<S>,
     commit_upload_mode: V2UploadMode,
-    accepted_state: StdRwLock<RepositoryState>,
-    accepted_runs: StdRwLock<Vec<V2IndexRootRunRef>>,
-    accepted_anchor: StdRwLock<Option<super::repository::V2AnchorState>>,
+    accepted: StdRwLock<V2AcceptedState>,
     mutation_lock: Mutex<()>,
+    publication_lock: TokioRwLock<()>,
     payload_segment_fill_locks: Vec<Mutex<()>>,
-    pending_payloads: StdMutex<Vec<PendingV2Payload>>,
+    pending: StdMutex<PendingV2State>,
+    mutation_owner: Arc<AtomicU8>,
+    recovery_required: AtomicBool,
     payload_sections: StdRwLock<V2PayloadSectionCache>,
     commit_headers: StdRwLock<V2CommitHeaderCache>,
     payload_headers: StdRwLock<V2PayloadHeaderCache>,
     #[cfg(test)]
     fail_next_restore: AtomicBool,
     #[cfg(test)]
-    full_state_clone_count: AtomicUsize,
+    fail_next_local_install: AtomicBool,
+}
+
+const V2_MUTATION_OWNER_IDLE: u8 = 0;
+const V2_MUTATION_OWNER_COORDINATOR: u8 = 1;
+const V2_MUTATION_OWNER_DIRECT: u8 = 2;
+
+pub(super) struct V2CoordinatorLease {
+    owner: Arc<AtomicU8>,
+}
+
+pub(super) struct V2CoordinatedMutation<'a, A> {
+    lease: &'a V2CoordinatorLease,
+    anchor: &'a A,
+}
+
+impl<'a, A> V2CoordinatedMutation<'a, A> {
+    pub(super) fn new(lease: &'a V2CoordinatorLease, anchor: &'a A) -> Self {
+        Self { lease, anchor }
+    }
+}
+
+struct V2DirectMutationLease {
+    owner: Arc<AtomicU8>,
+}
+
+impl Drop for V2CoordinatorLease {
+    fn drop(&mut self) {
+        self.owner.store(V2_MUTATION_OWNER_IDLE, Ordering::Release);
+    }
+}
+
+impl Drop for V2DirectMutationLease {
+    fn drop(&mut self) {
+        self.owner.store(V2_MUTATION_OWNER_IDLE, Ordering::Release);
+    }
+}
+
+#[derive(Default)]
+struct V2AcceptedState {
+    repository: RepositoryState,
+    runs: Vec<V2IndexRootRunRef>,
+    anchor: Option<super::repository::V2AnchorState>,
+}
+
+struct PendingV2Install {
+    sequence: Sequence,
+    mutations: Vec<PendingV2InstallMutation>,
+    run: Option<V2IndexRootRunRef>,
+}
+
+enum PendingV2InstallMutation {
+    Upsert {
+        entry: Box<NamespaceEntry>,
+        prefix_tokens: Vec<PrefixToken>,
+        manifest: TrustedManifest,
+    },
+    Tombstone {
+        blind_key: rs3_types::BlindIndexKey,
+        generation: Sequence,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -95,8 +156,7 @@ struct PendingV2Payload {
 
 #[derive(Debug)]
 pub(crate) struct V2StagedPutRollback {
-    state: RepositoryStateRollback,
-    pending_payloads_len: usize,
+    checkpoint: PendingV2Checkpoint,
 }
 
 #[derive(Clone, Debug)]
@@ -163,14 +223,15 @@ where
             ),
             commit_store: V2CommitStore::new(store, keyring, commit_options),
             commit_upload_mode,
-            accepted_state: StdRwLock::new(RepositoryState::default()),
-            accepted_runs: StdRwLock::new(Vec::new()),
-            accepted_anchor: StdRwLock::new(None),
+            accepted: StdRwLock::new(V2AcceptedState::default()),
             mutation_lock: Mutex::new(()),
+            publication_lock: TokioRwLock::new(()),
             payload_segment_fill_locks: (0..V2_PAYLOAD_FILL_LOCK_STRIPES)
                 .map(|_| Mutex::new(()))
                 .collect(),
-            pending_payloads: StdMutex::new(Vec::new()),
+            pending: StdMutex::new(PendingV2State::new(Sequence::ZERO)),
+            mutation_owner: Arc::new(AtomicU8::new(V2_MUTATION_OWNER_IDLE)),
+            recovery_required: AtomicBool::new(false),
             payload_sections: StdRwLock::new(V2PayloadSectionCache::with_max_bytes(
                 payload_section_cache_max_bytes,
             )),
@@ -179,7 +240,7 @@ where
             #[cfg(test)]
             fail_next_restore: AtomicBool::new(false),
             #[cfg(test)]
-            full_state_clone_count: AtomicUsize::new(0),
+            fail_next_local_install: AtomicBool::new(false),
         }
     }
 
@@ -193,20 +254,50 @@ where
     where
         A: V2CommitAnchor,
     {
+        let _mutation_lease = self.claim_direct_mutation()?;
+        let _publication_guard = self.publication_lock.write().await;
         let stored = self
             .commit_store
             .write_genesis_snapshot(anchor)
             .await
             .map_err(v2_repository_error)?;
-        *self
-            .accepted_anchor
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = Some(stored.anchor_state.clone());
+        match self.accepted.write() {
+            Ok(mut accepted) => accepted.anchor = Some(stored.anchor_state.clone()),
+            Err(error) => {
+                self.mark_local_recovery_required();
+                tracing::error!(
+                    target: "rs3_repository",
+                    operation = "v2_install_genesis",
+                    error = %error,
+                    "v2 genesis anchor advanced but local state installation failed; restart is required",
+                );
+                return Err(RepositoryError::AcceptedRecoveryRequired);
+            }
+        }
         Ok(stored)
     }
 
     /// Writes a signed catalog checkpoint from the current trusted state.
     pub async fn write_index_snapshot<A>(&self, anchor: &A) -> Result<V2StoredCommit>
+    where
+        A: V2CommitAnchor,
+    {
+        let _mutation_lease = self.claim_direct_mutation()?;
+        self.write_index_snapshot_inner(anchor).await
+    }
+
+    pub(super) async fn write_index_snapshot_coordinated<A>(
+        &self,
+        mutation: V2CoordinatedMutation<'_, A>,
+    ) -> Result<V2StoredCommit>
+    where
+        A: V2CommitAnchor,
+    {
+        self.validate_coordinator_lease(mutation.lease)?;
+        self.write_index_snapshot_inner(mutation.anchor).await
+    }
+
+    async fn write_index_snapshot_inner<A>(&self, anchor: &A) -> Result<V2StoredCommit>
     where
         A: V2CommitAnchor,
     {
@@ -218,28 +309,30 @@ where
             .map_err(v2_repository_error)?
             .ok_or_else(|| v2_repository_error(V2FormatError::MissingAnchor))?;
         if self
-            .accepted_anchor
+            .accepted
             .read()
             .map_err(|_| RepositoryError::StatePoisoned)?
+            .anchor
             .as_ref()
             != Some(&base_anchor)
         {
             return Err(v2_repository_error(V2FormatError::StaleAnchor));
         }
-        let expected_state = self
-            .accepted_state
-            .read()
-            .map_err(|_| RepositoryError::StatePoisoned)?
-            .clone();
-        let expected_runs = self
-            .accepted_runs
-            .read()
-            .map_err(|_| RepositoryError::StatePoisoned)?
-            .clone();
+        let (covered_generation, expected_live_object_count, expected_runs) = {
+            let accepted = self
+                .accepted
+                .read()
+                .map_err(|_| RepositoryError::StatePoisoned)?;
+            (
+                accepted.repository.next_sequence,
+                u64::try_from(accepted.repository.list_entries.len())
+                    .map_err(|_| v2_repository_error(V2FormatError::IndexRootLimitExceeded))?,
+                accepted.runs.clone(),
+            )
+        };
         let root = V2IndexRoot::new(
-            expected_state.next_sequence,
-            u64::try_from(expected_state.list_entries.len())
-                .map_err(|_| v2_repository_error(V2FormatError::IndexRootLimitExceeded))?,
+            covered_generation,
+            expected_live_object_count,
             self.commit_store.options().format_ref.clone(),
             self.commit_store.options().keyring_envelope_ref.clone(),
             expected_runs.clone(),
@@ -270,26 +363,17 @@ where
             .await
             .map_err(v2_repository_error)?;
 
-        let fresh = V2Repository::new(
-            self.commit_store.store().clone(),
-            keyring.as_ref().clone(),
-            self.repository.options,
-            self.commit_store.options().clone(),
-        );
-        fresh.load_chain_from_anchor(&temporary_anchor).await?;
-        if *fresh
-            .accepted_state
-            .read()
-            .map_err(|_| RepositoryError::StatePoisoned)?
-            != expected_state
-            || *fresh
-                .accepted_runs
-                .read()
-                .map_err(|_| RepositoryError::StatePoisoned)?
-                != expected_runs
-        {
-            return Err(v2_repository_error(V2FormatError::InvalidIndexRoot));
-        }
+        let candidate_anchor = temporary_anchor
+            .read_v2()
+            .await
+            .map_err(v2_repository_error)?
+            .ok_or_else(|| v2_repository_error(V2FormatError::MissingAnchor))?;
+        let candidate_chain = self
+            .commit_store
+            .load_replay_chain_from_state(&candidate_anchor)
+            .await
+            .map_err(v2_repository_error)?;
+        self.verify_exact_index_root(&candidate_chain, &root)?;
         if anchor.read_v2().await.map_err(v2_repository_error)? != Some(base_anchor) {
             return Err(v2_repository_error(V2FormatError::StaleAnchor));
         }
@@ -302,11 +386,54 @@ where
             )
             .await
             .map_err(v2_repository_error)?;
-        *self
-            .accepted_anchor
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = Some(adopted.anchor_state.clone());
+        match self.accepted.write() {
+            Ok(mut accepted) => accepted.anchor = Some(adopted.anchor_state.clone()),
+            Err(error) => {
+                self.mark_local_recovery_required();
+                tracing::error!(
+                    target: "rs3_repository",
+                    operation = "v2_install_index_snapshot",
+                    error = %error,
+                    "v2 index-root anchor advanced but local state installation failed; restart is required",
+                );
+                return Err(RepositoryError::AcceptedRecoveryRequired);
+            }
+        }
         Ok(adopted)
+    }
+
+    fn verify_exact_index_root(&self, chain: &V2ReplayChain, expected: &V2IndexRoot) -> Result<()> {
+        let [commit] = chain.commits_newest_first.as_slice() else {
+            return Err(v2_repository_error(V2FormatError::InvalidIndexRoot));
+        };
+        let mut roots = commit
+            .parsed_header
+            .header
+            .section_index
+            .iter()
+            .enumerate()
+            .filter(|(_, section)| section.section_type == V2SectionType::IndexRoot);
+        let Some((index, _)) = roots.next() else {
+            return Err(v2_repository_error(V2FormatError::InvalidIndexRoot));
+        };
+        if roots.next().is_some() {
+            return Err(v2_repository_error(V2FormatError::InvalidIndexRoot));
+        }
+        let stored_root = replay_section_bytes(commit, index)?;
+        let actual = self
+            .commit_store
+            .open_index_root_without_replay(
+                commit,
+                u32::try_from(index)
+                    .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+                stored_root,
+                self.commit_store.options().replay_limits,
+            )
+            .map_err(v2_repository_error)?;
+        if actual != *expected {
+            return Err(v2_repository_error(V2FormatError::InvalidIndexRoot));
+        }
+        Ok(())
     }
 
     /// Loads and replays the commit chain selected by the v2 anchor.
@@ -314,7 +441,27 @@ where
     where
         A: V2CommitAnchor,
     {
+        let _mutation_lease = self.claim_direct_mutation()?;
+        self.load_chain_from_anchor_inner(anchor).await
+    }
+
+    pub(super) async fn load_chain_from_anchor_coordinated<A>(
+        &self,
+        mutation: V2CoordinatedMutation<'_, A>,
+    ) -> Result<Option<V2ReplayChain>>
+    where
+        A: V2CommitAnchor,
+    {
+        self.validate_coordinator_lease(mutation.lease)?;
+        self.load_chain_from_anchor_inner(mutation.anchor).await
+    }
+
+    async fn load_chain_from_anchor_inner<A>(&self, anchor: &A) -> Result<Option<V2ReplayChain>>
+    where
+        A: V2CommitAnchor,
+    {
         let _guard = self.mutation_lock.lock().await;
+        let _publication_guard = self.publication_lock.write().await;
         let Some(anchor_state) = anchor.read_v2().await.map_err(v2_repository_error)? else {
             return Ok(None);
         };
@@ -327,21 +474,19 @@ where
         if anchor.read_v2().await.map_err(v2_repository_error)? != Some(anchor_state.clone()) {
             return Err(v2_repository_error(V2FormatError::StaleAnchor));
         }
-        let accepted = rebuilt.clone();
-        let mut state = self.repository.write_state()?;
-        *state = rebuilt;
+        let recovered_sequence = rebuilt.next_sequence;
         *self
-            .accepted_state
+            .accepted
             .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = accepted;
-        *self
-            .accepted_runs
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = accepted_runs;
-        *self
-            .accepted_anchor
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = Some(anchor_state);
+            .map_err(|_| RepositoryError::StatePoisoned)? = V2AcceptedState {
+            repository: rebuilt,
+            runs: accepted_runs,
+            anchor: Some(anchor_state),
+        };
+        self.pending
+            .lock()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .reset_to_accepted_sequence(recovered_sequence)?;
         Ok(Some(chain))
     }
 
@@ -377,22 +522,24 @@ where
 
     /// Loads and replays a supplied v2 commit chain.
     pub fn replay_chain(&self, chain: &V2CommitChain) -> Result<()> {
+        let _publication_guard = self
+            .publication_lock
+            .try_write()
+            .map_err(|_| RepositoryError::CommitBackpressure)?;
         let rebuilt = self.replay_chain_to_state(chain)?;
-        let accepted = rebuilt.clone();
-        let mut state = self.repository.write_state()?;
-        *state = rebuilt;
+        let recovered_sequence = rebuilt.next_sequence;
         *self
-            .accepted_state
+            .accepted
             .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = accepted;
-        self.accepted_runs
-            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? = V2AcceptedState {
+            repository: rebuilt,
+            runs: Vec::new(),
+            anchor: None,
+        };
+        self.pending
+            .lock()
             .map_err(|_| RepositoryError::StatePoisoned)?
-            .clear();
-        *self
-            .accepted_anchor
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = None;
+            .reset_to_accepted_sequence(recovered_sequence)?;
         Ok(())
     }
 
@@ -422,10 +569,12 @@ where
     where
         A: V2CommitAnchor,
     {
+        let _mutation_lease = self.claim_direct_mutation()?;
         let _guard = self.mutation_lock.lock().await;
+        let _publication_guard = self.publication_lock.write().await;
         self.ensure_accepted_anchor_matches(anchor).await?;
-        let (metadata, rollback) = self.stage_put(key, body, options).await?;
-        if let Err(error) = self.publish_pending_index_delta(anchor).await {
+        let (metadata, rollback) = self.stage_put_unlocked(key, body, options)?;
+        if let Err(error) = self.publish_pending_index_delta_locked(anchor).await {
             self.rollback_staged_puts(vec![rollback])?;
             return Err(error);
         }
@@ -446,10 +595,61 @@ where
         A: V2CommitAnchor,
         St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
+        let _mutation_lease = self.claim_direct_mutation()?;
+        self.put_committed_streaming_known_len_inner(
+            anchor,
+            key,
+            plaintext_len,
+            stream,
+            options,
+            multipart_part_size,
+        )
+        .await
+    }
+
+    pub(super) async fn put_committed_streaming_known_len_coordinated<A, St>(
+        &self,
+        mutation: V2CoordinatedMutation<'_, A>,
+        key: LogicalPath,
+        plaintext_len: u64,
+        stream: St,
+        options: RepositoryPutOptions,
+        multipart_part_size: usize,
+    ) -> Result<RepositoryObjectMetadata>
+    where
+        A: V2CommitAnchor,
+        St: Stream<Item = Result<Bytes>> + Unpin + Send,
+    {
+        self.validate_coordinator_lease(mutation.lease)?;
+        self.put_committed_streaming_known_len_inner(
+            mutation.anchor,
+            key,
+            plaintext_len,
+            stream,
+            options,
+            multipart_part_size,
+        )
+        .await
+    }
+
+    async fn put_committed_streaming_known_len_inner<A, St>(
+        &self,
+        anchor: &A,
+        key: LogicalPath,
+        plaintext_len: u64,
+        stream: St,
+        options: RepositoryPutOptions,
+        multipart_part_size: usize,
+    ) -> Result<RepositoryObjectMetadata>
+    where
+        A: V2CommitAnchor,
+        St: Stream<Item = Result<Bytes>> + Unpin + Send,
+    {
         let _guard = self.mutation_lock.lock().await;
+        let _publication_guard = self.publication_lock.write().await;
         let base_anchor = self.ensure_accepted_anchor_matches(anchor).await?;
         let (staged, rollback) =
-            self.stage_put_metadata_sync_with_rollback(key, plaintext_len, options)?;
+            self.stage_put_metadata_sync_with_rollback(key, plaintext_len, options, None)?;
         let keyring = self.repository.keyring()?;
         let staged_content_len = staged.content_len;
         let staged_manifest_id = staged.manifest_id.clone();
@@ -495,10 +695,14 @@ where
                         {
                             return Err(V2FormatError::SectionBounds);
                         }
+                        let pending = self
+                            .pending_snapshot()
+                            .map_err(|_| V2FormatError::InvalidHeaderField)?;
                         let delta = self
                             .pending_index_delta_for_commit(
                                 &commit_key,
                                 std::slice::from_ref(&expected_location),
+                                &pending,
                             )
                             .map_err(|_| V2FormatError::InvalidHeaderField)?;
                         let sealed_delta = seal_index_delta_object(&finalizer_keyring, &delta)
@@ -528,36 +732,51 @@ where
             })
             .await
             .map_err(v2_repository_error);
-        let stored = match stored {
-            Ok(uploaded) => {
-                let adopted = self
-                    .commit_store
-                    .adopt_verified_unanchored_child(anchor, &base_anchor, &uploaded.stored)
-                    .await
-                    .map_err(v2_repository_error);
-                match adopted {
-                    Ok(stored) => super::repository::V2StoredStreamingCommit {
-                        stored,
-                        output: uploaded.output,
-                    },
-                    Err(error) => {
-                        self.rollback_state_mutations(vec![rollback])?;
-                        return Err(error);
-                    }
-                }
-            }
+        let uploaded = match stored {
+            Ok(uploaded) => uploaded,
             Err(error) => {
                 self.rollback_state_mutations(vec![rollback])?;
                 return Err(error);
             }
         };
-        self.resolve_accepted_payload_refs(&stored.stored.anchor_state, &[stored.output])?;
-        self.accept_pending_state(staged.sequence)?;
-        *self
-            .accepted_anchor
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? =
-            Some(stored.stored.anchor_state.clone());
+        let mut pending = self.pending_snapshot()?;
+        let install = match self.resolve_pending_payload_refs(
+            &mut pending,
+            &uploaded.stored.anchor_state,
+            std::slice::from_ref(&uploaded.output),
+        ) {
+            Ok(()) => self.prepare_pending_install(&pending, staged.sequence, None),
+            Err(error) => Err(error),
+        };
+        let install = match install {
+            Ok(install) => install,
+            Err(error) => {
+                self.rollback_state_mutations(vec![rollback])?;
+                return Err(error);
+            }
+        };
+        let adopted = match self
+            .commit_store
+            .adopt_verified_unanchored_child(anchor, &base_anchor, &uploaded.stored)
+            .await
+            .map_err(v2_repository_error)
+        {
+            Ok(stored) => stored,
+            Err(error) => {
+                self.rollback_state_mutations(vec![rollback])?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.install_pending_commit(install, adopted.anchor_state) {
+            self.mark_local_recovery_required();
+            tracing::error!(
+                target: "rs3_repository",
+                operation = "v2_install_streaming_commit",
+                error = %error,
+                "v2 streaming anchor advanced but local state installation failed; restart is required",
+            );
+            return Err(RepositoryError::AcceptedRecoveryRequired);
+        }
         Ok(staged.metadata)
     }
 
@@ -575,7 +794,58 @@ where
         A: V2CommitAnchor,
         St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
+        let _mutation_lease = self.claim_direct_mutation()?;
+        self.put_committed_streaming_unknown_len_inner(
+            anchor,
+            key,
+            stream,
+            options,
+            multipart_part_size,
+            max_plaintext_len,
+        )
+        .await
+    }
+
+    pub(super) async fn put_committed_streaming_unknown_len_coordinated<A, St>(
+        &self,
+        mutation: V2CoordinatedMutation<'_, A>,
+        key: LogicalPath,
+        stream: St,
+        options: RepositoryPutOptions,
+        multipart_part_size: usize,
+        max_plaintext_len: u64,
+    ) -> Result<RepositoryObjectMetadata>
+    where
+        A: V2CommitAnchor,
+        St: Stream<Item = Result<Bytes>> + Unpin + Send,
+    {
+        self.validate_coordinator_lease(mutation.lease)?;
+        self.put_committed_streaming_unknown_len_inner(
+            mutation.anchor,
+            key,
+            stream,
+            options,
+            multipart_part_size,
+            max_plaintext_len,
+        )
+        .await
+    }
+
+    async fn put_committed_streaming_unknown_len_inner<A, St>(
+        &self,
+        anchor: &A,
+        key: LogicalPath,
+        stream: St,
+        options: RepositoryPutOptions,
+        multipart_part_size: usize,
+        max_plaintext_len: u64,
+    ) -> Result<RepositoryObjectMetadata>
+    where
+        A: V2CommitAnchor,
+        St: Stream<Item = Result<Bytes>> + Unpin + Send,
+    {
         let _guard = self.mutation_lock.lock().await;
+        let _publication_guard = self.publication_lock.write().await;
         let base_anchor = self.ensure_accepted_anchor_matches(anchor).await?;
         self.ensure_put_create_allowed(&key, &options)?;
         let keyring = self.repository.keyring()?;
@@ -607,6 +877,7 @@ where
                                 key,
                                 input.plaintext_len,
                                 options,
+                                None,
                             )
                             .map_err(|error| match error {
                                 RepositoryError::ObjectTooLarge => V2FormatError::ObjectTooLarge,
@@ -630,10 +901,14 @@ where
                             offset: 0,
                             length: input.payload_len,
                         };
+                        let pending = self
+                            .pending_snapshot()
+                            .map_err(|_| V2FormatError::InvalidHeaderField)?;
                         let delta = self
                             .pending_index_delta_for_commit(
                                 &commit_key,
                                 std::slice::from_ref(&location),
+                                &pending,
                             )
                             .map_err(|_| V2FormatError::InvalidHeaderField)?;
                         let sealed_delta = seal_index_delta_object(&finalizer_keyring, &delta)
@@ -663,30 +938,8 @@ where
             })
             .await
             .map_err(v2_repository_error);
-        let stored = match stored {
-            Ok(uploaded) => {
-                let adopted = self
-                    .commit_store
-                    .adopt_verified_unanchored_child(anchor, &base_anchor, &uploaded.stored)
-                    .await
-                    .map_err(v2_repository_error);
-                match adopted {
-                    Ok(stored) => super::repository::V2StoredStreamingCommit {
-                        stored,
-                        output: uploaded.output,
-                    },
-                    Err(error) => {
-                        if let Some(rollback) = staged_rollback
-                            .lock()
-                            .map_err(|_| RepositoryError::StatePoisoned)?
-                            .take()
-                        {
-                            self.rollback_state_mutations(vec![rollback])?;
-                        }
-                        return Err(error);
-                    }
-                }
-            }
+        let uploaded = match stored {
+            Ok(uploaded) => uploaded,
             Err(error) => {
                 if let Some(rollback) = staged_rollback
                     .lock()
@@ -698,17 +951,58 @@ where
                 return Err(error);
             }
         };
-        self.resolve_accepted_payload_refs(
-            &stored.stored.anchor_state,
-            std::slice::from_ref(&stored.output.location),
-        )?;
-        self.accept_pending_state(stored.output.staged.sequence)?;
-        *self
-            .accepted_anchor
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? =
-            Some(stored.stored.anchor_state.clone());
-        Ok(stored.output.staged.metadata)
+        let sequence = uploaded.output.staged.sequence;
+        let mut pending = self.pending_snapshot()?;
+        let install = match self.resolve_pending_payload_refs(
+            &mut pending,
+            &uploaded.stored.anchor_state,
+            std::slice::from_ref(&uploaded.output.location),
+        ) {
+            Ok(()) => self.prepare_pending_install(&pending, sequence, None),
+            Err(error) => Err(error),
+        };
+        let install = match install {
+            Ok(install) => install,
+            Err(error) => {
+                if let Some(rollback) = staged_rollback
+                    .lock()
+                    .map_err(|_| RepositoryError::StatePoisoned)?
+                    .take()
+                {
+                    self.rollback_state_mutations(vec![rollback])?;
+                }
+                return Err(error);
+            }
+        };
+        let adopted = match self
+            .commit_store
+            .adopt_verified_unanchored_child(anchor, &base_anchor, &uploaded.stored)
+            .await
+            .map_err(v2_repository_error)
+        {
+            Ok(stored) => stored,
+            Err(error) => {
+                if let Some(rollback) = staged_rollback
+                    .lock()
+                    .map_err(|_| RepositoryError::StatePoisoned)?
+                    .take()
+                {
+                    self.rollback_state_mutations(vec![rollback])?;
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.install_pending_commit(install, adopted.anchor_state) {
+            self.mark_local_recovery_required();
+            tracing::error!(
+                target: "rs3_repository",
+                operation = "v2_install_streaming_commit",
+                error = %error,
+                "v2 streaming anchor advanced but local state installation failed; restart is required",
+            );
+            return Err(RepositoryError::AcceptedRecoveryRequired);
+        }
+        Ok(uploaded.output.staged.metadata)
     }
 
     /// Stages an object write without publishing the covering v2 commit.
@@ -721,31 +1015,24 @@ where
         body: Bytes,
         options: RepositoryPutOptions,
     ) -> Result<(RepositoryObjectMetadata, V2StagedPutRollback)> {
+        let _publication_guard = self.publication_lock.read().await;
+        self.stage_put_unlocked(key, body, options)
+    }
+
+    fn stage_put_unlocked(
+        &self,
+        key: LogicalPath,
+        body: Bytes,
+        options: RepositoryPutOptions,
+    ) -> Result<(RepositoryObjectMetadata, V2StagedPutRollback)> {
         let plaintext_len =
             u64::try_from(body.len()).map_err(|_| RepositoryError::CommitFailed {
                 reason: "payload length does not fit in u64".to_owned(),
             })?;
-        // Acquire the payload lock before mutating namespace state so a
-        // poisoned lock cannot leave a half-staged write behind.
-        let mut pending_payloads = self
-            .pending_payloads
-            .lock()
-            .map_err(|_| RepositoryError::StatePoisoned)?;
-        let pending_payloads_len = pending_payloads.len();
-        let (staged, state) =
-            self.stage_put_metadata_sync_with_rollback(key, plaintext_len, options)?;
-        pending_payloads.push(PendingV2Payload {
-            manifest_id: staged.manifest_id,
-            body,
-        });
+        let (staged, checkpoint) =
+            self.stage_put_metadata_sync_with_rollback(key, plaintext_len, options, Some(body))?;
 
-        Ok((
-            staged.metadata,
-            V2StagedPutRollback {
-                state,
-                pending_payloads_len,
-            },
-        ))
+        Ok((staged.metadata, V2StagedPutRollback { checkpoint }))
     }
 
     fn stage_put_metadata_sync_with_rollback(
@@ -753,7 +1040,8 @@ where
         key: LogicalPath,
         plaintext_len: u64,
         options: RepositoryPutOptions,
-    ) -> Result<(StagedV2Put, RepositoryStateRollback)> {
+        pending_body: Option<Bytes>,
+    ) -> Result<(StagedV2Put, PendingV2Checkpoint)> {
         let retention = strongest_retention_policy(
             self.repository.options.default_retention,
             options.retention,
@@ -764,37 +1052,38 @@ where
         let prefix_tokens =
             prefix_tokens_for_key(&keyring, &primary_blind_key.key_id, key.as_str())?;
 
-        let (sequence, manifest_id, stale_tombstones) = {
-            let mut state = self.repository.write_state()?;
-            let existing_blind_keys = existing_blind_keys(&state.namespace, &lookup_blind_keys);
-            if options.create_only && !existing_blind_keys.is_empty() {
-                return Err(RepositoryError::AlreadyExists(key));
-            }
+        let accepted = self
+            .accepted
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let existing = lookup_blind_keys
+            .iter()
+            .filter_map(|candidate| {
+                pending
+                    .effective_head(&accepted.repository, &candidate.blind_key)
+                    .live()
+                    .map(|entry| (candidate.blind_key.clone(), entry.namespace_key_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        if options.create_only && !existing.is_empty() {
+            return Err(RepositoryError::AlreadyExists(key));
+        }
 
-            let sequence = next_sequence(&mut state)?;
-            let material = object_material(key.as_str(), sequence);
-            let manifest_id = keyring.derive_manifest_id(&material)?;
-            let stale_tombstones = existing_blind_keys
-                .into_iter()
-                .filter(|blind_key| blind_key != &primary_blind_key.blind_key)
-                .map(|blind_key| {
-                    state
-                        .namespace
-                        .head(&blind_key)
-                        .map(|entry| (blind_key, entry.namespace_key_id.clone()))
-                })
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| RepositoryError::CommitFailed {
-                    reason: "namespace entry disappeared while staging overwrite".to_owned(),
-                })?;
-
-            (sequence, manifest_id, stale_tombstones)
-        };
+        let sequence = pending.allocate_sequence()?;
+        let material = object_material(key.as_str(), sequence);
+        let manifest_id = keyring.derive_manifest_id(&material)?;
+        let stale_tombstones = existing
+            .into_iter()
+            .filter(|(blind_key, _)| blind_key != &primary_blind_key.blind_key)
+            .collect::<Vec<_>>();
 
         let pending_object_id = BackendObjectId::new(format!("v2-pending/{}", sequence.get()))?;
         let entry_payload_id = pending_object_id.clone();
         let modified_at_ms = current_time_ms();
-        let primary_blind_key_value = primary_blind_key.blind_key.clone();
         let entry = NamespaceEntry {
             namespace_key_id: primary_blind_key.key_id,
             blind_key: primary_blind_key.blind_key,
@@ -823,37 +1112,29 @@ where
         };
         let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
 
-        let rollback = {
-            let mut state = self.repository.write_state()?;
-            let rollback = RepositoryStateRollback::capture(
-                &state,
-                stale_tombstones
-                    .iter()
-                    .map(|(blind_key, _)| blind_key.clone())
-                    .chain(std::iter::once(primary_blind_key_value)),
-                manifest_id.clone(),
-                &key,
-            );
-            for (stale_blind_key, namespace_key_id) in stale_tombstones {
-                state.tombstone_namespace_entry(stale_blind_key.clone(), sequence);
-                state.pending_index_deltas.push(IndexDelta::Tombstone {
-                    namespace_key_id,
-                    blind_key: stale_blind_key,
-                    path: key.clone(),
-                    generation: sequence,
-                });
-            }
-            state.pending_index_deltas.push(IndexDelta::Upsert {
-                entry: Box::new(entry.clone()),
-                prefix_tokens: prefix_tokens.clone(),
-                sealed_manifest: Box::new(sealed_manifest),
+        let mut deltas = Vec::with_capacity(stale_tombstones.len().saturating_add(1));
+        for (stale_blind_key, namespace_key_id) in stale_tombstones {
+            deltas.push(IndexDelta::Tombstone {
+                namespace_key_id,
+                blind_key: stale_blind_key,
+                path: key.clone(),
+                generation: sequence,
             });
-            state
-                .manifests
-                .insert(manifest_id.clone(), manifest.clone());
-            state.upsert_namespace_entry(entry, prefix_tokens);
-            rollback
-        };
+        }
+        deltas.push(IndexDelta::Upsert {
+            entry: Box::new(entry),
+            prefix_tokens,
+            sealed_manifest: Box::new(sealed_manifest),
+        });
+        let payload = pending_body.map(|body| PendingV2Payload {
+            manifest_id: manifest_id.clone(),
+            body,
+        });
+        let rollback = pending.append_operation(
+            deltas,
+            Some((manifest_id.clone(), manifest.clone())),
+            payload,
+        )?;
 
         tracing::info!(
             target: "rs3_repository",
@@ -884,8 +1165,20 @@ where
         }
         let keyring = self.repository.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
-        let state = self.repository.read_state()?;
-        if existing_blind_keys(&state.namespace, &lookup_blind_keys).is_empty() {
+        let accepted = self
+            .accepted
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        if lookup_blind_keys.iter().all(|candidate| {
+            pending
+                .effective_head(&accepted.repository, &candidate.blind_key)
+                .live()
+                .is_none()
+        }) {
             Ok(())
         } else {
             Err(RepositoryError::AlreadyExists(key.clone()))
@@ -902,13 +1195,14 @@ where
         let keyring = self.repository.keyring()?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
         let state = self
-            .accepted_state
+            .accepted
             .read()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        let entry = first_namespace_entry(&state.namespace, &lookup_blind_keys)
+        let entry = first_namespace_entry(&state.repository.namespace, &lookup_blind_keys)
             .cloned()
             .ok_or_else(|| RepositoryError::NotFound(key.clone()))?;
         let manifest = state
+            .repository
             .manifests
             .get(&entry.manifest_id)
             .cloned()
@@ -1419,10 +1713,10 @@ where
         limit: usize,
     ) -> Result<Vec<RepositoryListEntry>> {
         let state = self
-            .accepted_state
+            .accepted
             .read()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        Ok(state.list_page(prefix, start_after, limit))
+        Ok(state.repository.list_page(prefix, start_after, limit))
     }
 
     /// Deletes a client-visible object after the tombstone commit is accepted.
@@ -1430,10 +1724,31 @@ where
     where
         A: V2CommitAnchor,
     {
+        let _mutation_lease = self.claim_direct_mutation()?;
+        self.delete_committed_inner(anchor, key).await
+    }
+
+    pub(super) async fn delete_committed_coordinated<A>(
+        &self,
+        mutation: V2CoordinatedMutation<'_, A>,
+        key: LogicalPath,
+    ) -> Result<DeleteOutcome>
+    where
+        A: V2CommitAnchor,
+    {
+        self.validate_coordinator_lease(mutation.lease)?;
+        self.delete_committed_inner(mutation.anchor, key).await
+    }
+
+    async fn delete_committed_inner<A>(&self, anchor: &A, key: LogicalPath) -> Result<DeleteOutcome>
+    where
+        A: V2CommitAnchor,
+    {
         let _guard = self.mutation_lock.lock().await;
+        let _publication_guard = self.publication_lock.write().await;
         self.ensure_accepted_anchor_matches(anchor).await?;
-        let (_object_id, rollback) = self.repository.tombstone_namespace_for_delete(&key)?;
-        if let Err(error) = self.publish_pending_index_delta(anchor).await {
+        let rollback = self.stage_delete(&key)?;
+        if let Err(error) = self.publish_pending_index_delta_locked(anchor).await {
             self.rollback_state_mutations(vec![rollback])?;
             return Err(error);
         }
@@ -1452,17 +1767,181 @@ where
     where
         A: V2CommitAnchor,
     {
+        let _mutation_lease = self.claim_direct_mutation()?;
+        self.set_legal_hold_committed_inner(anchor, key, status)
+            .await
+    }
+
+    pub(super) async fn set_legal_hold_committed_coordinated<A>(
+        &self,
+        mutation: V2CoordinatedMutation<'_, A>,
+        key: LogicalPath,
+        status: LegalHoldStatus,
+    ) -> Result<RepositoryObjectMetadata>
+    where
+        A: V2CommitAnchor,
+    {
+        self.validate_coordinator_lease(mutation.lease)?;
+        self.set_legal_hold_committed_inner(mutation.anchor, key, status)
+            .await
+    }
+
+    async fn set_legal_hold_committed_inner<A>(
+        &self,
+        anchor: &A,
+        key: LogicalPath,
+        status: LegalHoldStatus,
+    ) -> Result<RepositoryObjectMetadata>
+    where
+        A: V2CommitAnchor,
+    {
         let _guard = self.mutation_lock.lock().await;
+        let _publication_guard = self.publication_lock.write().await;
         self.ensure_accepted_anchor_matches(anchor).await?;
-        let (metadata, rollback) = self
-            .repository
-            .set_legal_hold_with_rollback(&key, status)
-            .await?;
-        if let Err(error) = self.publish_pending_index_delta(anchor).await {
+        let (metadata, rollback) = self.stage_legal_hold(&key, status).await?;
+        if let Err(error) = self.publish_pending_index_delta_locked(anchor).await {
             self.rollback_state_mutations(vec![rollback])?;
             return Err(error);
         }
         Ok(metadata)
+    }
+
+    fn stage_delete(&self, key: &LogicalPath) -> Result<PendingV2Checkpoint> {
+        let keyring = self.repository.keyring()?;
+        let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
+        let accepted = self
+            .accepted
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let live = lookup_blind_keys
+            .iter()
+            .filter_map(|candidate| {
+                pending
+                    .effective_head(&accepted.repository, &candidate.blind_key)
+                    .live()
+                    .map(|entry| (candidate.blind_key.clone(), entry.namespace_key_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        if live.is_empty() {
+            return Err(RepositoryError::NotFound(key.clone()));
+        }
+        let sequence = pending.allocate_sequence()?;
+        let deltas = live
+            .into_iter()
+            .map(|(blind_key, namespace_key_id)| IndexDelta::Tombstone {
+                namespace_key_id,
+                blind_key,
+                path: key.clone(),
+                generation: sequence,
+            })
+            .collect();
+        pending.append_operation(deltas, None, None)
+    }
+
+    async fn stage_legal_hold(
+        &self,
+        key: &LogicalPath,
+        status: LegalHoldStatus,
+    ) -> Result<(RepositoryObjectMetadata, PendingV2Checkpoint)> {
+        let keyring = self.repository.keyring()?;
+        let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
+        let (original, trusted_manifest) = {
+            let accepted = self
+                .accepted
+                .read()
+                .map_err(|_| RepositoryError::StatePoisoned)?;
+            let pending = self
+                .pending
+                .lock()
+                .map_err(|_| RepositoryError::StatePoisoned)?;
+            let entry = lookup_blind_keys
+                .iter()
+                .find_map(|candidate| {
+                    pending
+                        .effective_head(&accepted.repository, &candidate.blind_key)
+                        .live()
+                })
+                .cloned()
+                .ok_or_else(|| RepositoryError::NotFound(key.clone()))?;
+            let manifest = pending
+                .manifest(&accepted.repository, &entry.manifest_id)
+                .cloned();
+            (entry, manifest)
+        };
+
+        self.repository
+            .store
+            .set_legal_hold_at(
+                &original.object_id,
+                original.object_version_id.as_ref(),
+                status,
+            )
+            .await?;
+        let backend = self
+            .repository
+            .store
+            .head_at(&original.object_id, original.object_version_id.as_ref())
+            .await?;
+
+        let accepted = self
+            .accepted
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let current = lookup_blind_keys
+            .iter()
+            .find_map(|candidate| {
+                pending
+                    .effective_head(&accepted.repository, &candidate.blind_key)
+                    .live()
+            })
+            .cloned()
+            .ok_or_else(|| RepositoryError::NotFound(key.clone()))?;
+        if current.manifest_id != original.manifest_id || current.object_id != original.object_id {
+            return Err(v2_repository_error(V2FormatError::StaleAnchor));
+        }
+
+        let sequence = pending.allocate_sequence()?;
+        let manifest_id = keyring.derive_manifest_id(&object_material(key.as_str(), sequence))?;
+        let mut updated = current;
+        updated.manifest_id = manifest_id.clone();
+        updated.generation = sequence;
+        updated.legal_hold = backend.legal_hold.or(Some(status));
+        updated.object_version_id = backend.version_id.or(updated.object_version_id);
+        let prefix_tokens =
+            prefix_tokens_for_key(&keyring, &updated.namespace_key_id, key.as_str())?;
+        let manifest = TrustedManifest {
+            key: key.clone(),
+            content_len: trusted_manifest
+                .as_ref()
+                .map_or(updated.content_len, |manifest| manifest.content_len),
+            modified_at_ms: backend.modified_at_ms.unwrap_or_else(current_time_ms),
+            retention: trusted_manifest
+                .as_ref()
+                .map_or(updated.retention, |manifest| manifest.retention),
+            legal_hold: updated.legal_hold,
+        };
+        updated.content_len = manifest.content_len;
+        updated.modified_at_ms = manifest.modified_at_ms;
+        updated.retention = manifest.retention;
+        let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
+        let rollback = pending.append_operation(
+            vec![IndexDelta::Upsert {
+                entry: Box::new(updated),
+                prefix_tokens,
+                sealed_manifest: Box::new(sealed_manifest),
+            }],
+            Some((manifest_id, manifest.clone())),
+            None,
+        )?;
+        Ok((manifest.into_metadata(), rollback))
     }
 
     pub(crate) fn rollback_staged_puts(&self, rollbacks: Vec<V2StagedPutRollback>) -> Result<()> {
@@ -1471,22 +1950,23 @@ where
             return Err(RepositoryError::StatePoisoned);
         }
 
-        let mut pending_payloads = self
-            .pending_payloads
+        let mut pending = self
+            .pending
             .lock()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        let mut state = self.repository.write_state()?;
         for rollback in rollbacks.into_iter().rev() {
-            rollback.state.restore(&mut state);
-            pending_payloads.truncate(rollback.pending_payloads_len);
+            pending.rollback(rollback.checkpoint)?;
         }
         Ok(())
     }
 
-    fn rollback_state_mutations(&self, rollbacks: Vec<RepositoryStateRollback>) -> Result<()> {
-        let mut state = self.repository.write_state()?;
+    fn rollback_state_mutations(&self, rollbacks: Vec<PendingV2Checkpoint>) -> Result<()> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
         for rollback in rollbacks.into_iter().rev() {
-            rollback.restore(&mut state);
+            pending.rollback(rollback)?;
         }
         Ok(())
     }
@@ -1497,8 +1977,16 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn full_state_clone_count_for_tests(&self) -> usize {
-        self.full_state_clone_count.load(Ordering::SeqCst)
+    pub(crate) fn fail_next_local_install_for_tests(&self) {
+        self.fail_next_local_install.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_operation_count_for_tests(&self) -> Result<usize> {
+        self.pending
+            .lock()
+            .map(|pending| pending.len())
+            .map_err(|_| RepositoryError::StatePoisoned)
     }
 
     #[cfg(test)]
@@ -1509,27 +1997,31 @@ where
     #[cfg(test)]
     pub(crate) fn resize_accepted_run_catalog_for_tests(&self, count: usize) -> Result<()> {
         let mut runs = self
-            .accepted_runs
+            .accepted
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        let run = runs.last().cloned().ok_or(RepositoryError::StatePoisoned)?;
-        runs.resize(count, run);
+        let run = runs
+            .runs
+            .last()
+            .cloned()
+            .ok_or(RepositoryError::StatePoisoned)?;
+        runs.runs.resize(count, run);
         Ok(())
     }
 
     /// Returns the path-redacted number of active authenticated index runs.
     pub fn active_index_run_count(&self) -> Result<usize> {
-        self.accepted_runs
+        self.accepted
             .read()
-            .map(|runs| runs.len())
+            .map(|accepted| accepted.runs.len())
             .map_err(|_| RepositoryError::StatePoisoned)
     }
 
     /// Returns the path-redacted number of uncompacted foreground index runs.
     pub(crate) fn active_level_zero_index_run_count(&self) -> Result<usize> {
-        self.accepted_runs
+        self.accepted
             .read()
-            .map(|runs| runs.iter().filter(|run| run.level == 0).count())
+            .map(|accepted| accepted.runs.iter().filter(|run| run.level == 0).count())
             .map_err(|_| RepositoryError::StatePoisoned)
     }
 
@@ -1540,15 +2032,22 @@ where
     where
         A: V2CommitAnchor,
     {
-        let Some(sequence) = self.pending_index_delta_sequence()? else {
+        let _publication_guard = self.publication_lock.write().await;
+        self.publish_pending_index_delta_locked(anchor).await
+    }
+
+    async fn publish_pending_index_delta_locked<A>(
+        &self,
+        anchor: &A,
+    ) -> Result<Option<V2StoredCommit>>
+    where
+        A: V2CommitAnchor,
+    {
+        let mut pending = self.pending_snapshot()?;
+        let Some(sequence) = pending.commit_sequence() else {
             return Ok(None);
         };
         let base_anchor = self.ensure_accepted_anchor_matches(anchor).await?;
-        let pending_payloads = self
-            .pending_payloads
-            .lock()
-            .map_err(|_| RepositoryError::StatePoisoned)?
-            .clone();
         let mut accepted_locations = None;
         let mut accepted_pack_locations = None;
         let mut accepted_run = None;
@@ -1557,7 +2056,7 @@ where
             .commit_store
             .write_child_commit_with(&temporary_anchor, |commit_key| {
                 if let Some(packed) = self
-                    .pending_packed_sections_for_commit(commit_key, &pending_payloads)
+                    .pending_packed_sections_for_commit(commit_key, &pending)
                     .map_err(|_| V2FormatError::InvalidHeaderField)?
                 {
                     accepted_pack_locations = Some(packed.locations);
@@ -1568,7 +2067,7 @@ where
                     return Ok(write);
                 }
                 let pending = self
-                    .pending_delta_sections_for_commit(commit_key, &pending_payloads)
+                    .pending_delta_sections_for_commit(commit_key, &pending)
                     .map_err(|_| V2FormatError::InvalidHeaderField)?;
                 accepted_locations = Some(pending.locations);
                 let mut write =
@@ -1603,47 +2102,45 @@ where
             },
         });
         if let Some(run) = accepted_run.as_ref() {
-            let accepted_runs = self
-                .accepted_runs
+            let accepted = self
+                .accepted
                 .read()
                 .map_err(|_| RepositoryError::StatePoisoned)?;
-            if accepted_runs.len() >= V2_INDEX_ROOT_MAX_RUNS {
+            if accepted.runs.len() >= V2_INDEX_ROOT_MAX_RUNS {
                 return Err(v2_repository_error(V2FormatError::IndexRootLimitExceeded));
             }
-            if accepted_runs
+            if accepted
+                .runs
                 .last()
                 .is_some_and(|previous| previous.maximum_generation >= run.minimum_generation)
             {
                 return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
             }
         }
+        if let Some(locations) = accepted_pack_locations.as_ref() {
+            self.resolve_pending_pack_refs(&mut pending, &uploaded, locations)?;
+        } else {
+            let locations = accepted_locations
+                .as_ref()
+                .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
+            self.resolve_pending_payload_refs(&mut pending, &uploaded.anchor_state, locations)?;
+        }
+        let install = self.prepare_pending_install(&pending, sequence, accepted_run)?;
         let stored = self
             .commit_store
             .adopt_verified_unanchored_child(anchor, &base_anchor, &uploaded)
             .await
             .map_err(v2_repository_error)?;
-        if let Some(locations) = accepted_pack_locations {
-            self.resolve_accepted_pack_refs(&stored, &locations)?;
-        } else {
-            let locations = accepted_locations
-                .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
-            self.resolve_accepted_payload_refs(&stored.anchor_state, &locations)?;
+        if let Err(error) = self.install_pending_commit(install, stored.anchor_state.clone()) {
+            self.mark_local_recovery_required();
+            tracing::error!(
+                target: "rs3_repository",
+                operation = "v2_install_accepted_commit",
+                error = %error,
+                "v2 anchor advanced but local state installation failed; restart is required",
+            );
+            return Err(RepositoryError::AcceptedRecoveryRequired);
         }
-        self.accept_pending_state(sequence)?;
-        if let Some(run) = accepted_run {
-            self.accepted_runs
-                .write()
-                .map_err(|_| RepositoryError::StatePoisoned)?
-                .push(run);
-        }
-        self.pending_payloads
-            .lock()
-            .map_err(|_| RepositoryError::StatePoisoned)?
-            .clear();
-        *self
-            .accepted_anchor
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = Some(stored.anchor_state.clone());
         Ok(Some(stored))
     }
 
@@ -1660,9 +2157,10 @@ where
             .map_err(v2_repository_error)?
             .ok_or_else(|| v2_repository_error(V2FormatError::MissingAnchor))?;
         if self
-            .accepted_anchor
+            .accepted
             .read()
             .map_err(|_| RepositoryError::StatePoisoned)?
+            .anchor
             .as_ref()
             != Some(&current)
         {
@@ -1671,66 +2169,126 @@ where
         Ok(current)
     }
 
-    fn accept_pending_state(&self, sequence: Sequence) -> Result<()> {
-        let mut state = self.repository.write_state()?;
-        if state.next_sequence != sequence {
+    fn pending_snapshot(&self) -> Result<PendingV2Snapshot> {
+        self.pending
+            .lock()
+            .map_err(|_| RepositoryError::StatePoisoned)
+            .map(|pending| pending.snapshot())
+    }
+
+    fn prepare_pending_install(
+        &self,
+        pending: &PendingV2Snapshot,
+        sequence: Sequence,
+        run: Option<V2IndexRootRunRef>,
+    ) -> Result<PendingV2Install> {
+        if pending.commit_sequence() != Some(sequence) {
             return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
         }
-        let mut accepted = self
-            .accepted_state
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)?;
-
-        for delta in &state.pending_index_deltas {
+        let manifests = pending
+            .manifests()
+            .iter()
+            .map(|(manifest_id, manifest)| (manifest_id, manifest))
+            .collect::<BTreeMap<_, _>>();
+        let mut mutations = Vec::with_capacity(pending.deltas().len());
+        for delta in pending.deltas() {
             match delta {
                 IndexDelta::Upsert {
                     entry,
                     prefix_tokens,
                     ..
                 } => {
-                    let Some(manifest) = state.manifests.get(&entry.manifest_id) else {
+                    let manifest = manifests
+                        .get(&entry.manifest_id)
+                        .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
+                    if matches!(entry.payload_ref, Some(PayloadReference::V2Self { .. }))
+                        || entry.generation > sequence
+                    {
                         return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
-                    };
-                    accepted
-                        .manifests
-                        .insert(entry.manifest_id.clone(), manifest.clone());
-                    // A key may be overwritten more than once in one batch.
-                    // Only the final live entry belongs in the accepted view.
-                    let Some(live_entry) = state.namespace.head(&entry.blind_key) else {
-                        continue;
-                    };
-                    if live_entry.manifest_id != entry.manifest_id {
-                        continue;
                     }
-                    accepted.upsert_namespace_entry(live_entry.clone(), prefix_tokens.clone());
+                    mutations.push(PendingV2InstallMutation::Upsert {
+                        entry: Box::new((**entry).clone()),
+                        prefix_tokens: prefix_tokens.clone(),
+                        manifest: (*manifest).clone(),
+                    });
                 }
                 IndexDelta::Tombstone {
                     blind_key,
                     generation,
                     ..
-                } => accepted.tombstone_namespace_entry(blind_key.clone(), *generation),
+                } => mutations.push(PendingV2InstallMutation::Tombstone {
+                    blind_key: blind_key.clone(),
+                    generation: *generation,
+                }),
             }
         }
-        accepted.next_sequence = accepted.next_sequence.max(sequence);
-        accepted.pending_index_deltas.clear();
-        accepted.pending_checkpoint_published_at_ms = None;
-        state.pending_index_deltas.clear();
-        state.pending_checkpoint_published_at_ms = None;
-        Ok(())
+        let accepted = self
+            .accepted
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        if sequence <= accepted.repository.next_sequence {
+            return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
+        }
+        drop(accepted);
+        self.pending
+            .lock()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .validate_snapshot(pending)?;
+        Ok(PendingV2Install {
+            sequence,
+            mutations,
+            run,
+        })
     }
 
-    /// Replaces the accepted view after an out-of-band state rebuild.
-    ///
-    /// Normal commits use `accept_pending_state` so their cost is bounded by
-    /// the delta. Compaction is rare and replaces the full state by design.
-    fn accept_current_state(&self) -> Result<()> {
+    fn install_pending_commit(
+        &self,
+        install: PendingV2Install,
+        anchor: super::repository::V2AnchorState,
+    ) -> Result<()> {
         #[cfg(test)]
-        self.full_state_clone_count.fetch_add(1, Ordering::SeqCst);
-        let state = self.repository.read_state()?.clone();
-        *self
-            .accepted_state
+        if self.fail_next_local_install.swap(false, Ordering::SeqCst) {
+            return Err(RepositoryError::StatePoisoned);
+        }
+        let mut accepted = self
+            .accepted
             .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = state;
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        // The exclusive publication barrier prevents any staged or accepted
+        // mutation between pre-CAS validation and this local installation.
+        for mutation in install.mutations {
+            match mutation {
+                PendingV2InstallMutation::Upsert {
+                    entry,
+                    prefix_tokens,
+                    manifest,
+                } => {
+                    accepted
+                        .repository
+                        .manifests
+                        .insert(entry.manifest_id.clone(), manifest);
+                    accepted
+                        .repository
+                        .upsert_namespace_entry(*entry, prefix_tokens);
+                }
+                PendingV2InstallMutation::Tombstone {
+                    blind_key,
+                    generation,
+                } => accepted
+                    .repository
+                    .tombstone_namespace_entry(blind_key, generation),
+            }
+        }
+        accepted.repository.next_sequence = install.sequence;
+        if let Some(run) = install.run {
+            accepted.runs.push(run);
+        }
+        accepted.anchor = Some(anchor);
+        pending.clear_after_validated_publication();
         Ok(())
     }
 
@@ -1739,18 +2297,24 @@ where
         &self,
         content_len: u64,
     ) -> Result<()> {
-        let mut state = self
-            .accepted_state
+        let mut accepted = self
+            .accepted
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        let Some((mut entry, prefix_tokens)) = state
+        let state = &mut accepted.repository;
+        let Some(mut entry) = state
             .namespace
-            .live_entries_with_prefixes()
-            .into_iter()
-            .find(|(entry, _)| entry.content_len == content_len)
+            .live_entries()
+            .find(|entry| entry.content_len == content_len)
+            .cloned()
         else {
             return Err(RepositoryError::StatePoisoned);
         };
+        let prefix_tokens = state
+            .namespace
+            .prefix_tokens(&entry.blind_key)
+            .cloned()
+            .collect();
         match entry.payload_ref.as_mut() {
             Some(PayloadReference::V2Commit { length, .. }) => {
                 *length = (*length).saturating_sub(1);
@@ -1770,39 +2334,47 @@ where
 
     #[cfg(test)]
     pub(crate) fn shorten_accepted_content_len_for_tests(&self, content_len: u64) -> Result<()> {
-        let mut state = self
-            .accepted_state
+        let mut accepted = self
+            .accepted
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        let Some((mut entry, prefix_tokens)) = state
+        let state = &mut accepted.repository;
+        let Some(mut entry) = state
             .namespace
-            .live_entries_with_prefixes()
-            .into_iter()
-            .find(|(entry, _)| entry.content_len == content_len)
+            .live_entries()
+            .find(|entry| entry.content_len == content_len)
+            .cloned()
         else {
             return Err(RepositoryError::StatePoisoned);
         };
+        let prefix_tokens = state
+            .namespace
+            .prefix_tokens(&entry.blind_key)
+            .cloned()
+            .collect();
         entry.content_len = entry.content_len.saturating_sub(1);
         state.replace_namespace_entry(entry, prefix_tokens);
         Ok(())
     }
 
     fn pending_index_delta_sequence(&self) -> Result<Option<Sequence>> {
-        let state = self.repository.read_state()?;
-        Ok((!state.pending_index_deltas.is_empty()).then_some(state.next_sequence))
+        self.pending
+            .lock()
+            .map_err(|_| RepositoryError::StatePoisoned)
+            .map(|pending| pending.snapshot().commit_sequence())
     }
 
     fn pending_delta_sections_for_commit(
         &self,
         commit_key: &V2CommitKey,
-        pending_payloads: &[PendingV2Payload],
+        pending: &PendingV2Snapshot,
     ) -> Result<PendingV2CommitSections> {
         let keyring = self.repository.keyring()?;
-        let mut sections = Vec::with_capacity(pending_payloads.len().saturating_add(1));
-        let mut locations = Vec::with_capacity(pending_payloads.len());
+        let mut sections = Vec::with_capacity(pending.payloads().len().saturating_add(1));
+        let mut locations = Vec::with_capacity(pending.payloads().len());
         let mut next_offset = 0_u64;
 
-        for (ordinal, pending) in pending_payloads.iter().enumerate() {
+        for (ordinal, pending) in pending.payloads().iter().enumerate() {
             let payload_id = Self::v2_payload_id(commit_key, ordinal)?;
             let payload = seal_streamable_payload_object(
                 &keyring,
@@ -1832,7 +2404,7 @@ where
                 .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?;
         }
 
-        let delta = self.pending_index_delta_for_commit(commit_key, &locations)?;
+        let delta = self.pending_index_delta_for_commit(commit_key, &locations, pending)?;
         let (retention, legal_hold) = commit_protection_for_deltas(&delta.deltas);
         let sealed_delta = seal_index_delta_object(&keyring, &delta)?;
         let bytes = Bytes::from(index_delta_object_bytes(&sealed_delta)?);
@@ -1854,9 +2426,9 @@ where
         &self,
         commit_key: &V2CommitKey,
         locations: &[PendingV2PayloadLocation],
+        pending: &PendingV2Snapshot,
     ) -> Result<IndexDeltaObject> {
-        let state = self.repository.read_state()?;
-        let mut deltas = state.pending_index_deltas.clone();
+        let mut deltas = pending.deltas().to_vec();
         for delta in &mut deltas {
             let IndexDelta::Upsert { entry, .. } = delta else {
                 continue;
@@ -1882,47 +2454,22 @@ where
         }
 
         Ok(IndexDeltaObject {
-            sequence: state.next_sequence,
+            sequence: pending
+                .commit_sequence()
+                .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?,
             deltas,
         })
     }
 
-    fn resolve_accepted_payload_refs(
+    fn resolve_pending_payload_refs(
         &self,
+        pending: &mut PendingV2Snapshot,
         anchor_state: &super::repository::V2AnchorState,
         locations: &[PendingV2PayloadLocation],
     ) -> Result<()> {
-        if locations.is_empty() {
-            return Ok(());
-        }
-
-        let mut state = self.repository.write_state()?;
-        let mut pending_upserts = state
-            .pending_index_deltas
-            .iter()
-            .filter_map(|delta| match delta {
-                IndexDelta::Upsert {
-                    entry,
-                    prefix_tokens,
-                    ..
-                } => Some((entry.blind_key.clone(), prefix_tokens.clone())),
-                IndexDelta::Tombstone { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        if pending_upserts.is_empty() {
-            // Compaction rewrites live payloads without a pending delta. It is
-            // an explicit maintenance operation, so resolving its plan may
-            // scan the full namespace; normal commits stay delta-bounded.
-            pending_upserts = state
-                .namespace
-                .live_entries_with_prefixes()
-                .into_iter()
-                .map(|(entry, prefix_tokens)| (entry.blind_key, prefix_tokens))
-                .collect();
-        }
         let mut resolved_count = 0_usize;
-        for (blind_key, prefix_tokens) in &pending_upserts {
-            let Some(mut entry) = state.namespace.head(blind_key).cloned() else {
+        for delta in pending.deltas_mut() {
+            let IndexDelta::Upsert { entry, .. } = delta else {
                 continue;
             };
             let Some(location) = locations
@@ -1943,16 +2490,16 @@ where
                 offset: location.offset,
                 length: location.length,
             });
-            state.replace_namespace_entry(entry, prefix_tokens.clone());
             resolved_count = resolved_count.saturating_add(1);
         }
-
-        let unresolved_live_self_refs = pending_upserts.iter().any(|(blind_key, _)| {
-            state.namespace.head(blind_key).is_some_and(|entry| {
-                matches!(entry.payload_ref, Some(PayloadReference::V2Self { .. }))
-            })
+        let unresolved_self_refs = pending.deltas().iter().any(|delta| {
+            matches!(
+                delta,
+                IndexDelta::Upsert { entry, .. }
+                    if matches!(entry.payload_ref, Some(PayloadReference::V2Self { .. }))
+            )
         });
-        if resolved_count == 0 || unresolved_live_self_refs {
+        if resolved_count != locations.len() || unresolved_self_refs {
             return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
         }
         Ok(())
@@ -2329,6 +2876,70 @@ where
         ))?;
         let keyring = self.repository.keyring()?;
         open_index_delta_object(&keyring, &object_id, &sealed_delta)
+    }
+}
+
+impl<S> V2Repository<S> {
+    pub(super) fn claim_commit_coordinator(&self) -> Result<Arc<V2CoordinatorLease>> {
+        self.ensure_local_state_ready()?;
+        self.mutation_owner
+            .compare_exchange(
+                V2_MUTATION_OWNER_IDLE,
+                V2_MUTATION_OWNER_COORDINATOR,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| RepositoryError::CommitFailed {
+                reason: "v2 repository already has an active mutation owner".to_owned(),
+            })?;
+        Ok(Arc::new(V2CoordinatorLease {
+            owner: Arc::clone(&self.mutation_owner),
+        }))
+    }
+
+    fn claim_direct_mutation(&self) -> Result<V2DirectMutationLease> {
+        self.ensure_local_state_ready()?;
+        self.mutation_owner
+            .compare_exchange(
+                V2_MUTATION_OWNER_IDLE,
+                V2_MUTATION_OWNER_DIRECT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| RepositoryError::CommitFailed {
+                reason: "v2 repository mutation is owned by the active commit coordinator"
+                    .to_owned(),
+            })?;
+        Ok(V2DirectMutationLease {
+            owner: Arc::clone(&self.mutation_owner),
+        })
+    }
+
+    fn validate_coordinator_lease(&self, lease: &V2CoordinatorLease) -> Result<()> {
+        self.ensure_local_state_ready()?;
+        if Arc::ptr_eq(&self.mutation_owner, &lease.owner)
+            && self.mutation_owner.load(Ordering::Acquire) == V2_MUTATION_OWNER_COORDINATOR
+        {
+            return Ok(());
+        }
+        Err(RepositoryError::CommitFailed {
+            reason: "v2 commit coordinator does not own this repository".to_owned(),
+        })
+    }
+
+    pub(super) fn local_recovery_required(&self) -> bool {
+        self.recovery_required.load(Ordering::Acquire)
+    }
+
+    fn mark_local_recovery_required(&self) {
+        self.recovery_required.store(true, Ordering::Release);
+    }
+
+    fn ensure_local_state_ready(&self) -> Result<()> {
+        if self.local_recovery_required() {
+            return Err(RepositoryError::AcceptedRecoveryRequired);
+        }
+        Ok(())
     }
 }
 

@@ -269,7 +269,8 @@ impl RuntimeRepository {
             Arc::clone(&repository),
             anchor_handle.clone(),
             coordinator_options(config.batching),
-        );
+        )
+        .map_err(repository_init)?;
         #[cfg(feature = "k8s")]
         let coordinator = match maintenance_guard {
             Some(guard) => coordinator.with_maintenance_guard(guard),
@@ -312,8 +313,8 @@ impl RuntimeRepository {
                 "retained v2 repository anchor is missing the commit object version id",
             ));
         }
-        self.repository
-            .load_chain_from_anchor(&self.anchor)
+        self.coordinator
+            .reload_from_anchor()
             .await
             .map_err(repository_init)?
             .ok_or_else(|| repository_init("v2-preview repository anchor is missing"))?;
@@ -551,8 +552,8 @@ pub async fn init_v2_repository_from_config(
         ));
     };
     let chain = runtime
-        .repository
-        .load_chain_from_anchor(&runtime.anchor)
+        .coordinator
+        .reload_from_anchor()
         .await
         .map_err(repository_init)?
         .ok_or_else(|| {

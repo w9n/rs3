@@ -2094,9 +2094,9 @@ async fn v2_repository_concurrent_range_reads_avoid_full_commit_gets() {
     );
     let repository = Arc::new(V2Repository::new(
         store.clone(),
-        keyring,
+        keyring.clone(),
         RepositoryOptions::default(),
-        options,
+        options.clone(),
     ));
     let anchor = V2MemoryAnchor::new();
     let key = LogicalPath::new("snapshots/v2-concurrent-cache-miss.bin")
@@ -2162,11 +2162,11 @@ async fn v2_repository_full_reads_fetch_payload_sections_not_full_commits() {
     ));
     let anchor = V2MemoryAnchor::new();
     must_repo(repository.write_genesis_snapshot(&anchor).await);
-    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+    let coordinator = Arc::new(must_repo(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         anchor,
         CommitCoordinatorOptions::new(2, Duration::from_secs(60)),
-    ));
+    )));
     let first_key =
         LogicalPath::new("snapshots/v2-cache-fill-a.bin").unwrap_or_else(|error| panic!("{error}"));
     let second_key =
@@ -2707,6 +2707,71 @@ async fn v2_repository_keeps_accepted_object_visible_during_pending_delete() {
 }
 
 #[tokio::test]
+async fn v2_repository_legal_hold_is_visible_only_after_anchor_acceptance() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    let key =
+        LogicalPath::new("snapshots/legal-hold.bin").unwrap_or_else(|error| panic!("{error}"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                key.clone(),
+                Bytes::from_static(b"held"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    let failed = repository
+        .set_legal_hold_committed(
+            &FailOnceV2Anchor::new(anchor.clone()),
+            key.clone(),
+            LegalHoldStatus::On,
+        )
+        .await;
+
+    assert!(matches!(failed, Err(RepositoryError::CommitFailed { .. })));
+    assert_eq!(must_repo(repository.head(&key)).legal_hold, None);
+
+    let held = must_repo(
+        repository
+            .set_legal_hold_committed(&anchor, key.clone(), LegalHoldStatus::On)
+            .await,
+    );
+    assert_eq!(held.legal_hold, Some(LegalHoldStatus::On));
+    assert_eq!(
+        must_repo(repository.get_range(&key, ByteRange::Full).await),
+        Bytes::from_static(b"held")
+    );
+
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    assert_eq!(
+        must_repo(fresh.head(&key)).legal_hold,
+        Some(LegalHoldStatus::On)
+    );
+    assert_eq!(
+        must_repo(fresh.get_range(&key, ByteRange::Full).await),
+        Bytes::from_static(b"held")
+    );
+}
+
+#[tokio::test]
 async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
@@ -2724,11 +2789,11 @@ async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
     ));
     let anchor = V2MemoryAnchor::new();
     must_repo(repository.write_genesis_snapshot(&anchor).await);
-    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+    let coordinator = Arc::new(must_repo(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         anchor.clone(),
         CommitCoordinatorOptions::new(2, Duration::from_secs(60)),
-    ));
+    )));
     let first_key =
         LogicalPath::new("snapshots/v2-batched-a.bin").unwrap_or_else(|error| panic!("{error}"));
     let second_key =
@@ -2846,6 +2911,227 @@ async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
 }
 
 #[tokio::test]
+async fn v2_repository_admits_only_one_commit_coordinator_instance() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store,
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+
+    let first = must_repo(V2CommitCoordinator::new(
+        Arc::clone(&repository),
+        anchor.clone(),
+    ));
+    let duplicate = V2CommitCoordinator::new(Arc::clone(&repository), anchor.clone());
+    assert!(matches!(
+        duplicate,
+        Err(crate::RepositoryError::CommitFailed { reason })
+            if reason == "v2 repository already has an active mutation owner"
+    ));
+    let direct = repository
+        .put_committed(
+            &anchor,
+            must_type(LogicalPath::new("snapshots/direct-bypass.bin")),
+            Bytes::from_static(b"must not stage"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(matches!(
+        direct,
+        Err(crate::RepositoryError::CommitFailed { reason })
+            if reason == "v2 repository mutation is owned by the active commit coordinator"
+    ));
+    assert!(matches!(
+        repository
+            .compact_packed_index_runs(&anchor, &UnenforcedQuiescedMaintenanceGuard,)
+            .await,
+        Err(crate::RepositoryError::CommitFailed { .. })
+    ));
+    assert!(matches!(
+        repository
+            .write_compaction_snapshot(
+                &anchor,
+                &UnenforcedQuiescedMaintenanceGuard,
+                V2FullGcDryRunOptions::default(),
+                false,
+            )
+            .await,
+        Err(crate::RepositoryError::CommitFailed { .. })
+    ));
+    assert_eq!(must_repo(repository.pending_operation_count_for_tests()), 0);
+
+    drop(first);
+    let replacement = must_repo(V2CommitCoordinator::new(repository, anchor));
+    assert!(!replacement.status().poisoned);
+}
+
+#[tokio::test]
+async fn v2_delayed_publisher_retains_repository_ownership_after_cancellation() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store,
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = Arc::new(must_repo(V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        anchor.clone(),
+        CommitCoordinatorOptions::new(2, Duration::from_millis(25)),
+    )));
+    let pending = {
+        let coordinator = Arc::clone(&coordinator);
+        tokio::spawn(async move {
+            coordinator
+                .put_committed(
+                    must_type(LogicalPath::new("snapshots/cancelled-waiter.bin")),
+                    Bytes::from_static(b"accepted by delayed publisher"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while must_repo(repository.pending_operation_count_for_tests()) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|error| panic!("staged write did not appear: {error}"));
+
+    pending.abort();
+    assert!(pending.await.is_err());
+    drop(coordinator);
+    assert!(matches!(
+        V2CommitCoordinator::new(Arc::clone(&repository), anchor.clone()),
+        Err(crate::RepositoryError::CommitFailed { .. })
+    ));
+
+    let replacement = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match V2CommitCoordinator::new(Arc::clone(&repository), anchor.clone()) {
+                Ok(replacement) => break replacement,
+                Err(crate::RepositoryError::CommitFailed { .. }) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(error) => panic!("unexpected replacement error: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|error| panic!("delayed publisher did not release ownership: {error}"));
+    assert!(!replacement.status().poisoned);
+}
+
+#[tokio::test]
+async fn v2_accepted_commit_reports_local_recovery_requirement() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = must_repo(V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        anchor.clone(),
+        CommitCoordinatorOptions::new(1, Duration::ZERO),
+    ));
+    repository.fail_next_local_install_for_tests();
+    let key = must_type(LogicalPath::new("snapshots/recovery-required.bin"));
+
+    let result = coordinator
+        .put_committed(
+            key.clone(),
+            Bytes::from_static(b"durably accepted"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::RepositoryError::AcceptedRecoveryRequired)
+    ));
+    assert!(coordinator.status().poisoned);
+    drop(coordinator);
+    assert!(matches!(
+        V2CommitCoordinator::new(Arc::clone(&repository), anchor.clone()),
+        Err(crate::RepositoryError::AcceptedRecoveryRequired)
+    ));
+
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    assert_eq!(must_repo(fresh.head(&key)).content_len, 16);
+}
+
+#[tokio::test]
+async fn v2_direct_accepted_commit_reports_local_recovery_requirement() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    repository.fail_next_local_install_for_tests();
+    let key = must_type(LogicalPath::new("snapshots/direct-recovery-required.bin"));
+
+    let result = repository
+        .put_committed(
+            &anchor,
+            key.clone(),
+            Bytes::from_static(b"durably accepted"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::RepositoryError::AcceptedRecoveryRequired)
+    ));
+
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    assert_eq!(must_repo(fresh.head(&key)).content_len, 16);
+}
+
+#[tokio::test]
 async fn v2_commit_coordinator_packs_sixty_four_small_objects_with_bounded_amplification() {
     const OBJECT_COUNT: usize = 64;
     const OBJECT_BYTES: usize = 512;
@@ -2860,17 +3146,17 @@ async fn v2_commit_coordinator_packs_sixty_four_small_objects_with_bounded_ampli
     );
     let repository = Arc::new(V2Repository::new(
         store.clone(),
-        keyring,
+        keyring.clone(),
         RepositoryOptions::default(),
-        options,
+        options.clone(),
     ));
     let anchor = V2MemoryAnchor::new();
     must_repo(repository.write_genesis_snapshot(&anchor).await);
-    let coordinator = Arc::new(V2CommitCoordinator::with_options(
-        repository,
+    let coordinator = Arc::new(must_repo(V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
         anchor.clone(),
         CommitCoordinatorOptions::new(OBJECT_COUNT, Duration::from_secs(60)),
-    ));
+    )));
     let mut writes = tokio::task::JoinSet::new();
     for ordinal in 0..OBJECT_COUNT {
         let coordinator = Arc::clone(&coordinator);
@@ -2903,13 +3189,9 @@ async fn v2_commit_coordinator_packs_sixty_four_small_objects_with_bounded_ampli
         "stored={} logical={logical_bytes}",
         metadata.content_len
     );
-    let chain = must_repo(
-        coordinator
-            .repository()
-            .load_chain_from_anchor(&anchor)
-            .await,
-    )
-    .expect("v2 chain should exist");
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let chain =
+        must_repo(fresh.load_chain_from_anchor(&anchor).await).expect("v2 chain should exist");
     let sections = &chain.commits_newest_first[0]
         .parsed_header
         .header
@@ -2948,11 +3230,11 @@ async fn v2_commit_retention_covers_strongest_staged_object() {
     ));
     let anchor = V2MemoryAnchor::new();
     must_repo(repository.write_genesis_snapshot(&anchor).await);
-    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+    let coordinator = Arc::new(must_repo(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         anchor.clone(),
         CommitCoordinatorOptions::new(2, Duration::from_secs(60)),
-    ));
+    )));
 
     let weak = {
         let coordinator = Arc::clone(&coordinator);
@@ -3022,11 +3304,11 @@ async fn v2_commit_coordinator_rolls_back_batch_after_anchor_failure() {
     ));
     let anchor = V2MemoryAnchor::new();
     must_repo(repository.write_genesis_snapshot(&anchor).await);
-    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+    let coordinator = Arc::new(must_repo(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         FailOnceV2Anchor::new(anchor.clone()),
         CommitCoordinatorOptions::new(2, Duration::from_secs(60)),
-    ));
+    )));
     let first_key =
         LogicalPath::new("snapshots/v2-failed-a.bin").unwrap_or_else(|error| panic!("{error}"));
     let second_key =
@@ -3116,11 +3398,11 @@ async fn v2_commit_coordinator_recovers_after_transient_publish_failure() {
     ));
     let anchor = V2MemoryAnchor::new();
     must_repo(repository.write_genesis_snapshot(&anchor).await);
-    let coordinator = V2CommitCoordinator::with_options(
+    let coordinator = must_repo(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         FailOnceV2Anchor::new(anchor.clone()),
         CommitCoordinatorOptions::new(1, Duration::from_secs(60)),
-    );
+    ));
     let failed_key = LogicalPath::new("snapshots/v2-transient-failed.bin")
         .unwrap_or_else(|error| panic!("{error}"));
 
@@ -3195,11 +3477,11 @@ async fn v2_commit_coordinator_rollback_restores_overwritten_object() {
             )
             .await,
     );
-    let coordinator = V2CommitCoordinator::with_options(
+    let coordinator = must_repo(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         FailOnceV2Anchor::new(anchor.clone()),
         CommitCoordinatorOptions::new(1, Duration::from_secs(1)),
-    );
+    ));
 
     let failed = coordinator
         .put_committed(
@@ -3239,11 +3521,11 @@ async fn v2_commit_coordinator_poisons_when_batch_rollback_fails() {
     let anchor = V2MemoryAnchor::new();
     must_repo(repository.write_genesis_snapshot(&anchor).await);
     repository.fail_next_restore_for_tests();
-    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+    let coordinator = Arc::new(must_repo(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         FailOnceV2Anchor::new(anchor.clone()),
         CommitCoordinatorOptions::new(2, Duration::from_secs(60)),
-    ));
+    )));
     let first_key =
         LogicalPath::new("snapshots/v2-poison-a.bin").unwrap_or_else(|error| panic!("{error}"));
     let second_key =
@@ -3327,11 +3609,11 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
     ));
     let anchor = V2MemoryAnchor::new();
     must_repo(repository.write_genesis_snapshot(&anchor).await);
-    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+    let coordinator = Arc::new(must_repo(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         anchor.clone(),
         CommitCoordinatorOptions::new(8, Duration::from_secs(60)).with_max_pending_items(1),
-    ));
+    )));
     let first_key = LogicalPath::new("snapshots/v2-backpressure-first.bin")
         .unwrap_or_else(|error| panic!("{error}"));
 
@@ -3385,7 +3667,7 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
 }
 
 #[tokio::test]
-async fn v2_commit_coordinator_scales_without_full_state_clones() {
+async fn v2_commit_coordinator_round_trips_128_writes_across_reload() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
@@ -3402,11 +3684,11 @@ async fn v2_commit_coordinator_scales_without_full_state_clones() {
     ));
     let anchor = V2MemoryAnchor::new();
     must_repo(repository.write_genesis_snapshot(&anchor).await);
-    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+    let coordinator = Arc::new(must_repo(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         anchor.clone(),
         CommitCoordinatorOptions::new(32, Duration::from_secs(1)),
-    ));
+    )));
 
     for batch in 0..4 {
         let mut writes = tokio::task::JoinSet::new();
@@ -3435,7 +3717,6 @@ async fn v2_commit_coordinator_scales_without_full_state_clones() {
     }
 
     assert_eq!(must_repo(repository.list("snapshots/")).len(), 128);
-    assert_eq!(repository.full_state_clone_count_for_tests(), 0);
     let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
     must_repo(fresh.load_chain_from_anchor(&anchor).await);
     assert_eq!(must_repo(fresh.list("snapshots/")).len(), 128);
@@ -3846,11 +4127,11 @@ async fn v2_commit_coordinator_flushes_before_index_snapshot() {
         .unwrap_or_else(|error| panic!("{error}"));
 
     must_repo(repository.write_genesis_snapshot(&anchor).await);
-    let coordinator = Arc::new(V2CommitCoordinator::with_options(
+    let coordinator = Arc::new(must_repo(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         anchor.clone(),
         CommitCoordinatorOptions::new(8, Duration::from_secs(60)),
-    ));
+    )));
     let pending = {
         let coordinator = Arc::clone(&coordinator);
         let key = key.clone();
@@ -5172,11 +5453,11 @@ async fn v2_coordinator_compacts_automatically_at_the_run_watermark() {
     ));
     let anchor = V2MemoryAnchor::new();
     must_repo(repository.write_genesis_snapshot(&anchor).await);
-    let coordinator = V2CommitCoordinator::with_options(
+    let coordinator = must_repo(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         anchor.clone(),
         CommitCoordinatorOptions::new(1, Duration::ZERO).with_max_pending_items(1),
-    )
+    ))
     .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard);
     let object_count = V2_INDEX_COMPACTION_REQUEST_RUNS + 1;
 
@@ -5229,11 +5510,11 @@ async fn v2_coordinator_poisoned_compaction_guard_stops_before_staging() {
             .await,
     );
     must_repo(repository.resize_accepted_run_catalog_for_tests(V2_INDEX_COMPACTION_REQUEST_RUNS));
-    let coordinator = V2CommitCoordinator::with_options(
+    let coordinator = must_repo(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         anchor,
         CommitCoordinatorOptions::new(1, Duration::ZERO).with_max_pending_items(1),
-    )
+    ))
     .with_maintenance_guard(FailsAfterMaintenanceGuard::new(0));
     store
         .reset_operation_counts()
@@ -5295,11 +5576,11 @@ async fn v2_coordinator_pauses_before_staging_when_compaction_guard_is_unavailab
             .await,
     );
     must_repo(repository.resize_accepted_run_catalog_for_tests(V2_INDEX_COMPACTION_PAUSE_RUNS));
-    let coordinator = V2CommitCoordinator::with_options(
+    let coordinator = must_repo(V2CommitCoordinator::with_options(
         Arc::clone(&repository),
         anchor.clone(),
         CommitCoordinatorOptions::new(1, Duration::ZERO).with_max_pending_items(1),
-    );
+    ));
     let base = must_v2(anchor.read_v2().await).expect("base anchor should exist");
     store
         .reset_operation_counts()

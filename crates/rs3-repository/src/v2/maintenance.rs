@@ -11,7 +11,7 @@ use super::service::packed::{
 };
 use super::{
     V2_CAPABILITY_COMPACTED_INDEX_RUNS, V2_CAPABILITY_FRAMED_INDEX, V2_SUPPORTED_CAPABILITY_FLAGS,
-    V2CommitKind, V2IndexRootRunRef, V2SectionType, open_v2_index_root,
+    V2CommitKind, V2IndexRoot, V2IndexRootRunRef, V2SectionType, open_v2_index_root,
 };
 use crate::checkpoint::open_index_delta_object;
 use crate::state::{RepositoryState, apply_index_delta_object};
@@ -376,14 +376,13 @@ impl<S> V2CommitStore<S>
 where
     S: BlobStore,
 {
-    pub(crate) async fn apply_index_root_to_state(
+    pub(crate) fn open_index_root_without_replay(
         &self,
-        state: &mut RepositoryState,
         containing_commit: &V2ReplayCommit,
         section_ordinal: u32,
         stored_root: &[u8],
         limits: V2ReplayLimits,
-    ) -> V2Result<V2ResolvedIndexRoot> {
+    ) -> V2Result<V2IndexRoot> {
         let header = &containing_commit.parsed_header.header;
         let context = repository_context_from_refs(
             &self.options().repository_id,
@@ -405,6 +404,40 @@ where
         {
             return Err(V2FormatError::InvalidIndexRoot);
         }
+        match header.parent.as_ref() {
+            Some(_) => {}
+            None if header.self_ref.sequence == Sequence::new(1)
+                && root.covered_generation() == Sequence::ZERO
+                && root.runs().is_empty() => {}
+            _ => return Err(V2FormatError::InvalidIndexRoot),
+        }
+        let referenced_commit_bytes = root.runs().iter().try_fold(0_u64, |total, run| {
+            total.checked_add(run.location.commit_stored_len)
+        });
+        if root.runs().len() > limits.max_commits
+            || root.claims().total_stored_run_bytes() > limits.max_total_commit_bytes
+            || referenced_commit_bytes.is_none_or(|bytes| bytes > limits.max_total_commit_bytes)
+        {
+            return Err(V2FormatError::ReplayBudgetExceeded);
+        }
+        Ok(root)
+    }
+
+    pub(crate) async fn apply_index_root_to_state(
+        &self,
+        state: &mut RepositoryState,
+        containing_commit: &V2ReplayCommit,
+        section_ordinal: u32,
+        stored_root: &[u8],
+        limits: V2ReplayLimits,
+    ) -> V2Result<V2ResolvedIndexRoot> {
+        let header = &containing_commit.parsed_header.header;
+        let root = self.open_index_root_without_replay(
+            containing_commit,
+            section_ordinal,
+            stored_root,
+            limits,
+        )?;
         let covered_parent_sequence = match header.parent.as_ref() {
             Some(parent) => parent.sequence,
             None if header.self_ref.sequence == Sequence::new(1)
@@ -415,16 +448,6 @@ where
             }
             _ => return Err(V2FormatError::InvalidIndexRoot),
         };
-        let referenced_commit_bytes = root.runs().iter().try_fold(0_u64, |total, run| {
-            total.checked_add(run.location.commit_stored_len)
-        });
-        if root.runs().len() > limits.max_commits
-            || root.claims().total_stored_run_bytes() > limits.max_total_commit_bytes
-            || referenced_commit_bytes.is_none_or(|bytes| bytes > limits.max_total_commit_bytes)
-        {
-            return Err(V2FormatError::ReplayBudgetExceeded);
-        }
-
         let mut ordered_runs = root.runs().to_vec();
         ordered_runs.sort_by_key(|run| (run.minimum_generation, run.run_sequence, run.run_id));
         *state = RepositoryState::default();
@@ -939,8 +962,8 @@ where
             .clone();
         let mut roots = Vec::new();
 
-        for (entry, _) in state.namespace.live_entries_with_prefixes() {
-            let (commit_key, commit_version_id, body_digest) = match entry.payload_ref {
+        for entry in state.namespace.live_entries() {
+            let (commit_key, commit_version_id, body_digest) = match &entry.payload_ref {
                 Some(PayloadReference::V2Commit {
                     commit_key,
                     commit_version_id,
@@ -952,7 +975,7 @@ where
                     commit_version_id,
                     body_digest,
                     ..
-                }) => (commit_key, commit_version_id, body_digest),
+                }) => (commit_key.clone(), commit_version_id.clone(), *body_digest),
                 None => continue,
                 Some(PayloadReference::V2Self { .. } | PayloadReference::V2PackSelf { .. }) => {
                     return Err(V2FormatError::InvalidHeaderField);

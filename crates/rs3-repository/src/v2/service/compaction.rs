@@ -129,7 +129,29 @@ where
         A: V2CommitAnchor,
         G: V2MaintenanceGuard,
     {
+        let _mutation_lease = self.claim_direct_mutation()?;
+        self.write_compaction_snapshot_inner(
+            anchor,
+            guard,
+            options,
+            retained_provider_conformance_passed,
+        )
+        .await
+    }
+
+    async fn write_compaction_snapshot_inner<A, G>(
+        &self,
+        anchor: &A,
+        guard: &G,
+        options: V2FullGcDryRunOptions,
+        retained_provider_conformance_passed: bool,
+    ) -> Result<V2StoredCommit>
+    where
+        A: V2CommitAnchor,
+        G: V2MaintenanceGuard,
+    {
         let _guard = self.mutation_lock.lock().await;
+        let _publication_guard = self.publication_lock.write().await;
         if self.pending_index_delta_sequence()?.is_some() {
             return Err(RepositoryError::CommitFailed {
                 reason: "v2 compaction requires no pending index delta".to_owned(),
@@ -137,27 +159,20 @@ where
         }
         let (has_packed_payload, live_object_count, live_plaintext_bytes) = {
             let state = self
-                .accepted_state
+                .accepted
                 .read()
                 .map_err(|_| RepositoryError::StatePoisoned)?;
-            state
-                .namespace
-                .live_entries_with_prefixes()
-                .into_iter()
-                .fold(
-                    (false, 0_usize, 0_u64),
-                    |(has_pack, count, bytes), (entry, _)| {
-                        (
-                            has_pack
-                                || matches!(
-                                    entry.payload_ref,
-                                    Some(PayloadReference::V2Pack { .. })
-                                ),
-                            count.saturating_add(1),
-                            bytes.saturating_add(entry.content_len),
-                        )
-                    },
-                )
+            state.repository.namespace.live_entries().fold(
+                (false, 0_usize, 0_u64),
+                |(has_pack, count, bytes), entry| {
+                    (
+                        has_pack
+                            || matches!(entry.payload_ref, Some(PayloadReference::V2Pack { .. })),
+                        count.saturating_add(1),
+                        bytes.saturating_add(entry.content_len),
+                    )
+                },
+            )
         };
         if has_packed_payload {
             return Err(RepositoryError::CommitFailed {
@@ -221,8 +236,11 @@ where
             .await
             .map_err(v2_repository_error)?;
 
-        self.verify_compaction_snapshot_with_fresh_reader(&temporary_anchor, &plan)
+        let compacted_state = self
+            .verify_compaction_snapshot_with_fresh_reader(&temporary_anchor, &plan)
             .await?;
+        accepted_locations.ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
+        let recovered_sequence = compacted_state.next_sequence;
 
         guard
             .verify_v2_maintenance(Some(&base_anchor))
@@ -241,18 +259,38 @@ where
             )
             .await
             .map_err(v2_repository_error)?;
-        let locations = accepted_locations
-            .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
-        self.resolve_accepted_payload_refs(&adopted.anchor_state, &locations)?;
-        self.accept_current_state()?;
-        self.accepted_runs
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)?
-            .clear();
-        *self
-            .accepted_anchor
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)? = Some(adopted.anchor_state.clone());
+        let mut accepted = match self.accepted.write() {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                self.mark_local_recovery_required();
+                tracing::error!(
+                    target: "rs3_repository",
+                    operation = "v2_install_legacy_compaction",
+                    error = %error,
+                    "v2 compaction anchor advanced but local state installation failed; restart is required",
+                );
+                return Err(RepositoryError::AcceptedRecoveryRequired);
+            }
+        };
+        let mut pending = match self.pending.lock() {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.mark_local_recovery_required();
+                tracing::error!(
+                    target: "rs3_repository",
+                    operation = "v2_install_legacy_compaction",
+                    error = %error,
+                    "v2 compaction anchor advanced but local staging installation failed; restart is required",
+                );
+                return Err(RepositoryError::AcceptedRecoveryRequired);
+            }
+        };
+        *accepted = super::V2AcceptedState {
+            repository: compacted_state,
+            runs: Vec::new(),
+            anchor: Some(adopted.anchor_state.clone()),
+        };
+        pending.reset_after_validated_publication(recovered_sequence);
         Ok(adopted)
     }
 
@@ -359,8 +397,8 @@ where
     )> {
         let mut sections = BTreeSet::new();
         let mut pack_records = BTreeSet::new();
-        for (entry, _) in state.namespace.live_entries_with_prefixes() {
-            match entry.payload_ref {
+        for entry in state.namespace.live_entries() {
+            match &entry.payload_ref {
                 Some(PayloadReference::V2Commit {
                     commit_key,
                     commit_version_id,
@@ -370,11 +408,11 @@ where
                     ..
                 }) => {
                     sections.insert(V2LivePayloadSectionKey {
-                        commit_key,
-                        commit_version_id,
-                        body_digest,
-                        offset,
-                        length,
+                        commit_key: commit_key.clone(),
+                        commit_version_id: commit_version_id.clone(),
+                        body_digest: *body_digest,
+                        offset: *offset,
+                        length: *length,
                     });
                 }
                 Some(PayloadReference::V2Pack {
@@ -387,12 +425,12 @@ where
                     ..
                 }) => {
                     pack_records.insert(V2LivePayloadPackRecordKey {
-                        commit_key,
-                        commit_version_id,
-                        body_digest,
-                        pack_section_ordinal,
-                        pack_record_count,
-                        record_ordinal,
+                        commit_key: commit_key.clone(),
+                        commit_version_id: commit_version_id.clone(),
+                        body_digest: *body_digest,
+                        pack_section_ordinal: *pack_section_ordinal,
+                        pack_record_count: *pack_record_count,
+                        record_ordinal: *record_ordinal,
                         content_len: entry.content_len,
                     });
                 }
@@ -408,26 +446,38 @@ where
     async fn compaction_snapshot_plan(&self) -> Result<V2CompactionSnapshotPlan> {
         let entries = {
             let state = self
-                .accepted_state
+                .accepted
                 .read()
                 .map_err(|_| RepositoryError::StatePoisoned)?;
             state
+                .repository
                 .namespace
-                .live_entries_with_prefixes()
-                .into_iter()
-                .map(|(entry, prefix_tokens)| {
+                .live_entries()
+                .map(|entry| {
+                    let prefix_tokens = state
+                        .repository
+                        .namespace
+                        .prefix_tokens(&entry.blind_key)
+                        .cloned()
+                        .collect();
                     let manifest = state
+                        .repository
                         .manifests
                         .get(&entry.manifest_id)
                         .cloned()
                         .ok_or_else(|| RepositoryError::InvalidObjectFormat {
                             object_id: entry.object_id.clone(),
                         })?;
-                    Ok((entry, prefix_tokens, manifest))
+                    Ok((entry.clone(), prefix_tokens, manifest))
                 })
                 .collect::<Result<Vec<_>>>()?
         };
-        let sequence = self.repository.read_state()?.next_sequence;
+        let sequence = self
+            .accepted
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .repository
+            .next_sequence;
         let mut payloads = Vec::with_capacity(entries.len());
         let mut verification = Vec::with_capacity(entries.len());
         let keyring = self.repository.keyring()?;
@@ -547,7 +597,7 @@ where
         &self,
         anchor: &A,
         plan: &V2CompactionSnapshotPlan,
-    ) -> Result<()>
+    ) -> Result<crate::state::RepositoryState>
     where
         A: V2CommitAnchor,
     {
@@ -564,6 +614,12 @@ where
                 return Err(v2_repository_error(V2FormatError::ObjectLengthMismatch));
             }
         }
-        Ok(())
+        let state = fresh
+            .accepted
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .repository
+            .clone();
+        Ok(state)
     }
 }
