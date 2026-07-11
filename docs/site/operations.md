@@ -39,9 +39,12 @@ executing S3 operations, and per-process S3 operation rate. Align ingress,
 proxy, pod memory, and service mesh limits with the gateway values so oversized or
 excessive traffic is rejected before it consumes pod resources. Known-length
 `PutObject` bodies above the buffered threshold stream into backend multipart
-commit uploads when the backend supports multipart. Unknown-length or chunked
-uploads buffer only until the threshold is crossed, then continue through the
-same multipart commit path and remain bounded by `RS3_MAX_PUT_OBJECT_BYTES`.
+commit uploads when the backend supports multipart. The S3 listener requires
+the payload length supplied by normal `Content-Length` or valid SigV4 streaming
+metadata; an unsigned HTTP chunked request without a length is rejected with
+S3 `411 MissingContentLength`. The lower repository layer still bounds an
+EOF-finalized stream by `RS3_MAX_PUT_OBJECT_BYTES` for internal callers and
+fault testing.
 Operators MUST configure a backend lifecycle rule that aborts incomplete
 multipart uploads, because client disconnects and crashes can leave provider
 temporary parts that repository GC cannot see.

@@ -64,6 +64,7 @@ The replacement `v02` design accepts specific backend-visible leakage:
 | Commit sequence and run inventory | Sequence-bounded commit keys and immutable run objects expose commit and compaction activity. | Batch commits, use random object IDs, keep catalog counts, levels, and bounds encrypted. |
 | Compaction cadence | The provider sees sibling delta-carrier and root writes, plus later cleanup. | Compact at bounded active-run watermarks and consider optional jitter; never include paths in scheduling telemetry. |
 | Payload-pack shape and access | A commit exposes aggregate pack size, and exact range reads reveal ciphertext span and access patterns. | Batch by bounded protection cohort, randomize record order, keep record descriptors inside encrypted authenticated index runs, and consider optional padding only with measured budgets. |
+| Streamed-payload shape and access | A canonical `[PAYLOAD, INDEX_RUN]` multipart commit reveals that one streamed carrier was written, its ciphertext length, write cadence, and later range-access spans. A zero-length stream still has an authenticated payload header and is distinguishable by size from larger streams. | Keep path and payload identity inside authenticated ciphertext, use opaque random commit keys, fetch only authenticated segments, and treat padding or traffic shaping as future measured modes. |
 | Deterministic metadata equality | Stable metadata sealing can produce identical sealed bytes for identical metadata under identical associated data. | Bind framed ciphertext to a unique run and frame context; complete equality analysis before format freeze. |
 
 Optional mitigations include padding, pack-size normalization, commit batching,
@@ -75,7 +76,7 @@ compact payload-pack, index-run, and index-root sections. No production
 repository used `v01`, and no migration or dual reader is planned.
 
 !!! warning "Security implementation status"
-    The gateway reads and writes a transitional `v02` commit envelope with
+    The gateway reads and writes the preview `v02` commit envelope with
     signed per-section digests. Bounded normal writes use encrypted payload
     packs and framed index runs; recovery replays index runs without reading
     payload bytes. The encrypted run carries each payload record's authenticated
@@ -87,11 +88,13 @@ repository used `v01`, and no migration or dual reader is planned.
     writes signed `INDEX_ROOT` catalogs of exact embedded run sections.
     Publication reads back and opens the exact signed candidate root and every
     new compacted run before anchor adoption, and maintenance derives exact run
-    and live-payload reachability from the same verified catalog. Guarded metadata-only packed-run compaction
-    and automatic active-run watermarks are implemented. Production claims
-    remain blocked on framed streaming, protection-cohort and GC qualification,
-    the pinned fresh-process filesystem lane, live-provider reruns, and external
-    cryptographic review.
+    and live-payload reachability from the same verified catalog. Known-length,
+    unknown-length, and zero-length streaming writes use the canonical
+    `[PAYLOAD, INDEX_RUN]` shape and enter the same catalog. Guarded metadata-only
+    packed/streamed-run compaction and automatic active-run watermarks are
+    implemented. Production claims remain blocked on protection-cohort and
+    retained-provider GC qualification, the pinned fresh-process filesystem
+    lane, live-provider reruns, and external cryptographic review.
 
 ## Control Map
 
@@ -117,11 +120,13 @@ repository used `v01`, and no migration or dual reader is planned.
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
 | v02 index frames cannot be transplanted or reordered | Frame AEAD binds immutable repository identity, the historical keyring-envelope reference, exact object key, section ordinal, run identity, and complete frame descriptor. The signed catalog binds exact embedded commit version, length, body digest, layout, level, and compaction generation. Compacted carriers must be direct siblings of their root with the exact parent and sequence relation. | Framed-run and root codecs, guarded sibling publication, exact candidate read-back, exact catalog recovery, bounded replay, and corruption tests. Retained-provider restart and fault qualification remain. |
 | v02 payload-pack records cannot be transplanted or downgraded | Record AEAD binds immutable repository identity, historical keyring context, exact object key, pack, section, record, segment, layout, and length facts. Encrypted `INDEX_RUN` descriptors bind the pack identity, content-key ID, historical envelope object and digest, ordinal, offset, length, and plaintext digest. The accepted signed reference binds the returned exact version, length, and commit-body digest. | The bounded ciphertext-only pack codec, canonical segmentation, publication, direct cold range-read, replay, and corruption tests are implemented; protection-cohort partitioning and cleaning remain release blockers. |
+| v02 streamed payloads cannot be detached from their exact carrier | A self-stream run record binds the payload identity, signed section ordinal, and authenticated segmented header. Replay and compaction materialize an exact external carrier with commit key/version, stored length/body digest, historical keyring envelope, section start/ordinal/offset/length/digest, payload identity, and header. Section ranges beyond the exact stored object fail closed. | Canonical known/unknown/zero-length write, replay, checkpoint, exact-carrier tamper, compaction, GC, and range-read tests. Retained-provider fault qualification remains. |
+| Decrypted streamed-payload cache entries cannot alias across authenticated carriers | The in-memory cache key hashes repository/keyring context and every exact commit, section, payload-header, and content-length fact. Decryption continues to use the real payload ID as AEAD associated data, not the synthetic cache key. | Cache-field binding, cache/AEAD identity separation, and section-bound tests. The derived key is process-local and creates no backend object or additional backend-visible identifier. |
 | Cold packed reads do not fetch unrelated records or metadata | Recovery materializes authenticated direct record descriptors from encrypted runs. A fresh post-recovery read uses one exact backend range `GET`; a 512 B record fetches 528 B including its AEAD tag, for 1.03125x ciphertext-byte amplification. | Direct cold-read request-count and exact-range repository test; the scale harness enforces configurable request and byte-amplification ceilings during sentinel reads. |
 | v02 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery verifies exact bounded run sections sequentially from a signed catalog under count and byte ceilings. Runtime publication keeps one accepted state plus a hard-bounded 1,024-mutation overlay; compaction uses per-run scratch state and shared identifiers rather than a cumulative replay scratch or candidate namespace. | Embedded and compacted recovery tests pass. Three automatic-compaction 1M runs passed at 2,809,462,784-2,809,933,824 B peak RSS; the pinned fresh-process filesystem lane remains. |
 | v02 checkpoint failure cannot anchor unrecoverable state | A coordinator requests metadata-only compaction at 256 active runs. A missing guard or a fully validated nonreducing bounded plan may defer below 896 and retry at later 64-run boundaries; both fail closed at 896. Configured-guard, corruption, storage, anchor, and other compaction errors poison immediately. The hard 1,024-run verifier ceiling remains. | Automatic success, missing-guard and nonreducing-plan retry and pause, configured-guard failure, hard-ceiling, and exact recovered-run-count tests. Three 1M release runs crossed six compaction windows and recovered 233 active runs; adversarial restart and retained-provider qualification remain. |
-| v02 compaction cannot publish a partial or payload-rewriting merge | At most the oldest 128 foreground level-0 runs are merged newest-wins including tombstones; newer level-0 and existing level-1 shards remain exact-referenced; self-pack references become exact historical external references; equal-generation groups are indivisible; candidate carriers and root are direct siblings read back and opened exactly before one fenced CAS. Level denotes tier, not epoch, and the preview decoder rejects levels above 1. | Pure planner, bounded-window selection, historical-envelope, no-payload-write, exact candidate read-back, guard-loss, publication-lineage, recovery, invalid-tier, and automatic-watermark tests. Bottom-tier tombstone reclamation remains future guarded or offline work. |
-| v02 GC retains every live payload without retaining whole ancestry | Effective run records mark exact payload commit versions; catalog-named run commits and protected roots are marked before exact-version sweep. | Implemented for embedded and compacted catalog runs; payload-pack cleaning remains blocked. |
+| v02 compaction cannot publish a partial or payload-rewriting merge | At most the oldest 128 foreground level-0 runs are merged newest-wins including tombstones; newer level-0 and existing level-1 shards remain exact-referenced; self-pack and self-stream references become exact historical external references; equal-generation groups are indivisible; candidate carriers and root are direct siblings read back and opened exactly before one fenced CAS. Level denotes tier, not epoch, and the preview decoder rejects levels above 1. | Pure planner, bounded-window selection, historical-envelope, mixed pack/stream no-payload-write, exact candidate read-back, guard-loss, publication-lineage, recovery, invalid-tier, and automatic-watermark tests. Bottom-tier tombstone reclamation remains future guarded or offline work. |
+| v02 GC retains every live payload without retaining whole ancestry | Effective run records mark exact payload-pack and streamed-carrier commit versions; catalog-named run commits and protected roots are marked before exact-version sweep. Zero-length streamed carriers remain reachable because the authenticated run still references them. | Implemented for embedded and compacted catalog runs and streamed carriers; payload-pack cleaning remains blocked. |
 
 ## Rollback Rule
 
@@ -203,8 +208,8 @@ anchor-bound versions remain exactly readable. The object key is then not the
 uniqueness authority; the signed commit, external anchor, object digest, and
 provider version ID are.
 
-In both the removed prototype and transitional `v02`, commit keys include a random
-component. For retained-version
+In both the removed prototype and current preview `v02`, commit keys include a
+random component. For retained-version
 providers that do not support atomic create, the writer performs a preflight
 `HEAD` and binds the accepted object version into the anchor. A same-sequence
 or orphaned retained commit is reported and skipped by automatic GC until
@@ -302,9 +307,10 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
 
 ## Current Open Risks
 
-- The `v02` catalog, packed-run compaction, and automatic watermark paths remain
-  preview-scoped. Durable format freeze, retained-provider qualification, and
-  external cryptographic review are still outstanding.
+- The `v02` catalog, wire-version-4 pack/stream run model, compaction, and
+  automatic watermark paths remain preview-scoped. Durable format freeze,
+  retained-provider qualification, and external cryptographic review are still
+  outstanding.
 - Durable format compatibility is not promised yet.
 - The cryptographic design has not had an external review.
 - Metadata sealing uses a standard misuse-resistant AEAD, but deterministic
@@ -316,6 +322,10 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
   must account for provider-visible equality through omitted writes and shared
   liveness, not merely hide a content digest inside encrypted metadata. See the
   [deduplication design note](reference/deduplication.md).
+- Foreground standalone payload uploads are also deferred. They would separate
+  payload publication from the covering signed run and add orphan adoption,
+  exact-retention, and cleanup states without improving the primary Kopia path,
+  which already chunks and deduplicates its repository data.
 - Payload-pack protection cohorts and cleaning have not passed retained-version,
   legal-hold, protected-root, or crash testing.
 - Packed-run catalog compaction and automatic pre-ceiling backpressure pass the

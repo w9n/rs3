@@ -306,21 +306,45 @@ The current writer default is adaptive: small objects keep 512 B segments,
 medium objects use 8 KiB segments, and larger objects use 64 KiB segments. The
 historical fixed-size matrix below still explains the byte/request tradeoff.
 
-For `v2-preview`, payload bytes live inside signed commit objects. Current
-gateway smoke runs on 2026-05-16 show the expected write request floor: one
-backend commit PUT per sequential write, with concurrent writes batched into
-fewer commit PUTs. Payload sections now carry per-payload identities, so range
-reads can verify and decrypt the requested payload segments without reading the
-whole commit body. New v2 refs carry payload-header facts plus the padded
-commit section offset, so hot-path range reads fetch only the required
-ciphertext span. Repeated or concurrent overlapping ranges reuse the decrypted
-segment cache behind a striped per-payload fill gate, so independent payloads
-can still fill in parallel. Full-file reads fetch the named payload section.
-Older refs still fall back to bounded commit-header and payload-header probes.
-Large streaming PUTs serialize writes while the gateway reads the request body
-into the signed multipart commit. `RS3_STREAM_READ_STALL_TIMEOUT_SECS` bounds
-how long one stalled client body can hold that write path before the request
-fails as incomplete.
+For `v2-preview`, bounded payload packs and large streamed payloads live inside
+signed commit objects. A streamed write now has the canonical section shape
+`[PAYLOAD, INDEX_RUN]`, so it enters the same checkpoint, compaction, recovery,
+and GC graph as a bounded packed write. Payload sections carry authenticated
+per-payload identities and segmented-header facts, so range reads can verify and
+decrypt the requested segments without reading the whole commit body. Full-file
+reads fetch the named payload section.
+
+Repeated or concurrent overlapping streamed ranges reuse the decrypted-segment
+cache behind a striped per-payload fill gate. Its in-memory cache identity binds
+repository/keyring context and the exact commit, version, body, section,
+payload-header, and content-length facts, while AEAD still uses the actual
+payload ID. This hardening changes cache correctness, not the amount of backend
+data required for a cache miss. Large streaming PUTs serialize writes while the
+gateway reads the request body into the signed multipart commit.
+`RS3_STREAM_READ_STALL_TIMEOUT_SECS` bounds how long one stalled client body can
+hold that write path before the request fails as incomplete. Checkpoint and
+compaction publication are metadata-only for both packed and streamed carriers;
+they preserve exact historical references instead of copying payload bytes.
+
+The 2026-05 measurements below predate the current index-run wire version 4
+self/external stream-carrier model. They remain historical payload segmentation
+and request-shape evidence, not performance qualification for the completed
+framed-stream series. The known-length gateway rerun below checks the new write
+shape. Post-checkpoint cold reads and mixed pack/stream compaction still need a
+measured matrix before making a complete performance claim; EOF-finalized,
+zero-length, checkpoint/reload, compaction, and GC correctness are test-backed.
+
+A 2026-07-11 local RustFS gateway rerun covered three independent release-mode
+samples of four sequential 32 MiB known-length uploads. Elapsed time was
+3.853-9.856 s, plaintext throughput was 12.99-33.22 MiB/s, peak gateway RSS was
+71,086,080-71,450,624 B, write amplification was 1.00067675-1.00067697x, and
+each upload caused one backend commit `PUT` plus one exact read-back `GET`.
+The throughput spread is too wide for a release claim, but the byte and request
+shape is stable. The current S3 boundary rejects unsigned HTTP/1.1 chunked
+`PutObject` without `Content-Length` with S3 `411 MissingContentLength`, as
+required by its S3 parser. The repository's EOF-finalized internal stream path
+passes direct tests, but it is not an externally qualified gateway lane.
+
 The default partial commit-batch wait is now 25 ms. A 2026-05-17 local gateway
 smoke recorded the current medium-object shape: sequential 256 KiB writes used
 1.0 backend requests per client write, parallel batched writes used 0.125
@@ -328,7 +352,9 @@ requests per client write, full reads used 0.016 requests per client read after
 cache fill, and 4 KiB range reads used 0.063 requests per client read. Large
 67,108,865 B known-length and chunked unknown-length PUTs both used one commit
 PUT plus one retained-profile preflight `HEAD`; write-byte amplification was
-1.0004x. Eight 4 KiB ranges from a large object used one backend range `GET`
+1.0004x under the then-current gateway boundary. The unknown-length result is
+historical and is not reproducible through the current S3 parser. Eight 4 KiB
+ranges from a large object used one backend range `GET`
 after cache fill, with 2.0005x read-byte amplification from the 64 KiB adaptive
 payload segment. The raw JSONL artifacts are retained as ignored local release
 evidence and should be copied to release assets only after review.
@@ -397,6 +423,9 @@ and host load can dominate.
 
 - Keep run order alternating between direct and gateway lanes.
 - Keep measuring variability with at least three runs for release claims.
+- Rerun known-length streamed uploads, post-checkpoint cold ranges,
+  and mixed pack/stream compaction under wire version 4; report request, byte,
+  elapsed, CPU, and RSS results separately from the historical May artifacts.
 - Reduce commit stage-lock and commit-wait time without allowing commits to
   race writes whose sequence state is not yet indexed.
 - Add provider matrix runs for additional S3-compatible stores after the

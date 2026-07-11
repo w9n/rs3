@@ -55,16 +55,21 @@ not add ad hoc hashing, MAC, encryption, or key derivation logic.
     payload bytes. Signed `INDEX_ROOT` checkpoints catalog exact embedded run
     sections; publication reads back and opens the exact signed root and every
     new compacted run before anchor adoption. They also drive exact maintenance
-    reachability. Guarded metadata-only compaction and
-    automatic active-run watermarks are implemented for packed runs. Framed
-    streaming, payload protection cohorts, complete GC qualification, and the
-    pinned fresh-process filesystem lane remain release blockers. The current
-    automatic-compaction 1M in-memory gate passes.
+    reachability. Guarded metadata-only compaction and automatic active-run
+    watermarks are implemented for packed and streamed payload carriers.
+    Known-length, unknown-length, and zero-length streaming writes publish the
+    canonical `[PAYLOAD, INDEX_RUN]` shape and participate in the same catalog,
+    compaction, and GC graph. Payload protection cohorts, complete
+    retained-provider GC qualification, and the pinned fresh-process filesystem
+    lane remain release blockers. The current automatic-compaction 1M in-memory
+    gate passes.
 
 Normal writes are append-friendly and value-separated:
 
-1. Put every non-empty value in the batch into one encrypted payload pack and
-   stage one compact framed binary index run. Empty values are index-only.
+1. Put every non-empty bounded value in the batch into one encrypted payload
+   pack and stage one compact framed binary index run. Empty bounded values are
+   index-only. A genuinely streamed request instead writes one encrypted
+   `PAYLOAD` followed by its `INDEX_RUN`, including for a zero-length stream.
 2. Publish a signed `v02` commit under a random path-private key.
 3. Advance the external commit anchor.
 4. Acknowledge the client write only after the covering commit is accepted.
@@ -83,6 +88,25 @@ This lets a cold read issue one exact range `GET` instead of fetching a pack
 directory first. Retention mode, expiry horizon, and legal-hold requirement
 define protection cohorts because the backend protects the containing object.
 
+A streamed value is also immutable and value-separated, but its ciphertext is
+the `PAYLOAD` section of the same commit as its foreground run. While that run
+is embedded, a self-stream pointer carries the authenticated payload identity,
+section ordinal, and segmented-payload header. Before compaction removes the
+source-run boundary, the pointer is normalized to an exact external carrier:
+commit key and provider version, stored object length and body digest,
+historical keyring-envelope reference, section start, ordinal, offset, length,
+and digest, plus the payload identity and header. Compaction and checkpoints
+therefore move metadata references only. They do not read or rewrite streamed
+payload ciphertext.
+
+The preview does not upload foreground payloads as standalone `objects/v02/`
+objects and does not deduplicate them in the gateway. Keeping payload and run in
+one signed commit gives publication one atomic anchor transition and keeps
+liveness explicit. Standalone carriers and deduplication would add orphan,
+retention, equality-leakage, and shared-liveness policy that has not yet been
+qualified; Kopia already performs chunking and deduplication for the primary
+client workload.
+
 `v02` replaces monolithic index snapshots with an encrypted LSM-style index.
 Recent immutable foreground runs are level 0. Each compaction selects at most
 the oldest 128 level-0 runs, merges that bounded window newest-wins, retains
@@ -92,9 +116,10 @@ rewritten. Level is a storage tier, never a compaction epoch. The preview
 format accepts only level 0 and level 1, rejecting higher values until a future
 capability explicitly defines another tier. Equal-generation mutations remain
 indivisible so a root cannot
-publish half of one logical generation. Pointers to packs embedded beside a
-source run are normalized to exact external historical commit and
-keyring-envelope references before source boundaries are discarded. A retained
+publish half of one logical generation. Pointers to packs or streams embedded
+beside a source run are normalized to exact external historical commit,
+section, and keyring-envelope references before source boundaries are
+discarded. A retained
 level-1 tombstone masks older records in earlier level-1 shards. Reclaiming
 those bottom-tier tombstones and the records they mask remains future guarded
 or offline maintenance. A small signed `INDEX_ROOT` catalog names the complete
@@ -106,8 +131,9 @@ ordinal. The blinded namespace projection answers `HEAD` and `GET`; the
 path-sorted listing projection answers prefix listings. Frame-local container
 tables share exact object references. Values never live in an index frame, so
 LSM compaction is metadata-only and cold recovery does not read user data. Run
-wire version 3 uses canonical bounded varints for generation and content length
-in both projections.
+wire version 4 adds canonical self-stream and exact external-stream carriers to
+the existing bounded pack pointers. It uses canonical bounded varints for
+generation and content length in both projections.
 
 The runtime keeps one accepted compact state plus a hard-bounded 1,024-mutation
 overlay. An exclusive publication barrier freezes that overlay from pre-CAS
@@ -197,12 +223,14 @@ root. Anchor import from a trusted bundle verifies the graph before recreating
 a missing anchor.
 
 Catalogs and effective index records are exact reachability roots. `INDEX_ROOT`
-catalogs name index runs only; effective highest-generation records name the
-payload packs. Maintenance marks the exact catalog and run versions plus the
-exact payload-containing object versions selected by live records. A payload
-reference does not keep its commit's entire ancestry reachable. GC completes a
-fail-closed mark before any deletion and rechecks both the maintenance fence and
-anchor before deleting an exact version.
+catalogs name index runs only; effective highest-generation records name exact
+payload-pack or streamed-payload carriers. Maintenance marks the exact catalog
+and run versions plus the exact payload-containing object versions selected by
+live records. A payload reference does not keep its commit's entire ancestry
+reachable. This rule also protects a zero-length streamed carrier even though a
+client read can return an empty body without fetching payload bytes. GC
+completes a fail-closed mark before any deletion and rechecks both the
+maintenance fence and anchor before deleting an exact version.
 
 Payload-pack cleaning is separate from index compaction. It rewrites live
 records from a sufficiently sparse pack into a new random pack, publishes new
@@ -240,13 +268,21 @@ S3 listing and timestamps are not coordination primitives. A future
 disconnected mode would need explicit branches, authenticated merge semantics,
 and deterministic conflict policy in a different repository contract.
 
-Payload segmentation is recorded per pack record. Small values use one AEAD
-record; medium and large values use larger authenticated segments for bounded
-range reads. The authenticated index descriptor carries the physical record
-layout, so thresholds are writer policy rather than repository-format
-constants and the pack needs no separately fetched directory. Bounded commits
-use one single-part upload with a compact header; only genuinely streaming
-commits pay the fixed multipart header reservation.
+Payload segmentation is recorded per pack record or streamed-payload header.
+Small packed values use one AEAD record; medium and large values use
+independently authenticated segments for bounded range reads. The authenticated
+index descriptor carries the physical pack layout or exact streamed section
+facts, so neither read path needs an unauthenticated directory lookup. Bounded
+commits use one single-part upload with a compact header; only genuinely
+streaming commits pay the fixed multipart header reservation.
+
+Partial streamed reads fetch only the authenticated ciphertext segments that
+cover the requested plaintext range. The in-memory decrypted-segment cache uses
+an opaque identity derived from repository and historical keyring context plus
+the exact commit, version, body, section, payload-header, and content-length
+facts. The actual payload ID remains the AEAD identity. This prevents cache
+entries from aliasing across exact carriers without creating a backend object
+or exposing a new backend key.
 
 ## S3 Compatibility
 
