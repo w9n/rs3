@@ -68,6 +68,12 @@ pub(crate) struct PerfArgs {
     /// Fail a write scenario when backend bytes exceed this plaintext ratio.
     #[arg(long)]
     max_write_amp: Option<f64>,
+    /// Fail reload verification when cold-read bytes exceed this plaintext ratio.
+    #[arg(long, requires = "verify_reload")]
+    max_cold_read_amp: Option<f64>,
+    /// Fail reload verification above this many backend requests per cold read.
+    #[arg(long, requires = "verify_reload")]
+    max_cold_read_requests_per_read: Option<f64>,
     /// Number of read operations in read scenarios.
     #[arg(long, default_value_t = 128)]
     reads: usize,
@@ -257,6 +263,11 @@ impl TraceFormat {
 }
 
 pub(crate) fn run(args: PerfArgs) -> Result<()> {
+    let cold_read_limits_requested =
+        args.max_cold_read_amp.is_some() || args.max_cold_read_requests_per_read.is_some();
+    if cold_read_limits_requested && !args.verify_reload {
+        anyhow::bail!("cold-read limits require --verify-reload");
+    }
     if args.verify_reload
         && !matches!(
             args.scenario,
@@ -278,6 +289,24 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
         .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
     {
         anyhow::bail!("--max-write-amp must be finite and greater than zero");
+    }
+    if args
+        .max_cold_read_amp
+        .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
+    {
+        anyhow::bail!("--max-cold-read-amp must be finite and greater than zero");
+    }
+    if args
+        .max_cold_read_requests_per_read
+        .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
+    {
+        anyhow::bail!("--max-cold-read-requests-per-read must be finite and greater than zero");
+    }
+    if cold_read_limits_requested && args.objects == 0 {
+        anyhow::bail!("cold-read limits require at least one object");
+    }
+    if args.max_cold_read_amp.is_some() && args.object_size == 0 {
+        anyhow::bail!("--max-cold-read-amp requires a non-empty object");
     }
     #[cfg(feature = "containers")]
     if args.verify_reload && args.backend == PerfBackend::S3GatewayContainer {
@@ -319,6 +348,9 @@ async fn run_async(args: PerfArgs) -> Result<()> {
     if args.format == ReportFormat::Tsv {
         print_header();
     }
+    let cold_read_limits_requested =
+        args.max_cold_read_amp.is_some() || args.max_cold_read_requests_per_read.is_some();
+    let mut cold_read_gate_evaluated = false;
     for scenario in scenarios {
         let report = match scenario {
             PerfScenario::All => unreachable!("expanded above"),
@@ -329,7 +361,17 @@ async fn run_async(args: PerfArgs) -> Result<()> {
             PerfScenario::RangeRead => range_read(&args).await?,
         };
         report.enforce_max_write_amplification(args.max_write_amp)?;
+        if report.reload_verification.is_some() {
+            report.enforce_cold_read_limits(
+                args.max_cold_read_amp,
+                args.max_cold_read_requests_per_read,
+            )?;
+            cold_read_gate_evaluated = cold_read_limits_requested;
+        }
         report.print(args.format)?;
+    }
+    if cold_read_limits_requested && !cold_read_gate_evaluated {
+        anyhow::bail!("cold-read limits did not receive reload verification evidence");
     }
 
     Ok(())
@@ -402,6 +444,12 @@ fn add_perf_args(
     }
     if let Some(max_write_amp) = args.max_write_amp {
         command.args(["--max-write-amp", &max_write_amp.to_string()]);
+    }
+    if let Some(max_cold_read_amp) = args.max_cold_read_amp {
+        command.args(["--max-cold-read-amp", &max_cold_read_amp.to_string()]);
+    }
+    if let Some(limit) = args.max_cold_read_requests_per_read {
+        command.args(["--max-cold-read-requests-per-read", &limit.to_string()]);
     }
     command.args(["--reads", &args.reads.to_string()]);
     command.args(["--range-len", &args.range_len.to_string()]);
@@ -715,7 +763,7 @@ where
     S: BlobStore + Clone,
 {
     let started = Instant::now();
-    let repository = v2_repository(args, store)?;
+    let repository = v2_repository(args, store.clone())?;
     repository
         .load_chain_from_anchor(anchor)
         .await
@@ -734,6 +782,10 @@ where
     }
 
     let checked_indices = verification_indices(args.objects);
+    let cold_read_counts_before = store
+        .operation_counts()
+        .context("failed to capture pre-read backend counts")?;
+    let cold_read_started = Instant::now();
     for index in &checked_indices {
         let key = path(&format!("perf/write-committed-parallel/object-{index:08}"))?;
         let actual = repository
@@ -744,6 +796,17 @@ where
             anyhow::bail!("reloaded object {index} did not match its written payload");
         }
     }
+    let cold_read_elapsed = cold_read_started.elapsed();
+    let cold_read_counts_after = store
+        .operation_counts()
+        .context("failed to capture post-read backend counts")?;
+    let cold_read_counts =
+        operation_counts_delta(&cold_read_counts_after, &cold_read_counts_before)?;
+    let requested_plaintext_bytes = checked_indices
+        .len()
+        .checked_mul(expected_body.len())
+        .context("cold-read plaintext byte count overflowed usize")?;
+    validate_cold_read_counts(&cold_read_counts, checked_indices.len())?;
 
     Ok(ReloadVerification {
         checkpoint,
@@ -751,6 +814,12 @@ where
         expected_objects: args.objects,
         listed_objects: entries.len(),
         checked_objects: checked_indices.len(),
+        cold_reads: ColdReadMeasurement {
+            elapsed: cold_read_elapsed,
+            logical_reads: checked_indices.len(),
+            requested_plaintext_bytes,
+            counts: cold_read_counts,
+        },
     })
 }
 
@@ -944,13 +1013,14 @@ struct PerfReport {
     reload_verification: Option<ReloadVerification>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ReloadVerification {
     checkpoint: Option<CheckpointMeasurement>,
     elapsed: Duration,
     expected_objects: usize,
     listed_objects: usize,
     checked_objects: usize,
+    cold_reads: ColdReadMeasurement,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -960,7 +1030,7 @@ struct CheckpointMeasurement {
     elapsed: Duration,
 }
 
-#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 struct ReloadVerificationReport {
     verified: bool,
     checkpoint: Option<CheckpointMeasurementReport>,
@@ -968,6 +1038,7 @@ struct ReloadVerificationReport {
     expected_objects: usize,
     listed_objects: usize,
     checked_objects: usize,
+    cold_reads: ColdReadMeasurementReport,
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -977,8 +1048,31 @@ struct CheckpointMeasurementReport {
     elapsed_ms: f64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ColdReadMeasurement {
+    elapsed: Duration,
+    logical_reads: usize,
+    requested_plaintext_bytes: usize,
+    counts: BlobOperationCounts,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ColdReadMeasurementReport {
+    cache_state: &'static str,
+    elapsed_ms: f64,
+    logical_reads: usize,
+    requested_plaintext_bytes: usize,
+    backend_requests: u64,
+    requests_per_read: Option<f64>,
+    gets: u64,
+    heads: u64,
+    lists: u64,
+    bytes_read: u64,
+    byte_amplification: Option<f64>,
+}
+
 impl ReloadVerification {
-    fn report(self) -> ReloadVerificationReport {
+    fn report(&self) -> ReloadVerificationReport {
         ReloadVerificationReport {
             verified: true,
             checkpoint: self.checkpoint.map(CheckpointMeasurement::report),
@@ -986,6 +1080,7 @@ impl ReloadVerification {
             expected_objects: self.expected_objects,
             listed_objects: self.listed_objects,
             checked_objects: self.checked_objects,
+            cold_reads: self.cold_reads.report(),
         }
     }
 }
@@ -996,6 +1091,28 @@ impl CheckpointMeasurement {
             requested_after_objects: self.requested_after_objects,
             actual_after_objects: self.actual_after_objects,
             elapsed_ms: self.elapsed.as_secs_f64() * 1_000.0,
+        }
+    }
+}
+
+impl ColdReadMeasurement {
+    fn report(&self) -> ColdReadMeasurementReport {
+        let backend_requests = backend_request_count(&self.counts);
+        ColdReadMeasurementReport {
+            cache_state: "fresh-post-recovery",
+            elapsed_ms: self.elapsed.as_secs_f64() * 1_000.0,
+            logical_reads: self.logical_reads,
+            requested_plaintext_bytes: self.requested_plaintext_bytes,
+            backend_requests,
+            requests_per_read: ratio_optional(backend_requests, self.logical_reads as u64),
+            gets: self.counts.get,
+            heads: self.counts.head,
+            lists: self.counts.list,
+            bytes_read: self.counts.bytes_read,
+            byte_amplification: ratio_optional(
+                self.counts.bytes_read,
+                self.requested_plaintext_bytes as u64,
+            ),
         }
     }
 }
@@ -1053,6 +1170,48 @@ impl PerfReport {
         Ok(())
     }
 
+    fn enforce_cold_read_limits(
+        &self,
+        byte_limit: Option<f64>,
+        request_limit: Option<f64>,
+    ) -> Result<()> {
+        if byte_limit.is_none() && request_limit.is_none() {
+            return Ok(());
+        }
+        let verification = self
+            .reload_verification
+            .as_ref()
+            .context("cold-read limits require reload verification evidence")?;
+        let cold = &verification.cold_reads;
+        if let Some(limit) = byte_limit {
+            let actual = ratio_optional(
+                cold.counts.bytes_read,
+                cold.requested_plaintext_bytes as u64,
+            )
+            .context("cold-read byte limit requires non-empty plaintext evidence")?;
+            if actual > limit {
+                anyhow::bail!(
+                    "{} cold-read amplification {actual:.6}x exceeds {limit:.6}x",
+                    self.scenario
+                );
+            }
+        }
+        if let Some(limit) = request_limit {
+            let actual = ratio_optional(
+                backend_request_count(&cold.counts),
+                cold.logical_reads as u64,
+            )
+            .context("cold-read request limit requires at least one logical read")?;
+            if actual > limit {
+                anyhow::bail!(
+                    "{} cold-read requests {actual:.6} per read exceeds {limit:.6}",
+                    self.scenario
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn print(&self, format: ReportFormat) -> Result<()> {
         match format {
             ReportFormat::Tsv => {
@@ -1082,11 +1241,12 @@ impl PerfReport {
         let backend_requests_per_operation =
             ratio_optional(backend_requests, self.operations as u64);
         let latency = self.operation_latency;
-        let reload_verification = self.reload_verification;
+        let reload_verification = self.reload_verification.as_ref();
         let checkpoint = reload_verification.and_then(|verification| verification.checkpoint);
+        let cold_reads = reload_verification.map(|verification| &verification.cold_reads);
 
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{:.3}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}",
             self.scenario,
             self.backend.as_str(),
             self.repository_format,
@@ -1140,6 +1300,24 @@ impl PerfReport {
             checkpoint.map_or(0.0, |measurement| {
                 measurement.elapsed.as_secs_f64() * 1_000.0
             }),
+            cold_reads.map_or(0.0, |measurement| {
+                measurement.elapsed.as_secs_f64() * 1_000.0
+            }),
+            cold_reads.map_or(0, |measurement| measurement.logical_reads),
+            cold_reads.map_or(0, |measurement| backend_request_count(&measurement.counts)),
+            format_amp(cold_reads.and_then(|measurement| {
+                ratio_optional(
+                    backend_request_count(&measurement.counts),
+                    measurement.logical_reads as u64,
+                )
+            })),
+            cold_reads.map_or(0, |measurement| measurement.counts.bytes_read),
+            format_amp(cold_reads.and_then(|measurement| {
+                ratio_optional(
+                    measurement.counts.bytes_read,
+                    measurement.requested_plaintext_bytes as u64,
+                )
+            })),
         );
     }
 
@@ -1201,7 +1379,7 @@ impl PerfReport {
                 self.counts.bytes_read,
                 self.requested_plaintext_read_bytes as u64,
             ),
-            "reload_verification": self.reload_verification.map(ReloadVerification::report),
+            "reload_verification": self.reload_verification.as_ref().map(ReloadVerification::report),
         });
         println!("{}", serde_json::to_string(&report)?);
         Ok(())
@@ -1233,7 +1411,7 @@ impl PerfReport {
 
 fn print_header() {
     println!(
-        "scenario\tbackend\trepository_format\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tpayload_segment_size\tadaptive_payload_segment_size\tconcurrency\telapsed_ms\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tset_legal_hold\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp\treload_verified\treload_elapsed_ms\treload_expected_objects\treload_listed_objects\treload_checked_objects\tcheckpoint_requested_after_objects\tcheckpoint_actual_after_objects\tcheckpoint_elapsed_ms"
+        "scenario\tbackend\trepository_format\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tpayload_segment_size\tadaptive_payload_segment_size\tconcurrency\telapsed_ms\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tset_legal_hold\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp\treload_verified\treload_elapsed_ms\treload_expected_objects\treload_listed_objects\treload_checked_objects\tcheckpoint_requested_after_objects\tcheckpoint_actual_after_objects\tcheckpoint_elapsed_ms\tcold_read_elapsed_ms\tcold_read_logical_reads\tcold_read_backend_requests\tcold_read_requests_per_read\tcold_read_backend_bytes\tcold_read_amp"
     );
 }
 
@@ -1488,6 +1666,68 @@ fn checked_mul(left: usize, right: usize) -> Result<usize> {
         .context("scenario byte count overflowed usize")
 }
 
+fn operation_counts_delta(
+    after: &BlobOperationCounts,
+    before: &BlobOperationCounts,
+) -> Result<BlobOperationCounts> {
+    let delta = |field: &'static str, after: u64, before: u64| {
+        after
+            .checked_sub(before)
+            .with_context(|| format!("backend {field} counter decreased during measurement"))
+    };
+    Ok(BlobOperationCounts {
+        put: delta("PUT", after.put, before.put)?,
+        get: delta("GET", after.get, before.get)?,
+        head: delta("HEAD", after.head, before.head)?,
+        list: delta("LIST", after.list, before.list)?,
+        delete: delta("DELETE", after.delete, before.delete)?,
+        extend_retention: delta(
+            "retention extension",
+            after.extend_retention,
+            before.extend_retention,
+        )?,
+        set_legal_hold: delta(
+            "legal-hold update",
+            after.set_legal_hold,
+            before.set_legal_hold,
+        )?,
+        flush: delta("cache flush", after.flush, before.flush)?,
+        multipart_put: delta(
+            "multipart completion",
+            after.multipart_put,
+            before.multipart_put,
+        )?,
+        bytes_written: delta("written-byte", after.bytes_written, before.bytes_written)?,
+        bytes_read: delta("read-byte", after.bytes_read, before.bytes_read)?,
+    })
+}
+
+fn backend_request_count(counts: &BlobOperationCounts) -> u64 {
+    counts
+        .put
+        .saturating_add(counts.get)
+        .saturating_add(counts.head)
+        .saturating_add(counts.list)
+        .saturating_add(counts.delete)
+        .saturating_add(counts.extend_retention)
+        .saturating_add(counts.set_legal_hold)
+        .saturating_add(counts.flush)
+        .saturating_add(counts.multipart_put)
+}
+
+fn validate_cold_read_counts(counts: &BlobOperationCounts, logical_reads: usize) -> Result<()> {
+    let expected_gets =
+        u64::try_from(logical_reads).context("cold-read logical read count does not fit in u64")?;
+    let request_count = backend_request_count(counts);
+    if counts.get != expected_gets || request_count != expected_gets {
+        anyhow::bail!(
+            "cold reads required {request_count} backend operations and {} GETs for {logical_reads} records",
+            counts.get,
+        );
+    }
+    Ok(())
+}
+
 fn mib_per_second(bytes: usize, elapsed: Duration) -> f64 {
     if elapsed.is_zero() {
         return 0.0;
@@ -1551,7 +1791,11 @@ fn init_tracing(filter: &str, format: TraceFormat) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{checkpoint_due, verification_indices};
+    use super::{
+        backend_request_count, checkpoint_due, operation_counts_delta, validate_cold_read_counts,
+        verification_indices,
+    };
+    use rs3_storage::BlobOperationCounts;
 
     #[test]
     fn checkpoint_threshold_fires_once_at_the_first_completed_batch() {
@@ -1567,5 +1811,84 @@ mod tests {
         assert_eq!(verification_indices(1), vec![0]);
         assert_eq!(verification_indices(2), vec![0, 1]);
         assert_eq!(verification_indices(5), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn operation_count_delta_covers_every_counter() {
+        let before = BlobOperationCounts {
+            put: 1,
+            get: 2,
+            head: 3,
+            list: 4,
+            delete: 5,
+            extend_retention: 6,
+            set_legal_hold: 7,
+            flush: 8,
+            multipart_put: 9,
+            bytes_written: 10,
+            bytes_read: 11,
+        };
+        let after = BlobOperationCounts {
+            put: 2,
+            get: 4,
+            head: 6,
+            list: 8,
+            delete: 10,
+            extend_retention: 12,
+            set_legal_hold: 14,
+            flush: 16,
+            multipart_put: 18,
+            bytes_written: 20,
+            bytes_read: 22,
+        };
+
+        let delta = operation_counts_delta(&after, &before)
+            .unwrap_or_else(|error| panic!("compute operation counter delta: {error}"));
+
+        assert_eq!(delta, before);
+    }
+
+    #[test]
+    fn operation_count_delta_rejects_a_decreasing_counter() {
+        let before = BlobOperationCounts {
+            get: 2,
+            ..BlobOperationCounts::default()
+        };
+        let after = BlobOperationCounts {
+            get: 1,
+            ..BlobOperationCounts::default()
+        };
+
+        let error = operation_counts_delta(&after, &before)
+            .expect_err("a decreasing counter must invalidate the measurement");
+
+        assert!(error.to_string().contains("GET counter decreased"));
+    }
+
+    #[test]
+    fn cold_read_count_validation_accepts_only_one_get_per_read() {
+        let counts = BlobOperationCounts {
+            get: 3,
+            bytes_read: 1_584,
+            ..BlobOperationCounts::default()
+        };
+
+        validate_cold_read_counts(&counts, 3)
+            .unwrap_or_else(|error| panic!("validate direct cold reads: {error}"));
+        assert_eq!(backend_request_count(&counts), 3);
+    }
+
+    #[test]
+    fn cold_read_count_validation_rejects_hidden_non_get_work() {
+        let counts = BlobOperationCounts {
+            get: 3,
+            multipart_put: 1,
+            ..BlobOperationCounts::default()
+        };
+
+        let error = validate_cold_read_counts(&counts, 3)
+            .expect_err("non-GET backend work must invalidate the cold-read gate");
+
+        assert!(error.to_string().contains("4 backend operations"));
     }
 }

@@ -296,6 +296,8 @@ perf-scale-tier OBJECTS:
         --verify-reload \
         --checkpoint-after-objects "${checkpoint_after}" \
         --max-write-amp 1.50 \
+        --max-cold-read-amp 1.04 \
+        --max-cold-read-requests-per-read 1.0 \
         --format jsonl
     done
 
