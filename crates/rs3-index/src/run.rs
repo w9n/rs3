@@ -4,14 +4,23 @@ use rs3_types::{
     BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LegalHoldStatus, LogicalPath,
     RetentionMode, RetentionPolicy, Sequence,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Domain separator at the start of every independently authenticated frame plaintext.
-pub const INDEX_RUN_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-run-frame-plaintext\n";
+pub const INDEX_RUN_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-run-frame-plaintext:v2\n";
 
 /// Version of the canonical index-run wire encoding.
-pub const INDEX_RUN_WIRE_VERSION: u16 = 1;
+pub const INDEX_RUN_WIRE_VERSION: u16 = 2;
+
+/// Maximum stored size of one v02 payload pack.
+pub const INDEX_PACK_MAX_STORED_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Maximum number of records in one v02 payload pack.
+pub const INDEX_PACK_MAX_RECORDS: u32 = 1_024;
+
+const INDEX_PACK_SEGMENT_BYTES: u64 = 64 * 1024;
+const INDEX_PACK_SEGMENT_TAG_BYTES: u64 = 16;
 
 /// Decoder and encoder resource limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,7 +126,7 @@ fn decode_lower_hex(byte: u8) -> Option<u8> {
 }
 
 /// Exact external payload-pack container referenced by compact pointers.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IndexRunContainer {
     /// Opaque backend object identifier.
     pub object_id: BackendObjectId,
@@ -127,14 +136,105 @@ pub struct IndexRunContainer {
     pub stored_len: u64,
     /// Signed commit body digest authenticating every declared section.
     pub commit_body_digest: [u8; 32],
+    /// Historical encrypted-keyring envelope needed to reconstruct payload AEAD context.
+    pub keyring_envelope: IndexRunKeyringRef,
     /// Absolute byte offset of the payload-pack section in the stored object.
     pub pack_section_offset: u64,
     /// Section ordinal bound into payload-pack record and directory authentication.
     pub pack_section_ordinal: u32,
     /// Stored byte length of the payload-pack section.
     pub pack_section_len: u64,
+    /// Random identity bound into every payload-pack AEAD operation.
+    pub pack_id: [u8; 32],
+    /// Historical content-encryption key needed to open payload records.
+    pub content_key_id: KeyId,
     /// Authenticated number of records in the payload-pack directory.
     pub pack_record_count: u32,
+}
+
+impl fmt::Debug for IndexRunContainer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IndexRunContainer")
+            .field("object_id", &self.object_id)
+            .field("version_id", &self.version_id)
+            .field("stored_len", &self.stored_len)
+            .field("commit_body_digest", &"<redacted>")
+            .field("keyring_envelope", &self.keyring_envelope)
+            .field("pack_section_offset", &self.pack_section_offset)
+            .field("pack_section_ordinal", &self.pack_section_ordinal)
+            .field("pack_section_len", &self.pack_section_len)
+            .field("pack_id", &"<redacted>")
+            .field("content_key_id", &self.content_key_id)
+            .field("pack_record_count", &self.pack_record_count)
+            .finish()
+    }
+}
+
+/// Historical encrypted-keyring envelope facts bound into a payload pack's AEAD context.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IndexRunKeyringRef {
+    /// Exact backend object identifier of the encrypted keyring envelope.
+    pub object_id: BackendObjectId,
+    /// SHA-256 digest of the encrypted keyring envelope.
+    pub digest: [u8; 32],
+}
+
+impl fmt::Debug for IndexRunKeyringRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IndexRunKeyringRef")
+            .field("object_id", &self.object_id)
+            .field("digest", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Shared facts for the payload pack carried by the same commit as an index run.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IndexRunSelfPack {
+    /// Random identity bound into every payload-pack AEAD operation.
+    pub pack_id: [u8; 32],
+    /// Historical content-encryption key needed to open payload records.
+    pub content_key_id: KeyId,
+    /// Exact stored payload-pack section length.
+    pub stored_len: u64,
+    /// Authenticated number of records in the pack.
+    pub record_count: u32,
+}
+
+impl fmt::Debug for IndexRunSelfPack {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IndexRunSelfPack")
+            .field("pack_id", &"<redacted>")
+            .field("content_key_id", &self.content_key_id)
+            .field("stored_len", &self.stored_len)
+            .field("record_count", &self.record_count)
+            .finish()
+    }
+}
+
+/// Exact compact facts needed to read and authenticate one payload-pack record.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IndexPackRecordPointer {
+    /// Logical directory ordinal of the payload record.
+    pub record_ordinal: u32,
+    /// Absolute ciphertext offset from the start of the payload-pack section.
+    pub physical_offset: u32,
+    /// SHA-256 digest over the complete plaintext record.
+    pub plaintext_digest: [u8; 32],
+}
+
+impl fmt::Debug for IndexPackRecordPointer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IndexPackRecordPointer")
+            .field("record_ordinal", &self.record_ordinal)
+            .field("physical_offset", &self.physical_offset)
+            .field("plaintext_digest", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Compact location of an encrypted payload-pack record.
@@ -144,15 +244,15 @@ pub enum IndexPayloadPointer {
     Empty,
     /// Record in the payload pack carried by the same commit as this run.
     SelfPack {
-        /// Payload-pack directory record ordinal.
-        record_ordinal: u32,
+        /// Exact record read and authentication facts.
+        record: IndexPackRecordPointer,
     },
     /// Record in an exact external payload-pack container.
     ExternalPack {
         /// Ordinal into [`IndexRun::containers`].
         container_ordinal: u32,
-        /// Payload-pack directory record ordinal.
-        record_ordinal: u32,
+        /// Exact record read and authentication facts.
+        record: IndexPackRecordPointer,
     },
 }
 
@@ -251,8 +351,8 @@ impl IndexMutation {
 pub struct IndexRun {
     /// Repository sequence represented by this batch.
     pub sequence: Sequence,
-    /// Authenticated record count for the payload pack carried by this run's commit.
-    pub self_pack_record_count: Option<u32>,
+    /// Exact shared facts for the payload pack carried by this run's commit.
+    pub self_pack: Option<IndexRunSelfPack>,
     /// Deduplicated exact external payload-pack containers.
     pub containers: Vec<IndexRunContainer>,
     /// Canonically ordered namespace mutations.
@@ -405,6 +505,10 @@ pub enum IndexRunError {
     InvalidContainerOrder,
     /// A declared payload-pack record count is zero or disagrees with use.
     InvalidPackRecordCount,
+    /// A compact record pointer falls outside its exact payload pack.
+    InvalidPackRecordRange,
+    /// Repeated facts for the same logical payload-pack record disagree.
+    PackRecordFactsMismatch,
     /// A container-table entry is not referenced by any namespace mutation.
     UnusedContainer(u32),
     /// A payload-pack section is empty or falls outside its containing object.
@@ -483,6 +587,12 @@ impl fmt::Display for IndexRunError {
             Self::InvalidPackRecordCount => {
                 formatter.write_str("invalid payload-pack record count")
             }
+            Self::InvalidPackRecordRange => {
+                formatter.write_str("invalid payload-pack record range")
+            }
+            Self::PackRecordFactsMismatch => {
+                formatter.write_str("payload-pack record facts disagree")
+            }
             Self::UnusedContainer(ordinal) => {
                 write!(formatter, "unused container ordinal {ordinal}")
             }
@@ -558,6 +668,7 @@ pub fn encode_index_run_frames(
         limits.max_containers,
     )?;
     validate_count("mutation count", run.mutations.len(), limits.max_mutations)?;
+    validate_self_pack(run.self_pack.as_ref(), limits)?;
     validate_containers(&run.containers, limits)?;
     validate_mutations(run, limits)?;
 
@@ -582,9 +693,21 @@ pub fn encode_index_run_frames(
         }
         record.u64(container.stored_len)?;
         record.bytes(&container.commit_body_digest)?;
+        record.string(
+            container.keyring_envelope.object_id.as_str(),
+            limits.max_object_id_bytes,
+            "keyring envelope object id",
+        )?;
+        record.bytes(&container.keyring_envelope.digest)?;
         record.u32(container.pack_section_ordinal)?;
         record.u64(container.pack_section_offset)?;
         record.u64(container.pack_section_len)?;
+        record.bytes(&container.pack_id)?;
+        record.string(
+            container.content_key_id.as_str(),
+            limits.max_key_id_bytes,
+            "content key id",
+        )?;
         record.varint(u64::from(container.pack_record_count))?;
         metadata.push(PreparedRecord::metadata(record.finish()));
     }
@@ -680,7 +803,7 @@ pub fn encode_index_run_frames(
         IndexRunFrameRole::Metadata,
         run.sequence,
         mutation_count,
-        run.self_pack_record_count,
+        run.self_pack.as_ref(),
         &metadata,
         true,
         limits,
@@ -689,7 +812,7 @@ pub fn encode_index_run_frames(
         IndexRunFrameRole::Namespace,
         run.sequence,
         mutation_count,
-        run.self_pack_record_count,
+        run.self_pack.as_ref(),
         &namespace,
         false,
         limits,
@@ -698,7 +821,7 @@ pub fn encode_index_run_frames(
         IndexRunFrameRole::Listing,
         run.sequence,
         mutation_count,
-        run.self_pack_record_count,
+        run.self_pack.as_ref(),
         &listing,
         false,
         limits,
@@ -727,7 +850,7 @@ fn pack_prepared_frames(
     role: IndexRunFrameRole,
     sequence: Sequence,
     mutation_count: u32,
-    self_pack_record_count: Option<u32>,
+    self_pack: Option<&IndexRunSelfPack>,
     records: &[PreparedRecord],
     emit_when_empty: bool,
     limits: &IndexRunLimits,
@@ -748,7 +871,7 @@ fn pack_prepared_frames(
                 .checked_add(framed_len)
                 .ok_or(IndexRunError::IntegerOverflow)?;
             let candidate_count = end - start + 1;
-            if frame_header_len(role, records.len(), candidate_count, self_pack_record_count)?
+            if frame_header_len(role, records.len(), candidate_count, self_pack)?
                 .checked_add(candidate_payload)
                 .ok_or(IndexRunError::IntegerOverflow)?
                 > limits.max_frame_bytes
@@ -778,7 +901,7 @@ fn pack_prepared_frames(
                 mutation_count,
                 role_record_count: records.len(),
                 frame_record_count: frame_records.len(),
-                self_pack_record_count,
+                self_pack,
             },
         )?;
         for record in frame_records {
@@ -805,19 +928,19 @@ fn pack_prepared_frames(
     Ok(frames)
 }
 
-struct FrameEncodingFacts {
+struct FrameEncodingFacts<'a> {
     role: IndexRunFrameRole,
     role_ordinal: u32,
     sequence: Sequence,
     mutation_count: u32,
     role_record_count: usize,
     frame_record_count: usize,
-    self_pack_record_count: Option<u32>,
+    self_pack: Option<&'a IndexRunSelfPack>,
 }
 
 fn encode_frame_header(
     writer: &mut Writer,
-    facts: &FrameEncodingFacts,
+    facts: &FrameEncodingFacts<'_>,
 ) -> Result<(), IndexRunError> {
     writer.bytes(INDEX_RUN_PLAINTEXT_DOMAIN)?;
     writer.u16(INDEX_RUN_WIRE_VERSION)?;
@@ -828,11 +951,14 @@ fn encode_frame_header(
     writer.varint(usize_to_u64(facts.role_record_count)?)?;
     writer.varint(usize_to_u64(facts.frame_record_count)?)?;
     if facts.role == IndexRunFrameRole::Metadata {
-        match facts.self_pack_record_count {
+        match facts.self_pack {
             None => writer.u8(0)?,
-            Some(count) => {
+            Some(pack) => {
                 writer.u8(1)?;
-                writer.varint(u64::from(count))?;
+                writer.bytes(&pack.pack_id)?;
+                writer.string(pack.content_key_id.as_str(), usize::MAX, "content key id")?;
+                writer.u64(pack.stored_len)?;
+                writer.varint(u64::from(pack.record_count))?;
             }
         }
     }
@@ -843,7 +969,7 @@ fn frame_header_len(
     role: IndexRunFrameRole,
     role_record_count: usize,
     frame_record_count: usize,
-    self_pack_record_count: Option<u32>,
+    self_pack: Option<&IndexRunSelfPack>,
 ) -> Result<usize, IndexRunError> {
     let base = INDEX_RUN_PLAINTEXT_DOMAIN.len() + 2 + 1 + 4 + 8 + 5;
     let mut length = base
@@ -854,9 +980,17 @@ fn frame_header_len(
         length = length
             .checked_add(1)
             .ok_or(IndexRunError::IntegerOverflow)?;
-        if let Some(count) = self_pack_record_count {
+        if let Some(pack) = self_pack {
             length = length
-                .checked_add(varint_len(u64::from(count)))
+                .checked_add(32)
+                .and_then(|value| {
+                    value.checked_add(varint_len(
+                        usize_to_u64(pack.content_key_id.as_str().len()).ok()?,
+                    ))
+                })
+                .and_then(|value| value.checked_add(pack.content_key_id.as_str().len()))
+                .and_then(|value| value.checked_add(8))
+                .and_then(|value| value.checked_add(varint_len(u64::from(pack.record_count))))
                 .ok_or(IndexRunError::IntegerOverflow)?;
         }
     }
@@ -888,7 +1022,7 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
 
     let mut sequence = None;
     let mut mutation_count = None;
-    let mut self_pack_record_count = None;
+    let mut self_pack = None;
     let mut saw_self_pack_fact = false;
     let mut containers = Vec::new();
     let mut namespace: Vec<Option<NamespaceProjection>> = Vec::new();
@@ -968,13 +1102,11 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
                         maximum: limits.max_containers,
                     });
                 }
-                let frame_self_count = header
-                    .self_pack_record_count
-                    .ok_or(IndexRunError::FrameFactsMismatch)?;
-                if saw_self_pack_fact && self_pack_record_count != frame_self_count {
+                let frame_self_pack = header.self_pack.ok_or(IndexRunError::FrameFactsMismatch)?;
+                if saw_self_pack_fact && self_pack != frame_self_pack {
                     return Err(IndexRunError::FrameFactsMismatch);
                 }
-                self_pack_record_count = frame_self_count;
+                self_pack = frame_self_pack;
                 saw_self_pack_fact = true;
                 for _ in 0..header.frame_record_count {
                     let mut record = reader.record(limits.max_record_bytes)?;
@@ -1007,7 +1139,7 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
                     let projection = decode_namespace_projection(
                         &mut record,
                         &containers,
-                        self_pack_record_count,
+                        self_pack.as_ref(),
                         limits,
                     )?;
                     if let NamespaceProjection::Upsert { payload, .. } = &projection {
@@ -1099,16 +1231,17 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
         containers.len(),
         &used_containers,
         uses_self_pack,
-        self_pack_record_count,
+        self_pack.as_ref(),
     )?;
     let mut ordered_mutations = Vec::with_capacity(mutations.len());
     for (index, mutation) in mutations.into_iter().enumerate() {
         let ordinal = u32::try_from(index).map_err(|_| IndexRunError::IntegerOverflow)?;
         ordered_mutations.push(mutation.ok_or(IndexRunError::ProjectionMismatch { ordinal })?);
     }
+    validate_repeated_record_facts(&ordered_mutations, self_pack.as_ref(), &containers)?;
     Ok(IndexRun {
         sequence: sequence.ok_or(IndexRunError::InvalidFrameOrder)?,
-        self_pack_record_count,
+        self_pack,
         containers,
         mutations: ordered_mutations,
     })
@@ -1121,7 +1254,7 @@ struct DecodedFrameHeader {
     mutation_count: u32,
     role_record_count: usize,
     frame_record_count: usize,
-    self_pack_record_count: Option<Option<u32>>,
+    self_pack: Option<Option<IndexRunSelfPack>>,
 }
 
 fn decode_frame_header<'a>(
@@ -1158,10 +1291,25 @@ fn decode_frame_header<'a>(
         "frame record count",
         limits.max_mutations.max(limits.max_containers),
     )?;
-    let self_pack_record_count = if role == IndexRunFrameRole::Metadata {
+    let self_pack = if role == IndexRunFrameRole::Metadata {
         Some(match reader.u8()? {
             0 => None,
-            1 => Some(reader.u32_varint()?),
+            1 => {
+                let mut pack_id = [0_u8; 32];
+                pack_id.copy_from_slice(reader.bytes(32)?);
+                let content_key_id =
+                    reader.typed_string("content key id", limits.max_key_id_bytes, KeyId::new)?;
+                let stored_len = reader.u64()?;
+                let record_count = reader.u32_varint()?;
+                let pack = IndexRunSelfPack {
+                    pack_id,
+                    content_key_id,
+                    stored_len,
+                    record_count,
+                };
+                validate_self_pack(Some(&pack), limits)?;
+                Some(pack)
+            }
             value => {
                 return Err(IndexRunError::InvalidTag {
                     field: "self pack option",
@@ -1180,7 +1328,7 @@ fn decode_frame_header<'a>(
             mutation_count,
             role_record_count,
             frame_record_count,
-            self_pack_record_count,
+            self_pack,
         },
         reader,
     ))
@@ -1225,14 +1373,35 @@ fn decode_container(
     let stored_len = record.u64()?;
     let mut commit_body_digest = [0_u8; 32];
     commit_body_digest.copy_from_slice(record.bytes(32)?);
+    let keyring_envelope_object_id = record.typed_string(
+        "keyring envelope object id",
+        limits.max_object_id_bytes,
+        BackendObjectId::new,
+    )?;
+    let mut keyring_envelope_digest = [0_u8; 32];
+    keyring_envelope_digest.copy_from_slice(record.bytes(32)?);
     let container = IndexRunContainer {
         object_id,
         version_id,
         stored_len,
         commit_body_digest,
+        keyring_envelope: IndexRunKeyringRef {
+            object_id: keyring_envelope_object_id,
+            digest: keyring_envelope_digest,
+        },
         pack_section_ordinal: record.u32()?,
         pack_section_offset: record.u64()?,
         pack_section_len: record.u64()?,
+        pack_id: {
+            let mut pack_id = [0_u8; 32];
+            pack_id.copy_from_slice(record.bytes(32)?);
+            pack_id
+        },
+        content_key_id: record.typed_string(
+            "content key id",
+            limits.max_key_id_bytes,
+            KeyId::new,
+        )?,
         pack_record_count: record.u32_varint()?,
     };
     validate_container_range(&container)?;
@@ -1242,7 +1411,7 @@ fn decode_container(
 fn decode_namespace_projection(
     record: &mut Reader<'_>,
     containers: &[IndexRunContainer],
-    self_pack_record_count: Option<u32>,
+    self_pack: Option<&IndexRunSelfPack>,
     limits: &IndexRunLimits,
 ) -> Result<NamespaceProjection, IndexRunError> {
     match record.u8()? {
@@ -1251,9 +1420,10 @@ fn decode_namespace_projection(
             let namespace_key_id =
                 record.typed_string("namespace key id", limits.max_key_id_bytes, KeyId::new)?;
             let generation = Sequence::new(record.u64()?);
-            let payload = decode_payload_pointer(record, containers, self_pack_record_count)?;
+            let payload = decode_payload_pointer(record, containers, self_pack)?;
             let content_len = record.u64()?;
             validate_empty_payload(payload, content_len)?;
+            validate_payload_pointer(payload, content_len, self_pack, containers)?;
             Ok(NamespaceProjection::Upsert {
                 blind_key,
                 namespace_key_id,
@@ -1365,10 +1535,9 @@ fn validate_container_use(
     container_count: usize,
     used_containers: &BTreeSet<u32>,
     uses_self_pack: bool,
-    self_pack_record_count: Option<u32>,
+    self_pack: Option<&IndexRunSelfPack>,
 ) -> Result<(), IndexRunError> {
-    if uses_self_pack != self_pack_record_count.is_some()
-        || self_pack_record_count.is_some_and(|count| count == 0)
+    if uses_self_pack != self_pack.is_some() || self_pack.is_some_and(|pack| pack.record_count == 0)
     {
         return Err(IndexRunError::InvalidPackRecordCount);
     }
@@ -1510,6 +1679,16 @@ fn validate_containers(
                 limits.max_version_id_bytes,
             )?;
         }
+        validate_count(
+            "keyring envelope object id",
+            container.keyring_envelope.object_id.as_str().len(),
+            limits.max_object_id_bytes,
+        )?;
+        validate_count(
+            "content key id",
+            container.content_key_id.as_str().len(),
+            limits.max_key_id_bytes,
+        )?;
         validate_container_range(container)?;
         let key = (&container.object_id, &container.version_id);
         if let Some(previous_key) = previous {
@@ -1531,10 +1710,34 @@ fn validate_container_range(container: &IndexRunContainer) -> Result<(), IndexRu
         .checked_add(container.pack_section_len)
         .ok_or(IndexRunError::InvalidContainerRange)?;
     if container.pack_section_len == 0
+        || container.pack_section_len > INDEX_PACK_MAX_STORED_BYTES
         || container.pack_record_count == 0
+        || container.pack_record_count > INDEX_PACK_MAX_RECORDS
         || section_end > container.stored_len
     {
         return Err(IndexRunError::InvalidContainerRange);
+    }
+    Ok(())
+}
+
+fn validate_self_pack(
+    self_pack: Option<&IndexRunSelfPack>,
+    limits: &IndexRunLimits,
+) -> Result<(), IndexRunError> {
+    let Some(pack) = self_pack else {
+        return Ok(());
+    };
+    validate_count(
+        "content key id",
+        pack.content_key_id.as_str().len(),
+        limits.max_key_id_bytes,
+    )?;
+    if pack.stored_len == 0
+        || pack.stored_len > INDEX_PACK_MAX_STORED_BYTES
+        || pack.record_count == 0
+        || pack.record_count > INDEX_PACK_MAX_RECORDS
+    {
+        return Err(IndexRunError::InvalidPackRecordCount);
     }
     Ok(())
 }
@@ -1561,25 +1764,33 @@ fn validate_mutations(run: &IndexRun, limits: &IndexRunLimits) -> Result<(), Ind
                     limits.max_path_bytes,
                 )?;
                 validate_empty_payload(upsert.payload, upsert.content_len)?;
+                validate_payload_pointer(
+                    upsert.payload,
+                    upsert.content_len,
+                    run.self_pack.as_ref(),
+                    &run.containers,
+                )?;
                 match upsert.payload {
                     IndexPayloadPointer::Empty => {}
-                    IndexPayloadPointer::SelfPack { record_ordinal } => {
+                    IndexPayloadPointer::SelfPack { record } => {
                         let count = run
-                            .self_pack_record_count
+                            .self_pack
+                            .as_ref()
+                            .map(|pack| pack.record_count)
                             .ok_or(IndexRunError::InvalidPackRecordCount)?;
-                        if record_ordinal >= count {
+                        if record.record_ordinal >= count {
                             return Err(IndexRunError::InvalidPackRecordCount);
                         }
                         uses_self_pack = true;
                     }
                     IndexPayloadPointer::ExternalPack {
                         container_ordinal,
-                        record_ordinal,
+                        record,
                     } => {
                         validate_container_ordinal(container_ordinal, run.containers.len())?;
                         let container = &run.containers[usize::try_from(container_ordinal)
                             .map_err(|_| IndexRunError::IntegerOverflow)?];
-                        if record_ordinal >= container.pack_record_count {
+                        if record.record_ordinal >= container.pack_record_count {
                             return Err(IndexRunError::InvalidPackRecordCount);
                         }
                         used_containers.insert(container_ordinal);
@@ -1604,8 +1815,9 @@ fn validate_mutations(run: &IndexRun, limits: &IndexRunLimits) -> Result<(), Ind
         run.containers.len(),
         &used_containers,
         uses_self_pack,
-        run.self_pack_record_count,
-    )
+        run.self_pack.as_ref(),
+    )?;
+    validate_repeated_record_facts(&run.mutations, run.self_pack.as_ref(), &run.containers)
 }
 
 fn validate_empty_payload(
@@ -1614,6 +1826,106 @@ fn validate_empty_payload(
 ) -> Result<(), IndexRunError> {
     if matches!(pointer, IndexPayloadPointer::Empty) != (content_len == 0) {
         return Err(IndexRunError::InvalidEmptyPayload);
+    }
+    Ok(())
+}
+
+fn validate_payload_pointer(
+    pointer: IndexPayloadPointer,
+    content_len: u64,
+    self_pack: Option<&IndexRunSelfPack>,
+    containers: &[IndexRunContainer],
+) -> Result<(), IndexRunError> {
+    let (record, pack_stored_len) = match pointer {
+        IndexPayloadPointer::Empty => return Ok(()),
+        IndexPayloadPointer::SelfPack { record } => (
+            record,
+            self_pack
+                .map(|pack| pack.stored_len)
+                .ok_or(IndexRunError::InvalidPackRecordCount)?,
+        ),
+        IndexPayloadPointer::ExternalPack {
+            container_ordinal,
+            record,
+        } => {
+            validate_container_ordinal(container_ordinal, containers.len())?;
+            let container = &containers
+                [usize::try_from(container_ordinal).map_err(|_| IndexRunError::IntegerOverflow)?];
+            (record, container.pack_section_len)
+        }
+    };
+    let stored_len = derived_record_stored_len(content_len)?;
+    let end = u64::from(record.physical_offset)
+        .checked_add(stored_len)
+        .ok_or(IndexRunError::InvalidPackRecordRange)?;
+    if content_len == 0 || end > pack_stored_len {
+        return Err(IndexRunError::InvalidPackRecordRange);
+    }
+    Ok(())
+}
+
+fn derived_record_stored_len(content_len: u64) -> Result<u64, IndexRunError> {
+    let segment_count = content_len.div_ceil(INDEX_PACK_SEGMENT_BYTES);
+    content_len
+        .checked_add(
+            segment_count
+                .checked_mul(INDEX_PACK_SEGMENT_TAG_BYTES)
+                .ok_or(IndexRunError::InvalidPackRecordRange)?,
+        )
+        .ok_or(IndexRunError::InvalidPackRecordRange)
+}
+
+fn validate_repeated_record_facts(
+    mutations: &[IndexMutation],
+    self_pack: Option<&IndexRunSelfPack>,
+    containers: &[IndexRunContainer],
+) -> Result<(), IndexRunError> {
+    let mut facts = BTreeMap::new();
+    let mut spans = Vec::new();
+    for mutation in mutations {
+        let IndexMutation::Upsert(upsert) = mutation else {
+            continue;
+        };
+        let (source, record) = match upsert.payload {
+            IndexPayloadPointer::Empty => continue,
+            IndexPayloadPointer::SelfPack { record } => (0_u32, record),
+            IndexPayloadPointer::ExternalPack {
+                container_ordinal,
+                record,
+            } => (
+                container_ordinal
+                    .checked_add(1)
+                    .ok_or(IndexRunError::IntegerOverflow)?,
+                record,
+            ),
+        };
+        validate_payload_pointer(upsert.payload, upsert.content_len, self_pack, containers)?;
+        let key = (source, record.record_ordinal);
+        let value = (record, upsert.content_len);
+        match facts.get(&key) {
+            Some(previous) if previous != &value => {
+                return Err(IndexRunError::PackRecordFactsMismatch);
+            }
+            Some(_) => continue,
+            None => {
+                facts.insert(key, value);
+            }
+        }
+        let end = u64::from(record.physical_offset)
+            .checked_add(derived_record_stored_len(upsert.content_len)?)
+            .ok_or(IndexRunError::InvalidPackRecordRange)?;
+        spans.push((source, record.physical_offset, end, record.record_ordinal));
+    }
+    spans.sort_unstable();
+    for adjacent in spans.windows(2) {
+        let (left_source, _, left_end, left_ordinal) = adjacent[0];
+        let (right_source, right_start, _, right_ordinal) = adjacent[1];
+        if left_source == right_source
+            && left_ordinal != right_ordinal
+            && u64::from(right_start) < left_end
+        {
+            return Err(IndexRunError::PackRecordFactsMismatch);
+        }
     }
     Ok(())
 }
@@ -1632,17 +1944,17 @@ fn encode_payload_pointer(
 ) -> Result<(), IndexRunError> {
     match pointer {
         IndexPayloadPointer::Empty => writer.u8(0)?,
-        IndexPayloadPointer::SelfPack { record_ordinal } => {
+        IndexPayloadPointer::SelfPack { record } => {
             writer.u8(1)?;
-            writer.varint(u64::from(record_ordinal))?;
+            encode_pack_record_pointer(writer, record)?;
         }
         IndexPayloadPointer::ExternalPack {
             container_ordinal,
-            record_ordinal,
+            record,
         } => {
             writer.u8(2)?;
             writer.varint(u64::from(container_ordinal))?;
-            writer.varint(u64::from(record_ordinal))?;
+            encode_pack_record_pointer(writer, record)?;
         }
     }
     Ok(())
@@ -1651,22 +1963,22 @@ fn encode_payload_pointer(
 fn decode_payload_pointer(
     reader: &mut Reader<'_>,
     containers: &[IndexRunContainer],
-    self_pack_record_count: Option<u32>,
+    self_pack: Option<&IndexRunSelfPack>,
 ) -> Result<IndexPayloadPointer, IndexRunError> {
     match reader.u8()? {
         0 => Ok(IndexPayloadPointer::Empty),
         1 => {
-            let record_ordinal = reader.u32_varint()?;
-            if self_pack_record_count.is_none_or(|count| record_ordinal >= count) {
+            let record = decode_pack_record_pointer(reader)?;
+            if self_pack.is_none_or(|pack| record.record_ordinal >= pack.record_count) {
                 return Err(IndexRunError::InvalidPackRecordCount);
             }
-            Ok(IndexPayloadPointer::SelfPack { record_ordinal })
+            Ok(IndexPayloadPointer::SelfPack { record })
         }
         2 => {
             let container_ordinal = reader.u32_varint()?;
             validate_container_ordinal(container_ordinal, containers.len())?;
-            let record_ordinal = reader.u32_varint()?;
-            if record_ordinal
+            let record = decode_pack_record_pointer(reader)?;
+            if record.record_ordinal
                 >= containers[usize::try_from(container_ordinal)
                     .map_err(|_| IndexRunError::IntegerOverflow)?]
                 .pack_record_count
@@ -1675,7 +1987,7 @@ fn decode_payload_pointer(
             }
             Ok(IndexPayloadPointer::ExternalPack {
                 container_ordinal,
-                record_ordinal,
+                record,
             })
         }
         value => Err(IndexRunError::InvalidTag {
@@ -1683,6 +1995,29 @@ fn decode_payload_pointer(
             value,
         }),
     }
+}
+
+fn encode_pack_record_pointer(
+    writer: &mut Writer,
+    pointer: IndexPackRecordPointer,
+) -> Result<(), IndexRunError> {
+    writer.varint(u64::from(pointer.record_ordinal))?;
+    writer.varint(u64::from(pointer.physical_offset))?;
+    writer.bytes(&pointer.plaintext_digest)
+}
+
+fn decode_pack_record_pointer(
+    reader: &mut Reader<'_>,
+) -> Result<IndexPackRecordPointer, IndexRunError> {
+    let record_ordinal = reader.u32_varint()?;
+    let physical_offset = reader.u32_varint()?;
+    let mut plaintext_digest = [0_u8; 32];
+    plaintext_digest.copy_from_slice(reader.bytes(32)?);
+    Ok(IndexPackRecordPointer {
+        record_ordinal,
+        physical_offset,
+        plaintext_digest,
+    })
 }
 
 fn encode_retention(
@@ -1964,9 +2299,10 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use crate::run::{
-        INDEX_RUN_PLAINTEXT_DOMAIN, IndexBlindKey, IndexMutation, IndexPayloadPointer, IndexRun,
-        IndexRunContainer, IndexRunError, IndexRunFrameRole, IndexRunLimits, IndexRunSearchBound,
-        IndexTombstone, IndexUpsert, decode_index_run, decode_index_run_frames, encode_index_run,
+        INDEX_RUN_PLAINTEXT_DOMAIN, IndexBlindKey, IndexMutation, IndexPackRecordPointer,
+        IndexPayloadPointer, IndexRun, IndexRunContainer, IndexRunError, IndexRunFrameRole,
+        IndexRunKeyringRef, IndexRunLimits, IndexRunSearchBound, IndexRunSelfPack, IndexTombstone,
+        IndexUpsert, decode_index_run, decode_index_run_frames, encode_index_run,
         encode_index_run_frames,
     };
     use rs3_types::{
@@ -1977,15 +2313,21 @@ mod tests {
     fn fixture() -> IndexRun {
         IndexRun {
             sequence: Sequence::new(9),
-            self_pack_record_count: None,
+            self_pack: None,
             containers: vec![IndexRunContainer {
                 object_id: BackendObjectId::new("objects/pack-a").expect("object id"),
                 version_id: Some(BackendVersionId::new("version-3").expect("version id")),
                 stored_len: 4_096,
                 commit_body_digest: [0x22; 32],
+                keyring_envelope: IndexRunKeyringRef {
+                    object_id: BackendObjectId::new("keyrings/historical").expect("object id"),
+                    digest: [0x23; 32],
+                },
                 pack_section_ordinal: 3,
                 pack_section_offset: 512,
                 pack_section_len: 2_048,
+                pack_id: [0x11; 32],
+                content_key_id: KeyId::new("content-1").expect("key id"),
                 pack_record_count: 8,
             }],
             mutations: vec![
@@ -1997,7 +2339,11 @@ mod tests {
                     generation: Sequence::new(17),
                     payload: IndexPayloadPointer::ExternalPack {
                         container_ordinal: 0,
-                        record_ordinal: 7,
+                        record: IndexPackRecordPointer {
+                            record_ordinal: 7,
+                            physical_offset: 100,
+                            plaintext_digest: [0x66; 32],
+                        },
                     },
                     content_len: 1_234,
                     modified_at_ms: -55,
@@ -2181,7 +2527,11 @@ mod tests {
         second_upsert.path = LogicalPath::new("tenant/second").expect("second path");
         second_upsert.payload = IndexPayloadPointer::ExternalPack {
             container_ordinal: 1,
-            record_ordinal: 0,
+            record: IndexPackRecordPointer {
+                record_ordinal: 0,
+                physical_offset: 100,
+                plaintext_digest: [0x77; 32],
+            },
         };
         run.mutations.push(IndexMutation::Upsert(second_upsert));
         let mut encoded = encode_index_run(&run, &limits).expect("encode distinct containers");
@@ -2202,7 +2552,7 @@ mod tests {
         let encoded = encode_index_run(&fixture(), &IndexRunLimits::default()).expect("encode run");
         assert_eq!(
             hex(&encoded),
-            "0389017273333a696e6465782d72756e2d6672616d652d706c61696e746578740a00010000000000000000000000000902010100570e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222000000030000000000000200000000000000080008b8017273333a696e6465782d72756e2d6672616d652d706c61696e746578740a00010100000000000000000000000902020250000033333333333333333333333333333333333333333333333333333333333333330b6e616d6573706163652d31000000000000001102000700000000000004d2ffffffffffffffc901020000001e0236010144444444444444444444444444444444444444444444444444444444444444440b6e616d6573706163652d3100000000000000127b7273333a696e6465782d72756e2d6672616d652d706c61696e746578740a0001020000000000000000000000090202021901010e74656e616e742f64656c6574656400000000000000123000001574656e616e742f736e617073686f742f6368756e6b000000000000001100000000000004d2ffffffffffffffc9"
+            "03eb017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00020000000000000000000000000902010100b5010e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c23232323232323232323232323232323232323232323232323232323232323230000000300000000000002000000000000000800111111111111111111111111111111111111111111111111111111111111111109636f6e74656e742d3108dc017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00020100000000000000000000000902020271000033333333333333333333333333333333333333333333333333333333333333330b6e616d6573706163652d31000000000000001102000764666666666666666666666666666666666666666666666666666666666666666600000000000004d2ffffffffffffffc901020000001e0236010144444444444444444444444444444444444444444444444444444444444444440b6e616d6573706163652d3100000000000000127e7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0002020000000000000000000000090202021901010e74656e616e742f64656c6574656400000000000000123000001574656e616e742f736e617073686f742f6368756e6b000000000000001100000000000004d2ffffffffffffffc9"
         );
     }
 
@@ -2213,6 +2563,8 @@ mod tests {
         assert!(!debug.contains("tenant/snapshot/chunk"));
         assert!(!debug.contains("tenant/deleted"));
         assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("[17, 17, 17"));
+        assert!(!debug.contains("[102, 102, 102"));
 
         let encoded = encode_index_run_frames(&run, &IndexRunLimits::default())
             .expect("encode redaction fixture");
@@ -2225,11 +2577,11 @@ mod tests {
     #[test]
     fn frames_are_bounded_typed_and_canonically_sorted() {
         let limits = IndexRunLimits {
-            max_frame_bytes: 180,
+            max_frame_bytes: 300,
             ..IndexRunLimits::default()
         };
         let encoded = encode_index_run_frames(&fixture(), &limits).expect("encode frames");
-        assert!(encoded.frames.iter().all(|frame| frame.bytes.len() <= 180));
+        assert!(encoded.frames.iter().all(|frame| frame.bytes.len() <= 300));
         assert_eq!(encoded.frames[0].role, IndexRunFrameRole::Metadata);
         let namespace = encoded
             .frames
@@ -2328,7 +2680,11 @@ mod tests {
         if let IndexMutation::Upsert(upsert) = &mut run.mutations[0] {
             upsert.payload = IndexPayloadPointer::ExternalPack {
                 container_ordinal: 0,
-                record_ordinal: 8,
+                record: IndexPackRecordPointer {
+                    record_ordinal: 8,
+                    physical_offset: 100,
+                    plaintext_digest: [0x66; 32],
+                },
             };
         }
         assert_eq!(
@@ -2337,18 +2693,202 @@ mod tests {
         );
 
         if let IndexMutation::Upsert(upsert) = &mut run.mutations[0] {
-            upsert.payload = IndexPayloadPointer::SelfPack { record_ordinal: 2 };
+            upsert.payload = IndexPayloadPointer::SelfPack {
+                record: IndexPackRecordPointer {
+                    record_ordinal: 2,
+                    physical_offset: 100,
+                    plaintext_digest: [0x66; 32],
+                },
+            };
         }
         run.containers.clear();
         assert_eq!(
             encode_index_run_frames(&run, &limits),
             Err(IndexRunError::InvalidPackRecordCount)
         );
-        run.self_pack_record_count = Some(3);
+        run.self_pack = Some(IndexRunSelfPack {
+            pack_id: [0x88; 32],
+            content_key_id: KeyId::new("historical-content").expect("key id"),
+            stored_len: 2_048,
+            record_count: 3,
+        });
         let encoded = encode_index_run_frames(&run, &limits).expect("encode self pack pointer");
         assert_eq!(
             decode_index_run_frames(&frame_bytes(encoded), &limits),
             Ok(run)
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_pack_record_ranges_on_encode_and_decode() {
+        let limits = IndexRunLimits::default();
+        let mut run = fixture();
+        set_fixture_physical_offset(&mut run, 799);
+        assert_eq!(
+            encode_index_run_frames(&run, &limits),
+            Err(IndexRunError::InvalidPackRecordRange)
+        );
+
+        set_fixture_physical_offset(&mut run, 798);
+        let encoded = encode_index_run_frames(&run, &limits).expect("boundary record range");
+        let mut frames = frame_bytes(encoded);
+        let encoded_offset = [0x9e, 0x06];
+        let offset = frames
+            .iter()
+            .enumerate()
+            .find_map(|(frame_index, frame)| {
+                frame
+                    .windows(encoded_offset.len())
+                    .position(|window| window == encoded_offset)
+                    .map(|offset| (frame_index, offset))
+            })
+            .expect("encoded physical offset");
+        frames[offset.0][offset.1] = 0x9f;
+        assert_eq!(
+            decode_index_run_frames(&frames, &limits),
+            Err(IndexRunError::InvalidPackRecordRange)
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_or_overlapping_repeated_record_facts() {
+        let limits = IndexRunLimits::default();
+        let mut run = fixture();
+        let IndexMutation::Upsert(mut duplicate) = run.mutations[0].clone() else {
+            panic!("fixture starts with upsert");
+        };
+        duplicate.mutation_ordinal = 2;
+        duplicate.blind_key = IndexBlindKey::from_bytes([0x55; 32]);
+        duplicate.path = LogicalPath::new("tenant/duplicate").expect("path");
+        if let IndexPayloadPointer::ExternalPack { record, .. } = &mut duplicate.payload {
+            record.plaintext_digest = [0x77; 32];
+        }
+        run.mutations.push(IndexMutation::Upsert(duplicate.clone()));
+        assert_eq!(
+            encode_index_run_frames(&run, &limits),
+            Err(IndexRunError::PackRecordFactsMismatch)
+        );
+
+        if let IndexPayloadPointer::ExternalPack { record, .. } = &mut duplicate.payload {
+            record.plaintext_digest = [0x66; 32];
+            record.record_ordinal = 6;
+        }
+        run.mutations[2] = IndexMutation::Upsert(duplicate);
+        assert_eq!(
+            encode_index_run_frames(&run, &limits),
+            Err(IndexRunError::PackRecordFactsMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_transplanted_self_pack_facts_between_metadata_frames() {
+        let limits = IndexRunLimits {
+            max_frame_bytes: 300,
+            ..IndexRunLimits::default()
+        };
+        let mut run = fixture();
+        let mut second_container = run.containers[0].clone();
+        second_container.object_id =
+            BackendObjectId::new("objects/pack-b").expect("second object id");
+        second_container.pack_id = [0x12; 32];
+        run.containers.push(second_container);
+
+        let IndexMutation::Upsert(mut external) = run.mutations[0].clone() else {
+            panic!("fixture starts with upsert");
+        };
+        external.mutation_ordinal = 2;
+        external.blind_key = IndexBlindKey::from_bytes([0x55; 32]);
+        external.path = LogicalPath::new("tenant/external-two").expect("path");
+        let IndexPayloadPointer::ExternalPack {
+            container_ordinal, ..
+        } = &mut external.payload
+        else {
+            panic!("fixture uses an external pack");
+        };
+        *container_ordinal = 1;
+        run.mutations.push(IndexMutation::Upsert(external));
+
+        let IndexMutation::Upsert(mut local) = run.mutations[0].clone() else {
+            panic!("fixture starts with upsert");
+        };
+        local.mutation_ordinal = 3;
+        local.blind_key = IndexBlindKey::from_bytes([0x77; 32]);
+        local.path = LogicalPath::new("tenant/local").expect("path");
+        local.payload = IndexPayloadPointer::SelfPack {
+            record: IndexPackRecordPointer {
+                record_ordinal: 0,
+                physical_offset: 0,
+                plaintext_digest: [0x99; 32],
+            },
+        };
+        run.self_pack = Some(IndexRunSelfPack {
+            pack_id: [0x88; 32],
+            content_key_id: KeyId::new("historical-content").expect("key id"),
+            stored_len: 1_250,
+            record_count: 1,
+        });
+        run.mutations.push(IndexMutation::Upsert(local));
+
+        let encoded = encode_index_run_frames(&run, &limits).expect("multi-frame metadata");
+        let metadata: Vec<_> = encoded
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| frame.role == IndexRunFrameRole::Metadata)
+            .map(|(index, _)| index)
+            .collect();
+        assert!(metadata.len() >= 2);
+        let mut frames = frame_bytes(encoded);
+        let pack_id_offset = frames[metadata[1]]
+            .windows(32)
+            .position(|window| window == [0x88; 32])
+            .expect("repeated self-pack id");
+        frames[metadata[1]][pack_id_offset] ^= 1;
+        assert_eq!(
+            decode_index_run_frames(&frames, &limits),
+            Err(IndexRunError::FrameFactsMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_hostile_pack_fact_bounds() {
+        let limits = IndexRunLimits::default();
+        let mut run = fixture();
+        run.containers[0].pack_section_len = super::INDEX_PACK_MAX_STORED_BYTES + 1;
+        run.containers[0].stored_len = run.containers[0].pack_section_len;
+        assert_eq!(
+            encode_index_run_frames(&run, &limits),
+            Err(IndexRunError::InvalidContainerRange)
+        );
+
+        run = fixture();
+        run.containers[0].pack_record_count = super::INDEX_PACK_MAX_RECORDS + 1;
+        assert_eq!(
+            encode_index_run_frames(&run, &limits),
+            Err(IndexRunError::InvalidContainerRange)
+        );
+
+        run = fixture();
+        run.containers.clear();
+        let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
+            panic!("fixture starts with upsert");
+        };
+        upsert.payload = IndexPayloadPointer::SelfPack {
+            record: IndexPackRecordPointer {
+                record_ordinal: 0,
+                physical_offset: 0,
+                plaintext_digest: [0x66; 32],
+            },
+        };
+        run.self_pack = Some(IndexRunSelfPack {
+            pack_id: [0x88; 32],
+            content_key_id: KeyId::new("historical-content").expect("key id"),
+            stored_len: super::INDEX_PACK_MAX_STORED_BYTES + 1,
+            record_count: 1,
+        });
+        assert_eq!(
+            encode_index_run_frames(&run, &limits),
+            Err(IndexRunError::InvalidPackRecordCount)
         );
     }
 
@@ -2376,6 +2916,16 @@ mod tests {
             .into_iter()
             .map(|frame| frame.bytes)
             .collect()
+    }
+
+    fn set_fixture_physical_offset(run: &mut IndexRun, physical_offset: u32) {
+        let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
+            panic!("fixture starts with upsert");
+        };
+        let IndexPayloadPointer::ExternalPack { record, .. } = &mut upsert.payload else {
+            panic!("fixture uses an external pack");
+        };
+        record.physical_offset = physical_offset;
     }
 
     fn hex(bytes: &[u8]) -> String {

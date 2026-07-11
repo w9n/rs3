@@ -1311,8 +1311,9 @@ mod tests {
     use bytes::Bytes;
     use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
     use rs3_index::run::{
-        IndexBlindKey, IndexMutation, IndexPayloadPointer, IndexRun, IndexRunContainer,
-        IndexRunFrameRole, IndexRunLimits, IndexRunSearchBound, IndexTombstone, IndexUpsert,
+        IndexBlindKey, IndexMutation, IndexPackRecordPointer, IndexPayloadPointer, IndexRun,
+        IndexRunContainer, IndexRunFrameRole, IndexRunKeyringRef, IndexRunLimits,
+        IndexRunSearchBound, IndexRunSelfPack, IndexTombstone, IndexUpsert,
         encode_index_run_frames,
     };
     use rs3_types::{
@@ -1369,7 +1370,7 @@ mod tests {
 
     fn limits() -> IndexRunLimits {
         IndexRunLimits {
-            max_frame_bytes: 240,
+            max_frame_bytes: 512,
             ..IndexRunLimits::default()
         }
     }
@@ -1377,15 +1378,26 @@ mod tests {
     fn fixture() -> IndexRun {
         IndexRun {
             sequence: Sequence::new(9),
-            self_pack_record_count: Some(4),
+            self_pack: Some(IndexRunSelfPack {
+                pack_id: [0x11; 32],
+                content_key_id: must(KeyId::new("content-v1")),
+                stored_len: 128,
+                record_count: 4,
+            }),
             containers: vec![IndexRunContainer {
                 object_id: object_id("objects/v02/pack-a"),
                 version_id: Some(must(BackendVersionId::new("version-3"))),
                 stored_len: 4_096,
                 commit_body_digest: [0x22; 32],
+                keyring_envelope: IndexRunKeyringRef {
+                    object_id: object_id("metadata/v02/keyring-a"),
+                    digest: [0x33; 32],
+                },
                 pack_section_ordinal: 1,
                 pack_section_offset: 512,
                 pack_section_len: 2_048,
+                pack_id: [0x44; 32],
+                content_key_id: must(KeyId::new("content-v0")),
                 pack_record_count: 8,
             }],
             mutations: vec![
@@ -1395,7 +1407,13 @@ mod tests {
                     namespace_key_id: must(KeyId::new("namespace")),
                     path: must(LogicalPath::new("tenant/z-last")),
                     generation: Sequence::new(17),
-                    payload: IndexPayloadPointer::SelfPack { record_ordinal: 0 },
+                    payload: IndexPayloadPointer::SelfPack {
+                        record: IndexPackRecordPointer {
+                            record_ordinal: 0,
+                            physical_offset: 0,
+                            plaintext_digest: [0x55; 32],
+                        },
+                    },
                     content_len: 4,
                     modified_at_ms: 10,
                     retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
@@ -1409,7 +1427,11 @@ mod tests {
                     generation: Sequence::new(18),
                     payload: IndexPayloadPointer::ExternalPack {
                         container_ordinal: 0,
-                        record_ordinal: 2,
+                        record: IndexPackRecordPointer {
+                            record_ordinal: 2,
+                            physical_offset: 42,
+                            plaintext_digest: [0x66; 32],
+                        },
                     },
                     content_len: 5,
                     modified_at_ms: 11,
@@ -1515,7 +1537,7 @@ mod tests {
         let limits = limits();
         let run = IndexRun {
             sequence: Sequence::new(21),
-            self_pack_record_count: None,
+            self_pack: None,
             containers: Vec::new(),
             mutations: vec![IndexMutation::Tombstone(IndexTombstone {
                 mutation_ordinal: 0,

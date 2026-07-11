@@ -54,10 +54,22 @@ pub enum PayloadReference {
     V2PackSelf {
         /// Commit section ordinal containing the payload pack.
         pack_section_ordinal: u32,
+        /// Random pack identity bound into every record AEAD operation.
+        pack_id: [u8; 32],
+        /// Historical content-encryption key needed to open the record.
+        content_key_id: KeyId,
+        /// Current commit's encrypted-keyring envelope object bound into payload AEAD context.
+        keyring_envelope_object_id: BackendObjectId,
+        /// SHA-256 digest of that encrypted-keyring envelope.
+        keyring_envelope_digest: [u8; 32],
         /// Authenticated number of logical records in the pack directory.
         pack_record_count: u32,
         /// Logical record ordinal in the pack directory.
         record_ordinal: u32,
+        /// Absolute ciphertext offset from the start of the payload-pack section.
+        record_offset: u32,
+        /// SHA-256 digest over the complete plaintext record.
+        plaintext_digest: [u8; 32],
     },
     /// Compact payload-pack record in an accepted exact commit object.
     V2Pack {
@@ -76,10 +88,22 @@ pub enum PayloadReference {
         pack_offset: u64,
         /// Encrypted payload-pack section byte length.
         length: u64,
+        /// Random pack identity bound into every record AEAD operation.
+        pack_id: [u8; 32],
+        /// Historical content-encryption key needed to open the record.
+        content_key_id: KeyId,
+        /// Historical encrypted-keyring envelope object bound into payload AEAD context.
+        keyring_envelope_object_id: BackendObjectId,
+        /// SHA-256 digest of that encrypted-keyring envelope.
+        keyring_envelope_digest: [u8; 32],
         /// Authenticated number of logical records in the pack directory.
         pack_record_count: u32,
         /// Logical record ordinal in the pack directory.
         record_ordinal: u32,
+        /// Absolute ciphertext offset from the start of the payload-pack section.
+        record_offset: u32,
+        /// SHA-256 digest over the complete plaintext record.
+        plaintext_digest: [u8; 32],
     },
     /// Payload bytes are in the current commit that carries this index delta.
     V2Self {
@@ -600,13 +624,13 @@ mod tests {
         CHECKPOINT_EVIDENCE_DOMAIN, CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CheckpointEvidence,
         CommitRecord, INDEX_DELTA_OBJECT_DOMAIN, INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta,
         IndexDeltaObject, KeyringSnapshot, MANIFEST_PLAINTEXT_DOMAIN, ManifestObject,
-        NamespaceEntry, NamespaceIndex, SealedIndexDeltaObject, canonical_commit_record_bytes,
-        checkpoint_evidence_bytes, checkpoint_object_bytes, index_delta_object_bytes,
-        index_delta_plaintext_bytes, manifest_plaintext_bytes,
+        NamespaceEntry, NamespaceIndex, PayloadReference, SealedIndexDeltaObject,
+        canonical_commit_record_bytes, checkpoint_evidence_bytes, checkpoint_object_bytes,
+        index_delta_object_bytes, index_delta_plaintext_bytes, manifest_plaintext_bytes,
     };
     use rs3_types::{
-        BackendObjectId, BlindIndexKey, CheckpointId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
-        LogicalPath, ManifestId, PrefixToken, Sequence,
+        BackendObjectId, BackendVersionId, BlindIndexKey, CheckpointId, KeyDescriptor, KeyId,
+        KeyPurpose, KeyStatus, LogicalPath, ManifestId, PrefixToken, Sequence,
     };
 
     fn blind_key(value: &str) -> BlindIndexKey {
@@ -938,6 +962,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![key_id("new"), key_id("old")]
         );
+    }
+
+    #[test]
+    fn payload_pack_references_round_trip_direct_read_facts() {
+        let references = [
+            PayloadReference::V2PackSelf {
+                pack_section_ordinal: 2,
+                pack_id: [0x11; 32],
+                content_key_id: key_id("historical-content"),
+                keyring_envelope_object_id: object_id("keyrings/current"),
+                keyring_envelope_digest: [0x12; 32],
+                pack_record_count: 7,
+                record_ordinal: 3,
+                record_offset: 4_096,
+                plaintext_digest: [0x22; 32],
+            },
+            PayloadReference::V2Pack {
+                commit_key: object_id("commits/opaque"),
+                commit_version_id: Some(BackendVersionId::new("version-1").expect("version id")),
+                body_digest: [0x33; 32],
+                commit_stored_len: 32_768,
+                pack_section_ordinal: 4,
+                pack_offset: 8_192,
+                length: 16_384,
+                pack_id: [0x44; 32],
+                content_key_id: key_id("older-content"),
+                keyring_envelope_object_id: object_id("keyrings/historical"),
+                keyring_envelope_digest: [0x45; 32],
+                pack_record_count: 11,
+                record_ordinal: 5,
+                record_offset: 12_288,
+                plaintext_digest: [0x55; 32],
+            },
+        ];
+
+        for reference in references {
+            let encoded = serde_json::to_vec(&reference).expect("serialize payload reference");
+            let decoded: PayloadReference =
+                serde_json::from_slice(&encoded).expect("deserialize payload reference");
+            assert_eq!(decoded, reference);
+        }
     }
 
     #[test]

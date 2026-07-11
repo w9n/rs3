@@ -1958,6 +1958,130 @@ async fn v2_repository_range_reads_cache_headers_without_full_commit_gets() {
 }
 
 #[tokio::test]
+async fn v2_rooted_cold_pack_read_fetches_only_exact_record_ciphertext() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    let key = must_type(LogicalPath::new("snapshots/v2-direct-cold-read.bin"));
+    let body = Bytes::from(vec![37_u8; 512]);
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                key.clone(),
+                body.clone(),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(repository.write_index_snapshot(&anchor).await);
+
+    let fresh = V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    );
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    store.reset_operation_counts();
+
+    let restored = must_repo(fresh.get_range(&key, ByteRange::Full).await);
+    let counts = store.operation_counts();
+
+    assert_eq!(restored, body);
+    assert_eq!(counts.get, 1);
+    assert_eq!(counts.head, 0);
+    assert_eq!(counts.list, 0);
+    assert_eq!(counts.bytes_read, 512 + 16);
+    assert_eq!(store.full_commit_get_count(), 0);
+    assert_eq!(store.ranged_commit_get_count(), 1);
+}
+
+#[tokio::test]
+async fn v2_rooted_pack_read_uses_the_historical_keyring_envelope_context() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = must_crypto(KeyRing::generate_random());
+    let original_options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let original = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        original_options,
+    );
+    let anchor = V2MemoryAnchor::new();
+    let key = must_type(LogicalPath::new("snapshots/v2-historical-envelope.bin"));
+    let body = Bytes::from(vec![73_u8; 512]);
+
+    must_repo(original.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        original
+            .put_committed(
+                &anchor,
+                key.clone(),
+                body.clone(),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+
+    let rotated_envelope = V2KeyringEnvelopeRef {
+        object_id: object_id("keyrings/00000000000000000002-rotated"),
+        digest: [8_u8; 32],
+    };
+    let rotated_options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        rotated_envelope,
+        sample_format_ref(),
+    );
+    let rotated = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        rotated_options.clone(),
+    );
+    must_repo(rotated.load_chain_from_anchor(&anchor).await);
+    must_repo(rotated.write_index_snapshot(&anchor).await);
+
+    let fresh = V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        rotated_options,
+    );
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    store.reset_operation_counts();
+
+    let restored = must_repo(fresh.get_range(&key, ByteRange::Full).await);
+    let counts = store.operation_counts();
+
+    assert_eq!(restored, body);
+    assert_eq!(counts.get, 1);
+    assert_eq!(counts.head, 0);
+    assert_eq!(counts.list, 0);
+    assert_eq!(counts.bytes_read, 512 + 16);
+}
+
+#[tokio::test]
 async fn v2_repository_concurrent_range_reads_avoid_full_commit_gets() {
     let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::from_millis(50));
     let keyring = must_crypto(KeyRing::generate_random());

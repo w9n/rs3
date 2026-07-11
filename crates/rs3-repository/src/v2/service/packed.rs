@@ -5,8 +5,9 @@ use crate::error::Result;
 use crate::namespace::prefix_tokens_for_key;
 use crate::state::{RepositoryState, TrustedManifest, object_material};
 use rs3_index::run::{
-    IndexBlindKey, IndexMutation, IndexPayloadPointer, IndexRun, IndexRunContainer, IndexRunLimits,
-    IndexTombstone, IndexUpsert,
+    IndexBlindKey, IndexMutation, IndexPackRecordPointer, IndexPayloadPointer, IndexRun,
+    IndexRunContainer, IndexRunKeyringRef, IndexRunLimits, IndexRunSelfPack, IndexTombstone,
+    IndexUpsert,
 };
 use rs3_index::{IndexDelta, NamespaceEntry, PayloadReference};
 use rs3_storage::BlobStore;
@@ -15,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::v2::{
     V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitKey, V2CommitSection, V2FormatError,
-    V2KeyringEnvelopeRef, V2ParsedCommitHeader, V2PayloadPackDirectory, V2PayloadPackRecordInput,
-    V2SectionType, V2StoredCommit, digest_v2_section, open_v2_index_run,
+    V2KeyringEnvelopeRef, V2ParsedCommitHeader, V2PayloadPackLayout, V2PayloadPackRecord,
+    V2PayloadPackRecordInput, V2SectionType, V2StoredCommit, digest_v2_section, open_v2_index_run,
     open_v2_index_run_directory, probe_v2_index_run_header, seal_v2_index_run,
     seal_v2_payload_pack,
 };
@@ -24,8 +25,8 @@ use crate::v2::{
 pub(super) struct PendingV2PackRecordLocation {
     pub(super) manifest_id: ManifestId,
     pub(super) pack_section_ordinal: Option<u32>,
-    pub(super) pack_record_count: u32,
-    pub(super) record_ordinal: Option<u32>,
+    pub(super) pack: Option<IndexRunSelfPack>,
+    pub(super) record: Option<IndexPackRecordPointer>,
     pub(super) offset: u64,
     pub(super) length: u64,
 }
@@ -33,7 +34,6 @@ pub(super) struct PendingV2PackRecordLocation {
 pub(super) struct PendingV2PackedCommitSections {
     pub(super) sections: Vec<V2CommitSection>,
     pub(super) locations: Vec<PendingV2PackRecordLocation>,
-    pub(super) pack_directory: Option<V2PayloadPackDirectory>,
     pub(super) run: PendingV2IndexRunFacts,
     pub(super) retention: Option<rs3_types::RetentionPolicy>,
     pub(super) legal_hold: Option<rs3_types::LegalHoldStatus>,
@@ -129,8 +129,6 @@ where
                 plaintext: pending.body.clone(),
             });
         }
-        let pack_record_count = u32::try_from(pack_inputs.len())
-            .map_err(|_| v2_repository_error(V2FormatError::PayloadPackLimitExceeded))?;
         let pack_section_ordinal = (!pack_inputs.is_empty()).then_some(0_u32);
         let index_section_ordinal = u32::from(pack_section_ordinal.is_some());
 
@@ -151,6 +149,10 @@ where
                     pack_section_ordinal,
                     pack_offset,
                     length,
+                    pack_id,
+                    content_key_id,
+                    keyring_envelope_object_id,
+                    keyring_envelope_digest,
                     pack_record_count,
                     ..
                 }) => {
@@ -159,9 +161,15 @@ where
                         version_id: commit_version_id.clone(),
                         stored_len: *commit_stored_len,
                         commit_body_digest: *body_digest,
+                        keyring_envelope: IndexRunKeyringRef {
+                            object_id: keyring_envelope_object_id.clone(),
+                            digest: *keyring_envelope_digest,
+                        },
                         pack_section_ordinal: *pack_section_ordinal,
                         pack_section_offset: *pack_offset,
                         pack_section_len: *length,
+                        pack_id: *pack_id,
+                        content_key_id: content_key_id.clone(),
                         pack_record_count: *pack_record_count,
                     });
                 }
@@ -172,6 +180,26 @@ where
             }
         }
         let containers = external_containers.into_iter().collect::<Vec<_>>();
+
+        let context = commit_repository_context(self, commit_key)?;
+        let sealed_pack = if pack_inputs.is_empty() {
+            None
+        } else {
+            Some(
+                match seal_v2_payload_pack(
+                    &keyring,
+                    &context,
+                    &commit_key.object_id,
+                    pack_section_ordinal
+                        .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?,
+                    &pack_inputs,
+                ) {
+                    Ok(pack) => pack,
+                    Err(V2FormatError::PayloadPackLimitExceeded) => return Ok(None),
+                    Err(error) => return Err(v2_repository_error(error)),
+                },
+            )
+        };
 
         let mut mutations = Vec::with_capacity(deltas.len());
         for (ordinal, delta) in deltas.iter().enumerate() {
@@ -188,8 +216,18 @@ where
                     } else if let Some(Some(record_ordinal)) =
                         record_ordinals.get(&entry.manifest_id)
                     {
+                        let record = sealed_pack
+                            .as_ref()
+                            .and_then(|pack| pack.layout().record(*record_ordinal))
+                            .ok_or_else(|| {
+                                v2_repository_error(V2FormatError::InvalidPayloadPack)
+                            })?;
                         IndexPayloadPointer::SelfPack {
-                            record_ordinal: *record_ordinal,
+                            record: IndexPackRecordPointer {
+                                record_ordinal: record.ordinal(),
+                                physical_offset: record.physical_offset(),
+                                plaintext_digest: *record.plaintext_digest(),
+                            },
                         }
                     } else {
                         let Some(PayloadReference::V2Pack {
@@ -200,8 +238,14 @@ where
                             pack_section_ordinal,
                             pack_offset,
                             length,
+                            pack_id,
+                            content_key_id,
+                            keyring_envelope_object_id,
+                            keyring_envelope_digest,
                             pack_record_count,
                             record_ordinal,
+                            record_offset,
+                            plaintext_digest,
                             ..
                         }) = entry.payload_ref.as_ref()
                         else {
@@ -212,9 +256,15 @@ where
                             version_id: commit_version_id.clone(),
                             stored_len: *commit_stored_len,
                             commit_body_digest: *body_digest,
+                            keyring_envelope: IndexRunKeyringRef {
+                                object_id: keyring_envelope_object_id.clone(),
+                                digest: *keyring_envelope_digest,
+                            },
                             pack_section_ordinal: *pack_section_ordinal,
                             pack_section_offset: *pack_offset,
                             pack_section_len: *length,
+                            pack_id: *pack_id,
+                            content_key_id: content_key_id.clone(),
                             pack_record_count: *pack_record_count,
                         };
                         let container_ordinal = containers
@@ -224,7 +274,11 @@ where
                             container_ordinal: u32::try_from(container_ordinal).map_err(|_| {
                                 v2_repository_error(V2FormatError::IndexRunLimitExceeded)
                             })?,
-                            record_ordinal: *record_ordinal,
+                            record: IndexPackRecordPointer {
+                                record_ordinal: *record_ordinal,
+                                physical_offset: *record_offset,
+                                plaintext_digest: *plaintext_digest,
+                            },
                         }
                     };
                     mutations.push(IndexMutation::Upsert(IndexUpsert {
@@ -258,31 +312,20 @@ where
         }
         drop(state);
 
-        let context = commit_repository_context(self, commit_key)?;
         let mut sections = Vec::with_capacity(2);
         let mut locations = Vec::with_capacity(pack_inputs.len());
-        let mut pack_directory = None;
-        if let Some(pack_section_ordinal) = pack_section_ordinal {
-            let pack = match seal_v2_payload_pack(
-                &keyring,
-                &context,
-                &commit_key.object_id,
-                pack_section_ordinal,
-                &pack_inputs,
-            ) {
-                Ok(pack) => pack,
-                Err(V2FormatError::PayloadPackLimitExceeded) => return Ok(None),
-                Err(error) => return Err(v2_repository_error(error)),
-            };
-            pack_directory = Some(pack.directory().clone());
+        if let (Some(pack_section_ordinal), Some(pack)) = (pack_section_ordinal, sealed_pack) {
             let length = u64::try_from(pack.bytes().len())
                 .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
             for (manifest_id, record_ordinal) in &record_ordinals {
+                let record = record_ordinal
+                    .and_then(|ordinal| pack.layout().record(ordinal))
+                    .map(index_pack_record_pointer);
                 locations.push(PendingV2PackRecordLocation {
                     manifest_id: manifest_id.clone(),
                     pack_section_ordinal: record_ordinal.map(|_| pack_section_ordinal),
-                    pack_record_count,
-                    record_ordinal: *record_ordinal,
+                    pack: record.map(|_| index_run_self_pack(pack.layout())),
+                    record,
                     offset: 0,
                     length: record_ordinal.map_or(0, |_| length),
                 });
@@ -297,8 +340,8 @@ where
                 locations.push(PendingV2PackRecordLocation {
                     manifest_id: manifest_id.clone(),
                     pack_section_ordinal: None,
-                    pack_record_count: 0,
-                    record_ordinal: None,
+                    pack: None,
+                    record: None,
                     offset: 0,
                     length: 0,
                 });
@@ -312,7 +355,7 @@ where
             .map_err(|_| v2_repository_error(V2FormatError::IndexRunLimitExceeded))?;
         let run = IndexRun {
             sequence: run_sequence,
-            self_pack_record_count: (pack_record_count > 0).then_some(pack_record_count),
+            self_pack: locations.iter().find_map(|location| location.pack.clone()),
             containers,
             mutations,
         };
@@ -359,7 +402,6 @@ where
         Ok(Some(PendingV2PackedCommitSections {
             sections,
             locations,
-            pack_directory,
             run: run_facts,
             retention,
             legal_hold,
@@ -402,8 +444,12 @@ where
             };
             entry.object_id = stored.anchor_state.commit_key.clone();
             entry.object_version_id = stored.version_id.clone();
-            entry.payload_ref = match (location.pack_section_ordinal, location.record_ordinal) {
-                (Some(pack_section_ordinal), Some(record_ordinal)) => {
+            entry.payload_ref = match (
+                location.pack_section_ordinal,
+                location.pack.as_ref(),
+                location.record,
+            ) {
+                (Some(pack_section_ordinal), Some(pack), Some(record)) => {
                     Some(PayloadReference::V2Pack {
                         commit_key: stored.anchor_state.commit_key.clone(),
                         commit_version_id: stored.version_id.clone(),
@@ -415,11 +461,26 @@ where
                             .checked_add(location.offset)
                             .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?,
                         length: location.length,
-                        pack_record_count: location.pack_record_count,
-                        record_ordinal,
+                        pack_id: pack.pack_id,
+                        content_key_id: pack.content_key_id.clone(),
+                        keyring_envelope_object_id: self
+                            .commit_store
+                            .options()
+                            .keyring_envelope_ref
+                            .object_id
+                            .clone(),
+                        keyring_envelope_digest: self
+                            .commit_store
+                            .options()
+                            .keyring_envelope_ref
+                            .digest,
+                        pack_record_count: pack.record_count,
+                        record_ordinal: record.record_ordinal,
+                        record_offset: record.physical_offset,
+                        plaintext_digest: record.plaintext_digest,
                     })
                 }
-                (None, None) if entry.content_len == 0 => None,
+                (None, None, None) if entry.content_len == 0 => None,
                 _ => return Err(v2_repository_error(V2FormatError::InvalidHeaderField)),
             };
             state.replace_namespace_entry(entry, prefix_tokens.clone());
@@ -544,8 +605,8 @@ pub(in crate::v2) fn apply_packed_index_run(
             section_digest: descriptor.digest,
         },
     };
-    let self_pack = match run.self_pack_record_count {
-        Some(record_count) => {
+    let self_pack = match run.self_pack.as_ref() {
+        Some(pack) => {
             let mut matches = replay
                 .parsed_header
                 .header
@@ -556,14 +617,14 @@ pub(in crate::v2) fn apply_packed_index_run(
             let Some((ordinal, section)) = matches.next() else {
                 return Err(v2_repository_error(V2FormatError::SectionBounds));
             };
-            if matches.next().is_some() || record_count == 0 {
+            if matches.next().is_some() || section.length != pack.stored_len {
                 return Err(v2_repository_error(V2FormatError::SectionBounds));
             }
             Some((
                 u32::try_from(ordinal)
                     .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
                 section,
-                record_count,
+                pack,
             ))
         }
         None => {
@@ -590,9 +651,8 @@ pub(in crate::v2) fn apply_packed_index_run(
                 verify_blind_key(keyring, &upsert.namespace_key_id, &upsert.path, &blind_key)?;
                 let payload_ref = match upsert.payload {
                     IndexPayloadPointer::Empty => None,
-                    IndexPayloadPointer::SelfPack { record_ordinal } => {
-                        let Some((pack_section_ordinal, section, pack_record_count)) = self_pack
-                        else {
+                    IndexPayloadPointer::SelfPack { record } => {
+                        let Some((pack_section_ordinal, section, pack)) = self_pack else {
                             return Err(v2_repository_error(V2FormatError::SectionBounds));
                         };
                         Some(PayloadReference::V2Pack {
@@ -606,13 +666,28 @@ pub(in crate::v2) fn apply_packed_index_run(
                                 .checked_add(section.offset)
                                 .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?,
                             length: section.length,
-                            pack_record_count,
-                            record_ordinal,
+                            pack_id: pack.pack_id,
+                            content_key_id: pack.content_key_id.clone(),
+                            keyring_envelope_object_id: replay
+                                .parsed_header
+                                .header
+                                .keyring_envelope_ref
+                                .object_id
+                                .clone(),
+                            keyring_envelope_digest: replay
+                                .parsed_header
+                                .header
+                                .keyring_envelope_ref
+                                .digest,
+                            pack_record_count: pack.record_count,
+                            record_ordinal: record.record_ordinal,
+                            record_offset: record.physical_offset,
+                            plaintext_digest: record.plaintext_digest,
                         })
                     }
                     IndexPayloadPointer::ExternalPack {
                         container_ordinal,
-                        record_ordinal,
+                        record,
                     } => {
                         let container = run
                             .containers
@@ -630,8 +705,17 @@ pub(in crate::v2) fn apply_packed_index_run(
                             pack_section_ordinal: container.pack_section_ordinal,
                             pack_offset: container.pack_section_offset,
                             length: container.pack_section_len,
+                            pack_id: container.pack_id,
+                            content_key_id: container.content_key_id.clone(),
+                            keyring_envelope_object_id: container
+                                .keyring_envelope
+                                .object_id
+                                .clone(),
+                            keyring_envelope_digest: container.keyring_envelope.digest,
                             pack_record_count: container.pack_record_count,
-                            record_ordinal,
+                            record_ordinal: record.record_ordinal,
+                            record_offset: record.physical_offset,
+                            plaintext_digest: record.plaintext_digest,
                         })
                     }
                 };
@@ -693,6 +777,23 @@ pub(in crate::v2) fn apply_packed_index_run(
     }
     state.next_sequence = state.next_sequence.max(run.sequence);
     Ok(accepted_run)
+}
+
+fn index_run_self_pack(layout: &V2PayloadPackLayout) -> IndexRunSelfPack {
+    IndexRunSelfPack {
+        pack_id: layout.facts().pack_id().into_bytes(),
+        content_key_id: layout.facts().content_key_id().clone(),
+        stored_len: u64::from(layout.facts().stored_len()),
+        record_count: layout.facts().record_count(),
+    }
+}
+
+fn index_pack_record_pointer(record: &V2PayloadPackRecord) -> IndexPackRecordPointer {
+    IndexPackRecordPointer {
+        record_ordinal: record.ordinal(),
+        physical_offset: record.physical_offset(),
+        plaintext_digest: *record.plaintext_digest(),
+    }
 }
 
 fn index_run_bounds(mutations: &[IndexMutation]) -> Result<IndexRunBounds> {
