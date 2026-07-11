@@ -439,22 +439,21 @@ fn gateway_put_object_unknown_len_with_curl(
         .spawn()
         .context("failed to start curl for unknown-length gateway PutObject")?;
     let mut stdin = child.stdin.take().context("curl stdin was not captured")?;
-    stdin
-        .write_all(&body)
-        .context("failed to stream unknown-length body to curl")?;
+    let write_error = stdin.write_all(&body).err().map(|error| error.to_string());
     drop(stdin);
 
     let output = child
         .wait_with_output()
         .context("failed to wait for curl unknown-length PutObject")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if output.status.success() && stdout.trim() == "200" {
+    if write_error.is_none() && output.status.success() && stdout.trim() == "200" {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     anyhow::bail!(
-        "curl unknown-length PutObject failed with status {} stdout {:?} stderr {:?}",
+        "curl unknown-length PutObject failed with status {} write_error {:?} stdout {:?} stderr {:?}",
         output.status,
+        write_error,
         stdout.trim(),
         stderr.trim()
     );
