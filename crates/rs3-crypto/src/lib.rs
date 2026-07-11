@@ -28,5 +28,5 @@ pub use error::CryptoError;
 pub use fingerprint::derive_public_fingerprint;
 pub use keyring::{KeyMaterial, KeyRing, MIN_REPOSITORY_SALT_LEN, RepositoryKeyContext};
 pub use metadata::MetadataSeal;
-pub use payload::PayloadSeal;
+pub use payload::{PayloadPackSegmentSeal, PayloadSeal, digest_payload_record};
 pub use secret::SecretBytes;

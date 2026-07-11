@@ -12,7 +12,9 @@ mod error;
 mod format;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
+mod index_run;
 mod maintenance;
+mod payload_pack;
 mod provider;
 mod repository;
 mod service;
@@ -36,11 +38,27 @@ pub use error::{V2ErrorClass, V2FormatError, V2Result};
 pub use format::{
     V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef, V2MaintenanceConfig, v2_format_object_id,
 };
+pub use index_run::{
+    V2_INDEX_RUN_FIXED_HEADER_BYTES, V2_INDEX_RUN_ID_LEN, V2_INDEX_RUN_MAX_FRAME_COUNT,
+    V2_INDEX_RUN_MAX_FRAME_PLAINTEXT_BYTES, V2_INDEX_RUN_MAX_OBJECT_BYTES,
+    V2IndexRunFrameDescriptor, V2IndexRunHeaderProbe, V2IndexRunId, V2SealedIndexRun,
+    V2VerifiedIndexRunDirectory, open_v2_index_run, open_v2_index_run_directory,
+    open_v2_index_run_frame, open_v2_index_run_frames, probe_v2_index_run_header,
+    seal_v2_index_run,
+};
 pub use maintenance::{
     UnenforcedQuiescedMaintenanceGuard, V2FullGcApplyOptions, V2FullGcApplyReport,
     V2FullGcDryRunOptions, V2FullGcDryRunReport, V2MaintenanceBudgets, V2MaintenanceGuard,
     V2MaintenancePlanCost, V2MaintenanceReport, V2OrphanCandidate, V2OrphanGcOptions,
     V2OrphanGcReport, V2OrphanReport,
+};
+pub use payload_pack::{
+    V2_PAYLOAD_PACK_MAX_BYTES, V2_PAYLOAD_PACK_MAX_HEADER_BYTES, V2_PAYLOAD_PACK_MAX_RECORDS,
+    V2_PAYLOAD_PACK_SEGMENT_BYTES, V2PayloadPackDirectory, V2PayloadPackRecord,
+    V2PayloadPackRecordInput, V2PayloadPackRecordSpan, V2SealedPayloadPack, open_v2_payload_pack,
+    open_v2_payload_pack_directory, open_v2_payload_pack_record, open_v2_payload_pack_record_range,
+    open_v2_payload_pack_record_span, plan_v2_payload_pack_record_range,
+    probe_v2_payload_pack_header_len, seal_v2_payload_pack,
 };
 pub use provider::{
     V2ProviderCheckStatus, V2ProviderConformanceCheck, V2ProviderConformanceOptions,

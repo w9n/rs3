@@ -103,6 +103,18 @@ pub enum V2FormatError {
     /// A section's stored bytes do not match its signed descriptor digest.
     #[error("v2 commit section digest mismatch")]
     SectionDigestMismatch,
+    /// A framed index run has an invalid, truncated, or ambiguous encoding.
+    #[error("invalid v2 framed index run")]
+    InvalidIndexRun,
+    /// A framed index run exceeds a fixed hostile-input limit.
+    #[error("v2 framed index run limit exceeded")]
+    IndexRunLimitExceeded,
+    /// A compact payload pack has an invalid, truncated, or ambiguous encoding.
+    #[error("invalid v2 payload pack")]
+    InvalidPayloadPack,
+    /// A compact payload pack exceeds a fixed hostile-input limit.
+    #[error("v2 payload pack limit exceeded")]
+    PayloadPackLimitExceeded,
     /// A cryptographic operation other than verification failed.
     #[error("v2 cryptographic operation failed")]
     CryptoOperation,
@@ -190,6 +202,10 @@ impl V2FormatError {
             | Self::ReservedSectionFlags
             | Self::BodyDigestMismatch
             | Self::SectionDigestMismatch
+            | Self::InvalidIndexRun
+            | Self::IndexRunLimitExceeded
+            | Self::InvalidPayloadPack
+            | Self::PayloadPackLimitExceeded
             | Self::CryptoOperation
             | Self::TypeValidation
             | Self::AnchorReadFailed

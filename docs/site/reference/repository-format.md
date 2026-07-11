@@ -106,9 +106,11 @@ out-of-order or overlapping sections, arithmetic overflow, duplicate ordinals,
 lengths outside the object, and trailing data not covered by the signed layout.
 
 Capability bit `0x01` requires signed per-section digests and is implemented.
-Bit `0x02` identifies the framed index contract. It remains reserved and is
-rejected by the transitional reader until `INDEX_RUN` and `INDEX_ROOT` codecs
-land; the complete v02 reader and writer will require both bits.
+Bit `0x02` identifies the framed index contract. The bounded `INDEX_RUN` codec
+is implemented, but the bit remains reserved and is rejected by the
+transitional commit reader until `INDEX_RUN` publication and `INDEX_ROOT`
+recovery are integrated. The complete v02 reader and writer will require both
+bits.
 
 Normal commits contain one encrypted `INDEX_RUN` and at most one encrypted
 `PAYLOAD_PACK`; an all-delete or all-empty batch needs no payload pack. A
@@ -133,10 +135,13 @@ Each pack has a random 256-bit identity, one content-key identifier, a bounded
 encrypted directory, and records in randomized physical order. A small record
 is ciphertext followed by one 16-byte AEAD tag. Its nonce is derived through a
 keyed KDF from the pack identity, record ordinal, and authenticated plaintext
-digest, so the format does not store a nonce per record. Large records retain
-bounded segmented AEAD for efficient range reads. The cutoff and segment size
-are writer policy recorded in the pack; the first engineering cutoff is about
-64 KiB and is not a format invariant.
+digest, so the format does not store a nonce per record. Records larger than 64
+KiB use canonical 64 KiB independently authenticated segments for efficient
+range reads; smaller records use one segment. Both writer and reader enforce
+that rule so a writer bug cannot create pathological one-byte segments or make
+a one-byte range request read an entire large record. The bounded in-memory
+normal-commit codec accepts at most 32 MiB per pack; larger values stay on the
+streaming payload path.
 
 The encrypted directory maps record ordinals to bounded ciphertext spans and
 authenticated plaintext lengths. An index payload pointer is a container-table

@@ -1,5 +1,7 @@
 //! Append-friendly index and checkpoint model.
 
+pub mod run;
+
 use rs3_types::{
     BackendObjectId, BackendObjectRef, BackendVersionId, BlindIndexKey, CheckpointId,
     KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LegalHoldStatus, ManifestId, PrefixToken,

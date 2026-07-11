@@ -382,10 +382,11 @@ Preview evidence should show:
 
 The replacement repository generation must complete all of these together:
 
-- implement canonical framed `INDEX_RUN` objects and small signed `INDEX_ROOT`
-  catalogs under the new `commits/v02` generation;
-- replace one payload section per object with immutable value-separated
-  `PAYLOAD_PACK` sections, compact record pointers, and protection cohorts;
+- integrate the implemented canonical framed `INDEX_RUN` codec and add small
+  signed `INDEX_ROOT` catalogs under the new `commits/v02` generation;
+- integrate the implemented immutable value-separated `PAYLOAD_PACK` codec,
+  compact record pointers, and protection cohorts in place of one payload
+  section per object;
 - replace cumulative delta retention with descriptor-first, one-frame-at-a-time
   recovery;
 - keep one accepted repository state plus a bounded pending mutation overlay;
