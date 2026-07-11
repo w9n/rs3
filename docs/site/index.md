@@ -60,12 +60,15 @@ restore-bundle workflows, retention-aware storage contracts, metrics, tracing,
 and performance measurement against a straight proxy baseline.
 
 `commits/v01` has been removed and is unsupported; it had no production
-repositories. The runtime now reads and writes a transitional `commits/v02`
-envelope, while the replacement framed-run and signed-catalog architecture is
-not implemented. Existing gateway and provider results remain regression
-evidence, but a repository release is blocked until the complete format passes
-recovery, checkpoint, GC, retained-provider, and 1M-object scale gates. No
-`v01` migration or dual reader is planned.
+repositories. The runtime now reads and writes bounded `commits/v02` payload
+packs, encrypted index runs, and signed index-root checkpoints. Packed reads
+resolve authenticated record descriptors from the encrypted index and fetch
+the exact payload ciphertext range without first reading pack metadata.
+Existing gateway and provider results remain regression evidence, but a
+repository release is blocked until compaction, automatic watermarks, complete
+GC and protection-cohort behavior, retained-provider qualification, and the
+fresh-process 1M-object scale gates pass. No `v01` migration or dual reader is
+planned.
 
 Do not treat the current repository format, cryptographic formats, or runtime
 defaults as production-stable yet.

@@ -156,13 +156,14 @@ just perf-scale-100k
 just perf-scale-1m
 ```
 
-The July 11 signed-root rerun produced three passing release runs per tier:
+The July 11 ciphertext-only-pack and direct-descriptor rerun produced three
+passing release runs per tier:
 
 | Tier | Batch | Result | Elapsed range | Checkpoint range | Reload range | Commit PUTs | Write amplification |
 | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| 10k | 64 | Pass, 3/3 | 573-580 ms | 188-195 ms | 101-117 ms | 158 | 1.494895x |
-| 100k | 1,024 | Pass, 3/3 | 7.17-7.30 s | 2.116-2.126 s | 1.142-1.163 s | 99 | 1.442633x |
-| 1M | 1,024 | Pass, 3/3 | 90.62-91.22 s | 25.18-25.23 s | 14.99-15.05 s | 978 | 1.442480x |
+| 10k | 64 | Pass, 3/3 | 584-601 ms | 197-201 ms | 99-117 ms | 158 | 1.442421x |
+| 100k | 1,024 | Pass, 3/3 | 7.30-7.43 s | 2.163-2.275 s | 1.185-1.336 s | 99 | 1.393577x |
+| 1M | 1,024 | Pass, 3/3 | 92.27-93.40 s | 25.95-26.86 s | 15.53-15.74 s | 978 | 1.393424x |
 
 The main backend counts and elapsed time include the signed checkpoint PUT and
 the checkpoint candidate's internal new-reader verification. The separately
@@ -170,21 +171,21 @@ reported reload is excluded from those counts and time. It discards writer-side
 state, reloads from the accepted anchor through another same-process repository
 instance, verifies exact cardinality, and reads the first, middle, and last
 payload. The JSON/TSV artifact records both the requested and actual checkpoint
-position. The explicit 1,024-item bulk lane fits the same 64 KiB encrypted
-directory limit; the normal low-latency default remains 64. The recipes fail
-above 1.50x checkpoint-inclusive write amplification. The 1M reload was below
-the documented 180-second target, but this is not the pinned runner, the backend
-is in memory, and the lightweight harness does not record its own RSS. The
-absolute time and 4 GiB gates still require a fresh-process, filesystem-backed,
-process-instrumented pinned run.
+position. The explicit 1,024-item bulk lane uses the same ciphertext-only pack
+format; the normal low-latency default remains 64. The recipes fail above 1.50x
+checkpoint-inclusive write amplification, 1.04x cold-read byte amplification,
+or one backend request per cold sentinel. Every run measured exactly three
+range `GET`s for three sentinel reads and 1.03125x cold-read byte amplification.
+The 1M reload was below the documented 180-second target, but this is not the
+pinned runner, the backend is in memory, and the lightweight harness does not
+record its own RSS. The absolute time and 4 GiB gates still require a
+fresh-process, filesystem-backed, process-instrumented pinned run.
 
 The final 1M root contains about 977 runs and leaves only 47 catalog slots.
 Publication now fails closed before a compact write would exceed the 1,024-run
 format bound. Checkpointing does not compact runs, however, so packed-run
 compaction plus an automatic checkpoint/compaction watermark remain production
-blockers. These runs also do not measure cold-read amplification: an uncached
-record in a 1,024-record pack first needs the roughly 62 KiB authenticated pack
-directory.
+blockers.
 
 ### Payload-size evidence
 
@@ -194,14 +195,18 @@ payload sizes:
 
 | Objects | Object size | Batch | Result | Elapsed range | Checkpoint range | Reload range | PUTs | Write amplification |
 | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | 4 KiB | 64 | Pass, 3/3 | 766-803 ms | 181-206 ms | 93-110 ms | 158 | 1.061877x |
-| 1,024 | 256 KiB | 64 | Pass, 3/3 | 1.70-1.74 s | 9.7-18.5 ms | 8.8-9.1 ms | 17 | 1.001178x |
+| 10,000 | 4 KiB | 64 | Pass, 3/3 | 806-859 ms | 197-210 ms | 106-142 ms | 158 | 1.055425x |
+| 1,024 | 256 KiB | 64 | Pass, 3/3 | 1.85-1.90 s | 10.0-17.7 ms | 8.6-8.8 ms | 17 | 1.001081x |
+
+All six runs used one exact range `GET` per cold sentinel. Cold-read byte
+amplification was 1.00390625x for 4 KiB records and 1.000244140625x for 256 KiB
+records.
 
 Representative commands, repeated three times, were:
 
 ```sh
-target/release/xtask perf --scenario write-committed-parallel --objects 10000 --object-size 4096 --commit-batch-items 64 --commit-max-pending-items 64 --concurrency 64 --verify-reload --checkpoint-after-objects 10000 --max-write-amp 1.15 --format jsonl
-target/release/xtask perf --scenario write-committed-parallel --objects 1024 --object-size 262144 --commit-batch-items 64 --commit-max-pending-items 64 --concurrency 64 --verify-reload --checkpoint-after-objects 1024 --max-write-amp 1.03 --format jsonl
+target/release/xtask perf --scenario write-committed-parallel --objects 10000 --object-size 4096 --commit-batch-items 64 --commit-max-pending-items 64 --concurrency 64 --verify-reload --checkpoint-after-objects 10000 --max-write-amp 1.15 --max-cold-read-amp 1.01 --max-cold-read-requests-per-read 1.0 --format jsonl
+target/release/xtask perf --scenario write-committed-parallel --objects 1024 --object-size 262144 --commit-batch-items 64 --commit-max-pending-items 64 --concurrency 64 --verify-reload --checkpoint-after-objects 1024 --max-write-amp 1.03 --max-cold-read-amp 1.001 --max-cold-read-requests-per-read 1.0 --format jsonl
 ```
 
 ## July 2026 Larger Restore Matrix

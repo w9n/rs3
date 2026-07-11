@@ -74,8 +74,12 @@ crash recovery a concrete boundary.
 The payload pack is an immutable value log. It carries shared encryption and
 container facts once, keeps small-record overhead to one AEAD tag, randomizes
 record order, and retains segmented AEAD for large range-readable values. The
-index stores compact container and record ordinals instead of repeating full
-payload references. Retention mode, expiry horizon, and legal-hold requirement
+pack itself is ciphertext-only. Its encrypted `INDEX_RUN` stores authenticated
+shared pack facts plus each record's ordinal, physical offset, plaintext
+length, and digest. The accepted record reference also preserves the exact
+historical keyring-envelope object and digest used by the containing commit.
+This lets a cold read issue one exact range `GET` instead of fetching a pack
+directory first. Retention mode, expiry horizon, and legal-hold requirement
 define protection cohorts because the backend protects the containing object.
 
 `v02` replaces monolithic index snapshots with an encrypted LSM-style index.
@@ -192,10 +196,11 @@ and deterministic conflict policy in a different repository contract.
 
 Payload segmentation is recorded per pack record. Small values use one AEAD
 record; medium and large values use larger authenticated segments for bounded
-range reads. Reads follow the authenticated pack directory, so thresholds are
-writer policy rather than repository-format constants. Bounded commits use one
-single-part upload with a compact header; only genuinely streaming commits pay
-the fixed multipart header reservation.
+range reads. The authenticated index descriptor carries the physical record
+layout, so thresholds are writer policy rather than repository-format
+constants and the pack needs no separately fetched directory. Bounded commits
+use one single-part upload with a compact header; only genuinely streaming
+commits pay the fixed multipart header reservation.
 
 ## S3 Compatibility
 

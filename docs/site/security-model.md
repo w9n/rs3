@@ -63,30 +63,32 @@ The replacement `v02` design accepts specific backend-visible leakage:
 | Broad object class | `format/`, `keyrings/`, `commits/v02/`, and `objects/v02/` support lifecycle and operations. | Keep class names generic and path-free; standalone run and cleaned-pack keys do not reveal object type, level, tenant, or workload. |
 | Commit sequence and run inventory | Sequence-bounded commit keys and immutable run objects expose commit and compaction activity. | Batch commits, use random object IDs, keep catalog counts, levels, and bounds encrypted. |
 | Compaction cadence | The provider sees standalone run writes and later cleanup. | Use bounded size tiers and optional compaction jitter; never include paths in scheduling telemetry. |
-| Payload-pack shape and access | A commit exposes aggregate pack size, and range reads can reveal record-size and access patterns. | Batch by bounded protection cohort, randomize record order, keep directories encrypted, and consider optional padding only with measured budgets. |
+| Payload-pack shape and access | A commit exposes aggregate pack size, and exact range reads reveal ciphertext span and access patterns. | Batch by bounded protection cohort, randomize record order, keep record descriptors inside encrypted authenticated index runs, and consider optional padding only with measured budgets. |
 | Deterministic metadata equality | Stable metadata sealing can produce identical sealed bytes for identical metadata under identical associated data. | Bind framed ciphertext to a unique run and frame context; complete equality analysis before format freeze. |
 
 Optional mitigations include padding, pack-size normalization, commit batching,
 compaction jitter, and stricter telemetry redaction.
 
 The removed prototype used `format/`, `keyrings/`, and
-`commits/v01/<sequence>/<random-id>`. The transitional runtime now uses
-`commits/v02`, but still has prototype index sections and durable prefix-token
-semantics. No production repository used `v01`, and no migration or dual reader
-is planned.
+`commits/v01/<sequence>/<random-id>`. The runtime now uses `commits/v02` with
+compact payload-pack, index-run, and index-root sections. No production
+repository used `v01`, and no migration or dual reader is planned.
 
 !!! warning "Security implementation status"
     The gateway reads and writes a transitional `v02` commit envelope with
     signed per-section digests. Bounded normal writes use encrypted payload
     packs and framed index runs; recovery replays index runs without reading
-    payload bytes, and payload ranges authenticate only the required canonical
-    segments. Publication verifies the returned object length and immediate
-    exact-version visibility before advancing the external anchor. The gateway
-    reads and writes signed `INDEX_ROOT` catalogs of exact embedded run
-    sections. Candidate checkpoints are reconstructed by a fresh reader before
-    anchor adoption, and maintenance derives exact run and live-payload
-    reachability from the same verified catalog. Standalone compacted runs are
-    not implemented. Production claims remain blocked on automatic checkpoint
+    payload bytes. The encrypted run carries each payload record's authenticated
+    physical descriptor and the containing commit's historical keyring-envelope
+    reference. A cold payload read therefore fetches and authenticates only the
+    required canonical ciphertext segments, without a pack-directory request.
+    Publication verifies the returned object length and immediate exact-version
+    visibility before advancing the external anchor. The gateway reads and
+    writes signed `INDEX_ROOT` catalogs of exact embedded run sections.
+    Candidate checkpoints are reconstructed by a fresh reader before anchor
+    adoption, and maintenance derives exact run and live-payload reachability
+    from the same verified catalog. Standalone compacted runs are not
+    implemented. Production claims remain blocked on automatic checkpoint
     watermarks, framed streaming, hostile scale recovery, live-provider reruns,
     and external cryptographic review.
 
@@ -111,8 +113,9 @@ is planned.
 | Incident restore does not advance repository state | `restore-readonly` mode requires an accepted anchor and rejects supported mutations. | Gateway mode config, startup, and S3 adapter tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
-| v02 index frames cannot be transplanted or reordered | Frame AEAD binds immutable repository identity, the historical keyring-envelope reference, exact object key, section ordinal, run identity, authenticated directory digest, and complete frame descriptor. The signed catalog binds exact embedded commit version, length, body digest, layout, and run facts. | Framed-run and root codecs, exact catalog recovery, publication, bounded replay, and corruption tests. Standalone compacted runs remain blocked. |
-| v02 payload-pack records cannot be transplanted or downgraded | Record AEAD binds immutable repository identity, historical keyring context, exact object key, pack, section, record, segment, layout, and length facts. The accepted signed reference binds the returned exact version, length, and commit-body digest. | The bounded compact-pack codec, canonical segmentation, publication, range-read, cache, replay, and corruption tests are implemented; protection-cohort partitioning and cleaning remain release blockers. |
+| v02 index frames cannot be transplanted or reordered | Frame AEAD binds immutable repository identity, the historical keyring-envelope reference, exact object key, section ordinal, run identity, and complete frame descriptor. The signed catalog binds exact embedded commit version, length, body digest, layout, and run facts. | Framed-run and root codecs, exact catalog recovery, publication, bounded replay, and corruption tests. Standalone compacted runs remain blocked. |
+| v02 payload-pack records cannot be transplanted or downgraded | Record AEAD binds immutable repository identity, historical keyring context, exact object key, pack, section, record, segment, layout, and length facts. Encrypted `INDEX_RUN` descriptors bind the pack identity, content-key ID, historical envelope object and digest, ordinal, offset, length, and plaintext digest. The accepted signed reference binds the returned exact version, length, and commit-body digest. | The bounded ciphertext-only pack codec, canonical segmentation, publication, direct cold range-read, replay, and corruption tests are implemented; protection-cohort partitioning and cleaning remain release blockers. |
+| Cold packed reads do not fetch unrelated records or metadata | Recovery materializes authenticated direct record descriptors from encrypted runs. A fresh post-recovery read uses one exact backend range `GET`; a 512 B record fetches 528 B including its AEAD tag, for 1.03125x ciphertext-byte amplification. | Direct cold-read request-count and exact-range repository test; the scale harness enforces configurable request and byte-amplification ceilings during sentinel reads. |
 | v02 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery verifies exact bounded run sections sequentially from a signed catalog under count and byte ceilings. | Implemented for embedded runs; same-process in-memory 100k and 1M evidence passes, while fresh-process filesystem and pinned RSS gates remain. |
 | v02 checkpoint failure cannot anchor unrecoverable state | The compact writer fails closed before accepting a 1,025th active run. Fenced automatic checkpointing must degrade and compact before that hard ceiling. | Hard-ceiling backpressure is implemented; packed-run compaction, automatic watermarks, and adversarial pause/resume testing remain required. |
 | v02 GC retains every live payload without retaining whole ancestry | Effective run records mark exact payload commit versions; catalog-named run commits and protected roots are marked before exact-version sweep. | Implemented for embedded catalog runs; standalone run inventory and cleaning remain blocked. |

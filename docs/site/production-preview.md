@@ -278,7 +278,7 @@ blocked until the complete `commits/v02` contract is implemented and passes the
 format, recovery, checkpoint, retained-provider, GC, and scale gates.
 
 Governance-bypass IAM review remains operator-owned, live provider gates must be
-rerun after the new run-object path lands, and public security claims need
+rerun against the direct-descriptor path, and public security claims need
 separate external review.
 
 ## Non-Goals
@@ -382,13 +382,12 @@ Preview evidence should show:
 
 The replacement repository generation must complete all of these together:
 
-- integrate the implemented canonical framed `INDEX_RUN` codec and add small
-  signed `INDEX_ROOT` catalogs under the new `commits/v02` generation;
-- integrate the implemented immutable value-separated `PAYLOAD_PACK` codec,
-  compact record pointers, and protection cohorts in place of one payload
-  section per object;
-- replace cumulative delta retention with descriptor-first, one-frame-at-a-time
-  recovery;
+- finish qualification of the integrated canonical `INDEX_RUN` codec and small
+  signed `INDEX_ROOT` catalogs under `commits/v02`;
+- finish protection-cohort behavior for the integrated ciphertext-only
+  `PAYLOAD_PACK` codec and authenticated direct record descriptors;
+- extend descriptor-first bounded recovery from embedded runs to the complete
+  standalone compaction path;
 - keep one accepted repository state plus a bounded pending mutation overlay;
 - add fenced automatic checkpointing with degraded and write-paused failure
   posture before absolute replay ceilings;
@@ -397,7 +396,8 @@ The replacement repository generation must complete all of these together:
 - pass fresh-process committed-write recovery at 10k, 100k, and 1M objects,
   including exact cardinality and first, middle, and last payload verification;
 - enforce the small-object write-amplification ceilings in the performance
-  reference, including separate raw-S3 and real Kopia/Velero tiny-file lanes;
+  reference, enforce one-request direct cold reads and their byte ceiling, and
+  keep separate raw-S3 and real Kopia/Velero tiny-file lanes;
 - prove payload-pack reachability and cleaning across tombstones, protected
   historical roots, retention, legal hold, and interrupted repacks;
 - qualify exact standalone-run versions, restart, checkpoint crash, stale

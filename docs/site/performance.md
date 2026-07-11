@@ -95,16 +95,16 @@ commands and amplification ratios are recorded in
 `tests/PERFORMANCE_BASELINE.md`.
 
 On 2026-07-11 the checkpoint-inclusive release-binary harness passed all three
-runs at 10k, 100k, and 1M objects. The 10k lane retains the normal 64-item
-low-latency batch. The 100k and 1M lanes use the explicit 1,024-item bulk batch,
-which fits the same 64 KiB authenticated pack-directory ceiling and keeps each
-measured final catalog below its 1,024-run ceiling.
+runs at 10k, 100k, and 1M objects with ciphertext-only packs and direct
+encrypted-index descriptors. The 10k lane retained the normal 64-item
+low-latency batch. The 100k and 1M lanes used the explicit 1,024-item bulk batch
+and kept each measured final catalog below its 1,024-run ceiling.
 
 | Objects | Batch | Median elapsed | Median checkpoint | Median fresh reload | PUTs | Write amp |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | 64 | 579 ms | 191 ms | 105 ms | 158 | 1.49490x |
-| 100,000 | 1,024 | 7.23 s | 2.116 s | 1.155 s | 99 | 1.44263x |
-| 1,000,000 | 1,024 | 90.71 s | 25.22 s | 15.00 s | 978 | 1.44248x |
+| 10,000 | 64 | 588 ms | 198 ms | 107 ms | 158 | 1.44242x |
+| 100,000 | 1,024 | 7.35 s | 2.169 s | 1.203 s | 99 | 1.39358x |
+| 1,000,000 | 1,024 | 92.48 s | 26.37 s | 15.55 s | 978 | 1.39342x |
 
 The main elapsed time and backend counters include writes, final checkpoint
 publication, and the checkpoint candidate's internal new-reader verification.
@@ -120,10 +120,14 @@ The 1M checkpoint catalogs about 977 runs, leaving only 47 run slots. The writer
 now stops before accepting a 1,025th compact run, so exhaustion fails closed,
 but checkpointing does not compact those runs. Packed-run compaction and an
 automatic checkpoint/compaction watermark remain production blockers. The
-bulk lane is qualified here for write amplification, bounded recovery, and
-sentinel correctness only. A cold 512 B read from an uncached 1,024-record pack
-first needs its roughly 62 KiB authenticated directory, so cold-read request and
-byte amplification still need a separate enforced gate.
+recorded bulk lane is qualified here for write amplification, bounded recovery,
+and sentinel correctness only. The current layout removes the pack directory:
+encrypted `INDEX_RUN` state authenticates the record's exact physical offset,
+length, digest, pack facts, and historical keyring-envelope reference. After a
+fresh recovery, each measured 512 B sentinel read used one exact range
+`GET` for 528 B of ciphertext, or 1.03125x byte amplification. The scale recipes
+enforced at most one backend request per sentinel and 1.04x byte amplification
+in every run.
 
 The removed prototype representation had previously failed the small-object
 efficiency gate at roughly 12.86x for the 10k lane. Exact accounting of one
@@ -146,10 +150,12 @@ the 12.8x amplification; the prototype representation was.
 
 The replacement is one value-separated `PAYLOAD_PACK` plus one compact binary
 `INDEX_RUN` per batch. The release measurements, including one final signed
-catalog checkpoint, recorded 1.49490x for 10k 512 B objects, 1.06188x for 10k
-4 KiB objects, and 1.00118x for 1,024 256 KiB objects. The first-principles
+catalog checkpoint, recorded 1.44242x for 10k 512 B objects, 1.05542x for 10k
+4 KiB objects, and 1.00108x for 1,024 256 KiB objects. The first-principles
 floor for the 512 B path is about 1.2x, so the remaining gap is fixed metadata
-and authenticated directory/index material, not payload copying.
+and authenticated index material, not payload copying.
+Cold sentinel reads used one exact range `GET` per record at 1.00390625x for
+4 KiB records and 1.000244140625x for 256 KiB records.
 
 Qualification must enforce, not merely report, these initial ceilings:
 
@@ -166,10 +172,13 @@ The repository integration suite enforces the physical shape for a 64-object
 batch (one single-PUT commit, one payload pack, and one index run) and the 1.50x
 hard ceiling for a 32-byte-path lane. The release-binary scale recipes now also
 publish a signed root, measure its elapsed time, reload through that root, and
-include its bytes in write amplification. The longer-path and cold-read
-matrices remain separate gates.
+include its bytes in write amplification. After reload they isolate the first,
+middle, and last reads from recovery counters, require one exact range `GET`
+per object, and enforce at most 1.04x cold-read byte amplification. The
+longer-path matrix remains a separate gate.
 The fixed scale recipes fail when checkpoint-inclusive write amplification
-exceeds 1.50x; they do not merely print the ratio.
+exceeds 1.50x, cold-read byte amplification exceeds 1.04x, or a sentinel read
+uses more than one backend request; they do not merely print the ratios.
 
 The harness must also vary logical path lengths across 32 B, 256 B, and
 1,024 B, and report payload amplification separately from fixed metadata bytes

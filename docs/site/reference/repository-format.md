@@ -1,19 +1,21 @@
 # Repository Format Reference
 
 The repository format is draft. This page is the design contract for
-`commits/v02`. It is not a compatibility promise. The gateway now reads and
-writes a transitional `v02` commit envelope, but the catalog-and-run design on
-this page is not complete.
+`commits/v02`. It is not a compatibility promise. The gateway reads and writes
+bounded payload packs, encrypted index runs, and signed index-root checkpoints,
+but compaction, automatic watermarks, protection cohorts, and final
+qualification are not complete.
 
 !!! warning "Implementation status"
     `commits/v01` has been removed and is unsupported. No production repository
     depends on it, so `rs3` will not add a migration path or a dual reader. The
     current `v02` envelope authenticates every stored section with a signed
-    digest and rebuilds namespace state without reading payload ciphertext, but
-    it still uses prototype `INDEX_DELTA` and `INDEX_SNAPSHOT` sections. Framed
-    `INDEX_RUN`, signed `INDEX_ROOT`, compaction, automatic checkpointing, and
-    the new recovery gates remain to be implemented. Until those gates pass,
-    the runtime is evaluation-only.
+    digest. Bounded normal writes use ciphertext-only `PAYLOAD_PACK` sections,
+    authenticated `INDEX_RUN` record descriptors, and signed `INDEX_ROOT`
+    checkpoints; recovery rebuilds namespace state without reading payload
+    ciphertext. Compaction, automatic checkpointing watermarks, framed
+    streaming, protection cohorts, and final recovery qualification remain.
+    Until those gates pass, the runtime is evaluation-only.
 
 ## Invariants
 
@@ -130,29 +132,33 @@ batch places its non-empty values into one pack and stores only compact pack
 pointers in `INDEX_RUN`. Empty objects are index-only. Index checkpointing and
 compaction never rewrite payload bytes.
 
-Each pack has a random 256-bit identity, one content-key identifier, a bounded
-encrypted directory, and records in randomized physical order. A small record
-is ciphertext followed by one 16-byte AEAD tag. Its nonce is derived through a
+Each pack has a random 256-bit identity, one content-key identifier, and records
+in randomized physical order. The pack section contains ciphertext only; its
+authenticated layout lives in the encrypted `INDEX_RUN`. A small record is
+ciphertext followed by one 16-byte AEAD tag. Its nonce is derived through a
 keyed KDF from the pack identity, record ordinal, and authenticated plaintext
 digest, so the format does not store a nonce per record. Records larger than 64
 KiB use canonical 64 KiB independently authenticated segments for efficient
 range reads; smaller records use one segment. Both writer and reader enforce
 that rule so a writer bug cannot create pathological one-byte segments or make
 a one-byte range request read an entire large record. The bounded in-memory
-normal-commit codec accepts at most 1,024 records, a 64 KiB encrypted
-directory, and 32 MiB per pack; larger values stay on the streaming payload
-path. The normal low-latency coordinator uses 64 records, while the
-release-binary bulk scale lane uses 1,024. These are writer policies inside the
-same bounded format, not different trust models. A cold small-record read from
-the bulk shape must first authenticate its roughly 62 KiB encrypted directory;
-cold-read amplification is therefore qualified separately from bulk write and
-recovery evidence.
+normal-commit codec accepts at most 1,024 records and 32 MiB per pack; larger
+values stay on the streaming payload path. The normal low-latency coordinator
+uses 64 records, while the release-binary bulk scale lane uses 1,024. These are
+writer policies inside the same bounded format, not different trust models.
 
-The encrypted directory maps record ordinals to bounded ciphertext spans and
-authenticated plaintext lengths. An index payload pointer is a container-table
-ordinal plus record ordinal, rather than a repeated commit key, payload ID,
-key ID, nonce, offset, and digest. The signed containing-object descriptor and
-encrypted container table carry those shared facts once.
+The encrypted index container table carries the shared pack identity,
+content-key ID, record count, and exact containing-object reference. For a pack
+embedded beside the run, the historical keyring-envelope object and digest come
+from that signed commit; an external container-table entry preserves them
+explicitly. Each compact record pointer carries its record ordinal, physical
+ciphertext offset, and plaintext digest, while the authenticated mutation
+carries the plaintext length. The decoder validates the complete bounded
+layout, including canonical segment lengths, non-overlap, pack limits, and
+arithmetic overflow. Once recovery has authenticated the run, a cold read can
+calculate the exact ciphertext span without another metadata fetch. For a 512
+B record, one exact range `GET` fetches 528 B including the AEAD tag, or
+1.03125x ciphertext-byte amplification.
 
 Record associated data binds the immutable repository identity, the exact
 historical keyring-envelope reference signed by the containing commit, exact
@@ -434,6 +440,9 @@ include:
   documented 4-vCPU, 16-GiB runner;
 - no payload reads during normal index recovery and at most 1.25x index byte
   read amplification;
+- fresh post-recovery sentinel reads that use one exact backend range `GET` per
+  record and at most 1.04x ciphertext-byte amplification for 512 B values (528
+  B including the AEAD tag, or 1.03125x, is the format expectation);
 - enforced small-object write gates for a 64-object batch: at most 1.50x for
   512 B values (target 1.40x), at most 1.15x for 4 KiB values, at most 1.03x
   for 256 KiB values, and at most 320 fixed backend bytes per empty object;
