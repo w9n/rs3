@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Result alias for type validation.
@@ -50,12 +51,12 @@ impl fmt::Display for PublicBucket {
 
 /// Plaintext logical path inside the trusted boundary.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct LogicalPath(String);
+pub struct LogicalPath(Arc<str>);
 
 impl LogicalPath {
     /// Creates a validated logical path.
     pub fn new(value: impl Into<String>) -> Result<Self> {
-        validate_non_empty("logical path", value.into()).map(Self)
+        validate_non_empty("logical path", value.into()).map(|value| Self(value.into()))
     }
 
     /// Returns the logical path as a string slice.
@@ -79,12 +80,12 @@ impl fmt::Display for LogicalPath {
 
 /// Secret-keyed lookup token for a logical path.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct BlindIndexKey(String);
+pub struct BlindIndexKey(Arc<str>);
 
 impl BlindIndexKey {
     /// Creates a validated blind index key.
     pub fn new(value: impl Into<String>) -> Result<Self> {
-        validate_non_empty("blind index key", value.into()).map(Self)
+        validate_non_empty("blind index key", value.into()).map(|value| Self(value.into()))
     }
 
     /// Returns the key as an encoded string.
@@ -101,12 +102,12 @@ impl fmt::Display for BlindIndexKey {
 
 /// Secret-keyed lookup token for a client-visible prefix.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct PrefixToken(String);
+pub struct PrefixToken(Arc<str>);
 
 impl PrefixToken {
     /// Creates a validated prefix token.
     pub fn new(value: impl Into<String>) -> Result<Self> {
-        validate_non_empty("prefix token", value.into()).map(Self)
+        validate_non_empty("prefix token", value.into()).map(|value| Self(value.into()))
     }
 
     /// Returns the token as an encoded string.
@@ -123,12 +124,12 @@ impl fmt::Display for PrefixToken {
 
 /// Opaque object identifier used by the backend store.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct BackendObjectId(String);
+pub struct BackendObjectId(Arc<str>);
 
 impl BackendObjectId {
     /// Creates a validated backend object identifier.
     pub fn new(value: impl Into<String>) -> Result<Self> {
-        validate_non_empty("backend object id", value.into()).map(Self)
+        validate_non_empty("backend object id", value.into()).map(|value| Self(value.into()))
     }
 
     /// Returns the identifier as a string slice.
@@ -145,12 +146,12 @@ impl fmt::Display for BackendObjectId {
 
 /// Opaque provider version identifier for a backend object.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct BackendVersionId(String);
+pub struct BackendVersionId(Arc<str>);
 
 impl BackendVersionId {
     /// Creates a validated backend version identifier.
     pub fn new(value: impl Into<String>) -> Result<Self> {
-        validate_non_empty("backend version id", value.into()).map(Self)
+        validate_non_empty("backend version id", value.into()).map(|value| Self(value.into()))
     }
 
     /// Returns the identifier as a string slice.
@@ -201,12 +202,12 @@ impl From<BackendObjectId> for BackendObjectRef {
 
 /// Identifier for an encrypted manifest.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ManifestId(String);
+pub struct ManifestId(Arc<str>);
 
 impl ManifestId {
     /// Creates a validated manifest identifier.
     pub fn new(value: impl Into<String>) -> Result<Self> {
-        validate_non_empty("manifest id", value.into()).map(Self)
+        validate_non_empty("manifest id", value.into()).map(|value| Self(value.into()))
     }
 
     /// Returns the identifier as a string slice.
@@ -267,12 +268,12 @@ impl fmt::Display for RepositoryId {
 
 /// Identifier for a cryptographic key inside a repository keyring.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct KeyId(String);
+pub struct KeyId(Arc<str>);
 
 impl KeyId {
     /// Creates a validated key identifier.
     pub fn new(value: impl Into<String>) -> Result<Self> {
-        validate_non_empty("key id", value.into()).map(Self)
+        validate_non_empty("key id", value.into()).map(|value| Self(value.into()))
     }
 
     /// Returns the identifier as a string slice.
@@ -418,6 +419,7 @@ impl RetentionPolicy {
 #[cfg(test)]
 mod tests {
     use super::{KeyId, KeyStatus, LogicalPath, PrefixToken, PublicBucket, Sequence};
+    use std::sync::Arc;
 
     #[test]
     fn rejects_empty_bucket() {
@@ -438,6 +440,14 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("namespace"));
         assert!(!debug.contains("plaintext"));
+    }
+
+    #[test]
+    fn logical_path_clones_share_validated_storage() {
+        let path = LogicalPath::new("namespace/snapshot.tar").expect("valid logical path");
+        let cloned = path.clone();
+
+        assert!(Arc::ptr_eq(&path.0, &cloned.0));
     }
 
     #[test]

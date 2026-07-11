@@ -11,7 +11,7 @@ use std::fmt;
 pub const INDEX_RUN_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-run-frame-plaintext:v2\n";
 
 /// Version of the canonical index-run wire encoding.
-pub const INDEX_RUN_WIRE_VERSION: u16 = 2;
+pub const INDEX_RUN_WIRE_VERSION: u16 = 3;
 
 /// Maximum stored size of one v02 payload pack.
 pub const INDEX_PACK_MAX_STORED_BYTES: u64 = 32 * 1024 * 1024;
@@ -731,9 +731,9 @@ pub fn encode_index_run_frames(
                     limits.max_key_id_bytes,
                     "namespace key id",
                 )?;
-                record.u64(upsert.generation.get())?;
+                record.varint(upsert.generation.get())?;
                 encode_payload_pointer(&mut record, upsert.payload)?;
-                record.u64(upsert.content_len)?;
+                record.varint(upsert.content_len)?;
                 record.i64(upsert.modified_at_ms)?;
                 encode_retention(&mut record, upsert.retention)?;
                 encode_legal_hold(&mut record, upsert.legal_hold)?;
@@ -746,7 +746,7 @@ pub fn encode_index_run_frames(
                     limits.max_key_id_bytes,
                     "namespace key id",
                 )?;
-                record.u64(tombstone.generation.get())?;
+                record.varint(tombstone.generation.get())?;
             }
         }
         namespace.push(PreparedRecord {
@@ -774,8 +774,8 @@ pub fn encode_index_run_frames(
             IndexMutation::Upsert(upsert) => {
                 record.u8(0)?;
                 record.string(upsert.path.as_str(), limits.max_path_bytes, "logical path")?;
-                record.u64(upsert.generation.get())?;
-                record.u64(upsert.content_len)?;
+                record.varint(upsert.generation.get())?;
+                record.varint(upsert.content_len)?;
                 record.i64(upsert.modified_at_ms)?;
             }
             IndexMutation::Tombstone(tombstone) => {
@@ -785,7 +785,7 @@ pub fn encode_index_run_frames(
                     limits.max_path_bytes,
                     "logical path",
                 )?;
-                record.u64(tombstone.generation.get())?;
+                record.varint(tombstone.generation.get())?;
             }
         }
         listing.push(PreparedRecord {
@@ -1419,9 +1419,9 @@ fn decode_namespace_projection(
             let blind_key = decode_blind_key(record)?;
             let namespace_key_id =
                 record.typed_string("namespace key id", limits.max_key_id_bytes, KeyId::new)?;
-            let generation = Sequence::new(record.u64()?);
+            let generation = Sequence::new(record.varint()?);
             let payload = decode_payload_pointer(record, containers, self_pack)?;
-            let content_len = record.u64()?;
+            let content_len = record.varint()?;
             validate_empty_payload(payload, content_len)?;
             validate_payload_pointer(payload, content_len, self_pack, containers)?;
             Ok(NamespaceProjection::Upsert {
@@ -1442,7 +1442,7 @@ fn decode_namespace_projection(
                 limits.max_key_id_bytes,
                 KeyId::new,
             )?,
-            generation: Sequence::new(record.u64()?),
+            generation: Sequence::new(record.varint()?),
         }),
         value => Err(IndexRunError::InvalidTag {
             field: "namespace mutation",
@@ -1457,12 +1457,12 @@ fn decode_listing_projection(
 ) -> Result<ListingProjection, IndexRunError> {
     let tag = record.u8()?;
     let path = record.typed_string("logical path", limits.max_path_bytes, LogicalPath::new)?;
-    let generation = Sequence::new(record.u64()?);
+    let generation = Sequence::new(record.varint()?);
     match tag {
         0 => Ok(ListingProjection::Upsert {
             path,
             generation,
-            content_len: record.u64()?,
+            content_len: record.varint()?,
             modified_at_ms: record.i64()?,
         }),
         1 => Ok(ListingProjection::Tombstone { path, generation }),
@@ -2552,7 +2552,7 @@ mod tests {
         let encoded = encode_index_run(&fixture(), &IndexRunLimits::default()).expect("encode run");
         assert_eq!(
             hex(&encoded),
-            "03eb017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00020000000000000000000000000902010100b5010e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c23232323232323232323232323232323232323232323232323232323232323230000000300000000000002000000000000000800111111111111111111111111111111111111111111111111111111111111111109636f6e74656e742d3108dc017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00020100000000000000000000000902020271000033333333333333333333333333333333333333333333333333333333333333330b6e616d6573706163652d31000000000000001102000764666666666666666666666666666666666666666666666666666666666666666600000000000004d2ffffffffffffffc901020000001e0236010144444444444444444444444444444444444444444444444444444444444444440b6e616d6573706163652d3100000000000000127e7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0002020000000000000000000000090202021901010e74656e616e742f64656c6574656400000000000000123000001574656e616e742f736e617073686f742f6368756e6b000000000000001100000000000004d2ffffffffffffffc9"
+            "03eb017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00030000000000000000000000000902010100b5010e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c23232323232323232323232323232323232323232323232323232323232323230000000300000000000002000000000000000800111111111111111111111111111111111111111111111111111111111111111109636f6e74656e742d3108c8017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00030100000000000000000000000902020264000033333333333333333333333333333333333333333333333333333333333333330b6e616d6573706163652d3111020007646666666666666666666666666666666666666666666666666666666666666666d209ffffffffffffffc901020000001e022f010144444444444444444444444444444444444444444444444444444444444444440b6e616d6573706163652d31126a7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0003020000000000000000000000090202021201010e74656e616e742f64656c65746564122300001574656e616e742f736e617073686f742f6368756e6b11d209ffffffffffffffc9"
         );
     }
 
@@ -2623,12 +2623,12 @@ mod tests {
             .iter()
             .position(|frame| frame.role == IndexRunFrameRole::Listing)
             .expect("listing frame");
-        let content_len = 1_234_u64.to_be_bytes();
+        let content_len = [0xd2, 0x09];
         let content_len_offset = mismatched[listing_index]
             .windows(content_len.len())
             .position(|window| window == content_len)
             .expect("listing content length");
-        mismatched[listing_index][content_len_offset + 7] ^= 1;
+        mismatched[listing_index][content_len_offset + 1] ^= 1;
         assert_eq!(
             decode_index_run_frames(&mismatched, &limits),
             Err(IndexRunError::ProjectionMismatch { ordinal: 0 })

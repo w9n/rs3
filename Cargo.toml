@@ -63,7 +63,7 @@ kube = { version = "3.1.0", default-features = false, features = [
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
-serde = { version = "1.0.219", features = ["derive"] }
+serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = "1.0.140"
 secrecy = "0.10.3"
 subtle = { version = "2", default-features = false }

@@ -526,6 +526,16 @@ impl NamespaceIndex {
         self.entries.get(blind_key)
     }
 
+    /// Iterates live namespace entries in stable blind-key order without cloning.
+    pub fn live_entries(&self) -> impl Iterator<Item = &NamespaceEntry> {
+        self.entries.values()
+    }
+
+    /// Iterates one live entry's prefix tokens in stable order without cloning.
+    pub fn prefix_tokens(&self, blind_key: &BlindIndexKey) -> impl Iterator<Item = &PrefixToken> {
+        self.entry_prefixes.get(blind_key).into_iter().flatten()
+    }
+
     /// Captures one key's live entry, prefix membership, and tombstone.
     pub fn snapshot_key(&self, blind_key: &BlindIndexKey) -> NamespaceIndexKeySnapshot {
         NamespaceIndexKeySnapshot {
@@ -561,21 +571,6 @@ impl NamespaceIndex {
             .into_iter()
             .flatten()
             .filter_map(|blind_key| self.entries.get(blind_key))
-            .collect()
-    }
-
-    /// Returns live entries with their associated prefix tokens in stable order.
-    pub fn live_entries_with_prefixes(&self) -> Vec<(NamespaceEntry, Vec<PrefixToken>)> {
-        self.entries
-            .values()
-            .map(|entry| {
-                let prefix_tokens = self
-                    .entry_prefixes
-                    .get(&entry.blind_key)
-                    .map(|tokens| tokens.iter().cloned().collect())
-                    .unwrap_or_default();
-                (entry.clone(), prefix_tokens)
-            })
             .collect()
     }
 
