@@ -10,13 +10,15 @@ use rs3_index::run::{
 };
 use rs3_index::{IndexDelta, NamespaceEntry, PayloadReference};
 use rs3_storage::BlobStore;
-use rs3_types::{BackendVersionId, ManifestId};
+use rs3_types::{BackendVersionId, LogicalPath, ManifestId, Sequence};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::v2::{
     V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitKey, V2CommitSection, V2FormatError,
-    V2ParsedCommitHeader, V2PayloadPackDirectory, V2PayloadPackRecordInput, V2SectionType,
-    V2StoredCommit, open_v2_index_run, seal_v2_index_run, seal_v2_payload_pack,
+    V2KeyringEnvelopeRef, V2ParsedCommitHeader, V2PayloadPackDirectory, V2PayloadPackRecordInput,
+    V2SectionType, V2StoredCommit, digest_v2_section, open_v2_index_run,
+    open_v2_index_run_directory, probe_v2_index_run_header, seal_v2_index_run,
+    seal_v2_payload_pack,
 };
 
 pub(super) struct PendingV2PackRecordLocation {
@@ -32,8 +34,32 @@ pub(super) struct PendingV2PackedCommitSections {
     pub(super) sections: Vec<V2CommitSection>,
     pub(super) locations: Vec<PendingV2PackRecordLocation>,
     pub(super) pack_directory: Option<V2PayloadPackDirectory>,
+    pub(super) run: PendingV2IndexRunFacts,
     pub(super) retention: Option<rs3_types::RetentionPolicy>,
     pub(super) legal_hold: Option<rs3_types::LegalHoldStatus>,
+}
+
+pub(super) struct PendingV2IndexRunFacts {
+    pub(super) run_id: [u8; 32],
+    pub(super) run_sequence: Sequence,
+    pub(super) minimum_generation: Sequence,
+    pub(super) maximum_generation: Sequence,
+    pub(super) mutation_count: u32,
+    pub(super) frame_count: u32,
+    pub(super) namespace_bounds: (IndexBlindKey, IndexBlindKey),
+    pub(super) listing_bounds: (LogicalPath, LogicalPath),
+    pub(super) keyring_envelope_ref: V2KeyringEnvelopeRef,
+    pub(super) section_ordinal: u32,
+    pub(super) section_offset: u64,
+    pub(super) section_len: u64,
+    pub(super) section_digest: [u8; 32],
+}
+
+struct IndexRunBounds {
+    minimum_generation: Sequence,
+    maximum_generation: Sequence,
+    namespace: (IndexBlindKey, IndexBlindKey),
+    listing: (LogicalPath, LogicalPath),
 }
 
 impl<S> V2Repository<S>
@@ -278,10 +304,14 @@ where
                 });
             }
         }
+        let run_sequence = self
+            .pending_index_delta_sequence()?
+            .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
+        let bounds = index_run_bounds(&mutations)?;
+        let mutation_count = u32::try_from(mutations.len())
+            .map_err(|_| v2_repository_error(V2FormatError::IndexRunLimitExceeded))?;
         let run = IndexRun {
-            sequence: self
-                .pending_index_delta_sequence()?
-                .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?,
+            sequence: run_sequence,
             self_pack_record_count: (pack_record_count > 0).then_some(pack_record_count),
             containers,
             mutations,
@@ -298,6 +328,29 @@ where
             Err(V2FormatError::IndexRunLimitExceeded) => return Ok(None),
             Err(error) => return Err(v2_repository_error(error)),
         };
+        let probe = probe_v2_index_run_header(sealed_run.bytes()).map_err(v2_repository_error)?;
+        let section_offset = sections.iter().try_fold(0_u64, |offset, section| {
+            offset.checked_add(u64::try_from(section.bytes.len()).ok()?)
+        });
+        let section_offset =
+            section_offset.ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?;
+        let section_len = u64::try_from(sealed_run.bytes().len())
+            .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
+        let run_facts = PendingV2IndexRunFacts {
+            run_id: *sealed_run.run_id().as_bytes(),
+            run_sequence,
+            minimum_generation: bounds.minimum_generation,
+            maximum_generation: bounds.maximum_generation,
+            mutation_count,
+            frame_count: probe.frame_count(),
+            namespace_bounds: bounds.namespace,
+            listing_bounds: bounds.listing,
+            keyring_envelope_ref: self.commit_store.options().keyring_envelope_ref.clone(),
+            section_ordinal: index_section_ordinal,
+            section_offset,
+            section_len,
+            section_digest: digest_v2_section(sealed_run.bytes()),
+        };
         sections.push(V2CommitSection::new(
             V2SectionType::IndexRun,
             V2_SECTION_FLAG_MUST_UNDERSTAND,
@@ -307,6 +360,7 @@ where
             sections,
             locations,
             pack_directory,
+            run: run_facts,
             retention,
             legal_hold,
         }))
@@ -396,13 +450,22 @@ pub(in crate::v2) fn apply_packed_index_run(
     repository_id: &rs3_types::RepositoryId,
     state: &mut RepositoryState,
     replay: V2PackedIndexRunReplay<'_>,
-) -> Result<()> {
+) -> Result<crate::v2::V2IndexRootRunRef> {
     let context = repository_context_from_refs(
         repository_id,
         &replay.parsed_header.header.keyring_envelope_ref,
     )?;
     let commit_key = &replay.parsed_header.header.self_ref.commit_key;
     let run = open_v2_index_run(
+        keyring,
+        &context,
+        commit_key,
+        replay.section_ordinal,
+        replay.stored_run,
+        &IndexRunLimits::default(),
+    )
+    .map_err(v2_repository_error)?;
+    let directory = open_v2_index_run_directory(
         keyring,
         &context,
         commit_key,
@@ -435,6 +498,52 @@ pub(in crate::v2) fn apply_packed_index_run(
     if maximum_generation != Some(run.sequence) {
         return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
     }
+    let bounds = index_run_bounds(&run.mutations)?;
+    let mutation_count = u32::try_from(run.mutations.len())
+        .map_err(|_| v2_repository_error(V2FormatError::IndexRunLimitExceeded))?;
+    let descriptor = replay
+        .parsed_header
+        .header
+        .section_index
+        .get(
+            usize::try_from(replay.section_ordinal)
+                .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+        )
+        .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?;
+    if descriptor.section_type != V2SectionType::IndexRun
+        || descriptor.length
+            != u64::try_from(replay.stored_run.len())
+                .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?
+        || descriptor.digest != digest_v2_section(replay.stored_run)
+    {
+        return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+    }
+    let accepted_run = crate::v2::V2IndexRootRunRef {
+        run_id: *directory.run_id().as_bytes(),
+        run_sequence: run.sequence,
+        minimum_generation: bounds.minimum_generation,
+        maximum_generation: bounds.maximum_generation,
+        mutation_count,
+        frame_count: u32::try_from(directory.frames().len())
+            .map_err(|_| v2_repository_error(V2FormatError::IndexRunLimitExceeded))?,
+        level: 0,
+        compaction_generation: 0,
+        namespace_bounds: bounds.namespace,
+        listing_bounds: bounds.listing,
+        keyring_envelope_ref: replay.parsed_header.header.keyring_envelope_ref.clone(),
+        location: crate::v2::V2EmbeddedIndexRunLocation {
+            commit_key: commit_key.clone(),
+            version_id: replay.version_id.cloned(),
+            commit_stored_len: replay.object_len,
+            commit_body_digest: replay.parsed_header.header.body_digest,
+            sections_start: u64::try_from(replay.parsed_header.sections_start)
+                .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+            section_ordinal: replay.section_ordinal,
+            section_offset: descriptor.offset,
+            section_len: descriptor.length,
+            section_digest: descriptor.digest,
+        },
+    };
     let self_pack = match run.self_pack_record_count {
         Some(record_count) => {
             let mut matches = replay
@@ -583,10 +692,47 @@ pub(in crate::v2) fn apply_packed_index_run(
         }
     }
     state.next_sequence = state.next_sequence.max(run.sequence);
-    Ok(())
+    Ok(accepted_run)
 }
 
-pub(super) fn repository_context_from_refs(
+fn index_run_bounds(mutations: &[IndexMutation]) -> Result<IndexRunBounds> {
+    let Some(first) = mutations.first() else {
+        return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+    };
+    let (first_generation, first_blind_key, first_path) = mutation_facts(first);
+    let mut minimum_generation = first_generation;
+    let mut maximum_generation = first_generation;
+    let mut minimum_blind_key = first_blind_key;
+    let mut maximum_blind_key = first_blind_key;
+    let mut minimum_path = first_path.clone();
+    let mut maximum_path = first_path.clone();
+    for mutation in &mutations[1..] {
+        let (generation, blind_key, path) = mutation_facts(mutation);
+        minimum_generation = minimum_generation.min(generation);
+        maximum_generation = maximum_generation.max(generation);
+        minimum_blind_key = minimum_blind_key.min(blind_key);
+        maximum_blind_key = maximum_blind_key.max(blind_key);
+        minimum_path = minimum_path.min(path.clone());
+        maximum_path = maximum_path.max(path.clone());
+    }
+    Ok(IndexRunBounds {
+        minimum_generation,
+        maximum_generation,
+        namespace: (minimum_blind_key, maximum_blind_key),
+        listing: (minimum_path, maximum_path),
+    })
+}
+
+fn mutation_facts(mutation: &IndexMutation) -> (Sequence, IndexBlindKey, &LogicalPath) {
+    match mutation {
+        IndexMutation::Upsert(upsert) => (upsert.generation, upsert.blind_key, &upsert.path),
+        IndexMutation::Tombstone(tombstone) => {
+            (tombstone.generation, tombstone.blind_key, &tombstone.path)
+        }
+    }
+}
+
+pub(in crate::v2) fn repository_context_from_refs(
     repository_id: &rs3_types::RepositoryId,
     keyring_reference: &crate::v2::V2KeyringEnvelopeRef,
 ) -> Result<Vec<u8>> {

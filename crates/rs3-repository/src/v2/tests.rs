@@ -734,12 +734,19 @@ fn v02_wire_codes_and_required_capabilities_are_closed() {
 
     let keyring = signing_keyring();
     let (commit_key, _, body) = sample_object(V2UploadMode::SinglePut);
-    for capability_flags in [0_u8, 2, 3, 0x81] {
+    assert_eq!(&body[16..24], &1_u64.to_be_bytes());
+    for capability_flags in [0_u8, 2, 0x81] {
         let mut tampered = body.to_vec();
         tampered[23] = capability_flags;
         let error = parse_v2_commit_object(&commit_key.object_id, Bytes::from(tampered), &keyring);
         assert!(matches!(error, Err(V2FormatError::UnsupportedCapabilities)));
     }
+    let mut tampered = body.to_vec();
+    tampered[23] = 3;
+    assert!(matches!(
+        parse_v2_commit_object(&commit_key.object_id, Bytes::from(tampered), &keyring),
+        Err(V2FormatError::HeaderDigestMismatch)
+    ));
 }
 
 #[test]
@@ -787,6 +794,7 @@ fn framed_delta_section_shapes_round_trip() {
         header.section_index = section_index.clone();
         header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::SinglePut));
         let body = must_v2(header.encode_object(V2UploadMode::SinglePut, &section_region));
+        assert_eq!(&body[16..24], &3_u64.to_be_bytes());
         let parsed = must_v2(parse_v2_commit_object(
             &commit_key.object_id,
             body,
@@ -837,6 +845,14 @@ fn framed_section_semantics_reject_noncanonical_shapes() {
         flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
         digest: digest_v2_section(&[]),
     }];
+    assert!(super::commit::validate_commit_section_semantics(&header).is_ok());
+    header.section_index[0].flags = 0;
+    assert!(matches!(
+        super::commit::validate_commit_section_semantics(&header),
+        Err(V2FormatError::InvalidHeaderField)
+    ));
+    header.section_index[0].flags = V2_SECTION_FLAG_MUST_UNDERSTAND;
+    header.self_ref.sequence = Sequence::new(4);
     assert!(matches!(
         super::commit::validate_commit_section_semantics(&header),
         Err(V2FormatError::InvalidHeaderField)
@@ -3384,6 +3400,45 @@ async fn v2_index_snapshot_bounds_replay_and_preserves_namespace() {
 }
 
 #[tokio::test]
+async fn v2_index_root_recovery_rejects_tampered_exact_catalog_run() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                must_type(LogicalPath::new("roots/exact-run")),
+                Bytes::from_static(b"catalog run payload"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    let run_anchor = must_v2(anchor.read_v2().await).expect("run head should be anchored");
+    must_repo(repository.write_index_snapshot(&anchor).await);
+    store.corrupt_ranged_commit_gets_for(run_anchor.commit_key);
+
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    assert!(matches!(
+        fresh.load_chain_from_anchor(&anchor).await,
+        Err(RepositoryError::CommitFailed { .. })
+    ));
+}
+
+#[tokio::test]
 async fn v2_orphan_gc_keeps_live_payload_commits_referenced_by_index_snapshot() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
@@ -3483,7 +3538,7 @@ async fn v2_orphan_gc_keeps_live_payload_commits_referenced_by_index_snapshot() 
 }
 
 #[tokio::test]
-async fn v2_index_snapshot_refuses_existing_out_of_chain_live_payload_refs() {
+async fn v2_index_snapshot_allows_repeated_exact_catalog_checkpoints() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
@@ -3509,13 +3564,87 @@ async fn v2_index_snapshot_refuses_existing_out_of_chain_live_payload_refs() {
     );
     must_repo(repository.write_index_snapshot(&anchor).await);
 
-    let repeated = repository.write_index_snapshot(&anchor).await;
+    let repeated = must_repo(repository.write_index_snapshot(&anchor).await);
+    assert_eq!(repeated.anchor_state.sequence, Sequence::new(4));
+}
 
-    assert!(matches!(
-        repeated,
-        Err(RepositoryError::CommitFailed { reason })
-            if reason.contains("compaction snapshot")
-    ));
+#[tokio::test]
+async fn v2_concurrent_writers_cas_without_losing_the_winner() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let first = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let second = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    must_repo(first.write_genesis_snapshot(&anchor).await);
+    must_repo(second.load_chain_from_anchor(&anchor).await);
+
+    let first_key = must_type(LogicalPath::new("writers/first"));
+    let second_key = must_type(LogicalPath::new("writers/second"));
+    let (first_result, second_result) = tokio::join!(
+        first.put_committed(
+            &anchor,
+            first_key.clone(),
+            Bytes::from_static(b"first writer"),
+            RepositoryPutOptions::default(),
+        ),
+        second.put_committed(
+            &anchor,
+            second_key.clone(),
+            Bytes::from_static(b"second writer"),
+            RepositoryPutOptions::default(),
+        )
+    );
+    assert_ne!(first_result.is_ok(), second_result.is_ok());
+    let loser_was_stale = [first_result.as_ref(), second_result.as_ref()]
+        .into_iter()
+        .filter_map(|result| result.err())
+        .all(|error| {
+            matches!(error, RepositoryError::CommitFailed { reason } if reason.contains("stale"))
+        });
+    assert!(loser_was_stale);
+
+    let retry_repository = if first_result.is_err() {
+        &first
+    } else {
+        &second
+    };
+    let retry_key = if first_result.is_err() {
+        first_key
+    } else {
+        second_key
+    };
+    must_repo(retry_repository.load_chain_from_anchor(&anchor).await);
+    must_repo(
+        retry_repository
+            .put_committed(
+                &anchor,
+                retry_key,
+                Bytes::from_static(b"retried writer"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let chain = must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    assert!(chain.is_some());
+    assert_eq!(must_repo(fresh.list_page("writers/", None, 10)).len(), 2);
 }
 
 #[tokio::test]
@@ -4418,7 +4547,10 @@ async fn v2_compaction_snapshot_rejects_packed_state_until_index_root_exists() {
 
     assert_eq!(before.mixed_commit_count, 1);
     assert!(before.live_bytes_to_copy > 0);
-    assert!(matches!(compaction, Err(RepositoryError::CommitFailed { .. })));
+    assert!(matches!(
+        compaction,
+        Err(RepositoryError::CommitFailed { .. })
+    ));
     assert_eq!(restored, live_body);
     assert!(matches!(deleted, Err(RepositoryError::NotFound(_))));
 }

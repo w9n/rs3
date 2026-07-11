@@ -52,11 +52,13 @@ not add ad hoc hashing, MAC, encryption, or key derivation logic.
     repositories and will not gain a migration path or dual reader. The runtime
     now publishes bounded normal batches as one compact `PAYLOAD_PACK` plus one
     framed `INDEX_RUN`, and bounded recovery replays those runs without reading
-    payload bytes. Signed `INDEX_ROOT` catalogs, standalone compacted runs, and
-    catalog-bounded recovery are not implemented yet. Packed-state compaction
-    fails closed until `INDEX_ROOT` replaces the old snapshot model; the
-    explicitly bounded legacy-only maintenance path remains for transitional
-    fixtures.
+    payload bytes. Signed `INDEX_ROOT` checkpoints catalog exact embedded run
+    sections, are reconstructed by a fresh reader before anchor adoption, and
+    drive exact maintenance reachability. Standalone compacted runs, automatic
+    checkpoint watermarks, and framed streaming are not implemented yet.
+    Packed-state compaction remains fail-closed until the standalone-run path
+    lands; the explicitly bounded legacy-only compaction path remains for
+    transitional fixtures.
 
 Normal writes are append-friendly and value-separated:
 

@@ -140,25 +140,28 @@ where
                 .accepted_state
                 .read()
                 .map_err(|_| RepositoryError::StatePoisoned)?;
-            state.namespace.live_entries_with_prefixes().into_iter().fold(
-                (false, 0_usize, 0_u64),
-                |(has_pack, count, bytes), (entry, _)| {
-                    (
-                        has_pack
-                            || matches!(
-                                entry.payload_ref,
-                                Some(PayloadReference::V2Pack { .. })
-                            ),
-                        count.saturating_add(1),
-                        bytes.saturating_add(entry.content_len),
-                    )
-                },
-            )
+            state
+                .namespace
+                .live_entries_with_prefixes()
+                .into_iter()
+                .fold(
+                    (false, 0_usize, 0_u64),
+                    |(has_pack, count, bytes), (entry, _)| {
+                        (
+                            has_pack
+                                || matches!(
+                                    entry.payload_ref,
+                                    Some(PayloadReference::V2Pack { .. })
+                                ),
+                            count.saturating_add(1),
+                            bytes.saturating_add(entry.content_len),
+                        )
+                    },
+                )
         };
         if has_packed_payload {
             return Err(RepositoryError::CommitFailed {
-                reason: "packed v02 compaction requires the INDEX_ROOT checkpoint path"
-                    .to_owned(),
+                reason: "packed v02 compaction requires the INDEX_ROOT checkpoint path".to_owned(),
             });
         }
         if live_object_count > 64
@@ -242,6 +245,14 @@ where
             .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
         self.resolve_accepted_payload_refs(&adopted.anchor_state, &locations)?;
         self.accept_current_state()?;
+        self.accepted_runs
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .clear();
+        *self
+            .accepted_anchor
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? = Some(adopted.anchor_state.clone());
         Ok(adopted)
     }
 

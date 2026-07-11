@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 
 /// Trusted manifest metadata used by the current in-memory query model.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TrustedManifest {
     /// Client-visible key inside the trusted boundary.
     pub(crate) key: LogicalPath,
@@ -28,7 +28,7 @@ pub(crate) struct TrustedManifest {
 }
 
 /// Mutable repository state guarded by the repository lock.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RepositoryState {
     /// Trusted namespace query model.
     pub(crate) namespace: NamespaceIndex,

@@ -109,6 +109,12 @@ pub enum V2FormatError {
     /// A framed index run exceeds a fixed hostile-input limit.
     #[error("v2 framed index run limit exceeded")]
     IndexRunLimitExceeded,
+    /// An index-root catalog has an invalid, truncated, or ambiguous encoding.
+    #[error("invalid v2 index root")]
+    InvalidIndexRoot,
+    /// An index-root catalog exceeds a fixed hostile-input limit.
+    #[error("v2 index root limit exceeded")]
+    IndexRootLimitExceeded,
     /// A compact payload pack has an invalid, truncated, or ambiguous encoding.
     #[error("invalid v2 payload pack")]
     InvalidPayloadPack,
@@ -204,6 +210,8 @@ impl V2FormatError {
             | Self::SectionDigestMismatch
             | Self::InvalidIndexRun
             | Self::IndexRunLimitExceeded
+            | Self::InvalidIndexRoot
+            | Self::IndexRootLimitExceeded
             | Self::InvalidPayloadPack
             | Self::PayloadPackLimitExceeded
             | Self::CryptoOperation

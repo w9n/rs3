@@ -36,7 +36,8 @@ pub const V2_CAPABILITY_SIGNED_SECTION_DIGESTS: u64 = 1 << 0;
 /// Commit index sections use the framed v02 run/catalog encoding.
 pub const V2_CAPABILITY_FRAMED_INDEX: u64 = 1 << 1;
 /// v02 capabilities understood by this transitional reader.
-pub const V2_SUPPORTED_CAPABILITY_FLAGS: u64 = V2_CAPABILITY_SIGNED_SECTION_DIGESTS;
+pub const V2_SUPPORTED_CAPABILITY_FLAGS: u64 =
+    V2_CAPABILITY_SIGNED_SECTION_DIGESTS | V2_CAPABILITY_FRAMED_INDEX;
 /// Capabilities required on every commit written or accepted by this reader.
 pub const V2_REQUIRED_CAPABILITY_FLAGS: u64 = V2_CAPABILITY_SIGNED_SECTION_DIGESTS;
 /// Section flag indicating the section type must be understood.
@@ -448,6 +449,9 @@ pub fn parse_v2_commit_header(
     if header.algorithms != V2Algorithms::v02() {
         return Err(V2FormatError::InvalidAlgorithms);
     }
+    if fixed.capability_flags != capability_flags_for_header(&header) {
+        return Err(V2FormatError::UnsupportedCapabilities);
+    }
     let commit_key = V2CommitKey::parse(&header.self_ref.commit_key)?;
     if commit_key.sequence != header.self_ref.sequence {
         return Err(V2FormatError::SelfKeyMismatch);
@@ -602,6 +606,7 @@ enum SignatureMode {
 
 #[derive(Clone, Copy)]
 struct FixedHeader {
+    capability_flags: u64,
     upload_mode: V2UploadMode,
     header_len: usize,
     header_span_len: usize,
@@ -665,6 +670,7 @@ fn parse_fixed_header(input: &[u8]) -> V2Result<FixedHeader> {
     }
 
     Ok(FixedHeader {
+        capability_flags,
         upload_mode,
         header_len,
         header_span_len,
@@ -701,7 +707,7 @@ fn header_span(
     out[..V2_COMMIT_MAGIC.len()].copy_from_slice(V2_COMMIT_MAGIC);
     out[8..12].copy_from_slice(&V2_FORMAT_VERSION.to_be_bytes());
     out[12..16].copy_from_slice(&V2_MIN_READER_VERSION.to_be_bytes());
-    out[16..24].copy_from_slice(&V2_REQUIRED_CAPABILITY_FLAGS.to_be_bytes());
+    out[16..24].copy_from_slice(&capability_flags_for_header(header).to_be_bytes());
     out[24] = upload_mode.to_wire();
     out[28..32].copy_from_slice(&(cbor.len() as u32).to_be_bytes());
     out[HEADER_CBOR_START..HEADER_CBOR_START + cbor.len()].copy_from_slice(&cbor);
@@ -1189,6 +1195,15 @@ fn validate_section_layout(
 }
 
 pub(crate) fn validate_commit_section_semantics(header: &V2CommitHeader) -> V2Result<()> {
+    match header.parent.as_ref() {
+        None if header.self_ref.sequence != Sequence::new(1) => {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
+        Some(parent) if parent.sequence.checked_next() != Some(header.self_ref.sequence) => {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
+        _ => {}
+    }
     let snapshot_count = header
         .section_index
         .iter()
@@ -1215,16 +1230,32 @@ pub(crate) fn validate_commit_section_semantics(header: &V2CommitHeader) -> V2Re
     }
 
     if header.kind == V2CommitKind::Root {
-        if snapshot_count != 1
-            || delta_count != 0
-            || header
+        let legacy_root = snapshot_count == 1
+            && delta_count == 0
+            && header
                 .section_index
                 .last()
                 .map(|section| section.section_type)
-                != Some(V2SectionType::IndexSnapshot)
-            || header.section_index[..header.section_index.len().saturating_sub(1)]
+                == Some(V2SectionType::IndexSnapshot)
+            && header.section_index[..header.section_index.len().saturating_sub(1)]
                 .iter()
-                .any(|section| section.section_type != V2SectionType::Payload)
+                .all(|section| section.section_type == V2SectionType::Payload);
+        let framed_root = matches!(
+            header.section_index.as_slice(),
+            [V2SectionDescriptor {
+                section_type: V2SectionType::IndexRoot,
+                ..
+            }]
+        );
+        if delta_count != 0
+            || (!legacy_root && !framed_root)
+            || (framed_root && snapshot_count != 0)
+            || (!framed_root && snapshot_count != 1)
+            || header
+                .section_index
+                .iter()
+                .any(|section| section.section_type == V2SectionType::IndexRun)
+            || (framed_root && header.section_index[0].flags != V2_SECTION_FLAG_MUST_UNDERSTAND)
         {
             return Err(V2FormatError::InvalidHeaderField);
         }
@@ -1261,4 +1292,18 @@ pub(crate) fn validate_commit_section_semantics(header: &V2CommitHeader) -> V2Re
     }
 
     Ok(())
+}
+
+fn capability_flags_for_header(header: &V2CommitHeader) -> u64 {
+    let framed = if header.section_index.iter().any(|section| {
+        matches!(
+            section.section_type,
+            V2SectionType::IndexRun | V2SectionType::IndexRoot | V2SectionType::PayloadPack
+        )
+    }) {
+        V2_CAPABILITY_FRAMED_INDEX
+    } else {
+        0
+    };
+    V2_REQUIRED_CAPABILITY_FLAGS | framed
 }

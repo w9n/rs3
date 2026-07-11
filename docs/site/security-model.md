@@ -82,10 +82,13 @@ is planned.
     payload bytes, and payload ranges authenticate only the required canonical
     segments. Publication verifies the returned object length and immediate
     exact-version visibility before advancing the external anchor. The gateway
-    does not yet read or write `INDEX_ROOT` catalogs or `objects/v02`
-    standalone runs. Production claims remain blocked on that recovery
-    boundary, hostile scale recovery, live-provider reruns, and external
-    cryptographic review.
+    reads and writes signed `INDEX_ROOT` catalogs of exact embedded run
+    sections. Candidate checkpoints are reconstructed by a fresh reader before
+    anchor adoption, and maintenance derives exact run and live-payload
+    reachability from the same verified catalog. Standalone compacted runs are
+    not implemented. Production claims remain blocked on automatic checkpoint
+    watermarks, framed streaming, hostile scale recovery, live-provider reruns,
+    and external cryptographic review.
 
 ## Control Map
 
@@ -101,18 +104,18 @@ is planned.
 | Writes are not acknowledged before commit acceptance | Commit coordinator waits for a covering signed commit and anchor advance. | v2 coordinator and commit tests. |
 | Storage rollback is not trusted as latest state | Ed25519 commit verification, Kubernetes Lease anchor, and retained exact-version commit reads. | v2 anchor, replay, recovery import, and orphan-report tests. |
 | v2 writes are not acknowledged before signed commit acceptance | The v2 commit coordinator batches staged writes into a signed commit and advances the external v2 anchor before returning success. | v2 coordinator batching, rollback, and snapshot tests. |
-| Transitional v2 replay does not read payload ciphertext | Signed per-section digests let readers walk to the nearest encrypted index snapshot while range-reading only authenticated index sections. Fixed commit, cumulative-object, and retained-index budgets still fail closed. | v2 bounded replay, payload-independent request-count, malformed-length, and range-tamper tests. |
+| v2 replay does not read payload ciphertext | Signed per-section digests and an encrypted `INDEX_ROOT` let readers verify exact run sections and replay the post-root tail without reading payload sections. Fixed commit, catalog, object-byte, and retained-index budgets fail closed. | v2 bounded replay, root codec, root-plus-tail, payload-independent request-count, malformed-length, and range-tamper tests. |
 | Create-only writes are not silently downgraded | Atomic-create providers must honor `PutObject` with `If-None-Match: *`; non-atomic `HEAD` before `PUT` is not treated as production create-only. | Storage contract tests and opt-in live S3 tests. |
 | Retained restore reads do not trust mutable latest objects | Retained-version providers must return version IDs for restore-critical writes; anchors bind commit versions and restore reads exact versions. | Memory version-addressed storage tests, v2 retained commit tests, and opt-in live S3 Object Lock tests. |
 | Single-writer read-write serving is guarded in Kubernetes deployments | `RS3_WRITER_GUARD=required` acquires a unique process identity and monotonic fencing token on the anchor Lease before serving. Every anchor advance verifies that live fence in the same resource-version CAS. | Lease skew, handoff, stale-writer, runtime startup guard, and configuration tests. |
 | Incident restore does not advance repository state | `restore-readonly` mode requires an accepted anchor and rejects supported mutations. | Gateway mode config, startup, and S3 adapter tests. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
-| v02 index frames cannot be transplanted or reordered | Frame AEAD binds immutable repository identity, the historical keyring-envelope reference, exact object key, section ordinal, run identity, authenticated directory digest, and complete frame descriptor. A future signed catalog separately binds standalone provider versions and lengths. | The bounded framed-run codec, commit publication, bounded replay, and corruption tests are implemented; catalogs and selected-projection recovery remain release blockers. |
+| v02 index frames cannot be transplanted or reordered | Frame AEAD binds immutable repository identity, the historical keyring-envelope reference, exact object key, section ordinal, run identity, authenticated directory digest, and complete frame descriptor. The signed catalog binds exact embedded commit version, length, body digest, layout, and run facts. | Framed-run and root codecs, exact catalog recovery, publication, bounded replay, and corruption tests. Standalone compacted runs remain blocked. |
 | v02 payload-pack records cannot be transplanted or downgraded | Record AEAD binds immutable repository identity, historical keyring context, exact object key, pack, section, record, segment, layout, and length facts. The accepted signed reference binds the returned exact version, length, and commit-body digest. | The bounded compact-pack codec, canonical segmentation, publication, range-read, cache, replay, and corruption tests are implemented; protection-cohort partitioning and cleaning remain release blockers. |
-| v02 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery applies one bounded authenticated frame at a time from an exact signed catalog. | Required for v02; 100k and 1M fresh-recovery gates currently block release. |
+| v02 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery verifies exact bounded run sections sequentially from a signed catalog under count and byte ceilings. | Implemented for embedded runs; 100k and 1M fresh-recovery gates still block release. |
 | v02 checkpoint failure cannot anchor unrecoverable state | Fenced automatic checkpointing degrades, then pauses mutation before fixed tail-byte, commit, or run-count ceilings. | Required for v02; not implemented. |
-| v02 GC retains every live payload without retaining whole ancestry | Effective run records mark exact payload commit versions; full mark completes before exact-version sweep. | Required for v02; not implemented. |
+| v02 GC retains every live payload without retaining whole ancestry | Effective run records mark exact payload commit versions; catalog-named run commits and protected roots are marked before exact-version sweep. | Implemented for embedded catalog runs; standalone run inventory and cleaning remain blocked. |
 
 ## Rollback Rule
 

@@ -1121,7 +1121,10 @@ where
         for (index, section) in parsed_header.header.section_index.iter().enumerate() {
             let retain = matches!(
                 section.section_type,
-                V2SectionType::IndexDelta | V2SectionType::IndexSnapshot | V2SectionType::IndexRun
+                V2SectionType::IndexDelta
+                    | V2SectionType::IndexSnapshot
+                    | V2SectionType::IndexRun
+                    | V2SectionType::IndexRoot
             );
             if !retain {
                 continue;
@@ -1475,6 +1478,45 @@ where
             object_len,
             sections_start,
         })
+    }
+
+    /// Adopts a child returned by this store after publication through a
+    /// temporary anchor bound to `expected_parent`.
+    ///
+    /// Unlike ambiguous-upload recovery, this path does not re-read payload
+    /// sections. The typed result was produced only after the original write's
+    /// length, visibility, and provider-profile checks succeeded. The real
+    /// anchor CAS supplies the remaining stale-writer exclusion.
+    pub(crate) async fn adopt_verified_unanchored_child<A>(
+        &self,
+        anchor: &A,
+        expected_parent: &V2AnchorState,
+        uploaded: &V2StoredCommit,
+    ) -> V2Result<V2StoredCommit>
+    where
+        A: V2CommitAnchor,
+    {
+        let current = anchor.read_v2().await?;
+        if current.as_ref() != Some(expected_parent)
+            || expected_parent.sequence.checked_next() != Some(uploaded.anchor_state.sequence)
+            || uploaded.commit_key.sequence != uploaded.anchor_state.sequence
+            || uploaded.commit_key.object_id != uploaded.anchor_state.commit_key
+            || uploaded.version_id != uploaded.anchor_state.version_id
+            || uploaded.anchor_state.format_ref != expected_parent.format_ref
+            || uploaded.anchor_state.format_ref != self.options.format_ref
+            || uploaded.sections_start > uploaded.object_len
+        {
+            return Err(V2FormatError::StaleAnchor);
+        }
+        self.verify_existing_commit_postconditions(
+            &uploaded.commit_key.object_id,
+            uploaded.version_id.as_ref(),
+        )
+        .await?;
+        anchor
+            .compare_and_advance_v2(Some(expected_parent), uploaded.anchor_state.clone())
+            .await?;
+        Ok(uploaded.clone())
     }
 
     /// Verifies a recovery bundle and recreates a missing anchor from it.

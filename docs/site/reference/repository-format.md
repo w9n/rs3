@@ -70,12 +70,12 @@ These class names, object counts, ciphertext sizes, provider version IDs, and
 write/compaction timing are accepted leakage. Plaintext catalog bounds, run
 levels, logical object counts, paths, and payload identities remain encrypted.
 
-The transitional writer publishes signed per-section digests with
-`INDEX_DELTA` and `INDEX_SNAPSHOT` sections under this generation. Its recovery
-path range-reads only those authenticated index sections. Those section
-semantics are not the stable `v02` contract. Repositories created before
-`INDEX_RUN` and `INDEX_ROOT` land remain evaluation data and may need
-recreation.
+Bounded writes publish `PAYLOAD_PACK` plus `INDEX_RUN`; signed `INDEX_ROOT`
+checkpoints replace the parent-chain replay boundary with an exact catalog of
+accepted run sections. Streaming writes still use the transitional
+`INDEX_DELTA` shape and therefore make the current state ineligible for a
+catalog checkpoint until framed streaming publication lands. All current v02
+repositories remain evaluation data and may need recreation.
 
 ## Signed Commits
 
@@ -96,8 +96,8 @@ and encrypted sections. The signed header covers:
 
 The complete header span is limited to 8 KiB and a reader accepts at most 65
 sections so the transitional envelope remains bounded. The completed normal
-writer emits at most one `PAYLOAD_PACK` and one `INDEX_RUN`; a combined catalog
-checkpoint may additionally carry one `INDEX_ROOT`. Multipart commits reserve
+writer emits at most one `PAYLOAD_PACK` and one `INDEX_RUN`; a catalog
+checkpoint contains exactly one `INDEX_ROOT`. Multipart commits reserve
 the fixed header span only when the body is genuinely streamed. Bounded commits
 use one `PutObject` and the canonical encoded header length, without 8 KiB
 padding.
@@ -105,13 +105,11 @@ Readers reject non-canonical encodings, unknown required capabilities,
 out-of-order or overlapping sections, arithmetic overflow, duplicate ordinals,
 lengths outside the object, and trailing data not covered by the signed layout.
 
-Capability bit `0x01` requires signed per-section digests and is implemented.
-Bit `0x02` identifies the complete framed index contract. Compact
-`PAYLOAD_PACK`/`INDEX_RUN` publication, range reads, and bounded run replay are
-implemented under the transitional capability set. Writers do not advertise
-bit `0x02` until `INDEX_ROOT` recovery is integrated, because advertising the
-complete contract before its recovery boundary exists would be dishonest. The
-complete v02 reader and writer will require both bits.
+Capability bit `0x01` requires signed per-section digests. Bit `0x02` identifies
+framed index sections. The fixed header advertises `0x01` for transitional
+delta/snapshot commits and `0x03` whenever a commit contains `PAYLOAD_PACK`,
+`INDEX_RUN`, or `INDEX_ROOT`; the signed section shape must agree with those
+bits. Readers support both shapes during the preview transition.
 
 Normal commits contain one encrypted `INDEX_RUN` and at most one encrypted
 `PAYLOAD_PACK`; an all-delete or all-empty batch needs no payload pack. A
@@ -259,11 +257,11 @@ Cold recovery starts only from the external anchor:
 
 1. Read and verify bounded signed commit headers from the anchored head back to
    the newest accepted `INDEX_ROOT`.
-2. Retain compact descriptors, not commit bodies or cumulative encrypted index
-   sections.
+2. Retain the root and tail index sections only, not payload sections or commit
+   bodies.
 3. Open the catalog and every named run by exact key and provider version.
-4. Verify and apply one bounded frame at a time, resolving records by generation
-   into one accepted state.
+4. Verify and apply each bounded run in generation order, retaining no
+   cumulative run set beyond the accepted state.
 5. Replay post-catalog commit runs oldest to newest, again retaining at most one
    bounded frame beyond the accepted state.
 6. Verify catalog cardinality and structural invariants, then sample exact
@@ -318,8 +316,8 @@ Compaction and catalog publication use this order:
 4. Verify exact provider version, length, digest, retention, and legal-hold
    posture for every candidate run.
 5. Write the signed catalog checkpoint commit.
-6. Open the candidate through a fresh reader and verify state cardinality and
-   selected payload reads.
+6. Open the candidate through a fresh reader and compare the complete trusted
+   namespace state and accepted run lineage.
 7. Recheck the writer fence and unchanged anchor.
 8. Advance the real anchor with one resource-version CAS that also checks the
    fence identity and token.

@@ -4,14 +4,15 @@ use super::commit::{V2_SECTION_FLAG_COMPRESSED, V2_SECTION_FLAG_MUST_UNDERSTAND,
 use super::error::V2FormatError;
 use super::repository::{
     V2CommitAnchor, V2CommitChain, V2CommitSection, V2CommitStore, V2CommitStoreOptions,
-    V2CommitWrite, V2FinalizedStreamingPayloadWrite, V2ReplayChain, V2ReplayCommit, V2StoredCommit,
-    V2StreamingPayloadWrite,
+    V2CommitWrite, V2FinalizedStreamingPayloadWrite, V2MemoryAnchor, V2ReplayChain, V2ReplayCommit,
+    V2StoredCommit, V2StreamingPayloadWrite,
 };
 use super::{
-    V2_MAX_HEADER_SIZE, V2_PAYLOAD_PACK_FIXED_HEADER_BYTES, V2ParsedCommit, V2ParsedCommitHeader,
-    V2PayloadPackDirectory, V2SectionType, V2UploadMode, open_v2_payload_pack_cached_record_span,
+    V2_MAX_HEADER_SIZE, V2_PAYLOAD_PACK_FIXED_HEADER_BYTES, V2EmbeddedIndexRunLocation,
+    V2IndexRoot, V2IndexRootRunRef, V2ParsedCommit, V2ParsedCommitHeader, V2PayloadPackDirectory,
+    V2SectionType, V2UploadMode, open_v2_payload_pack_cached_record_span,
     open_v2_payload_pack_directory, open_v2_payload_pack_record_span_with_segments,
-    plan_v2_payload_pack_record_range, probe_v2_payload_pack_header_len,
+    plan_v2_payload_pack_record_range, probe_v2_payload_pack_header_len, seal_v2_index_root,
 };
 use crate::checkpoint::{open_index_delta_object, seal_index_delta_object, seal_manifest_record};
 use crate::error::{RepositoryError, Result};
@@ -45,7 +46,6 @@ use rs3_types::{
     RetentionPolicy, Sequence,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
 use std::marker::PhantomData;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -70,6 +70,8 @@ pub struct V2Repository<S> {
     commit_store: V2CommitStore<S>,
     commit_upload_mode: V2UploadMode,
     accepted_state: StdRwLock<RepositoryState>,
+    accepted_runs: StdRwLock<Vec<V2IndexRootRunRef>>,
+    accepted_anchor: StdRwLock<Option<super::repository::V2AnchorState>>,
     mutation_lock: Mutex<()>,
     payload_segment_fill_locks: Vec<Mutex<()>>,
     pending_payloads: StdMutex<Vec<PendingV2Payload>>,
@@ -160,6 +162,8 @@ where
             commit_store: V2CommitStore::new(store, keyring, commit_options),
             commit_upload_mode,
             accepted_state: StdRwLock::new(RepositoryState::default()),
+            accepted_runs: StdRwLock::new(Vec::new()),
+            accepted_anchor: StdRwLock::new(None),
             mutation_lock: Mutex::new(()),
             payload_segment_fill_locks: (0..V2_PAYLOAD_FILL_LOCK_STRIPES)
                 .map(|_| Mutex::new(()))
@@ -188,32 +192,120 @@ where
     where
         A: V2CommitAnchor,
     {
-        self.commit_store
+        let stored = self
+            .commit_store
             .write_genesis_snapshot(anchor)
             .await
-            .map_err(v2_repository_error)
+            .map_err(v2_repository_error)?;
+        *self
+            .accepted_anchor
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? = Some(stored.anchor_state.clone());
+        Ok(stored)
     }
 
-    /// Writes a full namespace snapshot commit from the current trusted state.
+    /// Writes a signed catalog checkpoint from the current trusted state.
     pub async fn write_index_snapshot<A>(&self, anchor: &A) -> Result<V2StoredCommit>
     where
         A: V2CommitAnchor,
     {
         let _guard = self.mutation_lock.lock().await;
         self.publish_pending_index_delta(anchor).await?;
-        let chain = self
-            .commit_store
-            .load_replay_chain_from_anchor(anchor)
+        let base_anchor = anchor
+            .read_v2()
             .await
             .map_err(v2_repository_error)?
             .ok_or_else(|| v2_repository_error(V2FormatError::MissingAnchor))?;
-        self.ensure_index_snapshot_payload_refs_are_chain_reachable(&chain)
-            .await?;
-        let section = self.index_snapshot_section()?;
-        self.commit_store
-            .write_child_commit(anchor, V2CommitWrite::snapshot(vec![section]))
+        if self
+            .accepted_anchor
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .as_ref()
+            != Some(&base_anchor)
+        {
+            return Err(v2_repository_error(V2FormatError::StaleAnchor));
+        }
+        let expected_state = self
+            .accepted_state
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .clone();
+        let expected_runs = self
+            .accepted_runs
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .clone();
+        let root = V2IndexRoot::new(
+            expected_state.next_sequence,
+            u64::try_from(expected_state.list_entries.len())
+                .map_err(|_| v2_repository_error(V2FormatError::IndexRootLimitExceeded))?,
+            self.commit_store.options().format_ref.clone(),
+            self.commit_store.options().keyring_envelope_ref.clone(),
+            expected_runs.clone(),
+        )
+        .map_err(v2_repository_error)?;
+        let temporary_anchor = V2MemoryAnchor::with_state(base_anchor.clone());
+        let keyring = self.repository.keyring()?;
+        let context = packed::repository_context_from_refs(
+            &self.commit_store.options().repository_id,
+            &self.commit_store.options().keyring_envelope_ref,
+        )?;
+        let uploaded = self
+            .commit_store
+            .write_child_commit_with(&temporary_anchor, |commit_key| {
+                let sealed = seal_v2_index_root(
+                    keyring.as_ref(),
+                    &context,
+                    &commit_key.object_id,
+                    0,
+                    &root,
+                )?;
+                Ok(V2CommitWrite::snapshot(vec![V2CommitSection::new(
+                    V2SectionType::IndexRoot,
+                    V2_SECTION_FLAG_MUST_UNDERSTAND,
+                    sealed.bytes().clone(),
+                )]))
+            })
             .await
-            .map_err(v2_repository_error)
+            .map_err(v2_repository_error)?;
+
+        let fresh = V2Repository::new(
+            self.commit_store.store().clone(),
+            keyring.as_ref().clone(),
+            self.repository.options,
+            self.commit_store.options().clone(),
+        );
+        fresh.load_chain_from_anchor(&temporary_anchor).await?;
+        if *fresh
+            .accepted_state
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            != expected_state
+            || *fresh
+                .accepted_runs
+                .read()
+                .map_err(|_| RepositoryError::StatePoisoned)?
+                != expected_runs
+        {
+            return Err(v2_repository_error(V2FormatError::InvalidIndexRoot));
+        }
+        if anchor.read_v2().await.map_err(v2_repository_error)? != Some(base_anchor) {
+            return Err(v2_repository_error(V2FormatError::StaleAnchor));
+        }
+        let adopted = self
+            .commit_store
+            .adopt_unanchored_child(
+                anchor,
+                &uploaded.commit_key.object_id,
+                uploaded.version_id.as_ref(),
+            )
+            .await
+            .map_err(v2_repository_error)?;
+        *self
+            .accepted_anchor
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? = Some(adopted.anchor_state.clone());
+        Ok(adopted)
     }
 
     /// Loads and replays the commit chain selected by the v2 anchor.
@@ -221,19 +313,19 @@ where
     where
         A: V2CommitAnchor,
     {
+        let _guard = self.mutation_lock.lock().await;
+        let Some(anchor_state) = anchor.read_v2().await.map_err(v2_repository_error)? else {
+            return Ok(None);
+        };
         let chain = self
             .commit_store
-            .load_replay_chain_from_anchor(anchor)
+            .load_replay_chain_from_state(&anchor_state)
             .await
             .map_err(v2_repository_error)?;
-        if let Some(chain) = chain.as_ref() {
-            self.replay_bounded_chain(chain).await?;
+        let (rebuilt, accepted_runs) = self.replay_bounded_chain_to_state_and_runs(&chain).await?;
+        if anchor.read_v2().await.map_err(v2_repository_error)? != Some(anchor_state.clone()) {
+            return Err(v2_repository_error(V2FormatError::StaleAnchor));
         }
-        Ok(chain)
-    }
-
-    async fn replay_bounded_chain(&self, chain: &V2ReplayChain) -> Result<()> {
-        let rebuilt = self.replay_bounded_chain_to_state(chain).await?;
         let accepted = rebuilt.clone();
         let mut state = self.repository.write_state()?;
         *state = rebuilt;
@@ -241,14 +333,32 @@ where
             .accepted_state
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)? = accepted;
-        Ok(())
+        *self
+            .accepted_runs
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? = accepted_runs;
+        *self
+            .accepted_anchor
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? = Some(anchor_state);
+        Ok(Some(chain))
     }
 
     async fn replay_bounded_chain_to_state(
         &self,
         chain: &V2ReplayChain,
     ) -> Result<RepositoryState> {
+        self.replay_bounded_chain_to_state_and_runs(chain)
+            .await
+            .map(|(state, _)| state)
+    }
+
+    async fn replay_bounded_chain_to_state_and_runs(
+        &self,
+        chain: &V2ReplayChain,
+    ) -> Result<(RepositoryState, Vec<V2IndexRootRunRef>)> {
         let mut rebuilt = RepositoryState::default();
+        let mut accepted_runs = Vec::new();
         let mut previous_published_at_ms = None;
         for commit in chain.commits_newest_first.iter().rev() {
             let published_at_ms = commit.parsed_header.header.publish_time_ms;
@@ -256,10 +366,12 @@ where
                 return Err(v2_repository_error(V2FormatError::StaleAnchor));
             }
             previous_published_at_ms = Some(published_at_ms);
-            self.apply_replay_commit_sections(&mut rebuilt, commit)
-                .await?;
+            accepted_runs.extend(
+                self.apply_replay_commit_sections(&mut rebuilt, commit)
+                    .await?,
+            );
         }
-        Ok(rebuilt)
+        Ok((rebuilt, accepted_runs))
     }
 
     /// Loads and replays a supplied v2 commit chain.
@@ -272,6 +384,14 @@ where
             .accepted_state
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)? = accepted;
+        self.accepted_runs
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .clear();
+        *self
+            .accepted_anchor
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? = None;
         Ok(())
     }
 
@@ -302,6 +422,7 @@ where
         A: V2CommitAnchor,
     {
         let _guard = self.mutation_lock.lock().await;
+        self.ensure_accepted_anchor_matches(anchor).await?;
         let (metadata, rollback) = self.stage_put(key, body, options).await?;
         if let Err(error) = self.publish_pending_index_delta(anchor).await {
             self.rollback_staged_puts(vec![rollback])?;
@@ -325,6 +446,7 @@ where
         St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
         let _guard = self.mutation_lock.lock().await;
+        let base_anchor = self.ensure_accepted_anchor_matches(anchor).await?;
         let (staged, rollback) =
             self.stage_put_metadata_sync_with_rollback(key, plaintext_len, options)?;
         let keyring = self.repository.keyring()?;
@@ -332,9 +454,10 @@ where
         let staged_manifest_id = staged.manifest_id.clone();
         let staged_retention = staged.metadata.retention;
         let staged_legal_hold = staged.metadata.legal_hold;
+        let temporary_anchor = V2MemoryAnchor::with_state(base_anchor.clone());
         let stored = self
             .commit_store
-            .write_child_commit_with_streaming_payload(anchor, |commit_key| {
+            .write_child_commit_with_streaming_payload(&temporary_anchor, |commit_key| {
                 let payload_id =
                     Self::v2_payload_id(commit_key, 0).map_err(|_| V2FormatError::SectionBounds)?;
                 let payload_segment_size = self
@@ -405,7 +528,23 @@ where
             .await
             .map_err(v2_repository_error);
         let stored = match stored {
-            Ok(stored) => stored,
+            Ok(uploaded) => {
+                let adopted = self
+                    .commit_store
+                    .adopt_verified_unanchored_child(anchor, &base_anchor, &uploaded.stored)
+                    .await
+                    .map_err(v2_repository_error);
+                match adopted {
+                    Ok(stored) => super::repository::V2StoredStreamingCommit {
+                        stored,
+                        output: uploaded.output,
+                    },
+                    Err(error) => {
+                        self.rollback_state_mutations(vec![rollback])?;
+                        return Err(error);
+                    }
+                }
+            }
             Err(error) => {
                 self.rollback_state_mutations(vec![rollback])?;
                 return Err(error);
@@ -413,6 +552,11 @@ where
         };
         self.resolve_accepted_payload_refs(&stored.stored.anchor_state, &[stored.output])?;
         self.accept_pending_state(staged.sequence)?;
+        *self
+            .accepted_anchor
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? =
+            Some(stored.stored.anchor_state.clone());
         Ok(staged.metadata)
     }
 
@@ -431,6 +575,7 @@ where
         St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
         let _guard = self.mutation_lock.lock().await;
+        let base_anchor = self.ensure_accepted_anchor_matches(anchor).await?;
         self.ensure_put_create_allowed(&key, &options)?;
         let keyring = self.repository.keyring()?;
         let payload_segment_size = self.payload_segment_size_for_object_len(max_plaintext_len)?;
@@ -440,9 +585,10 @@ where
         );
         let upload_legal_hold = options.legal_hold;
         let staged_rollback = StdMutex::new(None);
+        let temporary_anchor = V2MemoryAnchor::with_state(base_anchor.clone());
         let stored = self
             .commit_store
-            .write_child_commit_with_streaming_payload(anchor, |commit_key| {
+            .write_child_commit_with_streaming_payload(&temporary_anchor, |commit_key| {
                 let payload_id =
                     Self::v2_payload_id(commit_key, 0).map_err(|_| V2FormatError::SectionBounds)?;
                 let payload_sealer = SegmentedPayloadSealer::new(&keyring, payload_segment_size)
@@ -517,7 +663,29 @@ where
             .await
             .map_err(v2_repository_error);
         let stored = match stored {
-            Ok(stored) => stored,
+            Ok(uploaded) => {
+                let adopted = self
+                    .commit_store
+                    .adopt_verified_unanchored_child(anchor, &base_anchor, &uploaded.stored)
+                    .await
+                    .map_err(v2_repository_error);
+                match adopted {
+                    Ok(stored) => super::repository::V2StoredStreamingCommit {
+                        stored,
+                        output: uploaded.output,
+                    },
+                    Err(error) => {
+                        if let Some(rollback) = staged_rollback
+                            .lock()
+                            .map_err(|_| RepositoryError::StatePoisoned)?
+                            .take()
+                        {
+                            self.rollback_state_mutations(vec![rollback])?;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
             Err(error) => {
                 if let Some(rollback) = staged_rollback
                     .lock()
@@ -534,6 +702,11 @@ where
             std::slice::from_ref(&stored.output.location),
         )?;
         self.accept_pending_state(stored.output.staged.sequence)?;
+        *self
+            .accepted_anchor
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? =
+            Some(stored.stored.anchor_state.clone());
         Ok(stored.output.staged.metadata)
     }
 
@@ -1310,6 +1483,7 @@ where
         A: V2CommitAnchor,
     {
         let _guard = self.mutation_lock.lock().await;
+        self.ensure_accepted_anchor_matches(anchor).await?;
         let (_object_id, rollback) = self.repository.tombstone_namespace_for_delete(&key)?;
         if let Err(error) = self.publish_pending_index_delta(anchor).await {
             self.rollback_state_mutations(vec![rollback])?;
@@ -1331,6 +1505,7 @@ where
         A: V2CommitAnchor,
     {
         let _guard = self.mutation_lock.lock().await;
+        self.ensure_accepted_anchor_matches(anchor).await?;
         let (metadata, rollback) = self
             .repository
             .set_legal_hold_with_rollback(&key, status)
@@ -1388,6 +1563,7 @@ where
         let Some(sequence) = self.pending_index_delta_sequence()? else {
             return Ok(None);
         };
+        let base_anchor = self.ensure_accepted_anchor_matches(anchor).await?;
         let pending_payloads = self
             .pending_payloads
             .lock()
@@ -1396,15 +1572,18 @@ where
         let mut accepted_locations = None;
         let mut accepted_pack_locations = None;
         let mut accepted_pack_directory = None;
-        let stored = self
+        let mut accepted_run = None;
+        let temporary_anchor = V2MemoryAnchor::with_state(base_anchor.clone());
+        let uploaded = self
             .commit_store
-            .write_child_commit_with(anchor, |commit_key| {
+            .write_child_commit_with(&temporary_anchor, |commit_key| {
                 if let Some(packed) = self
                     .pending_packed_sections_for_commit(commit_key, &pending_payloads)
                     .map_err(|_| V2FormatError::InvalidHeaderField)?
                 {
                     accepted_pack_directory = packed.pack_directory;
                     accepted_pack_locations = Some(packed.locations);
+                    accepted_run = Some(packed.run);
                     let mut write =
                         V2CommitWrite::delta(packed.sections).with_retention(packed.retention);
                     write = write.with_legal_hold(packed.legal_hold);
@@ -1419,6 +1598,45 @@ where
                 write = write.with_legal_hold(pending.legal_hold);
                 Ok(write)
             })
+            .await
+            .map_err(v2_repository_error)?;
+        let accepted_run = accepted_run.map(|run| V2IndexRootRunRef {
+            run_id: run.run_id,
+            run_sequence: run.run_sequence,
+            minimum_generation: run.minimum_generation,
+            maximum_generation: run.maximum_generation,
+            mutation_count: run.mutation_count,
+            frame_count: run.frame_count,
+            level: 0,
+            compaction_generation: 0,
+            namespace_bounds: run.namespace_bounds,
+            listing_bounds: run.listing_bounds,
+            keyring_envelope_ref: run.keyring_envelope_ref,
+            location: V2EmbeddedIndexRunLocation {
+                commit_key: uploaded.anchor_state.commit_key.clone(),
+                version_id: uploaded.version_id.clone(),
+                commit_stored_len: uploaded.object_len,
+                commit_body_digest: uploaded.anchor_state.body_digest,
+                sections_start: uploaded.sections_start,
+                section_ordinal: run.section_ordinal,
+                section_offset: run.section_offset,
+                section_len: run.section_len,
+                section_digest: run.section_digest,
+            },
+        });
+        if let Some(run) = accepted_run.as_ref()
+            && self
+                .accepted_runs
+                .read()
+                .map_err(|_| RepositoryError::StatePoisoned)?
+                .last()
+                .is_some_and(|previous| previous.maximum_generation >= run.minimum_generation)
+        {
+            return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+        }
+        let stored = self
+            .commit_store
+            .adopt_verified_unanchored_child(anchor, &base_anchor, &uploaded)
             .await
             .map_err(v2_repository_error)?;
         if let Some(locations) = accepted_pack_locations {
@@ -1456,11 +1674,45 @@ where
             self.resolve_accepted_payload_refs(&stored.anchor_state, &locations)?;
         }
         self.accept_pending_state(sequence)?;
+        if let Some(run) = accepted_run {
+            self.accepted_runs
+                .write()
+                .map_err(|_| RepositoryError::StatePoisoned)?
+                .push(run);
+        }
         self.pending_payloads
             .lock()
             .map_err(|_| RepositoryError::StatePoisoned)?
             .clear();
+        *self
+            .accepted_anchor
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)? = Some(stored.anchor_state.clone());
         Ok(Some(stored))
+    }
+
+    async fn ensure_accepted_anchor_matches<A>(
+        &self,
+        anchor: &A,
+    ) -> Result<super::repository::V2AnchorState>
+    where
+        A: V2CommitAnchor,
+    {
+        let current = anchor
+            .read_v2()
+            .await
+            .map_err(v2_repository_error)?
+            .ok_or_else(|| v2_repository_error(V2FormatError::MissingAnchor))?;
+        if self
+            .accepted_anchor
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .as_ref()
+            != Some(&current)
+        {
+            return Err(v2_repository_error(V2FormatError::StaleAnchor));
+        }
+        Ok(current)
     }
 
     fn accept_pending_state(&self, sequence: Sequence) -> Result<()> {
@@ -1954,9 +2206,10 @@ where
                         },
                     )?;
                 }
-                V2SectionType::IndexRoot
-                | V2SectionType::Directives
-                | V2SectionType::Unknown(_) => {
+                V2SectionType::IndexRoot => {
+                    return Err(v2_repository_error(V2FormatError::UnsupportedSection));
+                }
+                V2SectionType::Directives | V2SectionType::Unknown(_) => {
                     if section.flags & V2_SECTION_FLAG_MUST_UNDERSTAND != 0 {
                         return Err(v2_repository_error(V2FormatError::UnsupportedSection));
                     }
@@ -1970,7 +2223,7 @@ where
         &self,
         state: &mut RepositoryState,
         commit: &V2ReplayCommit,
-    ) -> Result<()> {
+    ) -> Result<Vec<V2IndexRootRunRef>> {
         let cache_key = V2CommitHeaderCacheKey {
             commit_key: commit.parsed_header.header.self_ref.commit_key.clone(),
             commit_version_id: commit.version_id.clone(),
@@ -1978,6 +2231,7 @@ where
         };
         self.cache_commit_header(cache_key, commit.parsed_header.clone())?;
 
+        let mut accepted_runs = Vec::new();
         for (index, section) in commit.parsed_header.header.section_index.iter().enumerate() {
             if section.flags & V2_SECTION_FLAG_COMPRESSED != 0 {
                 return Err(v2_repository_error(V2FormatError::UnsupportedSection));
@@ -2015,7 +2269,7 @@ where
                 V2SectionType::IndexRun => {
                     let section_bytes = replay_section_bytes(commit, index)?;
                     let keyring = self.repository.keyring()?;
-                    packed::apply_packed_index_run(
+                    accepted_runs.push(packed::apply_packed_index_run(
                         keyring.as_ref(),
                         &self.commit_store.options().repository_id,
                         state,
@@ -2027,18 +2281,32 @@ where
                                 .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
                             stored_run: section_bytes,
                         },
-                    )?;
+                    )?);
                 }
-                V2SectionType::IndexRoot
-                | V2SectionType::Directives
-                | V2SectionType::Unknown(_) => {
+                V2SectionType::IndexRoot => {
+                    let section_bytes = replay_section_bytes(commit, index)?;
+                    accepted_runs = self
+                        .commit_store
+                        .apply_index_root_to_state(
+                            state,
+                            commit,
+                            u32::try_from(index)
+                                .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+                            section_bytes,
+                            self.commit_store.options().replay_limits,
+                        )
+                        .await
+                        .map_err(v2_repository_error)?
+                        .runs;
+                }
+                V2SectionType::Directives | V2SectionType::Unknown(_) => {
                     if section.flags & V2_SECTION_FLAG_MUST_UNDERSTAND != 0 {
                         return Err(v2_repository_error(V2FormatError::UnsupportedSection));
                     }
                 }
             }
         }
-        Ok(())
+        Ok(accepted_runs)
     }
 
     async fn resolve_replay_payload_refs(
@@ -2118,104 +2386,6 @@ where
                 length,
             });
         }
-        Ok(())
-    }
-
-    fn index_snapshot_section(&self) -> Result<V2CommitSection> {
-        let keyring = self.repository.keyring()?;
-        let snapshot = {
-            let state = self.repository.read_state()?;
-            let mut deltas = Vec::new();
-            for (entry, prefix_tokens) in state.namespace.live_entries_with_prefixes() {
-                let manifest = state.manifests.get(&entry.manifest_id).ok_or_else(|| {
-                    RepositoryError::InvalidObjectFormat {
-                        object_id: entry.object_id.clone(),
-                    }
-                })?;
-                let sealed_manifest = seal_manifest_record(&keyring, &entry.manifest_id, manifest)?;
-                deltas.push(IndexDelta::Upsert {
-                    entry: Box::new(entry),
-                    prefix_tokens,
-                    sealed_manifest: Box::new(sealed_manifest),
-                });
-            }
-            IndexDeltaObject {
-                sequence: state.next_sequence,
-                deltas,
-            }
-        };
-        let sealed_snapshot = seal_index_delta_object(&keyring, &snapshot)?;
-        let bytes = Bytes::from(index_delta_object_bytes(&sealed_snapshot)?);
-        Ok(V2CommitSection::new(
-            V2SectionType::IndexSnapshot,
-            V2_SECTION_FLAG_MUST_UNDERSTAND,
-            bytes,
-        ))
-    }
-
-    async fn ensure_index_snapshot_payload_refs_are_chain_reachable(
-        &self,
-        chain: &V2ReplayChain,
-    ) -> Result<()> {
-        let reachable = chain
-            .commits_newest_first
-            .iter()
-            .map(|commit| {
-                (
-                    commit.parsed_header.header.self_ref.commit_key.clone(),
-                    commit.version_id.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        let pack_validation_keys = {
-            let state = self
-                .accepted_state
-                .read()
-                .map_err(|_| RepositoryError::StatePoisoned)?;
-            let mut pack_validation_keys = Vec::new();
-            for (entry, _) in state.namespace.live_entries_with_prefixes() {
-                let is_pack = matches!(
-                    entry.payload_ref.as_ref(),
-                    Some(PayloadReference::V2Pack { .. })
-                );
-                let (commit_key, commit_version_id) = match entry.payload_ref {
-                Some(PayloadReference::V2Commit {
-                    commit_key,
-                    commit_version_id,
-                    ..
-                })
-                | Some(PayloadReference::V2Pack {
-                    commit_key,
-                    commit_version_id,
-                    ..
-                }) => (commit_key, commit_version_id),
-                None => continue,
-                Some(PayloadReference::V2Self { .. } | PayloadReference::V2PackSelf { .. }) => {
-                    return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
-                }
-                };
-                if !reachable.contains(&(commit_key, commit_version_id)) {
-                    return Err(RepositoryError::CommitFailed {
-                        reason: "v2 index snapshot would preserve live payloads outside the snapshot chain; run v2 compaction snapshot instead".to_owned(),
-                    });
-                }
-                if is_pack {
-                    let manifest = state.manifests.get(&entry.manifest_id).ok_or_else(|| {
-                        RepositoryError::InvalidObjectFormat {
-                            object_id: entry.object_id.clone(),
-                        }
-                    })?;
-                    pack_validation_keys.push(manifest.key.clone());
-                }
-            }
-            pack_validation_keys
-        };
-
-        for key in pack_validation_keys {
-            self.get_range(&key, ByteRange::Slice { offset: 0, len: 0 })
-                .await?;
-        }
-
         Ok(())
     }
 

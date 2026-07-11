@@ -218,7 +218,7 @@ fn invalid_case_bad_algorithm() -> InvalidVectorCase {
 fn invalid_case_unsupported_capability() -> InvalidVectorCase {
     let fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
     let mut body = fixture.encode(V2UploadMode::SinglePut).to_vec();
-    body[23] = 3;
+    body[23] = 0x81;
     InvalidVectorCase {
         name: "unsupported-capability",
         keyring: fixture.keyring,

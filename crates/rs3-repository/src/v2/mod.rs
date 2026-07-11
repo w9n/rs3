@@ -12,6 +12,7 @@ mod error;
 mod format;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
+mod index_root;
 mod index_run;
 mod maintenance;
 mod payload_pack;
@@ -37,6 +38,12 @@ pub use coordinator::{V2CommitCoordinator, V2CommitCoordinatorStatus, V2Committe
 pub use error::{V2ErrorClass, V2FormatError, V2Result};
 pub use format::{
     V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef, V2MaintenanceConfig, v2_format_object_id,
+};
+pub use index_root::{
+    V2_INDEX_ROOT_FIXED_HEADER_BYTES, V2_INDEX_ROOT_ID_LEN, V2_INDEX_ROOT_MAX_BYTES,
+    V2_INDEX_ROOT_MAX_RUNS, V2_INDEX_ROOT_MAX_TOTAL_MUTATIONS, V2_INDEX_ROOT_MAX_TOTAL_RUN_BYTES,
+    V2EmbeddedIndexRunLocation, V2IndexRoot, V2IndexRootClaims, V2IndexRootId, V2IndexRootRunRef,
+    V2SealedIndexRoot, open_v2_index_root, seal_v2_index_root,
 };
 pub use index_run::{
     V2_INDEX_RUN_FIXED_HEADER_BYTES, V2_INDEX_RUN_ID_LEN, V2_INDEX_RUN_MAX_FRAME_COUNT,

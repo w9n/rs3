@@ -1,13 +1,18 @@
 //! v2 maintenance planning and conservative apply paths.
 
-use super::V2SectionType;
 use super::commit::{V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitKey};
 use super::error::{V2FormatError, V2Result};
 use super::provider::V2ProviderProfile;
 use super::repository::{
     V2AnchorState, V2CommitAnchor, V2CommitStore, V2ReplayChain, V2ReplayCommit, V2ReplayLimits,
 };
-use super::service::packed::{V2PackedIndexRunReplay, apply_packed_index_run};
+use super::service::packed::{
+    V2PackedIndexRunReplay, apply_packed_index_run, repository_context_from_refs,
+};
+use super::{
+    V2_CAPABILITY_FRAMED_INDEX, V2_SUPPORTED_CAPABILITY_FLAGS, V2CommitKind, V2IndexRootRunRef,
+    V2SectionType, open_v2_index_root,
+};
 use crate::checkpoint::open_index_delta_object;
 use crate::state::{RepositoryState, apply_index_delta_object};
 use async_trait::async_trait;
@@ -334,6 +339,11 @@ struct V2ReachabilityState {
     chain_retained_bytes: u64,
 }
 
+pub(crate) struct V2ResolvedIndexRoot {
+    pub(crate) runs: Vec<V2IndexRootRunRef>,
+    referenced_commits: Vec<V2ReplayCommit>,
+}
+
 impl V2ReachabilityState {
     fn include_chain(&mut self, chain: &V2ReplayChain, protected: bool) {
         self.chain_get_count = self
@@ -366,6 +376,121 @@ impl<S> V2CommitStore<S>
 where
     S: BlobStore,
 {
+    pub(crate) async fn apply_index_root_to_state(
+        &self,
+        state: &mut RepositoryState,
+        containing_commit: &V2ReplayCommit,
+        section_ordinal: u32,
+        stored_root: &[u8],
+        limits: V2ReplayLimits,
+    ) -> V2Result<V2ResolvedIndexRoot> {
+        let header = &containing_commit.parsed_header.header;
+        let context = repository_context_from_refs(
+            &self.options().repository_id,
+            &header.keyring_envelope_ref,
+        )
+        .map_err(|_| V2FormatError::InvalidIndexRoot)?;
+        let root = open_v2_index_root(
+            self.keyring(),
+            &context,
+            &header.self_ref.commit_key,
+            section_ordinal,
+            stored_root,
+        )?;
+        if root.keyring_envelope_ref() != &header.keyring_envelope_ref
+            || root.format_ref() != &self.options().format_ref
+            || root.required_capabilities() & !V2_SUPPORTED_CAPABILITY_FLAGS != 0
+            || root.required_capabilities() & V2_CAPABILITY_FRAMED_INDEX == 0
+        {
+            return Err(V2FormatError::InvalidIndexRoot);
+        }
+        let covered_parent_sequence = match header.parent.as_ref() {
+            Some(parent) => parent.sequence,
+            None if header.self_ref.sequence == Sequence::new(1)
+                && root.covered_generation() == Sequence::ZERO
+                && root.runs().is_empty() =>
+            {
+                Sequence::ZERO
+            }
+            _ => return Err(V2FormatError::InvalidIndexRoot),
+        };
+        let referenced_commit_bytes = root.runs().iter().try_fold(0_u64, |total, run| {
+            total.checked_add(run.location.commit_stored_len)
+        });
+        if root.runs().len() > limits.max_commits
+            || root.claims().total_stored_run_bytes() > limits.max_total_commit_bytes
+            || referenced_commit_bytes.is_none_or(|bytes| bytes > limits.max_total_commit_bytes)
+        {
+            return Err(V2FormatError::ReplayBudgetExceeded);
+        }
+
+        let mut ordered_runs = root.runs().to_vec();
+        ordered_runs.sort_by_key(|run| (run.minimum_generation, run.run_sequence, run.run_id));
+        *state = RepositoryState::default();
+        let mut runs = Vec::with_capacity(ordered_runs.len());
+        let mut referenced_commits = Vec::with_capacity(ordered_runs.len());
+        for expected in ordered_runs {
+            let location = &expected.location;
+            let replay = self
+                .read_replay_commit_at(&location.commit_key, location.version_id.as_ref())
+                .await?;
+            let referenced_header = &replay.parsed_header.header;
+            let descriptor_index = usize::try_from(location.section_ordinal)
+                .map_err(|_| V2FormatError::SectionBounds)?;
+            let descriptor = referenced_header
+                .section_index
+                .get(descriptor_index)
+                .ok_or(V2FormatError::InvalidIndexRoot)?;
+            if replay.version_id != location.version_id
+                || replay.object_len != location.commit_stored_len
+                || replay.parsed_header.sections_start
+                    != usize::try_from(location.sections_start)
+                        .map_err(|_| V2FormatError::SectionBounds)?
+                || referenced_header.kind != V2CommitKind::Delta
+                || referenced_header.self_ref.sequence > covered_parent_sequence
+                || referenced_header.body_digest != location.commit_body_digest
+                || referenced_header.keyring_envelope_ref != expected.keyring_envelope_ref
+                || descriptor.section_type != V2SectionType::IndexRun
+                || descriptor.flags != V2_SECTION_FLAG_MUST_UNDERSTAND
+                || descriptor.offset != location.section_offset
+                || descriptor.length != location.section_len
+                || descriptor.digest != location.section_digest
+            {
+                return Err(V2FormatError::InvalidIndexRoot);
+            }
+            let stored_run = commit_section_bytes(&replay, descriptor_index)?;
+            let actual = apply_packed_index_run(
+                self.keyring(),
+                &self.options().repository_id,
+                state,
+                V2PackedIndexRunReplay {
+                    parsed_header: &replay.parsed_header,
+                    version_id: replay.version_id.as_ref(),
+                    object_len: replay.object_len,
+                    section_ordinal: location.section_ordinal,
+                    stored_run,
+                },
+            )
+            .map_err(|_| V2FormatError::InvalidIndexRun)?;
+            if actual != expected {
+                return Err(V2FormatError::InvalidIndexRoot);
+            }
+            runs.push(actual);
+            referenced_commits.push(replay);
+        }
+        if state.next_sequence != root.covered_generation()
+            || u64::try_from(state.list_entries.len())
+                .map_err(|_| V2FormatError::IndexRootLimitExceeded)?
+                != root.expected_live_object_count()
+        {
+            return Err(V2FormatError::InvalidIndexRoot);
+        }
+        Ok(V2ResolvedIndexRoot {
+            runs,
+            referenced_commits,
+        })
+    }
+
     /// Reports unanchored commit objects without deleting anything.
     pub async fn report_orphans<A>(&self, anchor: &A) -> V2Result<V2OrphanReport>
     where
@@ -696,9 +821,20 @@ where
         reachability: &mut V2ReachabilityState,
         chain: &V2ReplayChain,
         protected: bool,
-        _budgets: V2MaintenanceBudgets,
+        budgets: V2MaintenanceBudgets,
     ) -> V2Result<()> {
-        for root in self.live_payload_roots_from_chain(chain)? {
+        let limits = self.remaining_graph_limits(reachability, budgets)?;
+        let (live_payload_roots, referenced_run_commits) =
+            self.live_payload_roots_from_chain(chain, limits).await?;
+        if !referenced_run_commits.is_empty() {
+            reachability.include_chain(
+                &V2ReplayChain {
+                    commits_newest_first: referenced_run_commits,
+                },
+                protected,
+            );
+        }
+        for root in live_payload_roots {
             let version_key = (root.commit_key.clone(), root.version_id.clone());
             if reachability.reachable_versions.contains(&version_key) {
                 continue;
@@ -723,8 +859,56 @@ where
         Ok(())
     }
 
-    fn live_payload_roots_from_chain(&self, chain: &V2ReplayChain) -> V2Result<Vec<V2AnchorState>> {
-        let state = self.replay_chain_to_namespace_state(chain)?;
+    fn remaining_graph_limits(
+        &self,
+        reachability: &V2ReachabilityState,
+        budgets: V2MaintenanceBudgets,
+    ) -> V2Result<V2ReplayLimits> {
+        let configured = self.options().replay_limits;
+        let used_commits = usize::try_from(reachability.chain_get_count)
+            .map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?;
+        let mut max_commits = configured
+            .max_commits
+            .checked_sub(used_commits)
+            .ok_or(V2FormatError::ReplayBudgetExceeded)?;
+        if let Some(max_requests) = budgets.max_request_count {
+            let remaining = max_requests
+                .checked_sub(reachability.chain_get_count)
+                .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
+            max_commits = max_commits.min(
+                usize::try_from(remaining).map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?,
+            );
+        }
+        let mut max_total_commit_bytes = configured
+            .max_total_commit_bytes
+            .checked_sub(reachability.chain_read_bytes)
+            .ok_or(V2FormatError::ReplayBudgetExceeded)?;
+        if let Some(max_bytes) = budgets.max_range_read_bytes {
+            max_total_commit_bytes = max_total_commit_bytes.min(
+                max_bytes
+                    .checked_sub(reachability.chain_read_bytes)
+                    .ok_or(V2FormatError::MaintenanceBudgetExceeded)?,
+            );
+        }
+        let max_retained_bytes = configured
+            .max_retained_bytes
+            .checked_sub(reachability.chain_retained_bytes)
+            .ok_or(V2FormatError::ReplayBudgetExceeded)?;
+        Ok(V2ReplayLimits {
+            max_commits,
+            max_total_commit_bytes,
+            max_retained_bytes,
+            ..configured
+        })
+    }
+
+    async fn live_payload_roots_from_chain(
+        &self,
+        chain: &V2ReplayChain,
+        limits: V2ReplayLimits,
+    ) -> V2Result<(Vec<V2AnchorState>, Vec<V2ReplayCommit>)> {
+        let (state, referenced_run_commits) =
+            self.replay_chain_to_namespace_state(chain, limits).await?;
         let signing_key_id = chain
             .commits_newest_first
             .first()
@@ -765,11 +949,16 @@ where
             });
         }
 
-        Ok(roots)
+        Ok((roots, referenced_run_commits))
     }
 
-    fn replay_chain_to_namespace_state(&self, chain: &V2ReplayChain) -> V2Result<RepositoryState> {
+    async fn replay_chain_to_namespace_state(
+        &self,
+        chain: &V2ReplayChain,
+        limits: V2ReplayLimits,
+    ) -> V2Result<(RepositoryState, Vec<V2ReplayCommit>)> {
         let mut state = RepositoryState::default();
+        let mut referenced_run_commits = Vec::new();
         let mut previous_published_at_ms = None;
         for commit in chain.commits_newest_first.iter().rev() {
             let published_at_ms = commit.parsed_header.header.publish_time_ms;
@@ -777,16 +966,21 @@ where
                 return Err(V2FormatError::StaleAnchor);
             }
             previous_published_at_ms = Some(published_at_ms);
-            self.apply_commit_sections_to_namespace_state(&mut state, commit)?;
+            referenced_run_commits.extend(
+                self.apply_commit_sections_to_namespace_state(&mut state, commit, limits)
+                    .await?,
+            );
         }
-        Ok(state)
+        Ok((state, referenced_run_commits))
     }
 
-    fn apply_commit_sections_to_namespace_state(
+    async fn apply_commit_sections_to_namespace_state(
         &self,
         state: &mut RepositoryState,
         commit: &V2ReplayCommit,
-    ) -> V2Result<()> {
+        limits: V2ReplayLimits,
+    ) -> V2Result<Vec<V2ReplayCommit>> {
+        let mut referenced_run_commits = Vec::new();
         for (index, section) in commit.parsed_header.header.section_index.iter().enumerate() {
             match section.section_type {
                 V2SectionType::IndexDelta => {
@@ -843,7 +1037,17 @@ where
                     .map_err(|_| V2FormatError::InvalidIndexRun)?;
                 }
                 V2SectionType::IndexRoot => {
-                    return Err(V2FormatError::UnsupportedSection);
+                    let section_bytes = commit_section_bytes(commit, index)?;
+                    let resolved = self
+                        .apply_index_root_to_state(
+                            state,
+                            commit,
+                            u32::try_from(index).map_err(|_| V2FormatError::SectionBounds)?,
+                            section_bytes,
+                            limits,
+                        )
+                        .await?;
+                    referenced_run_commits.extend(resolved.referenced_commits);
                 }
                 V2SectionType::Directives | V2SectionType::Unknown(_) => {
                     if section.flags & V2_SECTION_FLAG_MUST_UNDERSTAND != 0 {
@@ -852,7 +1056,7 @@ where
                 }
             }
         }
-        Ok(())
+        Ok(referenced_run_commits)
     }
 
     fn open_index_delta_section(

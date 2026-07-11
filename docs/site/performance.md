@@ -160,11 +160,11 @@ against the direct path.
 
 The earlier 100k tier wrote successfully but fresh reload failed closed with
 `v2 recovery replay budget exceeded`; the 1M tier reached the same recovery
-failure. Those measurements used the removed `commits/v01` generation. The
-transitional v02 reader still has the prototype delta/snapshot chain and fixed
-replay-depth budget, so 100k and 1M remain production blockers and must be rerun
-after catalog recovery lands. A successful write-only million-object run is not
-accepted as scale evidence. Final `v02` qualification must use a fresh process
+failure. Those measurements used the removed `commits/v01` generation. The v02
+reader now checkpoints bounded embedded runs through signed `INDEX_ROOT`
+catalogs, but the 100k and 1M gates remain production blockers and must be rerun
+against that path. A successful write-only million-object run is not accepted
+as scale evidence. Final `v02` qualification must use a fresh process
 and verify exact listing cardinality plus first, middle, and last object bytes.
 Its descriptor-first reader must retain no cumulative encrypted delta set, read
 no payload sections merely to rebuild the index, and use at most 1.25x the index
