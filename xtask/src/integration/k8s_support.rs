@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 
 pub(crate) const ACCESS_KEY_ID: &str = "rs3-fixture-access-key";
+pub(crate) const ADMIN_BEARER_TOKEN: &str = "rs3-fixture-admin-token-12345";
 pub(crate) const CHART_NAME: &str = "rs3-gateway";
 pub(crate) const CHART_PATH: &str = "charts/rs3-gateway";
 pub(crate) const DEFAULT_PUBLIC_BUCKET: &str = "client-bucket";
@@ -85,6 +86,10 @@ pub(crate) fn helm_install_gateway(
             &helm_set_string("gateway.mode", values.gateway_mode),
             "--set-string",
             &helm_set_string("admin.profile", "local"),
+            "--set",
+            "admin.createToken=true",
+            "--set-string",
+            &helm_set_string("admin.bearerToken", ADMIN_BEARER_TOKEN),
             "--set-string",
             &format!("publicBucket={}", values.public_bucket),
             "--set",
