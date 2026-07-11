@@ -11,9 +11,10 @@ use super::{
     V2_INDEX_ROOT_MAX_RUNS, V2_MAX_HEADER_SIZE, V2EmbeddedIndexRunLocation, V2IndexRoot,
     V2IndexRootRunRef, V2KeyringEnvelopeRef, V2ParsedCommit, V2ParsedCommitHeader,
     V2PayloadPackFacts, V2PayloadPackId, V2PayloadPackRecordContext, V2PayloadPackRecordRef,
-    V2SectionType, V2UploadMode, open_v2_payload_pack_cached_record_span,
+    V2SectionDescriptor, V2SectionType, V2StreamPayloadCacheIdentity, V2UploadMode,
+    digest_v2_section, open_v2_payload_pack_cached_record_span,
     open_v2_payload_pack_record_span_with_segments, plan_v2_payload_pack_record_range,
-    seal_v2_index_root,
+    seal_v2_index_root, validated_v2_stream_payload_start,
 };
 use crate::checkpoint::{open_index_delta_object, seal_index_delta_object, seal_manifest_record};
 use crate::error::{RepositoryError, Result};
@@ -29,7 +30,9 @@ use crate::payload::{
     parse_segmented_payload_header_with_total_len, probe_payload_header,
     seal_streamable_payload_object, segmented_ciphertext_span, total_segmented_payload_len,
 };
-use crate::service::{Repository, RepositoryOptions, strongest_retention_policy};
+use crate::service::{
+    DecryptedSegmentIdentity, Repository, RepositoryOptions, strongest_retention_policy,
+};
 use crate::state::{RepositoryState, TrustedManifest, apply_index_delta_object, object_material};
 use bytes::Bytes;
 use futures_util::Stream;
@@ -164,6 +167,8 @@ struct PendingV2PayloadLocation {
     manifest_id: ManifestId,
     payload_id: BackendObjectId,
     payload_header: PayloadHeaderReference,
+    section_ordinal: u32,
+    section_digest: [u8; 32],
     sections_start: Option<u64>,
     offset: u64,
     length: u64,
@@ -186,6 +191,12 @@ struct StagedV2Put {
 struct StreamingV2PutFinalized {
     staged: StagedV2Put,
     location: PendingV2PayloadLocation,
+    run: packed::PendingV2IndexRunFacts,
+}
+
+struct StreamingV2PayloadFinalized {
+    location: PendingV2PayloadLocation,
+    run: packed::PendingV2IndexRunFacts,
 }
 
 /// Client-visible object resolved against an accepted v2 namespace state.
@@ -679,12 +690,13 @@ where
                     manifest_id: staged_manifest_id.clone(),
                     payload_id: payload_id.clone(),
                     payload_header,
+                    section_ordinal: 0,
+                    section_digest: [0_u8; 32],
                     sections_start: Self::sections_start_for_upload_mode(self.commit_upload_mode),
                     offset: 0,
                     length: payload_len,
                 };
                 let commit_key = commit_key.clone();
-                let finalizer_keyring = keyring.clone();
                 let finalize =
                     move |input: super::repository::V2StreamingPayloadFinalizationInput| {
                         if input.plaintext_len != staged_content_len
@@ -695,25 +707,24 @@ where
                         {
                             return Err(V2FormatError::SectionBounds);
                         }
+                        let mut location = expected_location;
+                        location.section_digest = input.payload_digest;
                         let pending = self
                             .pending_snapshot()
                             .map_err(|_| V2FormatError::InvalidHeaderField)?;
-                        let delta = self
-                            .pending_index_delta_for_commit(
+                        let sealed_run = self
+                            .pending_streaming_index_run_for_commit(
                                 &commit_key,
-                                std::slice::from_ref(&expected_location),
+                                &location,
                                 &pending,
                             )
                             .map_err(|_| V2FormatError::InvalidHeaderField)?;
-                        let sealed_delta = seal_index_delta_object(&finalizer_keyring, &delta)
-                            .map_err(|_| V2FormatError::InvalidHeaderField)?;
-                        let index_delta = Bytes::from(
-                            index_delta_object_bytes(&sealed_delta)
-                                .map_err(|_| V2FormatError::InvalidHeaderField)?,
-                        );
                         Ok(V2FinalizedStreamingPayloadWrite {
-                            index_delta,
-                            output: expected_location,
+                            index_run: sealed_run.bytes,
+                            output: StreamingV2PayloadFinalized {
+                                location,
+                                run: sealed_run.run,
+                            },
                         })
                     };
                 Ok(V2StreamingPayloadWrite {
@@ -739,13 +750,34 @@ where
                 return Err(error);
             }
         };
+        let mut output = uploaded.output;
+        let accepted_run = match self.verify_streaming_commit_sections(
+            &uploaded.stored,
+            &uploaded.payload_section,
+            &uploaded.index_run_section,
+            &mut output.location,
+            &output.run,
+        ) {
+            Ok(()) => {
+                let run = self.accepted_run_ref(output.run, &uploaded.stored);
+                self.validate_accepted_run_append(&run).map(|()| run)
+            }
+            Err(error) => Err(error),
+        };
+        let accepted_run = match accepted_run {
+            Ok(run) => run,
+            Err(error) => {
+                self.rollback_state_mutations(vec![rollback])?;
+                return Err(error);
+            }
+        };
         let mut pending = self.pending_snapshot()?;
         let install = match self.resolve_pending_payload_refs(
             &mut pending,
-            &uploaded.stored.anchor_state,
-            std::slice::from_ref(&uploaded.output),
+            &uploaded.stored,
+            std::slice::from_ref(&output.location),
         ) {
-            Ok(()) => self.prepare_pending_install(&pending, staged.sequence, None),
+            Ok(()) => self.prepare_pending_install(&pending, staged.sequence, Some(accepted_run)),
             Err(error) => Err(error),
         };
         let install = match install {
@@ -865,7 +897,6 @@ where
                 let payload_sealer = SegmentedPayloadSealer::new(&keyring, payload_segment_size)
                     .map_err(|_| V2FormatError::InvalidHeaderField)?;
                 let commit_key = commit_key.clone();
-                let finalizer_keyring = keyring.clone();
                 let key = key.clone();
                 let options = options.clone();
                 let payload_id_for_location = payload_id.clone();
@@ -895,6 +926,8 @@ where
                             manifest_id: staged.manifest_id.clone(),
                             payload_id: payload_id_for_location,
                             payload_header,
+                            section_ordinal: 0,
+                            section_digest: input.payload_digest,
                             sections_start: Self::sections_start_for_upload_mode(
                                 self.commit_upload_mode,
                             ),
@@ -904,22 +937,20 @@ where
                         let pending = self
                             .pending_snapshot()
                             .map_err(|_| V2FormatError::InvalidHeaderField)?;
-                        let delta = self
-                            .pending_index_delta_for_commit(
+                        let sealed_run = self
+                            .pending_streaming_index_run_for_commit(
                                 &commit_key,
-                                std::slice::from_ref(&location),
+                                &location,
                                 &pending,
                             )
                             .map_err(|_| V2FormatError::InvalidHeaderField)?;
-                        let sealed_delta = seal_index_delta_object(&finalizer_keyring, &delta)
-                            .map_err(|_| V2FormatError::InvalidHeaderField)?;
-                        let index_delta = Bytes::from(
-                            index_delta_object_bytes(&sealed_delta)
-                                .map_err(|_| V2FormatError::InvalidHeaderField)?,
-                        );
                         Ok(V2FinalizedStreamingPayloadWrite {
-                            index_delta,
-                            output: StreamingV2PutFinalized { staged, location },
+                            index_run: sealed_run.bytes,
+                            output: StreamingV2PutFinalized {
+                                staged,
+                                location,
+                                run: sealed_run.run,
+                            },
                         })
                     };
                 Ok(V2StreamingPayloadWrite {
@@ -951,14 +982,41 @@ where
                 return Err(error);
             }
         };
-        let sequence = uploaded.output.staged.sequence;
+        let mut output = uploaded.output;
+        let accepted_run = match self.verify_streaming_commit_sections(
+            &uploaded.stored,
+            &uploaded.payload_section,
+            &uploaded.index_run_section,
+            &mut output.location,
+            &output.run,
+        ) {
+            Ok(()) => {
+                let run = self.accepted_run_ref(output.run, &uploaded.stored);
+                self.validate_accepted_run_append(&run).map(|()| run)
+            }
+            Err(error) => Err(error),
+        };
+        let accepted_run = match accepted_run {
+            Ok(run) => run,
+            Err(error) => {
+                if let Some(rollback) = staged_rollback
+                    .lock()
+                    .map_err(|_| RepositoryError::StatePoisoned)?
+                    .take()
+                {
+                    self.rollback_state_mutations(vec![rollback])?;
+                }
+                return Err(error);
+            }
+        };
+        let sequence = output.staged.sequence;
         let mut pending = self.pending_snapshot()?;
         let install = match self.resolve_pending_payload_refs(
             &mut pending,
-            &uploaded.stored.anchor_state,
-            std::slice::from_ref(&uploaded.output.location),
+            &uploaded.stored,
+            std::slice::from_ref(&output.location),
         ) {
-            Ok(()) => self.prepare_pending_install(&pending, sequence, None),
+            Ok(()) => self.prepare_pending_install(&pending, sequence, Some(accepted_run)),
             Err(error) => Err(error),
         };
         let install = match install {
@@ -1002,7 +1060,7 @@ where
             );
             return Err(RepositoryError::AcceptedRecoveryRequired);
         }
-        Ok(uploaded.output.staged.metadata)
+        Ok(output.staged.metadata)
     }
 
     /// Stages an object write without publishing the covering v2 commit.
@@ -1292,11 +1350,17 @@ where
             commit_key,
             commit_version_id,
             body_digest,
+            commit_stored_len,
+            keyring_envelope_object_id,
+            keyring_envelope_digest,
+            payload_section_ordinal,
+            payload_section_digest,
             payload_id,
             payload_header,
             sections_start,
             offset,
             length,
+            ..
         } = payload_ref
         else {
             return Err(RepositoryError::InvalidObjectFormat {
@@ -1324,6 +1388,11 @@ where
                 commit_key,
                 commit_version_id,
                 body_digest,
+                commit_stored_len,
+                keyring_envelope_object_id,
+                keyring_envelope_digest,
+                payload_section_ordinal,
+                payload_section_digest,
                 payload_id,
                 payload_header,
                 sections_start,
@@ -1493,14 +1562,24 @@ where
                 let header = self
                     .read_commit_header_for_payload(&commit_header_key)
                     .await?;
-                ensure_payload_section_declared_in_header(&header, payload.offset, payload.length)?;
+                let (section_ordinal, section) =
+                    payload_section_descriptor_in_header(&header, payload.offset, payload.length)?;
+                if section_ordinal != payload.payload_section_ordinal
+                    || section.digest != payload.payload_section_digest
+                {
+                    return Err(v2_repository_error(V2FormatError::SectionBounds));
+                }
                 u64::try_from(header.sections_start)
                     .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?
             }
         };
-        let payload_start = sections_start
-            .checked_add(payload.offset)
-            .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?;
+        let payload_start = validated_v2_stream_payload_start(
+            sections_start,
+            payload.offset,
+            payload.length,
+            payload.commit_stored_len,
+        )
+        .map_err(v2_repository_error)?;
 
         if range == ByteRange::Full {
             let body = self
@@ -1515,6 +1594,11 @@ where
                 )
                 .await
                 .map_err(v2_repository_error)?;
+            if digest_v2_section(&body) != payload.payload_section_digest {
+                return Err(RepositoryError::InvalidObjectFormat {
+                    object_id: payload.payload_id.clone(),
+                });
+            }
             let plaintext = open_payload_object(keyring, &payload.payload_id, body.clone(), range)?;
             if u64::try_from(plaintext.len()).ok() != Some(payload.content_len) {
                 return Err(RepositoryError::InvalidObjectFormat {
@@ -1543,12 +1627,37 @@ where
             &payload.payload_id,
         )?;
         let span = segmented_ciphertext_span(&payload_header, range)?;
-        let payload_cache_ref = BackendObjectRef {
-            object_id: payload.payload_id.clone(),
-            version_id: payload.commit_version_id.clone(),
+        let keyring_envelope_ref = V2KeyringEnvelopeRef {
+            object_id: payload.keyring_envelope_object_id.clone(),
+            digest: payload.keyring_envelope_digest,
         };
+        let repository_keyring_context = packed::repository_context_from_refs(
+            &self.commit_store.options().repository_id,
+            &keyring_envelope_ref,
+        )?;
+        let payload_header_ref = payload_header_reference(&payload_header)?;
+        let payload_cache_ref = V2StreamPayloadCacheIdentity {
+            repository_keyring_context: &repository_keyring_context,
+            commit_key: &payload.commit_key,
+            commit_version_id: payload.commit_version_id.as_ref(),
+            commit_body_digest: payload.body_digest,
+            commit_stored_len: payload.commit_stored_len,
+            payload_section_ordinal: payload.payload_section_ordinal,
+            payload_section_digest: payload.payload_section_digest,
+            sections_start,
+            payload_section_offset: payload.offset,
+            payload_section_len: payload.length,
+            payload_id: &payload.payload_id,
+            payload_header: &payload_header_ref,
+            content_len: payload.content_len,
+        }
+        .cache_ref()
+        .map_err(v2_repository_error)?;
         if let Some(plaintext) = self.repository.open_cached_decrypted_segments(
-            &payload_cache_ref,
+            DecryptedSegmentIdentity {
+                cache_ref: &payload_cache_ref,
+                payload_id: &payload.payload_id,
+            },
             &payload_header,
             range,
         )? {
@@ -1559,7 +1668,10 @@ where
             .lock()
             .await;
         if let Some(plaintext) = self.repository.open_cached_decrypted_segments(
-            &payload_cache_ref,
+            DecryptedSegmentIdentity {
+                cache_ref: &payload_cache_ref,
+                payload_id: &payload.payload_id,
+            },
             &payload_header,
             range,
         )? {
@@ -1584,7 +1696,10 @@ where
         };
         self.repository.open_and_cache_decrypted_segments(
             keyring,
-            &payload_cache_ref,
+            DecryptedSegmentIdentity {
+                cache_ref: &payload_cache_ref,
+                payload_id: &payload.payload_id,
+            },
             &payload_header,
             range,
             span,
@@ -2077,30 +2192,7 @@ where
             })
             .await
             .map_err(v2_repository_error)?;
-        let accepted_run = accepted_run.map(|run| V2IndexRootRunRef {
-            run_id: run.run_id,
-            run_sequence: run.run_sequence,
-            minimum_generation: run.minimum_generation,
-            maximum_generation: run.maximum_generation,
-            mutation_count: run.mutation_count,
-            frame_count: run.frame_count,
-            level: 0,
-            compaction_generation: 0,
-            namespace_bounds: run.namespace_bounds,
-            listing_bounds: run.listing_bounds,
-            keyring_envelope_ref: run.keyring_envelope_ref,
-            location: V2EmbeddedIndexRunLocation {
-                commit_key: uploaded.anchor_state.commit_key.clone(),
-                version_id: uploaded.version_id.clone(),
-                commit_stored_len: uploaded.object_len,
-                commit_body_digest: uploaded.anchor_state.body_digest,
-                sections_start: uploaded.sections_start,
-                section_ordinal: run.section_ordinal,
-                section_offset: run.section_offset,
-                section_len: run.section_len,
-                section_digest: run.section_digest,
-            },
-        });
+        let accepted_run = accepted_run.map(|run| self.accepted_run_ref(run, &uploaded));
         if let Some(run) = accepted_run.as_ref() {
             let accepted = self
                 .accepted
@@ -2123,7 +2215,7 @@ where
             let locations = accepted_locations
                 .as_ref()
                 .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
-            self.resolve_pending_payload_refs(&mut pending, &uploaded.anchor_state, locations)?;
+            self.resolve_pending_payload_refs(&mut pending, &uploaded, locations)?;
         }
         let install = self.prepare_pending_install(&pending, sequence, accepted_run)?;
         let stored = self
@@ -2142,6 +2234,88 @@ where
             return Err(RepositoryError::AcceptedRecoveryRequired);
         }
         Ok(Some(stored))
+    }
+
+    fn accepted_run_ref(
+        &self,
+        run: packed::PendingV2IndexRunFacts,
+        uploaded: &V2StoredCommit,
+    ) -> V2IndexRootRunRef {
+        V2IndexRootRunRef {
+            run_id: run.run_id,
+            run_sequence: run.run_sequence,
+            minimum_generation: run.minimum_generation,
+            maximum_generation: run.maximum_generation,
+            mutation_count: run.mutation_count,
+            frame_count: run.frame_count,
+            level: 0,
+            compaction_generation: 0,
+            namespace_bounds: run.namespace_bounds,
+            listing_bounds: run.listing_bounds,
+            keyring_envelope_ref: run.keyring_envelope_ref,
+            location: V2EmbeddedIndexRunLocation {
+                commit_key: uploaded.anchor_state.commit_key.clone(),
+                version_id: uploaded.version_id.clone(),
+                commit_stored_len: uploaded.object_len,
+                commit_body_digest: uploaded.anchor_state.body_digest,
+                sections_start: uploaded.sections_start,
+                section_ordinal: run.section_ordinal,
+                section_offset: run.section_offset,
+                section_len: run.section_len,
+                section_digest: run.section_digest,
+            },
+        }
+    }
+
+    fn verify_streaming_commit_sections(
+        &self,
+        stored: &V2StoredCommit,
+        payload_section: &V2SectionDescriptor,
+        index_run_section: &V2SectionDescriptor,
+        location: &mut PendingV2PayloadLocation,
+        run: &packed::PendingV2IndexRunFacts,
+    ) -> Result<()> {
+        if location.section_ordinal != 0
+            || location.offset != 0
+            || payload_section.section_type != V2SectionType::Payload
+            || payload_section.flags != V2_SECTION_FLAG_MUST_UNDERSTAND
+            || payload_section.offset != location.offset
+            || payload_section.length != location.length
+            || payload_section.digest != location.section_digest
+            || run.section_ordinal != 1
+            || index_run_section.section_type != V2SectionType::IndexRun
+            || index_run_section.flags != V2_SECTION_FLAG_MUST_UNDERSTAND
+            || index_run_section.offset != run.section_offset
+            || index_run_section.length != run.section_len
+            || index_run_section.digest != run.section_digest
+            || run.section_offset != location.length
+            || run.keyring_envelope_ref != self.commit_store.options().keyring_envelope_ref
+            || location
+                .sections_start
+                .is_some_and(|sections_start| sections_start != stored.sections_start)
+        {
+            return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+        }
+        location.sections_start = Some(stored.sections_start);
+        Ok(())
+    }
+
+    fn validate_accepted_run_append(&self, run: &V2IndexRootRunRef) -> Result<()> {
+        let accepted = self
+            .accepted
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        if accepted.runs.len() >= V2_INDEX_ROOT_MAX_RUNS {
+            return Err(v2_repository_error(V2FormatError::IndexRootLimitExceeded));
+        }
+        if accepted
+            .runs
+            .last()
+            .is_some_and(|previous| previous.maximum_generation >= run.minimum_generation)
+        {
+            return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+        }
+        Ok(())
     }
 
     async fn ensure_accepted_anchor_matches<A>(
@@ -2386,6 +2560,7 @@ where
                 payload_header_reference(&parse_segmented_payload_header(&payload_id, &payload)?)?;
             let length = u64::try_from(payload.len())
                 .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
+            let section_digest = digest_v2_section(&payload);
             sections.push(V2CommitSection::new(
                 V2SectionType::Payload,
                 V2_SECTION_FLAG_MUST_UNDERSTAND,
@@ -2395,6 +2570,9 @@ where
                 manifest_id: pending.manifest_id.clone(),
                 payload_id,
                 payload_header,
+                section_ordinal: u32::try_from(ordinal)
+                    .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+                section_digest,
                 sections_start: Self::sections_start_for_upload_mode(self.commit_upload_mode),
                 offset: next_offset,
                 length,
@@ -2464,7 +2642,7 @@ where
     fn resolve_pending_payload_refs(
         &self,
         pending: &mut PendingV2Snapshot,
-        anchor_state: &super::repository::V2AnchorState,
+        stored: &V2StoredCommit,
         locations: &[PendingV2PayloadLocation],
     ) -> Result<()> {
         let mut resolved_count = 0_usize;
@@ -2478,12 +2656,22 @@ where
             else {
                 continue;
             };
-            entry.object_id = anchor_state.commit_key.clone();
-            entry.object_version_id = anchor_state.version_id.clone();
+            entry.object_id = stored.anchor_state.commit_key.clone();
+            entry.object_version_id = stored.anchor_state.version_id.clone();
             entry.payload_ref = Some(PayloadReference::V2Commit {
-                commit_key: anchor_state.commit_key.clone(),
-                commit_version_id: anchor_state.version_id.clone(),
-                body_digest: anchor_state.body_digest,
+                commit_key: stored.anchor_state.commit_key.clone(),
+                commit_version_id: stored.anchor_state.version_id.clone(),
+                body_digest: stored.anchor_state.body_digest,
+                commit_stored_len: stored.object_len,
+                keyring_envelope_object_id: self
+                    .commit_store
+                    .options()
+                    .keyring_envelope_ref
+                    .object_id
+                    .clone(),
+                keyring_envelope_digest: self.commit_store.options().keyring_envelope_ref.digest,
+                payload_section_ordinal: location.section_ordinal,
+                payload_section_digest: location.section_digest,
                 payload_id: location.payload_id.clone(),
                 payload_header: Some(location.payload_header.clone()),
                 sections_start: location.sections_start,
@@ -2799,7 +2987,8 @@ where
             else {
                 continue;
             };
-            ensure_payload_section_declared_in_header(&commit.parsed_header, offset, length)?;
+            let (payload_section_ordinal, payload_section) =
+                payload_section_descriptor_in_header(&commit.parsed_header, offset, length)?;
             let payload_header = match payload_header {
                 Some(reference) => reference,
                 None => {
@@ -2820,6 +3009,20 @@ where
                         commit_key: commit.parsed_header.header.self_ref.commit_key.clone(),
                         commit_version_id: commit.version_id.clone(),
                         body_digest: commit.parsed_header.header.body_digest,
+                        commit_stored_len: commit.object_len,
+                        keyring_envelope_object_id: commit
+                            .parsed_header
+                            .header
+                            .keyring_envelope_ref
+                            .object_id
+                            .clone(),
+                        keyring_envelope_digest: commit
+                            .parsed_header
+                            .header
+                            .keyring_envelope_ref
+                            .digest,
+                        payload_section_ordinal,
+                        payload_section_digest: payload_section.digest,
                         payload_id: payload_id.clone(),
                         payload_header: None,
                         sections_start: Some(sections_start),
@@ -2850,6 +3053,16 @@ where
                 commit_key,
                 commit_version_id: commit.version_id.clone(),
                 body_digest: commit.parsed_header.header.body_digest,
+                commit_stored_len: commit.object_len,
+                keyring_envelope_object_id: commit
+                    .parsed_header
+                    .header
+                    .keyring_envelope_ref
+                    .object_id
+                    .clone(),
+                keyring_envelope_digest: commit.parsed_header.header.keyring_envelope_ref.digest,
+                payload_section_ordinal,
+                payload_section_digest: payload_section.digest,
                 payload_id,
                 payload_header: Some(payload_header),
                 sections_start: Some(sections_start),
@@ -2990,6 +3203,11 @@ struct V2CommitPayloadRead {
     commit_key: BackendObjectId,
     commit_version_id: Option<BackendVersionId>,
     body_digest: [u8; 32],
+    commit_stored_len: u64,
+    keyring_envelope_object_id: BackendObjectId,
+    keyring_envelope_digest: [u8; 32],
+    payload_section_ordinal: u32,
+    payload_section_digest: [u8; 32],
     payload_id: BackendObjectId,
     payload_header: Option<PayloadHeaderReference>,
     sections_start: Option<u64>,
@@ -3260,7 +3478,8 @@ fn resolve_self_payload_refs(delta: &mut IndexDeltaObject, commit: &V2ParsedComm
         else {
             continue;
         };
-        ensure_payload_section_declared(commit, offset, length)?;
+        let (payload_section_ordinal, payload_section) =
+            payload_section_descriptor_in_header(&commit.parsed_header, offset, length)?;
         let payload_header = match payload_header {
             Some(reference) => reference,
             None => {
@@ -3288,6 +3507,17 @@ fn resolve_self_payload_refs(delta: &mut IndexDeltaObject, commit: &V2ParsedComm
             commit_key,
             commit_version_id: commit.version_id.clone(),
             body_digest: commit.parsed_header.header.body_digest,
+            commit_stored_len: u64::try_from(commit.body.len())
+                .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+            keyring_envelope_object_id: commit
+                .parsed_header
+                .header
+                .keyring_envelope_ref
+                .object_id
+                .clone(),
+            keyring_envelope_digest: commit.parsed_header.header.keyring_envelope_ref.digest,
+            payload_section_ordinal,
+            payload_section_digest: payload_section.digest,
             payload_id,
             payload_header: Some(payload_header),
             sections_start: Some(sections_start),
@@ -3312,29 +3542,28 @@ fn ensure_payload_header_matches_content_len(
     }
 }
 
-fn ensure_payload_section_declared(
-    commit: &V2ParsedCommit,
-    offset: u64,
-    length: u64,
-) -> Result<()> {
-    ensure_payload_section_declared_in_header(&commit.parsed_header, offset, length)
-}
-
-fn ensure_payload_section_declared_in_header(
+fn payload_section_descriptor_in_header(
     header: &V2ParsedCommitHeader,
     offset: u64,
     length: u64,
-) -> Result<()> {
-    let found = header.header.section_index.iter().any(|section| {
-        section.section_type == V2SectionType::Payload
-            && section.offset == offset
-            && section.length == length
-    });
-    if found {
-        Ok(())
-    } else {
-        Err(v2_repository_error(V2FormatError::SectionBounds))
-    }
+) -> Result<(u32, &crate::v2::V2SectionDescriptor)> {
+    header
+        .header
+        .section_index
+        .iter()
+        .enumerate()
+        .find(|(_, section)| {
+            section.section_type == V2SectionType::Payload
+                && section.offset == offset
+                && section.length == length
+        })
+        .map(|(ordinal, section)| {
+            u32::try_from(ordinal)
+                .map(|ordinal| (ordinal, section))
+                .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))
+        })
+        .transpose()?
+        .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))
 }
 
 fn commit_protection_for_deltas(

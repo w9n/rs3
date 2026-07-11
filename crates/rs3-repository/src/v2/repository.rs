@@ -440,13 +440,14 @@ pub(crate) struct V2StreamingPayloadWrite<St, Finalize, Output> {
 pub(crate) struct V2StreamingPayloadFinalizationInput {
     pub(crate) plaintext_len: u64,
     pub(crate) payload_len: u64,
+    pub(crate) payload_digest: [u8; 32],
     pub(crate) payload_header: crate::payload::SegmentedPayloadHeader,
 }
 
-/// Finalized index delta bytes and caller-owned output for a streamed payload.
+/// Finalized framed index-run bytes and caller-owned output for a streamed payload.
 #[derive(Clone, Debug)]
 pub(crate) struct V2FinalizedStreamingPayloadWrite<Output> {
-    pub(crate) index_delta: Bytes,
+    pub(crate) index_run: Bytes,
     pub(crate) output: Output,
 }
 
@@ -467,6 +468,8 @@ pub struct V2StoredCommit {
 
 pub(crate) struct V2StoredStreamingCommit<Output> {
     pub(crate) stored: V2StoredCommit,
+    pub(crate) payload_section: V2SectionDescriptor,
+    pub(crate) index_run_section: V2SectionDescriptor,
     pub(crate) output: Output,
 }
 
@@ -1729,6 +1732,8 @@ where
                 object_len: written.object_len,
                 sections_start: V2_MAX_HEADER_SIZE as u64,
             },
+            payload_section: written.payload_section,
+            index_run_section: written.index_run_section,
             output,
         })
     }
@@ -1976,6 +1981,7 @@ where
         let finalized = match (write.finalize)(V2StreamingPayloadFinalizationInput {
             plaintext_len: plaintext_seen,
             payload_len,
+            payload_digest: payload_digest.clone().finalize().into(),
             payload_header,
         }) {
             Ok(finalized) => finalized,
@@ -1984,36 +1990,35 @@ where
                 return Err(error);
             }
         };
-        let delta_len =
-            u64::try_from(finalized.index_delta.len()).map_err(|_| V2FormatError::SectionBounds)?;
+        let run_len =
+            u64::try_from(finalized.index_run.len()).map_err(|_| V2FormatError::SectionBounds)?;
         let object_len = (V2_MAX_HEADER_SIZE as u64)
             .checked_add(payload_len)
-            .and_then(|length| length.checked_add(delta_len))
+            .and_then(|length| length.checked_add(run_len))
             .ok_or(V2FormatError::SectionBounds)?;
-        let section_index = vec![
-            V2SectionDescriptor {
-                section_type: V2SectionType::Payload,
-                offset: 0,
-                length: payload_len,
-                flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-                digest: payload_digest.finalize().into(),
-            },
-            V2SectionDescriptor {
-                section_type: V2SectionType::IndexDelta,
-                offset: payload_len,
-                length: delta_len,
-                flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-                digest: digest_v2_section(&finalized.index_delta),
-            },
-        ];
+        let payload_section = V2SectionDescriptor {
+            section_type: V2SectionType::Payload,
+            offset: 0,
+            length: payload_len,
+            flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+            digest: payload_digest.finalize().into(),
+        };
+        let index_run_section = V2SectionDescriptor {
+            section_type: V2SectionType::IndexRun,
+            offset: payload_len,
+            length: run_len,
+            flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+            digest: digest_v2_section(&finalized.index_run),
+        };
+        let section_index = vec![payload_section.clone(), index_run_section.clone()];
 
-        body_digest.update(&finalized.index_delta);
+        body_digest.update(&finalized.index_run);
         if assembler
-            .push_section_bytes(&mut multipart, &finalized.index_delta)
+            .push_section_bytes(&mut multipart, &finalized.index_run)
             .await
             .is_err()
         {
-            abort_v2_commit_multipart(multipart, "index_delta").await;
+            abort_v2_commit_multipart(multipart, "index_run").await;
             return Err(V2FormatError::StorageOperationFailed);
         }
         let body_digest = body_digest.finalize().into();
@@ -2049,6 +2054,8 @@ where
             object_len,
             body_digest,
             signing_key_id: header.signing_key_id,
+            payload_section,
+            index_run_section,
             output: finalized.output,
         })
     }
@@ -2303,6 +2310,8 @@ struct V2StreamingCommitWriteResult<Output> {
     object_len: u64,
     body_digest: [u8; 32],
     signing_key_id: KeyId,
+    payload_section: V2SectionDescriptor,
+    index_run_section: V2SectionDescriptor,
     output: Output,
 }
 

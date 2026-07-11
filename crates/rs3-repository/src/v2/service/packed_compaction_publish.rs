@@ -14,7 +14,9 @@ use crate::v2::{
     V2MaintenanceGuard, V2MemoryAnchor, V2SectionType, V2StoredCommit, digest_v2_section,
     open_v2_index_run, probe_v2_index_run_header, seal_v2_index_root, seal_v2_index_run,
 };
-use rs3_index::run::{IndexRun, IndexRunContainer, IndexRunKeyringRef, IndexRunLimits};
+use rs3_index::run::{
+    IndexRun, IndexRunContainer, IndexRunKeyringRef, IndexRunLimits, IndexRunStreamContainer,
+};
 use rs3_storage::BlobStore;
 use rs3_types::{LegalHoldStatus, RetentionPolicy};
 
@@ -423,13 +425,62 @@ where
             )
             .map_err(v2_repository_error)?;
             let self_pack_container = source_self_pack_container(&run, &replay)?;
+            let self_stream_container = source_self_stream_container(&run, &replay)?;
             sources.push(PackedCompactionSourceRun {
                 run,
                 self_pack_container,
+                self_stream_container,
             });
         }
         Ok(sources)
     }
+}
+
+fn source_self_stream_container(
+    run: &IndexRun,
+    replay: &crate::v2::repository::V2ReplayCommit,
+) -> Result<Option<IndexRunStreamContainer>> {
+    let Some(stream) = run.self_stream.as_ref() else {
+        return Ok(None);
+    };
+    let section = replay
+        .parsed_header
+        .header
+        .section_index
+        .get(
+            usize::try_from(stream.payload_section_ordinal)
+                .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+        )
+        .ok_or_else(|| v2_repository_error(V2FormatError::InvalidIndexRun))?;
+    if section.section_type != V2SectionType::Payload
+        || section.flags != V2_SECTION_FLAG_MUST_UNDERSTAND
+    {
+        return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+    }
+    let sections_start = u64::try_from(replay.parsed_header.sections_start)
+        .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
+    Ok(Some(IndexRunStreamContainer {
+        object_id: replay.parsed_header.header.self_ref.commit_key.clone(),
+        version_id: replay.version_id.clone(),
+        stored_len: replay.object_len,
+        commit_body_digest: replay.parsed_header.header.body_digest,
+        keyring_envelope: IndexRunKeyringRef {
+            object_id: replay
+                .parsed_header
+                .header
+                .keyring_envelope_ref
+                .object_id
+                .clone(),
+            digest: replay.parsed_header.header.keyring_envelope_ref.digest,
+        },
+        sections_start,
+        payload_section_ordinal: stream.payload_section_ordinal,
+        payload_section_offset: section.offset,
+        payload_section_len: section.length,
+        payload_section_digest: section.digest,
+        payload_id: stream.payload_id.clone(),
+        payload_header: stream.payload_header.clone(),
+    }))
 }
 
 fn source_self_pack_container(

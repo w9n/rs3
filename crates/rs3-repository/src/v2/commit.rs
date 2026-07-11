@@ -1277,14 +1277,28 @@ pub(crate) fn validate_commit_section_semantics(header: &V2CommitHeader) -> V2Re
             header.section_index.as_slice(),
             [V2SectionDescriptor {
                 section_type: V2SectionType::IndexRun,
+                flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
                 ..
             }] | [
                 V2SectionDescriptor {
                     section_type: V2SectionType::PayloadPack,
+                    flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
                     ..
                 },
                 V2SectionDescriptor {
                     section_type: V2SectionType::IndexRun,
+                    flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                    ..
+                }
+            ] | [
+                V2SectionDescriptor {
+                    section_type: V2SectionType::Payload,
+                    flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                    ..
+                },
+                V2SectionDescriptor {
+                    section_type: V2SectionType::IndexRun,
+                    flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
                     ..
                 }
             ]

@@ -36,6 +36,11 @@ pub struct Repository<S> {
     decrypted_segments: RwLock<DecryptedSegmentCache>,
 }
 
+pub(crate) struct DecryptedSegmentIdentity<'a> {
+    pub(crate) cache_ref: &'a BackendObjectRef,
+    pub(crate) payload_id: &'a BackendObjectId,
+}
+
 /// Repository runtime options.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RepositoryOptions {
@@ -151,12 +156,12 @@ where
 
     pub(crate) fn open_cached_decrypted_segments(
         &self,
-        object_ref: &BackendObjectRef,
+        identity: DecryptedSegmentIdentity<'_>,
         header: &SegmentedPayloadHeader,
         range: ByteRange,
     ) -> Result<Option<Bytes>> {
         let selection = segmented_plaintext_selection(header, range)?;
-        match self.cached_decrypted_segments(object_ref, header, selection)? {
+        match self.cached_decrypted_segments(identity.cache_ref, header, selection)? {
             DecryptedSegmentLookup::Hit { segments, bytes } => {
                 record_decrypted_segment_cache_many(
                     "hit",
@@ -164,7 +169,7 @@ where
                     bytes,
                 );
                 Ok(Some(open_segmented_payload_cached_segments(
-                    &object_ref.object_id,
+                    identity.payload_id,
                     header,
                     range,
                     selection.start_segment,
@@ -184,7 +189,7 @@ where
     pub(crate) fn open_and_cache_decrypted_segments(
         &self,
         keyring: &KeyRing,
-        object_ref: &BackendObjectRef,
+        identity: DecryptedSegmentIdentity<'_>,
         header: &SegmentedPayloadHeader,
         range: ByteRange,
         span: SegmentCiphertextSpan,
@@ -192,13 +197,13 @@ where
     ) -> Result<Bytes> {
         let opened = open_segmented_payload_span_with_segments(
             keyring,
-            &object_ref.object_id,
+            identity.payload_id,
             header,
             range,
             span,
             ciphertext,
         )?;
-        self.cache_decrypted_segments(object_ref, &opened.segments)?;
+        self.cache_decrypted_segments(identity.cache_ref, &opened.segments)?;
         Ok(opened.plaintext)
     }
 
@@ -633,8 +638,15 @@ fn current_time_ms() -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecryptedSegmentCache, DecryptedSegmentCacheInsert};
+    use super::{
+        DecryptedSegmentCache, DecryptedSegmentCacheInsert, DecryptedSegmentIdentity, Repository,
+    };
+    use crate::payload::{
+        parse_segmented_payload_header, seal_streamable_payload_object, segmented_ciphertext_span,
+    };
+    use crate::test_support::signing_keyring;
     use bytes::Bytes;
+    use rs3_storage::{ByteRange, MemoryBlobStore};
     use rs3_types::{BackendObjectId, BackendObjectRef};
 
     fn object_id(value: &str) -> BackendObjectId {
@@ -710,5 +722,65 @@ mod tests {
         }
         assert!(cache.peek(&object, 0).is_none());
         assert_eq!(cache.current_bytes, 0);
+    }
+
+    #[test]
+    fn decrypted_segment_cache_identity_is_separate_from_payload_auth_identity() {
+        let keyring = signing_keyring();
+        let repository = Repository::with_keyring(MemoryBlobStore::new(), keyring.clone());
+        let payload_id = object_id("v2-payload/authenticated-payload");
+        let cache_ref = BackendObjectRef::from(object_id("v2-stream-cache/exact-carrier"));
+        let other_cache_ref = BackendObjectRef::from(object_id("v2-stream-cache/other-carrier"));
+        let plaintext = b"payload crossing more than one encrypted segment";
+        let sealed = seal_streamable_payload_object(&keyring, &payload_id, plaintext, 16)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let header = parse_segmented_payload_header(&payload_id, &sealed)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let range = ByteRange::Slice { offset: 7, len: 29 };
+        let span =
+            segmented_ciphertext_span(&header, range).unwrap_or_else(|error| panic!("{error}"));
+        let start = usize::try_from(span.offset).unwrap_or_else(|error| panic!("{error}"));
+        let end = usize::try_from(span.offset + span.len).unwrap_or_else(|error| panic!("{error}"));
+
+        let opened = repository
+            .open_and_cache_decrypted_segments(
+                &keyring,
+                DecryptedSegmentIdentity {
+                    cache_ref: &cache_ref,
+                    payload_id: &payload_id,
+                },
+                &header,
+                range,
+                span,
+                sealed.slice(start..end),
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(opened, Bytes::copy_from_slice(&plaintext[7..36]));
+        assert_eq!(
+            repository
+                .open_cached_decrypted_segments(
+                    DecryptedSegmentIdentity {
+                        cache_ref: &cache_ref,
+                        payload_id: &payload_id,
+                    },
+                    &header,
+                    range,
+                )
+                .unwrap_or_else(|error| panic!("{error}")),
+            Some(opened)
+        );
+        assert!(
+            repository
+                .open_cached_decrypted_segments(
+                    DecryptedSegmentIdentity {
+                        cache_ref: &other_cache_ref,
+                        payload_id: &payload_id,
+                    },
+                    &header,
+                    range,
+                )
+                .unwrap_or_else(|error| panic!("{error}"))
+                .is_none()
+        );
     }
 }

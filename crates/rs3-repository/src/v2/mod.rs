@@ -15,6 +15,7 @@ pub mod fuzzing;
 mod index_root;
 mod index_run;
 mod maintenance;
+mod payload_cache;
 mod payload_pack;
 mod provider;
 mod repository;
@@ -63,6 +64,7 @@ pub use maintenance::{
     V2MaintenancePlanCost, V2MaintenanceReport, V2OrphanCandidate, V2OrphanGcOptions,
     V2OrphanGcReport, V2OrphanReport,
 };
+pub(crate) use payload_cache::{V2StreamPayloadCacheIdentity, validated_v2_stream_payload_start};
 pub use payload_pack::{
     V2_PAYLOAD_PACK_ID_LEN, V2_PAYLOAD_PACK_MAX_BYTES, V2_PAYLOAD_PACK_MAX_RECORDS,
     V2_PAYLOAD_PACK_SEGMENT_BYTES, V2OpenedPayloadPackRecordSpan, V2PayloadPackFacts,

@@ -1505,7 +1505,8 @@ fn resolve_self_payload_refs(
         else {
             continue;
         };
-        ensure_payload_section_declared(commit, offset, length)?;
+        let (payload_section_ordinal, payload_section_digest) =
+            payload_section_facts(commit, offset, length)?;
         let sections_start = u64::try_from(commit.parsed_header.sections_start)
             .map_err(|_| V2FormatError::SectionBounds)?;
         let commit_key = commit.parsed_header.header.self_ref.commit_key.clone();
@@ -1515,6 +1516,16 @@ fn resolve_self_payload_refs(
             commit_key,
             commit_version_id: commit.version_id.clone(),
             body_digest: commit.parsed_header.header.body_digest,
+            commit_stored_len: commit.object_len,
+            keyring_envelope_object_id: commit
+                .parsed_header
+                .header
+                .keyring_envelope_ref
+                .object_id
+                .clone(),
+            keyring_envelope_digest: commit.parsed_header.header.keyring_envelope_ref.digest,
+            payload_section_ordinal,
+            payload_section_digest,
             payload_id,
             payload_header,
             sections_start: Some(sections_start),
@@ -1525,24 +1536,27 @@ fn resolve_self_payload_refs(
     Ok(())
 }
 
-fn ensure_payload_section_declared(
+fn payload_section_facts(
     commit: &V2ReplayCommit,
     offset: u64,
     length: u64,
-) -> V2Result<()> {
-    let found = commit
+) -> V2Result<(u32, [u8; 32])> {
+    commit
         .parsed_header
         .header
         .section_index
         .iter()
-        .any(|section| {
+        .enumerate()
+        .find(|(_, section)| {
             section.section_type == V2SectionType::Payload
                 && section.offset == offset
                 && section.length == length
-        });
-    if found {
-        Ok(())
-    } else {
-        Err(V2FormatError::SectionBounds)
-    }
+        })
+        .map(|(ordinal, section)| {
+            u32::try_from(ordinal)
+                .map(|ordinal| (ordinal, section.digest))
+                .map_err(|_| V2FormatError::SectionBounds)
+        })
+        .transpose()?
+        .ok_or(V2FormatError::SectionBounds)
 }

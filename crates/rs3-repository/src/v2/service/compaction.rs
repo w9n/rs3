@@ -7,7 +7,7 @@ use super::super::repository::{
 };
 use super::super::{
     V2_PAYLOAD_PACK_SEGMENT_BYTES, V2FullGcDryRunOptions, V2FullGcDryRunReport, V2MaintenanceGuard,
-    V2ProviderProfile, V2SectionType,
+    V2ProviderProfile, V2SectionType, digest_v2_section,
 };
 use super::{
     PendingV2CommitSections, PendingV2PayloadLocation, V2Repository, commit_protection_for_deltas,
@@ -536,6 +536,9 @@ where
         for payload in &plan.payloads {
             let length = u64::try_from(payload.payload.len())
                 .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
+            let section_ordinal = u32::try_from(sections.len())
+                .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
+            let section_digest = digest_v2_section(&payload.payload);
             sections.push(V2CommitSection::new(
                 V2SectionType::Payload,
                 V2_SECTION_FLAG_MUST_UNDERSTAND,
@@ -545,6 +548,8 @@ where
                 manifest_id: payload.entry.manifest_id.clone(),
                 payload_id: payload.payload_id.clone(),
                 payload_header: payload.payload_header.clone(),
+                section_ordinal,
+                section_digest,
                 sections_start: Self::sections_start_for_upload_mode(self.commit_upload_mode),
                 offset: next_offset,
                 length,

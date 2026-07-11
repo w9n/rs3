@@ -1,13 +1,17 @@
 //! Compact payload-pack and framed index-run publication for bounded v02 batches.
 
-use super::{PendingV2Snapshot, V2Repository, commit_protection_for_deltas, v2_repository_error};
+use super::{
+    PendingV2PayloadLocation, PendingV2Snapshot, V2Repository, commit_protection_for_deltas,
+    payload_header_from_reference, v2_repository_error,
+};
 use crate::error::{RepositoryError, Result};
 use crate::namespace::prefix_tokens_for_key;
+use crate::payload::total_segmented_payload_len;
 use crate::state::{RepositoryState, TrustedManifest, object_material};
 use rs3_index::run::{
     IndexBlindKey, IndexMutation, IndexPackRecordPointer, IndexPayloadPointer, IndexRun,
-    IndexRunContainer, IndexRunKeyringRef, IndexRunLimits, IndexRunSelfPack, IndexTombstone,
-    IndexUpsert,
+    IndexRunContainer, IndexRunKeyringRef, IndexRunLimits, IndexRunSelfPack, IndexRunSelfStream,
+    IndexRunStreamContainer, IndexTombstone, IndexUpsert,
 };
 use rs3_index::{IndexDelta, NamespaceEntry, PayloadReference};
 use rs3_storage::BlobStore;
@@ -39,6 +43,11 @@ pub(super) struct PendingV2PackedCommitSections {
     pub(super) legal_hold: Option<rs3_types::LegalHoldStatus>,
 }
 
+pub(super) struct PendingV2StreamingIndexRun {
+    pub(super) bytes: bytes::Bytes,
+    pub(super) run: PendingV2IndexRunFacts,
+}
+
 pub(super) struct PendingV2IndexRunFacts {
     pub(super) run_id: [u8; 32],
     pub(super) run_sequence: Sequence,
@@ -66,6 +75,114 @@ impl<S> V2Repository<S>
 where
     S: BlobStore + Clone,
 {
+    pub(super) fn pending_streaming_index_run_for_commit(
+        &self,
+        commit_key: &V2CommitKey,
+        location: &PendingV2PayloadLocation,
+        pending: &PendingV2Snapshot,
+    ) -> Result<PendingV2StreamingIndexRun> {
+        let keyring = self.repository.keyring()?;
+        let accepted = self
+            .accepted
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let mut mutations = Vec::with_capacity(pending.deltas().len());
+        for (ordinal, delta) in pending.deltas().iter().enumerate() {
+            let mutation_ordinal = u32::try_from(ordinal)
+                .map_err(|_| v2_repository_error(V2FormatError::IndexRunLimitExceeded))?;
+            match delta {
+                IndexDelta::Upsert { entry, .. } => {
+                    if entry.manifest_id != location.manifest_id
+                        || entry.content_len != location.payload_header.plaintext_len
+                    {
+                        return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
+                    }
+                    let manifest = pending
+                        .manifest(&accepted.repository, &entry.manifest_id)
+                        .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
+                    mutations.push(IndexMutation::Upsert(IndexUpsert {
+                        mutation_ordinal,
+                        blind_key: IndexBlindKey::try_from(&entry.blind_key)
+                            .map_err(|_| v2_repository_error(V2FormatError::InvalidHeaderField))?,
+                        namespace_key_id: entry.namespace_key_id.clone(),
+                        path: manifest.key.clone(),
+                        generation: entry.generation,
+                        payload: IndexPayloadPointer::SelfStream,
+                        content_len: entry.content_len,
+                        modified_at_ms: entry.modified_at_ms,
+                        retention: entry.retention,
+                        legal_hold: entry.legal_hold,
+                    }));
+                }
+                IndexDelta::Tombstone {
+                    namespace_key_id,
+                    blind_key,
+                    path,
+                    generation,
+                } => mutations.push(IndexMutation::Tombstone(IndexTombstone {
+                    mutation_ordinal,
+                    blind_key: IndexBlindKey::try_from(blind_key)
+                        .map_err(|_| v2_repository_error(V2FormatError::InvalidHeaderField))?,
+                    namespace_key_id: namespace_key_id.clone(),
+                    path: path.clone(),
+                    generation: *generation,
+                })),
+            }
+        }
+        drop(accepted);
+
+        let run_sequence = pending
+            .commit_sequence()
+            .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
+        let bounds = index_run_bounds(&mutations)?;
+        let mutation_count = u32::try_from(mutations.len())
+            .map_err(|_| v2_repository_error(V2FormatError::IndexRunLimitExceeded))?;
+        let run = IndexRun {
+            sequence: run_sequence,
+            self_pack: None,
+            self_stream: Some(IndexRunSelfStream {
+                payload_section_ordinal: location.section_ordinal,
+                payload_id: location.payload_id.clone(),
+                payload_header: location.payload_header.clone(),
+            }),
+            containers: Vec::new(),
+            stream_containers: Vec::new(),
+            mutations,
+        };
+        let context = commit_repository_context(self, commit_key)?;
+        let sealed = seal_v2_index_run(
+            &keyring,
+            &context,
+            &commit_key.object_id,
+            1,
+            &run,
+            &IndexRunLimits::default(),
+        )
+        .map_err(v2_repository_error)?;
+        let probe = probe_v2_index_run_header(sealed.bytes()).map_err(v2_repository_error)?;
+        let section_len = u64::try_from(sealed.bytes().len())
+            .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
+        let run = PendingV2IndexRunFacts {
+            run_id: *sealed.run_id().as_bytes(),
+            run_sequence,
+            minimum_generation: bounds.minimum_generation,
+            maximum_generation: bounds.maximum_generation,
+            mutation_count,
+            frame_count: probe.frame_count(),
+            namespace_bounds: bounds.namespace,
+            listing_bounds: bounds.listing,
+            keyring_envelope_ref: self.commit_store.options().keyring_envelope_ref.clone(),
+            section_ordinal: 1,
+            section_offset: location.length,
+            section_len,
+            section_digest: digest_v2_section(sealed.bytes()),
+        };
+        Ok(PendingV2StreamingIndexRun {
+            bytes: sealed.into_bytes(),
+            run,
+        })
+    }
+
     pub(super) fn pending_packed_sections_for_commit(
         &self,
         commit_key: &V2CommitKey,
@@ -136,6 +253,7 @@ where
         let index_section_ordinal = u32::from(pack_section_ordinal.is_some());
 
         let mut external_containers = BTreeSet::new();
+        let mut external_stream_containers = BTreeSet::new();
         for delta in &deltas {
             let IndexDelta::Upsert { entry, .. } = delta else {
                 continue;
@@ -176,13 +294,14 @@ where
                         pack_record_count: *pack_record_count,
                     });
                 }
-                // Transitional segmented payloads remain on the old delta path
-                // until the streaming writer adopts pack/run framing.
-                Some(PayloadReference::V2Commit { .. }) => return Ok(None),
+                Some(reference @ PayloadReference::V2Commit { .. }) => {
+                    external_stream_containers.insert(index_run_stream_container(reference)?);
+                }
                 _ => return Err(v2_repository_error(V2FormatError::InvalidHeaderField)),
             }
         }
         let containers = external_containers.into_iter().collect::<Vec<_>>();
+        let stream_containers = external_stream_containers.into_iter().collect::<Vec<_>>();
 
         let context = commit_repository_context(self, commit_key)?;
         let sealed_pack = if pack_inputs.is_empty() {
@@ -231,28 +350,25 @@ where
                                 plaintext_digest: *record.plaintext_digest(),
                             },
                         }
-                    } else {
-                        let Some(PayloadReference::V2Pack {
-                            commit_key,
-                            commit_version_id,
-                            body_digest,
-                            commit_stored_len,
-                            pack_section_ordinal,
-                            pack_offset,
-                            length,
-                            pack_id,
-                            content_key_id,
-                            keyring_envelope_object_id,
-                            keyring_envelope_digest,
-                            pack_record_count,
-                            record_ordinal,
-                            record_offset,
-                            plaintext_digest,
-                            ..
-                        }) = entry.payload_ref.as_ref()
-                        else {
-                            return Ok(None);
-                        };
+                    } else if let Some(PayloadReference::V2Pack {
+                        commit_key,
+                        commit_version_id,
+                        body_digest,
+                        commit_stored_len,
+                        pack_section_ordinal,
+                        pack_offset,
+                        length,
+                        pack_id,
+                        content_key_id,
+                        keyring_envelope_object_id,
+                        keyring_envelope_digest,
+                        pack_record_count,
+                        record_ordinal,
+                        record_offset,
+                        plaintext_digest,
+                        ..
+                    }) = entry.payload_ref.as_ref()
+                    {
                         let container = IndexRunContainer {
                             object_id: commit_key.clone(),
                             version_id: commit_version_id.clone(),
@@ -282,6 +398,20 @@ where
                                 plaintext_digest: *plaintext_digest,
                             },
                         }
+                    } else if let Some(reference @ PayloadReference::V2Commit { .. }) =
+                        entry.payload_ref.as_ref()
+                    {
+                        let container = index_run_stream_container(reference)?;
+                        let container_ordinal = stream_containers
+                            .binary_search(&container)
+                            .map_err(|_| v2_repository_error(V2FormatError::InvalidHeaderField))?;
+                        IndexPayloadPointer::ExternalStream {
+                            container_ordinal: u32::try_from(container_ordinal).map_err(|_| {
+                                v2_repository_error(V2FormatError::IndexRunLimitExceeded)
+                            })?,
+                        }
+                    } else {
+                        return Ok(None);
                     };
                     mutations.push(IndexMutation::Upsert(IndexUpsert {
                         mutation_ordinal,
@@ -358,7 +488,9 @@ where
         let run = IndexRun {
             sequence: run_sequence,
             self_pack: locations.iter().find_map(|location| location.pack.clone()),
+            self_stream: None,
             containers,
+            stream_containers,
             mutations,
         };
         let sealed_run = match seal_v2_index_run(
@@ -527,7 +659,10 @@ pub(in crate::v2) fn apply_packed_index_run(
         if replay.compaction_generation != 0 {
             return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
         }
-    } else if replay.compaction_generation == 0 || run.self_pack.is_some() {
+    } else if replay.compaction_generation == 0
+        || run.self_pack.is_some()
+        || run.self_stream.is_some()
+    {
         return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
     }
     // Logical mutations and signed commits have independent counters: one
@@ -635,6 +770,39 @@ pub(in crate::v2) fn apply_packed_index_run(
             None
         }
     };
+    let self_stream = match run.self_stream.as_ref() {
+        Some(stream) => {
+            let section = replay
+                .parsed_header
+                .header
+                .section_index
+                .get(
+                    usize::try_from(stream.payload_section_ordinal)
+                        .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+                )
+                .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?;
+            let payload_header = payload_header_from_reference(&stream.payload_header)?;
+            if section.section_type != V2SectionType::Payload
+                || section.flags != V2_SECTION_FLAG_MUST_UNDERSTAND
+                || total_segmented_payload_len(&payload_header)? != section.length
+            {
+                return Err(v2_repository_error(V2FormatError::SectionBounds));
+            }
+            Some((section, stream))
+        }
+        None => {
+            if replay
+                .parsed_header
+                .header
+                .section_index
+                .iter()
+                .any(|section| section.section_type == V2SectionType::Payload)
+            {
+                return Err(v2_repository_error(V2FormatError::SectionBounds));
+            }
+            None
+        }
+    };
 
     for mutation in run.mutations {
         match mutation {
@@ -713,6 +881,67 @@ pub(in crate::v2) fn apply_packed_index_run(
                             plaintext_digest: record.plaintext_digest,
                         })
                     }
+                    IndexPayloadPointer::SelfStream => {
+                        let Some((section, stream)) = self_stream else {
+                            return Err(v2_repository_error(V2FormatError::SectionBounds));
+                        };
+                        Some(PayloadReference::V2Commit {
+                            commit_key: commit_key.clone(),
+                            commit_version_id: replay.version_id.cloned(),
+                            body_digest: replay.parsed_header.header.body_digest,
+                            commit_stored_len: replay.object_len,
+                            keyring_envelope_object_id: replay
+                                .parsed_header
+                                .header
+                                .keyring_envelope_ref
+                                .object_id
+                                .clone(),
+                            keyring_envelope_digest: replay
+                                .parsed_header
+                                .header
+                                .keyring_envelope_ref
+                                .digest,
+                            payload_section_ordinal: stream.payload_section_ordinal,
+                            payload_section_digest: section.digest,
+                            payload_id: stream.payload_id.clone(),
+                            payload_header: Some(stream.payload_header.clone()),
+                            sections_start: Some(
+                                u64::try_from(replay.parsed_header.sections_start).map_err(
+                                    |_| v2_repository_error(V2FormatError::SectionBounds),
+                                )?,
+                            ),
+                            offset: section.offset,
+                            length: section.length,
+                        })
+                    }
+                    IndexPayloadPointer::ExternalStream { container_ordinal } => {
+                        let container = run
+                            .stream_containers
+                            .get(
+                                usize::try_from(container_ordinal).map_err(|_| {
+                                    v2_repository_error(V2FormatError::InvalidIndexRun)
+                                })?,
+                            )
+                            .ok_or_else(|| v2_repository_error(V2FormatError::InvalidIndexRun))?;
+                        Some(PayloadReference::V2Commit {
+                            commit_key: container.object_id.clone(),
+                            commit_version_id: container.version_id.clone(),
+                            body_digest: container.commit_body_digest,
+                            commit_stored_len: container.stored_len,
+                            keyring_envelope_object_id: container
+                                .keyring_envelope
+                                .object_id
+                                .clone(),
+                            keyring_envelope_digest: container.keyring_envelope.digest,
+                            payload_section_ordinal: container.payload_section_ordinal,
+                            payload_section_digest: container.payload_section_digest,
+                            payload_id: container.payload_id.clone(),
+                            payload_header: Some(container.payload_header.clone()),
+                            sections_start: Some(container.sections_start),
+                            offset: container.payload_section_offset,
+                            length: container.payload_section_len,
+                        })
+                    }
                 };
                 let manifest_id = keyring.derive_manifest_id(&object_material(
                     upsert.path.as_str(),
@@ -720,6 +949,11 @@ pub(in crate::v2) fn apply_packed_index_run(
                 ))?;
                 let (object_id, object_version_id) = match payload_ref.as_ref() {
                     Some(PayloadReference::V2Pack {
+                        commit_key,
+                        commit_version_id,
+                        ..
+                    }) => (commit_key.clone(), commit_version_id.clone()),
+                    Some(PayloadReference::V2Commit {
                         commit_key,
                         commit_version_id,
                         ..
@@ -781,6 +1015,44 @@ fn index_run_self_pack(layout: &V2PayloadPackLayout) -> IndexRunSelfPack {
         stored_len: u64::from(layout.facts().stored_len()),
         record_count: layout.facts().record_count(),
     }
+}
+
+fn index_run_stream_container(reference: &PayloadReference) -> Result<IndexRunStreamContainer> {
+    let PayloadReference::V2Commit {
+        commit_key,
+        commit_version_id,
+        body_digest,
+        commit_stored_len,
+        keyring_envelope_object_id,
+        keyring_envelope_digest,
+        payload_section_ordinal,
+        payload_section_digest,
+        payload_id,
+        payload_header: Some(payload_header),
+        sections_start: Some(sections_start),
+        offset,
+        length,
+    } = reference
+    else {
+        return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
+    };
+    Ok(IndexRunStreamContainer {
+        object_id: commit_key.clone(),
+        version_id: commit_version_id.clone(),
+        stored_len: *commit_stored_len,
+        commit_body_digest: *body_digest,
+        keyring_envelope: IndexRunKeyringRef {
+            object_id: keyring_envelope_object_id.clone(),
+            digest: *keyring_envelope_digest,
+        },
+        sections_start: *sections_start,
+        payload_section_ordinal: *payload_section_ordinal,
+        payload_section_offset: *offset,
+        payload_section_len: *length,
+        payload_section_digest: *payload_section_digest,
+        payload_id: payload_id.clone(),
+        payload_header: payload_header.clone(),
+    })
 }
 
 fn index_pack_record_pointer(record: &V2PayloadPackRecord) -> IndexPackRecordPointer {

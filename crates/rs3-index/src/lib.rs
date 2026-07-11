@@ -129,6 +129,16 @@ pub enum PayloadReference {
         commit_version_id: Option<BackendVersionId>,
         /// Commit body digest from the signed header.
         body_digest: [u8; 32],
+        /// Provider-reported complete commit-object length.
+        commit_stored_len: u64,
+        /// Historical encrypted-keyring envelope object bound into payload AEAD context.
+        keyring_envelope_object_id: BackendObjectId,
+        /// SHA-256 digest of that encrypted-keyring envelope.
+        keyring_envelope_digest: [u8; 32],
+        /// Signed section ordinal containing the streamed payload.
+        payload_section_ordinal: u32,
+        /// Signed digest of the complete streamed payload section.
+        payload_section_digest: [u8; 32],
         /// Opaque payload identity used as the AEAD associated-data object id.
         payload_id: BackendObjectId,
         /// Parsed segmented-payload header needed for direct range reads.

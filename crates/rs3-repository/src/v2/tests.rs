@@ -15,6 +15,7 @@ use super::{
 };
 use crate::{CommitCoordinatorOptions, RepositoryError, RepositoryOptions, RepositoryPutOptions};
 use bytes::Bytes;
+use futures_util::stream;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions};
 use rs3_types::{
@@ -783,6 +784,25 @@ fn framed_delta_section_shapes_round_trip() {
                 },
             ],
         ),
+        (
+            Bytes::from_static(b"payloadindex-run"),
+            vec![
+                V2SectionDescriptor {
+                    section_type: V2SectionType::Payload,
+                    offset: 0,
+                    length: 7,
+                    flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                    digest: digest_v2_section(b"payload"),
+                },
+                V2SectionDescriptor {
+                    section_type: V2SectionType::IndexRun,
+                    offset: 7,
+                    length: 9,
+                    flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+                    digest: digest_v2_section(b"index-run"),
+                },
+            ],
+        ),
     ];
 
     for (section_region, section_index) in cases {
@@ -818,7 +838,17 @@ fn framed_section_semantics_reject_noncanonical_shapes() {
             V2SectionType::PayloadPack,
             V2SectionType::IndexRun,
         ],
-        vec![V2SectionType::Payload, V2SectionType::IndexRun],
+        vec![V2SectionType::IndexRun, V2SectionType::Payload],
+        vec![
+            V2SectionType::Payload,
+            V2SectionType::Payload,
+            V2SectionType::IndexRun,
+        ],
+        vec![
+            V2SectionType::Payload,
+            V2SectionType::IndexRun,
+            V2SectionType::IndexRun,
+        ],
         vec![V2SectionType::IndexDelta, V2SectionType::IndexRun],
     ];
     for shape in invalid_shapes {
@@ -3723,6 +3753,217 @@ async fn v2_commit_coordinator_round_trips_128_writes_across_reload() {
 }
 
 #[tokio::test]
+async fn v2_framed_streaming_known_and_unknown_lengths_checkpoint_and_reload() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository_options = RepositoryOptions {
+        adaptive_payload_segment_size: false,
+        ..RepositoryOptions::default()
+    };
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        repository_options,
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    let known_key = must_type(LogicalPath::new("streaming/known.bin"));
+    let unknown_key = must_type(LogicalPath::new("streaming/unknown.bin"));
+    let empty_key = must_type(LogicalPath::new("streaming/empty.bin"));
+    let known_body = Bytes::from(
+        (0..131_089)
+            .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+            .collect::<Vec<_>>(),
+    );
+    let unknown_body = Bytes::from(vec![0x6d; 70_003]);
+    let multipart_part_size = super::commit::V2_MAX_HEADER_SIZE + 32 * 1024;
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed_streaming_known_len(
+                &anchor,
+                known_key.clone(),
+                known_body.len() as u64,
+                stream::iter(vec![
+                    Ok::<Bytes, RepositoryError>(known_body.slice(..31_337)),
+                    Ok(known_body.slice(31_337..96_001)),
+                    Ok(known_body.slice(96_001..)),
+                ]),
+                RepositoryPutOptions::default(),
+                multipart_part_size,
+            )
+            .await,
+    );
+    let known_chain = must_v2(
+        repository
+            .commit_store()
+            .load_chain_from_anchor(&anchor)
+            .await,
+    )
+    .expect("known streamed commit should be anchored");
+    assert_eq!(
+        known_chain.commits_newest_first[0]
+            .parsed_header
+            .header
+            .section_index
+            .iter()
+            .map(|section| section.section_type)
+            .collect::<Vec<_>>(),
+        vec![V2SectionType::Payload, V2SectionType::IndexRun]
+    );
+    assert!(
+        known_chain.commits_newest_first[0]
+            .parsed_header
+            .header
+            .section_index
+            .iter()
+            .all(|section| section.flags == V2_SECTION_FLAG_MUST_UNDERSTAND)
+    );
+    assert_eq!(
+        known_chain.commits_newest_first[0]
+            .parsed_header
+            .upload_mode,
+        V2UploadMode::MultipartPadded
+    );
+
+    must_repo(
+        repository
+            .put_committed_streaming_unknown_len(
+                &anchor,
+                unknown_key.clone(),
+                stream::iter(vec![
+                    Ok::<Bytes, RepositoryError>(unknown_body.slice(..17_777)),
+                    Ok(unknown_body.slice(17_777..)),
+                ]),
+                RepositoryPutOptions::default(),
+                multipart_part_size,
+                128 * 1024,
+            )
+            .await,
+    );
+    let unknown_chain = must_v2(
+        repository
+            .commit_store()
+            .load_chain_from_anchor(&anchor)
+            .await,
+    )
+    .expect("unknown streamed commit should be anchored");
+    assert_eq!(
+        unknown_chain.commits_newest_first[0]
+            .parsed_header
+            .header
+            .section_index
+            .iter()
+            .map(|section| section.section_type)
+            .collect::<Vec<_>>(),
+        vec![V2SectionType::Payload, V2SectionType::IndexRun]
+    );
+    assert!(
+        unknown_chain.commits_newest_first[0]
+            .parsed_header
+            .header
+            .section_index
+            .iter()
+            .all(|section| section.flags == V2_SECTION_FLAG_MUST_UNDERSTAND)
+    );
+
+    must_repo(
+        repository
+            .put_committed_streaming_known_len(
+                &anchor,
+                empty_key.clone(),
+                0,
+                stream::empty::<crate::Result<Bytes>>(),
+                RepositoryPutOptions::default(),
+                multipart_part_size,
+            )
+            .await,
+    );
+    let empty_chain = must_v2(
+        repository
+            .commit_store()
+            .load_chain_from_anchor(&anchor)
+            .await,
+    )
+    .expect("empty streamed commit should be anchored");
+    assert_eq!(
+        empty_chain.commits_newest_first[0]
+            .parsed_header
+            .header
+            .section_index
+            .iter()
+            .map(|section| section.section_type)
+            .collect::<Vec<_>>(),
+        vec![V2SectionType::Payload, V2SectionType::IndexRun]
+    );
+    assert!(
+        empty_chain.commits_newest_first[0]
+            .parsed_header
+            .header
+            .section_index
+            .iter()
+            .all(|section| section.flags == V2_SECTION_FLAG_MUST_UNDERSTAND)
+    );
+    assert_eq!(must_repo(repository.active_index_run_count()), 3);
+    let checkpoint = must_repo(repository.write_index_snapshot(&anchor).await);
+    assert_eq!(checkpoint.anchor_state.sequence, Sequence::new(5));
+
+    let fresh = V2Repository::new(store, keyring, repository_options, options);
+    let recovered = must_repo(fresh.load_chain_from_anchor(&anchor).await)
+        .expect("streaming checkpoint should reload");
+    assert_eq!(recovered.commits_newest_first.len(), 1);
+    assert_eq!(must_repo(fresh.active_index_run_count()), 3);
+    assert_eq!(must_repo(fresh.list("streaming/")).len(), 3);
+    assert_eq!(
+        must_repo(fresh.get_range(&known_key, ByteRange::Full).await),
+        known_body
+    );
+    assert_eq!(
+        must_repo(fresh.get_range(&unknown_key, ByteRange::Full).await),
+        unknown_body
+    );
+    assert_eq!(
+        must_repo(
+            fresh
+                .get_range(
+                    &known_key,
+                    ByteRange::Slice {
+                        offset: 65_530,
+                        len: 32,
+                    },
+                )
+                .await,
+        ),
+        known_body.slice(65_530..65_562)
+    );
+    assert_eq!(
+        must_repo(
+            fresh
+                .get_range(
+                    &unknown_key,
+                    ByteRange::Slice {
+                        offset: 17_770,
+                        len: 32,
+                    },
+                )
+                .await,
+        ),
+        unknown_body.slice(17_770..17_802)
+    );
+    assert_eq!(
+        must_repo(fresh.get_range(&empty_key, ByteRange::Full).await),
+        Bytes::new()
+    );
+}
+
+#[tokio::test]
 async fn v2_index_snapshot_bounds_replay_and_preserves_namespace() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
@@ -3940,6 +4181,107 @@ async fn v2_orphan_gc_keeps_live_payload_commits_referenced_by_index_snapshot() 
     assert_eq!(
         must_repo(fresh.get_range(&second_key, ByteRange::Full).await),
         second_body
+    );
+}
+
+#[tokio::test]
+async fn v2_orphan_gc_keeps_streamed_carrier_referenced_by_compacted_catalog() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository_options = RepositoryOptions {
+        adaptive_payload_segment_size: false,
+        ..RepositoryOptions::default()
+    };
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        repository_options,
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    let streamed_key = must_type(LogicalPath::new("streaming/gc-live.bin"));
+    let packed_key = must_type(LogicalPath::new("streaming/gc-packed.bin"));
+    let streamed_body = Bytes::from(vec![0x74; 192 * 1024 + 9]);
+    let multipart_part_size = super::commit::V2_MAX_HEADER_SIZE + 64 * 1024;
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed_streaming_unknown_len(
+                &anchor,
+                streamed_key.clone(),
+                stream::iter(vec![
+                    Ok::<Bytes, RepositoryError>(streamed_body.slice(..70_000)),
+                    Ok(streamed_body.slice(70_000..)),
+                ]),
+                RepositoryPutOptions::default(),
+                multipart_part_size,
+                256 * 1024,
+            )
+            .await,
+    );
+    let streamed_carrier = must_v2(anchor.read_v2().await).expect("stream carrier anchor");
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                packed_key.clone(),
+                Bytes::from_static(b"packed live payload"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(
+        repository
+            .compact_packed_index_runs(&anchor, &UnenforcedQuiescedMaintenanceGuard)
+            .await,
+    );
+    must_repo(repository.write_index_snapshot(&anchor).await);
+
+    let report = must_v2(repository.commit_store().report_orphans(&anchor).await);
+    assert!(
+        report
+            .candidates
+            .iter()
+            .all(|candidate| candidate.object_id != streamed_carrier.commit_key)
+    );
+    let gc = must_v2(
+        repository
+            .commit_store()
+            .delete_expired_orphans(
+                &anchor,
+                &UnenforcedQuiescedMaintenanceGuard,
+                V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+            )
+            .await,
+    );
+    assert!(gc.deleted_count > 0);
+    must_v2(
+        store
+            .head_at(
+                &streamed_carrier.commit_key,
+                streamed_carrier.version_id.as_ref(),
+            )
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed),
+    );
+
+    let fresh = V2Repository::new(store, keyring, repository_options, options);
+    must_repo(fresh.load_chain_from_anchor(&anchor).await)
+        .expect("GC should preserve the compacted streaming catalog");
+    assert_eq!(
+        must_repo(fresh.get_range(&streamed_key, ByteRange::Full).await),
+        streamed_body
+    );
+    assert_eq!(
+        must_repo(fresh.get_range(&packed_key, ByteRange::Full).await),
+        Bytes::from_static(b"packed live payload")
     );
 }
 
@@ -5012,6 +5354,136 @@ async fn v2_compaction_snapshot_rejects_packed_state_until_index_root_exists() {
     ));
     assert_eq!(restored, live_body);
     assert!(matches!(deleted, Err(RepositoryError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn v2_framed_streaming_run_compaction_preserves_payload_without_rewrite() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository_options = RepositoryOptions {
+        adaptive_payload_segment_size: false,
+        ..RepositoryOptions::default()
+    };
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        repository_options,
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    let streamed_key = must_type(LogicalPath::new("streaming/compacted.bin"));
+    let packed_key = must_type(LogicalPath::new("streaming/packed.bin"));
+    let deleted_key = must_type(LogicalPath::new("streaming/deleted.bin"));
+    let streamed_body = Bytes::from(vec![0x3a; 256 * 1024 + 17]);
+    let multipart_part_size = super::commit::V2_MAX_HEADER_SIZE + 64 * 1024;
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed_streaming_known_len(
+                &anchor,
+                streamed_key.clone(),
+                streamed_body.len() as u64,
+                stream::iter(vec![
+                    Ok::<Bytes, RepositoryError>(streamed_body.slice(..100_000)),
+                    Ok(streamed_body.slice(100_000..)),
+                ]),
+                RepositoryPutOptions::default(),
+                multipart_part_size,
+            )
+            .await,
+    );
+    let streamed_carrier = must_v2(anchor.read_v2().await).expect("stream carrier anchor");
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                packed_key.clone(),
+                Bytes::from_static(b"packed survivor"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                deleted_key.clone(),
+                Bytes::from_static(b"delete me"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(
+        repository
+            .delete_committed(&anchor, deleted_key.clone())
+            .await,
+    );
+    let source_run_count = must_repo(repository.active_index_run_count());
+    assert_eq!(source_run_count, 4);
+    store
+        .reset_operation_counts()
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    must_repo(
+        repository
+            .compact_packed_index_runs(&anchor, &UnenforcedQuiescedMaintenanceGuard)
+            .await,
+    );
+    let compaction_counts = store
+        .operation_counts()
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    assert_eq!(compaction_counts.multipart_put, 0);
+    assert_eq!(compaction_counts.delete, 0);
+    assert_eq!(compaction_counts.list, 0);
+    assert_eq!(compaction_counts.extend_retention, 0);
+    assert_eq!(compaction_counts.set_legal_hold, 0);
+    assert_eq!(compaction_counts.put, 2);
+    assert!(compaction_counts.bytes_read < streamed_body.len() as u64);
+    assert!(compaction_counts.bytes_written < streamed_body.len() as u64);
+    assert!(must_repo(repository.active_index_run_count()) < source_run_count);
+    must_v2(
+        store
+            .head_at(
+                &streamed_carrier.commit_key,
+                streamed_carrier.version_id.as_ref(),
+            )
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed),
+    );
+
+    let fresh = V2Repository::new(store, keyring, repository_options, options);
+    must_repo(fresh.load_chain_from_anchor(&anchor).await)
+        .expect("compacted streamed catalog should reload");
+    assert_eq!(
+        must_repo(
+            fresh
+                .get_range(
+                    &streamed_key,
+                    ByteRange::Slice {
+                        offset: 65_530,
+                        len: 32,
+                    },
+                )
+                .await,
+        ),
+        streamed_body.slice(65_530..65_562)
+    );
+    assert_eq!(
+        must_repo(fresh.get_range(&packed_key, ByteRange::Full).await),
+        Bytes::from_static(b"packed survivor")
+    );
+    assert!(matches!(
+        fresh.head(&deleted_key),
+        Err(RepositoryError::NotFound(_))
+    ));
 }
 
 #[tokio::test]
