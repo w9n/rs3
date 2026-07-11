@@ -215,6 +215,8 @@ impl RuntimeRepository {
     ) -> Result<Self, S3BoundaryError> {
         let store = build_store(&config.backend).await?;
         #[cfg(feature = "k8s")]
+        let maintenance_guard = writer_fence.clone();
+        #[cfg(feature = "k8s")]
         let anchor = build_v2_anchor_with_writer_fence(&config.anchor, writer_fence)?;
         #[cfg(not(feature = "k8s"))]
         let anchor = build_v2_anchor(&config.anchor)?;
@@ -263,11 +265,17 @@ impl RuntimeRepository {
                 .await
                 .map_err(repository_init)?;
         }
-        let coordinator = Arc::new(V2CommitCoordinator::with_options(
+        let coordinator = V2CommitCoordinator::with_options(
             Arc::clone(&repository),
             anchor_handle.clone(),
             coordinator_options(config.batching),
-        ));
+        );
+        #[cfg(feature = "k8s")]
+        let coordinator = match maintenance_guard {
+            Some(guard) => coordinator.with_maintenance_guard(guard),
+            None => coordinator,
+        };
+        let coordinator = Arc::new(coordinator);
 
         #[cfg(feature = "s3")]
         let s3_store = store.s3_store().cloned();

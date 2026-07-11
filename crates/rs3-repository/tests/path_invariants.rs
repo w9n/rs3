@@ -4,8 +4,8 @@ use bytes::Bytes;
 use proptest::prelude::*;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_repository::v2::{
-    V2CommitStoreOptions, V2FormatRef, V2KeyringEnvelopeRef, V2MemoryAnchor, V2ProviderProfile,
-    V2Repository,
+    UnenforcedQuiescedMaintenanceGuard, V2CommitStoreOptions, V2FormatRef, V2KeyringEnvelopeRef,
+    V2MemoryAnchor, V2ProviderProfile, V2Repository,
 };
 use rs3_repository::{RepositoryOptions, RepositoryPutOptions};
 use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore};
@@ -47,7 +47,7 @@ async fn check_committed_path(path: String) -> Result<(), String> {
         ),
     );
     let anchor = V2MemoryAnchor::new();
-    let logical_path = logical_path(path.clone())?;
+    let client_path = logical_path(path.clone())?;
 
     repository
         .write_genesis_snapshot(&anchor)
@@ -56,10 +56,23 @@ async fn check_committed_path(path: String) -> Result<(), String> {
     repository
         .put_committed(
             &anchor,
-            logical_path,
+            client_path,
             Bytes::from_static(b"constant test body"),
             RepositoryPutOptions::default(),
         )
+        .await
+        .map_err(|error| error.to_string())?;
+    repository
+        .put_committed(
+            &anchor,
+            logical_path(format!("{path}-compaction-peer"))?,
+            Bytes::from_static(b"second constant test body"),
+            RepositoryPutOptions::default(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    repository
+        .compact_packed_index_runs(&anchor, &UnenforcedQuiescedMaintenanceGuard)
         .await
         .map_err(|error| error.to_string())?;
 

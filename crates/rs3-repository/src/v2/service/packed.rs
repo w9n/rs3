@@ -55,11 +55,11 @@ pub(super) struct PendingV2IndexRunFacts {
     pub(super) section_digest: [u8; 32],
 }
 
-struct IndexRunBounds {
-    minimum_generation: Sequence,
-    maximum_generation: Sequence,
-    namespace: (IndexBlindKey, IndexBlindKey),
-    listing: (LogicalPath, LogicalPath),
+pub(in crate::v2) struct IndexRunBounds {
+    pub(in crate::v2) minimum_generation: Sequence,
+    pub(in crate::v2) maximum_generation: Sequence,
+    pub(in crate::v2) namespace: (IndexBlindKey, IndexBlindKey),
+    pub(in crate::v2) listing: (LogicalPath, LogicalPath),
 }
 
 impl<S> V2Repository<S>
@@ -504,6 +504,8 @@ pub(in crate::v2) struct V2PackedIndexRunReplay<'a> {
     pub(in crate::v2) object_len: u64,
     pub(in crate::v2) section_ordinal: u32,
     pub(in crate::v2) stored_run: &'a [u8],
+    pub(in crate::v2) level: u16,
+    pub(in crate::v2) compaction_generation: u64,
 }
 
 pub(in crate::v2) fn apply_packed_index_run(
@@ -535,6 +537,13 @@ pub(in crate::v2) fn apply_packed_index_run(
         &IndexRunLimits::default(),
     )
     .map_err(v2_repository_error)?;
+    if replay.level == 0 {
+        if replay.compaction_generation != 0 {
+            return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+        }
+    } else if replay.compaction_generation == 0 || run.self_pack.is_some() {
+        return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+    }
     // Logical mutations and signed commits have independent counters: one
     // batched commit can cover many mutation generations. Replay is oldest
     // first, so only enforce monotonicity within the mutation domain.
@@ -587,8 +596,8 @@ pub(in crate::v2) fn apply_packed_index_run(
         mutation_count,
         frame_count: u32::try_from(directory.frames().len())
             .map_err(|_| v2_repository_error(V2FormatError::IndexRunLimitExceeded))?,
-        level: 0,
-        compaction_generation: 0,
+        level: replay.level,
+        compaction_generation: replay.compaction_generation,
         namespace_bounds: bounds.namespace,
         listing_bounds: bounds.listing,
         keyring_envelope_ref: replay.parsed_header.header.keyring_envelope_ref.clone(),
@@ -796,7 +805,7 @@ fn index_pack_record_pointer(record: &V2PayloadPackRecord) -> IndexPackRecordPoi
     }
 }
 
-fn index_run_bounds(mutations: &[IndexMutation]) -> Result<IndexRunBounds> {
+pub(in crate::v2) fn index_run_bounds(mutations: &[IndexMutation]) -> Result<IndexRunBounds> {
     let Some(first) = mutations.first() else {
         return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
     };

@@ -1,12 +1,12 @@
 //! Canonical encrypted catalog for embedded v02 index-run sections.
 //!
-//! The first catalog generation deliberately supports only runs embedded in
-//! exact accepted commit versions. Standalone compacted-run references can be
-//! added as another canonical storage variant without changing the envelope.
+//! Run references name exact accepted foreground commits or exact
+//! metadata-only sibling commits published by guarded compaction.
 
 use super::{
-    V2_CAPABILITY_FRAMED_INDEX, V2_CAPABILITY_SIGNED_SECTION_DIGESTS, V2FormatError, V2FormatRef,
-    V2KeyringEnvelopeRef, V2Result,
+    V2_CAPABILITY_COMPACTED_INDEX_RUNS, V2_CAPABILITY_FRAMED_INDEX,
+    V2_CAPABILITY_SIGNED_SECTION_DIGESTS, V2FormatError, V2FormatRef, V2KeyringEnvelopeRef,
+    V2Result,
 };
 use bytes::Bytes;
 use getrandom::fill as fill_random;
@@ -26,6 +26,8 @@ pub const V2_INDEX_ROOT_MAX_RUNS: usize = 1_024;
 pub const V2_INDEX_ROOT_MAX_TOTAL_MUTATIONS: u64 = 16 * 1024 * 1024;
 /// Maximum cumulative encrypted run bytes claimed by one root.
 pub const V2_INDEX_ROOT_MAX_TOTAL_RUN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Maximum storage tier accepted in one index-root run reference.
+pub const V2_INDEX_ROOT_MAX_LEVEL: u16 = 1;
 /// Fixed public-envelope bytes required before the metadata key identifier.
 pub const V2_INDEX_ROOT_FIXED_HEADER_BYTES: usize = 72;
 
@@ -33,7 +35,7 @@ const INDEX_ROOT_MAGIC: &[u8; 8] = b"rs3:irt\n";
 const INDEX_ROOT_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-root-plaintext:v02\n";
 const INDEX_ROOT_AAD_DOMAIN: &[u8] = b"rs3:index-root-aad:v02\n";
 const INDEX_ROOT_FORMAT_GENERATION: u16 = 2;
-const INDEX_ROOT_WIRE_VERSION: u16 = 1;
+const INDEX_ROOT_WIRE_VERSION: u16 = 2;
 const INDEX_ROOT_NONCE_LEN: usize = 12;
 const INDEX_ROOT_TAG_LEN: usize = 16;
 const INDEX_ROOT_SEAL_OVERHEAD: usize = INDEX_ROOT_NONCE_LEN + INDEX_ROOT_TAG_LEN;
@@ -46,8 +48,9 @@ const INDEX_ROOT_MAX_RUN_RECORD_LEN: usize = 8 * 1_024;
 const INDEX_ROOT_MAX_RUN_BYTES: u64 = 8 * 1024 * 1024;
 const INDEX_ROOT_MAX_FRAMES_PER_RUN: u32 = 4_096;
 const INDEX_ROOT_MAX_MUTATIONS_PER_RUN: u32 = 65_536;
-const INDEX_ROOT_REQUIRED_CAPABILITIES: u64 =
-    V2_CAPABILITY_SIGNED_SECTION_DIGESTS | V2_CAPABILITY_FRAMED_INDEX;
+const INDEX_ROOT_REQUIRED_CAPABILITIES: u64 = V2_CAPABILITY_SIGNED_SECTION_DIGESTS
+    | V2_CAPABILITY_FRAMED_INDEX
+    | V2_CAPABILITY_COMPACTED_INDEX_RUNS;
 
 /// Random identity authenticated by the index-root envelope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -466,8 +469,8 @@ fn validate_runs(
             || run.minimum_generation > run.maximum_generation
             || run.maximum_generation != run.run_sequence
             || run.run_sequence > covered_generation
-            || run.level != 0
-            || run.compaction_generation != 0
+            || run.level > V2_INDEX_ROOT_MAX_LEVEL
+            || (run.level == 0) != (run.compaction_generation == 0)
             || run.namespace_bounds.0 > run.namespace_bounds.1
             || run.listing_bounds.0.as_str().as_bytes() > run.listing_bounds.1.as_str().as_bytes()
         {
@@ -1056,8 +1059,9 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        V2_INDEX_ROOT_FIXED_HEADER_BYTES, V2_INDEX_ROOT_MAX_RUNS, V2EmbeddedIndexRunLocation,
-        V2IndexRoot, V2IndexRootRunRef, open_v2_index_root, seal_v2_index_root,
+        V2_INDEX_ROOT_FIXED_HEADER_BYTES, V2_INDEX_ROOT_MAX_LEVEL, V2_INDEX_ROOT_MAX_RUNS,
+        V2EmbeddedIndexRunLocation, V2IndexRoot, V2IndexRootRunRef, open_v2_index_root,
+        seal_v2_index_root,
     };
     use crate::v2::{V2FormatError, V2FormatRef, V2KeyringEnvelopeRef};
     use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
@@ -1171,6 +1175,22 @@ mod tests {
         ))
     }
 
+    fn compacted_fixture() -> V2IndexRoot {
+        let mut older = run_ref(1, 8, "private/a");
+        older.level = 1;
+        older.compaction_generation = 10;
+        let mut newer = run_ref(2, 9, "private/b");
+        newer.level = V2_INDEX_ROOT_MAX_LEVEL;
+        newer.compaction_generation = 11;
+        must(V2IndexRoot::new(
+            Sequence::new(9),
+            2,
+            format_ref(),
+            keyring_ref(),
+            vec![newer, older],
+        ))
+    }
+
     #[test]
     fn encrypted_root_round_trips_and_sorts_runs() {
         let keyring = keyring();
@@ -1208,7 +1228,39 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(encoded).into();
         assert_eq!(
             hex::encode(digest),
-            "4be878b0bd86b2b39f3b0474d6d1c6c47f70beb57641162a0196b020148881ae"
+            "e01bdc75ba518aff1baa7ed92d0d5140aa92e6714c48cb31c05a0133752d018a"
+        );
+    }
+
+    #[test]
+    fn compacted_levels_round_trip_canonically() {
+        let keyring = keyring();
+        let object = object_id("commits/v02/00000000000000000012/compacted-root");
+        let root = compacted_fixture();
+        assert_eq!(root.claims().maximum_level(), V2_INDEX_ROOT_MAX_LEVEL);
+        let sealed = must(seal_v2_index_root(
+            &keyring,
+            REPOSITORY_CONTEXT,
+            &object,
+            0,
+            &root,
+        ));
+        assert_eq!(
+            must(open_v2_index_root(
+                &keyring,
+                REPOSITORY_CONTEXT,
+                &object,
+                0,
+                sealed.bytes(),
+            )),
+            root
+        );
+
+        let encoded = must(super::encode_root(&root));
+        let digest: [u8; 32] = Sha256::digest(encoded).into();
+        assert_eq!(
+            hex::encode(digest),
+            "af5a1487de478df37c2cd6d8de69baf4ffe7b0f2e46d7db859cca2b32aea8b38"
         );
     }
 
@@ -1344,6 +1396,68 @@ mod tests {
         assert!(matches!(
             V2IndexRoot::new(Sequence::new(9), 1, format_ref(), keyring_ref(), too_many),
             Err(V2FormatError::IndexRootLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_level_and_compaction_generation_pairs() {
+        let mut level_zero_with_generation = run_ref(1, 9, "private/a");
+        level_zero_with_generation.compaction_generation = 10;
+        assert!(matches!(
+            V2IndexRoot::new(
+                Sequence::new(9),
+                1,
+                format_ref(),
+                keyring_ref(),
+                vec![level_zero_with_generation],
+            ),
+            Err(V2FormatError::InvalidIndexRoot)
+        ));
+
+        let mut compacted_without_generation = run_ref(1, 9, "private/a");
+        compacted_without_generation.level = 1;
+        assert!(matches!(
+            V2IndexRoot::new(
+                Sequence::new(9),
+                1,
+                format_ref(),
+                keyring_ref(),
+                vec![compacted_without_generation],
+            ),
+            Err(V2FormatError::InvalidIndexRoot)
+        ));
+
+        let mut level_above_limit = run_ref(1, 9, "private/a");
+        level_above_limit.level = V2_INDEX_ROOT_MAX_LEVEL + 1;
+        level_above_limit.compaction_generation = 10;
+        assert!(matches!(
+            V2IndexRoot::new(
+                Sequence::new(9),
+                1,
+                format_ref(),
+                keyring_ref(),
+                vec![level_above_limit],
+            ),
+            Err(V2FormatError::InvalidIndexRoot)
+        ));
+    }
+
+    #[test]
+    fn rejects_legacy_root_wire_version() {
+        let keyring = keyring();
+        let object = object_id("commits/v02/00000000000000000010/root");
+        let sealed = must(seal_v2_index_root(
+            &keyring,
+            REPOSITORY_CONTEXT,
+            &object,
+            0,
+            &fixture(),
+        ));
+        let mut legacy = sealed.bytes().to_vec();
+        legacy[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        assert!(matches!(
+            open_v2_index_root(&keyring, REPOSITORY_CONTEXT, &object, 0, &legacy),
+            Err(V2FormatError::InvalidIndexRoot)
         ));
     }
 

@@ -24,26 +24,30 @@ mod service;
 mod tests;
 
 pub use commit::{
-    V2_CAPABILITY_FRAMED_INDEX, V2_CAPABILITY_SIGNED_SECTION_DIGESTS, V2_COMMIT_CONTENT_TYPE,
-    V2_COMMIT_MAGIC, V2_COMMIT_RANDOM_ID_B64_LEN, V2_COMMIT_RANDOM_ID_LEN, V2_DIGEST_LEN,
-    V2_FORMAT_VERSION, V2_HEADER_META_LEN, V2_MAX_COMMIT_SECTIONS, V2_MAX_HEADER_SIZE,
-    V2_MIN_READER_VERSION, V2_REQUIRED_CAPABILITY_FLAGS, V2_SECTION_FLAG_COMPRESSED,
-    V2_SECTION_FLAG_MUST_UNDERSTAND, V2_SIGNATURE_LEN, V2_SUPPORTED_CAPABILITY_FLAGS, V2Algorithms,
-    V2CommitHeader, V2CommitKey, V2CommitKind, V2CommitParentRef, V2CommitSelfRef,
-    V2KeyringEnvelopeRef, V2ParsedCommit, V2ParsedCommitHeader, V2SectionDescriptor, V2SectionType,
-    V2UploadMode, body_digest_for_v2_sections, digest_v2_section, generate_v2_commit_key,
-    parse_v2_commit_header, parse_v2_commit_object,
+    V2_CAPABILITY_COMPACTED_INDEX_RUNS, V2_CAPABILITY_FRAMED_INDEX,
+    V2_CAPABILITY_SIGNED_SECTION_DIGESTS, V2_COMMIT_CONTENT_TYPE, V2_COMMIT_MAGIC,
+    V2_COMMIT_RANDOM_ID_B64_LEN, V2_COMMIT_RANDOM_ID_LEN, V2_DIGEST_LEN, V2_FORMAT_VERSION,
+    V2_HEADER_META_LEN, V2_MAX_COMMIT_SECTIONS, V2_MAX_HEADER_SIZE, V2_MIN_READER_VERSION,
+    V2_REQUIRED_CAPABILITY_FLAGS, V2_SECTION_FLAG_COMPRESSED, V2_SECTION_FLAG_MUST_UNDERSTAND,
+    V2_SIGNATURE_LEN, V2_SUPPORTED_CAPABILITY_FLAGS, V2Algorithms, V2CommitHeader, V2CommitKey,
+    V2CommitKind, V2CommitParentRef, V2CommitSelfRef, V2KeyringEnvelopeRef, V2ParsedCommit,
+    V2ParsedCommitHeader, V2SectionDescriptor, V2SectionType, V2UploadMode,
+    body_digest_for_v2_sections, digest_v2_section, generate_v2_commit_key, parse_v2_commit_header,
+    parse_v2_commit_object,
 };
-pub use coordinator::{V2CommitCoordinator, V2CommitCoordinatorStatus, V2CommittedPut};
+pub use coordinator::{
+    V2_INDEX_COMPACTION_PAUSE_RUNS, V2_INDEX_COMPACTION_REQUEST_RUNS, V2CommitCoordinator,
+    V2CommitCoordinatorStatus, V2CommittedPut,
+};
 pub use error::{V2ErrorClass, V2FormatError, V2Result};
 pub use format::{
     V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef, V2MaintenanceConfig, v2_format_object_id,
 };
 pub use index_root::{
     V2_INDEX_ROOT_FIXED_HEADER_BYTES, V2_INDEX_ROOT_ID_LEN, V2_INDEX_ROOT_MAX_BYTES,
-    V2_INDEX_ROOT_MAX_RUNS, V2_INDEX_ROOT_MAX_TOTAL_MUTATIONS, V2_INDEX_ROOT_MAX_TOTAL_RUN_BYTES,
-    V2EmbeddedIndexRunLocation, V2IndexRoot, V2IndexRootClaims, V2IndexRootId, V2IndexRootRunRef,
-    V2SealedIndexRoot, open_v2_index_root, seal_v2_index_root,
+    V2_INDEX_ROOT_MAX_LEVEL, V2_INDEX_ROOT_MAX_RUNS, V2_INDEX_ROOT_MAX_TOTAL_MUTATIONS,
+    V2_INDEX_ROOT_MAX_TOTAL_RUN_BYTES, V2EmbeddedIndexRunLocation, V2IndexRoot, V2IndexRootClaims,
+    V2IndexRootId, V2IndexRootRunRef, V2SealedIndexRoot, open_v2_index_root, seal_v2_index_root,
 };
 pub use index_run::{
     V2_INDEX_RUN_FIXED_HEADER_BYTES, V2_INDEX_RUN_ID_LEN, V2_INDEX_RUN_MAX_FRAME_COUNT,

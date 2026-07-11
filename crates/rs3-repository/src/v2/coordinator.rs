@@ -2,6 +2,7 @@
 
 use super::repository::{V2AnchorState, V2CommitAnchor};
 use super::service::{V2Repository, V2StagedPutRollback};
+use super::{V2FormatError, V2MaintenanceGuard};
 use crate::CommitCoordinatorOptions;
 use crate::error::{RepositoryError, Result};
 use crate::model::{DeleteOutcome, RepositoryObjectMetadata, RepositoryPutOptions};
@@ -13,6 +14,12 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::sleep;
+
+/// Active-run count at which a guarded coordinator first requests compaction.
+pub const V2_INDEX_COMPACTION_REQUEST_RUNS: usize = 256;
+/// Active-run count at which writes pause unless guarded compaction succeeds.
+pub const V2_INDEX_COMPACTION_PAUSE_RUNS: usize = 896;
+const V2_INDEX_COMPACTION_RETRY_INTERVAL_RUNS: usize = 64;
 
 /// Result of a v2 write accepted by the external anchor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +38,7 @@ pub struct V2CommitCoordinator<S, A> {
     stage_lock: Arc<Mutex<()>>,
     batch: Arc<Mutex<PendingBatch>>,
     status: Arc<CoordinatorStatus>,
+    maintenance_guard: Option<Arc<dyn V2MaintenanceGuard>>,
 }
 
 #[derive(Default)]
@@ -131,7 +139,17 @@ where
             stage_lock: Arc::new(Mutex::new(())),
             batch: Arc::new(Mutex::new(PendingBatch::default())),
             status: Arc::new(CoordinatorStatus::default()),
+            maintenance_guard: None,
         }
+    }
+
+    /// Enables automatic metadata-only index compaction at catalog watermarks.
+    pub fn with_maintenance_guard<G>(mut self, guard: G) -> Self
+    where
+        G: V2MaintenanceGuard + 'static,
+    {
+        self.maintenance_guard = Some(Arc::new(guard));
+        self
     }
 
     /// Returns the coordinated v2 repository.
@@ -160,6 +178,7 @@ where
             let stage_lock_started = Instant::now();
             let _stage = self.stage_lock.lock().await;
             record_v2_commit_put_phase_duration("stage_lock_wait", stage_lock_started.elapsed());
+            self.prepare_index_catalog_for_growth_locked().await?;
             let should_start_timer = {
                 let batch = self.batch.lock().await;
                 if let Some(reason) = batch.failed.as_ref() {
@@ -278,6 +297,7 @@ where
     {
         let _stage = self.stage_lock.lock().await;
         self.publish_locked_batch().await?;
+        self.prepare_index_catalog_for_growth_locked().await?;
         let metadata = self
             .repository
             .put_committed_streaming_known_len(
@@ -315,6 +335,7 @@ where
     {
         let _stage = self.stage_lock.lock().await;
         self.publish_locked_batch().await?;
+        self.prepare_index_catalog_for_growth_locked().await?;
         let metadata = self
             .repository
             .put_committed_streaming_unknown_len(
@@ -342,6 +363,7 @@ where
     pub async fn delete_committed(&self, key: LogicalPath) -> Result<DeleteOutcome> {
         let _stage = self.stage_lock.lock().await;
         self.publish_locked_batch().await?;
+        self.prepare_index_catalog_for_growth_locked().await?;
         self.repository
             .delete_committed(self.anchor.as_ref(), key)
             .await
@@ -355,6 +377,7 @@ where
     ) -> Result<RepositoryObjectMetadata> {
         let _stage = self.stage_lock.lock().await;
         self.publish_locked_batch().await?;
+        self.prepare_index_catalog_for_growth_locked().await?;
         self.repository
             .set_legal_hold_committed(self.anchor.as_ref(), key, status)
             .await
@@ -364,6 +387,14 @@ where
     pub async fn write_index_snapshot(&self) -> Result<V2AnchorState> {
         let _stage = self.stage_lock.lock().await;
         self.publish_locked_batch().await?;
+        if self.prepare_index_catalog_for_growth_locked().await? {
+            return self
+                .anchor
+                .read_v2()
+                .await
+                .map_err(v2_commit_error)?
+                .ok_or_else(|| commit_failed("v2 anchor is missing after index compaction"));
+        }
         self.repository
             .write_index_snapshot(self.anchor.as_ref())
             .await
@@ -410,6 +441,79 @@ where
         }
         self.status.set_healthy();
         Ok(())
+    }
+
+    async fn prepare_index_catalog_for_growth_locked(&self) -> Result<bool> {
+        let initial_count = self.repository.active_index_run_count()?;
+        if initial_count < V2_INDEX_COMPACTION_REQUEST_RUNS {
+            return Ok(false);
+        }
+        let should_attempt = initial_count >= V2_INDEX_COMPACTION_PAUSE_RUNS
+            || initial_count % V2_INDEX_COMPACTION_RETRY_INTERVAL_RUNS == 0;
+        if !should_attempt {
+            return Ok(false);
+        }
+
+        // Another caller can stage the next batch before this task acquires
+        // the stage lock. Publish it first so compaction never folds
+        // unanchored mutations into a candidate root.
+        self.publish_locked_batch().await?;
+        let count = self.repository.active_index_run_count()?;
+        let level_zero_count = self.repository.active_level_zero_index_run_count()?;
+        if level_zero_count < 2 {
+            if count < V2_INDEX_COMPACTION_PAUSE_RUNS {
+                return Ok(false);
+            }
+            return self
+                .poison_for_compaction_failure(V2FormatError::MaintenanceBudgetExceeded.to_string())
+                .await;
+        }
+        if let Some(guard) = self.maintenance_guard.as_deref() {
+            match self
+                .repository
+                .compact_packed_index_runs(self.anchor.as_ref(), guard)
+                .await
+            {
+                Ok(_) => return Ok(true),
+                Err(RepositoryError::MaintenanceNotBeneficial)
+                    if count < V2_INDEX_COMPACTION_PAUSE_RUNS =>
+                {
+                    tracing::warn!(
+                        target: "rs3_repository",
+                        operation = "v2_index_auto_compaction",
+                        active_runs = count,
+                        result = "not_reducing",
+                        "v2 writer will retry bounded index compaction at a later watermark",
+                    );
+                    return Ok(false);
+                }
+                Err(error) => {
+                    return self.poison_for_compaction_failure(error.to_string()).await;
+                }
+            }
+        }
+        if count < V2_INDEX_COMPACTION_PAUSE_RUNS {
+            tracing::warn!(
+                target: "rs3_repository",
+                operation = "v2_index_auto_compaction",
+                active_runs = count,
+                result = "guard_unavailable",
+                "v2 index compaction is due but no maintenance guard is configured",
+            );
+            return Ok(false);
+        }
+        self.poison_for_compaction_failure(V2FormatError::MaintenanceAccessRequired.to_string())
+            .await
+    }
+
+    async fn poison_for_compaction_failure<T>(&self, reason: String) -> Result<T> {
+        let reason = format!("automatic v2 index compaction failed: {reason}");
+        {
+            let mut batch = self.batch.lock().await;
+            batch.failed = Some(reason.clone());
+        }
+        self.status.set_poisoned(reason.clone());
+        Err(RepositoryError::CommitFailed { reason })
     }
 }
 

@@ -10,8 +10,8 @@ use super::service::packed::{
     V2PackedIndexRunReplay, apply_packed_index_run, repository_context_from_refs,
 };
 use super::{
-    V2_CAPABILITY_FRAMED_INDEX, V2_SUPPORTED_CAPABILITY_FLAGS, V2CommitKind, V2IndexRootRunRef,
-    V2SectionType, open_v2_index_root,
+    V2_CAPABILITY_COMPACTED_INDEX_RUNS, V2_CAPABILITY_FRAMED_INDEX, V2_SUPPORTED_CAPABILITY_FLAGS,
+    V2CommitKind, V2IndexRootRunRef, V2SectionType, open_v2_index_root,
 };
 use crate::checkpoint::open_index_delta_object;
 use crate::state::{RepositoryState, apply_index_delta_object};
@@ -401,6 +401,7 @@ where
             || root.format_ref() != &self.options().format_ref
             || root.required_capabilities() & !V2_SUPPORTED_CAPABILITY_FLAGS != 0
             || root.required_capabilities() & V2_CAPABILITY_FRAMED_INDEX == 0
+            || root.required_capabilities() & V2_CAPABILITY_COMPACTED_INDEX_RUNS == 0
         {
             return Err(V2FormatError::InvalidIndexRoot);
         }
@@ -441,13 +442,30 @@ where
                 .section_index
                 .get(descriptor_index)
                 .ok_or(V2FormatError::InvalidIndexRoot)?;
+            let compacted = expected.level > 0;
+            let referenced_sequence = referenced_header.self_ref.sequence;
+            let valid_lineage = if compacted {
+                expected.compaction_generation == referenced_sequence.get()
+                    && referenced_sequence <= header.self_ref.sequence
+                    && referenced_header.parent.is_some()
+                    && referenced_header.section_index.len() == 1
+                    && descriptor_index == 0
+                    && if referenced_sequence == header.self_ref.sequence {
+                        referenced_header.parent == header.parent
+                    } else {
+                        referenced_sequence <= covered_parent_sequence
+                    }
+            } else {
+                expected.compaction_generation == 0
+                    && referenced_sequence <= covered_parent_sequence
+            };
             if replay.version_id != location.version_id
                 || replay.object_len != location.commit_stored_len
                 || replay.parsed_header.sections_start
                     != usize::try_from(location.sections_start)
                         .map_err(|_| V2FormatError::SectionBounds)?
                 || referenced_header.kind != V2CommitKind::Delta
-                || referenced_header.self_ref.sequence > covered_parent_sequence
+                || !valid_lineage
                 || referenced_header.body_digest != location.commit_body_digest
                 || referenced_header.keyring_envelope_ref != expected.keyring_envelope_ref
                 || descriptor.section_type != V2SectionType::IndexRun
@@ -469,6 +487,8 @@ where
                     object_len: replay.object_len,
                     section_ordinal: location.section_ordinal,
                     stored_run,
+                    level: expected.level,
+                    compaction_generation: expected.compaction_generation,
                 },
             )
             .map_err(|_| V2FormatError::InvalidIndexRun)?;
@@ -1032,6 +1052,8 @@ where
                             section_ordinal: u32::try_from(index)
                                 .map_err(|_| V2FormatError::SectionBounds)?,
                             stored_run: section_bytes,
+                            level: 0,
+                            compaction_generation: 0,
                         },
                     )
                     .map_err(|_| V2FormatError::InvalidIndexRun)?;

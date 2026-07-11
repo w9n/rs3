@@ -1,5 +1,6 @@
 use super::{
-    UnenforcedQuiescedMaintenanceGuard, V2AnchorState, V2CommitAnchor, V2CommitCoordinator,
+    UnenforcedQuiescedMaintenanceGuard, V2_INDEX_COMPACTION_PAUSE_RUNS,
+    V2_INDEX_COMPACTION_REQUEST_RUNS, V2AnchorState, V2CommitAnchor, V2CommitCoordinator,
     V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite, V2FullGcApplyOptions,
     V2FullGcDryRunOptions, V2MaintenanceBudgets, V2MaintenanceGuard, V2MemoryAnchor,
     V2OrphanGcOptions, V2RecoveryBundle, V2ReplayLimits, V2Repository,
@@ -4730,6 +4731,605 @@ async fn v2_compaction_snapshot_rejects_packed_state_until_index_root_exists() {
     ));
     assert_eq!(restored, live_body);
     assert!(matches!(deleted, Err(RepositoryError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn v2_packed_run_compaction_preserves_newest_state_without_copying_payloads() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    let overwritten_key = must_type(LogicalPath::new("snapshots/compacted-overwrite.bin"));
+    let deleted_key = must_type(LogicalPath::new("snapshots/compacted-delete.bin"));
+    let stable_key = must_type(LogicalPath::new("snapshots/compacted-stable.bin"));
+    let old_body = Bytes::from(vec![11_u8; 512]);
+    let new_body = Bytes::from(vec![12_u8; 512]);
+    let stable_body = Bytes::from(vec![13_u8; 512]);
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    for (key, body) in [
+        (overwritten_key.clone(), old_body),
+        (deleted_key.clone(), Bytes::from(vec![14_u8; 512])),
+        (overwritten_key.clone(), new_body.clone()),
+        (stable_key.clone(), stable_body.clone()),
+    ] {
+        must_repo(
+            repository
+                .put_committed(&anchor, key, body, RepositoryPutOptions::default())
+                .await,
+        );
+    }
+    must_repo(
+        repository
+            .delete_committed(&anchor, deleted_key.clone())
+            .await,
+    );
+    let source_run_count = must_repo(repository.active_index_run_count());
+    assert_eq!(source_run_count, 5);
+
+    store.reset_operation_counts();
+    must_repo(
+        repository
+            .compact_packed_index_runs(&anchor, &UnenforcedQuiescedMaintenanceGuard)
+            .await,
+    );
+    let compaction_counts = store.operation_counts();
+    assert_eq!(compaction_counts.list, 0);
+    assert_eq!(compaction_counts.delete, 0);
+    assert!(must_repo(repository.active_index_run_count()) < source_run_count);
+
+    let fresh = V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    );
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    store.reset_operation_counts();
+    assert_eq!(
+        must_repo(fresh.get_range(&overwritten_key, ByteRange::Full).await),
+        new_body
+    );
+    let cold_counts = store.operation_counts();
+    assert_eq!(cold_counts.get, 1);
+    assert_eq!(cold_counts.bytes_read, 528);
+    assert_eq!(cold_counts.bytes_written, 0);
+    assert_eq!(
+        must_repo(fresh.get_range(&stable_key, ByteRange::Full).await),
+        stable_body
+    );
+    assert!(fresh.head(&deleted_key).is_err());
+    assert_eq!(
+        must_repo(fresh.list("snapshots/"))
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>(),
+        vec![overwritten_key, stable_key]
+    );
+}
+
+#[tokio::test]
+async fn v2_packed_run_compaction_preserves_historical_pack_envelope_context() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = must_crypto(KeyRing::generate_random());
+    let original_options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let original = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        original_options,
+    );
+    let anchor = V2MemoryAnchor::new();
+    let first_key = must_type(LogicalPath::new("snapshots/compacted-envelope-a.bin"));
+    let second_key = must_type(LogicalPath::new("snapshots/compacted-envelope-b.bin"));
+    let first_body = Bytes::from(vec![21_u8; 512]);
+
+    must_repo(original.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        original
+            .put_committed(
+                &anchor,
+                first_key.clone(),
+                first_body.clone(),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(
+        original
+            .put_committed(
+                &anchor,
+                second_key,
+                Bytes::from(vec![22_u8; 512]),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+
+    let rotated_options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        V2KeyringEnvelopeRef {
+            object_id: object_id("keyrings/00000000000000000002-compaction"),
+            digest: [23_u8; 32],
+        },
+        sample_format_ref(),
+    );
+    let rotated = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        rotated_options.clone(),
+    );
+    must_repo(rotated.load_chain_from_anchor(&anchor).await);
+    must_repo(
+        rotated
+            .compact_packed_index_runs(&anchor, &UnenforcedQuiescedMaintenanceGuard)
+            .await,
+    );
+
+    let fresh = V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        rotated_options,
+    );
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    store.reset_operation_counts();
+    assert_eq!(
+        must_repo(fresh.get_range(&first_key, ByteRange::Full).await),
+        first_body
+    );
+    let counts = store.operation_counts();
+    assert_eq!(counts.get, 1);
+    assert_eq!(counts.head, 0);
+    assert_eq!(counts.list, 0);
+    assert_eq!(counts.bytes_read, 528);
+}
+
+#[tokio::test]
+async fn v2_packed_run_compaction_recovery_rejects_a_tampered_sibling() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    for index in 0..2 {
+        must_repo(
+            repository
+                .put_committed(
+                    &anchor,
+                    must_type(LogicalPath::new(format!(
+                        "snapshots/compacted-sibling-{index}.bin"
+                    ))),
+                    Bytes::from(vec![index as u8; 512]),
+                    RepositoryPutOptions::default(),
+                )
+                .await,
+        );
+    }
+    must_repo(
+        repository
+            .compact_packed_index_runs(&anchor, &UnenforcedQuiescedMaintenanceGuard)
+            .await,
+    );
+    let root = must_v2(anchor.read_v2().await).expect("compacted root should be anchored");
+    let sibling = store
+        .list_prefix("commits/v02/")
+        .await
+        .expect("memory store listing should succeed")
+        .into_iter()
+        .find(|metadata| {
+            metadata.object_id != root.commit_key
+                && V2CommitKey::parse(&metadata.object_id)
+                    .is_ok_and(|key| key.sequence == root.sequence)
+        })
+        .expect("compacted sibling should exist");
+    store.corrupt_ranged_commit_gets_for(sibling.object_id);
+
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    assert!(matches!(
+        fresh.load_chain_from_anchor(&anchor).await,
+        Err(RepositoryError::CommitFailed { .. })
+    ));
+}
+
+#[tokio::test]
+async fn v2_packed_run_compaction_guard_loss_leaves_the_base_anchored() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let anchor = V2MemoryAnchor::new();
+    let first_key = must_type(LogicalPath::new("snapshots/compaction-guard-a.bin"));
+    let second_key = must_type(LogicalPath::new("snapshots/compaction-guard-b.bin"));
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    for (key, body) in [
+        (first_key.clone(), Bytes::from_static(b"first")),
+        (second_key.clone(), Bytes::from_static(b"second")),
+    ] {
+        must_repo(
+            repository
+                .put_committed(&anchor, key, body, RepositoryPutOptions::default())
+                .await,
+        );
+    }
+    let base = must_v2(anchor.read_v2().await).expect("base anchor should exist");
+    let error = repository
+        .compact_packed_index_runs(&anchor, &FailsAfterMaintenanceGuard::new(2))
+        .await
+        .expect_err("lost maintenance guard must stop the final anchor CAS");
+
+    assert!(matches!(error, RepositoryError::CommitFailed { .. }));
+    assert_eq!(must_v2(anchor.read_v2().await), Some(base));
+    assert_eq!(
+        must_repo(repository.get_range(&first_key, ByteRange::Full).await),
+        Bytes::from_static(b"first")
+    );
+    assert_eq!(
+        must_repo(repository.get_range(&second_key, ByteRange::Full).await),
+        Bytes::from_static(b"second")
+    );
+    assert!(
+        must_v2(repository.commit_store().report_orphans(&anchor).await)
+            .candidates
+            .len()
+            >= 2
+    );
+}
+
+#[tokio::test]
+async fn v2_packed_run_compaction_loses_final_cas_without_local_adoption() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    for index in 0..2 {
+        must_repo(
+            repository
+                .put_committed(
+                    &anchor,
+                    must_type(LogicalPath::new(format!(
+                        "snapshots/compaction-cas-base-{index}.bin"
+                    ))),
+                    Bytes::from(vec![index as u8; 512]),
+                    RepositoryPutOptions::default(),
+                )
+                .await,
+        );
+    }
+
+    let competitor = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    must_repo(competitor.load_chain_from_anchor(&anchor).await);
+    let blocking_anchor = BlockingV2Anchor::new(anchor.clone());
+    let task_repository = Arc::clone(&repository);
+    let task_anchor = blocking_anchor.clone();
+    let compaction = tokio::spawn(async move {
+        task_repository
+            .compact_packed_index_runs(&task_anchor, &UnenforcedQuiescedMaintenanceGuard)
+            .await
+    });
+    blocking_anchor.wait_until_blocked().await;
+
+    let competing_key = must_type(LogicalPath::new("snapshots/compaction-cas-winner.bin"));
+    must_repo(
+        competitor
+            .put_committed(
+                &anchor,
+                competing_key.clone(),
+                Bytes::from_static(b"winner"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    blocking_anchor.release();
+    let error = compaction
+        .await
+        .expect("compaction task should join")
+        .expect_err("compaction must lose the final anchor CAS");
+
+    assert!(matches!(error, RepositoryError::CommitFailed { .. }));
+    assert!(repository.head(&competing_key).is_err());
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    assert_eq!(
+        must_repo(fresh.get_range(&competing_key, ByteRange::Full).await),
+        Bytes::from_static(b"winner")
+    );
+    assert!(
+        must_v2(repository.commit_store().report_orphans(&anchor).await)
+            .candidates
+            .len()
+            >= 2
+    );
+}
+
+#[tokio::test]
+async fn v2_packed_run_compaction_preserves_older_tier_across_cycles() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+
+    for cycle in 0..2 {
+        for index in 0..2 {
+            must_repo(
+                repository
+                    .put_committed(
+                        &anchor,
+                        must_type(LogicalPath::new(format!(
+                            "snapshots/tiered-cycle-{cycle}-{index}.bin"
+                        ))),
+                        Bytes::from(vec![(cycle * 2 + index) as u8; 512]),
+                        RepositoryPutOptions::default(),
+                    )
+                    .await,
+            );
+        }
+        must_repo(
+            repository
+                .compact_packed_index_runs(&anchor, &UnenforcedQuiescedMaintenanceGuard)
+                .await,
+        );
+    }
+
+    assert_eq!(must_repo(repository.active_index_run_count()), 2);
+    assert_eq!(must_repo(repository.active_level_zero_index_run_count()), 0);
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    assert_eq!(must_repo(fresh.active_index_run_count()), 2);
+    assert_eq!(must_repo(fresh.list("snapshots/")).len(), 4);
+    for cycle in 0..2 {
+        for index in 0..2 {
+            let key = must_type(LogicalPath::new(format!(
+                "snapshots/tiered-cycle-{cycle}-{index}.bin"
+            )));
+            assert_eq!(
+                must_repo(fresh.get_range(&key, ByteRange::Full).await),
+                Bytes::from(vec![(cycle * 2 + index) as u8; 512])
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn v2_coordinator_compacts_automatically_at_the_run_watermark() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        anchor.clone(),
+        CommitCoordinatorOptions::new(1, Duration::ZERO).with_max_pending_items(1),
+    )
+    .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard);
+    let object_count = V2_INDEX_COMPACTION_REQUEST_RUNS + 1;
+
+    for index in 0..object_count {
+        must_repo(
+            coordinator
+                .put_committed(
+                    must_type(LogicalPath::new(format!(
+                        "snapshots/automatic-compaction-{index:04}.bin"
+                    ))),
+                    Bytes::from(vec![index as u8; 32]),
+                    RepositoryPutOptions::default(),
+                )
+                .await,
+        );
+    }
+
+    assert!(must_repo(repository.active_index_run_count()) < V2_INDEX_COMPACTION_REQUEST_RUNS);
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    assert_eq!(must_repo(fresh.list("snapshots/")).len(), object_count);
+}
+
+#[tokio::test]
+async fn v2_coordinator_poisoned_compaction_guard_stops_before_staging() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                must_type(LogicalPath::new("snapshots/guard-poison-existing.bin")),
+                Bytes::from_static(b"existing"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(repository.resize_accepted_run_catalog_for_tests(V2_INDEX_COMPACTION_REQUEST_RUNS));
+    let coordinator = V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        anchor,
+        CommitCoordinatorOptions::new(1, Duration::ZERO).with_max_pending_items(1),
+    )
+    .with_maintenance_guard(FailsAfterMaintenanceGuard::new(0));
+    store
+        .reset_operation_counts()
+        .expect("memory store should reset operation counts");
+
+    let error = coordinator
+        .put_committed(
+            must_type(LogicalPath::new("snapshots/guard-poison-blocked.bin")),
+            Bytes::from_static(b"must not stage"),
+            RepositoryPutOptions::default(),
+        )
+        .await
+        .expect_err("maintenance guard loss must poison the writer");
+
+    assert!(matches!(error, RepositoryError::CommitFailed { .. }));
+    assert!(coordinator.status().poisoned);
+    assert_eq!(
+        store
+            .operation_counts()
+            .expect("memory store should expose operation counts")
+            .put,
+        0
+    );
+    assert!(
+        repository
+            .head(&must_type(LogicalPath::new(
+                "snapshots/guard-poison-blocked.bin"
+            )))
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn v2_coordinator_pauses_before_staging_when_compaction_guard_is_unavailable() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                must_type(LogicalPath::new("snapshots/watermark-existing.bin")),
+                Bytes::from_static(b"existing"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(repository.resize_accepted_run_catalog_for_tests(V2_INDEX_COMPACTION_PAUSE_RUNS));
+    let coordinator = V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        anchor.clone(),
+        CommitCoordinatorOptions::new(1, Duration::ZERO).with_max_pending_items(1),
+    );
+    let base = must_v2(anchor.read_v2().await).expect("base anchor should exist");
+    store
+        .reset_operation_counts()
+        .expect("memory store should reset operation counts");
+
+    let error = coordinator
+        .put_committed(
+            must_type(LogicalPath::new("snapshots/watermark-blocked.bin")),
+            Bytes::from_static(b"must not stage"),
+            RepositoryPutOptions::default(),
+        )
+        .await
+        .expect_err("pause watermark must require guarded compaction");
+
+    assert!(matches!(error, RepositoryError::CommitFailed { .. }));
+    assert_eq!(must_v2(anchor.read_v2().await), Some(base));
+    assert_eq!(
+        store
+            .operation_counts()
+            .expect("memory store should expose operation counts")
+            .put,
+        0
+    );
+    assert!(
+        repository
+            .head(&must_type(LogicalPath::new(
+                "snapshots/watermark-blocked.bin"
+            )))
+            .is_err()
+    );
 }
 
 #[tokio::test]

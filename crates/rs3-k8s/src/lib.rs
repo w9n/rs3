@@ -7,7 +7,9 @@ use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::PostParams;
 use kube::{Api, Client};
-use rs3_repository::v2::{V2AnchorState, V2CommitAnchor, V2FormatError, V2FormatRef, V2Result};
+use rs3_repository::v2::{
+    V2AnchorState, V2CommitAnchor, V2FormatError, V2FormatRef, V2MaintenanceGuard, V2Result,
+};
 use rs3_types::{BackendObjectId, BackendVersionId, KeyId, Sequence};
 use std::collections::BTreeMap;
 use tokio::sync::OnceCell;
@@ -80,6 +82,17 @@ impl KubernetesLeaseAnchor {
             })
             .await?;
         Ok(Api::namespaced(client.clone(), &self.settings.namespace))
+    }
+}
+
+#[async_trait]
+impl V2MaintenanceGuard for WriterFence {
+    async fn verify_v2_maintenance(&self, _base_anchor: Option<&V2AnchorState>) -> V2Result<()> {
+        if self.is_live() {
+            Ok(())
+        } else {
+            Err(V2FormatError::MaintenanceAccessRequired)
+        }
     }
 }
 

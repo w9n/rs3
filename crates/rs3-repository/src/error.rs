@@ -56,6 +56,9 @@ pub enum RepositoryError {
         /// Failure reason.
         reason: String,
     },
+    /// A validated maintenance candidate would not reduce repository metadata.
+    #[error("repository maintenance candidate is not reducing")]
+    MaintenanceNotBeneficial,
     /// Too many writes are waiting for coordinated commit.
     #[error("commit coordinator is overloaded")]
     CommitBackpressure,

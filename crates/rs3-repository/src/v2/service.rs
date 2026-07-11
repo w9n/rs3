@@ -56,6 +56,8 @@ use tokio::sync::Mutex;
 
 mod compaction;
 pub(super) mod packed;
+mod packed_compaction;
+mod packed_compaction_publish;
 
 const V2_PAYLOAD_FILL_LOCK_STRIPES: usize = 64;
 const V2_MAX_PAYLOAD_HEADER_SIZE: u64 = 4 * 1024;
@@ -1501,13 +1503,34 @@ where
 
     #[cfg(test)]
     pub(crate) fn fill_accepted_run_catalog_for_tests(&self) -> Result<()> {
+        self.resize_accepted_run_catalog_for_tests(V2_INDEX_ROOT_MAX_RUNS)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resize_accepted_run_catalog_for_tests(&self, count: usize) -> Result<()> {
         let mut runs = self
             .accepted_runs
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)?;
         let run = runs.last().cloned().ok_or(RepositoryError::StatePoisoned)?;
-        runs.resize(V2_INDEX_ROOT_MAX_RUNS, run);
+        runs.resize(count, run);
         Ok(())
+    }
+
+    /// Returns the path-redacted number of active authenticated index runs.
+    pub fn active_index_run_count(&self) -> Result<usize> {
+        self.accepted_runs
+            .read()
+            .map(|runs| runs.len())
+            .map_err(|_| RepositoryError::StatePoisoned)
+    }
+
+    /// Returns the path-redacted number of uncompacted foreground index runs.
+    pub(crate) fn active_level_zero_index_run_count(&self) -> Result<usize> {
+        self.accepted_runs
+            .read()
+            .map(|runs| runs.iter().filter(|run| run.level == 0).count())
+            .map_err(|_| RepositoryError::StatePoisoned)
     }
 
     pub(crate) async fn publish_pending_index_delta<A>(
@@ -2100,6 +2123,8 @@ where
                             section_ordinal: u32::try_from(index)
                                 .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
                             stored_run: section_bytes,
+                            level: 0,
+                            compaction_generation: 0,
                         },
                     )?;
                 }
@@ -2177,6 +2202,8 @@ where
                             section_ordinal: u32::try_from(index)
                                 .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
                             stored_run: section_bytes,
+                            level: 0,
+                            compaction_generation: 0,
                         },
                     )?);
                 }

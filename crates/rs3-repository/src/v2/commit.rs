@@ -35,9 +35,12 @@ pub const V2_MIN_READER_VERSION: u32 = 2;
 pub const V2_CAPABILITY_SIGNED_SECTION_DIGESTS: u64 = 1 << 0;
 /// Commit index sections use the framed v02 run/catalog encoding.
 pub const V2_CAPABILITY_FRAMED_INDEX: u64 = 1 << 1;
+/// Signed roots can reference metadata-only compacted run siblings.
+pub const V2_CAPABILITY_COMPACTED_INDEX_RUNS: u64 = 1 << 2;
 /// v02 capabilities understood by this transitional reader.
-pub const V2_SUPPORTED_CAPABILITY_FLAGS: u64 =
-    V2_CAPABILITY_SIGNED_SECTION_DIGESTS | V2_CAPABILITY_FRAMED_INDEX;
+pub const V2_SUPPORTED_CAPABILITY_FLAGS: u64 = V2_CAPABILITY_SIGNED_SECTION_DIGESTS
+    | V2_CAPABILITY_FRAMED_INDEX
+    | V2_CAPABILITY_COMPACTED_INDEX_RUNS;
 /// Capabilities required on every commit written or accepted by this reader.
 pub const V2_REQUIRED_CAPABILITY_FLAGS: u64 = V2_CAPABILITY_SIGNED_SECTION_DIGESTS;
 /// Section flag indicating the section type must be understood.
@@ -1305,5 +1308,14 @@ fn capability_flags_for_header(header: &V2CommitHeader) -> u64 {
     } else {
         0
     };
-    V2_REQUIRED_CAPABILITY_FLAGS | framed
+    let compacted_runs = if header
+        .section_index
+        .iter()
+        .any(|section| section.section_type == V2SectionType::IndexRoot)
+    {
+        V2_CAPABILITY_COMPACTED_INDEX_RUNS
+    } else {
+        0
+    };
+    V2_REQUIRED_CAPABILITY_FLAGS | framed | compacted_runs
 }
