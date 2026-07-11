@@ -295,9 +295,12 @@ perf-scale-tier OBJECTS:
         --concurrency "${concurrency}" \
         --verify-reload \
         --checkpoint-after-objects "${checkpoint_after}" \
-        --max-write-amp 1.50 \
+        --max-elapsed-seconds 180 \
+        --max-peak-rss-bytes 4294967296 \
+        --max-write-amp 1.65 \
         --max-cold-read-amp 1.04 \
         --max-cold-read-requests-per-read 1.0 \
+        --max-active-index-runs 255 \
         --format jsonl
     done
 

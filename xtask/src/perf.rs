@@ -10,8 +10,8 @@ use bytes::Bytes;
 use clap::{Args, ValueEnum};
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_repository::v2::{
-    V2CommitCoordinator, V2CommitStoreOptions, V2FormatRef, V2KeyringEnvelopeRef, V2MemoryAnchor,
-    V2ProviderProfile, V2Repository,
+    UnenforcedQuiescedMaintenanceGuard, V2CommitCoordinator, V2CommitStoreOptions, V2FormatRef,
+    V2KeyringEnvelopeRef, V2MemoryAnchor, V2ProviderProfile, V2Repository,
 };
 use rs3_repository::{
     CommitCoordinatorOptions, DEFAULT_PAYLOAD_SEGMENT_SIZE, RepositoryOptions, RepositoryPutOptions,
@@ -68,12 +68,21 @@ pub(crate) struct PerfArgs {
     /// Fail a write scenario when backend bytes exceed this plaintext ratio.
     #[arg(long)]
     max_write_amp: Option<f64>,
+    /// Fail a scenario when its elapsed time exceeds this many seconds.
+    #[arg(long)]
+    max_elapsed_seconds: Option<f64>,
+    /// Fail a scenario when the harness process peak RSS exceeds this many bytes.
+    #[arg(long)]
+    max_peak_rss_bytes: Option<u64>,
     /// Fail reload verification when cold-read bytes exceed this plaintext ratio.
     #[arg(long, requires = "verify_reload")]
     max_cold_read_amp: Option<f64>,
     /// Fail reload verification above this many backend requests per cold read.
     #[arg(long, requires = "verify_reload")]
     max_cold_read_requests_per_read: Option<f64>,
+    /// Fail reload verification above this many active authenticated index runs.
+    #[arg(long, requires = "verify_reload")]
+    max_active_index_runs: Option<usize>,
     /// Number of read operations in read scenarios.
     #[arg(long, default_value_t = 128)]
     reads: usize,
@@ -265,8 +274,10 @@ impl TraceFormat {
 pub(crate) fn run(args: PerfArgs) -> Result<()> {
     let cold_read_limits_requested =
         args.max_cold_read_amp.is_some() || args.max_cold_read_requests_per_read.is_some();
-    if cold_read_limits_requested && !args.verify_reload {
-        anyhow::bail!("cold-read limits require --verify-reload");
+    let reload_limits_requested =
+        cold_read_limits_requested || args.max_active_index_runs.is_some();
+    if reload_limits_requested && !args.verify_reload {
+        anyhow::bail!("reload limits require --verify-reload");
     }
     if args.verify_reload
         && !matches!(
@@ -291,6 +302,15 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
         anyhow::bail!("--max-write-amp must be finite and greater than zero");
     }
     if args
+        .max_elapsed_seconds
+        .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
+    {
+        anyhow::bail!("--max-elapsed-seconds must be finite and greater than zero");
+    }
+    if args.max_peak_rss_bytes == Some(0) {
+        anyhow::bail!("--max-peak-rss-bytes must be greater than zero");
+    }
+    if args
         .max_cold_read_amp
         .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
     {
@@ -307,6 +327,9 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
     }
     if args.max_cold_read_amp.is_some() && args.object_size == 0 {
         anyhow::bail!("--max-cold-read-amp requires a non-empty object");
+    }
+    if args.max_active_index_runs == Some(0) {
+        anyhow::bail!("--max-active-index-runs must be greater than zero");
     }
     #[cfg(feature = "containers")]
     if args.verify_reload && args.backend == PerfBackend::S3GatewayContainer {
@@ -348,9 +371,10 @@ async fn run_async(args: PerfArgs) -> Result<()> {
     if args.format == ReportFormat::Tsv {
         print_header();
     }
-    let cold_read_limits_requested =
-        args.max_cold_read_amp.is_some() || args.max_cold_read_requests_per_read.is_some();
-    let mut cold_read_gate_evaluated = false;
+    let reload_limits_requested = args.max_cold_read_amp.is_some()
+        || args.max_cold_read_requests_per_read.is_some()
+        || args.max_active_index_runs.is_some();
+    let mut reload_gate_evaluated = false;
     for scenario in scenarios {
         let report = match scenario {
             PerfScenario::All => unreachable!("expanded above"),
@@ -360,18 +384,25 @@ async fn run_async(args: PerfArgs) -> Result<()> {
             PerfScenario::FullRead => full_read(&args).await?,
             PerfScenario::RangeRead => range_read(&args).await?,
         };
+        let peak_rss_bytes = process_peak_rss_bytes();
         report.enforce_max_write_amplification(args.max_write_amp)?;
+        report.enforce_resource_limits(
+            args.max_elapsed_seconds,
+            args.max_peak_rss_bytes,
+            peak_rss_bytes,
+        )?;
         if report.reload_verification.is_some() {
             report.enforce_cold_read_limits(
                 args.max_cold_read_amp,
                 args.max_cold_read_requests_per_read,
             )?;
-            cold_read_gate_evaluated = cold_read_limits_requested;
+            report.enforce_active_index_run_limit(args.max_active_index_runs)?;
+            reload_gate_evaluated = reload_limits_requested;
         }
-        report.print(args.format)?;
+        report.print_with_peak_rss(args.format, peak_rss_bytes)?;
     }
-    if cold_read_limits_requested && !cold_read_gate_evaluated {
-        anyhow::bail!("cold-read limits did not receive reload verification evidence");
+    if reload_limits_requested && !reload_gate_evaluated {
+        anyhow::bail!("reload limits did not receive verification evidence");
     }
 
     Ok(())
@@ -445,11 +476,20 @@ fn add_perf_args(
     if let Some(max_write_amp) = args.max_write_amp {
         command.args(["--max-write-amp", &max_write_amp.to_string()]);
     }
+    if let Some(limit) = args.max_elapsed_seconds {
+        command.args(["--max-elapsed-seconds", &limit.to_string()]);
+    }
+    if let Some(limit) = args.max_peak_rss_bytes {
+        command.args(["--max-peak-rss-bytes", &limit.to_string()]);
+    }
     if let Some(max_cold_read_amp) = args.max_cold_read_amp {
         command.args(["--max-cold-read-amp", &max_cold_read_amp.to_string()]);
     }
     if let Some(limit) = args.max_cold_read_requests_per_read {
         command.args(["--max-cold-read-requests-per-read", &limit.to_string()]);
+    }
+    if let Some(limit) = args.max_active_index_runs {
+        command.args(["--max-active-index-runs", &limit.to_string()]);
     }
     command.args(["--reads", &args.reads.to_string()]);
     command.args(["--range-len", &args.range_len.to_string()]);
@@ -497,15 +537,18 @@ where
 {
     let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
     let batch_items = args.objects.max(1);
-    let coordinator = Arc::new(V2CommitCoordinator::with_options(
-        repo,
-        anchor,
-        CommitCoordinatorOptions::new(
-            batch_items,
-            Duration::from_millis(args.commit_batch_delay_ms),
+    let coordinator = Arc::new(
+        V2CommitCoordinator::with_options(
+            repo,
+            anchor,
+            CommitCoordinatorOptions::new(
+                batch_items,
+                Duration::from_millis(args.commit_batch_delay_ms),
+            )
+            .with_max_pending_items(batch_items),
         )
-        .with_max_pending_items(batch_items),
-    ));
+        .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard),
+    );
     store
         .reset_operation_counts()
         .context("failed to reset operation counts")?;
@@ -587,7 +630,8 @@ where
     S: BlobStore + Clone + 'static,
 {
     let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
-    let coordinator = V2CommitCoordinator::with_options(repo, anchor, commit_options(args));
+    let coordinator = V2CommitCoordinator::with_options(repo, anchor, commit_options(args))
+        .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard);
     store
         .reset_operation_counts()
         .context("failed to reset operation counts")?;
@@ -659,11 +703,10 @@ where
 {
     let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
     let verification_anchor = anchor.clone();
-    let coordinator = Arc::new(V2CommitCoordinator::with_options(
-        repo,
-        anchor,
-        commit_options(args),
-    ));
+    let coordinator = Arc::new(
+        V2CommitCoordinator::with_options(repo, anchor, commit_options(args))
+            .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard),
+    );
     store
         .reset_operation_counts()
         .context("failed to reset operation counts")?;
@@ -769,6 +812,9 @@ where
         .await
         .context("failed to reload the accepted commit chain")?
         .context("the repository anchor did not select a commit chain")?;
+    let active_index_runs = repository
+        .active_index_run_count()
+        .context("failed to read the recovered active index-run count")?;
 
     let entries = repository
         .list("perf/write-committed-parallel/")
@@ -814,6 +860,7 @@ where
         expected_objects: args.objects,
         listed_objects: entries.len(),
         checked_objects: checked_indices.len(),
+        active_index_runs,
         cold_reads: ColdReadMeasurement {
             elapsed: cold_read_elapsed,
             logical_reads: checked_indices.len(),
@@ -1020,6 +1067,7 @@ struct ReloadVerification {
     expected_objects: usize,
     listed_objects: usize,
     checked_objects: usize,
+    active_index_runs: usize,
     cold_reads: ColdReadMeasurement,
 }
 
@@ -1038,6 +1086,7 @@ struct ReloadVerificationReport {
     expected_objects: usize,
     listed_objects: usize,
     checked_objects: usize,
+    active_index_runs: usize,
     cold_reads: ColdReadMeasurementReport,
 }
 
@@ -1080,6 +1129,7 @@ impl ReloadVerification {
             expected_objects: self.expected_objects,
             listed_objects: self.listed_objects,
             checked_objects: self.checked_objects,
+            active_index_runs: self.active_index_runs,
             cold_reads: self.cold_reads.report(),
         }
     }
@@ -1170,6 +1220,16 @@ impl PerfReport {
         Ok(())
     }
 
+    fn enforce_resource_limits(
+        &self,
+        max_elapsed_seconds: Option<f64>,
+        max_peak_rss_bytes: Option<u64>,
+        peak_rss_bytes: Option<u64>,
+    ) -> Result<()> {
+        enforce_max_elapsed_seconds(self.scenario, self.elapsed, max_elapsed_seconds)?;
+        enforce_max_peak_rss_bytes(self.scenario, peak_rss_bytes, max_peak_rss_bytes)
+    }
+
     fn enforce_cold_read_limits(
         &self,
         byte_limit: Option<f64>,
@@ -1212,17 +1272,40 @@ impl PerfReport {
         Ok(())
     }
 
+    fn enforce_active_index_run_limit(&self, limit: Option<usize>) -> Result<()> {
+        let Some(limit) = limit else {
+            return Ok(());
+        };
+        let actual = self
+            .reload_verification
+            .as_ref()
+            .context("active index-run limit requires reload verification evidence")?
+            .active_index_runs;
+        if actual > limit {
+            anyhow::bail!(
+                "{} recovered {actual} active index runs, exceeding limit {limit}",
+                self.scenario
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "containers")]
     fn print(&self, format: ReportFormat) -> Result<()> {
+        self.print_with_peak_rss(format, process_peak_rss_bytes())
+    }
+
+    fn print_with_peak_rss(&self, format: ReportFormat, peak_rss_bytes: Option<u64>) -> Result<()> {
         match format {
             ReportFormat::Tsv => {
-                self.print_tsv();
+                self.print_tsv(peak_rss_bytes);
                 Ok(())
             }
-            ReportFormat::Jsonl => self.print_jsonl(),
+            ReportFormat::Jsonl => self.print_jsonl(peak_rss_bytes),
         }
     }
 
-    fn print_tsv(&self) {
+    fn print_tsv(&self, peak_rss_bytes: Option<u64>) {
         let elapsed_ms = self.elapsed.as_secs_f64() * 1_000.0;
         let requested_plaintext_bytes = self.requested_plaintext_bytes();
         let throughput_mib_s = mib_per_second(requested_plaintext_bytes, self.elapsed);
@@ -1246,7 +1329,7 @@ impl PerfReport {
         let cold_reads = reload_verification.map(|verification| &verification.cold_reads);
 
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.scenario,
             self.backend.as_str(),
             self.repository_format,
@@ -1260,6 +1343,7 @@ impl PerfReport {
             self.adaptive_payload_segment_size,
             self.concurrency,
             elapsed_ms,
+            format_optional_u64(peak_rss_bytes),
             latency.samples,
             ns_to_ms(latency.min_ns),
             ns_f64_to_ms(latency.avg_ns),
@@ -1318,10 +1402,11 @@ impl PerfReport {
                     measurement.requested_plaintext_bytes as u64,
                 )
             })),
+            reload_verification.map_or(0, |verification| verification.active_index_runs),
         );
     }
 
-    fn print_jsonl(&self) -> Result<()> {
+    fn print_jsonl(&self, peak_rss_bytes: Option<u64>) -> Result<()> {
         let requested_plaintext_bytes = self.requested_plaintext_bytes();
         let backend_bytes = self.backend_bytes();
         let backend_requests = self.backend_requests();
@@ -1341,6 +1426,7 @@ impl PerfReport {
             "payload_segment_size": self.payload_segment_size,
             "adaptive_payload_segment_size": self.adaptive_payload_segment_size,
             "elapsed_ms": self.elapsed.as_secs_f64() * 1_000.0,
+            "peak_rss_bytes": peak_rss_bytes,
             "operation_latency": {
                 "samples": self.operation_latency.samples,
                 "min_ms": ns_to_ms(self.operation_latency.min_ns),
@@ -1411,7 +1497,7 @@ impl PerfReport {
 
 fn print_header() {
     println!(
-        "scenario\tbackend\trepository_format\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tpayload_segment_size\tadaptive_payload_segment_size\tconcurrency\telapsed_ms\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tset_legal_hold\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp\treload_verified\treload_elapsed_ms\treload_expected_objects\treload_listed_objects\treload_checked_objects\tcheckpoint_requested_after_objects\tcheckpoint_actual_after_objects\tcheckpoint_elapsed_ms\tcold_read_elapsed_ms\tcold_read_logical_reads\tcold_read_backend_requests\tcold_read_requests_per_read\tcold_read_backend_bytes\tcold_read_amp"
+        "scenario\tbackend\trepository_format\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tpayload_segment_size\tadaptive_payload_segment_size\tconcurrency\telapsed_ms\tpeak_rss_bytes\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tset_legal_hold\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp\treload_verified\treload_elapsed_ms\treload_expected_objects\treload_listed_objects\treload_checked_objects\tcheckpoint_requested_after_objects\tcheckpoint_actual_after_objects\tcheckpoint_elapsed_ms\tcold_read_elapsed_ms\tcold_read_logical_reads\tcold_read_backend_requests\tcold_read_requests_per_read\tcold_read_backend_bytes\tcold_read_amp\tactive_index_runs"
     );
 }
 
@@ -1752,6 +1838,70 @@ fn ratio_optional(numerator: u64, denominator: u64) -> Option<f64> {
     Some(numerator as f64 / denominator as f64)
 }
 
+fn enforce_max_elapsed_seconds(
+    scenario: &str,
+    elapsed: Duration,
+    limit: Option<f64>,
+) -> Result<()> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let actual = elapsed.as_secs_f64();
+    if actual > limit {
+        anyhow::bail!("{scenario} elapsed time {actual:.3}s exceeds {limit:.3}s");
+    }
+    Ok(())
+}
+
+fn enforce_max_peak_rss_bytes(
+    scenario: &str,
+    actual: Option<u64>,
+    limit: Option<u64>,
+) -> Result<()> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let actual = actual
+        .context("maximum peak RSS requires process VmHWM evidence from /proc/self/status")?;
+    if actual > limit {
+        anyhow::bail!("{scenario} process peak RSS {actual} bytes exceeds {limit} bytes");
+    }
+    Ok(())
+}
+
+fn process_peak_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        parse_proc_status_peak_rss(&status).ok().flatten()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn parse_proc_status_peak_rss(status: &str) -> Result<Option<u64>> {
+    let Some(value) = status.lines().find_map(|line| line.strip_prefix("VmHWM:")) else {
+        return Ok(None);
+    };
+    let mut fields = value.split_whitespace();
+    let kibibytes = fields
+        .next()
+        .context("VmHWM is missing its numeric value")?
+        .parse::<u64>()
+        .context("VmHWM has an invalid numeric value")?;
+    let unit = fields.next().context("VmHWM is missing its unit")?;
+    if unit != "kB" || fields.next().is_some() {
+        anyhow::bail!("VmHWM must contain exactly one value in kB");
+    }
+    kibibytes
+        .checked_mul(1024)
+        .map(Some)
+        .context("VmHWM byte count overflowed u64")
+}
+
 fn percentile_duration(samples: &[Duration], quantile: f64) -> Duration {
     let index = ((samples.len() as f64 * quantile).ceil() as usize)
         .saturating_sub(1)
@@ -1769,6 +1919,10 @@ fn ns_f64_to_ms(value: f64) -> f64 {
 
 fn format_amp(value: Option<f64>) -> String {
     value.map_or_else(|| "n/a".to_owned(), |value| format!("{value:.3}"))
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "n/a".to_owned(), |value| value.to_string())
 }
 
 fn init_tracing(filter: &str, format: TraceFormat) -> Result<()> {
@@ -1792,10 +1946,12 @@ fn init_tracing(filter: &str, format: TraceFormat) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        backend_request_count, checkpoint_due, operation_counts_delta, validate_cold_read_counts,
-        verification_indices,
+        backend_request_count, checkpoint_due, enforce_max_elapsed_seconds,
+        enforce_max_peak_rss_bytes, operation_counts_delta, parse_proc_status_peak_rss,
+        validate_cold_read_counts, verification_indices,
     };
     use rs3_storage::BlobOperationCounts;
+    use std::time::Duration;
 
     #[test]
     fn checkpoint_threshold_fires_once_at_the_first_completed_batch() {
@@ -1890,5 +2046,55 @@ mod tests {
             .expect_err("non-GET backend work must invalidate the cold-read gate");
 
         assert!(error.to_string().contains("4 backend operations"));
+    }
+
+    #[test]
+    fn elapsed_gate_accepts_equality_and_rejects_over_limit() {
+        enforce_max_elapsed_seconds("scale", Duration::from_secs(180), Some(180.0))
+            .unwrap_or_else(|error| panic!("accept elapsed time at limit: {error}"));
+
+        let error =
+            enforce_max_elapsed_seconds("scale", Duration::from_millis(180_001), Some(180.0))
+                .expect_err("elapsed time over the limit must fail");
+        assert!(error.to_string().contains("180.001s exceeds 180.000s"));
+    }
+
+    #[test]
+    fn peak_rss_gate_accepts_equality_and_rejects_over_limit() {
+        enforce_max_peak_rss_bytes("scale", Some(4_096), Some(4_096))
+            .unwrap_or_else(|error| panic!("accept peak RSS at limit: {error}"));
+
+        let error = enforce_max_peak_rss_bytes("scale", Some(4_097), Some(4_096))
+            .expect_err("peak RSS over the limit must fail");
+        assert!(error.to_string().contains("4097 bytes exceeds 4096 bytes"));
+    }
+
+    #[test]
+    fn peak_rss_gate_rejects_missing_evidence() {
+        let error = enforce_max_peak_rss_bytes("scale", None, Some(4_096))
+            .expect_err("an RSS gate without evidence must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires process VmHWM evidence")
+        );
+    }
+
+    #[test]
+    fn proc_status_peak_rss_parser_converts_kibibytes_to_bytes() {
+        let status = "Name:\txtask\nVmPeak:\t999 kB\nVmHWM:\t4096 kB\nVmRSS:\t1024 kB\n";
+
+        assert_eq!(
+            parse_proc_status_peak_rss(status)
+                .unwrap_or_else(|error| panic!("parse VmHWM: {error}")),
+            Some(4_194_304)
+        );
+        assert_eq!(
+            parse_proc_status_peak_rss("Name:\txtask\n")
+                .unwrap_or_else(|error| panic!("accept missing VmHWM: {error}")),
+            None
+        );
+        assert!(parse_proc_status_peak_rss("VmHWM:\t4096 MB\n").is_err());
     }
 }
