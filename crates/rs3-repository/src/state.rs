@@ -32,7 +32,7 @@ pub(crate) struct RepositoryState {
     /// Trusted manifests keyed by opaque manifest ID.
     pub(crate) manifests: BTreeMap<ManifestId, TrustedManifest>,
     /// Trusted list entries keyed by plaintext path inside the trusted boundary.
-    pub(crate) list_entries: BTreeMap<String, RepositoryListEntry>,
+    pub(crate) list_entries: BTreeMap<LogicalPath, RepositoryListEntry>,
     /// Next logical sequence to allocate.
     pub(crate) next_sequence: Sequence,
     /// Durable index mutations not yet covered by an accepted checkpoint.
@@ -78,8 +78,9 @@ impl RepositoryState {
             // A logical path has one live namespace entry. Key rotation first
             // tombstones historical blind keys, so the new entry can update
             // the list projection directly without scanning the repository.
+            let key = manifest.key.clone();
             self.list_entries.insert(
-                manifest.key.as_str().to_owned(),
+                key,
                 RepositoryListEntry {
                     key: manifest.key,
                     content_len: manifest.content_len,
@@ -122,13 +123,16 @@ impl RepositoryState {
     ) -> Vec<RepositoryListEntry> {
         let page_len = limit.saturating_add(1);
         let lower_bound = match start_after {
-            Some(start_after) if start_after >= prefix => Bound::Excluded(start_after.to_owned()),
-            _ => Bound::Included(prefix.to_owned()),
+            Some(start_after) if start_after >= prefix => Bound::Excluded(start_after),
+            _ => Bound::Included(prefix),
         };
         let mut entries = Vec::with_capacity(page_len.min(1024));
 
-        for (key, entry) in self.list_entries.range((lower_bound, Bound::Unbounded)) {
-            if !key.starts_with(prefix) {
+        for (key, entry) in self
+            .list_entries
+            .range::<str, _>((lower_bound, Bound::Unbounded))
+        {
+            if !key.as_str().starts_with(prefix) {
                 break;
             }
             entries.push(entry.clone());
@@ -164,13 +168,12 @@ impl RepositoryState {
             }
         }
 
-        let key = key.as_str();
         match selected {
             Some(entry) => {
-                self.list_entries.insert(key.to_owned(), entry);
+                self.list_entries.insert(key.clone(), entry);
             }
             None => {
-                self.list_entries.remove(key);
+                self.list_entries.remove(key.as_str());
             }
         }
     }

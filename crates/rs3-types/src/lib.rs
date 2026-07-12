@@ -1,6 +1,7 @@
 //! Shared strongly typed identifiers and policy types.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
@@ -62,6 +63,12 @@ impl LogicalPath {
     /// Returns the logical path as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl Borrow<str> for LogicalPath {
+    fn borrow(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -419,6 +426,7 @@ impl RetentionPolicy {
 #[cfg(test)]
 mod tests {
     use super::{KeyId, KeyStatus, LogicalPath, PrefixToken, PublicBucket, Sequence};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     #[test]
@@ -448,6 +456,15 @@ mod tests {
         let cloned = path.clone();
 
         assert!(Arc::ptr_eq(&path.0, &cloned.0));
+    }
+
+    #[test]
+    fn logical_path_supports_borrowed_ordered_map_lookups() {
+        let path = LogicalPath::new("namespace/snapshot.tar").expect("valid logical path");
+        let mut paths = BTreeMap::new();
+        paths.insert(path, 7);
+
+        assert_eq!(paths.get("namespace/snapshot.tar"), Some(&7));
     }
 
     #[test]
