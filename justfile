@@ -314,6 +314,69 @@ perf-scale-100k: (perf-scale-tier "100000")
 # Scheduled/manual high-capacity scale gate. This needs substantial memory.
 perf-scale-1m: (perf-scale-tier "1000000")
 
+# Run the pinned fresh-process filesystem scale tier. ROOT must name retained
+# local-disk evidence storage; each run keeps its backend and reports.
+[private]
+perf-scale-fs-tier OBJECTS ROOT:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    runs="${RS3_SCALE_GATE_RUNS:-3}"
+    if ! [[ "${runs}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "RS3_SCALE_GATE_RUNS must be a positive integer" >&2
+      exit 2
+    fi
+    mkdir -p "{{ROOT}}"
+    build_revision="$(git rev-parse --verify HEAD)"
+    if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then
+      build_revision="${build_revision}-dirty"
+    fi
+    RS3_BUILD_GIT_SHA="${build_revision}" cargo build --release -p xtask --bin xtask
+    batch_items=64
+    concurrency=64
+    if (( {{OBJECTS}} >= 100000 )); then
+      batch_items=1024
+      concurrency=1024
+    fi
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    for ((run = 1; run <= runs; run++)); do
+      run_root="{{ROOT}}/${stamp}-objects-{{OBJECTS}}-run-${run}"
+      backend_dir="${run_root}/backend"
+      evidence_dir="${run_root}/evidence"
+      echo "fresh-process filesystem scale run ${run}/${runs}: {{OBJECTS}} objects" >&2
+      target/release/xtask perf \
+        --scenario write-committed-parallel \
+        --objects "{{OBJECTS}}" \
+        --object-size 512 \
+        --commit-batch-items "${batch_items}" \
+        --commit-max-pending-items "${batch_items}" \
+        --concurrency "${concurrency}" \
+        --verify-reload \
+        --fresh-process-reload \
+        --checkpoint-after-objects "{{OBJECTS}}" \
+        --backend filesystem \
+        --backend-dir "${backend_dir}" \
+        --evidence-dir "${evidence_dir}" \
+        --max-elapsed-seconds 180 \
+        --max-reload-elapsed-seconds 180 \
+        --max-writer-peak-rss-bytes 4294967296 \
+        --max-reader-peak-rss-bytes 4294967296 \
+        --max-write-amp 1.65 \
+        --max-cold-read-amp 1.04 \
+        --max-cold-read-requests-per-read 1.0 \
+        --max-active-index-runs 255 \
+        --format jsonl
+      {
+        uname -a
+        rustc -Vv
+        df -T "${backend_dir}"
+      } > "${evidence_dir}/runner.txt"
+    done
+
+# Fresh-process filesystem qualification tiers. Pass a pinned local-disk root.
+perf-scale-fs-10k ROOT: (perf-scale-fs-tier "10000" ROOT)
+perf-scale-fs-100k ROOT: (perf-scale-fs-tier "100000" ROOT)
+perf-scale-fs-1m ROOT: (perf-scale-fs-tier "1000000" ROOT)
+
 # Run performance measurements against an S3 backend.
 perf-s3 *ARGS:
     cargo run -p xtask --bin xtask --features s3 -- perf --backend s3 {{ARGS}}

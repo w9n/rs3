@@ -224,6 +224,16 @@ Correctness, request, byte, allocation, and amplification bounds apply on every
 runner. The recipes apply generous elapsed and reload ceilings everywhere as
 regression tripwires; time results qualify a release only on pinned runners.
 
+`just perf-scale-fs-{10k,100k,1m} <root>` implements that qualification shape.
+It retains an fsynced filesystem backend while a writer process exits and a
+separate reader process recovers from a versioned trusted-anchor handoff stored
+outside the backend root. Writer and reader elapsed time and peak RSS are
+reported and gated independently. Reader verification counts the exact namespace
+and checks first, middle, and last payload bytes plus active-run and cold-read
+request/byte ceilings. “Fresh process” means empty rs3 process caches; Linux page
+cache state is runner-controlled and must not be described as cold unless the
+pinned-runner procedure actually enforces that condition.
+
 ## Current Release Matrix
 
 Run date: 2026-07-10. Gateway profile: release. Payload segment lane:

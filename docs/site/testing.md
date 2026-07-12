@@ -40,6 +40,7 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | 100k object scale gate | `just perf-scale-100k` | Release-binary 1,024-item bulk tier with the same final-checkpoint, recovery, cardinality, amplification, direct cold-read, and active-run-count checks. |
 | 270k bounded-compaction evidence | `just perf-scale-tier 270000` | Crosses the 256-run watermark with the 1,024-item bulk tier and applies the lifetime amplification, 180-second elapsed, 4 GiB peak-RSS, recovery, cold-read, and active-run gates. The final post-remediation sample completed in 11.655 s at 758,521,856 B peak RSS, 1.505740509x amplification, and 140 recovered runs. |
 | 1M object scale gate | `just perf-scale-1m` | Manual in-memory high-capacity tier with the same checks. Three 2026-07-12 release runs passed at 40.579-41.200 s, 2,197,200,896-2,197,594,112 B process peak RSS including the in-memory backend, 1.602593008x amplification, and 233 recovered runs. Final qualification still requires a fresh-process filesystem run on the pinned runner. |
+| Fresh-process filesystem scale gates | `just perf-scale-fs-10k <root>`, `just perf-scale-fs-100k <root>`, `just perf-scale-fs-1m <root>` | Runs the release writer and reader as separate processes over an explicitly selected local filesystem. The writer persists a versioned trusted-anchor handoff outside the backend root and exits before the reader starts. Evidence retains both process reports, independent peak RSS and elapsed gates, exact cardinality, active runs, first/middle/last payload verification, isolated cold-read counters, the backend directory, and basic runner metadata. |
 | Kopia measured matrix | `cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix --runs 3 --profile-set larger-restores --gateway-build-profile release --enforce-regression-budgets` | Release-grade Kopia restore comparison against the straight RustFS proxy baseline with current gateway defaults. |
 
 Expensive lanes emit artifacts under `.local/integration/` by default.
@@ -50,8 +51,11 @@ alone is not a recovery or release result. The underlying harness options
 `--max-cold-read-amp` and `--max-cold-read-requests-per-read` require
 `--verify-reload`. The `--max-active-index-runs` option also requires reload
 verification and checks the authenticated recovered catalog, not writer memory.
-The scale recipes also enforce `--max-elapsed-seconds 180`,
+The in-memory scale recipes also enforce `--max-elapsed-seconds 180`,
 `--max-reload-elapsed-seconds 30`, and `--max-peak-rss-bytes 4294967296`.
+The filesystem recipes use the same write ceiling, a conservative 180-second
+complete reader-verification ceiling, and separate 4 GiB writer and reader RSS
+ceilings. Release timing claims still require the documented pinned runner.
 Peak RSS comes from the harness process high-water mark, so an over-budget
 attempt fails even when all correctness checks pass. The harness prints the
 measurement before returning an aggregated gate error, so one expensive run
@@ -71,6 +75,11 @@ pausing at 896. Configured-guard, corruption, storage, anchor, and other
 compaction errors poison immediately. The three passing 1M runs cover six such
 passes and finish with 233 authenticated runs. These in-memory lanes do not
 replace the fresh-process filesystem/RSS gate.
+
+The filesystem lane proves a fresh application process with empty rs3 caches;
+it does not claim a cold kernel page cache. Use a pinned local-disk mount rather
+than `/tmp`, preserve every generated run directory, and record any runner-level
+cache-control procedure separately.
 
 The current gateway no longer has a v1 repository runtime. Commands with `v2`
 in their names keep their existing harness names, but they exercise the only

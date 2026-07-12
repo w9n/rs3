@@ -10,8 +10,9 @@ use bytes::Bytes;
 use clap::{Args, ValueEnum};
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_repository::v2::{
-    UnenforcedQuiescedMaintenanceGuard, V2CommitCoordinator, V2CommitStoreOptions, V2FormatRef,
-    V2KeyringEnvelopeRef, V2MemoryAnchor, V2ProviderProfile, V2Repository,
+    UnenforcedQuiescedMaintenanceGuard, V2AnchorState, V2CommitAnchor, V2CommitCoordinator,
+    V2CommitStoreOptions, V2FormatRef, V2KeyringEnvelopeRef, V2MemoryAnchor, V2ProviderProfile,
+    V2Repository,
 };
 use rs3_repository::{
     CommitCoordinatorOptions, DEFAULT_PAYLOAD_SEGMENT_SIZE, RepositoryOptions, RepositoryPutOptions,
@@ -26,14 +27,18 @@ use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath,
     RepositoryId,
 };
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "containers")]
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
 pub(super) const PERF_REPOSITORY_FORMAT: &str = "v2-preview";
+const FRESH_PROCESS_HANDOFF_SCHEMA: &str = "rs3.perf-fresh-process-handoff.v1";
+const FRESH_PROCESS_REPORT_SCHEMA: &str = "rs3.perf-fresh-process-report.v1";
+const PERF_BODY_PATTERN_VERSION: u32 = 1;
 
 /// Runs lightweight repository performance scenarios.
 #[derive(Debug, Args)]
@@ -62,6 +67,9 @@ pub(crate) struct PerfArgs {
     /// Reload and verify parallel committed writes through a new repository instance.
     #[arg(long)]
     verify_reload: bool,
+    /// Verify a filesystem write through a separate reader process.
+    #[arg(long, requires = "verify_reload")]
+    fresh_process_reload: bool,
     /// Publish one signed index-root checkpoint after at least this many writes.
     #[arg(long, requires = "verify_reload")]
     checkpoint_after_objects: Option<usize>,
@@ -77,6 +85,12 @@ pub(crate) struct PerfArgs {
     /// Fail a scenario when the harness process peak RSS exceeds this many bytes.
     #[arg(long)]
     max_peak_rss_bytes: Option<u64>,
+    /// Fail fresh-process qualification when the writer exceeds this peak RSS.
+    #[arg(long, requires = "fresh_process_reload")]
+    max_writer_peak_rss_bytes: Option<u64>,
+    /// Fail fresh-process qualification when the reader exceeds this peak RSS.
+    #[arg(long, requires = "fresh_process_reload")]
+    max_reader_peak_rss_bytes: Option<u64>,
     /// Fail reload verification when cold-read bytes exceed this plaintext ratio.
     #[arg(long, requires = "verify_reload")]
     max_cold_read_amp: Option<f64>,
@@ -107,6 +121,18 @@ pub(crate) struct PerfArgs {
     /// Filesystem backend root used with `--backend filesystem`.
     #[arg(long)]
     backend_dir: Option<PathBuf>,
+    /// Retained report directory used by fresh-process filesystem qualification.
+    #[arg(long, requires = "fresh_process_reload")]
+    evidence_dir: Option<PathBuf>,
+    /// Internal fresh-process qualification phase.
+    #[arg(long, value_enum, hide = true)]
+    fresh_process_phase: Option<FreshProcessPhase>,
+    /// Internal phase handoff path.
+    #[arg(long, hide = true)]
+    fresh_process_handoff: Option<PathBuf>,
+    /// Internal phase report path.
+    #[arg(long, hide = true)]
+    fresh_process_report: Option<PathBuf>,
     /// S3 bucket used with `--backend s3`.
     #[cfg(feature = "s3")]
     #[arg(long, env = "RS3_PERF_S3_BUCKET")]
@@ -186,6 +212,12 @@ pub(crate) enum PerfBackend {
     /// Gateway process backed by an ephemeral local S3-compatible container.
     #[cfg(feature = "containers")]
     S3GatewayContainer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum FreshProcessPhase {
+    Writer,
+    Reader,
 }
 
 impl PerfBackend {
@@ -275,6 +307,9 @@ impl TraceFormat {
 }
 
 pub(crate) fn run(args: PerfArgs) -> Result<()> {
+    if let Some(phase) = args.fresh_process_phase {
+        return run_fresh_process_phase(args, phase);
+    }
     let cold_read_limits_requested =
         args.max_cold_read_amp.is_some() || args.max_cold_read_requests_per_read.is_some();
     let reload_limits_requested = reload_limits_requested(&args);
@@ -318,6 +353,12 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
     if args.max_peak_rss_bytes == Some(0) {
         anyhow::bail!("--max-peak-rss-bytes must be greater than zero");
     }
+    if args.max_writer_peak_rss_bytes == Some(0) {
+        anyhow::bail!("--max-writer-peak-rss-bytes must be greater than zero");
+    }
+    if args.max_reader_peak_rss_bytes == Some(0) {
+        anyhow::bail!("--max-reader-peak-rss-bytes must be greater than zero");
+    }
     if args
         .max_cold_read_amp
         .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
@@ -338,6 +379,10 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
     }
     if args.max_active_index_runs == Some(0) {
         anyhow::bail!("--max-active-index-runs must be greater than zero");
+    }
+    if args.fresh_process_reload {
+        validate_fresh_process_args(&args)?;
+        return run_fresh_process_orchestrator(&args);
     }
     #[cfg(feature = "containers")]
     if args.verify_reload && args.backend == PerfBackend::S3GatewayContainer {
@@ -362,6 +407,312 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
         .build()
         .context("failed to build perf runtime")?;
     runtime.block_on(run_async(args))
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreshProcessHandoff {
+    schema: String,
+    source_revision: String,
+    repository_format: String,
+    backend_dir: PathBuf,
+    object_prefix: String,
+    objects: usize,
+    object_size: usize,
+    body_pattern_version: u32,
+    anchor: V2AnchorState,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreshProcessWriterReport {
+    schema: String,
+    phase: String,
+    process_id: u32,
+    peak_rss_bytes: Option<u64>,
+    objects: usize,
+    object_size: usize,
+    elapsed_ms: f64,
+    checkpoint_elapsed_ms: Option<f64>,
+    backend_requests: u64,
+    puts: u64,
+    gets: u64,
+    heads: u64,
+    bytes_written: u64,
+    bytes_read: u64,
+    requested_plaintext_write_bytes: usize,
+    write_amplification: Option<f64>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreshProcessReaderReport {
+    schema: String,
+    phase: String,
+    process_id: u32,
+    peak_rss_bytes: Option<u64>,
+    recovery_elapsed_ms: f64,
+    verification_elapsed_ms: f64,
+    expected_objects: usize,
+    listed_objects: usize,
+    checked_objects: usize,
+    active_index_runs: usize,
+    cold_read_elapsed_ms: f64,
+    cold_read_logical_reads: usize,
+    cold_read_backend_requests: u64,
+    cold_read_gets: u64,
+    cold_read_bytes: u64,
+    cold_read_requests_per_read: Option<f64>,
+    cold_read_amplification: Option<f64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct FreshProcessAggregateReport {
+    schema: String,
+    mode: String,
+    source_revision: String,
+    backend_dir: PathBuf,
+    evidence_dir: PathBuf,
+    handoff: PathBuf,
+    writer: FreshProcessWriterReport,
+    reader: FreshProcessReaderReport,
+}
+
+impl FreshProcessHandoff {
+    fn new(args: &PerfArgs, backend_dir: PathBuf, anchor: V2AnchorState) -> Self {
+        Self {
+            schema: FRESH_PROCESS_HANDOFF_SCHEMA.to_owned(),
+            source_revision: option_env!("RS3_BUILD_GIT_SHA")
+                .unwrap_or("unknown")
+                .to_owned(),
+            repository_format: PERF_REPOSITORY_FORMAT.to_owned(),
+            backend_dir,
+            object_prefix: "perf/write-committed-parallel/".to_owned(),
+            objects: args.objects,
+            object_size: args.object_size,
+            body_pattern_version: PERF_BODY_PATTERN_VERSION,
+            anchor,
+        }
+    }
+
+    fn validate(&self, args: &PerfArgs, backend_dir: &Path) -> Result<()> {
+        if self.schema != FRESH_PROCESS_HANDOFF_SCHEMA
+            || self.repository_format != PERF_REPOSITORY_FORMAT
+            || self.source_revision != option_env!("RS3_BUILD_GIT_SHA").unwrap_or("unknown")
+            || self.object_prefix != "perf/write-committed-parallel/"
+            || self.body_pattern_version != PERF_BODY_PATTERN_VERSION
+            || self.objects != args.objects
+            || self.object_size != args.object_size
+            || self.backend_dir != backend_dir
+        {
+            anyhow::bail!("fresh-process handoff facts do not match the requested qualification");
+        }
+        Ok(())
+    }
+}
+
+fn validate_fresh_process_args(args: &PerfArgs) -> Result<()> {
+    if args.scenario != PerfScenario::WriteCommittedParallel {
+        anyhow::bail!("--fresh-process-reload requires --scenario write-committed-parallel");
+    }
+    if args.backend != PerfBackend::Filesystem {
+        anyhow::bail!("--fresh-process-reload requires --backend filesystem");
+    }
+    if args.backend_dir.is_none() {
+        anyhow::bail!("--fresh-process-reload requires an explicit --backend-dir");
+    }
+    if args.evidence_dir.is_none() {
+        anyhow::bail!("--fresh-process-reload requires an explicit --evidence-dir");
+    }
+    if args.checkpoint_after_objects != Some(args.objects) {
+        anyhow::bail!(
+            "--fresh-process-reload requires --checkpoint-after-objects to equal --objects"
+        );
+    }
+    if args.format != ReportFormat::Jsonl {
+        anyhow::bail!("--fresh-process-reload requires --format jsonl");
+    }
+    if args.max_peak_rss_bytes.is_some() {
+        anyhow::bail!(
+            "use --max-writer-peak-rss-bytes and --max-reader-peak-rss-bytes with --fresh-process-reload"
+        );
+    }
+    Ok(())
+}
+
+fn run_fresh_process_orchestrator(args: &PerfArgs) -> Result<()> {
+    let requested_backend = args
+        .backend_dir
+        .as_ref()
+        .context("fresh-process backend directory is missing")?;
+    let requested_evidence = args
+        .evidence_dir
+        .as_ref()
+        .context("fresh-process evidence directory is missing")?;
+    create_fresh_directory(requested_backend, "backend")?;
+    create_fresh_directory(requested_evidence, "evidence")?;
+    let backend_dir = requested_backend
+        .canonicalize()
+        .context("failed to canonicalize fresh-process backend directory")?;
+    let evidence_dir = requested_evidence
+        .canonicalize()
+        .context("failed to canonicalize fresh-process evidence directory")?;
+    if evidence_dir.starts_with(&backend_dir) {
+        anyhow::bail!("fresh-process evidence directory must be outside the backend root");
+    }
+
+    let handoff_path = evidence_dir.join("handoff.json");
+    let writer_report_path = evidence_dir.join("writer.json");
+    let reader_report_path = evidence_dir.join("reader.json");
+    run_fresh_child(
+        args,
+        FreshProcessPhase::Writer,
+        &backend_dir,
+        &handoff_path,
+        &writer_report_path,
+    )?;
+    run_fresh_child(
+        args,
+        FreshProcessPhase::Reader,
+        &backend_dir,
+        &handoff_path,
+        &reader_report_path,
+    )?;
+
+    let aggregate = FreshProcessAggregateReport {
+        schema: FRESH_PROCESS_REPORT_SCHEMA.to_owned(),
+        mode: "fresh-process-filesystem".to_owned(),
+        source_revision: option_env!("RS3_BUILD_GIT_SHA")
+            .unwrap_or("unknown")
+            .to_owned(),
+        backend_dir,
+        evidence_dir: evidence_dir.clone(),
+        handoff: handoff_path,
+        writer: read_json(&writer_report_path)?,
+        reader: read_json(&reader_report_path)?,
+    };
+    write_json_atomic(&evidence_dir.join("report.json"), &aggregate)?;
+    println!("{}", serde_json::to_string(&aggregate)?);
+    Ok(())
+}
+
+fn create_fresh_directory(path: &Path, name: &str) -> Result<()> {
+    if path.exists() {
+        anyhow::bail!(
+            "fresh-process {name} directory already exists: {}",
+            path.display()
+        );
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent for {name} directory"))?;
+    }
+    std::fs::create_dir(path)
+        .with_context(|| format!("failed to create fresh-process {name} directory"))
+}
+
+fn run_fresh_child(
+    args: &PerfArgs,
+    phase: FreshProcessPhase,
+    backend_dir: &Path,
+    handoff_path: &Path,
+    report_path: &Path,
+) -> Result<()> {
+    let executable = std::env::current_exe().context("failed to locate current xtask binary")?;
+    let mut command = Command::new(executable);
+    command.arg("perf");
+    append_fresh_child_args(
+        &mut command,
+        args,
+        phase,
+        backend_dir,
+        handoff_path,
+        report_path,
+    );
+    let status = command
+        .status()
+        .with_context(|| format!("failed to start fresh-process {phase:?} phase"))?;
+    if !status.success() {
+        anyhow::bail!("fresh-process {phase:?} phase exited with {status}");
+    }
+    Ok(())
+}
+
+fn append_fresh_child_args(
+    command: &mut Command,
+    args: &PerfArgs,
+    phase: FreshProcessPhase,
+    backend_dir: &Path,
+    handoff_path: &Path,
+    report_path: &Path,
+) {
+    command.args(["--scenario", "write-committed-parallel"]);
+    command.args(["--objects", &args.objects.to_string()]);
+    command.args(["--object-size", &args.object_size.to_string()]);
+    command.args(["--commit-batch-items", &args.commit_batch_items.to_string()]);
+    command.args([
+        "--commit-batch-delay-ms",
+        &args.commit_batch_delay_ms.to_string(),
+    ]);
+    if let Some(limit) = args.commit_max_pending_items {
+        command.args(["--commit-max-pending-items", &limit.to_string()]);
+    }
+    command.args(["--concurrency", &args.concurrency.to_string()]);
+    command.arg("--verify-reload");
+    command.arg("--fresh-process-reload");
+    command.args(["--checkpoint-after-objects", &args.objects.to_string()]);
+    if let Some(limit) = args.max_write_amp {
+        command.args(["--max-write-amp", &limit.to_string()]);
+    }
+    if let Some(limit) = args.max_elapsed_seconds {
+        command.args(["--max-elapsed-seconds", &limit.to_string()]);
+    }
+    if let Some(limit) = args.max_reload_elapsed_seconds {
+        command.args(["--max-reload-elapsed-seconds", &limit.to_string()]);
+    }
+    if let Some(limit) = args.max_writer_peak_rss_bytes {
+        command.args(["--max-writer-peak-rss-bytes", &limit.to_string()]);
+    }
+    if let Some(limit) = args.max_reader_peak_rss_bytes {
+        command.args(["--max-reader-peak-rss-bytes", &limit.to_string()]);
+    }
+    if let Some(limit) = args.max_cold_read_amp {
+        command.args(["--max-cold-read-amp", &limit.to_string()]);
+    }
+    if let Some(limit) = args.max_cold_read_requests_per_read {
+        command.args(["--max-cold-read-requests-per-read", &limit.to_string()]);
+    }
+    if let Some(limit) = args.max_active_index_runs {
+        command.args(["--max-active-index-runs", &limit.to_string()]);
+    }
+    if let Some(size) = args.payload_segment_size {
+        command.args(["--payload-segment-size", &size.to_string()]);
+    }
+    command.args(["--backend", "filesystem"]);
+    command.arg("--backend-dir").arg(backend_dir);
+    command.args(["--format", "jsonl"]);
+    command.args([
+        "--fresh-process-phase",
+        match phase {
+            FreshProcessPhase::Writer => "writer",
+            FreshProcessPhase::Reader => "reader",
+        },
+    ]);
+    command.arg("--fresh-process-handoff").arg(handoff_path);
+    command.arg("--fresh-process-report").arg(report_path);
+}
+
+fn run_fresh_process_phase(args: PerfArgs, phase: FreshProcessPhase) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build fresh-process perf runtime")?;
+    runtime.block_on(async move {
+        match phase {
+            FreshProcessPhase::Writer => run_fresh_writer_phase(&args).await,
+            FreshProcessPhase::Reader => run_fresh_reader_phase(&args).await,
+        }
+    })
 }
 
 fn reload_limits_requested(args: &PerfArgs) -> bool {
@@ -648,6 +999,7 @@ where
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
+        checkpoint: None,
         reload_verification: None,
     })
 }
@@ -720,6 +1072,7 @@ where
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
+        checkpoint: None,
         reload_verification: None,
     })
 }
@@ -744,6 +1097,43 @@ async fn write_committed_parallel_with_store<S>(
     args: &PerfArgs,
     store: CountingBlobStore<S>,
 ) -> Result<PerfReport>
+where
+    S: BlobStore + Clone + Send + Sync + 'static,
+{
+    let written = perform_parallel_writes(args, store).await?;
+    let reload_verification = if args.verify_reload {
+        Some(
+            verify_parallel_reload(
+                args,
+                written.store.clone(),
+                &written.anchor,
+                &written.body,
+                written.checkpoint,
+            )
+            .await
+            .context("new repository instance verification failed")?,
+        )
+    } else {
+        None
+    };
+    parallel_write_report(args, written, reload_verification)
+}
+
+struct ParallelWriteMeasurement<S> {
+    store: CountingBlobStore<S>,
+    anchor: V2MemoryAnchor,
+    body: Bytes,
+    parallelism: usize,
+    latencies: Vec<Duration>,
+    elapsed: Duration,
+    counts: BlobOperationCounts,
+    checkpoint: Option<CheckpointMeasurement>,
+}
+
+async fn perform_parallel_writes<S>(
+    args: &PerfArgs,
+    store: CountingBlobStore<S>,
+) -> Result<ParallelWriteMeasurement<S>>
 where
     S: BlobStore + Clone + Send + Sync + 'static,
 {
@@ -810,15 +1200,23 @@ where
         .operation_counts()
         .context("failed to read operation counts")?;
     drop(coordinator);
-    let reload_verification = if args.verify_reload {
-        Some(
-            verify_parallel_reload(args, store, &verification_anchor, &body, checkpoint)
-                .await
-                .context("new repository instance verification failed")?,
-        )
-    } else {
-        None
-    };
+    Ok(ParallelWriteMeasurement {
+        store,
+        anchor: verification_anchor,
+        body,
+        parallelism,
+        latencies,
+        elapsed,
+        counts,
+        checkpoint,
+    })
+}
+
+fn parallel_write_report<S>(
+    args: &PerfArgs,
+    written: ParallelWriteMeasurement<S>,
+    reload_verification: Option<ReloadVerification>,
+) -> Result<PerfReport> {
     Ok(PerfReport {
         scenario: "write-committed-parallel",
         backend: args.backend,
@@ -833,12 +1231,253 @@ where
         commit_max_pending_items: commit_max_pending_items(args),
         payload_segment_size: args.payload_segment_size,
         adaptive_payload_segment_size: adaptive_payload_segment_size(args),
-        concurrency: parallelism,
-        operation_latency: OperationLatencyStats::from_samples(latencies),
-        elapsed,
-        counts,
+        concurrency: written.parallelism,
+        operation_latency: OperationLatencyStats::from_samples(written.latencies),
+        elapsed: written.elapsed,
+        counts: written.counts,
+        checkpoint: written.checkpoint,
         reload_verification,
     })
+}
+
+async fn run_fresh_writer_phase(args: &PerfArgs) -> Result<()> {
+    let backend_dir = canonical_phase_path(args.backend_dir.as_deref(), "backend")?;
+    let handoff_path = required_phase_path(args.fresh_process_handoff.as_deref(), "handoff")?;
+    let report_path = required_phase_path(args.fresh_process_report.as_deref(), "report")?;
+    let store = CountingBlobStore::new(
+        FilesystemBlobStore::new(backend_dir.clone())
+            .context("failed to open fresh-process filesystem backend")?,
+    );
+    let written = perform_parallel_writes(args, store).await?;
+    let anchor = written
+        .anchor
+        .read_v2()
+        .await
+        .context("failed to read writer anchor for fresh-process handoff")?
+        .context("fresh-process writer produced no accepted anchor")?;
+    let handoff = FreshProcessHandoff::new(args, backend_dir, anchor);
+    write_json_atomic(handoff_path, &handoff)?;
+
+    let report = parallel_write_report(args, written, None)?;
+    let peak_rss_bytes = process_peak_rss_bytes();
+    let phase_report = FreshProcessWriterReport {
+        schema: FRESH_PROCESS_REPORT_SCHEMA.to_owned(),
+        phase: "writer".to_owned(),
+        process_id: std::process::id(),
+        peak_rss_bytes,
+        objects: report.objects,
+        object_size: report.object_size,
+        elapsed_ms: report.elapsed.as_secs_f64() * 1_000.0,
+        checkpoint_elapsed_ms: report
+            .checkpoint
+            .map(|checkpoint| checkpoint.elapsed.as_secs_f64() * 1_000.0),
+        backend_requests: report.backend_requests(),
+        puts: report.counts.put,
+        gets: report.counts.get,
+        heads: report.counts.head,
+        bytes_written: report.counts.bytes_written,
+        bytes_read: report.counts.bytes_read,
+        requested_plaintext_write_bytes: report.requested_plaintext_write_bytes,
+        write_amplification: ratio_optional(
+            report.counts.bytes_written,
+            report.requested_plaintext_write_bytes as u64,
+        ),
+    };
+    write_json_atomic(report_path, &phase_report)?;
+
+    let mut failures = Vec::new();
+    record_gate_failure(
+        &mut failures,
+        report.enforce_max_write_amplification(args.max_write_amp),
+    );
+    record_gate_failure(
+        &mut failures,
+        report.enforce_resource_limits(args.max_elapsed_seconds, None, peak_rss_bytes),
+    );
+    record_gate_failure(
+        &mut failures,
+        enforce_max_peak_rss_bytes(
+            "fresh-process writer",
+            peak_rss_bytes,
+            args.max_writer_peak_rss_bytes,
+        ),
+    );
+    finish_gate_failures(failures)
+}
+
+async fn run_fresh_reader_phase(args: &PerfArgs) -> Result<()> {
+    let backend_dir = canonical_phase_path(args.backend_dir.as_deref(), "backend")?;
+    let handoff_path = required_phase_path(args.fresh_process_handoff.as_deref(), "handoff")?;
+    let report_path = required_phase_path(args.fresh_process_report.as_deref(), "report")?;
+    let handoff: FreshProcessHandoff = read_json(handoff_path)?;
+    handoff.validate(args, &backend_dir)?;
+    let store = CountingBlobStore::new(
+        FilesystemBlobStore::new(backend_dir)
+            .context("failed to open fresh-process filesystem backend")?,
+    );
+    let anchor = V2MemoryAnchor::with_state(handoff.anchor);
+    let verification = verify_parallel_reload(args, store, &anchor, &body(args.object_size), None)
+        .await
+        .context("fresh reader process verification failed")?;
+    let peak_rss_bytes = process_peak_rss_bytes();
+    let cold_reads = &verification.cold_reads;
+    let cold_read_backend_requests = backend_request_count(&cold_reads.counts);
+    let phase_report = FreshProcessReaderReport {
+        schema: FRESH_PROCESS_REPORT_SCHEMA.to_owned(),
+        phase: "reader".to_owned(),
+        process_id: std::process::id(),
+        peak_rss_bytes,
+        recovery_elapsed_ms: verification.recovery_elapsed.as_secs_f64() * 1_000.0,
+        verification_elapsed_ms: verification.elapsed.as_secs_f64() * 1_000.0,
+        expected_objects: verification.expected_objects,
+        listed_objects: verification.listed_objects,
+        checked_objects: verification.checked_objects,
+        active_index_runs: verification.active_index_runs,
+        cold_read_elapsed_ms: cold_reads.elapsed.as_secs_f64() * 1_000.0,
+        cold_read_logical_reads: cold_reads.logical_reads,
+        cold_read_backend_requests,
+        cold_read_gets: cold_reads.counts.get,
+        cold_read_bytes: cold_reads.counts.bytes_read,
+        cold_read_requests_per_read: ratio_optional(
+            cold_read_backend_requests,
+            cold_reads.logical_reads as u64,
+        ),
+        cold_read_amplification: ratio_optional(
+            cold_reads.counts.bytes_read,
+            cold_reads.requested_plaintext_bytes as u64,
+        ),
+    };
+    write_json_atomic(report_path, &phase_report)?;
+
+    let mut failures = Vec::new();
+    record_gate_failure(
+        &mut failures,
+        enforce_max_reload_elapsed_seconds(
+            "fresh-process reader",
+            Some(verification.elapsed),
+            args.max_reload_elapsed_seconds,
+        ),
+    );
+    record_gate_failure(
+        &mut failures,
+        enforce_max_peak_rss_bytes(
+            "fresh-process reader",
+            peak_rss_bytes,
+            args.max_reader_peak_rss_bytes,
+        ),
+    );
+    record_gate_failure(
+        &mut failures,
+        enforce_fresh_reader_cold_limits(
+            &verification,
+            args.max_cold_read_amp,
+            args.max_cold_read_requests_per_read,
+        ),
+    );
+    record_gate_failure(
+        &mut failures,
+        enforce_fresh_reader_active_run_limit(&verification, args.max_active_index_runs),
+    );
+    finish_gate_failures(failures)
+}
+
+fn canonical_phase_path(path: Option<&Path>, name: &str) -> Result<PathBuf> {
+    path.context(format!("fresh-process {name} path is missing"))?
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize fresh-process {name} path"))
+}
+
+fn required_phase_path<'a>(path: Option<&'a Path>, name: &str) -> Result<&'a Path> {
+    path.context(format!("fresh-process {name} path is missing"))
+}
+
+fn enforce_fresh_reader_cold_limits(
+    verification: &ReloadVerification,
+    byte_limit: Option<f64>,
+    request_limit: Option<f64>,
+) -> Result<()> {
+    let cold = &verification.cold_reads;
+    if let Some(limit) = byte_limit {
+        let actual = ratio_optional(
+            cold.counts.bytes_read,
+            cold.requested_plaintext_bytes as u64,
+        )
+        .context("cold-read byte limit requires non-empty plaintext evidence")?;
+        if actual > limit {
+            anyhow::bail!(
+                "fresh-process reader cold-read amplification {actual:.6}x exceeds {limit:.6}x"
+            );
+        }
+    }
+    if let Some(limit) = request_limit {
+        let actual = ratio_optional(
+            backend_request_count(&cold.counts),
+            cold.logical_reads as u64,
+        )
+        .context("cold-read request limit requires at least one logical read")?;
+        if actual > limit {
+            anyhow::bail!(
+                "fresh-process reader cold-read requests {actual:.6} per read exceeds {limit:.6}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn enforce_fresh_reader_active_run_limit(
+    verification: &ReloadVerification,
+    limit: Option<usize>,
+) -> Result<()> {
+    if let Some(limit) = limit
+        && verification.active_index_runs > limit
+    {
+        anyhow::bail!(
+            "fresh-process reader recovered {} active index runs, exceeding limit {limit}",
+            verification.active_index_runs
+        );
+    }
+    Ok(())
+}
+
+fn read_json<T>(path: &Path) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    serde_json::from_reader(file).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn write_json_atomic<T>(path: &Path, value: &T) -> Result<()>
+where
+    T: serde::Serialize,
+{
+    let parent = path
+        .parent()
+        .context("fresh-process JSON path has no parent")?;
+    let temp_path = parent.join(format!(
+        ".{}-{}-{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("report"),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    let bytes = serde_json::to_vec_pretty(value).context("failed to encode fresh-process JSON")?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .with_context(|| format!("failed to create {}", temp_path.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+    drop(file);
+    std::fs::rename(&temp_path, path)
+        .with_context(|| format!("failed to publish {}", path.display()))
 }
 
 async fn verify_parallel_reload<S>(
@@ -861,6 +1500,7 @@ where
     let active_index_runs = repository
         .active_index_run_count()
         .context("failed to read the recovered active index-run count")?;
+    let recovery_elapsed = started.elapsed();
 
     let entries = repository
         .list("perf/write-committed-parallel/")
@@ -902,6 +1542,7 @@ where
 
     Ok(ReloadVerification {
         checkpoint,
+        recovery_elapsed,
         elapsed: started.elapsed(),
         expected_objects: args.objects,
         listed_objects: entries.len(),
@@ -999,6 +1640,7 @@ where
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
+        checkpoint: None,
         reload_verification: None,
     })
 }
@@ -1081,6 +1723,7 @@ where
         operation_latency: OperationLatencyStats::from_samples(latencies),
         elapsed,
         counts,
+        checkpoint: None,
         reload_verification: None,
     })
 }
@@ -1103,12 +1746,14 @@ struct PerfReport {
     operation_latency: OperationLatencyStats,
     elapsed: Duration,
     counts: BlobOperationCounts,
+    checkpoint: Option<CheckpointMeasurement>,
     reload_verification: Option<ReloadVerification>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReloadVerification {
     checkpoint: Option<CheckpointMeasurement>,
+    recovery_elapsed: Duration,
     elapsed: Duration,
     expected_objects: usize,
     listed_objects: usize,
@@ -1128,6 +1773,7 @@ struct CheckpointMeasurement {
 struct ReloadVerificationReport {
     verified: bool,
     checkpoint: Option<CheckpointMeasurementReport>,
+    recovery_elapsed_ms: f64,
     elapsed_ms: f64,
     expected_objects: usize,
     listed_objects: usize,
@@ -1171,6 +1817,7 @@ impl ReloadVerification {
         ReloadVerificationReport {
             verified: true,
             checkpoint: self.checkpoint.map(CheckpointMeasurement::report),
+            recovery_elapsed_ms: self.recovery_elapsed.as_secs_f64() * 1_000.0,
             elapsed_ms: self.elapsed.as_secs_f64() * 1_000.0,
             expected_objects: self.expected_objects,
             listed_objects: self.listed_objects,
@@ -1381,7 +2028,9 @@ impl PerfReport {
             ratio_optional(backend_requests, self.operations as u64);
         let latency = self.operation_latency;
         let reload_verification = self.reload_verification.as_ref();
-        let checkpoint = reload_verification.and_then(|verification| verification.checkpoint);
+        let checkpoint = self
+            .checkpoint
+            .or_else(|| reload_verification.and_then(|verification| verification.checkpoint));
         let cold_reads = reload_verification.map(|verification| &verification.cold_reads);
 
         println!(
@@ -1463,10 +2112,18 @@ impl PerfReport {
     }
 
     fn print_jsonl(&self, peak_rss_bytes: Option<u64>) -> Result<()> {
+        println!(
+            "{}",
+            serde_json::to_string(&self.json_value(peak_rss_bytes))?
+        );
+        Ok(())
+    }
+
+    fn json_value(&self, peak_rss_bytes: Option<u64>) -> serde_json::Value {
         let requested_plaintext_bytes = self.requested_plaintext_bytes();
         let backend_bytes = self.backend_bytes();
         let backend_requests = self.backend_requests();
-        let report = serde_json::json!({
+        serde_json::json!({
             "scenario": self.scenario,
             "backend_name": self.backend.as_str(),
             "repository_format": self.repository_format,
@@ -1521,10 +2178,9 @@ impl PerfReport {
                 self.counts.bytes_read,
                 self.requested_plaintext_read_bytes as u64,
             ),
+            "checkpoint": self.checkpoint.map(CheckpointMeasurement::report),
             "reload_verification": self.reload_verification.as_ref().map(ReloadVerification::report),
-        });
-        println!("{}", serde_json::to_string(&report)?);
-        Ok(())
+        })
     }
 
     fn requested_plaintext_bytes(&self) -> usize {
@@ -2014,13 +2670,86 @@ fn init_tracing(filter: &str, format: TraceFormat) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        backend_request_count, checkpoint_due, enforce_max_elapsed_seconds,
-        enforce_max_peak_rss_bytes, enforce_max_reload_elapsed_seconds, finish_gate_failures,
-        operation_counts_delta, parse_proc_status_peak_rss, record_gate_failure,
-        validate_cold_read_counts, verification_indices,
+        FreshProcessHandoff, PerfArgs, backend_request_count, checkpoint_due,
+        enforce_max_elapsed_seconds, enforce_max_peak_rss_bytes,
+        enforce_max_reload_elapsed_seconds, finish_gate_failures, operation_counts_delta,
+        parse_proc_status_peak_rss, perf_format_ref, record_gate_failure,
+        validate_cold_read_counts, validate_fresh_process_args, verification_indices,
     };
+    use crate::{Cli, Commands};
+    use clap::Parser;
+    use rs3_repository::v2::V2AnchorState;
     use rs3_storage::BlobOperationCounts;
+    use rs3_types::{BackendObjectId, KeyId, Sequence};
+    use std::path::PathBuf;
     use std::time::Duration;
+
+    fn fresh_process_args() -> PerfArgs {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "perf",
+            "--scenario",
+            "write-committed-parallel",
+            "--objects",
+            "8",
+            "--verify-reload",
+            "--fresh-process-reload",
+            "--checkpoint-after-objects",
+            "8",
+            "--backend",
+            "filesystem",
+            "--backend-dir",
+            "/tmp/rs3-perf-test-backend",
+            "--evidence-dir",
+            "/tmp/rs3-perf-test-evidence",
+            "--format",
+            "jsonl",
+        ])
+        .unwrap_or_else(|error| panic!("parse fresh-process perf arguments: {error}"));
+        let Some(Commands::Perf(args)) = cli.command else {
+            panic!("expected perf command");
+        };
+        *args
+    }
+
+    #[test]
+    fn fresh_process_arguments_require_the_qualified_shape() {
+        let mut args = fresh_process_args();
+        validate_fresh_process_args(&args)
+            .unwrap_or_else(|error| panic!("valid fresh-process arguments: {error}"));
+
+        args.checkpoint_after_objects = Some(7);
+        let error = validate_fresh_process_args(&args)
+            .expect_err("checkpoint below object count must be rejected");
+        assert!(error.to_string().contains("equal --objects"));
+    }
+
+    #[test]
+    fn fresh_process_handoff_binds_the_requested_repository_facts() {
+        let args = fresh_process_args();
+        let backend_dir = PathBuf::from("/tmp/rs3-perf-test-backend");
+        let anchor = V2AnchorState {
+            sequence: Sequence::new(9),
+            commit_key: BackendObjectId::new("commits/v02/test")
+                .unwrap_or_else(|error| panic!("commit key: {error}")),
+            body_digest: [3; 32],
+            version_id: None,
+            signing_key_id: KeyId::new("signing")
+                .unwrap_or_else(|error| panic!("signing key: {error}")),
+            format_ref: perf_format_ref()
+                .unwrap_or_else(|error| panic!("format reference: {error}")),
+        };
+        let mut handoff = FreshProcessHandoff::new(&args, backend_dir.clone(), anchor);
+
+        handoff
+            .validate(&args, &backend_dir)
+            .unwrap_or_else(|error| panic!("valid handoff: {error}"));
+        handoff.objects = 9;
+        let error = handoff
+            .validate(&args, &backend_dir)
+            .expect_err("mismatched object count must be rejected");
+        assert!(error.to_string().contains("do not match"));
+    }
 
     #[test]
     fn gate_failures_are_aggregated_in_evaluation_order() {
