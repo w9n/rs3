@@ -8,6 +8,7 @@ use crate::integration::{S3ContainerProvider, s3_container};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::{Args, ValueEnum};
+use futures_util::stream;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_repository::v2::{
     UnenforcedQuiescedMaintenanceGuard, V2AnchorState, V2CommitAnchor, V2CommitCoordinator,
@@ -43,6 +44,7 @@ const PERF_OBJECT_PREFIX: &str = "perf/";
 const PERF_OBJECT_INDEX_DIGITS: usize = 20;
 const MIN_PERF_LOGICAL_PATH_LEN: usize = PERF_OBJECT_PREFIX.len() + PERF_OBJECT_INDEX_DIGITS;
 const MAX_PERF_LOGICAL_PATH_LEN: usize = 1024;
+const STANDALONE_PERF_MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
 
 /// Runs lightweight repository performance scenarios.
 #[derive(Debug, Args)]
@@ -83,6 +85,15 @@ pub(crate) struct PerfArgs {
     /// Fail a write scenario when backend bytes exceed this plaintext ratio.
     #[arg(long)]
     max_write_amp: Option<f64>,
+    /// Fail a write scenario when verification reads exceed this plaintext ratio.
+    #[arg(long)]
+    max_verification_read_amp: Option<f64>,
+    /// Fail a write scenario when total backend read and write bytes exceed this plaintext ratio.
+    #[arg(long)]
+    max_total_write_io_amp: Option<f64>,
+    /// Require this exact number of multipart part attempts per standalone object.
+    #[arg(long)]
+    expected_multipart_parts_per_object: Option<u64>,
     /// Fail a scenario when its elapsed time exceeds this many seconds.
     #[arg(long)]
     max_elapsed_seconds: Option<f64>,
@@ -197,6 +208,8 @@ pub(crate) enum PerfScenario {
     WriteCommitted,
     /// Write objects through the commit coordinator concurrently.
     WriteCommittedParallel,
+    /// Write known-length standalone payloads through the commit coordinator concurrently.
+    WriteStandaloneParallel,
     /// Repeatedly read a full object.
     FullRead,
     /// Repeatedly read plaintext ranges from one object.
@@ -279,6 +292,7 @@ impl PerfScenario {
             Self::WriteBatch => "write-batch",
             Self::WriteCommitted => "write-committed",
             Self::WriteCommittedParallel => "write-committed-parallel",
+            Self::WriteStandaloneParallel => "write-standalone-parallel",
             Self::FullRead => "full-read",
             Self::RangeRead => "range-read",
         }
@@ -337,12 +351,12 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
     if args.verify_reload
         && !matches!(
             args.scenario,
-            PerfScenario::All | PerfScenario::WriteCommittedParallel
+            PerfScenario::All
+                | PerfScenario::WriteCommittedParallel
+                | PerfScenario::WriteStandaloneParallel
         )
     {
-        anyhow::bail!(
-            "--verify-reload requires --scenario write-committed-parallel (or --scenario all)"
-        );
+        anyhow::bail!("--verify-reload requires a parallel write scenario (or --scenario all)");
     }
     if args
         .checkpoint_after_objects
@@ -355,6 +369,30 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
         .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
     {
         anyhow::bail!("--max-write-amp must be finite and greater than zero");
+    }
+    if args
+        .max_verification_read_amp
+        .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
+    {
+        anyhow::bail!("--max-verification-read-amp must be finite and greater than zero");
+    }
+    if args
+        .max_total_write_io_amp
+        .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
+    {
+        anyhow::bail!("--max-total-write-io-amp must be finite and greater than zero");
+    }
+    if args.expected_multipart_parts_per_object == Some(0) {
+        anyhow::bail!("--expected-multipart-parts-per-object must be greater than zero");
+    }
+    if (args.max_verification_read_amp.is_some()
+        || args.max_total_write_io_amp.is_some()
+        || args.expected_multipart_parts_per_object.is_some())
+        && args.scenario != PerfScenario::WriteStandaloneParallel
+    {
+        anyhow::bail!(
+            "standalone amplification and multipart gates require --scenario write-standalone-parallel"
+        );
     }
     if args
         .max_elapsed_seconds
@@ -790,6 +828,7 @@ async fn run_async(args: PerfArgs) -> Result<()> {
             PerfScenario::WriteBatch => write_batch(&args).await?,
             PerfScenario::WriteCommitted => write_committed(&args).await?,
             PerfScenario::WriteCommittedParallel => write_committed_parallel(&args).await?,
+            PerfScenario::WriteStandaloneParallel => write_standalone_parallel(&args).await?,
             PerfScenario::FullRead => full_read(&args).await?,
             PerfScenario::RangeRead => range_read(&args).await?,
         };
@@ -797,6 +836,18 @@ async fn run_async(args: PerfArgs) -> Result<()> {
         record_gate_failure(
             &mut gate_failures,
             report.enforce_max_write_amplification(args.max_write_amp),
+        );
+        record_gate_failure(
+            &mut gate_failures,
+            report.enforce_max_verification_read_amplification(args.max_verification_read_amp),
+        );
+        record_gate_failure(
+            &mut gate_failures,
+            report.enforce_max_total_write_io_amplification(args.max_total_write_io_amp),
+        );
+        record_gate_failure(
+            &mut gate_failures,
+            report.enforce_exact_multipart_counts(args.expected_multipart_parts_per_object),
         );
         record_gate_failure(
             &mut gate_failures,
@@ -854,7 +905,11 @@ fn run_s3_container_perf(args: &PerfArgs) -> Result<()> {
         args.s3_region.clone(),
     )?;
     let mut command = Command::new("cargo");
-    command.args(["run", "-p", "xtask", "--features", "s3", "--", "perf"]);
+    command.arg("run");
+    if args.gateway_build_profile == GatewayBuildProfile::Release {
+        command.arg("--release");
+    }
+    command.args(["-p", "xtask", "--features", "s3", "--", "perf"]);
     add_perf_args(&mut command, args, &target);
     command.env("AWS_ACCESS_KEY_ID", &target.access_key_id);
     command.env("AWS_SECRET_ACCESS_KEY", &target.secret_access_key);
@@ -913,6 +968,15 @@ fn add_perf_args(
     }
     if let Some(max_write_amp) = args.max_write_amp {
         command.args(["--max-write-amp", &max_write_amp.to_string()]);
+    }
+    if let Some(limit) = args.max_verification_read_amp {
+        command.args(["--max-verification-read-amp", &limit.to_string()]);
+    }
+    if let Some(limit) = args.max_total_write_io_amp {
+        command.args(["--max-total-write-io-amp", &limit.to_string()]);
+    }
+    if let Some(parts) = args.expected_multipart_parts_per_object {
+        command.args(["--expected-multipart-parts-per-object", &parts.to_string()]);
     }
     if let Some(limit) = args.max_elapsed_seconds {
         command.args(["--max-elapsed-seconds", &limit.to_string()]);
@@ -1149,6 +1213,24 @@ async fn write_committed_parallel(args: &PerfArgs) -> Result<PerfReport> {
     }
 }
 
+async fn write_standalone_parallel(args: &PerfArgs) -> Result<PerfReport> {
+    match args.backend {
+        PerfBackend::Memory => write_committed_parallel_with_store(args, memory_store()).await,
+        PerfBackend::Filesystem => {
+            anyhow::bail!("write-standalone-parallel requires a multipart-capable backend")
+        }
+        #[cfg(feature = "s3")]
+        PerfBackend::S3 => write_committed_parallel_with_store(args, s3_store(args).await?).await,
+        #[cfg(feature = "containers")]
+        PerfBackend::S3Container
+        | PerfBackend::S3GatewayContainer
+        | PerfBackend::GatewayFilesystem
+        | PerfBackend::GatewayMemory => {
+            unreachable!("handled before scenario dispatch")
+        }
+    }
+}
+
 async fn write_committed_parallel_with_store<S>(
     args: &PerfArgs,
     store: CountingBlobStore<S>,
@@ -1204,6 +1286,7 @@ where
         .context("failed to reset operation counts")?;
     let body = body(args.object_size);
     let parallelism = concurrency(args);
+    let standalone = args.scenario == PerfScenario::WriteStandaloneParallel;
     let mut latencies = Vec::with_capacity(args.objects);
     let started = Instant::now();
     let mut checkpoint = None;
@@ -1218,14 +1301,26 @@ where
             let logical_path_len = args.logical_path_len;
             handles.push(tokio::spawn(async move {
                 let operation_started = Instant::now();
-                coordinator
-                    .put_committed(
-                        perf_object_path(index, logical_path_len)?,
-                        body,
-                        RepositoryPutOptions::default(),
-                    )
-                    .await
-                    .with_context(|| format!("failed to commit object {index}"))?;
+                let key = perf_object_path(index, logical_path_len)?;
+                if standalone {
+                    let plaintext_len = u64::try_from(body.len())
+                        .context("standalone plaintext length does not fit in u64")?;
+                    coordinator
+                        .put_committed_streaming_known_len(
+                            key,
+                            plaintext_len,
+                            stream::iter(vec![Ok::<Bytes, rs3_repository::RepositoryError>(body)]),
+                            RepositoryPutOptions::default(),
+                            STANDALONE_PERF_MULTIPART_PART_SIZE,
+                        )
+                        .await
+                        .with_context(|| format!("failed to commit standalone object {index}"))?;
+                } else {
+                    coordinator
+                        .put_committed(key, body, RepositoryPutOptions::default())
+                        .await
+                        .with_context(|| format!("failed to commit object {index}"))?;
+                }
                 Ok::<Duration, anyhow::Error>(operation_started.elapsed())
             }));
         }
@@ -1275,7 +1370,11 @@ fn parallel_write_report<S>(
     reload_verification: Option<ReloadVerification>,
 ) -> Result<PerfReport> {
     Ok(PerfReport {
-        scenario: "write-committed-parallel",
+        scenario: if args.scenario == PerfScenario::WriteStandaloneParallel {
+            "write-standalone-parallel"
+        } else {
+            "write-committed-parallel"
+        },
         backend: args.backend,
         repository_format: PERF_REPOSITORY_FORMAT,
         objects: args.objects,
@@ -1578,7 +1677,11 @@ where
         );
     }
 
-    let checked_indices = verification_indices(args.objects);
+    let checked_indices = if args.scenario == PerfScenario::WriteStandaloneParallel {
+        (0..args.objects).collect()
+    } else {
+        verification_indices(args.objects)
+    };
     let cold_read_counts_before = store
         .operation_counts()
         .context("failed to capture pre-read backend counts")?;
@@ -1987,6 +2090,71 @@ impl PerfReport {
         Ok(())
     }
 
+    fn enforce_max_verification_read_amplification(&self, limit: Option<f64>) -> Result<()> {
+        let Some(limit) = limit else {
+            return Ok(());
+        };
+        let actual = ratio_optional(
+            self.counts.bytes_read,
+            self.requested_plaintext_write_bytes as u64,
+        )
+        .context("verification-read amplification requires plaintext write evidence")?;
+        if actual > limit {
+            anyhow::bail!(
+                "{} verification-read amplification {actual:.6}x exceeds {limit:.6}x",
+                self.scenario
+            );
+        }
+        Ok(())
+    }
+
+    fn enforce_max_total_write_io_amplification(&self, limit: Option<f64>) -> Result<()> {
+        let Some(limit) = limit else {
+            return Ok(());
+        };
+        let actual = ratio_optional(
+            self.counts
+                .bytes_written
+                .saturating_add(self.counts.bytes_read),
+            self.requested_plaintext_write_bytes as u64,
+        )
+        .context("total write-I/O amplification requires plaintext write evidence")?;
+        if actual > limit {
+            anyhow::bail!(
+                "{} total write-I/O amplification {actual:.6}x exceeds {limit:.6}x",
+                self.scenario
+            );
+        }
+        Ok(())
+    }
+
+    fn enforce_exact_multipart_counts(&self, parts_per_object: Option<u64>) -> Result<()> {
+        let Some(parts_per_object) = parts_per_object else {
+            return Ok(());
+        };
+        let objects = u64::try_from(self.objects).context("object count does not fit in u64")?;
+        let expected_parts = objects
+            .checked_mul(parts_per_object)
+            .context("expected multipart part count overflowed u64")?;
+        if self.counts.multipart_create != objects
+            || self.counts.multipart_upload_part != expected_parts
+            || self.counts.multipart_complete != objects
+            || self.counts.multipart_put != objects
+            || self.counts.multipart_abort != 0
+        {
+            anyhow::bail!(
+                "{} multipart counts mismatch: creates={}, parts={}, completes={}, committed={}, aborts={}; expected {objects}/{expected_parts}/{objects}/{objects}/0",
+                self.scenario,
+                self.counts.multipart_create,
+                self.counts.multipart_upload_part,
+                self.counts.multipart_complete,
+                self.counts.multipart_put,
+                self.counts.multipart_abort,
+            );
+        }
+        Ok(())
+    }
+
     fn enforce_resource_limits(
         &self,
         max_elapsed_seconds: Option<f64>,
@@ -2260,6 +2428,14 @@ impl PerfReport {
             "requested_plaintext_read_bytes": self.requested_plaintext_read_bytes,
             "write_amp": ratio_optional(
                 self.counts.bytes_written,
+                self.requested_plaintext_write_bytes as u64,
+            ),
+            "verification_read_amp": ratio_optional(
+                self.counts.bytes_read,
+                self.requested_plaintext_write_bytes as u64,
+            ),
+            "total_write_io_amp": ratio_optional(
+                self.counts.bytes_written.saturating_add(self.counts.bytes_read),
                 self.requested_plaintext_write_bytes as u64,
             ),
             "read_amp": ratio_optional(

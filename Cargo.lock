@@ -4711,6 +4711,7 @@ dependencies = [
  "aws-sdk-s3",
  "bytes",
  "clap",
+ "futures-util",
  "getrandom 0.3.4",
  "hex",
  "procfs",

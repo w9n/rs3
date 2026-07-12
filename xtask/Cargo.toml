@@ -33,6 +33,7 @@ aws-sdk-s3 = { version = "1.137.0", default-features = false, features = [
 bytes.workspace = true
 clap.workspace = true
 getrandom.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 procfs = { version = "0.18.0", optional = true }
 rs3-crypto = { version = "0.1.0", path = "../crates/rs3-crypto" }

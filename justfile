@@ -107,6 +107,7 @@ preview-gate-local:
 
 # Expensive v2 production-preview integration gate for release candidates.
 preview-gate-release:
+    just perf-standalone-gate
     just integration-kopia-gateway
     just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke
     just integration-velero-kopia-postgres-smoke
@@ -116,6 +117,7 @@ preview-gate-v2-nightly:
     just check-s3
     just fuzz-smoke
     just fault-injection-sweep
+    just perf-standalone-gate
     just integration-s3-gateway --tooling-smoke
     just integration-kopia-gateway
     just integration-k8s-gateway-v2 --wait-secs 240
@@ -289,10 +291,12 @@ perf-scale-tier OBJECTS:
     cargo build --release -p xtask --bin xtask
     batch_items=64
     concurrency=64
+    max_write_amp=1.50
     checkpoint_after={{OBJECTS}}
     if (( checkpoint_after >= 100000 )); then
-      batch_items=1024
-      concurrency=1024
+      batch_items=4096
+      concurrency=4096
+      max_write_amp=1.30
     fi
     for ((run = 1; run <= runs; run++)); do
       echo "scale gate run ${run}/${runs}: {{OBJECTS}} objects" >&2
@@ -308,7 +312,7 @@ perf-scale-tier OBJECTS:
         --max-elapsed-seconds 180 \
         --max-reload-elapsed-seconds 30 \
         --max-peak-rss-bytes 4294967296 \
-        --max-write-amp 1.50 \
+        --max-write-amp "${max_write_amp}" \
         --max-cold-read-amp 1.04 \
         --max-cold-read-requests-per-read 1.0 \
         --max-active-index-runs 255 \
@@ -384,9 +388,11 @@ perf-scale-fs-tier OBJECTS ROOT:
     RS3_BUILD_GIT_SHA="${build_revision}" cargo build --release -p xtask --bin xtask
     batch_items=64
     concurrency=64
+    max_write_amp=1.50
     if (( {{OBJECTS}} >= 100000 )); then
-      batch_items=1024
-      concurrency=1024
+      batch_items=4096
+      concurrency=4096
+      max_write_amp=1.30
     fi
     stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
     for ((run = 1; run <= runs; run++)); do
@@ -411,7 +417,7 @@ perf-scale-fs-tier OBJECTS ROOT:
         --max-reload-elapsed-seconds 180 \
         --max-writer-peak-rss-bytes 4294967296 \
         --max-reader-peak-rss-bytes 4294967296 \
-        --max-write-amp 1.50 \
+        --max-write-amp "${max_write_amp}" \
         --max-cold-read-amp 1.04 \
         --max-cold-read-requests-per-read 1.0 \
         --max-active-index-runs 255 \
@@ -439,6 +445,64 @@ perf-s3-container *ARGS:
 # Run performance measurements through a containerized gateway.
 perf-s3-gateway *ARGS:
     cargo run -p xtask --bin xtask --features containers -- perf --backend s3-gateway-container {{ARGS}}
+
+# Qualify concurrent known-length standalone writes through the release gateway,
+# then reload and exactly read every object through a fresh repository instance.
+perf-standalone-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    object_size=67108865
+    baseline_throughput=""
+    for concurrency in 1 2 4 8; do
+      output="$(cargo run --release -p xtask --bin xtask --features containers -- perf \
+        --backend s3-gateway-container \
+        --gateway-build-profile release \
+        --scenario write-standalone-parallel \
+        --objects "${concurrency}" \
+        --concurrency "${concurrency}" \
+        --object-size "${object_size}" \
+        --commit-batch-items 1 \
+        --max-write-amp 1.02 \
+        --max-verification-read-amp 1.02 \
+        --max-total-write-io-amp 2.04 \
+        --max-elapsed-seconds 240 \
+        --max-peak-rss-bytes 1073741824 \
+        --format jsonl)"
+      printf '%s\n' "${output}"
+      throughput="$(printf '%s\n' "${output}" | sed -n 's/.*"plaintext_mib_s":\([0-9.eE+-]*\).*/\1/p')"
+      if [[ -z "${throughput}" ]]; then
+        echo "standalone gate could not parse plaintext throughput" >&2
+        exit 1
+      fi
+      if (( concurrency == 1 )); then
+        baseline_throughput="${throughput}"
+      elif (( concurrency == 8 )); then
+        if ! awk -v baseline="${baseline_throughput}" -v current="${throughput}" \
+          'BEGIN { exit !(current >= baseline * 2.0) }'; then
+          echo "standalone concurrency-8 throughput ${throughput} MiB/s is below 2x concurrency-1 ${baseline_throughput} MiB/s" >&2
+          exit 1
+        fi
+      fi
+    done
+    cargo run --release -p xtask --bin xtask --features containers -- perf \
+      --backend s3-container \
+      --gateway-build-profile release \
+      --scenario write-standalone-parallel \
+      --objects 8 \
+      --concurrency 8 \
+      --object-size "${object_size}" \
+      --commit-batch-items 1 \
+      --verify-reload \
+      --expected-multipart-parts-per-object 5 \
+      --max-write-amp 1.02 \
+      --max-verification-read-amp 1.02 \
+      --max-total-write-io-amp 2.04 \
+      --max-cold-read-amp 1.02 \
+      --max-cold-read-requests-per-read 1 \
+      --max-reload-elapsed-seconds 30 \
+      --max-elapsed-seconds 240 \
+      --max-peak-rss-bytes 1073741824 \
+      --format jsonl
 
 # Run the workspace suite with nextest.
 nextest:

@@ -31,6 +31,7 @@ const GATEWAY_REPOSITORY_SALT_HEX: &str =
     "2222222222222222222222222222222222222222222222222222222222222222";
 const GATEWAY_START_TIMEOUT: Duration = Duration::from_secs(120);
 const GATEWAY_OPERATION_TIMEOUT: Duration = Duration::from_secs(240);
+const GATEWAY_BUFFERED_PUT_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 const GATEWAY_LOCAL_BUCKET: &str = "local-backend";
 const GATEWAY_LOCAL_REGION: &str = "us-east-1";
 
@@ -51,6 +52,14 @@ pub(super) fn run_s3_gateway_container_perf(args: &PerfArgs) -> Result<()> {
             .s3_prefix
             .clone()
             .unwrap_or_else(default_gateway_prefix);
+        let standalone_prefix = format!("{}/objects/v02/", backend_prefix.trim_end_matches('/'));
+        let backend_client = s3_container::s3_client_with_timeout(
+            &target.endpoint_url,
+            &target.region,
+            &target.access_key_id,
+            &target.secret_access_key,
+            GATEWAY_OPERATION_TIMEOUT,
+        );
         let backend = GatewayBackend::s3_container(&target, backend_prefix);
         let mut gateway = RunningPerfGateway::start(backend, args).await?;
         let client = s3_container::s3_client_with_timeout(
@@ -66,12 +75,48 @@ pub(super) fn run_s3_gateway_container_perf(args: &PerfArgs) -> Result<()> {
         }
         for scenario in scenarios {
             let report = run_gateway_perf_scenario(args, scenario, &client, &gateway).await?;
-            report.print_with_peak_rss(args.format, gateway.peak_rss_bytes())?;
+            if scenario == PerfScenario::WriteStandaloneParallel {
+                enforce_standalone_backend_shape(
+                    &backend_client,
+                    &target.bucket,
+                    &standalone_prefix,
+                    args.objects,
+                )
+                .await?;
+            }
+            let peak_rss_bytes = gateway.peak_rss_bytes();
+            enforce_gateway_report(args, &report, peak_rss_bytes)?;
+            report.print_with_peak_rss(args.format, peak_rss_bytes)?;
         }
 
         gateway.shutdown()?;
         Ok(())
     })
+}
+
+async fn enforce_standalone_backend_shape(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    expected_objects: usize,
+) -> Result<()> {
+    let output = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .send()
+        .await
+        .context("failed to inspect standalone backend shape")?;
+    if output.is_truncated() == Some(true) {
+        anyhow::bail!("standalone backend-shape check exceeded one bounded page");
+    }
+    let actual_objects = output.contents().len();
+    if actual_objects != expected_objects {
+        anyhow::bail!(
+            "standalone backend-shape mismatch: found {actual_objects} opaque payload objects, expected {expected_objects}"
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn run_gateway_filesystem_perf(args: &PerfArgs) -> Result<()> {
@@ -105,7 +150,9 @@ fn run_local_gateway_perf(args: &PerfArgs, backend: GatewayBackend) -> Result<()
         }
         for scenario in scenarios {
             let report = run_gateway_perf_scenario(args, scenario, &client, &gateway).await?;
-            report.print_with_peak_rss(args.format, gateway.peak_rss_bytes())?;
+            let peak_rss_bytes = gateway.peak_rss_bytes();
+            enforce_gateway_report(args, &report, peak_rss_bytes)?;
+            report.print_with_peak_rss(args.format, peak_rss_bytes)?;
         }
 
         gateway.shutdown()?;
@@ -126,6 +173,7 @@ fn gateway_perf_scenarios(scenario: PerfScenario) -> Result<Vec<PerfScenario>> {
                 "write-batch is not a client-visible gateway scenario; use write-committed"
             )
         }
+        PerfScenario::WriteStandaloneParallel => Ok(vec![PerfScenario::WriteStandaloneParallel]),
         scenario => Ok(vec![scenario]),
     }
 }
@@ -141,6 +189,9 @@ async fn run_gateway_perf_scenario(
         PerfScenario::WriteBatch => unreachable!("rejected before dispatch"),
         PerfScenario::WriteCommitted => gateway_write_committed(args, client, gateway).await,
         PerfScenario::WriteCommittedParallel => {
+            gateway_write_committed_parallel(args, client, gateway).await
+        }
+        PerfScenario::WriteStandaloneParallel => {
             gateway_write_committed_parallel(args, client, gateway).await
         }
         PerfScenario::FullRead => gateway_full_read(args, client, gateway).await,
@@ -197,6 +248,17 @@ async fn gateway_write_committed_parallel(
     client: &aws_sdk_s3::Client,
     gateway: &RunningPerfGateway,
 ) -> Result<PerfReport> {
+    if args.scenario == PerfScenario::WriteStandaloneParallel {
+        if args.gateway_unknown_length_put {
+            anyhow::bail!("write-standalone-parallel requires known-length gateway PUTs");
+        }
+        if args.object_size <= GATEWAY_BUFFERED_PUT_OBJECT_BYTES {
+            anyhow::bail!(
+                "write-standalone-parallel requires --object-size greater than {} bytes",
+                GATEWAY_BUFFERED_PUT_OBJECT_BYTES
+            );
+        }
+    }
     let body = body(args.object_size);
     let parallelism = concurrency(args);
     let unknown_length = args.gateway_unknown_length_put;
@@ -245,7 +307,9 @@ async fn gateway_write_committed_parallel(
     let counts = gateway.backend_operation_counts().await?;
     gateway_write_report(
         args,
-        if args.gateway_unknown_length_put {
+        if args.scenario == PerfScenario::WriteStandaloneParallel {
+            "write-standalone-parallel"
+        } else if args.gateway_unknown_length_put {
             "write-committed-parallel-unknown-length"
         } else {
             "write-committed-parallel"
@@ -255,6 +319,22 @@ async fn gateway_write_committed_parallel(
         latencies,
         elapsed,
         counts,
+    )
+}
+
+fn enforce_gateway_report(
+    args: &PerfArgs,
+    report: &PerfReport,
+    peak_rss_bytes: Option<u64>,
+) -> Result<()> {
+    report.enforce_max_write_amplification(args.max_write_amp)?;
+    report.enforce_max_verification_read_amplification(args.max_verification_read_amp)?;
+    report.enforce_max_total_write_io_amplification(args.max_total_write_io_amp)?;
+    report.enforce_exact_multipart_counts(args.expected_multipart_parts_per_object)?;
+    report.enforce_resource_limits(
+        args.max_elapsed_seconds,
+        args.max_peak_rss_bytes,
+        peak_rss_bytes,
     )
 }
 
