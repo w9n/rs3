@@ -2241,7 +2241,6 @@ where
         if cancellation.is_cancelled() {
             return Err(V2FormatError::ObjectBodyReadFailed);
         }
-        let required_retain_until_ms = required_retain_until_ms(retention);
         let payload_sealer = SegmentedPayloadSealer::new(&self.keyring, payload_segment_size)
             .map_err(|_| V2FormatError::InvalidHeaderField)?;
         let mut assembler = MultipartObjectAssembler::new(multipart_part_size)?;
@@ -2424,6 +2423,28 @@ where
             return Err(V2FormatError::ObjectBodyReadFailed);
         }
         let metadata = assembler.complete(multipart).await.map_err(storage_to_v2)?;
+        if metadata.object_id != object_id || metadata.content_len != object_len {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        let retention_version = match self.options.provider_profile {
+            V2ProviderProfile::RetainedVersionObjectLock => Some(
+                metadata
+                    .version_id
+                    .as_ref()
+                    .ok_or(V2FormatError::ProviderProfileFailed)?,
+            ),
+            V2ProviderProfile::Dev | V2ProviderProfile::AtomicCreate => {
+                metadata.version_id.as_ref()
+            }
+        };
+        let required_retain_until_ms = required_retain_until_ms(retention);
+        if required_retain_until_ms.is_some() {
+            let retention = retention.ok_or(V2FormatError::ProviderProfileFailed)?;
+            self.store
+                .extend_retention_at(&object_id, retention_version, retention)
+                .await
+                .map_err(storage_to_v2)?;
+        }
         let object_digest: [u8; 32] = object_digest.finalize().into();
         let version_id = self
             .verify_commit_postconditions(
