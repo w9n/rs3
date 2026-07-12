@@ -81,9 +81,11 @@ The payload pack is an immutable value log. It carries shared encryption and
 container facts once, keeps small-record overhead to one AEAD tag, randomizes
 record order, and retains segmented AEAD for large range-readable values. The
 pack itself is ciphertext-only. Its encrypted `INDEX_RUN` stores authenticated
-shared pack facts plus each record's ordinal, physical offset, plaintext
-length, and digest. The accepted record reference also preserves the exact
-historical keyring-envelope object and digest used by the containing commit.
+shared pack facts plus each record's ordinal, physical offset, and plaintext
+length. Per-segment AEAD binds the complete record and segment layout, so a
+second plaintext digest is not stored. The accepted record reference preserves
+the exact historical keyring-envelope object and digest used by the containing
+commit.
 This lets a cold read issue one exact range `GET` instead of fetching a pack
 directory first. Retention mode, expiry horizon, and legal-hold requirement
 define protection cohorts because the backend protects the containing object.

@@ -308,7 +308,7 @@ perf-scale-tier OBJECTS:
         --max-elapsed-seconds 180 \
         --max-reload-elapsed-seconds 30 \
         --max-peak-rss-bytes 4294967296 \
-        --max-write-amp 1.65 \
+        --max-write-amp 1.50 \
         --max-cold-read-amp 1.04 \
         --max-cold-read-requests-per-read 1.0 \
         --max-active-index-runs 255 \
@@ -336,7 +336,7 @@ perf-scale-path-matrix-tier OBJECTS:
       exit 2
     fi
     cargo build --release -p xtask --bin xtask
-    for specification in "32:1.50" "256:2.00" "1024:3.60"; do
+    for specification in "32:1.32" "256:1.80" "1024:3.40"; do
       path_len="${specification%%:*}"
       max_write_amp="${specification##*:}"
       for ((run = 1; run <= runs; run++)); do
@@ -411,7 +411,7 @@ perf-scale-fs-tier OBJECTS ROOT:
         --max-reload-elapsed-seconds 180 \
         --max-writer-peak-rss-bytes 4294967296 \
         --max-reader-peak-rss-bytes 4294967296 \
-        --max-write-amp 1.65 \
+        --max-write-amp 1.50 \
         --max-cold-read-amp 1.04 \
         --max-cold-read-requests-per-read 1.0 \
         --max-active-index-runs 255 \

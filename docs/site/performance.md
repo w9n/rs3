@@ -109,33 +109,38 @@ and length fields, and validates catalog-only rewrites by reading back the exact
 signed root and new run bytes. It does not rebuild a second complete namespace
 to prove that an immutable catalog still names the same state.
 
-On 2026-07-12 the automatic-compaction 1M lane at revision `7023c65`
+On 2026-07-12 the automatic-compaction 1M lane at revision `0c8ce72`
 passed three release runs with 512 B values, batch and concurrency 1,024, the
 180-second elapsed gate, a 30-second same-process reload gate, and the 4 GiB
 process high-water gate:
 
 | Run | Elapsed | Recovery | Reload total | Peak RSS | PUT | GET | HEAD | Active runs | Write amp | Cold read |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 39.135 s | 7.559 s | 7.587 s | 1,953,775,616 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
-| 2 | 45.049 s | 7.822 s | 7.863 s | 1,953,808,384 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
-| 3 | 42.664 s | 6.364 s | 6.391 s | 1,953,574,912 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
+| 1 | 32.321 s | 5.106 s | 5.148 s | 1,771,307,008 B | 1,008 | 3,433 | 806 | 233 | 1.459546533x | 1 GET/read, 1.03125x |
+| 2 | 32.233 s | 5.188 s | 5.230 s | 1,771,573,248 B | 1,008 | 3,433 | 806 | 233 | 1.459546533x | 1 GET/read, 1.03125x |
+| 3 | 32.462 s | 5.110 s | 5.153 s | 1,771,466,752 B | 1,008 | 3,433 | 806 | 233 | 1.459546533x | 1 GET/read, 1.03125x |
 
 Each run performed six bounded metadata-only compactions, reloaded exactly one
 million entries through a new repository instance, and verified the first,
-middle, and last payload. The v02 accepted state no longer derives or retains
+middle, and last payload. Removing the redundant per-record plaintext digest
+and interning namespace-key IDs reduced lifetime backend writes by 73,214,822 B,
+or 8.9%, from the previous 1.602593008x lane. The current three-run 10k path
+matrix measured exactly 1.288831836x, 1.757713086x, and 3.351974023x for 32 B,
+256 B, and 1,024 B paths. The v02 accepted state no longer derives or retains
 the legacy prefix-token projection because v02 listing uses its separate
 trusted path-ordered projection. Ordered path keys and exact carrier facts are
 structurally shared; records from one authenticated container retain one
 carrier allocation while preserving the exact serialized representation and
 authentication inputs. A same-host 100k sample moved from 282,611,712 B and
 823.807 ms reload before these changes to 193,286,144 B and 468.2 ms. The prior
-1M evidence peaked at 2,197,200,896-2,197,594,112 B; the final runs above
-peaked at 1,953,574,912-1,953,808,384 B. Backend bytes, request counts,
+1M evidence peaked at 2,197,200,896-2,197,594,112 B; an intermediate revision
+peaked at 1,953,574,912-1,953,808,384 B; the final runs above peaked at
+1,771,307,008-1,771,573,248 B. Backend bytes, request counts,
 recovered run count, and cold-read shape remained exact. The in-memory scale
 process also retains the complete simulated backend, so its high-water mark is
 not gateway-only memory.
 
-The same revision also passed three local controlled-filesystem runs with a
+The earlier `7023c65` revision passed three local controlled-filesystem runs with a
 writer process that exited before a fresh reader process started:
 
 | Run | Writer elapsed | Checkpoint | Writer RSS | Reader recovery | Reader verification | Reader RSS |
@@ -148,15 +153,17 @@ Every filesystem run recovered exactly 1,000,000 entries and 233 active runs,
 then verified the first, middle, and last payload with one exact range `GET`
 and 1.03125x byte amplification per read. Each recorded 1,008 PUTs, 3,433 GETs,
 806 HEADs, 820,502,647 B written, 258,733,774 B read, and 1.602544232x write
-amplification. This qualifies separate-process recovery and repository-process
-RSS excluding an in-memory backend on that local filesystem. It is not an HTTP
-gateway measurement, the pinned release-runner timing qualification, or a
+amplification. Those runs predate the record-digest removal and namespace-key
+table, so current-revision fresh-process qualification remains required. The
+lane measures repository-process RSS excluding an in-memory backend on that
+local filesystem. It is not an HTTP gateway measurement, the pinned
+release-runner timing qualification, or a
 retained-provider qualification, and the fresh process does not imply a cold
 kernel page cache.
 
 The current layout removes the pack directory:
 encrypted `INDEX_RUN` state authenticates the record's exact physical offset,
-length, digest, pack facts, and historical keyring-envelope reference. After a
+length, pack facts, and historical keyring-envelope reference. After a
 fresh recovery, each measured 512 B sentinel read used one exact range
 `GET` for 528 B of ciphertext, or 1.03125x byte amplification. The scale recipes
 enforced at most one backend request per sentinel and 1.04x byte amplification
@@ -199,7 +206,7 @@ Qualification must enforce, not merely report, these initial ceilings:
 | 64 objects of 4 KiB | 1.15x |
 | 64 objects of 256 KiB | 1.03x |
 | sequential committed 512 B objects | 3.0x |
-| checkpoint-and-compaction-inclusive lifetime 512 B lane | 1.65x |
+| checkpoint-and-compaction-inclusive lifetime 512 B lane | 1.50x |
 
 The repository integration suite enforces the physical shape for a 64-object
 batch (one single-PUT commit, one payload pack, and one index run) and the 1.50x
@@ -209,11 +216,12 @@ include its bytes in write amplification. After reload they isolate the first,
 middle, and last reads from recovery counters, require one exact range `GET`
 per object, and enforce at most 1.04x cold-read byte amplification. The
 longer-path matrix remains a separate gate.
-The 1.50x bound remains the one-batch physical-shape gate. It was not a valid
-lifetime scale ceiling because it excluded automatic maintenance; the lifetime
-512 B scale gate is 1.65x.
+The 1.50x bound now covers both the one-batch physical-shape gate and the
+checkpoint-and-compaction-inclusive lifetime scale lane. The path-length
+matrix separately enforces 1.32x, 1.80x, and 3.40x for exact 32 B, 256 B, and
+1,024 B logical paths.
 The fixed scale recipes fail when checkpoint-and-compaction-inclusive write
-amplification exceeds 1.65x, cold-read byte amplification exceeds 1.04x, or a
+amplification exceeds 1.50x, cold-read byte amplification exceeds 1.04x, or a
 sentinel read uses more than one backend request, or fresh recovery reports more
 than 255 active index runs; they do not merely print the ratios.
 

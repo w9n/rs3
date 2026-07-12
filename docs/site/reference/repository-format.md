@@ -171,11 +171,13 @@ The encrypted index container table carries the shared pack identity,
 content-key ID, record count, and exact containing-object reference. For a pack
 embedded beside the run, the historical keyring-envelope object and digest come
 from that signed commit; an external container-table entry preserves them
-explicitly. Each compact record pointer carries its record ordinal, physical
-ciphertext offset, and plaintext digest, while the authenticated mutation
-carries the plaintext length. The decoder validates the complete bounded
-layout, including canonical segment lengths, non-overlap, pack limits, and
-arithmetic overflow. Once recovery has authenticated the run, a cold read can
+explicitly. Each compact record pointer carries its record ordinal and physical
+ciphertext offset, while the authenticated mutation carries the plaintext
+length. The metadata frame stores each sorted unique namespace-key ID once,
+and namespace mutations reference it by a bounded ordinal. The decoder
+validates the complete bounded layout, including canonical segment lengths,
+non-overlap, pack limits, and arithmetic overflow. Once recovery has
+authenticated the run, a cold read can
 calculate the exact ciphertext span without another metadata fetch. For a 512
 B record, one exact range `GET` fetches 528 B including the AEAD tag, or
 1.03125x ciphertext-byte amplification.
@@ -597,7 +599,7 @@ include:
   512 B values (target 1.40x), at most 1.15x for 4 KiB values, at most 1.03x
   for 256 KiB values, and at most 320 fixed backend bytes per empty object;
 - a sequential 512 B committed-write gate of at most 3.0x plus a
-  checkpoint-and-compaction-inclusive lifetime gate of at most 1.65x;
+  checkpoint-and-compaction-inclusive lifetime gate of at most 1.50x;
 - amplification evidence at 32 B, 256 B, and 1,024 B logical path lengths that
   reports payload amplification separately from fixed metadata bytes per
   object;
