@@ -2,8 +2,8 @@
 
 use super::{
     GatewayBuildProfile, OperationLatencyStats, PERF_REPOSITORY_FORMAT, PerfArgs, PerfReport,
-    PerfScenario, ReportFormat, body, checked_mul, commit_batch_items, commit_max_pending_items,
-    concurrency, print_header,
+    PerfScenario, ReportFormat, TemporaryBackendDir, body, checked_mul, commit_batch_items,
+    commit_max_pending_items, concurrency, print_header, process_peak_rss_bytes_for_pid,
 };
 use crate::integration::s3_container;
 use anyhow::{Context, Result};
@@ -30,6 +30,9 @@ const GATEWAY_KEYRING_WRAPPING_KEY_ID: &str = "wrap-integration";
 const GATEWAY_REPOSITORY_SALT_HEX: &str =
     "2222222222222222222222222222222222222222222222222222222222222222";
 const GATEWAY_START_TIMEOUT: Duration = Duration::from_secs(120);
+const GATEWAY_OPERATION_TIMEOUT: Duration = Duration::from_secs(240);
+const GATEWAY_LOCAL_BUCKET: &str = "local-backend";
+const GATEWAY_LOCAL_REGION: &str = "us-east-1";
 
 pub(super) fn run_s3_gateway_container_perf(args: &PerfArgs) -> Result<()> {
     let scenarios = gateway_perf_scenarios(args.scenario)?;
@@ -48,12 +51,14 @@ pub(super) fn run_s3_gateway_container_perf(args: &PerfArgs) -> Result<()> {
             .s3_prefix
             .clone()
             .unwrap_or_else(default_gateway_prefix);
-        let mut gateway = RunningPerfGateway::start(&target, args, backend_prefix).await?;
-        let client = s3_container::s3_client(
+        let backend = GatewayBackend::s3_container(&target, backend_prefix);
+        let mut gateway = RunningPerfGateway::start(backend, args).await?;
+        let client = s3_container::s3_client_with_timeout(
             &format!("http://{}", gateway.addr),
             &target.region,
             GATEWAY_ACCESS_KEY_ID,
             GATEWAY_SECRET_ACCESS_KEY,
+            GATEWAY_OPERATION_TIMEOUT,
         );
 
         if args.format == ReportFormat::Tsv {
@@ -61,7 +66,46 @@ pub(super) fn run_s3_gateway_container_perf(args: &PerfArgs) -> Result<()> {
         }
         for scenario in scenarios {
             let report = run_gateway_perf_scenario(args, scenario, &client, &gateway).await?;
-            report.print(args.format)?;
+            report.print_with_peak_rss(args.format, gateway.peak_rss_bytes())?;
+        }
+
+        gateway.shutdown()?;
+        Ok(())
+    })
+}
+
+pub(super) fn run_gateway_filesystem_perf(args: &PerfArgs) -> Result<()> {
+    let backend_root = TemporaryBackendDir::new()?;
+    run_local_gateway_perf(args, GatewayBackend::filesystem(backend_root.path()))
+}
+
+pub(super) fn run_gateway_memory_perf(args: &PerfArgs) -> Result<()> {
+    run_local_gateway_perf(args, GatewayBackend::memory())
+}
+
+fn run_local_gateway_perf(args: &PerfArgs, backend: GatewayBackend) -> Result<()> {
+    let scenarios = gateway_perf_scenarios(args.scenario)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build gateway perf runtime")?;
+
+    runtime.block_on(async {
+        let mut gateway = RunningPerfGateway::start(backend, args).await?;
+        let client = s3_container::s3_client_with_timeout(
+            &format!("http://{}", gateway.addr),
+            &gateway.region,
+            GATEWAY_ACCESS_KEY_ID,
+            GATEWAY_SECRET_ACCESS_KEY,
+            GATEWAY_OPERATION_TIMEOUT,
+        );
+
+        if args.format == ReportFormat::Tsv {
+            print_header();
+        }
+        for scenario in scenarios {
+            let report = run_gateway_perf_scenario(args, scenario, &client, &gateway).await?;
+            report.print_with_peak_rss(args.format, gateway.peak_rss_bytes())?;
         }
 
         gateway.shutdown()?;
@@ -491,21 +535,76 @@ struct RunningPerfGateway {
     addr: SocketAddr,
     region: String,
     child: Child,
+    metrics_source: GatewayMetricsSource,
     logs: Arc<Mutex<Vec<String>>>,
     readers: Vec<JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy)]
+enum GatewayMetricsSource {
+    S3Provider,
+    GenericStorage,
+}
+
+struct GatewayBackend {
+    endpoint: String,
+    bucket: String,
+    prefix: String,
+    region: String,
+    credentials: Option<(String, String)>,
+    enable_s3_feature: bool,
+    metrics_source: GatewayMetricsSource,
+}
+
+impl GatewayBackend {
+    fn s3_container(backend: &s3_container::RunningS3Container, prefix: String) -> Self {
+        Self {
+            endpoint: backend.endpoint_url.clone(),
+            bucket: backend.bucket.clone(),
+            prefix,
+            region: backend.region.clone(),
+            credentials: Some((
+                backend.access_key_id.clone(),
+                backend.secret_access_key.clone(),
+            )),
+            enable_s3_feature: true,
+            metrics_source: GatewayMetricsSource::S3Provider,
+        }
+    }
+
+    fn filesystem(root: &std::path::Path) -> Self {
+        Self {
+            endpoint: format!("file://{}", root.display()),
+            bucket: GATEWAY_LOCAL_BUCKET.to_owned(),
+            prefix: default_gateway_prefix(),
+            region: GATEWAY_LOCAL_REGION.to_owned(),
+            credentials: None,
+            enable_s3_feature: false,
+            metrics_source: GatewayMetricsSource::GenericStorage,
+        }
+    }
+
+    fn memory() -> Self {
+        Self {
+            endpoint: "memory://local".to_owned(),
+            bucket: GATEWAY_LOCAL_BUCKET.to_owned(),
+            prefix: default_gateway_prefix(),
+            region: GATEWAY_LOCAL_REGION.to_owned(),
+            credentials: None,
+            enable_s3_feature: false,
+            metrics_source: GatewayMetricsSource::GenericStorage,
+        }
+    }
+}
+
 impl RunningPerfGateway {
-    async fn start(
-        backend: &s3_container::RunningS3Container,
-        args: &PerfArgs,
-        backend_prefix: String,
-    ) -> Result<Self> {
+    async fn start(backend: GatewayBackend, args: &PerfArgs) -> Result<Self> {
         let addr = reserve_gateway_addr()?;
         let mut child = Command::new("cargo");
-        child
-            .arg("run")
-            .args(["-p", "rs3-server", "--features", "s3"]);
+        child.arg("run").args(["-p", "rs3-server"]);
+        if backend.enable_s3_feature {
+            child.args(["--features", "s3"]);
+        }
         if args.gateway_build_profile == GatewayBuildProfile::Release {
             child.arg("--release");
         }
@@ -520,9 +619,9 @@ impl RunningPerfGateway {
             ])
             .env("RUST_LOG", "rs3_storage=debug,rs3_repository=info,info")
             .env("RS3_PUBLIC_BUCKET", GATEWAY_PUBLIC_BUCKET)
-            .env("RS3_BACKEND_ENDPOINT", &backend.endpoint_url)
+            .env("RS3_BACKEND_ENDPOINT", &backend.endpoint)
             .env("RS3_BACKEND_BUCKET", &backend.bucket)
-            .env("RS3_BACKEND_PREFIX", backend_prefix)
+            .env("RS3_BACKEND_PREFIX", &backend.prefix)
             .env("RS3_ANCHOR_MODE", "memory")
             .env("RS3_ALLOW_MEMORY_ANCHOR", "true")
             .env("RS3_ADMIN_PROFILE", "local")
@@ -555,8 +654,6 @@ impl RunningPerfGateway {
             )
             .env("RS3_STATIC_ACCESS_KEY_ID", GATEWAY_ACCESS_KEY_ID)
             .env("RS3_STATIC_SECRET_ACCESS_KEY", GATEWAY_SECRET_ACCESS_KEY)
-            .env("AWS_ACCESS_KEY_ID", &backend.access_key_id)
-            .env("AWS_SECRET_ACCESS_KEY", &backend.secret_access_key)
             .env("AWS_DEFAULT_REGION", &backend.region)
             .env_remove("AWS_SESSION_TOKEN")
             .env_remove("AWS_PROFILE")
@@ -567,6 +664,15 @@ impl RunningPerfGateway {
             .env_remove("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some((access_key_id, secret_access_key)) = &backend.credentials {
+            child
+                .env("AWS_ACCESS_KEY_ID", access_key_id)
+                .env("AWS_SECRET_ACCESS_KEY", secret_access_key);
+        } else {
+            child
+                .env_remove("AWS_ACCESS_KEY_ID")
+                .env_remove("AWS_SECRET_ACCESS_KEY");
+        }
         if let Some(payload_segment_size) = args.payload_segment_size {
             child.env(
                 "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
@@ -594,8 +700,9 @@ impl RunningPerfGateway {
 
         let mut gateway = Self {
             addr,
-            region: backend.region.clone(),
+            region: backend.region,
             child,
+            metrics_source: backend.metrics_source,
             logs,
             readers,
         };
@@ -624,7 +731,12 @@ impl RunningPerfGateway {
             .logs
             .lock()
             .map_err(|_| anyhow::anyhow!("gateway log capture lock poisoned"))?;
-        Ok(parse_gateway_backend_counts(&logs))
+        let counts = parse_gateway_backend_counts(&logs, self.metrics_source);
+        counts.context("gateway backend emitted no matching rs3_storage operation evidence")
+    }
+
+    fn peak_rss_bytes(&self) -> Option<u64> {
+        process_peak_rss_bytes_for_pid(self.child.id())
     }
 
     fn captured_log_tail(&self, max_lines: usize) -> Result<String> {
@@ -700,44 +812,88 @@ impl Drop for RunningPerfGateway {
     }
 }
 
-fn parse_gateway_backend_counts(logs: &[String]) -> BlobOperationCounts {
+fn parse_gateway_backend_counts(
+    logs: &[String],
+    metrics_source: GatewayMetricsSource,
+) -> Option<BlobOperationCounts> {
     let mut counts = BlobOperationCounts::default();
+    let mut observed_operation = false;
     for line in logs {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         let fields = value.get("fields").unwrap_or(&value);
-        if json_field_str(fields, "provider") != Some("s3") {
-            continue;
-        }
         let Some(operation) = json_field_str(fields, "operation") else {
             continue;
         };
-        match operation {
-            "put" => counts.put = counts.put.saturating_add(1),
-            "get" => counts.get = counts.get.saturating_add(1),
-            "head" => counts.head = counts.head.saturating_add(1),
-            "list" => counts.list = counts.list.saturating_add(1),
-            "delete" => counts.delete = counts.delete.saturating_add(1),
-            "extend_retention" => {
-                counts.extend_retention = counts.extend_retention.saturating_add(1);
+        match metrics_source {
+            GatewayMetricsSource::S3Provider => {
+                if json_field_str(fields, "provider") != Some("s3") {
+                    continue;
+                }
+                if !count_backend_operation(&mut counts, operation) {
+                    continue;
+                }
+                observed_operation = true;
+                if json_field_str(fields, "result") == Some("ok") {
+                    counts.bytes_written = counts
+                        .bytes_written
+                        .saturating_add(json_field_u64(fields, "bytes_sent"));
+                    counts.bytes_read = counts
+                        .bytes_read
+                        .saturating_add(json_field_u64(fields, "bytes_received"));
+                }
             }
-            "set_legal_hold" => {
-                counts.set_legal_hold = counts.set_legal_hold.saturating_add(1);
+            GatewayMetricsSource::GenericStorage => {
+                if fields.get("provider").is_some() {
+                    continue;
+                }
+                if !count_generic_storage_operation(&mut counts, operation) {
+                    continue;
+                }
+                observed_operation = true;
+                if json_field_str(fields, "result") == Some("ok") {
+                    if operation == "put" {
+                        counts.bytes_written = counts
+                            .bytes_written
+                            .saturating_add(json_field_u64(fields, "requested_len"));
+                    } else if operation == "get_range" {
+                        counts.bytes_read = counts
+                            .bytes_read
+                            .saturating_add(json_field_u64(fields, "bytes_read"));
+                    }
+                }
             }
-            _ => continue,
-        }
-
-        if json_field_str(fields, "result") == Some("ok") {
-            counts.bytes_written = counts
-                .bytes_written
-                .saturating_add(json_field_u64(fields, "bytes_sent"));
-            counts.bytes_read = counts
-                .bytes_read
-                .saturating_add(json_field_u64(fields, "bytes_received"));
         }
     }
-    counts
+    observed_operation.then_some(counts)
+}
+
+fn count_backend_operation(counts: &mut BlobOperationCounts, operation: &str) -> bool {
+    match operation {
+        "put" => counts.put = counts.put.saturating_add(1),
+        "get" => counts.get = counts.get.saturating_add(1),
+        "head" => counts.head = counts.head.saturating_add(1),
+        "list" => counts.list = counts.list.saturating_add(1),
+        "delete" => counts.delete = counts.delete.saturating_add(1),
+        "extend_retention" => {
+            counts.extend_retention = counts.extend_retention.saturating_add(1);
+        }
+        "set_legal_hold" => {
+            counts.set_legal_hold = counts.set_legal_hold.saturating_add(1);
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn count_generic_storage_operation(counts: &mut BlobOperationCounts, operation: &str) -> bool {
+    let provider_operation = match operation {
+        "get_range" => "get",
+        "list_prefix" => "list",
+        operation => operation,
+    };
+    count_backend_operation(counts, provider_operation)
 }
 
 fn json_field_str<'a>(fields: &'a Value, key: &str) -> Option<&'a str> {
@@ -804,7 +960,7 @@ fn default_gateway_prefix() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_gateway_backend_counts;
+    use super::{GatewayMetricsSource, parse_gateway_backend_counts};
 
     #[test]
     fn parses_gateway_backend_counts_from_json_logs() {
@@ -816,12 +972,43 @@ mod tests {
             "not json".to_owned(),
         ];
 
-        let counts = parse_gateway_backend_counts(&logs);
+        let counts = parse_gateway_backend_counts(&logs, GatewayMetricsSource::S3Provider)
+            .unwrap_or_else(|| panic!("expected S3 provider operation evidence"));
 
         assert_eq!(counts.put, 1);
         assert_eq!(counts.get, 1);
         assert_eq!(counts.head, 1);
         assert_eq!(counts.bytes_written, 12);
         assert_eq!(counts.bytes_read, 7);
+    }
+
+    #[test]
+    fn parses_gateway_backend_counts_from_generic_storage_logs() {
+        let logs = vec![
+            r#"{"target":"rs3_storage","fields":{"operation":"put","requested_len":12,"result":"ok"}}"#.to_owned(),
+            r#"{"target":"rs3_storage","fields":{"operation":"get_range","bytes_read":7,"result":"ok"}}"#.to_owned(),
+            r#"{"target":"rs3_storage","fields":{"operation":"head","result":"not_found"}}"#.to_owned(),
+            r#"{"target":"rs3_storage","fields":{"operation":"list_prefix","result":"ok"}}"#.to_owned(),
+            r#"{"target":"rs3_storage","fields":{"provider":"s3","operation":"put","result":"ok","bytes_sent":99}}"#.to_owned(),
+        ];
+
+        let counts = parse_gateway_backend_counts(&logs, GatewayMetricsSource::GenericStorage)
+            .unwrap_or_else(|| panic!("expected generic storage operation evidence"));
+
+        assert_eq!(counts.put, 1);
+        assert_eq!(counts.get, 1);
+        assert_eq!(counts.head, 1);
+        assert_eq!(counts.list, 1);
+        assert_eq!(counts.bytes_written, 12);
+        assert_eq!(counts.bytes_read, 7);
+    }
+
+    #[test]
+    fn generic_storage_counts_are_unavailable_without_operation_evidence() {
+        let logs = vec!["not json".to_owned()];
+
+        assert!(
+            parse_gateway_backend_counts(&logs, GatewayMetricsSource::GenericStorage).is_none()
+        );
     }
 }

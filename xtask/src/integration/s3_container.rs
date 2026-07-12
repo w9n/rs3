@@ -71,9 +71,25 @@ pub(crate) fn s3_client(
     access_key_id: &str,
     secret_access_key: &str,
 ) -> Client {
+    s3_client_with_timeout(
+        endpoint_url,
+        region,
+        access_key_id,
+        secret_access_key,
+        Duration::from_secs(10),
+    )
+}
+
+pub(crate) fn s3_client_with_timeout(
+    endpoint_url: &str,
+    region: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+    operation_timeout: Duration,
+) -> Client {
     let timeout_config = TimeoutConfig::builder()
-        .operation_attempt_timeout(Duration::from_secs(5))
-        .operation_timeout(Duration::from_secs(10))
+        .operation_attempt_timeout(operation_timeout)
+        .operation_timeout(operation_timeout)
         .build();
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())

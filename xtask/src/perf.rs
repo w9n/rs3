@@ -212,6 +212,12 @@ pub(crate) enum PerfBackend {
     /// Gateway process backed by an ephemeral local S3-compatible container.
     #[cfg(feature = "containers")]
     S3GatewayContainer,
+    /// Gateway process backed by an ephemeral local filesystem.
+    #[cfg(feature = "containers")]
+    GatewayFilesystem,
+    /// Gateway process backed by an ephemeral in-memory object store.
+    #[cfg(feature = "containers")]
+    GatewayMemory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -231,6 +237,10 @@ impl PerfBackend {
             Self::S3Container => "s3-container",
             #[cfg(feature = "containers")]
             Self::S3GatewayContainer => "s3-gateway-container",
+            #[cfg(feature = "containers")]
+            Self::GatewayFilesystem => "gateway-filesystem",
+            #[cfg(feature = "containers")]
+            Self::GatewayMemory => "gateway-memory",
         }
     }
 }
@@ -385,7 +395,14 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
         return run_fresh_process_orchestrator(&args);
     }
     #[cfg(feature = "containers")]
-    if args.verify_reload && args.backend == PerfBackend::S3GatewayContainer {
+    if args.verify_reload
+        && matches!(
+            args.backend,
+            PerfBackend::S3GatewayContainer
+                | PerfBackend::GatewayFilesystem
+                | PerfBackend::GatewayMemory
+        )
+    {
         anyhow::bail!("--verify-reload is not supported by the gateway-backed perf harness");
     }
 
@@ -400,6 +417,14 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
     #[cfg(feature = "containers")]
     if args.backend == PerfBackend::S3GatewayContainer {
         return gateway::run_s3_gateway_container_perf(&args);
+    }
+    #[cfg(feature = "containers")]
+    if args.backend == PerfBackend::GatewayFilesystem {
+        return gateway::run_gateway_filesystem_perf(&args);
+    }
+    #[cfg(feature = "containers")]
+    if args.backend == PerfBackend::GatewayMemory {
+        return gateway::run_gateway_memory_perf(&args);
     }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -919,7 +944,10 @@ async fn write_batch(args: &PerfArgs) -> Result<PerfReport> {
         #[cfg(feature = "s3")]
         PerfBackend::S3 => write_batch_with_store(args, s3_store(args).await?).await,
         #[cfg(feature = "containers")]
-        PerfBackend::S3Container | PerfBackend::S3GatewayContainer => {
+        PerfBackend::S3Container
+        | PerfBackend::S3GatewayContainer
+        | PerfBackend::GatewayFilesystem
+        | PerfBackend::GatewayMemory => {
             unreachable!("handled before scenario dispatch")
         }
     }
@@ -1014,7 +1042,10 @@ async fn write_committed(args: &PerfArgs) -> Result<PerfReport> {
         #[cfg(feature = "s3")]
         PerfBackend::S3 => write_committed_with_store(args, s3_store(args).await?).await,
         #[cfg(feature = "containers")]
-        PerfBackend::S3Container | PerfBackend::S3GatewayContainer => {
+        PerfBackend::S3Container
+        | PerfBackend::S3GatewayContainer
+        | PerfBackend::GatewayFilesystem
+        | PerfBackend::GatewayMemory => {
             unreachable!("handled before scenario dispatch")
         }
     }
@@ -1087,7 +1118,10 @@ async fn write_committed_parallel(args: &PerfArgs) -> Result<PerfReport> {
         #[cfg(feature = "s3")]
         PerfBackend::S3 => write_committed_parallel_with_store(args, s3_store(args).await?).await,
         #[cfg(feature = "containers")]
-        PerfBackend::S3Container | PerfBackend::S3GatewayContainer => {
+        PerfBackend::S3Container
+        | PerfBackend::S3GatewayContainer
+        | PerfBackend::GatewayFilesystem
+        | PerfBackend::GatewayMemory => {
             unreachable!("handled before scenario dispatch")
         }
     }
@@ -1588,7 +1622,10 @@ async fn full_read(args: &PerfArgs) -> Result<PerfReport> {
         #[cfg(feature = "s3")]
         PerfBackend::S3 => full_read_with_store(args, s3_store(args).await?).await,
         #[cfg(feature = "containers")]
-        PerfBackend::S3Container | PerfBackend::S3GatewayContainer => {
+        PerfBackend::S3Container
+        | PerfBackend::S3GatewayContainer
+        | PerfBackend::GatewayFilesystem
+        | PerfBackend::GatewayMemory => {
             unreachable!("handled before scenario dispatch")
         }
     }
@@ -1655,7 +1692,10 @@ async fn range_read(args: &PerfArgs) -> Result<PerfReport> {
         #[cfg(feature = "s3")]
         PerfBackend::S3 => range_read_with_store(args, s3_store(args).await?).await,
         #[cfg(feature = "containers")]
-        PerfBackend::S3Container | PerfBackend::S3GatewayContainer => {
+        PerfBackend::S3Container
+        | PerfBackend::S3GatewayContainer
+        | PerfBackend::GatewayFilesystem
+        | PerfBackend::GatewayMemory => {
             unreachable!("handled before scenario dispatch")
         }
     }
@@ -1991,11 +2031,6 @@ impl PerfReport {
             );
         }
         Ok(())
-    }
-
-    #[cfg(feature = "containers")]
-    fn print(&self, format: ReportFormat) -> Result<()> {
-        self.print_with_peak_rss(format, process_peak_rss_bytes())
     }
 
     fn print_with_peak_rss(&self, format: ReportFormat, peak_rss_bytes: Option<u64>) -> Result<()> {
@@ -2594,14 +2629,19 @@ fn enforce_max_peak_rss_bytes(
 }
 
 fn process_peak_rss_bytes() -> Option<u64> {
+    process_peak_rss_bytes_for_pid(std::process::id())
+}
+
+fn process_peak_rss_bytes_for_pid(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
         parse_proc_status_peak_rss(&status).ok().flatten()
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = pid;
         None
     }
 }
