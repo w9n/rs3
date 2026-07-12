@@ -10,6 +10,17 @@ pub(in crate::v2) const V2_STANDALONE_OBJECT_PREFIX: &str = "objects/v02/";
 const V2_STANDALONE_OBJECT_ID_BYTES: usize = 32;
 const V2_STANDALONE_OBJECT_ID_B64_LEN: usize = 43;
 
+/// Generates a fresh path-private identity for one immutable standalone object.
+pub(in crate::v2) fn generate_v2_standalone_object_id() -> V2Result<BackendObjectId> {
+    let mut random_id = [0_u8; V2_STANDALONE_OBJECT_ID_BYTES];
+    getrandom::fill(&mut random_id).map_err(|_| V2FormatError::RandomnessUnavailable)?;
+    BackendObjectId::new(format!(
+        "{V2_STANDALONE_OBJECT_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(random_id)
+    ))
+    .map_err(V2FormatError::from)
+}
+
 /// Validates the canonical random object key and non-empty sealed-object length.
 pub(in crate::v2) fn validate_v2_standalone_object(
     object_id: &BackendObjectId,

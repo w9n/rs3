@@ -25,14 +25,16 @@ use rs3_index::PayloadHeaderReference;
 use rs3_index::run::{
     IndexMutation, IndexPayloadPointer, IndexRunLimits, IndexRunStandaloneStreamContainer,
 };
-use rs3_storage::{BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions};
+use rs3_storage::{
+    BlobMetadata, BlobStore, ByteRange, CountingBlobStore, MemoryBlobStore, PutOptions,
+};
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
     LegalHoldStatus, LogicalPath, RepositoryId, RetentionMode, RetentionPolicy, Sequence,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Barrier, Notify};
 
 fn must_v2<T>(result: super::V2Result<T>) -> T {
@@ -588,6 +590,7 @@ struct SlowCommitGetStore {
     in_flight_ranged_commit_gets: Arc<AtomicUsize>,
     max_in_flight_ranged_commit_gets: Arc<AtomicUsize>,
     corrupt_ranged_commit_gets_for: Arc<Mutex<Option<BackendObjectId>>>,
+    corrupt_standalone_reads: Arc<std::sync::atomic::AtomicBool>,
     standalone_gets: Arc<AtomicUsize>,
     standalone_puts: Arc<AtomicUsize>,
 }
@@ -602,6 +605,7 @@ impl SlowCommitGetStore {
             in_flight_ranged_commit_gets: Arc::new(AtomicUsize::new(0)),
             max_in_flight_ranged_commit_gets: Arc::new(AtomicUsize::new(0)),
             corrupt_ranged_commit_gets_for: Arc::new(Mutex::new(None)),
+            corrupt_standalone_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             standalone_gets: Arc::new(AtomicUsize::new(0)),
             standalone_puts: Arc::new(AtomicUsize::new(0)),
         }
@@ -661,21 +665,28 @@ impl SlowCommitGetStore {
         *guard = None;
     }
 
+    fn corrupt_standalone_reads(&self) {
+        self.corrupt_standalone_reads.store(true, Ordering::SeqCst);
+    }
+
     fn maybe_corrupt_commit_range(
         &self,
         object_id: &BackendObjectId,
         range: ByteRange,
         body: Bytes,
     ) -> Bytes {
-        if matches!(range, ByteRange::Full) {
+        let corrupt_standalone = object_id.as_str().starts_with("objects/v02/")
+            && self.corrupt_standalone_reads.load(Ordering::SeqCst);
+        if matches!(range, ByteRange::Full) && !corrupt_standalone {
             return body;
         }
-        let should_corrupt = self
-            .corrupt_ranged_commit_gets_for
-            .lock()
-            .expect("corruption target lock should not be poisoned")
-            .as_ref()
-            == Some(object_id);
+        let should_corrupt = corrupt_standalone
+            || self
+                .corrupt_ranged_commit_gets_for
+                .lock()
+                .expect("corruption target lock should not be poisoned")
+                .as_ref()
+                == Some(object_id);
         if !should_corrupt || body.is_empty() {
             return body;
         }
@@ -3173,6 +3184,294 @@ async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
             .map(|entry| entry.key)
             .collect::<Vec<_>>(),
         vec![first_key, second_key]
+    );
+}
+
+#[tokio::test]
+async fn v2_commit_coordinator_publishes_known_length_stream_as_standalone_object() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = must_repo(V2CommitCoordinator::new(
+        Arc::clone(&repository),
+        anchor.clone(),
+    ));
+    let key = must_type(LogicalPath::new("streaming/standalone.bin"));
+    let body = Bytes::from(
+        (0..131_089)
+            .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+            .collect::<Vec<_>>(),
+    );
+
+    must_repo(
+        coordinator
+            .put_committed_streaming_known_len(
+                key.clone(),
+                body.len() as u64,
+                stream::iter(vec![
+                    Ok::<Bytes, RepositoryError>(body.slice(..31_337)),
+                    Ok(body.slice(31_337..96_001)),
+                    Ok(body.slice(96_001..)),
+                ]),
+                RepositoryPutOptions::default(),
+                super::commit::V2_MAX_HEADER_SIZE + 32 * 1024,
+            )
+            .await,
+    );
+
+    let chain = must_v2(
+        repository
+            .commit_store()
+            .load_chain_from_anchor(&anchor)
+            .await,
+    )
+    .expect("standalone commit chain");
+    assert_eq!(
+        chain.commits_newest_first[0]
+            .parsed_header
+            .header
+            .section_index
+            .iter()
+            .map(|section| section.section_type)
+            .collect::<Vec<_>>(),
+        vec![V2SectionType::IndexRun]
+    );
+    assert_eq!(
+        store.standalone_io_counts().0,
+        1,
+        "post-write verification must use one full streaming read"
+    );
+    let standalone_objects = store
+        .list_prefix("objects/v02/")
+        .await
+        .expect("list standalone objects");
+    assert_eq!(standalone_objects.len(), 1);
+    assert_eq!(
+        must_repo(repository.get_range(&key, ByteRange::Full).await),
+        body
+    );
+
+    drop(coordinator);
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    assert_eq!(
+        must_repo(
+            fresh
+                .get_range(
+                    &key,
+                    ByteRange::Slice {
+                        offset: 10_003,
+                        len: 110_004,
+                    },
+                )
+                .await,
+        ),
+        body.slice(10_003..120_007)
+    );
+}
+
+#[tokio::test]
+async fn v2_commit_coordinator_cancellation_aborts_unfinished_standalone_upload() {
+    let store = CountingBlobStore::new(MemoryBlobStore::new());
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    store
+        .reset_operation_counts()
+        .expect("reset storage counters");
+    let original_anchor = must_v2(anchor.read_v2().await).expect("genesis anchor");
+    let coordinator = Arc::new(must_repo(V2CommitCoordinator::new(
+        Arc::clone(&repository),
+        anchor.clone(),
+    )));
+    let key = must_type(LogicalPath::new("streaming/cancelled.bin"));
+    let pending = {
+        let coordinator = Arc::clone(&coordinator);
+        let key = key.clone();
+        tokio::spawn(async move {
+            coordinator
+                .put_committed_streaming_known_len(
+                    key,
+                    2,
+                    stream::pending::<crate::Result<Bytes>>(),
+                    RepositoryPutOptions::default(),
+                    super::commit::V2_MAX_HEADER_SIZE + 32 * 1024,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if store
+                .operation_counts()
+                .expect("read storage counters")
+                .multipart_create
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("multipart upload should start");
+
+    pending.abort();
+    assert!(pending.await.is_err());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if store
+                .operation_counts()
+                .expect("read storage counters")
+                .multipart_abort
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled multipart upload should abort");
+
+    assert_eq!(must_v2(anchor.read_v2().await), Some(original_anchor));
+    assert!(repository.head(&key).is_err());
+    assert!(
+        store
+            .list_prefix("objects/v02/")
+            .await
+            .expect("list standalone objects")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn v2_standalone_readback_digest_mismatch_fails_before_anchor_advance() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let original_anchor = must_v2(anchor.read_v2().await).expect("genesis anchor");
+    let coordinator = must_repo(V2CommitCoordinator::new(
+        Arc::clone(&repository),
+        anchor.clone(),
+    ));
+    let key = must_type(LogicalPath::new("streaming/corrupt-readback.bin"));
+    let body = Bytes::from(vec![0x5a; 96 * 1024 + 17]);
+    store.corrupt_standalone_reads();
+
+    let result = coordinator
+        .put_committed_streaming_known_len(
+            key.clone(),
+            body.len() as u64,
+            stream::iter(vec![Ok::<Bytes, RepositoryError>(body)]),
+            RepositoryPutOptions::default(),
+            super::commit::V2_MAX_HEADER_SIZE + 32 * 1024,
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(must_v2(anchor.read_v2().await), Some(original_anchor));
+    assert!(repository.head(&key).is_err());
+    assert_eq!(
+        store
+            .list_prefix("objects/v02/")
+            .await
+            .expect("list standalone orphan")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn v2_retained_standalone_requires_absolute_deadline_and_legal_hold() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let retention = RetentionPolicy::new(RetentionMode::Compliance, 1);
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::RetainedVersionObjectLock,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    )
+    .with_retention(Some(retention))
+    .with_legal_hold(Some(LegalHoldStatus::On));
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = must_repo(V2CommitCoordinator::new(repository, anchor));
+    let before_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_millis() as i64;
+
+    must_repo(
+        coordinator
+            .put_committed_streaming_known_len(
+                must_type(LogicalPath::new("streaming/retained.bin")),
+                4,
+                stream::iter(vec![Ok::<Bytes, RepositoryError>(Bytes::from_static(
+                    b"held",
+                ))]),
+                RepositoryPutOptions::default(),
+                super::commit::V2_MAX_HEADER_SIZE + 32 * 1024,
+            )
+            .await,
+    );
+
+    let objects = store
+        .list_prefix_versions("objects/v02/")
+        .await
+        .expect("list retained standalone object");
+    assert_eq!(objects.len(), 1);
+    assert_eq!(objects[0].retention, Some(retention));
+    assert_eq!(objects[0].legal_hold, Some(LegalHoldStatus::On));
+    assert!(
+        objects[0]
+            .retain_until_ms
+            .is_some_and(|deadline| deadline >= before_ms + 86_400_000)
     );
 }
 

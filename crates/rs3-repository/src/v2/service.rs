@@ -5,7 +5,8 @@ use super::error::V2FormatError;
 use super::repository::{
     V2CommitAnchor, V2CommitChain, V2CommitSection, V2CommitStore, V2CommitStoreOptions,
     V2CommitWrite, V2FinalizedStreamingPayloadWrite, V2MemoryAnchor, V2ReplayChain, V2ReplayCommit,
-    V2StoredCommit, V2StreamingPayloadWrite,
+    V2StandalonePayloadWrite, V2StandaloneUploadCancellation, V2StoredCommit,
+    V2StoredStandalonePayload, V2StreamingPayloadWrite,
 };
 use super::{
     V2_INDEX_ROOT_MAX_RUNS, V2_MAX_HEADER_SIZE, V2EmbeddedIndexRunLocation, V2IndexRoot,
@@ -62,7 +63,7 @@ mod packed_compaction_publish;
 mod read_stream;
 mod staging;
 
-use super::standalone::validate_v2_standalone_object;
+use super::standalone::{generate_v2_standalone_object_id, validate_v2_standalone_object};
 pub use read_stream::V2AuthenticatedReadBody;
 use staging::{PendingV2Checkpoint, PendingV2Snapshot, PendingV2State};
 
@@ -197,9 +198,15 @@ struct StreamingV2PutFinalized {
     run: packed::PendingV2IndexRunFacts,
 }
 
+#[cfg(test)]
 struct StreamingV2PayloadFinalized {
     location: PendingV2PayloadLocation,
     run: packed::PendingV2IndexRunFacts,
+}
+
+pub(super) struct V2StandalonePayloadUpload {
+    stored: V2StoredStandalonePayload,
+    _inflight: super::repository::V2InflightStandaloneObject,
 }
 
 /// Client-visible object resolved against an accepted v2 namespace state.
@@ -596,7 +603,8 @@ where
     }
 
     /// Streams a known-length object into one multipart-backed v2 commit.
-    pub async fn put_committed_streaming_known_len<A, St>(
+    #[cfg(test)]
+    pub(crate) async fn put_committed_streaming_known_len<A, St>(
         &self,
         anchor: &A,
         key: LogicalPath,
@@ -621,31 +629,183 @@ where
         .await
     }
 
-    pub(super) async fn put_committed_streaming_known_len_coordinated<A, St>(
+    pub(super) async fn upload_standalone_streaming_known_len<St>(
+        &self,
+        plaintext_len: u64,
+        stream: St,
+        options: &RepositoryPutOptions,
+        multipart_part_size: usize,
+        cancellation: Arc<V2StandaloneUploadCancellation>,
+    ) -> Result<V2StandalonePayloadUpload>
+    where
+        St: Stream<Item = Result<Bytes>> + Unpin + Send,
+    {
+        let object_id = generate_v2_standalone_object_id().map_err(v2_repository_error)?;
+        let inflight = self
+            .commit_store
+            .claim_inflight_standalone_object(object_id.clone())
+            .map_err(v2_repository_error)?;
+        let retention = strongest_retention_policy(
+            strongest_retention_policy(
+                self.repository.options.default_retention,
+                self.commit_store.retention_policy(),
+            ),
+            options.retention,
+        );
+        let legal_hold = if options.legal_hold == Some(LegalHoldStatus::On)
+            || self.commit_store.options().legal_hold == Some(LegalHoldStatus::On)
+        {
+            Some(LegalHoldStatus::On)
+        } else {
+            options
+                .legal_hold
+                .or(self.commit_store.options().legal_hold)
+        };
+        let payload_segment_size = self.payload_segment_size_for_object_len(plaintext_len)?;
+        let stored = self
+            .commit_store
+            .write_standalone_streaming_payload(V2StandalonePayloadWrite {
+                object_id,
+                plaintext_len,
+                payload_segment_size,
+                stream,
+                retention,
+                legal_hold,
+                multipart_part_size,
+                cancellation,
+            })
+            .await
+            .map_err(v2_repository_error)?;
+        Ok(V2StandalonePayloadUpload {
+            stored,
+            _inflight: inflight,
+        })
+    }
+
+    pub(super) async fn publish_standalone_streaming_known_len_coordinated<A>(
         &self,
         mutation: V2CoordinatedMutation<'_, A>,
         key: LogicalPath,
         plaintext_len: u64,
-        stream: St,
+        upload: V2StandalonePayloadUpload,
         options: RepositoryPutOptions,
-        multipart_part_size: usize,
     ) -> Result<RepositoryObjectMetadata>
     where
         A: V2CommitAnchor,
-        St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
         self.validate_coordinator_lease(mutation.lease)?;
-        self.put_committed_streaming_known_len_inner(
-            mutation.anchor,
-            key,
-            plaintext_len,
-            stream,
-            options,
-            multipart_part_size,
-        )
-        .await
+        let _guard = self.mutation_lock.lock().await;
+        let _publication_guard = self.publication_lock.write().await;
+        let base_anchor = self.ensure_accepted_anchor_matches(mutation.anchor).await?;
+        let (staged, rollback) =
+            self.stage_put_metadata_sync_with_rollback(key, plaintext_len, options, None)?;
+        let carrier = Arc::new(V2StandaloneStreamCarrierReference {
+            object_id: upload.stored.object_id.clone(),
+            version_id: upload.stored.version_id.clone(),
+            object_digest: upload.stored.object_digest,
+            stored_len: upload.stored.object_len,
+            keyring_envelope_object_id: self
+                .commit_store
+                .options()
+                .keyring_envelope_ref
+                .object_id
+                .clone(),
+            keyring_envelope_digest: self.commit_store.options().keyring_envelope_ref.digest,
+            payload_header: payload_header_reference(&upload.stored.payload_header)?,
+        });
+        let result = self
+            .publish_staged_standalone_locked(mutation.anchor, &base_anchor, &staged, carrier)
+            .await;
+        match result {
+            Ok(()) => Ok(staged.metadata),
+            Err(RepositoryError::AcceptedRecoveryRequired) => {
+                Err(RepositoryError::AcceptedRecoveryRequired)
+            }
+            Err(error) => {
+                self.rollback_state_mutations(vec![rollback])?;
+                Err(error)
+            }
+        }
     }
 
+    async fn publish_staged_standalone_locked<A>(
+        &self,
+        anchor: &A,
+        base_anchor: &super::repository::V2AnchorState,
+        staged: &StagedV2Put,
+        carrier: Arc<V2StandaloneStreamCarrierReference>,
+    ) -> Result<()>
+    where
+        A: V2CommitAnchor,
+    {
+        validate_v2_standalone_object(&carrier.object_id, carrier.stored_len)
+            .map_err(v2_repository_error)?;
+        if carrier.payload_header.plaintext_len != staged.content_len {
+            return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
+        }
+        let mut pending = self.pending_snapshot()?;
+        let mut resolved = false;
+        for delta in pending.deltas_mut() {
+            let IndexDelta::Upsert { entry, .. } = delta else {
+                continue;
+            };
+            if entry.manifest_id != staged.manifest_id {
+                continue;
+            }
+            if resolved || entry.content_len != staged.content_len {
+                return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
+            }
+            entry.object_id = carrier.object_id.clone();
+            entry.object_version_id = carrier.version_id.clone();
+            entry.payload_ref = Some(PayloadReference::V2StandaloneStream {
+                carrier: Arc::clone(&carrier),
+            });
+            resolved = true;
+        }
+        if !resolved {
+            return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
+        }
+        let temporary_anchor = V2MemoryAnchor::with_state(base_anchor.clone());
+        let mut accepted_run = None;
+        let uploaded = self
+            .commit_store
+            .write_child_commit_with(&temporary_anchor, |commit_key| {
+                let packed = self
+                    .pending_packed_sections_for_commit(commit_key, &pending)
+                    .map_err(|_| V2FormatError::InvalidHeaderField)?
+                    .ok_or(V2FormatError::InvalidHeaderField)?;
+                accepted_run = Some(packed.run);
+                Ok(V2CommitWrite::delta(packed.sections)
+                    .with_retention(packed.retention)
+                    .with_legal_hold(packed.legal_hold))
+            })
+            .await
+            .map_err(v2_repository_error)?;
+        let accepted_run = accepted_run
+            .map(|run| self.accepted_run_ref(run, &uploaded))
+            .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
+        self.validate_accepted_run_append(&accepted_run)?;
+        let install =
+            self.prepare_pending_install(&pending, staged.sequence, Some(accepted_run))?;
+        let adopted = self
+            .commit_store
+            .adopt_verified_unanchored_child(anchor, base_anchor, &uploaded)
+            .await
+            .map_err(v2_repository_error)?;
+        if let Err(error) = self.install_pending_commit(install, adopted.anchor_state) {
+            self.mark_local_recovery_required();
+            tracing::error!(
+                target: "rs3_repository",
+                operation = "v2_install_standalone_commit",
+                error = %error,
+                "v2 standalone anchor advanced but local state installation failed; restart is required",
+            );
+            return Err(RepositoryError::AcceptedRecoveryRequired);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     async fn put_committed_streaming_known_len_inner<A, St>(
         &self,
         anchor: &A,

@@ -28,6 +28,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -451,6 +452,66 @@ pub(crate) struct V2FinalizedStreamingPayloadWrite<Output> {
     pub(crate) output: Output,
 }
 
+/// Complete authenticated facts for one independently uploaded payload object.
+pub(crate) struct V2StoredStandalonePayload {
+    pub(crate) object_id: BackendObjectId,
+    pub(crate) version_id: Option<BackendVersionId>,
+    pub(crate) object_len: u64,
+    pub(crate) object_digest: [u8; 32],
+    pub(crate) payload_header: crate::payload::SegmentedPayloadHeader,
+}
+
+pub(crate) struct V2StandalonePayloadWrite<St> {
+    pub(crate) object_id: BackendObjectId,
+    pub(crate) plaintext_len: u64,
+    pub(crate) payload_segment_size: usize,
+    pub(crate) stream: St,
+    pub(crate) retention: Option<RetentionPolicy>,
+    pub(crate) legal_hold: Option<LegalHoldStatus>,
+    pub(crate) multipart_part_size: usize,
+    pub(crate) cancellation: Arc<V2StandaloneUploadCancellation>,
+}
+
+struct V2WritePostconditions {
+    expected_object_len: u64,
+    required_retention: Option<RetentionPolicy>,
+    required_retain_until_ms: Option<i64>,
+    required_legal_hold: Option<LegalHoldStatus>,
+    expected_stored_digest: Option<[u8; 32]>,
+}
+
+impl V2WritePostconditions {
+    fn commit(
+        expected_object_len: u64,
+        required_retention: Option<RetentionPolicy>,
+        required_legal_hold: Option<LegalHoldStatus>,
+    ) -> Self {
+        Self {
+            expected_object_len,
+            required_retention,
+            required_retain_until_ms: None,
+            required_legal_hold,
+            expected_stored_digest: None,
+        }
+    }
+
+    fn standalone(
+        expected_object_len: u64,
+        required_retention: Option<RetentionPolicy>,
+        required_retain_until_ms: Option<i64>,
+        required_legal_hold: Option<LegalHoldStatus>,
+        expected_stored_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            expected_object_len,
+            required_retention,
+            required_retain_until_ms,
+            required_legal_hold,
+            expected_stored_digest: Some(expected_stored_digest),
+        }
+    }
+}
+
 /// Result of a v2 commit write accepted by the anchor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V2StoredCommit {
@@ -766,6 +827,54 @@ pub struct V2CommitStore<S> {
     store: S,
     keyring: KeyRing,
     options: V2CommitStoreOptions,
+    inflight_standalone_objects: Arc<RwLock<BTreeSet<BackendObjectId>>>,
+}
+
+pub(crate) struct V2InflightStandaloneObject {
+    object_id: BackendObjectId,
+    roots: Arc<RwLock<BTreeSet<BackendObjectId>>>,
+}
+
+pub(crate) struct V2StandaloneUploadCancellation {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl V2StandaloneUploadCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.notify.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+impl Drop for V2InflightStandaloneObject {
+    fn drop(&mut self) {
+        if let Ok(mut roots) = self.roots.write() {
+            roots.remove(&self.object_id);
+        }
+    }
 }
 
 impl<S> V2CommitStore<S>
@@ -778,7 +887,40 @@ where
             store,
             keyring,
             options,
+            inflight_standalone_objects: Arc::new(RwLock::new(BTreeSet::new())),
         }
+    }
+
+    pub(crate) fn claim_inflight_standalone_object(
+        &self,
+        object_id: BackendObjectId,
+    ) -> V2Result<V2InflightStandaloneObject> {
+        // This process-local root closes the online race with maintenance run by
+        // this store instance, including test rehearsals with a zero minimum age.
+        // Destructive external maintenance is separately fenced by
+        // V2MaintenanceGuard quiescence, so it cannot race the single writer.
+        let mut roots = self
+            .inflight_standalone_objects
+            .write()
+            .map_err(|_| V2FormatError::StorageOperationFailed)?;
+        if !roots.insert(object_id.clone()) {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
+        drop(roots);
+        Ok(V2InflightStandaloneObject {
+            object_id,
+            roots: Arc::clone(&self.inflight_standalone_objects),
+        })
+    }
+
+    pub(crate) fn is_inflight_standalone_object(
+        &self,
+        object_id: &BackendObjectId,
+    ) -> V2Result<bool> {
+        self.inflight_standalone_objects
+            .read()
+            .map(|roots| roots.contains(object_id))
+            .map_err(|_| V2FormatError::StorageOperationFailed)
     }
 
     /// Returns the backing store.
@@ -1655,9 +1797,7 @@ where
                 .verify_commit_postconditions(
                     &commit_key.object_id,
                     &metadata,
-                    object_len,
-                    commit_retention,
-                    commit_legal_hold,
+                    V2WritePostconditions::commit(object_len, commit_retention, commit_legal_hold),
                 )
                 .await?;
             let anchor_state = V2AnchorState {
@@ -1726,9 +1866,11 @@ where
             .verify_commit_postconditions(
                 &commit_key.object_id,
                 &written.metadata,
-                written.object_len,
-                commit_retention,
-                commit_legal_hold,
+                V2WritePostconditions::commit(
+                    written.object_len,
+                    commit_retention,
+                    commit_legal_hold,
+                ),
             )
             .await?;
         let anchor_state = V2AnchorState {
@@ -2078,6 +2220,260 @@ where
         })
     }
 
+    /// Encrypts and uploads one immutable standalone payload without touching repository state.
+    pub(crate) async fn write_standalone_streaming_payload<St>(
+        &self,
+        write: V2StandalonePayloadWrite<St>,
+    ) -> V2Result<V2StoredStandalonePayload>
+    where
+        St: Stream<Item = crate::Result<Bytes>> + Unpin + Send,
+    {
+        let V2StandalonePayloadWrite {
+            object_id,
+            plaintext_len: expected_plaintext_len,
+            payload_segment_size,
+            mut stream,
+            retention,
+            legal_hold,
+            multipart_part_size,
+            cancellation,
+        } = write;
+        if cancellation.is_cancelled() {
+            return Err(V2FormatError::ObjectBodyReadFailed);
+        }
+        let required_retain_until_ms = required_retain_until_ms(retention);
+        let payload_sealer = SegmentedPayloadSealer::new(&self.keyring, payload_segment_size)
+            .map_err(|_| V2FormatError::InvalidHeaderField)?;
+        let mut assembler = MultipartObjectAssembler::new(multipart_part_size)?;
+        let mut multipart = self
+            .create_standalone_multipart_upload(&object_id, retention, legal_hold)
+            .await
+            .map_err(storage_to_v2)?;
+        let mut object_digest = Sha256::new();
+        let payload_header = payload_sealer.header();
+        object_digest.update(&payload_header);
+        if assembler
+            .push_bytes(&mut multipart, &payload_header)
+            .await
+            .is_err()
+        {
+            abort_v2_commit_multipart(multipart, "standalone_header").await;
+            return Err(V2FormatError::StorageOperationFailed);
+        }
+        if cancellation.is_cancelled() {
+            abort_v2_commit_multipart(multipart, "standalone_cancelled").await;
+            return Err(V2FormatError::ObjectBodyReadFailed);
+        }
+
+        let mut plaintext_seen = 0_u64;
+        let mut next_segment_index = 0_usize;
+        let mut segment = Vec::with_capacity(payload_segment_size);
+        let mut pending_segment: Option<(usize, Vec<u8>)> = None;
+        let segment_auth = StreamingPayloadSegmentAuth {
+            keyring: &self.keyring,
+            payload_sealer: &payload_sealer,
+            payload_id: &object_id,
+        };
+        loop {
+            let next_chunk = match tokio::select! {
+                () = cancellation.cancelled() => {
+                    abort_v2_commit_multipart(multipart, "standalone_cancelled").await;
+                    return Err(V2FormatError::ObjectBodyReadFailed);
+                }
+                next = tokio::time::timeout(
+                    self.options.stream_read_stall_timeout,
+                    stream.next(),
+                ) => next,
+            } {
+                Ok(next_chunk) => next_chunk,
+                Err(_elapsed) => {
+                    abort_v2_commit_multipart(multipart, "standalone_stream_timeout").await;
+                    return Err(V2FormatError::ObjectBodyReadFailed);
+                }
+            };
+            let Some(chunk) = next_chunk else {
+                break;
+            };
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(crate::RepositoryError::ObjectBodyReadFailed) => {
+                    abort_v2_commit_multipart(multipart, "standalone_stream_read").await;
+                    return Err(V2FormatError::ObjectBodyReadFailed);
+                }
+                Err(_error) => {
+                    abort_v2_commit_multipart(multipart, "standalone_stream_read").await;
+                    return Err(V2FormatError::StorageOperationFailed);
+                }
+            };
+            plaintext_seen = plaintext_seen
+                .checked_add(u64::try_from(chunk.len()).map_err(|_| V2FormatError::SectionBounds)?)
+                .ok_or(V2FormatError::SectionBounds)?;
+            if plaintext_seen > expected_plaintext_len {
+                abort_v2_commit_multipart(multipart, "standalone_plaintext_length").await;
+                return Err(V2FormatError::ObjectLengthMismatch);
+            }
+            let mut remaining = chunk.as_ref();
+            while !remaining.is_empty() {
+                let take = payload_segment_size
+                    .saturating_sub(segment.len())
+                    .min(remaining.len());
+                segment.extend_from_slice(&remaining[..take]);
+                remaining = &remaining[take..];
+                if segment.len() == payload_segment_size {
+                    if let Some((ready_index, ready_segment)) = pending_segment.take()
+                        && push_standalone_payload_segment(
+                            &segment_auth,
+                            &mut StandalonePayloadSegmentWriter {
+                                object_digest: &mut object_digest,
+                                assembler: &mut assembler,
+                                multipart: &mut multipart,
+                            },
+                            ready_index,
+                            &ready_segment,
+                            false,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        abort_v2_commit_multipart(multipart, "standalone_payload_segment").await;
+                        return Err(V2FormatError::StorageOperationFailed);
+                    }
+                    pending_segment = Some((next_segment_index, std::mem::take(&mut segment)));
+                    next_segment_index = next_segment_index
+                        .checked_add(1)
+                        .ok_or(V2FormatError::SectionBounds)?;
+                    segment = Vec::with_capacity(payload_segment_size);
+                }
+            }
+        }
+        if plaintext_seen != expected_plaintext_len {
+            abort_v2_commit_multipart(multipart, "standalone_plaintext_length").await;
+            return Err(V2FormatError::ObjectLengthMismatch);
+        }
+        if !segment.is_empty() {
+            if let Some((ready_index, ready_segment)) = pending_segment.take()
+                && push_standalone_payload_segment(
+                    &segment_auth,
+                    &mut StandalonePayloadSegmentWriter {
+                        object_digest: &mut object_digest,
+                        assembler: &mut assembler,
+                        multipart: &mut multipart,
+                    },
+                    ready_index,
+                    &ready_segment,
+                    false,
+                )
+                .await
+                .is_err()
+            {
+                abort_v2_commit_multipart(multipart, "standalone_payload_segment").await;
+                return Err(V2FormatError::StorageOperationFailed);
+            }
+            if push_standalone_payload_segment(
+                &segment_auth,
+                &mut StandalonePayloadSegmentWriter {
+                    object_digest: &mut object_digest,
+                    assembler: &mut assembler,
+                    multipart: &mut multipart,
+                },
+                next_segment_index,
+                &segment,
+                true,
+            )
+            .await
+            .is_err()
+            {
+                abort_v2_commit_multipart(multipart, "standalone_payload_segment").await;
+                return Err(V2FormatError::StorageOperationFailed);
+            }
+        } else if let Some((ready_index, ready_segment)) = pending_segment.take()
+            && push_standalone_payload_segment(
+                &segment_auth,
+                &mut StandalonePayloadSegmentWriter {
+                    object_digest: &mut object_digest,
+                    assembler: &mut assembler,
+                    multipart: &mut multipart,
+                },
+                ready_index,
+                &ready_segment,
+                true,
+            )
+            .await
+            .is_err()
+        {
+            abort_v2_commit_multipart(multipart, "standalone_payload_segment").await;
+            return Err(V2FormatError::StorageOperationFailed);
+        }
+
+        let payload_header = payload_sealer
+            .header_reference(plaintext_seen)
+            .map_err(|_| V2FormatError::InvalidHeaderField)?;
+        let object_len = payload_sealer
+            .sealed_len_for_plaintext_len(plaintext_seen)
+            .map_err(|_| V2FormatError::SectionBounds)?;
+        if cancellation.is_cancelled() {
+            abort_v2_commit_multipart(multipart, "standalone_cancelled").await;
+            return Err(V2FormatError::ObjectBodyReadFailed);
+        }
+        if assembler.flush_final_part(&mut multipart).await.is_err() {
+            abort_v2_commit_multipart(multipart, "standalone_final_part").await;
+            return Err(V2FormatError::StorageOperationFailed);
+        }
+        if cancellation.is_cancelled() {
+            abort_v2_commit_multipart(multipart, "standalone_cancelled").await;
+            return Err(V2FormatError::ObjectBodyReadFailed);
+        }
+        let metadata = assembler.complete(multipart).await.map_err(storage_to_v2)?;
+        let object_digest: [u8; 32] = object_digest.finalize().into();
+        let version_id = self
+            .verify_commit_postconditions(
+                &object_id,
+                &metadata,
+                V2WritePostconditions::standalone(
+                    object_len,
+                    retention,
+                    required_retain_until_ms,
+                    legal_hold,
+                    object_digest,
+                ),
+            )
+            .await?;
+        Ok(V2StoredStandalonePayload {
+            object_id,
+            version_id,
+            object_len,
+            object_digest,
+            payload_header,
+        })
+    }
+
+    async fn create_standalone_multipart_upload(
+        &self,
+        object_id: &BackendObjectId,
+        retention: Option<RetentionPolicy>,
+        legal_hold: Option<LegalHoldStatus>,
+    ) -> rs3_storage::Result<Box<dyn rs3_storage::BlobMultipartUpload>> {
+        if self.options.provider_profile == V2ProviderProfile::RetainedVersionObjectLock {
+            match self.store.head(object_id).await {
+                Ok(_) => return Err(StorageError::AlreadyExists(object_id.clone())),
+                Err(StorageError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.store
+            .create_multipart_upload(
+                object_id,
+                PutOptions {
+                    retention,
+                    legal_hold,
+                    content_type: Some("application/vnd.rs3.payload.v02".to_owned()),
+                    do_not_recreate: self.options.provider_profile
+                        != V2ProviderProfile::RetainedVersionObjectLock,
+                },
+            )
+            .await
+    }
+
     async fn put_commit_object(
         &self,
         object_id: &BackendObjectId,
@@ -2138,49 +2534,118 @@ where
         &self,
         object_id: &BackendObjectId,
         metadata: &BlobMetadata,
-        expected_object_len: u64,
-        retention: Option<RetentionPolicy>,
-        legal_hold: Option<LegalHoldStatus>,
+        postconditions: V2WritePostconditions,
     ) -> V2Result<Option<BackendVersionId>> {
-        if metadata.content_len != expected_object_len || expected_object_len == 0 {
+        if metadata.content_len != postconditions.expected_object_len
+            || postconditions.expected_object_len == 0
+        {
             return Err(V2FormatError::ProviderProfileFailed);
         }
-        let visible = self
+        let exact = self
             .store
-            .get_range_at(
-                object_id,
-                metadata.version_id.as_ref(),
-                ByteRange::Slice { offset: 0, len: 1 },
-            )
+            .head_at(object_id, metadata.version_id.as_ref())
             .await
             .map_err(|_| V2FormatError::ProviderProfileFailed)?;
-        if visible.len() != 1 {
+        if exact.object_id != *object_id
+            || exact.version_id != metadata.version_id
+            || exact.content_len != postconditions.expected_object_len
+        {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        if let Some(expected_digest) = postconditions.expected_stored_digest {
+            self.verify_exact_stored_object_digest(
+                object_id,
+                exact.version_id.as_ref(),
+                postconditions.expected_object_len,
+                expected_digest,
+            )
+            .await?;
+        } else {
+            let visible = self
+                .store
+                .get_range_at(
+                    object_id,
+                    exact.version_id.as_ref(),
+                    ByteRange::Slice { offset: 0, len: 1 },
+                )
+                .await
+                .map_err(|_| V2FormatError::ProviderProfileFailed)?;
+            if visible.len() != 1 {
+                return Err(V2FormatError::ProviderProfileFailed);
+            }
+        }
+        if postconditions
+            .required_retain_until_ms
+            .is_some_and(|required| exact.retain_until_ms.is_none_or(|actual| actual < required))
+        {
             return Err(V2FormatError::ProviderProfileFailed);
         }
         match self.options.provider_profile {
-            V2ProviderProfile::Dev | V2ProviderProfile::AtomicCreate => {
-                Ok(metadata.version_id.clone())
-            }
+            V2ProviderProfile::Dev | V2ProviderProfile::AtomicCreate => Ok(exact.version_id),
             V2ProviderProfile::RetainedVersionObjectLock => {
-                if retention.is_none() && legal_hold != Some(LegalHoldStatus::On) {
-                    return Err(V2FormatError::ProviderProfileFailed);
-                }
-                let Some(version_id) = metadata.version_id.clone() else {
-                    return Err(V2FormatError::ProviderProfileFailed);
-                };
-                if let Some(retention) = retention
-                    && !retention_satisfies(metadata.retention.as_ref(), &retention)
+                if postconditions.required_retention.is_none()
+                    && postconditions.required_legal_hold != Some(LegalHoldStatus::On)
                 {
                     return Err(V2FormatError::ProviderProfileFailed);
                 }
-                if legal_hold == Some(LegalHoldStatus::On)
-                    && metadata.legal_hold != Some(LegalHoldStatus::On)
+                let Some(version_id) = exact.version_id.clone() else {
+                    return Err(V2FormatError::ProviderProfileFailed);
+                };
+                if let Some(retention) = postconditions.required_retention
+                    && !retention_satisfies(exact.retention.as_ref(), &retention)
+                {
+                    return Err(V2FormatError::ProviderProfileFailed);
+                }
+                if postconditions.required_legal_hold == Some(LegalHoldStatus::On)
+                    && exact.legal_hold != Some(LegalHoldStatus::On)
                 {
                     return Err(V2FormatError::ProviderProfileFailed);
                 }
                 Ok(Some(version_id))
             }
         }
+    }
+
+    async fn verify_exact_stored_object_digest(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        expected_object_len: u64,
+        expected_digest: [u8; 32],
+    ) -> V2Result<()> {
+        let mut digest = Sha256::new();
+        let mut reader = self
+            .store
+            .open_range_at(object_id, version_id, ByteRange::Full)
+            .await
+            .map_err(|_| V2FormatError::ProviderProfileFailed)?;
+        if reader.exact_len() != expected_object_len {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        let mut bytes_read = 0_u64;
+        while let Some(bytes) = reader
+            .next_chunk()
+            .await
+            .map_err(|_| V2FormatError::ProviderProfileFailed)?
+        {
+            let chunk_len =
+                u64::try_from(bytes.len()).map_err(|_| V2FormatError::ProviderProfileFailed)?;
+            if chunk_len == 0 {
+                return Err(V2FormatError::ProviderProfileFailed);
+            }
+            bytes_read = bytes_read
+                .checked_add(chunk_len)
+                .ok_or(V2FormatError::ProviderProfileFailed)?;
+            if bytes_read > expected_object_len {
+                return Err(V2FormatError::ProviderProfileFailed);
+            }
+            digest.update(&bytes);
+        }
+        let actual_digest: [u8; 32] = digest.finalize().into();
+        if bytes_read != expected_object_len || actual_digest != expected_digest {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        Ok(())
     }
 
     async fn verify_existing_commit_postconditions(
@@ -2297,6 +2762,12 @@ struct StreamingPayloadSegmentWriter<'a> {
     multipart: &'a mut Box<dyn rs3_storage::BlobMultipartUpload>,
 }
 
+struct StandalonePayloadSegmentWriter<'a> {
+    object_digest: &'a mut Sha256,
+    assembler: &'a mut MultipartObjectAssembler,
+    multipart: &'a mut Box<dyn BlobMultipartUpload>,
+}
+
 async fn push_streaming_payload_segment(
     auth: &StreamingPayloadSegmentAuth<'_>,
     writer: &mut StreamingPayloadSegmentWriter<'_>,
@@ -2323,6 +2794,31 @@ async fn push_streaming_payload_segment(
         .map_err(|_| V2FormatError::StorageOperationFailed)
 }
 
+async fn push_standalone_payload_segment(
+    auth: &StreamingPayloadSegmentAuth<'_>,
+    writer: &mut StandalonePayloadSegmentWriter<'_>,
+    segment_index: usize,
+    plaintext: &[u8],
+    is_final: bool,
+) -> V2Result<()> {
+    let ciphertext = auth
+        .payload_sealer
+        .seal_segment(
+            auth.keyring,
+            auth.payload_id,
+            segment_index,
+            plaintext,
+            is_final,
+        )
+        .map_err(|_| V2FormatError::StorageOperationFailed)?;
+    writer.object_digest.update(&ciphertext);
+    writer
+        .assembler
+        .push_bytes(writer.multipart, &ciphertext)
+        .await
+        .map_err(storage_to_v2)
+}
+
 struct V2StreamingCommitWriteResult<Output> {
     metadata: BlobMetadata,
     object_len: u64,
@@ -2339,6 +2835,69 @@ struct MultipartCommitAssembler {
     first_section_bytes: Vec<u8>,
     current_part_index: usize,
     current_part: Vec<u8>,
+}
+
+struct MultipartObjectAssembler {
+    part_size: usize,
+    current_part_index: usize,
+    current_part: Vec<u8>,
+}
+
+impl MultipartObjectAssembler {
+    fn new(part_size: usize) -> V2Result<Self> {
+        if part_size == 0 {
+            return Err(V2FormatError::SectionBounds);
+        }
+        Ok(Self {
+            part_size,
+            current_part_index: 0,
+            current_part: Vec::with_capacity(part_size),
+        })
+    }
+
+    async fn push_bytes(
+        &mut self,
+        upload: &mut Box<dyn BlobMultipartUpload>,
+        mut bytes: &[u8],
+    ) -> rs3_storage::Result<()> {
+        while !bytes.is_empty() {
+            let take = (self.part_size - self.current_part.len()).min(bytes.len());
+            self.current_part.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.current_part.len() == self.part_size {
+                let part = Bytes::from(std::mem::take(&mut self.current_part));
+                upload.put_part(self.current_part_index, part).await?;
+                self.current_part_index =
+                    self.current_part_index.checked_add(1).ok_or_else(|| {
+                        StorageError::Provider("multipart part index overflow".to_owned())
+                    })?;
+                self.current_part = Vec::with_capacity(self.part_size);
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush_final_part(
+        &mut self,
+        upload: &mut Box<dyn BlobMultipartUpload>,
+    ) -> rs3_storage::Result<()> {
+        if !self.current_part.is_empty() {
+            upload
+                .put_part(
+                    self.current_part_index,
+                    Bytes::from(std::mem::take(&mut self.current_part)),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn complete(
+        self,
+        upload: Box<dyn BlobMultipartUpload>,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        upload.complete().await
+    }
 }
 
 impl MultipartCommitAssembler {
@@ -2431,6 +2990,14 @@ fn current_time_ms() -> i64 {
         .unwrap_or(Duration::ZERO)
         .as_millis();
     i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+fn required_retain_until_ms(retention: Option<RetentionPolicy>) -> Option<i64> {
+    let retention = retention?;
+    if retention.mode == rs3_types::RetentionMode::None || retention.retain_days == 0 {
+        return None;
+    }
+    current_time_ms().checked_add(i64::from(retention.retain_days).checked_mul(86_400_000)?)
 }
 
 fn retention_satisfies(actual: Option<&RetentionPolicy>, requested: &RetentionPolicy) -> bool {

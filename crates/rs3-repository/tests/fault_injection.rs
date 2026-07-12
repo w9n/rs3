@@ -5,9 +5,9 @@ use bytes::Bytes;
 use futures_util::stream;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_repository::v2::{
-    UnenforcedQuiescedMaintenanceGuard, V2_MAX_HEADER_SIZE, V2CommitAnchor, V2CommitSection,
-    V2CommitStore, V2CommitStoreOptions, V2CommitWrite, V2FormatError, V2FormatRef,
-    V2FullGcApplyOptions, V2FullGcDryRunOptions, V2KeyringEnvelopeRef, V2MemoryAnchor,
+    UnenforcedQuiescedMaintenanceGuard, V2_MAX_HEADER_SIZE, V2CommitAnchor, V2CommitCoordinator,
+    V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite, V2FormatError,
+    V2FormatRef, V2FullGcApplyOptions, V2FullGcDryRunOptions, V2KeyringEnvelopeRef, V2MemoryAnchor,
     V2ProviderProfile, V2RecoveryBundle, V2SectionType,
 };
 use rs3_repository::{RepositoryError, RepositoryOptions, RepositoryPutOptions};
@@ -209,11 +209,17 @@ async fn streaming_put_fault_sweep_never_exposes_partial_object_and_aborts_parts
             .expect("genesis should write");
 
         let store = FaultInjectingBlobStore::new(inner.clone(), Vec::new());
-        let repository = make_repository(store.clone(), keyring.clone(), options.clone());
+        let repository = Arc::new(make_repository(
+            store.clone(),
+            keyring.clone(),
+            options.clone(),
+        ));
         repository
             .load_chain_from_anchor(&anchor)
             .await
             .expect("fresh repository should replay genesis");
+        let coordinator = V2CommitCoordinator::new(Arc::clone(&repository), anchor.clone())
+            .expect("coordinator should start");
         let fault_index = store
             .next_operation_index()
             .expect("fault index should be readable")
@@ -232,9 +238,8 @@ async fn streaming_put_fault_sweep_never_exposes_partial_object_and_aborts_parts
             Ok(Bytes::copy_from_slice(&body[1024..2048])),
             Ok(Bytes::copy_from_slice(&body[2048..])),
         ];
-        let result = repository
+        let result = coordinator
             .put_committed_streaming_known_len(
-                &anchor,
                 key.clone(),
                 body.len() as u64,
                 stream::iter(chunks),

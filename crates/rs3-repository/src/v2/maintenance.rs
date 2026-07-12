@@ -667,6 +667,11 @@ where
                     .map_err(|_| V2FormatError::StorageOperationFailed)?
             };
             for mut metadata in listed {
+                if object_class == V2OrphanObjectClass::Object
+                    && self.is_inflight_standalone_object(&metadata.object_id)?
+                {
+                    continue;
+                }
                 let exact_reachable = reachability
                     .reachable_versions
                     .contains(&(metadata.object_id.clone(), metadata.version_id.clone()));

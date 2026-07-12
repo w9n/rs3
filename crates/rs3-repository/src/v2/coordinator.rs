@@ -1,6 +1,8 @@
 //! Commit coordination for preview v2 repository writes.
 
-use super::repository::{V2AnchorState, V2CommitAnchor, V2ReplayChain};
+use super::repository::{
+    V2AnchorState, V2CommitAnchor, V2ReplayChain, V2StandaloneUploadCancellation,
+};
 use super::service::{
     V2CoordinatedMutation, V2CoordinatorLease, V2Repository, V2StagedPutRollback,
 };
@@ -55,6 +57,32 @@ struct PendingBatch {
 
 struct CommitWaiter {
     tx: oneshot::Sender<std::result::Result<V2AnchorState, CommitWaiterError>>,
+}
+
+struct CancelStandaloneUploadOnDrop {
+    cancellation: Arc<V2StandaloneUploadCancellation>,
+    armed: bool,
+}
+
+impl CancelStandaloneUploadOnDrop {
+    fn new(cancellation: Arc<V2StandaloneUploadCancellation>) -> Self {
+        Self {
+            cancellation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelStandaloneUploadOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -194,6 +222,19 @@ where
         self.status.snapshot()
     }
 
+    fn clone_for_owned_task(&self) -> Self {
+        Self {
+            repository: Arc::clone(&self.repository),
+            anchor: Arc::clone(&self.anchor),
+            options: self.options,
+            stage_lock: Arc::clone(&self.stage_lock),
+            batch: Arc::clone(&self.batch),
+            status: Arc::clone(&self.status),
+            lease: Arc::clone(&self.lease),
+            maintenance_guard: self.maintenance_guard.clone(),
+        }
+    }
+
     /// Writes an object and returns only after a covering v2 commit is accepted.
     pub async fn put_committed(
         &self,
@@ -313,7 +354,8 @@ where
         })
     }
 
-    /// Writes one known-length streamed object after flushing pending batches.
+    /// Uploads one known-length payload outside the publication lease, then
+    /// publishes its exact immutable object reference in a short fenced batch.
     pub async fn put_committed_streaming_known_len<St>(
         &self,
         key: LogicalPath,
@@ -323,32 +365,56 @@ where
         multipart_part_size: usize,
     ) -> Result<V2CommittedPut>
     where
-        St: Stream<Item = Result<Bytes>> + Unpin + Send,
+        St: Stream<Item = Result<Bytes>> + Unpin + Send + 'static,
     {
-        let _stage = self.stage_lock.lock().await;
-        self.publish_locked_batch().await?;
-        self.prepare_index_catalog_for_growth_locked().await?;
-        let metadata = self
-            .repository
-            .put_committed_streaming_known_len_coordinated(
-                V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref()),
-                key,
-                plaintext_len,
-                stream,
-                options,
-                multipart_part_size,
-            )
-            .await?;
-        let anchor_state = self
-            .anchor
-            .read_v2()
+        let cancellation = Arc::new(V2StandaloneUploadCancellation::new());
+        let mut cancel_on_drop = CancelStandaloneUploadOnDrop::new(Arc::clone(&cancellation));
+        let repository = Arc::clone(&self.repository);
+        let upload_options = options.clone();
+        let upload_task = tokio::spawn(async move {
+            repository
+                .upload_standalone_streaming_known_len(
+                    plaintext_len,
+                    stream,
+                    &upload_options,
+                    multipart_part_size,
+                    cancellation,
+                )
+                .await
+        });
+        let upload = upload_task
             .await
-            .map_err(v2_commit_error)?
-            .ok_or_else(|| commit_failed("v2 anchor is missing after streamed commit"))?;
-        Ok(V2CommittedPut {
-            metadata,
-            anchor_state,
-        })
+            .map_err(|_| commit_failed("v2 standalone upload task failed"))??;
+        let owned = self.clone_for_owned_task();
+        let publication_task = tokio::spawn(async move {
+            let _stage = owned.stage_lock.lock().await;
+            owned.publish_locked_batch().await?;
+            owned.prepare_index_catalog_for_growth_locked().await?;
+            let metadata = owned
+                .repository
+                .publish_standalone_streaming_known_len_coordinated(
+                    V2CoordinatedMutation::new(&owned.lease, owned.anchor.as_ref()),
+                    key,
+                    plaintext_len,
+                    upload,
+                    options,
+                )
+                .await?;
+            let anchor_state = owned
+                .anchor
+                .read_v2()
+                .await
+                .map_err(v2_commit_error)?
+                .ok_or_else(|| commit_failed("v2 anchor is missing after streamed commit"))?;
+            Ok(V2CommittedPut {
+                metadata,
+                anchor_state,
+            })
+        });
+        cancel_on_drop.disarm();
+        publication_task
+            .await
+            .map_err(|_| commit_failed("v2 standalone publication task failed"))?
     }
 
     /// Writes one unknown-length streamed object after flushing pending batches.

@@ -259,6 +259,7 @@ where
 
         let mut external_containers = BTreeSet::new();
         let mut external_stream_containers = BTreeSet::new();
+        let mut external_standalone_stream_containers = BTreeSet::new();
         for delta in &deltas {
             let IndexDelta::Upsert { entry, .. } = delta else {
                 continue;
@@ -273,11 +274,18 @@ where
                 Some(reference @ PayloadReference::V2CommitStream { .. }) => {
                     external_stream_containers.insert(index_run_stream_container(reference)?);
                 }
+                Some(PayloadReference::V2StandaloneStream { carrier }) => {
+                    external_standalone_stream_containers
+                        .insert(index_run_standalone_stream_container(carrier));
+                }
                 _ => return Err(v2_repository_error(V2FormatError::InvalidHeaderField)),
             }
         }
         let containers = external_containers.into_iter().collect::<Vec<_>>();
         let stream_containers = external_stream_containers.into_iter().collect::<Vec<_>>();
+        let standalone_stream_containers = external_standalone_stream_containers
+            .into_iter()
+            .collect::<Vec<_>>();
 
         let context = commit_repository_context(self, commit_key)?;
         let sealed_pack = if pack_inputs.is_empty() {
@@ -349,6 +357,18 @@ where
                             .binary_search(&container)
                             .map_err(|_| v2_repository_error(V2FormatError::InvalidHeaderField))?;
                         IndexPayloadPointer::ExternalStream {
+                            container_ordinal: u32::try_from(container_ordinal).map_err(|_| {
+                                v2_repository_error(V2FormatError::IndexRunLimitExceeded)
+                            })?,
+                        }
+                    } else if let Some(PayloadReference::V2StandaloneStream { carrier }) =
+                        entry.payload_ref.as_ref()
+                    {
+                        let container = index_run_standalone_stream_container(carrier);
+                        let container_ordinal = standalone_stream_containers
+                            .binary_search(&container)
+                            .map_err(|_| v2_repository_error(V2FormatError::InvalidHeaderField))?;
+                        IndexPayloadPointer::ExternalStandaloneStream {
                             container_ordinal: u32::try_from(container_ordinal).map_err(|_| {
                                 v2_repository_error(V2FormatError::IndexRunLimitExceeded)
                             })?,
@@ -434,7 +454,7 @@ where
             self_stream: None,
             containers,
             stream_containers,
-            standalone_stream_containers: Vec::new(),
+            standalone_stream_containers,
             mutations,
         };
         let sealed_run = match seal_v2_index_run(
@@ -1024,6 +1044,22 @@ fn index_run_pack_container(carrier: &V2PackCarrierReference) -> IndexRunContain
         pack_id: carrier.pack_id,
         content_key_id: carrier.content_key_id.clone(),
         pack_record_count: carrier.pack_record_count,
+    }
+}
+
+fn index_run_standalone_stream_container(
+    carrier: &V2StandaloneStreamCarrierReference,
+) -> IndexRunStandaloneStreamContainer {
+    IndexRunStandaloneStreamContainer {
+        object_id: carrier.object_id.clone(),
+        version_id: carrier.version_id.clone(),
+        stored_len: carrier.stored_len,
+        object_digest: carrier.object_digest,
+        keyring_envelope: IndexRunKeyringRef {
+            object_id: carrier.keyring_envelope_object_id.clone(),
+            digest: carrier.keyring_envelope_digest,
+        },
+        payload_header: carrier.payload_header.clone(),
     }
 }
 
