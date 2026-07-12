@@ -10,7 +10,7 @@ use super::commit::{
     v2_commit_header_span_len, validate_commit_section_semantics, validate_v2_commit_object_len,
 };
 use super::error::{V2FormatError, V2Result};
-use super::format::V2FormatRef;
+use super::format::{V2FormatRef, V2KeyringEnvelopeRootRef};
 use super::provider::V2ProviderProfile;
 use crate::payload::SegmentedPayloadSealer;
 use async_trait::async_trait;
@@ -21,8 +21,8 @@ use rs3_storage::{
     BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore, ByteRange, PutOptions, StorageError,
 };
 use rs3_types::{
-    BackendObjectId, BackendVersionId, KeyId, LegalHoldStatus, RepositoryId, RetentionPolicy,
-    Sequence,
+    BackendObjectId, BackendVersionId, KeyId, LegalHoldStatus, RepositoryId, RetentionMode,
+    RetentionPolicy, Sequence,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
@@ -260,6 +260,8 @@ pub struct V2CommitStoreOptions {
     pub keyring_envelope_ref: V2KeyringEnvelopeRef,
     /// Active encrypted format-root reference to bind into anchors.
     pub format_ref: V2FormatRef,
+    /// Full active keyring-envelope reference used by retention maintenance.
+    pub maintenance_keyring_envelope_ref: Option<V2KeyringEnvelopeRootRef>,
     /// Resource budgets for startup and disaster-recovery replay.
     pub replay_limits: V2ReplayLimits,
 }
@@ -287,6 +289,7 @@ impl V2CommitStoreOptions {
             legal_hold: None,
             keyring_envelope_ref,
             format_ref,
+            maintenance_keyring_envelope_ref: None,
             replay_limits: V2ReplayLimits::default(),
         }
     }
@@ -312,6 +315,15 @@ impl V2CommitStoreOptions {
     /// Uses a specific legal-hold status for commit objects.
     pub const fn with_legal_hold(mut self, legal_hold: Option<LegalHoldStatus>) -> Self {
         self.legal_hold = legal_hold;
+        self
+    }
+
+    /// Supplies the exact active keyring envelope for retention maintenance.
+    pub fn with_maintenance_keyring_envelope_ref(
+        mut self,
+        keyring_envelope_ref: V2KeyringEnvelopeRootRef,
+    ) -> Self {
+        self.maintenance_keyring_envelope_ref = Some(keyring_envelope_ref);
         self
     }
 
@@ -945,6 +957,24 @@ where
 
     pub(super) fn keyring(&self) -> &KeyRing {
         &self.keyring
+    }
+
+    fn validate_write_protection_profile(
+        &self,
+        retention: Option<RetentionPolicy>,
+        legal_hold: Option<LegalHoldStatus>,
+    ) -> V2Result<()> {
+        if legal_hold == Some(LegalHoldStatus::On) {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        let active_retention = retention
+            .is_some_and(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0);
+        if active_retention
+            && self.options.provider_profile != V2ProviderProfile::RetainedVersionObjectLock
+        {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        Ok(())
     }
 
     /// Writes and anchors the required genesis snapshot commit.
@@ -1749,6 +1779,7 @@ where
             let commit_retention =
                 strongest_retention_policy(self.options.retention, write.retention);
             let commit_legal_hold = strongest_legal_hold(self.options.legal_hold, write.legal_hold);
+            self.validate_write_protection_profile(commit_retention, commit_legal_hold)?;
             let (section_index, section_region) = build_section_region(&write.sections)?;
             let body_digest = body_digest_for_v2_sections(&section_index, &section_region)?;
             let upload_mode = if write
@@ -1852,6 +1883,7 @@ where
         let write = build(&commit_key)?;
         let commit_retention = strongest_retention_policy(self.options.retention, write.retention);
         let commit_legal_hold = strongest_legal_hold(self.options.legal_hold, write.legal_hold);
+        self.validate_write_protection_profile(commit_retention, commit_legal_hold)?;
         let written = self
             .put_streaming_payload_commit_object(
                 &commit_key,
@@ -2238,6 +2270,7 @@ where
             multipart_part_size,
             cancellation,
         } = write;
+        self.validate_write_protection_profile(retention, legal_hold)?;
         if cancellation.is_cancelled() {
             return Err(V2FormatError::ObjectBodyReadFailed);
         }
@@ -2763,6 +2796,8 @@ fn storage_error_class(error: &StorageError) -> &'static str {
         StorageError::LegalHoldBlocked => "legal_hold_blocked",
         StorageError::LegalHoldUnsupported => "legal_hold_unsupported",
         StorageError::MultipartUnsupported => "multipart_unsupported",
+        StorageError::PagedListingUnsupported => "paged_listing_unsupported",
+        StorageError::InvalidListPage => "invalid_list_page",
     }
 }
 

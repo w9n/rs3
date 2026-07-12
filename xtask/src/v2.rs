@@ -6,13 +6,15 @@ use bytes::Bytes;
 use clap::{Args, Subcommand, ValueEnum};
 use rs3_crypto::{FormatEnvelope, KeyRing, KeyringEnvelope, RepositoryKeyContext, SecretBytes};
 #[cfg(feature = "s3")]
+use rs3_repository::store_keyring_envelope;
+#[cfg(feature = "s3")]
 use rs3_repository::v2::{
     UnenforcedQuiescedMaintenanceGuard, V2FullGcApplyOptions, V2FullGcDryRunOptions,
-    V2KeyringEnvelopeRef, V2MaintenanceBudgets, V2OrphanGcOptions, generate_v2_commit_key,
+    V2MaintenanceBudgets, V2OrphanGcOptions, generate_v2_commit_key,
 };
 use rs3_repository::v2::{
     V2CommitChain, V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot,
-    V2KeyringEnvelopeRootRef, V2ProviderProfile, V2RecoveryBundle,
+    V2KeyringEnvelopeRootRef, V2ProviderProfile, V2RecoveryBundle, v2_format_object_id,
 };
 #[cfg(feature = "s3")]
 use rs3_storage::PutOptions;
@@ -20,8 +22,7 @@ use rs3_storage::{BlobStore, ByteRange, FilesystemBlobStore};
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
 #[cfg(feature = "s3")]
-use rs3_types::{BackendObjectId, BackendVersionId};
-use rs3_types::{RepositoryId, RetentionMode, RetentionPolicy, Sequence};
+use rs3_types::{KeyPurpose, RepositoryId, RetentionMode, RetentionPolicy, Sequence};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -219,45 +220,136 @@ async fn gc_rehearsal(args: V2GcRehearsalArgs) -> Result<serde_json::Value> {
     if !args.retained_provider_conformance_passed {
         bail!("--retained-provider-conformance-passed is required for retained GC rehearsal");
     }
+    if args.retention_days == 0 {
+        bail!("--retention-days must be greater than zero");
+    }
     match args.backend.backend {
         V2Backend::Filesystem => bail!("retained GC rehearsal requires --backend s3"),
         #[cfg(feature = "s3")]
         V2Backend::S3 => {
-            let prefix = args.backend.s3_prefix.clone();
+            let mut random = [0_u8; 12];
+            getrandom::fill(&mut random)
+                .map_err(|_| anyhow::anyhow!("failed to create isolated rehearsal prefix"))?;
+            let parent = args
+                .backend
+                .s3_prefix
+                .as_deref()
+                .unwrap_or_default()
+                .trim_end_matches('/');
+            let prefix = if parent.is_empty() {
+                format!("rs3-gc-rehearsal/{}/", hex::encode(random))
+            } else {
+                format!("{parent}/rs3-gc-rehearsal/{}/", hex::encode(random))
+            };
+            let mut args = args;
+            args.backend.s3_prefix = Some(prefix.clone());
             let store = s3_store(&args.backend).await?;
-            gc_rehearsal_with_store(store, args, prefix).await
+            gc_rehearsal_with_store(store, args).await
         }
     }
 }
 
 #[cfg(feature = "s3")]
-async fn gc_rehearsal_with_store<S>(
-    store: S,
-    args: V2GcRehearsalArgs,
-    backend_prefix: Option<String>,
-) -> Result<serde_json::Value>
+async fn gc_rehearsal_with_store<S>(store: S, args: V2GcRehearsalArgs) -> Result<serde_json::Value>
 where
     S: BlobStore + Clone,
 {
     let retention = RetentionPolicy::new(retention_mode(args.retention_mode), args.retention_days);
+    for prefix in ["commits/v02/", "objects/v02/", "keyrings/", "format/"] {
+        let existing = store
+            .list_prefix(prefix)
+            .await
+            .with_context(|| format!("failed to inspect rehearsal prefix class {prefix}"))?;
+        if !existing.is_empty() {
+            bail!("retained GC rehearsal isolated prefix is unexpectedly non-empty");
+        }
+    }
+
+    let repository_id = rehearsal_repository_id()?;
+    let mut repository_salt = vec![0_u8; 32];
+    getrandom::fill(&mut repository_salt)
+        .map_err(|_| anyhow::anyhow!("failed to generate rehearsal repository salt"))?;
+    let context = RepositoryKeyContext::new(repository_id.clone(), repository_salt)
+        .context("failed to create rehearsal repository key context")?;
+    let mut wrapping_key_bytes = vec![0_u8; SecretBytes::MIN_LEN];
+    getrandom::fill(&mut wrapping_key_bytes)
+        .map_err(|_| anyhow::anyhow!("failed to generate rehearsal wrapping key"))?;
+    let wrapping_key =
+        SecretBytes::new(wrapping_key_bytes).context("failed to create rehearsal wrapping key")?;
     let keyring = KeyRing::generate_random().context("failed to generate rehearsal keyring")?;
+    let keyring_envelope = keyring
+        .seal_keyring_envelope(&context, "gc-rehearsal-wrap", &wrapping_key, 1)
+        .context("failed to seal rehearsal keyring")?;
+    let keyring_reference =
+        store_keyring_envelope(&store, &keyring_envelope, Some(retention), None)
+            .await
+            .context("failed to store rehearsal keyring envelope")?;
+    let keyring_root = V2KeyringEnvelopeRootRef {
+        generation: keyring_reference.generation,
+        digest: keyring_reference.digest,
+        object_id: keyring_reference.object_id,
+        version_id: keyring_reference.version_id,
+    };
+    let signing_key_id = keyring
+        .primary_key_id(KeyPurpose::CheckpointSigning)
+        .context("rehearsal keyring has no signing key")?;
+    let format_root = V2FormatRoot::new(
+        repository_id.clone(),
+        keyring_root.clone(),
+        signing_key_id,
+        V2ProviderProfile::RetainedVersionObjectLock,
+        Some(retention),
+    );
+    let format_plaintext = format_root
+        .to_plaintext_bytes()
+        .context("failed to encode rehearsal format root")?;
+    let format_envelope = FormatEnvelope::seal(
+        &context,
+        "gc-rehearsal-wrap",
+        &wrapping_key,
+        1,
+        &format_plaintext,
+    )
+    .context("failed to seal rehearsal format root")?;
+    let format_digest = format_envelope
+        .digest()
+        .context("failed to digest rehearsal format root")?;
+    let format_object_id = v2_format_object_id(format_envelope.generation, &format_digest)
+        .context("failed to build rehearsal format-root object ID")?;
+    let format_metadata = store
+        .put(
+            &format_object_id,
+            Bytes::from(
+                format_envelope
+                    .to_object_bytes()
+                    .context("failed to encode rehearsal format envelope")?,
+            ),
+            PutOptions {
+                retention: Some(retention),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .context("failed to store rehearsal format root")?;
+    let format_ref = V2FormatRef {
+        generation: format_envelope.generation,
+        digest: format_digest,
+        object_id: format_object_id,
+        version_id: format_metadata.version_id,
+    };
+    let keyring_ref = keyring_root
+        .commit_ref()
+        .context("failed to create rehearsal commit keyring reference")?;
     let commit_options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::RetainedVersionObjectLock,
-        rehearsal_repository_id()?,
-        rehearsal_keyring_ref()?,
-        rehearsal_format_ref()?,
+        repository_id,
+        keyring_ref,
+        format_ref.clone(),
     )
+    .with_maintenance_keyring_envelope_ref(keyring_root.clone())
     .with_retention(Some(retention));
-    let repository = V2CommitStore::new(store.clone(), keyring, commit_options);
+    let repository = V2CommitStore::new(store.clone(), keyring, commit_options.clone());
     let anchor = rs3_repository::v2::V2MemoryAnchor::new();
-
-    let existing_commits = store
-        .list_prefix("commits/v02/")
-        .await
-        .context("failed to inspect retained GC rehearsal target prefix")?;
-    if !existing_commits.is_empty() {
-        bail!("retained GC rehearsal refuses to run when commits/v02/ is not empty");
-    }
 
     let genesis = repository
         .write_genesis_snapshot(&anchor)
@@ -270,7 +362,7 @@ where
         .context("failed to generate protected orphan key")?
         .object_id;
 
-    let unprotected_metadata = store
+    store
         .put(
             &unprotected_key,
             Bytes::from_static(b"rs3-v2-gc-rehearsal-unprotected"),
@@ -278,7 +370,7 @@ where
         )
         .await
         .context("failed to write unprotected exact-version orphan")?;
-    let protected_metadata = store
+    store
         .put(
             &protected_key,
             Bytes::from_static(b"rs3-v2-gc-rehearsal-protected"),
@@ -293,10 +385,12 @@ where
     let dry_run_options = V2FullGcDryRunOptions {
         budgets: V2MaintenanceBudgets {
             max_delete_count: Some(1),
-            max_retention_extend_count: Some(0),
+            max_retention_extend_count: Some(3),
             ..V2MaintenanceBudgets::default()
         },
-        retention_renewal_horizon: std::time::Duration::ZERO,
+        retention_renewal_horizon: std::time::Duration::from_secs(
+            u64::from(args.retention_days.saturating_add(1)) * 24 * 60 * 60,
+        ),
         ..V2FullGcDryRunOptions::default()
     };
     let before = repository
@@ -316,9 +410,15 @@ where
     if before.retention_blocked_bytes == 0 {
         bail!("retained GC rehearsal expected a retention-blocked protected candidate");
     }
+    if before.retention_renewal_commit_count != 3 {
+        bail!(
+            "retained GC rehearsal expected three live root renewals, got {}",
+            before.retention_renewal_commit_count
+        );
+    }
 
     let apply = repository
-        .apply_fully_dead_orphans(
+        .apply_full_gc(
             &anchor,
             &UnenforcedQuiescedMaintenanceGuard,
             V2FullGcApplyOptions {
@@ -339,6 +439,12 @@ where
             apply.orphan_gc.protected_count
         );
     }
+    if apply.retention_renewed_object_count != 3 {
+        bail!(
+            "retained GC rehearsal expected three verified renewals, got {}",
+            apply.retention_renewed_object_count
+        );
+    }
 
     let after = repository
         .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
@@ -348,10 +454,32 @@ where
         bail!("retained GC rehearsal post-apply state did not preserve only protected candidates");
     }
 
-    let verified = repository
+    let opened_format = open_format_root(
+        &store,
+        &context,
+        "gc-rehearsal-wrap",
+        &wrapping_key,
+        &format_ref,
+    )
+    .await
+    .context("failed to reopen renewed format root")?;
+    if opened_format != format_root {
+        bail!("renewed format root did not reopen to the expected authenticated state");
+    }
+    let reopened_keyring = open_keyring_envelope(
+        &store,
+        &context,
+        "gc-rehearsal-wrap",
+        &wrapping_key,
+        &keyring_root,
+    )
+    .await
+    .context("failed to reopen renewed keyring envelope")?;
+    let fresh_repository = V2CommitStore::new(store.clone(), reopened_keyring, commit_options);
+    let verified = fresh_repository
         .load_chain_from_anchor(&anchor)
         .await
-        .context("failed to verify anchor chain after retained GC rehearsal")?
+        .context("failed to verify anchor chain through renewed restore roots")?
         .map(|chain| chain.commits_newest_first.len())
         .unwrap_or_default();
 
@@ -360,7 +488,6 @@ where
         "passed": true,
         "backend": {
             "kind": "s3",
-            "prefix": backend_prefix,
         },
         "retention": {
             "mode": retention_mode_name(retention.mode),
@@ -368,12 +495,6 @@ where
         },
         "anchor": {
             "sequence": genesis.anchor_state.sequence.get(),
-            "commit_key": genesis.anchor_state.commit_key.as_str(),
-            "version_id": genesis.anchor_state.version_id.as_ref().map(BackendVersionId::as_str),
-        },
-        "probe_objects": {
-            "unprotected_version_id": unprotected_metadata.version_id.as_ref().map(BackendVersionId::as_str),
-            "protected_version_id": protected_metadata.version_id.as_ref().map(BackendVersionId::as_str),
         },
         "dry_run_before": {
             "candidate_commit_count": before.candidate_commit_count,
@@ -386,6 +507,8 @@ where
             "exact_version_apply_ready": before.exact_version_apply_ready,
         },
         "apply": {
+            "retention_renewed_object_count": apply.retention_renewed_object_count,
+            "retention_renewed_bytes": apply.retention_renewed_bytes,
             "scanned_count": apply.orphan_gc.scanned_count,
             "deleted_count": apply.orphan_gc.deleted_count,
             "protected_count": apply.orphan_gc.protected_count,
@@ -423,24 +546,6 @@ fn rehearsal_repository_id() -> Result<RepositoryId> {
 }
 
 #[cfg(feature = "s3")]
-fn rehearsal_keyring_ref() -> Result<V2KeyringEnvelopeRef> {
-    Ok(V2KeyringEnvelopeRef {
-        object_id: BackendObjectId::new("keyrings/gc-rehearsal-envelope".to_owned())?,
-        digest: [0x11; 32],
-    })
-}
-
-#[cfg(feature = "s3")]
-fn rehearsal_format_ref() -> Result<V2FormatRef> {
-    Ok(V2FormatRef {
-        generation: 1,
-        digest: "22".repeat(32),
-        object_id: BackendObjectId::new("format/00000000000000000001/gc-rehearsal".to_owned())?,
-        version_id: None,
-    })
-}
-
-#[cfg(feature = "s3")]
 fn retention_mode(mode: V2RetentionModeArg) -> RetentionMode {
     match mode {
         V2RetentionModeArg::Governance => RetentionMode::Governance,
@@ -457,8 +562,8 @@ fn print_gc_rehearsal_report(report: &serde_json::Value, format: V2ReportFormat)
             println!("schema={}", report["schema"].as_str().unwrap_or_default());
             println!("passed={}", report["passed"].as_bool().unwrap_or(false));
             println!(
-                "backend_prefix={}",
-                report["backend"]["prefix"].as_str().unwrap_or_default()
+                "backend_kind={}",
+                report["backend"]["kind"].as_str().unwrap_or_default()
             );
             println!(
                 "retention_mode={}",

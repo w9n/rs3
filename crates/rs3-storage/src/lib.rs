@@ -13,6 +13,7 @@ use rs3_types::{
     BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionMode, RetentionPolicy,
 };
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -111,10 +112,44 @@ pub enum StorageError {
     /// Multipart upload is unsupported for this provider or option set.
     #[error("multipart upload is unsupported")]
     MultipartUnsupported,
+    /// The provider cannot expose bounded incremental listings.
+    #[error("bounded listing is unsupported")]
+    PagedListingUnsupported,
+    /// A provider returned a listing page that violated the requested bound.
+    #[error("provider returned an invalid listing page")]
+    InvalidListPage,
 }
 
 /// Convenient result alias for storage operations.
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+/// Selects whether a bounded listing returns current objects or exact versions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobListMode {
+    /// Return only the current version of each object.
+    Current,
+    /// Return every addressable object version.
+    Versions,
+}
+
+/// One bounded page of object metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobListPage {
+    /// Entries returned by this page.
+    pub entries: Vec<BlobMetadata>,
+    /// Whether the listing has no further pages.
+    pub is_complete: bool,
+}
+
+/// Provider-private incremental listing session.
+///
+/// Implementations keep provider cursors private and must perform at most one
+/// remote provider LIST request per call.
+#[async_trait]
+pub trait BlobList: Send {
+    /// Returns at most `max_items` entries from the next listing page.
+    async fn next_page(&mut self, max_items: NonZeroUsize) -> Result<BlobListPage>;
+}
 
 /// Provider-neutral multipart upload session.
 #[async_trait]
@@ -229,6 +264,19 @@ pub trait BlobStore: Send + Sync {
     async fn list_prefix_versions(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
         let _ = prefix;
         Err(StorageError::VersionUnsupported)
+    }
+
+    /// Opens a bounded incremental listing without exposing provider cursors.
+    ///
+    /// Providers must override this method to opt in. The default fails closed
+    /// rather than adapting through an unbounded whole-prefix listing.
+    async fn open_bounded_list(
+        &self,
+        prefix: &str,
+        mode: BlobListMode,
+    ) -> Result<Box<dyn BlobList>> {
+        let _ = (prefix, mode);
+        Err(StorageError::PagedListingUnsupported)
     }
 
     /// Deletes an object or writes a provider-specific delete marker.
@@ -516,6 +564,18 @@ where
         self.inner.list_prefix_versions(prefix).await
     }
 
+    async fn open_bounded_list(
+        &self,
+        prefix: &str,
+        mode: BlobListMode,
+    ) -> Result<Box<dyn BlobList>> {
+        let inner = self.inner.open_bounded_list(prefix, mode).await?;
+        Ok(Box::new(CountingBlobList {
+            inner,
+            counts: Arc::clone(&self.counts),
+        }))
+    }
+
     async fn delete(&self, object_id: &BackendObjectId) -> Result<()> {
         self.mutate_counts(|counts| {
             counts.delete = counts.delete.saturating_add(1);
@@ -595,6 +655,28 @@ where
 struct CountingBlobRead {
     inner: Box<dyn BlobRead>,
     counts: Arc<RwLock<BlobOperationCounts>>,
+}
+
+struct CountingBlobList {
+    inner: Box<dyn BlobList>,
+    counts: Arc<RwLock<BlobOperationCounts>>,
+}
+
+#[async_trait]
+impl BlobList for CountingBlobList {
+    async fn next_page(&mut self, max_items: NonZeroUsize) -> Result<BlobListPage> {
+        {
+            let mut counts = self.counts.write().map_err(|_| {
+                StorageError::Provider("counting blob store lock poisoned".to_owned())
+            })?;
+            counts.list = counts.list.saturating_add(1);
+        }
+        let page = self.inner.next_page(max_items).await?;
+        if page.entries.len() > max_items.get() {
+            return Err(StorageError::InvalidListPage);
+        }
+        Ok(page)
+    }
 }
 
 #[async_trait]
@@ -757,6 +839,93 @@ struct MemoryMultipartUpload {
     object_id: BackendObjectId,
     options: PutOptions,
     parts: BTreeMap<usize, Bytes>,
+}
+
+struct MemoryBlobList {
+    store: MemoryBlobStore,
+    prefix: String,
+    mode: BlobListMode,
+    current_after: Option<BackendObjectId>,
+    version_after: Option<(BackendObjectId, usize)>,
+    complete: bool,
+}
+
+#[async_trait]
+impl BlobList for MemoryBlobList {
+    async fn next_page(&mut self, max_items: NonZeroUsize) -> Result<BlobListPage> {
+        if self.complete {
+            return Ok(BlobListPage {
+                entries: Vec::new(),
+                is_complete: true,
+            });
+        }
+
+        let started = Instant::now();
+        let object_kind = prefix_kind(&self.prefix);
+        let mut state = self.store.write_state()?;
+        state.counts.list = state.counts.list.saturating_add(1);
+
+        let limit = max_items.get();
+        let mut entries = Vec::with_capacity(limit.min(1_024));
+        let mut has_more = false;
+        match self.mode {
+            BlobListMode::Current => {
+                for (object_id, versions) in &state.objects {
+                    if self
+                        .current_after
+                        .as_ref()
+                        .is_some_and(|after| object_id <= after)
+                        || !object_id.as_str().starts_with(&self.prefix)
+                    {
+                        continue;
+                    }
+                    let Some(object) = versions.last() else {
+                        continue;
+                    };
+                    if entries.len() == limit {
+                        has_more = true;
+                        break;
+                    }
+                    self.current_after = Some(object_id.clone());
+                    entries.push(object.metadata.clone());
+                }
+            }
+            BlobListMode::Versions => {
+                for (object_id, versions) in &state.objects {
+                    if !object_id.as_str().starts_with(&self.prefix) {
+                        continue;
+                    }
+                    for (version_index, object) in versions.iter().enumerate() {
+                        if self.version_after.as_ref().is_some_and(
+                            |(after_object_id, after_version_index)| {
+                                object_id < after_object_id
+                                    || (object_id == after_object_id
+                                        && version_index <= *after_version_index)
+                            },
+                        ) {
+                            continue;
+                        }
+                        if entries.len() == limit {
+                            has_more = true;
+                            break;
+                        }
+                        self.version_after = Some((object_id.clone(), version_index));
+                        entries.push(object.metadata.clone());
+                    }
+                    if has_more {
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.complete = !has_more;
+        record_blob_list(object_kind, entries.len(), "ok", started.elapsed());
+        Ok(BlobListPage {
+            entries,
+            is_complete: self.complete,
+        })
+    }
 }
 
 #[async_trait]
@@ -1071,6 +1240,21 @@ impl BlobStore for MemoryBlobStore {
         record_blob_list(object_kind, entries.len(), "ok", started.elapsed());
 
         Ok(entries)
+    }
+
+    async fn open_bounded_list(
+        &self,
+        prefix: &str,
+        mode: BlobListMode,
+    ) -> Result<Box<dyn BlobList>> {
+        Ok(Box::new(MemoryBlobList {
+            store: self.clone(),
+            prefix: prefix.to_owned(),
+            mode,
+            current_after: None,
+            version_after: None,
+            complete: false,
+        }))
     }
 
     async fn delete(&self, object_id: &BackendObjectId) -> Result<()> {
@@ -1531,11 +1715,66 @@ pub(crate) fn elapsed_us(elapsed: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlobStore, ByteRange, CountingBlobStore, MemoryBlobStore, PutOptions, StorageError,
-        read_range, retention_blocks_delete,
+        BlobListMode, BlobMetadata, BlobStore, ByteRange, CountingBlobStore, MemoryBlobStore,
+        PutOptions, Result, StorageError, read_range, retention_blocks_delete,
+    };
+    #[cfg(feature = "test-util")]
+    use super::{
+        FaultAction, FaultInjectingBlobStore, FaultMatcher, FaultOperationKind, FaultRule,
     };
     use bytes::Bytes;
     use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
+    use std::num::NonZeroUsize;
+
+    struct LegacyOnlyBlobStore(MemoryBlobStore);
+
+    #[async_trait::async_trait]
+    impl BlobStore for LegacyOnlyBlobStore {
+        async fn put(
+            &self,
+            object_id: &BackendObjectId,
+            body: Bytes,
+            options: PutOptions,
+        ) -> Result<BlobMetadata> {
+            self.0.put(object_id, body, options).await
+        }
+
+        async fn get_range(&self, object_id: &BackendObjectId, range: ByteRange) -> Result<Bytes> {
+            self.0.get_range(object_id, range).await
+        }
+
+        async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {
+            self.0.head(object_id).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
+            self.0.list_prefix(prefix).await
+        }
+
+        async fn delete(&self, object_id: &BackendObjectId) -> Result<()> {
+            self.0.delete(object_id).await
+        }
+
+        async fn extend_retention(
+            &self,
+            object_id: &BackendObjectId,
+            policy: RetentionPolicy,
+        ) -> Result<()> {
+            self.0.extend_retention(object_id, policy).await
+        }
+
+        async fn set_legal_hold(
+            &self,
+            object_id: &BackendObjectId,
+            status: LegalHoldStatus,
+        ) -> Result<()> {
+            self.0.set_legal_hold(object_id, status).await
+        }
+
+        async fn flush_caches(&self) -> Result<()> {
+            self.0.flush_caches().await
+        }
+    }
 
     fn object_id(value: &str) -> BackendObjectId {
         match BackendObjectId::new(value) {
@@ -1549,6 +1788,10 @@ mod tests {
             Ok(counts) => counts,
             Err(error) => panic!("{error}"),
         }
+    }
+
+    fn page_size(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).unwrap_or_else(|| panic!("page size must be non-zero"))
     }
 
     #[test]
@@ -1743,6 +1986,185 @@ mod tests {
         assert_eq!(
             object_ids,
             vec![object_id("segments/a"), object_id("segments/b")]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_listing_fails_closed_without_provider_support() {
+        let store = LegacyOnlyBlobStore(MemoryBlobStore::new());
+
+        let listing = store
+            .open_bounded_list("segments/", BlobListMode::Current)
+            .await;
+
+        assert!(matches!(
+            listing,
+            Err(StorageError::PagedListingUnsupported)
+        ));
+    }
+
+    #[tokio::test]
+    async fn memory_store_pages_current_objects_with_a_hard_bound() {
+        let store = MemoryBlobStore::new();
+        for name in ["segments/a", "segments/b", "segments/c", "index/a"] {
+            store
+                .put(
+                    &object_id(name),
+                    Bytes::from_static(b"body"),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("put object: {error}"));
+        }
+        let mut listing = store
+            .open_bounded_list("segments/", BlobListMode::Current)
+            .await
+            .unwrap_or_else(|error| panic!("open listing: {error}"));
+
+        let first = listing
+            .next_page(page_size(2))
+            .await
+            .unwrap_or_else(|error| panic!("read first page: {error}"));
+        let second = listing
+            .next_page(page_size(2))
+            .await
+            .unwrap_or_else(|error| panic!("read second page: {error}"));
+
+        assert_eq!(first.entries.len(), 2);
+        assert!(!first.is_complete);
+        assert_eq!(second.entries.len(), 1);
+        assert!(second.is_complete);
+        let object_ids = first
+            .entries
+            .into_iter()
+            .chain(second.entries)
+            .map(|metadata| metadata.object_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            object_ids,
+            vec![
+                object_id("segments/a"),
+                object_id("segments/b"),
+                object_id("segments/c")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_store_pages_exact_versions_without_duplicates() {
+        let store = MemoryBlobStore::new();
+        let first_id = object_id("segments/a");
+        for body in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
+            store
+                .put(
+                    &first_id,
+                    Bytes::copy_from_slice(body),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("put version: {error}"));
+        }
+        store
+            .put(
+                &object_id("segments/b"),
+                Bytes::from_static(b"four"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("put object: {error}"));
+        let mut listing = store
+            .open_bounded_list("segments/", BlobListMode::Versions)
+            .await
+            .unwrap_or_else(|error| panic!("open listing: {error}"));
+        let mut versions = Vec::new();
+        loop {
+            let page = listing
+                .next_page(page_size(2))
+                .await
+                .unwrap_or_else(|error| panic!("read page: {error}"));
+            assert!(page.entries.len() <= 2);
+            versions.extend(
+                page.entries
+                    .into_iter()
+                    .map(|metadata| (metadata.object_id, metadata.version_id)),
+            );
+            if page.is_complete {
+                break;
+            }
+        }
+
+        assert_eq!(versions.len(), 4);
+        let unique = versions.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), versions.len());
+    }
+
+    #[tokio::test]
+    async fn counting_store_counts_each_bounded_list_page() {
+        let store = CountingBlobStore::new(MemoryBlobStore::new());
+        for name in ["segments/a", "segments/b"] {
+            store
+                .put(
+                    &object_id(name),
+                    Bytes::from_static(b"body"),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("put object: {error}"));
+        }
+        store
+            .reset_operation_counts()
+            .unwrap_or_else(|error| panic!("reset counts: {error}"));
+        let mut listing = store
+            .open_bounded_list("segments/", BlobListMode::Current)
+            .await
+            .unwrap_or_else(|error| panic!("open listing: {error}"));
+
+        let first = listing
+            .next_page(page_size(1))
+            .await
+            .unwrap_or_else(|error| panic!("read first page: {error}"));
+        let second = listing
+            .next_page(page_size(1))
+            .await
+            .unwrap_or_else(|error| panic!("read second page: {error}"));
+
+        assert!(!first.is_complete);
+        assert!(second.is_complete);
+        assert_eq!(store.operation_counts().map(|counts| counts.list), Ok(2));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn fault_store_injects_faults_at_bounded_page_boundaries() {
+        let inner = MemoryBlobStore::new();
+        inner
+            .put(
+                &object_id("segments/a"),
+                Bytes::from_static(b"body"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("put object: {error}"));
+        let store = FaultInjectingBlobStore::new(
+            inner,
+            vec![FaultRule::new(
+                FaultMatcher::operation(FaultOperationKind::ListPrefixPage),
+                FaultAction::return_error("page failed"),
+            )],
+        );
+        let mut listing = store
+            .open_bounded_list("segments/", BlobListMode::Current)
+            .await
+            .unwrap_or_else(|error| panic!("open listing: {error}"));
+
+        let page = listing.next_page(page_size(1)).await;
+
+        assert!(matches!(page, Err(StorageError::Provider(_))));
+        assert_eq!(
+            store
+                .operation_log()
+                .map(|events| events.first().map(|event| event.kind)),
+            Ok(Some(FaultOperationKind::ListPrefixPage))
         );
     }
 

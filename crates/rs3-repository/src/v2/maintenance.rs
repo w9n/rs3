@@ -21,17 +21,20 @@ use rs3_index::{
     INDEX_DELTA_OBJECT_DOMAIN, IndexDelta, IndexDeltaObject, PayloadReference,
     SealedIndexDeltaObject, V2CommitStreamCarrierReference, V2StandaloneStreamCarrierReference,
 };
-use rs3_storage::BlobMetadata;
-use rs3_storage::{BlobStore, StorageError};
+use rs3_storage::{BlobListMode, BlobMetadata, BlobStore, StorageError};
 use rs3_types::{
     BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionMode, RetentionPolicy, Sequence,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_RETENTION_RENEWAL_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MIN_ORPHAN_GC_AGE: Duration = Duration::from_secs(60 * 60);
+const MAINTENANCE_LIST_PAGE_ITEMS: usize = 1_000;
+const DEFAULT_MAX_INVENTORY_PAGES: u64 = 4_096;
+const DEFAULT_MAX_INVENTORY_ITEMS: u64 = 2_000_000;
 
 /// Broad path-private class of one v2 orphan candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,7 +173,7 @@ pub struct V2MaintenanceReport {
 }
 
 /// Operator-accepted budgets for v2 full-maintenance dry runs and apply plans.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct V2MaintenanceBudgets {
     /// Maximum planned backend requests.
     pub max_request_count: Option<u64>,
@@ -186,6 +189,26 @@ pub struct V2MaintenanceBudgets {
     pub max_delete_count: Option<u64>,
     /// Maximum planned retention-extension calls.
     pub max_retention_extend_count: Option<u64>,
+    /// Maximum provider pages consumed while building object inventory.
+    pub max_inventory_page_count: u64,
+    /// Maximum object/version entries consumed while building inventory.
+    pub max_inventory_item_count: u64,
+}
+
+impl Default for V2MaintenanceBudgets {
+    fn default() -> Self {
+        Self {
+            max_request_count: None,
+            max_version_list_count: None,
+            max_head_count: None,
+            max_range_read_bytes: None,
+            max_write_bytes: None,
+            max_delete_count: None,
+            max_retention_extend_count: None,
+            max_inventory_page_count: DEFAULT_MAX_INVENTORY_PAGES,
+            max_inventory_item_count: DEFAULT_MAX_INVENTORY_ITEMS,
+        }
+    }
 }
 
 /// Request and byte estimates for a v2 full-maintenance plan.
@@ -205,6 +228,10 @@ pub struct V2MaintenancePlanCost {
     pub delete_count: u64,
     /// Planned retention-extension calls.
     pub retention_extend_count: u64,
+    /// Provider listing pages consumed by the inventory.
+    pub inventory_page_count: u64,
+    /// Object/version entries consumed by the inventory.
+    pub inventory_item_count: u64,
 }
 
 impl V2MaintenancePlanCost {
@@ -220,6 +247,8 @@ impl V2MaintenancePlanCost {
                 budgets.max_retention_extend_count,
                 self.retention_extend_count,
             )
+            && self.inventory_page_count <= budgets.max_inventory_page_count
+            && self.inventory_item_count <= budgets.max_inventory_item_count
     }
 }
 
@@ -231,6 +260,9 @@ pub struct V2FullGcDryRunOptions {
     /// Plan live commit retention renewal when retain-until is within this horizon.
     pub retention_renewal_horizon: Duration,
     /// Additional trusted historical roots that must remain reachable.
+    ///
+    /// Every root must bind the active exact format reference. Cross-format
+    /// protected-root maintenance fails with [`V2FormatError::InvalidFormatRoot`].
     pub protected_roots: Vec<V2AnchorState>,
 }
 
@@ -326,6 +358,10 @@ pub struct V2FullGcApplyOptions {
 pub struct V2FullGcApplyReport {
     /// Dry-run report used as the apply preflight.
     pub dry_run: V2FullGcDryRunReport,
+    /// Live exact object versions whose retention was renewed and verified.
+    pub retention_renewed_object_count: usize,
+    /// Live exact object bytes covered by verified retention renewal.
+    pub retention_renewed_bytes: u64,
     /// Exact deletion result for fully dead orphan objects.
     pub orphan_gc: V2OrphanGcReport,
 }
@@ -338,6 +374,7 @@ struct V2RetentionRenewalPlan {
     blocked_bytes: u64,
     head_count: u64,
     extend_count: u64,
+    targets: Vec<V2RetentionTarget>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -345,6 +382,23 @@ struct V2RetentionTarget {
     object_id: BackendObjectId,
     version_id: Option<BackendVersionId>,
     stored_len: u64,
+    required_retention: Option<RetentionPolicy>,
+    required_legal_hold: Option<LegalHoldStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct V2FullGcPlan {
+    report: V2FullGcDryRunReport,
+    retention_renewal: V2RetentionRenewalPlan,
+    orphans: V2OrphanReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct V2OrphanInventory {
+    report: V2OrphanReport,
+    list_request_count: u64,
+    version_list_request_count: u64,
+    item_count: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -360,8 +414,16 @@ struct V2StandalonePayloadRoot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum V2LivePayloadRoot {
-    Commit(V2AnchorState),
-    Standalone(V2StandalonePayloadRoot),
+    Commit {
+        root: V2AnchorState,
+        retention: Option<RetentionPolicy>,
+        legal_hold: Option<LegalHoldStatus>,
+    },
+    Standalone {
+        root: V2StandalonePayloadRoot,
+        retention: Option<RetentionPolicy>,
+        legal_hold: Option<LegalHoldStatus>,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -370,8 +432,7 @@ struct V2ReachabilityState {
     current_chain: Option<V2ReplayChain>,
     reachable: BTreeSet<BackendObjectId>,
     reachable_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
-    renewal_targets: Vec<V2RetentionTarget>,
-    renewal_seen: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
+    renewal_targets: BTreeMap<(BackendObjectId, Option<BackendVersionId>), V2RetentionTarget>,
     protected_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
     reachable_commit_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
     reachable_object_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
@@ -380,6 +441,7 @@ struct V2ReachabilityState {
     chain_get_count: u64,
     chain_read_bytes: u64,
     chain_retained_bytes: u64,
+    graph_head_count: u64,
 }
 
 pub(crate) struct V2ResolvedIndexRoot {
@@ -388,7 +450,13 @@ pub(crate) struct V2ResolvedIndexRoot {
 }
 
 impl V2ReachabilityState {
-    fn include_chain(&mut self, chain: &V2ReplayChain, protected: bool) {
+    fn include_chain(
+        &mut self,
+        chain: &V2ReplayChain,
+        protected: bool,
+        retention: Option<RetentionPolicy>,
+        legal_hold: Option<LegalHoldStatus>,
+    ) -> V2Result<()> {
         self.chain_get_count = self
             .chain_get_count
             .saturating_add(usize_to_u64(chain.commits_newest_first.len()));
@@ -406,23 +474,26 @@ impl V2ReachabilityState {
             self.reachable.insert(object_id.clone());
             self.reachable_versions.insert(version_key.clone());
             self.reachable_commit_versions.insert(version_key.clone());
-            if self.renewal_seen.insert(version_key.clone()) {
-                self.renewal_targets.push(V2RetentionTarget {
-                    object_id,
-                    version_id: commit.version_id.clone(),
-                    stored_len: commit.object_len,
-                });
-            }
+            self.include_renewal_target(
+                object_id,
+                commit.version_id.clone(),
+                commit.object_len,
+                retention,
+                legal_hold,
+            )?;
             if protected {
                 self.protected_versions.insert(version_key);
             }
         }
+        Ok(())
     }
 
     fn include_standalone(
         &mut self,
         root: V2StandalonePayloadRoot,
         protected: bool,
+        retention: Option<RetentionPolicy>,
+        legal_hold: Option<LegalHoldStatus>,
     ) -> V2Result<()> {
         let version_key = (root.object_id.clone(), root.version_id.clone());
         match self.standalone_facts.get(&version_key) {
@@ -438,15 +509,66 @@ impl V2ReachabilityState {
         self.reachable.insert(root.object_id.clone());
         self.reachable_versions.insert(version_key.clone());
         self.reachable_object_versions.insert(version_key.clone());
-        if self.renewal_seen.insert(version_key.clone()) {
-            self.renewal_targets.push(V2RetentionTarget {
-                object_id: root.object_id,
-                version_id: root.version_id,
-                stored_len: root.stored_len,
-            });
-        }
+        self.include_renewal_target(
+            root.object_id,
+            root.version_id,
+            root.stored_len,
+            retention,
+            legal_hold,
+        )?;
         if protected {
             self.protected_versions.insert(version_key);
+        }
+        Ok(())
+    }
+
+    fn include_renewal_target(
+        &mut self,
+        object_id: BackendObjectId,
+        version_id: Option<BackendVersionId>,
+        stored_len: u64,
+        retention: Option<RetentionPolicy>,
+        legal_hold: Option<LegalHoldStatus>,
+    ) -> V2Result<()> {
+        let key = (object_id.clone(), version_id.clone());
+        if let Some(target) = self.renewal_targets.get_mut(&key) {
+            if target.stored_len != stored_len {
+                return Err(V2FormatError::ProviderProfileFailed);
+            }
+            target.required_retention = strongest_retention(target.required_retention, retention);
+            if legal_hold == Some(LegalHoldStatus::On) {
+                target.required_legal_hold = Some(LegalHoldStatus::On);
+            }
+            return Ok(());
+        }
+        self.renewal_targets.insert(
+            key,
+            V2RetentionTarget {
+                object_id,
+                version_id,
+                stored_len,
+                required_retention: retention,
+                required_legal_hold: legal_hold,
+            },
+        );
+        Ok(())
+    }
+
+    fn include_required_protection(
+        &mut self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        retention: Option<RetentionPolicy>,
+        legal_hold: Option<LegalHoldStatus>,
+    ) -> V2Result<()> {
+        let key = (object_id.clone(), version_id.cloned());
+        let target = self
+            .renewal_targets
+            .get_mut(&key)
+            .ok_or(V2FormatError::InvalidHeaderField)?;
+        target.required_retention = strongest_retention(target.required_retention, retention);
+        if legal_hold == Some(LegalHoldStatus::On) {
+            target.required_legal_hold = Some(LegalHoldStatus::On);
         }
         Ok(())
     }
@@ -624,6 +746,8 @@ where
     }
 
     /// Reports unanchored v2 objects while preserving supplied historical roots.
+    ///
+    /// Supplied roots must bind the active exact format reference.
     pub async fn report_orphans_with_protected_roots<A>(
         &self,
         anchor: &A,
@@ -633,15 +757,23 @@ where
         A: V2CommitAnchor,
     {
         let reachability = self
-            .load_reachability(anchor, protected_roots, V2MaintenanceBudgets::default())
+            .load_reachability(
+                anchor,
+                protected_roots,
+                V2MaintenanceBudgets::default(),
+                false,
+            )
             .await?;
-        self.report_orphans_from_reachability(&reachability).await
+        self.report_orphans_from_reachability(&reachability, V2MaintenanceBudgets::default())
+            .await
+            .map(|inventory| inventory.report)
     }
 
     async fn report_orphans_from_reachability(
         &self,
         reachability: &V2ReachabilityState,
-    ) -> V2Result<V2OrphanReport> {
+        budgets: V2MaintenanceBudgets,
+    ) -> V2Result<V2OrphanInventory> {
         let anchor_sequence = reachability
             .anchor_state
             .as_ref()
@@ -650,84 +782,146 @@ where
         let retained_profile =
             self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock;
         let mut candidates = Vec::new();
+        let mut request_count = reachability
+            .chain_get_count
+            .saturating_add(reachability.graph_head_count);
+        let mut version_list_count = 0_u64;
+        let mut list_request_count = 0_u64;
+        let mut inventory_item_count = 0_u64;
+        let mut head_count = reachability.graph_head_count;
         let now_ms = current_time_ms();
         for (prefix, object_class) in [
             ("commits/v02/", V2OrphanObjectClass::Commit),
             ("objects/v02/", V2OrphanObjectClass::Object),
         ] {
-            let listed = if retained_profile {
-                self.store()
-                    .list_prefix_versions(prefix)
-                    .await
-                    .map_err(|_| V2FormatError::StorageOperationFailed)?
+            let mode = if retained_profile {
+                BlobListMode::Versions
             } else {
-                self.store()
-                    .list_prefix(prefix)
-                    .await
-                    .map_err(|_| V2FormatError::StorageOperationFailed)?
+                BlobListMode::Current
             };
-            for mut metadata in listed {
-                if object_class == V2OrphanObjectClass::Object
-                    && self.is_inflight_standalone_object(&metadata.object_id)?
-                {
-                    continue;
-                }
-                let exact_reachable = reachability
-                    .reachable_versions
-                    .contains(&(metadata.object_id.clone(), metadata.version_id.clone()));
-                let mut exact_protection_checked = !retained_profile;
+            let mut listing = self
+                .store()
+                .open_bounded_list(prefix, mode)
+                .await
+                .map_err(|_| V2FormatError::StorageOperationFailed)?;
+            loop {
+                ensure_next_budgeted_operation(
+                    Some(budgets.max_inventory_page_count),
+                    list_request_count,
+                )?;
+                ensure_next_budgeted_operation(budgets.max_request_count, request_count)?;
                 if retained_profile {
-                    if exact_reachable {
+                    ensure_next_budgeted_operation(
+                        budgets.max_version_list_count,
+                        version_list_count,
+                    )?;
+                    version_list_count = version_list_count.saturating_add(1);
+                }
+                let remaining_items = budgets
+                    .max_inventory_item_count
+                    .checked_sub(inventory_item_count)
+                    .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
+                let page_items = usize::try_from(
+                    remaining_items
+                        .min(MAINTENANCE_LIST_PAGE_ITEMS as u64)
+                        .max(1),
+                )
+                .map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?;
+                let page_items = NonZeroUsize::new(page_items)
+                    .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
+                request_count = request_count.saturating_add(1);
+                list_request_count = list_request_count.saturating_add(1);
+                let page = listing
+                    .next_page(page_items)
+                    .await
+                    .map_err(|_| V2FormatError::StorageOperationFailed)?;
+                if page.entries.len() > page_items.get() {
+                    return Err(V2FormatError::ProviderProfileFailed);
+                }
+                inventory_item_count = inventory_item_count
+                    .checked_add(usize_to_u64(page.entries.len()))
+                    .filter(|count| *count <= budgets.max_inventory_item_count)
+                    .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
+                for mut metadata in page.entries {
+                    if object_class == V2OrphanObjectClass::Object
+                        && self.is_inflight_standalone_object(&metadata.object_id)?
+                    {
                         continue;
                     }
-                    if let Some(version_id) = metadata.version_id.as_ref()
-                        && let Ok(head) = self
-                            .store()
-                            .head_at(&metadata.object_id, Some(version_id))
-                            .await
-                    {
-                        metadata = head;
-                        exact_protection_checked = true;
+                    let exact_reachable = reachability
+                        .reachable_versions
+                        .contains(&(metadata.object_id.clone(), metadata.version_id.clone()));
+                    let mut exact_protection_checked = !retained_profile;
+                    if retained_profile {
+                        if exact_reachable {
+                            continue;
+                        }
+                        if let Some(version_id) = metadata.version_id.as_ref() {
+                            ensure_next_budgeted_operation(
+                                budgets.max_request_count,
+                                request_count,
+                            )?;
+                            ensure_next_budgeted_operation(budgets.max_head_count, head_count)?;
+                            request_count = request_count.saturating_add(1);
+                            head_count = head_count.saturating_add(1);
+                            if let Ok(head) = self
+                                .store()
+                                .head_at(&metadata.object_id, Some(version_id))
+                                .await
+                            {
+                                metadata = head;
+                                exact_protection_checked = true;
+                            }
+                        }
+                    } else if reachability.reachable.contains(&metadata.object_id) {
+                        continue;
                     }
-                } else if reachability.reachable.contains(&metadata.object_id) {
-                    continue;
+                    let sequence = if object_class == V2OrphanObjectClass::Commit {
+                        V2CommitKey::parse(&metadata.object_id)
+                            .ok()
+                            .map(|key| key.sequence)
+                    } else {
+                        None
+                    };
+                    let delete_blocked_by_unknown_protection = retained_profile
+                        && (metadata.version_id.is_none() || !exact_protection_checked);
+                    candidates.push(V2OrphanCandidate {
+                        object_class,
+                        object_id: metadata.object_id,
+                        version_id: metadata.version_id,
+                        content_len: metadata.content_len,
+                        modified_at_ms: metadata.modified_at_ms,
+                        sequence,
+                        same_sequence_as_anchor: sequence
+                            .zip(anchor_sequence)
+                            .is_some_and(|(left, right)| left == right),
+                        retention: metadata.retention,
+                        retain_until_ms: metadata.retain_until_ms,
+                        delete_blocked_by_retention: retention_blocks_delete(
+                            metadata.retention.as_ref(),
+                            metadata.retain_until_ms,
+                            now_ms,
+                        ),
+                        delete_blocked_by_legal_hold: metadata.legal_hold
+                            == Some(LegalHoldStatus::On),
+                        delete_blocked_by_unknown_protection,
+                    });
                 }
-                let sequence = if object_class == V2OrphanObjectClass::Commit {
-                    V2CommitKey::parse(&metadata.object_id)
-                        .ok()
-                        .map(|key| key.sequence)
-                } else {
-                    None
-                };
-                let delete_blocked_by_unknown_protection = retained_profile
-                    && (metadata.version_id.is_none() || !exact_protection_checked);
-                candidates.push(V2OrphanCandidate {
-                    object_class,
-                    object_id: metadata.object_id,
-                    version_id: metadata.version_id,
-                    content_len: metadata.content_len,
-                    modified_at_ms: metadata.modified_at_ms,
-                    sequence,
-                    same_sequence_as_anchor: sequence
-                        .zip(anchor_sequence)
-                        .is_some_and(|(left, right)| left == right),
-                    retention: metadata.retention,
-                    retain_until_ms: metadata.retain_until_ms,
-                    delete_blocked_by_retention: retention_blocks_delete(
-                        metadata.retention.as_ref(),
-                        metadata.retain_until_ms,
-                        now_ms,
-                    ),
-                    delete_blocked_by_legal_hold: metadata.legal_hold == Some(LegalHoldStatus::On),
-                    delete_blocked_by_unknown_protection,
-                });
+                if page.is_complete {
+                    break;
+                }
             }
         }
 
-        Ok(V2OrphanReport {
-            reachable_commit_count: reachability.reachable_commit_versions.len(),
-            reachable_object_count: reachability.reachable_object_versions.len(),
-            candidates,
+        Ok(V2OrphanInventory {
+            report: V2OrphanReport {
+                reachable_commit_count: reachability.reachable_commit_versions.len(),
+                reachable_object_count: reachability.reachable_object_versions.len(),
+                candidates,
+            },
+            list_request_count,
+            version_list_request_count: version_list_count,
+            item_count: inventory_item_count,
         })
     }
 
@@ -762,6 +956,8 @@ where
     }
 
     /// Deletes expired orphan objects while preserving supplied historical roots.
+    ///
+    /// Supplied roots must bind the active exact format reference.
     pub async fn delete_expired_orphans_with_protected_roots<A>(
         &self,
         anchor: &A,
@@ -873,11 +1069,21 @@ where
         anchor: &A,
         protected_roots: &[V2AnchorState],
         budgets: V2MaintenanceBudgets,
+        include_restore_metadata: bool,
     ) -> V2Result<V2ReachabilityState>
     where
         A: V2CommitAnchor,
     {
         let anchor_state = anchor.read_v2().await?;
+        if anchor_state
+            .as_ref()
+            .is_some_and(|state| state.format_ref != self.options().format_ref)
+            || protected_roots
+                .iter()
+                .any(|root| root.format_ref != self.options().format_ref)
+        {
+            return Err(V2FormatError::InvalidFormatRoot);
+        }
         let mut reachability = V2ReachabilityState {
             anchor_state: anchor_state.clone(),
             ..V2ReachabilityState::default()
@@ -887,7 +1093,7 @@ where
             let chain = self
                 .load_maintenance_chain(state, &reachability, budgets)
                 .await?;
-            reachability.include_chain(&chain, false);
+            reachability.include_chain(&chain, false, None, None)?;
             self.include_live_payload_roots(&mut reachability, &chain, false, budgets)
                 .await?;
             reachability.current_chain = Some(chain);
@@ -897,12 +1103,87 @@ where
             let chain = self
                 .load_maintenance_chain(protected_root, &reachability, budgets)
                 .await?;
-            reachability.include_chain(&chain, true);
+            reachability.include_chain(&chain, true, None, None)?;
             self.include_live_payload_roots(&mut reachability, &chain, true, budgets)
                 .await?;
         }
 
+        if include_restore_metadata {
+            self.include_restore_metadata_roots(&mut reachability, budgets)
+                .await?;
+        }
+
         Ok(reachability)
+    }
+
+    async fn include_restore_metadata_roots(
+        &self,
+        reachability: &mut V2ReachabilityState,
+        budgets: V2MaintenanceBudgets,
+    ) -> V2Result<()> {
+        let retention = reachability
+            .renewal_targets
+            .values()
+            .fold(self.retention_policy(), |retention, target| {
+                strongest_retention(retention, target.required_retention)
+            });
+        let has_legal_hold = reachability
+            .renewal_targets
+            .values()
+            .any(|target| target.required_legal_hold == Some(LegalHoldStatus::On));
+        if has_legal_hold {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        let Some(retention) = active_retention(retention) else {
+            return Ok(());
+        };
+        let Some(keyring) = self.options().maintenance_keyring_envelope_ref.as_ref() else {
+            return Err(V2FormatError::ProviderProfileFailed);
+        };
+        if keyring.commit_ref()? != self.options().keyring_envelope_ref {
+            return Err(V2FormatError::InvalidFormatRoot);
+        }
+        let roots = [
+            (
+                self.options().format_ref.object_id.clone(),
+                self.options().format_ref.version_id.clone(),
+            ),
+            (keyring.object_id.clone(), keyring.version_id.clone()),
+        ];
+        let retained_profile =
+            self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock;
+        for (object_id, version_id) in roots {
+            if retained_profile && version_id.is_none() {
+                return Err(V2FormatError::ProviderProfileFailed);
+            }
+            ensure_next_budgeted_operation(
+                budgets.max_request_count,
+                reachability
+                    .chain_get_count
+                    .saturating_add(reachability.graph_head_count),
+            )?;
+            ensure_next_budgeted_operation(budgets.max_head_count, reachability.graph_head_count)?;
+            reachability.graph_head_count = reachability.graph_head_count.saturating_add(1);
+            let exact = self
+                .store()
+                .head_at(&object_id, version_id.as_ref())
+                .await
+                .map_err(|_| V2FormatError::StorageOperationFailed)?;
+            if exact.object_id != object_id
+                || version_id.is_some() && exact.version_id != version_id
+                || exact.content_len == 0
+            {
+                return Err(V2FormatError::ProviderProfileFailed);
+            }
+            reachability.include_renewal_target(
+                object_id,
+                version_id,
+                exact.content_len,
+                Some(retention),
+                None,
+            )?;
+        }
+        Ok(())
     }
 
     async fn load_maintenance_chain(
@@ -920,7 +1201,11 @@ where
             .ok_or(V2FormatError::ReplayBudgetExceeded)?;
         if let Some(max_requests) = budgets.max_request_count {
             let remaining = max_requests
-                .checked_sub(reachability.chain_get_count)
+                .checked_sub(
+                    reachability
+                        .chain_get_count
+                        .saturating_add(reachability.graph_head_count),
+                )
                 .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
             max_commits = max_commits.min(
                 usize::try_from(remaining).map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?,
@@ -965,23 +1250,49 @@ where
         budgets: V2MaintenanceBudgets,
     ) -> V2Result<()> {
         let limits = self.remaining_graph_limits(reachability, budgets)?;
-        let (live_payload_roots, referenced_run_commits) =
+        let (live_payload_roots, referenced_run_commits, represented_retention) =
             self.live_payload_roots_from_chain(chain, limits).await?;
+        for commit in &chain.commits_newest_first {
+            reachability.include_required_protection(
+                &commit.parsed_header.header.self_ref.commit_key,
+                commit.version_id.as_ref(),
+                represented_retention,
+                None,
+            )?;
+        }
         if !referenced_run_commits.is_empty() {
             reachability.include_chain(
                 &V2ReplayChain {
                     commits_newest_first: referenced_run_commits,
                 },
                 protected,
-            );
+                represented_retention,
+                None,
+            )?;
         }
         for root in live_payload_roots {
             match root {
-                V2LivePayloadRoot::Commit(root) => {
+                V2LivePayloadRoot::Commit {
+                    root,
+                    retention,
+                    legal_hold,
+                } => {
                     let version_key = (root.commit_key.clone(), root.version_id.clone());
                     if reachability.reachable_versions.contains(&version_key) {
+                        reachability.include_required_protection(
+                            &root.commit_key,
+                            root.version_id.as_ref(),
+                            retention,
+                            legal_hold,
+                        )?;
                         continue;
                     }
+                    ensure_next_budgeted_operation(
+                        budgets.max_request_count,
+                        reachability
+                            .chain_get_count
+                            .saturating_add(reachability.graph_head_count),
+                    )?;
                     let commit = self
                         .read_replay_commit_at(&root.commit_key, root.version_id.as_ref())
                         .await?;
@@ -996,11 +1307,41 @@ where
                             commits_newest_first: vec![commit],
                         },
                         protected,
-                    );
+                        retention,
+                        legal_hold,
+                    )?;
                 }
-                V2LivePayloadRoot::Standalone(root) => {
+                V2LivePayloadRoot::Standalone {
+                    root,
+                    retention,
+                    legal_hold,
+                } => {
                     validate_standalone_payload_root(&root)?;
-                    reachability.include_standalone(root, protected)?;
+                    ensure_next_budgeted_operation(
+                        budgets.max_request_count,
+                        reachability
+                            .chain_get_count
+                            .saturating_add(reachability.graph_head_count),
+                    )?;
+                    ensure_next_budgeted_operation(
+                        budgets.max_head_count,
+                        reachability.graph_head_count,
+                    )?;
+                    reachability.graph_head_count = reachability.graph_head_count.saturating_add(1);
+                    let exact = self
+                        .store()
+                        .head_at(&root.object_id, root.version_id.as_ref())
+                        .await
+                        .map_err(|_| V2FormatError::StorageOperationFailed)?;
+                    if exact.object_id != root.object_id
+                        || root.version_id.is_some() && exact.version_id != root.version_id
+                        || exact.content_len != root.stored_len
+                        || legal_hold == Some(LegalHoldStatus::On)
+                            && exact.legal_hold != Some(LegalHoldStatus::On)
+                    {
+                        return Err(V2FormatError::ProviderProfileFailed);
+                    }
+                    reachability.include_standalone(root, protected, retention, legal_hold)?;
                 }
             }
         }
@@ -1022,7 +1363,11 @@ where
             .ok_or(V2FormatError::ReplayBudgetExceeded)?;
         if let Some(max_requests) = budgets.max_request_count {
             let remaining = max_requests
-                .checked_sub(reachability.chain_get_count)
+                .checked_sub(
+                    reachability
+                        .chain_get_count
+                        .saturating_add(reachability.graph_head_count),
+                )
                 .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
             max_commits = max_commits.min(
                 usize::try_from(remaining).map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?,
@@ -1055,7 +1400,11 @@ where
         &self,
         chain: &V2ReplayChain,
         limits: V2ReplayLimits,
-    ) -> V2Result<(Vec<V2LivePayloadRoot>, Vec<V2ReplayCommit>)> {
+    ) -> V2Result<(
+        Vec<V2LivePayloadRoot>,
+        Vec<V2ReplayCommit>,
+        Option<RetentionPolicy>,
+    )> {
         let (state, referenced_run_commits) =
             self.replay_chain_to_namespace_state(chain, limits).await?;
         let signing_key_id = chain
@@ -1067,8 +1416,10 @@ where
             .signing_key_id
             .clone();
         let mut roots = Vec::new();
+        let mut represented_retention = None;
 
         for entry in state.namespace.live_entries() {
+            represented_retention = strongest_retention(represented_retention, entry.retention);
             let root = match &entry.payload_ref {
                 Some(PayloadReference::V2CommitStream { carrier }) => commit_payload_root(
                     carrier.commit_key.clone(),
@@ -1076,6 +1427,8 @@ where
                     carrier.body_digest,
                     &signing_key_id,
                     self.options().format_ref.clone(),
+                    entry.retention,
+                    entry.legal_hold,
                 )?,
                 Some(PayloadReference::V2Pack { carrier, .. }) => commit_payload_root(
                     carrier.commit_key.clone(),
@@ -1083,9 +1436,15 @@ where
                     carrier.body_digest,
                     &signing_key_id,
                     self.options().format_ref.clone(),
+                    entry.retention,
+                    entry.legal_hold,
                 )?,
                 Some(PayloadReference::V2StandaloneStream { carrier }) => {
-                    V2LivePayloadRoot::Standalone(standalone_payload_root(carrier))
+                    V2LivePayloadRoot::Standalone {
+                        root: standalone_payload_root(carrier),
+                        retention: entry.retention,
+                        legal_hold: entry.legal_hold,
+                    }
                 }
                 None => continue,
                 Some(PayloadReference::V2Self { .. } | PayloadReference::V2PackSelf { .. }) => {
@@ -1095,7 +1454,7 @@ where
             roots.push(root);
         }
 
-        Ok((roots, referenced_run_commits))
+        Ok((roots, referenced_run_commits, represented_retention))
     }
 
     async fn replay_chain_to_namespace_state(
@@ -1240,7 +1599,7 @@ where
         A: V2CommitAnchor,
     {
         let reachability = self
-            .load_reachability(anchor, &[], V2MaintenanceBudgets::default())
+            .load_reachability(anchor, &[], V2MaintenanceBudgets::default(), true)
             .await?;
         let chain = reachability.current_chain.as_ref();
         let verified_commit_count = chain
@@ -1252,7 +1611,10 @@ where
             .and_then(|commit| {
                 age_since_ms(now_ms, Some(commit.parsed_header.header.publish_time_ms))
             });
-        let orphans = self.report_orphans_from_reachability(&reachability).await?;
+        let orphans = self
+            .report_orphans_from_reachability(&reachability, V2MaintenanceBudgets::default())
+            .await?
+            .report;
         let orphan_candidate_bytes = orphans.candidates.iter().fold(0_u64, |total, candidate| {
             total.saturating_add(candidate.content_len)
         });
@@ -1272,8 +1634,11 @@ where
             .max();
         let retention_renewal = if chain.is_some() {
             self.plan_retention_renewal(
-                &reachability.renewal_targets,
+                reachability.renewal_targets.values(),
                 DEFAULT_RETENTION_RENEWAL_HORIZON,
+                V2MaintenanceBudgets::default(),
+                0,
+                0,
             )
             .await?
         } else {
@@ -1298,7 +1663,8 @@ where
     ///
     /// This first-stage planner is intentionally limited to v2 object inventory
     /// and fully dead orphan deletion. Mixed accepted-commit repack details are
-    /// filled by the repository service after namespace replay.
+    /// filled by the repository service after namespace replay. Protected roots
+    /// must bind the active exact format reference.
     pub async fn full_gc_dry_run<A>(
         &self,
         anchor: &A,
@@ -1307,21 +1673,61 @@ where
     where
         A: V2CommitAnchor,
     {
+        self.build_full_gc_plan(anchor, options)
+            .await
+            .map(|plan| plan.report)
+    }
+
+    async fn build_full_gc_plan<A>(
+        &self,
+        anchor: &A,
+        options: V2FullGcDryRunOptions,
+    ) -> V2Result<V2FullGcPlan>
+    where
+        A: V2CommitAnchor,
+    {
         let reachability = self
-            .load_reachability(anchor, &options.protected_roots, options.budgets)
+            .load_reachability(anchor, &options.protected_roots, options.budgets, true)
             .await?;
         let chain_live_commit_count = reachability
             .current_chain
             .as_ref()
             .map(|chain| chain.commits_newest_first.len())
             .unwrap_or_default();
-        let orphans = self.report_orphans_from_reachability(&reachability).await?;
+        let inventory = self
+            .report_orphans_from_reachability(&reachability, options.budgets)
+            .await?;
+        let list_request_count = inventory.list_request_count;
+        let version_list_count = inventory.version_list_request_count;
+        let inventory_item_count = inventory.item_count;
+        let orphans = inventory.report;
         let retained_profile =
             self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock;
+        let inventory_head_count = if retained_profile {
+            usize_to_u64(
+                orphans
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.version_id.is_some())
+                    .count(),
+            )
+        } else {
+            0
+        };
+        let used_head_count = reachability
+            .graph_head_count
+            .saturating_add(inventory_head_count);
+        let used_request_count = reachability
+            .chain_get_count
+            .saturating_add(used_head_count)
+            .saturating_add(list_request_count);
         let retention_renewal = self
             .plan_retention_renewal(
-                &reachability.renewal_targets,
+                reachability.renewal_targets.values(),
                 options.retention_renewal_horizon,
+                options.budgets,
+                used_request_count,
+                used_head_count,
             )
             .await?;
 
@@ -1358,23 +1764,27 @@ where
             delete_count = delete_count.saturating_add(1);
         }
 
-        let version_list_count = 2 * u64::from(retained_profile);
-        let prefix_list_count = 2 * u64::from(!retained_profile);
+        let prefix_list_count = list_request_count.saturating_sub(version_list_count);
         let chain_get_count = reachability.chain_get_count;
         let planned_cost = V2MaintenancePlanCost {
             request_count: version_list_count
                 .saturating_add(prefix_list_count)
                 .saturating_add(chain_get_count)
+                .saturating_add(reachability.graph_head_count)
                 .saturating_add(head_count)
                 .saturating_add(delete_count)
                 .saturating_add(retention_renewal.head_count)
                 .saturating_add(retention_renewal.extend_count),
             version_list_count,
-            head_count: head_count.saturating_add(retention_renewal.head_count),
+            head_count: head_count
+                .saturating_add(reachability.graph_head_count)
+                .saturating_add(retention_renewal.head_count),
             range_read_bytes: reachability.chain_read_bytes,
             write_bytes: 0,
             delete_count,
             retention_extend_count: retention_renewal.extend_count,
+            inventory_page_count: list_request_count,
+            inventory_item_count,
         };
         let fits_budgets = planned_cost.fits_budgets(options.budgets);
         let exact_version_apply_ready = !retained_profile
@@ -1382,7 +1792,7 @@ where
                 candidate.version_id.is_some() || candidate.delete_blocked_by_unknown_protection
             });
 
-        Ok(V2FullGcDryRunReport {
+        let report = V2FullGcDryRunReport {
             base_sequence: reachability
                 .anchor_state
                 .as_ref()
@@ -1406,17 +1816,24 @@ where
             planned_cost,
             fits_budgets,
             exact_version_apply_ready,
+        };
+        Ok(V2FullGcPlan {
+            report,
+            retention_renewal,
+            orphans,
         })
     }
 
-    /// Applies the first destructive full-maintenance stage: fully dead orphan
-    /// object deletion.
+    /// Applies guarded exact retention renewal, then fully dead orphan deletion.
     ///
-    /// This does not repack mixed accepted commits. It fails closed unless the
-    /// dry-run budget passes, retained-version provider conformance is supplied
-    /// for retained repositories, and the maintenance guard plus base anchor are
-    /// still valid before each exact-version delete.
-    pub async fn apply_fully_dead_orphans<A, G>(
+    /// This does not repack mixed accepted commits. A failed run may already
+    /// have irreversibly strengthened some exact-version retention, but no
+    /// orphan deletion begins until every planned renewal succeeds. Apply fails
+    /// closed unless the dry-run budget passes, retained-version provider
+    /// conformance is supplied for retained repositories, and the maintenance
+    /// guard plus base anchor are still valid before each mutation. Protected
+    /// roots must bind the active exact format reference.
+    pub async fn apply_full_gc<A, G>(
         &self,
         anchor: &A,
         guard: &G,
@@ -1436,22 +1853,36 @@ where
             return Err(V2FormatError::ProviderProfileFailed);
         }
 
-        let dry_run = self
-            .full_gc_dry_run(anchor, options.dry_run.clone())
+        let plan = self
+            .build_full_gc_plan(anchor, options.dry_run.clone())
             .await?;
+        let V2FullGcPlan {
+            report: dry_run,
+            retention_renewal,
+            orphans,
+        } = plan;
         if !dry_run.fits_budgets {
             return Err(V2FormatError::MaintenanceBudgetExceeded);
         }
         if !dry_run.exact_version_apply_ready {
             return Err(V2FormatError::ProviderProfileFailed);
         }
+        if dry_run.retention_renewal_blocked_count != 0 {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
         if anchor.read_v2().await? != base_anchor {
             return Err(V2FormatError::StaleAnchor);
         }
 
-        let orphans = self
-            .report_orphans_with_protected_roots(anchor, &options.dry_run.protected_roots)
+        let (retention_renewed_object_count, retention_renewed_bytes) = self
+            .apply_retention_renewal(
+                anchor,
+                guard,
+                base_anchor.as_ref(),
+                retention_renewal.targets,
+            )
             .await?;
+
         let gc = self
             .delete_expired_orphan_candidates(
                 anchor,
@@ -1465,21 +1896,94 @@ where
 
         Ok(V2FullGcApplyReport {
             dry_run,
+            retention_renewed_object_count,
+            retention_renewed_bytes,
             orphan_gc: gc,
         })
     }
 
+    async fn apply_retention_renewal<A, G>(
+        &self,
+        anchor: &A,
+        guard: &G,
+        base_anchor: Option<&V2AnchorState>,
+        targets: Vec<V2RetentionTarget>,
+    ) -> V2Result<(usize, u64)>
+    where
+        A: V2CommitAnchor,
+        G: V2MaintenanceGuard,
+    {
+        let retained_profile =
+            self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock;
+        let mut renewed_count = 0_usize;
+        let mut renewed_bytes = 0_u64;
+
+        for target in targets {
+            let policy = target
+                .required_retention
+                .ok_or(V2FormatError::ProviderProfileFailed)?;
+            guard.verify_v2_maintenance(base_anchor).await?;
+            if anchor.read_v2().await? != base_anchor.cloned() {
+                return Err(V2FormatError::StaleAnchor);
+            }
+            if retained_profile && target.version_id.is_none() {
+                return Err(V2FormatError::ProviderProfileFailed);
+            }
+
+            let required_retain_until_ms = required_retain_until_ms(policy)?;
+            self.store()
+                .extend_retention_at(&target.object_id, target.version_id.as_ref(), policy)
+                .await
+                .map_err(|_| V2FormatError::StorageOperationFailed)?;
+            let exact = self
+                .store()
+                .head_at(&target.object_id, target.version_id.as_ref())
+                .await
+                .map_err(|_| V2FormatError::ProviderProfileFailed)?;
+            let object_matches = exact.object_id == target.object_id;
+            let version_matches = exact.version_id == target.version_id;
+            let length_matches = exact.content_len == target.stored_len;
+            let retention_matches = retention_satisfies(exact.retention.as_ref(), &policy);
+            let legal_hold_matches = target.required_legal_hold != Some(LegalHoldStatus::On)
+                || exact.legal_hold == Some(LegalHoldStatus::On);
+            let deadline_matches = exact
+                .retain_until_ms
+                .is_some_and(|actual| actual >= required_retain_until_ms);
+            if !(object_matches
+                && version_matches
+                && length_matches
+                && retention_matches
+                && legal_hold_matches
+                && deadline_matches)
+            {
+                tracing::error!(
+                    target: "rs3_repository",
+                    operation = "v2_retention_renewal_verify",
+                    object_matches,
+                    version_matches,
+                    length_matches,
+                    retention_matches,
+                    legal_hold_matches,
+                    deadline_matches,
+                    "exact retention renewal postcondition failed",
+                );
+                return Err(V2FormatError::ProviderProfileFailed);
+            }
+            renewed_count = renewed_count.saturating_add(1);
+            renewed_bytes = renewed_bytes.saturating_add(target.stored_len);
+        }
+
+        Ok((renewed_count, renewed_bytes))
+    }
+
     async fn plan_retention_renewal(
         &self,
-        targets: &[V2RetentionTarget],
+        targets: impl IntoIterator<Item = &V2RetentionTarget>,
         horizon: Duration,
+        budgets: V2MaintenanceBudgets,
+        mut used_request_count: u64,
+        mut used_head_count: u64,
     ) -> V2Result<V2RetentionRenewalPlan> {
-        let Some(policy) = active_retention(self.retention_policy()) else {
-            return Ok(V2RetentionRenewalPlan::default());
-        };
-        if targets.is_empty() {
-            return Ok(V2RetentionRenewalPlan::default());
-        }
         let retained_profile =
             self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock;
         let renew_before_ms =
@@ -1487,6 +1991,14 @@ where
         let mut plan = V2RetentionRenewalPlan::default();
 
         for target in targets {
+            let policy = active_retention(strongest_retention(
+                self.retention_policy(),
+                target.required_retention,
+            ));
+            let requires_hold = target.required_legal_hold == Some(LegalHoldStatus::On);
+            if policy.is_none() && !requires_hold {
+                continue;
+            }
             let object_id = &target.object_id;
             let version_id = target.version_id.as_ref();
             if retained_profile && version_id.is_none() {
@@ -1495,6 +2007,10 @@ where
                 continue;
             }
 
+            ensure_next_budgeted_operation(budgets.max_request_count, used_request_count)?;
+            ensure_next_budgeted_operation(budgets.max_head_count, used_head_count)?;
+            used_request_count = used_request_count.saturating_add(1);
+            used_head_count = used_head_count.saturating_add(1);
             plan.head_count = plan.head_count.saturating_add(1);
             let metadata = if retained_profile {
                 self.store().head_at(object_id, version_id).await
@@ -1503,10 +2019,30 @@ where
             }
             .map_err(|_| V2FormatError::StorageOperationFailed)?;
 
-            if retention_renewal_needed(&metadata, policy, renew_before_ms) {
+            if metadata.object_id != target.object_id
+                || metadata.version_id != target.version_id
+                || metadata.content_len != target.stored_len
+                || requires_hold && metadata.legal_hold != Some(LegalHoldStatus::On)
+            {
+                plan.blocked_count = plan.blocked_count.saturating_add(1);
+                plan.blocked_bytes = plan.blocked_bytes.saturating_add(target.stored_len);
+                continue;
+            }
+
+            if let Some(policy) = policy
+                && retention_renewal_needed(&metadata, policy, renew_before_ms)
+            {
                 plan.commit_count = plan.commit_count.saturating_add(1);
                 plan.bytes = plan.bytes.saturating_add(metadata.content_len);
                 plan.extend_count = plan.extend_count.saturating_add(1);
+                plan.head_count = plan.head_count.saturating_add(1);
+                plan.targets.push(V2RetentionTarget {
+                    object_id: metadata.object_id,
+                    version_id: metadata.version_id,
+                    stored_len: metadata.content_len,
+                    required_retention: Some(policy),
+                    required_legal_hold: target.required_legal_hold,
+                });
             }
         }
 
@@ -1520,16 +2056,22 @@ fn commit_payload_root(
     body_digest: [u8; 32],
     signing_key_id: &rs3_types::KeyId,
     format_ref: super::V2FormatRef,
+    retention: Option<RetentionPolicy>,
+    legal_hold: Option<LegalHoldStatus>,
 ) -> V2Result<V2LivePayloadRoot> {
     let parsed_key = V2CommitKey::parse(&commit_key)?;
-    Ok(V2LivePayloadRoot::Commit(V2AnchorState {
-        sequence: parsed_key.sequence,
-        commit_key,
-        body_digest,
-        version_id,
-        signing_key_id: signing_key_id.clone(),
-        format_ref,
-    }))
+    Ok(V2LivePayloadRoot::Commit {
+        root: V2AnchorState {
+            sequence: parsed_key.sequence,
+            commit_key,
+            body_digest,
+            version_id,
+            signing_key_id: signing_key_id.clone(),
+            format_ref,
+        },
+        retention,
+        legal_hold,
+    })
 }
 
 fn standalone_payload_root(
@@ -1572,6 +2114,13 @@ fn budget_allows(limit: Option<u64>, value: u64) -> bool {
     limit.is_none_or(|limit| value <= limit)
 }
 
+fn ensure_next_budgeted_operation(limit: Option<u64>, used: u64) -> V2Result<()> {
+    if limit.is_some_and(|limit| used >= limit) {
+        return Err(V2FormatError::MaintenanceBudgetExceeded);
+    }
+    Ok(())
+}
+
 fn active_retention(policy: Option<RetentionPolicy>) -> Option<RetentionPolicy> {
     policy.filter(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
 }
@@ -1603,6 +2152,24 @@ fn retention_mode_strength(mode: RetentionMode) -> u8 {
     }
 }
 
+fn strongest_retention(
+    left: Option<RetentionPolicy>,
+    right: Option<RetentionPolicy>,
+) -> Option<RetentionPolicy> {
+    match (active_retention(left), active_retention(right)) {
+        (Some(left), Some(right)) => Some(RetentionPolicy::new(
+            if retention_mode_strength(left.mode) >= retention_mode_strength(right.mode) {
+                left.mode
+            } else {
+                right.mode
+            },
+            left.retain_days.max(right.retain_days),
+        )),
+        (Some(policy), None) | (None, Some(policy)) => Some(policy),
+        (None, None) => None,
+    }
+}
+
 fn retention_blocks_delete(
     policy: Option<&RetentionPolicy>,
     retain_until_ms: Option<i64>,
@@ -1618,6 +2185,16 @@ fn retention_blocks_delete(
 
 fn duration_millis_i64_saturating(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn required_retain_until_ms(policy: RetentionPolicy) -> V2Result<i64> {
+    current_time_ms()
+        .checked_add(
+            i64::from(policy.retain_days)
+                .checked_mul(86_400_000)
+                .ok_or(V2FormatError::ProviderProfileFailed)?,
+        )
+        .ok_or(V2FormatError::ProviderProfileFailed)
 }
 
 fn commit_section_bytes(commit: &V2ReplayCommit, index: usize) -> V2Result<&[u8]> {
@@ -1706,7 +2283,10 @@ fn payload_section_facts(
 
 #[cfg(test)]
 mod tests {
-    use super::{V2ReachabilityState, V2StandalonePayloadRoot, validate_standalone_payload_root};
+    use super::{
+        V2FormatError, V2ReachabilityState, V2StandalonePayloadRoot,
+        validate_standalone_payload_root,
+    };
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use rs3_index::PayloadHeaderReference;
@@ -1745,7 +2325,7 @@ mod tests {
         let mut reachability = V2ReachabilityState::default();
 
         reachability
-            .include_standalone(root.clone(), false)
+            .include_standalone(root.clone(), false, None, None)
             .expect("mark live standalone root");
         assert!(reachability.reachable.contains(&root.object_id));
         assert!(reachability.reachable_versions.contains(&version_key));
@@ -1758,14 +2338,18 @@ mod tests {
         assert_eq!(reachability.renewal_targets.len(), 1);
 
         reachability
-            .include_standalone(root.clone(), true)
+            .include_standalone(root.clone(), true, None, None)
             .expect("protect exact standalone root");
         assert!(reachability.protected_versions.contains(&version_key));
         assert_eq!(reachability.renewal_targets.len(), 1);
 
         let mut conflicting = root;
         conflicting.object_digest[0] ^= 1;
-        assert!(reachability.include_standalone(conflicting, true).is_err());
+        assert!(
+            reachability
+                .include_standalone(conflicting, true, None, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1791,5 +2375,25 @@ mod tests {
         let mut empty = valid;
         empty.stored_len = 0;
         assert!(validate_standalone_payload_root(&empty).is_err());
+    }
+
+    #[test]
+    fn renewal_targets_scale_with_unique_exact_versions_and_reject_conflicts() {
+        let mut reachability = V2ReachabilityState::default();
+        for ordinal in 0..4_096_u64 {
+            let object_id = BackendObjectId::new(format!("objects/v02/{ordinal:020}"))
+                .expect("bounded object ID");
+            reachability
+                .include_renewal_target(object_id, None, ordinal + 1, None, None)
+                .expect("unique target");
+        }
+        assert_eq!(reachability.renewal_targets.len(), 4_096);
+
+        let object_id =
+            BackendObjectId::new("objects/v02/00000000000000000000").expect("bounded object ID");
+        assert_eq!(
+            reachability.include_renewal_target(object_id, None, 2, None, None),
+            Err(V2FormatError::ProviderProfileFailed)
+        );
     }
 }

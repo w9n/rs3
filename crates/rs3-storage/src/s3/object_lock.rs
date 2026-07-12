@@ -26,14 +26,14 @@ pub(super) fn provider_legal_hold(status: Option<LegalHoldStatus>) -> Option<Leg
 }
 
 pub(super) fn retain_until_date(policy: &RetentionPolicy) -> Result<SdkDateTime> {
-    let now_secs = current_epoch_secs()?;
-    let retain_secs = i64::from(policy.retain_days)
-        .checked_mul(86_400)
+    let now_ms = current_epoch_ms()?;
+    let retain_ms = i64::from(policy.retain_days)
+        .checked_mul(86_400_000)
         .ok_or_else(|| StorageError::Provider("retention period is out of range".to_owned()))?;
-    let retain_until_secs = now_secs
-        .checked_add(retain_secs)
+    let retain_until_ms = now_ms
+        .checked_add(retain_ms)
         .ok_or_else(|| StorageError::Provider("retention date is out of range".to_owned()))?;
-    Ok(SdkDateTime::from_secs(retain_until_secs))
+    Ok(SdkDateTime::from_millis(retain_until_ms))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,9 +286,12 @@ fn stronger_retention_mode(left: RetentionMode, right: RetentionMode) -> Retenti
 }
 
 pub(super) fn current_epoch_ms() -> Result<i64> {
-    current_epoch_secs()?
-        .checked_mul(1_000)
-        .ok_or_else(|| StorageError::Provider("current time is out of range".to_owned()))
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| StorageError::Provider(error.to_string()))?
+        .as_millis();
+    i64::try_from(millis)
+        .map_err(|_| StorageError::Provider("current time is out of range".to_owned()))
 }
 
 fn current_epoch_secs() -> Result<i64> {

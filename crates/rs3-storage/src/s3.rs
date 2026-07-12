@@ -2,10 +2,10 @@
 
 use crate::read::{BlobReadSource, exact_blob_read};
 use crate::{
-    BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore, ByteRange, PutOptions, Result,
-    StorageError, object_kind, prefix_kind, record_blob_delete, record_blob_extend_retention,
-    record_blob_get, record_blob_head, record_blob_list, record_blob_put,
-    record_blob_set_legal_hold,
+    BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore,
+    ByteRange, PutOptions, Result, StorageError, object_kind, prefix_kind, record_blob_delete,
+    record_blob_extend_retention, record_blob_get, record_blob_head, record_blob_list,
+    record_blob_put, record_blob_set_legal_hold,
 };
 use async_trait::async_trait;
 use aws_sdk_s3::Client as SdkS3Client;
@@ -13,6 +13,7 @@ use aws_sdk_s3::primitives::ByteStream as SdkByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
 use rs3_types::{BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionPolicy};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -157,6 +158,209 @@ pub struct S3BlobStore {
     client: SdkS3Client,
     config: S3BlobStoreConfig,
     metrics: Arc<S3ProviderMetricCounters>,
+}
+
+struct S3BlobList {
+    store: S3BlobStore,
+    object_kind: String,
+    key_prefix: String,
+    mode: BlobListMode,
+    continuation_token: Option<String>,
+    key_marker: Option<String>,
+    version_id_marker: Option<String>,
+    complete: bool,
+}
+
+#[async_trait]
+impl BlobList for S3BlobList {
+    async fn next_page(&mut self, max_items: NonZeroUsize) -> Result<BlobListPage> {
+        if self.complete {
+            return Ok(BlobListPage {
+                entries: Vec::new(),
+                is_complete: true,
+            });
+        }
+
+        let started = Instant::now();
+        let max_keys =
+            i32::try_from(max_items.get().min(1_000)).map_err(|_| StorageError::InvalidListPage)?;
+        let mut entries = Vec::with_capacity(max_keys as usize);
+        match self.mode {
+            BlobListMode::Current => {
+                let mut request = self
+                    .store
+                    .client
+                    .list_objects_v2()
+                    .bucket(self.store.config.bucket.as_str())
+                    .max_keys(max_keys);
+                if !self.key_prefix.is_empty() {
+                    request = request.prefix(self.key_prefix.as_str());
+                }
+                if let Some(token) = self.continuation_token.as_deref() {
+                    request = request.continuation_token(token);
+                }
+                let output = match request.send().await {
+                    Ok(output) => {
+                        self.store.record_provider_operation(
+                            S3ProviderOperation::List,
+                            &self.object_kind,
+                            "ok",
+                            0,
+                            0,
+                            started.elapsed(),
+                        )?;
+                        output
+                    }
+                    Err(error) => {
+                        let error =
+                            StorageError::Provider(format!("failed to list objects: {error}"));
+                        let result = storage_error_result(&error);
+                        self.store.record_provider_operation(
+                            S3ProviderOperation::List,
+                            &self.object_kind,
+                            result,
+                            0,
+                            0,
+                            started.elapsed(),
+                        )?;
+                        record_blob_list(&self.object_kind, 0, result, started.elapsed());
+                        return Err(error);
+                    }
+                };
+                for object in output.contents() {
+                    let Some(key) = object.key() else {
+                        continue;
+                    };
+                    let Some(object_id) = self.store.config.object_id_from_key(key)? else {
+                        continue;
+                    };
+                    let content_len = object
+                        .size()
+                        .and_then(|size| u64::try_from(size).ok())
+                        .unwrap_or_default();
+                    let modified_at_ms = object
+                        .last_modified()
+                        .map(|modified_at| modified_at.to_millis())
+                        .transpose()
+                        .map_err(provider_error)?;
+                    entries.push(BlobMetadata {
+                        object_id,
+                        content_len,
+                        modified_at_ms,
+                        etag: object.e_tag().map(str::to_owned),
+                        version_id: None,
+                        retention: None,
+                        retain_until_ms: None,
+                        legal_hold: None,
+                    });
+                }
+                self.complete = !output.is_truncated().unwrap_or(false);
+                let next_token = output.next_continuation_token().map(str::to_owned);
+                if !self.complete && (next_token.is_none() || next_token == self.continuation_token)
+                {
+                    return Err(StorageError::InvalidListPage);
+                }
+                self.continuation_token = next_token;
+            }
+            BlobListMode::Versions => {
+                let mut request = self
+                    .store
+                    .client
+                    .list_object_versions()
+                    .bucket(self.store.config.bucket.as_str())
+                    .max_keys(max_keys);
+                if !self.key_prefix.is_empty() {
+                    request = request.prefix(self.key_prefix.as_str());
+                }
+                if let Some(marker) = self.key_marker.as_deref() {
+                    request = request.key_marker(marker);
+                }
+                if let Some(marker) = self.version_id_marker.as_deref() {
+                    request = request.version_id_marker(marker);
+                }
+                let output = match request.send().await {
+                    Ok(output) => {
+                        self.store.record_provider_operation(
+                            S3ProviderOperation::List,
+                            &self.object_kind,
+                            "ok",
+                            0,
+                            0,
+                            started.elapsed(),
+                        )?;
+                        output
+                    }
+                    Err(error) => {
+                        let error = StorageError::Provider(format!(
+                            "failed to list object versions: {error}"
+                        ));
+                        let result = storage_error_result(&error);
+                        self.store.record_provider_operation(
+                            S3ProviderOperation::List,
+                            &self.object_kind,
+                            result,
+                            0,
+                            0,
+                            started.elapsed(),
+                        )?;
+                        record_blob_list(&self.object_kind, 0, result, started.elapsed());
+                        return Err(error);
+                    }
+                };
+                for version in output.versions() {
+                    let Some(key) = version.key() else {
+                        continue;
+                    };
+                    let Some(object_id) = self.store.config.object_id_from_key(key)? else {
+                        continue;
+                    };
+                    let Some(version_id) = version.version_id() else {
+                        continue;
+                    };
+                    let content_len = version
+                        .size()
+                        .and_then(|size| u64::try_from(size).ok())
+                        .unwrap_or_default();
+                    let modified_at_ms = version
+                        .last_modified()
+                        .map(|modified_at| modified_at.to_millis())
+                        .transpose()
+                        .map_err(provider_error)?;
+                    entries.push(BlobMetadata {
+                        object_id,
+                        content_len,
+                        modified_at_ms,
+                        etag: version.e_tag().map(str::to_owned),
+                        version_id: Some(backend_version_id_from_str(version_id)?),
+                        retention: None,
+                        retain_until_ms: None,
+                        legal_hold: None,
+                    });
+                }
+                self.complete = !output.is_truncated().unwrap_or(false);
+                let next_key_marker = output.next_key_marker().map(str::to_owned);
+                let next_version_id_marker = output.next_version_id_marker().map(str::to_owned);
+                if !self.complete
+                    && ((next_key_marker.is_none() && next_version_id_marker.is_none())
+                        || (next_key_marker == self.key_marker
+                            && next_version_id_marker == self.version_id_marker))
+                {
+                    return Err(StorageError::InvalidListPage);
+                }
+                self.key_marker = next_key_marker;
+                self.version_id_marker = next_version_id_marker;
+            }
+        }
+
+        if entries.len() > max_items.get() {
+            return Err(StorageError::InvalidListPage);
+        }
+        record_blob_list(&self.object_kind, entries.len(), "ok", started.elapsed());
+        Ok(BlobListPage {
+            entries,
+            is_complete: self.complete,
+        })
+    }
 }
 
 impl S3BlobStore {
@@ -885,6 +1089,23 @@ impl BlobStore for S3BlobStore {
         )?;
         record_blob_head(object_kind, result_label, started.elapsed());
         result
+    }
+
+    async fn open_bounded_list(
+        &self,
+        prefix: &str,
+        mode: BlobListMode,
+    ) -> Result<Box<dyn BlobList>> {
+        Ok(Box::new(S3BlobList {
+            store: self.clone(),
+            object_kind: prefix_kind(prefix).to_owned(),
+            key_prefix: self.config.list_key_prefix(prefix),
+            mode,
+            continuation_token: None,
+            key_marker: None,
+            version_id_marker: None,
+            complete: false,
+        }))
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {

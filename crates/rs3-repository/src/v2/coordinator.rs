@@ -13,7 +13,7 @@ use crate::model::{DeleteOutcome, RepositoryObjectMetadata, RepositoryPutOptions
 use bytes::Bytes;
 use futures_util::Stream;
 use rs3_storage::BlobStore;
-use rs3_types::{LegalHoldStatus, LogicalPath};
+use rs3_types::{LegalHoldStatus, LogicalPath, RetentionPolicy};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, oneshot};
@@ -53,6 +53,13 @@ struct PendingBatch {
     publishing: bool,
     generation: u64,
     failed: Option<String>,
+    protection: Option<V2ProtectionCohort>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct V2ProtectionCohort {
+    retention: Option<RetentionPolicy>,
+    legal_hold: Option<LegalHoldStatus>,
 }
 
 struct CommitWaiter {
@@ -222,6 +229,11 @@ where
         self.status.snapshot()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn pending_item_count_for_tests(&self) -> usize {
+        self.batch.lock().await.waiters.len()
+    }
+
     fn clone_for_owned_task(&self) -> Self {
         Self {
             repository: Arc::clone(&self.repository),
@@ -242,10 +254,23 @@ where
         body: Bytes,
         options: RepositoryPutOptions,
     ) -> Result<V2CommittedPut> {
+        self.repository.validate_client_object_lock(&options)?;
+        let (retention, legal_hold) = self.repository.effective_put_protection(&options);
+        let protection = V2ProtectionCohort {
+            retention,
+            legal_hold,
+        };
         let (metadata, rx, delayed_publish_generation, should_publish_now) = {
             let stage_lock_started = Instant::now();
             let _stage = self.stage_lock.lock().await;
             record_v2_commit_put_phase_duration("stage_lock_wait", stage_lock_started.elapsed());
+            let incompatible_pending = {
+                let batch = self.batch.lock().await;
+                !batch.waiters.is_empty() && batch.protection != Some(protection)
+            };
+            if incompatible_pending {
+                self.publish_locked_batch().await?;
+            }
             self.prepare_index_catalog_for_growth_locked().await?;
             let should_start_timer = {
                 let batch = self.batch.lock().await;
@@ -282,6 +307,13 @@ where
             let (metadata, rollback) = staged?;
             let (tx, rx) = oneshot::channel();
             let mut batch = self.batch.lock().await;
+            if batch.waiters.is_empty() {
+                batch.protection = Some(protection);
+            } else if batch.protection != Some(protection) {
+                return Err(commit_failed(
+                    "v2 commit batch contains incompatible protection cohorts",
+                ));
+            }
             let delayed_publish_generation = if should_start_timer {
                 batch.generation = batch.generation.wrapping_add(1);
                 Some(batch.generation)
@@ -367,6 +399,7 @@ where
     where
         St: Stream<Item = Result<Bytes>> + Unpin + Send + 'static,
     {
+        self.repository.validate_client_object_lock(&options)?;
         let cancellation = Arc::new(V2StandaloneUploadCancellation::new());
         let mut cancel_on_drop = CancelStandaloneUploadOnDrop::new(Arc::clone(&cancellation));
         let repository = Arc::clone(&self.repository);
@@ -429,6 +462,7 @@ where
     where
         St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
+        self.repository.validate_client_object_lock(&options)?;
         let _stage = self.stage_lock.lock().await;
         self.publish_locked_batch().await?;
         self.prepare_index_catalog_for_growth_locked().await?;
@@ -468,15 +502,12 @@ where
             .await
     }
 
-    /// Applies legal hold after flushing any pending staged v2 write batch.
+    /// Rejects legal-hold mutation until dependency-wide hold lifecycle exists.
     pub async fn set_legal_hold_committed(
         &self,
         key: LogicalPath,
         status: LegalHoldStatus,
     ) -> Result<RepositoryObjectMetadata> {
-        let _stage = self.stage_lock.lock().await;
-        self.publish_locked_batch().await?;
-        self.prepare_index_catalog_for_growth_locked().await?;
         self.repository
             .set_legal_hold_committed_coordinated(
                 V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref()),
@@ -546,6 +577,7 @@ where
         .await;
         let mut batch = self.batch.lock().await;
         batch.publishing = false;
+        batch.protection = None;
         if let Err(failure) = result {
             if let Some(poison_reason) = failure.poison_reason.clone() {
                 batch.failed = Some(poison_reason.clone());
@@ -711,6 +743,7 @@ async fn publish_pending_v2_batch<S, A>(
     .await;
     let mut batch = batch.lock().await;
     batch.publishing = false;
+    batch.protection = None;
     if let Err(failure) = result {
         if let Some(poison_reason) = failure.poison_reason {
             batch.failed = Some(poison_reason.clone());

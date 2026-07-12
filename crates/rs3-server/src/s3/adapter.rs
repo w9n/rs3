@@ -16,8 +16,8 @@ use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, stream};
 use rs3_repository::v2::V2AuthenticatedReadBody;
 use rs3_repository::{RepositoryError, RepositoryPutOptions};
-use rs3_storage::ByteRange;
-use rs3_types::{LegalHoldStatus, PublicBucket};
+use rs3_storage::{ByteRange, StorageError};
+use rs3_types::{PublicBucket, RetentionMode};
 use s3s::dto::{
     Bucket, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
     DeletedObject, Error as DeleteObjectError, GetBucketLocationInput, GetBucketLocationOutput,
@@ -46,6 +46,7 @@ pub(super) struct GatewayS3Service {
     max_put_object_bytes: u64,
     buffered_put_object_bytes: u64,
     backend_multipart_part_bytes: u64,
+    retention_writes_qualified: bool,
     request_slots: Arc<Semaphore>,
     request_rate_limiter: RequestRateLimiter,
     upload_body_budget: UploadBodyBudget,
@@ -85,6 +86,9 @@ impl GatewayS3Service {
             max_put_object_bytes: config.hardening.max_put_object_bytes,
             buffered_put_object_bytes: config.hardening.buffered_put_object_bytes,
             backend_multipart_part_bytes: config.hardening.backend_multipart_part_bytes,
+            retention_writes_qualified: config.repository.retention.is_some_and(|retention| {
+                retention.mode != RetentionMode::None && retention.retain_days > 0
+            }),
             request_slots: Arc::new(Semaphore::new(config.hardening.max_concurrent_requests)),
             request_rate_limiter: RequestRateLimiter::new(
                 config.hardening.request_rate_limit_per_second,
@@ -744,6 +748,17 @@ impl S3 for GatewayS3Service {
 
             let retention = put_object_retention_policy(&input)?;
             let legal_hold = put_object_legal_hold_status(&input)?;
+            if retention.is_some() && !self.retention_writes_qualified {
+                return Err(repository_error(RepositoryError::Storage(
+                    StorageError::RetentionExtensionUnsupported,
+                )));
+            }
+            if legal_hold.is_some() {
+                return Err(s3s::s3_error!(
+                    NotImplemented,
+                    "v02 legal hold publication is not supported"
+                ));
+            }
             let key = logical_path(input.key)?;
             let create_only = match input.if_none_match.as_ref() {
                 Some(s3s::dto::ETagCondition::Any) => true,
@@ -1224,20 +1239,11 @@ impl S3 for GatewayS3Service {
             let _admission = self.admit_request(OPERATION)?;
             self.check_bucket(&input.bucket)?;
             self.check_mutation_allowed()?;
-            let status = put_object_legal_hold_request_status(&input)?;
-            if status == LegalHoldStatus::Off {
-                return Err(s3s::s3_error!(
-                    AccessDenied,
-                    "clearing Object Lock legal holds through this gateway is not supported"
-                ));
-            }
-
-            let key = logical_path(input.key)?;
-            self.repository
-                .set_legal_hold_committed(key, status)
-                .await
-                .map_err(repository_error)?;
-            Ok(S3Response::new(PutObjectLegalHoldOutput::default()))
+            let _ = put_object_legal_hold_request_status(&input)?;
+            Err(s3s::s3_error!(
+                NotImplemented,
+                "v02 legal hold publication is not supported"
+            ))
         }
         .instrument(span)
         .await;
@@ -1582,7 +1588,7 @@ mod tests {
     use bytes::Bytes;
     use rs3_repository::v2::V2CommitAnchor;
     use rs3_storage::BlobStore;
-    use rs3_types::{LegalHoldStatus, RetentionMode};
+    use rs3_types::RetentionMode;
     use s3s::dto::{
         Delete, DeleteObjectInput, DeleteObjectsInput, GetBucketLocationInput, GetObjectInput,
         GetObjectLegalHoldInput, HeadBucketInput, HeadObjectInput, ListBucketsInput,
@@ -1599,6 +1605,17 @@ mod tests {
             .unwrap_or_else(|error| {
                 panic!("{error}");
             })
+    }
+
+    async fn retained_gateway_service() -> GatewayS3Service {
+        let mut config = runtime_config(true);
+        config.repository.retention = Some(rs3_types::RetentionPolicy::new(
+            RetentionMode::Governance,
+            1,
+        ));
+        GatewayS3Service::from_config(&config)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 
     #[test]
@@ -2731,7 +2748,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_object_maps_object_lock_retention() {
-        let service = gateway_service().await;
+        let service = retained_gateway_service().await;
         let retain_until = Timestamp::from(SystemTime::now() + Duration::from_secs(172_801));
 
         let put = service
@@ -2775,7 +2792,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_object_maps_object_lock_legal_hold() {
+    async fn put_object_rejects_retention_for_unqualified_repository() {
+        let service = gateway_service().await;
+        let retain_until = Timestamp::from(SystemTime::now() + Duration::from_secs(86_401));
+
+        let error = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/unqualified-retention.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"must not commit",
+                )))),
+                object_lock_mode: Some(ObjectLockMode::from_static(ObjectLockMode::COMPLIANCE)),
+                object_lock_retain_until_date: Some(retain_until),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect_err("unqualified retention should be rejected");
+
+        assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
+        assert_eq!(accepted_v2_sequence(&service).await, 1);
+    }
+
+    #[tokio::test]
+    async fn put_object_rejects_object_lock_legal_hold() {
         let service = gateway_service().await;
 
         let put = service
@@ -2789,30 +2829,12 @@ mod tests {
                 ..PutObjectInput::default()
             }))
             .await;
-        assert!(put.is_ok());
-
-        let commit = accepted_v2_commit_metadata(&service).await;
-        assert_eq!(commit.legal_hold, Some(LegalHoldStatus::On));
-
-        let head = service
-            .head_object(s3_request(HeadObjectInput {
-                bucket: "client-bucket".to_owned(),
-                key: "snapshots/held.bin".to_owned(),
-                ..HeadObjectInput::default()
-            }))
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(
-            head.output
-                .object_lock_legal_hold_status
-                .as_ref()
-                .map(|status| status.as_str()),
-            Some(ObjectLockLegalHoldStatus::ON)
-        );
+        let error = put.expect_err("legal-hold PUT should be rejected");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]
-    async fn object_legal_hold_operations_support_enable_and_read() {
+    async fn object_legal_hold_enable_is_rejected_and_read_remains_available() {
         let service = gateway_service().await;
         let put = service
             .put_object(s3_request(PutObjectInput {
@@ -2836,7 +2858,8 @@ mod tests {
                 ..PutObjectLegalHoldInput::default()
             }))
             .await;
-        assert!(enable.is_ok());
+        let error = enable.expect_err("legal-hold enable should be rejected");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
 
         let get = service
             .get_object_legal_hold(s3_request(GetObjectLegalHoldInput {
@@ -2852,7 +2875,7 @@ mod tests {
                 .as_ref()
                 .and_then(|hold| hold.status.as_ref())
                 .map(|status| status.as_str()),
-            Some(ObjectLockLegalHoldStatus::ON)
+            Some(ObjectLockLegalHoldStatus::OFF)
         );
     }
 
@@ -2864,9 +2887,6 @@ mod tests {
                 bucket: "client-bucket".to_owned(),
                 key: "snapshots/legal-hold-release.bin".to_owned(),
                 body: Some(StreamingBlob::from(Body::from(Bytes::from_static(b"held")))),
-                object_lock_legal_hold_status: Some(ObjectLockLegalHoldStatus::from_static(
-                    ObjectLockLegalHoldStatus::ON,
-                )),
                 ..PutObjectInput::default()
             }))
             .await;
@@ -2884,9 +2904,9 @@ mod tests {
                 ..PutObjectLegalHoldInput::default()
             }))
             .await
-            .expect_err("gateway should not clear legal hold");
+            .expect_err("gateway should reject legal-hold mutation");
 
-        assert_eq!(*release.code(), s3s::S3ErrorCode::AccessDenied);
+        assert_eq!(*release.code(), s3s::S3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]

@@ -495,6 +495,15 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
                 "multipart upload is not supported by this backend"
             )
         }
+        RepositoryError::Storage(StorageError::PagedListingUnsupported) => {
+            s3s::s3_error!(
+                NotImplemented,
+                "bounded listing is not supported by this backend"
+            )
+        }
+        RepositoryError::Storage(StorageError::InvalidListPage) => {
+            repository_operation_failed("Storage::InvalidListPage")
+        }
         RepositoryError::Storage(StorageError::MissingVersionId(_)) => {
             warn_repository_internal_error("Storage::MissingVersionId");
             s3s::s3_error!(

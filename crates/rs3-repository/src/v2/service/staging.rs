@@ -175,6 +175,10 @@ impl PendingV2State {
         self.deltas.is_empty() && self.manifests.is_empty() && self.payloads.is_empty()
     }
 
+    pub(super) fn deltas(&self) -> &[IndexDelta] {
+        &self.deltas
+    }
+
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.deltas.len()
@@ -309,6 +313,7 @@ impl PendingV2State {
             .map_or(PendingV2EffectiveHead::Absent, PendingV2EffectiveHead::Live)
     }
 
+    #[cfg(test)]
     pub(super) fn manifest<'a>(
         &'a self,
         accepted: &'a RepositoryState,

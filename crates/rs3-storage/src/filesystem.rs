@@ -2,15 +2,17 @@
 
 use crate::read::{BLOB_READ_CHUNK_BYTES, BlobReadSource, exact_blob_read};
 use crate::{
-    BlobMetadata, BlobRead, BlobStore, ByteRange, PutOptions, Result, StorageError, object_kind,
-    prefix_kind, record_blob_delete, record_blob_extend_retention, record_blob_get,
-    record_blob_head, record_blob_list, record_blob_put, record_blob_set_legal_hold,
+    BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobRead, BlobStore, ByteRange, PutOptions,
+    Result, StorageError, object_kind, prefix_kind, record_blob_delete,
+    record_blob_extend_retention, record_blob_get, record_blob_head, record_blob_list,
+    record_blob_put, record_blob_set_legal_hold,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -224,6 +226,28 @@ impl BlobStore for FilesystemBlobStore {
         Ok(entries)
     }
 
+    async fn open_bounded_list(
+        &self,
+        prefix: &str,
+        mode: BlobListMode,
+    ) -> Result<Box<dyn BlobList>> {
+        if mode == BlobListMode::Versions {
+            return Err(StorageError::VersionUnsupported);
+        }
+        let prefix_path = if prefix.is_empty() {
+            self.root.clone()
+        } else {
+            self.root.join(safe_relative_path(prefix)?)
+        };
+        Ok(Box::new(FilesystemBlobList {
+            root: self.root.clone(),
+            prefix: prefix.to_owned(),
+            pending_root: Some(prefix_path),
+            directories: Vec::new(),
+            complete: false,
+        }))
+    }
+
     async fn delete(&self, object_id: &BackendObjectId) -> Result<()> {
         let started = Instant::now();
         let kind = object_kind(object_id);
@@ -288,6 +312,81 @@ impl BlobStore for FilesystemBlobStore {
             "blob store operation completed",
         );
         Ok(())
+    }
+}
+
+struct FilesystemBlobList {
+    root: PathBuf,
+    prefix: String,
+    pending_root: Option<PathBuf>,
+    directories: Vec<fs::ReadDir>,
+    complete: bool,
+}
+
+#[async_trait]
+impl BlobList for FilesystemBlobList {
+    async fn next_page(&mut self, max_items: NonZeroUsize) -> Result<BlobListPage> {
+        if self.complete {
+            return Ok(BlobListPage {
+                entries: Vec::new(),
+                is_complete: true,
+            });
+        }
+
+        let started = Instant::now();
+        let kind = prefix_kind(&self.prefix);
+        let mut entries = Vec::with_capacity(max_items.get().min(1_024));
+        if let Some(root) = self.pending_root.take() {
+            match fs::metadata(&root) {
+                Ok(metadata) if metadata.is_dir() => {
+                    self.directories
+                        .push(fs::read_dir(root).map_err(provider_error)?);
+                }
+                Ok(metadata) if metadata.is_file() => {
+                    let object_id = object_id_from_path(&self.root, &root)?;
+                    if object_id.as_str().starts_with(&self.prefix) {
+                        entries.push(blob_metadata(object_id, metadata));
+                    }
+                    self.complete = true;
+                }
+                Ok(_) => self.complete = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.complete = true;
+                }
+                Err(error) => return Err(provider_error(error)),
+            }
+        }
+
+        while entries.len() < max_items.get() && !self.complete {
+            let Some(directory) = self.directories.last_mut() else {
+                self.complete = true;
+                break;
+            };
+            let Some(entry) = directory.next() else {
+                self.directories.pop();
+                continue;
+            };
+            let entry = entry.map_err(provider_error)?;
+            let file_type = entry.file_type().map_err(provider_error)?;
+            if file_type.is_dir() {
+                self.directories
+                    .push(fs::read_dir(entry.path()).map_err(provider_error)?);
+            } else if file_type.is_file() {
+                let object_id = object_id_from_path(&self.root, &entry.path())?;
+                if object_id.as_str().starts_with(&self.prefix) {
+                    entries.push(blob_metadata(
+                        object_id,
+                        entry.metadata().map_err(provider_error)?,
+                    ));
+                }
+            }
+        }
+
+        record_blob_list(kind, entries.len(), "ok", started.elapsed());
+        Ok(BlobListPage {
+            entries,
+            is_complete: self.complete,
+        })
     }
 }
 
@@ -560,9 +659,10 @@ fn provider_error(error: std::io::Error) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::FilesystemBlobStore;
-    use crate::{BlobStore, ByteRange, PutOptions, StorageError};
+    use crate::{BlobListMode, BlobStore, ByteRange, PutOptions, StorageError};
     use bytes::Bytes;
     use rs3_types::{BackendObjectId, RetentionMode, RetentionPolicy};
+    use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -648,6 +748,60 @@ mod tests {
             object_ids,
             vec![object_id("segments/a"), object_id("segments/b")]
         );
+    }
+
+    #[tokio::test]
+    async fn filesystem_store_pages_prefixes_with_a_hard_bound() {
+        let dir = TestDir::new();
+        let store = FilesystemBlobStore::new(dir.path()).unwrap_or_else(|error| panic!("{error}"));
+        for name in [
+            "segments/one/a",
+            "segments/one/b",
+            "segments/two/c",
+            "index/a",
+        ] {
+            store
+                .put(
+                    &object_id(name),
+                    Bytes::from_static(b"body"),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("put object: {error}"));
+        }
+        let mut listing = store
+            .open_bounded_list("segments/", BlobListMode::Current)
+            .await
+            .unwrap_or_else(|error| panic!("open listing: {error}"));
+        let page_size = NonZeroUsize::new(2).unwrap_or_else(|| panic!("non-zero page size"));
+        let mut listed = Vec::new();
+        loop {
+            let page = listing
+                .next_page(page_size)
+                .await
+                .unwrap_or_else(|error| panic!("read page: {error}"));
+            assert!(page.entries.len() <= page_size.get());
+            listed.extend(page.entries.into_iter().map(|metadata| metadata.object_id));
+            if page.is_complete {
+                break;
+            }
+        }
+        listed.sort();
+
+        assert_eq!(
+            listed,
+            vec![
+                object_id("segments/one/a"),
+                object_id("segments/one/b"),
+                object_id("segments/two/c")
+            ]
+        );
+        assert!(matches!(
+            store
+                .open_bounded_list("segments/", BlobListMode::Versions)
+                .await,
+            Err(StorageError::VersionUnsupported)
+        ));
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@ use super::{
     V2_INDEX_ROOT_MAX_RUNS, V2_MAX_HEADER_SIZE, V2EmbeddedIndexRunLocation, V2IndexRoot,
     V2IndexRootRunRef, V2KeyringEnvelopeRef, V2ParsedCommit, V2ParsedCommitHeader,
     V2PayloadPackFacts, V2PayloadPackId, V2PayloadPackRecordContext, V2PayloadPackRecordRef,
-    V2SectionDescriptor, V2SectionType, V2StreamPayloadCacheIdentity,
+    V2ProviderProfile, V2SectionDescriptor, V2SectionType, V2StreamPayloadCacheIdentity,
     V2StreamPayloadCarrierCacheIdentity, V2UploadMode, digest_v2_section,
     open_v2_payload_pack_cached_record_span, open_v2_payload_pack_record_span_with_segments,
     plan_v2_payload_pack_record_range, seal_v2_index_root, validated_v2_stream_payload_start,
@@ -46,7 +46,7 @@ use rs3_index::{
 use rs3_storage::{BlobStore, ByteRange, StorageError};
 use rs3_types::{
     BackendObjectId, BackendObjectRef, BackendVersionId, LegalHoldStatus, LogicalPath, ManifestId,
-    RetentionPolicy, Sequence,
+    RetentionMode, RetentionPolicy, Sequence,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -227,6 +227,48 @@ impl<S> V2Repository<S>
 where
     S: BlobStore + Clone,
 {
+    pub(super) fn validate_client_object_lock(&self, options: &RepositoryPutOptions) -> Result<()> {
+        let (retention, legal_hold) = self.effective_put_protection(options);
+        if legal_hold == Some(LegalHoldStatus::On) {
+            return Err(StorageError::LegalHoldUnsupported.into());
+        }
+        let requests_retention = retention
+            .is_some_and(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0);
+        if requests_retention
+            && self.commit_store.provider_profile() != V2ProviderProfile::RetainedVersionObjectLock
+        {
+            return Err(StorageError::RetentionExtensionUnsupported.into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn effective_put_protection(
+        &self,
+        options: &RepositoryPutOptions,
+    ) -> (Option<RetentionPolicy>, Option<LegalHoldStatus>) {
+        let retention = strongest_retention_policy(
+            self.repository.options.default_retention,
+            options.retention,
+        );
+        self.effective_stored_protection(retention, options.legal_hold)
+    }
+
+    fn effective_stored_protection(
+        &self,
+        retention: Option<RetentionPolicy>,
+        legal_hold: Option<LegalHoldStatus>,
+    ) -> (Option<RetentionPolicy>, Option<LegalHoldStatus>) {
+        let retention = strongest_retention_policy(self.commit_store.retention_policy(), retention);
+        let legal_hold = if self.commit_store.options().legal_hold == Some(LegalHoldStatus::On)
+            || legal_hold == Some(LegalHoldStatus::On)
+        {
+            Some(LegalHoldStatus::On)
+        } else {
+            None
+        };
+        (retention, legal_hold)
+    }
+
     /// Creates a v2 repository service over a blob store.
     pub fn new(
         store: S,
@@ -640,6 +682,7 @@ where
     where
         St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
+        self.validate_client_object_lock(options)?;
         let object_id = generate_v2_standalone_object_id().map_err(v2_repository_error)?;
         let inflight = self
             .commit_store
@@ -1039,6 +1082,7 @@ where
         A: V2CommitAnchor,
         St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
+        self.validate_client_object_lock(&options)?;
         let _guard = self.mutation_lock.lock().await;
         let _publication_guard = self.publication_lock.write().await;
         let base_anchor = self.ensure_accepted_anchor_matches(anchor).await?;
@@ -1263,10 +1307,12 @@ where
         options: RepositoryPutOptions,
         pending_body: Option<Bytes>,
     ) -> Result<(StagedV2Put, PendingV2Checkpoint)> {
+        self.validate_client_object_lock(&options)?;
         let retention = strongest_retention_policy(
             self.repository.options.default_retention,
             options.retention,
         );
+        let requested_protection = self.effective_stored_protection(retention, options.legal_hold);
         let keyring = self.repository.keyring()?;
         let primary_blind_key = keyring.derive_primary_blind_index_key(&key)?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(&key)?;
@@ -1278,6 +1324,17 @@ where
             .pending
             .lock()
             .map_err(|_| RepositoryError::StatePoisoned)?;
+        if pending.deltas().iter().any(|delta| {
+            let IndexDelta::Upsert { entry, .. } = delta else {
+                return false;
+            };
+            self.effective_stored_protection(entry.retention, entry.legal_hold)
+                != requested_protection
+        }) {
+            return Err(RepositoryError::CommitFailed {
+                reason: "v2 pending batch contains an incompatible protection cohort".to_owned(),
+            });
+        }
         let existing = lookup_blind_keys
             .iter()
             .filter_map(|candidate| {
@@ -2153,7 +2210,7 @@ where
         })
     }
 
-    /// Applies legal hold after the covering v2 commit is accepted.
+    /// Rejects legal-hold mutation until dependency-wide hold lifecycle exists.
     pub async fn set_legal_hold_committed<A>(
         &self,
         anchor: &A,
@@ -2163,9 +2220,8 @@ where
     where
         A: V2CommitAnchor,
     {
-        let _mutation_lease = self.claim_direct_mutation()?;
-        self.set_legal_hold_committed_inner(anchor, key, status)
-            .await
+        let _ = (anchor, key, status);
+        Err(StorageError::LegalHoldUnsupported.into())
     }
 
     pub(super) async fn set_legal_hold_committed_coordinated<A>(
@@ -2178,28 +2234,8 @@ where
         A: V2CommitAnchor,
     {
         self.validate_coordinator_lease(mutation.lease)?;
-        self.set_legal_hold_committed_inner(mutation.anchor, key, status)
-            .await
-    }
-
-    async fn set_legal_hold_committed_inner<A>(
-        &self,
-        anchor: &A,
-        key: LogicalPath,
-        status: LegalHoldStatus,
-    ) -> Result<RepositoryObjectMetadata>
-    where
-        A: V2CommitAnchor,
-    {
-        let _guard = self.mutation_lock.lock().await;
-        let _publication_guard = self.publication_lock.write().await;
-        self.ensure_accepted_anchor_matches(anchor).await?;
-        let (metadata, rollback) = self.stage_legal_hold(&key, status).await?;
-        if let Err(error) = self.publish_pending_index_delta_locked(anchor).await {
-            self.rollback_state_mutations(vec![rollback])?;
-            return Err(error);
-        }
-        Ok(metadata)
+        let _ = (mutation.anchor, key, status);
+        Err(StorageError::LegalHoldUnsupported.into())
     }
 
     fn stage_delete(&self, key: &LogicalPath) -> Result<PendingV2Checkpoint> {
@@ -2236,106 +2272,6 @@ where
             })
             .collect();
         pending.append_operation(deltas, None, None)
-    }
-
-    async fn stage_legal_hold(
-        &self,
-        key: &LogicalPath,
-        status: LegalHoldStatus,
-    ) -> Result<(RepositoryObjectMetadata, PendingV2Checkpoint)> {
-        let keyring = self.repository.keyring()?;
-        let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
-        let (original, trusted_manifest) = {
-            let accepted = self
-                .accepted
-                .read()
-                .map_err(|_| RepositoryError::StatePoisoned)?;
-            let pending = self
-                .pending
-                .lock()
-                .map_err(|_| RepositoryError::StatePoisoned)?;
-            let entry = lookup_blind_keys
-                .iter()
-                .find_map(|candidate| {
-                    pending
-                        .effective_head(&accepted.repository, &candidate.blind_key)
-                        .live()
-                })
-                .cloned()
-                .ok_or_else(|| RepositoryError::NotFound(key.clone()))?;
-            let manifest = pending
-                .manifest(&accepted.repository, &entry.manifest_id)
-                .cloned();
-            (entry, manifest)
-        };
-
-        self.repository
-            .store
-            .set_legal_hold_at(
-                &original.object_id,
-                original.object_version_id.as_ref(),
-                status,
-            )
-            .await?;
-        let backend = self
-            .repository
-            .store
-            .head_at(&original.object_id, original.object_version_id.as_ref())
-            .await?;
-
-        let accepted = self
-            .accepted
-            .read()
-            .map_err(|_| RepositoryError::StatePoisoned)?;
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| RepositoryError::StatePoisoned)?;
-        let current = lookup_blind_keys
-            .iter()
-            .find_map(|candidate| {
-                pending
-                    .effective_head(&accepted.repository, &candidate.blind_key)
-                    .live()
-            })
-            .cloned()
-            .ok_or_else(|| RepositoryError::NotFound(key.clone()))?;
-        if current.manifest_id != original.manifest_id || current.object_id != original.object_id {
-            return Err(v2_repository_error(V2FormatError::StaleAnchor));
-        }
-
-        let sequence = pending.allocate_sequence()?;
-        let manifest_id = keyring.derive_manifest_id(&object_material(key.as_str(), sequence))?;
-        let mut updated = current;
-        updated.manifest_id = manifest_id.clone();
-        updated.generation = sequence;
-        updated.legal_hold = backend.legal_hold.or(Some(status));
-        updated.object_version_id = backend.version_id.or(updated.object_version_id);
-        let manifest = TrustedManifest {
-            key: key.clone(),
-            content_len: trusted_manifest
-                .as_ref()
-                .map_or(updated.content_len, |manifest| manifest.content_len),
-            modified_at_ms: backend.modified_at_ms.unwrap_or_else(current_time_ms),
-            retention: trusted_manifest
-                .as_ref()
-                .map_or(updated.retention, |manifest| manifest.retention),
-            legal_hold: updated.legal_hold,
-        };
-        updated.content_len = manifest.content_len;
-        updated.modified_at_ms = manifest.modified_at_ms;
-        updated.retention = manifest.retention;
-        let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
-        let rollback = pending.append_operation(
-            vec![IndexDelta::Upsert {
-                entry: Box::new(updated),
-                prefix_tokens: Vec::new(),
-                sealed_manifest: Box::new(sealed_manifest),
-            }],
-            Some((manifest_id, manifest.clone())),
-            None,
-        )?;
-        Ok((manifest.into_metadata(), rollback))
     }
 
     pub(crate) fn rollback_staged_puts(&self, rollbacks: Vec<V2StagedPutRollback>) -> Result<()> {

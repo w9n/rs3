@@ -42,8 +42,7 @@ use rs3_storage::MemoryBlobStore;
 use rs3_storage::S3BlobStore;
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{
-    BackendObjectId, KeyPurpose, LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy,
-    Sequence,
+    BackendObjectId, KeyPurpose, LogicalPath, RetentionMode, RetentionPolicy, Sequence,
 };
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -232,12 +231,14 @@ impl RuntimeRepository {
         .await?;
         let initialized = !loaded.anchor_present;
         let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
+        let maintenance_keyring_ref = loaded.keyring_ref.clone();
         let commit_options = V2CommitStoreOptions::for_profile(
             provider_profile,
             config.repository_keys.repository_id.clone(),
             commit_ref,
             loaded.format_ref,
         )
+        .with_maintenance_keyring_envelope_ref(maintenance_keyring_ref)
         .with_retention(config.repository.retention)
         .with_stream_read_stall_timeout(config.hardening.stream_read_stall_timeout);
         let repository = Arc::new(V2Repository::new(
@@ -468,14 +469,6 @@ impl RuntimeRepository {
         self.coordinator.delete_committed(key).await
     }
 
-    pub(super) async fn set_legal_hold_committed(
-        &self,
-        key: LogicalPath,
-        status: LegalHoldStatus,
-    ) -> Result<RepositoryObjectMetadata, RepositoryError> {
-        self.coordinator.set_legal_hold_committed(key, status).await
-    }
-
     pub(super) fn admin_facts_source(&self) -> Arc<dyn AdminRuntimeFactsSource> {
         Arc::new(RuntimeRepositoryAdminFacts {
             repository: self.clone(),
@@ -700,12 +693,14 @@ pub(crate) async fn v2_quick_maintenance_from_config(
     )
     .await?;
     let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
+    let maintenance_keyring_ref = loaded.keyring_ref.clone();
     let commit_options = V2CommitStoreOptions::for_profile(
         provider_profile,
         config.repository_keys.repository_id.clone(),
         commit_ref,
         loaded.format_ref,
     )
+    .with_maintenance_keyring_envelope_ref(maintenance_keyring_ref)
     .with_retention(config.repository.retention);
     let commit_store = V2CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
     commit_store
@@ -740,12 +735,14 @@ pub async fn export_v2_recovery_bundle_from_config(
     )
     .await?;
     let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
+    let maintenance_keyring_ref = loaded.keyring_ref.clone();
     let commit_options = V2CommitStoreOptions::for_profile(
         provider_profile,
         config.repository_keys.repository_id.clone(),
         commit_ref,
         loaded.format_ref,
     )
+    .with_maintenance_keyring_envelope_ref(maintenance_keyring_ref)
     .with_retention(config.repository.retention);
     let commit_store = V2CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
     commit_store
@@ -824,12 +821,14 @@ pub async fn import_v2_anchor_from_config(
     )
     .await?;
     let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
+    let maintenance_keyring_ref = loaded.keyring_ref.clone();
     let commit_options = V2CommitStoreOptions::for_profile(
         provider_profile,
         config.repository_keys.repository_id.clone(),
         commit_ref,
         loaded.format_ref,
     )
+    .with_maintenance_keyring_envelope_ref(maintenance_keyring_ref)
     .with_retention(config.repository.retention);
     let commit_store = V2CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
 

@@ -1,14 +1,15 @@
 //! Fault-injecting `BlobStore` test utilities.
 
 use crate::{
-    BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore, ByteRange, PutOptions, Result,
-    StorageError,
+    BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore,
+    ByteRange, PutOptions, Result, StorageError,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use rs3_types::{BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionPolicy};
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -38,6 +39,10 @@ pub enum FaultOperationKind {
     ListPrefix,
     /// Version-addressed prefix listing.
     ListPrefixVersions,
+    /// One page of a latest-version prefix listing.
+    ListPrefixPage,
+    /// One page of a version-addressed prefix listing.
+    ListPrefixVersionsPage,
     /// Latest-version delete.
     Delete,
     /// Version-addressed delete.
@@ -541,6 +546,24 @@ where
         }
     }
 
+    async fn open_bounded_list(
+        &self,
+        prefix: &str,
+        mode: BlobListMode,
+    ) -> Result<Box<dyn BlobList>> {
+        let inner = self.inner.open_bounded_list(prefix, mode).await?;
+        let operation = match mode {
+            BlobListMode::Current => FaultOperationKind::ListPrefixPage,
+            BlobListMode::Versions => FaultOperationKind::ListPrefixVersionsPage,
+        };
+        Ok(Box::new(FaultInjectingBlobList {
+            inner,
+            script: self.script.clone(),
+            operation,
+            prefix: prefix.to_owned(),
+        }))
+    }
+
     async fn delete(&self, object_id: &BackendObjectId) -> Result<()> {
         let effect = self
             .script
@@ -621,6 +644,33 @@ where
             .begin(FaultOperationKind::FlushCaches, None, None)?;
         self.inner.flush_caches().await?;
         finish_success((), effect)
+    }
+}
+
+struct FaultInjectingBlobList {
+    inner: Box<dyn BlobList>,
+    script: FaultScript,
+    operation: FaultOperationKind,
+    prefix: String,
+}
+
+#[async_trait]
+impl BlobList for FaultInjectingBlobList {
+    async fn next_page(&mut self, max_items: NonZeroUsize) -> Result<BlobListPage> {
+        let effect = self
+            .script
+            .begin(self.operation, None, Some(&self.prefix))?;
+        let mut page = self.inner.next_page(max_items).await?;
+        if page.entries.len() > max_items.get() {
+            return Err(StorageError::InvalidListPage);
+        }
+        match effect {
+            FaultEffect::StaleList(omit_count) => {
+                page.entries = omit_newest(page.entries, omit_count);
+                Ok(page)
+            }
+            other => finish_success(page, other),
+        }
     }
 }
 

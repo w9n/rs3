@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use rs3_repository::v2::{V2AnchorState, V2CommitAnchor, V2Result};
-use rs3_storage::{BlobMetadata, BlobMultipartUpload, BlobStore, ByteRange, PutOptions};
+use rs3_storage::{
+    BlobList, BlobListMode, BlobMetadata, BlobMultipartUpload, BlobStore, ByteRange, PutOptions,
+};
 use std::sync::Arc;
 
 pub(super) type RuntimeStore = DynBlobStore;
@@ -80,6 +82,14 @@ impl BlobStore for DynBlobStore {
 
     async fn list_prefix_versions(&self, prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
         self.inner.list_prefix_versions(prefix).await
+    }
+
+    async fn open_bounded_list(
+        &self,
+        prefix: &str,
+        mode: BlobListMode,
+    ) -> rs3_storage::Result<Box<dyn BlobList>> {
+        self.inner.open_bounded_list(prefix, mode).await
     }
 
     async fn delete(&self, object_id: &rs3_types::BackendObjectId) -> rs3_storage::Result<()> {

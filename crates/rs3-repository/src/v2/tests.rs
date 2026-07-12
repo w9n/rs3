@@ -26,8 +26,8 @@ use rs3_index::run::{
     IndexMutation, IndexPayloadPointer, IndexRunLimits, IndexRunStandaloneStreamContainer,
 };
 use rs3_storage::{
-    BlobMetadata, BlobMultipartUpload, BlobStore, ByteRange, CountingBlobStore, MemoryBlobStore,
-    PutOptions,
+    BlobList, BlobListMode, BlobMetadata, BlobMultipartUpload, BlobStore, ByteRange,
+    CountingBlobStore, MemoryBlobStore, PutOptions,
 };
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
@@ -391,6 +391,60 @@ fn sample_format_ref() -> V2FormatRef {
         object_id: object_id(&format!("format/{:020}-{}", 1_u64, hex::encode([7_u8; 32]))),
         version_id: Some(must_type(BackendVersionId::new("format-version-1"))),
     }
+}
+
+async fn retained_commit_store(
+    store: MemoryBlobStore,
+    retention: RetentionPolicy,
+) -> V2CommitStore<MemoryBlobStore> {
+    let options = commit_store_options_with_maintenance_roots(
+        &store,
+        V2ProviderProfile::RetainedVersionObjectLock,
+        Some(retention),
+    )
+    .await;
+    V2CommitStore::new(store, signing_keyring(), options)
+}
+
+async fn commit_store_options_with_maintenance_roots(
+    store: &MemoryBlobStore,
+    profile: V2ProviderProfile,
+    retention: Option<RetentionPolicy>,
+) -> V2CommitStoreOptions {
+    let keyring_ref = sample_keyring_envelope_ref();
+    let keyring_metadata = store
+        .put(
+            &keyring_ref.object_id,
+            Bytes::from_static(b"encrypted-keyring-envelope"),
+            PutOptions {
+                retention,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("put keyring root: {error}"));
+    let mut format_ref = sample_format_ref();
+    let format_metadata = store
+        .put(
+            &format_ref.object_id,
+            Bytes::from_static(b"encrypted-format-root"),
+            PutOptions {
+                retention,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("put format root: {error}"));
+    format_ref.version_id = format_metadata.version_id.clone();
+    let keyring_root = V2KeyringEnvelopeRootRef {
+        generation: 1,
+        digest: hex::encode(keyring_ref.digest),
+        object_id: keyring_ref.object_id.clone(),
+        version_id: keyring_metadata.version_id,
+    };
+    V2CommitStoreOptions::for_profile(profile, sample_repository_id(), keyring_ref, format_ref)
+        .with_maintenance_keyring_envelope_ref(keyring_root)
+        .with_retention(retention)
 }
 
 #[test]
@@ -796,6 +850,14 @@ impl BlobStore for TrackedMultipartStore {
         self.inner.list_prefix_versions(prefix).await
     }
 
+    async fn open_bounded_list(
+        &self,
+        prefix: &str,
+        mode: BlobListMode,
+    ) -> rs3_storage::Result<Box<dyn BlobList>> {
+        self.inner.open_bounded_list(prefix, mode).await
+    }
+
     async fn delete(&self, object_id: &BackendObjectId) -> rs3_storage::Result<()> {
         self.inner.delete(object_id).await
     }
@@ -1064,6 +1126,14 @@ impl BlobStore for SlowCommitGetStore {
 
     async fn list_prefix_versions(&self, prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
         self.inner.list_prefix_versions(prefix).await
+    }
+
+    async fn open_bounded_list(
+        &self,
+        prefix: &str,
+        mode: BlobListMode,
+    ) -> rs3_storage::Result<Box<dyn BlobList>> {
+        self.inner.open_bounded_list(prefix, mode).await
     }
 
     async fn delete(&self, object_id: &BackendObjectId) -> rs3_storage::Result<()> {
@@ -3254,7 +3324,7 @@ async fn v2_repository_keeps_accepted_object_visible_during_pending_delete() {
 }
 
 #[tokio::test]
-async fn v2_repository_legal_hold_is_visible_only_after_anchor_acceptance() {
+async fn v2_repository_rejects_legal_hold_without_mutating_state() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
@@ -3284,7 +3354,9 @@ async fn v2_repository_legal_hold_is_visible_only_after_anchor_acceptance() {
             )
             .await,
     );
-    let failed = repository
+    let original_anchor = must_v2(anchor.read_v2().await).expect("genesis anchor");
+    let before = store.operation_counts();
+    let result = repository
         .set_legal_hold_committed(
             &FailOnceV2Anchor::new(anchor.clone()),
             key.clone(),
@@ -3292,30 +3364,99 @@ async fn v2_repository_legal_hold_is_visible_only_after_anchor_acceptance() {
         )
         .await;
 
-    assert!(matches!(failed, Err(RepositoryError::CommitFailed { .. })));
+    assert!(matches!(
+        result,
+        Err(RepositoryError::Storage(
+            rs3_storage::StorageError::LegalHoldUnsupported
+        ))
+    ));
+    assert_eq!(must_v2(anchor.read_v2().await), Some(original_anchor));
+    assert_eq!(store.operation_counts(), before);
     assert_eq!(must_repo(repository.head(&key)).legal_hold, None);
-
-    let held = must_repo(
-        repository
-            .set_legal_hold_committed(&anchor, key.clone(), LegalHoldStatus::On)
-            .await,
-    );
-    assert_eq!(held.legal_hold, Some(LegalHoldStatus::On));
     assert_eq!(
         must_repo(repository.get_range(&key, ByteRange::Full).await),
         Bytes::from_static(b"held")
     );
+}
 
-    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
-    must_repo(fresh.load_chain_from_anchor(&anchor).await);
-    assert_eq!(
-        must_repo(fresh.head(&key)).legal_hold,
-        Some(LegalHoldStatus::On)
+#[tokio::test]
+async fn v2_atomic_profile_rejects_request_retention_without_mutating_state() {
+    let store = MemoryBlobStore::new();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::AtomicCreate,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
     );
-    assert_eq!(
-        must_repo(fresh.get_range(&key, ByteRange::Full).await),
-        Bytes::from_static(b"held")
+    let repository = V2Repository::new(
+        store.clone(),
+        must_crypto(KeyRing::generate_random()),
+        RepositoryOptions::default(),
+        options,
     );
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let original_anchor = must_v2(anchor.read_v2().await).expect("genesis anchor");
+    let before = store.operation_counts();
+    let key = must_type(LogicalPath::new("snapshots/unqualified-retention.bin"));
+
+    let result = repository
+        .put_committed(
+            &anchor,
+            key.clone(),
+            Bytes::from_static(b"must not be stored"),
+            RepositoryPutOptions {
+                retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 1)),
+                ..RepositoryPutOptions::default()
+            },
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(RepositoryError::Storage(
+            rs3_storage::StorageError::RetentionExtensionUnsupported
+        ))
+    ));
+    assert_eq!(must_v2(anchor.read_v2().await), Some(original_anchor));
+    assert_eq!(store.operation_counts(), before);
+    assert!(matches!(
+        repository.head(&key),
+        Err(RepositoryError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn v2_commit_store_rejects_unqualified_protection_before_write() {
+    let store = MemoryBlobStore::new();
+    let repository = V2CommitStore::new(
+        store.clone(),
+        signing_keyring(),
+        V2CommitStoreOptions::for_profile(
+            V2ProviderProfile::AtomicCreate,
+            sample_repository_id(),
+            sample_keyring_envelope_ref(),
+            sample_format_ref(),
+        ),
+    );
+    let anchor = V2MemoryAnchor::new();
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let original_anchor = must_v2(anchor.read_v2().await).expect("genesis anchor");
+    let before = store.operation_counts();
+
+    for write in [
+        V2CommitWrite::delta(Vec::new())
+            .with_retention(Some(RetentionPolicy::new(RetentionMode::Compliance, 1))),
+        V2CommitWrite::delta(Vec::new()).with_legal_hold(Some(LegalHoldStatus::On)),
+    ] {
+        assert_eq!(
+            repository.write_child_commit(&anchor, write).await,
+            Err(V2FormatError::ProviderProfileFailed)
+        );
+    }
+
+    assert_eq!(must_v2(anchor.read_v2().await), Some(original_anchor));
+    assert_eq!(store.operation_counts(), before);
 }
 
 #[tokio::test]
@@ -3939,7 +4080,7 @@ async fn v2_full_gc_zero_age_skips_registered_inflight_standalone_object() {
     let report = must_v2(
         repository
             .commit_store()
-            .apply_fully_dead_orphans(
+            .apply_full_gc(
                 &anchor,
                 &UnenforcedQuiescedMaintenanceGuard,
                 V2FullGcApplyOptions {
@@ -4095,7 +4236,7 @@ async fn v2_writer_standalone_survives_compaction_checkpoint_and_full_gc() {
     let gc = must_v2(
         repository
             .commit_store()
-            .apply_fully_dead_orphans(
+            .apply_full_gc(
                 &anchor,
                 &UnenforcedQuiescedMaintenanceGuard,
                 V2FullGcApplyOptions {
@@ -4277,7 +4418,7 @@ async fn v2_standalone_readback_digest_mismatch_fails_before_anchor_advance() {
 }
 
 #[tokio::test]
-async fn v2_retained_standalone_requires_absolute_deadline_and_legal_hold() {
+async fn v2_retained_standalone_requires_absolute_deadline() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
     let retention = RetentionPolicy::new(RetentionMode::Compliance, 1);
@@ -4287,8 +4428,7 @@ async fn v2_retained_standalone_requires_absolute_deadline_and_legal_hold() {
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     )
-    .with_retention(Some(retention))
-    .with_legal_hold(Some(LegalHoldStatus::On));
+    .with_retention(Some(retention));
     let repository = Arc::new(V2Repository::new(
         store.clone(),
         keyring,
@@ -4327,7 +4467,7 @@ async fn v2_retained_standalone_requires_absolute_deadline_and_legal_hold() {
         .expect("list retained standalone object");
     assert_eq!(objects.len(), 1);
     assert_eq!(objects[0].retention, Some(retention));
-    assert_eq!(objects[0].legal_hold, Some(LegalHoldStatus::On));
+    assert_eq!(objects[0].legal_hold, None);
     let released_ms = body_release_ms.load(Ordering::SeqCst);
     assert!(released_ms > 0);
     assert!(
@@ -4348,8 +4488,7 @@ async fn v2_retained_standalone_rejects_missing_version_before_retention_mutatio
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     )
-    .with_retention(Some(retention))
-    .with_legal_hold(Some(LegalHoldStatus::On));
+    .with_retention(Some(retention));
     let repository = Arc::new(V2Repository::new(
         store.clone(),
         must_crypto(KeyRing::generate_random()),
@@ -4689,11 +4828,11 @@ async fn v2_commit_coordinator_packs_sixty_four_small_objects_with_bounded_ampli
 }
 
 #[tokio::test]
-async fn v2_commit_retention_covers_strongest_staged_object() {
+async fn v2_commit_coordinator_separates_incompatible_protection_cohorts() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
-        V2ProviderProfile::Dev,
+        V2ProviderProfile::RetainedVersionObjectLock,
         sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
@@ -4712,7 +4851,7 @@ async fn v2_commit_retention_covers_strongest_staged_object() {
         CommitCoordinatorOptions::new(2, Duration::from_secs(60)),
     )));
 
-    let weak = {
+    let weak = tokio::spawn({
         let coordinator = Arc::clone(&coordinator);
         async move {
             coordinator
@@ -4727,39 +4866,158 @@ async fn v2_commit_retention_covers_strongest_staged_object() {
                 )
                 .await
         }
-    };
-    let strong = {
+    });
+    while coordinator.pending_item_count_for_tests().await != 1 {
+        tokio::task::yield_now().await;
+    }
+    let mut strong = tokio::task::JoinSet::new();
+    for ordinal in 0..2 {
         let coordinator = Arc::clone(&coordinator);
-        async move {
+        strong.spawn(async move {
             coordinator
                 .put_committed(
-                    LogicalPath::new("snapshots/strong-retention.bin")
+                    LogicalPath::new(format!("snapshots/strong-retention-{ordinal}.bin"))
                         .unwrap_or_else(|error| panic!("{error}")),
                     Bytes::from_static(b"strong"),
                     RepositoryPutOptions {
                         retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
-                        legal_hold: Some(LegalHoldStatus::On),
                         ..RepositoryPutOptions::default()
                     },
                 )
                 .await
-        }
-    };
+        });
+    }
+    must_repo(weak.await.unwrap_or_else(|error| panic!("{error}")));
+    while let Some(result) = strong.join_next().await {
+        must_repo(result.unwrap_or_else(|error| panic!("{error}")));
+    }
+    assert_eq!(
+        must_repo(repository.accepted_pack_carrier_counts_for_tests()),
+        (3, 2)
+    );
+    let chain = must_v2(
+        repository
+            .commit_store()
+            .load_chain_from_anchor(&anchor)
+            .await,
+    )
+    .expect("v2 chain should exist");
+    let mut protection = Vec::new();
+    for commit in chain.commits_newest_first.iter().take(2) {
+        let metadata = store
+            .head_at(
+                &commit.parsed_header.header.self_ref.commit_key,
+                commit.version_id.as_ref(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        protection.push((metadata.retention, metadata.legal_hold));
+    }
+    protection.sort_by_key(|(retention, _)| retention.map_or(0, |policy| policy.retain_days));
+    assert_eq!(
+        protection,
+        vec![
+            (
+                Some(RetentionPolicy::new(RetentionMode::Governance, 1)),
+                None,
+            ),
+            (
+                Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
+                None,
+            ),
+        ]
+    );
+}
 
-    let (weak, strong) = tokio::join!(weak, strong);
-    must_repo(weak);
-    must_repo(strong);
-    let accepted = must_v2(anchor.read_v2().await).expect("v2 anchor should exist");
-    let metadata = store
-        .head_at(&accepted.commit_key, accepted.version_id.as_ref())
-        .await
-        .unwrap_or_else(|error| panic!("{error}"));
+#[tokio::test]
+async fn v2_direct_staging_rejects_mixed_protection_cohorts() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::RetainedVersionObjectLock,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .stage_put(
+                must_type(LogicalPath::new("cohorts/weak.bin")),
+                Bytes::from_static(b"weak"),
+                RepositoryPutOptions {
+                    retention: Some(RetentionPolicy::new(RetentionMode::Governance, 1)),
+                    ..RepositoryPutOptions::default()
+                },
+            )
+            .await,
+    );
+    let strong_key = must_type(LogicalPath::new("cohorts/strong.bin"));
+    assert!(matches!(
+        repository
+            .stage_put(
+                strong_key.clone(),
+                Bytes::from_static(b"strong"),
+                RepositoryPutOptions {
+                    retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
+                    ..RepositoryPutOptions::default()
+                },
+            )
+            .await,
+        Err(RepositoryError::CommitFailed { .. })
+    ));
+    must_repo(repository.publish_pending_index_delta(&anchor).await);
+    assert!(matches!(
+        repository.head(&strong_key),
+        Err(RepositoryError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn v2_direct_staging_normalizes_the_global_protection_floor() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let floor = RetentionPolicy::new(RetentionMode::Compliance, 30);
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::RetainedVersionObjectLock,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    )
+    .with_retention(Some(floor));
+    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+
+    must_repo(
+        repository
+            .stage_put(
+                must_type(LogicalPath::new("cohorts/global-floor-a.bin")),
+                Bytes::from_static(b"a"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(
+        repository
+            .stage_put(
+                must_type(LogicalPath::new("cohorts/global-floor-b.bin")),
+                Bytes::from_static(b"b"),
+                RepositoryPutOptions {
+                    retention: Some(RetentionPolicy::new(RetentionMode::Governance, 1)),
+                    ..RepositoryPutOptions::default()
+                },
+            )
+            .await,
+    );
+    must_repo(repository.publish_pending_index_delta(&anchor).await);
 
     assert_eq!(
-        metadata.retention,
-        Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
+        must_repo(repository.accepted_pack_carrier_counts_for_tests()),
+        (2, 1)
     );
-    assert_eq!(metadata.legal_hold, Some(LegalHoldStatus::On));
 }
 
 #[tokio::test]
@@ -6358,9 +6616,8 @@ async fn v2_orphan_gc_skips_retained_or_held_candidates() {
         sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
-    )
-    .with_legal_hold(Some(LegalHoldStatus::On));
-    let held = V2CommitStore::new(held_store, signing_keyring(), held_options);
+    );
+    let held = V2CommitStore::new(held_store.clone(), signing_keyring(), held_options);
     let held_anchor = V2MemoryAnchor::new();
 
     must_v2(held.write_genesis_snapshot(&held_anchor).await);
@@ -6374,6 +6631,20 @@ async fn v2_orphan_gc_skips_retained_or_held_candidates() {
             )]),
         )
         .await;
+    let anchored_key = must_v2(held_anchor.read_v2().await)
+        .expect("genesis anchor")
+        .commit_key;
+    let held_orphan = held_store
+        .list_prefix("commits/v02/")
+        .await
+        .expect("list held orphan")
+        .into_iter()
+        .find(|metadata| metadata.object_id != anchored_key)
+        .expect("unanchored commit");
+    held_store
+        .set_legal_hold(&held_orphan.object_id, LegalHoldStatus::On)
+        .await
+        .expect("apply fixture legal hold");
     let held_gc = must_v2(
         held.delete_expired_orphans(
             &held_anchor,
@@ -6446,16 +6717,63 @@ async fn v2_full_gc_dry_run_reports_unanchored_commit_budget() {
 }
 
 #[tokio::test]
+async fn v2_full_gc_inventory_stops_before_exceeding_item_or_page_budgets() {
+    let store = MemoryBlobStore::new();
+    let repository = V2CommitStore::new(
+        store.clone(),
+        signing_keyring(),
+        V2CommitStoreOptions::for_profile(
+            V2ProviderProfile::Dev,
+            sample_repository_id(),
+            sample_keyring_envelope_ref(),
+            sample_format_ref(),
+        ),
+    );
+    let anchor = V2MemoryAnchor::new();
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+
+    let before_items = store.operation_counts().expect("operation counts");
+    let item_limited = repository
+        .full_gc_dry_run(
+            &anchor,
+            V2FullGcDryRunOptions {
+                budgets: V2MaintenanceBudgets {
+                    max_inventory_item_count: 0,
+                    ..V2MaintenanceBudgets::default()
+                },
+                ..V2FullGcDryRunOptions::default()
+            },
+        )
+        .await;
+    let after_items = store.operation_counts().expect("operation counts");
+    assert_eq!(item_limited, Err(V2FormatError::MaintenanceBudgetExceeded));
+    assert_eq!(after_items.list.saturating_sub(before_items.list), 1);
+    assert_eq!(after_items.delete, before_items.delete);
+
+    let before_pages = store.operation_counts().expect("operation counts");
+    let page_limited = repository
+        .full_gc_dry_run(
+            &anchor,
+            V2FullGcDryRunOptions {
+                budgets: V2MaintenanceBudgets {
+                    max_inventory_page_count: 1,
+                    ..V2MaintenanceBudgets::default()
+                },
+                ..V2FullGcDryRunOptions::default()
+            },
+        )
+        .await;
+    let after_pages = store.operation_counts().expect("operation counts");
+    assert_eq!(page_limited, Err(V2FormatError::MaintenanceBudgetExceeded));
+    assert_eq!(after_pages.list.saturating_sub(before_pages.list), 1);
+    assert_eq!(after_pages.delete, before_pages.delete);
+}
+
+#[tokio::test]
 async fn retained_v2_full_gc_dry_run_reports_version_inventory_and_blocked_bytes() {
     let store = MemoryBlobStore::new();
-    let options = V2CommitStoreOptions::for_profile(
-        V2ProviderProfile::RetainedVersionObjectLock,
-        sample_repository_id(),
-        sample_keyring_envelope_ref(),
-        sample_format_ref(),
-    )
-    .with_retention(Some(RetentionPolicy::new(RetentionMode::Compliance, 30)));
-    let repository = V2CommitStore::new(store, signing_keyring(), options);
+    let retention = RetentionPolicy::new(RetentionMode::Compliance, 30);
+    let repository = retained_commit_store(store, retention).await;
     let anchor = V2MemoryAnchor::new();
 
     must_v2(repository.write_genesis_snapshot(&anchor).await);
@@ -6481,7 +6799,7 @@ async fn retained_v2_full_gc_dry_run_reports_version_inventory_and_blocked_bytes
     assert_eq!(report.dead_bytes_reclaimable, 0);
     assert!(report.retention_blocked_bytes > 0);
     assert_eq!(report.planned_cost.version_list_count, 2);
-    assert_eq!(report.planned_cost.head_count, 2);
+    assert_eq!(report.planned_cost.head_count, 6);
     assert_eq!(report.planned_cost.delete_count, 0);
     assert_eq!(report.planned_cost.retention_extend_count, 0);
     assert!(report.fits_budgets);
@@ -6489,16 +6807,81 @@ async fn retained_v2_full_gc_dry_run_reports_version_inventory_and_blocked_bytes
 }
 
 #[tokio::test]
-async fn retained_v2_full_gc_dry_run_plans_live_commit_retention_renewal() {
+async fn retained_v2_full_gc_fails_closed_without_exact_restore_metadata_roots() {
     let store = MemoryBlobStore::new();
+    let retention = RetentionPolicy::new(RetentionMode::Compliance, 30);
     let options = V2CommitStoreOptions::for_profile(
         V2ProviderProfile::RetainedVersionObjectLock,
         sample_repository_id(),
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     )
-    .with_retention(Some(RetentionPolicy::new(RetentionMode::Compliance, 30)));
+    .with_retention(Some(retention));
     let repository = V2CommitStore::new(store, signing_keyring(), options);
+    let anchor = V2MemoryAnchor::new();
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+
+    let result = repository
+        .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
+        .await;
+
+    assert_eq!(result, Err(V2FormatError::ProviderProfileFailed));
+}
+
+#[tokio::test]
+async fn v2_full_gc_propagates_request_retention_to_every_restore_dependency() {
+    let store = MemoryBlobStore::new();
+    let options = commit_store_options_with_maintenance_roots(
+        &store,
+        V2ProviderProfile::RetainedVersionObjectLock,
+        Some(RetentionPolicy::new(RetentionMode::Governance, 1)),
+    )
+    .await;
+    let repository = V2Repository::new(
+        store,
+        must_crypto(KeyRing::generate_random()),
+        RepositoryOptions::default(),
+        options,
+    );
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed(
+                &anchor,
+                must_type(LogicalPath::new("retained/request-only.bin")),
+                Bytes::from_static(b"retained"),
+                RepositoryPutOptions {
+                    retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
+                    ..RepositoryPutOptions::default()
+                },
+            )
+            .await,
+    );
+
+    let report = must_v2(
+        repository
+            .commit_store()
+            .full_gc_dry_run(
+                &anchor,
+                V2FullGcDryRunOptions {
+                    retention_renewal_horizon: Duration::from_secs(31 * 24 * 60 * 60),
+                    ..V2FullGcDryRunOptions::default()
+                },
+            )
+            .await,
+    );
+
+    assert_eq!(report.chain_live_commit_count, 2);
+    assert_eq!(report.retention_renewal_commit_count, 4);
+    assert_eq!(report.retention_renewal_blocked_count, 0);
+}
+
+#[tokio::test]
+async fn retained_v2_full_gc_dry_run_plans_live_commit_retention_renewal() {
+    let store = MemoryBlobStore::new();
+    let retention = RetentionPolicy::new(RetentionMode::Compliance, 30);
+    let repository = retained_commit_store(store, retention).await;
     let anchor = V2MemoryAnchor::new();
 
     must_v2(repository.write_genesis_snapshot(&anchor).await);
@@ -6539,25 +6922,19 @@ async fn retained_v2_full_gc_dry_run_plans_live_commit_retention_renewal() {
     assert_eq!(default_report.retention_renewal_commit_count, 0);
     assert_eq!(default_report.planned_cost.retention_extend_count, 0);
     assert_eq!(renewal_report.chain_live_commit_count, 2);
-    assert_eq!(renewal_report.retention_renewal_commit_count, 2);
+    assert_eq!(renewal_report.retention_renewal_commit_count, 4);
     assert!(renewal_report.retention_renewal_bytes > 0);
     assert_eq!(renewal_report.retention_renewal_blocked_count, 0);
-    assert_eq!(renewal_report.planned_cost.retention_extend_count, 2);
-    assert_eq!(renewal_report.planned_cost.head_count, 2);
+    assert_eq!(renewal_report.planned_cost.retention_extend_count, 4);
+    assert_eq!(renewal_report.planned_cost.head_count, 10);
     assert!(!renewal_report.fits_budgets);
 }
 
 #[tokio::test]
 async fn retained_v2_full_gc_dry_run_plans_protected_root_retention_renewal() {
     let store = MemoryBlobStore::new();
-    let options = V2CommitStoreOptions::for_profile(
-        V2ProviderProfile::RetainedVersionObjectLock,
-        sample_repository_id(),
-        sample_keyring_envelope_ref(),
-        sample_format_ref(),
-    )
-    .with_retention(Some(RetentionPolicy::new(RetentionMode::Compliance, 30)));
-    let repository = V2CommitStore::new(store, signing_keyring(), options);
+    let retention = RetentionPolicy::new(RetentionMode::Compliance, 30);
+    let repository = retained_commit_store(store, retention).await;
     let anchor = V2MemoryAnchor::new();
 
     must_v2(repository.write_genesis_snapshot(&anchor).await);
@@ -6605,9 +6982,9 @@ async fn retained_v2_full_gc_dry_run_plans_protected_root_retention_renewal() {
     assert_eq!(report.protected_root_count, 1);
     assert_eq!(report.protected_commit_count, 2);
     assert_eq!(report.candidate_commit_count, 0);
-    assert_eq!(report.retention_renewal_commit_count, 3);
-    assert_eq!(report.planned_cost.head_count, 3);
-    assert_eq!(report.planned_cost.retention_extend_count, 3);
+    assert_eq!(report.retention_renewal_commit_count, 5);
+    assert_eq!(report.planned_cost.head_count, 12);
+    assert_eq!(report.planned_cost.retention_extend_count, 5);
 }
 
 #[tokio::test]
@@ -6635,7 +7012,7 @@ async fn v2_full_gc_apply_requires_maintenance_guard() {
         )
         .await;
     let apply = repository
-        .apply_fully_dead_orphans(
+        .apply_full_gc(
             &anchor,
             &RejectingMaintenanceGuard,
             V2FullGcApplyOptions {
@@ -6678,7 +7055,7 @@ async fn v2_full_gc_apply_deletes_only_fully_dead_orphans_after_dry_run() {
         .await;
     let apply = must_v2(
         repository
-            .apply_fully_dead_orphans(
+            .apply_full_gc(
                 &anchor,
                 &UnenforcedQuiescedMaintenanceGuard,
                 V2FullGcApplyOptions {
@@ -6735,7 +7112,7 @@ async fn v2_full_gc_apply_returns_partial_report_on_mid_pass_guard_abort() {
 
     let apply = must_v2(
         repository
-            .apply_fully_dead_orphans(
+            .apply_full_gc(
                 &anchor,
                 &guard,
                 V2FullGcApplyOptions {
@@ -6763,6 +7140,39 @@ async fn v2_full_gc_apply_returns_partial_report_on_mid_pass_guard_abort() {
         Some(V2FormatError::MaintenanceAccessRequired)
     );
     assert_eq!(after.candidates.len(), 1);
+}
+
+#[tokio::test]
+async fn v2_full_gc_rejects_cross_format_protected_root_before_storage_reads() {
+    let store = MemoryBlobStore::new();
+    let repository = V2CommitStore::new(
+        store.clone(),
+        signing_keyring(),
+        V2CommitStoreOptions::for_profile(
+            V2ProviderProfile::Dev,
+            sample_repository_id(),
+            sample_keyring_envelope_ref(),
+            sample_format_ref(),
+        ),
+    );
+    let anchor = V2MemoryAnchor::new();
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let mut incompatible = must_v2(anchor.read_v2().await).expect("genesis anchor");
+    incompatible.format_ref.digest = hex::encode([0x5a; 32]);
+    let before = store.operation_counts();
+
+    let result = repository
+        .full_gc_dry_run(
+            &anchor,
+            V2FullGcDryRunOptions {
+                protected_roots: vec![incompatible],
+                ..V2FullGcDryRunOptions::default()
+            },
+        )
+        .await;
+
+    assert_eq!(result, Err(V2FormatError::InvalidFormatRoot));
+    assert_eq!(store.operation_counts(), before);
 }
 
 #[tokio::test]
@@ -6824,7 +7234,7 @@ async fn v2_full_gc_apply_preserves_supplied_historical_roots() {
     );
     let apply = must_v2(
         repository
-            .apply_fully_dead_orphans(
+            .apply_full_gc(
                 &anchor,
                 &UnenforcedQuiescedMaintenanceGuard,
                 V2FullGcApplyOptions {
@@ -6862,7 +7272,7 @@ async fn retained_v2_full_gc_apply_requires_provider_conformance() {
 
     must_v2(repository.write_genesis_snapshot(&anchor).await);
     let apply = repository
-        .apply_fully_dead_orphans(
+        .apply_full_gc(
             &anchor,
             &UnenforcedQuiescedMaintenanceGuard,
             V2FullGcApplyOptions {
@@ -6879,14 +7289,8 @@ async fn retained_v2_full_gc_apply_requires_provider_conformance() {
 #[tokio::test]
 async fn retained_v2_full_gc_apply_deletes_unprotected_exact_version_after_conformance() {
     let store = MemoryBlobStore::new();
-    let options = V2CommitStoreOptions::for_profile(
-        V2ProviderProfile::RetainedVersionObjectLock,
-        sample_repository_id(),
-        sample_keyring_envelope_ref(),
-        sample_format_ref(),
-    )
-    .with_retention(Some(RetentionPolicy::new(RetentionMode::Compliance, 30)));
-    let repository = V2CommitStore::new(store.clone(), signing_keyring(), options);
+    let retention = RetentionPolicy::new(RetentionMode::Compliance, 30);
+    let repository = retained_commit_store(store.clone(), retention).await;
     let anchor = V2MemoryAnchor::new();
 
     must_v2(repository.write_genesis_snapshot(&anchor).await);
@@ -6907,7 +7311,7 @@ async fn retained_v2_full_gc_apply_deletes_unprotected_exact_version_after_confo
     );
     let apply = must_v2(
         repository
-            .apply_fully_dead_orphans(
+            .apply_full_gc(
                 &anchor,
                 &UnenforcedQuiescedMaintenanceGuard,
                 V2FullGcApplyOptions {
@@ -6927,6 +7331,155 @@ async fn retained_v2_full_gc_apply_deletes_unprotected_exact_version_after_confo
     assert!(dry_run.exact_version_apply_ready);
     assert_eq!(apply.orphan_gc.deleted_count, 1);
     assert_eq!(after.candidates.len(), 0);
+}
+
+#[tokio::test]
+async fn retained_v2_full_gc_renews_exact_live_versions_before_deleting() {
+    let store = MemoryBlobStore::new();
+    let retention = RetentionPolicy::new(RetentionMode::Compliance, 1);
+    let repository = retained_commit_store(store.clone(), retention).await;
+    let anchor = V2MemoryAnchor::new();
+
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let child = must_v2(
+        repository
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::delta(vec![V2CommitSection::new(
+                    V2SectionType::IndexDelta,
+                    0,
+                    Bytes::from_static(b"renew-live-exact-version"),
+                )]),
+            )
+            .await,
+    );
+    store
+        .put(
+            &child.commit_key.object_id,
+            Bytes::from_static(b"newer-untrusted-latest-version"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("put newer version: {error}"));
+    let orphan_key = must_v2(generate_v2_commit_key(Sequence::new(99))).object_id;
+    store
+        .put(
+            &orphan_key,
+            Bytes::from_static(b"delete-after-renewal"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("put orphan: {error}"));
+
+    let apply = must_v2(
+        repository
+            .apply_full_gc(
+                &anchor,
+                &UnenforcedQuiescedMaintenanceGuard,
+                V2FullGcApplyOptions {
+                    dry_run: V2FullGcDryRunOptions {
+                        budgets: V2MaintenanceBudgets {
+                            max_retention_extend_count: Some(4),
+                            ..V2MaintenanceBudgets::default()
+                        },
+                        retention_renewal_horizon: Duration::from_secs(2 * 24 * 60 * 60),
+                        ..V2FullGcDryRunOptions::default()
+                    },
+                    orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+                    retained_provider_conformance_passed: true,
+                },
+            )
+            .await,
+    );
+
+    assert_eq!(apply.retention_renewed_object_count, 4);
+    assert!(apply.retention_renewed_bytes > 0);
+    assert_eq!(apply.orphan_gc.deleted_count, 1);
+    assert_eq!(apply.orphan_gc.same_sequence_skipped_count, 1);
+    let anchored = store
+        .head_at(&child.commit_key.object_id, child.version_id.as_ref())
+        .await
+        .unwrap_or_else(|error| panic!("head anchored version: {error}"));
+    let latest = store
+        .head(&child.commit_key.object_id)
+        .await
+        .unwrap_or_else(|error| panic!("head latest version: {error}"));
+    assert_eq!(anchored.retention, Some(retention));
+    assert!(anchored.retain_until_ms.is_some());
+    assert_eq!(latest.retention, None);
+}
+
+#[tokio::test]
+async fn retained_v2_full_gc_renews_format_and_keyring_roots() {
+    let store = MemoryBlobStore::new();
+    let retention = RetentionPolicy::new(RetentionMode::Compliance, 1);
+    let keyring_ref = sample_keyring_envelope_ref();
+    let keyring_metadata = store
+        .put(
+            &keyring_ref.object_id,
+            Bytes::from_static(b"encrypted-keyring-envelope"),
+            PutOptions {
+                retention: Some(retention),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("put keyring root: {error}"));
+    let mut format_ref = sample_format_ref();
+    let format_metadata = store
+        .put(
+            &format_ref.object_id,
+            Bytes::from_static(b"encrypted-format-root"),
+            PutOptions {
+                retention: Some(retention),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("put format root: {error}"));
+    format_ref.version_id = format_metadata.version_id.clone();
+    let keyring_root = V2KeyringEnvelopeRootRef {
+        generation: 1,
+        digest: hex::encode(keyring_ref.digest),
+        object_id: keyring_ref.object_id.clone(),
+        version_id: keyring_metadata.version_id.clone(),
+    };
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::RetainedVersionObjectLock,
+        sample_repository_id(),
+        keyring_ref,
+        format_ref,
+    )
+    .with_maintenance_keyring_envelope_ref(keyring_root)
+    .with_retention(Some(retention));
+    let repository = V2CommitStore::new(store, signing_keyring(), options);
+    let anchor = V2MemoryAnchor::new();
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+
+    let apply = must_v2(
+        repository
+            .apply_full_gc(
+                &anchor,
+                &UnenforcedQuiescedMaintenanceGuard,
+                V2FullGcApplyOptions {
+                    dry_run: V2FullGcDryRunOptions {
+                        budgets: V2MaintenanceBudgets {
+                            max_retention_extend_count: Some(3),
+                            ..V2MaintenanceBudgets::default()
+                        },
+                        retention_renewal_horizon: Duration::from_secs(2 * 24 * 60 * 60),
+                        ..V2FullGcDryRunOptions::default()
+                    },
+                    orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+                    retained_provider_conformance_passed: true,
+                },
+            )
+            .await,
+    );
+
+    assert_eq!(apply.retention_renewed_object_count, 3);
+    assert!(apply.retention_renewed_bytes > 0);
+    assert_eq!(apply.orphan_gc.deleted_count, 0);
 }
 
 #[tokio::test]

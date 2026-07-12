@@ -7,16 +7,18 @@ use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_repository::v2::{
     UnenforcedQuiescedMaintenanceGuard, V2_MAX_HEADER_SIZE, V2CommitAnchor, V2CommitCoordinator,
     V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite, V2FormatError,
-    V2FormatRef, V2FullGcApplyOptions, V2FullGcDryRunOptions, V2KeyringEnvelopeRef, V2MemoryAnchor,
+    V2FormatRef, V2FullGcApplyOptions, V2FullGcDryRunOptions, V2KeyringEnvelopeRef,
+    V2KeyringEnvelopeRootRef, V2MaintenanceBudgets, V2MemoryAnchor, V2OrphanGcOptions,
     V2ProviderProfile, V2RecoveryBundle, V2SectionType,
 };
 use rs3_repository::{RepositoryError, RepositoryOptions, RepositoryPutOptions};
 use rs3_storage::{
     BlobStore, ByteRange, FaultAction, FaultCrashHook, FaultInjectingBlobStore, FaultMatcher,
-    FaultOperationKind, FaultRule, MemoryBlobStore,
+    FaultOperationKind, FaultRule, MemoryBlobStore, PutOptions,
 };
 use rs3_types::{
-    BackendObjectId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath, Sequence,
+    BackendObjectId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath, RetentionMode,
+    RetentionPolicy, Sequence,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -138,7 +140,7 @@ async fn gc_stale_list_preserves_live_payload_refs_and_protected_roots() {
     let store = FaultInjectingBlobStore::new(
         inner.clone(),
         vec![FaultRule::new(
-            FaultMatcher::operation(FaultOperationKind::ListPrefix),
+            FaultMatcher::operation(FaultOperationKind::ListPrefixPage),
             FaultAction::stale_list(1),
         )],
     );
@@ -149,7 +151,7 @@ async fn gc_stale_list_preserves_live_payload_refs_and_protected_roots() {
         .expect("fresh repository should replay snapshot");
     let apply = gc_repository
         .commit_store()
-        .apply_fully_dead_orphans(
+        .apply_full_gc(
             &anchor,
             &UnenforcedQuiescedMaintenanceGuard,
             V2FullGcApplyOptions {
@@ -177,7 +179,7 @@ async fn gc_stale_list_preserves_live_payload_refs_and_protected_roots() {
             .operation_log()
             .expect("operation log should be readable")
             .iter()
-            .any(|event| event.kind == FaultOperationKind::ListPrefix)
+            .any(|event| event.kind == FaultOperationKind::ListPrefixPage)
     );
     assert_eq!(
         recovered
@@ -280,6 +282,161 @@ async fn streaming_put_fault_sweep_never_exposes_partial_object_and_aborts_parts
             }
         }
     }
+}
+
+#[tokio::test]
+async fn ambiguous_multipart_completion_leaves_only_an_invisible_gc_orphan() {
+    let inner = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let options = commit_options();
+    let anchor = V2MemoryAnchor::new();
+    make_repository(inner.clone(), keyring.clone(), options.clone())
+        .write_genesis_snapshot(&anchor)
+        .await
+        .expect("genesis should write");
+    let store = FaultInjectingBlobStore::new(
+        inner.clone(),
+        vec![FaultRule::new(
+            FaultMatcher::operation(FaultOperationKind::MultipartComplete),
+            FaultAction::error_after_write("ambiguous multipart completion"),
+        )],
+    );
+    let repository = Arc::new(make_repository(store, keyring.clone(), options.clone()));
+    repository
+        .load_chain_from_anchor(&anchor)
+        .await
+        .expect("repository should load genesis");
+    let coordinator = V2CommitCoordinator::new(Arc::clone(&repository), anchor.clone())
+        .expect("coordinator should start");
+    let key = logical_path("snapshots/ambiguous-complete.bin");
+    let result = coordinator
+        .put_committed_streaming_known_len(
+            key.clone(),
+            4096,
+            stream::iter([Ok::<Bytes, RepositoryError>(Bytes::from(vec![0x4a; 4096]))]),
+            RepositoryPutOptions::default(),
+            V2_MAX_HEADER_SIZE + 512,
+        )
+        .await;
+    assert!(result.is_err());
+
+    let recovered = make_repository(inner.clone(), keyring, options);
+    recovered
+        .load_chain_from_anchor(&anchor)
+        .await
+        .expect("recovery should retain genesis");
+    assert!(matches!(
+        recovered.get_range(&key, ByteRange::Full).await,
+        Err(RepositoryError::NotFound(_))
+    ));
+    let orphans = recovered
+        .commit_store()
+        .report_orphans(&anchor)
+        .await
+        .expect("orphan report should succeed");
+    assert_eq!(
+        orphans
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.object_class == rs3_repository::v2::V2OrphanObjectClass::Object
+            })
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_retention_renewal_aborts_before_any_orphan_delete() {
+    let inner = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let retention = RetentionPolicy::new(RetentionMode::Compliance, 1);
+    let mut options = V2CommitStoreOptions {
+        provider_profile: V2ProviderProfile::RetainedVersionObjectLock,
+        retention: Some(retention),
+        ..commit_options()
+    };
+    let keyring_metadata = inner
+        .put(
+            &options.keyring_envelope_ref.object_id,
+            Bytes::from_static(b"encrypted-keyring-envelope"),
+            PutOptions {
+                retention: Some(retention),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .expect("keyring root should write");
+    let format_metadata = inner
+        .put(
+            &options.format_ref.object_id,
+            Bytes::from_static(b"encrypted-format-root"),
+            PutOptions {
+                retention: Some(retention),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .expect("format root should write");
+    options.format_ref.version_id = format_metadata.version_id;
+    options.maintenance_keyring_envelope_ref = Some(V2KeyringEnvelopeRootRef {
+        generation: 1,
+        digest: hex::encode(options.keyring_envelope_ref.digest),
+        object_id: options.keyring_envelope_ref.object_id.clone(),
+        version_id: keyring_metadata.version_id,
+    });
+    let anchor = V2MemoryAnchor::new();
+    let setup = V2CommitStore::new(inner.clone(), keyring.clone(), options.clone());
+    let genesis = setup
+        .write_genesis_snapshot(&anchor)
+        .await
+        .expect("retained genesis should write");
+    let orphan =
+        object_id("commits/v02/00000000000000000099/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    inner
+        .put(
+            &orphan,
+            Bytes::from_static(b"delete only after renewal"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("orphan should write");
+    let store = FaultInjectingBlobStore::new(
+        inner.clone(),
+        vec![FaultRule::new(
+            FaultMatcher::operation(FaultOperationKind::ExtendRetentionAt),
+            FaultAction::error_after_write("ambiguous retention renewal"),
+        )],
+    );
+    let repository = V2CommitStore::new(store, keyring, options);
+    let result = repository
+        .apply_full_gc(
+            &anchor,
+            &UnenforcedQuiescedMaintenanceGuard,
+            V2FullGcApplyOptions {
+                dry_run: V2FullGcDryRunOptions {
+                    budgets: V2MaintenanceBudgets {
+                        max_retention_extend_count: Some(3),
+                        ..V2MaintenanceBudgets::default()
+                    },
+                    retention_renewal_horizon: Duration::from_secs(2 * 24 * 60 * 60),
+                    ..V2FullGcDryRunOptions::default()
+                },
+                orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+                retained_provider_conformance_passed: true,
+            },
+        )
+        .await;
+    assert_eq!(result, Err(V2FormatError::StorageOperationFailed));
+    assert!(inner.head(&orphan).await.is_ok());
+    let exact = inner
+        .head_at(&genesis.commit_key.object_id, genesis.version_id.as_ref())
+        .await
+        .expect("ambiguous renewal may safely have strengthened exact retention");
+    assert_eq!(
+        exact.retention,
+        Some(RetentionPolicy::new(RetentionMode::Compliance, 1))
+    );
 }
 
 #[tokio::test]
