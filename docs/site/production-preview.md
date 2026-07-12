@@ -15,7 +15,7 @@ repository-format promise.
     payload-skipping replay, guarded metadata-only packed-run compaction, and
     automatic active-run watermarks. Existing compatibility and provider
     results are useful gateway regression evidence, but protection cohorts,
-    complete GC, framed streaming, the pinned fresh-process filesystem lane,
+    complete GC, framed streaming, pinned-runner filesystem qualification,
     retained-provider reruns, and external review still block the complete `v02` format and a
     production repository release. There will be no `v01` migration or
     dual-reader requirement.
@@ -236,7 +236,8 @@ At a glance:
 
 | Evidence | Result |
 | --- | --- |
-| Current v02 bounded-compaction scale lane | Passed three automatic-compaction release runs on 2026-07-12 with 1,000,000 512 B objects, batch and concurrency 1,024. Elapsed was 40.579 s, 40.743 s, and 41.200 s; checkpoint time was 1.972 ms, 2.181 ms, and 4.308 ms; reload time was 6.412 s, 6.752 s, and 6.955 s. Every run recorded 1,008 PUTs, 3,433 GETs, 806 HEADs, 1.602593008x write amplification, 233 recovered active runs, peak RSS between 2,197,200,896 and 2,197,594,112 B including the in-memory backend, and one exact `GET` at 1.03125x per cold sentinel. This satisfies the current 180-second write/checkpoint, 30-second reload, 4 GiB, 1.65x, 255-run, and direct-read ceilings. |
+| Current v02 bounded-compaction scale lane | Revision `7023c65` passed three automatic-compaction release runs on 2026-07-12 with 1,000,000 512 B objects. Elapsed was 39.135-45.049 s, recovery was 6.364-7.822 s, and total reload was 6.391-7.863 s. Every run recorded 1,008 PUTs, 3,433 GETs, 806 HEADs, 1.602593008x write amplification, 233 active runs, peak RSS of 1,953,574,912-1,953,808,384 B including the in-memory backend, and one exact `GET` at 1.03125x per cold sentinel. |
+| Current local fresh-process filesystem lane | The same revision passed three controlled local-filesystem 1M runs. Writer elapsed was 44.707-46.835 s and RSS was 957,411,328-958,234,624 B; fresh-reader recovery was 6.009-6.607 s, verification was 6.047-6.647 s, and RSS was 1,137,709,056-1,138,118,656 B. Every run recovered the exact million entries and 233 runs at 1.602544232x write amplification. These repository-process values exclude an in-memory backend; this is not pinned-runner timing, an HTTP gateway measurement, or provider qualification. |
 | Current local v02 release gate | Passed on 2026-07-11 with `just preview-gate-release` after the framed stream-carrier changes. Direct Kopia gateway backup/restore passed. A fresh kind cluster completed Velero dynamic-PVC backup, deleted the source namespace, restarted and recovered the gateway, restored the PVC, and verified the restored pod before cleanup. A second fresh kind cluster completed Velero/Postgres backup, source deletion, restore, pod readiness, and database-content verification before cleanup. The gate also exposed and repaired a stale Helm integration fixture that omitted the now-required local admin token. |
 | Live retained-backend v2 preview gate | Passed on 2026-05-18 with `just preview-gate-v2-live`. S3 gateway/tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes all passed against fresh opaque backend prefixes. |
 | Live retained-backend v2 GC rehearsal | Passed on 2026-05-21 with `just v2-gc-rehearsal-live` against a fresh Object Lock prefix. The dry run found two orphan candidates, planned one exact-version delete, treated the retained orphan as protected, applied one unprotected exact-version delete, left the protected candidate blocked, and reloaded the anchor-selected chain. |
@@ -392,8 +393,9 @@ bounded passes, selecting at most the oldest 128 level-0 runs while preserving
 newer level-0 and existing level-1 shards. A missing guard or fully validated
 nonreducing bounded plan may defer and retry at later 64-run boundaries; both
 block writes at 896. Configured-guard, corruption, storage, anchor, and other
-compaction errors poison immediately. Pinned fresh-process filesystem evidence
-and retained-provider restart/fault qualification remain outstanding.
+compaction errors poison immediately. Three local controlled-filesystem runs
+now qualify the fresh-process mechanism and independent writer/reader RSS.
+Pinned-runner timing and retained-provider restart/fault qualification remain.
 
 - finish qualification of the integrated canonical `INDEX_RUN` codec and small
   signed `INDEX_ROOT` catalogs under `commits/v02`;

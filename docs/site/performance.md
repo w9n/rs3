@@ -109,28 +109,50 @@ and length fields, and validates catalog-only rewrites by reading back the exact
 signed root and new run bytes. It does not rebuild a second complete namespace
 to prove that an immutable catalog still names the same state.
 
-On 2026-07-12 the automatic-compaction 1M lane passed three release
-runs with 512 B values, batch and concurrency 1,024, the 180-second elapsed
-gate, a 30-second same-process reload gate, and the 4 GiB process high-water
-gate:
+On 2026-07-12 the automatic-compaction 1M lane at revision `7023c65`
+passed three release runs with 512 B values, batch and concurrency 1,024, the
+180-second elapsed gate, a 30-second same-process reload gate, and the 4 GiB
+process high-water gate:
 
-| Run | Elapsed | Checkpoint | Fresh reload | Peak RSS | PUT | GET | HEAD | Active runs | Write amp | Cold read |
+| Run | Elapsed | Recovery | Reload total | Peak RSS | PUT | GET | HEAD | Active runs | Write amp | Cold read |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 40.579 s | 1.972 ms | 6.412 s | 2,197,200,896 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
-| 2 | 40.743 s | 2.181 ms | 6.752 s | 2,197,594,112 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
-| 3 | 41.200 s | 4.308 ms | 6.955 s | 2,197,561,344 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
+| 1 | 39.135 s | 7.559 s | 7.587 s | 1,953,775,616 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
+| 2 | 45.049 s | 7.822 s | 7.863 s | 1,953,808,384 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
+| 3 | 42.664 s | 6.364 s | 6.391 s | 1,953,574,912 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
 
 Each run performed six bounded metadata-only compactions, reloaded exactly one
 million entries through a new repository instance, and verified the first,
 middle, and last payload. The v02 accepted state no longer derives or retains
 the legacy prefix-token projection because v02 listing uses its separate
-trusted path-ordered projection. Against a same-host 100k pre-change sample,
-that reduced peak RSS from 282,611,712 B to 217,219,072 B and reload from
-823.807 ms to 549.552 ms without changing backend bytes, request counts, run
-count, or cold-read shape. The in-memory scale process also retains the complete
-simulated backend, so its high-water mark is not gateway-only memory. These
-same-process results close the automatic-compaction resource gate, but do not
-replace the pinned fresh-process filesystem lane.
+trusted path-ordered projection. Ordered path keys and exact carrier facts are
+structurally shared; records from one authenticated container retain one
+carrier allocation while preserving the exact serialized representation and
+authentication inputs. A same-host 100k sample moved from 282,611,712 B and
+823.807 ms reload before these changes to 193,286,144 B and 468.2 ms. The prior
+1M evidence peaked at 2,197,200,896-2,197,594,112 B; the final runs above
+peaked at 1,953,574,912-1,953,808,384 B. Backend bytes, request counts,
+recovered run count, and cold-read shape remained exact. The in-memory scale
+process also retains the complete simulated backend, so its high-water mark is
+not gateway-only memory.
+
+The same revision also passed three local controlled-filesystem runs with a
+writer process that exited before a fresh reader process started:
+
+| Run | Writer elapsed | Checkpoint | Writer RSS | Reader recovery | Reader verification | Reader RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 46.623 s | 7.546 ms | 958,234,624 B | 6.094 s | 6.136 s | 1,138,118,656 B |
+| 2 | 44.707 s | 7.157 ms | 957,411,328 B | 6.607 s | 6.647 s | 1,137,709,056 B |
+| 3 | 46.835 s | 8.062 ms | 957,632,512 B | 6.009 s | 6.047 s | 1,138,057,216 B |
+
+Every filesystem run recovered exactly 1,000,000 entries and 233 active runs,
+then verified the first, middle, and last payload with one exact range `GET`
+and 1.03125x byte amplification per read. Each recorded 1,008 PUTs, 3,433 GETs,
+806 HEADs, 820,502,647 B written, 258,733,774 B read, and 1.602544232x write
+amplification. This qualifies separate-process recovery and repository-process
+RSS excluding an in-memory backend on that local filesystem. It is not an HTTP
+gateway measurement, the pinned release-runner timing qualification, or a
+retained-provider qualification, and the fresh process does not imply a cold
+kernel page cache.
 
 The current layout removes the pack directory:
 encrypted `INDEX_RUN` state authenticates the record's exact physical offset,

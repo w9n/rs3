@@ -60,9 +60,9 @@ not add ad hoc hashing, MAC, encryption, or key derivation logic.
     Known-length, unknown-length, and zero-length streaming writes publish the
     canonical `[PAYLOAD, INDEX_RUN]` shape and participate in the same catalog,
     compaction, and GC graph. Payload protection cohorts, complete
-    retained-provider GC qualification, and the pinned fresh-process filesystem
-    lane remain release blockers. The current automatic-compaction 1M in-memory
-    gate passes.
+    retained-provider GC qualification, and pinned-runner filesystem
+    qualification remain release blockers. The current automatic-compaction 1M
+    in-memory gate and three local separate-process filesystem runs pass.
 
 Normal writes are append-friendly and value-separated:
 

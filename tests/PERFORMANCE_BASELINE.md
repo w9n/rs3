@@ -187,25 +187,40 @@ level-1 shards. Scale reports include `active_index_runs` after fresh recovery
 and fail above 255 after the final checkpoint. The harness also records process
 high-water RSS and aggregates all gate failures after printing the report.
 
-On 2026-07-12 the lane passed three release runs with 1,000,000
-512 B objects, batch and concurrency 1,024:
+On 2026-07-12 revision `7023c65` passed three release runs with
+1,000,000 512 B objects, batch and concurrency 1,024:
 
-| Run | Elapsed | Checkpoint | Reload | Peak RSS | PUT | GET | HEAD | Active runs | Write amplification | Cold read |
+| Run | Elapsed | Recovery | Reload total | Peak RSS | PUT | GET | HEAD | Active runs | Write amplification | Cold read |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 40.579 s | 1.972 ms | 6.412 s | 2,197,200,896 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
-| 2 | 40.743 s | 2.181 ms | 6.752 s | 2,197,594,112 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
-| 3 | 41.200 s | 4.308 ms | 6.955 s | 2,197,561,344 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
+| 1 | 39.135 s | 7.559 s | 7.587 s | 1,953,775,616 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
+| 2 | 45.049 s | 7.822 s | 7.863 s | 1,953,808,384 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
+| 3 | 42.664 s | 6.364 s | 6.391 s | 1,953,574,912 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
 
 Every run performed six bounded metadata-only compactions, passed the
 180-second write/checkpoint, 30-second reload, and 4 GiB resource ceilings,
 recovered exactly one million list entries, and verified first, middle, and last
-payload bytes. Removing the unused v02 prefix-token projection reduced a
-same-host 100k sample from 282,611,712 B to 217,219,072 B peak RSS and from
-823.807 ms to 549.552 ms reload time while backend bytes, request counts, run
-count, and cold-read shape remained exact. The process high-water values include
-the complete in-memory backend, not only trusted gateway state. These results
-cover the same-process in-memory lane; the pinned fresh-process filesystem gate
-remains.
+payload bytes. Removing the unused v02 prefix-token projection, sharing ordered
+path keys, and structurally sharing exact carrier facts reduced a same-host
+100k sample from 282,611,712 B to 193,286,144 B peak RSS and from 823.807 ms to
+468.2 ms reload. The process high-water values include the complete in-memory
+backend, not only trusted gateway state.
+
+The same revision passed three controlled local-filesystem runs with separate
+writer and fresh reader processes:
+
+| Run | Writer elapsed | Checkpoint | Writer RSS | Reader recovery | Reader verification | Reader RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 46.623 s | 7.546 ms | 958,234,624 B | 6.094 s | 6.136 s | 1,138,118,656 B |
+| 2 | 44.707 s | 7.157 ms | 957,411,328 B | 6.607 s | 6.647 s | 1,137,709,056 B |
+| 3 | 46.835 s | 8.062 ms | 957,632,512 B | 6.009 s | 6.047 s | 1,138,057,216 B |
+
+Every filesystem run recovered the exact million entries and 233 active runs,
+and retained the one-GET, 1.03125x cold-read shape. Counts were 1,008 PUTs,
+3,433 GETs, and 806 HEADs; the backend recorded 820,502,647 B written,
+258,733,774 B read, and 1.602544232x write amplification. This is local
+separate-process repository RSS excluding an in-memory backend, not an HTTP
+gateway measurement, pinned release-runner timing, or retained-provider
+qualification.
 
 ### Payload-size evidence
 

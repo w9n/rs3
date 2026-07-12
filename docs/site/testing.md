@@ -39,8 +39,8 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | 10k object scale gate | `just perf-scale-10k` | Three release-binary committed-write runs. Every run publishes a final signed checkpoint, discards writer state, reloads through a new repository instance, checks exact list cardinality, reads the first, middle, and last payload, and enforces the 1.65x lifetime write gate, 30-second reload ceiling, 1.04x cold-read byte amplification, one backend request per sentinel read, and at most 255 recovered active index runs. Runs on every CI change. |
 | 100k object scale gate | `just perf-scale-100k` | Release-binary 1,024-item bulk tier with the same final-checkpoint, recovery, cardinality, amplification, direct cold-read, and active-run-count checks. |
 | 270k bounded-compaction evidence | `just perf-scale-tier 270000` | Crosses the 256-run watermark with the 1,024-item bulk tier and applies the lifetime amplification, 180-second elapsed, 4 GiB peak-RSS, recovery, cold-read, and active-run gates. The final post-remediation sample completed in 11.655 s at 758,521,856 B peak RSS, 1.505740509x amplification, and 140 recovered runs. |
-| 1M object scale gate | `just perf-scale-1m` | Manual in-memory high-capacity tier with the same checks. Three 2026-07-12 release runs passed at 40.579-41.200 s, 2,197,200,896-2,197,594,112 B process peak RSS including the in-memory backend, 1.602593008x amplification, and 233 recovered runs. Final qualification still requires a fresh-process filesystem run on the pinned runner. |
-| Fresh-process filesystem scale gates | `just perf-scale-fs-10k <root>`, `just perf-scale-fs-100k <root>`, `just perf-scale-fs-1m <root>` | Runs the release writer and reader as separate processes over an explicitly selected local filesystem. The writer persists a versioned trusted-anchor handoff outside the backend root and exits before the reader starts. Evidence retains both process reports, independent peak RSS and elapsed gates, exact cardinality, active runs, first/middle/last payload verification, isolated cold-read counters, the backend directory, and basic runner metadata. |
+| 1M object scale gate | `just perf-scale-1m` | Manual in-memory high-capacity tier with the same checks. Three 2026-07-12 runs at revision `7023c65` passed at 39.135-45.049 s, 1,953,574,912-1,953,808,384 B process peak RSS including the in-memory backend, 1.602593008x amplification, and 233 recovered runs. |
+| Fresh-process filesystem scale gates | `just perf-scale-fs-10k <root>`, `just perf-scale-fs-100k <root>`, `just perf-scale-fs-1m <root>` | Runs release writer and reader processes over an explicitly selected filesystem. Three local controlled-filesystem 1M runs at revision `7023c65` passed with 957,411,328-958,234,624 B writer RSS, 1,137,709,056-1,138,118,656 B reader RSS, 6.009-6.607 s recovery, exact cardinality, 233 active runs, and exact sentinel reads. These repository-process values exclude an in-memory backend; this is not pinned-runner timing, an HTTP gateway measurement, or provider qualification. |
 | Kopia measured matrix | `cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix --runs 3 --profile-set larger-restores --gateway-build-profile release --enforce-regression-budgets` | Release-grade Kopia restore comparison against the straight RustFS proxy baseline with current gateway defaults. |
 
 Expensive lanes emit artifacts under `.local/integration/` by default.
@@ -73,8 +73,9 @@ level-0 and prior level-1 shards. A missing guard or fully validated
 nonreducing bounded plan may defer and retry at later 64-run boundaries before
 pausing at 896. Configured-guard, corruption, storage, anchor, and other
 compaction errors poison immediately. The three passing 1M runs cover six such
-passes and finish with 233 authenticated runs. These in-memory lanes do not
-replace the fresh-process filesystem/RSS gate.
+passes and finish with 233 authenticated runs. The local controlled-filesystem
+1M lane also passes three times; release timing still requires the documented
+pinned runner.
 
 The filesystem lane proves a fresh application process with empty rs3 caches;
 it does not claim a cold kernel page cache. Use a pinned local-disk mount rather
