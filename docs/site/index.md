@@ -67,8 +67,10 @@ the exact payload ciphertext range without first reading pack metadata.
 Existing gateway and provider results remain regression evidence. Guarded
 compaction and automatic watermarks now pass the in-memory 1M resource gate, but
 a repository release remains blocked on retained-provider restart/fault gates,
-complete GC and protection-cohort behavior, external review, and the pinned
-fresh-process 1M filesystem lane. No `v01` migration or dual reader is planned.
+an operator-safe maintenance controller, external review, and the pinned
+fresh-process 1M filesystem lane. New writes already isolate effective
+protection cohorts, and the exact full-GC engine renews restore dependencies
+before guarded orphan deletion. No `v01` migration or dual reader is planned.
 
 Do not treat the current repository format, cryptographic formats, or runtime
 defaults as production-stable yet.

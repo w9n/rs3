@@ -5,8 +5,8 @@ records the researched extension boundary so storage savings do not quietly
 weaken path privacy, confidentiality, retention, or restore correctness.
 
 !!! warning "Research status"
-    Land compact payload packs, framed index runs, signed catalogs, exact-root
-    GC, protection cohorts, cleaning, and the stable scale gates first. The
+    Finish mixed-pack cleaning, the operator maintenance controller, and the
+    stable retained-provider scale gates first. The
     modes below are not implemented or configurable. Enabling one will require
     a new format capability, security review, and workload evidence.
 

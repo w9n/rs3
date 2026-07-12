@@ -12,7 +12,7 @@ reports, and stored metadata remain path-private.
 | `HeadBucket` | Implemented | Accepts only the configured public bucket. | Basic SDK bucket probes work. |
 | `ListBuckets` | Implemented | Returns the configured public bucket. | Basic SDK account probes work without exposing backend buckets. |
 | `GetBucketLocation` | Implemented | Returns the configured S3 region. | SDK region discovery works for the served bucket. |
-| `PutObject` | Implemented | Supports normal writes, create-only `If-None-Match: *`, Object Lock retention headers, legal-hold-on headers, bounded buffering, and concurrent declared-length large bodies through backend multipart standalone payloads followed by fenced publication. Rejects append offsets and unsupported conditionals. | Kopia, Velero, and single-stream upload clients can write through the gateway within configured size and admission budgets. |
+| `PutObject` | Implemented | Supports normal writes, create-only `If-None-Match: *`, qualified Object Lock retention headers, bounded buffering, and concurrent declared-length large bodies through backend multipart standalone payloads followed by fenced publication. Per-request retention is rejected unless the repository uses the retained-version profile. Legal-hold headers, append offsets, and unsupported conditionals are rejected before repository mutation. | Kopia, Velero, and single-stream upload clients can write through the gateway within configured size and admission budgets. |
 | `HeadObject` | Implemented | Returns metadata, ETag, length, last-modified, and supported Object Lock headers. Rejects object versions and part-number metadata probes. | Metadata-only probes work without reading payload bytes. |
 | `GetObject` | Implemented | Supports full-object and byte-range reads. Rejects object versions and part-number reads. | Restore clients can perform full and ranged reads. |
 | `ListObjects` | Implemented | Supports prefix, delimiter, marker, and bounded result pages. | Older S3 clients can list logical prefixes. |
@@ -20,7 +20,7 @@ reports, and stored metadata remain path-private.
 | `DeleteObject` | Implemented | Performs a logical tombstone commit. Rejects versioned and conditional deletes. | Clients can delete current logical objects; retained backend versions remain protected until maintenance can remove eligible garbage. |
 | `DeleteObjects` | Implemented | Performs per-key logical tombstone commits, returns per-key `Deleted` or `Error` entries, and honors quiet mode. Versioned or conditional entries return per-key errors. | Batch-delete clients such as barman-cloud can clean up logical keys without losing per-object failure detail. |
 | `GetObjectLegalHold` | Implemented | Reads the current logical object's legal-hold status. Rejects versioned reads. | Object Lock aware clients can inspect legal hold. |
-| `PutObjectLegalHold` | Partial | Allows setting legal hold on. Clearing legal hold is refused. Rejects versioned writes. | Operators can add protection through S3-compatible clients; release remains a backend/operator maintenance action. |
+| `PutObjectLegalHold` | Not implemented | Both setting and clearing legal hold are refused for v02. Restore dependencies do not yet have a complete hold-propagation and guarded-release lifecycle. | Clients must use finite repository retention; legal-hold publication is unavailable in the preview. |
 
 ## Guarded Partials
 
@@ -28,7 +28,7 @@ reports, and stored metadata remain path-private.
 | --- | --- | --- |
 | Restore-readonly mode | Rejects mutating operations including `PutObject`, `PutObjectLegalHold`, `DeleteObject`, and `DeleteObjects`. | Restore gateways can serve reads without accepting repository mutations. |
 | Object versions | Provider version IDs protect repository internals, but client-facing versioned object operations are not supported. | Clients must address the current logical object, not S3 object versions. |
-| Object Lock retention | `PutObject` accepts retention headers and repository retention can strengthen backend commit protection. Client-facing retention mutation APIs are not implemented. | Retention is configured at the gateway and write path, not by later client-side release or shortening. |
+| Object Lock retention | `PutObject` accepts retention headers only when startup selected and qualified the retained-version profile. An AtomicCreate or development repository cannot be upgraded by one request. Repository retention can strengthen backend commit protection; client-facing retention mutation APIs are not implemented. | Retention is configured at repository initialization or supplied on a qualified retained write, not by later client-side release or shortening. |
 | Client multipart upload | Not implemented. Large `PutObject` streams may still use backend multipart internally. | Clients that require S3 multipart upload APIs must use single-stream upload mode or stay under `RS3_MAX_PUT_OBJECT_BYTES`. |
 
 ## Explicitly Not Implemented

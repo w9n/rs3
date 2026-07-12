@@ -57,19 +57,23 @@ not add ad hoc hashing, MAC, encryption, or key derivation logic.
     new compacted run before anchor adoption. They also drive exact maintenance
     reachability. Guarded metadata-only compaction and automatic active-run
     watermarks are implemented for packed and streamed payload carriers.
-    Known-length, unknown-length, and zero-length streaming writes publish the
-    canonical `[PAYLOAD, INDEX_RUN]` shape and participate in the same catalog,
-    compaction, and GC graph. Payload protection cohorts, complete
-    retained-provider GC qualification, and pinned-runner filesystem
-    qualification remain release blockers. The current automatic-compaction 1M
+    Unknown-length and zero-length streaming writes publish the canonical
+    `[PAYLOAD, INDEX_RUN]` shape. Large known-length requests publish an opaque
+    standalone payload carrier plus a short `[INDEX_RUN]` commit containing its
+    encrypted exact reference. Both participate in the same catalog, compaction,
+    and GC graph. New bounded writes are partitioned by effective protection
+    cohort, and guarded full GC renews exact restore dependencies before orphan
+    deletion. Retained-provider restart/fault qualification and pinned-runner
+    filesystem qualification remain release blockers. The current automatic-compaction 1M
     in-memory gate and three local separate-process filesystem runs pass.
 
 Normal writes are append-friendly and value-separated:
 
 1. Put every non-empty bounded value in the batch into one encrypted payload
    pack and stage one compact framed binary index run. Empty bounded values are
-   index-only. A genuinely streamed request instead writes one encrypted
-   `PAYLOAD` followed by its `INDEX_RUN`, including for a zero-length stream.
+   index-only. An unknown-length or zero-length streamed request instead writes
+   one encrypted `PAYLOAD` followed by its `INDEX_RUN`; large known-length
+   requests use the standalone carrier flow described below.
 2. Publish a signed `v02` commit under a random path-private key.
 3. Advance the external commit anchor.
 4. Acknowledge the client write only after the covering commit is accepted.
@@ -104,8 +108,7 @@ payload ciphertext.
 
 For a known-length large request, the preview instead uploads one encrypted
 segmented `objects/v02/` carrier outside the publication lock. It verifies the
-completed exact version, length, post-completion retention horizon, legal-hold
-state, EOF, and full ciphertext
+completed exact version, length, post-completion retention horizon, EOF, and full ciphertext
 digest before a short fenced commit publishes the encrypted reference. This
 allows distinct large uploads to overlap while keeping repository ordering at
 one atomic anchor transition per mutation. Cancellation before unambiguous
@@ -113,6 +116,11 @@ multipart completion aborts the upload. Ambiguous completion, create-only
 races, or anchor failure can leave an invisible opaque orphan, which guarded
 maintenance reports and later reclaims. Same-process GC excludes registered
 in-flight carriers even with a zero minimum age.
+
+The v02 preview does not publish new legal holds. It rejects client hold
+requests until every catalog, chain, format, and keyring dependency can be held
+and later released through one guarded lifecycle. The storage conformance layer
+still tests provider legal-hold mechanics independently.
 
 The gateway does not deduplicate payloads. Deduplication would add equality
 leakage and shared-liveness policy; Kopia already performs chunking and

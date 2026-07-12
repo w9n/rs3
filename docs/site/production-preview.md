@@ -14,9 +14,10 @@ repository-format promise.
     `commits/v02` envelope with framed index runs, signed catalogs,
     payload-skipping replay, guarded metadata-only packed-run compaction, and
     automatic active-run watermarks. Existing compatibility and provider
-    results are useful gateway regression evidence, but protection cohorts,
-    complete GC, pinned-runner filesystem qualification, retained-provider
-    streaming reruns, and external
+    results are useful gateway regression evidence. New-write protection
+    cohorts and exact guarded full GC are implemented locally, but a production
+    maintenance controller, pinned-runner filesystem qualification,
+    retained-provider restart/fault reruns, and external
     review still block the complete `v02` format and a production repository
     release. There will be no `v01` migration or
     dual-reader requirement.
@@ -245,9 +246,10 @@ At a glance:
 | --- | --- |
 | Current v02 low-amplification scale lane | Revision `b8b78be` passed three wire-v6 release runs on 2026-07-12 using 4,096-record batches with 1,000,000 unique 512 B objects. Elapsed was 44.639-45.553 s, recovery was 5.013-5.101 s, and total reload was 5.051-5.141 s. Every run recorded 246 PUTs, 253 GETs, 248 HEADs, 1.268292436x write amplification, 245 active runs, peak RSS of 1,680,826,368-1,681,162,240 B including the in-memory backend, and one exact `GET` at 1.03125x per cold sentinel. |
 | Current local fresh-process filesystem lane | Revision `b8b78be` passed three wire-v6 ext4 1M runs using separate writer and reader processes. Writer elapsed was 47.488-48.313 s and RSS was 955,772,928-956,428,288 B; fresh-reader recovery was 5.389-5.558 s, verification was 5.426-5.594 s, and RSS was 1,009,971,200-1,010,356,224 B. Every run recovered the exact million entries and 245 runs at 1.268284240x write amplification. These repository-process values exclude an in-memory backend. This is not pinned-runner timing, an HTTP gateway measurement, or provider qualification. |
-| Current standalone S3 and gateway lane | Revision `b8b78be` passed an eight-writer direct S3 run against disposable MinIO in 2.106 s at 243.15 MiB/s, with exactly 8 creates, 40 parts, 8 completes, 1.000269x writes, fresh reload, and exact full reads. After the host bridge was repaired, the exact `just perf-standalone-gate` recipe passed against disposable RustFS on 2026-07-12. Release-gateway throughput at concurrency 1/2/4/8 was 105.41/178.86/315.16/432.66 MiB/s, or 4.10x scaling from one to eight writers. Every point stayed at 1.000270x writes and 2.000515x total verified I/O. The direct companion recorded exactly 8 creates, 40 parts, 8 completes, no aborts, fresh reload, and exact full reads at 258.23 MiB/s. |
+| Current standalone S3 and gateway lane | The corrected equal-work `just perf-standalone-gate` passed against disposable RustFS on 2026-07-12 with eight 67,108,865 B objects at every concurrency. Release-gateway throughput at concurrency 1/2/4/8 was 110.90/192.16/295.27/411.74 MiB/s, or 3.71x scaling from one to eight writers. Every point stayed at 1.000270x writes, 1.000246x verification reads, and 2.000515x total verified I/O. Peak RSS was 247,099,392/367,484,928/603,152,384/939,343,872 B. The direct companion recorded exactly 8 creates, 40 parts, 8 completes, no aborts, fresh reload, and one exact full read per object at 266.25 MiB/s. |
 | Current bounded full-restore HTTP lane | Revision `c51aa24` passed three release-gateway runs of three complete 256 MiB restores. Average read latency was 581.727-664.972 ms, plaintext throughput was 373.240-428.565 MiB/s, gateway peak RSS was 564,342,784-564,801,536 B including the in-process ciphertext backend and preceding upload, and every restore used one backend GET at 1.000244420x read amplification. This qualifies the real HTTP path and child-process accounting, not external-provider memory behavior. |
 | Most recent local v02 release gate | On 2026-07-12 the current candidate passed every local release-gate component individually: the exact standalone performance gate, direct Kopia gateway backup/restore, a fresh-kind Velero/Kopia dynamic-PVC backup plus forced gateway restart and restore, and the Velero/Postgres backup and database restore. The dynamic-PVC lane installed disposable RustFS, rs3, OpenEBS, and Velero, deleted the source namespace, proved the replacement gateway container had never restarted, restored the namespace, and verified the restored pod bytes. This is local disposable-backend evidence, not retained-provider or pinned-runner qualification. |
+| Current local retained-version and exact-GC gate | `just preview-gate-v2-retained-local` passed against disposable Object-Lock-enabled RustFS on 2026-07-12. Storage retention, legal hold, exact-version reads, version-delete blocking, and retained multipart passed. The isolated GC rehearsal created real encrypted keyring and format roots, planned 17 requests, renewed and verified three exact live versions covering 15,117 B, deleted one unprotected exact orphan, preserved one retained orphan, then reopened both authority roots and replayed the anchor-selected chain with a fresh repository. The gateway retention smoke also passed. This is local provider evidence, not the required external retained-provider restart/fault rerun. |
 | Live retained-backend v2 preview gate | Passed on 2026-05-18 with `just preview-gate-v2-live`. S3 gateway/tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes all passed against fresh opaque backend prefixes. |
 | Live retained-backend v2 GC rehearsal | Passed on 2026-05-21 with `just v2-gc-rehearsal-live` against a fresh Object Lock prefix. The dry run found two orphan candidates, planned one exact-version delete, treated the retained orphan as protected, applied one unprotected exact-version delete, left the protected candidate blocked, and reloaded the anchor-selected chain. |
 | Live retained-backend v2 DR anchor import/export | Passed on 2026-05-18 against fresh v2 Velero dynamic-PVC gateway-restart output. The source backup/restore lane passed, the source bundle verified 34 commits, a new kind cluster with a missing Lease rejected import when the retention context was omitted, import with governance retention recreated the Lease, and the recovered bundle verified the same anchor. |
@@ -408,24 +410,31 @@ Pinned-runner timing and retained-provider restart/fault qualification remain.
 
 - finish qualification of the integrated canonical `INDEX_RUN` codec and small
   signed `INDEX_ROOT` catalogs under `commits/v02`;
-- finish protection-cohort behavior for the integrated ciphertext-only
-  `PAYLOAD_PACK` codec and authenticated direct record descriptors;
+- qualify the implemented effective-protection cohort partitioning for the
+  integrated ciphertext-only `PAYLOAD_PACK` codec on retained providers;
 - qualify descriptor-first bounded recovery across the guarded compacted-run
   sibling publication path;
 - keep one accepted repository state plus a bounded pending mutation overlay;
 - qualify bounded fenced automatic compaction from the 256-run request
   watermark through missing-guard 64-run retries and the 896-run pause, before
   the 1,024-run ceiling;
-- make maintenance mark exact catalog, run, and effective payload versions
-  without recursively retaining entire payload commit ancestry;
+- ship an operator-safe maintenance controller around the implemented single-plan
+  exact mark, restore-dependency renewal, and orphan apply engine;
+- qualify bounded paged inventory at production cardinality and expose its page
+  and item ceilings through the maintenance controller;
+- implement dependency-wide legal-hold propagation plus guarded release before
+  enabling v02 client holds;
+- implement cross-format protected-root renewal before allowing format/keyring
+  rotation while historical protected roots remain;
 - pass fresh-process committed-write recovery at 10k, 100k, and 1M objects,
   including exact cardinality, at most 255 recovered active runs after the
   final checkpoint, and first, middle, and last payload verification;
 - enforce the small-object write-amplification ceilings in the performance
   reference, enforce one-request direct cold reads and their byte ceiling, and
   keep separate raw-S3 and real Kopia/Velero tiny-file lanes;
-- prove payload-pack reachability and cleaning across tombstones, protected
-  historical roots, retention, legal hold, and interrupted repacks;
+- qualify payload-pack cleaning across tombstones, protected historical roots,
+  retention, legal hold, and interrupted repacks before promising prompt space
+  reclamation;
 - qualify exact compacted sibling-carrier versions, restart, checkpoint crash, stale
   fencing, delayed visibility, retention renewal, and writer handoff on a real
   retained provider;

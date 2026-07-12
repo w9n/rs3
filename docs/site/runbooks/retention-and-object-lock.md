@@ -38,11 +38,28 @@ Needed: A retain until at least Day 50
 The gateway must extend reused objects and must never shorten retention. If the
 provider cannot extend retention, protected writes fail.
 
-v2 maintenance now reports when current or protected historical-root commit
-versions should have retention renewed soon. That renewal is still a planned
-operator fact, not an automatic mutating maintenance action. Keep object-store
-retention windows long enough to cover the operational gap until mutating
-renewal is implemented.
+v2 full-GC maintenance reports when current or protected historical-root
+versions need renewal. A guarded apply renews and verifies the exact catalog,
+run, payload, format-root, and keyring-envelope versions before it attempts any
+orphan deletion. It consumes inventory through bounded provider pages, uses one
+immutable plan, and fails closed when a page/item budget, exact authority root,
+or protection fact is unavailable.
+The preview library defaults to at most 4,096 inventory pages and 2,000,000
+object/version entries per plan. The future operator controller must expose
+these ceilings and require an explicit increase for larger repositories.
+
+All protected historical roots in one maintenance run must reference the
+active exact format root. Do not omit an older-format protected root to make GC
+pass. Freeze rotation and destructive maintenance until that root is retired or
+exported; cross-format renewal is not implemented. v02 also rejects new client
+legal holds and refuses full maintenance for an existing held graph until
+dependency-wide hold propagation and guarded release are implemented.
+
+Renewal is not a background service yet. Keep Object Lock windows longer than
+the maximum interval between guarded maintenance runs plus the maximum outage
+and incident-response interval. A failed apply may already have strengthened
+some exact versions; retention extension is intentionally irreversible and the
+run must be retried from a new dry run.
 
 v2 compaction can rewrite the current live namespace into a protected snapshot
 commit after verifying that snapshot with a fresh reader. Old source commits are

@@ -4,8 +4,9 @@ The repository format is draft. This page is the design contract for
 `commits/v02`. It is not a compatibility promise. The gateway reads and writes
 bounded payload packs, encrypted index runs, signed index-root checkpoints, and
 canonical framed streamed payloads with guarded metadata-only compaction.
-Protection cohorts, complete retained-provider GC qualification, and final
-qualification are not complete.
+New bounded writes are partitioned by effective protection cohort, and exact
+full-GC planning plus guarded retention renewal are implemented. Live-provider
+restart/fault qualification and final release qualification are not complete.
 
 !!! warning "Implementation status"
     `commits/v01` has been removed and is unsupported. No production repository
@@ -14,11 +15,12 @@ qualification are not complete.
     digest. Bounded normal writes use ciphertext-only `PAYLOAD_PACK` sections,
     authenticated `INDEX_RUN` record descriptors, and signed `INDEX_ROOT`
     checkpoints; recovery rebuilds namespace state without reading payload
-    ciphertext. Known-length, unknown-length, and zero-length streams use
-    `[PAYLOAD, INDEX_RUN]`, and exact stream carriers survive checkpoints,
-    metadata-only compaction, and GC marking. Guarded compaction and automatic
-    active-run watermarks are implemented. Protection cohorts, complete
-    retained-provider GC qualification, and final recovery qualification remain.
+    ciphertext. Unknown-length and zero-length streams use
+    `[PAYLOAD, INDEX_RUN]`; large known-length writes use a standalone
+    `objects/v02` payload plus `[INDEX_RUN]`. Exact stream carriers survive
+    checkpoints, metadata-only compaction, and GC marking. Guarded compaction,
+    automatic active-run watermarks, and new-write protection cohorts are
+    implemented. Live retained-provider and final recovery qualification remain.
     Until those gates pass, the runtime is evaluation-only.
 
 ## Invariants
@@ -201,6 +203,8 @@ Retention and legal hold apply to the physical containing object. Batches must
 therefore use one protection cohort, or be partitioned by retention mode,
 retain-until horizon, and legal-hold requirement. Reusing or repacking a value
 must never weaken the strongest logical protection that reaches it.
+The format retains the hold dimension for fail-closed parsing of historical
+state, but the v02 gateway currently rejects new client legal holds.
 
 Padding is not part of the first `v02` contract. Content-defined chunking,
 gateway-level deduplication, and compression are also outside the baseline
@@ -534,14 +538,37 @@ protected, recheck the maintenance fence and anchor before every deletion, and
 delete exact versions only. Prepared but unaccepted objects remain protected
 until the configured orphan-age floor passes. Retention-renewal planning
 includes catalogs, runs, payload commits, format roots, and keyring envelopes.
+The guarded apply uses that single immutable plan, renews and verifies exact
+live versions before any deletion, and aborts if authority-root references or
+protection metadata are missing. Request-level retention is conservatively
+propagated to every dependency required to restore the represented state.
+Inventory is consumed through provider-private bounded pages under explicit
+page and item ceilings. A provider without bounded paging, an oversized page,
+or exhaustion of either ceiling aborts before mutation.
 
-Payload-pack cleaning is a separate log-cleaning operation. A fully dead pack
+Protected historical anchors must bind the active exact format-root reference.
+Supplying a root from another format generation fails before object-store
+reads. Operators must not rotate or rewrap the active format/keyring authority
+while such a root is required; cross-format protected-root renewal is not
+implemented. Existing held graphs also fail full maintenance. New v02 legal
+holds are disabled until hold propagation and guarded release cover every
+restore dependency.
+
+Payload-pack cleaning is a separate space-reclamation operation, not part of
+the exact-root deletion proof. A fully dead pack
 may be deleted only after the complete exact-root mark, orphan-age floor,
 protection checks, and maintenance-fence checks pass. A mixed pack is left in
 place until its dead fraction justifies cleaning. Cleaning re-encrypts its live
 records into a new random pack, publishes higher-generation physical
 references, and retains the old exact version while any current or protected
 historical root reaches it. Mutable reference counts are not authoritative.
+
+Current writers never mix different effective `(retention mode, retain days,
+legal hold)` cohorts in one new payload pack. Client legal-hold publication is
+currently disabled, but the cohort dimension remains a defensive format
+invariant for preexisting data. Packs written before that rule, or
+otherwise conservatively over-protected, remain safe but may occupy space until
+a future cleaner rewrites their live records.
 
 If a candidate pack has live fraction `l`, cleaning must copy at least
 `l / (1 - l)` bytes for every byte it can reclaim. The cleaner therefore uses
@@ -645,7 +672,7 @@ small-object batches. The current reader does not promise to open earlier
 preview run wires. Recreate evaluation
 repositories when the preview wire changes. Catalog, exact descriptors,
 framed streaming, and guarded metadata-only mixed-carrier compaction are
-integrated, while protection cohorts, complete retained-provider GC, and final
+integrated, while retained-provider restart/fault GC qualification and final
 bounded-recovery qualification remain incomplete. Wire details freeze only
 after cryptographic review, scale gates, retained-provider evidence, and
 recovery runbooks all pass together.

@@ -15,11 +15,14 @@ repository-format or security guarantee. New preview repositories use the
 gateway.
 
 Large known-length and chunked uploads use the same catalogued state model as
-bounded batches. Each streamed commit has the canonical signed section shape
-`[PAYLOAD, INDEX_RUN]`; checkpoints, recovery, compaction, and garbage
-collection retain the exact historical payload carrier without copying its
-ciphertext. Zero-length streamed requests remain authenticated stream carriers
-rather than being rewritten into a different wire shape.
+bounded batches. Unknown-length and zero-length streamed commits use the signed
+section shape `[PAYLOAD, INDEX_RUN]`. Large known-length requests instead upload
+one opaque standalone payload carrier before publishing a short `[INDEX_RUN]`
+commit containing its encrypted exact reference. Checkpoints, recovery,
+compaction, and garbage collection retain either historical payload carrier
+without copying its ciphertext. Zero-length streamed requests remain
+authenticated stream carriers rather than being rewritten into a different wire
+shape.
 
 Current engineering priorities:
 
