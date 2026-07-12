@@ -375,6 +375,27 @@ bounded by the authenticated segment size and a roughly 1 MiB grouping target,
 not object length. Reader and writer segment sizes have a 64 MiB hard ceiling;
 the normal adaptive large-object segment remains 64 KiB.
 
+On 2026-07-12 revision `c51aa24` passed three release-gateway runs with one
+256 MiB object and three full HTTP restores per run. The Docker-free harness
+measures the gateway child rather than the driver process:
+
+| Run | Elapsed, 3 reads | Average read | Plaintext throughput | Gateway peak RSS | Backend GETs | Read amp |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 2.058 s | 664.972 ms | 373.240 MiB/s | 564,801,536 B | 3 | 1.000244420x |
+| 2 | 1.894 s | 614.531 ms | 405.552 MiB/s | 564,396,032 B | 3 | 1.000244420x |
+| 3 | 1.792 s | 581.727 ms | 428.565 MiB/s | 564,342,784 B | 3 | 1.000244420x |
+
+All runs returned exact bytes through the real S3 HTTP adapter. Backend reads
+were 805,503,201 B for 805,306,368 B of plaintext. The local in-memory backend
+retains the 256 MiB ciphertext object inside the gateway process, and the
+process high-water also includes the preceding streamed upload. This lane
+therefore qualifies bounded HTTP response mechanics, child-process accounting,
+request shape, and byte amplification. It does not replace an external S3 or
+filesystem-backed large-stream memory qualification. The container-backed lane
+was attempted separately, but both local RustFS and MinIO containers failed
+their readiness timeout before rs3 started; no result from those failed runs is
+treated as product evidence.
+
 The 2026-05 measurements below predate the current index-run wire version 4
 self/external stream-carrier model. They remain historical payload segmentation
 and request-shape evidence, not performance qualification for the completed

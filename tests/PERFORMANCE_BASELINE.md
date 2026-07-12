@@ -222,6 +222,26 @@ separate-process repository RSS excluding an in-memory backend, not an HTTP
 gateway measurement, pinned release-runner timing, or retained-provider
 qualification.
 
+### Bounded HTTP full-read evidence
+
+Revision `c51aa24` adds a Docker-free real HTTP gateway lane whose RSS field is
+the release gateway child, not the xtask driver. Three runs of three complete
+256 MiB restores produced:
+
+| Run | Elapsed, 3 reads | Average read | Plaintext throughput | Gateway peak RSS | Backend GETs | Read amp |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 2.058 s | 664.972 ms | 373.240 MiB/s | 564,801,536 B | 3 | 1.000244420x |
+| 2 | 1.894 s | 614.531 ms | 405.552 MiB/s | 564,396,032 B | 3 | 1.000244420x |
+| 3 | 1.792 s | 581.727 ms | 428.565 MiB/s | 564,342,784 B | 3 | 1.000244420x |
+
+Each run used exactly one backend GET per restore and read 805,503,201 B for
+805,306,368 B of plaintext. The in-memory backend and streamed upload
+high-water are included in the gateway RSS, so this qualifies the real HTTP
+path, child-process accounting, request shape, and byte amplification. It does
+not qualify external-provider memory behavior. Container-backed attempts
+failed during RustFS and MinIO readiness before rs3 started, so those attempts
+provide no product evidence.
+
 ### Payload-size evidence
 
 The same release binary, final signed checkpoint, new-instance reload, exact
