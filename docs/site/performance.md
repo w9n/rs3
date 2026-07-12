@@ -140,26 +140,23 @@ recovered run count, and cold-read shape remained exact. The in-memory scale
 process also retains the complete simulated backend, so its high-water mark is
 not gateway-only memory.
 
-The earlier `7023c65` revision passed three local controlled-filesystem runs with a
-writer process that exited before a fresh reader process started:
+Revision `647db90` also passed three ext4 runs with a writer process that exited
+before a fresh reader process started:
 
 | Run | Writer elapsed | Checkpoint | Writer RSS | Reader recovery | Reader verification | Reader RSS |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 46.623 s | 7.546 ms | 958,234,624 B | 6.094 s | 6.136 s | 1,138,118,656 B |
-| 2 | 44.707 s | 7.157 ms | 957,411,328 B | 6.607 s | 6.647 s | 1,137,709,056 B |
-| 3 | 46.835 s | 8.062 ms | 957,632,512 B | 6.009 s | 6.047 s | 1,138,057,216 B |
+| 1 | 38.958 s | 7.441 ms | 914,804,736 B | 5.466 s | 5.501 s | 1,005,285,376 B |
+| 2 | 39.034 s | 7.575 ms | 915,124,224 B | 5.503 s | 5.538 s | 1,004,957,696 B |
+| 3 | 39.037 s | 7.114 ms | 915,202,048 B | 5.592 s | 5.629 s | 1,004,638,208 B |
 
 Every filesystem run recovered exactly 1,000,000 entries and 233 active runs,
 then verified the first, middle, and last payload with one exact range `GET`
 and 1.03125x byte amplification per read. Each recorded 1,008 PUTs, 3,433 GETs,
-806 HEADs, 820,502,647 B written, 258,733,774 B read, and 1.602544232x write
-amplification. Those runs predate the record-digest removal and namespace-key
-table, so current-revision fresh-process qualification remains required. The
-lane measures repository-process RSS excluding an in-memory backend on that
-local filesystem. It is not an HTTP gateway measurement, the pinned
-release-runner timing qualification, or a
-retained-provider qualification, and the fresh process does not imply a cold
-kernel page cache.
+806 HEADs, 747,262,852 B written, 194,247,550 B read, and 1.459497758x write
+amplification. The lane measures repository-process RSS excluding an in-memory
+backend on that local filesystem. It is not an HTTP gateway measurement, the
+pinned release-runner timing qualification, or a retained-provider
+qualification, and the fresh process does not imply a cold kernel page cache.
 
 The current layout removes the pack directory:
 encrypted `INDEX_RUN` state authenticates the record's exact physical offset,
