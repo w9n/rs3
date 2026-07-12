@@ -119,6 +119,7 @@ preview-gate-v2-nightly:
     just fault-injection-sweep
     just perf-standalone-gate
     just integration-s3-gateway --tooling-smoke
+    just preview-gate-v2-retained-local
     just integration-kopia-gateway
     just integration-k8s-gateway-v2 --wait-secs 240
     just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke
@@ -186,6 +187,11 @@ integration-s3-container *ARGS:
 # Run the S3 gateway integration harness.
 integration-s3-gateway *ARGS:
     cargo run -p xtask --bin xtask --features containers -- integration s3-gateway {{ARGS}}
+
+# Qualify retained-version storage and gateway behavior against disposable local providers.
+preview-gate-v2-retained-local:
+    just integration-s3-container --qualification-profile retained-version --object-lock --retention-days 1 --gc-rehearsal
+    just integration-s3-gateway --retention-mode governance --retention-days 1 --tooling-smoke
 
 # Run the v2 live S3 gateway integration harness.
 integration-s3-gateway-v2-live *ARGS:
@@ -260,6 +266,7 @@ helm-lint:
         --set repository.retention.mode=governance \
         --set repository.retention.days=1 \
         --set-string recovery.publicKey=ed25519:0000000000000000000000000000000000000000000000000000000000000000
+    python3 tests/helm_network_policy.py
 
 # Run the workspace test suite.
 test:
@@ -452,6 +459,7 @@ perf-standalone-gate:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release -p xtask --bin xtask --features containers
+    objects=8
     object_size=67108865
     baseline_throughput=""
     for concurrency in 1 2 4 8; do
@@ -459,7 +467,7 @@ perf-standalone-gate:
         --backend s3-gateway-container \
         --gateway-build-profile release \
         --scenario write-standalone-parallel \
-        --objects "${concurrency}" \
+        --objects "${objects}" \
         --concurrency "${concurrency}" \
         --object-size "${object_size}" \
         --commit-batch-items 1 \
@@ -489,7 +497,7 @@ perf-standalone-gate:
       --backend s3-container \
       --gateway-build-profile release \
       --scenario write-standalone-parallel \
-      --objects 8 \
+      --objects "${objects}" \
       --concurrency 8 \
       --object-size "${object_size}" \
       --commit-batch-items 1 \

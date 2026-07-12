@@ -427,6 +427,22 @@ pub fn open_v2_index_root(
     Ok(root)
 }
 
+/// Exercises the bounded canonical decoder after an envelope has authenticated plaintext.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn decode_v2_index_root_plaintext_for_fuzzing(input: &[u8]) -> V2Result<()> {
+    let root = decode_root(input)?;
+    if encode_root(&root)? != input {
+        return Err(V2FormatError::InvalidIndexRoot);
+    }
+    Ok(())
+}
+
+/// Produces current canonical plaintext so fuzzing can mutate authenticated decoder inputs.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn encode_v2_index_root_plaintext_for_fuzzing(root: &V2IndexRoot) -> V2Result<Vec<u8>> {
+    encode_root(root)
+}
+
 fn validate_root(root: &V2IndexRoot) -> V2Result<()> {
     if root.required_capabilities != INDEX_ROOT_REQUIRED_CAPABILITIES {
         return Err(V2FormatError::InvalidIndexRoot);
@@ -1231,6 +1247,13 @@ mod tests {
             hex::encode(digest),
             "35f15d7fc27f058c963bb8c2df350e9875bf94fe1705b785f06324ed3de168f5"
         );
+    }
+
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn fuzz_plaintext_decoder_accepts_current_canonical_root() {
+        let encoded = must(super::encode_root(&fixture()));
+        must(super::decode_v2_index_root_plaintext_for_fuzzing(&encoded));
     }
 
     #[test]

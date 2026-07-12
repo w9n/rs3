@@ -5,6 +5,9 @@ use crate::payload::{
     open_payload_object, parse_segmented_payload_header_with_total_len,
     seal_streamable_payload_object, segmented_ciphertext_span, total_segmented_payload_len,
 };
+use crate::v2::index_root::{
+    decode_v2_index_root_plaintext_for_fuzzing, encode_v2_index_root_plaintext_for_fuzzing,
+};
 use crate::v2::{
     V2_SECTION_FLAG_MUST_UNDERSTAND, V2Algorithms, V2CommitHeader, V2CommitKey, V2CommitKind,
     V2CommitParentRef, V2CommitSelfRef, V2EmbeddedIndexRunLocation, V2FormatError, V2FormatRef,
@@ -242,11 +245,20 @@ pub fn open_v2_index_root_object(input: &[u8]) {
         return;
     }
 
+    let _ = decode_v2_index_root_plaintext_for_fuzzing(input);
+
     let keyring = signing_keyring();
     let containing_object = object_id("commits/v02/fuzz-index-root");
     let _ = open_v2_index_root(&keyring, b"fuzz-repository", &containing_object, 3, input);
 
     let root = index_root_fixture();
+    let plaintext = encode_v2_index_root_plaintext_for_fuzzing(&root)
+        .unwrap_or_else(|error| panic!("index-root fixture failed to encode: {error}"));
+    decode_v2_index_root_plaintext_for_fuzzing(&plaintext)
+        .unwrap_or_else(|error| panic!("encoded index-root fixture failed to decode: {error}"));
+    exercise_near_valid_bytes(input, &plaintext, |candidate| {
+        let _ = decode_v2_index_root_plaintext_for_fuzzing(candidate);
+    });
     let sealed = seal_v2_index_root(&keyring, b"fuzz-repository", &containing_object, 3, &root)
         .unwrap_or_else(|error| panic!("index-root fixture failed to seal: {error}"));
     let opened = open_v2_index_root(

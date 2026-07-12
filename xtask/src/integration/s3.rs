@@ -75,6 +75,9 @@ pub(crate) struct S3LocalArgs {
     /// Retention duration used by the Object Lock live test.
     #[arg(long, env = "RS3_TEST_S3_RETENTION_DAYS")]
     retention_days: Option<u32>,
+    /// Rehearse exact retained-version GC in the disposable container bucket.
+    #[arg(long, default_value_t = false)]
+    gc_rehearsal: bool,
 }
 
 pub(crate) fn run_s3_local(args: S3LocalArgs) -> Result<()> {
@@ -90,6 +93,14 @@ fn validate_s3_profile(args: &S3LocalArgs) -> Result<()> {
     if args.qualification_profile == S3QualificationProfile::RetainedVersion && !args.object_lock {
         anyhow::bail!(
             "the retained-version S3 qualification profile requires --object-lock so retention, legal hold, version IDs, and exact-version reads are tested"
+        );
+    }
+    if args.gc_rehearsal
+        && (args.mode != S3LocalMode::Container
+            || args.qualification_profile != S3QualificationProfile::RetainedVersion)
+    {
+        anyhow::bail!(
+            "--gc-rehearsal requires container mode with the retained-version qualification profile"
         );
     }
 
@@ -135,9 +146,9 @@ fn run_container_s3(args: S3LocalArgs) -> Result<()> {
         provider: args
             .provider
             .unwrap_or_else(|| target.provider.as_label().to_owned()),
-        bucket: Some(target.bucket),
-        endpoint_url: Some(target.endpoint_url),
-        region: Some(target.region),
+        bucket: Some(target.bucket.clone()),
+        endpoint_url: Some(target.endpoint_url.clone()),
+        region: Some(target.region.clone()),
         prefix: args.prefix,
         allow_http: Some(true),
         virtual_hosted_style: Some(false),
@@ -145,10 +156,57 @@ fn run_container_s3(args: S3LocalArgs) -> Result<()> {
         object_lock: args.object_lock,
         retention_days: args.retention_days,
         credentials: Some(AwsCredentials {
-            access_key_id: target.access_key_id,
-            secret_access_key: target.secret_access_key,
+            access_key_id: target.access_key_id.clone(),
+            secret_access_key: target.secret_access_key.clone(),
         }),
-    })
+    })?;
+    if args.gc_rehearsal {
+        run_container_gc_rehearsal(&target, args.retention_days.unwrap_or(1))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "containers")]
+fn run_container_gc_rehearsal(
+    target: &s3_container::RunningS3Container,
+    retention_days: u32,
+) -> Result<()> {
+    let executable = std::env::current_exe().context("failed to locate xtask executable")?;
+    let retention_days = retention_days.to_string();
+    let mut command = Command::new(executable);
+    command.args([
+        "v2",
+        "gc-rehearsal",
+        "--backend",
+        "s3",
+        "--s3-bucket",
+        &target.bucket,
+        "--s3-prefix",
+        "local-retained-gc",
+        "--s3-endpoint-url",
+        &target.endpoint_url,
+        "--s3-region",
+        &target.region,
+        "--s3-allow-http",
+        "--retention-days",
+        &retention_days,
+        "--retained-provider-conformance-passed",
+        "--format",
+        "json",
+    ]);
+    command.env("AWS_ACCESS_KEY_ID", &target.access_key_id);
+    command.env("AWS_SECRET_ACCESS_KEY", &target.secret_access_key);
+    command.env("AWS_DEFAULT_REGION", &target.region);
+    command.env_remove("AWS_SESSION_TOKEN");
+    command.env_remove("AWS_PROFILE");
+    let status = command
+        .status()
+        .context("failed to start retained GC rehearsal")?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("retained GC rehearsal exited with {status}");
+    }
 }
 
 struct LiveS3Contract {
@@ -272,6 +330,7 @@ mod tests {
             qualification_profile,
             object_lock,
             retention_days: None,
+            gc_rehearsal: false,
         }
     }
 
