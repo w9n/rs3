@@ -1322,7 +1322,6 @@ where
                         pack_record_count: carrier.pack_record_count,
                         record_ordinal: record.record_ordinal,
                         record_offset: record.record_offset,
-                        plaintext_digest: record.plaintext_digest,
                         content_len,
                     },
                     range,
@@ -1425,11 +1424,7 @@ where
             pack.pack_record_count,
         )
         .map_err(v2_repository_error)?;
-        let record = V2PayloadPackRecordRef::new(
-            pack.record_ordinal,
-            pack.record_offset,
-            pack.plaintext_digest,
-        );
+        let record = V2PayloadPackRecordRef::new(pack.record_ordinal, pack.record_offset);
         let context = packed::repository_context_from_refs(
             &self.commit_store.options().repository_id,
             &V2KeyringEnvelopeRef {
@@ -3571,7 +3566,6 @@ struct V2CommitPackRead {
     pack_record_count: u32,
     record_ordinal: u32,
     record_offset: u32,
-    plaintext_digest: [u8; 32],
     content_len: u64,
 }
 
@@ -3598,7 +3592,6 @@ fn pack_payload_cache_ref(
     digest.update(pack.pack_record_count.to_be_bytes());
     digest.update(pack.record_ordinal.to_be_bytes());
     digest.update(pack.record_offset.to_be_bytes());
-    digest.update(pack.plaintext_digest);
     digest.update(pack.content_len.to_be_bytes());
     Ok(BackendObjectRef {
         object_id: BackendObjectId::new(format!(
@@ -3990,7 +3983,6 @@ mod tests {
             pack_record_count: 64,
             record_ordinal: 7,
             record_offset: 512,
-            plaintext_digest: [4_u8; 32],
             content_len: 512,
         }
     }
@@ -4017,9 +4009,6 @@ mod tests {
         variants.push(variant);
         let mut variant = original.clone();
         variant.record_offset += 1;
-        variants.push(variant);
-        let mut variant = original.clone();
-        variant.plaintext_digest[0] ^= 1;
         variants.push(variant);
         let mut variant = original.clone();
         variant.content_len += 1;

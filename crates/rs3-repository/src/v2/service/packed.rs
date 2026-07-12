@@ -323,7 +323,6 @@ where
                             record: IndexPackRecordPointer {
                                 record_ordinal: record.ordinal(),
                                 physical_offset: record.physical_offset(),
-                                plaintext_digest: *record.plaintext_digest(),
                             },
                         }
                     } else if let Some(PayloadReference::V2Pack { carrier, record }) =
@@ -340,7 +339,6 @@ where
                             record: IndexPackRecordPointer {
                                 record_ordinal: record.record_ordinal,
                                 physical_offset: record.record_offset,
-                                plaintext_digest: record.plaintext_digest,
                             },
                         }
                     } else if let Some(reference @ PayloadReference::V2CommitStream { .. }) =
@@ -556,7 +554,6 @@ where
                         record: V2PackRecordReference {
                             record_ordinal: record.record_ordinal,
                             record_offset: record.physical_offset,
-                            plaintext_digest: record.plaintext_digest,
                         },
                     })
                 }
@@ -1105,7 +1102,6 @@ fn pack_record_reference(record: IndexPackRecordPointer) -> V2PackRecordReferenc
     V2PackRecordReference {
         record_ordinal: record.record_ordinal,
         record_offset: record.physical_offset,
-        plaintext_digest: record.plaintext_digest,
     }
 }
 
@@ -1113,7 +1109,6 @@ fn index_pack_record_pointer(record: &V2PayloadPackRecord) -> IndexPackRecordPoi
     IndexPackRecordPointer {
         record_ordinal: record.ordinal(),
         physical_offset: record.physical_offset(),
-        plaintext_digest: *record.plaintext_digest(),
     }
 }
 

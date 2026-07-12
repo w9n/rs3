@@ -8,7 +8,7 @@
 use super::{V2FormatError, V2Result};
 use bytes::Bytes;
 use getrandom::fill as fill_random;
-use rs3_crypto::{KeyRing, ct_eq, digest_payload_record};
+use rs3_crypto::KeyRing;
 use rs3_types::{BackendObjectId, KeyId};
 use std::fmt;
 use std::ops::Range;
@@ -22,8 +22,8 @@ pub const V2_PAYLOAD_PACK_SEGMENT_BYTES: usize = 64 * 1024;
 /// Random pack identifier bytes.
 pub const V2_PAYLOAD_PACK_ID_LEN: usize = 32;
 
-const PAYLOAD_PACK_SEGMENT_AAD_DOMAIN: &[u8] = b"rs3:payload-pack-segment-aad:v2\n";
-const PAYLOAD_PACK_SEGMENT_NONCE_CONTEXT_DOMAIN: &[u8] = b"rs3:payload-pack-segment-context:v2\n";
+const PAYLOAD_PACK_SEGMENT_AAD_DOMAIN: &[u8] = b"rs3:payload-pack-segment-aad:v3\n";
+const PAYLOAD_PACK_SEGMENT_NONCE_CONTEXT_DOMAIN: &[u8] = b"rs3:payload-pack-segment-context:v3\n";
 const AEAD_TAG_LEN: u64 = 16;
 const MAX_CONTEXT_LEN: usize = 1024;
 const MAX_OBJECT_KEY_LEN: usize = 1024;
@@ -151,7 +151,6 @@ impl V2PayloadPackFacts {
 pub struct V2PayloadPackRecordRef {
     record_ordinal: u32,
     physical_offset: u32,
-    plaintext_digest: [u8; 32],
 }
 
 impl fmt::Debug for V2PayloadPackRecordRef {
@@ -160,7 +159,6 @@ impl fmt::Debug for V2PayloadPackRecordRef {
             .debug_struct("V2PayloadPackRecordRef")
             .field("record_ordinal", &self.record_ordinal)
             .field("physical_offset", &self.physical_offset)
-            .field("plaintext_digest", &"<redacted>")
             .finish()
     }
 }
@@ -168,15 +166,10 @@ impl fmt::Debug for V2PayloadPackRecordRef {
 impl V2PayloadPackRecordRef {
     /// Constructs record facts recovered from an authenticated encrypted index run.
     #[must_use]
-    pub const fn new(
-        record_ordinal: u32,
-        physical_offset: u32,
-        plaintext_digest: [u8; 32],
-    ) -> Self {
+    pub const fn new(record_ordinal: u32, physical_offset: u32) -> Self {
         Self {
             record_ordinal,
             physical_offset,
-            plaintext_digest,
         }
     }
 
@@ -190,12 +183,6 @@ impl V2PayloadPackRecordRef {
     #[must_use]
     pub const fn physical_offset(&self) -> u32 {
         self.physical_offset
-    }
-
-    /// Returns the authenticated SHA-256 plaintext digest.
-    #[must_use]
-    pub const fn plaintext_digest(&self) -> &[u8; 32] {
-        &self.plaintext_digest
     }
 }
 
@@ -468,7 +455,6 @@ fn seal_v2_payload_pack_with_layout(
             reference: V2PayloadPackRecordRef::new(
                 u32::try_from(ordinal).map_err(|_| V2FormatError::PayloadPackLimitExceeded)?,
                 0,
-                digest_payload_record(&input.plaintext),
             ),
             plaintext_len,
         });
@@ -672,7 +658,6 @@ pub fn open_v2_payload_pack_record_span_with_segments(
             context.facts.content_key_id(),
             &aad,
             &nonce_context,
-            &context.record.plaintext_digest,
             ciphertext,
         )?;
         if u64::try_from(plaintext.len()).ok() != Some(segment_plaintext_len) {
@@ -688,13 +673,7 @@ pub fn open_v2_payload_pack_record_span_with_segments(
     if cursor != ciphertext_span.len() {
         return Err(V2FormatError::InvalidPayloadPack);
     }
-    finish_opened_span(
-        context.record,
-        context.plaintext_len,
-        span,
-        selected_plaintext,
-        segments,
-    )
+    finish_opened_span(span, selected_plaintext, segments)
 }
 
 /// Reassembles an exact planned range from authenticated cached segments.
@@ -725,8 +704,7 @@ pub fn open_v2_payload_pack_cached_record_span(
         }
         selected_plaintext.extend_from_slice(plaintext);
     }
-    finish_opened_span(record, plaintext_len, span, selected_plaintext, Vec::new())
-        .map(|opened| opened.plaintext)
+    finish_opened_span(span, selected_plaintext, Vec::new()).map(|opened| opened.plaintext)
 }
 
 /// Opens one range from complete ciphertext-only pack bytes.
@@ -765,10 +743,8 @@ pub fn open_v2_payload_pack_record(
 }
 
 fn finish_opened_span(
-    record: &V2PayloadPackRecordRef,
-    plaintext_len: u64,
     span: &V2PayloadPackRecordSpan,
-    mut selected_plaintext: Vec<u8>,
+    selected_plaintext: Vec<u8>,
     segments: Vec<(u32, Bytes)>,
 ) -> V2Result<V2OpenedPayloadPackRecordSpan> {
     let selected_start = u64::from(span.start_segment)
@@ -792,13 +768,6 @@ fn finish_opened_span(
     let requested = selected_plaintext
         .get(trim_start..trim_end)
         .ok_or(V2FormatError::InvalidPayloadPack)?;
-    if span.requested.start == 0 && span.requested.end == plaintext_len {
-        let digest = digest_payload_record(requested);
-        if !ct_eq(&digest, &record.plaintext_digest) {
-            selected_plaintext.fill(0);
-            return Err(V2FormatError::InvalidPayloadPack);
-        }
-    }
     Ok(V2OpenedPayloadPackRecordSpan {
         plaintext: Bytes::copy_from_slice(requested),
         segments,
@@ -843,9 +812,7 @@ fn seal_record_into(
     plaintext: &[u8],
     pack: &mut [u8],
 ) -> V2Result<()> {
-    if u64::try_from(plaintext.len()).ok() != Some(plaintext_len)
-        || !ct_eq(&digest_payload_record(plaintext), &record.plaintext_digest)
-    {
+    if u64::try_from(plaintext.len()).ok() != Some(plaintext_len) {
         return Err(V2FormatError::InvalidPayloadPack);
     }
     let count = segment_count(plaintext_len)?;
@@ -875,12 +842,7 @@ fn seal_record_into(
         )?;
         let nonce_context =
             segment_nonce_context(facts.pack_id, record.record_ordinal, segment_ordinal);
-        let sealed = keyring.seal_payload_pack_segment(
-            &aad,
-            &nonce_context,
-            &record.plaintext_digest,
-            plaintext_segment,
-        )?;
+        let sealed = keyring.seal_payload_pack_segment(&aad, &nonce_context, plaintext_segment)?;
         if sealed.key_id != *facts.content_key_id()
             || u64::try_from(sealed.ciphertext.len()).ok()
                 != segment_plaintext_len.checked_add(AEAD_TAG_LEN)
@@ -921,7 +883,6 @@ fn segment_associated_data(
     aad.extend_from_slice(&record.record_ordinal.to_be_bytes());
     aad.extend_from_slice(&record.physical_offset.to_be_bytes());
     aad.extend_from_slice(&plaintext_len.to_be_bytes());
-    aad.extend_from_slice(&record.plaintext_digest);
     aad.extend_from_slice(&segment_ordinal.to_be_bytes());
     aad.extend_from_slice(&segment_ciphertext_offset(segment_ordinal)?.to_be_bytes());
     aad.extend_from_slice(&segment_plaintext_len.to_be_bytes());
@@ -1168,6 +1129,89 @@ mod tests {
     }
 
     #[test]
+    fn production_seal_attempts_use_fresh_pack_identities() {
+        let records = [V2PayloadPackRecordInput {
+            plaintext: Bytes::from_static(b"same logical record"),
+        }];
+        let containing_object = object_id("commits/opaque-commit");
+        let first = must_v2(seal_v2_payload_pack(
+            &keyring(),
+            REPOSITORY_CONTEXT,
+            &containing_object,
+            SECTION_ORDINAL,
+            &records,
+        ));
+        let second = must_v2(seal_v2_payload_pack(
+            &keyring(),
+            REPOSITORY_CONTEXT,
+            &containing_object,
+            SECTION_ORDINAL,
+            &records,
+        ));
+
+        assert_ne!(
+            first.layout().facts().pack_id(),
+            second.layout().facts().pack_id()
+        );
+        assert_ne!(first.bytes(), second.bytes());
+        assert_eq!(must_v2(open_record(&first, 0)), records[0].plaintext);
+        assert_eq!(must_v2(open_record(&second, 0)), records[0].plaintext);
+    }
+
+    #[test]
+    fn segment_reorder_and_cross_record_transplant_fail_closed() {
+        let plaintext_len = V2_PAYLOAD_PACK_SEGMENT_BYTES * 2;
+        let records = [
+            V2PayloadPackRecordInput {
+                plaintext: Bytes::from(vec![0x41; plaintext_len]),
+            },
+            V2PayloadPackRecordInput {
+                plaintext: Bytes::from(vec![0x42; plaintext_len]),
+            },
+        ];
+        let pack = must_v2(seal_v2_payload_pack_with_layout(
+            &keyring(),
+            REPOSITORY_CONTEXT,
+            &object_id("commits/opaque-commit"),
+            SECTION_ORDINAL,
+            &records,
+            V2PayloadPackId::from_bytes([0x31; V2_PAYLOAD_PACK_ID_LEN]),
+            &[0, 1],
+        ));
+        let segment_stored_len = V2_PAYLOAD_PACK_SEGMENT_BYTES + AEAD_TAG_LEN as usize;
+        let first_offset = pack
+            .layout()
+            .record(0)
+            .expect("first record")
+            .physical_offset() as usize;
+        let second_offset = pack
+            .layout()
+            .record(1)
+            .expect("second record")
+            .physical_offset() as usize;
+
+        let mut reordered = pack.bytes().to_vec();
+        reordered[first_offset..first_offset + segment_stored_len * 2]
+            .rotate_left(segment_stored_len);
+        let first = pack.layout().record(0).expect("first record");
+        let containing_object = object_id("commits/opaque-commit");
+        let context = must_v2(V2PayloadPackRecordContext::new(
+            REPOSITORY_CONTEXT,
+            &containing_object,
+            SECTION_ORDINAL,
+            pack.layout().facts(),
+            first,
+            first.plaintext_len(),
+        ));
+        assert!(open_v2_payload_pack_record(&keyring(), &context, &reordered).is_err());
+
+        let mut transplanted = pack.bytes().to_vec();
+        let source = pack.bytes()[second_offset..second_offset + segment_stored_len].to_vec();
+        transplanted[first_offset..first_offset + segment_stored_len].copy_from_slice(&source);
+        assert!(open_v2_payload_pack_record(&keyring(), &context, &transplanted).is_err());
+    }
+
+    #[test]
     fn range_plan_fetches_only_intersecting_canonical_segments_and_caches_them() {
         let plaintext = Bytes::from(
             (0..(V2_PAYLOAD_PACK_SEGMENT_BYTES * 2 + 32))
@@ -1376,10 +1420,6 @@ mod tests {
             )
             .is_err()
         );
-        bad_record = record.reference().clone();
-        bad_record.plaintext_digest[0] ^= 1;
-        assert!(open(facts, &bad_record).is_err());
-
         let mut ciphertext = pack.bytes().to_vec();
         ciphertext[record.physical_offset() as usize] ^= 1;
         assert!(
@@ -1632,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_output_redacts_plaintext_digest_and_pack_identity() {
+    fn debug_output_redacts_plaintext_and_pack_identity() {
         let input = V2PayloadPackRecordInput {
             plaintext: Bytes::from_static(b"top-secret-payload"),
         };
@@ -1641,9 +1681,8 @@ mod tests {
         assert!(debug.contains("plaintext_len"));
 
         let pack = sample_pack();
-        let digest_debug = format!("{:?}", digest_payload_record(b"range-friendly-value"));
         let debug = format!("{pack:?}");
-        assert!(!debug.contains(&digest_debug));
+        assert!(!debug.contains("range-friendly-value"));
         assert!(!debug.contains(&format!("{:?}", [9_u8; V2_PAYLOAD_PACK_ID_LEN])));
         assert!(debug.contains("<redacted>"));
     }

@@ -664,11 +664,10 @@ mod tests {
         }
     }
 
-    fn record(ordinal: u32, byte: u8) -> IndexPackRecordPointer {
+    fn record(ordinal: u32) -> IndexPackRecordPointer {
         IndexPackRecordPointer {
             record_ordinal: ordinal,
             physical_offset: ordinal * 64,
-            plaintext_digest: [byte; 32],
         }
     }
 
@@ -742,7 +741,7 @@ mod tests {
                     generation,
                     IndexPayloadPointer::ExternalPack {
                         container_ordinal: 0,
-                        record: record(0, container_byte),
+                        record: record(0),
                     },
                 )],
             },
@@ -925,9 +924,7 @@ mod tests {
                     0,
                     key(3),
                     3,
-                    IndexPayloadPointer::SelfPack {
-                        record: record(2, 9),
-                    },
+                    IndexPayloadPointer::SelfPack { record: record(2) },
                 )],
             },
             self_pack_container: Some(exact_container.clone()),
@@ -950,7 +947,7 @@ mod tests {
             upsert.payload,
             IndexPayloadPointer::ExternalPack {
                 container_ordinal: 0,
-                record: record(2, 9),
+                record: record(2),
             }
         );
     }
@@ -1054,7 +1051,7 @@ mod tests {
                     4,
                     IndexPayloadPointer::ExternalPack {
                         container_ordinal: 0,
-                        record: record(0, 1),
+                        record: record(0),
                     },
                 )],
             },
@@ -1075,7 +1072,7 @@ mod tests {
                     5,
                     IndexPayloadPointer::ExternalPack {
                         container_ordinal: 0,
-                        record: record(1, 2),
+                        record: record(1),
                     },
                 )],
             },
@@ -1149,7 +1146,7 @@ mod tests {
     #[test]
     fn equivalent_self_and_external_facts_are_not_ambiguous() {
         let exact_container = container(5);
-        let record = record(1, 5);
+        let record = record(1);
         let self_source = PackedCompactionSourceRun {
             run: IndexRun {
                 sequence: sequence(6),

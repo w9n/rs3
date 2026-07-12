@@ -69,8 +69,6 @@ pub enum PayloadReference {
         record_ordinal: u32,
         /// Absolute ciphertext offset from the start of the payload-pack section.
         record_offset: u32,
-        /// SHA-256 digest over the complete plaintext record.
-        plaintext_digest: [u8; 32],
     },
     /// Compact payload-pack record in an accepted exact commit object.
     V2Pack {
@@ -147,8 +145,6 @@ pub struct V2PackRecordReference {
     pub record_ordinal: u32,
     /// Absolute ciphertext offset from the start of the payload-pack section.
     pub record_offset: u32,
-    /// SHA-256 digest over the complete plaintext record.
-    pub plaintext_digest: [u8; 32],
 }
 
 /// Exact accepted commit and section facts for a streamed payload.
@@ -1055,7 +1051,6 @@ mod tests {
             record: V2PackRecordReference {
                 record_ordinal: 5,
                 record_offset: 12_288,
-                plaintext_digest: [0x55; 32],
             },
         };
         let references = [
@@ -1068,7 +1063,6 @@ mod tests {
                 pack_record_count: 7,
                 record_ordinal: 3,
                 record_offset: 4_096,
-                plaintext_digest: [0x22; 32],
             },
             accepted,
         ];
@@ -1099,7 +1093,6 @@ mod tests {
             pack_record_count: u32,
             record_ordinal: u32,
             record_offset: u32,
-            plaintext_digest: [u8; 32],
         },
         V2CommitStream {
             commit_key: &'a BackendObjectId,
@@ -1140,7 +1133,6 @@ mod tests {
         let record = V2PackRecordReference {
             record_ordinal: 5,
             record_offset: 12_288,
-            plaintext_digest: [0x55; 32],
         };
         let shared = PayloadReference::V2Pack {
             carrier: Arc::clone(&carrier),
@@ -1161,7 +1153,6 @@ mod tests {
             pack_record_count: carrier.pack_record_count,
             record_ordinal: record.record_ordinal,
             record_offset: record.record_offset,
-            plaintext_digest: record.plaintext_digest,
         };
 
         assert_eq!(

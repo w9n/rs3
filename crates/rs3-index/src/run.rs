@@ -327,8 +327,6 @@ pub struct IndexPackRecordPointer {
     pub record_ordinal: u32,
     /// Absolute ciphertext offset from the start of the payload-pack section.
     pub physical_offset: u32,
-    /// SHA-256 digest over the complete plaintext record.
-    pub plaintext_digest: [u8; 32],
 }
 
 impl fmt::Debug for IndexPackRecordPointer {
@@ -337,7 +335,6 @@ impl fmt::Debug for IndexPackRecordPointer {
             .debug_struct("IndexPackRecordPointer")
             .field("record_ordinal", &self.record_ordinal)
             .field("physical_offset", &self.physical_offset)
-            .field("plaintext_digest", &"<redacted>")
             .finish()
     }
 }
@@ -2837,8 +2834,7 @@ fn encode_pack_record_pointer(
     pointer: IndexPackRecordPointer,
 ) -> Result<(), IndexRunError> {
     writer.varint(u64::from(pointer.record_ordinal))?;
-    writer.varint(u64::from(pointer.physical_offset))?;
-    writer.bytes(&pointer.plaintext_digest)
+    writer.varint(u64::from(pointer.physical_offset))
 }
 
 fn decode_pack_record_pointer(
@@ -2846,12 +2842,9 @@ fn decode_pack_record_pointer(
 ) -> Result<IndexPackRecordPointer, IndexRunError> {
     let record_ordinal = reader.u32_varint()?;
     let physical_offset = reader.u32_varint()?;
-    let mut plaintext_digest = [0_u8; 32];
-    plaintext_digest.copy_from_slice(reader.bytes(32)?);
     Ok(IndexPackRecordPointer {
         record_ordinal,
         physical_offset,
-        plaintext_digest,
     })
 }
 
@@ -3182,7 +3175,6 @@ mod tests {
                         record: IndexPackRecordPointer {
                             record_ordinal: 7,
                             physical_offset: 100,
-                            plaintext_digest: [0x66; 32],
                         },
                     },
                     content_len: 1_234,
@@ -3596,7 +3588,6 @@ mod tests {
             record: IndexPackRecordPointer {
                 record_ordinal: 0,
                 physical_offset: 0,
-                plaintext_digest: [0x73; 32],
             },
         };
         pack_upsert.content_len = 16;
@@ -3767,7 +3758,6 @@ mod tests {
             record: IndexPackRecordPointer {
                 record_ordinal: 0,
                 physical_offset: 100,
-                plaintext_digest: [0x77; 32],
             },
         };
         run.mutations.push(IndexMutation::Upsert(second_upsert));
@@ -3789,7 +3779,7 @@ mod tests {
         let encoded = encode_index_run(&fixture(), &IndexRunLimits::default()).expect("encode run");
         assert_eq!(
             hex(&encoded),
-            "03ec017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00050000000000000000000000000902010100b601000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c23232323232323232323232323232323232323232323232323232323232323230000000300000000000002000000000000000800111111111111111111111111111111111111111111111111111111111111111109636f6e74656e742d3108c8017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00050100000000000000000000000902020264000033333333333333333333333333333333333333333333333333333333333333330b6e616d6573706163652d3111020007646666666666666666666666666666666666666666666666666666666666666666d209ffffffffffffffc901020000001e022f010144444444444444444444444444444444444444444444444444444444444444440b6e616d6573706163652d31126a7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0005020000000000000000000000090202021201010e74656e616e742f64656c65746564122300001574656e616e742f736e617073686f742f6368756e6b11d209ffffffffffffffc9"
+            "03ec017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00050000000000000000000000000902010100b601000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c23232323232323232323232323232323232323232323232323232323232323230000000300000000000002000000000000000800111111111111111111111111111111111111111111111111111111111111111109636f6e74656e742d3108a8017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00050100000000000000000000000902020244000033333333333333333333333333333333333333333333333333333333333333330b6e616d6573706163652d311102000764d209ffffffffffffffc901020000001e022f010144444444444444444444444444444444444444444444444444444444444444440b6e616d6573706163652d31126a7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0005020000000000000000000000090202021201010e74656e616e742f64656c65746564122300001574656e616e742f736e617073686f742f6368756e6b11d209ffffffffffffffc9"
         );
     }
 
@@ -3920,7 +3910,6 @@ mod tests {
                 record: IndexPackRecordPointer {
                     record_ordinal: 8,
                     physical_offset: 100,
-                    plaintext_digest: [0x66; 32],
                 },
             };
         }
@@ -3934,7 +3923,6 @@ mod tests {
                 record: IndexPackRecordPointer {
                     record_ordinal: 2,
                     physical_offset: 100,
-                    plaintext_digest: [0x66; 32],
                 },
             };
         }
@@ -3998,7 +3986,7 @@ mod tests {
         duplicate.blind_key = IndexBlindKey::from_bytes([0x55; 32]);
         duplicate.path = LogicalPath::new("tenant/duplicate").expect("path");
         if let IndexPayloadPointer::ExternalPack { record, .. } = &mut duplicate.payload {
-            record.plaintext_digest = [0x77; 32];
+            record.physical_offset += 1;
         }
         run.mutations.push(IndexMutation::Upsert(duplicate.clone()));
         assert_eq!(
@@ -4007,7 +3995,7 @@ mod tests {
         );
 
         if let IndexPayloadPointer::ExternalPack { record, .. } = &mut duplicate.payload {
-            record.plaintext_digest = [0x66; 32];
+            record.physical_offset -= 1;
             record.record_ordinal = 6;
         }
         run.mutations[2] = IndexMutation::Upsert(duplicate);
@@ -4055,7 +4043,6 @@ mod tests {
             record: IndexPackRecordPointer {
                 record_ordinal: 0,
                 physical_offset: 0,
-                plaintext_digest: [0x99; 32],
             },
         };
         run.self_pack = Some(IndexRunSelfPack {
@@ -4114,7 +4101,6 @@ mod tests {
             record: IndexPackRecordPointer {
                 record_ordinal: 0,
                 physical_offset: 0,
-                plaintext_digest: [0x66; 32],
             },
         };
         run.self_pack = Some(IndexRunSelfPack {

@@ -1428,7 +1428,6 @@ mod tests {
                         record: IndexPackRecordPointer {
                             record_ordinal: 0,
                             physical_offset: 0,
-                            plaintext_digest: [0x55; 32],
                         },
                     },
                     content_len: 4,
@@ -1447,7 +1446,6 @@ mod tests {
                         record: IndexPackRecordPointer {
                             record_ordinal: 2,
                             physical_offset: 42,
-                            plaintext_digest: [0x66; 32],
                         },
                     },
                     content_len: 5,
