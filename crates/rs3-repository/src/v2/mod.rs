@@ -88,4 +88,4 @@ pub use repository::{
     V2MemoryAnchor, V2RecoveryBundle, V2ReplayChain, V2ReplayCommit, V2ReplayLimits,
     V2StoredCommit,
 };
-pub use service::{V2Repository, V2ResolvedObject};
+pub use service::{V2AuthenticatedReadBody, V2Repository, V2ResolvedObject};

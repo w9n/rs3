@@ -23,7 +23,7 @@ pub use fault::{
     FaultOperationKind, FaultRule,
 };
 pub use filesystem::FilesystemBlobStore;
-pub use read::BlobRead;
+pub use read::{BlobRead, MAX_BLOB_READ_CHUNK_BYTES};
 #[cfg(feature = "s3")]
 pub use s3::{S3BlobStore, S3BlobStoreConfig, S3ProviderMetrics, S3ProviderOperationMetrics};
 

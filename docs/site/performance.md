@@ -363,22 +363,26 @@ hold that write path before the request fails as incomplete. Checkpoint and
 compaction publication are metadata-only for both packed and streamed carriers;
 they preserve exact historical references instead of copying payload bytes.
 
-Full streamed-carrier reads still verify the complete signed payload-section
-digest before releasing plaintext. The current non-caching opener shares the
-owning ciphertext buffer and does not retain a duplicate plaintext segment set,
-so its transient data is approximately one ciphertext body plus one plaintext
-body and one active segment instead of duplicate full-size ciphertext and
-plaintext representations. Response memory remains proportional to object size.
-Bounded-memory full responses require a verified ciphertext spool or a wire
-change; they are not yet a production claim.
+Full streamed-carrier reads use one exact provider stream. The gateway validates
+the authenticated segmented header before constructing the response, then
+decrypts bounded groups and releases a group only after every included AEAD tag
+passes. It hashes the complete ciphertext section concurrently and withholds the
+final plaintext group until exact EOF and the signed aggregate section digest
+both pass. A corrupt or truncated backend may therefore deliver an authentic
+prefix before the response fails, as an S3 range read already can, but it cannot
+deliver forged plaintext or a falsely complete object. Working memory is
+bounded by the authenticated segment size and a roughly 1 MiB grouping target,
+not object length. Reader and writer segment sizes have a 64 MiB hard ceiling;
+the normal adaptive large-object segment remains 64 KiB.
 
 The 2026-05 measurements below predate the current index-run wire version 4
 self/external stream-carrier model. They remain historical payload segmentation
 and request-shape evidence, not performance qualification for the completed
 framed-stream series. The known-length gateway rerun below checks the new write
-shape. Post-checkpoint cold reads and mixed pack/stream compaction still need a
-measured matrix before making a complete performance claim; EOF-finalized,
-zero-length, checkpoint/reload, compaction, and GC correctness are test-backed.
+shape. Post-checkpoint cold reads, direct full streaming, and mixed pack/stream
+compaction still need a retained-provider measured matrix before making a
+complete performance claim; EOF-finalized, zero-length, bounded full-read,
+checkpoint/reload, compaction, and GC correctness are test-backed.
 
 A 2026-07-11 local RustFS gateway rerun covered three independent release-mode
 samples of four sequential 32 MiB known-length uploads. Elapsed time was

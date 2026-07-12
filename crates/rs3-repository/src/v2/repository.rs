@@ -18,7 +18,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use rs3_crypto::KeyRing;
 use rs3_storage::{
-    BlobMetadata, BlobMultipartUpload, BlobStore, ByteRange, PutOptions, StorageError,
+    BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore, ByteRange, PutOptions, StorageError,
 };
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyId, LegalHoldStatus, RepositoryId, RetentionPolicy,
@@ -1403,6 +1403,24 @@ where
         }
         self.store
             .get_range_at(object_id, version_id, range)
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed)
+    }
+
+    /// Opens exact commit bytes without buffering the complete requested range.
+    pub(crate) async fn open_commit_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> V2Result<Box<dyn BlobRead>> {
+        if self.options.provider_profile == V2ProviderProfile::RetainedVersionObjectLock
+            && version_id.is_none()
+        {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
+        self.store
+            .open_range_at(object_id, version_id, range)
             .await
             .map_err(|_| V2FormatError::StorageOperationFailed)
     }

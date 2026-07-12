@@ -15,9 +15,10 @@ repository-format promise.
     payload-skipping replay, guarded metadata-only packed-run compaction, and
     automatic active-run watermarks. Existing compatibility and provider
     results are useful gateway regression evidence, but protection cohorts,
-    complete GC, framed streaming, pinned-runner filesystem qualification,
-    retained-provider reruns, and external review still block the complete `v02` format and a
-    production repository release. There will be no `v01` migration or
+    complete GC, concurrent standalone large-payload publication, pinned-runner
+    filesystem qualification, retained-provider streaming reruns, and external
+    review still block the complete `v02` format and a production repository
+    release. There will be no `v01` migration or
     dual-reader requirement.
 
 ## Preview Scope

@@ -252,8 +252,13 @@ metadata only and never read, decrypt, or copy the streamed payload.
 A partial read derives the minimal complete ciphertext-segment span from the
 authenticated header and section facts, bounds it against the exact stored
 commit length, and issues an exact-version range `GET` when the provider supplies
-versions. A full read fetches the named payload section. Decrypted segments are
-cached under a process-local opaque digest of repository/keyring context,
+versions. A full streamed-carrier read opens one exact provider stream, validates
+the authenticated header before returning a response, authenticates bounded
+segment groups before releasing them, and verifies exact EOF plus the aggregate
+signed section digest before releasing the final group. A failure may leave the
+client with an authentic prefix but never forged plaintext or a falsely complete
+object. Decrypted range segments are cached under a process-local opaque digest
+of repository/keyring context,
 commit key/version/body/stored length, section ordinal/digest/start/offset/length,
 payload identity/header, and content length. The actual payload identity remains
 the AEAD associated-data identity. The synthetic cache identity is never written

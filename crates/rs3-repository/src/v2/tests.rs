@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{CommitCoordinatorOptions, RepositoryError, RepositoryOptions, RepositoryPutOptions};
 use bytes::Bytes;
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions};
 use rs3_types::{
@@ -3969,6 +3969,66 @@ async fn v2_framed_streaming_known_and_unknown_lengths_checkpoint_and_reload() {
         must_repo(fresh.get_range(&empty_key, ByteRange::Full).await),
         Bytes::new()
     );
+}
+
+#[tokio::test]
+async fn v2_streamed_payload_full_read_is_bounded_and_uses_one_backend_get() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    );
+    let anchor = V2MemoryAnchor::new();
+    let key = must_type(LogicalPath::new("streaming/bounded-full-read.bin"));
+    let body = Bytes::from(
+        (0..(2 * 1024 * 1024 + 17))
+            .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+            .collect::<Vec<_>>(),
+    );
+
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_repo(
+        repository
+            .put_committed_streaming_known_len(
+                &anchor,
+                key.clone(),
+                body.len() as u64,
+                stream::iter(vec![Ok::<Bytes, RepositoryError>(body.clone())]),
+                RepositoryPutOptions::default(),
+                super::commit::V2_MAX_HEADER_SIZE + 1024 * 1024,
+            )
+            .await,
+    );
+    store
+        .reset_operation_counts()
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    let resolved = must_repo(repository.resolve_object(&key));
+    let mut read = must_repo(repository.get_resolved_full_stream(&resolved).await)
+        .expect("streamed carrier should expose a bounded body");
+    assert_eq!(read.content_len(), body.len() as u64);
+    assert!(read.working_set_bytes() < body.len() as u64 * 2);
+    let mut chunks = Vec::new();
+    while let Some(chunk) = read.next().await {
+        chunks.push(must_repo(chunk));
+    }
+    let restored = chunks.iter().flatten().copied().collect::<Vec<_>>();
+    let counts = store
+        .operation_counts()
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    assert!(chunks.len() >= 3);
+    assert_eq!(restored, body);
+    assert_eq!(counts.get, 1);
 }
 
 #[tokio::test]

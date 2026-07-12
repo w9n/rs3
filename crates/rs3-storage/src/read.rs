@@ -2,7 +2,9 @@ use crate::{Result, StorageError};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-pub(crate) const BLOB_READ_CHUNK_BYTES: usize = 1024 * 1024;
+/// Maximum bytes emitted by one incremental blob-read chunk.
+pub const MAX_BLOB_READ_CHUNK_BYTES: usize = 1024 * 1024;
+pub(crate) const BLOB_READ_CHUNK_BYTES: usize = MAX_BLOB_READ_CHUNK_BYTES;
 
 /// Incremental body returned by a blob-store read.
 ///
@@ -250,6 +252,30 @@ mod tests {
             .expect("second chunk");
         assert_eq!(first.len(), super::BLOB_READ_CHUNK_BYTES);
         assert_eq!(second, Bytes::from_static(&[7]));
+        assert_eq!(read.next_chunk().await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn exact_reader_splits_oversized_provider_chunks() {
+        let oversized = Bytes::from(vec![3_u8; super::MAX_BLOB_READ_CHUNK_BYTES + 17]);
+        let mut read = scripted(
+            [Ok(Some(oversized.clone())), Ok(None)],
+            oversized.len() as u64,
+        );
+
+        let first = read
+            .next_chunk()
+            .await
+            .expect("first read")
+            .expect("first chunk");
+        let second = read
+            .next_chunk()
+            .await
+            .expect("second read")
+            .expect("second chunk");
+
+        assert_eq!(first.len(), super::MAX_BLOB_READ_CHUNK_BYTES);
+        assert_eq!(second.len(), 17);
         assert_eq!(read.next_chunk().await, Ok(None));
     }
 }

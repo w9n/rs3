@@ -27,8 +27,8 @@ use rs3_index::KeyringEnvelopeReference;
 use rs3_k8s::WriterFence;
 pub use rs3_repository::v2::V2_RESTORE_BUNDLE_SCHEMA;
 use rs3_repository::v2::{
-    V2AnchorState, V2CommitAnchor, V2CommitCoordinator, V2CommitKey, V2CommitStore,
-    V2CommitStoreOptions, V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef,
+    V2AnchorState, V2AuthenticatedReadBody, V2CommitAnchor, V2CommitCoordinator, V2CommitKey,
+    V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef,
     V2ProviderConformanceOptions, V2ProviderConformanceReport, V2ProviderProfile, V2RecoveryBundle,
     V2Repository, V2ResolvedObject, check_v2_provider_conformance, v2_format_object_id,
 };
@@ -440,6 +440,15 @@ impl RuntimeRepository {
     ) -> Result<Bytes, RepositoryError> {
         self.repository
             .get_resolved_range(&resolved.inner, range)
+            .await
+    }
+
+    pub(super) async fn get_resolved_full_stream(
+        &self,
+        resolved: &RuntimeResolvedObject,
+    ) -> Result<Option<V2AuthenticatedReadBody>, RepositoryError> {
+        self.repository
+            .get_resolved_full_stream(&resolved.inner)
             .await
     }
 

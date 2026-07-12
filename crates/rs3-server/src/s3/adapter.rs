@@ -14,6 +14,7 @@ use super::runtime::RuntimeRepository;
 use crate::{AdminReadinessSource, AdminRuntimeFactsSource, GatewayMode, RuntimeConfig};
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, stream};
+use rs3_repository::v2::V2AuthenticatedReadBody;
 use rs3_repository::{RepositoryError, RepositoryPutOptions};
 use rs3_storage::ByteRange;
 use rs3_types::{LegalHoldStatus, PublicBucket};
@@ -516,6 +517,70 @@ fn reserved_download_body(body: Bytes, reservation: DownloadBodyReservation) -> 
     }) as DynByteStream)
 }
 
+struct ReservedAuthenticatedDownloadBody {
+    body: Mutex<V2AuthenticatedReadBody>,
+    remaining: Option<usize>,
+    operation: &'static str,
+    _reservation: DownloadBodyReservation,
+}
+
+impl Stream for ReservedAuthenticatedDownloadBody {
+    type Item = Result<Bytes, StdError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let polled = {
+            let mut body = match self.body.lock() {
+                Ok(body) => body,
+                Err(_) => {
+                    return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                        "authenticated download body lock poisoned",
+                    )))));
+                }
+            };
+            Pin::new(&mut *body).poll_next(cx)
+        };
+        match polled {
+            Poll::Ready(Some(Ok(chunk))) => {
+                if let Some(remaining) = self.remaining.as_mut() {
+                    *remaining = remaining.saturating_sub(chunk.len());
+                }
+                record_s3_response_body_bytes(self.operation, chunk.len());
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.remaining = Some(0);
+                Poll::Ready(Some(Err(Box::new(error))))
+            }
+            Poll::Ready(None) => {
+                self.remaining = Some(0);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl ByteStream for ReservedAuthenticatedDownloadBody {
+    fn remaining_length(&self) -> RemainingLength {
+        self.remaining
+            .map_or_else(RemainingLength::unknown, RemainingLength::new_exact)
+    }
+}
+
+fn reserved_authenticated_download_body(
+    body: V2AuthenticatedReadBody,
+    reservation: DownloadBodyReservation,
+    operation: &'static str,
+) -> Body {
+    let remaining = usize::try_from(body.content_len()).ok();
+    Body::from(Box::pin(ReservedAuthenticatedDownloadBody {
+        body: Mutex::new(body),
+        remaining,
+        operation,
+        _reservation: reservation,
+    }) as DynByteStream)
+}
+
 #[derive(Clone)]
 struct RequestRateLimiter {
     max_per_second: u64,
@@ -968,33 +1033,53 @@ impl S3 for GatewayS3Service {
                 Some(range) => range.end - range.start,
                 None => metadata.content_len,
             };
-            let download_body_reservation = self
-                .download_body_budget
-                .reserve(OPERATION, response_body_len)?;
-            let repository_range =
-                repository_read_range(resolved_range.as_ref(), metadata.content_len);
-            let body = self
-                .repository
-                .get_resolved_range(&resolved, repository_range)
-                .await
-                .map_err(repository_error)?;
-            record_s3_response_body_bytes(OPERATION, body.len());
+            let authenticated_stream = if resolved_range.is_none() {
+                self.repository
+                    .get_resolved_full_stream(&resolved)
+                    .await
+                    .map_err(repository_error)?
+            } else {
+                None
+            };
+            let (response_body, streamed) = match authenticated_stream {
+                Some(body) => {
+                    let reservation = self
+                        .download_body_budget
+                        .reserve(OPERATION, body.working_set_bytes())?;
+                    (
+                        reserved_authenticated_download_body(body, reservation, OPERATION),
+                        true,
+                    )
+                }
+                None => {
+                    let reservation = self
+                        .download_body_budget
+                        .reserve(OPERATION, response_body_len)?;
+                    let repository_range =
+                        repository_read_range(resolved_range.as_ref(), metadata.content_len);
+                    let body = self
+                        .repository
+                        .get_resolved_range(&resolved, repository_range)
+                        .await
+                        .map_err(repository_error)?;
+                    record_s3_response_body_bytes(OPERATION, body.len());
+                    (reserved_download_body(body, reservation), false)
+                }
+            };
 
             tracing::debug!(
                 target: "rs3_server",
                 operation = OPERATION,
                 request_id,
                 requested_range,
-                response_body_bytes = body.len(),
+                response_body_bytes = response_body_len,
+                streamed,
                 "S3 response body prepared",
             );
-            let content_length = i64_len(body.len() as u64)?;
+            let content_length = i64_len(response_body_len)?;
             let mut output = GetObjectOutput {
                 accept_ranges: Some("bytes".to_owned()),
-                body: Some(StreamingBlob::from(reserved_download_body(
-                    body,
-                    download_body_reservation,
-                ))),
+                body: Some(StreamingBlob::from(response_body)),
                 content_length: Some(content_length),
                 content_type: Some("application/octet-stream".to_owned()),
                 e_tag: Some(etag(metadata.content_len, metadata.modified_at_ms)),
@@ -2445,6 +2530,45 @@ mod tests {
 
         assert_eq!(service.download_body_budget.in_flight_bytes(), 4);
         drop(response);
+        assert_eq!(service.download_body_budget.in_flight_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn streamed_get_uses_bounded_working_set_instead_of_object_length() {
+        let mut config = runtime_config(true);
+        config.hardening.max_put_object_bytes = 8 * 1024 * 1024;
+        config.hardening.buffered_put_object_bytes = 3;
+        config.hardening.backend_multipart_part_bytes = 5 * 1024 * 1024;
+        config.hardening.max_in_flight_download_body_bytes = 4 * 1024 * 1024;
+        let service = GatewayS3Service::from_config(&config)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let body = Bytes::from(vec![0x4d; 5 * 1024 * 1024 + 17]);
+
+        service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/large-stream.bin".to_owned(),
+                content_length: Some(body.len() as i64),
+                body: Some(StreamingBlob::from(Body::from(body.clone()))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let response = service
+            .get_object(s3_request(GetObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/large-stream.bin".to_owned(),
+                ..GetObjectInput::default()
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let reserved = service.download_body_budget.in_flight_bytes();
+
+        assert!(reserved > 0);
+        assert!(reserved < body.len() as u64);
+        assert_eq!(response_body(response).await, body);
         assert_eq!(service.download_body_budget.in_flight_bytes(), 0);
     }
 

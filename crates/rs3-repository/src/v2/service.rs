@@ -58,8 +58,10 @@ mod compaction;
 pub(super) mod packed;
 mod packed_compaction;
 mod packed_compaction_publish;
+mod read_stream;
 mod staging;
 
+pub use read_stream::V2AuthenticatedReadBody;
 use staging::{PendingV2Checkpoint, PendingV2Snapshot, PendingV2State};
 
 const V2_PAYLOAD_FILL_LOCK_STRIPES: usize = 64;
@@ -1384,6 +1386,101 @@ where
         .await
     }
 
+    /// Opens a bounded full-object stream for a commit-carried payload.
+    ///
+    /// Packed objects return `None` and should use the bounded pack read path.
+    pub async fn get_resolved_full_stream(
+        &self,
+        resolved: &V2ResolvedObject,
+    ) -> Result<Option<V2AuthenticatedReadBody>> {
+        let entry = resolved.entry.clone();
+        if entry.content_len == 0 {
+            return Ok(None);
+        }
+        let Some(PayloadReference::V2Commit { carrier }) = entry.payload_ref else {
+            return Ok(None);
+        };
+        let V2StreamCarrierReference {
+            commit_key,
+            commit_version_id,
+            body_digest,
+            commit_stored_len,
+            keyring_envelope_object_id,
+            keyring_envelope_digest,
+            payload_section_ordinal,
+            payload_section_digest,
+            payload_id,
+            payload_header,
+            sections_start,
+            offset,
+            length,
+        } = carrier.as_ref().clone();
+        let cache_key = V2PayloadSectionCacheKey {
+            commit_key: commit_key.clone(),
+            commit_version_id: commit_version_id.clone(),
+            body_digest,
+            payload_id: payload_id.clone(),
+            offset,
+            length,
+        };
+        let payload = V2CommitPayloadRead {
+            commit_key,
+            commit_version_id,
+            body_digest,
+            commit_stored_len,
+            keyring_envelope_object_id,
+            keyring_envelope_digest,
+            payload_section_ordinal,
+            payload_section_digest,
+            payload_id,
+            payload_header,
+            sections_start,
+            offset,
+            length,
+            content_len: entry.content_len,
+        };
+        let payload_start = self.validated_payload_start(&payload).await?;
+        let header = match payload.payload_header.as_ref() {
+            Some(reference) => payload_header_from_reference(reference)?,
+            None => {
+                self.read_payload_header_from_commit(&payload, payload_start, &cache_key)
+                    .await?
+            }
+        };
+        if total_segmented_payload_len(&header)? != payload.length {
+            return Err(RepositoryError::InvalidObjectFormat {
+                object_id: payload.payload_id,
+            });
+        }
+        ensure_payload_header_matches_content_len(
+            &header,
+            payload.content_len,
+            &payload.payload_id,
+        )?;
+        let reader = self
+            .commit_store
+            .open_commit_range_at(
+                &payload.commit_key,
+                payload.commit_version_id.as_ref(),
+                ByteRange::Slice {
+                    offset: payload_start,
+                    len: payload.length,
+                },
+            )
+            .await
+            .map_err(v2_repository_error)?;
+        let body = read_stream::open_authenticated_payload_stream(
+            reader,
+            self.repository.keyring()?,
+            payload.payload_id,
+            header,
+            payload.payload_section_digest,
+            payload.length,
+        )
+        .await?;
+        Ok(Some(body))
+    }
+
     async fn read_pack_range_from_commit(
         &self,
         keyring: &KeyRing,
@@ -1529,35 +1626,7 @@ where
         range: ByteRange,
         cache_key: V2PayloadSectionCacheKey,
     ) -> Result<Bytes> {
-        let sections_start = match payload.sections_start {
-            Some(sections_start) => sections_start,
-            None => {
-                let commit_header_key = V2CommitHeaderCacheKey {
-                    commit_key: payload.commit_key.clone(),
-                    commit_version_id: payload.commit_version_id.clone(),
-                    body_digest: payload.body_digest,
-                };
-                let header = self
-                    .read_commit_header_for_payload(&commit_header_key)
-                    .await?;
-                let (section_ordinal, section) =
-                    payload_section_descriptor_in_header(&header, payload.offset, payload.length)?;
-                if section_ordinal != payload.payload_section_ordinal
-                    || section.digest != payload.payload_section_digest
-                {
-                    return Err(v2_repository_error(V2FormatError::SectionBounds));
-                }
-                u64::try_from(header.sections_start)
-                    .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?
-            }
-        };
-        let payload_start = validated_v2_stream_payload_start(
-            sections_start,
-            payload.offset,
-            payload.length,
-            payload.commit_stored_len,
-        )
-        .map_err(v2_repository_error)?;
+        let payload_start = self.validated_payload_start(&payload).await?;
 
         if range == ByteRange::Full {
             let body = self
@@ -1622,7 +1691,9 @@ where
             commit_stored_len: payload.commit_stored_len,
             payload_section_ordinal: payload.payload_section_ordinal,
             payload_section_digest: payload.payload_section_digest,
-            sections_start,
+            sections_start: payload_start
+                .checked_sub(payload.offset)
+                .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?,
             payload_section_offset: payload.offset,
             payload_section_len: payload.length,
             payload_id: &payload.payload_id,
@@ -1683,6 +1754,38 @@ where
             span,
             ciphertext,
         )
+    }
+
+    async fn validated_payload_start(&self, payload: &V2CommitPayloadRead) -> Result<u64> {
+        let sections_start = match payload.sections_start {
+            Some(sections_start) => sections_start,
+            None => {
+                let commit_header_key = V2CommitHeaderCacheKey {
+                    commit_key: payload.commit_key.clone(),
+                    commit_version_id: payload.commit_version_id.clone(),
+                    body_digest: payload.body_digest,
+                };
+                let header = self
+                    .read_commit_header_for_payload(&commit_header_key)
+                    .await?;
+                let (section_ordinal, section) =
+                    payload_section_descriptor_in_header(&header, payload.offset, payload.length)?;
+                if section_ordinal != payload.payload_section_ordinal
+                    || section.digest != payload.payload_section_digest
+                {
+                    return Err(v2_repository_error(V2FormatError::SectionBounds));
+                }
+                u64::try_from(header.sections_start)
+                    .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?
+            }
+        };
+        validated_v2_stream_payload_start(
+            sections_start,
+            payload.offset,
+            payload.length,
+            payload.commit_stored_len,
+        )
+        .map_err(v2_repository_error)
     }
 
     async fn read_commit_header_for_payload(
