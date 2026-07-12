@@ -909,7 +909,16 @@ fn run_s3_container_perf(args: &PerfArgs) -> Result<()> {
     if args.gateway_build_profile == GatewayBuildProfile::Release {
         command.arg("--release");
     }
-    command.args(["-p", "xtask", "--features", "s3", "--", "perf"]);
+    command.args([
+        "-p",
+        "xtask",
+        "--bin",
+        "xtask",
+        "--features",
+        "s3",
+        "--",
+        "perf",
+    ]);
     add_perf_args(&mut command, args, &target);
     command.env("AWS_ACCESS_KEY_ID", &target.access_key_id);
     command.env("AWS_SECRET_ACCESS_KEY", &target.secret_access_key);

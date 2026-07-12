@@ -451,10 +451,11 @@ perf-s3-gateway *ARGS:
 perf-standalone-gate:
     #!/usr/bin/env bash
     set -euo pipefail
+    cargo build --release -p xtask --bin xtask --features containers
     object_size=67108865
     baseline_throughput=""
     for concurrency in 1 2 4 8; do
-      output="$(cargo run --release -p xtask --bin xtask --features containers -- perf \
+      output="$(target/release/xtask perf \
         --backend s3-gateway-container \
         --gateway-build-profile release \
         --scenario write-standalone-parallel \
@@ -484,7 +485,7 @@ perf-standalone-gate:
         fi
       fi
     done
-    cargo run --release -p xtask --bin xtask --features containers -- perf \
+    target/release/xtask perf \
       --backend s3-container \
       --gateway-build-profile release \
       --scenario write-standalone-parallel \
