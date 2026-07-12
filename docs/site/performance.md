@@ -103,7 +103,7 @@ baseline before automatic packed-run compaction:
 | 100,000 | 1,024 | 7.35 s | 2.169 s | 1.203 s | 99 | 1.39358x |
 | 1,000,000 | 1,024 | 92.48 s | 26.37 s | 15.55 s | 978 | 1.39342x |
 
-The current lane keeps one accepted state plus a bounded 1,024-mutation overlay,
+Those measurements used one accepted state plus a bounded 1,024-mutation overlay,
 shares cloned identifier storage, uses canonical varints for v02 run generation
 and length fields, and validates catalog-only rewrites by reading back the exact
 signed root and new run bytes. It does not rebuild a second complete namespace
@@ -120,7 +120,30 @@ process high-water gate:
 | 2 | 32.233 s | 5.188 s | 5.230 s | 1,771,573,248 B | 1,008 | 3,433 | 806 | 233 | 1.459546533x | 1 GET/read, 1.03125x |
 | 3 | 32.462 s | 5.110 s | 5.153 s | 1,771,466,752 B | 1,008 | 3,433 | 806 | 233 | 1.459546533x | 1 GET/read, 1.03125x |
 
-Each run performed six bounded metadata-only compactions, reloaded exactly one
+Wire version 6 raises the bounded pack and speculative-overlay ceiling to 4,096
+records. This is a low-amplification bulk policy, not the 64-record low-latency
+default. At one million unique 512 B objects it creates 245 foreground runs,
+stays below the 256-run compaction trigger, and therefore avoids rewriting the
+index merely to satisfy the 255-run recovery gate. Three release runs on
+2026-07-12 produced identical physical accounting:
+
+| Run | Elapsed | Recovery | Reload total | Peak RSS | PUT | GET | HEAD | Active runs | Write amp | Cold read |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 43.892 s | 4.873 s | 4.909 s | 1,681,723,392 B | 246 | 253 | 248 | 245 | 1.268292436x | 1 GET/read, 1.03125x |
+| 2 | 43.850 s | 4.905 s | 4.941 s | 1,681,272,832 B | 246 | 253 | 248 | 245 | 1.268292436x | 1 GET/read, 1.03125x |
+| 3 | 43.963 s | 4.942 s | 4.980 s | 1,681,440,768 B | 246 | 253 | 248 | 245 | 1.268292436x | 1 GET/read, 1.03125x |
+
+That removes 97,897,125 backend write bytes per million-object run, 13.1%
+relative to the wire-v5 compaction lane. It is a real tradeoff: median object
+latency rises because each publication seals and sorts a larger bounded batch.
+A one-run 2,048-record comparison completed in 34.188 s at 1.394975344x writes
+and 1.646860754x total write-path I/O, while 4,096-record runs took about 43.9 s
+at 1.268292436x writes and about 1.269019x total write-path I/O. The release
+recipe chooses the lower-amplification point; operators that prioritize latency
+retain the smaller normal batching policy.
+
+The earlier wire-v5 runs performed six bounded metadata-only compactions,
+reloaded exactly one
 million entries through a new repository instance, and verified the first,
 middle, and last payload. Removing the redundant per-record plaintext digest
 and interning namespace-key IDs reduced lifetime backend writes by 73,214,822 B,
@@ -140,7 +163,7 @@ recovered run count, and cold-read shape remained exact. The in-memory scale
 process also retains the complete simulated backend, so its high-water mark is
 not gateway-only memory.
 
-Revision `647db90` also passed three ext4 runs with a writer process that exited
+Revision `647db90` passed three earlier ext4 runs with a writer process that exited
 before a fresh reader process started:
 
 | Run | Writer elapsed | Checkpoint | Writer RSS | Reader recovery | Reader verification | Reader RSS |
@@ -157,6 +180,20 @@ amplification. The lane measures repository-process RSS excluding an in-memory
 backend on that local filesystem. It is not an HTTP gateway measurement, the
 pinned release-runner timing qualification, or a retained-provider
 qualification, and the fresh process does not imply a cold kernel page cache.
+
+The current wire-v6 candidate then passed three equivalent fresh-process ext4
+runs using 4,096-record batches. The build recorded a dirty source identifier,
+so these qualify the implementation shape but must be repeated at the exact
+committed release revision:
+
+| Run | Writer elapsed | Checkpoint | Writer RSS | Reader recovery | Reader verification | Reader RSS | Write amp | Active runs |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 46.824 s | 8.330 ms | 955,678,720 B | 5.350 s | 5.391 s | 1,010,372,608 B | 1.268284240x | 245 |
+| 2 | 46.791 s | 8.039 ms | 955,850,752 B | 5.280 s | 5.316 s | 1,010,085,888 B | 1.268284240x | 245 |
+| 3 | 46.673 s | 7.476 ms | 956,338,176 B | 5.300 s | 5.340 s | 1,010,331,648 B | 1.268284240x | 245 |
+
+Every run recovered exactly one million entries after writer exit, verified all
+three sentinels, and kept one exact 528 B range `GET` per 512 B cold read.
 
 The current layout removes the pack directory:
 encrypted `INDEX_RUN` state authenticates the record's exact physical offset,
@@ -348,23 +385,30 @@ The current writer default is adaptive: small objects keep 512 B segments,
 medium objects use 8 KiB segments, and larger objects use 64 KiB segments. The
 historical fixed-size matrix below still explains the byte/request tradeoff.
 
-For `v2-preview`, bounded payload packs and large streamed payloads live inside
-signed commit objects. A streamed write now has the canonical section shape
-`[PAYLOAD, INDEX_RUN]`, so it enters the same checkpoint, compaction, recovery,
-and GC graph as a bounded packed write. Payload sections carry authenticated
-per-payload identities and segmented-header facts, so range reads can verify and
-decrypt the requested segments without reading the whole commit body. Full-file
-reads fetch the named payload section.
+For `v2-preview`, bounded payload packs and unknown-length streamed payloads live
+inside signed commit objects. An unknown-length streamed write has the canonical
+section shape `[PAYLOAD, INDEX_RUN]`. A declared-length large write seals a
+random standalone payload concurrently, verifies the complete stored object,
+then publishes an `[INDEX_RUN]` exact reference. Both paths enter the same
+checkpoint, compaction, recovery, and GC graph. Payload carriers have
+authenticated per-payload identities and segmented-header facts, so range reads
+can verify and decrypt the requested segments without reading unrelated
+ciphertext.
 
 Repeated or concurrent overlapping streamed ranges reuse the decrypted-segment
 cache behind a striped per-payload fill gate. Its in-memory cache identity binds
 repository/keyring context and the exact commit, version, body, section,
 payload-header, and content-length facts, while AEAD still uses the actual
 payload ID. This hardening changes cache correctness, not the amount of backend
-data required for a cache miss. Large streaming PUTs serialize writes while the
-gateway reads the request body into the signed multipart commit.
+data required for a cache miss. Large declared-length PUT bodies can overlap;
+only their short reference publication is serialized and fenced. The writer
+performs one full incremental ciphertext verification read before publication.
+Consequently standalone write-byte amplification should remain near 1.0x,
+while total backend I/O during the write is intentionally near 2.0x. Reporting
+those ratios separately avoids calling an integrity read a write-amplification
+regression.
 `RS3_STREAM_READ_STALL_TIMEOUT_SECS` bounds how long one stalled client body can
-hold that write path before the request fails as incomplete. Checkpoint and
+remain open before the request fails as incomplete. Checkpoint and
 compaction publication are metadata-only for both packed and streamed carriers;
 they preserve exact historical references instead of copying payload bytes.
 
@@ -401,7 +445,7 @@ was attempted separately, but both local RustFS and MinIO containers failed
 their readiness timeout before rs3 started; no result from those failed runs is
 treated as product evidence.
 
-The 2026-05 measurements below predate the current index-run wire version 4
+The 2026-05 measurements below predate the current index-run wire version 6
 self/external stream-carrier model. They remain historical payload segmentation
 and request-shape evidence, not performance qualification for the completed
 framed-stream series. The known-length gateway rerun below checks the new write
@@ -420,6 +464,22 @@ shape is stable. The current S3 boundary rejects unsigned HTTP/1.1 chunked
 `PutObject` without `Content-Length` with S3 `411 MissingContentLength`, as
 required by its S3 parser. The repository's EOF-finalized internal stream path
 passes direct tests, but it is not an externally qualified gateway lane.
+
+The new standalone gate uses 67,108,865 B, one byte above the default 64 MiB
+buffering threshold, and a 16 MiB multipart part target. A release-build direct
+memory-backend smoke produced exactly one multipart create, five part uploads,
+one completion, one committed object, and no abort. It measured 1.000269x
+committed-write amplification, 1.000245x verification-read amplification, and
+2.000515x total write-path I/O. Fresh-instance reload and exact full reads also
+passed in the smaller smoke. The `just perf-standalone-gate` release recipe adds
+the 1/2/4/8 gateway concurrency matrix plus a direct container-backed exact-
+multipart and reload companion. It requires concurrency-8 aggregate plaintext
+throughput to reach at least twice the same-host concurrency-1 result and checks
+exact standalone-object cardinality directly on the disposable backend, so a
+serialized or accidentally packed gateway path cannot qualify silently. The
+full container matrix and retained provider
+rerun remain release evidence to collect; the memory smoke is an architectural
+byte/count check, not a provider claim.
 
 The default partial commit-batch wait is now 25 ms. A 2026-05-17 local gateway
 smoke recorded the current medium-object shape: sequential 256 KiB writes used
@@ -500,7 +560,7 @@ and host load can dominate.
 - Keep run order alternating between direct and gateway lanes.
 - Keep measuring variability with at least three runs for release claims.
 - Rerun known-length streamed uploads, post-checkpoint cold ranges,
-  and mixed pack/stream compaction under wire version 4; report request, byte,
+  and mixed pack/stream compaction under wire version 6; report request, byte,
   elapsed, CPU, and RSS results separately from the historical May artifacts.
 - Reduce commit stage-lock and commit-wait time without allowing commits to
   race writes whose sequence state is not yet indexed.

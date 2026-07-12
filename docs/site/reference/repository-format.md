@@ -63,9 +63,9 @@ The sequence component bounds commit discovery and operational analysis. The
 random component prevents paths, namespace equality, and content identity from
 appearing in keys. The current compactor stores index shards in sibling
 `commits/v02/` delta carriers so the existing signed commit and exact-version
-machinery authenticates them. `objects/v02/` remains reserved for possible
-independently sealed objects such as payload packs created by later cleaning.
-Foreground standalone payload uploads are not part of the current format.
+machinery authenticates them. `objects/v02/` stores independently sealed
+known-length streamed payloads and remains the namespace for possible payload
+packs created by later cleaning.
 Reserved keys do not distinguish object type, index level, tenant, path, or
 workload.
 
@@ -81,8 +81,10 @@ write/compaction timing are accepted leakage. Plaintext catalog bounds, run
 levels, logical object counts, paths, and payload identities remain encrypted.
 
 Bounded writes publish `[PAYLOAD_PACK, INDEX_RUN]`; all-delete or all-empty
-bounded batches may publish `[INDEX_RUN]`. Streamed writes publish exactly
-`[PAYLOAD, INDEX_RUN]`, including zero-length streams. Signed `INDEX_ROOT`
+bounded batches may publish `[INDEX_RUN]`. Unknown-length streams publish
+exactly `[PAYLOAD, INDEX_RUN]`, including zero-length streams. Known-length
+large streams first seal one random `objects/v02/` payload, then publish an
+`[INDEX_RUN]` commit that exact-references it. Signed `INDEX_ROOT`
 checkpoints replace the parent-chain replay boundary with an exact catalog of
 accepted run sections. All current v02 repositories remain evaluation data and
 may need recreation.
@@ -106,8 +108,10 @@ and encrypted sections. The signed header covers:
 
 The complete header span is limited to 8 KiB and a reader accepts at most 65
 sections so the preview envelope remains bounded. The completed normal writer
-emits `[INDEX_RUN]`, `[PAYLOAD_PACK, INDEX_RUN]`, or `[PAYLOAD, INDEX_RUN]`; a
-catalog checkpoint contains exactly one `INDEX_ROOT`. Multipart commits reserve
+emits `[INDEX_RUN]`, `[PAYLOAD_PACK, INDEX_RUN]`, or `[PAYLOAD, INDEX_RUN]`; an
+`[INDEX_RUN]` may carry an encrypted exact reference to one separately sealed
+standalone payload. A catalog checkpoint contains exactly one `INDEX_ROOT`.
+Multipart commits reserve
 the fixed header span only when the body is genuinely streamed. Bounded commits
 use one `PutObject` and the canonical encoded header length, without 8 KiB
 padding.
@@ -133,7 +137,7 @@ encrypted `INDEX_ROOT`. A checkpoint may
 also cover a final bounded mutation batch, but the catalog must describe the
 exact resulting state.
 
-The current framed index plaintext is wire version 4. Mutation ordinals,
+The current framed index plaintext is wire version 6. Mutation ordinals,
 generations, content lengths, and bounded counts use canonical varints; readers
 reject overlong encodings. Generation and content length appear in both the
 namespace and listing projections because each projection must be independently
@@ -162,9 +166,10 @@ KiB use canonical 64 KiB independently authenticated segments for efficient
 range reads; smaller records use one segment. Both writer and reader enforce
 that rule so a writer bug cannot create pathological one-byte segments or make
 a one-byte range request read an entire large record. The bounded in-memory
-normal-commit codec accepts at most 1,024 records and 32 MiB per pack; larger
+normal-commit codec accepts at most 4,096 records and 32 MiB per pack; larger
 values stay on the streaming payload path. The normal low-latency coordinator
-uses 64 records, while the release-binary bulk scale lane uses 1,024. These are
+uses 64 records, while the release-binary high-throughput scale lane can use
+4,096. These are
 writer policies inside the same bounded format, not different trust models.
 
 The encrypted index container table carries the shared pack identity,
@@ -267,14 +272,23 @@ the AEAD associated-data identity. The synthetic cache identity is never written
 to the backend and adds no backend-visible name, although the provider still
 observes range offsets, lengths, timing, and cache misses.
 
-Foreground standalone payload objects are deferred. Separating payload upload
-from the signed run would require adoption semantics for partially published
-objects, another retained-version and orphan-cleanup state, and equivalent
-cross-object authentication without improving the primary Kopia path. Gateway
-deduplication is deferred for the same reason plus its equality and
+Known-length large payloads use a foreground standalone carrier. The gateway
+uploads encrypted segmented ciphertext under a fresh random `objects/v02/` key
+without holding the publication lock, renews the exact completed version's
+effective retention horizon from a post-completion clock capture, and verifies
+exact object identity, version, length, retention deadline, legal
+hold, exact EOF, and a complete ciphertext digest before publication. A short
+fenced publication then commits only the encrypted exact reference. Until that
+anchor transition succeeds the object is an invisible orphan. Process-local
+in-flight roots protect it from same-process GC; destructive maintenance across
+processes still requires the documented external quiescence guard. An
+ambiguous multipart completion or failed anchor transition can leave an opaque
+orphan for later report and guarded reclamation.
+
+Gateway deduplication remains deferred because it adds equality and
 shared-liveness leakage; Kopia already chunks, packs, and deduplicates its own
-repository blobs. Any future standalone or deduplicating mode needs an explicit
-capability and its own security and GC qualification.
+repository blobs. Any future deduplicating mode needs an explicit capability
+and its own security and GC qualification.
 
 ## Framed Index Runs
 
@@ -398,7 +412,7 @@ generation conflicts, catalog-count mismatches, resource-ceiling violations,
 or anchor drift all fail closed.
 
 The runtime keeps one accepted compact state plus a hard-bounded
-1,024-mutation overlay. Unaccepted writes never mutate accepted state. An
+4,096-mutation overlay. Unaccepted writes never mutate accepted state. An
 exclusive publication barrier freezes the overlay from commit snapshot through
 the anchor CAS and local install. Successful anchor publication applies the
 validated overlay once; failed publication discards it. Startup must not clone
@@ -624,9 +638,11 @@ amplification ceilings apply everywhere.
 
 There is no stable repository-format promise yet. `commits/v01` is removed and
 unsupported without migration support. The gateway reads and writes the preview
-`commits/v02` envelope with index-run wire version 4. Version 4 is the first run
-wire that includes exact self/external streamed carriers; the current reader
-does not promise to open earlier preview run wires. Recreate evaluation
+`commits/v02` envelope with index-run wire version 6. Version 4 introduced exact
+self/external streamed carriers, version 5 interns namespace-key identifiers,
+and version 6 raises the authenticated bounded pack capacity for high-throughput
+small-object batches. The current reader does not promise to open earlier
+preview run wires. Recreate evaluation
 repositories when the preview wire changes. Catalog, exact descriptors,
 framed streaming, and guarded metadata-only mixed-carrier compaction are
 integrated, while protection cohorts, complete retained-provider GC, and final

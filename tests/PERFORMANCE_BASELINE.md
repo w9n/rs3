@@ -173,11 +173,12 @@ reported reload is excluded from those counts and time. It discards writer-side
 state, reloads from the accepted anchor through another same-process repository
 instance, verifies exact cardinality, and reads the first, middle, and last
 payload. The JSON/TSV artifact records both the requested and actual checkpoint
-position. The explicit 1,024-item bulk lane uses the same ciphertext-only pack
+position. The historical 1,024-item bulk lane uses the same ciphertext-only pack
 format; the normal low-latency default remains 64. These pre-maintenance runs
 were below the former 1.50x checkpoint-only ceiling. That ceiling was not a
-valid lifetime gate once automatic compaction landed; current scale recipes use
-1.65x for checkpoint-and-compaction-inclusive 512 B writes. They also fail above
+valid lifetime gate once automatic compaction landed. The current wire-v6
+recipes retain 1.50x for the 64-item 10k lane and require 1.30x for the
+4,096-item 100k and 1M low-amplification lanes. They also fail above
 1.04x cold-read byte amplification or one backend request per cold sentinel.
 Every run measured exactly three range `GET`s for three sentinel reads and
 1.03125x cold-read byte amplification.
@@ -221,6 +222,25 @@ and retained the one-GET, 1.03125x cold-read shape. Counts were 1,008 PUTs,
 separate-process repository RSS excluding an in-memory backend, not an HTTP
 gateway measurement, pinned release-runner timing, or retained-provider
 qualification.
+
+The current wire-v6 candidate raises the bounded payload-pack and speculative-
+overlay ceiling to 4,096 records. At one million unique 512 B objects this
+produces 245 runs, below the 256-run compaction trigger, and avoids rewriting
+index metadata merely to satisfy the 255-run recovery gate. Three in-memory
+release runs produced identical byte and request accounting:
+
+| Run | Elapsed | Recovery | Reload total | Peak RSS | PUT | GET | HEAD | Active runs | Write amplification |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 43.892 s | 4.873 s | 4.909 s | 1,681,723,392 B | 246 | 253 | 248 | 245 | 1.268292436x |
+| 2 | 43.850 s | 4.905 s | 4.941 s | 1,681,272,832 B | 246 | 253 | 248 | 245 | 1.268292436x |
+| 3 | 43.963 s | 4.942 s | 4.980 s | 1,681,440,768 B | 246 | 253 | 248 | 245 | 1.268292436x |
+
+Three fresh-process ext4 runs of the same dirty candidate recorded
+46.673-46.824 s writer time, 955,678,720-956,338,176 B writer RSS,
+5.280-5.350 s recovery, 1,010,085,888-1,010,372,608 B reader RSS,
+1.268284240x writes, exact million cardinality, 245 active runs, and one exact
+528 B range `GET` per 512 B sentinel. The dirty build identifier means the exact
+committed release revision still needs the pinned-runner repetition.
 
 ### Bounded HTTP full-read evidence
 

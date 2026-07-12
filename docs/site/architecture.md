@@ -90,8 +90,9 @@ This lets a cold read issue one exact range `GET` instead of fetching a pack
 directory first. Retention mode, expiry horizon, and legal-hold requirement
 define protection cohorts because the backend protects the containing object.
 
-A streamed value is also immutable and value-separated, but its ciphertext is
-the `PAYLOAD` section of the same commit as its foreground run. While that run
+A streamed value is also immutable and value-separated. Unknown-length streams
+keep ciphertext in the `PAYLOAD` section of the same commit as the foreground
+run. While that run
 is embedded, a self-stream pointer carries the authenticated payload identity,
 section ordinal, and segmented-payload header. Before compaction removes the
 source-run boundary, the pointer is normalized to an exact external carrier:
@@ -101,13 +102,21 @@ and digest, plus the payload identity and header. Compaction and checkpoints
 therefore move metadata references only. They do not read or rewrite streamed
 payload ciphertext.
 
-The preview does not upload foreground payloads as standalone `objects/v02/`
-objects and does not deduplicate them in the gateway. Keeping payload and run in
-one signed commit gives publication one atomic anchor transition and keeps
-liveness explicit. Standalone carriers and deduplication would add orphan,
-retention, equality-leakage, and shared-liveness policy that has not yet been
-qualified; Kopia already performs chunking and deduplication for the primary
-client workload.
+For a known-length large request, the preview instead uploads one encrypted
+segmented `objects/v02/` carrier outside the publication lock. It verifies the
+completed exact version, length, post-completion retention horizon, legal-hold
+state, EOF, and full ciphertext
+digest before a short fenced commit publishes the encrypted reference. This
+allows distinct large uploads to overlap while keeping repository ordering at
+one atomic anchor transition per mutation. Cancellation before unambiguous
+multipart completion aborts the upload. Ambiguous completion, create-only
+races, or anchor failure can leave an invisible opaque orphan, which guarded
+maintenance reports and later reclaims. Same-process GC excludes registered
+in-flight carriers even with a zero minimum age.
+
+The gateway does not deduplicate payloads. Deduplication would add equality
+leakage and shared-liveness policy; Kopia already performs chunking and
+deduplication for the primary client workload.
 
 `v02` replaces monolithic index snapshots with an encrypted LSM-style index.
 Recent immutable foreground runs are level 0. Each compaction selects at most
@@ -133,11 +142,12 @@ ordinal. The blinded namespace projection answers `HEAD` and `GET`; the
 path-sorted listing projection answers prefix listings. Frame-local container
 tables share exact object references. Values never live in an index frame, so
 LSM compaction is metadata-only and cold recovery does not read user data. Run
-wire version 4 adds canonical self-stream and exact external-stream carriers to
-the existing bounded pack pointers. It uses canonical bounded varints for
-generation and content length in both projections.
+wire version 6 includes canonical self-stream and exact external-stream
+carriers, an authenticated namespace-key table, and larger bounded small-object
+packs. It uses canonical bounded varints for generation and content length in
+both projections.
 
-The runtime keeps one accepted compact state plus a hard-bounded 1,024-mutation
+The runtime keeps one accepted compact state plus a hard-bounded 4,096-mutation
 overlay. An exclusive publication barrier freezes that overlay from pre-CAS
 validation through accepted-state installation. Publication failure discards
 the overlay instead of rolling back a second full state copy. This preserves
@@ -262,6 +272,12 @@ from publishing and clearing another batch's speculative overlay. All semantic
 installation checks occur before anchor CAS. If the anchor advances but local
 lock installation fails, callers receive an explicit recovery-required error,
 new mutations stop, and the process must restart from the accepted anchor.
+
+The single owner does not serialize large request bodies. Distinct declared-
+length standalone uploads run concurrently, then queue for the short stage,
+commit, and anchor publication section. A stalled standalone request therefore
+does not block an unrelated buffered mutation. Conflicting create-only writes
+are resolved during fenced publication, with exactly one visible winner.
 
 Disconnected writers that merely share S3 are unsupported. Conditional object
 creation can prevent a collision at one key, but it cannot fence a stale writer,

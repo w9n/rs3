@@ -39,7 +39,9 @@ executing S3 operations, and per-process S3 operation rate. Align ingress,
 proxy, pod memory, and service mesh limits with the gateway values so oversized or
 excessive traffic is rejected before it consumes pod resources. Known-length
 `PutObject` bodies above the buffered threshold stream into backend multipart
-commit uploads when the backend supports multipart. The S3 listener requires
+standalone payload uploads when the backend supports multipart. Distinct bodies
+may upload concurrently; signed-reference publication remains serialized and
+fenced. The S3 listener requires
 the payload length supplied by normal `Content-Length` or valid SigV4 streaming
 metadata; an unsigned HTTP chunked request without a length is rejected with
 S3 `411 MissingContentLength`. The lower repository layer still bounds an
@@ -48,6 +50,12 @@ fault testing.
 Operators MUST configure a backend lifecycle rule that aborts incomplete
 multipart uploads, because client disconnects and crashes can leave provider
 temporary parts that repository GC cannot see.
+
+A completed standalone object remains invisible until its exact encrypted
+reference is anchored. Ambiguous multipart completion or a later publication
+failure can therefore leave an opaque repository orphan. Status and guarded
+maintenance report those objects; do not run destructive maintenance from a
+different process without the external quiescence guard.
 
 Example S3 lifecycle shape, adapting the prefix syntax to the selected
 provider:
