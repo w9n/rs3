@@ -4,7 +4,7 @@ use crate::v2::{V2FormatError, V2Result};
 use rs3_index::run::encode_index_run_frames;
 use rs3_index::run::{
     IndexBlindKey, IndexMutation, IndexPayloadPointer, IndexRun, IndexRunContainer, IndexRunLimits,
-    IndexRunStreamContainer,
+    IndexRunStandaloneStreamContainer, IndexRunStreamContainer,
 };
 use rs3_types::Sequence;
 #[cfg(test)]
@@ -28,6 +28,7 @@ pub(super) struct PackedCompactionSourceRun {
 enum ResolvedCarrier {
     Pack(Arc<IndexRunContainer>),
     Stream(Arc<IndexRunStreamContainer>),
+    StandaloneStream(Arc<IndexRunStandaloneStreamContainer>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +91,13 @@ fn plan_packed_run_compaction_counted(
 
     let source_count = sources.len();
     let mut winners = BTreeMap::<IndexBlindKey, ResolvedMutation>::new();
+    let mut standalone_carriers = BTreeMap::<
+        (
+            rs3_types::BackendObjectId,
+            Option<rs3_types::BackendVersionId>,
+        ),
+        Arc<IndexRunStandaloneStreamContainer>,
+    >::new();
 
     for mut source in sources {
         // Decoded input is normally already validated. Revalidating at this
@@ -111,10 +119,30 @@ fn plan_packed_run_compaction_counted(
             .drain(..)
             .map(Arc::new)
             .collect::<Vec<_>>();
+        let standalone_stream_containers = source
+            .run
+            .standalone_stream_containers
+            .drain(..)
+            .map(|container| {
+                let key = (container.object_id.clone(), container.version_id.clone());
+                match standalone_carriers.get(&key) {
+                    Some(existing) if existing.as_ref() != &container => {
+                        Err(V2FormatError::InvalidIndexRun)
+                    }
+                    Some(existing) => Ok(Arc::clone(existing)),
+                    None => {
+                        let container = Arc::new(container);
+                        standalone_carriers.insert(key, Arc::clone(&container));
+                        Ok(container)
+                    }
+                }
+            })
+            .collect::<V2Result<Vec<_>>>()?;
         for mutation in source.run.mutations.drain(..) {
             let resolved = resolve_mutation(
                 &pack_containers,
                 &stream_containers,
+                &standalone_stream_containers,
                 self_pack_container.as_ref(),
                 self_stream_container.as_ref(),
                 mutation,
@@ -193,6 +221,7 @@ fn validate_self_containers(source: &PackedCompactionSourceRun) -> V2Result<()> 
 fn resolve_mutation(
     pack_containers: &[Arc<IndexRunContainer>],
     stream_containers: &[Arc<IndexRunStreamContainer>],
+    standalone_stream_containers: &[Arc<IndexRunStandaloneStreamContainer>],
     self_pack_container: Option<&Arc<IndexRunContainer>>,
     self_stream_container: Option<&Arc<IndexRunStreamContainer>>,
     mutation: IndexMutation,
@@ -256,8 +285,19 @@ fn resolve_mutation(
                         Some(ResolvedCarrier::Stream(container)),
                     )
                 }
-                IndexPayloadPointer::ExternalStandaloneStream { .. } => {
-                    return Err(V2FormatError::UnsupportedSection);
+                IndexPayloadPointer::ExternalStandaloneStream { container_ordinal } => {
+                    let index = usize::try_from(container_ordinal)
+                        .map_err(|_| V2FormatError::InvalidIndexRun)?;
+                    let container = standalone_stream_containers
+                        .get(index)
+                        .cloned()
+                        .ok_or(V2FormatError::InvalidIndexRun)?;
+                    (
+                        IndexPayloadPointer::ExternalStandaloneStream {
+                            container_ordinal: 0,
+                        },
+                        Some(ResolvedCarrier::StandaloneStream(container)),
+                    )
                 }
             };
             upsert.mutation_ordinal = 0;
@@ -385,7 +425,7 @@ fn build_and_validate_run(
         .iter()
         .filter_map(|mutation| match &mutation.carrier {
             Some(ResolvedCarrier::Pack(container)) => Some(Arc::clone(container)),
-            Some(ResolvedCarrier::Stream(_)) | None => None,
+            Some(ResolvedCarrier::Stream(_) | ResolvedCarrier::StandaloneStream(_)) | None => None,
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -394,7 +434,16 @@ fn build_and_validate_run(
         .iter()
         .filter_map(|mutation| match &mutation.carrier {
             Some(ResolvedCarrier::Stream(container)) => Some(Arc::clone(container)),
-            Some(ResolvedCarrier::Pack(_)) | None => None,
+            Some(ResolvedCarrier::Pack(_) | ResolvedCarrier::StandaloneStream(_)) | None => None,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let standalone_stream_containers = mutations
+        .iter()
+        .filter_map(|mutation| match &mutation.carrier {
+            Some(ResolvedCarrier::StandaloneStream(container)) => Some(Arc::clone(container)),
+            Some(ResolvedCarrier::Pack(_) | ResolvedCarrier::Stream(_)) | None => None,
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -431,6 +480,18 @@ fn build_and_validate_run(
                             .map_err(|_| V2FormatError::IndexRunLimitExceeded)?,
                     };
                 }
+                (
+                    IndexPayloadPointer::ExternalStandaloneStream { .. },
+                    Some(ResolvedCarrier::StandaloneStream(container)),
+                ) => {
+                    let container_ordinal = standalone_stream_containers
+                        .binary_search(container)
+                        .map_err(|_| V2FormatError::InvalidIndexRun)?;
+                    upsert.payload = IndexPayloadPointer::ExternalStandaloneStream {
+                        container_ordinal: u32::try_from(container_ordinal)
+                            .map_err(|_| V2FormatError::IndexRunLimitExceeded)?,
+                    };
+                }
                 (IndexPayloadPointer::Empty, None) => {}
                 _ => return Err(V2FormatError::InvalidIndexRun),
             }
@@ -450,7 +511,10 @@ fn build_and_validate_run(
             .into_iter()
             .map(|container| container.as_ref().clone())
             .collect(),
-        standalone_stream_containers: Vec::new(),
+        standalone_stream_containers: standalone_stream_containers
+            .into_iter()
+            .map(|container| container.as_ref().clone())
+            .collect(),
         mutations: canonical_mutations,
     };
     encode_index_run_frames(&run, limits).map_err(|_| V2FormatError::IndexRunLimitExceeded)?;
@@ -481,6 +545,8 @@ fn set_mutation_ordinal(mutation: &mut IndexMutation, ordinal: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use rs3_index::PayloadHeaderReference;
     use rs3_index::run::{
         IndexPackRecordPointer, IndexRunKeyringRef, IndexRunSelfPack, IndexRunSelfStream,
@@ -574,6 +640,26 @@ mod tests {
             payload_section_len,
             payload_section_digest: [byte.wrapping_add(2); 32],
             payload_id: object_id(&format!("payloads/stream-{byte}")),
+            payload_header,
+        }
+    }
+
+    fn standalone_stream_container(byte: u8) -> IndexRunStandaloneStreamContainer {
+        let payload_header = stream_header();
+        IndexRunStandaloneStreamContainer {
+            object_id: object_id(&format!(
+                "objects/v02/{}",
+                URL_SAFE_NO_PAD.encode([byte; 32])
+            )),
+            version_id: Some(must(BackendVersionId::new(format!(
+                "standalone-version-{byte}"
+            )))),
+            stored_len: payload_header.header_len + payload_header.plaintext_len + 16,
+            object_digest: [byte; 32],
+            keyring_envelope: IndexRunKeyringRef {
+                object_id: object_id(&format!("keys/standalone-{byte}")),
+                digest: [byte.wrapping_add(1); 32],
+            },
             payload_header,
         }
     }
@@ -691,6 +777,81 @@ mod tests {
             self_pack_container: None,
             self_stream_container: None,
         }
+    }
+
+    fn external_standalone_stream_source(
+        sequence_value: u64,
+        blind_key: IndexBlindKey,
+        generation: u64,
+        exact_container: IndexRunStandaloneStreamContainer,
+    ) -> PackedCompactionSourceRun {
+        PackedCompactionSourceRun {
+            run: IndexRun {
+                sequence: sequence(sequence_value),
+                self_pack: None,
+                self_stream: None,
+                containers: Vec::new(),
+                stream_containers: Vec::new(),
+                standalone_stream_containers: vec![exact_container],
+                mutations: vec![upsert(
+                    0,
+                    blind_key,
+                    generation,
+                    IndexPayloadPointer::ExternalStandaloneStream {
+                        container_ordinal: 0,
+                    },
+                )],
+            },
+            self_pack_container: None,
+            self_stream_container: None,
+        }
+    }
+
+    #[test]
+    fn mixed_carriers_are_deduplicated_sorted_and_reindexed_exactly() {
+        let pack = container(7);
+        let stream = stream_container(8);
+        let standalone = standalone_stream_container(9);
+        let planned = must(plan_packed_run_compaction(
+            vec![
+                external_source(3, key(3), 3, 7),
+                external_stream_source(4, key(4), 4, stream.clone()),
+                external_standalone_stream_source(5, key(5), 5, standalone.clone()),
+            ],
+            &IndexRunLimits::default(),
+        ));
+
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].containers, vec![pack]);
+        assert_eq!(planned[0].stream_containers, vec![stream]);
+        assert_eq!(planned[0].standalone_stream_containers, vec![standalone]);
+        let IndexMutation::Upsert(standalone_upsert) = &planned[0].mutations[2] else {
+            panic!("expected standalone upsert");
+        };
+        assert_eq!(
+            standalone_upsert.payload,
+            IndexPayloadPointer::ExternalStandaloneStream {
+                container_ordinal: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn conflicting_exact_standalone_carrier_facts_fail_planning() {
+        let first = standalone_stream_container(9);
+        let mut conflicting = first.clone();
+        conflicting.keyring_envelope.digest[0] ^= 0x80;
+
+        assert_eq!(
+            plan_packed_run_compaction(
+                vec![
+                    external_standalone_stream_source(3, key(3), 3, first),
+                    external_standalone_stream_source(4, key(4), 4, conflicting),
+                ],
+                &IndexRunLimits::default(),
+            ),
+            Err(V2FormatError::InvalidIndexRun)
+        );
     }
 
     #[test]

@@ -588,6 +588,8 @@ struct SlowCommitGetStore {
     in_flight_ranged_commit_gets: Arc<AtomicUsize>,
     max_in_flight_ranged_commit_gets: Arc<AtomicUsize>,
     corrupt_ranged_commit_gets_for: Arc<Mutex<Option<BackendObjectId>>>,
+    standalone_gets: Arc<AtomicUsize>,
+    standalone_puts: Arc<AtomicUsize>,
 }
 
 impl SlowCommitGetStore {
@@ -600,6 +602,8 @@ impl SlowCommitGetStore {
             in_flight_ranged_commit_gets: Arc::new(AtomicUsize::new(0)),
             max_in_flight_ranged_commit_gets: Arc::new(AtomicUsize::new(0)),
             corrupt_ranged_commit_gets_for: Arc::new(Mutex::new(None)),
+            standalone_gets: Arc::new(AtomicUsize::new(0)),
+            standalone_puts: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -612,6 +616,8 @@ impl SlowCommitGetStore {
         self.in_flight_ranged_commit_gets.store(0, Ordering::SeqCst);
         self.max_in_flight_ranged_commit_gets
             .store(0, Ordering::SeqCst);
+        self.standalone_gets.store(0, Ordering::SeqCst);
+        self.standalone_puts.store(0, Ordering::SeqCst);
     }
 
     fn operation_counts(&self) -> rs3_storage::BlobOperationCounts {
@@ -630,6 +636,13 @@ impl SlowCommitGetStore {
 
     fn max_in_flight_ranged_commit_get_count(&self) -> u64 {
         self.max_in_flight_ranged_commit_gets.load(Ordering::SeqCst) as u64
+    }
+
+    fn standalone_io_counts(&self) -> (u64, u64) {
+        (
+            self.standalone_gets.load(Ordering::SeqCst) as u64,
+            self.standalone_puts.load(Ordering::SeqCst) as u64,
+        )
     }
 
     fn corrupt_ranged_commit_gets_for(&self, object_id: BackendObjectId) {
@@ -704,7 +717,22 @@ impl BlobStore for SlowCommitGetStore {
         body: Bytes,
         options: PutOptions,
     ) -> rs3_storage::Result<BlobMetadata> {
+        if object_id.as_str().starts_with("objects/v02/") {
+            self.standalone_puts.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.put(object_id, body, options).await
+    }
+
+    fn supports_multipart_upload(&self) -> bool {
+        self.inner.supports_multipart_upload()
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        object_id: &BackendObjectId,
+        options: PutOptions,
+    ) -> rs3_storage::Result<Box<dyn rs3_storage::BlobMultipartUpload>> {
+        self.inner.create_multipart_upload(object_id, options).await
     }
 
     async fn get_range(
@@ -712,6 +740,9 @@ impl BlobStore for SlowCommitGetStore {
         object_id: &BackendObjectId,
         range: ByteRange,
     ) -> rs3_storage::Result<Bytes> {
+        if object_id.as_str().starts_with("objects/v02/") {
+            self.standalone_gets.fetch_add(1, Ordering::SeqCst);
+        }
         self.record_commit_get(object_id, range).await;
         let body = self.inner.get_range(object_id, range).await?;
         Ok(self.maybe_corrupt_commit_range(object_id, range, body))
@@ -723,6 +754,9 @@ impl BlobStore for SlowCommitGetStore {
         version_id: Option<&BackendVersionId>,
         range: ByteRange,
     ) -> rs3_storage::Result<Bytes> {
+        if object_id.as_str().starts_with("objects/v02/") {
+            self.standalone_gets.fetch_add(1, Ordering::SeqCst);
+        }
         self.record_commit_get(object_id, range).await;
         let body = self
             .inner
@@ -6076,6 +6110,85 @@ async fn v2_packed_run_compaction_preserves_newest_state_without_copying_payload
             .map(|entry| entry.key)
             .collect::<Vec<_>>(),
         vec![overwritten_key, stable_key]
+    );
+}
+
+#[tokio::test]
+async fn v2_packed_run_compaction_preserves_mixed_standalone_metadata_without_payload_io() {
+    let fixture = standalone_read_fixture(V2ProviderProfile::Dev, false, false).await;
+    let store = SlowCommitGetStore::new(fixture.store, Duration::ZERO);
+    let repository = V2Repository::new(
+        store.clone(),
+        fixture.keyring.clone(),
+        RepositoryOptions::default(),
+        fixture.options.clone(),
+    );
+    must_repo(repository.load_chain_from_anchor(&fixture.anchor).await);
+    store.reset_operation_counts();
+    must_repo(
+        repository
+            .full_gc_dry_run(&fixture.anchor, V2FullGcDryRunOptions::default())
+            .await,
+    );
+    assert_eq!(store.standalone_io_counts(), (0, 0));
+    let packed_key = must_type(LogicalPath::new("standalone/mixed-packed.bin"));
+    let streamed_key = must_type(LogicalPath::new("standalone/mixed-streamed.bin"));
+    let packed_body = Bytes::from_static(b"mixed packed payload");
+    let streamed_body = Bytes::from(vec![0x5a; 256 * 1024 + 19]);
+    must_repo(
+        repository
+            .put_committed(
+                &fixture.anchor,
+                packed_key.clone(),
+                packed_body.clone(),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(
+        repository
+            .put_committed_streaming_known_len(
+                &fixture.anchor,
+                streamed_key.clone(),
+                streamed_body.len() as u64,
+                stream::iter(vec![Ok::<Bytes, RepositoryError>(streamed_body.clone())]),
+                RepositoryPutOptions::default(),
+                super::commit::V2_MAX_HEADER_SIZE + 64 * 1024,
+            )
+            .await,
+    );
+    assert_eq!(must_repo(repository.active_index_run_count()), 3);
+
+    store.reset_operation_counts();
+    must_repo(
+        repository
+            .compact_packed_index_runs(&fixture.anchor, &UnenforcedQuiescedMaintenanceGuard)
+            .await,
+    );
+    must_repo(repository.write_index_snapshot(&fixture.anchor).await);
+    assert_eq!(store.standalone_io_counts(), (0, 0));
+
+    let fresh = V2Repository::new(
+        store.clone(),
+        fixture.keyring,
+        RepositoryOptions::default(),
+        fixture.options,
+    );
+    store.reset_operation_counts();
+    must_repo(fresh.load_chain_from_anchor(&fixture.anchor).await)
+        .expect("checkpointed mixed compacted catalog should reload");
+    assert_eq!(store.standalone_io_counts(), (0, 0));
+    assert_eq!(
+        must_repo(fresh.get_range(&fixture.key, ByteRange::Full).await),
+        fixture.body
+    );
+    assert_eq!(
+        must_repo(fresh.get_range(&packed_key, ByteRange::Full).await),
+        packed_body
+    );
+    assert_eq!(
+        must_repo(fresh.get_range(&streamed_key, ByteRange::Full).await),
+        streamed_body
     );
 }
 

@@ -157,7 +157,7 @@ where
                 reason: "v2 compaction requires no pending index delta".to_owned(),
             });
         }
-        let (has_packed_payload, live_object_count, live_plaintext_bytes) = {
+        let (has_external_payload, live_object_count, live_plaintext_bytes) = {
             let state = self
                 .accepted
                 .read()
@@ -167,14 +167,20 @@ where
                 |(has_pack, count, bytes), entry| {
                     (
                         has_pack
-                            || matches!(entry.payload_ref, Some(PayloadReference::V2Pack { .. })),
+                            || matches!(
+                                entry.payload_ref,
+                                Some(
+                                    PayloadReference::V2Pack { .. }
+                                        | PayloadReference::V2StandaloneStream { .. }
+                                )
+                            ),
                         count.saturating_add(1),
                         bytes.saturating_add(entry.content_len),
                     )
                 },
             )
         };
-        if has_packed_payload {
+        if has_external_payload {
             return Err(RepositoryError::CommitFailed {
                 reason: "packed v02 compaction requires the INDEX_ROOT checkpoint path".to_owned(),
             });
@@ -423,9 +429,7 @@ where
                 Some(PayloadReference::V2Self { .. } | PayloadReference::V2PackSelf { .. }) => {
                     return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
                 }
-                Some(PayloadReference::V2StandaloneStream { .. }) => {
-                    return Err(v2_repository_error(V2FormatError::UnsupportedSection));
-                }
+                Some(PayloadReference::V2StandaloneStream { .. }) => {}
             }
         }
         Ok((sections, pack_records))
