@@ -957,7 +957,8 @@ mod imp {
             ],
         )
         .context("failed to restart gateway deployment")?;
-        wait_for_gateway_rollout(args, kubeconfig_path)
+        wait_for_gateway_rollout(args, kubeconfig_path)?;
+        assert_gateway_containers_never_restarted(args, kubeconfig_path)
     }
 
     fn wait_for_gateway_rollout(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
@@ -977,6 +978,46 @@ mod imp {
             ],
         )
         .context("gateway deployment did not become ready after restart")
+    }
+
+    fn assert_gateway_containers_never_restarted(
+        args: &VeleroKopiaSmokeArgs,
+        kubeconfig_path: &Path,
+    ) -> Result<()> {
+        let selector = format!(
+            "app.kubernetes.io/name=rs3-gateway,app.kubernetes.io/instance={}",
+            args.release_name
+        );
+        let output = kubectl_capture(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &[
+                "-n",
+                &args.gateway_namespace,
+                "get",
+                "pods",
+                "-l",
+                &selector,
+                "-o",
+                r#"jsonpath={range .items[*].status.containerStatuses[*]}{.restartCount}{"\n"}{end}"#,
+            ],
+        )
+        .context("failed to inspect gateway container restart counts")?;
+
+        let mut observed = false;
+        for raw_count in output.lines() {
+            let count = raw_count.trim().parse::<u64>().with_context(|| {
+                format!("gateway restart count `{raw_count}` was not an integer")
+            })?;
+            observed = true;
+            if count != 0 {
+                bail!("gateway container restarted {count} time(s) during rollout");
+            }
+        }
+        if !observed {
+            bail!("gateway rollout exposed no container restart count");
+        }
+        Ok(())
     }
 
     fn assert_no_backend_writes_during_restore(

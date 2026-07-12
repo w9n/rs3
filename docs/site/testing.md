@@ -32,7 +32,7 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | Velero/Kopia | `just integration-velero-kopia-smoke` | Velero node-agent/Kopia backup and restore smoke. |
 | Live v2 Velero dynamic PVC | `just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-bucket <bucket> --backend-endpoint-url <endpoint> --backend-region <region> --backend-prefix <fresh-prefix>` | Velero/Kopia dynamic-PVC backup and restore through a v2-preview gateway after a gateway restart, against an existing retained backend. |
 | Live v2 Velero Postgres | `just integration-velero-kopia-postgres-v2-live --backend-bucket <bucket> --backend-endpoint-url <endpoint> --backend-region <region> --backend-prefix <fresh-prefix>` | Velero/Kopia Postgres backup and restore through a v2-preview gateway against an existing retained backend. |
-| Preview release gate | `just preview-gate-release` | v2 Kopia gateway, Velero dynamic PVC gateway-restart in normal write mode, and Velero Postgres smoke. |
+| Preview release gate | `just preview-gate-release` | v2 Kopia gateway, Velero dynamic PVC gateway-restart in normal write mode, and Velero Postgres smoke. The restart lane rejects any gateway container restart during the forced rollout. |
 | Velero strict restore-readonly | `just integration-velero-kopia-dynamic-pvc-restore-readonly-smoke` | Incident-restore behavior: restored bytes verify, Velero artifact writes are denied, and backend writes stay at zero during restore. |
 | Lightweight perf smoke | `just perf-s3-gateway --format jsonl` | Small gateway scenario metrics and amplification. |
 | Gateway perf smoke | `just perf-s3-gateway --objects 32 --object-size 262144 --reads 64 --range-len 4096 --commit-batch-items 8 --concurrency 8 --format jsonl` | Release-profile local gateway run for current v2 request cost, throughput, and amplification. |
@@ -150,7 +150,8 @@ just integration-kopia-gateway --mode provided --backend-prefix <fresh-prefix>
 For the Kubernetes path, run the Velero dynamic PVC gateway-restart lane against
 the same provider. This creates a disposable kind cluster, runs a Velero/Kopia
 backup, deletes the namespace, restarts the stateless gateway, restores the
-namespace, and verifies the restored file bytes:
+namespace, verifies that the replacement gateway container did not enter a
+startup restart loop, and verifies the restored file bytes:
 
 ```sh
 RS3_REPOSITORY_RETENTION_MODE=governance \

@@ -135,8 +135,10 @@ Expected Secret keys are:
   is not a safe lock service. Multiple disconnected `restore-readonly` readers
   are supported when each can verify the accepted anchored state.
 - The chart enables the admin listener by default and uses unauthenticated
-  `/readyz` on the admin port for readiness and `/healthz` for liveness. Admin fact
-  routes still require the configured bearer token.
+  `/healthz` for startup and liveness plus `/readyz` for readiness. The startup
+  probe allows up to ten minutes for bounded repository recovery before
+  liveness can restart the process. Admin fact routes still require the
+  configured bearer token.
 - `metrics.enabled=true` exposes the gateway metrics listener through the main
   Service. `metrics.serviceMonitor.enabled=true` also renders a Prometheus
   Operator `ServiceMonitor`.

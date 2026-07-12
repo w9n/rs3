@@ -342,6 +342,12 @@ Use [Alerting](reference/alerts.md) for starting Prometheus rules covering
 accepted-checkpoint freshness, commit publishing, anchor advance failures, and
 gateway probes.
 
+The Helm deployment uses an HTTP startup probe with a ten-minute budget before
+enabling liveness and readiness probes. This lets bounded commit and index
+recovery finish without a liveness restart loop. A process that never exposes
+the admin health listener still fails closed and is restarted when the startup
+budget expires.
+
 ## Logs And Traces
 
 Use JSON logs when collecting structured runtime evidence:
