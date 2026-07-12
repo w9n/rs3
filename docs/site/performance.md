@@ -485,11 +485,15 @@ simultaneous 64 MiB+1 B single-PUT objects in 5.984 s, compared with 5.67 s for
 one object, about 7.6x aggregate scaling. The backend held exactly nine opaque
 standalone objects and all nine gateway reads matched the source checksum.
 
-The host's Docker bridge stopped forwarding published container ports during
-the formal recipe, so both RustFS and MinIO testcontainers failed readiness
-before rs3 started. The equivalent host-network S3 evidence above qualifies the
-product path, but the exact `just perf-standalone-gate` container wrapper and a
-retained-provider rerun remain release evidence to collect.
+After the host Docker bridge was repaired, the exact
+`just perf-standalone-gate` recipe passed against disposable RustFS on
+2026-07-12. Release-gateway throughput at concurrency 1/2/4/8 was
+105.41/178.86/315.16/432.66 MiB/s, so the eight-writer point reached 4.10x the
+single-writer baseline. Every point stayed at 1.000270x writes and 2.000515x
+total verified I/O. The direct companion completed at 258.23 MiB/s with exactly
+eight multipart creates, 40 part uploads, eight completes, no aborts, fresh
+reload, and exact full reads. A retained-provider rerun remains release evidence
+to collect.
 
 The default partial commit-batch wait is now 25 ms. A 2026-05-17 local gateway
 smoke recorded the current medium-object shape: sequential 256 KiB writes used
