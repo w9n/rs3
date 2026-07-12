@@ -487,18 +487,18 @@ standalone objects and all nine gateway reads matched the source checksum.
 
 After the host Docker bridge was repaired, the exact
 `just perf-standalone-gate` recipe passed against disposable RustFS on
-2026-07-12 with the same eight-object, 512 MiB plaintext workload at every
-concurrency. Release-gateway throughput at concurrency 1/2/4/8 was
-110.90/192.16/295.27/411.74 MiB/s, so the eight-writer point reached 3.71x the
-single-writer baseline. Peak gateway RSS was 247,099,392/367,484,928/
-603,152,384/939,343,872 B. Every point stayed at 1.000270x writes,
-1.000246x verification reads, and 2.000515x total verified I/O. The direct
-companion completed at 266.25 MiB/s with exactly eight multipart creates,
-40 part uploads, eight completes, no aborts, fresh reload, and one exact full
-read per object at 1.000245x. Gateway logs expose aggregate provider PUTs rather
-than multipart lifecycle counts, so exact part-count enforcement stays on the
-direct provider companion instead of inventing evidence. A retained-provider
-restart rerun remains release evidence to collect.
+2026-07-12 at revision `ebcdfe9`, with the same eight-object, 512 MiB plaintext
+workload at every concurrency. Release-gateway throughput at concurrency
+1/2/4/8 was 82.77/151.73/238.85/326.09 MiB/s, so the eight-writer point reached
+3.94x the single-writer baseline. Peak gateway RSS was 205,455,360/355,057,664/
+570,654,720/722,866,176 B. Every point stayed at 1.000270x writes, 1.000246x
+verification reads, and 2.000515x total verified I/O. The direct companion
+completed at 225.35 MiB/s with exactly eight multipart creates, 40 part uploads,
+eight completes, no aborts, 34.37 ms recovery, 1.633 s full reload verification,
+and one exact full read per object at 1.000245x. Gateway logs expose aggregate
+provider PUTs rather than multipart lifecycle counts, so exact part-count
+enforcement stays on the direct provider companion instead of inventing
+evidence. A retained-provider restart rerun remains release evidence to collect.
 
 The default partial commit-batch wait is now 25 ms. A 2026-05-17 local gateway
 smoke recorded the current medium-object shape: sequential 256 KiB writes used
