@@ -3941,7 +3941,7 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
 }
 
 #[tokio::test]
-async fn v2_commit_coordinator_round_trips_128_writes_across_reload() {
+async fn v2_commit_coordinator_checkpoints_multiple_batches_across_reload() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
@@ -3991,6 +3991,7 @@ async fn v2_commit_coordinator_round_trips_128_writes_across_reload() {
     }
 
     assert_eq!(must_repo(repository.list("snapshots/")).len(), 128);
+    must_repo(coordinator.write_index_snapshot().await);
     let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
     must_repo(fresh.load_chain_from_anchor(&anchor).await);
     assert_eq!(must_repo(fresh.list("snapshots/")).len(), 128);

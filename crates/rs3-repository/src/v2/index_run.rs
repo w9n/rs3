@@ -1059,8 +1059,12 @@ fn validate_directory_layout(
             }
         }
     }
+    let maximum_metadata_records = u64::from(container_count)
+        .checked_add(u64::from(mutation_count))
+        .ok_or(V2FormatError::InvalidIndexRun)?;
     if expected_offset != stored_len
-        || metadata_records != u64::from(container_count)
+        || metadata_records < u64::from(container_count)
+        || metadata_records > maximum_metadata_records
         || (mutation_count == 0 && (saw_namespace || saw_listing))
         || (mutation_count > 0 && (!saw_namespace || !saw_listing))
         || namespace_records != u64::from(mutation_count)
