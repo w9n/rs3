@@ -187,22 +187,25 @@ level-1 shards. Scale reports include `active_index_runs` after fresh recovery
 and fail above 255 after the final checkpoint. The harness also records process
 high-water RSS and aggregates all gate failures after printing the report.
 
-On 2026-07-11 the corrected lane passed three release runs with 1,000,000
+On 2026-07-12 the lane passed three release runs with 1,000,000
 512 B objects, batch and concurrency 1,024:
 
 | Run | Elapsed | Checkpoint | Reload | Peak RSS | PUT | GET | HEAD | Active runs | Write amplification | Cold read |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 44.806 s | 2.590 ms | 9.789 s | 2,809,933,824 B | 1,008 | 3,433 | 806 | 233 | 1.602591508x | 1 GET/read, 1.03125x |
-| 2 | 44.701 s | 2.045 ms | 10.354 s | 2,809,462,784 B | 1,008 | 3,433 | 806 | 233 | 1.602591508x | 1 GET/read, 1.03125x |
-| 3 | 46.019 s | 2.030 ms | 9.575 s | 2,809,634,816 B | 1,008 | 3,433 | 806 | 233 | 1.602591508x | 1 GET/read, 1.03125x |
+| 1 | 40.579 s | 1.972 ms | 6.412 s | 2,197,200,896 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
+| 2 | 40.743 s | 2.181 ms | 6.752 s | 2,197,594,112 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
+| 3 | 41.200 s | 4.308 ms | 6.955 s | 2,197,561,344 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
 
 Every run performed six bounded metadata-only compactions, passed the
 180-second write/checkpoint, 30-second reload, and 4 GiB resource ceilings,
 recovered exactly one million list entries, and verified first, middle, and last
-payload bytes. A final 270k preflight under the same code completed in 11.655 s
-at 758,521,856 B peak RSS,
-1.505740509x amplification, and 140 active runs. These results cover the
-same-process in-memory lane; the pinned fresh-process filesystem gate remains.
+payload bytes. Removing the unused v02 prefix-token projection reduced a
+same-host 100k sample from 282,611,712 B to 217,219,072 B peak RSS and from
+823.807 ms to 549.552 ms reload time while backend bytes, request counts, run
+count, and cold-read shape remained exact. The process high-water values include
+the complete in-memory backend, not only trusted gateway state. These results
+cover the same-process in-memory lane; the pinned fresh-process filesystem gate
+remains.
 
 ### Payload-size evidence
 

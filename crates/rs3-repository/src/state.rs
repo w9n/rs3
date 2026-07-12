@@ -62,6 +62,18 @@ impl RepositoryState {
     ) {
         let affected_manifest = self.manifests.get(&entry.manifest_id).cloned();
         self.namespace.upsert(entry, prefix_tokens);
+        self.update_list_entry(affected_manifest);
+    }
+
+    /// Inserts an entry for a repository generation whose listing projection
+    /// is maintained separately from the legacy prefix-token index.
+    pub(crate) fn upsert_namespace_entry_without_prefixes(&mut self, entry: NamespaceEntry) {
+        let affected_manifest = self.manifests.get(&entry.manifest_id).cloned();
+        self.namespace.upsert_without_prefixes(entry);
+        self.update_list_entry(affected_manifest);
+    }
+
+    fn update_list_entry(&mut self, affected_manifest: Option<TrustedManifest>) {
         if let Some(manifest) = affected_manifest {
             // A logical path has one live namespace entry. Key rotation first
             // tombstones historical blind keys, so the new entry can update

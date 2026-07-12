@@ -23,7 +23,7 @@ use crate::model::{
     DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry, RepositoryObjectMetadata,
     RepositoryPutOptions,
 };
-use crate::namespace::{first_namespace_entry, prefix_tokens_for_key};
+use crate::namespace::first_namespace_entry;
 use crate::payload::{
     PayloadHeaderProbe, SegmentedPayloadFormat, SegmentedPayloadHeader, SegmentedPayloadSealer,
     adaptive_payload_segment_size, open_payload_object, parse_segmented_payload_header,
@@ -44,7 +44,7 @@ use rs3_index::{
 use rs3_storage::{BlobStore, ByteRange, StorageError};
 use rs3_types::{
     BackendObjectId, BackendObjectRef, BackendVersionId, LegalHoldStatus, LogicalPath, ManifestId,
-    PrefixToken, RetentionPolicy, Sequence,
+    RetentionPolicy, Sequence,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -142,7 +142,6 @@ struct PendingV2Install {
 enum PendingV2InstallMutation {
     Upsert {
         entry: Box<NamespaceEntry>,
-        prefix_tokens: Vec<PrefixToken>,
         manifest: TrustedManifest,
     },
     Tombstone {
@@ -1107,9 +1106,6 @@ where
         let keyring = self.repository.keyring()?;
         let primary_blind_key = keyring.derive_primary_blind_index_key(&key)?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(&key)?;
-        let prefix_tokens =
-            prefix_tokens_for_key(&keyring, &primary_blind_key.key_id, key.as_str())?;
-
         let accepted = self
             .accepted
             .read()
@@ -1181,7 +1177,7 @@ where
         }
         deltas.push(IndexDelta::Upsert {
             entry: Box::new(entry),
-            prefix_tokens,
+            prefix_tokens: Vec::new(),
             sealed_manifest: Box::new(sealed_manifest),
         });
         let payload = pending_body.map(|body| PendingV2Payload {
@@ -2030,8 +2026,6 @@ where
         updated.generation = sequence;
         updated.legal_hold = backend.legal_hold.or(Some(status));
         updated.object_version_id = backend.version_id.or(updated.object_version_id);
-        let prefix_tokens =
-            prefix_tokens_for_key(&keyring, &updated.namespace_key_id, key.as_str())?;
         let manifest = TrustedManifest {
             key: key.clone(),
             content_len: trusted_manifest
@@ -2050,7 +2044,7 @@ where
         let rollback = pending.append_operation(
             vec![IndexDelta::Upsert {
                 entry: Box::new(updated),
-                prefix_tokens,
+                prefix_tokens: Vec::new(),
                 sealed_manifest: Box::new(sealed_manifest),
             }],
             Some((manifest_id, manifest.clone())),
@@ -2367,11 +2361,7 @@ where
         let mut mutations = Vec::with_capacity(pending.deltas().len());
         for delta in pending.deltas() {
             match delta {
-                IndexDelta::Upsert {
-                    entry,
-                    prefix_tokens,
-                    ..
-                } => {
+                IndexDelta::Upsert { entry, .. } => {
                     let manifest = manifests
                         .get(&entry.manifest_id)
                         .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
@@ -2382,7 +2372,6 @@ where
                     }
                     mutations.push(PendingV2InstallMutation::Upsert {
                         entry: Box::new((**entry).clone()),
-                        prefix_tokens: prefix_tokens.clone(),
                         manifest: (*manifest).clone(),
                     });
                 }
@@ -2436,18 +2425,14 @@ where
         // mutation between pre-CAS validation and this local installation.
         for mutation in install.mutations {
             match mutation {
-                PendingV2InstallMutation::Upsert {
-                    entry,
-                    prefix_tokens,
-                    manifest,
-                } => {
+                PendingV2InstallMutation::Upsert { entry, manifest } => {
                     accepted
                         .repository
                         .manifests
                         .insert(entry.manifest_id.clone(), manifest);
                     accepted
                         .repository
-                        .upsert_namespace_entry(*entry, prefix_tokens);
+                        .upsert_namespace_entry_without_prefixes(*entry);
                 }
                 PendingV2InstallMutation::Tombstone {
                     blind_key,

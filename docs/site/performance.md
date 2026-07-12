@@ -109,23 +109,28 @@ and length fields, and validates catalog-only rewrites by reading back the exact
 signed root and new run bytes. It does not rebuild a second complete namespace
 to prove that an immutable catalog still names the same state.
 
-On 2026-07-11 the corrected automatic-compaction 1M lane passed three release
+On 2026-07-12 the automatic-compaction 1M lane passed three release
 runs with 512 B values, batch and concurrency 1,024, the 180-second elapsed
 gate, a 30-second same-process reload gate, and the 4 GiB process high-water
 gate:
 
 | Run | Elapsed | Checkpoint | Fresh reload | Peak RSS | PUT | GET | HEAD | Active runs | Write amp | Cold read |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 44.806 s | 2.590 ms | 9.789 s | 2,809,933,824 B | 1,008 | 3,433 | 806 | 233 | 1.602591508x | 1 GET/read, 1.03125x |
-| 2 | 44.701 s | 2.045 ms | 10.354 s | 2,809,462,784 B | 1,008 | 3,433 | 806 | 233 | 1.602591508x | 1 GET/read, 1.03125x |
-| 3 | 46.019 s | 2.030 ms | 9.575 s | 2,809,634,816 B | 1,008 | 3,433 | 806 | 233 | 1.602591508x | 1 GET/read, 1.03125x |
+| 1 | 40.579 s | 1.972 ms | 6.412 s | 2,197,200,896 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
+| 2 | 40.743 s | 2.181 ms | 6.752 s | 2,197,594,112 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
+| 3 | 41.200 s | 4.308 ms | 6.955 s | 2,197,561,344 B | 1,008 | 3,433 | 806 | 233 | 1.602593008x | 1 GET/read, 1.03125x |
 
 Each run performed six bounded metadata-only compactions, reloaded exactly one
 million entries through a new repository instance, and verified the first,
-middle, and last payload. A final 270k preflight under the same code completed
-in 11.655 s at 758,521,856 B peak RSS, 1.505740509x amplification, and 140
-active runs. These same-process in-memory results close the automatic-compaction
-resource gate, but do not replace the pinned fresh-process filesystem lane.
+middle, and last payload. The v02 accepted state no longer derives or retains
+the legacy prefix-token projection because v02 listing uses its separate
+trusted path-ordered projection. Against a same-host 100k pre-change sample,
+that reduced peak RSS from 282,611,712 B to 217,219,072 B and reload from
+823.807 ms to 549.552 ms without changing backend bytes, request counts, run
+count, or cold-read shape. The in-memory scale process also retains the complete
+simulated backend, so its high-water mark is not gateway-only memory. These
+same-process results close the automatic-compaction resource gate, but do not
+replace the pinned fresh-process filesystem lane.
 
 The current layout removes the pack directory:
 encrypted `INDEX_RUN` state authenticates the record's exact physical offset,

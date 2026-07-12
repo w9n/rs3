@@ -5,7 +5,6 @@ use super::{
     payload_header_from_reference, v2_repository_error,
 };
 use crate::error::{RepositoryError, Result};
-use crate::namespace::prefix_tokens_for_key;
 use crate::payload::total_segmented_payload_len;
 use crate::state::{RepositoryState, TrustedManifest, object_material};
 use rs3_index::run::{
@@ -960,8 +959,6 @@ pub(in crate::v2) fn apply_packed_index_run(
                     }) => (commit_key.clone(), commit_version_id.clone()),
                     _ => (commit_key.clone(), replay.version_id.cloned()),
                 };
-                let prefix_tokens =
-                    prefix_tokens_for_key(keyring, &upsert.namespace_key_id, upsert.path.as_str())?;
                 state.manifests.insert(
                     manifest_id.clone(),
                     TrustedManifest {
@@ -972,22 +969,19 @@ pub(in crate::v2) fn apply_packed_index_run(
                         legal_hold: upsert.legal_hold,
                     },
                 );
-                state.upsert_namespace_entry(
-                    NamespaceEntry {
-                        namespace_key_id: upsert.namespace_key_id,
-                        blind_key,
-                        object_id,
-                        object_version_id,
-                        payload_ref,
-                        manifest_id,
-                        content_len: upsert.content_len,
-                        modified_at_ms: upsert.modified_at_ms,
-                        generation: upsert.generation,
-                        retention: upsert.retention,
-                        legal_hold: upsert.legal_hold,
-                    },
-                    prefix_tokens,
-                );
+                state.upsert_namespace_entry_without_prefixes(NamespaceEntry {
+                    namespace_key_id: upsert.namespace_key_id,
+                    blind_key,
+                    object_id,
+                    object_version_id,
+                    payload_ref,
+                    manifest_id,
+                    content_len: upsert.content_len,
+                    modified_at_ms: upsert.modified_at_ms,
+                    generation: upsert.generation,
+                    retention: upsert.retention,
+                    legal_hold: upsert.legal_hold,
+                });
             }
             IndexMutation::Tombstone(tombstone) => {
                 let blind_key = tombstone

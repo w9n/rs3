@@ -526,9 +526,20 @@ impl NamespaceIndex {
                 .insert(entry.blind_key.clone());
         }
 
-        self.entry_prefixes
-            .insert(entry.blind_key.clone(), prefix_set);
+        if !prefix_set.is_empty() {
+            self.entry_prefixes
+                .insert(entry.blind_key.clone(), prefix_set);
+        }
         self.entries.insert(entry.blind_key.clone(), entry);
+    }
+
+    /// Inserts or replaces an entry without building the legacy prefix-token
+    /// projection.
+    ///
+    /// Callers that maintain a separate plaintext listing projection inside
+    /// their trusted boundary do not need the forward and reverse prefix maps.
+    pub fn upsert_without_prefixes(&mut self, entry: NamespaceEntry) {
+        self.upsert(entry, Vec::new());
     }
 
     /// Looks up an entry by blind key.
@@ -1034,6 +1045,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![object_id]
         );
+    }
+
+    #[test]
+    fn namespace_upsert_without_prefixes_skips_both_prefix_projections() {
+        let mut index = NamespaceIndex::new();
+        let blind_key = blind_key("blind-a");
+        let old_prefix = prefix_token("prefix-old");
+        let replacement = object_id("segments/opaque-b");
+
+        index.upsert(
+            entry(blind_key.clone(), object_id("segments/opaque-a")),
+            vec![old_prefix.clone()],
+        );
+        index.upsert_without_prefixes(entry(blind_key.clone(), replacement.clone()));
+
+        assert_eq!(
+            index.head(&blind_key).map(|entry| &entry.object_id),
+            Some(&replacement)
+        );
+        assert!(index.prefix_tokens(&blind_key).next().is_none());
+        assert!(index.list_prefix(&old_prefix).is_empty());
+        assert!(!index.entry_prefixes.contains_key(&blind_key));
+        assert!(index.prefixes.is_empty());
     }
 
     #[test]
