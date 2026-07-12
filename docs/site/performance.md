@@ -124,22 +124,23 @@ Wire version 6 raises the bounded pack and speculative-overlay ceiling to 4,096
 records. This is a low-amplification bulk policy, not the 64-record low-latency
 default. At one million unique 512 B objects it creates 245 foreground runs,
 stays below the 256-run compaction trigger, and therefore avoids rewriting the
-index merely to satisfy the 255-run recovery gate. Three release runs on
-2026-07-12 produced identical physical accounting:
+index merely to satisfy the 255-run recovery gate. Three release runs at
+revision `b8b78be` on 2026-07-12 produced identical physical accounting:
 
 | Run | Elapsed | Recovery | Reload total | Peak RSS | PUT | GET | HEAD | Active runs | Write amp | Cold read |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 43.892 s | 4.873 s | 4.909 s | 1,681,723,392 B | 246 | 253 | 248 | 245 | 1.268292436x | 1 GET/read, 1.03125x |
-| 2 | 43.850 s | 4.905 s | 4.941 s | 1,681,272,832 B | 246 | 253 | 248 | 245 | 1.268292436x | 1 GET/read, 1.03125x |
-| 3 | 43.963 s | 4.942 s | 4.980 s | 1,681,440,768 B | 246 | 253 | 248 | 245 | 1.268292436x | 1 GET/read, 1.03125x |
+| 1 | 45.553 s | 5.101 s | 5.141 s | 1,680,826,368 B | 246 | 253 | 248 | 245 | 1.268292436x | 1 GET/read, 1.03125x |
+| 2 | 44.902 s | 5.013 s | 5.051 s | 1,681,043,456 B | 246 | 253 | 248 | 245 | 1.268292436x | 1 GET/read, 1.03125x |
+| 3 | 44.639 s | 5.056 s | 5.095 s | 1,681,162,240 B | 246 | 253 | 248 | 245 | 1.268292436x | 1 GET/read, 1.03125x |
 
 That removes 97,897,125 backend write bytes per million-object run, 13.1%
 relative to the wire-v5 compaction lane. It is a real tradeoff: median object
 latency rises because each publication seals and sorts a larger bounded batch.
 A one-run 2,048-record comparison completed in 34.188 s at 1.394975344x writes
-and 1.646860754x total write-path I/O, while 4,096-record runs took about 43.9 s
-at 1.268292436x writes and about 1.269019x total write-path I/O. The release
-recipe chooses the lower-amplification point; operators that prioritize latency
+and 1.646860754x total write-path I/O, while committed 4,096-record runs took
+44.6-45.6 s at 1.268292436x writes and about 1.269019x total write-path I/O.
+The release recipe chooses the lower-amplification point; operators that
+prioritize latency
 retain the smaller normal batching policy.
 
 The earlier wire-v5 runs performed six bounded metadata-only compactions,
@@ -181,16 +182,14 @@ backend on that local filesystem. It is not an HTTP gateway measurement, the
 pinned release-runner timing qualification, or a retained-provider
 qualification, and the fresh process does not imply a cold kernel page cache.
 
-The current wire-v6 candidate then passed three equivalent fresh-process ext4
-runs using 4,096-record batches. The build recorded a dirty source identifier,
-so these qualify the implementation shape but must be repeated at the exact
-committed release revision:
+Revision `b8b78be` then passed three equivalent fresh-process ext4 runs using
+4,096-record batches:
 
 | Run | Writer elapsed | Checkpoint | Writer RSS | Reader recovery | Reader verification | Reader RSS | Write amp | Active runs |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 46.824 s | 8.330 ms | 955,678,720 B | 5.350 s | 5.391 s | 1,010,372,608 B | 1.268284240x | 245 |
-| 2 | 46.791 s | 8.039 ms | 955,850,752 B | 5.280 s | 5.316 s | 1,010,085,888 B | 1.268284240x | 245 |
-| 3 | 46.673 s | 7.476 ms | 956,338,176 B | 5.300 s | 5.340 s | 1,010,331,648 B | 1.268284240x | 245 |
+| 1 | 47.574 s | 10.319 ms | 956,428,288 B | 5.389 s | 5.426 s | 1,009,971,200 B | 1.268284240x | 245 |
+| 2 | 47.488 s | 8.457 ms | 956,030,976 B | 5.471 s | 5.508 s | 1,010,356,224 B | 1.268284240x | 245 |
+| 3 | 48.313 s | 7.255 ms | 955,772,928 B | 5.558 s | 5.594 s | 1,010,176,000 B | 1.268284240x | 245 |
 
 Every run recovered exactly one million entries after writer exit, verified all
 three sentinels, and kept one exact 528 B range `GET` per 512 B cold read.
@@ -477,9 +476,20 @@ multipart and reload companion. It requires concurrency-8 aggregate plaintext
 throughput to reach at least twice the same-host concurrency-1 result and checks
 exact standalone-object cardinality directly on the disposable backend, so a
 serialized or accidentally packed gateway path cannot qualify silently. The
-full container matrix and retained provider
-rerun remain release evidence to collect; the memory smoke is an architectural
-byte/count check, not a provider claim.
+committed candidate also passed an eight-writer direct S3 run against a
+disposable MinIO backend: 512 MiB of plaintext completed in 2.106 s
+(243.15 MiB/s), with exactly eight multipart creates, 40 part uploads, eight
+completes, no aborts, 1.000269x write amplification, and fresh-instance full
+reads at 1.000245x. A release gateway against the same backend moved eight
+simultaneous 64 MiB+1 B single-PUT objects in 5.984 s, compared with 5.67 s for
+one object, about 7.6x aggregate scaling. The backend held exactly nine opaque
+standalone objects and all nine gateway reads matched the source checksum.
+
+The host's Docker bridge stopped forwarding published container ports during
+the formal recipe, so both RustFS and MinIO testcontainers failed readiness
+before rs3 started. The equivalent host-network S3 evidence above qualifies the
+product path, but the exact `just perf-standalone-gate` container wrapper and a
+retained-provider rerun remain release evidence to collect.
 
 The default partial commit-batch wait is now 25 ms. A 2026-05-17 local gateway
 smoke recorded the current medium-object shape: sequential 256 KiB writes used

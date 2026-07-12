@@ -223,7 +223,7 @@ separate-process repository RSS excluding an in-memory backend, not an HTTP
 gateway measurement, pinned release-runner timing, or retained-provider
 qualification.
 
-The current wire-v6 candidate raises the bounded payload-pack and speculative-
+Revision `b8b78be` raises the bounded payload-pack and speculative-
 overlay ceiling to 4,096 records. At one million unique 512 B objects this
 produces 245 runs, below the 256-run compaction trigger, and avoids rewriting
 index metadata merely to satisfy the 255-run recovery gate. Three in-memory
@@ -231,16 +231,16 @@ release runs produced identical byte and request accounting:
 
 | Run | Elapsed | Recovery | Reload total | Peak RSS | PUT | GET | HEAD | Active runs | Write amplification |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 43.892 s | 4.873 s | 4.909 s | 1,681,723,392 B | 246 | 253 | 248 | 245 | 1.268292436x |
-| 2 | 43.850 s | 4.905 s | 4.941 s | 1,681,272,832 B | 246 | 253 | 248 | 245 | 1.268292436x |
-| 3 | 43.963 s | 4.942 s | 4.980 s | 1,681,440,768 B | 246 | 253 | 248 | 245 | 1.268292436x |
+| 1 | 45.553 s | 5.101 s | 5.141 s | 1,680,826,368 B | 246 | 253 | 248 | 245 | 1.268292436x |
+| 2 | 44.902 s | 5.013 s | 5.051 s | 1,681,043,456 B | 246 | 253 | 248 | 245 | 1.268292436x |
+| 3 | 44.639 s | 5.056 s | 5.095 s | 1,681,162,240 B | 246 | 253 | 248 | 245 | 1.268292436x |
 
-Three fresh-process ext4 runs of the same dirty candidate recorded
-46.673-46.824 s writer time, 955,678,720-956,338,176 B writer RSS,
-5.280-5.350 s recovery, 1,010,085,888-1,010,372,608 B reader RSS,
+Three fresh-process ext4 runs of the same committed revision recorded
+47.488-48.313 s writer time, 955,772,928-956,428,288 B writer RSS,
+5.389-5.558 s recovery, 1,009,971,200-1,010,356,224 B reader RSS,
 1.268284240x writes, exact million cardinality, 245 active runs, and one exact
-528 B range `GET` per 512 B sentinel. The dirty build identifier means the exact
-committed release revision still needs the pinned-runner repetition.
+528 B range `GET` per 512 B sentinel. Pinned-runner timing still needs a release
+repetition.
 
 ### Bounded HTTP full-read evidence
 
