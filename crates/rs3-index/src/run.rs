@@ -635,6 +635,14 @@ pub enum IndexRunError {
     UnusedStreamContainer(u32),
     /// A standalone-stream table entry is not referenced by any namespace mutation.
     UnusedStandaloneStreamContainer(u32),
+    /// Namespace-key table entries are not in canonical order.
+    InvalidNamespaceKeyOrder,
+    /// A namespace-key table entry is repeated.
+    DuplicateNamespaceKey,
+    /// A namespace-key table entry is not referenced by any mutation.
+    UnusedNamespaceKey(u32),
+    /// A namespace mutation references no namespace-key table entry.
+    InvalidNamespaceKeyOrdinal(u32),
     /// A payload-pack section is empty or falls outside its containing object.
     InvalidContainerRange,
     /// A streamed payload section or its authenticated header facts are invalid.
@@ -734,6 +742,18 @@ impl fmt::Display for IndexRunError {
                     formatter,
                     "unused standalone stream container ordinal {ordinal}"
                 )
+            }
+            Self::InvalidNamespaceKeyOrder => {
+                formatter.write_str("namespace key table is not canonically ordered")
+            }
+            Self::DuplicateNamespaceKey => {
+                formatter.write_str("duplicate namespace key table entry")
+            }
+            Self::UnusedNamespaceKey(ordinal) => {
+                write!(formatter, "unused namespace key ordinal {ordinal}")
+            }
+            Self::InvalidNamespaceKeyOrdinal(ordinal) => {
+                write!(formatter, "invalid namespace key ordinal {ordinal}")
             }
             Self::InvalidContainerRange => {
                 formatter.write_str("invalid payload-pack section range")
@@ -837,7 +857,23 @@ pub fn encode_index_run_frames(
     )?;
     validate_mutations(run, limits)?;
 
-    let mut metadata = Vec::with_capacity(container_count);
+    let namespace_key_ids = run
+        .mutations
+        .iter()
+        .map(mutation_namespace_key_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    validate_count(
+        "namespace key count",
+        namespace_key_ids.len(),
+        limits.max_mutations,
+    )?;
+
+    let metadata_count = container_count
+        .checked_add(namespace_key_ids.len())
+        .ok_or(IndexRunError::IntegerOverflow)?;
+    let mut metadata = Vec::with_capacity(metadata_count);
     for container in &run.containers {
         let mut record = Writer::new(limits.max_record_bytes);
         record.u8(0)?;
@@ -902,6 +938,16 @@ pub fn encode_index_run_frames(
         encode_payload_header(&mut record, &container.payload_header)?;
         metadata.push(PreparedRecord::metadata(record.finish()));
     }
+    for namespace_key_id in &namespace_key_ids {
+        let mut record = Writer::new(limits.max_record_bytes);
+        record.u8(3)?;
+        record.string(
+            namespace_key_id.as_str(),
+            limits.max_key_id_bytes,
+            "namespace key id",
+        )?;
+        metadata.push(PreparedRecord::metadata(record.finish()));
+    }
 
     let mut namespace_order: Vec<_> = run.mutations.iter().collect();
     namespace_order.sort_by(|left, right| {
@@ -917,11 +963,10 @@ pub fn encode_index_run_frames(
             IndexMutation::Upsert(upsert) => {
                 record.u8(0)?;
                 record.bytes(upsert.blind_key.as_bytes())?;
-                record.string(
-                    upsert.namespace_key_id.as_str(),
-                    limits.max_key_id_bytes,
-                    "namespace key id",
-                )?;
+                record.varint(namespace_key_ordinal(
+                    &namespace_key_ids,
+                    &upsert.namespace_key_id,
+                )?)?;
                 record.varint(upsert.generation.get())?;
                 encode_payload_pointer(&mut record, upsert.payload)?;
                 record.varint(upsert.content_len)?;
@@ -932,11 +977,10 @@ pub fn encode_index_run_frames(
             IndexMutation::Tombstone(tombstone) => {
                 record.u8(1)?;
                 record.bytes(tombstone.blind_key.as_bytes())?;
-                record.string(
-                    tombstone.namespace_key_id.as_str(),
-                    limits.max_key_id_bytes,
-                    "namespace key id",
-                )?;
+                record.varint(namespace_key_ordinal(
+                    &namespace_key_ids,
+                    &tombstone.namespace_key_id,
+                )?)?;
                 record.varint(tombstone.generation.get())?;
             }
         }
@@ -995,8 +1039,8 @@ pub fn encode_index_run_frames(
         run.sequence,
         mutation_count,
         self_payload,
+        namespace_key_ids.len(),
         &metadata,
-        true,
         limits,
     )?;
     frames.extend(pack_prepared_frames(
@@ -1004,8 +1048,8 @@ pub fn encode_index_run_frames(
         run.sequence,
         mutation_count,
         self_payload,
+        namespace_key_ids.len(),
         &namespace,
-        false,
         limits,
     )?);
     frames.extend(pack_prepared_frames(
@@ -1013,8 +1057,8 @@ pub fn encode_index_run_frames(
         run.sequence,
         mutation_count,
         self_payload,
+        namespace_key_ids.len(),
         &listing,
-        false,
         limits,
     )?);
     let total = frames.iter().try_fold(0_usize, |total, frame| {
@@ -1049,11 +1093,11 @@ fn pack_prepared_frames(
     sequence: Sequence,
     mutation_count: u32,
     self_payload: IndexRunSelfPayload<'_>,
+    namespace_key_count: usize,
     records: &[PreparedRecord],
-    emit_when_empty: bool,
     limits: &IndexRunLimits,
 ) -> Result<Vec<EncodedIndexRunFrame>, IndexRunError> {
-    if records.is_empty() && !emit_when_empty {
+    if records.is_empty() && role != IndexRunFrameRole::Metadata {
         return Ok(Vec::new());
     }
     let mut frames = Vec::new();
@@ -1069,9 +1113,15 @@ fn pack_prepared_frames(
                 .checked_add(framed_len)
                 .ok_or(IndexRunError::IntegerOverflow)?;
             let candidate_count = end - start + 1;
-            if frame_header_len(role, records.len(), candidate_count, self_payload)?
-                .checked_add(candidate_payload)
-                .ok_or(IndexRunError::IntegerOverflow)?
+            if frame_header_len(
+                role,
+                records.len(),
+                candidate_count,
+                self_payload,
+                namespace_key_count,
+            )?
+            .checked_add(candidate_payload)
+            .ok_or(IndexRunError::IntegerOverflow)?
                 > limits.max_frame_bytes
             {
                 break;
@@ -1100,6 +1150,7 @@ fn pack_prepared_frames(
                 role_record_count: records.len(),
                 frame_record_count: frame_records.len(),
                 self_payload,
+                namespace_key_count,
             },
         )?;
         for record in frame_records {
@@ -1134,6 +1185,7 @@ struct FrameEncodingFacts<'a> {
     role_record_count: usize,
     frame_record_count: usize,
     self_payload: IndexRunSelfPayload<'a>,
+    namespace_key_count: usize,
 }
 
 fn encode_frame_header(
@@ -1165,6 +1217,7 @@ fn encode_frame_header(
                 encode_payload_header(writer, &stream.payload_header)?;
             }
         }
+        writer.varint(usize_to_u64(facts.namespace_key_count)?)?;
     }
     Ok(())
 }
@@ -1174,6 +1227,7 @@ fn frame_header_len(
     role_record_count: usize,
     frame_record_count: usize,
     self_payload: IndexRunSelfPayload<'_>,
+    namespace_key_count: usize,
 ) -> Result<usize, IndexRunError> {
     let base = INDEX_RUN_PLAINTEXT_DOMAIN.len() + 2 + 1 + 4 + 8 + 5;
     let mut length = base
@@ -1214,6 +1268,9 @@ fn frame_header_len(
             }
             IndexRunSelfPayload::None => {}
         }
+        length = length
+            .checked_add(varint_len(usize_to_u64(namespace_key_count)?))
+            .ok_or(IndexRunError::IntegerOverflow)?;
     }
     Ok(length)
 }
@@ -1322,6 +1379,8 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
     let mut containers = Vec::new();
     let mut stream_containers = Vec::new();
     let mut standalone_stream_containers = Vec::new();
+    let mut namespace_key_ids: Vec<KeyId> = Vec::new();
+    let mut declared_namespace_key_count = None;
     let mut namespace: Vec<Option<NamespaceProjection>> = Vec::new();
     let mut mutations: Vec<Option<IndexMutation>> = Vec::new();
     let mut previous_container = None;
@@ -1329,11 +1388,13 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
     let mut previous_standalone_stream_container = None;
     let mut saw_stream_container = false;
     let mut saw_standalone_stream_container = false;
+    let mut saw_namespace_key_id = false;
     let mut previous_namespace_key = None;
     let mut previous_listing_key: Option<(LogicalPath, u32)> = None;
     let mut used_containers = BTreeSet::new();
     let mut used_stream_containers = BTreeSet::new();
     let mut used_standalone_stream_containers = BTreeSet::new();
+    let mut used_namespace_key_ids = BTreeSet::new();
     let mut uses_self_pack = false;
     let mut self_stream_uses = 0_usize;
     let mut expected_role = IndexRunFrameRole::Metadata;
@@ -1379,8 +1440,6 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
                 let count = usize::try_from(header.mutation_count)
                     .map_err(|_| IndexRunError::IntegerOverflow)?;
                 validate_count("mutation count", count, limits.max_mutations)?;
-                namespace.resize_with(count, || None);
-                mutations.resize_with(count, || None);
             }
             Some(value) if value == header.mutation_count => {}
             Some(_) => return Err(IndexRunError::FrameFactsMismatch),
@@ -1399,12 +1458,23 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
 
         match header.role {
             IndexRunFrameRole::Metadata => {
-                if header.role_record_count > limits.max_containers {
-                    return Err(IndexRunError::LimitExceeded {
-                        field: "container count",
-                        actual: header.role_record_count,
-                        maximum: limits.max_containers,
-                    });
+                let frame_namespace_key_count = header
+                    .namespace_key_count
+                    .ok_or(IndexRunError::FrameFactsMismatch)?;
+                if frame_namespace_key_count > header.role_record_count
+                    || frame_namespace_key_count
+                        > usize::try_from(header.mutation_count)
+                            .map_err(|_| IndexRunError::IntegerOverflow)?
+                {
+                    return Err(IndexRunError::FrameFactsMismatch);
+                }
+                match declared_namespace_key_count {
+                    None => {
+                        declared_namespace_key_count = Some(frame_namespace_key_count);
+                        namespace_key_ids = Vec::with_capacity(frame_namespace_key_count);
+                    }
+                    Some(count) if count == frame_namespace_key_count => {}
+                    Some(_) => return Err(IndexRunError::FrameFactsMismatch),
                 }
                 let frame_self_pack = header.self_pack.ok_or(IndexRunError::FrameFactsMismatch)?;
                 let frame_self_stream = header
@@ -1422,9 +1492,18 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
                     let mut record = reader.record(limits.max_record_bytes)?;
                     match record.u8()? {
                         0 => {
-                            if saw_stream_container || saw_standalone_stream_container {
+                            if saw_stream_container
+                                || saw_standalone_stream_container
+                                || saw_namespace_key_id
+                            {
                                 return Err(IndexRunError::InvalidContainerOrder);
                             }
+                            validate_next_container_count(
+                                &containers,
+                                &stream_containers,
+                                &standalone_stream_containers,
+                                limits,
+                            )?;
                             let container = decode_container(&mut record, limits)?;
                             let key = (container.object_id.clone(), container.version_id.clone());
                             if let Some(previous) = &previous_container {
@@ -1439,9 +1518,15 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
                             containers.push(container);
                         }
                         1 => {
-                            if saw_standalone_stream_container {
+                            if saw_standalone_stream_container || saw_namespace_key_id {
                                 return Err(IndexRunError::InvalidContainerOrder);
                             }
+                            validate_next_container_count(
+                                &containers,
+                                &stream_containers,
+                                &standalone_stream_containers,
+                                limits,
+                            )?;
                             saw_stream_container = true;
                             let container = decode_stream_container(&mut record, limits)?;
                             let key = (container.object_id.clone(), container.version_id.clone());
@@ -1457,6 +1542,15 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
                             stream_containers.push(container);
                         }
                         2 => {
+                            if saw_namespace_key_id {
+                                return Err(IndexRunError::InvalidContainerOrder);
+                            }
+                            validate_next_container_count(
+                                &containers,
+                                &stream_containers,
+                                &standalone_stream_containers,
+                                limits,
+                            )?;
                             saw_standalone_stream_container = true;
                             let container =
                                 decode_standalone_stream_container(&mut record, limits)?;
@@ -1472,6 +1566,31 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
                             previous_standalone_stream_container = Some(key);
                             standalone_stream_containers.push(container);
                         }
+                        3 => {
+                            saw_namespace_key_id = true;
+                            let declared = declared_namespace_key_count
+                                .ok_or(IndexRunError::FrameFactsMismatch)?;
+                            if namespace_key_ids.len() >= declared {
+                                return Err(IndexRunError::FrameFactsMismatch);
+                            }
+                            let namespace_key_id = record.typed_string(
+                                "namespace key id",
+                                limits.max_key_id_bytes,
+                                KeyId::new,
+                            )?;
+                            if let Some(previous) = namespace_key_ids.last() {
+                                match previous.cmp(&namespace_key_id) {
+                                    std::cmp::Ordering::Less => {}
+                                    std::cmp::Ordering::Equal => {
+                                        return Err(IndexRunError::DuplicateNamespaceKey);
+                                    }
+                                    std::cmp::Ordering::Greater => {
+                                        return Err(IndexRunError::InvalidNamespaceKeyOrder);
+                                    }
+                                }
+                            }
+                            namespace_key_ids.push(namespace_key_id);
+                        }
                         value => {
                             return Err(IndexRunError::InvalidTag {
                                 field: "container type",
@@ -1483,25 +1602,37 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
                 }
             }
             IndexRunFrameRole::Namespace => {
-                saw_namespace = true;
+                let declared =
+                    declared_namespace_key_count.ok_or(IndexRunError::FrameFactsMismatch)?;
+                if namespace_key_ids.len() != declared {
+                    return Err(IndexRunError::FrameFactsMismatch);
+                }
                 if header.role_record_count
                     != usize::try_from(header.mutation_count)
                         .map_err(|_| IndexRunError::IntegerOverflow)?
                 {
                     return Err(IndexRunError::FrameFactsMismatch);
                 }
+                if !saw_namespace {
+                    let count = usize::try_from(header.mutation_count)
+                        .map_err(|_| IndexRunError::IntegerOverflow)?;
+                    namespace.resize_with(count, || None);
+                    mutations.resize_with(count, || None);
+                    saw_namespace = true;
+                }
                 for _ in 0..header.frame_record_count {
                     let mut record = reader.record(limits.max_record_bytes)?;
                     let ordinal = record.u32_varint()?;
-                    let projection = decode_namespace_projection(
+                    let (projection, namespace_key_ordinal) = decode_namespace_projection(
                         &mut record,
+                        &namespace_key_ids,
                         &containers,
                         self_pack.as_ref(),
                         &stream_containers,
                         self_stream.as_ref(),
                         &standalone_stream_containers,
-                        limits,
                     )?;
+                    used_namespace_key_ids.insert(namespace_key_ordinal);
                     if let NamespaceProjection::Upsert { payload, .. } = &projection {
                         match payload {
                             IndexPayloadPointer::Empty => {}
@@ -1592,10 +1723,16 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
     if count == 0 && (saw_namespace || saw_listing) {
         return Err(IndexRunError::FrameFactsMismatch);
     }
+    let declared_namespace_key_count =
+        declared_namespace_key_count.ok_or(IndexRunError::FrameFactsMismatch)?;
+    if namespace_key_ids.len() != declared_namespace_key_count {
+        return Err(IndexRunError::FrameFactsMismatch);
+    }
     if containers
         .len()
         .checked_add(stream_containers.len())
         .and_then(|count| count.checked_add(standalone_stream_containers.len()))
+        .and_then(|count| count.checked_add(namespace_key_ids.len()))
         .ok_or(IndexRunError::IntegerOverflow)?
         != frames_metadata_total(frames, limits)?
     {
@@ -1624,6 +1761,7 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
         standalone_stream_containers.len(),
         &used_standalone_stream_containers,
     )?;
+    validate_namespace_key_use(namespace_key_ids.len(), &used_namespace_key_ids)?;
     let mut ordered_mutations = Vec::with_capacity(mutations.len());
     for (index, mutation) in mutations.into_iter().enumerate() {
         let ordinal = u32::try_from(index).map_err(|_| IndexRunError::IntegerOverflow)?;
@@ -1650,6 +1788,7 @@ struct DecodedFrameHeader {
     frame_record_count: usize,
     self_pack: Option<Option<IndexRunSelfPack>>,
     self_stream: Option<Option<IndexRunSelfStream>>,
+    namespace_key_count: Option<usize>,
 }
 
 fn decode_frame_header<'a>(
@@ -1678,16 +1817,18 @@ fn decode_frame_header<'a>(
     let role_ordinal = reader.u32()?;
     let sequence = Sequence::new(reader.u64()?);
     let mutation_count = reader.u32_varint()?;
-    let role_record_count = reader.bounded_count(
-        "role record count",
-        limits.max_mutations.max(limits.max_containers),
-    )?;
-    let frame_record_count = reader.bounded_count(
-        "frame record count",
-        limits.max_mutations.max(limits.max_containers),
-    )?;
-    let (self_pack, self_stream) = if role == IndexRunFrameRole::Metadata {
-        match reader.u8()? {
+    let role_record_limit = if role == IndexRunFrameRole::Metadata {
+        limits
+            .max_containers
+            .checked_add(limits.max_mutations)
+            .ok_or(IndexRunError::IntegerOverflow)?
+    } else {
+        limits.max_mutations
+    };
+    let role_record_count = reader.bounded_count("role record count", role_record_limit)?;
+    let frame_record_count = reader.bounded_count("frame record count", role_record_limit)?;
+    let (self_pack, self_stream, namespace_key_count) = if role == IndexRunFrameRole::Metadata {
+        let (self_pack, self_stream) = match reader.u8()? {
             0 => (Some(None), Some(None)),
             1 => {
                 let mut pack_id = [0_u8; 32];
@@ -1724,9 +1865,12 @@ fn decode_frame_header<'a>(
                     value,
                 });
             }
-        }
+        };
+        let namespace_key_count =
+            reader.bounded_count("namespace key count", limits.max_mutations)?;
+        (self_pack, self_stream, Some(namespace_key_count))
     } else {
-        (None, None)
+        (None, None, None)
     };
     Ok((
         DecodedFrameHeader {
@@ -1738,6 +1882,7 @@ fn decode_frame_header<'a>(
             frame_record_count,
             self_pack,
             self_stream,
+            namespace_key_count,
         },
         reader,
     ))
@@ -1893,18 +2038,18 @@ fn decode_exact_container(
 
 fn decode_namespace_projection(
     record: &mut Reader<'_>,
+    namespace_key_ids: &[KeyId],
     containers: &[IndexRunContainer],
     self_pack: Option<&IndexRunSelfPack>,
     stream_containers: &[IndexRunStreamContainer],
     self_stream: Option<&IndexRunSelfStream>,
     standalone_stream_containers: &[IndexRunStandaloneStreamContainer],
-    limits: &IndexRunLimits,
-) -> Result<NamespaceProjection, IndexRunError> {
+) -> Result<(NamespaceProjection, u32), IndexRunError> {
     match record.u8()? {
         0 => {
             let blind_key = decode_blind_key(record)?;
-            let namespace_key_id =
-                record.typed_string("namespace key id", limits.max_key_id_bytes, KeyId::new)?;
+            let (namespace_key_ordinal, namespace_key_id) =
+                decode_namespace_key_reference(record, namespace_key_ids)?;
             let generation = Sequence::new(record.varint()?);
             let payload = decode_payload_pointer(
                 record,
@@ -1925,31 +2070,51 @@ fn decode_namespace_projection(
                 stream_containers,
                 standalone_stream_containers,
             )?;
-            Ok(NamespaceProjection::Upsert {
-                blind_key,
-                namespace_key_id,
-                generation,
-                payload,
-                content_len,
-                modified_at_ms: record.i64()?,
-                retention: decode_retention(record)?,
-                legal_hold: decode_legal_hold(record)?,
-            })
+            Ok((
+                NamespaceProjection::Upsert {
+                    blind_key,
+                    namespace_key_id,
+                    generation,
+                    payload,
+                    content_len,
+                    modified_at_ms: record.i64()?,
+                    retention: decode_retention(record)?,
+                    legal_hold: decode_legal_hold(record)?,
+                },
+                namespace_key_ordinal,
+            ))
         }
-        1 => Ok(NamespaceProjection::Tombstone {
-            blind_key: decode_blind_key(record)?,
-            namespace_key_id: record.typed_string(
-                "namespace key id",
-                limits.max_key_id_bytes,
-                KeyId::new,
-            )?,
-            generation: Sequence::new(record.varint()?),
-        }),
+        1 => {
+            let blind_key = decode_blind_key(record)?;
+            let (namespace_key_ordinal, namespace_key_id) =
+                decode_namespace_key_reference(record, namespace_key_ids)?;
+            Ok((
+                NamespaceProjection::Tombstone {
+                    blind_key,
+                    namespace_key_id,
+                    generation: Sequence::new(record.varint()?),
+                },
+                namespace_key_ordinal,
+            ))
+        }
         value => Err(IndexRunError::InvalidTag {
             field: "namespace mutation",
             value,
         }),
     }
+}
+
+fn decode_namespace_key_reference(
+    record: &mut Reader<'_>,
+    namespace_key_ids: &[KeyId],
+) -> Result<(u32, KeyId), IndexRunError> {
+    let ordinal = record.u32_varint()?;
+    let index = usize::try_from(ordinal).map_err(|_| IndexRunError::IntegerOverflow)?;
+    let namespace_key_id = namespace_key_ids
+        .get(index)
+        .ok_or(IndexRunError::InvalidNamespaceKeyOrdinal(ordinal))?
+        .clone();
+    Ok((ordinal, namespace_key_id))
 }
 
 fn decode_listing_projection(
@@ -2051,6 +2216,34 @@ fn validate_container_use(
     Ok(())
 }
 
+fn validate_next_container_count(
+    containers: &[IndexRunContainer],
+    stream_containers: &[IndexRunStreamContainer],
+    standalone_stream_containers: &[IndexRunStandaloneStreamContainer],
+    limits: &IndexRunLimits,
+) -> Result<(), IndexRunError> {
+    let actual = containers
+        .len()
+        .checked_add(stream_containers.len())
+        .and_then(|count| count.checked_add(standalone_stream_containers.len()))
+        .and_then(|count| count.checked_add(1))
+        .ok_or(IndexRunError::IntegerOverflow)?;
+    validate_count("container count", actual, limits.max_containers)
+}
+
+fn validate_namespace_key_use(
+    namespace_key_count: usize,
+    used_namespace_key_ids: &BTreeSet<u32>,
+) -> Result<(), IndexRunError> {
+    for index in 0..namespace_key_count {
+        let ordinal = u32::try_from(index).map_err(|_| IndexRunError::IntegerOverflow)?;
+        if !used_namespace_key_ids.contains(&ordinal) {
+            return Err(IndexRunError::UnusedNamespaceKey(ordinal));
+        }
+    }
+    Ok(())
+}
+
 fn validate_stream_container_use(
     container_count: usize,
     used_containers: &BTreeSet<u32>,
@@ -2092,7 +2285,7 @@ pub fn decode_index_run(
     let mut bundle = Reader::new(encoded);
     let maximum_frames = limits
         .max_mutations
-        .checked_mul(2)
+        .checked_mul(3)
         .and_then(|value| value.checked_add(limits.max_containers))
         .and_then(|value| value.checked_add(1))
         .ok_or(IndexRunError::IntegerOverflow)?;
@@ -2173,6 +2366,25 @@ fn mutation_blind_key(mutation: &IndexMutation) -> IndexBlindKey {
         IndexMutation::Upsert(upsert) => upsert.blind_key,
         IndexMutation::Tombstone(tombstone) => tombstone.blind_key,
     }
+}
+
+fn mutation_namespace_key_id(mutation: &IndexMutation) -> &KeyId {
+    match mutation {
+        IndexMutation::Upsert(upsert) => &upsert.namespace_key_id,
+        IndexMutation::Tombstone(tombstone) => &tombstone.namespace_key_id,
+    }
+}
+
+fn namespace_key_ordinal(
+    namespace_key_ids: &[&KeyId],
+    namespace_key_id: &KeyId,
+) -> Result<u64, IndexRunError> {
+    let ordinal = namespace_key_ids
+        .binary_search_by(|candidate| candidate.cmp(&namespace_key_id))
+        .map_err(|_| IndexRunError::InvalidValue {
+            field: "namespace key id",
+        })?;
+    usize_to_u64(ordinal)
 }
 
 fn mutation_path(mutation: &IndexMutation) -> &LogicalPath {
@@ -3193,6 +3405,19 @@ mod tests {
         }
     }
 
+    fn two_namespace_key_fixture() -> IndexRun {
+        let mut run = fixture();
+        let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
+            panic!("fixture starts with an upsert");
+        };
+        upsert.namespace_key_id = KeyId::new("namespace-b").expect("namespace key id");
+        let IndexMutation::Tombstone(tombstone) = &mut run.mutations[1] else {
+            panic!("fixture ends with a tombstone");
+        };
+        tombstone.namespace_key_id = KeyId::new("namespace-a").expect("namespace key id");
+        run
+    }
+
     fn stream_header() -> PayloadHeaderReference {
         PayloadHeaderReference {
             chunk_size: 64 * 1024,
@@ -3309,6 +3534,120 @@ mod tests {
         let decoded = decode_index_run(&encoded, &limits).expect("decode run");
 
         assert_eq!(decoded, run);
+        let IndexMutation::Upsert(upsert) = &decoded.mutations[0] else {
+            panic!("fixture starts with an upsert");
+        };
+        let IndexMutation::Tombstone(tombstone) = &decoded.mutations[1] else {
+            panic!("fixture ends with a tombstone");
+        };
+        assert_eq!(
+            upsert.namespace_key_id.as_str().as_ptr(),
+            tombstone.namespace_key_id.as_str().as_ptr(),
+            "decoded table references should share KeyId storage"
+        );
+    }
+
+    #[test]
+    fn namespace_key_table_is_sorted_unique_and_referenced_by_ordinal() {
+        let run = two_namespace_key_fixture();
+        let limits = IndexRunLimits::default();
+        let encoded = encode_index_run_frames(&run, &limits).expect("encode key table");
+        let frames = frame_bytes(encoded.clone());
+        let all_bytes = frames.concat();
+
+        assert_eq!(
+            all_bytes
+                .windows(b"namespace-a".len())
+                .filter(|window| *window == b"namespace-a")
+                .count(),
+            1
+        );
+        assert_eq!(
+            all_bytes
+                .windows(b"namespace-b".len())
+                .filter(|window| *window == b"namespace-b")
+                .count(),
+            1
+        );
+        assert!(
+            all_bytes
+                .windows(b"namespace-a".len())
+                .position(|window| window == b"namespace-a")
+                < all_bytes
+                    .windows(b"namespace-b".len())
+                    .position(|window| window == b"namespace-b")
+        );
+        assert_eq!(decode_index_run_frames(&frames, &limits), Ok(run));
+    }
+
+    #[test]
+    fn rejects_malformed_namespace_key_tables_and_ordinals() {
+        let run = two_namespace_key_fixture();
+        let limits = IndexRunLimits::default();
+        let encoded = encode_index_run_frames(&run, &limits).expect("encode key table");
+
+        let mut duplicate = frame_bytes(encoded.clone());
+        replace_frame_bytes(&mut duplicate, b"namespace-b", b"namespace-a");
+        assert_eq!(
+            decode_index_run_frames(&duplicate, &limits),
+            Err(IndexRunError::DuplicateNamespaceKey)
+        );
+
+        let mut unsorted = frame_bytes(encoded.clone());
+        replace_frame_bytes(&mut unsorted, b"namespace-a", b"namespace-z");
+        assert_eq!(
+            decode_index_run_frames(&unsorted, &limits),
+            Err(IndexRunError::InvalidNamespaceKeyOrder)
+        );
+
+        let mut unused = frame_bytes(encoded.clone());
+        set_namespace_key_ordinal(&mut unused, 0x33, 0);
+        assert_eq!(
+            decode_index_run_frames(&unused, &limits),
+            Err(IndexRunError::UnusedNamespaceKey(1))
+        );
+
+        let mut out_of_range = frame_bytes(encoded);
+        set_namespace_key_ordinal(&mut out_of_range, 0x33, 2);
+        assert_eq!(
+            decode_index_run_frames(&out_of_range, &limits),
+            Err(IndexRunError::InvalidNamespaceKeyOrdinal(2))
+        );
+    }
+
+    #[test]
+    fn namespace_key_table_limits_fail_closed() {
+        let limits = IndexRunLimits {
+            max_mutations: 2,
+            ..IndexRunLimits::default()
+        };
+        let encoded = encode_index_run_frames(&fixture(), &limits).expect("encode key table");
+        let mut excessive_count = frame_bytes(encoded);
+        let table_count_offset = INDEX_RUN_PLAINTEXT_DOMAIN.len() + 2 + 1 + 4 + 8 + 3 + 1;
+        excessive_count[0][table_count_offset] = 3;
+        assert_eq!(
+            decode_index_run_frames(&excessive_count, &limits),
+            Err(IndexRunError::LimitExceeded {
+                field: "namespace key count",
+                actual: 3,
+                maximum: 2,
+            })
+        );
+
+        let encoded = encode_index_run_frames(&fixture(), &IndexRunLimits::default())
+            .expect("encode key table");
+        let short_key_limit = IndexRunLimits {
+            max_key_id_bytes: 10,
+            ..IndexRunLimits::default()
+        };
+        assert_eq!(
+            decode_index_run_frames(&frame_bytes(encoded), &short_key_limit),
+            Err(IndexRunError::LimitExceeded {
+                field: "namespace key id",
+                actual: 11,
+                maximum: 10,
+            })
+        );
     }
 
     #[test]
@@ -3779,7 +4118,7 @@ mod tests {
         let encoded = encode_index_run(&fixture(), &IndexRunLimits::default()).expect("encode run");
         assert_eq!(
             hex(&encoded),
-            "03ec017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00050000000000000000000000000902010100b601000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c23232323232323232323232323232323232323232323232323232323232323230000000300000000000002000000000000000800111111111111111111111111111111111111111111111111111111111111111109636f6e74656e742d3108a8017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00050100000000000000000000000902020244000033333333333333333333333333333333333333333333333333333333333333330b6e616d6573706163652d311102000764d209ffffffffffffffc901020000001e022f010144444444444444444444444444444444444444444444444444444444444444440b6e616d6573706163652d31126a7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0005020000000000000000000000090202021201010e74656e616e742f64656c65746564122300001574656e616e742f736e617073686f742f6368756e6b11d209ffffffffffffffc9"
+            "03fb017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0005000000000000000000000000090202020001b601000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c23232323232323232323232323232323232323232323232323232323232323230000000300000000000002000000000000000800111111111111111111111111111111111111111111111111111111111111111109636f6e74656e742d31080d030b6e616d6573706163652d3192017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0005010000000000000000000000090202023900003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901020000001e02240101444444444444444444444444444444444444444444444444444444444444444400126a7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0005020000000000000000000000090202021201010e74656e616e742f64656c65746564122300001574656e616e742f736e617073686f742f6368756e6b11d209ffffffffffffffc9"
         );
     }
 
@@ -4008,7 +4347,7 @@ mod tests {
     #[test]
     fn rejects_transplanted_self_pack_facts_between_metadata_frames() {
         let limits = IndexRunLimits {
-            max_frame_bytes: 300,
+            max_frame_bytes: 320,
             ..IndexRunLimits::default()
         };
         let mut run = fixture();
@@ -4139,6 +4478,36 @@ mod tests {
             .into_iter()
             .map(|frame| frame.bytes)
             .collect()
+    }
+
+    fn replace_frame_bytes(frames: &mut [Vec<u8>], from: &[u8], to: &[u8]) {
+        assert_eq!(from.len(), to.len());
+        let (frame_index, offset) = frames
+            .iter()
+            .enumerate()
+            .find_map(|(frame_index, frame)| {
+                frame
+                    .windows(from.len())
+                    .position(|window| window == from)
+                    .map(|offset| (frame_index, offset))
+            })
+            .expect("encoded bytes");
+        frames[frame_index][offset..offset + from.len()].copy_from_slice(to);
+    }
+
+    fn set_namespace_key_ordinal(frames: &mut [Vec<u8>], blind_byte: u8, ordinal: u8) {
+        let blind_key = [blind_byte; 32];
+        let (frame_index, offset) = frames
+            .iter()
+            .enumerate()
+            .find_map(|(frame_index, frame)| {
+                frame
+                    .windows(blind_key.len())
+                    .position(|window| window == blind_key)
+                    .map(|offset| (frame_index, offset))
+            })
+            .expect("namespace blind key");
+        frames[frame_index][offset + blind_key.len()] = ordinal;
     }
 
     fn set_fixture_physical_offset(run: &mut IndexRun, physical_offset: u32) {
