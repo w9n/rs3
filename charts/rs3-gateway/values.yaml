@@ -39,14 +39,19 @@ metrics:
   serviceMonitor:
     enabled: false
 
-# Optional baseline NetworkPolicy. The default-off template is intentionally
-# provider-neutral; narrow egress peers to your backend endpoint and
-# kube-apiserver address, or replace this with provider-specific policy.
+# Optional baseline NetworkPolicy. Empty selectors render deny-all rules in the
+# local profile and fail validation when the production profile enables the
+# policy. Configure narrow peers for S3 clients, metrics scrapers, the backend,
+# cluster DNS, and the kube-apiserver, or replace this with provider-specific
+# policy.
 networkPolicy:
   enabled: false
   ingress:
     namespaceSelector: {}
     podSelector: {}
+    metrics:
+      namespaceSelector: {}
+      podSelector: {}
   egress:
     backend:
       to: []
@@ -58,6 +63,10 @@ networkPolicy:
       ports:
         - protocol: TCP
           port: 443
+    # DNS peers are cluster-specific. Select only the cluster DNS pods or their
+    # documented service IP; the template fixes the allowed ports to UDP/TCP 53.
+    dns:
+      to: []
 
 # read-write accepts repository mutations; restore-readonly rejects them.
 # writerGuard=required enforces Kubernetes Lease coordination for read-write.

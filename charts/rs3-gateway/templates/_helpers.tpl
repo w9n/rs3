@@ -39,6 +39,21 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{- define "rs3-gateway.validateNetworkPolicyPeers" -}}
+{{- $label := .label -}}
+{{- range $peer := .peers -}}
+{{- $ipBlock := default (dict) (get $peer "ipBlock") -}}
+{{- $namespaceSelector := default (dict) (get $peer "namespaceSelector") -}}
+{{- $podSelector := default (dict) (get $peer "podSelector") -}}
+{{- $ipBlockConfigured := not (empty (get $ipBlock "cidr")) -}}
+{{- $namespaceConfigured := or (not (empty (get $namespaceSelector "matchLabels"))) (not (empty (get $namespaceSelector "matchExpressions"))) -}}
+{{- $podConfigured := or (not (empty (get $podSelector "matchLabels"))) (not (empty (get $podSelector "matchExpressions"))) -}}
+{{- if not (or $ipBlockConfigured (or $namespaceConfigured $podConfigured)) -}}
+{{- fail (printf "%s must contain a non-empty ipBlock, namespaceSelector, or podSelector" $label) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "rs3-gateway.validateValues" -}}
 {{- if and (ne .Values.admin.profile "local") (ne .Values.admin.profile "production") -}}
 {{- fail "admin.profile must be local or production" -}}
@@ -48,6 +63,11 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- if and (not .Values.image.digest) (not .Values.image.tag) -}}
 {{- fail "image.tag is required when image.digest is empty" -}}
+{{- end -}}
+{{- if .Values.networkPolicy.enabled -}}
+{{- include "rs3-gateway.validateNetworkPolicyPeers" (dict "label" "networkPolicy.egress.backend.to peers" "peers" .Values.networkPolicy.egress.backend.to) -}}
+{{- include "rs3-gateway.validateNetworkPolicyPeers" (dict "label" "networkPolicy.egress.kubeApi.to peers" "peers" .Values.networkPolicy.egress.kubeApi.to) -}}
+{{- include "rs3-gateway.validateNetworkPolicyPeers" (dict "label" "networkPolicy.egress.dns.to peers" "peers" .Values.networkPolicy.egress.dns.to) -}}
 {{- end -}}
 {{- if and (ne .Values.image.pullPolicy "Always") (and (ne .Values.image.pullPolicy "IfNotPresent") (ne .Values.image.pullPolicy "Never")) -}}
 {{- fail "image.pullPolicy must be Always, IfNotPresent, or Never" -}}
@@ -79,6 +99,33 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- if not (regexMatch "^ed25519:[a-fA-F0-9]{64}$" .Values.recovery.publicKey) -}}
 {{- fail "admin.profile=production requires recovery.publicKey as ed25519:<64 hex characters>" -}}
+{{- end -}}
+{{- if .Values.networkPolicy.enabled -}}
+{{- $ingressNamespaceSelector := default (dict) .Values.networkPolicy.ingress.namespaceSelector -}}
+{{- $ingressPodSelector := default (dict) .Values.networkPolicy.ingress.podSelector -}}
+{{- $ingressNamespaceConfigured := or (not (empty (get $ingressNamespaceSelector "matchLabels"))) (not (empty (get $ingressNamespaceSelector "matchExpressions"))) -}}
+{{- $ingressPodConfigured := or (not (empty (get $ingressPodSelector "matchLabels"))) (not (empty (get $ingressPodSelector "matchExpressions"))) -}}
+{{- if not (or $ingressNamespaceConfigured $ingressPodConfigured) -}}
+{{- fail "admin.profile=production with networkPolicy.enabled=true requires a non-empty S3 ingress namespaceSelector or podSelector" -}}
+{{- end -}}
+{{- if empty .Values.networkPolicy.egress.backend.to -}}
+{{- fail "admin.profile=production with networkPolicy.enabled=true requires networkPolicy.egress.backend.to peers" -}}
+{{- end -}}
+{{- if empty .Values.networkPolicy.egress.kubeApi.to -}}
+{{- fail "admin.profile=production with networkPolicy.enabled=true requires networkPolicy.egress.kubeApi.to peers" -}}
+{{- end -}}
+{{- if empty .Values.networkPolicy.egress.dns.to -}}
+{{- fail "admin.profile=production with networkPolicy.enabled=true requires networkPolicy.egress.dns.to peers" -}}
+{{- end -}}
+{{- if .Values.metrics.enabled -}}
+{{- $metricsNamespaceSelector := default (dict) .Values.networkPolicy.ingress.metrics.namespaceSelector -}}
+{{- $metricsPodSelector := default (dict) .Values.networkPolicy.ingress.metrics.podSelector -}}
+{{- $metricsNamespaceConfigured := or (not (empty (get $metricsNamespaceSelector "matchLabels"))) (not (empty (get $metricsNamespaceSelector "matchExpressions"))) -}}
+{{- $metricsPodConfigured := or (not (empty (get $metricsPodSelector "matchLabels"))) (not (empty (get $metricsPodSelector "matchExpressions"))) -}}
+{{- if not (or $metricsNamespaceConfigured $metricsPodConfigured) -}}
+{{- fail "admin.profile=production with metrics and NetworkPolicy enabled requires a non-empty metrics ingress namespaceSelector or podSelector" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if not .Values.repository.id -}}

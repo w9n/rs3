@@ -1,4 +1,9 @@
 {{- if .Values.networkPolicy.enabled -}}
+{{- $s3Ingress := or (not (empty .Values.networkPolicy.ingress.namespaceSelector)) (not (empty .Values.networkPolicy.ingress.podSelector)) -}}
+{{- $metricsIngress := and .Values.metrics.enabled (or (not (empty .Values.networkPolicy.ingress.metrics.namespaceSelector)) (not (empty .Values.networkPolicy.ingress.metrics.podSelector))) -}}
+{{- $backendEgress := not (empty .Values.networkPolicy.egress.backend.to) -}}
+{{- $kubeApiEgress := not (empty .Values.networkPolicy.egress.kubeApi.to) -}}
+{{- $dnsEgress := not (empty .Values.networkPolicy.egress.dns.to) -}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -12,26 +17,69 @@ spec:
   policyTypes:
     - Ingress
     - Egress
+  {{- if or $s3Ingress $metricsIngress }}
   ingress:
+    {{- if $s3Ingress }}
     - from:
+        {{- if not (empty .Values.networkPolicy.ingress.namespaceSelector) }}
         - namespaceSelector:
             {{- toYaml .Values.networkPolicy.ingress.namespaceSelector | nindent 12 }}
+          {{- if not (empty .Values.networkPolicy.ingress.podSelector) }}
           podSelector:
             {{- toYaml .Values.networkPolicy.ingress.podSelector | nindent 12 }}
+          {{- end }}
+        {{- else }}
+        - podSelector:
+            {{- toYaml .Values.networkPolicy.ingress.podSelector | nindent 12 }}
+        {{- end }}
       ports:
         - protocol: TCP
           port: {{ .Values.service.port }}
+    {{- end }}
+    {{- if $metricsIngress }}
+    - from:
+        {{- if not (empty .Values.networkPolicy.ingress.metrics.namespaceSelector) }}
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.ingress.metrics.namespaceSelector | nindent 12 }}
+          {{- if not (empty .Values.networkPolicy.ingress.metrics.podSelector) }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.ingress.metrics.podSelector | nindent 12 }}
+          {{- end }}
+        {{- else }}
+        - podSelector:
+            {{- toYaml .Values.networkPolicy.ingress.metrics.podSelector | nindent 12 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.metrics.port }}
+    {{- end }}
+  {{- else }}
+  ingress: []
+  {{- end }}
+  {{- if or $backendEgress (or $kubeApiEgress $dnsEgress) }}
   egress:
-    -{{- with .Values.networkPolicy.egress.backend.to }}
-      to:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+    {{- if $backendEgress }}
+    - to:
+        {{- toYaml .Values.networkPolicy.egress.backend.to | nindent 8 }}
       ports:
         {{- toYaml .Values.networkPolicy.egress.backend.ports | nindent 8 }}
-    -{{- with .Values.networkPolicy.egress.kubeApi.to }}
-      to:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+    {{- end }}
+    {{- if $kubeApiEgress }}
+    - to:
+        {{- toYaml .Values.networkPolicy.egress.kubeApi.to | nindent 8 }}
       ports:
         {{- toYaml .Values.networkPolicy.egress.kubeApi.ports | nindent 8 }}
+    {{- end }}
+    {{- if $dnsEgress }}
+    - to:
+        {{- toYaml .Values.networkPolicy.egress.dns.to | nindent 8 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+  {{- else }}
+  egress: []
+  {{- end }}
 {{- end -}}

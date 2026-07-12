@@ -75,6 +75,13 @@ networkPolicy:
       matchLabels:
         kubernetes.io/metadata.name: backup-clients
     podSelector: {}
+    metrics:
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: prometheus
   egress:
     backend:
       to:
@@ -84,6 +91,14 @@ networkPolicy:
       to:
         - ipBlock:
             cidr: 10.30.0.0/24
+    dns:
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
 
 repository:
   id: tenant-a-repository
@@ -149,10 +164,16 @@ Expected Secret keys are:
   token only for Lease-backed deployments.
 - Default resources request 512Mi/250m and limit memory to 1536Mi. There is no
   CPU limit by default.
-- `networkPolicy.enabled=true` renders a baseline policy that admits S3 traffic
-  from the configured namespace/pod selector and allows egress rules for the
-  backend endpoint and Kubernetes API. Keep those peers narrow for your cluster,
-  or replace the template with provider-specific policy such as Cilium CNP.
+- `networkPolicy.enabled=true` renders a baseline policy that admits S3 and,
+  when enabled, metrics traffic only from their configured selectors. Egress is
+  limited to configured backend, Kubernetes API, and cluster-DNS peers; DNS is
+  fixed to UDP/TCP 53. The production profile rejects empty or selector-less
+  peer entries instead of silently rendering allow-all rules. Empty
+  local-profile selectors render deny-all ingress or egress, so configure
+  cluster-specific peers before expecting connectivity. CoreDNS labels and
+  service routing vary by cluster; verify the DNS peer against your network
+  plugin, or replace the template with provider-specific policy such as Cilium
+  CNP.
 - Use `gateway.mode=restore-readonly` for restore readers that must not mutate
   repository state.
 - Do not use `anchor.allowMemory=true` outside local development.
