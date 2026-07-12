@@ -1,10 +1,12 @@
-use crate::{Result, StorageError};
+use crate::{BlobMetadata, Result, StorageError};
 use aws_sdk_s3::primitives::DateTime as SdkDateTime;
 use aws_sdk_s3::types::{
     ObjectLockLegalHold, ObjectLockLegalHoldStatus as SdkObjectLockLegalHoldStatus,
     ObjectLockMode as SdkObjectLockMode, ObjectLockRetentionMode,
 };
-use rs3_types::{LegalHoldStatus, RetentionMode, RetentionPolicy};
+use rs3_types::{
+    BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionMode, RetentionPolicy,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(super) fn retention_is_active(policy: &RetentionPolicy) -> bool {
@@ -32,6 +34,79 @@ pub(super) fn retain_until_date(policy: &RetentionPolicy) -> Result<SdkDateTime>
         .checked_add(retain_secs)
         .ok_or_else(|| StorageError::Provider("retention date is out of range".to_owned()))?;
     Ok(SdkDateTime::from_secs(retain_until_secs))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RetentionExtension {
+    pub(super) policy: RetentionPolicy,
+    pub(super) retain_until_ms: i64,
+    pub(super) update_required: bool,
+}
+
+pub(super) fn plan_retention_extension(
+    actual: Option<&RetentionPolicy>,
+    actual_retain_until_ms: Option<i64>,
+    requested: RetentionPolicy,
+    now_ms: i64,
+) -> Result<RetentionExtension> {
+    if !retention_is_active(&requested) {
+        return Err(StorageError::Provider(
+            "retention extension requires an active policy".to_owned(),
+        ));
+    }
+    if actual.is_some() != actual_retain_until_ms.is_some() {
+        return Err(StorageError::Provider(
+            "S3 HEAD returned partial Object Lock metadata".to_owned(),
+        ));
+    }
+
+    let requested_duration_ms = i64::from(requested.retain_days)
+        .checked_mul(86_400_000)
+        .ok_or_else(|| StorageError::Provider("retention period is out of range".to_owned()))?;
+    let requested_retain_until_ms = now_ms
+        .checked_add(requested_duration_ms)
+        .ok_or_else(|| StorageError::Provider("retention date is out of range".to_owned()))?;
+    let mode = actual
+        .map(|actual| stronger_retention_mode(actual.mode, requested.mode))
+        .unwrap_or(requested.mode);
+    let retain_until_ms = actual_retain_until_ms
+        .map(|actual| actual.max(requested_retain_until_ms))
+        .unwrap_or(requested_retain_until_ms);
+    let update_required = actual
+        .is_none_or(|actual| retention_mode_strength(actual.mode) < retention_mode_strength(mode))
+        || actual_retain_until_ms.is_none_or(|actual| actual < requested_retain_until_ms);
+
+    Ok(RetentionExtension {
+        policy: RetentionPolicy::new(mode, requested.retain_days),
+        retain_until_ms,
+        update_required,
+    })
+}
+
+pub(super) fn verify_retention_extension(
+    metadata: &BlobMetadata,
+    object_id: &BackendObjectId,
+    version_id: Option<&BackendVersionId>,
+    expected_content_len: u64,
+    extension: RetentionExtension,
+) -> Result<()> {
+    if metadata.object_id != *object_id
+        || metadata.content_len != expected_content_len
+        || version_id.is_some() && metadata.version_id.as_ref() != version_id
+        || !retention_satisfies(metadata.retention.as_ref(), &extension.policy)
+        || metadata
+            .retain_until_ms
+            .is_none_or(|actual| actual < extension.retain_until_ms)
+    {
+        return Err(StorageError::Provider(
+            "S3 Object Lock extension verification failed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn sdk_retention_extension_date(extension: RetentionExtension) -> SdkDateTime {
+    SdkDateTime::from_millis(extension.retain_until_ms)
 }
 
 pub(super) fn sdk_object_lock_mode(policy: &RetentionPolicy) -> Result<SdkObjectLockMode> {
@@ -202,6 +277,20 @@ fn retention_mode_strength(mode: RetentionMode) -> u8 {
     }
 }
 
+fn stronger_retention_mode(left: RetentionMode, right: RetentionMode) -> RetentionMode {
+    if retention_mode_strength(left) >= retention_mode_strength(right) {
+        left
+    } else {
+        right
+    }
+}
+
+pub(super) fn current_epoch_ms() -> Result<i64> {
+    current_epoch_secs()?
+        .checked_mul(1_000)
+        .ok_or_else(|| StorageError::Provider("current time is out of range".to_owned()))
+}
+
 fn current_epoch_secs() -> Result<i64> {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -209,4 +298,136 @@ fn current_epoch_secs() -> Result<i64> {
         .as_secs();
     i64::try_from(secs)
         .map_err(|_| StorageError::Provider("current time is out of range".to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RetentionExtension, plan_retention_extension, verify_retention_extension};
+    use crate::BlobMetadata;
+    use rs3_types::{BackendObjectId, BackendVersionId, RetentionMode, RetentionPolicy};
+
+    const DAY_MS: i64 = 86_400_000;
+
+    fn object_id() -> BackendObjectId {
+        BackendObjectId::new("objects/v02/retention-test").unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn version_id(value: &str) -> BackendVersionId {
+        BackendVersionId::new(value).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn metadata(
+        version_id: BackendVersionId,
+        policy: Option<RetentionPolicy>,
+        retain_until_ms: Option<i64>,
+    ) -> BlobMetadata {
+        BlobMetadata {
+            object_id: object_id(),
+            content_len: 4096,
+            modified_at_ms: None,
+            etag: None,
+            version_id: Some(version_id),
+            retention: policy,
+            retain_until_ms,
+            legal_hold: None,
+        }
+    }
+
+    #[test]
+    fn same_policy_nearing_expiry_advances_from_one_captured_time() {
+        let now_ms = 1_700_000_000_000;
+        let actual = RetentionPolicy::new(RetentionMode::Governance, 30);
+        let extension = plan_retention_extension(
+            Some(&actual),
+            Some(now_ms + 5 * DAY_MS),
+            RetentionPolicy::new(RetentionMode::Governance, 30),
+            now_ms,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(extension.update_required);
+        assert_eq!(extension.policy.mode, RetentionMode::Governance);
+        assert_eq!(extension.retain_until_ms, now_ms + 30 * DAY_MS);
+    }
+
+    #[test]
+    fn stronger_compliance_mode_and_longer_deadline_are_preserved() {
+        let now_ms = 1_700_000_000_000;
+        let actual = RetentionPolicy::new(RetentionMode::Compliance, 90);
+        let actual_deadline = now_ms + 90 * DAY_MS;
+        let extension = plan_retention_extension(
+            Some(&actual),
+            Some(actual_deadline),
+            RetentionPolicy::new(RetentionMode::Governance, 30),
+            now_ms,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(!extension.update_required);
+        assert_eq!(extension.policy.mode, RetentionMode::Compliance);
+        assert_eq!(extension.retain_until_ms, actual_deadline);
+    }
+
+    #[test]
+    fn verification_is_bound_to_the_exact_version() {
+        let expected_version = version_id("expected-version");
+        let extension = RetentionExtension {
+            policy: RetentionPolicy::new(RetentionMode::Compliance, 30),
+            retain_until_ms: 1_800_000_000_000,
+            update_required: true,
+        };
+        let exact = metadata(
+            expected_version.clone(),
+            Some(extension.policy),
+            Some(extension.retain_until_ms),
+        );
+        assert!(
+            verify_retention_extension(
+                &exact,
+                &object_id(),
+                Some(&expected_version),
+                4096,
+                extension,
+            )
+            .is_ok()
+        );
+
+        let wrong = metadata(
+            version_id("wrong-version"),
+            Some(extension.policy),
+            Some(extension.retain_until_ms),
+        );
+        assert!(
+            verify_retention_extension(
+                &wrong,
+                &object_id(),
+                Some(&expected_version),
+                4096,
+                extension,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ambiguous_success_without_a_verified_deadline_fails_closed() {
+        let version = version_id("exact-version");
+        let extension = RetentionExtension {
+            policy: RetentionPolicy::new(RetentionMode::Governance, 30),
+            retain_until_ms: 1_800_000_000_000,
+            update_required: true,
+        };
+        let unverifiable = metadata(version.clone(), Some(extension.policy), None);
+
+        assert!(
+            verify_retention_extension(
+                &unverifiable,
+                &object_id(),
+                Some(&version),
+                4096,
+                extension,
+            )
+            .is_err()
+        );
+    }
 }

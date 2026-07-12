@@ -3,10 +3,11 @@ use super::errors::{
     backend_version_id_from_str, map_sdk_common_error, map_sdk_put_error, provider_error,
 };
 use super::object_lock::{
-    legal_hold_from_s3_head, legal_hold_from_s3_legal_hold, retain_until_date,
-    retain_until_ms_from_s3_head, retention_from_s3_head, retention_is_active,
-    retention_mode_label, retention_satisfies, sdk_legal_hold_status, sdk_object_lock_mode,
-    sdk_object_lock_retention_mode, verify_legal_hold, verify_retention,
+    current_epoch_ms, legal_hold_from_s3_head, legal_hold_from_s3_legal_hold,
+    plan_retention_extension, retain_until_date, retain_until_ms_from_s3_head,
+    retention_from_s3_head, retention_is_active, retention_mode_label, sdk_legal_hold_status,
+    sdk_object_lock_mode, sdk_object_lock_retention_mode, sdk_retention_extension_date,
+    verify_legal_hold, verify_retention, verify_retention_extension,
 };
 use crate::{BlobMetadata, PutOptions, Result, StorageError};
 use aws_sdk_s3::primitives::ByteStream as SdkByteStream;
@@ -198,14 +199,34 @@ impl S3BlobStore {
             return Ok(());
         }
         let client = &self.client;
+        let now_ms = current_epoch_ms()?;
         let existing = self.head_with_sdk(object_id, version_id).await?;
-        if retention_satisfies(existing.retention.as_ref(), policy) {
-            return Ok(());
+        let extension = plan_retention_extension(
+            existing.retention.as_ref(),
+            existing.retain_until_ms,
+            *policy,
+            now_ms,
+        )?;
+        if !extension.update_required {
+            return verify_retention_extension(
+                &existing,
+                object_id,
+                version_id,
+                existing.content_len,
+                extension,
+            );
+        }
+        if existing.object_id != *object_id
+            || version_id.is_some() && existing.version_id.as_ref() != version_id
+        {
+            return Err(StorageError::Provider(
+                "S3 Object Lock extension selected the wrong object version".to_owned(),
+            ));
         }
 
         let retention = ObjectLockRetention::builder()
-            .mode(sdk_object_lock_retention_mode(policy)?)
-            .retain_until_date(retain_until_date(policy)?)
+            .mode(sdk_object_lock_retention_mode(&extension.policy)?)
+            .retain_until_date(sdk_retention_extension_date(extension))
             .build();
         let mut request = client
             .put_object_retention()
@@ -222,7 +243,13 @@ impl S3BlobStore {
             .map_err(|error| map_sdk_common_error(error, object_id))?;
 
         let verified = self.head_with_sdk(object_id, version_id).await?;
-        verify_retention(verified.retention.as_ref(), policy)
+        verify_retention_extension(
+            &verified,
+            object_id,
+            version_id,
+            existing.content_len,
+            extension,
+        )
     }
 
     pub(super) async fn set_s3_legal_hold(

@@ -808,13 +808,23 @@ where
 
     run_unprotected_exact_delete_check(store, options, checks).await?;
 
+    let original_retain_until_ms = first.retain_until_ms;
     let extended = RetentionPolicy::new(options.retention.mode, options.retention.retain_days + 1);
     match store
         .extend_retention_at(&object_id, Some(&first_version), extended)
         .await
     {
         Ok(()) => match store.head_at(&object_id, Some(&first_version)).await {
-            Ok(metadata) if retention_satisfies(metadata.retention.as_ref(), &extended) => {
+            Ok(metadata)
+                if metadata.version_id.as_ref() == Some(&first_version)
+                    && retention_satisfies(metadata.retention.as_ref(), &extended)
+                    && metadata
+                        .retain_until_ms
+                        .zip(original_retain_until_ms)
+                        .is_some_and(|(extended_until, original_until)| {
+                            extended_until > original_until
+                        }) =>
+            {
                 checks.push(V2ProviderConformanceCheck::passed(
                     "retained-extension-verifiable",
                 ));
