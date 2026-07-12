@@ -313,9 +313,22 @@ pub struct BlobOperationCounts {
     pub set_legal_hold: u64,
     /// Number of cache flush calls.
     pub flush: u64,
-    /// Number of completed multipart upload calls.
+    /// Number of multipart completions that successfully committed an object.
     pub multipart_put: u64,
-    /// Bytes accepted by successful PUT calls.
+    /// Number of wrapper-observed multipart-create request attempts.
+    pub multipart_create: u64,
+    /// Number of wrapper-observed multipart part-upload request attempts.
+    pub multipart_upload_part: u64,
+    /// Number of wrapper-observed multipart-complete request attempts.
+    pub multipart_complete: u64,
+    /// Number of wrapper-observed multipart-abort request attempts.
+    pub multipart_abort: u64,
+    /// Request-body bytes offered to wrapper-observed PUT and multipart-part attempts.
+    ///
+    /// This includes failed attempts visible to the wrapper, but cannot include
+    /// retries performed internally by a provider SDK.
+    pub bytes_uploaded_attempted: u64,
+    /// Object bytes committed by successful PUT or multipart-complete calls.
     pub bytes_written: u64,
     /// Bytes returned by successful GET calls.
     pub bytes_read: u64,
@@ -381,8 +394,13 @@ where
         body: Bytes,
         options: PutOptions,
     ) -> Result<BlobMetadata> {
+        let attempted_len = u64::try_from(body.len())
+            .map_err(|_| StorageError::Provider("upload length does not fit in u64".to_owned()))?;
         self.mutate_counts(|counts| {
             counts.put = counts.put.saturating_add(1);
+            counts.bytes_uploaded_attempted = counts
+                .bytes_uploaded_attempted
+                .saturating_add(attempted_len);
         })?;
         let metadata = self.inner.put(object_id, body, options).await?;
         self.mutate_counts(|counts| {
@@ -400,6 +418,9 @@ where
         object_id: &BackendObjectId,
         options: PutOptions,
     ) -> Result<Box<dyn BlobMultipartUpload>> {
+        self.mutate_counts(|counts| {
+            counts.multipart_create = counts.multipart_create.saturating_add(1);
+        })?;
         let upload = self
             .inner
             .create_multipart_upload(object_id, options)
@@ -605,11 +626,28 @@ struct CountingMultipartUpload {
 #[async_trait]
 impl BlobMultipartUpload for CountingMultipartUpload {
     async fn put_part(&mut self, part_index: usize, body: Bytes) -> Result<()> {
+        let attempted_len = u64::try_from(body.len())
+            .map_err(|_| StorageError::Provider("upload length does not fit in u64".to_owned()))?;
+        {
+            let mut counts = self.counts.write().map_err(|_| {
+                StorageError::Provider("counting blob store lock poisoned".to_owned())
+            })?;
+            counts.multipart_upload_part = counts.multipart_upload_part.saturating_add(1);
+            counts.bytes_uploaded_attempted = counts
+                .bytes_uploaded_attempted
+                .saturating_add(attempted_len);
+        }
         self.inner.put_part(part_index, body).await
     }
 
     async fn complete(self: Box<Self>) -> Result<BlobMetadata> {
         let Self { inner, counts } = *self;
+        {
+            let mut counts = counts.write().map_err(|_| {
+                StorageError::Provider("counting blob store lock poisoned".to_owned())
+            })?;
+            counts.multipart_complete = counts.multipart_complete.saturating_add(1);
+        }
         let metadata = inner.complete().await?;
         let mut counts = counts
             .write()
@@ -620,7 +658,13 @@ impl BlobMultipartUpload for CountingMultipartUpload {
     }
 
     async fn abort(self: Box<Self>) -> Result<()> {
-        let Self { inner, .. } = *self;
+        let Self { inner, counts } = *self;
+        {
+            let mut counts = counts.write().map_err(|_| {
+                StorageError::Provider("counting blob store lock poisoned".to_owned())
+            })?;
+            counts.multipart_abort = counts.multipart_abort.saturating_add(1);
+        }
         inner.abort().await
     }
 }
@@ -1844,8 +1888,76 @@ mod tests {
         assert_eq!(counts.head, 1);
         assert_eq!(counts.get, 1);
         assert_eq!(counts.list, 1);
+        assert_eq!(counts.bytes_uploaded_attempted, 11);
         assert_eq!(counts.bytes_written, 11);
         assert_eq!(counts.bytes_read, 5);
+    }
+
+    #[tokio::test]
+    async fn counting_store_tracks_every_multipart_attempt_and_committed_bytes() {
+        let store = CountingBlobStore::new(MemoryBlobStore::new());
+        let object_id = object_id("segments/multipart");
+        let mut upload = store
+            .create_multipart_upload(&object_id, PutOptions::default())
+            .await
+            .unwrap_or_else(|error| panic!("create multipart upload: {error}"));
+
+        upload
+            .put_part(0, Bytes::from_static(b"hello "))
+            .await
+            .unwrap_or_else(|error| panic!("put first part: {error}"));
+        upload
+            .put_part(1, Bytes::from_static(b"world"))
+            .await
+            .unwrap_or_else(|error| panic!("put second part: {error}"));
+        let metadata = upload
+            .complete()
+            .await
+            .unwrap_or_else(|error| panic!("complete multipart upload: {error}"));
+
+        let counts = store
+            .operation_counts()
+            .unwrap_or_else(|error| panic!("read operation counts: {error}"));
+        assert_eq!(metadata.content_len, 11);
+        assert_eq!(counts.put, 0);
+        assert_eq!(counts.multipart_create, 1);
+        assert_eq!(counts.multipart_upload_part, 2);
+        assert_eq!(counts.multipart_complete, 1);
+        assert_eq!(counts.multipart_abort, 0);
+        assert_eq!(counts.multipart_put, 1);
+        assert_eq!(counts.bytes_uploaded_attempted, 11);
+        assert_eq!(counts.bytes_written, 11);
+    }
+
+    #[tokio::test]
+    async fn counting_store_keeps_failed_upload_attempts_without_committing_bytes() {
+        let store = CountingBlobStore::new(MemoryBlobStore::new());
+        let object_id = object_id("segments/failed-multipart");
+        let mut upload = store
+            .create_multipart_upload(&object_id, PutOptions::default())
+            .await
+            .unwrap_or_else(|error| panic!("create multipart upload: {error}"));
+        upload
+            .put_part(0, Bytes::from_static(b"first"))
+            .await
+            .unwrap_or_else(|error| panic!("put first part: {error}"));
+        let duplicate = upload.put_part(0, Bytes::from_static(b"retry")).await;
+        assert!(duplicate.is_err());
+        upload
+            .abort()
+            .await
+            .unwrap_or_else(|error| panic!("abort multipart upload: {error}"));
+
+        let counts = store
+            .operation_counts()
+            .unwrap_or_else(|error| panic!("read operation counts: {error}"));
+        assert_eq!(counts.multipart_create, 1);
+        assert_eq!(counts.multipart_upload_part, 2);
+        assert_eq!(counts.multipart_complete, 0);
+        assert_eq!(counts.multipart_abort, 1);
+        assert_eq!(counts.multipart_put, 0);
+        assert_eq!(counts.bytes_uploaded_attempted, 10);
+        assert_eq!(counts.bytes_written, 0);
     }
 
     #[tokio::test]

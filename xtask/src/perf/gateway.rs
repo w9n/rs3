@@ -164,7 +164,9 @@ async fn gateway_write_committed(
             client,
             gateway.addr,
             &gateway.region,
-            format!("perf/write-committed/object-{index:08}"),
+            super::perf_object_path(index, args.logical_path_len)?
+                .as_str()
+                .to_owned(),
             body.clone(),
             args.gateway_unknown_length_put,
         )
@@ -212,13 +214,16 @@ async fn gateway_write_committed_parallel(
             let client = client.clone();
             let body = body.clone();
             let gateway_region = gateway_region.clone();
+            let key = super::perf_object_path(index, args.logical_path_len)?
+                .as_str()
+                .to_owned();
             handles.push(tokio::spawn(async move {
                 let operation_started = Instant::now();
                 gateway_put_object(
                     &client,
                     gateway_addr,
                     &gateway_region,
-                    format!("perf/write-committed-parallel/object-{index:08}"),
+                    key,
                     body,
                     unknown_length,
                 )
@@ -296,6 +301,7 @@ async fn gateway_full_read(
         repository_format: PERF_REPOSITORY_FORMAT,
         objects: 1,
         object_size: args.object_size,
+        logical_path_len: None,
         operations: args.reads,
         requested_plaintext_write_bytes: 0,
         requested_plaintext_read_bytes: checked_mul(args.reads, args.object_size)?,
@@ -368,6 +374,7 @@ async fn gateway_range_read(
         repository_format: PERF_REPOSITORY_FORMAT,
         objects: 1,
         object_size: args.object_size,
+        logical_path_len: None,
         operations: args.reads,
         requested_plaintext_write_bytes: 0,
         requested_plaintext_read_bytes: checked_mul(args.reads, range_len)?,
@@ -400,6 +407,7 @@ fn gateway_write_report(
         repository_format: PERF_REPOSITORY_FORMAT,
         objects,
         object_size: args.object_size,
+        logical_path_len: Some(args.logical_path_len),
         operations,
         requested_plaintext_write_bytes: checked_mul(objects, args.object_size)?,
         requested_plaintext_read_bytes: 0,
@@ -835,6 +843,11 @@ fn parse_gateway_backend_counts(
                     continue;
                 }
                 observed_operation = true;
+                if operation == "put" {
+                    counts.bytes_uploaded_attempted = counts
+                        .bytes_uploaded_attempted
+                        .saturating_add(json_field_u64(fields, "bytes_sent"));
+                }
                 if json_field_str(fields, "result") == Some("ok") {
                     counts.bytes_written = counts
                         .bytes_written
@@ -852,6 +865,11 @@ fn parse_gateway_backend_counts(
                     continue;
                 }
                 observed_operation = true;
+                if operation == "put" {
+                    counts.bytes_uploaded_attempted = counts
+                        .bytes_uploaded_attempted
+                        .saturating_add(json_field_u64(fields, "requested_len"));
+                }
                 if json_field_str(fields, "result") == Some("ok") {
                     if operation == "put" {
                         counts.bytes_written = counts
@@ -978,6 +996,7 @@ mod tests {
         assert_eq!(counts.put, 1);
         assert_eq!(counts.get, 1);
         assert_eq!(counts.head, 1);
+        assert_eq!(counts.bytes_uploaded_attempted, 12);
         assert_eq!(counts.bytes_written, 12);
         assert_eq!(counts.bytes_read, 7);
     }
@@ -999,6 +1018,7 @@ mod tests {
         assert_eq!(counts.get, 1);
         assert_eq!(counts.head, 1);
         assert_eq!(counts.list, 1);
+        assert_eq!(counts.bytes_uploaded_attempted, 12);
         assert_eq!(counts.bytes_written, 12);
         assert_eq!(counts.bytes_read, 7);
     }

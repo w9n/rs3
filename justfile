@@ -314,6 +314,47 @@ perf-scale-100k: (perf-scale-tier "100000")
 # Scheduled/manual high-capacity scale gate. This needs substantial memory.
 perf-scale-1m: (perf-scale-tier "1000000")
 
+# Enforce exact logical-path-length write-amplification evidence without
+# conflating it with the automatic-compaction lifetime lane.
+[private]
+perf-scale-path-matrix-tier OBJECTS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    runs="${RS3_SCALE_GATE_RUNS:-3}"
+    if ! [[ "${runs}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "RS3_SCALE_GATE_RUNS must be a positive integer" >&2
+      exit 2
+    fi
+    cargo build --release -p xtask --bin xtask
+    for specification in "32:1.50" "256:2.00" "1024:3.60"; do
+      path_len="${specification%%:*}"
+      max_write_amp="${specification##*:}"
+      for ((run = 1; run <= runs; run++)); do
+        echo "path matrix run ${run}/${runs}: {{OBJECTS}} objects, ${path_len}-byte paths" >&2
+        target/release/xtask perf \
+          --scenario write-committed-parallel \
+          --objects "{{OBJECTS}}" \
+          --object-size 512 \
+          --logical-path-len "${path_len}" \
+          --commit-batch-items 64 \
+          --commit-max-pending-items 64 \
+          --concurrency 64 \
+          --verify-reload \
+          --checkpoint-after-objects "{{OBJECTS}}" \
+          --max-elapsed-seconds 180 \
+          --max-reload-elapsed-seconds 30 \
+          --max-peak-rss-bytes 4294967296 \
+          --max-write-amp "${max_write_amp}" \
+          --max-cold-read-amp 1.04 \
+          --max-cold-read-requests-per-read 1.0 \
+          --max-active-index-runs 255 \
+          --format jsonl
+      done
+    done
+
+# Three-run 10k matrix for 32, 256, and 1,024-byte logical paths.
+perf-scale-path-matrix: (perf-scale-path-matrix-tier "10000")
+
 # Run the pinned fresh-process filesystem scale tier. ROOT must name retained
 # local-disk evidence storage; each run keeps its backend and reports.
 [private]

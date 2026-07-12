@@ -36,9 +36,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
 pub(super) const PERF_REPOSITORY_FORMAT: &str = "v2-preview";
-const FRESH_PROCESS_HANDOFF_SCHEMA: &str = "rs3.perf-fresh-process-handoff.v1";
-const FRESH_PROCESS_REPORT_SCHEMA: &str = "rs3.perf-fresh-process-report.v1";
+const FRESH_PROCESS_HANDOFF_SCHEMA: &str = "rs3.perf-fresh-process-handoff.v2";
+const FRESH_PROCESS_REPORT_SCHEMA: &str = "rs3.perf-fresh-process-report.v2";
 const PERF_BODY_PATTERN_VERSION: u32 = 1;
+const PERF_OBJECT_PREFIX: &str = "perf/";
+const PERF_OBJECT_INDEX_DIGITS: usize = 20;
+const MIN_PERF_LOGICAL_PATH_LEN: usize = PERF_OBJECT_PREFIX.len() + PERF_OBJECT_INDEX_DIGITS;
+const MAX_PERF_LOGICAL_PATH_LEN: usize = 1024;
 
 /// Runs lightweight repository performance scenarios.
 #[derive(Debug, Args)]
@@ -52,6 +56,9 @@ pub(crate) struct PerfArgs {
     /// Plaintext object size in bytes.
     #[arg(long, default_value_t = 1024 * 1024)]
     object_size: usize,
+    /// Exact byte length of deterministic logical paths in write scenarios.
+    #[arg(long, default_value_t = 45)]
+    logical_path_len: usize,
     /// Maximum number of committed writes covered by one repository commit.
     #[arg(long, default_value_t = 64)]
     commit_batch_items: usize,
@@ -317,6 +324,7 @@ impl TraceFormat {
 }
 
 pub(crate) fn run(args: PerfArgs) -> Result<()> {
+    validate_perf_logical_path_len(args.logical_path_len)?;
     if let Some(phase) = args.fresh_process_phase {
         return run_fresh_process_phase(args, phase);
     }
@@ -444,6 +452,7 @@ struct FreshProcessHandoff {
     object_prefix: String,
     objects: usize,
     object_size: usize,
+    logical_path_len: usize,
     body_pattern_version: u32,
     anchor: V2AnchorState,
 }
@@ -457,12 +466,19 @@ struct FreshProcessWriterReport {
     peak_rss_bytes: Option<u64>,
     objects: usize,
     object_size: usize,
+    logical_path_len: usize,
     elapsed_ms: f64,
     checkpoint_elapsed_ms: Option<f64>,
     backend_requests: u64,
     puts: u64,
+    multipart_create_requests: u64,
+    multipart_upload_part_requests: u64,
+    multipart_complete_requests: u64,
+    multipart_abort_requests: u64,
+    multipart_objects_committed: u64,
     gets: u64,
     heads: u64,
+    bytes_uploaded_attempted: u64,
     bytes_written: u64,
     bytes_read: u64,
     requested_plaintext_write_bytes: usize,
@@ -512,9 +528,10 @@ impl FreshProcessHandoff {
                 .to_owned(),
             repository_format: PERF_REPOSITORY_FORMAT.to_owned(),
             backend_dir,
-            object_prefix: "perf/write-committed-parallel/".to_owned(),
+            object_prefix: PERF_OBJECT_PREFIX.to_owned(),
             objects: args.objects,
             object_size: args.object_size,
+            logical_path_len: args.logical_path_len,
             body_pattern_version: PERF_BODY_PATTERN_VERSION,
             anchor,
         }
@@ -524,10 +541,11 @@ impl FreshProcessHandoff {
         if self.schema != FRESH_PROCESS_HANDOFF_SCHEMA
             || self.repository_format != PERF_REPOSITORY_FORMAT
             || self.source_revision != option_env!("RS3_BUILD_GIT_SHA").unwrap_or("unknown")
-            || self.object_prefix != "perf/write-committed-parallel/"
+            || self.object_prefix != PERF_OBJECT_PREFIX
             || self.body_pattern_version != PERF_BODY_PATTERN_VERSION
             || self.objects != args.objects
             || self.object_size != args.object_size
+            || self.logical_path_len != args.logical_path_len
             || self.backend_dir != backend_dir
         {
             anyhow::bail!("fresh-process handoff facts do not match the requested qualification");
@@ -674,6 +692,7 @@ fn append_fresh_child_args(
     command.args(["--scenario", "write-committed-parallel"]);
     command.args(["--objects", &args.objects.to_string()]);
     command.args(["--object-size", &args.object_size.to_string()]);
+    command.args(["--logical-path-len", &args.logical_path_len.to_string()]);
     command.args(["--commit-batch-items", &args.commit_batch_items.to_string()]);
     command.args([
         "--commit-batch-delay-ms",
@@ -985,11 +1004,12 @@ where
     for index in 0..args.objects {
         let coordinator = Arc::clone(&coordinator);
         let body = body.clone();
+        let logical_path_len = args.logical_path_len;
         handles.push(tokio::spawn(async move {
             let operation_started = Instant::now();
             coordinator
                 .put_committed(
-                    path(&format!("perf/write-batch/object-{index:08}"))?,
+                    perf_object_path(index, logical_path_len)?,
                     body,
                     RepositoryPutOptions::default(),
                 )
@@ -1015,6 +1035,7 @@ where
         repository_format: PERF_REPOSITORY_FORMAT,
         objects: args.objects,
         object_size: args.object_size,
+        logical_path_len: Some(args.logical_path_len),
         operations: args.objects,
         requested_plaintext_write_bytes: checked_mul(args.objects, args.object_size)?,
         requested_plaintext_read_bytes: 0,
@@ -1072,7 +1093,7 @@ where
         let operation_started = Instant::now();
         coordinator
             .put_committed(
-                path(&format!("perf/write-committed/object-{index:08}"))?,
+                perf_object_path(index, args.logical_path_len)?,
                 body.clone(),
                 RepositoryPutOptions::default(),
             )
@@ -1091,6 +1112,7 @@ where
         repository_format: PERF_REPOSITORY_FORMAT,
         objects: args.objects,
         object_size: args.object_size,
+        logical_path_len: Some(args.logical_path_len),
         operations: args.objects,
         requested_plaintext_write_bytes: checked_mul(args.objects, args.object_size)?,
         requested_plaintext_read_bytes: 0,
@@ -1193,11 +1215,12 @@ where
         for index in next..end {
             let coordinator = Arc::clone(&coordinator);
             let body = body.clone();
+            let logical_path_len = args.logical_path_len;
             handles.push(tokio::spawn(async move {
                 let operation_started = Instant::now();
                 coordinator
                     .put_committed(
-                        path(&format!("perf/write-committed-parallel/object-{index:08}"))?,
+                        perf_object_path(index, logical_path_len)?,
                         body,
                         RepositoryPutOptions::default(),
                     )
@@ -1257,6 +1280,7 @@ fn parallel_write_report<S>(
         repository_format: PERF_REPOSITORY_FORMAT,
         objects: args.objects,
         object_size: args.object_size,
+        logical_path_len: Some(args.logical_path_len),
         operations: args.objects,
         requested_plaintext_write_bytes: checked_mul(args.objects, args.object_size)?,
         requested_plaintext_read_bytes: 0,
@@ -1301,14 +1325,21 @@ async fn run_fresh_writer_phase(args: &PerfArgs) -> Result<()> {
         peak_rss_bytes,
         objects: report.objects,
         object_size: report.object_size,
+        logical_path_len: args.logical_path_len,
         elapsed_ms: report.elapsed.as_secs_f64() * 1_000.0,
         checkpoint_elapsed_ms: report
             .checkpoint
             .map(|checkpoint| checkpoint.elapsed.as_secs_f64() * 1_000.0),
         backend_requests: report.backend_requests(),
         puts: report.counts.put,
+        multipart_create_requests: report.counts.multipart_create,
+        multipart_upload_part_requests: report.counts.multipart_upload_part,
+        multipart_complete_requests: report.counts.multipart_complete,
+        multipart_abort_requests: report.counts.multipart_abort,
+        multipart_objects_committed: report.counts.multipart_put,
         gets: report.counts.get,
         heads: report.counts.head,
+        bytes_uploaded_attempted: report.counts.bytes_uploaded_attempted,
         bytes_written: report.counts.bytes_written,
         bytes_read: report.counts.bytes_read,
         requested_plaintext_write_bytes: report.requested_plaintext_write_bytes,
@@ -1537,7 +1568,7 @@ where
     let recovery_elapsed = started.elapsed();
 
     let entries = repository
-        .list("perf/write-committed-parallel/")
+        .list(PERF_OBJECT_PREFIX)
         .context("failed to list reloaded objects")?;
     if entries.len() != args.objects {
         anyhow::bail!(
@@ -1553,7 +1584,7 @@ where
         .context("failed to capture pre-read backend counts")?;
     let cold_read_started = Instant::now();
     for index in &checked_indices {
-        let key = path(&format!("perf/write-committed-parallel/object-{index:08}"))?;
+        let key = perf_object_path(*index, args.logical_path_len)?;
         let actual = repository
             .get_range(&key, ByteRange::Full)
             .await
@@ -1665,6 +1696,7 @@ where
         repository_format: PERF_REPOSITORY_FORMAT,
         objects: 1,
         object_size: args.object_size,
+        logical_path_len: None,
         operations: args.reads,
         requested_plaintext_write_bytes: 0,
         requested_plaintext_read_bytes: checked_mul(args.reads, args.object_size)?,
@@ -1751,6 +1783,7 @@ where
         repository_format: PERF_REPOSITORY_FORMAT,
         objects: 1,
         object_size: args.object_size,
+        logical_path_len: None,
         operations: args.reads,
         requested_plaintext_write_bytes: 0,
         requested_plaintext_read_bytes: checked_mul(args.reads, range_len)?,
@@ -1774,6 +1807,7 @@ struct PerfReport {
     repository_format: &'static str,
     objects: usize,
     object_size: usize,
+    logical_path_len: Option<usize>,
     operations: usize,
     requested_plaintext_write_bytes: usize,
     requested_plaintext_read_bytes: usize,
@@ -2069,7 +2103,7 @@ impl PerfReport {
         let cold_reads = reload_verification.map(|verification| &verification.cold_reads);
 
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.2}\t{:.2}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.scenario,
             self.backend.as_str(),
             self.repository_format,
@@ -2143,6 +2177,15 @@ impl PerfReport {
                 )
             })),
             reload_verification.map_or(0, |verification| verification.active_index_runs),
+            self.logical_path_len
+                .map_or_else(|| "n/a".to_owned(), |length| length.to_string()),
+            self.counts.multipart_create,
+            self.counts.multipart_upload_part,
+            self.counts.multipart_complete,
+            self.counts.multipart_abort,
+            self.counts.multipart_put,
+            self.counts.bytes_uploaded_attempted,
+            self.counts.bytes_written,
         );
     }
 
@@ -2164,6 +2207,7 @@ impl PerfReport {
             "repository_format": self.repository_format,
             "objects": self.objects,
             "object_size": self.object_size,
+            "logical_path_len": self.logical_path_len,
             "operations": self.operations,
             "commit": {
                 "batch_items": self.commit_batch_items,
@@ -2198,7 +2242,16 @@ impl PerfReport {
                 "extend_retention": self.counts.extend_retention,
                 "set_legal_hold": self.counts.set_legal_hold,
                 "flushes": self.counts.flush,
+                "multipart": {
+                    "create_requests": self.counts.multipart_create,
+                    "upload_part_requests": self.counts.multipart_upload_part,
+                    "complete_requests": self.counts.multipart_complete,
+                    "abort_requests": self.counts.multipart_abort,
+                    "objects_committed": self.counts.multipart_put,
+                },
                 "bytes": backend_bytes,
+                "bytes_uploaded_attempted": self.counts.bytes_uploaded_attempted,
+                "bytes_committed": self.counts.bytes_written,
                 "bytes_written": self.counts.bytes_written,
                 "bytes_read": self.counts.bytes_read,
             },
@@ -2230,21 +2283,13 @@ impl PerfReport {
     }
 
     fn backend_requests(&self) -> u64 {
-        self.counts
-            .put
-            .saturating_add(self.counts.get)
-            .saturating_add(self.counts.head)
-            .saturating_add(self.counts.list)
-            .saturating_add(self.counts.delete)
-            .saturating_add(self.counts.extend_retention)
-            .saturating_add(self.counts.set_legal_hold)
-            .saturating_add(self.counts.flush)
+        backend_request_count(&self.counts)
     }
 }
 
 fn print_header() {
     println!(
-        "scenario\tbackend\trepository_format\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tpayload_segment_size\tadaptive_payload_segment_size\tconcurrency\telapsed_ms\tpeak_rss_bytes\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tset_legal_hold\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp\treload_verified\treload_elapsed_ms\treload_expected_objects\treload_listed_objects\treload_checked_objects\tcheckpoint_requested_after_objects\tcheckpoint_actual_after_objects\tcheckpoint_elapsed_ms\tcold_read_elapsed_ms\tcold_read_logical_reads\tcold_read_backend_requests\tcold_read_requests_per_read\tcold_read_backend_bytes\tcold_read_amp\tactive_index_runs"
+        "scenario\tbackend\trepository_format\tobjects\tobject_size\toperations\tcommit_batch_items\tcommit_batch_delay_ms\tcommit_max_pending_items\tpayload_segment_size\tadaptive_payload_segment_size\tconcurrency\telapsed_ms\tpeak_rss_bytes\toperation_latency_samples\toperation_latency_min_ms\toperation_latency_avg_ms\toperation_latency_p50_ms\toperation_latency_p95_ms\toperation_latency_p99_ms\toperation_latency_max_ms\tplaintext_mib_s\tbackend_mib_s\tbackend_requests\tbackend_requests_per_s\tbackend_requests_per_operation\tputs\tgets\theads\tlists\tdeletes\textend_retention\tset_legal_hold\tflushes\tbackend_bytes\tbackend_bytes_written\tbackend_bytes_read\trequested_plaintext_bytes\trequested_plaintext_write_bytes\trequested_plaintext_read_bytes\twrite_amp\tread_amp\treload_verified\treload_elapsed_ms\treload_expected_objects\treload_listed_objects\treload_checked_objects\tcheckpoint_requested_after_objects\tcheckpoint_actual_after_objects\tcheckpoint_elapsed_ms\tcold_read_elapsed_ms\tcold_read_logical_reads\tcold_read_backend_requests\tcold_read_requests_per_read\tcold_read_backend_bytes\tcold_read_amp\tactive_index_runs\tlogical_path_len\tmultipart_create_requests\tmultipart_upload_part_requests\tmultipart_complete_requests\tmultipart_abort_requests\tmultipart_objects_committed\tbackend_bytes_uploaded_attempted\tbackend_bytes_committed"
     );
 }
 
@@ -2384,6 +2429,28 @@ fn body(size: usize) -> Bytes {
 
 fn path(value: &str) -> Result<LogicalPath> {
     LogicalPath::new(value.to_owned()).map_err(Into::into)
+}
+
+fn validate_perf_logical_path_len(length: usize) -> Result<()> {
+    if !(MIN_PERF_LOGICAL_PATH_LEN..=MAX_PERF_LOGICAL_PATH_LEN).contains(&length) {
+        anyhow::bail!(
+            "--logical-path-len must be between {MIN_PERF_LOGICAL_PATH_LEN} and {MAX_PERF_LOGICAL_PATH_LEN} bytes"
+        );
+    }
+    Ok(())
+}
+
+fn perf_object_path(index: usize, length: usize) -> Result<LogicalPath> {
+    validate_perf_logical_path_len(length)?;
+    let filler_len = length
+        .checked_sub(MIN_PERF_LOGICAL_PATH_LEN)
+        .context("logical path length is below the deterministic path prefix")?;
+    let index = format!("{index:0width$}", width = PERF_OBJECT_INDEX_DIGITS);
+    let value = format!("{PERF_OBJECT_PREFIX}{}{index}", "x".repeat(filler_len));
+    if value.len() != length {
+        anyhow::bail!("logical path index exceeds the deterministic path width");
+    }
+    LogicalPath::new(value).map_err(Into::into)
 }
 
 fn perf_repository_id() -> Result<RepositoryId> {
@@ -2526,9 +2593,34 @@ fn operation_counts_delta(
         )?,
         flush: delta("cache flush", after.flush, before.flush)?,
         multipart_put: delta(
-            "multipart completion",
+            "committed multipart object",
             after.multipart_put,
             before.multipart_put,
+        )?,
+        multipart_create: delta(
+            "multipart create",
+            after.multipart_create,
+            before.multipart_create,
+        )?,
+        multipart_upload_part: delta(
+            "multipart upload part",
+            after.multipart_upload_part,
+            before.multipart_upload_part,
+        )?,
+        multipart_complete: delta(
+            "multipart complete",
+            after.multipart_complete,
+            before.multipart_complete,
+        )?,
+        multipart_abort: delta(
+            "multipart abort",
+            after.multipart_abort,
+            before.multipart_abort,
+        )?,
+        bytes_uploaded_attempted: delta(
+            "attempted uploaded byte",
+            after.bytes_uploaded_attempted,
+            before.bytes_uploaded_attempted,
         )?,
         bytes_written: delta("written-byte", after.bytes_written, before.bytes_written)?,
         bytes_read: delta("read-byte", after.bytes_read, before.bytes_read)?,
@@ -2545,7 +2637,10 @@ fn backend_request_count(counts: &BlobOperationCounts) -> u64 {
         .saturating_add(counts.extend_retention)
         .saturating_add(counts.set_legal_hold)
         .saturating_add(counts.flush)
-        .saturating_add(counts.multipart_put)
+        .saturating_add(counts.multipart_create)
+        .saturating_add(counts.multipart_upload_part)
+        .saturating_add(counts.multipart_complete)
+        .saturating_add(counts.multipart_abort)
 }
 
 fn validate_cold_read_counts(counts: &BlobOperationCounts, logical_reads: usize) -> Result<()> {
@@ -2713,8 +2808,9 @@ mod tests {
         FreshProcessHandoff, PerfArgs, backend_request_count, checkpoint_due,
         enforce_max_elapsed_seconds, enforce_max_peak_rss_bytes,
         enforce_max_reload_elapsed_seconds, finish_gate_failures, operation_counts_delta,
-        parse_proc_status_peak_rss, perf_format_ref, record_gate_failure,
-        validate_cold_read_counts, validate_fresh_process_args, verification_indices,
+        parse_proc_status_peak_rss, perf_format_ref, perf_object_path, record_gate_failure,
+        validate_cold_read_counts, validate_fresh_process_args, validate_perf_logical_path_len,
+        verification_indices,
     };
     use crate::{Cli, Commands};
     use clap::Parser;
@@ -2762,6 +2858,28 @@ mod tests {
         let error = validate_fresh_process_args(&args)
             .expect_err("checkpoint below object count must be rejected");
         assert!(error.to_string().contains("equal --objects"));
+    }
+
+    #[test]
+    fn deterministic_perf_paths_have_the_requested_exact_length() {
+        for length in [32, 45, 256, 1024] {
+            let first = perf_object_path(1, length)
+                .unwrap_or_else(|error| panic!("build {length}-byte path: {error}"));
+            let second = perf_object_path(2, length)
+                .unwrap_or_else(|error| panic!("build {length}-byte path: {error}"));
+            assert_eq!(first.as_str().len(), length);
+            assert_eq!(second.as_str().len(), length);
+            assert_ne!(first, second);
+            assert!(first.as_str().starts_with("perf/"));
+        }
+    }
+
+    #[test]
+    fn perf_path_length_rejects_values_outside_the_scale_matrix_envelope() {
+        assert!(validate_perf_logical_path_len(24).is_err());
+        assert!(validate_perf_logical_path_len(25).is_ok());
+        assert!(validate_perf_logical_path_len(1024).is_ok());
+        assert!(validate_perf_logical_path_len(1025).is_err());
     }
 
     #[test]
@@ -2835,8 +2953,13 @@ mod tests {
             set_legal_hold: 7,
             flush: 8,
             multipart_put: 9,
-            bytes_written: 10,
-            bytes_read: 11,
+            multipart_create: 10,
+            multipart_upload_part: 11,
+            multipart_complete: 12,
+            multipart_abort: 13,
+            bytes_uploaded_attempted: 14,
+            bytes_written: 15,
+            bytes_read: 16,
         };
         let after = BlobOperationCounts {
             put: 2,
@@ -2848,8 +2971,13 @@ mod tests {
             set_legal_hold: 14,
             flush: 16,
             multipart_put: 18,
-            bytes_written: 20,
-            bytes_read: 22,
+            multipart_create: 20,
+            multipart_upload_part: 22,
+            multipart_complete: 24,
+            multipart_abort: 26,
+            bytes_uploaded_attempted: 28,
+            bytes_written: 30,
+            bytes_read: 32,
         };
 
         let delta = operation_counts_delta(&after, &before)
@@ -2892,7 +3020,7 @@ mod tests {
     fn cold_read_count_validation_rejects_hidden_non_get_work() {
         let counts = BlobOperationCounts {
             get: 3,
-            multipart_put: 1,
+            multipart_complete: 1,
             ..BlobOperationCounts::default()
         };
 
@@ -2900,6 +3028,21 @@ mod tests {
             .expect_err("non-GET backend work must invalidate the cold-read gate");
 
         assert!(error.to_string().contains("4 backend operations"));
+    }
+
+    #[test]
+    fn backend_request_count_uses_multipart_lifecycle_attempts_not_success_aliases() {
+        let counts = BlobOperationCounts {
+            put: 1,
+            multipart_create: 1,
+            multipart_upload_part: 2,
+            multipart_complete: 1,
+            multipart_abort: 1,
+            multipart_put: 1,
+            ..BlobOperationCounts::default()
+        };
+
+        assert_eq!(backend_request_count(&counts), 6);
     }
 
     #[test]
