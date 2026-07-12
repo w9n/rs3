@@ -37,10 +37,13 @@ pub const V2_CAPABILITY_SIGNED_SECTION_DIGESTS: u64 = 1 << 0;
 pub const V2_CAPABILITY_FRAMED_INDEX: u64 = 1 << 1;
 /// Signed roots can reference metadata-only compacted run siblings.
 pub const V2_CAPABILITY_COMPACTED_INDEX_RUNS: u64 = 1 << 2;
+/// Framed index runs can authenticate standalone streamed-payload objects.
+pub const V2_CAPABILITY_STANDALONE_PAYLOADS: u64 = 1 << 3;
 /// v02 capabilities understood by this transitional reader.
 pub const V2_SUPPORTED_CAPABILITY_FLAGS: u64 = V2_CAPABILITY_SIGNED_SECTION_DIGESTS
     | V2_CAPABILITY_FRAMED_INDEX
-    | V2_CAPABILITY_COMPACTED_INDEX_RUNS;
+    | V2_CAPABILITY_COMPACTED_INDEX_RUNS
+    | V2_CAPABILITY_STANDALONE_PAYLOADS;
 /// Capabilities required on every commit written or accepted by this reader.
 pub const V2_REQUIRED_CAPABILITY_FLAGS: u64 = V2_CAPABILITY_SIGNED_SECTION_DIGESTS;
 /// Section flag indicating the section type must be understood.
@@ -1331,5 +1334,15 @@ fn capability_flags_for_header(header: &V2CommitHeader) -> u64 {
     } else {
         0
     };
-    V2_REQUIRED_CAPABILITY_FLAGS | framed | compacted_runs
+    let standalone_payloads = if header.section_index.iter().any(|section| {
+        matches!(
+            section.section_type,
+            V2SectionType::IndexRun | V2SectionType::IndexRoot
+        )
+    }) {
+        V2_CAPABILITY_STANDALONE_PAYLOADS
+    } else {
+        0
+    };
+    V2_REQUIRED_CAPABILITY_FLAGS | framed | compacted_runs | standalone_payloads
 }

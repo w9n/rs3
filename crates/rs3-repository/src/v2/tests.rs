@@ -6,12 +6,13 @@ use super::{
     V2OrphanGcOptions, V2RecoveryBundle, V2ReplayLimits, V2Repository,
 };
 use super::{
-    V2_RESTORE_BUNDLE_SCHEMA, V2_SECTION_FLAG_MUST_UNDERSTAND, V2Algorithms, V2CommitHeader,
-    V2CommitKey, V2CommitKind, V2CommitParentRef, V2CommitSelfRef, V2ErrorClass, V2FormatError,
-    V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRef, V2KeyringEnvelopeRootRef,
-    V2ProviderCheckStatus, V2ProviderConformanceOptions, V2ProviderProfile, V2SectionDescriptor,
-    V2SectionType, V2UploadMode, body_digest_for_v2_sections, check_v2_provider_conformance,
-    digest_v2_section, generate_v2_commit_key, parse_v2_commit_object,
+    V2_CAPABILITY_STANDALONE_PAYLOADS, V2_RESTORE_BUNDLE_SCHEMA, V2_SECTION_FLAG_MUST_UNDERSTAND,
+    V2_SUPPORTED_CAPABILITY_FLAGS, V2Algorithms, V2CommitHeader, V2CommitKey, V2CommitKind,
+    V2CommitParentRef, V2CommitSelfRef, V2ErrorClass, V2FormatError, V2FormatRef, V2FormatRoot,
+    V2KeyringEnvelopeRef, V2KeyringEnvelopeRootRef, V2ProviderCheckStatus,
+    V2ProviderConformanceOptions, V2ProviderProfile, V2SectionDescriptor, V2SectionType,
+    V2UploadMode, body_digest_for_v2_sections, check_v2_provider_conformance, digest_v2_section,
+    generate_v2_commit_key, parse_v2_commit_object,
 };
 use crate::{CommitCoordinatorOptions, RepositoryError, RepositoryOptions, RepositoryPutOptions};
 use bytes::Bytes;
@@ -724,6 +725,8 @@ fn multipart_commit_round_trips_with_padded_header() {
 
 #[test]
 fn v02_wire_codes_and_required_capabilities_are_closed() {
+    assert_eq!(V2_CAPABILITY_STANDALONE_PAYLOADS, 8);
+    assert_eq!(V2_SUPPORTED_CAPABILITY_FLAGS, 15);
     assert_eq!(V2CommitKind::Delta.to_wire(), 1);
     assert_eq!(V2CommitKind::Root.to_wire(), 2);
     assert_eq!(V2SectionType::IndexDelta.to_wire(), 1);
@@ -815,7 +818,7 @@ fn framed_delta_section_shapes_round_trip() {
         header.section_index = section_index.clone();
         header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::SinglePut));
         let body = must_v2(header.encode_object(V2UploadMode::SinglePut, &section_region));
-        assert_eq!(&body[16..24], &3_u64.to_be_bytes());
+        assert_eq!(&body[16..24], &11_u64.to_be_bytes());
         let parsed = must_v2(parse_v2_commit_object(
             &commit_key.object_id,
             body,

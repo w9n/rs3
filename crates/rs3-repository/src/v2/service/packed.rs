@@ -150,6 +150,7 @@ where
             }),
             containers: Vec::new(),
             stream_containers: Vec::new(),
+            standalone_stream_containers: Vec::new(),
             mutations,
         };
         let context = commit_repository_context(self, commit_key)?;
@@ -434,6 +435,7 @@ where
             self_stream: None,
             containers,
             stream_containers,
+            standalone_stream_containers: Vec::new(),
             mutations,
         };
         let sealed_run = match seal_v2_index_run(
@@ -606,6 +608,11 @@ pub(in crate::v2) fn apply_packed_index_run(
         &IndexRunLimits::default(),
     )
     .map_err(v2_repository_error)?;
+    // Wire v5 reserves and authenticates standalone stream carriers before the
+    // repository read, reachability, and maintenance graph accepts them.
+    if !run.standalone_stream_containers.is_empty() {
+        return Err(v2_repository_error(V2FormatError::UnsupportedSection));
+    }
     let directory = open_v2_index_run_directory(
         keyring,
         &context,
@@ -878,6 +885,9 @@ pub(in crate::v2) fn apply_packed_index_run(
                         Some(PayloadReference::V2Commit {
                             carrier: Arc::clone(carrier),
                         })
+                    }
+                    IndexPayloadPointer::ExternalStandaloneStream { .. } => {
+                        return Err(v2_repository_error(V2FormatError::UnsupportedSection));
                     }
                 };
                 let manifest_id = keyring.derive_manifest_id(&object_material(

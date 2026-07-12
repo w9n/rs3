@@ -256,6 +256,9 @@ fn resolve_mutation(
                         Some(ResolvedCarrier::Stream(container)),
                     )
                 }
+                IndexPayloadPointer::ExternalStandaloneStream { .. } => {
+                    return Err(V2FormatError::UnsupportedSection);
+                }
             };
             upsert.mutation_ordinal = 0;
             upsert.payload = payload;
@@ -447,6 +450,7 @@ fn build_and_validate_run(
             .into_iter()
             .map(|container| container.as_ref().clone())
             .collect(),
+        standalone_stream_containers: Vec::new(),
         mutations: canonical_mutations,
     };
     encode_index_run_frames(&run, limits).map_err(|_| V2FormatError::IndexRunLimitExceeded)?;
@@ -619,6 +623,7 @@ mod tests {
             self_stream: None,
             containers: Vec::new(),
             stream_containers: Vec::new(),
+            standalone_stream_containers: Vec::new(),
             mutations,
         }
     }
@@ -644,6 +649,7 @@ mod tests {
                 self_stream: None,
                 containers: vec![container(container_byte)],
                 stream_containers: Vec::new(),
+                standalone_stream_containers: Vec::new(),
                 mutations: vec![upsert(
                     0,
                     blind_key,
@@ -672,6 +678,7 @@ mod tests {
                 self_stream: None,
                 containers: Vec::new(),
                 stream_containers: vec![exact_container],
+                standalone_stream_containers: Vec::new(),
                 mutations: vec![upsert(
                     0,
                     blind_key,
@@ -752,6 +759,7 @@ mod tests {
                 self_stream: None,
                 containers: Vec::new(),
                 stream_containers: Vec::new(),
+                standalone_stream_containers: Vec::new(),
                 mutations: vec![upsert(
                     0,
                     key(3),
@@ -800,6 +808,7 @@ mod tests {
                 }),
                 containers: Vec::new(),
                 stream_containers: Vec::new(),
+                standalone_stream_containers: Vec::new(),
                 mutations: vec![upsert(0, key(3), 3, IndexPayloadPointer::SelfStream)],
             },
             self_pack_container: None,
@@ -847,6 +856,7 @@ mod tests {
                 }),
                 containers: Vec::new(),
                 stream_containers: Vec::new(),
+                standalone_stream_containers: Vec::new(),
                 mutations: vec![upsert(0, key(3), 3, IndexPayloadPointer::SelfStream)],
             },
             self_pack_container: None,
@@ -876,6 +886,7 @@ mod tests {
                 self_stream: None,
                 containers: vec![high.clone()],
                 stream_containers: Vec::new(),
+                standalone_stream_containers: Vec::new(),
                 mutations: vec![upsert(
                     0,
                     key(1),
@@ -896,6 +907,7 @@ mod tests {
                 self_stream: None,
                 containers: vec![low.clone()],
                 stream_containers: Vec::new(),
+                standalone_stream_containers: Vec::new(),
                 mutations: vec![upsert(
                     0,
                     key(2),
@@ -989,6 +1001,7 @@ mod tests {
                 self_stream: None,
                 containers: Vec::new(),
                 stream_containers: Vec::new(),
+                standalone_stream_containers: Vec::new(),
                 mutations: vec![upsert(
                     0,
                     key(5),
@@ -1006,6 +1019,7 @@ mod tests {
                 self_stream: None,
                 containers: vec![exact_container.clone()],
                 stream_containers: Vec::new(),
+                standalone_stream_containers: Vec::new(),
                 mutations: vec![upsert(
                     0,
                     key(5),

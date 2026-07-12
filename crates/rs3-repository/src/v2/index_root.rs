@@ -5,8 +5,8 @@
 
 use super::{
     V2_CAPABILITY_COMPACTED_INDEX_RUNS, V2_CAPABILITY_FRAMED_INDEX,
-    V2_CAPABILITY_SIGNED_SECTION_DIGESTS, V2FormatError, V2FormatRef, V2KeyringEnvelopeRef,
-    V2Result,
+    V2_CAPABILITY_SIGNED_SECTION_DIGESTS, V2_CAPABILITY_STANDALONE_PAYLOADS, V2FormatError,
+    V2FormatRef, V2KeyringEnvelopeRef, V2Result,
 };
 use bytes::Bytes;
 use getrandom::fill as fill_random;
@@ -50,7 +50,8 @@ const INDEX_ROOT_MAX_FRAMES_PER_RUN: u32 = 4_096;
 const INDEX_ROOT_MAX_MUTATIONS_PER_RUN: u32 = 65_536;
 const INDEX_ROOT_REQUIRED_CAPABILITIES: u64 = V2_CAPABILITY_SIGNED_SECTION_DIGESTS
     | V2_CAPABILITY_FRAMED_INDEX
-    | V2_CAPABILITY_COMPACTED_INDEX_RUNS;
+    | V2_CAPABILITY_COMPACTED_INDEX_RUNS
+    | V2_CAPABILITY_STANDALONE_PAYLOADS;
 
 /// Random identity authenticated by the index-root envelope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1228,7 +1229,7 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(encoded).into();
         assert_eq!(
             hex::encode(digest),
-            "e01bdc75ba518aff1baa7ed92d0d5140aa92e6714c48cb31c05a0133752d018a"
+            "35f15d7fc27f058c963bb8c2df350e9875bf94fe1705b785f06324ed3de168f5"
         );
     }
 
@@ -1260,7 +1261,7 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(encoded).into();
         assert_eq!(
             hex::encode(digest),
-            "af5a1487de478df37c2cd6d8de69baf4ffe7b0f2e46d7db859cca2b32aea8b38"
+            "6a6f0ff7f0436fdee46eb25454dddbe3d85fb3a9ed3702464885a17c59697b8e"
         );
     }
 

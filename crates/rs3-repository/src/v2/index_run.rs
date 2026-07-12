@@ -373,6 +373,7 @@ pub fn seal_v2_index_run(
         .containers
         .len()
         .checked_add(run.stream_containers.len())
+        .and_then(|count| count.checked_add(run.standalone_stream_containers.len()))
         .ok_or(V2FormatError::IndexRunLimitExceeded)?;
     let container_count = to_u32(container_count)?;
     let run_id = V2IndexRunId::generate()?;
@@ -666,6 +667,7 @@ fn verify_logical_directory_match(
         .containers
         .len()
         .checked_add(run.stream_containers.len())
+        .and_then(|count| count.checked_add(run.standalone_stream_containers.len()))
         .ok_or(V2FormatError::IndexRunLimitExceeded)?;
     if run.sequence != directory.sequence
         || run.mutations.len() != directory.mutation_count as usize
@@ -1414,6 +1416,7 @@ mod tests {
                 pack_record_count: 8,
             }],
             stream_containers: Vec::new(),
+            standalone_stream_containers: Vec::new(),
             mutations: vec![
                 IndexMutation::Upsert(IndexUpsert {
                     mutation_ordinal: 0,
@@ -1496,6 +1499,7 @@ mod tests {
             }),
             containers: Vec::new(),
             stream_containers: Vec::new(),
+            standalone_stream_containers: Vec::new(),
             mutations: vec![IndexMutation::Upsert(IndexUpsert {
                 mutation_ordinal: 0,
                 blind_key: IndexBlindKey::from_bytes([0x92; 32]),
@@ -1541,6 +1545,7 @@ mod tests {
                 payload_id: object_id("payloads/v02/external-stream"),
                 payload_header,
             }],
+            standalone_stream_containers: Vec::new(),
             mutations: vec![IndexMutation::Upsert(IndexUpsert {
                 mutation_ordinal: 0,
                 blind_key: IndexBlindKey::from_bytes([0x96; 32]),
@@ -1721,6 +1726,7 @@ mod tests {
             self_stream: None,
             containers: Vec::new(),
             stream_containers: Vec::new(),
+            standalone_stream_containers: Vec::new(),
             mutations: vec![IndexMutation::Tombstone(IndexTombstone {
                 mutation_ordinal: 0,
                 blind_key: IndexBlindKey::from_bytes([0x55; 32]),
