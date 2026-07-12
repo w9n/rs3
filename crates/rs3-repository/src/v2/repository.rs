@@ -940,6 +940,15 @@ where
         &self.store
     }
 
+    pub(super) fn rebind_store<T>(&self, store: T) -> V2CommitStore<T> {
+        V2CommitStore {
+            store,
+            keyring: self.keyring.clone(),
+            options: self.options.clone(),
+            inflight_standalone_objects: Arc::clone(&self.inflight_standalone_objects),
+        }
+    }
+
     /// Returns the configured provider profile.
     pub(super) const fn provider_profile(&self) -> V2ProviderProfile {
         self.options.provider_profile

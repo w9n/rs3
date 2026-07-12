@@ -137,6 +137,11 @@ pub enum BlobListMode {
 pub struct BlobListPage {
     /// Entries returned by this page.
     pub entries: Vec<BlobMetadata>,
+    /// Raw provider members consumed to produce this page.
+    ///
+    /// This includes filtered members such as S3 delete markers and must be no
+    /// smaller than `entries.len()` or greater than the requested page limit.
+    pub consumed_items: usize,
     /// Whether the listing has no further pages.
     pub is_complete: bool,
 }
@@ -147,7 +152,7 @@ pub struct BlobListPage {
 /// remote provider LIST request per call.
 #[async_trait]
 pub trait BlobList: Send {
-    /// Returns at most `max_items` entries from the next listing page.
+    /// Consumes and returns at most `max_items` members from the next page.
     async fn next_page(&mut self, max_items: NonZeroUsize) -> Result<BlobListPage>;
 }
 
@@ -672,7 +677,7 @@ impl BlobList for CountingBlobList {
             counts.list = counts.list.saturating_add(1);
         }
         let page = self.inner.next_page(max_items).await?;
-        if page.entries.len() > max_items.get() {
+        if page.consumed_items < page.entries.len() || page.consumed_items > max_items.get() {
             return Err(StorageError::InvalidListPage);
         }
         Ok(page)
@@ -856,6 +861,7 @@ impl BlobList for MemoryBlobList {
         if self.complete {
             return Ok(BlobListPage {
                 entries: Vec::new(),
+                consumed_items: 0,
                 is_complete: true,
             });
         }
@@ -921,8 +927,10 @@ impl BlobList for MemoryBlobList {
 
         self.complete = !has_more;
         record_blob_list(object_kind, entries.len(), "ok", started.elapsed());
+        let consumed_items = entries.len();
         Ok(BlobListPage {
             entries,
+            consumed_items,
             is_complete: self.complete,
         })
     }

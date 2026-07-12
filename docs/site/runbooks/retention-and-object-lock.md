@@ -45,8 +45,21 @@ orphan deletion. It consumes inventory through bounded provider pages, uses one
 immutable plan, and fails closed when a page/item budget, exact authority root,
 or protection fact is unavailable.
 The preview library defaults to at most 4,096 inventory pages and 2,000,000
-object/version entries per plan. The future operator controller must expose
-these ceilings and require an explicit increase for larger repositories.
+raw provider inventory members per plan. Filtered members such as S3 delete
+markers consume that item budget too. The future operator controller must
+expose these ceilings and require an explicit increase for larger repositories.
+
+Full-GC planning wraps its store in a read-only ledger. Every logical provider
+`HEAD`, bounded range `GET`, and LIST page is charged before it is forwarded,
+including commit replay, referenced catalog runs, protected roots, and renewal
+inspection. Reports combine those observed reads with the exact planned delete,
+retention-extension, and post-extension verification calls. A zero remaining
+item budget performs no speculative LIST. Counts do not include retries hidden
+inside a provider SDK, so retry policy remains a separate transport control.
+The S3 adapter additionally caps each raw list response at 16 MiB before XML
+deserialization and rejects returned member counts above the requested
+`MaxKeys`; protocol-invalid providers therefore cannot turn a bounded page into
+an unbounded allocation.
 
 All protected historical roots in one maintenance run must reference the
 active exact format root. Do not omit an older-format protected root to make GC
@@ -65,7 +78,10 @@ v2 compaction can rewrite the current live namespace into a protected snapshot
 commit after verifying that snapshot with a fresh reader. Old source commits are
 not force-deleted by compaction; they remain subject to exact-version orphan GC,
 provider retention, legal hold, operator budgets, and any protected historical
-roots that have not been explicitly discarded.
+roots that have not been explicitly discarded. The legacy mixed-commit snapshot
+publisher has a data-dependent write and fresh-reader verification shape, so it
+fails finite request, HEAD, range-read, or write-byte ceilings until that
+mutation path has its own end-to-end ledger.
 
 ## Cluster Takeover
 

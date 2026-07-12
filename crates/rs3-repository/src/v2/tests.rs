@@ -6551,7 +6551,7 @@ async fn v2_orphan_inventory_classifies_and_budgets_standalone_objects() {
     assert_eq!(orphans.candidates[0].sequence, None);
     assert_eq!(dry_run.planned_cost.version_list_count, 0);
     assert_eq!(dry_run.planned_cost.delete_count, 1);
-    assert_eq!(dry_run.planned_cost.request_count, 4);
+    assert_eq!(dry_run.planned_cost.request_count, 6);
 }
 
 #[test]
@@ -6747,7 +6747,7 @@ async fn v2_full_gc_inventory_stops_before_exceeding_item_or_page_budgets() {
         .await;
     let after_items = store.operation_counts().expect("operation counts");
     assert_eq!(item_limited, Err(V2FormatError::MaintenanceBudgetExceeded));
-    assert_eq!(after_items.list.saturating_sub(before_items.list), 1);
+    assert_eq!(after_items.list.saturating_sub(before_items.list), 0);
     assert_eq!(after_items.delete, before_items.delete);
 
     let before_pages = store.operation_counts().expect("operation counts");
@@ -6767,6 +6767,113 @@ async fn v2_full_gc_inventory_stops_before_exceeding_item_or_page_budgets() {
     assert_eq!(page_limited, Err(V2FormatError::MaintenanceBudgetExceeded));
     assert_eq!(after_pages.list.saturating_sub(before_pages.list), 1);
     assert_eq!(after_pages.delete, before_pages.delete);
+}
+
+#[tokio::test]
+async fn v2_full_gc_budgets_every_provider_read_used_by_planning() {
+    let store = MemoryBlobStore::new();
+    let repository = V2CommitStore::new(
+        store.clone(),
+        signing_keyring(),
+        V2CommitStoreOptions::for_profile(
+            V2ProviderProfile::Dev,
+            sample_repository_id(),
+            sample_keyring_envelope_ref(),
+            sample_format_ref(),
+        ),
+    );
+    let anchor = V2MemoryAnchor::new();
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+
+    store
+        .reset_operation_counts()
+        .expect("reset operation counts");
+    let report = must_v2(
+        repository
+            .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
+            .await,
+    );
+    let counts = store.operation_counts().expect("operation counts");
+    assert_eq!(
+        report.planned_cost.request_count,
+        counts
+            .get
+            .saturating_add(counts.head)
+            .saturating_add(counts.list)
+    );
+    assert_eq!(report.planned_cost.head_count, counts.head);
+    assert_eq!(report.planned_cost.range_read_bytes, counts.bytes_read);
+    assert_eq!(report.planned_cost.inventory_page_count, counts.list);
+
+    store
+        .reset_operation_counts()
+        .expect("reset operation counts");
+    let head_limited = repository
+        .full_gc_dry_run(
+            &anchor,
+            V2FullGcDryRunOptions {
+                budgets: V2MaintenanceBudgets {
+                    max_head_count: Some(0),
+                    ..V2MaintenanceBudgets::default()
+                },
+                ..V2FullGcDryRunOptions::default()
+            },
+        )
+        .await;
+    let counts = store.operation_counts().expect("operation counts");
+    assert_eq!(head_limited, Err(V2FormatError::MaintenanceBudgetExceeded));
+    assert_eq!(counts.head, 0);
+    assert_eq!(counts.get, 0);
+    assert_eq!(counts.list, 0);
+
+    store
+        .reset_operation_counts()
+        .expect("reset operation counts");
+    let range_limited = repository
+        .full_gc_dry_run(
+            &anchor,
+            V2FullGcDryRunOptions {
+                budgets: V2MaintenanceBudgets {
+                    max_range_read_bytes: Some(0),
+                    ..V2MaintenanceBudgets::default()
+                },
+                ..V2FullGcDryRunOptions::default()
+            },
+        )
+        .await;
+    let counts = store.operation_counts().expect("operation counts");
+    assert_eq!(range_limited, Err(V2FormatError::MaintenanceBudgetExceeded));
+    assert_eq!(counts.head, 1);
+    assert_eq!(counts.get, 0);
+    assert_eq!(counts.list, 0);
+
+    store
+        .reset_operation_counts()
+        .expect("reset operation counts");
+    let request_limited = repository
+        .full_gc_dry_run(
+            &anchor,
+            V2FullGcDryRunOptions {
+                budgets: V2MaintenanceBudgets {
+                    max_request_count: Some(2),
+                    ..V2MaintenanceBudgets::default()
+                },
+                ..V2FullGcDryRunOptions::default()
+            },
+        )
+        .await;
+    let counts = store.operation_counts().expect("operation counts");
+    assert_eq!(
+        request_limited,
+        Err(V2FormatError::MaintenanceBudgetExceeded)
+    );
+    assert!(
+        counts
+            .get
+            .saturating_add(counts.head)
+            .saturating_add(counts.list)
+            <= 2
+    );
 }
 
 #[tokio::test]
@@ -6799,11 +6906,58 @@ async fn retained_v2_full_gc_dry_run_reports_version_inventory_and_blocked_bytes
     assert_eq!(report.dead_bytes_reclaimable, 0);
     assert!(report.retention_blocked_bytes > 0);
     assert_eq!(report.planned_cost.version_list_count, 2);
-    assert_eq!(report.planned_cost.head_count, 6);
+    assert_eq!(report.planned_cost.head_count, 7);
     assert_eq!(report.planned_cost.delete_count, 0);
     assert_eq!(report.planned_cost.retention_extend_count, 0);
     assert!(report.fits_budgets);
     assert!(report.exact_version_apply_ready);
+}
+
+#[tokio::test]
+async fn retained_v2_full_gc_rejects_a_swallowed_candidate_head_budget_failure() {
+    let store = MemoryBlobStore::new();
+    let repository = V2CommitStore::new(
+        store.clone(),
+        signing_keyring(),
+        V2CommitStoreOptions::for_profile(
+            V2ProviderProfile::RetainedVersionObjectLock,
+            sample_repository_id(),
+            sample_keyring_envelope_ref(),
+            sample_format_ref(),
+        )
+        .with_retention(None),
+    );
+    let anchor = V2MemoryAnchor::new();
+    store
+        .put(
+            &object_id("objects/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            Bytes::from_static(b"retained-budgeted-orphan"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("write retained orphan fixture");
+    let anchor_before = must_v2(anchor.read_v2().await);
+    let deletes_before = store.operation_counts().expect("operation counts").delete;
+
+    let result = repository
+        .full_gc_dry_run(
+            &anchor,
+            V2FullGcDryRunOptions {
+                budgets: V2MaintenanceBudgets {
+                    max_head_count: Some(0),
+                    ..V2MaintenanceBudgets::default()
+                },
+                ..V2FullGcDryRunOptions::default()
+            },
+        )
+        .await;
+
+    assert_eq!(result, Err(V2FormatError::MaintenanceBudgetExceeded));
+    assert_eq!(must_v2(anchor.read_v2().await), anchor_before);
+    assert_eq!(
+        store.operation_counts().expect("operation counts").delete,
+        deletes_before
+    );
 }
 
 #[tokio::test]
@@ -6926,7 +7080,7 @@ async fn retained_v2_full_gc_dry_run_plans_live_commit_retention_renewal() {
     assert!(renewal_report.retention_renewal_bytes > 0);
     assert_eq!(renewal_report.retention_renewal_blocked_count, 0);
     assert_eq!(renewal_report.planned_cost.retention_extend_count, 4);
-    assert_eq!(renewal_report.planned_cost.head_count, 10);
+    assert_eq!(renewal_report.planned_cost.head_count, 12);
     assert!(!renewal_report.fits_budgets);
 }
 
@@ -6983,7 +7137,7 @@ async fn retained_v2_full_gc_dry_run_plans_protected_root_retention_renewal() {
     assert_eq!(report.protected_commit_count, 2);
     assert_eq!(report.candidate_commit_count, 0);
     assert_eq!(report.retention_renewal_commit_count, 5);
-    assert_eq!(report.planned_cost.head_count, 12);
+    assert_eq!(report.planned_cost.head_count, 15);
     assert_eq!(report.planned_cost.retention_extend_count, 5);
 }
 
@@ -7492,7 +7646,12 @@ async fn v2_repository_full_gc_dry_run_reports_mixed_commit_payload_bytes() {
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
-    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    );
     let anchor = V2MemoryAnchor::new();
     let live_key = must_type(LogicalPath::new("snapshots/live-after-delete.bin"));
     let deleted_key = must_type(LogicalPath::new("snapshots/deleted-from-mixed.bin"));
@@ -7519,16 +7678,46 @@ async fn v2_repository_full_gc_dry_run_reports_mixed_commit_payload_bytes() {
     must_repo(repository.publish_pending_index_delta(&anchor).await);
     must_repo(repository.delete_committed(&anchor, deleted_key).await);
 
+    store
+        .reset_operation_counts()
+        .expect("reset operation counts");
     let report = must_repo(
         repository
             .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
             .await,
     );
+    let counts = store.operation_counts().expect("operation counts");
 
     assert_eq!(report.mixed_commit_count, 1);
     assert!(report.live_bytes_to_copy > 0);
     assert!(report.mixed_dead_bytes_repackable > report.live_bytes_to_copy);
     assert_eq!(report.fully_dead_commit_count, 0);
+    assert_eq!(
+        report.planned_cost.request_count,
+        counts
+            .get
+            .saturating_add(counts.head)
+            .saturating_add(counts.list)
+            .saturating_add(1)
+    );
+    assert_eq!(report.planned_cost.head_count, counts.head);
+    assert_eq!(report.planned_cost.range_read_bytes, counts.bytes_read);
+
+    let bounded = must_repo(
+        repository
+            .full_gc_dry_run(
+                &anchor,
+                V2FullGcDryRunOptions {
+                    budgets: V2MaintenanceBudgets {
+                        max_request_count: Some(u64::MAX),
+                        ..V2MaintenanceBudgets::default()
+                    },
+                    ..V2FullGcDryRunOptions::default()
+                },
+            )
+            .await,
+    );
+    assert!(!bounded.fits_budgets);
 }
 
 #[tokio::test]
@@ -7838,6 +8027,27 @@ async fn v2_packed_run_compaction_preserves_newest_state_without_copying_payload
     assert_eq!(compaction_counts.list, 0);
     assert_eq!(compaction_counts.delete, 0);
     assert!(must_repo(repository.active_index_run_count()) < source_run_count);
+
+    store.reset_operation_counts();
+    let maintenance = must_repo(
+        repository
+            .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
+            .await,
+    );
+    let maintenance_counts = store.operation_counts();
+    assert_eq!(
+        maintenance.planned_cost.request_count,
+        maintenance_counts
+            .get
+            .saturating_add(maintenance_counts.head)
+            .saturating_add(maintenance_counts.list)
+            .saturating_add(maintenance.planned_cost.delete_count)
+    );
+    assert_eq!(maintenance.planned_cost.head_count, maintenance_counts.head);
+    assert_eq!(
+        maintenance.planned_cost.range_read_bytes,
+        maintenance_counts.bytes_read
+    );
 
     let fresh = V2Repository::new(
         store.clone(),

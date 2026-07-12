@@ -80,20 +80,14 @@ where
     where
         A: V2CommitAnchor,
     {
-        let mut report = self
+        let (mut report, current) = self
             .commit_store
-            .full_gc_dry_run(anchor, options.clone())
+            .full_gc_dry_run_with_state(anchor, options.clone())
             .await
             .map_err(v2_repository_error)?;
-        let Some(chain) = self
-            .commit_store
-            .load_replay_chain_from_anchor(anchor)
-            .await
-            .map_err(v2_repository_error)?
-        else {
+        let Some((chain, state)) = current else {
             return Ok(report);
         };
-        let state = self.replay_bounded_chain_to_state(&chain).await?;
         let (mixed_count, live_bytes_to_copy, mixed_dead_bytes_repackable) =
             self.current_head_mixed_payload_summary(&state, &chain)?;
         report.mixed_commit_count = mixed_count;
@@ -106,6 +100,16 @@ where
                 .write_bytes
                 .saturating_add(live_bytes_to_copy);
             report.fits_budgets = report.planned_cost.fits_budgets(options.budgets);
+            if options.budgets.max_request_count.is_some()
+                || options.budgets.max_head_count.is_some()
+                || options.budgets.max_range_read_bytes.is_some()
+                || options.budgets.max_write_bytes.is_some()
+            {
+                // Snapshot publication and fresh-reader verification have a
+                // data-dependent request shape. Finite I/O ceilings fail closed
+                // until that separate mutation path is metered end to end.
+                report.fits_budgets = false;
+            }
         }
         Ok(report)
     }

@@ -329,6 +329,7 @@ impl BlobList for FilesystemBlobList {
         if self.complete {
             return Ok(BlobListPage {
                 entries: Vec::new(),
+                consumed_items: 0,
                 is_complete: true,
             });
         }
@@ -383,8 +384,10 @@ impl BlobList for FilesystemBlobList {
         }
 
         record_blob_list(kind, entries.len(), "ok", started.elapsed());
+        let consumed_items = entries.len();
         Ok(BlobListPage {
             entries,
+            consumed_items,
             is_complete: self.complete,
         })
     }

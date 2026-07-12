@@ -553,15 +553,6 @@ where
         Ok(Some(chain))
     }
 
-    async fn replay_bounded_chain_to_state(
-        &self,
-        chain: &V2ReplayChain,
-    ) -> Result<RepositoryState> {
-        self.replay_bounded_chain_to_state_and_runs(chain)
-            .await
-            .map(|(state, _)| state)
-    }
-
     async fn replay_bounded_chain_to_state_and_runs(
         &self,
         chain: &V2ReplayChain,

@@ -11,7 +11,14 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client as SdkS3Client;
 use aws_sdk_s3::primitives::ByteStream as SdkByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_smithy_runtime_api::box_error::BoxError;
+use aws_smithy_runtime_api::client::interceptors::Intercept;
+use aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut;
+use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::config_bag::ConfigBag;
 use bytes::Bytes;
+use http_body_util::Limited;
 use rs3_types::{BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionPolicy};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -42,6 +49,45 @@ use object_lock::{
     verify_legal_hold, verify_retention,
 };
 use requests::sdk_range_header;
+
+const MAX_LIST_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+struct LimitListResponseBody;
+
+impl Intercept for LimitListResponseBody {
+    fn name(&self) -> &'static str {
+        "LimitListResponseBody"
+    }
+
+    fn modify_before_deserialization(
+        &self,
+        context: &mut BeforeDeserializationInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        let body = context.response_mut().take_body();
+        *context.response_mut().body_mut() =
+            limit_list_response_body(body, MAX_LIST_RESPONSE_BODY_BYTES);
+        Ok(())
+    }
+}
+
+fn limit_list_response_body(body: SdkBody, max_bytes: usize) -> SdkBody {
+    SdkBody::from_body_1_x(Limited::new(body, max_bytes))
+}
+
+fn validate_list_response_members(page_limit: usize, member_counts: &[usize]) -> Result<usize> {
+    let returned_count = member_counts.iter().try_fold(0_usize, |total, count| {
+        total
+            .checked_add(*count)
+            .ok_or(StorageError::InvalidListPage)
+    })?;
+    if returned_count > page_limit {
+        return Err(StorageError::InvalidListPage);
+    }
+    Ok(returned_count)
+}
 
 struct S3ReadSource {
     body: SdkByteStream,
@@ -177,6 +223,7 @@ impl BlobList for S3BlobList {
         if self.complete {
             return Ok(BlobListPage {
                 entries: Vec::new(),
+                consumed_items: 0,
                 is_complete: true,
             });
         }
@@ -184,7 +231,9 @@ impl BlobList for S3BlobList {
         let started = Instant::now();
         let max_keys =
             i32::try_from(max_items.get().min(1_000)).map_err(|_| StorageError::InvalidListPage)?;
-        let mut entries = Vec::with_capacity(max_keys as usize);
+        let page_limit = usize::try_from(max_keys).map_err(|_| StorageError::InvalidListPage)?;
+        let mut entries = Vec::with_capacity(page_limit);
+        let consumed_items;
         match self.mode {
             BlobListMode::Current => {
                 let mut request = self
@@ -199,7 +248,12 @@ impl BlobList for S3BlobList {
                 if let Some(token) = self.continuation_token.as_deref() {
                     request = request.continuation_token(token);
                 }
-                let output = match request.send().await {
+                let output = match request
+                    .customize()
+                    .interceptor(LimitListResponseBody)
+                    .send()
+                    .await
+                {
                     Ok(output) => {
                         self.store.record_provider_operation(
                             S3ProviderOperation::List,
@@ -227,6 +281,10 @@ impl BlobList for S3BlobList {
                         return Err(error);
                     }
                 };
+                consumed_items = validate_list_response_members(
+                    page_limit,
+                    &[output.contents().len(), output.common_prefixes().len()],
+                )?;
                 for object in output.contents() {
                     let Some(key) = object.key() else {
                         continue;
@@ -278,7 +336,12 @@ impl BlobList for S3BlobList {
                 if let Some(marker) = self.version_id_marker.as_deref() {
                     request = request.version_id_marker(marker);
                 }
-                let output = match request.send().await {
+                let output = match request
+                    .customize()
+                    .interceptor(LimitListResponseBody)
+                    .send()
+                    .await
+                {
                     Ok(output) => {
                         self.store.record_provider_operation(
                             S3ProviderOperation::List,
@@ -307,6 +370,14 @@ impl BlobList for S3BlobList {
                         return Err(error);
                     }
                 };
+                consumed_items = validate_list_response_members(
+                    page_limit,
+                    &[
+                        output.versions().len(),
+                        output.delete_markers().len(),
+                        output.common_prefixes().len(),
+                    ],
+                )?;
                 for version in output.versions() {
                     let Some(key) = version.key() else {
                         continue;
@@ -352,12 +423,13 @@ impl BlobList for S3BlobList {
             }
         }
 
-        if entries.len() > max_items.get() {
+        if entries.len() > page_limit {
             return Err(StorageError::InvalidListPage);
         }
         record_blob_list(&self.object_kind, entries.len(), "ok", started.elapsed());
         Ok(BlobListPage {
             entries,
+            consumed_items,
             is_complete: self.complete,
         })
     }
@@ -1126,7 +1198,12 @@ impl BlobStore for S3BlobStore {
             if let Some(token) = continuation_token.as_deref() {
                 request = request.continuation_token(token);
             }
-            match request.send().await {
+            match request
+                .customize()
+                .interceptor(LimitListResponseBody)
+                .send()
+                .await
+            {
                 Ok(page) => {
                     self.record_provider_operation(
                         S3ProviderOperation::List,
@@ -1222,7 +1299,12 @@ impl BlobStore for S3BlobStore {
                 request = request.version_id_marker(marker);
             }
 
-            let output = match request.send().await {
+            let output = match request
+                .customize()
+                .interceptor(LimitListResponseBody)
+                .send()
+                .await
+            {
                 Ok(output) => output,
                 Err(error) => {
                     let storage_error =
@@ -1556,12 +1638,16 @@ impl BlobStore for S3BlobStore {
 #[cfg(test)]
 mod tests {
     use super::requests::sdk_range_header;
-    use super::{S3BlobStore, S3BlobStoreConfig, collect_get_body};
+    use super::{
+        S3BlobStore, S3BlobStoreConfig, collect_get_body, limit_list_response_body,
+        validate_list_response_members,
+    };
     use crate::{ByteRange, StorageError};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
     use aws_sdk_s3::primitives::ByteStream;
     use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
     use rs3_types::BackendObjectId;
 
     fn object_id(value: &str) -> BackendObjectId {
@@ -1625,6 +1711,42 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(StorageError::Provider(_))));
+    }
+
+    #[tokio::test]
+    async fn list_response_body_limit_accepts_exact_length_and_rejects_overrun() {
+        let exact = limit_list_response_body(
+            aws_smithy_types::body::SdkBody::from_body_1_x(Full::new(Bytes::from_static(b"exact"))),
+            5,
+        )
+        .collect()
+        .await
+        .unwrap_or_else(|error| panic!("{error}"))
+        .to_bytes();
+        let overrun = limit_list_response_body(
+            aws_smithy_types::body::SdkBody::from_body_1_x(Full::new(Bytes::from_static(
+                b"too long",
+            ))),
+            3,
+        )
+        .collect()
+        .await;
+
+        assert_eq!(exact, Bytes::from_static(b"exact"));
+        assert!(overrun.is_err());
+    }
+
+    #[test]
+    fn list_response_member_limit_counts_every_raw_member_class() {
+        assert_eq!(validate_list_response_members(5, &[2, 2, 1]), Ok(5));
+        assert_eq!(
+            validate_list_response_members(5, &[2, 2, 2]),
+            Err(StorageError::InvalidListPage)
+        );
+        assert_eq!(
+            validate_list_response_members(usize::MAX, &[usize::MAX, 1]),
+            Err(StorageError::InvalidListPage)
+        );
     }
 
     #[test]

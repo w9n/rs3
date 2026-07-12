@@ -661,7 +661,7 @@ impl BlobList for FaultInjectingBlobList {
             .script
             .begin(self.operation, None, Some(&self.prefix))?;
         let mut page = self.inner.next_page(max_items).await?;
-        if page.entries.len() > max_items.get() {
+        if page.consumed_items < page.entries.len() || page.consumed_items > max_items.get() {
             return Err(StorageError::InvalidListPage);
         }
         match effect {

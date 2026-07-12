@@ -17,17 +17,21 @@ use super::{
 use crate::checkpoint::open_index_delta_object;
 use crate::state::{RepositoryState, apply_index_delta_object};
 use async_trait::async_trait;
+use bytes::Bytes;
 use rs3_index::{
     INDEX_DELTA_OBJECT_DOMAIN, IndexDelta, IndexDeltaObject, PayloadReference,
     SealedIndexDeltaObject, V2CommitStreamCarrierReference, V2StandaloneStreamCarrierReference,
 };
-use rs3_storage::{BlobListMode, BlobMetadata, BlobStore, StorageError};
+use rs3_storage::{
+    BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore,
+    ByteRange, PutOptions, StorageError,
+};
 use rs3_types::{
     BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionMode, RetentionPolicy, Sequence,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_RETENTION_RENEWAL_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -35,6 +39,297 @@ const MIN_ORPHAN_GC_AGE: Duration = Duration::from_secs(60 * 60);
 const MAINTENANCE_LIST_PAGE_ITEMS: usize = 1_000;
 const DEFAULT_MAX_INVENTORY_PAGES: u64 = 4_096;
 const DEFAULT_MAX_INVENTORY_ITEMS: u64 = 2_000_000;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct V2MaintenanceIoUsage {
+    request_count: u64,
+    version_list_count: u64,
+    head_count: u64,
+    range_read_bytes: u64,
+    list_page_count: u64,
+    exhausted: bool,
+}
+
+struct V2MaintenanceBudgetedStore<'a, S> {
+    inner: &'a S,
+    budgets: V2MaintenanceBudgets,
+    usage: Arc<RwLock<V2MaintenanceIoUsage>>,
+}
+
+impl<S> Clone for V2MaintenanceBudgetedStore<'_, S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner,
+            budgets: self.budgets,
+            usage: Arc::clone(&self.usage),
+        }
+    }
+}
+
+impl<'a, S> V2MaintenanceBudgetedStore<'a, S> {
+    fn new(inner: &'a S, budgets: V2MaintenanceBudgets) -> Self {
+        Self {
+            inner,
+            budgets,
+            usage: Arc::new(RwLock::new(V2MaintenanceIoUsage::default())),
+        }
+    }
+
+    fn usage(&self) -> rs3_storage::Result<V2MaintenanceIoUsage> {
+        self.usage
+            .read()
+            .map(|usage| *usage)
+            .map_err(|_| maintenance_budget_storage_error())
+    }
+
+    fn charge(
+        &self,
+        head_count: u64,
+        range_read_bytes: u64,
+        list_mode: Option<BlobListMode>,
+    ) -> rs3_storage::Result<()> {
+        charge_maintenance_io(
+            self.budgets,
+            &self.usage,
+            head_count,
+            range_read_bytes,
+            list_mode,
+        )
+    }
+
+    fn reject_unbounded_read(&self) -> rs3_storage::Result<()> {
+        let mut usage = self
+            .usage
+            .write()
+            .map_err(|_| maintenance_budget_storage_error())?;
+        usage.exhausted = true;
+        Err(maintenance_budget_storage_error())
+    }
+
+    fn charge_range(&self, range: ByteRange) -> rs3_storage::Result<()> {
+        match range {
+            ByteRange::Slice { len, .. } => self.charge(0, len, None),
+            ByteRange::Full => self.reject_unbounded_read(),
+        }
+    }
+}
+
+struct V2MaintenanceBudgetedList {
+    inner: Box<dyn BlobList>,
+    budgets: V2MaintenanceBudgets,
+    usage: Arc<RwLock<V2MaintenanceIoUsage>>,
+    mode: BlobListMode,
+}
+
+#[async_trait]
+impl BlobList for V2MaintenanceBudgetedList {
+    async fn next_page(&mut self, max_items: NonZeroUsize) -> rs3_storage::Result<BlobListPage> {
+        charge_maintenance_io(self.budgets, &self.usage, 0, 0, Some(self.mode))?;
+        let page = self.inner.next_page(max_items).await?;
+        if page.consumed_items < page.entries.len() || page.consumed_items > max_items.get() {
+            return Err(StorageError::InvalidListPage);
+        }
+        Ok(page)
+    }
+}
+
+#[async_trait]
+impl<S> BlobStore for V2MaintenanceBudgetedStore<'_, S>
+where
+    S: BlobStore,
+{
+    async fn put(
+        &self,
+        _object_id: &BackendObjectId,
+        _body: Bytes,
+        _options: PutOptions,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        Err(maintenance_read_only_storage_error())
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        _object_id: &BackendObjectId,
+        _options: PutOptions,
+    ) -> rs3_storage::Result<Box<dyn BlobMultipartUpload>> {
+        Err(maintenance_read_only_storage_error())
+    }
+
+    async fn get_range(
+        &self,
+        object_id: &BackendObjectId,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Bytes> {
+        self.charge_range(range)?;
+        self.inner.get_range(object_id, range).await
+    }
+
+    async fn get_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Bytes> {
+        self.charge_range(range)?;
+        self.inner.get_range_at(object_id, version_id, range).await
+    }
+
+    async fn open_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Box<dyn BlobRead>> {
+        self.charge_range(range)?;
+        self.inner.open_range_at(object_id, version_id, range).await
+    }
+
+    async fn head(&self, object_id: &BackendObjectId) -> rs3_storage::Result<BlobMetadata> {
+        self.charge(1, 0, None)?;
+        self.inner.head(object_id).await
+    }
+
+    async fn head_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        self.charge(1, 0, None)?;
+        self.inner.head_at(object_id, version_id).await
+    }
+
+    async fn list_prefix(&self, _prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
+        Err(StorageError::PagedListingUnsupported)
+    }
+
+    async fn list_prefix_versions(&self, _prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
+        Err(StorageError::PagedListingUnsupported)
+    }
+
+    async fn open_bounded_list(
+        &self,
+        prefix: &str,
+        mode: BlobListMode,
+    ) -> rs3_storage::Result<Box<dyn BlobList>> {
+        let inner = self.inner.open_bounded_list(prefix, mode).await?;
+        Ok(Box::new(V2MaintenanceBudgetedList {
+            inner,
+            budgets: self.budgets,
+            usage: Arc::clone(&self.usage),
+            mode,
+        }))
+    }
+
+    async fn delete(&self, _object_id: &BackendObjectId) -> rs3_storage::Result<()> {
+        Err(maintenance_read_only_storage_error())
+    }
+
+    async fn delete_at(
+        &self,
+        _object_id: &BackendObjectId,
+        _version_id: Option<&BackendVersionId>,
+    ) -> rs3_storage::Result<()> {
+        Err(maintenance_read_only_storage_error())
+    }
+
+    async fn extend_retention(
+        &self,
+        _object_id: &BackendObjectId,
+        _policy: RetentionPolicy,
+    ) -> rs3_storage::Result<()> {
+        Err(maintenance_read_only_storage_error())
+    }
+
+    async fn extend_retention_at(
+        &self,
+        _object_id: &BackendObjectId,
+        _version_id: Option<&BackendVersionId>,
+        _policy: RetentionPolicy,
+    ) -> rs3_storage::Result<()> {
+        Err(maintenance_read_only_storage_error())
+    }
+
+    async fn set_legal_hold(
+        &self,
+        _object_id: &BackendObjectId,
+        _status: LegalHoldStatus,
+    ) -> rs3_storage::Result<()> {
+        Err(maintenance_read_only_storage_error())
+    }
+
+    async fn set_legal_hold_at(
+        &self,
+        _object_id: &BackendObjectId,
+        _version_id: Option<&BackendVersionId>,
+        _status: LegalHoldStatus,
+    ) -> rs3_storage::Result<()> {
+        Err(maintenance_read_only_storage_error())
+    }
+
+    async fn flush_caches(&self) -> rs3_storage::Result<()> {
+        Err(maintenance_read_only_storage_error())
+    }
+}
+
+fn maintenance_budget_storage_error() -> StorageError {
+    StorageError::Provider("maintenance I/O budget exhausted".to_owned())
+}
+
+fn charge_maintenance_io(
+    budgets: V2MaintenanceBudgets,
+    usage: &RwLock<V2MaintenanceIoUsage>,
+    head_count: u64,
+    range_read_bytes: u64,
+    list_mode: Option<BlobListMode>,
+) -> rs3_storage::Result<()> {
+    let mut usage = usage
+        .write()
+        .map_err(|_| maintenance_budget_storage_error())?;
+    if usage.exhausted {
+        return Err(maintenance_budget_storage_error());
+    }
+    let request_count = usage.request_count.checked_add(1);
+    let next_head_count = usage.head_count.checked_add(head_count);
+    let next_range_read_bytes = usage.range_read_bytes.checked_add(range_read_bytes);
+    let list_page_count = usage
+        .list_page_count
+        .checked_add(u64::from(list_mode.is_some()));
+    let version_list_count = usage
+        .version_list_count
+        .checked_add(u64::from(list_mode == Some(BlobListMode::Versions)));
+    let next = request_count
+        .zip(next_head_count)
+        .zip(next_range_read_bytes)
+        .zip(list_page_count)
+        .zip(version_list_count);
+    let Some((
+        (((request_count, head_count), range_read_bytes), list_page_count),
+        version_list_count,
+    )) = next
+    else {
+        usage.exhausted = true;
+        return Err(maintenance_budget_storage_error());
+    };
+    if !budget_allows(budgets.max_request_count, request_count)
+        || !budget_allows(budgets.max_head_count, head_count)
+        || !budget_allows(budgets.max_range_read_bytes, range_read_bytes)
+        || list_page_count > budgets.max_inventory_page_count
+        || !budget_allows(budgets.max_version_list_count, version_list_count)
+    {
+        usage.exhausted = true;
+        return Err(maintenance_budget_storage_error());
+    }
+    usage.request_count = request_count;
+    usage.head_count = head_count;
+    usage.range_read_bytes = range_read_bytes;
+    usage.list_page_count = list_page_count;
+    usage.version_list_count = version_list_count;
+    Ok(())
+}
+
+fn maintenance_read_only_storage_error() -> StorageError {
+    StorageError::Provider("maintenance planning store is read-only".to_owned())
+}
 
 /// Broad path-private class of one v2 orphan candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,6 +468,9 @@ pub struct V2MaintenanceReport {
 }
 
 /// Operator-accepted budgets for v2 full-maintenance dry runs and apply plans.
+///
+/// Request counts are logical `BlobStore` operations issued by rs3. Retries
+/// hidden inside a provider SDK are outside this ledger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct V2MaintenanceBudgets {
     /// Maximum planned backend requests.
@@ -191,7 +489,9 @@ pub struct V2MaintenanceBudgets {
     pub max_retention_extend_count: Option<u64>,
     /// Maximum provider pages consumed while building object inventory.
     pub max_inventory_page_count: u64,
-    /// Maximum object/version entries consumed while building inventory.
+    /// Maximum raw provider members consumed while building inventory.
+    ///
+    /// Filtered members such as S3 delete markers count against this ceiling.
     pub max_inventory_item_count: u64,
 }
 
@@ -211,7 +511,7 @@ impl Default for V2MaintenanceBudgets {
     }
 }
 
-/// Request and byte estimates for a v2 full-maintenance plan.
+/// Observed planning reads and planned mutations for v2 full maintenance.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct V2MaintenancePlanCost {
     /// Planned backend requests across verification, inventory, and mutation.
@@ -230,7 +530,7 @@ pub struct V2MaintenancePlanCost {
     pub retention_extend_count: u64,
     /// Provider listing pages consumed by the inventory.
     pub inventory_page_count: u64,
-    /// Object/version entries consumed by the inventory.
+    /// Raw provider members consumed by the inventory.
     pub inventory_item_count: u64,
 }
 
@@ -391,6 +691,8 @@ struct V2FullGcPlan {
     report: V2FullGcDryRunReport,
     retention_renewal: V2RetentionRenewalPlan,
     orphans: V2OrphanReport,
+    current_chain: Option<V2ReplayChain>,
+    current_state: Option<RepositoryState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -430,6 +732,7 @@ enum V2LivePayloadRoot {
 struct V2ReachabilityState {
     anchor_state: Option<V2AnchorState>,
     current_chain: Option<V2ReplayChain>,
+    current_state: Option<RepositoryState>,
     reachable: BTreeSet<BackendObjectId>,
     reachable_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
     renewal_targets: BTreeMap<(BackendObjectId, Option<BackendVersionId>), V2RetentionTarget>,
@@ -821,12 +1124,9 @@ where
                     .max_inventory_item_count
                     .checked_sub(inventory_item_count)
                     .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
-                let page_items = usize::try_from(
-                    remaining_items
-                        .min(MAINTENANCE_LIST_PAGE_ITEMS as u64)
-                        .max(1),
-                )
-                .map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?;
+                let page_items =
+                    usize::try_from(remaining_items.min(MAINTENANCE_LIST_PAGE_ITEMS as u64))
+                        .map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?;
                 let page_items = NonZeroUsize::new(page_items)
                     .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
                 request_count = request_count.saturating_add(1);
@@ -835,11 +1135,13 @@ where
                     .next_page(page_items)
                     .await
                     .map_err(|_| V2FormatError::StorageOperationFailed)?;
-                if page.entries.len() > page_items.get() {
+                if page.consumed_items < page.entries.len()
+                    || page.consumed_items > page_items.get()
+                {
                     return Err(V2FormatError::ProviderProfileFailed);
                 }
                 inventory_item_count = inventory_item_count
-                    .checked_add(usize_to_u64(page.entries.len()))
+                    .checked_add(usize_to_u64(page.consumed_items))
                     .filter(|count| *count <= budgets.max_inventory_item_count)
                     .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
                 for mut metadata in page.entries {
@@ -1090,18 +1392,18 @@ where
         };
 
         if let Some(state) = anchor_state.as_ref() {
-            let chain = self
-                .load_maintenance_chain(state, &reachability, budgets)
-                .await?;
+            let chain = self.load_maintenance_chain(state, &reachability).await?;
             reachability.include_chain(&chain, false, None, None)?;
-            self.include_live_payload_roots(&mut reachability, &chain, false, budgets)
+            let current_state = self
+                .include_live_payload_roots(&mut reachability, &chain, false, budgets)
                 .await?;
             reachability.current_chain = Some(chain);
+            reachability.current_state = Some(current_state);
         }
 
         for protected_root in protected_roots {
             let chain = self
-                .load_maintenance_chain(protected_root, &reachability, budgets)
+                .load_maintenance_chain(protected_root, &reachability)
                 .await?;
             reachability.include_chain(&chain, true, None, None)?;
             self.include_live_payload_roots(&mut reachability, &chain, true, budgets)
@@ -1190,38 +1492,18 @@ where
         &self,
         root: &V2AnchorState,
         reachability: &V2ReachabilityState,
-        budgets: V2MaintenanceBudgets,
     ) -> V2Result<V2ReplayChain> {
         let configured = self.options().replay_limits;
         let used_commits = usize::try_from(reachability.chain_get_count)
             .map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?;
-        let mut max_commits = configured
+        let max_commits = configured
             .max_commits
             .checked_sub(used_commits)
             .ok_or(V2FormatError::ReplayBudgetExceeded)?;
-        if let Some(max_requests) = budgets.max_request_count {
-            let remaining = max_requests
-                .checked_sub(
-                    reachability
-                        .chain_get_count
-                        .saturating_add(reachability.graph_head_count),
-                )
-                .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
-            max_commits = max_commits.min(
-                usize::try_from(remaining).map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?,
-            );
-        }
-
-        let mut max_total_commit_bytes = configured
+        let max_total_commit_bytes = configured
             .max_total_commit_bytes
             .checked_sub(reachability.chain_read_bytes)
             .ok_or(V2FormatError::ReplayBudgetExceeded)?;
-        if let Some(max_bytes) = budgets.max_range_read_bytes {
-            let remaining = max_bytes
-                .checked_sub(reachability.chain_read_bytes)
-                .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
-            max_total_commit_bytes = max_total_commit_bytes.min(remaining);
-        }
         let max_retained_bytes = configured
             .max_retained_bytes
             .checked_sub(reachability.chain_retained_bytes)
@@ -1248,9 +1530,9 @@ where
         chain: &V2ReplayChain,
         protected: bool,
         budgets: V2MaintenanceBudgets,
-    ) -> V2Result<()> {
-        let limits = self.remaining_graph_limits(reachability, budgets)?;
-        let (live_payload_roots, referenced_run_commits, represented_retention) =
+    ) -> V2Result<RepositoryState> {
+        let limits = self.remaining_graph_limits(reachability)?;
+        let (state, live_payload_roots, referenced_run_commits, represented_retention) =
             self.live_payload_roots_from_chain(chain, limits).await?;
         for commit in &chain.commits_newest_first {
             reachability.include_required_protection(
@@ -1346,44 +1628,24 @@ where
             }
         }
 
-        Ok(())
+        Ok(state)
     }
 
     fn remaining_graph_limits(
         &self,
         reachability: &V2ReachabilityState,
-        budgets: V2MaintenanceBudgets,
     ) -> V2Result<V2ReplayLimits> {
         let configured = self.options().replay_limits;
         let used_commits = usize::try_from(reachability.chain_get_count)
             .map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?;
-        let mut max_commits = configured
+        let max_commits = configured
             .max_commits
             .checked_sub(used_commits)
             .ok_or(V2FormatError::ReplayBudgetExceeded)?;
-        if let Some(max_requests) = budgets.max_request_count {
-            let remaining = max_requests
-                .checked_sub(
-                    reachability
-                        .chain_get_count
-                        .saturating_add(reachability.graph_head_count),
-                )
-                .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
-            max_commits = max_commits.min(
-                usize::try_from(remaining).map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?,
-            );
-        }
-        let mut max_total_commit_bytes = configured
+        let max_total_commit_bytes = configured
             .max_total_commit_bytes
             .checked_sub(reachability.chain_read_bytes)
             .ok_or(V2FormatError::ReplayBudgetExceeded)?;
-        if let Some(max_bytes) = budgets.max_range_read_bytes {
-            max_total_commit_bytes = max_total_commit_bytes.min(
-                max_bytes
-                    .checked_sub(reachability.chain_read_bytes)
-                    .ok_or(V2FormatError::MaintenanceBudgetExceeded)?,
-            );
-        }
         let max_retained_bytes = configured
             .max_retained_bytes
             .checked_sub(reachability.chain_retained_bytes)
@@ -1401,6 +1663,7 @@ where
         chain: &V2ReplayChain,
         limits: V2ReplayLimits,
     ) -> V2Result<(
+        RepositoryState,
         Vec<V2LivePayloadRoot>,
         Vec<V2ReplayCommit>,
         Option<RetentionPolicy>,
@@ -1454,7 +1717,7 @@ where
             roots.push(root);
         }
 
-        Ok((roots, referenced_run_commits, represented_retention))
+        Ok((state, roots, referenced_run_commits, represented_retention))
     }
 
     async fn replay_chain_to_namespace_state(
@@ -1678,7 +1941,62 @@ where
             .map(|plan| plan.report)
     }
 
+    pub(super) async fn full_gc_dry_run_with_state<A>(
+        &self,
+        anchor: &A,
+        options: V2FullGcDryRunOptions,
+    ) -> V2Result<(
+        V2FullGcDryRunReport,
+        Option<(V2ReplayChain, RepositoryState)>,
+    )>
+    where
+        A: V2CommitAnchor,
+    {
+        let plan = self.build_full_gc_plan(anchor, options).await?;
+        let current = plan.current_chain.zip(plan.current_state);
+        Ok((plan.report, current))
+    }
+
     async fn build_full_gc_plan<A>(
+        &self,
+        anchor: &A,
+        options: V2FullGcDryRunOptions,
+    ) -> V2Result<V2FullGcPlan>
+    where
+        A: V2CommitAnchor,
+    {
+        let budgeted_store = V2MaintenanceBudgetedStore::new(self.store(), options.budgets);
+        let usage_handle = budgeted_store.clone();
+        let budgeted_repository = self.rebind_store(budgeted_store);
+        let result = budgeted_repository
+            .build_full_gc_plan_inner(anchor, options.clone())
+            .await;
+        let usage = usage_handle
+            .usage()
+            .map_err(|_| V2FormatError::StorageOperationFailed)?;
+        if usage.exhausted {
+            return Err(V2FormatError::MaintenanceBudgetExceeded);
+        }
+        let mut plan = result?;
+        let mutation_request_count = plan
+            .report
+            .planned_cost
+            .delete_count
+            .saturating_add(plan.report.planned_cost.retention_extend_count)
+            .saturating_add(plan.report.planned_cost.retention_extend_count);
+        plan.report.planned_cost.request_count =
+            usage.request_count.saturating_add(mutation_request_count);
+        plan.report.planned_cost.version_list_count = usage.version_list_count;
+        plan.report.planned_cost.head_count = usage
+            .head_count
+            .saturating_add(plan.report.planned_cost.retention_extend_count);
+        plan.report.planned_cost.range_read_bytes = usage.range_read_bytes;
+        plan.report.planned_cost.inventory_page_count = usage.list_page_count;
+        plan.report.fits_budgets = plan.report.planned_cost.fits_budgets(options.budgets);
+        Ok(plan)
+    }
+
+    async fn build_full_gc_plan_inner<A>(
         &self,
         anchor: &A,
         options: V2FullGcDryRunOptions,
@@ -1821,6 +2139,8 @@ where
             report,
             retention_renewal,
             orphans,
+            current_chain: reachability.current_chain,
+            current_state: reachability.current_state,
         })
     }
 
@@ -1860,6 +2180,7 @@ where
             report: dry_run,
             retention_renewal,
             orphans,
+            ..
         } = plan;
         if !dry_run.fits_budgets {
             return Err(V2FormatError::MaintenanceBudgetExceeded);
