@@ -14,6 +14,11 @@ const STREAMABLE_PAYLOAD_SEGMENT_AAD_DOMAIN: &[u8] =
 pub(crate) const PAYLOAD_HEADER_PROBE_LEN: u64 = 128;
 /// Default plaintext bytes per independently encrypted payload segment.
 pub const DEFAULT_PAYLOAD_SEGMENT_SIZE: usize = 512;
+/// Maximum plaintext bytes accepted in one independently encrypted payload segment.
+///
+/// This bounds reader and writer working memory even when authenticated repository
+/// metadata or operator configuration is malformed.
+pub const MAX_PAYLOAD_SEGMENT_SIZE: usize = 64 * 1024 * 1024;
 const MEDIUM_PAYLOAD_SEGMENT_SIZE: usize = 8 * 1024;
 const LARGE_PAYLOAD_SEGMENT_SIZE: usize = 64 * 1024;
 const MEDIUM_PAYLOAD_THRESHOLD: usize = 8 * 1024;
@@ -61,10 +66,10 @@ pub(crate) struct SegmentedPayloadSealer {
 
 impl SegmentedPayloadSealer {
     pub(crate) fn new(keyring: &KeyRing, chunk_size: usize) -> Result<Self> {
-        if chunk_size == 0 {
-            return Err(StorageError::Provider(
-                "payload chunk size must be greater than zero".to_owned(),
-            )
+        if chunk_size == 0 || chunk_size > MAX_PAYLOAD_SEGMENT_SIZE {
+            return Err(StorageError::Provider(format!(
+                "payload chunk size must be between 1 and {MAX_PAYLOAD_SEGMENT_SIZE} bytes"
+            ))
             .into());
         }
         let chunk_size = u64::try_from(chunk_size).map_err(|_| {
@@ -291,7 +296,10 @@ pub(crate) fn parse_segmented_payload_header_with_total_len(
     };
 
     let chunk_size = read_u64(object_id, &mut cursor)?;
-    if chunk_size == 0 {
+    if chunk_size == 0
+        || chunk_size
+            > u64::try_from(MAX_PAYLOAD_SEGMENT_SIZE).map_err(|_| StorageError::InvalidRange)?
+    {
         return Err(invalid_payload_object(object_id));
     }
     let plaintext_len = match format {
@@ -828,6 +836,12 @@ pub(crate) fn total_segmented_payload_len(header: &SegmentedPayloadHeader) -> Re
 }
 
 fn segment_count(header: &SegmentedPayloadHeader) -> Result<usize> {
+    if header.chunk_size == 0
+        || header.chunk_size
+            > u64::try_from(MAX_PAYLOAD_SEGMENT_SIZE).map_err(|_| StorageError::InvalidRange)?
+    {
+        return Err(StorageError::InvalidRange.into());
+    }
     let count = if header.plaintext_len == 0 {
         0
     } else {
@@ -1028,14 +1042,45 @@ fn invalid_payload_object(object_id: &BackendObjectId) -> RepositoryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_PAYLOAD_SEGMENT_SIZE, PayloadHeaderProbe, open_payload_object,
-        open_segmented_payload_span_inner, parse_segmented_payload_header,
-        parse_segmented_payload_header_with_total_len, probe_payload_header, seal_payload_object,
-        seal_streamable_payload_object, segmented_ciphertext_span,
+        DEFAULT_PAYLOAD_SEGMENT_SIZE, MAX_PAYLOAD_SEGMENT_SIZE, PayloadHeaderProbe,
+        SegmentedPayloadSealer, open_payload_object, open_segmented_payload_span_inner,
+        parse_segmented_payload_header, parse_segmented_payload_header_with_total_len,
+        probe_payload_header, seal_payload_object, seal_streamable_payload_object,
+        segmented_ciphertext_span,
     };
     use crate::test_support::{backend_object_id, signing_keyring, wrong_content_keyring};
     use bytes::Bytes;
     use rs3_storage::ByteRange;
+
+    #[test]
+    fn payload_sealer_rejects_unbounded_segment_size() {
+        let keyring = signing_keyring();
+        let result =
+            SegmentedPayloadSealer::new(&keyring, MAX_PAYLOAD_SEGMENT_SIZE.saturating_add(1));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn payload_parser_rejects_unbounded_segment_size() {
+        let keyring = signing_keyring();
+        let object_id = backend_object_id("segments/unbounded");
+        let sealed = seal_streamable_payload_object(
+            &keyring,
+            &object_id,
+            b"bounded",
+            DEFAULT_PAYLOAD_SEGMENT_SIZE,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let mut malformed = sealed.to_vec();
+        let start = super::STREAMABLE_PAYLOAD_OBJECT_DOMAIN.len();
+        let end = start + std::mem::size_of::<u64>();
+        malformed[start..end].copy_from_slice(&(MAX_PAYLOAD_SEGMENT_SIZE as u64 + 1).to_be_bytes());
+
+        let parsed = parse_segmented_payload_header(&object_id, &malformed);
+
+        assert!(parsed.is_err());
+    }
 
     #[test]
     fn payload_object_round_trips() {

@@ -96,7 +96,7 @@ cluster resources.
 | `RS3_BACKEND_MULTIPART_PART_BYTES` | no | `16777216` | Backend multipart part size for large `PutObject` writes. S3-compatible backends require at least `5242880` bytes. |
 | `RS3_STREAM_READ_STALL_TIMEOUT_SECS` | no | `30` | Maximum idle time between chunks while the gateway streams a large `PutObject` request body into a backend multipart commit. Stalled streams fail as incomplete request bodies. |
 | `RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES` | no | `536870912` | Admission budget for request body bytes held by in-flight upload operations. Buffered uploads reserve their full collected body; streaming uploads reserve a bounded working set, not a hard RSS cap for every HTTP chunk. Excess uploads fail with S3 `SlowDown`. |
-| `RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES` | no | `536870912` | Admission budget for response body bytes held by in-flight download operations. Full-object and ranged `GetObject` responses reserve their resolved response length until the response body is dropped. Excess downloads fail with S3 `SlowDown`. |
+| `RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES` | no | `536870912` | Admission budget for response memory held by in-flight downloads. Buffered pack and range responses reserve their resolved length. Full streamed-carrier responses reserve a conservative bounded working set derived from the authenticated segment size, while their total response may be larger. Reservations remain until the body is consumed or dropped; excess downloads fail with S3 `SlowDown`. |
 | `RS3_REQUEST_RATE_LIMIT_PER_SECOND` | no | `1024` | Per-process S3 operation admission rate. Bursts up to one second of capacity are allowed; excess operations fail with S3 `SlowDown`. |
 
 ## Backend Storage
@@ -203,7 +203,7 @@ where practical, and backend credentials that cannot write.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `RS3_PAYLOAD_SEGMENT_SIZE_BYTES` | no | adaptive, `512` B floor | Plaintext bytes per independently encrypted payload segment. Leave unset to use adaptive per-object defaults: 512 B for small objects, 8 KiB for medium objects, and 64 KiB for large objects. Set it to force a fixed segment size. |
+| `RS3_PAYLOAD_SEGMENT_SIZE_BYTES` | no | adaptive, `512` B floor | Plaintext bytes per independently encrypted payload segment. Leave unset to use adaptive per-object defaults: 512 B for small objects, 8 KiB for medium objects, and 64 KiB for large objects. Set it to force a fixed segment size. Writers and readers reject values above 64 MiB so one authenticated segment cannot force an unbounded allocation. |
 | `RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES` | no | `268435456` | Maximum plaintext bytes retained in the process-local decrypted segment LRU cache. Set to `0` to disable the cache. |
 | `RS3_COMMIT_MAX_BATCH_ITEMS` | no | `64` | Maximum staged writes covered by one commit batch. |
 | `RS3_COMMIT_MAX_BATCH_DELAY_MS` | no | `25` | Maximum delay before publishing a partial commit batch. |

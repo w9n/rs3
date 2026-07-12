@@ -847,11 +847,24 @@ fn parse_repository_config(source: &impl ConfigSource) -> Result<RepositoryConfi
     let adaptive_payload_segment_size = payload_segment_size_value.is_none();
     let payload_segment_size = collect_config_error(
         &mut errors,
-        parse_positive_usize(
-            "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
-            payload_segment_size_value,
-            DEFAULT_PAYLOAD_SEGMENT_SIZE,
-        ),
+        (|| {
+            let size = parse_positive_usize(
+                "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
+                payload_segment_size_value,
+                DEFAULT_PAYLOAD_SEGMENT_SIZE,
+            )?;
+            if size > rs3_repository::MAX_PAYLOAD_SEGMENT_SIZE {
+                return Err(ConfigError::Invalid {
+                    key: "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
+                    value: size.to_string(),
+                    reason: format!(
+                        "expected at most {} bytes",
+                        rs3_repository::MAX_PAYLOAD_SEGMENT_SIZE
+                    ),
+                });
+            }
+            Ok(size)
+        })(),
     );
     let decrypted_segment_cache_max_bytes = collect_config_error(
         &mut errors,
@@ -1668,6 +1681,17 @@ mod tests {
                 retention: None,
                 allow_init: false,
             })
+        );
+    }
+
+    #[test]
+    fn rejects_unbounded_repository_payload_segment_size() {
+        let source = minimal_source().with("RS3_PAYLOAD_SEGMENT_SIZE_BYTES", "67108865");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == "RS3_PAYLOAD_SEGMENT_SIZE_BYTES")
         );
     }
 

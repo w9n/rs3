@@ -22,5 +22,5 @@ pub use model::{
     DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry, RepositoryObjectMetadata,
     RepositoryPutOptions,
 };
-pub use payload::DEFAULT_PAYLOAD_SEGMENT_SIZE;
+pub use payload::{DEFAULT_PAYLOAD_SEGMENT_SIZE, MAX_PAYLOAD_SEGMENT_SIZE};
 pub use service::{DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES, Repository, RepositoryOptions};
