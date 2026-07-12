@@ -1,9 +1,11 @@
 //! S3-compatible `BlobStore` implementation.
 
+use crate::read::{BlobReadSource, exact_blob_read};
 use crate::{
-    BlobMetadata, BlobMultipartUpload, BlobStore, ByteRange, PutOptions, Result, StorageError,
-    object_kind, prefix_kind, record_blob_delete, record_blob_extend_retention, record_blob_get,
-    record_blob_head, record_blob_list, record_blob_put, record_blob_set_legal_hold,
+    BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore, ByteRange, PutOptions, Result,
+    StorageError, object_kind, prefix_kind, record_blob_delete, record_blob_extend_retention,
+    record_blob_get, record_blob_head, record_blob_list, record_blob_put,
+    record_blob_set_legal_hold,
 };
 use async_trait::async_trait;
 use aws_sdk_s3::Client as SdkS3Client;
@@ -39,6 +41,82 @@ use object_lock::{
     verify_legal_hold, verify_retention,
 };
 use requests::sdk_range_header;
+
+struct S3ReadSource {
+    body: SdkByteStream,
+}
+
+#[async_trait]
+impl BlobReadSource for S3ReadSource {
+    async fn next_source_chunk(&mut self) -> Result<Option<Bytes>> {
+        self.body.try_next().await.map_err(provider_error)
+    }
+}
+
+struct ObservedS3Read {
+    inner: Box<dyn BlobRead>,
+    store: S3BlobStore,
+    object_kind: String,
+    range: ByteRange,
+    started: Instant,
+    bytes_read: u64,
+    terminal: bool,
+}
+
+#[async_trait]
+impl BlobRead for ObservedS3Read {
+    fn exact_len(&self) -> u64 {
+        self.inner.exact_len()
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
+        match self.inner.next_chunk().await {
+            Ok(Some(chunk)) => {
+                self.bytes_read = self.bytes_read.saturating_add(chunk.len() as u64);
+                Ok(Some(chunk))
+            }
+            Ok(None) => {
+                self.record("ok")?;
+                Ok(None)
+            }
+            Err(error) => {
+                self.record("error")?;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl ObservedS3Read {
+    fn record(&mut self, result: &str) -> Result<()> {
+        if self.terminal {
+            return Ok(());
+        }
+        self.terminal = true;
+        self.store.record_provider_operation(
+            S3ProviderOperation::Get,
+            &self.object_kind,
+            result,
+            0,
+            self.bytes_read,
+            self.started.elapsed(),
+        )?;
+        record_blob_get(
+            &self.object_kind,
+            self.range,
+            self.bytes_read,
+            result,
+            self.started.elapsed(),
+        );
+        Ok(())
+    }
+}
+
+impl Drop for ObservedS3Read {
+    fn drop(&mut self) {
+        let _ = self.record("cancelled");
+    }
+}
 
 async fn collect_get_body(mut body: SdkByteStream, range: ByteRange) -> Result<Bytes> {
     let ByteRange::Slice { len, .. } = range else {
@@ -660,6 +738,105 @@ impl BlobStore for S3BlobStore {
                 Err(storage_error)
             }
         }
+    }
+
+    async fn open_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> Result<Box<dyn BlobRead>> {
+        if matches!(range, ByteRange::Slice { len: 0, .. }) {
+            let body = self.get_range_at(object_id, version_id, range).await?;
+            return Ok(crate::read::bytes_blob_read(body, 0));
+        }
+
+        let started = Instant::now();
+        let object_kind = object_kind(object_id).to_owned();
+        let mut request = self
+            .client
+            .get_object()
+            .bucket(self.config.bucket.as_str())
+            .key(self.config.object_key(object_id));
+        if let Some(version_id) = version_id {
+            request = request.version_id(version_id.as_str());
+        }
+        if let Some(range_header) = sdk_range_header(range)? {
+            request = request.range(range_header);
+        }
+
+        let output = match request.send().await {
+            Ok(output) => output,
+            Err(error) => {
+                let storage_error = map_sdk_get_error(error, object_id);
+                let result = storage_error_result(&storage_error);
+                self.record_provider_operation(
+                    S3ProviderOperation::Get,
+                    &object_kind,
+                    result,
+                    0,
+                    0,
+                    started.elapsed(),
+                )?;
+                record_blob_get(&object_kind, range, 0, result, started.elapsed());
+                return Err(storage_error);
+            }
+        };
+        let declared_len = output
+            .content_length()
+            .ok_or_else(|| {
+                StorageError::Provider("S3 GET response omitted Content-Length".to_owned())
+            })
+            .and_then(|length| {
+                u64::try_from(length).map_err(|_| {
+                    StorageError::Provider(
+                        "S3 GET response Content-Length is out of range".to_owned(),
+                    )
+                })
+            });
+        let declared_len = match declared_len {
+            Ok(declared_len) => declared_len,
+            Err(error) => {
+                self.record_provider_operation(
+                    S3ProviderOperation::Get,
+                    &object_kind,
+                    "error",
+                    0,
+                    0,
+                    started.elapsed(),
+                )?;
+                record_blob_get(&object_kind, range, 0, "error", started.elapsed());
+                return Err(error);
+            }
+        };
+        let exact_len = match range {
+            ByteRange::Full => declared_len,
+            ByteRange::Slice { len, .. } => len,
+        };
+        if declared_len != exact_len {
+            self.record_provider_operation(
+                S3ProviderOperation::Get,
+                &object_kind,
+                "error",
+                0,
+                0,
+                started.elapsed(),
+            )?;
+            record_blob_get(&object_kind, range, 0, "error", started.elapsed());
+            return Err(StorageError::Provider(
+                "S3 GET response Content-Length did not match the requested range".to_owned(),
+            ));
+        }
+
+        Ok(Box::new(ObservedS3Read {
+            inner: exact_blob_read(S3ReadSource { body: output.body }, exact_len),
+            store: self.clone(),
+            object_kind,
+            range,
+            started,
+            bytes_read: 0,
+            terminal: false,
+        }))
     }
 
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {

@@ -3,6 +3,7 @@
 #[cfg(feature = "test-util")]
 mod fault;
 mod filesystem;
+mod read;
 #[cfg(feature = "s3")]
 mod s3;
 
@@ -22,6 +23,7 @@ pub use fault::{
     FaultOperationKind, FaultRule,
 };
 pub use filesystem::FilesystemBlobStore;
+pub use read::BlobRead;
 #[cfg(feature = "s3")]
 pub use s3::{S3BlobStore, S3BlobStoreConfig, S3ProviderMetrics, S3ProviderOperationMetrics};
 
@@ -174,6 +176,27 @@ pub trait BlobStore: Send + Sync {
             return Err(StorageError::VersionUnsupported);
         }
         self.get_range(object_id, range).await
+    }
+
+    /// Opens a bounded incremental read from a specific provider version.
+    ///
+    /// The default adapter preserves compatibility for stores that only expose
+    /// buffered reads. Providers with streaming response bodies should override
+    /// this method so large objects do not need to be materialized in memory.
+    async fn open_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> Result<Box<dyn BlobRead>> {
+        let body = self.get_range_at(object_id, version_id, range).await?;
+        let exact_len = match range {
+            ByteRange::Full => u64::try_from(body.len()).map_err(|_| {
+                StorageError::Provider("read length does not fit in u64".to_owned())
+            })?,
+            ByteRange::Slice { len, .. } => len,
+        };
+        Ok(read::bytes_blob_read(body, exact_len))
     }
 
     /// Reads object metadata without fetching the body.
@@ -400,6 +423,25 @@ where
         Ok(body)
     }
 
+    async fn open_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> Result<Box<dyn BlobRead>> {
+        self.mutate_counts(|counts| {
+            counts.get = counts.get.saturating_add(1);
+        })?;
+        let inner = self
+            .inner
+            .open_range_at(object_id, version_id, range)
+            .await?;
+        Ok(Box::new(CountingBlobRead {
+            inner,
+            counts: Arc::clone(&self.counts),
+        }))
+    }
+
     async fn get_range_at(
         &self,
         object_id: &BackendObjectId,
@@ -526,6 +568,32 @@ where
             counts.flush = counts.flush.saturating_add(1);
         })?;
         self.inner.flush_caches().await
+    }
+}
+
+struct CountingBlobRead {
+    inner: Box<dyn BlobRead>,
+    counts: Arc<RwLock<BlobOperationCounts>>,
+}
+
+#[async_trait]
+impl BlobRead for CountingBlobRead {
+    fn exact_len(&self) -> u64 {
+        self.inner.exact_len()
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
+        let chunk = self.inner.next_chunk().await?;
+        if let Some(chunk) = chunk.as_ref() {
+            let chunk_len = u64::try_from(chunk.len()).map_err(|_| {
+                StorageError::Provider("read length does not fit in u64".to_owned())
+            })?;
+            let mut counts = self.counts.write().map_err(|_| {
+                StorageError::Provider("counting blob store lock poisoned".to_owned())
+            })?;
+            counts.bytes_read = counts.bytes_read.saturating_add(chunk_len);
+        }
+        Ok(chunk)
     }
 }
 
@@ -833,6 +901,46 @@ impl BlobStore for MemoryBlobStore {
         Ok(body)
     }
 
+    async fn open_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> Result<Box<dyn BlobRead>> {
+        let started = Instant::now();
+        let kind = object_kind(object_id).to_owned();
+        let body = {
+            let mut state = self.write_state()?;
+            state.counts.get = state.counts.get.saturating_add(1);
+            let Some(object) = state
+                .objects
+                .get(object_id)
+                .and_then(|versions| memory_object_at(versions, version_id))
+            else {
+                record_blob_get(&kind, range, 0, "not_found", started.elapsed());
+                return Err(StorageError::NotFound(object_id.clone()));
+            };
+            match read_range(&object.body, range) {
+                Ok(body) => body,
+                Err(error) => {
+                    record_blob_get(&kind, range, 0, "invalid_range", started.elapsed());
+                    return Err(error);
+                }
+            }
+        };
+        let exact_len = u64::try_from(body.len())
+            .map_err(|_| StorageError::Provider("read length does not fit in u64".to_owned()))?;
+        Ok(Box::new(ObservedMemoryRead {
+            inner: read::bytes_blob_read(body, exact_len),
+            store: self.clone(),
+            kind,
+            range,
+            started,
+            bytes_read: 0,
+            terminal: false,
+        }))
+    }
+
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {
         let started = Instant::now();
         let object_kind = object_kind(object_id);
@@ -1118,6 +1226,67 @@ impl BlobStore for MemoryBlobStore {
             "blob store operation completed",
         );
         Ok(())
+    }
+}
+
+struct ObservedMemoryRead {
+    inner: Box<dyn BlobRead>,
+    store: MemoryBlobStore,
+    kind: String,
+    range: ByteRange,
+    started: Instant,
+    bytes_read: u64,
+    terminal: bool,
+}
+
+#[async_trait]
+impl BlobRead for ObservedMemoryRead {
+    fn exact_len(&self) -> u64 {
+        self.inner.exact_len()
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
+        match self.inner.next_chunk().await {
+            Ok(Some(chunk)) => {
+                let chunk_len = u64::try_from(chunk.len()).map_err(|_| {
+                    StorageError::Provider("read length does not fit in u64".to_owned())
+                })?;
+                let mut state = self.store.write_state()?;
+                state.counts.bytes_read = state.counts.bytes_read.saturating_add(chunk_len);
+                self.bytes_read = self.bytes_read.saturating_add(chunk_len);
+                Ok(Some(chunk))
+            }
+            Ok(None) => {
+                self.record("ok");
+                Ok(None)
+            }
+            Err(error) => {
+                self.record("error");
+                Err(error)
+            }
+        }
+    }
+}
+
+impl ObservedMemoryRead {
+    fn record(&mut self, result: &str) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        record_blob_get(
+            &self.kind,
+            self.range,
+            self.bytes_read,
+            result,
+            self.started.elapsed(),
+        );
+    }
+}
+
+impl Drop for ObservedMemoryRead {
+    fn drop(&mut self) {
+        self.record("cancelled");
     }
 }
 
@@ -1677,5 +1846,63 @@ mod tests {
         assert_eq!(counts.list, 1);
         assert_eq!(counts.bytes_written, 11);
         assert_eq!(counts.bytes_read, 5);
+    }
+
+    #[tokio::test]
+    async fn streamed_version_read_is_bounded_and_counted_as_consumed() {
+        let inner = MemoryBlobStore::new();
+        let store = CountingBlobStore::new(inner);
+        let object_id = object_id("segments/streamed");
+        let first = store
+            .put(
+                &object_id,
+                Bytes::from(vec![1_u8; super::read::BLOB_READ_CHUNK_BYTES + 1]),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        store
+            .put(
+                &object_id,
+                Bytes::from_static(b"newer"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        store
+            .reset_operation_counts()
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let mut read = store
+            .open_range_at(&object_id, first.version_id.as_ref(), ByteRange::Full)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            read.exact_len(),
+            (super::read::BLOB_READ_CHUNK_BYTES + 1) as u64
+        );
+        let first_chunk = read
+            .next_chunk()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .expect("first chunk");
+        assert_eq!(first_chunk.len(), super::read::BLOB_READ_CHUNK_BYTES);
+        assert_eq!(store.operation_counts().map(|counts| counts.get), Ok(1));
+        assert_eq!(
+            store.operation_counts().map(|counts| counts.bytes_read),
+            Ok(super::read::BLOB_READ_CHUNK_BYTES as u64)
+        );
+
+        let final_chunk = read
+            .next_chunk()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .expect("final chunk");
+        assert_eq!(final_chunk, Bytes::from_static(&[1]));
+        assert_eq!(read.next_chunk().await, Ok(None));
+        assert_eq!(
+            store.operation_counts().map(|counts| counts.bytes_read),
+            Ok((super::read::BLOB_READ_CHUNK_BYTES + 1) as u64)
+        );
     }
 }

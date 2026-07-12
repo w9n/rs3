@@ -1,7 +1,8 @@
 //! Fault-injecting `BlobStore` test utilities.
 
 use crate::{
-    BlobMetadata, BlobMultipartUpload, BlobStore, ByteRange, PutOptions, Result, StorageError,
+    BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore, ByteRange, PutOptions, Result,
+    StorageError,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -480,6 +481,22 @@ where
             .get_range_at(object_id, version_id, range)
             .await?;
         finish_success(body, effect)
+    }
+
+    async fn open_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> Result<Box<dyn BlobRead>> {
+        let effect = self
+            .script
+            .begin(FaultOperationKind::GetRangeAt, Some(object_id), None)?;
+        let read = self
+            .inner
+            .open_range_at(object_id, version_id, range)
+            .await?;
+        finish_success(read, effect)
     }
 
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {

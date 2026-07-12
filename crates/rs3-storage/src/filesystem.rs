@@ -1,9 +1,10 @@
 //! Local filesystem `BlobStore` implementation.
 
+use crate::read::{BLOB_READ_CHUNK_BYTES, BlobReadSource, exact_blob_read};
 use crate::{
-    BlobMetadata, BlobStore, ByteRange, PutOptions, Result, StorageError, object_kind, prefix_kind,
-    record_blob_delete, record_blob_extend_retention, record_blob_get, record_blob_head,
-    record_blob_list, record_blob_put, record_blob_set_legal_hold,
+    BlobMetadata, BlobRead, BlobStore, ByteRange, PutOptions, Result, StorageError, object_kind,
+    prefix_kind, record_blob_delete, record_blob_extend_retention, record_blob_get,
+    record_blob_head, record_blob_list, record_blob_put, record_blob_set_legal_hold,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -139,6 +140,44 @@ impl BlobStore for FilesystemBlobStore {
         Ok(body)
     }
 
+    async fn open_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&rs3_types::BackendVersionId>,
+        range: ByteRange,
+    ) -> Result<Box<dyn BlobRead>> {
+        if version_id.is_some() {
+            return Err(StorageError::VersionUnsupported);
+        }
+
+        let started = Instant::now();
+        let kind = object_kind(object_id).to_owned();
+        let path = self.object_path(object_id)?;
+        let (source, exact_len) = match open_file_range(&path, range) {
+            Ok(opened) => opened,
+            Err(StorageError::NotFound(_)) => {
+                record_blob_get(&kind, range, 0, "not_found", started.elapsed());
+                return Err(StorageError::NotFound(object_id.clone()));
+            }
+            Err(StorageError::InvalidRange) => {
+                record_blob_get(&kind, range, 0, "invalid_range", started.elapsed());
+                return Err(StorageError::InvalidRange);
+            }
+            Err(error) => {
+                record_blob_get(&kind, range, 0, "error", started.elapsed());
+                return Err(error);
+            }
+        };
+        Ok(Box::new(ObservedFilesystemRead {
+            inner: exact_blob_read(source, exact_len),
+            kind,
+            range,
+            started,
+            bytes_read: 0,
+            terminal: false,
+        }))
+    }
+
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {
         let started = Instant::now();
         let kind = object_kind(object_id);
@@ -252,6 +291,92 @@ impl BlobStore for FilesystemBlobStore {
     }
 }
 
+struct FileReadSource {
+    file: File,
+    range_remaining: Option<u64>,
+}
+
+#[async_trait]
+impl BlobReadSource for FileReadSource {
+    async fn next_source_chunk(&mut self) -> Result<Option<Bytes>> {
+        if self.range_remaining == Some(0) {
+            return Ok(None);
+        }
+        let limit = self
+            .range_remaining
+            .map_or(BLOB_READ_CHUNK_BYTES, |remaining| {
+                usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(BLOB_READ_CHUNK_BYTES)
+            });
+        let mut buffer = vec![0_u8; limit];
+        let read = self.file.read(&mut buffer).map_err(provider_error)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        buffer.truncate(read);
+        if let Some(remaining) = self.range_remaining.as_mut() {
+            *remaining = remaining.saturating_sub(read as u64);
+        }
+        Ok(Some(Bytes::from(buffer)))
+    }
+}
+
+struct ObservedFilesystemRead {
+    inner: Box<dyn BlobRead>,
+    kind: String,
+    range: ByteRange,
+    started: Instant,
+    bytes_read: u64,
+    terminal: bool,
+}
+
+#[async_trait]
+impl BlobRead for ObservedFilesystemRead {
+    fn exact_len(&self) -> u64 {
+        self.inner.exact_len()
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
+        match self.inner.next_chunk().await {
+            Ok(Some(chunk)) => {
+                self.bytes_read = self.bytes_read.saturating_add(chunk.len() as u64);
+                Ok(Some(chunk))
+            }
+            Ok(None) => {
+                self.record("ok");
+                Ok(None)
+            }
+            Err(error) => {
+                self.record("error");
+                Err(error)
+            }
+        }
+    }
+}
+
+impl ObservedFilesystemRead {
+    fn record(&mut self, result: &str) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        record_blob_get(
+            &self.kind,
+            self.range,
+            self.bytes_read,
+            result,
+            self.started.elapsed(),
+        );
+    }
+}
+
+impl Drop for ObservedFilesystemRead {
+    fn drop(&mut self) {
+        self.record("cancelled");
+    }
+}
+
 fn write_new_file(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(body)?;
@@ -297,6 +422,29 @@ fn read_file_range(path: &Path, range: ByteRange) -> Result<Bytes> {
             Ok(Bytes::from(body))
         }
     }
+}
+
+fn open_file_range(path: &Path, range: ByteRange) -> Result<(FileReadSource, u64)> {
+    let mut file = File::open(path).map_err(|error| map_read_error(path, error))?;
+    let file_len = file.metadata().map_err(provider_error)?.len();
+    let (offset, exact_len, range_remaining) = match range {
+        ByteRange::Full => (0, file_len, None),
+        ByteRange::Slice { offset, len } => {
+            let end = offset.checked_add(len).ok_or(StorageError::InvalidRange)?;
+            if offset > file_len || end > file_len {
+                return Err(StorageError::InvalidRange);
+            }
+            (offset, len, Some(len))
+        }
+    };
+    file.seek(SeekFrom::Start(offset)).map_err(provider_error)?;
+    Ok((
+        FileReadSource {
+            file,
+            range_remaining,
+        },
+        exact_len,
+    ))
 }
 
 fn collect_files(
@@ -579,5 +727,119 @@ mod tests {
             .await;
 
         assert_eq!(put, Err(StorageError::RetentionExtensionUnsupported));
+    }
+
+    #[tokio::test]
+    async fn filesystem_streams_full_and_sliced_reads_in_bounded_chunks() {
+        let dir = TestDir::new();
+        let store = FilesystemBlobStore::new(dir.path()).unwrap_or_else(|error| panic!("{error}"));
+        let object_id = object_id("segments/streamed");
+        let body = Bytes::from(vec![9_u8; super::BLOB_READ_CHUNK_BYTES + 17]);
+        store
+            .put(&object_id, body.clone(), PutOptions::default())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let mut full = store
+            .open_range_at(&object_id, None, ByteRange::Full)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(full.exact_len(), body.len() as u64);
+        let first = full
+            .next_chunk()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .expect("first chunk");
+        let second = full
+            .next_chunk()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .expect("second chunk");
+        assert_eq!(first.len(), super::BLOB_READ_CHUNK_BYTES);
+        assert_eq!(second.len(), 17);
+        assert_eq!(full.next_chunk().await, Ok(None));
+
+        let mut slice = store
+            .open_range_at(
+                &object_id,
+                None,
+                ByteRange::Slice {
+                    offset: body.len() as u64 - 9,
+                    len: 9,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(slice.exact_len(), 9);
+        assert_eq!(
+            slice.next_chunk().await,
+            Ok(Some(Bytes::from_static(&[9_u8; 9])))
+        );
+        assert_eq!(slice.next_chunk().await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn filesystem_stream_detects_truncation_after_open() {
+        let dir = TestDir::new();
+        let store = FilesystemBlobStore::new(dir.path()).unwrap_or_else(|error| panic!("{error}"));
+        let object_id = object_id("segments/truncated");
+        store
+            .put(
+                &object_id,
+                Bytes::from_static(b"original"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut read = store
+            .open_range_at(&object_id, None, ByteRange::Full)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join(object_id.as_str()))
+            .and_then(|file| file.set_len(3))
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(
+            read.next_chunk().await,
+            Ok(Some(Bytes::from_static(b"ori")))
+        );
+        assert!(matches!(
+            read.next_chunk().await,
+            Err(StorageError::Provider(message)) if message.contains("before its exact length")
+        ));
+    }
+
+    #[tokio::test]
+    async fn filesystem_stream_never_emits_bytes_appended_after_open() {
+        let dir = TestDir::new();
+        let store = FilesystemBlobStore::new(dir.path()).unwrap_or_else(|error| panic!("{error}"));
+        let object_id = object_id("segments/extended");
+        store
+            .put(
+                &object_id,
+                Bytes::from_static(b"abc"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut read = store
+            .open_range_at(&object_id, None, ByteRange::Full)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join(object_id.as_str()))
+            .unwrap_or_else(|error| panic!("{error}"));
+        file.write_all(b"d")
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(matches!(
+            read.next_chunk().await,
+            Err(StorageError::Provider(message)) if message.contains("exceeded its exact length")
+        ));
+        assert_eq!(read.next_chunk().await, Ok(None));
     }
 }
