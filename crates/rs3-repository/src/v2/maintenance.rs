@@ -16,25 +16,41 @@ use super::{
 use crate::checkpoint::open_index_delta_object;
 use crate::state::{RepositoryState, apply_index_delta_object};
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rs3_index::{
     INDEX_DELTA_OBJECT_DOMAIN, IndexDelta, IndexDeltaObject, PayloadReference,
-    SealedIndexDeltaObject, V2StreamCarrierReference,
+    SealedIndexDeltaObject, V2CommitStreamCarrierReference, V2StandaloneStreamCarrierReference,
 };
 use rs3_storage::BlobMetadata;
 use rs3_storage::{BlobStore, StorageError};
 use rs3_types::{
     BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionMode, RetentionPolicy, Sequence,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_RETENTION_RENEWAL_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MIN_ORPHAN_GC_AGE: Duration = Duration::from_secs(60 * 60);
+const V2_STANDALONE_OBJECT_PREFIX: &str = "objects/v02/";
+const V2_STANDALONE_OBJECT_ID_BYTES: usize = 32;
+const V2_STANDALONE_OBJECT_ID_B64_LEN: usize = 43;
 
-/// Unanchored v2 commit object discovered by orphan reporting.
+/// Broad path-private class of one v2 orphan candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum V2OrphanObjectClass {
+    /// Signed commit object under `commits/v02/`.
+    Commit,
+    /// Opaque independently sealed object under `objects/v02/`.
+    Object,
+}
+
+/// Unanchored v2 backend object discovered by orphan reporting.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V2OrphanCandidate {
+    /// Broad backend-visible object class.
+    pub object_class: V2OrphanObjectClass,
     /// Opaque backend object ID.
     pub object_id: BackendObjectId,
     /// Provider version ID visible in listing, when available.
@@ -64,7 +80,9 @@ pub struct V2OrphanCandidate {
 pub struct V2OrphanReport {
     /// Reachable commit object count in the verified anchor chain.
     pub reachable_commit_count: usize,
-    /// Candidate commits under `commits/v02/` that are not anchor-reachable.
+    /// Reachable independently sealed objects referenced by live payload state.
+    pub reachable_object_count: usize,
+    /// Candidate objects under the v2 commit and object prefixes that are not reachable.
     pub candidates: Vec<V2OrphanCandidate>,
 }
 
@@ -145,13 +163,13 @@ pub struct V2MaintenanceReport {
     pub protected_orphan_candidate_count: usize,
     /// Oldest visible orphan age in milliseconds, when provider timestamps exist.
     pub oldest_orphan_age_ms: Option<u128>,
-    /// Live commit versions that should have retention extended within the default renewal horizon.
+    /// Live object versions that should have retention extended within the default renewal horizon.
     pub retention_renewal_commit_count: usize,
-    /// Live commit bytes covered by planned retention renewal.
+    /// Live object bytes covered by planned retention renewal.
     pub retention_renewal_bytes: u64,
-    /// Live commit versions whose renewal could not be planned from available metadata.
+    /// Live object versions whose renewal could not be planned from available metadata.
     pub retention_renewal_blocked_count: usize,
-    /// Live commit bytes whose renewal could not be planned from available metadata.
+    /// Live object bytes whose renewal could not be planned from available metadata.
     pub retention_renewal_blocked_bytes: u64,
 }
 
@@ -239,15 +257,15 @@ pub struct V2FullGcDryRunReport {
     pub chain_live_commit_count: usize,
     /// Operator-supplied historical roots included in reachability.
     pub protected_root_count: usize,
-    /// Unique commit versions included through historical roots.
+    /// Unique exact object versions included through historical roots.
     pub protected_commit_count: usize,
-    /// Unanchored commit candidates inspected.
+    /// Unanchored commit and standalone-object candidates inspected.
     pub candidate_commit_count: usize,
-    /// Fully dead commit candidates outside provider protection.
+    /// Fully dead object candidates outside provider protection.
     pub fully_dead_commit_count: usize,
     /// Mixed accepted commit count selected for repack.
     pub mixed_commit_count: usize,
-    /// Bytes in unanchored commits that can become reclaimable by exact delete.
+    /// Bytes in unanchored objects that can become reclaimable by exact delete.
     pub dead_bytes_reclaimable: u64,
     /// Live bytes that would be copied by repack.
     pub live_bytes_to_copy: u64,
@@ -259,13 +277,13 @@ pub struct V2FullGcDryRunReport {
     pub legal_hold_blocked_bytes: u64,
     /// Dead bytes blocked by missing exact version or protection metadata.
     pub unknown_protection_blocked_bytes: u64,
-    /// Live commit versions that should have retention extended within the requested horizon.
+    /// Live object versions that should have retention extended within the requested horizon.
     pub retention_renewal_commit_count: usize,
-    /// Live commit bytes covered by planned retention renewal.
+    /// Live object bytes covered by planned retention renewal.
     pub retention_renewal_bytes: u64,
-    /// Live commit versions whose renewal could not be planned from available metadata.
+    /// Live object versions whose renewal could not be planned from available metadata.
     pub retention_renewal_blocked_count: usize,
-    /// Live commit bytes whose renewal could not be planned from available metadata.
+    /// Live object bytes whose renewal could not be planned from available metadata.
     pub retention_renewal_blocked_bytes: u64,
     /// Planned request and byte cost.
     pub planned_cost: V2MaintenancePlanCost,
@@ -312,7 +330,7 @@ pub struct V2FullGcApplyOptions {
 pub struct V2FullGcApplyReport {
     /// Dry-run report used as the apply preflight.
     pub dry_run: V2FullGcDryRunReport,
-    /// Exact deletion result for fully dead orphan commits.
+    /// Exact deletion result for fully dead orphan objects.
     pub orphan_gc: V2OrphanGcReport,
 }
 
@@ -326,15 +344,39 @@ struct V2RetentionRenewalPlan {
     extend_count: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct V2RetentionTarget {
+    object_id: BackendObjectId,
+    version_id: Option<BackendVersionId>,
+    stored_len: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct V2StandalonePayloadRoot {
+    object_id: BackendObjectId,
+    version_id: Option<BackendVersionId>,
+    stored_len: u64,
+    object_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum V2LivePayloadRoot {
+    Commit(V2AnchorState),
+    Standalone(V2StandalonePayloadRoot),
+}
+
 #[derive(Clone, Debug, Default)]
 struct V2ReachabilityState {
     anchor_state: Option<V2AnchorState>,
     current_chain: Option<V2ReplayChain>,
     reachable: BTreeSet<BackendObjectId>,
     reachable_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
-    renewal_commits: Vec<V2ReplayCommit>,
+    renewal_targets: Vec<V2RetentionTarget>,
     renewal_seen: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
     protected_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
+    reachable_commit_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
+    reachable_object_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
+    standalone_facts: BTreeMap<(BackendObjectId, Option<BackendVersionId>), (u64, [u8; 32])>,
     chain_get_count: u64,
     chain_read_bytes: u64,
     chain_retained_bytes: u64,
@@ -361,15 +403,52 @@ impl V2ReachabilityState {
                 });
             let object_id = commit.parsed_header.header.self_ref.commit_key.clone();
             let version_key = (object_id.clone(), commit.version_id.clone());
-            self.reachable.insert(object_id);
+            self.reachable.insert(object_id.clone());
             self.reachable_versions.insert(version_key.clone());
+            self.reachable_commit_versions.insert(version_key.clone());
             if self.renewal_seen.insert(version_key.clone()) {
-                self.renewal_commits.push(commit.clone());
+                self.renewal_targets.push(V2RetentionTarget {
+                    object_id,
+                    version_id: commit.version_id.clone(),
+                    stored_len: commit.object_len,
+                });
             }
             if protected {
                 self.protected_versions.insert(version_key);
             }
         }
+    }
+
+    fn include_standalone(
+        &mut self,
+        root: V2StandalonePayloadRoot,
+        protected: bool,
+    ) -> V2Result<()> {
+        let version_key = (root.object_id.clone(), root.version_id.clone());
+        let facts = (root.stored_len, root.object_digest);
+        match self.standalone_facts.get(&version_key) {
+            Some(previous) if previous != &facts => {
+                return Err(V2FormatError::InvalidHeaderField);
+            }
+            Some(_) => {}
+            None => {
+                self.standalone_facts.insert(version_key.clone(), facts);
+            }
+        }
+        self.reachable.insert(root.object_id.clone());
+        self.reachable_versions.insert(version_key.clone());
+        self.reachable_object_versions.insert(version_key.clone());
+        if self.renewal_seen.insert(version_key.clone()) {
+            self.renewal_targets.push(V2RetentionTarget {
+                object_id: root.object_id,
+                version_id: root.version_id,
+                stored_len: root.stored_len,
+            });
+        }
+        if protected {
+            self.protected_versions.insert(version_key);
+        }
+        Ok(())
     }
 }
 
@@ -535,7 +614,7 @@ where
         })
     }
 
-    /// Reports unanchored commit objects without deleting anything.
+    /// Reports unanchored v2 objects without deleting anything.
     pub async fn report_orphans<A>(&self, anchor: &A) -> V2Result<V2OrphanReport>
     where
         A: V2CommitAnchor,
@@ -543,7 +622,7 @@ where
         self.report_orphans_with_protected_roots(anchor, &[]).await
     }
 
-    /// Reports unanchored commit objects while preserving supplied historical roots.
+    /// Reports unanchored v2 objects while preserving supplied historical roots.
     pub async fn report_orphans_with_protected_roots<A>(
         &self,
         anchor: &A,
@@ -569,74 +648,86 @@ where
 
         let retained_profile =
             self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock;
-        let listed = if retained_profile {
-            self.store()
-                .list_prefix_versions("commits/v02/")
-                .await
-                .map_err(|_| V2FormatError::StorageOperationFailed)?
-        } else {
-            self.store()
-                .list_prefix("commits/v02/")
-                .await
-                .map_err(|_| V2FormatError::StorageOperationFailed)?
-        };
         let mut candidates = Vec::new();
         let now_ms = current_time_ms();
-        for mut metadata in listed {
-            let exact_reachable = reachability
-                .reachable_versions
-                .contains(&(metadata.object_id.clone(), metadata.version_id.clone()));
-            let mut exact_protection_checked = !retained_profile;
-            if retained_profile {
-                if exact_reachable {
+        for (prefix, object_class) in [
+            ("commits/v02/", V2OrphanObjectClass::Commit),
+            ("objects/v02/", V2OrphanObjectClass::Object),
+        ] {
+            let listed = if retained_profile {
+                self.store()
+                    .list_prefix_versions(prefix)
+                    .await
+                    .map_err(|_| V2FormatError::StorageOperationFailed)?
+            } else {
+                self.store()
+                    .list_prefix(prefix)
+                    .await
+                    .map_err(|_| V2FormatError::StorageOperationFailed)?
+            };
+            for mut metadata in listed {
+                let exact_reachable = reachability
+                    .reachable_versions
+                    .contains(&(metadata.object_id.clone(), metadata.version_id.clone()));
+                let mut exact_protection_checked = !retained_profile;
+                if retained_profile {
+                    if exact_reachable {
+                        continue;
+                    }
+                    if let Some(version_id) = metadata.version_id.as_ref()
+                        && let Ok(head) = self
+                            .store()
+                            .head_at(&metadata.object_id, Some(version_id))
+                            .await
+                    {
+                        metadata = head;
+                        exact_protection_checked = true;
+                    }
+                } else if reachability.reachable.contains(&metadata.object_id) {
                     continue;
                 }
-                if let Some(version_id) = metadata.version_id.as_ref()
-                    && let Ok(head) = self
-                        .store()
-                        .head_at(&metadata.object_id, Some(version_id))
-                        .await
-                {
-                    metadata = head;
-                    exact_protection_checked = true;
-                }
-            } else if reachability.reachable.contains(&metadata.object_id) {
-                continue;
+                let sequence = if object_class == V2OrphanObjectClass::Commit {
+                    V2CommitKey::parse(&metadata.object_id)
+                        .ok()
+                        .map(|key| key.sequence)
+                } else {
+                    None
+                };
+                let delete_blocked_by_unknown_protection = retained_profile
+                    && (metadata.version_id.is_none() || !exact_protection_checked);
+                candidates.push(V2OrphanCandidate {
+                    object_class,
+                    object_id: metadata.object_id,
+                    version_id: metadata.version_id,
+                    content_len: metadata.content_len,
+                    modified_at_ms: metadata.modified_at_ms,
+                    sequence,
+                    same_sequence_as_anchor: sequence
+                        .zip(anchor_sequence)
+                        .is_some_and(|(left, right)| left == right),
+                    retention: metadata.retention,
+                    retain_until_ms: metadata.retain_until_ms,
+                    delete_blocked_by_retention: retention_blocks_delete(
+                        metadata.retention.as_ref(),
+                        metadata.retain_until_ms,
+                        now_ms,
+                    ),
+                    delete_blocked_by_legal_hold: metadata.legal_hold == Some(LegalHoldStatus::On),
+                    delete_blocked_by_unknown_protection,
+                });
             }
-            let parsed_key = V2CommitKey::parse(&metadata.object_id).ok();
-            let sequence = parsed_key.as_ref().map(|key| key.sequence);
-            let delete_blocked_by_unknown_protection =
-                retained_profile && (metadata.version_id.is_none() || !exact_protection_checked);
-            candidates.push(V2OrphanCandidate {
-                object_id: metadata.object_id,
-                version_id: metadata.version_id,
-                content_len: metadata.content_len,
-                modified_at_ms: metadata.modified_at_ms,
-                sequence,
-                same_sequence_as_anchor: sequence
-                    .zip(anchor_sequence)
-                    .is_some_and(|(left, right)| left == right),
-                retention: metadata.retention,
-                retain_until_ms: metadata.retain_until_ms,
-                delete_blocked_by_retention: retention_blocks_delete(
-                    metadata.retention.as_ref(),
-                    metadata.retain_until_ms,
-                    now_ms,
-                ),
-                delete_blocked_by_legal_hold: metadata.legal_hold == Some(LegalHoldStatus::On),
-                delete_blocked_by_unknown_protection,
-            });
         }
 
         Ok(V2OrphanReport {
-            reachable_commit_count: reachability.reachable.len(),
+            reachable_commit_count: reachability.reachable_commit_versions.len(),
+            reachable_object_count: reachability.reachable_object_versions.len(),
             candidates,
         })
     }
 
-    /// Deletes expired, unprotected v2 orphan commits.
+    /// Deletes expired, unprotected v2 orphan objects.
     ///
-    /// This pass is intentionally conservative: reachable commits are discovered
+    /// This pass is intentionally conservative: reachable objects are discovered
     /// from the anchor-selected chain, retained or legally held objects are
     /// skipped, candidates without a usable provider timestamp are skipped, and
     /// same-sequence candidates are skipped unless explicitly enabled.
@@ -664,7 +755,7 @@ where
         .await
     }
 
-    /// Deletes expired orphan commits while preserving supplied historical roots.
+    /// Deletes expired orphan objects while preserving supplied historical roots.
     pub async fn delete_expired_orphans_with_protected_roots<A>(
         &self,
         anchor: &A,
@@ -879,25 +970,33 @@ where
             );
         }
         for root in live_payload_roots {
-            let version_key = (root.commit_key.clone(), root.version_id.clone());
-            if reachability.reachable_versions.contains(&version_key) {
-                continue;
+            match root {
+                V2LivePayloadRoot::Commit(root) => {
+                    let version_key = (root.commit_key.clone(), root.version_id.clone());
+                    if reachability.reachable_versions.contains(&version_key) {
+                        continue;
+                    }
+                    let commit = self
+                        .read_replay_commit_at(&root.commit_key, root.version_id.as_ref())
+                        .await?;
+                    if commit.parsed_header.header.self_ref.sequence != root.sequence
+                        || commit.parsed_header.header.body_digest != root.body_digest
+                        || commit.version_id != root.version_id
+                    {
+                        return Err(V2FormatError::BodyDigestMismatch);
+                    }
+                    reachability.include_chain(
+                        &V2ReplayChain {
+                            commits_newest_first: vec![commit],
+                        },
+                        protected,
+                    );
+                }
+                V2LivePayloadRoot::Standalone(root) => {
+                    validate_standalone_payload_root(&root)?;
+                    reachability.include_standalone(root, protected)?;
+                }
             }
-            let commit = self
-                .read_replay_commit_at(&root.commit_key, root.version_id.as_ref())
-                .await?;
-            if commit.parsed_header.header.self_ref.sequence != root.sequence
-                || commit.parsed_header.header.body_digest != root.body_digest
-                || commit.version_id != root.version_id
-            {
-                return Err(V2FormatError::BodyDigestMismatch);
-            }
-            reachability.include_chain(
-                &V2ReplayChain {
-                    commits_newest_first: vec![commit],
-                },
-                protected,
-            );
         }
 
         Ok(())
@@ -950,7 +1049,7 @@ where
         &self,
         chain: &V2ReplayChain,
         limits: V2ReplayLimits,
-    ) -> V2Result<(Vec<V2AnchorState>, Vec<V2ReplayCommit>)> {
+    ) -> V2Result<(Vec<V2LivePayloadRoot>, Vec<V2ReplayCommit>)> {
         let (state, referenced_run_commits) =
             self.replay_chain_to_namespace_state(chain, limits).await?;
         let signing_key_id = chain
@@ -964,31 +1063,30 @@ where
         let mut roots = Vec::new();
 
         for entry in state.namespace.live_entries() {
-            let (commit_key, commit_version_id, body_digest) = match &entry.payload_ref {
-                Some(PayloadReference::V2Commit { carrier }) => (
+            let root = match &entry.payload_ref {
+                Some(PayloadReference::V2CommitStream { carrier }) => commit_payload_root(
                     carrier.commit_key.clone(),
                     carrier.commit_version_id.clone(),
                     carrier.body_digest,
-                ),
-                Some(PayloadReference::V2Pack { carrier, .. }) => (
+                    &signing_key_id,
+                    self.options().format_ref.clone(),
+                )?,
+                Some(PayloadReference::V2Pack { carrier, .. }) => commit_payload_root(
                     carrier.commit_key.clone(),
                     carrier.commit_version_id.clone(),
                     carrier.body_digest,
-                ),
+                    &signing_key_id,
+                    self.options().format_ref.clone(),
+                )?,
+                Some(PayloadReference::V2StandaloneStream { carrier }) => {
+                    V2LivePayloadRoot::Standalone(standalone_payload_root(carrier))
+                }
                 None => continue,
                 Some(PayloadReference::V2Self { .. } | PayloadReference::V2PackSelf { .. }) => {
                     return Err(V2FormatError::InvalidHeaderField);
                 }
             };
-            let parsed_key = V2CommitKey::parse(&commit_key)?;
-            roots.push(V2AnchorState {
-                sequence: parsed_key.sequence,
-                commit_key,
-                body_digest,
-                version_id: commit_version_id,
-                signing_key_id: signing_key_id.clone(),
-                format_ref: self.options().format_ref.clone(),
-            });
+            roots.push(root);
         }
 
         Ok((roots, referenced_run_commits))
@@ -1134,19 +1232,20 @@ where
     where
         A: V2CommitAnchor,
     {
-        let chain = self.load_replay_chain_from_anchor(anchor).await?;
+        let reachability = self
+            .load_reachability(anchor, &[], V2MaintenanceBudgets::default())
+            .await?;
+        let chain = reachability.current_chain.as_ref();
         let verified_commit_count = chain
-            .as_ref()
             .map(|chain| chain.commits_newest_first.len())
             .unwrap_or_default();
         let now_ms = current_time_ms();
         let last_anchored_commit_age_ms = chain
-            .as_ref()
             .and_then(|chain| chain.commits_newest_first.first())
             .and_then(|commit| {
                 age_since_ms(now_ms, Some(commit.parsed_header.header.publish_time_ms))
             });
-        let orphans = self.report_orphans(anchor).await?;
+        let orphans = self.report_orphans_from_reachability(&reachability).await?;
         let orphan_candidate_bytes = orphans.candidates.iter().fold(0_u64, |total, candidate| {
             total.saturating_add(candidate.content_len)
         });
@@ -1164,9 +1263,9 @@ where
             .iter()
             .filter_map(|candidate| age_since_ms(now_ms, candidate.modified_at_ms))
             .max();
-        let retention_renewal = if let Some(chain) = chain.as_ref() {
+        let retention_renewal = if chain.is_some() {
             self.plan_retention_renewal(
-                &chain.commits_newest_first,
+                &reachability.renewal_targets,
                 DEFAULT_RETENTION_RENEWAL_HORIZON,
             )
             .await?
@@ -1190,9 +1289,9 @@ where
 
     /// Builds a path-redacted full-maintenance dry-run plan.
     ///
-    /// This first-stage planner is intentionally limited to commit-object
-    /// inventory and fully dead orphan deletion. Mixed accepted-commit repack
-    /// details are filled by the repository service after namespace replay.
+    /// This first-stage planner is intentionally limited to v2 object inventory
+    /// and fully dead orphan deletion. Mixed accepted-commit repack details are
+    /// filled by the repository service after namespace replay.
     pub async fn full_gc_dry_run<A>(
         &self,
         anchor: &A,
@@ -1214,7 +1313,7 @@ where
             self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock;
         let retention_renewal = self
             .plan_retention_renewal(
-                &reachability.renewal_commits,
+                &reachability.renewal_targets,
                 options.retention_renewal_horizon,
             )
             .await?;
@@ -1252,8 +1351,8 @@ where
             delete_count = delete_count.saturating_add(1);
         }
 
-        let version_list_count = u64::from(retained_profile);
-        let prefix_list_count = u64::from(!retained_profile);
+        let version_list_count = 2 * u64::from(retained_profile);
+        let prefix_list_count = 2 * u64::from(!retained_profile);
         let chain_get_count = reachability.chain_get_count;
         let planned_cost = V2MaintenancePlanCost {
             request_count: version_list_count
@@ -1304,7 +1403,7 @@ where
     }
 
     /// Applies the first destructive full-maintenance stage: fully dead orphan
-    /// commit deletion.
+    /// object deletion.
     ///
     /// This does not repack mixed accepted commits. It fails closed unless the
     /// dry-run budget passes, retained-version provider conformance is supplied
@@ -1365,13 +1464,13 @@ where
 
     async fn plan_retention_renewal(
         &self,
-        commits: &[V2ReplayCommit],
+        targets: &[V2RetentionTarget],
         horizon: Duration,
     ) -> V2Result<V2RetentionRenewalPlan> {
         let Some(policy) = active_retention(self.retention_policy()) else {
             return Ok(V2RetentionRenewalPlan::default());
         };
-        if commits.is_empty() {
+        if targets.is_empty() {
             return Ok(V2RetentionRenewalPlan::default());
         }
         let retained_profile =
@@ -1380,12 +1479,12 @@ where
             current_time_ms().saturating_add(duration_millis_i64_saturating(horizon));
         let mut plan = V2RetentionRenewalPlan::default();
 
-        for commit in commits {
-            let object_id = &commit.parsed_header.header.self_ref.commit_key;
-            let version_id = commit.version_id.as_ref();
+        for target in targets {
+            let object_id = &target.object_id;
+            let version_id = target.version_id.as_ref();
             if retained_profile && version_id.is_none() {
                 plan.blocked_count = plan.blocked_count.saturating_add(1);
-                plan.blocked_bytes = plan.blocked_bytes.saturating_add(commit.object_len);
+                plan.blocked_bytes = plan.blocked_bytes.saturating_add(target.stored_len);
                 continue;
             }
 
@@ -1406,6 +1505,62 @@ where
 
         Ok(plan)
     }
+}
+
+fn commit_payload_root(
+    commit_key: BackendObjectId,
+    version_id: Option<BackendVersionId>,
+    body_digest: [u8; 32],
+    signing_key_id: &rs3_types::KeyId,
+    format_ref: super::V2FormatRef,
+) -> V2Result<V2LivePayloadRoot> {
+    let parsed_key = V2CommitKey::parse(&commit_key)?;
+    Ok(V2LivePayloadRoot::Commit(V2AnchorState {
+        sequence: parsed_key.sequence,
+        commit_key,
+        body_digest,
+        version_id,
+        signing_key_id: signing_key_id.clone(),
+        format_ref,
+    }))
+}
+
+fn standalone_payload_root(
+    carrier: &V2StandaloneStreamCarrierReference,
+) -> V2StandalonePayloadRoot {
+    V2StandalonePayloadRoot {
+        object_id: carrier.object_id.clone(),
+        version_id: carrier.version_id.clone(),
+        stored_len: carrier.stored_len,
+        object_digest: carrier.object_digest,
+    }
+}
+
+fn validate_standalone_payload_root(root: &V2StandalonePayloadRoot) -> V2Result<()> {
+    let Some(encoded_id) = root
+        .object_id
+        .as_str()
+        .strip_prefix(V2_STANDALONE_OBJECT_PREFIX)
+    else {
+        return Err(V2FormatError::InvalidHeaderField);
+    };
+    if encoded_id.len() != V2_STANDALONE_OBJECT_ID_B64_LEN
+        || encoded_id.contains(['=', '/', '+'])
+        || root.stored_len == 0
+    {
+        return Err(V2FormatError::InvalidHeaderField);
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded_id)
+        .map_err(|_| V2FormatError::InvalidHeaderField)?;
+    let random_id: [u8; V2_STANDALONE_OBJECT_ID_BYTES] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| V2FormatError::InvalidHeaderField)?;
+    if URL_SAFE_NO_PAD.encode(random_id) != encoded_id {
+        return Err(V2FormatError::InvalidHeaderField);
+    }
+    Ok(())
 }
 
 fn current_time_ms() -> i64 {
@@ -1511,8 +1666,8 @@ fn resolve_self_payload_refs(
         let commit_key = commit.parsed_header.header.self_ref.commit_key.clone();
         entry.object_id = commit_key.clone();
         entry.object_version_id = commit.version_id.clone();
-        entry.payload_ref = Some(PayloadReference::V2Commit {
-            carrier: Arc::new(V2StreamCarrierReference {
+        entry.payload_ref = Some(PayloadReference::V2CommitStream {
+            carrier: Arc::new(V2CommitStreamCarrierReference {
                 commit_key,
                 commit_version_id: commit.version_id.clone(),
                 body_digest: commit.parsed_header.header.body_digest,
@@ -1560,4 +1715,83 @@ fn payload_section_facts(
         })
         .transpose()?
         .ok_or(V2FormatError::SectionBounds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{V2ReachabilityState, V2StandalonePayloadRoot, validate_standalone_payload_root};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use rs3_types::{BackendObjectId, BackendVersionId};
+
+    fn standalone_root(byte: u8) -> V2StandalonePayloadRoot {
+        V2StandalonePayloadRoot {
+            object_id: BackendObjectId::new(format!(
+                "objects/v02/{}",
+                URL_SAFE_NO_PAD.encode([byte; 32])
+            ))
+            .expect("standalone object id"),
+            version_id: Some(
+                BackendVersionId::new(format!("standalone-version-{byte}")).expect("version id"),
+            ),
+            stored_len: 4_096,
+            object_digest: [byte.wrapping_add(1); 32],
+        }
+    }
+
+    #[test]
+    fn standalone_roots_mark_exact_live_and_protected_versions() {
+        let root = standalone_root(0x31);
+        validate_standalone_payload_root(&root).expect("valid standalone root");
+        let version_key = (root.object_id.clone(), root.version_id.clone());
+        let mut reachability = V2ReachabilityState::default();
+
+        reachability
+            .include_standalone(root.clone(), false)
+            .expect("mark live standalone root");
+        assert!(reachability.reachable.contains(&root.object_id));
+        assert!(reachability.reachable_versions.contains(&version_key));
+        assert!(
+            reachability
+                .reachable_object_versions
+                .contains(&version_key)
+        );
+        assert!(!reachability.protected_versions.contains(&version_key));
+        assert_eq!(reachability.renewal_targets.len(), 1);
+
+        reachability
+            .include_standalone(root.clone(), true)
+            .expect("protect exact standalone root");
+        assert!(reachability.protected_versions.contains(&version_key));
+        assert_eq!(reachability.renewal_targets.len(), 1);
+
+        let mut conflicting = root;
+        conflicting.object_digest[0] ^= 1;
+        assert!(reachability.include_standalone(conflicting, true).is_err());
+    }
+
+    #[test]
+    fn standalone_roots_require_canonical_random_object_keys() {
+        let valid = standalone_root(0x41);
+        assert!(validate_standalone_payload_root(&valid).is_ok());
+
+        for invalid in [
+            "objects/v02/short",
+            "objects/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "objects/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+",
+            "objects/v02/AAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAA",
+            "commits/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            let mut root = valid.clone();
+            root.object_id = BackendObjectId::new(invalid).expect("syntactically valid object id");
+            assert!(
+                validate_standalone_payload_root(&root).is_err(),
+                "accepted malformed standalone key {invalid}"
+            );
+        }
+
+        let mut empty = valid;
+        empty.stored_len = 0;
+        assert!(validate_standalone_payload_root(&empty).is_err());
+    }
 }

@@ -62,7 +62,7 @@ pub use maintenance::{
     UnenforcedQuiescedMaintenanceGuard, V2FullGcApplyOptions, V2FullGcApplyReport,
     V2FullGcDryRunOptions, V2FullGcDryRunReport, V2MaintenanceBudgets, V2MaintenanceGuard,
     V2MaintenancePlanCost, V2MaintenanceReport, V2OrphanCandidate, V2OrphanGcOptions,
-    V2OrphanGcReport, V2OrphanReport,
+    V2OrphanGcReport, V2OrphanObjectClass, V2OrphanReport,
 };
 pub(crate) use payload_cache::{V2StreamPayloadCacheIdentity, validated_v2_stream_payload_start};
 pub use payload_pack::{

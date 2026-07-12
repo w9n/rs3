@@ -13,8 +13,8 @@ use rs3_index::run::{
     IndexRunStreamContainer, IndexTombstone, IndexUpsert,
 };
 use rs3_index::{
-    IndexDelta, NamespaceEntry, PayloadReference, V2PackCarrierReference, V2PackRecordReference,
-    V2StreamCarrierReference,
+    IndexDelta, NamespaceEntry, PayloadReference, V2CommitStreamCarrierReference,
+    V2PackCarrierReference, V2PackRecordReference,
 };
 use rs3_storage::BlobStore;
 use rs3_types::{BackendVersionId, LogicalPath, ManifestId, Sequence};
@@ -269,7 +269,7 @@ where
                 Some(PayloadReference::V2Pack { carrier, .. }) => {
                     external_containers.insert(index_run_pack_container(carrier));
                 }
-                Some(reference @ PayloadReference::V2Commit { .. }) => {
+                Some(reference @ PayloadReference::V2CommitStream { .. }) => {
                     external_stream_containers.insert(index_run_stream_container(reference)?);
                 }
                 _ => return Err(v2_repository_error(V2FormatError::InvalidHeaderField)),
@@ -342,7 +342,7 @@ where
                                 plaintext_digest: record.plaintext_digest,
                             },
                         }
-                    } else if let Some(reference @ PayloadReference::V2Commit { .. }) =
+                    } else if let Some(reference @ PayloadReference::V2CommitStream { .. }) =
                         entry.payload_ref.as_ref()
                     {
                         let container = index_run_stream_container(reference)?;
@@ -804,7 +804,7 @@ pub(in crate::v2) fn apply_packed_index_run(
     let sections_start = u64::try_from(replay.parsed_header.sections_start)
         .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
     let self_stream_carrier = self_stream.map(|(section, stream)| {
-        Arc::new(V2StreamCarrierReference {
+        Arc::new(V2CommitStreamCarrierReference {
             commit_key: commit_key.clone(),
             commit_version_id: replay.version_id.cloned(),
             body_digest: replay.parsed_header.header.body_digest,
@@ -870,7 +870,7 @@ pub(in crate::v2) fn apply_packed_index_run(
                         let Some(carrier) = self_stream_carrier.as_ref() else {
                             return Err(v2_repository_error(V2FormatError::SectionBounds));
                         };
-                        Some(PayloadReference::V2Commit {
+                        Some(PayloadReference::V2CommitStream {
                             carrier: Arc::clone(carrier),
                         })
                     }
@@ -882,7 +882,7 @@ pub(in crate::v2) fn apply_packed_index_run(
                                 })?,
                             )
                             .ok_or_else(|| v2_repository_error(V2FormatError::InvalidIndexRun))?;
-                        Some(PayloadReference::V2Commit {
+                        Some(PayloadReference::V2CommitStream {
                             carrier: Arc::clone(carrier),
                         })
                     }
@@ -899,7 +899,7 @@ pub(in crate::v2) fn apply_packed_index_run(
                         carrier.commit_key.clone(),
                         carrier.commit_version_id.clone(),
                     ),
-                    Some(PayloadReference::V2Commit { carrier }) => (
+                    Some(PayloadReference::V2CommitStream { carrier }) => (
                         carrier.commit_key.clone(),
                         carrier.commit_version_id.clone(),
                     ),
@@ -958,7 +958,7 @@ fn index_run_self_pack(layout: &V2PayloadPackLayout) -> IndexRunSelfPack {
 }
 
 fn index_run_stream_container(reference: &PayloadReference) -> Result<IndexRunStreamContainer> {
-    let PayloadReference::V2Commit { carrier } = reference else {
+    let PayloadReference::V2CommitStream { carrier } = reference else {
         return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
     };
     let (Some(payload_header), Some(sections_start)) =
@@ -1021,8 +1021,10 @@ fn pack_carrier_from_index_run(container: &IndexRunContainer) -> V2PackCarrierRe
     }
 }
 
-fn stream_carrier_from_index_run(container: &IndexRunStreamContainer) -> V2StreamCarrierReference {
-    V2StreamCarrierReference {
+fn stream_carrier_from_index_run(
+    container: &IndexRunStreamContainer,
+) -> V2CommitStreamCarrierReference {
+    V2CommitStreamCarrierReference {
         commit_key: container.object_id.clone(),
         commit_version_id: container.version_id.clone(),
         body_digest: container.commit_body_digest,

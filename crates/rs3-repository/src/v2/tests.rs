@@ -3,7 +3,7 @@ use super::{
     V2_INDEX_COMPACTION_REQUEST_RUNS, V2AnchorState, V2CommitAnchor, V2CommitCoordinator,
     V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite, V2FullGcApplyOptions,
     V2FullGcDryRunOptions, V2MaintenanceBudgets, V2MaintenanceGuard, V2MemoryAnchor,
-    V2OrphanGcOptions, V2RecoveryBundle, V2ReplayLimits, V2Repository,
+    V2OrphanGcOptions, V2OrphanObjectClass, V2RecoveryBundle, V2ReplayLimits, V2Repository,
 };
 use super::{
     V2_CAPABILITY_STANDALONE_PAYLOADS, V2_RESTORE_BUNDLE_SCHEMA, V2_SECTION_FLAG_MUST_UNDERSTAND,
@@ -4623,6 +4623,49 @@ async fn v2_orphan_gc_deletes_expired_unprotected_commit() {
     assert_eq!(after.candidates.len(), 0);
 }
 
+#[tokio::test]
+async fn v2_orphan_inventory_classifies_and_budgets_standalone_objects() {
+    let store = MemoryBlobStore::new();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2CommitStore::new(store.clone(), signing_keyring(), options);
+    let anchor = V2MemoryAnchor::new();
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    let object_id = object_id("objects/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    store
+        .put(
+            &object_id,
+            Bytes::from_static(b"unreferenced standalone ciphertext"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("write orphan standalone object");
+
+    let orphans = must_v2(repository.report_orphans(&anchor).await);
+    let dry_run = must_v2(
+        repository
+            .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
+            .await,
+    );
+
+    assert_eq!(orphans.reachable_commit_count, 1);
+    assert_eq!(orphans.reachable_object_count, 0);
+    assert_eq!(orphans.candidates.len(), 1);
+    assert_eq!(
+        orphans.candidates[0].object_class,
+        V2OrphanObjectClass::Object
+    );
+    assert_eq!(orphans.candidates[0].object_id, object_id);
+    assert_eq!(orphans.candidates[0].sequence, None);
+    assert_eq!(dry_run.planned_cost.version_list_count, 0);
+    assert_eq!(dry_run.planned_cost.delete_count, 1);
+    assert_eq!(dry_run.planned_cost.request_count, 4);
+}
+
 #[test]
 fn v2_orphan_gc_options_rejects_sub_hour_production_min_age() {
     assert_eq!(
@@ -4807,7 +4850,7 @@ async fn retained_v2_full_gc_dry_run_reports_version_inventory_and_blocked_bytes
     assert_eq!(report.fully_dead_commit_count, 0);
     assert_eq!(report.dead_bytes_reclaimable, 0);
     assert!(report.retention_blocked_bytes > 0);
-    assert_eq!(report.planned_cost.version_list_count, 1);
+    assert_eq!(report.planned_cost.version_list_count, 2);
     assert_eq!(report.planned_cost.head_count, 2);
     assert_eq!(report.planned_cost.delete_count, 0);
     assert_eq!(report.planned_cost.retention_extend_count, 0);

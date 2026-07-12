@@ -399,7 +399,7 @@ where
         let mut pack_records = BTreeSet::new();
         for entry in state.namespace.live_entries() {
             match &entry.payload_ref {
-                Some(PayloadReference::V2Commit { carrier }) => {
+                Some(PayloadReference::V2CommitStream { carrier }) => {
                     sections.insert(V2LivePayloadSectionKey {
                         commit_key: carrier.commit_key.clone(),
                         commit_version_id: carrier.commit_version_id.clone(),
@@ -422,6 +422,9 @@ where
                 None => {}
                 Some(PayloadReference::V2Self { .. } | PayloadReference::V2PackSelf { .. }) => {
                     return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
+                }
+                Some(PayloadReference::V2StandaloneStream { .. }) => {
+                    return Err(v2_repository_error(V2FormatError::UnsupportedSection));
                 }
             }
         }

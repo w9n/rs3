@@ -97,10 +97,16 @@ pub enum PayloadReference {
         length: u64,
     },
     /// Payload bytes are in a resolved v2 commit object.
-    V2Commit {
+    V2CommitStream {
         /// Exact carrier facts shared by every reference to this streamed payload.
         #[serde(flatten)]
-        carrier: Arc<V2StreamCarrierReference>,
+        carrier: Arc<V2CommitStreamCarrierReference>,
+    },
+    /// Streamed payload bytes stored in one exact standalone object.
+    V2StandaloneStream {
+        /// Exact carrier facts shared by every reference to this streamed payload.
+        #[serde(flatten)]
+        carrier: Arc<V2StandaloneStreamCarrierReference>,
     },
 }
 
@@ -147,7 +153,7 @@ pub struct V2PackRecordReference {
 
 /// Exact accepted commit and section facts for a streamed payload.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct V2StreamCarrierReference {
+pub struct V2CommitStreamCarrierReference {
     /// Commit object key containing the payload section.
     pub commit_key: BackendObjectId,
     /// Provider version identifier for exact-version reads, when available.
@@ -177,6 +183,26 @@ pub struct V2StreamCarrierReference {
     pub offset: u64,
     /// Encrypted payload-section byte length.
     pub length: u64,
+}
+
+/// Exact accepted standalone object facts for a streamed payload.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct V2StandaloneStreamCarrierReference {
+    /// Standalone backend object containing the encrypted payload.
+    pub object_id: BackendObjectId,
+    /// Provider version identifier for exact-version reads, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<BackendVersionId>,
+    /// Digest of the complete standalone ciphertext object.
+    pub object_digest: [u8; 32],
+    /// Provider-reported complete object length.
+    pub stored_len: u64,
+    /// Historical encrypted-keyring envelope object bound into payload AEAD context.
+    pub keyring_envelope_object_id: BackendObjectId,
+    /// SHA-256 digest of that encrypted-keyring envelope.
+    pub keyring_envelope_digest: [u8; 32],
+    /// Parsed segmented-payload header needed for direct range reads.
+    pub payload_header: PayloadHeaderReference,
 }
 
 /// Signed/encrypted payload-header facts used to plan direct range reads.
@@ -666,9 +692,10 @@ mod tests {
         CommitRecord, INDEX_DELTA_OBJECT_DOMAIN, INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta,
         IndexDeltaObject, KeyringSnapshot, MANIFEST_PLAINTEXT_DOMAIN, ManifestObject,
         NamespaceEntry, NamespaceIndex, PayloadReference, SealedIndexDeltaObject,
-        V2PackCarrierReference, V2PackRecordReference, V2StreamCarrierReference,
-        canonical_commit_record_bytes, checkpoint_evidence_bytes, checkpoint_object_bytes,
-        index_delta_object_bytes, index_delta_plaintext_bytes, manifest_plaintext_bytes,
+        V2CommitStreamCarrierReference, V2PackCarrierReference, V2PackRecordReference,
+        V2StandaloneStreamCarrierReference, canonical_commit_record_bytes,
+        checkpoint_evidence_bytes, checkpoint_object_bytes, index_delta_object_bytes,
+        index_delta_plaintext_bytes, manifest_plaintext_bytes,
     };
     use rs3_types::{
         BackendObjectId, BackendVersionId, BlindIndexKey, CheckpointId, KeyDescriptor, KeyId,
@@ -1074,7 +1101,7 @@ mod tests {
             record_offset: u32,
             plaintext_digest: [u8; 32],
         },
-        V2Commit {
+        V2CommitStream {
             commit_key: &'a BackendObjectId,
             #[serde(skip_serializing_if = "Option::is_none")]
             commit_version_id: &'a Option<BackendVersionId>,
@@ -1145,7 +1172,7 @@ mod tests {
 
     #[test]
     fn shared_stream_reference_preserves_the_flat_serialized_shape() {
-        let carrier = Arc::new(V2StreamCarrierReference {
+        let carrier = Arc::new(V2CommitStreamCarrierReference {
             commit_key: object_id("commits/stream"),
             commit_version_id: Some(BackendVersionId::new("version-2").expect("version id")),
             body_digest: [0x61; 32],
@@ -1166,10 +1193,10 @@ mod tests {
             offset: 17,
             length: 123_789,
         });
-        let shared = PayloadReference::V2Commit {
+        let shared = PayloadReference::V2CommitStream {
             carrier: Arc::clone(&carrier),
         };
-        let legacy = LegacyPayloadReference::V2Commit {
+        let legacy = LegacyPayloadReference::V2CommitStream {
             commit_key: &carrier.commit_key,
             commit_version_id: &carrier.commit_version_id,
             body_digest: carrier.body_digest,
@@ -1188,6 +1215,36 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&shared).expect("serialize shared stream reference"),
             serde_json::to_vec(&legacy).expect("serialize legacy stream reference")
+        );
+    }
+
+    #[test]
+    fn standalone_stream_reference_round_trips_its_distinct_typed_shape() {
+        let reference = PayloadReference::V2StandaloneStream {
+            carrier: Arc::new(V2StandaloneStreamCarrierReference {
+                object_id: object_id("objects/v02/standalone-stream"),
+                version_id: Some(BackendVersionId::new("version-3").expect("version id")),
+                object_digest: [0x71; 32],
+                stored_len: 131_233,
+                keyring_envelope_object_id: object_id("keyrings/standalone"),
+                keyring_envelope_digest: [0x72; 32],
+                payload_header: super::PayloadHeaderReference {
+                    chunk_size: 64 * 1024,
+                    plaintext_len: 131_072,
+                    key_id: key_id("standalone-content"),
+                    nonce_prefix: [0x73; 16],
+                    header_len: 113,
+                },
+            }),
+        };
+
+        let encoded = serde_json::to_vec(&reference).expect("serialize standalone reference");
+        assert!(encoded.starts_with(br#"{"V2StandaloneStream":{"#));
+        assert!(!encoded.windows(8).any(|window| window == b"V2Commit"));
+        assert_eq!(
+            serde_json::from_slice::<PayloadReference>(&encoded)
+                .expect("deserialize standalone reference"),
+            reference
         );
     }
 

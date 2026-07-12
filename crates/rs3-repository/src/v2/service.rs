@@ -39,7 +39,8 @@ use futures_util::Stream;
 use rs3_crypto::KeyRing;
 use rs3_index::{
     INDEX_DELTA_OBJECT_DOMAIN, IndexDelta, IndexDeltaObject, NamespaceEntry,
-    PayloadHeaderReference, PayloadReference, V2StreamCarrierReference, index_delta_object_bytes,
+    PayloadHeaderReference, PayloadReference, V2CommitStreamCarrierReference,
+    index_delta_object_bytes,
 };
 use rs3_storage::{BlobStore, ByteRange, StorageError};
 use rs3_types::{
@@ -1327,12 +1328,12 @@ where
                 )
                 .await;
         }
-        let PayloadReference::V2Commit { carrier } = payload_ref else {
+        let PayloadReference::V2CommitStream { carrier } = payload_ref else {
             return Err(RepositoryError::InvalidObjectFormat {
                 object_id: entry.object_id,
             });
         };
-        let V2StreamCarrierReference {
+        let V2CommitStreamCarrierReference {
             commit_key,
             commit_version_id,
             body_digest,
@@ -1397,10 +1398,10 @@ where
         if entry.content_len == 0 {
             return Ok(None);
         }
-        let Some(PayloadReference::V2Commit { carrier }) = entry.payload_ref else {
+        let Some(PayloadReference::V2CommitStream { carrier }) = entry.payload_ref else {
             return Ok(None);
         };
-        let V2StreamCarrierReference {
+        let V2CommitStreamCarrierReference {
             commit_key,
             commit_version_id,
             body_digest,
@@ -2560,7 +2561,7 @@ where
             .cloned()
             .collect();
         match entry.payload_ref.as_mut() {
-            Some(PayloadReference::V2Commit { carrier }) => {
+            Some(PayloadReference::V2CommitStream { carrier }) => {
                 let carrier = Arc::make_mut(carrier);
                 carrier.length = carrier.length.saturating_sub(1);
             }
@@ -2753,8 +2754,8 @@ where
             };
             entry.object_id = stored.anchor_state.commit_key.clone();
             entry.object_version_id = stored.anchor_state.version_id.clone();
-            entry.payload_ref = Some(PayloadReference::V2Commit {
-                carrier: Arc::new(V2StreamCarrierReference {
+            entry.payload_ref = Some(PayloadReference::V2CommitStream {
+                carrier: Arc::new(V2CommitStreamCarrierReference {
                     commit_key: stored.anchor_state.commit_key.clone(),
                     commit_version_id: stored.anchor_state.version_id.clone(),
                     body_digest: stored.anchor_state.body_digest,
@@ -3150,8 +3151,8 @@ where
             let commit_key = commit.parsed_header.header.self_ref.commit_key.clone();
             entry.object_id = commit_key.clone();
             entry.object_version_id = commit.version_id.clone();
-            entry.payload_ref = Some(PayloadReference::V2Commit {
-                carrier: Arc::new(V2StreamCarrierReference {
+            entry.payload_ref = Some(PayloadReference::V2CommitStream {
+                carrier: Arc::new(V2CommitStreamCarrierReference {
                     commit_key,
                     commit_version_id: commit.version_id.clone(),
                     body_digest: commit.parsed_header.header.body_digest,
@@ -3610,8 +3611,8 @@ fn resolve_self_payload_refs(delta: &mut IndexDeltaObject, commit: &V2ParsedComm
         let commit_key = commit.parsed_header.header.self_ref.commit_key.clone();
         entry.object_id = commit_key.clone();
         entry.object_version_id = commit.version_id.clone();
-        entry.payload_ref = Some(PayloadReference::V2Commit {
-            carrier: Arc::new(V2StreamCarrierReference {
+        entry.payload_ref = Some(PayloadReference::V2CommitStream {
+            carrier: Arc::new(V2CommitStreamCarrierReference {
                 commit_key,
                 commit_version_id: commit.version_id.clone(),
                 body_digest: commit.parsed_header.header.body_digest,
