@@ -10,6 +10,7 @@ use rs3_types::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 
 /// Domain separator prepended to canonical checkpoint payload bytes.
 pub const CHECKPOINT_RECORD_DOMAIN: &[u8] = b"rs3:checkpoint-record:v1\n";
@@ -73,37 +74,12 @@ pub enum PayloadReference {
     },
     /// Compact payload-pack record in an accepted exact commit object.
     V2Pack {
-        /// Commit object key containing the payload-pack section.
-        commit_key: BackendObjectId,
-        /// Provider version identifier for exact-version reads, when available.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        commit_version_id: Option<BackendVersionId>,
-        /// Commit body digest from the signed header.
-        body_digest: [u8; 32],
-        /// Provider-reported complete commit-object length.
-        commit_stored_len: u64,
-        /// Commit section ordinal containing the payload pack.
-        pack_section_ordinal: u32,
-        /// Absolute byte offset of the payload-pack section in the commit object.
-        pack_offset: u64,
-        /// Encrypted payload-pack section byte length.
-        length: u64,
-        /// Random pack identity bound into every record AEAD operation.
-        pack_id: [u8; 32],
-        /// Historical content-encryption key needed to open the record.
-        content_key_id: KeyId,
-        /// Historical encrypted-keyring envelope object bound into payload AEAD context.
-        keyring_envelope_object_id: BackendObjectId,
-        /// SHA-256 digest of that encrypted-keyring envelope.
-        keyring_envelope_digest: [u8; 32],
-        /// Authenticated number of logical records in the pack directory.
-        pack_record_count: u32,
-        /// Logical record ordinal in the pack directory.
-        record_ordinal: u32,
-        /// Absolute ciphertext offset from the start of the payload-pack section.
-        record_offset: u32,
-        /// SHA-256 digest over the complete plaintext record.
-        plaintext_digest: [u8; 32],
+        /// Exact carrier facts shared by every record in the same payload pack.
+        #[serde(flatten)]
+        carrier: Arc<V2PackCarrierReference>,
+        /// Record-specific facts inside the shared payload pack.
+        #[serde(flatten)]
+        record: V2PackRecordReference,
     },
     /// Payload bytes are in the current commit that carries this index delta.
     V2Self {
@@ -122,36 +98,85 @@ pub enum PayloadReference {
     },
     /// Payload bytes are in a resolved v2 commit object.
     V2Commit {
-        /// Commit object key containing the payload section.
-        commit_key: BackendObjectId,
-        /// Provider version identifier for exact-version reads, when available.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        commit_version_id: Option<BackendVersionId>,
-        /// Commit body digest from the signed header.
-        body_digest: [u8; 32],
-        /// Provider-reported complete commit-object length.
-        commit_stored_len: u64,
-        /// Historical encrypted-keyring envelope object bound into payload AEAD context.
-        keyring_envelope_object_id: BackendObjectId,
-        /// SHA-256 digest of that encrypted-keyring envelope.
-        keyring_envelope_digest: [u8; 32],
-        /// Signed section ordinal containing the streamed payload.
-        payload_section_ordinal: u32,
-        /// Signed digest of the complete streamed payload section.
-        payload_section_digest: [u8; 32],
-        /// Opaque payload identity used as the AEAD associated-data object id.
-        payload_id: BackendObjectId,
-        /// Parsed segmented-payload header needed for direct range reads.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        payload_header: Option<PayloadHeaderReference>,
-        /// Absolute byte offset where the containing commit's section region starts.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sections_start: Option<u64>,
-        /// Byte offset relative to the commit section region.
-        offset: u64,
-        /// Encrypted payload-section byte length.
-        length: u64,
+        /// Exact carrier facts shared by every reference to this streamed payload.
+        #[serde(flatten)]
+        carrier: Arc<V2StreamCarrierReference>,
     },
+}
+
+/// Exact accepted commit and section facts shared by records in one payload pack.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct V2PackCarrierReference {
+    /// Commit object key containing the payload-pack section.
+    pub commit_key: BackendObjectId,
+    /// Provider version identifier for exact-version reads, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_version_id: Option<BackendVersionId>,
+    /// Commit body digest from the signed header.
+    pub body_digest: [u8; 32],
+    /// Provider-reported complete commit-object length.
+    pub commit_stored_len: u64,
+    /// Commit section ordinal containing the payload pack.
+    pub pack_section_ordinal: u32,
+    /// Absolute byte offset of the payload-pack section in the commit object.
+    pub pack_offset: u64,
+    /// Encrypted payload-pack section byte length.
+    pub length: u64,
+    /// Random pack identity bound into every record AEAD operation.
+    pub pack_id: [u8; 32],
+    /// Historical content-encryption key needed to open the record.
+    pub content_key_id: KeyId,
+    /// Historical encrypted-keyring envelope object bound into payload AEAD context.
+    pub keyring_envelope_object_id: BackendObjectId,
+    /// SHA-256 digest of that encrypted-keyring envelope.
+    pub keyring_envelope_digest: [u8; 32],
+    /// Authenticated number of logical records in the pack directory.
+    pub pack_record_count: u32,
+}
+
+/// Record-specific authenticated facts inside an accepted payload pack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct V2PackRecordReference {
+    /// Logical record ordinal in the pack directory.
+    pub record_ordinal: u32,
+    /// Absolute ciphertext offset from the start of the payload-pack section.
+    pub record_offset: u32,
+    /// SHA-256 digest over the complete plaintext record.
+    pub plaintext_digest: [u8; 32],
+}
+
+/// Exact accepted commit and section facts for a streamed payload.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct V2StreamCarrierReference {
+    /// Commit object key containing the payload section.
+    pub commit_key: BackendObjectId,
+    /// Provider version identifier for exact-version reads, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_version_id: Option<BackendVersionId>,
+    /// Commit body digest from the signed header.
+    pub body_digest: [u8; 32],
+    /// Provider-reported complete commit-object length.
+    pub commit_stored_len: u64,
+    /// Historical encrypted-keyring envelope object bound into payload AEAD context.
+    pub keyring_envelope_object_id: BackendObjectId,
+    /// SHA-256 digest of that encrypted-keyring envelope.
+    pub keyring_envelope_digest: [u8; 32],
+    /// Signed section ordinal containing the streamed payload.
+    pub payload_section_ordinal: u32,
+    /// Signed digest of the complete streamed payload section.
+    pub payload_section_digest: [u8; 32],
+    /// Opaque payload identity used as the AEAD associated-data object id.
+    pub payload_id: BackendObjectId,
+    /// Parsed segmented-payload header needed for direct range reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_header: Option<PayloadHeaderReference>,
+    /// Absolute byte offset where the containing commit's section region starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sections_start: Option<u64>,
+    /// Byte offset relative to the commit section region.
+    pub offset: u64,
+    /// Encrypted payload-section byte length.
+    pub length: u64,
 }
 
 /// Signed/encrypted payload-header facts used to plan direct range reads.
@@ -641,6 +666,7 @@ mod tests {
         CommitRecord, INDEX_DELTA_OBJECT_DOMAIN, INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta,
         IndexDeltaObject, KeyringSnapshot, MANIFEST_PLAINTEXT_DOMAIN, ManifestObject,
         NamespaceEntry, NamespaceIndex, PayloadReference, SealedIndexDeltaObject,
+        V2PackCarrierReference, V2PackRecordReference, V2StreamCarrierReference,
         canonical_commit_record_bytes, checkpoint_evidence_bytes, checkpoint_object_bytes,
         index_delta_object_bytes, index_delta_plaintext_bytes, manifest_plaintext_bytes,
     };
@@ -648,6 +674,8 @@ mod tests {
         BackendObjectId, BackendVersionId, BlindIndexKey, CheckpointId, KeyDescriptor, KeyId,
         KeyPurpose, KeyStatus, LogicalPath, ManifestId, PrefixToken, Sequence,
     };
+    use serde::Serialize;
+    use std::sync::Arc;
 
     fn blind_key(value: &str) -> BlindIndexKey {
         match BlindIndexKey::new(value) {
@@ -982,19 +1010,8 @@ mod tests {
 
     #[test]
     fn payload_pack_references_round_trip_direct_read_facts() {
-        let references = [
-            PayloadReference::V2PackSelf {
-                pack_section_ordinal: 2,
-                pack_id: [0x11; 32],
-                content_key_id: key_id("historical-content"),
-                keyring_envelope_object_id: object_id("keyrings/current"),
-                keyring_envelope_digest: [0x12; 32],
-                pack_record_count: 7,
-                record_ordinal: 3,
-                record_offset: 4_096,
-                plaintext_digest: [0x22; 32],
-            },
-            PayloadReference::V2Pack {
+        let accepted = PayloadReference::V2Pack {
+            carrier: Arc::new(V2PackCarrierReference {
                 commit_key: object_id("commits/opaque"),
                 commit_version_id: Some(BackendVersionId::new("version-1").expect("version id")),
                 body_digest: [0x33; 32],
@@ -1007,10 +1024,26 @@ mod tests {
                 keyring_envelope_object_id: object_id("keyrings/historical"),
                 keyring_envelope_digest: [0x45; 32],
                 pack_record_count: 11,
+            }),
+            record: V2PackRecordReference {
                 record_ordinal: 5,
                 record_offset: 12_288,
                 plaintext_digest: [0x55; 32],
             },
+        };
+        let references = [
+            PayloadReference::V2PackSelf {
+                pack_section_ordinal: 2,
+                pack_id: [0x11; 32],
+                content_key_id: key_id("historical-content"),
+                keyring_envelope_object_id: object_id("keyrings/current"),
+                keyring_envelope_digest: [0x12; 32],
+                pack_record_count: 7,
+                record_ordinal: 3,
+                record_offset: 4_096,
+                plaintext_digest: [0x22; 32],
+            },
+            accepted,
         ];
 
         for reference in references {
@@ -1019,6 +1052,143 @@ mod tests {
                 serde_json::from_slice(&encoded).expect("deserialize payload reference");
             assert_eq!(decoded, reference);
         }
+    }
+
+    #[derive(Serialize)]
+    enum LegacyPayloadReference<'a> {
+        V2Pack {
+            commit_key: &'a BackendObjectId,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            commit_version_id: &'a Option<BackendVersionId>,
+            body_digest: [u8; 32],
+            commit_stored_len: u64,
+            pack_section_ordinal: u32,
+            pack_offset: u64,
+            length: u64,
+            pack_id: [u8; 32],
+            content_key_id: &'a KeyId,
+            keyring_envelope_object_id: &'a BackendObjectId,
+            keyring_envelope_digest: [u8; 32],
+            pack_record_count: u32,
+            record_ordinal: u32,
+            record_offset: u32,
+            plaintext_digest: [u8; 32],
+        },
+        V2Commit {
+            commit_key: &'a BackendObjectId,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            commit_version_id: &'a Option<BackendVersionId>,
+            body_digest: [u8; 32],
+            commit_stored_len: u64,
+            keyring_envelope_object_id: &'a BackendObjectId,
+            keyring_envelope_digest: [u8; 32],
+            payload_section_ordinal: u32,
+            payload_section_digest: [u8; 32],
+            payload_id: &'a BackendObjectId,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            payload_header: &'a Option<super::PayloadHeaderReference>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sections_start: &'a Option<u64>,
+            offset: u64,
+            length: u64,
+        },
+    }
+
+    #[test]
+    fn shared_payload_pack_reference_preserves_the_flat_serialized_shape() {
+        let carrier = Arc::new(V2PackCarrierReference {
+            commit_key: object_id("commits/opaque"),
+            commit_version_id: Some(BackendVersionId::new("version-1").expect("version id")),
+            body_digest: [0x33; 32],
+            commit_stored_len: 32_768,
+            pack_section_ordinal: 4,
+            pack_offset: 8_192,
+            length: 16_384,
+            pack_id: [0x44; 32],
+            content_key_id: key_id("older-content"),
+            keyring_envelope_object_id: object_id("keyrings/historical"),
+            keyring_envelope_digest: [0x45; 32],
+            pack_record_count: 11,
+        });
+        let record = V2PackRecordReference {
+            record_ordinal: 5,
+            record_offset: 12_288,
+            plaintext_digest: [0x55; 32],
+        };
+        let shared = PayloadReference::V2Pack {
+            carrier: Arc::clone(&carrier),
+            record,
+        };
+        let legacy = LegacyPayloadReference::V2Pack {
+            commit_key: &carrier.commit_key,
+            commit_version_id: &carrier.commit_version_id,
+            body_digest: carrier.body_digest,
+            commit_stored_len: carrier.commit_stored_len,
+            pack_section_ordinal: carrier.pack_section_ordinal,
+            pack_offset: carrier.pack_offset,
+            length: carrier.length,
+            pack_id: carrier.pack_id,
+            content_key_id: &carrier.content_key_id,
+            keyring_envelope_object_id: &carrier.keyring_envelope_object_id,
+            keyring_envelope_digest: carrier.keyring_envelope_digest,
+            pack_record_count: carrier.pack_record_count,
+            record_ordinal: record.record_ordinal,
+            record_offset: record.record_offset,
+            plaintext_digest: record.plaintext_digest,
+        };
+
+        assert_eq!(
+            serde_json::to_vec(&shared).expect("serialize shared payload reference"),
+            serde_json::to_vec(&legacy).expect("serialize legacy payload reference")
+        );
+    }
+
+    #[test]
+    fn shared_stream_reference_preserves_the_flat_serialized_shape() {
+        let carrier = Arc::new(V2StreamCarrierReference {
+            commit_key: object_id("commits/stream"),
+            commit_version_id: Some(BackendVersionId::new("version-2").expect("version id")),
+            body_digest: [0x61; 32],
+            commit_stored_len: 65_536,
+            keyring_envelope_object_id: object_id("keyrings/stream"),
+            keyring_envelope_digest: [0x62; 32],
+            payload_section_ordinal: 3,
+            payload_section_digest: [0x63; 32],
+            payload_id: object_id("payloads/stream"),
+            payload_header: Some(super::PayloadHeaderReference {
+                chunk_size: 64 * 1024,
+                plaintext_len: 123_456,
+                key_id: key_id("stream-content"),
+                nonce_prefix: [0x64; 16],
+                header_len: 96,
+            }),
+            sections_start: Some(8_192),
+            offset: 17,
+            length: 123_789,
+        });
+        let shared = PayloadReference::V2Commit {
+            carrier: Arc::clone(&carrier),
+        };
+        let legacy = LegacyPayloadReference::V2Commit {
+            commit_key: &carrier.commit_key,
+            commit_version_id: &carrier.commit_version_id,
+            body_digest: carrier.body_digest,
+            commit_stored_len: carrier.commit_stored_len,
+            keyring_envelope_object_id: &carrier.keyring_envelope_object_id,
+            keyring_envelope_digest: carrier.keyring_envelope_digest,
+            payload_section_ordinal: carrier.payload_section_ordinal,
+            payload_section_digest: carrier.payload_section_digest,
+            payload_id: &carrier.payload_id,
+            payload_header: &carrier.payload_header,
+            sections_start: &carrier.sections_start,
+            offset: carrier.offset,
+            length: carrier.length,
+        };
+
+        assert_eq!(
+            serde_json::to_vec(&shared).expect("serialize shared stream reference"),
+            serde_json::to_vec(&legacy).expect("serialize legacy stream reference")
+        );
     }
 
     #[test]

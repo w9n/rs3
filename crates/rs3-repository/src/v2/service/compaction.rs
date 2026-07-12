@@ -399,38 +399,23 @@ where
         let mut pack_records = BTreeSet::new();
         for entry in state.namespace.live_entries() {
             match &entry.payload_ref {
-                Some(PayloadReference::V2Commit {
-                    commit_key,
-                    commit_version_id,
-                    body_digest,
-                    offset,
-                    length,
-                    ..
-                }) => {
+                Some(PayloadReference::V2Commit { carrier }) => {
                     sections.insert(V2LivePayloadSectionKey {
-                        commit_key: commit_key.clone(),
-                        commit_version_id: commit_version_id.clone(),
-                        body_digest: *body_digest,
-                        offset: *offset,
-                        length: *length,
+                        commit_key: carrier.commit_key.clone(),
+                        commit_version_id: carrier.commit_version_id.clone(),
+                        body_digest: carrier.body_digest,
+                        offset: carrier.offset,
+                        length: carrier.length,
                     });
                 }
-                Some(PayloadReference::V2Pack {
-                    commit_key,
-                    commit_version_id,
-                    body_digest,
-                    pack_section_ordinal,
-                    pack_record_count,
-                    record_ordinal,
-                    ..
-                }) => {
+                Some(PayloadReference::V2Pack { carrier, record }) => {
                     pack_records.insert(V2LivePayloadPackRecordKey {
-                        commit_key: commit_key.clone(),
-                        commit_version_id: commit_version_id.clone(),
-                        body_digest: *body_digest,
-                        pack_section_ordinal: *pack_section_ordinal,
-                        pack_record_count: *pack_record_count,
-                        record_ordinal: *record_ordinal,
+                        commit_key: carrier.commit_key.clone(),
+                        commit_version_id: carrier.commit_version_id.clone(),
+                        body_digest: carrier.body_digest,
+                        pack_section_ordinal: carrier.pack_section_ordinal,
+                        pack_record_count: carrier.pack_record_count,
+                        record_ordinal: record.record_ordinal,
                         content_len: entry.content_len,
                     });
                 }

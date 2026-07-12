@@ -18,7 +18,7 @@ use crate::state::{RepositoryState, apply_index_delta_object};
 use async_trait::async_trait;
 use rs3_index::{
     INDEX_DELTA_OBJECT_DOMAIN, IndexDelta, IndexDeltaObject, PayloadReference,
-    SealedIndexDeltaObject,
+    SealedIndexDeltaObject, V2StreamCarrierReference,
 };
 use rs3_storage::BlobMetadata;
 use rs3_storage::{BlobStore, StorageError};
@@ -26,6 +26,7 @@ use rs3_types::{
     BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionMode, RetentionPolicy, Sequence,
 };
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_RETENTION_RENEWAL_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -964,18 +965,16 @@ where
 
         for entry in state.namespace.live_entries() {
             let (commit_key, commit_version_id, body_digest) = match &entry.payload_ref {
-                Some(PayloadReference::V2Commit {
-                    commit_key,
-                    commit_version_id,
-                    body_digest,
-                    ..
-                })
-                | Some(PayloadReference::V2Pack {
-                    commit_key,
-                    commit_version_id,
-                    body_digest,
-                    ..
-                }) => (commit_key.clone(), commit_version_id.clone(), *body_digest),
+                Some(PayloadReference::V2Commit { carrier }) => (
+                    carrier.commit_key.clone(),
+                    carrier.commit_version_id.clone(),
+                    carrier.body_digest,
+                ),
+                Some(PayloadReference::V2Pack { carrier, .. }) => (
+                    carrier.commit_key.clone(),
+                    carrier.commit_version_id.clone(),
+                    carrier.body_digest,
+                ),
                 None => continue,
                 Some(PayloadReference::V2Self { .. } | PayloadReference::V2PackSelf { .. }) => {
                     return Err(V2FormatError::InvalidHeaderField);
@@ -1513,24 +1512,26 @@ fn resolve_self_payload_refs(
         entry.object_id = commit_key.clone();
         entry.object_version_id = commit.version_id.clone();
         entry.payload_ref = Some(PayloadReference::V2Commit {
-            commit_key,
-            commit_version_id: commit.version_id.clone(),
-            body_digest: commit.parsed_header.header.body_digest,
-            commit_stored_len: commit.object_len,
-            keyring_envelope_object_id: commit
-                .parsed_header
-                .header
-                .keyring_envelope_ref
-                .object_id
-                .clone(),
-            keyring_envelope_digest: commit.parsed_header.header.keyring_envelope_ref.digest,
-            payload_section_ordinal,
-            payload_section_digest,
-            payload_id,
-            payload_header,
-            sections_start: Some(sections_start),
-            offset,
-            length,
+            carrier: Arc::new(V2StreamCarrierReference {
+                commit_key,
+                commit_version_id: commit.version_id.clone(),
+                body_digest: commit.parsed_header.header.body_digest,
+                commit_stored_len: commit.object_len,
+                keyring_envelope_object_id: commit
+                    .parsed_header
+                    .header
+                    .keyring_envelope_ref
+                    .object_id
+                    .clone(),
+                keyring_envelope_digest: commit.parsed_header.header.keyring_envelope_ref.digest,
+                payload_section_ordinal,
+                payload_section_digest,
+                payload_id,
+                payload_header,
+                sections_start: Some(sections_start),
+                offset,
+                length,
+            }),
         });
     }
     Ok(())

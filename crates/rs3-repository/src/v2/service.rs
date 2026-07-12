@@ -39,7 +39,7 @@ use futures_util::Stream;
 use rs3_crypto::KeyRing;
 use rs3_index::{
     INDEX_DELTA_OBJECT_DOMAIN, IndexDelta, IndexDeltaObject, NamespaceEntry,
-    PayloadHeaderReference, PayloadReference, index_delta_object_bytes,
+    PayloadHeaderReference, PayloadReference, V2StreamCarrierReference, index_delta_object_bytes,
 };
 use rs3_storage::{BlobStore, ByteRange, StorageError};
 use rs3_types::{
@@ -1299,50 +1299,38 @@ where
                 object_id: entry.object_id,
             });
         };
-        if let PayloadReference::V2Pack {
-            commit_key,
-            commit_version_id,
-            body_digest,
-            commit_stored_len,
-            pack_section_ordinal,
-            pack_offset,
-            length,
-            pack_id,
-            content_key_id,
-            keyring_envelope_object_id,
-            keyring_envelope_digest,
-            pack_record_count,
-            record_ordinal,
-            record_offset,
-            plaintext_digest,
-        } = payload_ref
-        {
+        if let PayloadReference::V2Pack { carrier, record } = payload_ref {
             return self
                 .read_pack_range_from_commit(
                     &keyring,
                     V2CommitPackRead {
-                        commit_key,
-                        commit_version_id,
-                        body_digest,
-                        commit_stored_len,
-                        pack_section_ordinal,
-                        pack_offset,
-                        length,
-                        pack_id,
-                        content_key_id,
-                        keyring_envelope_object_id,
-                        keyring_envelope_digest,
-                        pack_record_count,
-                        record_ordinal,
-                        record_offset,
-                        plaintext_digest,
+                        commit_key: carrier.commit_key.clone(),
+                        commit_version_id: carrier.commit_version_id.clone(),
+                        body_digest: carrier.body_digest,
+                        commit_stored_len: carrier.commit_stored_len,
+                        pack_section_ordinal: carrier.pack_section_ordinal,
+                        pack_offset: carrier.pack_offset,
+                        length: carrier.length,
+                        pack_id: carrier.pack_id,
+                        content_key_id: carrier.content_key_id.clone(),
+                        keyring_envelope_object_id: carrier.keyring_envelope_object_id.clone(),
+                        keyring_envelope_digest: carrier.keyring_envelope_digest,
+                        pack_record_count: carrier.pack_record_count,
+                        record_ordinal: record.record_ordinal,
+                        record_offset: record.record_offset,
+                        plaintext_digest: record.plaintext_digest,
                         content_len,
                     },
                     range,
                 )
                 .await;
         }
-        let PayloadReference::V2Commit {
+        let PayloadReference::V2Commit { carrier } = payload_ref else {
+            return Err(RepositoryError::InvalidObjectFormat {
+                object_id: entry.object_id,
+            });
+        };
+        let V2StreamCarrierReference {
             commit_key,
             commit_version_id,
             body_digest,
@@ -1356,13 +1344,7 @@ where
             sections_start,
             offset,
             length,
-            ..
-        } = payload_ref
-        else {
-            return Err(RepositoryError::InvalidObjectFormat {
-                object_id: entry.object_id,
-            });
-        };
+        } = carrier.as_ref().clone();
 
         let cache_key = V2PayloadSectionCacheKey {
             commit_key: commit_key.clone(),
@@ -2475,11 +2457,13 @@ where
             .cloned()
             .collect();
         match entry.payload_ref.as_mut() {
-            Some(PayloadReference::V2Commit { length, .. }) => {
-                *length = (*length).saturating_sub(1);
+            Some(PayloadReference::V2Commit { carrier }) => {
+                let carrier = Arc::make_mut(carrier);
+                carrier.length = carrier.length.saturating_sub(1);
             }
-            Some(PayloadReference::V2Pack { length, .. }) => {
-                *length = (*length).saturating_sub(1);
+            Some(PayloadReference::V2Pack { carrier, .. }) => {
+                let carrier = Arc::make_mut(carrier);
+                carrier.length = carrier.length.saturating_sub(1);
             }
             _ => {
                 return Err(RepositoryError::InvalidObjectFormat {
@@ -2514,6 +2498,29 @@ where
         entry.content_len = entry.content_len.saturating_sub(1);
         state.replace_namespace_entry(entry, prefix_tokens);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accepted_pack_carrier_counts_for_tests(&self) -> Result<(usize, usize)> {
+        let accepted = self
+            .accepted
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        let mut total = 0_usize;
+        let mut unique = Vec::<Arc<rs3_index::V2PackCarrierReference>>::new();
+        for entry in accepted.repository.namespace.live_entries() {
+            let Some(PayloadReference::V2Pack { carrier, .. }) = entry.payload_ref.as_ref() else {
+                continue;
+            };
+            total = total.saturating_add(1);
+            if !unique
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, carrier))
+            {
+                unique.push(Arc::clone(carrier));
+            }
+        }
+        Ok((total, unique.len()))
     }
 
     fn pending_index_delta_sequence(&self) -> Result<Option<Sequence>> {
@@ -2644,24 +2651,30 @@ where
             entry.object_id = stored.anchor_state.commit_key.clone();
             entry.object_version_id = stored.anchor_state.version_id.clone();
             entry.payload_ref = Some(PayloadReference::V2Commit {
-                commit_key: stored.anchor_state.commit_key.clone(),
-                commit_version_id: stored.anchor_state.version_id.clone(),
-                body_digest: stored.anchor_state.body_digest,
-                commit_stored_len: stored.object_len,
-                keyring_envelope_object_id: self
-                    .commit_store
-                    .options()
-                    .keyring_envelope_ref
-                    .object_id
-                    .clone(),
-                keyring_envelope_digest: self.commit_store.options().keyring_envelope_ref.digest,
-                payload_section_ordinal: location.section_ordinal,
-                payload_section_digest: location.section_digest,
-                payload_id: location.payload_id.clone(),
-                payload_header: Some(location.payload_header.clone()),
-                sections_start: location.sections_start,
-                offset: location.offset,
-                length: location.length,
+                carrier: Arc::new(V2StreamCarrierReference {
+                    commit_key: stored.anchor_state.commit_key.clone(),
+                    commit_version_id: stored.anchor_state.version_id.clone(),
+                    body_digest: stored.anchor_state.body_digest,
+                    commit_stored_len: stored.object_len,
+                    keyring_envelope_object_id: self
+                        .commit_store
+                        .options()
+                        .keyring_envelope_ref
+                        .object_id
+                        .clone(),
+                    keyring_envelope_digest: self
+                        .commit_store
+                        .options()
+                        .keyring_envelope_ref
+                        .digest,
+                    payload_section_ordinal: location.section_ordinal,
+                    payload_section_digest: location.section_digest,
+                    payload_id: location.payload_id.clone(),
+                    payload_header: Some(location.payload_header.clone()),
+                    sections_start: location.sections_start,
+                    offset: location.offset,
+                    length: location.length,
+                }),
             });
             resolved_count = resolved_count.saturating_add(1);
         }
@@ -3035,24 +3048,30 @@ where
             entry.object_id = commit_key.clone();
             entry.object_version_id = commit.version_id.clone();
             entry.payload_ref = Some(PayloadReference::V2Commit {
-                commit_key,
-                commit_version_id: commit.version_id.clone(),
-                body_digest: commit.parsed_header.header.body_digest,
-                commit_stored_len: commit.object_len,
-                keyring_envelope_object_id: commit
-                    .parsed_header
-                    .header
-                    .keyring_envelope_ref
-                    .object_id
-                    .clone(),
-                keyring_envelope_digest: commit.parsed_header.header.keyring_envelope_ref.digest,
-                payload_section_ordinal,
-                payload_section_digest: payload_section.digest,
-                payload_id,
-                payload_header: Some(payload_header),
-                sections_start: Some(sections_start),
-                offset,
-                length,
+                carrier: Arc::new(V2StreamCarrierReference {
+                    commit_key,
+                    commit_version_id: commit.version_id.clone(),
+                    body_digest: commit.parsed_header.header.body_digest,
+                    commit_stored_len: commit.object_len,
+                    keyring_envelope_object_id: commit
+                        .parsed_header
+                        .header
+                        .keyring_envelope_ref
+                        .object_id
+                        .clone(),
+                    keyring_envelope_digest: commit
+                        .parsed_header
+                        .header
+                        .keyring_envelope_ref
+                        .digest,
+                    payload_section_ordinal,
+                    payload_section_digest: payload_section.digest,
+                    payload_id,
+                    payload_header: Some(payload_header),
+                    sections_start: Some(sections_start),
+                    offset,
+                    length,
+                }),
             });
         }
         Ok(())
@@ -3489,25 +3508,27 @@ fn resolve_self_payload_refs(delta: &mut IndexDeltaObject, commit: &V2ParsedComm
         entry.object_id = commit_key.clone();
         entry.object_version_id = commit.version_id.clone();
         entry.payload_ref = Some(PayloadReference::V2Commit {
-            commit_key,
-            commit_version_id: commit.version_id.clone(),
-            body_digest: commit.parsed_header.header.body_digest,
-            commit_stored_len: u64::try_from(commit.body.len())
-                .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
-            keyring_envelope_object_id: commit
-                .parsed_header
-                .header
-                .keyring_envelope_ref
-                .object_id
-                .clone(),
-            keyring_envelope_digest: commit.parsed_header.header.keyring_envelope_ref.digest,
-            payload_section_ordinal,
-            payload_section_digest: payload_section.digest,
-            payload_id,
-            payload_header: Some(payload_header),
-            sections_start: Some(sections_start),
-            offset,
-            length,
+            carrier: Arc::new(V2StreamCarrierReference {
+                commit_key,
+                commit_version_id: commit.version_id.clone(),
+                body_digest: commit.parsed_header.header.body_digest,
+                commit_stored_len: u64::try_from(commit.body.len())
+                    .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
+                keyring_envelope_object_id: commit
+                    .parsed_header
+                    .header
+                    .keyring_envelope_ref
+                    .object_id
+                    .clone(),
+                keyring_envelope_digest: commit.parsed_header.header.keyring_envelope_ref.digest,
+                payload_section_ordinal,
+                payload_section_digest: payload_section.digest,
+                payload_id,
+                payload_header: Some(payload_header),
+                sections_start: Some(sections_start),
+                offset,
+                length,
+            }),
         });
     }
     Ok(())

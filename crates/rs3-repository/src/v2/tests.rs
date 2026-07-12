@@ -3206,6 +3206,10 @@ async fn v2_commit_coordinator_packs_sixty_four_small_objects_with_bounded_ampli
     while let Some(write) = writes.join_next().await {
         must_repo(write.unwrap_or_else(|error| panic!("{error}")));
     }
+    assert_eq!(
+        must_repo(repository.accepted_pack_carrier_counts_for_tests()),
+        (OBJECT_COUNT, 1)
+    );
 
     let accepted = must_v2(anchor.read_v2().await).expect("v2 anchor should exist");
     let metadata = store
@@ -3239,6 +3243,10 @@ async fn v2_commit_coordinator_packs_sixty_four_small_objects_with_bounded_ampli
             .filter(|section| section.section_type == V2SectionType::IndexRun)
             .count(),
         1
+    );
+    assert_eq!(
+        must_repo(fresh.accepted_pack_carrier_counts_for_tests()),
+        (OBJECT_COUNT, 1)
     );
 }
 
