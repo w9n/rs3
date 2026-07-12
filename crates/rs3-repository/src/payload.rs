@@ -217,7 +217,7 @@ pub(crate) fn open_payload_object(
     range: ByteRange,
 ) -> Result<Bytes> {
     let header = parse_segmented_payload_header(object_id, &body)?;
-    open_segmented_payload_from_body(keyring, object_id, &header, &body, range)
+    open_segmented_payload_from_body(keyring, object_id, &header, body, range)
 }
 
 /// Probes enough bytes to parse the segmented payload header length.
@@ -396,7 +396,7 @@ pub(crate) fn open_segmented_payload_span(
     span: SegmentCiphertextSpan,
     ciphertext: Bytes,
 ) -> Result<Bytes> {
-    open_segmented_payload_span_with_segments(keyring, object_id, header, range, span, ciphertext)
+    open_segmented_payload_span_inner(keyring, object_id, header, range, span, ciphertext, false)
         .map(|opened| opened.plaintext)
 }
 
@@ -408,6 +408,18 @@ pub(crate) fn open_segmented_payload_span_with_segments(
     range: ByteRange,
     span: SegmentCiphertextSpan,
     ciphertext: Bytes,
+) -> Result<OpenedSegmentedPayloadSpan> {
+    open_segmented_payload_span_inner(keyring, object_id, header, range, span, ciphertext, true)
+}
+
+fn open_segmented_payload_span_inner(
+    keyring: &KeyRing,
+    object_id: &BackendObjectId,
+    header: &SegmentedPayloadHeader,
+    range: ByteRange,
+    span: SegmentCiphertextSpan,
+    ciphertext: Bytes,
+    retain_segments: bool,
 ) -> Result<OpenedSegmentedPayloadSpan> {
     let selection = SegmentSelection::new(header, range)?;
     if span.start_segment != selection.start_segment
@@ -422,7 +434,7 @@ pub(crate) fn open_segmented_payload_span_with_segments(
     }
 
     let mut output = Vec::with_capacity(selection.output_capacity()?);
-    let mut segments = Vec::with_capacity(selection.segment_count());
+    let mut segments = retain_segments.then(|| Vec::with_capacity(selection.segment_count()));
     let mut associated_data = Vec::with_capacity(segment_associated_data_capacity(object_id));
     for segment_index in selection.start_segment..selection.end_segment {
         let segment_range =
@@ -448,12 +460,14 @@ pub(crate) fn open_segmented_payload_span_with_segments(
             &mut associated_data,
         )?;
         append_segment_overlap(&mut output, header, &selection, segment_index, &plaintext)?;
-        segments.push((segment_index, Bytes::from(plaintext)));
+        if let Some(segments) = segments.as_mut() {
+            segments.push((segment_index, Bytes::from(plaintext)));
+        }
     }
 
     Ok(OpenedSegmentedPayloadSpan {
         plaintext: Bytes::from(output),
-        segments,
+        segments: segments.unwrap_or_default(),
     })
 }
 
@@ -616,7 +630,7 @@ fn open_segmented_payload_from_body(
     keyring: &KeyRing,
     object_id: &BackendObjectId,
     header: &SegmentedPayloadHeader,
-    body: &[u8],
+    body: Bytes,
     range: ByteRange,
 ) -> Result<Bytes> {
     let expected_len = total_segmented_payload_len(header)?;
@@ -627,16 +641,16 @@ fn open_segmented_payload_from_body(
     let start = usize::try_from(span.offset).map_err(|_| StorageError::InvalidRange)?;
     let len = usize::try_from(span.len).map_err(|_| StorageError::InvalidRange)?;
     let end = start.checked_add(len).ok_or(StorageError::InvalidRange)?;
-    let ciphertext = body
-        .get(start..end)
-        .ok_or_else(|| invalid_payload_object(object_id))?;
+    if end > body.len() {
+        return Err(invalid_payload_object(object_id));
+    }
     open_segmented_payload_span(
         keyring,
         object_id,
         header,
         range,
         span,
-        Bytes::copy_from_slice(ciphertext),
+        body.slice(start..end),
     )
 }
 
@@ -1015,9 +1029,9 @@ fn invalid_payload_object(object_id: &BackendObjectId) -> RepositoryError {
 mod tests {
     use super::{
         DEFAULT_PAYLOAD_SEGMENT_SIZE, PayloadHeaderProbe, open_payload_object,
-        parse_segmented_payload_header, parse_segmented_payload_header_with_total_len,
-        probe_payload_header, seal_payload_object, seal_streamable_payload_object,
-        segmented_ciphertext_span,
+        open_segmented_payload_span_inner, parse_segmented_payload_header,
+        parse_segmented_payload_header_with_total_len, probe_payload_header, seal_payload_object,
+        seal_streamable_payload_object, segmented_ciphertext_span,
     };
     use crate::test_support::{backend_object_id, signing_keyring, wrong_content_keyring};
     use bytes::Bytes;
@@ -1184,6 +1198,52 @@ mod tests {
         assert!(body.starts_with(super::PAYLOAD_OBJECT_DOMAIN));
         assert_eq!(full, plaintext);
         assert_eq!(range, &plaintext[chunk_size - 3..chunk_size + 13]);
+    }
+
+    #[test]
+    fn non_caching_open_does_not_retain_duplicate_plaintext_segments() {
+        let keyring = signing_keyring();
+        let object_id = backend_object_id("segments/non-caching-open");
+        let chunk_size = DEFAULT_PAYLOAD_SEGMENT_SIZE;
+        let plaintext = vec![7_u8; chunk_size * 2 + 17];
+        let body = seal_payload_object(&keyring, &object_id, &plaintext, chunk_size)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let header = parse_segmented_payload_header(&object_id, &body)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let span = segmented_ciphertext_span(&header, ByteRange::Full)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let start = usize::try_from(span.offset).unwrap_or_else(|error| panic!("{error}"));
+        let len = usize::try_from(span.len).unwrap_or_else(|error| panic!("{error}"));
+        let end = start
+            .checked_add(len)
+            .unwrap_or_else(|| panic!("ciphertext span overflow"));
+        let ciphertext = body.slice(start..end);
+
+        let non_caching = open_segmented_payload_span_inner(
+            &keyring,
+            &object_id,
+            &header,
+            ByteRange::Full,
+            span,
+            ciphertext.clone(),
+            false,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let caching = open_segmented_payload_span_inner(
+            &keyring,
+            &object_id,
+            &header,
+            ByteRange::Full,
+            span,
+            ciphertext,
+            true,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(non_caching.plaintext, plaintext);
+        assert!(non_caching.segments.is_empty());
+        assert_eq!(caching.plaintext, plaintext);
+        assert_eq!(caching.segments.len(), 3);
     }
 
     #[test]

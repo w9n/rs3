@@ -331,6 +331,15 @@ hold that write path before the request fails as incomplete. Checkpoint and
 compaction publication are metadata-only for both packed and streamed carriers;
 they preserve exact historical references instead of copying payload bytes.
 
+Full streamed-carrier reads still verify the complete signed payload-section
+digest before releasing plaintext. The current non-caching opener shares the
+owning ciphertext buffer and does not retain a duplicate plaintext segment set,
+so its transient data is approximately one ciphertext body plus one plaintext
+body and one active segment instead of duplicate full-size ciphertext and
+plaintext representations. Response memory remains proportional to object size.
+Bounded-memory full responses require a verified ciphertext spool or a wire
+change; they are not yet a production claim.
+
 The 2026-05 measurements below predate the current index-run wire version 4
 self/external stream-carrier model. They remain historical payload segmentation
 and request-shape evidence, not performance qualification for the completed
