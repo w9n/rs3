@@ -1,3 +1,4 @@
+use super::service::packed::repository_context_from_refs;
 use super::{
     UnenforcedQuiescedMaintenanceGuard, V2_INDEX_COMPACTION_PAUSE_RUNS,
     V2_INDEX_COMPACTION_REQUEST_RUNS, V2AnchorState, V2CommitAnchor, V2CommitCoordinator,
@@ -14,10 +15,16 @@ use super::{
     V2UploadMode, body_digest_for_v2_sections, check_v2_provider_conformance, digest_v2_section,
     generate_v2_commit_key, parse_v2_commit_object,
 };
+use super::{open_v2_index_run, seal_v2_index_run};
+use crate::payload::{parse_segmented_payload_header, seal_streamable_payload_object};
 use crate::{CommitCoordinatorOptions, RepositoryError, RepositoryOptions, RepositoryPutOptions};
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
+use rs3_index::PayloadHeaderReference;
+use rs3_index::run::{
+    IndexMutation, IndexPayloadPointer, IndexRunLimits, IndexRunStandaloneStreamContainer,
+};
 use rs3_storage::{BlobMetadata, BlobStore, ByteRange, MemoryBlobStore, PutOptions};
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
@@ -112,6 +119,198 @@ fn signing_keyring() -> KeyRing {
 
 fn sample_commit_key() -> V2CommitKey {
     must_v2(V2CommitKey::from_parts(Sequence::new(7), [9_u8; 32]))
+}
+
+struct StandaloneReadFixture {
+    store: MemoryBlobStore,
+    keyring: KeyRing,
+    options: V2CommitStoreOptions,
+    anchor: V2MemoryAnchor,
+    key: LogicalPath,
+    body: Bytes,
+    object_id: BackendObjectId,
+    object_version_id: Option<BackendVersionId>,
+    stored_body: Bytes,
+}
+
+async fn standalone_read_fixture(
+    profile: V2ProviderProfile,
+    exact_version: bool,
+    tamper_signed_header: bool,
+) -> StandaloneReadFixture {
+    let store = MemoryBlobStore::new();
+    let source_store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        profile,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(
+        source_store,
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let source_anchor = V2MemoryAnchor::new();
+    let key = must_type(LogicalPath::new("standalone/recovery.bin"));
+    let body = Bytes::from(
+        (0..(2 * 1024 * 1024 + 37))
+            .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+            .collect::<Vec<_>>(),
+    );
+    must_repo(repository.write_genesis_snapshot(&source_anchor).await);
+    must_repo(
+        repository
+            .put_committed_streaming_known_len(
+                &source_anchor,
+                key.clone(),
+                body.len() as u64,
+                stream::iter(vec![Ok::<Bytes, RepositoryError>(body.clone())]),
+                RepositoryPutOptions::default(),
+                super::commit::V2_MAX_HEADER_SIZE + 128 * 1024,
+            )
+            .await,
+    );
+
+    let chain = must_v2(
+        repository
+            .commit_store()
+            .load_chain_from_anchor(&source_anchor)
+            .await,
+    )
+    .expect("source commit chain");
+    let source = &chain.commits_newest_first[0];
+    let run_descriptor = source
+        .parsed_header
+        .header
+        .section_index
+        .iter()
+        .find(|section| section.section_type == V2SectionType::IndexRun)
+        .expect("source index run");
+    let run_start = source
+        .parsed_header
+        .sections_start
+        .checked_add(usize::try_from(run_descriptor.offset).expect("run offset"))
+        .expect("run start");
+    let run_end = run_start
+        .checked_add(usize::try_from(run_descriptor.length).expect("run length"))
+        .expect("run end");
+    let context = must_repo(repository_context_from_refs(
+        &options.repository_id,
+        &options.keyring_envelope_ref,
+    ));
+    let mut run = must_v2(open_v2_index_run(
+        &keyring,
+        &context,
+        &source.parsed_header.header.self_ref.commit_key,
+        u32::try_from(
+            source
+                .parsed_header
+                .header
+                .section_index
+                .iter()
+                .position(|section| section.section_type == V2SectionType::IndexRun)
+                .expect("run ordinal"),
+        )
+        .expect("run ordinal"),
+        &source.body[run_start..run_end],
+        &IndexRunLimits::default(),
+    ));
+
+    let object_id = object_id("objects/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    let stored_body = must_repo(seal_streamable_payload_object(
+        &keyring,
+        &object_id,
+        &body,
+        64 * 1024,
+    ));
+    let header = must_repo(parse_segmented_payload_header(&object_id, &stored_body));
+    let metadata = store
+        .put(
+            &object_id,
+            stored_body.clone(),
+            PutOptions {
+                retention: options.retention,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .expect("write standalone payload");
+    run.self_stream = None;
+    let mut payload_header = PayloadHeaderReference {
+        chunk_size: header.chunk_size,
+        plaintext_len: header.plaintext_len,
+        key_id: header.key_id,
+        nonce_prefix: header.nonce_prefix,
+        header_len: u64::try_from(header.header_len).expect("header length"),
+    };
+    if tamper_signed_header {
+        payload_header.nonce_prefix[0] ^= 0x80;
+    }
+    run.standalone_stream_containers = vec![IndexRunStandaloneStreamContainer {
+        object_id: object_id.clone(),
+        version_id: exact_version.then(|| metadata.version_id.clone()).flatten(),
+        stored_len: metadata.content_len,
+        object_digest: digest_v2_section(&stored_body),
+        keyring_envelope: rs3_index::run::IndexRunKeyringRef {
+            object_id: options.keyring_envelope_ref.object_id.clone(),
+            digest: options.keyring_envelope_ref.digest,
+        },
+        payload_header,
+    }];
+    for mutation in &mut run.mutations {
+        let IndexMutation::Upsert(upsert) = mutation else {
+            panic!("source run must contain one upsert");
+        };
+        upsert.payload = IndexPayloadPointer::ExternalStandaloneStream {
+            container_ordinal: 0,
+        };
+    }
+
+    let run_for_commit = run;
+    let context_for_commit = context;
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    );
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    must_v2(
+        repository
+            .commit_store()
+            .write_child_commit_with(&anchor, |commit_key| {
+                let sealed = seal_v2_index_run(
+                    &keyring,
+                    &context_for_commit,
+                    &commit_key.object_id,
+                    0,
+                    &run_for_commit,
+                    &IndexRunLimits::default(),
+                )?;
+                Ok(V2CommitWrite::delta(vec![V2CommitSection::new(
+                    V2SectionType::IndexRun,
+                    V2_SECTION_FLAG_MUST_UNDERSTAND,
+                    sealed.bytes().clone(),
+                )]))
+            })
+            .await,
+    );
+
+    StandaloneReadFixture {
+        store,
+        keyring,
+        options,
+        anchor,
+        key,
+        body,
+        object_id,
+        object_version_id: metadata.version_id,
+        stored_body,
+    }
 }
 
 fn sample_sections() -> (Vec<V2SectionDescriptor>, Bytes, [u8; 32]) {
@@ -4032,6 +4231,200 @@ async fn v2_streamed_payload_full_read_is_bounded_and_uses_one_backend_get() {
     assert!(chunks.len() >= 3);
     assert_eq!(restored, body);
     assert_eq!(counts.get, 1);
+}
+
+#[tokio::test]
+async fn v2_standalone_stream_recovers_checkpoints_and_uses_exact_bounded_reads() {
+    let fixture = standalone_read_fixture(V2ProviderProfile::Dev, false, false).await;
+    let repository = V2Repository::new(
+        fixture.store.clone(),
+        fixture.keyring.clone(),
+        RepositoryOptions::default(),
+        fixture.options.clone(),
+    );
+    must_repo(repository.load_chain_from_anchor(&fixture.anchor).await)
+        .expect("standalone snapshot should recover");
+
+    fixture
+        .store
+        .reset_operation_counts()
+        .expect("reset operation counts");
+    let range = ByteRange::Slice {
+        offset: 65_530,
+        len: 32,
+    };
+    assert_eq!(
+        must_repo(repository.get_range(&fixture.key, range).await),
+        fixture.body.slice(65_530..65_562)
+    );
+    let partial_counts = fixture
+        .store
+        .operation_counts()
+        .expect("partial operation counts");
+    assert_eq!(partial_counts.get, 1);
+    assert_eq!(partial_counts.head, 0);
+
+    must_repo(repository.write_index_snapshot(&fixture.anchor).await);
+    let reloaded = V2Repository::new(
+        fixture.store.clone(),
+        fixture.keyring,
+        RepositoryOptions::default(),
+        fixture.options,
+    );
+    let chain = must_repo(reloaded.load_chain_from_anchor(&fixture.anchor).await)
+        .expect("checkpointed standalone snapshot should recover");
+    assert_eq!(chain.commits_newest_first.len(), 1);
+    fixture
+        .store
+        .reset_operation_counts()
+        .expect("reset operation counts");
+
+    let resolved = must_repo(reloaded.resolve_object(&fixture.key));
+    let mut read = must_repo(reloaded.get_resolved_full_stream(&resolved).await)
+        .expect("standalone payload should expose a bounded body");
+    assert_eq!(read.content_len(), fixture.body.len() as u64);
+    assert!(read.working_set_bytes() < fixture.body.len() as u64 * 2);
+    let mut restored = Vec::new();
+    while let Some(chunk) = read.next().await {
+        restored.extend_from_slice(&must_repo(chunk));
+    }
+    assert_eq!(restored, fixture.body);
+    let full_counts = fixture
+        .store
+        .operation_counts()
+        .expect("full operation counts");
+    assert_eq!(full_counts.get, 1);
+    assert_eq!(full_counts.head, 0);
+}
+
+#[tokio::test]
+async fn v2_standalone_stream_rejects_header_digest_and_trailing_tampering() {
+    let header_fixture = standalone_read_fixture(V2ProviderProfile::Dev, false, true).await;
+    let header_reader = V2Repository::new(
+        header_fixture.store,
+        header_fixture.keyring,
+        RepositoryOptions::default(),
+        header_fixture.options,
+    );
+    must_repo(
+        header_reader
+            .load_chain_from_anchor(&header_fixture.anchor)
+            .await,
+    );
+    let resolved = must_repo(header_reader.resolve_object(&header_fixture.key));
+    assert!(
+        header_reader
+            .get_resolved_full_stream(&resolved)
+            .await
+            .is_err()
+    );
+
+    let digest_fixture = standalone_read_fixture(V2ProviderProfile::Dev, false, false).await;
+    let digest_reader = V2Repository::new(
+        digest_fixture.store.clone(),
+        digest_fixture.keyring,
+        RepositoryOptions::default(),
+        digest_fixture.options.clone(),
+    );
+    must_repo(
+        digest_reader
+            .load_chain_from_anchor(&digest_fixture.anchor)
+            .await,
+    );
+    let mut corrupted = digest_fixture.stored_body.to_vec();
+    let final_byte = corrupted.len() - 1;
+    corrupted[final_byte] ^= 0x80;
+    digest_fixture
+        .store
+        .put(
+            &digest_fixture.object_id,
+            Bytes::from(corrupted),
+            PutOptions::default(),
+        )
+        .await
+        .expect("replace standalone payload");
+    let resolved = must_repo(digest_reader.resolve_object(&digest_fixture.key));
+    let mut read = must_repo(digest_reader.get_resolved_full_stream(&resolved).await)
+        .expect("tampered stream opens before terminal authentication");
+    let mut restored = Vec::new();
+    let mut failed = false;
+    while let Some(chunk) = read.next().await {
+        match chunk {
+            Ok(chunk) => restored.extend_from_slice(&chunk),
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed);
+    assert!(restored.len() <= digest_fixture.body.len() - 37);
+
+    let trailing_fixture = standalone_read_fixture(V2ProviderProfile::Dev, false, false).await;
+    let trailing_reader = V2Repository::new(
+        trailing_fixture.store.clone(),
+        trailing_fixture.keyring,
+        RepositoryOptions::default(),
+        trailing_fixture.options,
+    );
+    must_repo(
+        trailing_reader
+            .load_chain_from_anchor(&trailing_fixture.anchor)
+            .await,
+    );
+    let mut overlong = trailing_fixture.stored_body.to_vec();
+    overlong.push(0x42);
+    trailing_fixture
+        .store
+        .put(
+            &trailing_fixture.object_id,
+            Bytes::from(overlong),
+            PutOptions::default(),
+        )
+        .await
+        .expect("append standalone suffix");
+    let resolved = must_repo(trailing_reader.resolve_object(&trailing_fixture.key));
+    assert!(
+        trailing_reader
+            .get_resolved_full_stream(&resolved)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn v2_standalone_stream_reads_the_signed_old_version_after_overwrite() {
+    let fixture =
+        standalone_read_fixture(V2ProviderProfile::RetainedVersionObjectLock, true, false).await;
+    let expected_version = fixture
+        .object_version_id
+        .clone()
+        .expect("retained standalone version");
+    let newer = fixture
+        .store
+        .put(
+            &fixture.object_id,
+            Bytes::from_static(b"newer malicious replacement"),
+            PutOptions {
+                retention: fixture.options.retention,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .expect("write newer standalone version");
+    assert_ne!(newer.version_id.as_ref(), Some(&expected_version));
+
+    let repository = V2Repository::new(
+        fixture.store,
+        fixture.keyring,
+        RepositoryOptions::default(),
+        fixture.options,
+    );
+    must_repo(repository.load_chain_from_anchor(&fixture.anchor).await);
+    assert_eq!(
+        must_repo(repository.get_range(&fixture.key, ByteRange::Full).await),
+        fixture.body
+    );
 }
 
 #[tokio::test]

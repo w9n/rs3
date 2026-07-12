@@ -2,12 +2,17 @@
 
 use crate::error::{RepositoryError, Result};
 use crate::model::{RepositoryListEntry, RepositoryObjectMetadata};
-use rs3_index::{DurableManifest, IndexDelta, IndexDeltaObject, NamespaceEntry, NamespaceIndex};
+use rs3_index::{
+    DurableManifest, IndexDelta, IndexDeltaObject, NamespaceEntry, NamespaceIndex,
+    V2StandaloneStreamCarrierReference,
+};
 use rs3_types::{
-    BlindIndexKey, LegalHoldStatus, LogicalPath, ManifestId, PrefixToken, RetentionPolicy, Sequence,
+    BackendObjectId, BackendVersionId, BlindIndexKey, LegalHoldStatus, LogicalPath, ManifestId,
+    PrefixToken, RetentionPolicy, Sequence,
 };
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::Arc;
 
 /// Trusted manifest metadata used by the current in-memory query model.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +44,11 @@ pub(crate) struct RepositoryState {
     pub(crate) pending_index_deltas: Vec<IndexDelta>,
     /// Stable timestamp for the current unaccepted checkpoint draft.
     pub(crate) pending_checkpoint_published_at_ms: Option<i64>,
+    /// Exact standalone carrier facts interned during v2 replay.
+    pub(crate) v2_standalone_carriers: BTreeMap<
+        (BackendObjectId, Option<BackendVersionId>),
+        Arc<V2StandaloneStreamCarrierReference>,
+    >,
 }
 
 impl Default for RepositoryState {
@@ -50,6 +60,7 @@ impl Default for RepositoryState {
             next_sequence: Sequence::ZERO,
             pending_index_deltas: Vec::new(),
             pending_checkpoint_published_at_ms: None,
+            v2_standalone_carriers: BTreeMap::new(),
         }
     }
 }

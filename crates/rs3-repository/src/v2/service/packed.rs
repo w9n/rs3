@@ -10,22 +10,23 @@ use crate::state::{RepositoryState, TrustedManifest, object_material};
 use rs3_index::run::{
     IndexBlindKey, IndexMutation, IndexPackRecordPointer, IndexPayloadPointer, IndexRun,
     IndexRunContainer, IndexRunKeyringRef, IndexRunLimits, IndexRunSelfPack, IndexRunSelfStream,
-    IndexRunStreamContainer, IndexTombstone, IndexUpsert,
+    IndexRunStandaloneStreamContainer, IndexRunStreamContainer, IndexTombstone, IndexUpsert,
 };
 use rs3_index::{
     IndexDelta, NamespaceEntry, PayloadReference, V2CommitStreamCarrierReference,
-    V2PackCarrierReference, V2PackRecordReference,
+    V2PackCarrierReference, V2PackRecordReference, V2StandaloneStreamCarrierReference,
 };
 use rs3_storage::BlobStore;
 use rs3_types::{BackendVersionId, LogicalPath, ManifestId, Sequence};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::v2::standalone::validate_v2_standalone_object;
 use crate::v2::{
     V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitKey, V2CommitSection, V2FormatError,
     V2KeyringEnvelopeRef, V2ParsedCommitHeader, V2PayloadPackLayout, V2PayloadPackRecord,
-    V2PayloadPackRecordInput, V2SectionType, V2StoredCommit, digest_v2_section, open_v2_index_run,
-    open_v2_index_run_directory, probe_v2_index_run_header, seal_v2_index_run,
+    V2PayloadPackRecordInput, V2ProviderProfile, V2SectionType, V2StoredCommit, digest_v2_section,
+    open_v2_index_run, open_v2_index_run_directory, probe_v2_index_run_header, seal_v2_index_run,
     seal_v2_payload_pack,
 };
 
@@ -586,6 +587,7 @@ pub(in crate::v2) struct V2PackedIndexRunReplay<'a> {
     pub(in crate::v2) stored_run: &'a [u8],
     pub(in crate::v2) level: u16,
     pub(in crate::v2) compaction_generation: u64,
+    pub(in crate::v2) provider_profile: V2ProviderProfile,
 }
 
 pub(in crate::v2) fn apply_packed_index_run(
@@ -608,10 +610,14 @@ pub(in crate::v2) fn apply_packed_index_run(
         &IndexRunLimits::default(),
     )
     .map_err(v2_repository_error)?;
-    // Wire v5 reserves and authenticates standalone stream carriers before the
-    // repository read, reachability, and maintenance graph accepts them.
-    if !run.standalone_stream_containers.is_empty() {
-        return Err(v2_repository_error(V2FormatError::UnsupportedSection));
+    for container in &run.standalone_stream_containers {
+        validate_v2_standalone_object(&container.object_id, container.stored_len)
+            .map_err(v2_repository_error)?;
+        if replay.provider_profile == V2ProviderProfile::RetainedVersionObjectLock
+            && container.version_id.is_none()
+        {
+            return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
+        }
     }
     let directory = open_v2_index_run_directory(
         keyring,
@@ -830,6 +836,14 @@ pub(in crate::v2) fn apply_packed_index_run(
         .iter()
         .map(|container| Arc::new(stream_carrier_from_index_run(container)))
         .collect::<Vec<_>>();
+    let standalone_stream_carriers = run
+        .standalone_stream_containers
+        .iter()
+        .map(|container| {
+            let carrier = standalone_stream_carrier_from_index_run(container);
+            intern_standalone_stream_carrier(state, carrier)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     for mutation in run.mutations {
         match mutation {
@@ -886,8 +900,17 @@ pub(in crate::v2) fn apply_packed_index_run(
                             carrier: Arc::clone(carrier),
                         })
                     }
-                    IndexPayloadPointer::ExternalStandaloneStream { .. } => {
-                        return Err(v2_repository_error(V2FormatError::UnsupportedSection));
+                    IndexPayloadPointer::ExternalStandaloneStream { container_ordinal } => {
+                        let carrier = standalone_stream_carriers
+                            .get(
+                                usize::try_from(container_ordinal).map_err(|_| {
+                                    v2_repository_error(V2FormatError::InvalidIndexRun)
+                                })?,
+                            )
+                            .ok_or_else(|| v2_repository_error(V2FormatError::InvalidIndexRun))?;
+                        Some(PayloadReference::V2StandaloneStream {
+                            carrier: Arc::clone(carrier),
+                        })
                     }
                 };
                 let manifest_id = keyring.derive_manifest_id(&object_material(
@@ -903,6 +926,9 @@ pub(in crate::v2) fn apply_packed_index_run(
                         carrier.commit_key.clone(),
                         carrier.commit_version_id.clone(),
                     ),
+                    Some(PayloadReference::V2StandaloneStream { carrier }) => {
+                        (carrier.object_id.clone(), carrier.version_id.clone())
+                    }
                     _ => (commit_key.clone(), replay.version_id.cloned()),
                 };
                 state.manifests.insert(
@@ -1041,6 +1067,40 @@ fn stream_carrier_from_index_run(
     }
 }
 
+fn standalone_stream_carrier_from_index_run(
+    container: &IndexRunStandaloneStreamContainer,
+) -> V2StandaloneStreamCarrierReference {
+    V2StandaloneStreamCarrierReference {
+        object_id: container.object_id.clone(),
+        version_id: container.version_id.clone(),
+        object_digest: container.object_digest,
+        stored_len: container.stored_len,
+        keyring_envelope_object_id: container.keyring_envelope.object_id.clone(),
+        keyring_envelope_digest: container.keyring_envelope.digest,
+        payload_header: container.payload_header.clone(),
+    }
+}
+
+fn intern_standalone_stream_carrier(
+    state: &mut RepositoryState,
+    carrier: V2StandaloneStreamCarrierReference,
+) -> Result<Arc<V2StandaloneStreamCarrierReference>> {
+    let key = (carrier.object_id.clone(), carrier.version_id.clone());
+    match state.v2_standalone_carriers.get(&key) {
+        Some(existing) if existing.as_ref() != &carrier => {
+            Err(v2_repository_error(V2FormatError::InvalidHeaderField))
+        }
+        Some(existing) => Ok(Arc::clone(existing)),
+        None => {
+            let carrier = Arc::new(carrier);
+            state
+                .v2_standalone_carriers
+                .insert(key, Arc::clone(&carrier));
+            Ok(carrier)
+        }
+    }
+}
+
 fn pack_record_reference(record: IndexPackRecordPointer) -> V2PackRecordReference {
     V2PackRecordReference {
         record_ordinal: record.record_ordinal,
@@ -1149,4 +1209,47 @@ fn verify_blind_key(
         return Err(v2_repository_error(V2FormatError::CryptoOperation));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::intern_standalone_stream_carrier;
+    use crate::state::RepositoryState;
+    use rs3_index::{PayloadHeaderReference, V2StandaloneStreamCarrierReference};
+    use rs3_types::{BackendObjectId, BackendVersionId, KeyId};
+    use std::sync::Arc;
+
+    fn carrier() -> V2StandaloneStreamCarrierReference {
+        V2StandaloneStreamCarrierReference {
+            object_id: BackendObjectId::new(
+                "objects/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            )
+            .expect("object id"),
+            version_id: Some(BackendVersionId::new("version-1").expect("version id")),
+            object_digest: [1; 32],
+            stored_len: 4_096,
+            keyring_envelope_object_id: BackendObjectId::new("meta/v02/keyring")
+                .expect("keyring object id"),
+            keyring_envelope_digest: [2; 32],
+            payload_header: PayloadHeaderReference {
+                chunk_size: 1_024,
+                plaintext_len: 3_900,
+                key_id: KeyId::new("content-key").expect("content key id"),
+                nonce_prefix: [3; 16],
+                header_len: 48,
+            },
+        }
+    }
+
+    #[test]
+    fn standalone_carrier_interning_reuses_exact_facts_and_rejects_conflicts() {
+        let mut state = RepositoryState::default();
+        let first = intern_standalone_stream_carrier(&mut state, carrier()).expect("first carrier");
+        let second = intern_standalone_stream_carrier(&mut state, carrier()).expect("same carrier");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let mut conflicting = carrier();
+        conflicting.keyring_envelope_digest[0] ^= 0x80;
+        assert!(intern_standalone_stream_carrier(&mut state, conflicting).is_err());
+    }
 }

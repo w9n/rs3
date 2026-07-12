@@ -9,6 +9,7 @@ use super::repository::{
 use super::service::packed::{
     V2PackedIndexRunReplay, apply_packed_index_run, repository_context_from_refs,
 };
+use super::standalone::validate_v2_standalone_object;
 use super::{
     V2_CAPABILITY_COMPACTED_INDEX_RUNS, V2_CAPABILITY_FRAMED_INDEX, V2_SUPPORTED_CAPABILITY_FLAGS,
     V2CommitKind, V2IndexRoot, V2IndexRootRunRef, V2SectionType, open_v2_index_root,
@@ -16,8 +17,6 @@ use super::{
 use crate::checkpoint::open_index_delta_object;
 use crate::state::{RepositoryState, apply_index_delta_object};
 use async_trait::async_trait;
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rs3_index::{
     INDEX_DELTA_OBJECT_DOMAIN, IndexDelta, IndexDeltaObject, PayloadReference,
     SealedIndexDeltaObject, V2CommitStreamCarrierReference, V2StandaloneStreamCarrierReference,
@@ -33,9 +32,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_RETENTION_RENEWAL_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MIN_ORPHAN_GC_AGE: Duration = Duration::from_secs(60 * 60);
-const V2_STANDALONE_OBJECT_PREFIX: &str = "objects/v02/";
-const V2_STANDALONE_OBJECT_ID_BYTES: usize = 32;
-const V2_STANDALONE_OBJECT_ID_B64_LEN: usize = 43;
 
 /// Broad path-private class of one v2 orphan candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -357,6 +353,9 @@ struct V2StandalonePayloadRoot {
     version_id: Option<BackendVersionId>,
     stored_len: u64,
     object_digest: [u8; 32],
+    keyring_envelope_object_id: BackendObjectId,
+    keyring_envelope_digest: [u8; 32],
+    payload_header: rs3_index::PayloadHeaderReference,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,7 +375,8 @@ struct V2ReachabilityState {
     protected_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
     reachable_commit_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
     reachable_object_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
-    standalone_facts: BTreeMap<(BackendObjectId, Option<BackendVersionId>), (u64, [u8; 32])>,
+    standalone_facts:
+        BTreeMap<(BackendObjectId, Option<BackendVersionId>), V2StandalonePayloadRoot>,
     chain_get_count: u64,
     chain_read_bytes: u64,
     chain_retained_bytes: u64,
@@ -425,14 +425,14 @@ impl V2ReachabilityState {
         protected: bool,
     ) -> V2Result<()> {
         let version_key = (root.object_id.clone(), root.version_id.clone());
-        let facts = (root.stored_len, root.object_digest);
         match self.standalone_facts.get(&version_key) {
-            Some(previous) if previous != &facts => {
+            Some(previous) if previous != &root => {
                 return Err(V2FormatError::InvalidHeaderField);
             }
             Some(_) => {}
             None => {
-                self.standalone_facts.insert(version_key.clone(), facts);
+                self.standalone_facts
+                    .insert(version_key.clone(), root.clone());
             }
         }
         self.reachable.insert(root.object_id.clone());
@@ -592,6 +592,7 @@ where
                     stored_run,
                     level: expected.level,
                     compaction_generation: expected.compaction_generation,
+                    provider_profile: self.provider_profile(),
                 },
             )
             .map_err(|_| V2FormatError::InvalidIndexRun)?;
@@ -1174,6 +1175,7 @@ where
                             stored_run: section_bytes,
                             level: 0,
                             compaction_generation: 0,
+                            provider_profile: self.provider_profile(),
                         },
                     )
                     .map_err(|_| V2FormatError::InvalidIndexRun)?;
@@ -1533,34 +1535,14 @@ fn standalone_payload_root(
         version_id: carrier.version_id.clone(),
         stored_len: carrier.stored_len,
         object_digest: carrier.object_digest,
+        keyring_envelope_object_id: carrier.keyring_envelope_object_id.clone(),
+        keyring_envelope_digest: carrier.keyring_envelope_digest,
+        payload_header: carrier.payload_header.clone(),
     }
 }
 
 fn validate_standalone_payload_root(root: &V2StandalonePayloadRoot) -> V2Result<()> {
-    let Some(encoded_id) = root
-        .object_id
-        .as_str()
-        .strip_prefix(V2_STANDALONE_OBJECT_PREFIX)
-    else {
-        return Err(V2FormatError::InvalidHeaderField);
-    };
-    if encoded_id.len() != V2_STANDALONE_OBJECT_ID_B64_LEN
-        || encoded_id.contains(['=', '/', '+'])
-        || root.stored_len == 0
-    {
-        return Err(V2FormatError::InvalidHeaderField);
-    }
-    let decoded = URL_SAFE_NO_PAD
-        .decode(encoded_id)
-        .map_err(|_| V2FormatError::InvalidHeaderField)?;
-    let random_id: [u8; V2_STANDALONE_OBJECT_ID_BYTES] = decoded
-        .as_slice()
-        .try_into()
-        .map_err(|_| V2FormatError::InvalidHeaderField)?;
-    if URL_SAFE_NO_PAD.encode(random_id) != encoded_id {
-        return Err(V2FormatError::InvalidHeaderField);
-    }
-    Ok(())
+    validate_v2_standalone_object(&root.object_id, root.stored_len)
 }
 
 fn current_time_ms() -> i64 {
@@ -1722,7 +1704,8 @@ mod tests {
     use super::{V2ReachabilityState, V2StandalonePayloadRoot, validate_standalone_payload_root};
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use rs3_types::{BackendObjectId, BackendVersionId};
+    use rs3_index::PayloadHeaderReference;
+    use rs3_types::{BackendObjectId, BackendVersionId, KeyId};
 
     fn standalone_root(byte: u8) -> V2StandalonePayloadRoot {
         V2StandalonePayloadRoot {
@@ -1736,6 +1719,16 @@ mod tests {
             ),
             stored_len: 4_096,
             object_digest: [byte.wrapping_add(1); 32],
+            keyring_envelope_object_id: BackendObjectId::new(format!("meta/v02/keyring-{byte}"))
+                .expect("keyring object id"),
+            keyring_envelope_digest: [byte.wrapping_add(2); 32],
+            payload_header: PayloadHeaderReference {
+                chunk_size: 1_024,
+                plaintext_len: 3_000,
+                key_id: KeyId::new(format!("content-key-{byte}")).expect("content key id"),
+                nonce_prefix: [byte.wrapping_add(3); 16],
+                header_len: 48,
+            },
         }
     }
 

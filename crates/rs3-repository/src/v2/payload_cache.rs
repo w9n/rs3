@@ -11,29 +11,35 @@ const V2_STREAM_PAYLOAD_CACHE_DOMAIN: &[u8] = b"rs3:v02-stream-segment-cache:v1\
 /// reference is only a cache namespace and must never replace it during open.
 pub(crate) struct V2StreamPayloadCacheIdentity<'a> {
     pub(crate) repository_keyring_context: &'a [u8],
-    pub(crate) commit_key: &'a BackendObjectId,
-    pub(crate) commit_version_id: Option<&'a BackendVersionId>,
-    pub(crate) commit_body_digest: [u8; 32],
-    pub(crate) commit_stored_len: u64,
-    pub(crate) payload_section_ordinal: u32,
-    pub(crate) payload_section_digest: [u8; 32],
-    pub(crate) sections_start: u64,
-    pub(crate) payload_section_offset: u64,
-    pub(crate) payload_section_len: u64,
+    pub(crate) carrier: V2StreamPayloadCarrierCacheIdentity<'a>,
     pub(crate) payload_id: &'a BackendObjectId,
     pub(crate) payload_header: &'a PayloadHeaderReference,
     pub(crate) content_len: u64,
 }
 
+pub(crate) enum V2StreamPayloadCarrierCacheIdentity<'a> {
+    Commit {
+        commit_key: &'a BackendObjectId,
+        commit_version_id: Option<&'a BackendVersionId>,
+        commit_body_digest: [u8; 32],
+        commit_stored_len: u64,
+        payload_section_ordinal: u32,
+        payload_section_digest: [u8; 32],
+        sections_start: u64,
+        payload_section_offset: u64,
+        payload_section_len: u64,
+    },
+    Standalone {
+        object_id: &'a BackendObjectId,
+        version_id: Option<&'a BackendVersionId>,
+        object_digest: [u8; 32],
+        stored_len: u64,
+    },
+}
+
 impl V2StreamPayloadCacheIdentity<'_> {
     /// Validates the exact carrier range and derives its plaintext-cache identity.
     pub(crate) fn cache_ref(&self) -> V2Result<BackendObjectRef> {
-        validated_v2_stream_payload_start(
-            self.sections_start,
-            self.payload_section_offset,
-            self.payload_section_len,
-            self.commit_stored_len,
-        )?;
         if self.payload_header.plaintext_len != self.content_len {
             return Err(V2FormatError::InvalidHeaderField);
         }
@@ -41,21 +47,50 @@ impl V2StreamPayloadCacheIdentity<'_> {
         let mut digest = Sha256::new();
         digest.update(V2_STREAM_PAYLOAD_CACHE_DOMAIN);
         update_digest_field(&mut digest, self.repository_keyring_context)?;
-        update_digest_field(&mut digest, self.commit_key.as_str().as_bytes())?;
-        match self.commit_version_id {
-            None => digest.update([0]),
-            Some(version_id) => {
-                digest.update([1]);
-                update_digest_field(&mut digest, version_id.as_str().as_bytes())?;
+        let cache_version_id = match &self.carrier {
+            V2StreamPayloadCarrierCacheIdentity::Commit {
+                commit_key,
+                commit_version_id,
+                commit_body_digest,
+                commit_stored_len,
+                payload_section_ordinal,
+                payload_section_digest,
+                sections_start,
+                payload_section_offset,
+                payload_section_len,
+            } => {
+                validated_v2_stream_payload_start(
+                    *sections_start,
+                    *payload_section_offset,
+                    *payload_section_len,
+                    *commit_stored_len,
+                )?;
+                digest.update([0]);
+                update_digest_field(&mut digest, commit_key.as_str().as_bytes())?;
+                update_version_id(&mut digest, *commit_version_id)?;
+                digest.update(commit_body_digest);
+                digest.update(commit_stored_len.to_be_bytes());
+                digest.update(payload_section_ordinal.to_be_bytes());
+                digest.update(payload_section_digest);
+                digest.update(sections_start.to_be_bytes());
+                digest.update(payload_section_offset.to_be_bytes());
+                digest.update(payload_section_len.to_be_bytes());
+                *commit_version_id
             }
-        }
-        digest.update(self.commit_body_digest);
-        digest.update(self.commit_stored_len.to_be_bytes());
-        digest.update(self.payload_section_ordinal.to_be_bytes());
-        digest.update(self.payload_section_digest);
-        digest.update(self.sections_start.to_be_bytes());
-        digest.update(self.payload_section_offset.to_be_bytes());
-        digest.update(self.payload_section_len.to_be_bytes());
+            V2StreamPayloadCarrierCacheIdentity::Standalone {
+                object_id,
+                version_id,
+                object_digest,
+                stored_len,
+            } => {
+                digest.update([1]);
+                update_digest_field(&mut digest, object_id.as_str().as_bytes())?;
+                update_version_id(&mut digest, *version_id)?;
+                digest.update(object_digest);
+                digest.update(stored_len.to_be_bytes());
+                *version_id
+            }
+        };
         update_digest_field(&mut digest, self.payload_id.as_str().as_bytes())?;
         digest.update(self.payload_header.chunk_size.to_be_bytes());
         digest.update(self.payload_header.plaintext_len.to_be_bytes());
@@ -71,9 +106,20 @@ impl V2StreamPayloadCacheIdentity<'_> {
         .map_err(|_| V2FormatError::InvalidHeaderField)?;
         Ok(BackendObjectRef {
             object_id,
-            version_id: self.commit_version_id.cloned(),
+            version_id: cache_version_id.cloned(),
         })
     }
+}
+
+fn update_version_id(digest: &mut Sha256, version_id: Option<&BackendVersionId>) -> V2Result<()> {
+    match version_id {
+        None => digest.update([0]),
+        Some(version_id) => {
+            digest.update([1]);
+            update_digest_field(digest, version_id.as_str().as_bytes())?;
+        }
+    }
+    Ok(())
 }
 
 /// Returns the absolute payload start after proving the complete section is in bounds.
@@ -104,7 +150,10 @@ fn update_digest_field(digest: &mut Sha256, value: &[u8]) -> V2Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{V2StreamPayloadCacheIdentity, validated_v2_stream_payload_start};
+    use super::{
+        V2StreamPayloadCacheIdentity, V2StreamPayloadCarrierCacheIdentity,
+        validated_v2_stream_payload_start,
+    };
     use crate::v2::V2FormatError;
     use rs3_index::PayloadHeaderReference;
     use rs3_types::{BackendObjectId, BackendVersionId, KeyId};
@@ -129,20 +178,47 @@ mod tests {
         fn identity(&self) -> V2StreamPayloadCacheIdentity<'_> {
             V2StreamPayloadCacheIdentity {
                 repository_keyring_context: &self.context,
-                commit_key: &self.commit_key,
-                commit_version_id: self.version_id.as_ref(),
-                commit_body_digest: self.body_digest,
-                commit_stored_len: self.stored_len,
-                payload_section_ordinal: self.section_ordinal,
-                payload_section_digest: self.section_digest,
-                sections_start: self.sections_start,
-                payload_section_offset: self.section_offset,
-                payload_section_len: self.section_len,
+                carrier: V2StreamPayloadCarrierCacheIdentity::Commit {
+                    commit_key: &self.commit_key,
+                    commit_version_id: self.version_id.as_ref(),
+                    commit_body_digest: self.body_digest,
+                    commit_stored_len: self.stored_len,
+                    payload_section_ordinal: self.section_ordinal,
+                    payload_section_digest: self.section_digest,
+                    sections_start: self.sections_start,
+                    payload_section_offset: self.section_offset,
+                    payload_section_len: self.section_len,
+                },
                 payload_id: &self.payload_id,
                 payload_header: &self.header,
                 content_len: self.content_len,
             }
         }
+    }
+
+    #[test]
+    fn standalone_and_commit_carriers_cannot_alias_cache_identity() {
+        let fixture = fixture();
+        let commit = fixture
+            .identity()
+            .cache_ref()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let standalone = V2StreamPayloadCacheIdentity {
+            repository_keyring_context: &fixture.context,
+            carrier: V2StreamPayloadCarrierCacheIdentity::Standalone {
+                object_id: &fixture.commit_key,
+                version_id: fixture.version_id.as_ref(),
+                object_digest: fixture.body_digest,
+                stored_len: fixture.stored_len,
+            },
+            payload_id: &fixture.payload_id,
+            payload_header: &fixture.header,
+            content_len: fixture.content_len,
+        }
+        .cache_ref()
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_ne!(commit, standalone);
     }
 
     fn object_id(value: &str) -> BackendObjectId {

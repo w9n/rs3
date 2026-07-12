@@ -406,6 +406,7 @@ where
                     stored_run,
                     level: expected.level,
                     compaction_generation: expected.compaction_generation,
+                    provider_profile: self.commit_store.provider_profile(),
                 },
             )?;
             if actual != expected {
