@@ -367,7 +367,7 @@ impl RuntimeRepository {
         multipart_part_size: usize,
     ) -> Result<RuntimeCommittedPut, RepositoryError>
     where
-        St: Stream<Item = Result<Bytes, RepositoryError>> + Unpin + Send,
+        St: Stream<Item = Result<Bytes, RepositoryError>> + Unpin + Send + 'static,
     {
         self.coordinator
             .put_committed_streaming_known_len(
