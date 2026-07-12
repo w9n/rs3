@@ -12,13 +12,13 @@ use std::fmt;
 pub const INDEX_RUN_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-run-frame-plaintext:v2\n";
 
 /// Version of the canonical index-run wire encoding.
-pub const INDEX_RUN_WIRE_VERSION: u16 = 5;
+pub const INDEX_RUN_WIRE_VERSION: u16 = 6;
 
 /// Maximum stored size of one v02 payload pack.
 pub const INDEX_PACK_MAX_STORED_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Maximum number of records in one v02 payload pack.
-pub const INDEX_PACK_MAX_RECORDS: u32 = 1_024;
+pub const INDEX_PACK_MAX_RECORDS: u32 = 4_096;
 
 const INDEX_PACK_SEGMENT_BYTES: u64 = 64 * 1024;
 const INDEX_PACK_SEGMENT_TAG_BYTES: u64 = 16;
@@ -3777,7 +3777,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_v4_frames() {
+    fn decoder_rejects_pre_v6_frames() {
         let limits = IndexRunLimits::default();
         let mut encoded = encode_index_run(&standalone_stream_fixture(), &limits)
             .expect("encode standalone stream run");
@@ -3786,11 +3786,11 @@ mod tests {
             .position(|window| window == INDEX_RUN_PLAINTEXT_DOMAIN)
             .expect("frame domain");
         let version_offset = domain_offset + INDEX_RUN_PLAINTEXT_DOMAIN.len();
-        encoded[version_offset..version_offset + 2].copy_from_slice(&4_u16.to_be_bytes());
+        encoded[version_offset..version_offset + 2].copy_from_slice(&5_u16.to_be_bytes());
 
         assert_eq!(
             decode_index_run(&encoded, &limits),
-            Err(IndexRunError::UnsupportedVersion(4))
+            Err(IndexRunError::UnsupportedVersion(5))
         );
     }
 
@@ -4118,7 +4118,7 @@ mod tests {
         let encoded = encode_index_run(&fixture(), &IndexRunLimits::default()).expect("encode run");
         assert_eq!(
             hex(&encoded),
-            "03fb017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0005000000000000000000000000090202020001b601000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c23232323232323232323232323232323232323232323232323232323232323230000000300000000000002000000000000000800111111111111111111111111111111111111111111111111111111111111111109636f6e74656e742d31080d030b6e616d6573706163652d3192017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0005010000000000000000000000090202023900003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901020000001e02240101444444444444444444444444444444444444444444444444444444444444444400126a7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0005020000000000000000000000090202021201010e74656e616e742f64656c65746564122300001574656e616e742f736e617073686f742f6368756e6b11d209ffffffffffffffc9"
+            "03fb017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006000000000000000000000000090202020001b601000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c23232323232323232323232323232323232323232323232323232323232323230000000300000000000002000000000000000800111111111111111111111111111111111111111111111111111111111111111109636f6e74656e742d31080d030b6e616d6573706163652d3192017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006010000000000000000000000090202023900003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901020000001e02240101444444444444444444444444444444444444444444444444444444444444444400126a7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006020000000000000000000000090202021201010e74656e616e742f64656c65746564122300001574656e616e742f736e617073686f742f6368756e6b11d209ffffffffffffffc9"
         );
     }
 
@@ -4451,6 +4451,52 @@ mod tests {
         assert_eq!(
             encode_index_run_frames(&run, &limits),
             Err(IndexRunError::InvalidPackRecordCount)
+        );
+    }
+
+    #[test]
+    fn pack_record_capacity_accepts_4096_and_rejects_4097() {
+        let limits = IndexRunLimits::default();
+        let mut run = fixture();
+        run.sequence = Sequence::new(4_096);
+        run.containers[0].pack_record_count = 4_096;
+        run.containers[0].pack_section_offset = 0;
+        run.containers[0].pack_section_len = 4_096 * 17;
+        run.containers[0].stored_len = run.containers[0].pack_section_len;
+        let IndexMutation::Upsert(template) = run.mutations.remove(0) else {
+            panic!("fixture starts with upsert");
+        };
+        run.mutations.clear();
+        for ordinal in 0_u32..4_096 {
+            let mut upsert = template.clone();
+            let mut blind_key = [0_u8; 32];
+            blind_key[..4].copy_from_slice(&ordinal.to_be_bytes());
+            upsert.mutation_ordinal = ordinal;
+            upsert.blind_key = IndexBlindKey::from_bytes(blind_key);
+            upsert.path =
+                LogicalPath::new(format!("tiny/{ordinal:04}")).expect("bounded logical path");
+            upsert.generation = Sequence::new(u64::from(ordinal) + 1);
+            upsert.payload = IndexPayloadPointer::ExternalPack {
+                container_ordinal: 0,
+                record: IndexPackRecordPointer {
+                    record_ordinal: ordinal,
+                    physical_offset: ordinal * 17,
+                },
+            };
+            upsert.content_len = 1;
+            upsert.modified_at_ms = i64::from(ordinal);
+            run.mutations.push(IndexMutation::Upsert(upsert));
+        }
+        let encoded = encode_index_run(&run, &limits).expect("4096-record pack fact");
+        assert_eq!(
+            decode_index_run(&encoded, &limits).expect("decode 4096-record pack fact"),
+            run
+        );
+
+        run.containers[0].pack_record_count = 4_097;
+        assert_eq!(
+            encode_index_run_frames(&run, &limits),
+            Err(IndexRunError::InvalidContainerRange)
         );
     }
 

@@ -51,8 +51,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "v5_index_run"
-path = "fuzz_targets/v5_index_run.rs"
+name = "v6_index_run"
+path = "fuzz_targets/v6_index_run.rs"
 test = false
 doc = false
 bench = false

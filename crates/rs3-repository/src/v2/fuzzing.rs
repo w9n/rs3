@@ -216,8 +216,8 @@ pub fn decode_index_delta_object(input: &[u8]) {
     let _ = open_index_delta_object(&signing_keyring(), &object_id("index/fuzz"), &sealed_delta);
 }
 
-/// Exercises the current v5 plaintext index-run parser with raw and near-valid inputs.
-pub fn decode_v5_index_run(input: &[u8]) {
+/// Exercises the current v6 plaintext index-run parser with raw and near-valid inputs.
+pub fn decode_v6_index_run(input: &[u8]) {
     if input.len() > MAX_FUZZ_INPUT_LEN {
         return;
     }
@@ -227,9 +227,9 @@ pub fn decode_v5_index_run(input: &[u8]) {
 
     let run = standalone_index_run_fixture();
     let encoded = encode_index_run(&run, &limits)
-        .unwrap_or_else(|error| panic!("v5 index-run fixture failed to encode: {error}"));
+        .unwrap_or_else(|error| panic!("v6 index-run fixture failed to encode: {error}"));
     let decoded = decode_index_run(&encoded, &limits)
-        .unwrap_or_else(|error| panic!("encoded v5 index run failed to decode: {error}"));
+        .unwrap_or_else(|error| panic!("encoded v6 index run failed to decode: {error}"));
     assert_eq!(decoded, run);
     exercise_near_valid_bytes(input, &encoded, |candidate| {
         let _ = decode_index_run(candidate, &limits);

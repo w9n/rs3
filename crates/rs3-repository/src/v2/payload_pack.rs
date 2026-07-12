@@ -14,7 +14,7 @@ use std::fmt;
 use std::ops::Range;
 
 /// Maximum logical records in one v02 payload pack.
-pub const V2_PAYLOAD_PACK_MAX_RECORDS: usize = 1_024;
+pub const V2_PAYLOAD_PACK_MAX_RECORDS: usize = rs3_index::run::INDEX_PACK_MAX_RECORDS as usize;
 /// Maximum complete pack bytes accepted by the bounded in-memory codec.
 pub const V2_PAYLOAD_PACK_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// Canonical independently authenticated plaintext segment size.
@@ -1501,6 +1501,7 @@ mod tests {
 
     #[test]
     fn bulk_pack_accepts_and_opens_the_bounded_record_ceiling() {
+        assert_eq!(V2_PAYLOAD_PACK_MAX_RECORDS, 4_096);
         let keyring = keyring();
         let containing_object = object_id("commits/opaque-commit");
         let records = (0..V2_PAYLOAD_PACK_MAX_RECORDS)
@@ -1625,6 +1626,7 @@ mod tests {
             };
             V2_PAYLOAD_PACK_MAX_RECORDS + 1
         ];
+        assert_eq!(too_many.len(), 4_097);
         assert!(
             seal_v2_payload_pack(
                 &keyring(),

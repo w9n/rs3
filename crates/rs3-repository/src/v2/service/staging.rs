@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// invariant of the repository itself, so independently configured callers
 /// cannot grow speculative trusted state without bound. The repository admits
 /// only one commit coordinator per service instance.
-pub(super) const V2_MAX_PENDING_OPERATIONS: usize = 1_024;
+pub(super) const V2_MAX_PENDING_OPERATIONS: usize = rs3_index::run::INDEX_PACK_MAX_RECORDS as usize;
 
 /// One rollback position inside the bounded speculative vectors.
 ///
@@ -429,6 +429,7 @@ mod tests {
 
     #[test]
     fn append_rejects_the_hard_limit_atomically() {
+        assert_eq!(V2_MAX_PENDING_OPERATIONS, 4_096);
         let mut pending = PendingV2State::new(Sequence::ZERO);
         let deltas = (0..V2_MAX_PENDING_OPERATIONS)
             .map(|index| {

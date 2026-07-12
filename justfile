@@ -44,7 +44,7 @@ fuzz-smoke:
       index_delta \
       keyring_envelope \
       restore_bundle \
-      v5_index_run \
+      v6_index_run \
       v2_index_root \
       v2_payload_pack \
       segmented_payload
