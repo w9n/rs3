@@ -38,7 +38,17 @@ fuzz-smoke:
     trap 'rm -rf "${tmpdir}"' EXIT
     RUSTC_BOOTSTRAP=1 cargo fuzz build --sanitizer none
     pids=()
-    for target in v2_commit v2_cbor index_delta keyring_envelope restore_bundle; do
+    for target in \
+      v2_commit \
+      v2_cbor \
+      index_delta \
+      keyring_envelope \
+      restore_bundle \
+      v5_index_run \
+      v2_index_root \
+      v2_payload_pack \
+      segmented_payload
+    do
       corpus="${tmpdir}/${target}"
       mkdir -p "${corpus}"
       if [[ -d "fuzz/corpus/${target}" ]]; then

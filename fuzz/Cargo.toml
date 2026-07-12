@@ -49,3 +49,31 @@ path = "fuzz_targets/restore_bundle.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "v5_index_run"
+path = "fuzz_targets/v5_index_run.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_index_root"
+path = "fuzz_targets/v2_index_root.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_payload_pack"
+path = "fuzz_targets/v2_payload_pack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segmented_payload"
+path = "fuzz_targets/segmented_payload.rs"
+test = false
+doc = false
+bench = false
