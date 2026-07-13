@@ -65,12 +65,14 @@ packs, encrypted index runs, and signed index-root checkpoints. Packed reads
 resolve authenticated record descriptors from the encrypted index and fetch
 the exact payload ciphertext range without first reading pack metadata.
 Existing gateway and provider results remain regression evidence. Guarded
-compaction and automatic watermarks now pass the in-memory 1M resource gate, but
-a repository release remains blocked on retained-provider restart/fault gates,
-an operator-safe maintenance controller, external review, and the pinned
-fresh-process 1M filesystem lane. New writes already isolate effective
-protection cohorts, and the exact full-GC engine renews restore dependencies
-before guarded orphan deletion. No `v01` migration or dual reader is planned.
+compaction, automatic watermarks, clean local fresh-process scale, the exact
+full-GC engine, and the fenced maintenance supervisor are implemented and pass
+local gates. A repository release remains blocked on current retained-provider
+restart/fault and production-cardinality maintenance qualification, exact
+candidate pinned-runner timing, owner release infrastructure, and external
+review. New writes isolate effective protection cohorts and maintenance renews
+restore dependencies before guarded orphan deletion. No `v01` migration or
+dual reader is planned.
 
 Do not treat the current repository format, cryptographic formats, or runtime
 defaults as production-stable yet.

@@ -52,7 +52,9 @@ just preview-gate-scale-candidate /path/to/retained-evidence
 
 The scale, path-length, filesystem, and standalone recipes embed the selected
 source revision in their reports and append `-dirty` when tracked changes are
-present. Dirty evidence is diagnostic only.
+present. Dirty evidence is diagnostic only. The filesystem reports live under
+the supplied root; capture the JSONL stdout from the path-length and standalone
+recipes with the release record.
 
 Run every three-sample measured Kopia profile separately so each command stays
 bounded and real-client performance is not inferred from adversarial raw-S3
@@ -69,9 +71,17 @@ Each summary binds the selected source revision and carries three alternating
 direct/gateway run pairs for its profile.
 
 Also preserve current provider-conformance, Kubernetes backup/restore,
-disaster-recovery, and release-profile performance evidence. A disposable
-local S3 implementation is useful regression evidence, but it is not proof of
-a production provider's retention or version-addressed-read behavior.
+disaster-recovery, and release-profile performance evidence. Schema-v4
+provider evidence must match the candidate source revision and reviewed
+principal fingerprint. Velero summaries and their nested gateway images must
+carry the same revision. A disposable local S3 implementation is useful
+regression evidence, but it is not proof of a production provider's retention
+or version-addressed-read behavior.
+
+Source binding is necessary but not sufficient for portable timing. Record the
+runner identity and CPU allocation, memory, kernel and Nix/toolchain closure,
+filesystem device and mount options, cache-control procedure, and exact
+provider image digests.
 
 ## Build And Publish
 

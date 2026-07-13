@@ -258,7 +258,7 @@ rbac:
   existing: false
 
 # Kubernetes resource requests and limits. The memory limit leaves headroom
-# above the measured roughly 790 MiB RSS in tests/PERFORMANCE_BASELINE.md; keep
+# above the measured candidate matrix and standalone-gate RSS; keep
 # CPU as a request, not a limit, so crypto and compression can burst.
 resources:
   requests:

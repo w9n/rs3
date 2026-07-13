@@ -10,16 +10,16 @@ repository-format promise.
 
 !!! danger "Repository release is currently blocked"
     `commits/v01` has been removed and is unsupported; it had no production
-    repositories. The runtime now reads and writes a transitional
+    repositories. The runtime now reads and writes the preview-scoped
     `commits/v02` envelope with framed index runs, signed catalogs,
     payload-skipping replay, guarded metadata-only packed-run compaction, and
     automatic active-run watermarks. Existing compatibility and provider
     results are useful gateway regression evidence. New-write protection
-    cohorts and exact guarded full GC are implemented locally, but a production
-    maintenance controller, pinned-runner filesystem qualification,
-    retained-provider restart/fault reruns, and external
-    review still block the complete `v02` format and a production repository
-    release. There will be no `v01` migration or
+    cohorts, exact guarded full GC, the maintenance supervisor, and its fenced
+    operator surfaces are implemented. Pinned-runner qualification, current
+    retained-provider restart/fault and production-cardinality maintenance
+    evidence, owner release infrastructure, and external review still block a
+    production repository release. There will be no `v01` migration or
     dual-reader requirement.
 
 ## Preview Scope
@@ -245,12 +245,12 @@ At a glance:
 
 | Evidence | Result |
 | --- | --- |
-| Current v02 low-amplification scale lane | Revision `b8b78be` passed three wire-v6 release runs on 2026-07-12 using 4,096-record batches with 1,000,000 unique 512 B objects. Elapsed was 44.639-45.553 s, recovery was 5.013-5.101 s, and total reload was 5.051-5.141 s. Every run recorded 246 PUTs, 253 GETs, 248 HEADs, 1.268292436x write amplification, 245 active runs, peak RSS of 1,680,826,368-1,681,162,240 B including the in-memory backend, and one exact `GET` at 1.03125x per cold sentinel. |
-| Current local fresh-process filesystem lane | Revision `b8b78be` passed three wire-v6 ext4 1M runs using separate writer and reader processes. Writer elapsed was 47.488-48.313 s and RSS was 955,772,928-956,428,288 B; fresh-reader recovery was 5.389-5.558 s, verification was 5.426-5.594 s, and RSS was 1,009,971,200-1,010,356,224 B. Every run recovered the exact million entries and 245 runs at 1.268284240x write amplification. These repository-process values exclude an in-memory backend. This is not pinned-runner timing, an HTTP gateway measurement, or provider qualification. |
-| Current standalone S3 and gateway lane | Revision `ebcdfe9` passed the corrected equal-work `just perf-standalone-gate` against disposable RustFS on 2026-07-12 with eight 67,108,865 B objects at every concurrency. Release-gateway throughput at concurrency 1/2/4/8 was 82.77/151.73/238.85/326.09 MiB/s, or 3.94x scaling from one to eight writers. Every point stayed at 1.000270x writes, 1.000246x verification reads, and 2.000515x total verified I/O. Peak RSS was 205,455,360/355,057,664/570,654,720/722,866,176 B. The direct companion recorded exactly 8 creates, 40 parts, 8 completes, no aborts, 34.37 ms recovery, 1.633 s full reload verification, and one exact full read per object at 225.35 MiB/s. |
-| Current bounded full-restore HTTP lane | Revision `c51aa24` passed three release-gateway runs of three complete 256 MiB restores. Average read latency was 581.727-664.972 ms, plaintext throughput was 373.240-428.565 MiB/s, gateway peak RSS was 564,342,784-564,801,536 B including the in-process ciphertext backend and preceding upload, and every restore used one backend GET at 1.000244420x read amplification. This qualifies the real HTTP path and child-process accounting, not external-provider memory behavior. |
-| Most recent local v02 release gate | Revision `ebcdfe9` passed every local release-gate component individually on 2026-07-12: the exact standalone performance gate, direct Kopia gateway backup/restore, a fresh-kind Velero/Kopia dynamic-PVC backup plus forced gateway restart and restore, and the Velero/Postgres backup and database restore. The dynamic-PVC lane installed disposable RustFS, rs3, OpenEBS, and Velero, deleted the source namespace, proved the replacement gateway container had never restarted, restored the namespace, and verified the restored pod bytes. This is local disposable-backend evidence, not retained-provider or pinned-runner qualification. |
-| Current local retained-version and exact-GC gate | Revision `62f6ef0` passed `just preview-gate-v2-retained-local` against disposable Object-Lock-enabled RustFS on 2026-07-12. All four live storage tests passed, covering retention, legal hold, exact-version reads, version-delete blocking, and retained multipart. The isolated GC rehearsal created real encrypted keyring and format roots, planned 19 actual/planned store operations, renewed and verified three exact live versions covering 15,152 B, deleted one unprotected exact orphan, preserved one retained orphan, then reopened both authority roots and replayed the anchor-selected chain with a fresh repository. The gateway retention smoke also passed. This is local provider evidence, not the required external retained-provider restart/fault rerun. |
+| Clean host-local fresh-process scale | Revision `dc7f1b9` passed the complete 10k, 100k, and 1M three-sample filesystem gate plus the path-length matrix on 2026-07-13. The 1M writers completed in 59.589-60.105 s at 955,781,120-956,370,944 B RSS and 1.268284240x writes. Fresh readers recovered in 5.324-5.482 s at 1,009,922,048-1,010,692,096 B RSS, listed exactly one million objects and 245 runs, and used one exact `GET` at 1.03125x per sentinel. This is clean host-local correctness and resource evidence, not pinned-runner timing, HTTP gateway, or provider qualification. |
+| Candidate-bound Kopia matrix | Revision `e35545f` passed all five separately bounded three-pair profiles on 2026-07-13 with source-bound summaries, workload consistency, and every expanded regression budget. Backend reads were 1.01-1.04x and writes were approximately 1.00x. Total elapsed was 0.29-1.62x and average gateway HWM RSS was 150.08-633.88 MiB, within the 1.75x and 1.25 GiB gates. This is local RustFS evidence, not a live-provider claim. |
+| Historical standalone S3 and gateway baseline | Revision `dc7f1b9` passed the equal-work `just perf-standalone-gate` against disposable RustFS on 2026-07-13. Release-gateway throughput at concurrency 1/2/4/8 was 98.50/190.33/281.76/401.28 MiB/s, or 4.07x scaling. Every point stayed at 1.000270x writes, 1.000246x verification reads, and 2.000515x total verified I/O. Peak RSS was 223,387,648/397,221,888/631,521,280/1,006,772,224 B. |
+| Historical bounded full-restore HTTP baseline | Revision `c51aa24` passed three release-gateway runs of three complete 256 MiB restores. Average read latency was 581.727-664.972 ms, plaintext throughput was 373.240-428.565 MiB/s, gateway peak RSS was 564,342,784-564,801,536 B including the in-process ciphertext backend and preceding upload, and every restore used one backend GET at 1.000244420x read amplification. The final candidate must rerun this lane. |
+| Historical local Kubernetes release gate | Revision `ebcdfe9` passed the standalone gate, direct Kopia, fresh-kind Velero/Kopia dynamic-PVC gateway-restart restore, and Velero/Postgres restore on 2026-07-12. This remains behavior evidence, but its Kubernetes summaries predate source-bound nested-image reporting and cannot qualify a later candidate. |
+| Historical local retained-version and exact-GC gate | Revision `62f6ef0` passed `just preview-gate-v2-retained-local` against disposable Object-Lock-enabled RustFS on 2026-07-12. All four live storage tests and the isolated exact-GC rehearsal passed. This remains local regression evidence, not current schema-v4 external-provider, restart, or fault qualification. |
 | Live retained-backend v2 preview gate | Passed on 2026-05-18 with `just preview-gate-v2-live`. S3 gateway/tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes all passed against fresh opaque backend prefixes. |
 | Live retained-backend v2 GC rehearsal | Passed on 2026-05-21 with `just v2-gc-rehearsal-live` against a fresh Object Lock prefix. The dry run found two orphan candidates, planned one exact-version delete, treated the retained orphan as protected, applied one unprotected exact-version delete, left the protected candidate blocked, and reloaded the anchor-selected chain. |
 | Live retained-backend v2 DR anchor import/export | Passed on 2026-05-18 against fresh v2 Velero dynamic-PVC gateway-restart output. The source backup/restore lane passed, the source bundle verified 34 commits, a new kind cluster with a missing Lease rejected import when the retention context was omitted, import with governance retention recreated the Lease, and the recovered bundle verified the same anchor. |
@@ -289,11 +289,12 @@ test does not replace that credential review.
 
 ## Release Candidate Note
 
-The current preview implementation remains useful for controlled Velero/Kopia,
-provider, and gateway evaluation. Do not initialize it for production data or
-present it as the new repository format. A repository release candidate is
-blocked until the complete `commits/v02` contract is implemented and passes the
-format, recovery, checkpoint, retained-provider, GC, and scale gates.
+The current preview implementation is suitable for controlled Velero/Kopia,
+provider, and gateway evaluation. Do not initialize it for production data
+until one exact candidate passes the pinned scale, current retained-provider,
+production-cardinality maintenance, disaster-recovery, and external-review
+gates. The local implementation blockers for the scoped `commits/v02` contract
+are closed; qualification and release authority are not.
 
 Governance-bypass IAM review remains operator-owned, live provider gates must be
 rerun against the direct-descriptor path, and public security claims need
@@ -311,8 +312,8 @@ The preview does not promise:
 
 ## Release Gates
 
-The commands below exercise the transitional preview implementation and remain
-useful regression checks. They do not qualify the complete `v02` contract.
+The commands below exercise the preview implementation. They qualify only the
+candidate and environment that produced retained, revision-bound evidence.
 
 Run the cheap local regression gate first:
 
@@ -405,14 +406,11 @@ Preview evidence should show:
 
 The replacement repository generation must complete all of these together:
 
-The automatic-compaction lane now passes three 1M runs. Each run performs six
-bounded passes, selecting at most the oldest 128 level-0 runs while preserving
-newer level-0 and existing level-1 shards. A missing guard or fully validated
-nonreducing bounded plan may defer and retry at later 64-run boundaries; both
-block writes at 896. Configured-guard, corruption, storage, anchor, and other
-compaction errors poison immediately. Three local controlled-filesystem runs
-now qualify the fresh-process mechanism and independent writer/reader RSS.
-Pinned-runner timing and retained-provider restart/fault qualification remain.
+The 4,096-record low-amplification 1M lane intentionally finishes at 245 active
+runs without crossing the 256-run compaction trigger. The earlier 1,024-record
+adversarial lane crossed six compaction windows and recovered 233 runs. Both
+mechanisms pass locally, but the exact release candidate still needs a
+trigger-crossing restart/fault lane and pinned-runner scale qualification.
 
 The in-gateway maintenance supervisor, enforced writer guard, plan-digest-gated
 admin and CLI workflow, break-glass Lease fence, and explicit inventory ceilings
@@ -420,33 +418,22 @@ close the maintenance trigger and operator-surface implementation blockers.
 Production-cardinality and retained-provider qualification remain release
 evidence, not inferred guarantees.
 
-- finish qualification of the integrated canonical `INDEX_RUN` codec and small
-  signed `INDEX_ROOT` catalogs under `commits/v02`;
-- qualify the implemented effective-protection cohort partitioning for the
-  integrated ciphertext-only `PAYLOAD_PACK` codec on retained providers;
-- qualify descriptor-first bounded recovery across the guarded compacted-run
-  sibling publication path;
-- keep one accepted repository state plus a bounded pending mutation overlay;
-- qualify bounded fenced automatic compaction from the 256-run request
-  watermark through missing-guard 64-run retries and the 896-run pause, before
-  the 1,024-run ceiling;
-- qualify bounded paged maintenance inventory at production cardinality on the
-  retained-provider profiles;
-- pass fresh-process committed-write recovery at 10k, 100k, and 1M objects,
-  including exact cardinality, at most 255 recovered active runs after the
-  final checkpoint, and first, middle, and last payload verification;
-- enforce the small-object write-amplification ceilings in the performance
-  reference, enforce one-request direct cold reads and their byte ceiling, and
-  keep separate raw-S3 and real Kopia/Velero tiny-file lanes;
-- qualify payload-pack cleaning across tombstones, protected historical roots,
-  retention, legal hold, and interrupted repacks before promising prompt space
-  reclamation;
-- qualify exact compacted sibling-carrier versions, restart, checkpoint crash, stale
-  fencing, delayed visibility, retention renewal, and writer handoff on a real
-  retained provider;
-- finalize canonical encoding, capability negotiation, key-provider, and
-  compatibility policy; and
-- complete external cryptographic and security review for public guarantees.
+- select one exact clean candidate and pass its full local, nightly, source-bound
+  Kubernetes/Velero, DR, and pinned-runner scale record;
+- qualify bounded paged maintenance inventory at production cardinality and
+  exact compacted sibling versions, restart, checkpoint crash, stale fencing,
+  delayed visibility, retention renewal, GC, and writer handoff on a real
+  retained provider using schema-v4 candidate- and principal-bound evidence;
+- document and approve the preview capability, key-provider, and compatibility
+  policy without implying in-place rotation or cross-format recovery;
+- configure the owner-controlled vulnerability route, signing identity,
+  registry, artifact retention, SBOM, provenance, scanning, and digest-based
+  publication path; and
+- complete external cryptographic and security review before public guarantees.
+
+Mixed-pack cleaning is not required for restore correctness. Prompt physical
+space reclamation from partially dead packs is not promised until a separate
+retained-provider and crash-qualified cleaner exists.
 
 Client legal hold, historical-root registration, and in-place format/data-key
 rotation are outside this release contract and fail closed. They become release

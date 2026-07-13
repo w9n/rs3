@@ -40,8 +40,8 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | 10k object scale gate | `just perf-scale-10k` | Three release-binary committed-write runs. Every run publishes a final signed checkpoint, discards writer state, reloads through a new repository instance, checks exact list cardinality, reads the first, middle, and last payload, and enforces the 1.50x lifetime write gate, 30-second reload ceiling, 1.04x cold-read byte amplification, one backend request per sentinel read, and at most 255 recovered active index runs. Runs on every CI change. |
 | 100k object scale gate | `just perf-scale-100k` | Release-binary 4,096-item low-amplification bulk tier with the same final-checkpoint, recovery, cardinality, amplification, direct cold-read, and active-run-count checks. |
 | 270k bounded-compaction evidence | `just perf-scale-tier 270000` | Crosses the 256-run watermark with the 1,024-item bulk tier and applies the lifetime amplification, 180-second elapsed, 4 GiB peak-RSS, recovery, cold-read, and active-run gates. The final post-remediation sample completed in 11.655 s at 758,521,856 B peak RSS, 1.505740509x amplification, and 140 recovered runs. |
-| 1M object scale gate | `just perf-scale-1m` | Manual in-memory high-capacity tier with the same checks. Revision `b8b78be` passed three wire-v6 4,096-record runs at 44.639-45.553 s, 1,680,826,368-1,681,162,240 B process peak RSS including the in-memory backend, 1.268292436x amplification, 245 recovered runs, and exact sentinel reads. |
-| Fresh-process filesystem scale gates | `just perf-scale-fs-10k <root>`, `just perf-scale-fs-100k <root>`, `just perf-scale-fs-1m <root>` | Runs release writer and reader processes over an explicitly selected filesystem. Revision `b8b78be` passed three wire-v6 1M runs with 4,096-record batches at 955,772,928-956,428,288 B writer RSS, 1,009,971,200-1,010,356,224 B reader RSS, 5.389-5.558 s recovery, 1.268284240x writes, exact cardinality, 245 active runs, and exact sentinel reads. Repository-process values exclude an in-memory backend. Pinned-runner timing still must be repeated before release qualification. |
+| 1M object scale gate | `just perf-scale-1m` | Manual in-memory high-capacity tier with the same checks. Historical revision `b8b78be` passed three wire-v6 4,096-record runs at 44.639-45.553 s, 1,680,826,368-1,681,162,240 B process peak RSS including the in-memory backend, 1.268292436x amplification, 245 recovered runs, and exact sentinel reads. |
+| Fresh-process filesystem scale gates | `just perf-scale-fs-10k <root>`, `just perf-scale-fs-100k <root>`, `just perf-scale-fs-1m <root>` | Runs release writer and reader processes over an explicitly selected filesystem. Clean revision `dc7f1b9` passed three 1M runs at 955,781,120-956,370,944 B writer RSS, 1,009,922,048-1,010,692,096 B reader RSS, 5.324-5.482 s recovery, 1.268284240x writes, exact cardinality, 245 active runs, and exact sentinel reads. This host was not the pinned release runner. |
 | Complete candidate scale sample | `just preview-gate-scale-candidate <root>` | Runs the three-sample path-length matrix plus fresh-process 10k, 100k, and 1M filesystem tiers. Use the documented pinned runner and retain `<root>` with the release record. Reports bind the source revision and mark dirty builds. |
 | Kopia measured matrix | `cargo run -p xtask --bin xtask --features containers -- integration kopia-measured-matrix --runs 3 --profile-set larger-restores --gateway-build-profile release --enforce-regression-budgets` | Release-grade Kopia restore comparison against the straight RustFS proxy baseline with current gateway defaults. |
 | Revision-bound Kopia candidate profile | `just perf-kopia-profile-candidate <profile>` | Three alternating direct/gateway pairs for one bounded real-client profile, with the exact clean or `-dirty` source revision embedded in `summary.json`. Run all five release-process profiles. |
@@ -75,10 +75,11 @@ each selecting at most the oldest 128 level-0 runs while preserving newer
 level-0 and prior level-1 shards. A missing guard or fully validated
 nonreducing bounded plan may defer and retry at later 64-run boundaries before
 pausing at 896. Configured-guard, corruption, storage, anchor, and other
-compaction errors poison immediately. The three passing 1M runs cover six such
-passes and finish with 233 authenticated runs. The local controlled-filesystem
-1M lane also passes three times; release timing still requires the documented
-pinned runner.
+compaction errors poison immediately. The current 4,096-record
+low-amplification 1M lane finishes at 245 runs without crossing the trigger.
+The earlier 1,024-record adversarial lane crossed six compaction windows and
+recovered 233 runs. Keep both lanes; one does not prove the other. Release
+timing still requires the documented pinned runner.
 
 The filesystem lane proves a fresh application process with empty rs3 caches;
 it does not claim a cold kernel page cache. Use a pinned local-disk mount rather

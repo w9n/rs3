@@ -49,12 +49,13 @@ and promoted.
 The command prints a compact table by default; pass
 `--print-summary-json` when a caller needs the full JSON on stdout.
 
-## July 2026 Lightweight Rerun
+## Historical July 2026 Lightweight Smoke
 
 A 2026-07-10 release-profile smoke reran the lightweight in-memory,
 filesystem, and gateway paths after dependency remediation. The current tree
 showed no material regression in the 16-object lane. This was one run per lane,
-so it is a regression smoke rather than a release performance claim.
+so it is a regression smoke rather than a release performance claim. These
+artifacts did not embed a source revision and are not candidate evidence.
 
 The current in-memory lane recorded 186.544 ms for 16 sequential committed
 writes and 3.628 ms for the parallel batched form. Full reads took 0.704 ms and
@@ -182,7 +183,7 @@ backend on that local filesystem. It is not an HTTP gateway measurement, the
 pinned release-runner timing qualification, or a retained-provider
 qualification, and the fresh process does not imply a cold kernel page cache.
 
-Revision `b8b78be` then passed three equivalent fresh-process ext4 runs using
+Historical revision `b8b78be` passed three equivalent fresh-process ext4 runs using
 4,096-record batches:
 
 | Run | Writer elapsed | Checkpoint | Writer RSS | Reader recovery | Reader verification | Reader RSS | Write amp | Active runs |
@@ -193,6 +194,16 @@ Revision `b8b78be` then passed three equivalent fresh-process ext4 runs using
 
 Every run recovered exactly one million entries after writer exit, verified all
 three sentinels, and kept one exact 528 B range `GET` per 512 B cold read.
+
+Clean revision `dc7f1b9` passed the complete candidate-shaped filesystem gate
+on 2026-07-13. Its three 1M writers completed in 59.589-60.105 s at
+955,781,120-956,370,944 B RSS and 1.268284240x writes. Fresh readers recovered
+in 5.324-5.482 s at 1,009,922,048-1,010,692,096 B RSS, listed exactly one
+million objects and 245 runs, and used one exact `GET` at 1.03125x for every
+cold sentinel. The same invocation passed three 10k and 100k samples plus the
+32, 256, and 1,024 B path-length amplification matrix. This host-local result
+qualifies correctness, amplification, and resource ceilings. It is not the
+documented pinned-runner timing qualification.
 
 The current layout removes the pack directory:
 encrypted `INDEX_RUN` state authenticates the record's exact physical offset,
@@ -299,10 +310,10 @@ pinned-runner procedure actually enforces that condition.
 
 ## Current Release Matrix
 
-Run date: 2026-07-10. Gateway profile: release. Payload segment lane:
-adaptive writer default. Workload set: `larger-restores`. Each row is the
-average of three direct/gateway run pairs. The direct baseline is the straight
-RustFS measurement proxy.
+On 2026-07-13, clean revision `e35545f` passed five separately bounded
+`perf-kopia-profile-candidate` runs. Each row is the average of three
+alternating direct/gateway pairs using a release gateway and the adaptive
+segment default. The direct baseline is the straight RustFS measurement proxy.
 
 Raw artifact: retained as ignored local release evidence.
 
@@ -310,31 +321,31 @@ Raw artifact: retained as ignored local release evidence.
 
 | Profile | Shape | Elapsed Ratio | Backend Requests | Backend Reads | Backend Writes | Gateway CPU | Gateway HWM RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `medium-restore` | one 64 MiB object | 1.01x | 0.51x | 1.01x | 1.00x | 0.81 s | 146.26 MiB |
-| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.30x | 0.03x | 1.02x | 1.01x | 0.83 s | 128.83 MiB |
-| `kubernetes-objects-large` | 6,144 manifests plus a 128 MiB fragment | 0.28x | 0.02x | 1.01x | 1.00x | 2.33 s | 273.13 MiB |
-| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.26x | 0.75x | 1.04x | 1.00x | 2.22 s | 420.39 MiB |
-| `postgres-pgdata-large` | larger relation/WAL/dump-shaped Postgres data directory | 1.39x | 0.83x | 1.04x | 1.00x | 4.20 s | 685.06 MiB |
+| `medium-restore` | one 64 MiB object | 1.06x | 1.06x | 1.01x | 1.00x | 1.01 s | 169.25 MiB |
+| `kubernetes-objects` | 1,536 manifests plus a 32 MiB fragment | 0.31x | 0.06x | 1.02x | 1.00x | 1.14 s | 150.08 MiB |
+| `kubernetes-objects-large` | 6,144 manifests plus a 128 MiB fragment | 0.29x | 0.03x | 1.01x | 1.00x | 3.17 s | 336.89 MiB |
+| `postgres-pgdata` | 96 relation files, 4 WAL segments, and an 8 MiB dump | 1.52x | 0.99x | 1.04x | 1.00x | 2.74 s | 438.50 MiB |
+| `postgres-pgdata-large` | larger relation/WAL/dump-shaped Postgres data directory | 1.62x | 1.00x | 1.04x | 1.00x | 5.47 s | 633.88 MiB |
 
 Interpretation:
 
 - Larger restore write bytes stay at about the straight proxy baseline, and
   read bytes stay within about 1.01x to 1.04x in this run.
-- Backend request counts are below the straight proxy baseline for every larger
-  profile in this run. The lowest ratios are the Kubernetes-shaped profiles,
+- Backend request counts are at or below 1.06x the straight proxy baseline.
+  The lowest ratios are the Kubernetes-shaped profiles,
   where the gateway's accepted index and decrypted segment cache avoid many
   repeated direct-backend reads.
-- Built-in regression budgets passed for request ratios, byte ratios, restore
-  phase ratios, and repeated-run stability.
+- Built-in regression budgets passed for total elapsed ratio, request and byte
+  ratios, restore ratio, repeated-run stability, and average gateway HWM RSS.
+  The total elapsed ceiling is 1.75x and the RSS ceiling is 1.25 GiB.
 - The Kubernetes-shaped profile had shorter elapsed time in this local harness
   despite similar backend bytes. Treat that as a local RustFS/proxy
   observation, not a cloud provider claim.
 - Postgres-shaped restore phases had shorter elapsed time than the direct path
   in this local harness, but full elapsed time is slower because commit
   publication and snapshot-create phases dominate the local run. Keep tracking
-  commit wait, stage-lock wait, and large PUT phases. Average commit wait rose
-  from 53 ms in `medium-restore` to 383 ms in `postgres-pgdata-large`; average
-  stage-lock wait rose from effectively zero to 79 ms.
+  commit wait, stage-lock wait, and large PUT phases. This is candidate-bound
+  local regression evidence, not provider or pinned-runner timing evidence.
 
 ## Expanded Sanity Run
 
@@ -501,7 +512,7 @@ enforcement stays on the direct provider companion instead of inventing
 evidence. A retained-provider restart rerun remains release evidence to collect.
 
 The default partial commit-batch wait is now 25 ms. A 2026-05-17 local gateway
-smoke recorded the current medium-object shape: sequential 256 KiB writes used
+smoke recorded a historical medium-object shape: sequential 256 KiB writes used
 1.0 backend requests per client write, parallel batched writes used 0.125
 requests per client write, full reads used 0.016 requests per client read after
 cache fill, and 4 KiB range reads used 0.063 requests per client read. Large
@@ -521,9 +532,8 @@ objects, and read 29.0 MB from the backend versus 28.9 MB for the direct RustFS
 baseline. Backend request count was lower through the gateway in that smoke:
 57 requests versus 708 for direct RustFS. Raw local summaries remain ignored
 workspace evidence unless deliberately promoted to a release asset.
-Treat this as Velero smoke evidence. The broader release-profile ratios still
-come from the Kopia measured matrix above until that matrix is refreshed after
-the v2 range-read change.
+Treat this as Velero smoke evidence. Current release-profile ratios come from
+the revision-bound Kopia measured matrix above.
 
 The three-run 2026-05-16 Kopia matrix after payload-ref metadata, striped v2
 range-fill coordination, and 25 ms batching passed budgets. Restore-phase
@@ -532,7 +542,7 @@ profiles because local commit publication and snapshot-create phases dominated.
 
 ## Historical Segment-Size Finding
 
-The `many-small-files` profile is the current edge case because Kopia issued
+The historical fixed-512-B `many-small-files` profile was the edge case because Kopia issued
 hundreds of small ranged reads while receiving only about 56 KiB of total S3
 response body. Fixed segment size strongly affected read-byte amplification
 there:

@@ -548,11 +548,10 @@ or exhaustion of either ceiling aborts before mutation.
 
 Protected historical anchors must bind the active exact format-root reference.
 Supplying a root from another format generation fails before object-store
-reads. Operators must not rotate or rewrap the active format/keyring authority
-while such a root is required; cross-format protected-root renewal is not
-implemented. Existing held graphs also fail full maintenance. New v02 legal
-holds are disabled until hold propagation and guarded release cover every
-restore dependency.
+reads. The gateway does not expose historical-root registration, in-place
+format/data-key rotation, or cross-format protected-root renewal. Existing held
+graphs also fail full maintenance. New v02 legal holds are disabled until hold
+propagation and guarded release cover every restore dependency.
 
 Payload-pack cleaning is a separate space-reclamation operation, not part of
 the exact-root deletion proof. A fully dead pack

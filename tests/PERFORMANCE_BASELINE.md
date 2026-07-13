@@ -78,15 +78,16 @@ These fields are intended to make restore regressions explainable from one
 summary artifact.
 
 The matrix command also writes `regression_budgets`. Passing
-`--enforce-regression-budgets` turns those built-in byte/request budget checks
-into a command failure. The budgets intentionally avoid wall-clock elapsed time,
-which is too environment-sensitive for a hard gate in this local harness.
+`--enforce-regression-budgets` turns those built-in checks into a command
+failure. Larger profiles gate total elapsed ratio, request and byte ratios,
+restore ratio, repeated-run stability, and average gateway HWM RSS. Ratios are
+local regression signals, not portable provider timing claims.
 
-## July 2026 Lightweight Rerun
+## Historical July 2026 Lightweight Smoke
 
 Run date: 2026-07-10. These are single-run release-profile smoke measurements,
 not a replacement for the three-run Kopia matrix. They were rerun before and
-after the dependency remediations in this review; the current tree showed no
+after the dependency remediations in this review; that measured tree showed no
 material regression in the small in-memory lane.
 
 Command shape:
@@ -128,7 +129,7 @@ was then changed to retain bounded per-mutation undo records, incrementally
 apply accepted state, target payload-reference resolution from the pending
 delta, and avoid a namespace scan for normal PUT list projection updates.
 
-The final current tree was measured three times with the same command shape.
+That historical tree was measured three times with the same command shape.
 The table reports median elapsed and latency values:
 
 | Objects | Elapsed | Throughput | Average latency | p99 latency |
@@ -284,29 +285,27 @@ target/release/xtask perf --scenario write-committed-parallel --objects 10000 --
 target/release/xtask perf --scenario write-committed-parallel --objects 1024 --object-size 262144 --commit-batch-items 64 --commit-max-pending-items 64 --concurrency 64 --verify-reload --checkpoint-after-objects 1024 --max-write-amp 1.03 --max-cold-read-amp 1.001 --max-cold-read-requests-per-read 1.0 --format jsonl
 ```
 
-## July 2026 Larger Restore Matrix
+## Current July 2026 Larger Restore Matrix
 
-Run date: 2026-07-10. Gateway profile: release. Payload segment lane: adaptive
-writer default. Workload set: `larger-restores`. Each row is the average of
-three direct/gateway run pairs. The raw summary is retained as ignored local
-release evidence.
+Run date: 2026-07-13. Clean revision: `e35545f`. Gateway profile: release.
+Payload segment lane: adaptive writer default. Each row is the average of three
+alternating direct/gateway pairs from one bounded candidate profile.
 
 `workload_consistency` and `regression_budgets` both passed with no failures.
 
 | Profile | Direct elapsed | Gateway elapsed | Elapsed ratio | Backend requests | Backend reads | Backend writes | Restore ratio | Gateway CPU | Gateway HWM RSS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| medium-restore | 2.93 s | 2.95 s | 1.01x | 0.51x | 1.01x | 1.00x | 0.63x | 0.81 s | 146.26 MiB |
-| kubernetes-objects | 9.81 s | 2.91 s | 0.30x | 0.03x | 1.02x | 1.01x | 0.12x | 0.83 s | 128.83 MiB |
-| kubernetes-objects-large | 34.16 s | 9.68 s | 0.28x | 0.02x | 1.01x | 1.00x | 0.19x | 2.33 s | 273.13 MiB |
-| postgres-pgdata | 2.81 s | 3.53 s | 1.26x | 0.75x | 1.04x | 1.00x | 0.65x | 2.22 s | 420.39 MiB |
-| postgres-pgdata-large | 3.87 s | 5.38 s | 1.39x | 0.83x | 1.04x | 1.00x | 0.57x | 4.20 s | 685.06 MiB |
+| medium-restore | 3.08 s | 3.26 s | 1.06x | 1.06x | 1.01x | 1.00x | 0.68x | 1.01 s | 169.25 MiB |
+| kubernetes-objects | 10.19 s | 3.16 s | 0.31x | 0.06x | 1.02x | 1.00x | 0.11x | 1.14 s | 150.08 MiB |
+| kubernetes-objects-large | 35.24 s | 10.34 s | 0.29x | 0.03x | 1.01x | 1.00x | 0.19x | 3.17 s | 336.89 MiB |
+| postgres-pgdata | 2.74 s | 4.17 s | 1.52x | 0.99x | 1.04x | 1.00x | 0.77x | 2.74 s | 438.50 MiB |
+| postgres-pgdata-large | 4.14 s | 6.70 s | 1.62x | 1.00x | 1.04x | 1.00x | 0.65x | 5.47 s | 633.88 MiB |
 
-Backend request and byte budgets remain healthy in this local RustFS matrix.
-The Postgres-shaped profiles restore faster through the gateway but remain
-slower end to end because snapshot creation and commit publication dominate.
-Average commit wait rose from 53 ms in `medium-restore` to 383 ms in
-`postgres-pgdata-large`; average stage-lock wait rose from effectively zero to
-79 ms.
+Every expanded budget passed. Larger profiles now fail above 1.75x total
+elapsed or 1.25 GiB average HWM RSS in addition to the existing request, byte,
+restore, and stability gates. The Postgres-shaped profiles restore faster
+through the gateway but remain slower end to end because snapshot creation and
+commit publication dominate.
 
 ## Historical Small-Profile Results
 
@@ -332,7 +331,7 @@ The many-small-files profile writes very little data directly, so fixed
 metadata, checkpoint, and envelope costs show up more strongly.
 
 Backend read-byte amplification is close to baseline for the small, changed,
-and medium profiles. The many-small-files profile remains the current edge case,
+and medium profiles. The historical many-small-files profile was the edge case,
 but the fixed 512 B segment lane now reads 1.72x backend bytes instead of 4.54x
 because repeated tiny client ranges are served from cached ciphertext spans.
 
@@ -429,15 +428,14 @@ cargo run -p xtask --bin xtask --features containers -- integration kopia-measur
 Validation artifact: retained as ignored local release evidence.
 
 The current built-in budgets check backend request, read-byte, and write-byte
-ratios for the small and larger profiles. The fixed 512 B `many-small-files`
-lane also
-checks that read bytes stay below 2.00x, write bytes below 2.25x, requests below
-0.50x, and payload span cache event hit ratio above 0.70. Elapsed ratios remain
-reported but are not enforced.
+ratios for the small and larger profiles. Larger profiles also gate restore and
+total elapsed ratios, repeated-run stability, and average gateway HWM RSS. The
+fixed 512 B `many-small-files` lane checks that read bytes stay below 2.00x,
+write bytes below 2.25x, and requests below 0.50x.
 
 ## Segment-Size Sweep
 
-Run date: 2026-05-03. Workload: `many-small-files`, because it is the current
+Run date: 2026-05-03. Workload: `many-small-files`, because it was the historical
 restore-heavy Kopia profile with many small ranged reads. Each row is the
 average of three direct/gateway run pairs with a fixed segment size. The direct
 RustFS baseline is the same straight proxy lane for every row.

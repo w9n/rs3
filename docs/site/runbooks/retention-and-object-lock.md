@@ -145,6 +145,12 @@ verifies retained writes, retained exact-version reads, retention extension,
 legal hold, and delete blocking without bypass headers; it does not replace an
 IAM or bucket policy review.
 
+Preserve the schema-v4 report produced by the exact release candidate. The
+gateway rejects evidence from another source revision, backend target,
+qualification profile, or principal fingerprint. Rebuilds, credential
+rotations, endpoint or prefix changes, and candidate changes require a fresh
+provider run.
+
 During restore verification, `rs3` reports how many verified restore-critical
 objects expose retention or legal-hold metadata. Treat that as repository
 evidence. Run with `--require-provider-delete-protection` for protected

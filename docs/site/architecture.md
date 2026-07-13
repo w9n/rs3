@@ -220,8 +220,7 @@ client paths as backend object keys.
 In `v02`, encrypted runs carry a blinded lookup projection and a plaintext-path
 listing projection inside authenticated ciphertext. Run keys, public metadata,
 and signed headers expose neither paths nor plaintext projection bounds. The
-transitional runtime's durable prefix-token representation is not carried into
-the completed format.
+v02 runtime does not persist the legacy durable prefix-token representation.
 
 ## Rollback Resistance
 
