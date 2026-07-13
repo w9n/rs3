@@ -134,6 +134,28 @@ fn add_common_budget_checks(profile: &str, summary: &Value, checks: &mut Vec<Val
                 checks,
                 profile,
                 summary,
+                "gateway_vs_direct.elapsed_ms_ratio",
+                &["comparison", "gateway_vs_direct", "elapsed_ms_ratio", "avg"],
+                1.75,
+            );
+            push_max_budget(
+                checks,
+                profile,
+                summary,
+                "gateway_process.vm_hwm_bytes",
+                &[
+                    "aggregate",
+                    "gateway",
+                    "gateway_process",
+                    "vm_hwm_bytes",
+                    "avg",
+                ],
+                1_342_177_280.0,
+            );
+            push_max_budget(
+                checks,
+                profile,
+                summary,
                 "gateway_vs_direct.backend_request_count_ratio",
                 &[
                     "comparison",
@@ -363,6 +385,7 @@ mod tests {
             "postgres-pgdata": {
                 "comparison": {
                     "gateway_vs_direct": {
+                        "elapsed_ms_ratio": { "avg": 1.25 },
                         "backend_request_count_ratio": { "avg": 1.00 },
                         "backend_read_bytes_ratio": { "avg": 1.04 },
                         "backend_write_bytes_ratio": { "avg": 1.04 },
@@ -373,6 +396,13 @@ mod tests {
                     "gateway_internal": {
                         "backend_read_bytes_per_client_get_response_byte": { "avg": 1.04 },
                         "backend_write_bytes_per_client_put_request_byte": { "avg": 1.04 }
+                    }
+                },
+                "aggregate": {
+                    "gateway": {
+                        "gateway_process": {
+                            "vm_hwm_bytes": { "avg": 805306368.0 }
+                        }
                     }
                 }
             }
@@ -390,6 +420,7 @@ mod tests {
             "postgres-pgdata-large": {
                 "comparison": {
                     "gateway_vs_direct": {
+                        "elapsed_ms_ratio": { "avg": 1.60 },
                         "backend_request_count_ratio": { "avg": 1.16 },
                         "backend_read_bytes_ratio": { "avg": 1.04 },
                         "backend_write_bytes_ratio": { "avg": 1.04 },
@@ -400,6 +431,13 @@ mod tests {
                     "gateway_internal": {
                         "backend_read_bytes_per_client_get_response_byte": { "avg": 1.04 },
                         "backend_write_bytes_per_client_put_request_byte": { "avg": 1.04 }
+                    }
+                },
+                "aggregate": {
+                    "gateway": {
+                        "gateway_process": {
+                            "vm_hwm_bytes": { "avg": 1073741824.0 }
+                        }
                     }
                 }
             }
@@ -417,6 +455,7 @@ mod tests {
             "kubernetes-objects": {
                 "comparison": {
                     "gateway_vs_direct": {
+                        "elapsed_ms_ratio": { "avg": 1.25 },
                         "backend_request_count_ratio": {
                             "avg": 1.00,
                             "relative_stddev": null
@@ -439,6 +478,13 @@ mod tests {
                             "relative_stddev": null
                         },
                         "backend_write_bytes_per_client_put_request_byte": { "avg": 1.04 }
+                    }
+                },
+                "aggregate": {
+                    "gateway": {
+                        "gateway_process": {
+                            "vm_hwm_bytes": { "avg": 805306368.0 }
+                        }
                     }
                 }
             }
@@ -469,6 +515,7 @@ mod tests {
             "postgres-pgdata": {
                 "comparison": {
                     "gateway_vs_direct": {
+                        "elapsed_ms_ratio": { "avg": 1.25 },
                         "backend_request_count_ratio": {
                             "avg": 1.00,
                             "relative_stddev": 0.01
@@ -492,6 +539,13 @@ mod tests {
                         },
                         "backend_write_bytes_per_client_put_request_byte": { "avg": 1.04 }
                     }
+                },
+                "aggregate": {
+                    "gateway": {
+                        "gateway_process": {
+                            "vm_hwm_bytes": { "avg": 805306368.0 }
+                        }
+                    }
                 }
             }
         });
@@ -513,6 +567,41 @@ mod tests {
                         && check["status"] == serde_json::json!("fail")
                 })
         );
+    }
+
+    #[test]
+    fn larger_restore_budgets_gate_total_elapsed_and_gateway_memory() {
+        let profiles = serde_json::json!({
+            "postgres-pgdata-large": {
+                "comparison": {
+                    "gateway_vs_direct": {
+                        "elapsed_ms_ratio": { "avg": 1.76 },
+                        "backend_request_count_ratio": { "avg": 1.00 },
+                        "backend_read_bytes_ratio": { "avg": 1.04 },
+                        "backend_write_bytes_ratio": { "avg": 1.00 },
+                        "phase_elapsed_ms_ratio": {
+                            "restore": { "avg": 1.04 }
+                        }
+                    },
+                    "gateway_internal": {
+                        "backend_read_bytes_per_client_get_response_byte": { "avg": 1.04 },
+                        "backend_write_bytes_per_client_put_request_byte": { "avg": 1.00 }
+                    }
+                },
+                "aggregate": {
+                    "gateway": {
+                        "gateway_process": {
+                            "vm_hwm_bytes": { "avg": 1342177281.0 }
+                        }
+                    }
+                }
+            }
+        });
+
+        let budgets = regression_budgets_json(&profiles, None);
+
+        assert_eq!(budgets["status"], serde_json::json!("fail"));
+        assert_eq!(budgets["failed"], serde_json::json!(2));
     }
 
     #[test]

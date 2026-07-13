@@ -42,6 +42,7 @@ impl ArtifactCollector {
         self.write_json(
             "summary.json",
             json!({
+                "source_revision": option_env!("RS3_BUILD_GIT_SHA").unwrap_or("unknown"),
                 "scenario": state.scenario_label,
                 "storage_path": state.storage_path.as_str(),
                 "repository_format": "v2-preview",

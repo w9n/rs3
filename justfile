@@ -4,6 +4,16 @@ set dotenv-load := false
 default:
     just --list
 
+# Print the exact tracked source revision used to build release evidence.
+_candidate-revision:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    revision="$(git rev-parse --verify HEAD)"
+    if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then
+      revision="${revision}-dirty"
+    fi
+    printf '%s\n' "${revision}"
+
 # Format Rust and TOML sources.
 fmt:
     cargo fmt
@@ -151,6 +161,8 @@ check-v2-provider-v2-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
       echo "RS3_GOVERNANCE_BYPASS_REVIEWED must be true after operator IAM review" >&2
       exit 2
     fi
+    build_revision="$(just --quiet _candidate-revision)"
+    RS3_BUILD_GIT_SHA="${build_revision}" \
     RS3_PUBLIC_BUCKET=client-bucket \
     RS3_BACKEND_ENDPOINT="{{ENDPOINT_URL}}" \
     RS3_BACKEND_BUCKET="{{BACKEND_BUCKET}}" \
@@ -218,35 +230,35 @@ integration-k8s-gateway-v2 *ARGS:
 
 # Run the Velero Kopia smoke test.
 integration-velero-kopia-smoke *ARGS:
-    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-smoke {{ARGS}}
+    RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-smoke {{ARGS}}
 
 # Run the Velero Kopia local-PV smoke test.
 integration-velero-kopia-local-pv-smoke *ARGS:
-    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-local-pv-smoke {{ARGS}}
+    RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-local-pv-smoke {{ARGS}}
 
 # Run the Velero Kopia dynamic-PVC smoke test.
 integration-velero-kopia-dynamic-pvc-smoke *ARGS:
-    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke {{ARGS}}
+    RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-smoke {{ARGS}}
 
 # Run the Velero Kopia dynamic-PVC gateway-restart smoke test.
 integration-velero-kopia-dynamic-pvc-gateway-restart-smoke *ARGS:
-    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke {{ARGS}}
+    RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke {{ARGS}}
 
 # Run the v2 live dynamic-PVC gateway-restart smoke test.
 integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live *ARGS:
-    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke --backend-mode provided --repository-retention-mode governance --repository-retention-days 1 {{ARGS}}
+    RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke --backend-mode provided --repository-retention-mode governance --repository-retention-days 1 {{ARGS}}
 
 # Run the Velero Kopia restore-readonly dynamic-PVC smoke test.
 integration-velero-kopia-dynamic-pvc-restore-readonly-smoke *ARGS:
-    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-restore-readonly-smoke {{ARGS}}
+    RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-restore-readonly-smoke {{ARGS}}
 
 # Run the Velero Kopia Postgres smoke test.
 integration-velero-kopia-postgres-smoke *ARGS:
-    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke {{ARGS}}
+    RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke {{ARGS}}
 
 # Run the v2 live Velero Kopia Postgres smoke test.
 integration-velero-kopia-postgres-v2-live *ARGS:
-    cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke --backend-mode provided --repository-retention-mode governance --repository-retention-days 1 {{ARGS}}
+    RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke --backend-mode provided --repository-retention-mode governance --repository-retention-days 1 {{ARGS}}
 
 # Lint both the local fixture and fail-closed production value profiles.
 helm-lint:

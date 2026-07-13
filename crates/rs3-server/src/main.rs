@@ -1579,7 +1579,8 @@ fn print_v2_provider_conformance_report(
                 })
                 .collect::<Vec<_>>();
             let report_json = serde_json::json!({
-                "schema": "rs3.v2-provider-conformance.v3",
+                "schema": "rs3.v2-provider-conformance.v4",
+                "source_revision": build_source_revision(),
                 "target_fingerprint": target_fingerprint,
                 "generated_at_ms": current_time_ms().unwrap_or(0),
                 "profile": provider_profile_name(report.profile),
@@ -1589,7 +1590,8 @@ fn print_v2_provider_conformance_report(
             println!("{}", serde_json::to_string_pretty(&report_json)?);
         }
         RecoveryReportFormat::Text => {
-            println!("schema=rs3.v2-provider-conformance.v3");
+            println!("schema=rs3.v2-provider-conformance.v4");
+            println!("source_revision={}", build_source_revision());
             println!("target_fingerprint={target_fingerprint}");
             println!("generated_at_ms={}", current_time_ms().unwrap_or(0));
             println!("profile={}", provider_profile_name(report.profile));
@@ -1612,6 +1614,10 @@ fn print_v2_provider_conformance_report(
         }
     }
     Ok(())
+}
+
+fn build_source_revision() -> &'static str {
+    option_env!("RS3_BUILD_GIT_SHA").unwrap_or("unknown")
 }
 
 fn print_v2_restore_bundle(bundle: &V2RecoveryBundle, format: RecoveryReportFormat) -> Result<()> {
@@ -2512,6 +2518,7 @@ mod tests {
     #[derive(Serialize)]
     struct TestProviderEvidence {
         schema: &'static str,
+        source_revision: &'static str,
         target_fingerprint: String,
         generated_at_ms: Option<i64>,
         profile: &'static str,
@@ -2963,7 +2970,8 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let evidence = TestProviderEvidence {
-            schema: "rs3.v2-provider-conformance.v3",
+            schema: "rs3.v2-provider-conformance.v4",
+            source_revision: super::build_source_revision(),
             target_fingerprint,
             generated_at_ms: super::current_time_ms(),
             profile: "retained-version-object-lock",

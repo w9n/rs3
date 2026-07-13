@@ -14,9 +14,11 @@ RUN mkdir -p xtask/src \
 COPY crates ./crates
 
 FROM source AS build-runtime
+ARG REVISION
 RUN --mount=type=cache,sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,sharing=locked,target=/src/target \
+    RS3_BUILD_GIT_SHA="${REVISION}" \
     cargo build --locked --release -p rs3-server --features s3,k8s --bin rs3-server \
     && cp /src/target/release/rs3-server /tmp/rs3-server
 

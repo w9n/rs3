@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ADMIN_STATUS_SCHEMA: &str = "rs3.admin-status.preview.v1";
 const ADMIN_POSTURE_SCHEMA: &str = "rs3.admin-posture.preview.v1";
-const PROVIDER_CONFORMANCE_SCHEMA: &str = "rs3.v2-provider-conformance.v3";
+const PROVIDER_CONFORMANCE_SCHEMA: &str = "rs3.v2-provider-conformance.v4";
 const PROVIDER_EVIDENCE_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
 
 /// Derives the path-safe identity of the exact backend target qualified by a
@@ -895,6 +895,13 @@ fn provider_conformance_summary(
     if report.schema != PROVIDER_CONFORMANCE_SCHEMA {
         return provider_conformance_unavailable("invalid", "provider-conformance.schema");
     }
+    let expected_source_revision = build_source_revision();
+    if expected_source_revision == "unknown" {
+        return provider_conformance_unavailable("invalid", "provider-conformance.source-unbound");
+    }
+    if report.source_revision != expected_source_revision {
+        return provider_conformance_unavailable("invalid", "provider-conformance.source-mismatch");
+    }
     if report.target_fingerprint != expected_target_fingerprint {
         return provider_conformance_unavailable("invalid", "provider-conformance.target-mismatch");
     }
@@ -1001,12 +1008,17 @@ fn provider_conformance_unavailable(
 #[derive(Deserialize, Serialize)]
 struct ProviderConformanceReportJson {
     schema: String,
+    source_revision: String,
     target_fingerprint: String,
     profile: String,
     passed: bool,
     #[serde(default)]
     generated_at_ms: Option<i64>,
     checks: Vec<ProviderConformanceCheckJson>,
+}
+
+fn build_source_revision() -> &'static str {
+    option_env!("RS3_BUILD_GIT_SHA").unwrap_or("unknown")
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1723,7 +1735,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_evidence_rejects_incomplete_wrong_target_and_future_reports() {
+    fn provider_evidence_rejects_incomplete_wrong_source_target_and_future_reports() {
         let mut config = runtime_config();
 
         let mut incomplete = retained_provider_evidence(&config);
@@ -1735,6 +1747,17 @@ mod tests {
         assert_eq!(
             report.provider.conformance.reason_code,
             Some("provider-conformance.check-manifest")
+        );
+
+        let mut wrong_source = retained_provider_evidence(&config);
+        wrong_source.source_revision = "different-source-revision".to_owned();
+        config.provider_conformance.report_file = Some(provider_report_file(
+            &serde_json::to_string(&wrong_source).unwrap_or_else(|error| panic!("{error}")),
+        ));
+        let report = admin_posture_report(&config, AdminReportProfile::Production);
+        assert_eq!(
+            report.provider.conformance.reason_code,
+            Some("provider-conformance.source-mismatch")
         );
 
         let mut wrong_target = retained_provider_evidence(&config);
@@ -1814,7 +1837,8 @@ mod tests {
         })
         .collect();
         ProviderConformanceReportJson {
-            schema: "rs3.v2-provider-conformance.v3".to_owned(),
+            schema: "rs3.v2-provider-conformance.v4".to_owned(),
+            source_revision: super::build_source_revision().to_owned(),
             target_fingerprint,
             profile: "retained-version-object-lock".to_owned(),
             passed: true,
