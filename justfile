@@ -222,11 +222,11 @@ integration-kopia-gateway-v2-live *ARGS:
 
 # Run the Kubernetes gateway integration harness.
 integration-k8s-gateway *ARGS:
-    cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway {{ARGS}}
+    RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway {{ARGS}}
 
 # Run the v2 Kubernetes gateway integration harness.
 integration-k8s-gateway-v2 *ARGS:
-    cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway {{ARGS}}
+    RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway {{ARGS}}
 
 # Run the Velero Kopia smoke test.
 integration-velero-kopia-smoke *ARGS:

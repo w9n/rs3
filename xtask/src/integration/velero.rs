@@ -298,9 +298,9 @@ mod imp {
     use crate::integration::k8s_support::{
         GatewayChartValues, K8sWorkspace, KEYRING_ENVELOPE_OBJECT_ID, KEYRING_WRAPPING_KEY_HEX,
         KEYRING_WRAPPING_KEY_ID, KindCluster, REPOSITORY_ID, REPOSITORY_SALT_HEX,
-        assert_v2_lease_anchor, default_cluster_name, helm_fullname, helm_install_gateway,
-        helm_lint_gateway, helm_set_gateway_mode, now_millis, path_str, require_command,
-        run_command, run_command_capture, split_image_ref,
+        assert_v2_lease_anchor, build_source_revision, default_cluster_name, helm_fullname,
+        helm_install_gateway, helm_lint_gateway, helm_set_gateway_mode, now_millis, path_str,
+        require_command, run_command, run_command_capture, split_image_ref,
     };
     use anyhow::{Context, Result, bail};
     use artifacts::{ArtifactCollector, gateway_backend_counts};
@@ -484,9 +484,19 @@ mod imp {
             } else {
                 "runtime"
             };
+            let revision_arg = format!("REVISION={}", build_source_revision());
             run_command(
                 &args.docker_bin,
-                &["build", "--target", target, "-t", args.image.as_str(), "."],
+                &[
+                    "build",
+                    "--build-arg",
+                    revision_arg.as_str(),
+                    "--target",
+                    target,
+                    "-t",
+                    args.image.as_str(),
+                    ".",
+                ],
             )
             .context("failed to build gateway image")?;
         }

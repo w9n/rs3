@@ -1,7 +1,7 @@
 //! Artifact and backend-pressure capture for Velero integration lanes.
 
 use super::{RunState, integration_storage_proxy, kubectl_capture};
-use crate::integration::k8s_support::{helm_fullname, now_millis};
+use crate::integration::k8s_support::{build_source_revision, helm_fullname, now_millis};
 use crate::integration::velero::VeleroKopiaSmokeArgs;
 use anyhow::{Context, Result};
 use rs3_storage::BlobOperationCounts;
@@ -42,7 +42,7 @@ impl ArtifactCollector {
         self.write_json(
             "summary.json",
             json!({
-                "source_revision": option_env!("RS3_BUILD_GIT_SHA").unwrap_or("unknown"),
+                "source_revision": build_source_revision(),
                 "scenario": state.scenario_label,
                 "storage_path": state.storage_path.as_str(),
                 "repository_format": "v2-preview",

@@ -561,6 +561,10 @@ pub(crate) fn now_millis() -> u128 {
         .as_millis()
 }
 
+pub(crate) fn build_source_revision() -> &'static str {
+    option_env!("RS3_BUILD_GIT_SHA").unwrap_or("unknown")
+}
+
 pub(crate) fn path_str(path: &Path) -> Result<&str> {
     path.to_str().context("path is not valid UTF-8")
 }

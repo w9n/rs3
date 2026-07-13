@@ -68,8 +68,8 @@ mod imp {
         ACCESS_KEY_ID, DEFAULT_PUBLIC_BUCKET, GATEWAY_PORT, GatewayChartValues, K8sWorkspace,
         KEYRING_ENVELOPE_OBJECT_ID, KEYRING_WRAPPING_KEY_HEX, KEYRING_WRAPPING_KEY_ID, KindCluster,
         PortForward, REPOSITORY_ID, REPOSITORY_SALT_HEX, SECRET_ACCESS_KEY, assert_v2_lease_anchor,
-        default_cluster_name, helm_fullname, helm_install_gateway, helm_lint_gateway,
-        require_command, run_command, split_image_ref,
+        build_source_revision, default_cluster_name, helm_fullname, helm_install_gateway,
+        helm_lint_gateway, require_command, run_command, split_image_ref,
     };
     use anyhow::{Context, Result, bail};
     use aws_sdk_s3::{
@@ -87,8 +87,19 @@ mod imp {
         helm_lint_gateway(&args.helm_bin)?;
 
         if !args.skip_image_build {
-            run_command(&args.docker_bin, &["build", "-t", args.image.as_str(), "."])
-                .context("failed to build gateway image")?;
+            let revision_arg = format!("REVISION={}", build_source_revision());
+            run_command(
+                &args.docker_bin,
+                &[
+                    "build",
+                    "--build-arg",
+                    revision_arg.as_str(),
+                    "-t",
+                    args.image.as_str(),
+                    ".",
+                ],
+            )
+            .context("failed to build gateway image")?;
         }
 
         let workspace = K8sWorkspace::new("rs3-k8s-integration")?;
