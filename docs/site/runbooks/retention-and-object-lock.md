@@ -63,12 +63,12 @@ deserialization and rejects returned member counts above the requested
 `MaxKeys`; protocol-invalid providers therefore cannot turn a bounded page into
 an unbounded allocation.
 
-All protected historical roots in one maintenance run must reference the
-active exact format root. Do not omit an older-format protected root to make GC
-pass. Freeze rotation and destructive maintenance until that root is retired or
-exported; cross-format renewal is not implemented. v02 also rejects new client
-legal holds and refuses full maintenance for an existing held graph until
-dependency-wide hold propagation and guarded release are implemented.
+The gateway does not expose historical-root registration or in-place format or
+data-key rotation. Automatic maintenance protects the current anchor graph.
+Repository-level maintenance rejects foreign-format protected roots before any
+storage read, and v02 rejects client legal holds. Treat those as unsupported
+capabilities. Do not bypass the rejection by omitting a root or mutating Object
+Lock metadata outside the documented provider qualification workflow.
 
 The read-write gateway now runs guarded renewal and orphan reclamation as a
 background service when `RS3_MAINTENANCE_MODE=auto`, which is the default.

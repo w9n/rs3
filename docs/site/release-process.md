@@ -43,6 +43,27 @@ just preview-gate-release
 just preview-gate-v2-nightly
 ```
 
+On the documented pinned runner, retain a dedicated local-disk evidence root
+and run the complete three-sample fresh-process scale gate:
+
+```sh
+just preview-gate-scale-candidate /path/to/retained-evidence
+```
+
+The scale, path-length, filesystem, and standalone recipes embed the selected
+source revision in their reports and append `-dirty` when tracked changes are
+present. Dirty evidence is diagnostic only.
+
+Run the three-sample measured Kopia matrix separately so real-client
+performance is not inferred from adversarial raw-S3 objects:
+
+```sh
+cargo run -p xtask --bin xtask --features containers -- \
+  integration kopia-measured-matrix --runs 3 \
+  --profile-set larger-restores --gateway-build-profile release \
+  --enforce-regression-budgets
+```
+
 Also preserve current provider-conformance, Kubernetes backup/restore,
 disaster-recovery, and release-profile performance evidence. A disposable
 local S3 implementation is useful regression evidence, but it is not proof of

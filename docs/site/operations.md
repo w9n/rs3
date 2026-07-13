@@ -548,6 +548,13 @@ format root and keyring envelope, checks `RS3_RECOVERY_PUBLIC_KEY`, then
 verifies the anchor-selected signed commit chain to the nearest snapshot
 without mutating storage or the external anchor.
 
+The bundle is a weak-subjectivity checkpoint, not a permanent snapshot pin.
+Automatic maintenance protects the current anchor graph and does not register
+older exported roots. Refresh the preserved bundle after maintenance or major
+repository changes, and before the provider retention window covering its
+referenced versions can expire. Keep at least one previously verified bundle
+until its replacement has been exported, signed, and verified.
+
 On a new cluster with a missing anchor, import the trusted v2 anchor from that
 bundle after configuring the same repository ID, salt, wrapping-key source,
 backend, and retention settings:

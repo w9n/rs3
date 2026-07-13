@@ -120,7 +120,9 @@ in-flight carriers even with a zero minimum age.
 The v02 preview does not publish new legal holds. It rejects client hold
 requests until every catalog, chain, format, and keyring dependency can be held
 and later released through one guarded lifecycle. The storage conformance layer
-still tests provider legal-hold mechanics independently.
+still tests provider legal-hold mechanics independently. This is an explicit
+unsupported S3 capability, not an incomplete protection mode operators may
+enable.
 
 The gateway does not deduplicate payloads. Deduplication would add equality
 leakage and shared-liveness policy; Kopia already performs chunking and

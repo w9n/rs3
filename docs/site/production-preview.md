@@ -432,10 +432,6 @@ evidence, not inferred guarantees.
   the 1,024-run ceiling;
 - qualify bounded paged maintenance inventory at production cardinality on the
   retained-provider profiles;
-- implement dependency-wide legal-hold propagation plus guarded release before
-  enabling v02 client holds;
-- implement cross-format protected-root renewal before allowing format/keyring
-  rotation while historical protected roots remain;
 - pass fresh-process committed-write recovery at 10k, 100k, and 1M objects,
   including exact cardinality, at most 255 recovered active runs after the
   final checkpoint, and first, middle, and last payload verification;
@@ -451,3 +447,10 @@ evidence, not inferred guarantees.
 - finalize canonical encoding, capability negotiation, key-provider, and
   compatibility policy; and
 - complete external cryptographic and security review for public guarantees.
+
+Client legal hold, historical-root registration, and in-place format/data-key
+rotation are outside this release contract and fail closed. They become release
+blockers only for a future version that chooses to expose them. The current
+recovery contract protects the live anchor graph and requires operators to
+refresh the externally preserved restore bundle within its retained-version
+window; an exported bundle is not a permanent snapshot pin.

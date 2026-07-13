@@ -146,6 +146,7 @@ check-v2-provider-v2-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
     #!/usr/bin/env bash
     set -euo pipefail
     : "${RS3_GOVERNANCE_BYPASS_REVIEWED:?set RS3_GOVERNANCE_BYPASS_REVIEWED=true after reviewing that gateway credentials cannot bypass governance retention}"
+    : "${RS3_PROVIDER_PRINCIPAL_FINGERPRINT:?set RS3_PROVIDER_PRINCIPAL_FINGERPRINT to the lowercase SHA-256 fingerprint of the reviewed credential principal}"
     if [[ "${RS3_GOVERNANCE_BYPASS_REVIEWED}" != "true" ]]; then
       echo "RS3_GOVERNANCE_BYPASS_REVIEWED must be true after operator IAM review" >&2
       exit 2
@@ -268,6 +269,7 @@ helm-lint:
         --set repository.retention.mode=governance \
         --set repository.retention.days=30 \
         --set providerConformance.existingConfigMap=fixture-provider-conformance \
+        --set-string providerConformance.principalFingerprint=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
         --set-string recovery.publicKey=ed25519:0000000000000000000000000000000000000000000000000000000000000000
     python3 tests/helm_network_policy.py
 
@@ -298,7 +300,11 @@ perf-scale-tier OBJECTS:
       echo "RS3_SCALE_GATE_RUNS must be a positive integer" >&2
       exit 2
     fi
-    cargo build --release -p xtask --bin xtask
+    build_revision="$(git rev-parse --verify HEAD)"
+    if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then
+      build_revision="${build_revision}-dirty"
+    fi
+    RS3_BUILD_GIT_SHA="${build_revision}" cargo build --release -p xtask --bin xtask
     batch_items=64
     concurrency=64
     max_write_amp=1.50
@@ -349,7 +355,11 @@ perf-scale-path-matrix-tier OBJECTS:
       echo "RS3_SCALE_GATE_RUNS must be a positive integer" >&2
       exit 2
     fi
-    cargo build --release -p xtask --bin xtask
+    build_revision="$(git rev-parse --verify HEAD)"
+    if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then
+      build_revision="${build_revision}-dirty"
+    fi
+    RS3_BUILD_GIT_SHA="${build_revision}" cargo build --release -p xtask --bin xtask
     for specification in "32:1.32" "256:1.80" "1024:3.40"; do
       path_len="${specification%%:*}"
       max_write_amp="${specification##*:}"
@@ -444,6 +454,14 @@ perf-scale-fs-10k ROOT: (perf-scale-fs-tier "10000" ROOT)
 perf-scale-fs-100k ROOT: (perf-scale-fs-tier "100000" ROOT)
 perf-scale-fs-1m ROOT: (perf-scale-fs-tier "1000000" ROOT)
 
+# Complete fresh-process scale and amplification sample for a release candidate.
+# Run on the documented pinned runner and retain ROOT as release evidence.
+preview-gate-scale-candidate ROOT:
+    just perf-scale-path-matrix
+    just perf-scale-fs-10k "{{ROOT}}"
+    just perf-scale-fs-100k "{{ROOT}}"
+    just perf-scale-fs-1m "{{ROOT}}"
+
 # Run performance measurements against an S3 backend.
 perf-s3 *ARGS:
     cargo run -p xtask --bin xtask --features s3 -- perf --backend s3 {{ARGS}}
@@ -461,7 +479,11 @@ perf-s3-gateway *ARGS:
 perf-standalone-gate:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build --release -p xtask --bin xtask --features containers
+    build_revision="$(git rev-parse --verify HEAD)"
+    if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then
+      build_revision="${build_revision}-dirty"
+    fi
+    RS3_BUILD_GIT_SHA="${build_revision}" cargo build --release -p xtask --bin xtask --features containers
     objects=8
     object_size=67108865
     baseline_throughput=""
