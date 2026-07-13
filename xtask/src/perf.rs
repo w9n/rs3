@@ -2382,6 +2382,7 @@ impl PerfReport {
             "scenario": self.scenario,
             "backend_name": self.backend.as_str(),
             "repository_format": self.repository_format,
+            "source_revision": option_env!("RS3_BUILD_GIT_SHA").unwrap_or("unknown"),
             "objects": self.objects,
             "object_size": self.object_size,
             "logical_path_len": self.logical_path_len,
