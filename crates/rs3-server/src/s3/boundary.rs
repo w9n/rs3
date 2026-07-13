@@ -25,6 +25,7 @@ pub struct GatewayS3Boundary {
     hardening: S3Hardening,
     admin_runtime_facts: Arc<dyn AdminRuntimeFactsSource>,
     admin_readiness: Arc<dyn AdminReadinessSource>,
+    maintenance_runtime: Arc<dyn crate::MaintenanceRuntime>,
 }
 
 impl GatewayS3Boundary {
@@ -70,6 +71,7 @@ impl GatewayS3Boundary {
         let adapter = GatewayS3Service::from_config(&config).await?;
         let admin_runtime_facts = adapter.admin_runtime_facts_source();
         let admin_readiness = adapter.admin_readiness_source();
+        let maintenance_runtime = adapter.maintenance_runtime();
         let mut builder = S3ServiceBuilder::new(adapter);
 
         let s3_config = Arc::new(S3Config::default());
@@ -86,6 +88,7 @@ impl GatewayS3Boundary {
             hardening: S3Hardening::required(),
             admin_runtime_facts,
             admin_readiness,
+            maintenance_runtime,
         })
     }
 
@@ -122,6 +125,11 @@ impl GatewayS3Boundary {
     /// Returns live readiness checks for repository, anchor, and backend state.
     pub fn admin_readiness_source(&self) -> Arc<dyn AdminReadinessSource> {
         Arc::clone(&self.admin_readiness)
+    }
+
+    /// Returns the repository maintenance surface for the supervisor.
+    pub fn maintenance_runtime(&self) -> Arc<dyn crate::MaintenanceRuntime> {
+        Arc::clone(&self.maintenance_runtime)
     }
 }
 

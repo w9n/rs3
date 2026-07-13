@@ -2,8 +2,8 @@
 
 use rs3_server::{
     AnchorConfig, BackendConfig, BatchConfig, GatewayMode, GatewayServer, GatewayServerError,
-    HardeningConfig, MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig,
-    RepositoryKeysConfig, RuntimeConfig, StaticCredentials, WriterGuardConfig,
+    HardeningConfig, MaintenanceConfig, MetricsConfig, ProviderConformanceConfig, RecoveryConfig,
+    RepositoryConfig, RepositoryKeysConfig, RuntimeConfig, StaticCredentials, WriterGuardConfig,
 };
 use rs3_types::{BackendObjectId, PublicBucket, RepositoryId};
 use secrecy::SecretString;
@@ -134,6 +134,7 @@ fn runtime_config() -> RuntimeConfig {
             retention: None,
             allow_init: true,
         },
+        maintenance: MaintenanceConfig::default(),
         provider_conformance: ProviderConformanceConfig::default(),
         recovery: RecoveryConfig::default(),
         repository_keys: RepositoryKeysConfig {

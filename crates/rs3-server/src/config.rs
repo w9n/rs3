@@ -2,6 +2,7 @@
 
 use crate::identity::StaticCredentials;
 use rs3_crypto::{MIN_REPOSITORY_SALT_LEN, SecretBytes, ct_eq, validate_recovery_public_key};
+use rs3_repository::v2::{DEFAULT_RETENTION_RENEWAL_HORIZON, V2MaintenanceBudgets};
 use rs3_repository::{DEFAULT_PAYLOAD_SEGMENT_SIZE, v2::DEFAULT_V2_STREAM_READ_STALL_TIMEOUT};
 use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
@@ -44,6 +45,22 @@ pub(crate) const KEYRING_WRAPPING_KEY_ID_ENV: &str = "RS3_KEYRING_WRAPPING_KEY_I
 const REPOSITORY_ID_ENV: &str = "RS3_REPOSITORY_ID";
 const ALLOW_MEMORY_ANCHOR_ENV: &str = "RS3_ALLOW_MEMORY_ANCHOR";
 const WRITER_GUARD_ENV: &str = "RS3_WRITER_GUARD";
+const MAINTENANCE_MODE_ENV: &str = "RS3_MAINTENANCE_MODE";
+const MAINTENANCE_RENEWAL_HORIZON_SECONDS_ENV: &str = "RS3_MAINTENANCE_RENEWAL_HORIZON_SECONDS";
+const MAINTENANCE_ORPHAN_PRESSURE_BYTES_ENV: &str = "RS3_MAINTENANCE_ORPHAN_PRESSURE_BYTES";
+const MAINTENANCE_ORPHAN_PRESSURE_COUNT_ENV: &str = "RS3_MAINTENANCE_ORPHAN_PRESSURE_COUNT";
+const MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS_ENV: &str =
+    "RS3_MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS";
+const MAINTENANCE_MAX_INTERVAL_SECONDS_ENV: &str = "RS3_MAINTENANCE_MAX_INTERVAL_SECONDS";
+const MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV: &str = "RS3_MAINTENANCE_MIN_COOLDOWN_SECONDS";
+const MAINTENANCE_PACING_DELAY_MS_ENV: &str = "RS3_MAINTENANCE_PACING_DELAY_MS";
+const MAINTENANCE_MAX_INVENTORY_PAGES_ENV: &str = "RS3_MAINTENANCE_MAX_INVENTORY_PAGES";
+const MAINTENANCE_MAX_INVENTORY_ITEMS_ENV: &str = "RS3_MAINTENANCE_MAX_INVENTORY_ITEMS";
+const DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_COUNT: u64 = 512;
+const DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS: u64 = 48 * 60 * 60;
+const DEFAULT_MAINTENANCE_MAX_INTERVAL_SECONDS: u64 = 7 * 24 * 60 * 60;
+const DEFAULT_MAINTENANCE_MIN_COOLDOWN_SECONDS: u64 = 60 * 60;
 
 /// Complete runtime configuration for the gateway process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +85,8 @@ pub struct RuntimeConfig {
     pub batching: BatchConfig,
     /// Repository object layout settings.
     pub repository: RepositoryConfig,
+    /// In-gateway maintenance supervisor settings.
+    pub maintenance: MaintenanceConfig,
     /// Last provider-conformance evidence settings.
     pub provider_conformance: ProviderConformanceConfig,
     /// Disaster-recovery trust settings.
@@ -298,6 +317,93 @@ pub struct RepositoryConfig {
     pub allow_init: bool,
 }
 
+/// In-gateway maintenance supervisor posture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaintenanceMode {
+    /// Run full maintenance automatically from supervisor triggers.
+    Auto,
+    /// Keep the supervisor idle until an operator trigger arrives.
+    Manual,
+    /// Do not run the maintenance supervisor at all.
+    Off,
+}
+
+impl MaintenanceMode {
+    /// Returns the environment/configuration spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// In-gateway maintenance supervisor settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaintenanceConfig {
+    /// Supervisor posture. Forced off for restore-readonly gateways.
+    pub mode: MaintenanceMode,
+    /// Lead time before the nearest provider retain-until deadline.
+    pub renewal_horizon: Duration,
+    /// Orphan bytes at which a full-maintenance run becomes due.
+    pub orphan_pressure_bytes: u64,
+    /// Orphan candidate count at which a full-maintenance run becomes due.
+    pub orphan_pressure_count: u64,
+    /// Oldest orphan age at which a full-maintenance run becomes due.
+    pub orphan_pressure_max_age: Duration,
+    /// Maximum interval between automatic full-maintenance runs.
+    pub max_interval: Duration,
+    /// Minimum cooldown between full-maintenance runs.
+    pub min_cooldown: Duration,
+    /// Optional pacing delay between maintenance backend operations.
+    pub pacing_delay: Option<Duration>,
+    /// Maximum provider pages consumed while building maintenance inventory.
+    pub max_inventory_pages: u64,
+    /// Maximum raw provider members consumed while building maintenance inventory.
+    pub max_inventory_items: u64,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        let budget_defaults = V2MaintenanceBudgets::default();
+        Self {
+            mode: MaintenanceMode::Auto,
+            renewal_horizon: DEFAULT_RETENTION_RENEWAL_HORIZON,
+            orphan_pressure_bytes: DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_BYTES,
+            orphan_pressure_count: DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_COUNT,
+            orphan_pressure_max_age: Duration::from_secs(
+                DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS,
+            ),
+            max_interval: Duration::from_secs(DEFAULT_MAINTENANCE_MAX_INTERVAL_SECONDS),
+            min_cooldown: Duration::from_secs(DEFAULT_MAINTENANCE_MIN_COOLDOWN_SECONDS),
+            pacing_delay: None,
+            max_inventory_pages: budget_defaults.max_inventory_page_count,
+            max_inventory_items: budget_defaults.max_inventory_item_count,
+        }
+    }
+}
+
+impl MaintenanceConfig {
+    /// Returns the forced posture for restore-readonly gateways.
+    pub fn forced_off() -> Self {
+        Self {
+            mode: MaintenanceMode::Off,
+            ..Self::default()
+        }
+    }
+
+    /// Returns maintenance I/O budgets derived from these settings.
+    pub fn budgets(&self) -> V2MaintenanceBudgets {
+        V2MaintenanceBudgets {
+            max_inventory_page_count: self.max_inventory_pages,
+            max_inventory_item_count: self.max_inventory_items,
+            op_pacing_delay: self.pacing_delay,
+            ..V2MaintenanceBudgets::default()
+        }
+    }
+}
+
 /// Provider-conformance evidence settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderConformanceConfig {
@@ -474,6 +580,10 @@ impl RuntimeConfig {
         };
         let batching = collect_config_error(&mut errors, parse_batch_config(source));
         let repository = collect_config_error(&mut errors, parse_repository_config(source));
+        let maintenance = collect_config_error(
+            &mut errors,
+            parse_maintenance_config(source, mode.unwrap_or(GatewayMode::ReadWrite)),
+        );
         let provider_conformance =
             collect_config_error(&mut errors, parse_provider_conformance_config(source));
         let recovery = collect_config_error(&mut errors, parse_recovery_config(source));
@@ -497,6 +607,7 @@ impl RuntimeConfig {
             writer_guard: require_collected_config(writer_guard)?,
             batching: require_collected_config(batching)?,
             repository: require_collected_config(repository)?,
+            maintenance: require_collected_config(maintenance)?,
             provider_conformance: require_collected_config(provider_conformance)?,
             recovery: require_collected_config(recovery)?,
             repository_keys: require_collected_config(repository_keys)?,
@@ -897,6 +1008,142 @@ fn parse_repository_config(source: &impl ConfigSource) -> Result<RepositoryConfi
         )?,
         retention: require_collected_config(retention)?,
         allow_init: require_collected_config(allow_init)?,
+    })
+}
+
+fn parse_maintenance_config(
+    source: &impl ConfigSource,
+    mode: GatewayMode,
+) -> Result<MaintenanceConfig, ConfigError> {
+    let maintenance_mode_value = optional_value(source, MAINTENANCE_MODE_ENV);
+    if mode == GatewayMode::RestoreReadOnly {
+        if let Some(value) = maintenance_mode_value {
+            return Err(ConfigError::Invalid {
+                key: MAINTENANCE_MODE_ENV,
+                value,
+                reason: "restore-readonly gateways force maintenance off; unset this variable"
+                    .to_owned(),
+            });
+        }
+        return Ok(MaintenanceConfig::forced_off());
+    }
+
+    let maintenance_mode = match maintenance_mode_value.as_deref() {
+        None | Some("auto") => MaintenanceMode::Auto,
+        Some("manual") => MaintenanceMode::Manual,
+        Some("off") => MaintenanceMode::Off,
+        Some(_) => {
+            return Err(ConfigError::Invalid {
+                key: MAINTENANCE_MODE_ENV,
+                value: maintenance_mode_value.unwrap_or_default(),
+                reason: "expected auto, manual, or off".to_owned(),
+            });
+        }
+    };
+
+    let mut errors = Vec::new();
+    let defaults = MaintenanceConfig::default();
+    let renewal_horizon = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            MAINTENANCE_RENEWAL_HORIZON_SECONDS_ENV,
+            source.value(MAINTENANCE_RENEWAL_HORIZON_SECONDS_ENV),
+            defaults.renewal_horizon.as_secs(),
+        ),
+    )
+    .map(Duration::from_secs);
+    let orphan_pressure_bytes = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            MAINTENANCE_ORPHAN_PRESSURE_BYTES_ENV,
+            source.value(MAINTENANCE_ORPHAN_PRESSURE_BYTES_ENV),
+            defaults.orphan_pressure_bytes,
+        ),
+    );
+    let orphan_pressure_count = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            MAINTENANCE_ORPHAN_PRESSURE_COUNT_ENV,
+            source.value(MAINTENANCE_ORPHAN_PRESSURE_COUNT_ENV),
+            defaults.orphan_pressure_count,
+        ),
+    );
+    let orphan_pressure_max_age = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS_ENV,
+            source.value(MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS_ENV),
+            defaults.orphan_pressure_max_age.as_secs(),
+        ),
+    )
+    .map(Duration::from_secs);
+    let max_interval = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            MAINTENANCE_MAX_INTERVAL_SECONDS_ENV,
+            source.value(MAINTENANCE_MAX_INTERVAL_SECONDS_ENV),
+            defaults.max_interval.as_secs(),
+        ),
+    )
+    .map(Duration::from_secs);
+    let min_cooldown = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV,
+            source.value(MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV),
+            defaults.min_cooldown.as_secs(),
+        ),
+    )
+    .map(Duration::from_secs);
+    let pacing_delay = match optional_value(source, MAINTENANCE_PACING_DELAY_MS_ENV) {
+        Some(value) => collect_config_error(
+            &mut errors,
+            parse_positive_u64(MAINTENANCE_PACING_DELAY_MS_ENV, Some(value), 1),
+        )
+        .map(|millis| Some(Duration::from_millis(millis))),
+        None => Some(None),
+    };
+    let max_inventory_pages = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            MAINTENANCE_MAX_INVENTORY_PAGES_ENV,
+            source.value(MAINTENANCE_MAX_INVENTORY_PAGES_ENV),
+            defaults.max_inventory_pages,
+        ),
+    );
+    let max_inventory_items = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            MAINTENANCE_MAX_INVENTORY_ITEMS_ENV,
+            source.value(MAINTENANCE_MAX_INVENTORY_ITEMS_ENV),
+            defaults.max_inventory_items,
+        ),
+    );
+    if let (Some(min_cooldown), Some(max_interval)) = (min_cooldown, max_interval)
+        && min_cooldown > max_interval
+    {
+        errors.push(ConfigError::Invalid {
+            key: MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV,
+            value: min_cooldown.as_secs().to_string(),
+            reason: format!("must be less than or equal to {MAINTENANCE_MAX_INTERVAL_SECONDS_ENV}"),
+        });
+    }
+
+    if !errors.is_empty() {
+        return Err(config_error_list(errors));
+    }
+
+    Ok(MaintenanceConfig {
+        mode: maintenance_mode,
+        renewal_horizon: require_collected_config(renewal_horizon)?,
+        orphan_pressure_bytes: require_collected_config(orphan_pressure_bytes)?,
+        orphan_pressure_count: require_collected_config(orphan_pressure_count)?,
+        orphan_pressure_max_age: require_collected_config(orphan_pressure_max_age)?,
+        max_interval: require_collected_config(max_interval)?,
+        min_cooldown: require_collected_config(min_cooldown)?,
+        pacing_delay: require_collected_config(pacing_delay)?,
+        max_inventory_pages: require_collected_config(max_inventory_pages)?,
+        max_inventory_items: require_collected_config(max_inventory_items)?,
     })
 }
 
@@ -1306,7 +1553,7 @@ fn secret_string_eq(left: &SecretString, right: &SecretString) -> bool {
 mod tests {
     use super::{
         AnchorConfig, BatchConfig, ConfigError, ConfigSource, GatewayMode, HardeningConfig,
-        MetricsConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
+        MaintenanceConfig, MetricsConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
         RepositoryKeyContextConfig, RepositoryKeysConfig, RepositoryToolConfig, RuntimeConfig,
         V2ProviderCheckConfig, WriterGuardConfig,
     };
@@ -1731,6 +1978,163 @@ mod tests {
         let config = RuntimeConfig::from_source(&source);
 
         assert_eq!(config.map(|config| config.repository.allow_init), Ok(true));
+    }
+
+    #[test]
+    fn parses_default_maintenance_config() {
+        let config = RuntimeConfig::from_source(&minimal_source());
+
+        let maintenance = match config {
+            Ok(config) => config.maintenance,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(maintenance, MaintenanceConfig::default());
+        assert_eq!(maintenance.mode, super::MaintenanceMode::Auto);
+        assert_eq!(
+            maintenance.renewal_horizon,
+            Duration::from_secs(7 * 24 * 60 * 60)
+        );
+        assert_eq!(maintenance.orphan_pressure_bytes, 1024 * 1024 * 1024);
+        assert_eq!(maintenance.orphan_pressure_count, 512);
+        assert_eq!(
+            maintenance.orphan_pressure_max_age,
+            Duration::from_secs(48 * 60 * 60)
+        );
+        assert_eq!(
+            maintenance.max_interval,
+            Duration::from_secs(7 * 24 * 60 * 60)
+        );
+        assert_eq!(maintenance.min_cooldown, Duration::from_secs(60 * 60));
+        assert_eq!(maintenance.pacing_delay, None);
+        let budgets = maintenance.budgets();
+        assert_eq!(budgets.op_pacing_delay, None);
+        assert_eq!(
+            budgets.max_inventory_page_count,
+            rs3_repository::v2::V2MaintenanceBudgets::default().max_inventory_page_count
+        );
+        assert_eq!(
+            budgets.max_inventory_item_count,
+            rs3_repository::v2::V2MaintenanceBudgets::default().max_inventory_item_count
+        );
+    }
+
+    #[test]
+    fn parses_maintenance_overrides() {
+        let source = minimal_source()
+            .with(super::MAINTENANCE_MODE_ENV, "manual")
+            .with(super::MAINTENANCE_RENEWAL_HORIZON_SECONDS_ENV, "86400")
+            .with(super::MAINTENANCE_ORPHAN_PRESSURE_BYTES_ENV, "1048576")
+            .with(super::MAINTENANCE_ORPHAN_PRESSURE_COUNT_ENV, "9")
+            .with(
+                super::MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS_ENV,
+                "7200",
+            )
+            .with(super::MAINTENANCE_MAX_INTERVAL_SECONDS_ENV, "259200")
+            .with(super::MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV, "600")
+            .with(super::MAINTENANCE_PACING_DELAY_MS_ENV, "25")
+            .with(super::MAINTENANCE_MAX_INVENTORY_PAGES_ENV, "128")
+            .with(super::MAINTENANCE_MAX_INVENTORY_ITEMS_ENV, "4096");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        let maintenance = match config {
+            Ok(config) => config.maintenance,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(maintenance.mode, super::MaintenanceMode::Manual);
+        assert_eq!(maintenance.renewal_horizon, Duration::from_secs(86_400));
+        assert_eq!(maintenance.orphan_pressure_bytes, 1_048_576);
+        assert_eq!(maintenance.orphan_pressure_count, 9);
+        assert_eq!(
+            maintenance.orphan_pressure_max_age,
+            Duration::from_secs(7_200)
+        );
+        assert_eq!(maintenance.max_interval, Duration::from_secs(259_200));
+        assert_eq!(maintenance.min_cooldown, Duration::from_secs(600));
+        assert_eq!(maintenance.pacing_delay, Some(Duration::from_millis(25)));
+        assert_eq!(maintenance.max_inventory_pages, 128);
+        assert_eq!(maintenance.max_inventory_items, 4_096);
+        let budgets = maintenance.budgets();
+        assert_eq!(budgets.op_pacing_delay, Some(Duration::from_millis(25)));
+        assert_eq!(budgets.max_inventory_page_count, 128);
+        assert_eq!(budgets.max_inventory_item_count, 4_096);
+    }
+
+    #[test]
+    fn rejects_invalid_maintenance_mode() {
+        let source = minimal_source().with(super::MAINTENANCE_MODE_ENV, "always");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::MAINTENANCE_MODE_ENV)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_maintenance_limits() {
+        for key in [
+            super::MAINTENANCE_RENEWAL_HORIZON_SECONDS_ENV,
+            super::MAINTENANCE_ORPHAN_PRESSURE_BYTES_ENV,
+            super::MAINTENANCE_ORPHAN_PRESSURE_COUNT_ENV,
+            super::MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS_ENV,
+            super::MAINTENANCE_MAX_INTERVAL_SECONDS_ENV,
+            super::MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV,
+            super::MAINTENANCE_PACING_DELAY_MS_ENV,
+            super::MAINTENANCE_MAX_INVENTORY_PAGES_ENV,
+            super::MAINTENANCE_MAX_INVENTORY_ITEMS_ENV,
+        ] {
+            let source = minimal_source().with(key, "0");
+
+            let config = RuntimeConfig::from_source(&source);
+
+            assert!(
+                matches!(config, Err(ConfigError::Invalid { key: invalid_key, .. }) if invalid_key == key),
+                "expected zero rejection for {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_maintenance_cooldown_above_max_interval() {
+        let source = minimal_source()
+            .with(super::MAINTENANCE_MAX_INTERVAL_SECONDS_ENV, "600")
+            .with(super::MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV, "601");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        assert!(
+            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV)
+        );
+    }
+
+    #[test]
+    fn forces_maintenance_off_for_restore_readonly() {
+        let source = minimal_source().with("RS3_GATEWAY_MODE", "restore-readonly");
+
+        let config = RuntimeConfig::from_source(&source);
+
+        let maintenance = match config {
+            Ok(config) => config.maintenance,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(maintenance.mode, super::MaintenanceMode::Off);
+    }
+
+    #[test]
+    fn rejects_maintenance_mode_for_restore_readonly() {
+        for value in ["auto", "manual", "off"] {
+            let source = minimal_source()
+                .with("RS3_GATEWAY_MODE", "restore-readonly")
+                .with(super::MAINTENANCE_MODE_ENV, value);
+
+            let config = RuntimeConfig::from_source(&source);
+
+            assert!(
+                matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::MAINTENANCE_MODE_ENV),
+                "expected rejection for RS3_MAINTENANCE_MODE={value} in restore-readonly mode"
+            );
+        }
     }
 
     #[test]

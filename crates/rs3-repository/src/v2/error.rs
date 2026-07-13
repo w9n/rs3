@@ -166,9 +166,15 @@ pub enum V2FormatError {
     /// Destructive maintenance plan exceeds an operator-supplied budget.
     #[error("v2 maintenance budget exceeded")]
     MaintenanceBudgetExceeded,
+    /// The exact private maintenance plan no longer matches the reviewed digest.
+    #[error("maintenance plan digest is stale: repository state moved since the dry run")]
+    MaintenancePlanChanged,
     /// Destructive orphan GC requires a safer minimum age.
     #[error("v2 orphan GC minimum age is below the production floor")]
     OrphanGcMinAgeTooLow,
+    /// Destructive maintenance stopped cleanly at a mutation boundary.
+    #[error("v2 maintenance run was cancelled")]
+    MaintenanceCancelled,
 }
 
 impl V2FormatError {
@@ -178,12 +184,14 @@ impl V2FormatError {
             Self::RandomnessUnavailable
             | Self::ObjectTooLarge
             | Self::ObjectLengthMismatch
-            | Self::ObjectBodyReadFailed => V2ErrorClass::RetryableClient,
+            | Self::ObjectBodyReadFailed
+            | Self::MaintenanceCancelled => V2ErrorClass::RetryableClient,
             Self::ProviderProfileFailed => V2ErrorClass::ProviderConformance,
             Self::RecoveryBundleRequired => V2ErrorClass::OperatorActionRequired,
             Self::RollbackUnsafeDr => V2ErrorClass::RollbackUnsafeDr,
             Self::MaintenanceAccessRequired
             | Self::MaintenanceBudgetExceeded
+            | Self::MaintenancePlanChanged
             | Self::OrphanGcMinAgeTooLow
             | Self::ReplayBudgetExceeded => V2ErrorClass::OperatorActionRequired,
             Self::InvalidCommitKey

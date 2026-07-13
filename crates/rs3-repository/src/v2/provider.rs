@@ -8,6 +8,68 @@ use serde::{Deserialize, Serialize};
 
 const S3_MIN_MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
 
+const COMMON_PROVIDER_CHECKS: &[&str] = &[
+    "basic-put",
+    "basic-head",
+    "basic-get",
+    "basic-range-get",
+    "basic-list",
+    "multipart-supported",
+    "multipart-create",
+    "multipart-put-part",
+    "multipart-complete",
+    "multipart-head",
+    "multipart-boundary-range-get",
+];
+const ATOMIC_CREATE_PROVIDER_CHECKS: &[&str] = &[
+    "atomic-create-first-put",
+    "atomic-create-duplicate-rejected",
+    "atomic-create-preserves-existing",
+    "multipart-atomic-open-before-race",
+    "multipart-atomic-racing-put",
+    "multipart-atomic-put-part",
+    "multipart-atomic-complete-rejected",
+    "multipart-atomic-preserves-existing",
+];
+const RETAINED_PROVIDER_CHECKS: &[&str] = &[
+    "multipart-retained-version-id",
+    "multipart-retained-exact-head",
+    "retained-put-version-id",
+    "retained-exact-head",
+    "retained-exact-get",
+    "retained-exact-range-get",
+    "retained-overwrite-version-id",
+    "retained-latest-get",
+    "retained-old-version-survives",
+    "retained-exact-version-inventory",
+    "retained-active-exact-delete-blocked",
+    "retained-unprotected-exact-delete",
+    "retained-extension-verifiable",
+    "retained-delete-blocked",
+    "legal-hold-put-version-id",
+    "legal-hold-verifiable",
+    "legal-hold-delete-blocked",
+    "retained-governance-bypass-review",
+];
+
+/// Returns the exact versioned check manifest required for one provider profile.
+///
+/// Retained production evidence always includes legal-hold behavior and the
+/// governance-bypass review. A report that omits either is not complete enough
+/// to authorize destructive retained maintenance.
+pub fn required_v2_provider_check_names(profile: V2ProviderProfile) -> Vec<&'static str> {
+    let profile_checks = match profile {
+        V2ProviderProfile::Dev => &[][..],
+        V2ProviderProfile::AtomicCreate => ATOMIC_CREATE_PROVIDER_CHECKS,
+        V2ProviderProfile::RetainedVersionObjectLock => RETAINED_PROVIDER_CHECKS,
+    };
+    COMMON_PROVIDER_CHECKS
+        .iter()
+        .chain(profile_checks)
+        .copied()
+        .collect()
+}
+
 /// v2 storage-provider profile selected for a repository.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum V2ProviderProfile {
@@ -116,9 +178,13 @@ pub struct V2ProviderConformanceReport {
 impl V2ProviderConformanceReport {
     /// Returns true when every conformance check passed.
     pub fn passed(&self) -> bool {
-        self.checks
-            .iter()
-            .all(|check| check.status == V2ProviderCheckStatus::Passed)
+        let required = required_v2_provider_check_names(self.profile);
+        self.checks.len() == required.len()
+            && required.iter().all(|required_name| {
+                self.checks.iter().any(|check| {
+                    check.name == *required_name && check.status == V2ProviderCheckStatus::Passed
+                })
+            })
     }
 
     /// Converts the report into a v2 result, preserving the report on success.

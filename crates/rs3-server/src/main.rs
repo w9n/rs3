@@ -5,20 +5,24 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rs3_crypto::SecretBytes;
 use rs3_repository::v2::{
-    V2AnchorState, V2ProviderCheckStatus, V2ProviderConformanceReport, V2ProviderProfile,
-    V2RecoveryBundle,
+    UnenforcedQuiescedMaintenanceGuard, V2AnchorState, V2FullGcDryRunOptions, V2FullGcDryRunReport,
+    V2ProviderCheckStatus, V2ProviderConformanceReport, V2ProviderProfile, V2RecoveryBundle,
 };
 use rs3_server::{
     AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReadiness,
     AdminReadinessSource, AdminReportProfile, AnchorConfig, GatewayMode, GatewayServer,
+    MaintenanceMode, OfflineMaintenanceEnvironment, OfflineMaintenanceError,
+    OfflineMaintenanceFence, OfflineMaintenanceOutcome, OfflineMaintenanceRequest,
     RepositoryToolConfig, RuntimeConfig, RuntimeV2ProviderConformanceOptions,
     V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport, V2ProviderCheckConfig,
     V2RecoveryBundleVerificationOptions, V2RecoveryBundleVerificationReport,
     V2RepositoryInitReport, WriterGuardConfig, backend_kind,
-    check_v2_provider_conformance_from_provider_config, doctor_findings, doctor_probe_from_config,
-    export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
-    init_v2_repository_from_config, inspect_keyring_envelope_from_tool_config,
-    rewrap_keyring_envelope_from_tool_config, runtime_config_profile,
+    check_v2_provider_conformance_from_provider_config, default_maintenance_orphan_gc_options,
+    doctor_findings, doctor_probe_from_config, export_v2_recovery_bundle_from_config,
+    import_v2_anchor_from_config, init_v2_repository_from_config,
+    inspect_keyring_envelope_from_tool_config, offline_maintenance_runtime_from_config,
+    provider_conformance_evidence_passed, provider_conformance_target_fingerprint,
+    rewrap_keyring_envelope_from_tool_config, run_offline_maintenance, runtime_config_profile,
     verify_v2_recovery_bundle_from_tool_config, write_v2_index_snapshot_from_config,
 };
 use rs3_server::{
@@ -81,8 +85,10 @@ enum Commands {
         gateway_mode: Option<GatewayModeArg>,
         #[arg(long, env = "RS3_ADMIN_BIND")]
         admin_bind: Option<SocketAddr>,
-        #[arg(long, env = "RS3_ADMIN_BEARER_TOKEN")]
+        #[arg(long, env = "RS3_ADMIN_BEARER_TOKEN", hide_env_values = true)]
         admin_bearer_token: Option<String>,
+        #[arg(long, env = "RS3_ADMIN_MUTATION_BEARER_TOKEN", hide_env_values = true)]
+        admin_mutation_bearer_token: Option<String>,
         #[arg(long, env = "RS3_ADMIN_PROFILE", value_enum, default_value_t = DoctorProfile::Production)]
         admin_profile: DoctorProfile,
     },
@@ -126,6 +132,95 @@ enum Commands {
     },
     /// Import a trusted v2 anchor after operator recovery review.
     ImportV2Anchor(Box<ImportV2AnchorArgs>),
+    /// Operate the in-gateway maintenance supervisor over the admin API.
+    Maintenance(Box<MaintenanceArgs>),
+    /// Break-glass maintenance for when the gateway cannot run.
+    MaintenanceOffline(Box<MaintenanceOfflineArgs>),
+}
+
+/// Break-glass offline maintenance against a stopped gateway.
+///
+/// Unlike `maintenance`, this never talks to a live gateway: it builds the
+/// backend and anchor from the same environment configuration as `serve`,
+/// acquires exclusive writer-fence ownership through the anchor backend, and
+/// fails closed while a live writer is renewing the fence.
+#[derive(Debug, Args)]
+struct MaintenanceOfflineArgs {
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = MaintenanceOutputFormat::Text, global = true)]
+    format: MaintenanceOutputFormat,
+    #[command(subcommand)]
+    command: MaintenanceOfflineCommand,
+}
+
+#[derive(Clone, Debug, Subcommand, PartialEq, Eq)]
+enum MaintenanceOfflineCommand {
+    /// Fence the repository and run the budgeted read-only plan.
+    DryRun,
+    /// Fence the repository and apply a plan digest from a prior offline dry-run.
+    Apply {
+        /// Plan digest from `maintenance-offline dry-run`.
+        #[arg(long)]
+        plan_digest: String,
+    },
+}
+
+/// Maintenance operations proxied through the gateway admin listener.
+///
+/// The CLI never touches the object store directly; every subcommand calls
+/// the authenticated admin HTTP surface of a live gateway.
+#[derive(Debug, Args)]
+struct MaintenanceArgs {
+    /// Gateway admin API origin, for example `http://127.0.0.1:9082`.
+    #[arg(long, env = "RS3_ADMIN_URL", global = true)]
+    admin_url: Option<String>,
+    /// Read bearer token for `maintenance status`.
+    #[arg(
+        long,
+        env = "RS3_ADMIN_BEARER_TOKEN",
+        hide_env_values = true,
+        global = true
+    )]
+    admin_bearer_token: Option<String>,
+    /// Mutation bearer token for destructive maintenance subcommands.
+    #[arg(
+        long,
+        env = "RS3_ADMIN_MUTATION_BEARER_TOKEN",
+        hide_env_values = true,
+        global = true
+    )]
+    admin_mutation_bearer_token: Option<String>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = MaintenanceOutputFormat::Text, global = true)]
+    format: MaintenanceOutputFormat,
+    #[command(subcommand)]
+    command: MaintenanceCommand,
+}
+
+#[derive(Clone, Debug, Subcommand, PartialEq, Eq)]
+enum MaintenanceCommand {
+    /// Show supervisor state, schedule, configuration, and history.
+    Status,
+    /// Run the budgeted read-only plan and print its plan digest.
+    DryRun,
+    /// Apply a plan digest produced by a prior dry-run.
+    Apply {
+        /// Plan digest from `maintenance dry-run`.
+        #[arg(long)]
+        plan_digest: String,
+    },
+    /// Cancel the in-flight maintenance run at its next mutation boundary.
+    Cancel,
+    /// Pause the automatic maintenance scheduler.
+    Pause,
+    /// Resume the automatic maintenance scheduler.
+    Resume,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum MaintenanceOutputFormat {
+    Text,
+    Json,
 }
 
 #[derive(Debug, Args)]
@@ -277,6 +372,7 @@ async fn main() -> Result<()> {
             gateway_mode,
             admin_bind,
             admin_bearer_token,
+            admin_mutation_bearer_token,
             admin_profile,
         } => {
             let mut config = RuntimeConfig::from_env()?;
@@ -289,16 +385,35 @@ async fn main() -> Result<()> {
             if let Some(gateway_mode) = gateway_mode {
                 config.mode = gateway_mode.into();
             }
-            let admin_config = admin_http_config(admin_bind, admin_bearer_token, admin_profile)?;
+            let admin_config = admin_http_config(
+                admin_bind,
+                admin_bearer_token,
+                admin_mutation_bearer_token,
+                admin_profile,
+            )?;
             enforce_serve_profile(&config, admin_profile, admin_config.is_some())?;
             install_metrics(config.metrics.bind)?;
             log_runtime_config(&config);
             let writer_guard = start_writer_guard(&config).await?;
-            let server = bind_gateway(config.clone(), &writer_guard).await?;
+            let server = match bind_gateway(config.clone(), &writer_guard).await {
+                Ok(server) => server,
+                Err(error) => {
+                    if let Err(release_error) = writer_guard.release().await {
+                        return Err(anyhow::anyhow!(
+                            "failed to bind gateway listener: {error}; writer fence release also failed: {release_error}"
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
             tracing::info!(bind = %server.local_addr(), "gateway S3 listener started");
+            let mut maintenance_supervisor = start_maintenance_supervisor(&config, &server);
             let run_result = match admin_config {
                 Some(admin_config) => {
-                    let admin_runtime_facts = server.admin_runtime_facts_source();
+                    let admin_runtime_facts = maintenance_aware_facts_source(
+                        server.admin_runtime_facts_source(),
+                        maintenance_supervisor.as_ref(),
+                    );
                     let admin_readiness =
                         writer_guard.readiness_source(server.admin_readiness_source());
                     let admin_server = AdminHttpServer::bind_with_runtime_sources(
@@ -307,7 +422,24 @@ async fn main() -> Result<()> {
                         admin_runtime_facts,
                         admin_readiness,
                     )
-                    .await?;
+                    .await;
+                    let mut admin_server = match admin_server {
+                        Ok(admin_server) => admin_server,
+                        Err(error) => {
+                            if let Some(supervisor) = maintenance_supervisor.take() {
+                                supervisor.shutdown().await;
+                            }
+                            if let Err(release_error) = writer_guard.release().await {
+                                return Err(anyhow::anyhow!(
+                                    "failed to bind admin listener: {error}; writer fence release also failed: {release_error}"
+                                ));
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                    if let Some(supervisor) = maintenance_supervisor.as_ref() {
+                        admin_server = admin_server.with_maintenance_control(supervisor.control());
+                    }
                     tracing::info!(
                         bind = %admin_server.local_addr(),
                         "gateway admin listener started",
@@ -319,6 +451,9 @@ async fn main() -> Result<()> {
                     .await
                     .map_err(anyhow::Error::from),
             };
+            if let Some(maintenance_supervisor) = maintenance_supervisor {
+                maintenance_supervisor.shutdown().await;
+            }
             let release_result = writer_guard.release().await;
             run_result?;
             release_result?;
@@ -402,7 +537,8 @@ async fn main() -> Result<()> {
             )
             .await?;
             let passed = report.passed();
-            print_v2_provider_conformance_report(&report, format)?;
+            let target_fingerprint = provider_conformance_target_fingerprint(&config);
+            print_v2_provider_conformance_report(&report, &target_fingerprint, format)?;
             if !passed {
                 anyhow::bail!("v2 provider conformance failed");
             }
@@ -415,9 +551,541 @@ async fn main() -> Result<()> {
             let report = import_v2_anchor_from_config(&config, bundle, options).await?;
             print_v2_anchor_import_report(&report, format)?;
         }
+        Commands::Maintenance(args) => {
+            run_maintenance_command(*args).await?;
+        }
+        Commands::MaintenanceOffline(args) => {
+            run_maintenance_offline_command(*args).await?;
+        }
     }
 
     Ok(())
+}
+
+/// Maximum accepted admin response size for maintenance CLI calls.
+const MAINTENANCE_CLI_MAX_RESPONSE_BYTES: usize = 512 * 1024;
+
+/// Runs one maintenance subcommand against the gateway admin listener.
+async fn run_maintenance_command(args: MaintenanceArgs) -> Result<()> {
+    let MaintenanceArgs {
+        admin_url,
+        admin_bearer_token,
+        admin_mutation_bearer_token,
+        format,
+        command,
+    } = args;
+    let admin_url =
+        admin_url.context("--admin-url or RS3_ADMIN_URL is required for maintenance commands")?;
+    let origin = parse_admin_origin(&admin_url)?;
+
+    let (method, path, body) = match &command {
+        MaintenanceCommand::Status => (http::Method::GET, "/admin/maintenance", None),
+        MaintenanceCommand::DryRun => (http::Method::POST, "/admin/maintenance/dry-run", None),
+        MaintenanceCommand::Apply { plan_digest } => (
+            http::Method::POST,
+            "/admin/maintenance/apply",
+            Some(serde_json::json!({ "plan_digest": plan_digest }).to_string()),
+        ),
+        MaintenanceCommand::Cancel => (http::Method::POST, "/admin/maintenance/cancel", None),
+        MaintenanceCommand::Pause => (http::Method::POST, "/admin/maintenance/pause", None),
+        MaintenanceCommand::Resume => (http::Method::POST, "/admin/maintenance/resume", None),
+    };
+    let token = if method == http::Method::POST {
+        admin_mutation_bearer_token.context(
+            "--admin-mutation-bearer-token or RS3_ADMIN_MUTATION_BEARER_TOKEN is required for maintenance mutations",
+        )?
+    } else {
+        admin_bearer_token
+            .or(admin_mutation_bearer_token)
+            .context("--admin-bearer-token or RS3_ADMIN_BEARER_TOKEN is required")?
+    };
+
+    let uri: http::Uri = format!("{origin}{path}")
+        .parse()
+        .context("failed to build admin request URI")?;
+    let mut request = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(http::header::ACCEPT, "application/json")
+        .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("x-rs3-admin-source", "cli");
+    if body.is_some() {
+        request = request.header(http::header::CONTENT_TYPE, "application/json");
+    }
+    let request = request
+        .body(http_body_util::Full::new(bytes::Bytes::from(
+            body.unwrap_or_default(),
+        )))
+        .context("failed to build admin request")?;
+
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http::<http_body_util::Full<bytes::Bytes>>();
+    let response =
+        tokio::time::timeout(std::time::Duration::from_secs(600), client.request(request))
+            .await
+            .context("gateway admin request timed out")?
+            .context("gateway admin request failed; is the gateway admin listener reachable?")?;
+    let status = response.status();
+    let bytes = read_admin_response_body(response.into_body()).await?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).context("gateway admin response is not valid JSON")?;
+
+    match format {
+        MaintenanceOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value)
+                    .context("failed to render admin response JSON")?
+            );
+        }
+        MaintenanceOutputFormat::Text => print_maintenance_text(&command, &value),
+    }
+    if !status.is_success() {
+        let code = value["error"]["code"].as_str().unwrap_or("unknown");
+        let message = value["error"]["message"].as_str().unwrap_or("");
+        anyhow::bail!("maintenance {command:?} failed with HTTP {status}: {code} {message}");
+    }
+    Ok(())
+}
+
+/// Reads a bounded admin response body.
+async fn read_admin_response_body(body: hyper::body::Incoming) -> Result<bytes::Bytes> {
+    use http_body_util::BodyExt;
+    let limited = http_body_util::Limited::new(body, MAINTENANCE_CLI_MAX_RESPONSE_BYTES);
+    match limited.collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(_error) => anyhow::bail!(
+            "gateway admin response failed or exceeded {MAINTENANCE_CLI_MAX_RESPONSE_BYTES} bytes"
+        ),
+    }
+}
+
+/// Validates the maintenance CLI admin origin.
+///
+/// Only plain `http://` origins are accepted; the admin listener is expected
+/// to be cluster-local or otherwise isolated. TLS origins are served by the
+/// read-only console instead.
+fn parse_admin_origin(value: &str) -> Result<String> {
+    let uri: http::Uri = value
+        .parse()
+        .context("RS3_ADMIN_URL must be a valid http origin")?;
+    if uri.scheme_str() != Some("http") {
+        anyhow::bail!("maintenance commands support http:// admin origins only");
+    }
+    let authority = uri
+        .authority()
+        .context("RS3_ADMIN_URL must include a host")?;
+    if authority.as_str().contains('@') {
+        anyhow::bail!("RS3_ADMIN_URL must not include credentials");
+    }
+    if (!uri.path().is_empty() && uri.path() != "/") || uri.query().is_some() {
+        anyhow::bail!("RS3_ADMIN_URL must be an origin without a path or query");
+    }
+    Ok(format!("http://{authority}"))
+}
+
+/// Prints a human-readable summary of one maintenance admin response.
+fn print_maintenance_text(command: &MaintenanceCommand, value: &serde_json::Value) {
+    if let Some(error) = value.get("error") {
+        println!(
+            "error: {} ({})",
+            error["message"].as_str().unwrap_or("unknown"),
+            error["code"].as_str().unwrap_or("unknown"),
+        );
+    }
+    match command {
+        MaintenanceCommand::Status => {
+            let supervisor = &value["supervisor"];
+            println!(
+                "state: {}",
+                supervisor["state"].as_str().unwrap_or("unavailable")
+            );
+            println!("mode: {}", supervisor["mode"].as_str().unwrap_or("unknown"));
+            println!(
+                "paused: {}",
+                supervisor["paused"].as_bool().unwrap_or(false)
+            );
+            println!(
+                "mutation enabled: {}",
+                value["mutation_enabled"].as_bool().unwrap_or(false)
+            );
+            println!(
+                "consecutive failures: {}",
+                supervisor["consecutive_failures"].as_u64().unwrap_or(0)
+            );
+            if let Some(at_ms) = value["next_trigger"]["at_ms"].as_i64() {
+                println!(
+                    "next trigger: {} at {}",
+                    value["next_trigger"]["reason"]
+                        .as_str()
+                        .unwrap_or("unknown"),
+                    at_ms
+                );
+            } else {
+                println!("next trigger: none");
+            }
+            if let Some(deadline) = supervisor["nearest_retain_until_ms"].as_i64() {
+                println!("nearest renewal deadline (ms): {deadline}");
+            }
+            let operations = value["operations"].as_array().map_or(0, Vec::len);
+            println!("recorded operations: {operations}");
+            for note in value["notes"].as_array().into_iter().flatten() {
+                if let Some(note) = note.as_str() {
+                    println!("note: {note}");
+                }
+            }
+        }
+        MaintenanceCommand::DryRun => {
+            if let Some(digest) = value["plan_digest"].as_str() {
+                println!("plan digest: {digest}");
+            }
+            let report = &value["report"];
+            println!(
+                "fits budgets: {}",
+                report["fits_budgets"].as_bool().unwrap_or(false)
+            );
+            println!(
+                "reclaimable dead bytes: {}",
+                report["dead_bytes_reclaimable"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "renewal targets: {} objects / {} bytes",
+                report["retention_renewal_commit_count"]
+                    .as_u64()
+                    .unwrap_or(0),
+                report["retention_renewal_bytes"].as_u64().unwrap_or(0)
+            );
+        }
+        MaintenanceCommand::Apply { .. }
+        | MaintenanceCommand::Cancel
+        | MaintenanceCommand::Pause
+        | MaintenanceCommand::Resume => {
+            let operation = &value["operation"];
+            if operation.is_object() {
+                println!(
+                    "operation {}: {}",
+                    operation["id"].as_str().unwrap_or("unknown"),
+                    operation["outcome"].as_str().unwrap_or("pending")
+                );
+                if matches!(command, MaintenanceCommand::Apply { .. }) {
+                    println!(
+                        "renewed: {} objects / {} bytes",
+                        operation["renewed_object_count"].as_u64().unwrap_or(0),
+                        operation["renewed_bytes"].as_u64().unwrap_or(0)
+                    );
+                    println!(
+                        "deleted orphans: {}",
+                        operation["deleted_object_count"].as_u64().unwrap_or(0)
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Poll interval while the offline fence observes a held Lease.
+#[cfg(feature = "k8s")]
+const OFFLINE_FENCE_ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Upper bound on the offline fence takeover observation loop.
+#[cfg(feature = "k8s")]
+const OFFLINE_FENCE_ACQUIRE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(4 * WRITER_LEASE_DURATION.as_secs());
+
+/// Runs one break-glass offline maintenance subcommand.
+async fn run_maintenance_offline_command(args: MaintenanceOfflineArgs) -> Result<()> {
+    let config = RuntimeConfig::from_env()?;
+    log_runtime_config(&config);
+    if !config.mode.allows_mutation() {
+        bail!("offline maintenance requires a mutation-capable gateway mode");
+    }
+
+    let command = match &args.command {
+        MaintenanceOfflineCommand::DryRun => rs3_server::OfflineMaintenanceCommand::DryRun,
+        MaintenanceOfflineCommand::Apply { plan_digest } => {
+            rs3_server::OfflineMaintenanceCommand::Apply {
+                plan_digest: plan_digest.clone(),
+            }
+        }
+    };
+    let request = OfflineMaintenanceRequest {
+        command,
+        dry_run: V2FullGcDryRunOptions {
+            budgets: config.maintenance.budgets(),
+            retention_renewal_horizon: config.maintenance.renewal_horizon,
+            protected_roots: Vec::new(),
+        },
+        orphan_gc: default_maintenance_orphan_gc_options(),
+        retained_provider_conformance_passed: provider_conformance_evidence_passed(&config),
+    };
+
+    let outcome = match &config.anchor {
+        AnchorConfig::Memory => {
+            // The memory anchor cannot host a real writer fence; RS3_ALLOW_MEMORY_ANCHOR
+            // already gated this configuration at parse time.
+            tracing::warn!(
+                "offline maintenance on the memory anchor uses the unenforced honor-system \
+                 guard; development use only",
+            );
+            let environment = MemoryOfflineMaintenanceEnvironment {
+                config: config.clone(),
+            };
+            run_offline_maintenance(&environment, request).await?
+        }
+        AnchorConfig::KubernetesLease {
+            namespace,
+            name,
+            field_manager,
+        } => {
+            #[cfg(feature = "k8s")]
+            {
+                let hostname = std::env::var("HOSTNAME").context(
+                    "offline maintenance needs HOSTNAME to identify this operator process",
+                )?;
+                // Same holder-identity pattern as the gateway writer guard,
+                // with a marker suffix so operators can tell a break-glass
+                // holder apart in the Lease.
+                let holder_identity = format!("{hostname}/{}/offline-maintenance", random_hex(16)?);
+                let lease_guard = KubernetesLeaseGuard::new(
+                    LeaseSettings {
+                        namespace: namespace.clone(),
+                        name: name.clone(),
+                        field_manager: field_manager.clone(),
+                    },
+                    holder_identity,
+                    WRITER_LEASE_DURATION,
+                )
+                .context("failed to configure offline writer lease guard")?;
+                let environment = KubernetesOfflineMaintenanceEnvironment {
+                    config: config.clone(),
+                    lease_guard: std::sync::Arc::new(lease_guard),
+                };
+                run_offline_maintenance(&environment, request).await?
+            }
+            #[cfg(not(feature = "k8s"))]
+            {
+                let _ = (namespace, name, field_manager);
+                bail!("offline maintenance on a kubernetes-lease anchor requires the k8s feature");
+            }
+        }
+    };
+
+    print_offline_maintenance_outcome(&outcome, args.format)
+}
+
+/// Offline environment for the development memory anchor.
+struct MemoryOfflineMaintenanceEnvironment {
+    config: RuntimeConfig,
+}
+
+/// No-op fence used with the memory anchor; there is nothing to release.
+struct MemoryOfflineFence;
+
+#[async_trait::async_trait]
+impl OfflineMaintenanceFence for MemoryOfflineFence {
+    async fn release(&self) -> Result<(), OfflineMaintenanceError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl OfflineMaintenanceEnvironment for MemoryOfflineMaintenanceEnvironment {
+    async fn acquire_fence(
+        &self,
+    ) -> Result<Box<dyn OfflineMaintenanceFence>, OfflineMaintenanceError> {
+        Ok(Box::new(MemoryOfflineFence))
+    }
+
+    async fn open_runtime(
+        &self,
+    ) -> Result<std::sync::Arc<dyn rs3_server::MaintenanceRuntime>, OfflineMaintenanceError> {
+        offline_maintenance_runtime_from_config(
+            &self.config,
+            std::sync::Arc::new(UnenforcedQuiescedMaintenanceGuard),
+        )
+        .await
+        .map_err(|error| OfflineMaintenanceError::OpenFailed {
+            reason: error.to_string(),
+        })
+    }
+}
+
+/// Offline environment fenced through the Kubernetes anchor Lease.
+#[cfg(feature = "k8s")]
+struct KubernetesOfflineMaintenanceEnvironment {
+    config: RuntimeConfig,
+    lease_guard: std::sync::Arc<KubernetesLeaseGuard>,
+}
+
+#[cfg(feature = "k8s")]
+struct KubernetesOfflineFence {
+    lease_guard: std::sync::Arc<KubernetesLeaseGuard>,
+    renew_task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(feature = "k8s")]
+#[async_trait::async_trait]
+impl OfflineMaintenanceFence for KubernetesOfflineFence {
+    async fn release(&self) -> Result<(), OfflineMaintenanceError> {
+        self.renew_task.abort();
+        self.lease_guard
+            .release()
+            .await
+            .map_err(|error| OfflineMaintenanceError::ReleaseFailed {
+                reason: error.to_string(),
+            })
+    }
+}
+
+#[cfg(feature = "k8s")]
+#[async_trait::async_trait]
+impl OfflineMaintenanceEnvironment for KubernetesOfflineMaintenanceEnvironment {
+    async fn acquire_fence(
+        &self,
+    ) -> Result<Box<dyn OfflineMaintenanceFence>, OfflineMaintenanceError> {
+        let deadline = std::time::Instant::now() + OFFLINE_FENCE_ACQUIRE_TIMEOUT;
+        loop {
+            match self.lease_guard.try_acquire().await {
+                Ok(_state) => break,
+                Err(LeaseGuardError::HeldByOther) => {
+                    // An unchanged holder is still under monotonic takeover
+                    // observation; keep watching for the full lease duration.
+                    if std::time::Instant::now() >= deadline {
+                        return Err(OfflineMaintenanceError::FenceUnavailable {
+                            reason: "writer fence takeover observation did not resolve in time"
+                                .to_owned(),
+                        });
+                    }
+                    tokio::time::sleep(OFFLINE_FENCE_ACQUIRE_POLL).await;
+                }
+                Err(error @ LeaseGuardError::HeldByLiveWriter) => {
+                    return Err(OfflineMaintenanceError::LiveWriterPresent {
+                        reason: error.to_string(),
+                    });
+                }
+                Err(error) => {
+                    return Err(OfflineMaintenanceError::FenceUnavailable {
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
+        tracing::info!("offline maintenance writer fence acquired");
+        let renew_task = tokio::spawn(renew_offline_writer_fence(std::sync::Arc::clone(
+            &self.lease_guard,
+        )));
+        Ok(Box::new(KubernetesOfflineFence {
+            lease_guard: std::sync::Arc::clone(&self.lease_guard),
+            renew_task,
+        }))
+    }
+
+    async fn open_runtime(
+        &self,
+    ) -> Result<std::sync::Arc<dyn rs3_server::MaintenanceRuntime>, OfflineMaintenanceError> {
+        let writer_fence = self.lease_guard.writer_fence().map_err(|error| {
+            OfflineMaintenanceError::OpenFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        rs3_server::offline_maintenance_runtime_from_writer_fence(&self.config, writer_fence)
+            .await
+            .map_err(|error| OfflineMaintenanceError::OpenFailed {
+                reason: error.to_string(),
+            })
+    }
+}
+
+/// Renews the offline writer fence until release or loss of ownership.
+///
+/// On loss of ownership the local fence goes dead and the engine's
+/// per-mutation guard and anchor rechecks fail closed at the next boundary.
+#[cfg(feature = "k8s")]
+async fn renew_offline_writer_fence(lease_guard: std::sync::Arc<KubernetesLeaseGuard>) {
+    loop {
+        tokio::time::sleep(WRITER_LEASE_RENEW_INTERVAL).await;
+        if let Err(error) = lease_guard.renew().await {
+            tracing::warn!(%error, "offline maintenance writer fence renewal failed");
+            if matches!(
+                error,
+                LeaseGuardError::HeldByOther
+                    | LeaseGuardError::HeldByLiveWriter
+                    | LeaseGuardError::LostLease
+            ) {
+                break;
+            }
+        }
+    }
+}
+
+/// Prints one offline maintenance outcome in the selected format.
+fn print_offline_maintenance_outcome(
+    outcome: &OfflineMaintenanceOutcome,
+    format: MaintenanceOutputFormat,
+) -> Result<()> {
+    match format {
+        MaintenanceOutputFormat::Json => {
+            let apply = outcome.apply.as_ref().map(|apply| {
+                serde_json::json!({
+                    "retention_renewed_object_count": apply.retention_renewed_object_count,
+                    "retention_renewed_bytes": apply.retention_renewed_bytes,
+                    "deleted_object_count": apply.orphan_gc.deleted_count,
+                    "protected_object_count": apply.orphan_gc.protected_count,
+                    "failed_delete_count": apply.orphan_gc.failed_delete_count,
+                })
+            });
+            let report = serde_json::json!({
+                "schema": "rs3.maintenance-offline.v1",
+                "command": if outcome.apply.is_some() { "apply" } else { "dry-run" },
+                "plan_digest": outcome.plan_digest,
+                "report": offline_dry_run_report_json(&outcome.dry_run),
+                "apply": apply,
+            });
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        MaintenanceOutputFormat::Text => {
+            println!("plan digest: {}", outcome.plan_digest);
+            println!("fits budgets: {}", outcome.dry_run.fits_budgets);
+            println!(
+                "reclaimable dead bytes: {}",
+                outcome.dry_run.dead_bytes_reclaimable
+            );
+            println!(
+                "renewal targets: {} objects / {} bytes",
+                outcome.dry_run.retention_renewal_commit_count,
+                outcome.dry_run.retention_renewal_bytes
+            );
+            if let Some(apply) = outcome.apply.as_ref() {
+                println!(
+                    "renewed: {} objects / {} bytes",
+                    apply.retention_renewed_object_count, apply.retention_renewed_bytes
+                );
+                println!("deleted orphans: {}", apply.orphan_gc.deleted_count);
+                println!("protected orphans: {}", apply.orphan_gc.protected_count);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Path-redacted JSON view of one dry-run report, matching the admin schema.
+fn offline_dry_run_report_json(report: &V2FullGcDryRunReport) -> serde_json::Value {
+    serde_json::json!({
+        "base_sequence": report.base_sequence.map(|sequence| sequence.get()),
+        "chain_live_commit_count": report.chain_live_commit_count,
+        "candidate_commit_count": report.candidate_commit_count,
+        "fully_dead_commit_count": report.fully_dead_commit_count,
+        "mixed_commit_count": report.mixed_commit_count,
+        "dead_bytes_reclaimable": report.dead_bytes_reclaimable,
+        "retention_blocked_bytes": report.retention_blocked_bytes,
+        "legal_hold_blocked_bytes": report.legal_hold_blocked_bytes,
+        "unknown_protection_blocked_bytes": report.unknown_protection_blocked_bytes,
+        "retention_renewal_commit_count": report.retention_renewal_commit_count,
+        "retention_renewal_bytes": report.retention_renewal_bytes,
+        "retention_renewal_blocked_count": report.retention_renewal_blocked_count,
+        "retention_renewal_blocked_bytes": report.retention_renewal_blocked_bytes,
+        "fits_budgets": report.fits_budgets,
+        "exact_version_apply_ready": report.exact_version_apply_ready,
+    })
 }
 
 async fn run_keyring_command(args: KeyringArgs) -> Result<()> {
@@ -894,6 +1562,7 @@ fn print_keyring_rewrap_report(
 
 fn print_v2_provider_conformance_report(
     report: &V2ProviderConformanceReport,
+    target_fingerprint: &str,
     format: RecoveryReportFormat,
 ) -> Result<()> {
     match format {
@@ -910,7 +1579,8 @@ fn print_v2_provider_conformance_report(
                 })
                 .collect::<Vec<_>>();
             let report_json = serde_json::json!({
-                "schema": "rs3.v2-provider-conformance.v1",
+                "schema": "rs3.v2-provider-conformance.v2",
+                "target_fingerprint": target_fingerprint,
                 "generated_at_ms": current_time_ms().unwrap_or(0),
                 "profile": provider_profile_name(report.profile),
                 "passed": report.passed(),
@@ -919,7 +1589,8 @@ fn print_v2_provider_conformance_report(
             println!("{}", serde_json::to_string_pretty(&report_json)?);
         }
         RecoveryReportFormat::Text => {
-            println!("schema=rs3.v2-provider-conformance.v1");
+            println!("schema=rs3.v2-provider-conformance.v2");
+            println!("target_fingerprint={target_fingerprint}");
             println!("generated_at_ms={}", current_time_ms().unwrap_or(0));
             println!("profile={}", provider_profile_name(report.profile));
             println!("passed={}", report.passed());
@@ -1087,8 +1758,8 @@ async fn run_doctor(config: &RuntimeConfig, profile: DoctorProfile, probe: bool)
 
     for finding in &findings {
         eprintln!(
-            "rs3 doctor [{}]: {}; remediation: {}",
-            finding.code, finding.message, finding.remediation
+            "rs3 doctor [{}] ({}): {}; remediation: {}",
+            finding.code, finding.severity, finding.message, finding.remediation
         );
     }
 
@@ -1108,7 +1779,11 @@ async fn run_doctor(config: &RuntimeConfig, profile: DoctorProfile, probe: bool)
     let probe_failure_count = probe_report
         .as_ref()
         .map_or(0, |probe_report| probe_report.failed_count());
-    let finding_count = findings.len() + probe_failure_count;
+    let blocking_finding_count = findings
+        .iter()
+        .filter(|finding| finding.is_blocking())
+        .count();
+    let finding_count = blocking_finding_count + probe_failure_count;
     if finding_count == 0 {
         println!("rs3 doctor: {} profile ok", profile.as_str());
         return Ok(());
@@ -1140,6 +1815,18 @@ fn enforce_serve_profile(
     }
 
     let findings = doctor_findings(config, AdminReportProfile::Production);
+    for finding in findings.iter().filter(|finding| !finding.is_blocking()) {
+        tracing::warn!(
+            code = finding.code,
+            message = finding.message,
+            remediation = finding.remediation,
+            "production serve posture warning",
+        );
+    }
+    let findings = findings
+        .into_iter()
+        .filter(|finding| finding.is_blocking())
+        .collect::<Vec<_>>();
     if findings.is_empty() {
         return Ok(());
     }
@@ -1157,6 +1844,7 @@ fn enforce_serve_profile(
 fn admin_http_config(
     bind: Option<SocketAddr>,
     bearer_token: Option<String>,
+    mutation_bearer_token: Option<String>,
     profile: DoctorProfile,
 ) -> Result<Option<AdminHttpConfig>> {
     let Some(bind) = bind else {
@@ -1166,11 +1854,16 @@ fn admin_http_config(
         anyhow::bail!("RS3_ADMIN_BEARER_TOKEN is required when RS3_ADMIN_BIND is set");
     };
     let token = AdminBearerToken::new(bearer_token)?;
-    Ok(Some(AdminHttpConfig::new(
-        bind,
-        AdminHttpAuth::bearer(token),
-        profile.into(),
-    )))
+    // Without a distinct mutation token, the admin listener stays read-only
+    // and POST maintenance routes are disabled.
+    let auth = match mutation_bearer_token {
+        Some(mutation_bearer_token) => {
+            let mutation = AdminBearerToken::new(mutation_bearer_token)?;
+            AdminHttpAuth::bearer_with_mutation(token, mutation)?
+        }
+        None => AdminHttpAuth::bearer(token),
+    };
+    Ok(Some(AdminHttpConfig::new(bind, auth, profile.into())))
 }
 
 struct WriterGuardRuntime {
@@ -1227,6 +1920,66 @@ impl WriterGuardRuntime {
                 .context("failed to release writer fence during orderly shutdown")?;
         }
         Ok(())
+    }
+}
+
+/// Starts the in-gateway maintenance supervisor for mutation-capable modes.
+///
+/// Restore-readonly gateways force maintenance off at configuration time, and
+/// `RS3_MAINTENANCE_MODE=off` keeps the supervisor from starting at all.
+fn start_maintenance_supervisor(
+    config: &RuntimeConfig,
+    server: &GatewayServer,
+) -> Option<rs3_server::MaintenanceSupervisorHandle> {
+    if !config.mode.allows_mutation() || config.maintenance.mode == MaintenanceMode::Off {
+        return None;
+    }
+    let conformance_config = config.clone();
+    let supervisor_config = rs3_server::MaintenanceSupervisorConfig::from_runtime(
+        config.maintenance,
+        config.repository.retention.is_some(),
+        std::sync::Arc::new(move || {
+            rs3_server::provider_conformance_evidence_passed(&conformance_config)
+        }),
+    );
+    let handle = rs3_server::MaintenanceSupervisor::start(
+        supervisor_config,
+        server.maintenance_runtime(),
+        std::sync::Arc::new(rs3_server::SystemMaintenanceClock),
+    );
+    tracing::info!(
+        maintenance_mode = config.maintenance.mode.as_str(),
+        "maintenance supervisor started",
+    );
+    Some(handle)
+}
+
+/// Wraps the gateway facts source so admin reports include supervisor status.
+fn maintenance_aware_facts_source(
+    inner: std::sync::Arc<dyn rs3_server::AdminRuntimeFactsSource>,
+    supervisor: Option<&rs3_server::MaintenanceSupervisorHandle>,
+) -> std::sync::Arc<dyn rs3_server::AdminRuntimeFactsSource> {
+    let Some(supervisor) = supervisor else {
+        return inner;
+    };
+    std::sync::Arc::new(MaintenanceAwareFactsSource {
+        inner,
+        status: supervisor.status(),
+    })
+}
+
+struct MaintenanceAwareFactsSource {
+    inner: std::sync::Arc<dyn rs3_server::AdminRuntimeFactsSource>,
+    status: rs3_server::MaintenanceStatusHandle,
+}
+
+impl rs3_server::AdminRuntimeFactsSource for MaintenanceAwareFactsSource {
+    fn snapshot(&self) -> rs3_server::AdminRuntimeFacts {
+        let mut facts = self.inner.snapshot();
+        facts.maintenance_supervisor = Some(rs3_server::AdminMaintenanceSupervisorSummary::from(
+            &self.status.snapshot(),
+        ));
+        facts
     }
 }
 
@@ -1677,17 +2430,22 @@ fn is_path_safe_tracing_target(target: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DoctorProfile, ImportV2AnchorArgs, RecoveryReportFormat, backend_kind, doctor_findings,
-        enforce_serve_profile, is_path_safe_tracing_target, parse_restore_bundle_json,
-        recovery_bundle_from_import_args, runtime_config_profile,
+        DoctorProfile, ImportV2AnchorArgs, MaintenanceArgs, MaintenanceCommand,
+        MaintenanceOutputFormat, RecoveryReportFormat, backend_kind, doctor_findings,
+        enforce_serve_profile, is_path_safe_tracing_target, parse_admin_origin,
+        parse_restore_bundle_json, provider_conformance_target_fingerprint,
+        recovery_bundle_from_import_args, run_maintenance_command, runtime_config_profile,
     };
     use rs3_server::{
-        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
-        ProviderConformanceConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
-        RepositoryKeysConfig, RuntimeConfig, StaticCredentials, WriterGuardConfig,
+        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MaintenanceConfig,
+        MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig,
+        RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
+        V2ProviderCheckConfig, WriterGuardConfig,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
+    use serde::Serialize;
+    use std::fs;
     use std::time::Duration;
 
     fn runtime_config() -> RuntimeConfig {
@@ -1731,6 +2489,7 @@ mod tests {
                 retention: None,
                 allow_init: true,
             },
+            maintenance: MaintenanceConfig::default(),
             provider_conformance: ProviderConformanceConfig::default(),
             recovery: RecoveryConfig::default(),
             repository_keys: RepositoryKeysConfig {
@@ -1748,6 +2507,324 @@ mod tests {
             },
             static_credentials: None,
         }
+    }
+
+    #[derive(Serialize)]
+    struct TestProviderEvidence {
+        schema: &'static str,
+        target_fingerprint: String,
+        generated_at_ms: Option<i64>,
+        profile: &'static str,
+        passed: bool,
+        checks: Vec<TestProviderCheck>,
+    }
+
+    #[derive(Serialize)]
+    struct TestProviderCheck {
+        name: &'static str,
+        status: &'static str,
+        reason: Option<&'static str>,
+    }
+
+    #[test]
+    fn admin_origin_parser_accepts_http_origins_only() {
+        assert_eq!(
+            parse_admin_origin("http://127.0.0.1:9082").unwrap_or_else(|error| panic!("{error}")),
+            "http://127.0.0.1:9082"
+        );
+        assert!(parse_admin_origin("https://admin.example").is_err());
+        assert!(parse_admin_origin("http://user:pw@host:1").is_err());
+        assert!(parse_admin_origin("http://127.0.0.1:9082/admin").is_err());
+    }
+
+    struct CliMockMaintenanceRuntime {
+        dry_run: rs3_repository::v2::V2FullGcDryRunReport,
+    }
+
+    impl CliMockMaintenanceRuntime {
+        fn new() -> Self {
+            Self {
+                dry_run: rs3_repository::v2::V2FullGcDryRunReport {
+                    base_sequence: None,
+                    chain_live_commit_count: 1,
+                    protected_root_count: 0,
+                    protected_commit_count: 0,
+                    candidate_commit_count: 0,
+                    fully_dead_commit_count: 0,
+                    mixed_commit_count: 0,
+                    dead_bytes_reclaimable: 0,
+                    live_bytes_to_copy: 0,
+                    mixed_dead_bytes_repackable: 0,
+                    retention_blocked_bytes: 0,
+                    legal_hold_blocked_bytes: 0,
+                    unknown_protection_blocked_bytes: 0,
+                    retention_renewal_commit_count: 0,
+                    retention_renewal_bytes: 0,
+                    retention_renewal_blocked_count: 0,
+                    retention_renewal_blocked_bytes: 0,
+                    planned_cost: rs3_repository::v2::V2MaintenancePlanCost::default(),
+                    fits_budgets: true,
+                    exact_version_apply_ready: true,
+                },
+            }
+        }
+
+        fn plan_digest(&self) -> String {
+            rs3_crypto::derive_public_fingerprint(
+                b"rs3.cli.mock-plan.v1",
+                &[&self.dry_run.dead_bytes_reclaimable.to_be_bytes()],
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rs3_server::MaintenanceRuntime for CliMockMaintenanceRuntime {
+        fn maintenance_guard_configured(&self) -> bool {
+            true
+        }
+
+        async fn quick_maintenance_report(
+            &self,
+        ) -> Result<rs3_repository::v2::V2MaintenanceReport, rs3_repository::RepositoryError>
+        {
+            Ok(rs3_repository::v2::V2MaintenanceReport {
+                anchor_present: true,
+                verified_commit_count: 1,
+                last_anchored_commit_age_ms: Some(0),
+                orphan_candidate_count: 0,
+                orphan_candidate_bytes: 0,
+                protected_orphan_candidate_count: 0,
+                oldest_orphan_age_ms: None,
+                reclaimable_orphan_candidate_count: 0,
+                reclaimable_orphan_candidate_bytes: 0,
+                oldest_reclaimable_orphan_age_ms: None,
+                retention_renewal_commit_count: 0,
+                retention_renewal_bytes: 0,
+                retention_renewal_blocked_count: 0,
+                retention_renewal_blocked_bytes: 0,
+                nearest_retain_until_ms: None,
+            })
+        }
+
+        async fn full_gc_dry_run(
+            &self,
+            _options: rs3_repository::v2::V2FullGcDryRunOptions,
+        ) -> Result<rs3_repository::v2::V2FullGcDryRunReport, rs3_repository::RepositoryError>
+        {
+            Ok(self.dry_run.clone())
+        }
+
+        async fn preview_full_gc_plan(
+            &self,
+            _options: rs3_repository::v2::V2FullGcApplyOptions,
+        ) -> Result<rs3_repository::v2::V2FullGcPlanPreview, rs3_repository::RepositoryError>
+        {
+            Ok(rs3_repository::v2::V2FullGcPlanPreview {
+                report: self.dry_run.clone(),
+                plan_digest: self.plan_digest(),
+            })
+        }
+
+        async fn run_full_maintenance(
+            &self,
+            _options: rs3_repository::v2::V2FullGcApplyOptions,
+            expected_plan_digest: Option<&str>,
+            _cancellation: &rs3_repository::v2::V2MaintenanceCancellation,
+            on_phase: &(dyn Fn(rs3_server::MaintenanceRunPhase) + Send + Sync),
+        ) -> Result<rs3_repository::v2::V2FullMaintenanceReport, rs3_repository::RepositoryError>
+        {
+            on_phase(rs3_server::MaintenanceRunPhase::Quiescing);
+            if let Some(expected) = expected_plan_digest
+                && self.plan_digest() != expected
+            {
+                return Err(rs3_repository::RepositoryError::CommitFailed {
+                    reason: rs3_server::MAINTENANCE_PLAN_STALE_REASON.to_owned(),
+                });
+            }
+            on_phase(rs3_server::MaintenanceRunPhase::Applying);
+            Ok(rs3_repository::v2::V2FullMaintenanceReport {
+                dry_run: self.dry_run.clone(),
+                apply: rs3_repository::v2::V2FullGcApplyReport {
+                    dry_run: self.dry_run.clone(),
+                    retention_renewed_object_count: 0,
+                    retention_renewed_bytes: 0,
+                    orphan_gc: rs3_repository::v2::V2OrphanGcReport::default(),
+                },
+            })
+        }
+    }
+
+    fn maintenance_cli_args(
+        addr: std::net::SocketAddr,
+        command: MaintenanceCommand,
+        format: MaintenanceOutputFormat,
+    ) -> MaintenanceArgs {
+        MaintenanceArgs {
+            admin_url: Some(format!("http://{addr}")),
+            admin_bearer_token: Some("cli-read-token-12345".to_owned()),
+            admin_mutation_bearer_token: Some("cli-mutation-token-1".to_owned()),
+            format,
+            command,
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_cli_smoke_against_ephemeral_admin_listener() {
+        let supervisor = rs3_server::MaintenanceSupervisor::start(
+            rs3_server::MaintenanceSupervisorConfig {
+                maintenance: rs3_server::MaintenanceConfig {
+                    mode: rs3_server::MaintenanceMode::Manual,
+                    ..rs3_server::MaintenanceConfig::default()
+                },
+                retention_configured: false,
+                orphan_gc: rs3_repository::v2::V2OrphanGcOptions::new_for_test_rehearsal(
+                    Duration::ZERO,
+                ),
+                retained_provider_conformance: std::sync::Arc::new(|| true),
+            },
+            std::sync::Arc::new(CliMockMaintenanceRuntime::new()),
+            std::sync::Arc::new(rs3_server::SystemMaintenanceClock),
+        );
+        let auth = rs3_server::AdminHttpAuth::bearer_with_mutation(
+            rs3_server::AdminBearerToken::new("cli-read-token-12345")
+                .unwrap_or_else(|error| panic!("{error}")),
+            rs3_server::AdminBearerToken::new("cli-mutation-token-1")
+                .unwrap_or_else(|error| panic!("{error}")),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let admin_config = rs3_server::AdminHttpConfig::new(
+            "127.0.0.1:0"
+                .parse()
+                .unwrap_or_else(|error| panic!("{error}")),
+            auth,
+            rs3_server::AdminReportProfile::Production,
+        );
+        let server = rs3_server::AdminHttpServer::bind(runtime_config(), admin_config)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .with_maintenance_control(supervisor.control());
+        let addr = server.local_addr();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_task = tokio::spawn(server.run_until_shutdown(async move {
+            let _ = shutdown_rx.await;
+        }));
+
+        run_maintenance_command(maintenance_cli_args(
+            addr,
+            MaintenanceCommand::Status,
+            MaintenanceOutputFormat::Text,
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("maintenance status failed: {error}"));
+
+        run_maintenance_command(maintenance_cli_args(
+            addr,
+            MaintenanceCommand::DryRun,
+            MaintenanceOutputFormat::Json,
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("maintenance dry-run failed: {error}"));
+
+        run_maintenance_command(maintenance_cli_args(
+            addr,
+            MaintenanceCommand::Pause,
+            MaintenanceOutputFormat::Text,
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("maintenance pause failed: {error}"));
+        assert!(supervisor.control().status_snapshot().paused);
+
+        run_maintenance_command(maintenance_cli_args(
+            addr,
+            MaintenanceCommand::Resume,
+            MaintenanceOutputFormat::Text,
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("maintenance resume failed: {error}"));
+
+        // Cancel without an in-flight run surfaces the admin conflict.
+        let error = run_maintenance_command(maintenance_cli_args(
+            addr,
+            MaintenanceCommand::Cancel,
+            MaintenanceOutputFormat::Text,
+        ))
+        .await
+        .expect_err("cancel without a run should fail");
+        assert!(error.to_string().contains("no-run-in-flight"));
+
+        // The read token is rejected for mutations end to end.
+        let mut read_only = maintenance_cli_args(
+            addr,
+            MaintenanceCommand::Pause,
+            MaintenanceOutputFormat::Text,
+        );
+        read_only.admin_mutation_bearer_token = Some("cli-read-token-12345".to_owned());
+        let error = run_maintenance_command(read_only)
+            .await
+            .expect_err("read token must not authorize mutations");
+        assert!(error.to_string().contains("mutation-token-required"));
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        supervisor.shutdown().await;
+    }
+
+    #[test]
+    fn maintenance_offline_cli_is_a_distinct_subcommand_with_digest_bound_apply() {
+        use clap::Parser;
+
+        let dry_run = super::Cli::try_parse_from(["rs3", "maintenance-offline", "dry-run"])
+            .unwrap_or_else(|error| panic!("{error}"));
+        let super::Commands::MaintenanceOffline(args) = dry_run.command else {
+            panic!("expected maintenance-offline command");
+        };
+        assert_eq!(args.command, super::MaintenanceOfflineCommand::DryRun);
+
+        let apply = super::Cli::try_parse_from([
+            "rs3",
+            "maintenance-offline",
+            "apply",
+            "--plan-digest",
+            "abcd",
+            "--format",
+            "json",
+        ])
+        .unwrap_or_else(|error| panic!("{error}"));
+        let super::Commands::MaintenanceOffline(args) = apply.command else {
+            panic!("expected maintenance-offline command");
+        };
+        assert_eq!(
+            args.command,
+            super::MaintenanceOfflineCommand::Apply {
+                plan_digest: "abcd".to_owned(),
+            }
+        );
+        assert_eq!(args.format, super::MaintenanceOutputFormat::Json);
+
+        // Apply without a reviewed plan digest must not parse.
+        assert!(super::Cli::try_parse_from(["rs3", "maintenance-offline", "apply"]).is_err());
+        // The live-gateway `maintenance` command remains a separate surface.
+        assert!(super::Cli::try_parse_from(["rs3", "maintenance", "offline"]).is_err());
+    }
+
+    #[test]
+    fn serve_help_hides_admin_bearer_token_environment_value() {
+        use clap::CommandFactory;
+
+        let command = super::Cli::command();
+        let serve = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "serve")
+            .unwrap_or_else(|| panic!("serve subcommand must exist"));
+        let admin_bearer_token = serve
+            .get_arguments()
+            .find(|argument| argument.get_id() == "admin_bearer_token")
+            .unwrap_or_else(|| panic!("serve admin bearer token argument must exist"));
+
+        assert!(admin_bearer_token.is_hide_env_values_set());
     }
 
     #[test]
@@ -1869,11 +2946,42 @@ mod tests {
         config.recovery.public_key = Some(
             "ed25519:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
         );
+        let provider_report = std::env::temp_dir().join(format!(
+            "rs3-doctor-provider-report-{}.json",
+            std::process::id()
+        ));
+        let target_fingerprint =
+            provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(&config));
+        let checks = rs3_repository::v2::required_v2_provider_check_names(
+            rs3_repository::v2::V2ProviderProfile::RetainedVersionObjectLock,
+        )
+        .into_iter()
+        .map(|name| TestProviderCheck {
+            name,
+            status: "passed",
+            reason: None,
+        })
+        .collect::<Vec<_>>();
+        let evidence = TestProviderEvidence {
+            schema: "rs3.v2-provider-conformance.v2",
+            target_fingerprint,
+            generated_at_ms: super::current_time_ms(),
+            profile: "retained-version-object-lock",
+            passed: true,
+            checks,
+        };
+        fs::write(
+            &provider_report,
+            serde_json::to_string(&evidence).unwrap_or_else(|error| panic!("{error}")),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        config.provider_conformance.report_file = Some(provider_report.clone());
 
         let findings = doctor_findings(&config, DoctorProfile::Production.into());
 
         assert!(findings.is_empty());
         assert!(enforce_serve_profile(&config, DoctorProfile::Production, true).is_ok());
+        fs::remove_file(provider_report).unwrap_or_else(|error| panic!("{error}"));
     }
 
     #[test]

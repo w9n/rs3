@@ -106,6 +106,10 @@ impl GatewayS3Service {
         self.repository.admin_facts_source()
     }
 
+    pub(super) fn maintenance_runtime(&self) -> Arc<dyn crate::maintenance::MaintenanceRuntime> {
+        self.repository.maintenance_runtime()
+    }
+
     pub(super) fn admin_readiness_source(&self) -> Arc<dyn AdminReadinessSource> {
         self.repository.admin_readiness_source()
     }

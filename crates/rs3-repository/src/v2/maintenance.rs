@@ -31,14 +31,21 @@ use rs3_types::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_RETENTION_RENEWAL_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Default lead time for extending provider retention on live objects.
+pub const DEFAULT_RETENTION_RENEWAL_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MIN_ORPHAN_GC_AGE: Duration = Duration::from_secs(60 * 60);
 const MAINTENANCE_LIST_PAGE_ITEMS: usize = 1_000;
 const DEFAULT_MAX_INVENTORY_PAGES: u64 = 4_096;
 const DEFAULT_MAX_INVENTORY_ITEMS: u64 = 2_000_000;
+const FULL_GC_PLAN_DIGEST_DOMAIN: &[u8] = b"rs3.full-gc.plan.v2-preview.v1";
+
+/// Path-safe reason returned when an apply digest does not match its exact plan.
+pub const V2_MAINTENANCE_PLAN_STALE_REASON: &str =
+    "maintenance plan digest is stale: repository state moved since the dry run";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct V2MaintenanceIoUsage {
@@ -112,6 +119,17 @@ impl<'a, S> V2MaintenanceBudgetedStore<'a, S> {
             ByteRange::Full => self.reject_unbounded_read(),
         }
     }
+
+    async fn pace(&self) {
+        pace_maintenance_operation(self.budgets.op_pacing_delay).await;
+    }
+}
+
+/// Sleeps for the configured maintenance pacing delay, when one is set.
+async fn pace_maintenance_operation(delay: Option<Duration>) {
+    if let Some(delay) = delay.filter(|delay| !delay.is_zero()) {
+        tokio::time::sleep(delay).await;
+    }
 }
 
 struct V2MaintenanceBudgetedList {
@@ -125,6 +143,7 @@ struct V2MaintenanceBudgetedList {
 impl BlobList for V2MaintenanceBudgetedList {
     async fn next_page(&mut self, max_items: NonZeroUsize) -> rs3_storage::Result<BlobListPage> {
         charge_maintenance_io(self.budgets, &self.usage, 0, 0, Some(self.mode))?;
+        pace_maintenance_operation(self.budgets.op_pacing_delay).await;
         let page = self.inner.next_page(max_items).await?;
         if page.consumed_items < page.entries.len() || page.consumed_items > max_items.get() {
             return Err(StorageError::InvalidListPage);
@@ -161,6 +180,7 @@ where
         range: ByteRange,
     ) -> rs3_storage::Result<Bytes> {
         self.charge_range(range)?;
+        self.pace().await;
         self.inner.get_range(object_id, range).await
     }
 
@@ -171,6 +191,7 @@ where
         range: ByteRange,
     ) -> rs3_storage::Result<Bytes> {
         self.charge_range(range)?;
+        self.pace().await;
         self.inner.get_range_at(object_id, version_id, range).await
     }
 
@@ -181,11 +202,13 @@ where
         range: ByteRange,
     ) -> rs3_storage::Result<Box<dyn BlobRead>> {
         self.charge_range(range)?;
+        self.pace().await;
         self.inner.open_range_at(object_id, version_id, range).await
     }
 
     async fn head(&self, object_id: &BackendObjectId) -> rs3_storage::Result<BlobMetadata> {
         self.charge(1, 0, None)?;
+        self.pace().await;
         self.inner.head(object_id).await
     }
 
@@ -195,6 +218,7 @@ where
         version_id: Option<&BackendVersionId>,
     ) -> rs3_storage::Result<BlobMetadata> {
         self.charge(1, 0, None)?;
+        self.pace().await;
         self.inner.head_at(object_id, version_id).await
     }
 
@@ -457,6 +481,12 @@ pub struct V2MaintenanceReport {
     pub protected_orphan_candidate_count: usize,
     /// Oldest visible orphan age in milliseconds, when provider timestamps exist.
     pub oldest_orphan_age_ms: Option<u128>,
+    /// Orphan candidates currently eligible for conservative deletion.
+    pub reclaimable_orphan_candidate_count: usize,
+    /// Total bytes held by orphan candidates currently eligible for deletion.
+    pub reclaimable_orphan_candidate_bytes: u64,
+    /// Oldest deletion-eligible orphan age in milliseconds.
+    pub oldest_reclaimable_orphan_age_ms: Option<u128>,
     /// Live object versions that should have retention extended within the default renewal horizon.
     pub retention_renewal_commit_count: usize,
     /// Live object bytes covered by planned retention renewal.
@@ -465,6 +495,9 @@ pub struct V2MaintenanceReport {
     pub retention_renewal_blocked_count: usize,
     /// Live object bytes whose renewal could not be planned from available metadata.
     pub retention_renewal_blocked_bytes: u64,
+    /// Earliest provider retain-until deadline observed across live renewal
+    /// targets, in milliseconds since the Unix epoch.
+    pub nearest_retain_until_ms: Option<i64>,
 }
 
 /// Operator-accepted budgets for v2 full-maintenance dry runs and apply plans.
@@ -493,6 +526,18 @@ pub struct V2MaintenanceBudgets {
     ///
     /// Filtered members such as S3 delete markers count against this ceiling.
     pub max_inventory_item_count: u64,
+    /// Optional autovacuum-style delay inserted before each budgeted planning
+    /// operation and before each destructive maintenance mutation.
+    ///
+    /// Budgets bound the total work of one pass; this knob bounds its
+    /// instantaneous backend pressure so client traffic keeps headroom while
+    /// maintenance runs. A true peak-memory ceiling is not cheaply enforceable
+    /// here because inventory memory is dominated by per-candidate records,
+    /// not by tracked I/O bytes; peak memory stays bounded instead through
+    /// bounded-bytes accounting: `max_inventory_page_count`,
+    /// `max_inventory_item_count`, and `max_range_read_bytes` cap every input
+    /// that grows planning state.
+    pub op_pacing_delay: Option<Duration>,
 }
 
 impl Default for V2MaintenanceBudgets {
@@ -507,6 +552,31 @@ impl Default for V2MaintenanceBudgets {
             max_retention_extend_count: None,
             max_inventory_page_count: DEFAULT_MAX_INVENTORY_PAGES,
             max_inventory_item_count: DEFAULT_MAX_INVENTORY_ITEMS,
+            op_pacing_delay: None,
+        }
+    }
+}
+
+/// Inputs that bound one read-only quick-maintenance report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V2QuickMaintenanceOptions {
+    /// Physical I/O and inventory limits for the report.
+    pub budgets: V2MaintenanceBudgets,
+    /// Lead time used when identifying retention-renewal targets.
+    pub retention_renewal_horizon: Duration,
+    /// Conservative deletion policy used to classify reclaimable orphans.
+    pub orphan_gc: V2OrphanGcOptions,
+}
+
+impl Default for V2QuickMaintenanceOptions {
+    fn default() -> Self {
+        Self {
+            budgets: V2MaintenanceBudgets::default(),
+            retention_renewal_horizon: DEFAULT_RETENTION_RENEWAL_HORIZON,
+            orphan_gc: V2OrphanGcOptions {
+                min_age: MIN_ORPHAN_GC_AGE,
+                delete_same_sequence: false,
+            },
         }
     }
 }
@@ -621,6 +691,20 @@ pub struct V2FullGcDryRunReport {
     pub exact_version_apply_ready: bool,
 }
 
+/// Path-redacted preview of one exact full-maintenance plan.
+///
+/// The digest is derived inside the repository layer from the complete private
+/// mutation plan. It binds every exact object/version identity, observed
+/// protection fact, renewal target, protected root, and apply option without
+/// exposing those private inputs to callers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V2FullGcPlanPreview {
+    /// Redacted operator-facing summary of the plan.
+    pub report: V2FullGcDryRunReport,
+    /// Lowercase SHA-256 digest of the exact private plan.
+    pub plan_digest: String,
+}
+
 /// Guard required before destructive v2 maintenance can mutate storage.
 #[async_trait]
 pub trait V2MaintenanceGuard: Send + Sync {
@@ -628,10 +712,54 @@ pub trait V2MaintenanceGuard: Send + Sync {
     async fn verify_v2_maintenance(&self, base_anchor: Option<&V2AnchorState>) -> V2Result<()>;
 }
 
+#[async_trait]
+impl<G> V2MaintenanceGuard for Arc<G>
+where
+    G: V2MaintenanceGuard + ?Sized,
+{
+    async fn verify_v2_maintenance(&self, base_anchor: Option<&V2AnchorState>) -> V2Result<()> {
+        self.as_ref().verify_v2_maintenance(base_anchor).await
+    }
+}
+
+/// Cooperative cancellation signal for destructive v2 maintenance runs.
+///
+/// Cancellation is honored at mutation boundaries only: an in-flight renewal
+/// or delete call always completes and is never interrupted mid-request, so
+/// backend state stays exactly what the engine already verified. Signals are
+/// one-shot per run; a later run with a fresh signal replans from current
+/// state and completes any remainder.
+#[derive(Debug, Default)]
+pub struct V2MaintenanceCancellation {
+    cancelled: AtomicBool,
+}
+
+impl V2MaintenanceCancellation {
+    /// Creates a signal that has not requested a stop.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Requests a clean stop at the next mutation boundary.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Returns true when a stop has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
 /// Unenforced guard for externally quiesced maintenance windows.
 ///
-/// This is an honor-system escape hatch for tests and isolated rehearsals until
-/// the Lease-backed guard ships. Production operators must supply a real guard.
+/// Test and rehearsal use only. This honor-system guard performs no ownership
+/// verification and must never appear on a production path: live gateways use
+/// the Lease-backed writer fence, and the break-glass offline command acquires
+/// exclusive writer-fence ownership through the anchor backend before it runs.
+/// The only remaining callers are tests and explicitly isolated rehearsals
+/// that opt in (for example `xtask v2 gc-rehearsal --unenforced-guard` against
+/// a fresh single-process prefix).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnenforcedQuiescedMaintenanceGuard;
 
@@ -674,6 +802,7 @@ struct V2RetentionRenewalPlan {
     blocked_bytes: u64,
     head_count: u64,
     extend_count: u64,
+    nearest_retain_until_ms: Option<i64>,
     targets: Vec<V2RetentionTarget>,
 }
 
@@ -689,10 +818,275 @@ struct V2RetentionTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct V2FullGcPlan {
     report: V2FullGcDryRunReport,
+    base_anchor: Option<V2AnchorState>,
     retention_renewal: V2RetentionRenewalPlan,
     orphans: V2OrphanReport,
     current_chain: Option<V2ReplayChain>,
     current_state: Option<RepositoryState>,
+}
+
+pub(super) struct V2PreparedFullGcPlan {
+    pub(super) plan_digest: String,
+    pub(super) options: V2FullGcApplyOptions,
+    plan: V2FullGcPlan,
+}
+
+impl V2PreparedFullGcPlan {
+    pub(super) fn report(&self) -> &V2FullGcDryRunReport {
+        &self.plan.report
+    }
+
+    pub(super) fn current(&self) -> Option<(&V2ReplayChain, &RepositoryState)> {
+        self.plan
+            .current_chain
+            .as_ref()
+            .zip(self.plan.current_state.as_ref())
+    }
+}
+
+fn push_plan_bytes(encoded: &mut Vec<u8>, value: &[u8]) {
+    encoded.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(value);
+}
+
+fn push_plan_bool(encoded: &mut Vec<u8>, value: bool) {
+    encoded.push(u8::from(value));
+}
+
+fn push_plan_option_u64(encoded: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&value.to_be_bytes());
+        }
+        None => encoded.push(0),
+    }
+}
+
+fn push_plan_option_i64(encoded: &mut Vec<u8>, value: Option<i64>) {
+    match value {
+        Some(value) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&value.to_be_bytes());
+        }
+        None => encoded.push(0),
+    }
+}
+
+fn push_plan_duration(encoded: &mut Vec<u8>, value: Duration) {
+    encoded.extend_from_slice(&value.as_secs().to_be_bytes());
+    encoded.extend_from_slice(&value.subsec_nanos().to_be_bytes());
+}
+
+fn push_plan_option_duration(encoded: &mut Vec<u8>, value: Option<Duration>) {
+    match value {
+        Some(value) => {
+            encoded.push(1);
+            push_plan_duration(encoded, value);
+        }
+        None => encoded.push(0),
+    }
+}
+
+fn push_plan_version(encoded: &mut Vec<u8>, value: Option<&BackendVersionId>) {
+    match value {
+        Some(value) => {
+            encoded.push(1);
+            push_plan_bytes(encoded, value.as_str().as_bytes());
+        }
+        None => encoded.push(0),
+    }
+}
+
+fn push_plan_retention(encoded: &mut Vec<u8>, value: Option<RetentionPolicy>) {
+    match value {
+        Some(value) => {
+            encoded.push(1);
+            encoded.push(match value.mode {
+                RetentionMode::None => 0,
+                RetentionMode::Governance => 1,
+                RetentionMode::Compliance => 2,
+            });
+            encoded.extend_from_slice(&value.retain_days.to_be_bytes());
+        }
+        None => encoded.push(0),
+    }
+}
+
+fn push_plan_legal_hold(encoded: &mut Vec<u8>, value: Option<LegalHoldStatus>) {
+    encoded.push(match value {
+        None => 0,
+        Some(LegalHoldStatus::Off) => 1,
+        Some(LegalHoldStatus::On) => 2,
+    });
+}
+
+fn encode_plan_anchor(anchor: &V2AnchorState) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&anchor.sequence.get().to_be_bytes());
+    push_plan_bytes(&mut encoded, anchor.commit_key.as_str().as_bytes());
+    encoded.extend_from_slice(&anchor.body_digest);
+    push_plan_version(&mut encoded, anchor.version_id.as_ref());
+    push_plan_bytes(&mut encoded, anchor.signing_key_id.as_str().as_bytes());
+    encoded.extend_from_slice(&anchor.format_ref.generation.to_be_bytes());
+    push_plan_bytes(&mut encoded, anchor.format_ref.digest.as_bytes());
+    push_plan_bytes(
+        &mut encoded,
+        anchor.format_ref.object_id.as_str().as_bytes(),
+    );
+    push_plan_version(&mut encoded, anchor.format_ref.version_id.as_ref());
+    encoded
+}
+
+fn encode_plan_budgets(encoded: &mut Vec<u8>, budgets: V2MaintenanceBudgets) {
+    push_plan_option_u64(encoded, budgets.max_request_count);
+    push_plan_option_u64(encoded, budgets.max_version_list_count);
+    push_plan_option_u64(encoded, budgets.max_head_count);
+    push_plan_option_u64(encoded, budgets.max_range_read_bytes);
+    push_plan_option_u64(encoded, budgets.max_write_bytes);
+    push_plan_option_u64(encoded, budgets.max_delete_count);
+    push_plan_option_u64(encoded, budgets.max_retention_extend_count);
+    encoded.extend_from_slice(&budgets.max_inventory_page_count.to_be_bytes());
+    encoded.extend_from_slice(&budgets.max_inventory_item_count.to_be_bytes());
+    push_plan_option_duration(encoded, budgets.op_pacing_delay);
+}
+
+fn encode_plan_options(options: &V2FullGcApplyOptions) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    encode_plan_budgets(&mut encoded, options.dry_run.budgets);
+    push_plan_duration(&mut encoded, options.dry_run.retention_renewal_horizon);
+    let mut protected_roots: Vec<Vec<u8>> = options
+        .dry_run
+        .protected_roots
+        .iter()
+        .map(encode_plan_anchor)
+        .collect();
+    protected_roots.sort_unstable();
+    encoded.extend_from_slice(&(protected_roots.len() as u64).to_be_bytes());
+    for root in protected_roots {
+        push_plan_bytes(&mut encoded, &root);
+    }
+    push_plan_duration(&mut encoded, options.orphan_gc.min_age);
+    push_plan_bool(&mut encoded, options.orphan_gc.delete_same_sequence);
+    push_plan_bool(&mut encoded, options.retained_provider_conformance_passed);
+    encoded
+}
+
+fn encode_plan_report(report: &V2FullGcDryRunReport) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    push_plan_option_u64(&mut encoded, report.base_sequence.map(Sequence::get));
+    for value in [
+        report.chain_live_commit_count as u64,
+        report.protected_root_count as u64,
+        report.protected_commit_count as u64,
+        report.candidate_commit_count as u64,
+        report.fully_dead_commit_count as u64,
+        report.mixed_commit_count as u64,
+        report.dead_bytes_reclaimable,
+        report.live_bytes_to_copy,
+        report.mixed_dead_bytes_repackable,
+        report.retention_blocked_bytes,
+        report.legal_hold_blocked_bytes,
+        report.unknown_protection_blocked_bytes,
+        report.retention_renewal_commit_count as u64,
+        report.retention_renewal_bytes,
+        report.retention_renewal_blocked_count as u64,
+        report.retention_renewal_blocked_bytes,
+        report.planned_cost.request_count,
+        report.planned_cost.version_list_count,
+        report.planned_cost.head_count,
+        report.planned_cost.range_read_bytes,
+        report.planned_cost.write_bytes,
+        report.planned_cost.delete_count,
+        report.planned_cost.retention_extend_count,
+        report.planned_cost.inventory_page_count,
+        report.planned_cost.inventory_item_count,
+    ] {
+        encoded.extend_from_slice(&value.to_be_bytes());
+    }
+    push_plan_bool(&mut encoded, report.fits_budgets);
+    push_plan_bool(&mut encoded, report.exact_version_apply_ready);
+    encoded
+}
+
+fn encode_plan_orphan(candidate: &V2OrphanCandidate) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    encoded.push(match candidate.object_class {
+        V2OrphanObjectClass::Commit => 0,
+        V2OrphanObjectClass::Object => 1,
+    });
+    push_plan_bytes(&mut encoded, candidate.object_id.as_str().as_bytes());
+    push_plan_version(&mut encoded, candidate.version_id.as_ref());
+    encoded.extend_from_slice(&candidate.content_len.to_be_bytes());
+    push_plan_option_i64(&mut encoded, candidate.modified_at_ms);
+    push_plan_option_u64(&mut encoded, candidate.sequence.map(Sequence::get));
+    push_plan_bool(&mut encoded, candidate.same_sequence_as_anchor);
+    push_plan_retention(&mut encoded, candidate.retention);
+    push_plan_option_i64(&mut encoded, candidate.retain_until_ms);
+    push_plan_bool(&mut encoded, candidate.delete_blocked_by_retention);
+    push_plan_bool(&mut encoded, candidate.delete_blocked_by_legal_hold);
+    push_plan_bool(&mut encoded, candidate.delete_blocked_by_unknown_protection);
+    encoded
+}
+
+fn encode_plan_renewal(target: &V2RetentionTarget) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    push_plan_bytes(&mut encoded, target.object_id.as_str().as_bytes());
+    push_plan_version(&mut encoded, target.version_id.as_ref());
+    encoded.extend_from_slice(&target.stored_len.to_be_bytes());
+    push_plan_retention(&mut encoded, target.required_retention);
+    push_plan_legal_hold(&mut encoded, target.required_legal_hold);
+    encoded
+}
+
+fn encode_plan_group(tag: &[u8], mut entries: Vec<Vec<u8>>) -> Vec<u8> {
+    entries.sort_unstable();
+    let mut encoded = Vec::new();
+    push_plan_bytes(&mut encoded, tag);
+    encoded.extend_from_slice(&(entries.len() as u64).to_be_bytes());
+    for entry in entries {
+        push_plan_bytes(&mut encoded, &entry);
+    }
+    encoded
+}
+
+fn full_gc_plan_digest(plan: &V2FullGcPlan, options: &V2FullGcApplyOptions) -> String {
+    let options = encode_plan_options(options);
+    let report = encode_plan_report(&plan.report);
+    let mut base_anchor = vec![u8::from(plan.base_anchor.is_some())];
+    if let Some(anchor) = plan.base_anchor.as_ref() {
+        push_plan_bytes(&mut base_anchor, &encode_plan_anchor(anchor));
+    }
+    let orphans = encode_plan_group(
+        b"orphans",
+        plan.orphans
+            .candidates
+            .iter()
+            .map(encode_plan_orphan)
+            .collect(),
+    );
+    let renewals = encode_plan_group(
+        b"renewals",
+        plan.retention_renewal
+            .targets
+            .iter()
+            .map(encode_plan_renewal)
+            .collect(),
+    );
+
+    let fields = [options, report, base_anchor, orphans, renewals];
+    let field_refs: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+    rs3_crypto::derive_public_fingerprint(FULL_GC_PLAN_DIGEST_DOMAIN, &field_refs)
+}
+
+/// Bounds applied to one destructive orphan-delete pass.
+struct V2OrphanDeleteBounds<'a> {
+    /// Delete-attempt ceiling from the accepted dry-run plan, when present.
+    max_delete_count: Option<u64>,
+    /// Cooperative cancellation checked before each delete.
+    cancellation: &'a V2MaintenanceCancellation,
+    /// Optional pacing delay applied before each delete mutation.
+    op_pacing_delay: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1252,7 +1646,11 @@ where
             base_anchor.as_ref(),
             report,
             options,
-            None,
+            V2OrphanDeleteBounds {
+                max_delete_count: None,
+                cancellation: &V2MaintenanceCancellation::new(),
+                op_pacing_delay: None,
+            },
         )
         .await
     }
@@ -1282,7 +1680,11 @@ where
             base_anchor.as_ref(),
             report,
             options,
-            None,
+            V2OrphanDeleteBounds {
+                max_delete_count: None,
+                cancellation: &V2MaintenanceCancellation::new(),
+                op_pacing_delay: None,
+            },
         )
         .await
     }
@@ -1294,11 +1696,16 @@ where
         base_anchor: Option<&V2AnchorState>,
         report: V2OrphanReport,
         options: V2OrphanGcOptions,
-        max_delete_count: Option<u64>,
+        bounds: V2OrphanDeleteBounds<'_>,
     ) -> V2Result<V2OrphanGcReport>
     where
         A: V2CommitAnchor,
     {
+        let V2OrphanDeleteBounds {
+            max_delete_count,
+            cancellation,
+            op_pacing_delay,
+        } = bounds;
         let now_ms = current_time_ms();
         let min_age_ms = options.min_age.as_millis();
         let mut gc = V2OrphanGcReport {
@@ -1330,6 +1737,12 @@ where
             if max_delete_count.is_some_and(|max| delete_attempt_count >= max) {
                 break;
             }
+            // A cancelled pass mirrors a mid-pass guard abort: it stops before
+            // the next delete and reports how far the partial pass got.
+            if cancellation.is_cancelled() {
+                gc.aborted = Some(V2FormatError::MaintenanceCancelled);
+                return Ok(gc);
+            }
             if let Err(error) = guard.verify_v2_maintenance(base_anchor).await {
                 gc.aborted = Some(error);
                 return Ok(gc);
@@ -1338,6 +1751,7 @@ where
                 gc.aborted = Some(V2FormatError::StaleAnchor);
                 return Ok(gc);
             }
+            pace_maintenance_operation(op_pacing_delay).await;
 
             let delete = if self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock
             {
@@ -1861,8 +2275,44 @@ where
     where
         A: V2CommitAnchor,
     {
+        self.quick_maintenance_with_options(anchor, V2QuickMaintenanceOptions::default())
+            .await
+    }
+
+    /// Runs read-only quick maintenance checks under explicit physical limits.
+    pub async fn quick_maintenance_with_options<A>(
+        &self,
+        anchor: &A,
+        options: V2QuickMaintenanceOptions,
+    ) -> V2Result<V2MaintenanceReport>
+    where
+        A: V2CommitAnchor,
+    {
+        let budgeted_store = V2MaintenanceBudgetedStore::new(self.store(), options.budgets);
+        let usage_handle = budgeted_store.clone();
+        let budgeted_repository = self.rebind_store(budgeted_store);
+        let result = budgeted_repository
+            .quick_maintenance_inner(anchor, options)
+            .await;
+        let usage = usage_handle
+            .usage()
+            .map_err(|_| V2FormatError::StorageOperationFailed)?;
+        if usage.exhausted {
+            return Err(V2FormatError::MaintenanceBudgetExceeded);
+        }
+        result
+    }
+
+    async fn quick_maintenance_inner<A>(
+        &self,
+        anchor: &A,
+        options: V2QuickMaintenanceOptions,
+    ) -> V2Result<V2MaintenanceReport>
+    where
+        A: V2CommitAnchor,
+    {
         let reachability = self
-            .load_reachability(anchor, &[], V2MaintenanceBudgets::default(), true)
+            .load_reachability(anchor, &[], options.budgets, true)
             .await?;
         let chain = reachability.current_chain.as_ref();
         let verified_commit_count = chain
@@ -1875,7 +2325,7 @@ where
                 age_since_ms(now_ms, Some(commit.parsed_header.header.publish_time_ms))
             });
         let orphans = self
-            .report_orphans_from_reachability(&reachability, V2MaintenanceBudgets::default())
+            .report_orphans_from_reachability(&reachability, options.budgets)
             .await?
             .report;
         let orphan_candidate_bytes = orphans.candidates.iter().fold(0_u64, |total, candidate| {
@@ -1895,11 +2345,36 @@ where
             .iter()
             .filter_map(|candidate| age_since_ms(now_ms, candidate.modified_at_ms))
             .max();
+        let reclaimable_orphans = orphans.candidates.iter().filter_map(|candidate| {
+            if candidate.delete_blocked_by_retention
+                || candidate.delete_blocked_by_legal_hold
+                || candidate.delete_blocked_by_unknown_protection
+                || candidate.same_sequence_as_anchor && !options.orphan_gc.delete_same_sequence
+            {
+                return None;
+            }
+            let age_ms = age_since_ms(now_ms, candidate.modified_at_ms)?;
+            (age_ms >= options.orphan_gc.min_age.as_millis()).then_some((candidate, age_ms))
+        });
+        let (
+            reclaimable_orphan_candidate_count,
+            reclaimable_orphan_candidate_bytes,
+            oldest_reclaimable_orphan_age_ms,
+        ) = reclaimable_orphans.fold(
+            (0_usize, 0_u64, None),
+            |(count, bytes, oldest), (candidate, age_ms)| {
+                (
+                    count.saturating_add(1),
+                    bytes.saturating_add(candidate.content_len),
+                    Some(oldest.map_or(age_ms, |current: u128| current.max(age_ms))),
+                )
+            },
+        );
         let retention_renewal = if chain.is_some() {
             self.plan_retention_renewal(
                 reachability.renewal_targets.values(),
-                DEFAULT_RETENTION_RENEWAL_HORIZON,
-                V2MaintenanceBudgets::default(),
+                options.retention_renewal_horizon,
+                options.budgets,
                 0,
                 0,
             )
@@ -1915,10 +2390,14 @@ where
             orphan_candidate_bytes,
             protected_orphan_candidate_count,
             oldest_orphan_age_ms,
+            reclaimable_orphan_candidate_count,
+            reclaimable_orphan_candidate_bytes,
+            oldest_reclaimable_orphan_age_ms,
             retention_renewal_commit_count: retention_renewal.commit_count,
             retention_renewal_bytes: retention_renewal.bytes,
             retention_renewal_blocked_count: retention_renewal.blocked_count,
             retention_renewal_blocked_bytes: retention_renewal.blocked_bytes,
+            nearest_retain_until_ms: retention_renewal.nearest_retain_until_ms,
         })
     }
 
@@ -2137,6 +2616,7 @@ where
         };
         Ok(V2FullGcPlan {
             report,
+            base_anchor: reachability.anchor_state,
             retention_renewal,
             orphans,
             current_chain: reachability.current_chain,
@@ -2163,8 +2643,68 @@ where
         A: V2CommitAnchor,
         G: V2MaintenanceGuard,
     {
+        self.apply_full_gc_cancellable(anchor, guard, options, &V2MaintenanceCancellation::new())
+            .await
+    }
+
+    /// Applies guarded full maintenance with a cooperative cancellation signal.
+    ///
+    /// Identical to [`Self::apply_full_gc`], except the run stops cleanly at
+    /// the next mutation boundary once `cancellation` fires. Cancellation
+    /// during renewal fails the run with
+    /// [`V2FormatError::MaintenanceCancelled`] before the next renewal call;
+    /// cancellation during deletion returns the partial orphan report with the
+    /// same abort marker. Nothing already mutated is rolled back, and a later
+    /// run replans from current state and completes the remainder.
+    pub async fn apply_full_gc_cancellable<A, G>(
+        &self,
+        anchor: &A,
+        guard: &G,
+        options: V2FullGcApplyOptions,
+        cancellation: &V2MaintenanceCancellation,
+    ) -> V2Result<V2FullGcApplyReport>
+    where
+        A: V2CommitAnchor,
+        G: V2MaintenanceGuard,
+    {
+        let prepared = self.prepare_full_gc_plan(anchor, options).await?;
+        self.apply_prepared_full_gc_cancellable(anchor, guard, prepared, cancellation)
+            .await
+    }
+
+    pub(super) async fn prepare_full_gc_plan<A>(
+        &self,
+        anchor: &A,
+        options: V2FullGcApplyOptions,
+    ) -> V2Result<V2PreparedFullGcPlan>
+    where
+        A: V2CommitAnchor,
+    {
+        let plan = self
+            .build_full_gc_plan(anchor, options.dry_run.clone())
+            .await?;
+        let plan_digest = full_gc_plan_digest(&plan, &options);
+        Ok(V2PreparedFullGcPlan {
+            plan_digest,
+            options,
+            plan,
+        })
+    }
+
+    pub(super) async fn apply_prepared_full_gc_cancellable<A, G>(
+        &self,
+        anchor: &A,
+        guard: &G,
+        prepared: V2PreparedFullGcPlan,
+        cancellation: &V2MaintenanceCancellation,
+    ) -> V2Result<V2FullGcApplyReport>
+    where
+        A: V2CommitAnchor,
+        G: V2MaintenanceGuard,
+    {
+        let V2PreparedFullGcPlan { options, plan, .. } = prepared;
         guard.verify_v2_maintenance(None).await?;
-        let base_anchor = anchor.read_v2().await?;
+        let base_anchor = plan.base_anchor.clone();
         guard.verify_v2_maintenance(base_anchor.as_ref()).await?;
 
         if self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock
@@ -2173,9 +2713,6 @@ where
             return Err(V2FormatError::ProviderProfileFailed);
         }
 
-        let plan = self
-            .build_full_gc_plan(anchor, options.dry_run.clone())
-            .await?;
         let V2FullGcPlan {
             report: dry_run,
             retention_renewal,
@@ -2195,12 +2732,15 @@ where
             return Err(V2FormatError::StaleAnchor);
         }
 
+        let op_pacing_delay = options.dry_run.budgets.op_pacing_delay;
         let (retention_renewed_object_count, retention_renewed_bytes) = self
             .apply_retention_renewal(
                 anchor,
                 guard,
                 base_anchor.as_ref(),
                 retention_renewal.targets,
+                cancellation,
+                op_pacing_delay,
             )
             .await?;
 
@@ -2211,7 +2751,11 @@ where
                 base_anchor.as_ref(),
                 orphans,
                 options.orphan_gc,
-                Some(dry_run.planned_cost.delete_count),
+                V2OrphanDeleteBounds {
+                    max_delete_count: Some(dry_run.planned_cost.delete_count),
+                    cancellation,
+                    op_pacing_delay,
+                },
             )
             .await?;
 
@@ -2229,6 +2773,8 @@ where
         guard: &G,
         base_anchor: Option<&V2AnchorState>,
         targets: Vec<V2RetentionTarget>,
+        cancellation: &V2MaintenanceCancellation,
+        op_pacing_delay: Option<Duration>,
     ) -> V2Result<(usize, u64)>
     where
         A: V2CommitAnchor,
@@ -2240,6 +2786,11 @@ where
         let mut renewed_bytes = 0_u64;
 
         for target in targets {
+            // Renewals only strengthen protection, so a cancelled run keeps
+            // everything already renewed and a later run replans the rest.
+            if cancellation.is_cancelled() {
+                return Err(V2FormatError::MaintenanceCancelled);
+            }
             let policy = target
                 .required_retention
                 .ok_or(V2FormatError::ProviderProfileFailed)?;
@@ -2250,6 +2801,7 @@ where
             if retained_profile && target.version_id.is_none() {
                 return Err(V2FormatError::ProviderProfileFailed);
             }
+            pace_maintenance_operation(op_pacing_delay).await;
 
             let required_retain_until_ms = required_retain_until_ms(policy)?;
             self.store()
@@ -2348,6 +2900,15 @@ where
                 plan.blocked_count = plan.blocked_count.saturating_add(1);
                 plan.blocked_bytes = plan.blocked_bytes.saturating_add(target.stored_len);
                 continue;
+            }
+
+            if policy.is_some()
+                && let Some(retain_until_ms) = metadata.retain_until_ms
+            {
+                plan.nearest_retain_until_ms = Some(
+                    plan.nearest_retain_until_ms
+                        .map_or(retain_until_ms, |nearest| nearest.min(retain_until_ms)),
+                );
             }
 
             if let Some(policy) = policy
@@ -2605,13 +3166,16 @@ fn payload_section_facts(
 #[cfg(test)]
 mod tests {
     use super::{
-        V2FormatError, V2ReachabilityState, V2StandalonePayloadRoot,
-        validate_standalone_payload_root,
+        V2FormatError, V2FullGcApplyOptions, V2FullGcDryRunOptions, V2FullGcDryRunReport,
+        V2FullGcPlan, V2MaintenancePlanCost, V2OrphanCandidate, V2OrphanGcOptions,
+        V2OrphanObjectClass, V2OrphanReport, V2ReachabilityState, V2RetentionRenewalPlan,
+        V2StandalonePayloadRoot, full_gc_plan_digest, validate_standalone_payload_root,
     };
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use rs3_index::PayloadHeaderReference;
     use rs3_types::{BackendObjectId, BackendVersionId, KeyId};
+    use std::time::Duration;
 
     fn standalone_root(byte: u8) -> V2StandalonePayloadRoot {
         V2StandalonePayloadRoot {
@@ -2636,6 +3200,92 @@ mod tests {
                 header_len: 48,
             },
         }
+    }
+
+    fn digest_plan(candidate_ids: [&str; 2]) -> V2FullGcPlan {
+        let candidates = candidate_ids
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, object_id)| V2OrphanCandidate {
+                object_class: V2OrphanObjectClass::Object,
+                object_id: BackendObjectId::new(object_id).expect("candidate object ID"),
+                version_id: Some(
+                    BackendVersionId::new(format!("version-{ordinal}"))
+                        .expect("candidate version ID"),
+                ),
+                content_len: if ordinal == 0 { 10 } else { 20 },
+                modified_at_ms: Some(1_000 + ordinal as i64),
+                sequence: None,
+                same_sequence_as_anchor: false,
+                retention: None,
+                retain_until_ms: None,
+                delete_blocked_by_retention: false,
+                delete_blocked_by_legal_hold: false,
+                delete_blocked_by_unknown_protection: false,
+            })
+            .collect();
+        V2FullGcPlan {
+            report: V2FullGcDryRunReport {
+                base_sequence: None,
+                chain_live_commit_count: 0,
+                protected_root_count: 0,
+                protected_commit_count: 0,
+                candidate_commit_count: 2,
+                fully_dead_commit_count: 2,
+                mixed_commit_count: 0,
+                dead_bytes_reclaimable: 30,
+                live_bytes_to_copy: 0,
+                mixed_dead_bytes_repackable: 0,
+                retention_blocked_bytes: 0,
+                legal_hold_blocked_bytes: 0,
+                unknown_protection_blocked_bytes: 0,
+                retention_renewal_commit_count: 0,
+                retention_renewal_bytes: 0,
+                retention_renewal_blocked_count: 0,
+                retention_renewal_blocked_bytes: 0,
+                planned_cost: V2MaintenancePlanCost {
+                    delete_count: 2,
+                    ..V2MaintenancePlanCost::default()
+                },
+                fits_budgets: true,
+                exact_version_apply_ready: true,
+            },
+            base_anchor: None,
+            retention_renewal: V2RetentionRenewalPlan::default(),
+            orphans: V2OrphanReport {
+                reachable_commit_count: 0,
+                reachable_object_count: 0,
+                candidates,
+            },
+            current_chain: None,
+            current_state: None,
+        }
+    }
+
+    fn digest_options() -> V2FullGcApplyOptions {
+        V2FullGcApplyOptions {
+            dry_run: V2FullGcDryRunOptions::default(),
+            orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+            retained_provider_conformance_passed: true,
+        }
+    }
+
+    #[test]
+    fn exact_plan_digest_rejects_aggregate_collisions_and_ignores_inventory_order() {
+        let first = digest_plan(["objects/v02/a", "objects/v02/b"]);
+        let collision = digest_plan(["objects/v02/c", "objects/v02/d"]);
+        assert_eq!(first.report, collision.report);
+        assert_ne!(
+            full_gc_plan_digest(&first, &digest_options()),
+            full_gc_plan_digest(&collision, &digest_options())
+        );
+
+        let mut reordered = first.clone();
+        reordered.orphans.candidates.reverse();
+        assert_eq!(
+            full_gc_plan_digest(&first, &digest_options()),
+            full_gc_plan_digest(&reordered, &digest_options())
+        );
     }
 
     #[test]

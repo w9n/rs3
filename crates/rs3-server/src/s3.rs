@@ -18,13 +18,16 @@ pub use recovery_tools::{
     rewrap_keyring_envelope_with_store, verify_v2_recovery_bundle_from_tool_config,
     verify_v2_recovery_bundle_with_store,
 };
+#[cfg(feature = "k8s")]
+pub use runtime::offline_maintenance_runtime_from_writer_fence;
 pub(crate) use runtime::v2_quick_maintenance_from_config;
 pub use runtime::{
     DoctorProbeCheck, DoctorProbeReport, RuntimeV2ProviderConformanceOptions,
     V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport, V2RepositoryInitReport,
     check_v2_provider_conformance_from_config, check_v2_provider_conformance_from_provider_config,
     doctor_probe_from_config, export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
-    init_v2_repository_from_config, write_v2_index_snapshot_from_config,
+    init_v2_repository_from_config, offline_maintenance_runtime_from_config,
+    write_v2_index_snapshot_from_config,
 };
 use thiserror::Error;
 
@@ -58,9 +61,9 @@ pub(super) fn repository_init(error: impl ToString) -> S3BoundaryError {
 pub(super) mod test_support {
     use crate::GatewayMode;
     use crate::{
-        AnchorConfig, BackendConfig, BatchConfig, HardeningConfig, MetricsConfig,
-        ProviderConformanceConfig, RecoveryConfig, RepositoryConfig, RepositoryKeysConfig,
-        RuntimeConfig, WriterGuardConfig,
+        AnchorConfig, BackendConfig, BatchConfig, HardeningConfig, MaintenanceConfig,
+        MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig,
+        RepositoryKeysConfig, RuntimeConfig, WriterGuardConfig,
     };
     use rs3_types::{PublicBucket, RepositoryId};
     use secrecy::SecretString;
@@ -103,6 +106,7 @@ pub(super) mod test_support {
                 retention: None,
                 allow_init: true,
             },
+            maintenance: MaintenanceConfig::default(),
             provider_conformance: ProviderConformanceConfig::default(),
             recovery: RecoveryConfig::default(),
             repository_keys: RepositoryKeysConfig {

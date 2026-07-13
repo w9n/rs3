@@ -39,7 +39,7 @@ pub use commit::{
 };
 pub use coordinator::{
     V2_INDEX_COMPACTION_PAUSE_RUNS, V2_INDEX_COMPACTION_REQUEST_RUNS, V2CommitCoordinator,
-    V2CommitCoordinatorStatus, V2CommittedPut,
+    V2CommitCoordinatorStatus, V2CommittedPut, V2MaintenanceWindow,
 };
 pub use error::{V2ErrorClass, V2FormatError, V2Result};
 pub use format::{
@@ -60,10 +60,12 @@ pub use index_run::{
     seal_v2_index_run,
 };
 pub use maintenance::{
-    UnenforcedQuiescedMaintenanceGuard, V2FullGcApplyOptions, V2FullGcApplyReport,
-    V2FullGcDryRunOptions, V2FullGcDryRunReport, V2MaintenanceBudgets, V2MaintenanceGuard,
-    V2MaintenancePlanCost, V2MaintenanceReport, V2OrphanCandidate, V2OrphanGcOptions,
-    V2OrphanGcReport, V2OrphanObjectClass, V2OrphanReport,
+    DEFAULT_RETENTION_RENEWAL_HORIZON, UnenforcedQuiescedMaintenanceGuard,
+    V2_MAINTENANCE_PLAN_STALE_REASON, V2FullGcApplyOptions, V2FullGcApplyReport,
+    V2FullGcDryRunOptions, V2FullGcDryRunReport, V2FullGcPlanPreview, V2MaintenanceBudgets,
+    V2MaintenanceCancellation, V2MaintenanceGuard, V2MaintenancePlanCost, V2MaintenanceReport,
+    V2OrphanCandidate, V2OrphanGcOptions, V2OrphanGcReport, V2OrphanObjectClass, V2OrphanReport,
+    V2QuickMaintenanceOptions,
 };
 pub(crate) use payload_cache::{
     V2StreamPayloadCacheIdentity, V2StreamPayloadCarrierCacheIdentity,
@@ -82,6 +84,7 @@ pub use payload_pack::{
 pub use provider::{
     V2ProviderCheckStatus, V2ProviderConformanceCheck, V2ProviderConformanceOptions,
     V2ProviderConformanceReport, V2ProviderProfile, check_v2_provider_conformance,
+    required_v2_provider_check_names,
 };
 pub use repository::{
     DEFAULT_V2_FULL_CHAIN_MAX_BYTES, DEFAULT_V2_FULL_COMMIT_MAX_BYTES,
@@ -92,4 +95,6 @@ pub use repository::{
     V2MemoryAnchor, V2RecoveryBundle, V2ReplayChain, V2ReplayCommit, V2ReplayLimits,
     V2StoredCommit,
 };
-pub use service::{V2AuthenticatedReadBody, V2Repository, V2ResolvedObject};
+pub use service::{
+    V2AuthenticatedReadBody, V2FullMaintenanceReport, V2Repository, V2ResolvedObject,
+};

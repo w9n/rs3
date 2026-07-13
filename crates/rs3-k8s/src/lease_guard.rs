@@ -159,6 +159,18 @@ struct ObservedCompetitor {
     observed_at: Duration,
 }
 
+/// Outcome of one takeover-eligibility evaluation for a held Lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TakeoverDecision {
+    /// The competitor stayed unchanged for a full monotonic lease duration.
+    Allowed,
+    /// The competitor is being observed; it has not yet proven dead or live.
+    Observing,
+    /// The competitor changed while under observation, so a live writer is
+    /// actively renewing the Lease.
+    CompetitorRenewed,
+}
+
 #[derive(Clone, Debug)]
 struct LeaseCoordinationState {
     holder_identity: Option<String>,
@@ -255,8 +267,12 @@ where
             {
                 Some(lease) => {
                     let current = lease_coordination_state(&lease, self.lease_duration)?;
-                    if !self.may_take_ownership(&current, monotonic_time)? {
-                        return Err(LeaseGuardError::HeldByOther);
+                    match self.may_take_ownership(&current, monotonic_time)? {
+                        TakeoverDecision::Allowed => {}
+                        TakeoverDecision::Observing => return Err(LeaseGuardError::HeldByOther),
+                        TakeoverDecision::CompetitorRenewed => {
+                            return Err(LeaseGuardError::HeldByLiveWriter);
+                        }
                     }
                     let claim = WriterFenceClaim {
                         holder_identity: self.holder_identity.clone(),
@@ -410,9 +426,9 @@ where
         &self,
         current: &LeaseCoordinationState,
         now: Duration,
-    ) -> Result<bool, LeaseGuardError> {
+    ) -> Result<TakeoverDecision, LeaseGuardError> {
         let Some(record) = current.observation() else {
-            return Ok(true);
+            return Ok(TakeoverDecision::Allowed);
         };
 
         let mut observed = self
@@ -424,16 +440,22 @@ where
                 record,
                 observed_at: now,
             });
-            return Ok(false);
+            return Ok(TakeoverDecision::Observing);
         };
         if previous.record != record {
+            // The holder advanced its fence or renewal counter while this
+            // process was watching, so a live writer is actively renewing.
             *observed = Some(ObservedCompetitor {
                 record,
                 observed_at: now,
             });
-            return Ok(false);
+            return Ok(TakeoverDecision::CompetitorRenewed);
         }
-        Ok(now.saturating_sub(previous.observed_at) >= current.lease_duration)
+        if now.saturating_sub(previous.observed_at) >= current.lease_duration {
+            Ok(TakeoverDecision::Allowed)
+        } else {
+            Ok(TakeoverDecision::Observing)
+        }
     }
 
     fn current_claim(&self) -> Result<WriterFenceClaim, LeaseGuardError> {
@@ -509,17 +531,26 @@ impl KubernetesLeaseGuard {
     /// Waits until the configured Lease can be acquired safely.
     pub async fn acquire(&self) -> Result<LeaseGuardState, LeaseGuardError> {
         loop {
-            match self
-                .inner
-                .acquire_at(Timestamp::now(), self.inner.clock.elapsed())
-                .await
-            {
-                Err(LeaseGuardError::HeldByOther) => {
+            match self.try_acquire().await {
+                Err(LeaseGuardError::HeldByOther | LeaseGuardError::HeldByLiveWriter) => {
                     tokio::time::sleep(ACQUIRE_POLL_INTERVAL).await;
                 }
                 result => return result,
             }
         }
+    }
+
+    /// Attempts one acquisition without waiting out a held Lease.
+    ///
+    /// Returns [`LeaseGuardError::HeldByOther`] while an unchanged holder is
+    /// still under monotonic takeover observation and
+    /// [`LeaseGuardError::HeldByLiveWriter`] when the holder renewed during
+    /// that observation, so break-glass callers can fail closed instead of
+    /// waiting for a live gateway to exit.
+    pub async fn try_acquire(&self) -> Result<LeaseGuardState, LeaseGuardError> {
+        self.inner
+            .acquire_at(Timestamp::now(), self.inner.clock.elapsed())
+            .await
     }
 
     /// Renews the configured Lease using monotonic local liveness.
@@ -558,8 +589,10 @@ pub struct LeaseGuardState {
 /// Errors raised by reusable Lease guard operations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseGuardError {
-    /// Lease is held by another live identity.
+    /// Lease is held by another identity still under takeover observation.
     HeldByOther,
+    /// Lease is held by a live writer that renewed while under observation.
+    HeldByLiveWriter,
     /// This process no longer owns the previously acquired Lease.
     LostLease,
     /// Kubernetes update conflicted enough times that the guard gave up.
@@ -578,6 +611,9 @@ impl fmt::Display for LeaseGuardError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::HeldByOther => "lease is held by another live identity",
+            Self::HeldByLiveWriter => {
+                "lease is held by a live writer that renewed during takeover observation"
+            }
             Self::LostLease => "writer lease ownership was lost",
             Self::UpdateConflictLimit => "lease update conflict limit exceeded",
             Self::Conflict => "lease update conflict",
@@ -976,7 +1012,7 @@ mod tests {
             guard
                 .acquire_at(timestamp(10_000), Duration::from_secs(29))
                 .await,
-            Err(LeaseGuardError::HeldByOther)
+            Err(LeaseGuardError::HeldByLiveWriter)
         );
         assert_eq!(
             guard
@@ -984,6 +1020,35 @@ mod tests {
                 .await,
             Err(LeaseGuardError::HeldByOther)
         );
+    }
+
+    #[tokio::test]
+    async fn observed_renewal_reports_a_live_writer_and_never_takes_over() {
+        let api = FakeLeaseApi::default();
+        *api.lease.lock().await = Some(held_lease("pod-b/process-1", 7, 11));
+        let guard = lease_guard(api.clone(), "operator/offline-maintenance");
+
+        // First sighting only starts the observation window.
+        assert_eq!(
+            guard.acquire_at(timestamp(0), Duration::ZERO).await,
+            Err(LeaseGuardError::HeldByOther)
+        );
+        // The holder renews while under observation: this is a live writer.
+        *api.lease.lock().await = Some(held_lease("pod-b/process-1", 7, 12));
+        assert_eq!(
+            guard.acquire_at(timestamp(5), Duration::from_secs(5)).await,
+            Err(LeaseGuardError::HeldByLiveWriter)
+        );
+        // Every further renewal keeps failing closed, even past the original
+        // observation window.
+        *api.lease.lock().await = Some(held_lease("pod-b/process-1", 7, 13));
+        assert_eq!(
+            guard
+                .acquire_at(timestamp(120), Duration::from_secs(120))
+                .await,
+            Err(LeaseGuardError::HeldByLiveWriter)
+        );
+        assert!(guard.writer_fence().is_err());
     }
 
     #[tokio::test]

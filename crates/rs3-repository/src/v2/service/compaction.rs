@@ -6,8 +6,9 @@ use super::super::repository::{
     V2CommitAnchor, V2CommitSection, V2CommitWrite, V2MemoryAnchor, V2ReplayChain, V2StoredCommit,
 };
 use super::super::{
-    V2_PAYLOAD_PACK_SEGMENT_BYTES, V2FullGcDryRunOptions, V2FullGcDryRunReport, V2MaintenanceGuard,
-    V2ProviderProfile, V2SectionType, digest_v2_section,
+    V2_PAYLOAD_PACK_SEGMENT_BYTES, V2FullGcApplyOptions, V2FullGcApplyReport,
+    V2FullGcDryRunOptions, V2FullGcDryRunReport, V2FullGcPlanPreview, V2MaintenanceCancellation,
+    V2MaintenanceGuard, V2ProviderProfile, V2SectionType, digest_v2_section,
 };
 use super::{
     PendingV2CommitSections, PendingV2PayloadLocation, V2Repository, commit_protection_for_deltas,
@@ -16,7 +17,7 @@ use super::{
 use crate::checkpoint::{seal_index_delta_object, seal_manifest_record};
 use crate::error::{RepositoryError, Result};
 use crate::payload::{parse_segmented_payload_header, seal_streamable_payload_object};
-use crate::state::TrustedManifest;
+use crate::state::{RepositoryState, TrustedManifest};
 use bytes::Bytes;
 use rs3_index::{
     IndexDelta, IndexDeltaObject, NamespaceEntry, PayloadHeaderReference, PayloadReference,
@@ -25,6 +26,19 @@ use rs3_index::{
 use rs3_storage::{BlobStore, ByteRange};
 use rs3_types::{BackendObjectId, BackendVersionId, LogicalPath, PrefixToken, Sequence};
 use std::collections::BTreeSet;
+
+/// Outcome of one quiesced in-process v2 full-maintenance run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V2FullMaintenanceReport {
+    /// Budgeted service-level dry run captured inside the exclusion window.
+    ///
+    /// This report overlays mixed-commit repack candidates for observability
+    /// only. The apply pass below never repacks, so its own engine-level
+    /// preflight remains the budget gate for the mutations it performs.
+    pub dry_run: V2FullGcDryRunReport,
+    /// Destructive renewal-then-delete outcome, including the engine preflight.
+    pub apply: V2FullGcApplyReport,
+}
 
 struct V2CompactionSnapshotPlan {
     sequence: Sequence,
@@ -80,16 +94,51 @@ where
     where
         A: V2CommitAnchor,
     {
-        let (mut report, current) = self
+        let (report, current) = self
             .commit_store
             .full_gc_dry_run_with_state(anchor, options.clone())
             .await
             .map_err(v2_repository_error)?;
+        let current = current.as_ref().map(|(chain, state)| (chain, state));
+        self.overlay_full_gc_service_report(report, current, options.budgets)
+    }
+
+    /// Builds a repository-owned preview digest for the exact private apply plan.
+    pub async fn preview_full_gc_plan<A>(
+        &self,
+        anchor: &A,
+        options: V2FullGcApplyOptions,
+    ) -> Result<V2FullGcPlanPreview>
+    where
+        A: V2CommitAnchor,
+    {
+        let prepared = self
+            .commit_store
+            .prepare_full_gc_plan(anchor, options.clone())
+            .await
+            .map_err(v2_repository_error)?;
+        let report = self.overlay_full_gc_service_report(
+            prepared.report().clone(),
+            prepared.current(),
+            options.dry_run.budgets,
+        )?;
+        Ok(V2FullGcPlanPreview {
+            report,
+            plan_digest: prepared.plan_digest,
+        })
+    }
+
+    fn overlay_full_gc_service_report(
+        &self,
+        mut report: V2FullGcDryRunReport,
+        current: Option<(&V2ReplayChain, &RepositoryState)>,
+        budgets: super::super::V2MaintenanceBudgets,
+    ) -> Result<V2FullGcDryRunReport> {
         let Some((chain, state)) = current else {
             return Ok(report);
         };
         let (mixed_count, live_bytes_to_copy, mixed_dead_bytes_repackable) =
-            self.current_head_mixed_payload_summary(&state, &chain)?;
+            self.current_head_mixed_payload_summary(state, chain)?;
         report.mixed_commit_count = mixed_count;
         report.live_bytes_to_copy = live_bytes_to_copy;
         report.mixed_dead_bytes_repackable = mixed_dead_bytes_repackable;
@@ -99,11 +148,11 @@ where
                 .planned_cost
                 .write_bytes
                 .saturating_add(live_bytes_to_copy);
-            report.fits_budgets = report.planned_cost.fits_budgets(options.budgets);
-            if options.budgets.max_request_count.is_some()
-                || options.budgets.max_head_count.is_some()
-                || options.budgets.max_range_read_bytes.is_some()
-                || options.budgets.max_write_bytes.is_some()
+            report.fits_budgets = report.planned_cost.fits_budgets(budgets);
+            if budgets.max_request_count.is_some()
+                || budgets.max_head_count.is_some()
+                || budgets.max_range_read_bytes.is_some()
+                || budgets.max_write_bytes.is_some()
             {
                 // Snapshot publication and fresh-reader verification have a
                 // data-dependent request shape. Finite I/O ceilings fail closed
@@ -112,6 +161,69 @@ where
             }
         }
         Ok(report)
+    }
+
+    /// Runs budgeted retention renewal plus orphan deletion for one quiesced
+    /// exclusion window.
+    ///
+    /// The caller must hold a window that excludes concurrent v2 publications
+    /// for the whole call, normally
+    /// [`super::super::V2CommitCoordinator::begin_maintenance_window`], and
+    /// must pass that window's verified guard. The engine keeps its existing
+    /// invariants: renewal runs strictly before deletion, and every mutation
+    /// rechecks the maintenance guard plus the base anchor and fails closed on
+    /// loss. The cancellation signal is honored between mutations only; a
+    /// cancelled or aborted run leaves a re-runnable plan behind. Mixed-commit
+    /// repack is out of scope for this pass and stays on the separate guarded
+    /// compaction-snapshot path.
+    pub async fn apply_full_gc_quiesced<A, G>(
+        &self,
+        anchor: &A,
+        guard: &G,
+        options: V2FullGcApplyOptions,
+        cancellation: &V2MaintenanceCancellation,
+    ) -> Result<V2FullMaintenanceReport>
+    where
+        A: V2CommitAnchor,
+        G: V2MaintenanceGuard,
+    {
+        self.apply_full_gc_quiesced_expected(anchor, guard, options, None, cancellation)
+            .await
+    }
+
+    /// Applies the exact private plan prepared and optionally digest-checked in
+    /// this quiesced call, without reopening a planning gap before mutation.
+    pub async fn apply_full_gc_quiesced_expected<A, G>(
+        &self,
+        anchor: &A,
+        guard: &G,
+        options: V2FullGcApplyOptions,
+        expected_plan_digest: Option<&str>,
+        cancellation: &V2MaintenanceCancellation,
+    ) -> Result<V2FullMaintenanceReport>
+    where
+        A: V2CommitAnchor,
+        G: V2MaintenanceGuard,
+    {
+        let prepared = self
+            .commit_store
+            .prepare_full_gc_plan(anchor, options.clone())
+            .await
+            .map_err(v2_repository_error)?;
+        if expected_plan_digest.is_some_and(|expected| prepared.plan_digest != expected) {
+            return Err(v2_repository_error(V2FormatError::MaintenancePlanChanged));
+        }
+        let dry_run = self.overlay_full_gc_service_report(
+            prepared.report().clone(),
+            prepared.current(),
+            options.dry_run.budgets,
+        )?;
+        let apply = self
+            .commit_store
+            .apply_prepared_full_gc_cancellable(anchor, guard, prepared, cancellation)
+            .await
+            .map_err(v2_repository_error)?;
+        Ok(V2FullMaintenanceReport { dry_run, apply })
     }
 
     /// Writes a guarded compaction snapshot that copies current live payload

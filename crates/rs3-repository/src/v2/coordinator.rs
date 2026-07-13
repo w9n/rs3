@@ -4,9 +4,10 @@ use super::repository::{
     V2AnchorState, V2CommitAnchor, V2ReplayChain, V2StandaloneUploadCancellation,
 };
 use super::service::{
-    V2CoordinatedMutation, V2CoordinatorLease, V2Repository, V2StagedPutRollback,
+    V2CoordinatedMutation, V2CoordinatorLease, V2FullMaintenanceReport, V2Repository,
+    V2StagedPutRollback,
 };
-use super::{V2FormatError, V2MaintenanceGuard};
+use super::{V2FormatError, V2FullGcApplyOptions, V2MaintenanceCancellation, V2MaintenanceGuard};
 use crate::CommitCoordinatorOptions;
 use crate::error::{RepositoryError, Result};
 use crate::model::{DeleteOutcome, RepositoryObjectMetadata, RepositoryPutOptions};
@@ -16,7 +17,7 @@ use rs3_storage::BlobStore;
 use rs3_types::{LegalHoldStatus, LogicalPath, RetentionPolicy};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 use tokio::time::sleep;
 
 /// Active-run count at which a guarded coordinator first requests compaction.
@@ -32,6 +33,46 @@ pub struct V2CommittedPut {
     pub metadata: RepositoryObjectMetadata,
     /// Accepted v2 anchor state covering this write.
     pub anchor_state: V2AnchorState,
+}
+
+/// Exclusive in-process v2 maintenance window over a drained coordinator.
+///
+/// While this window is held the coordinator staging lock stays locked, so no
+/// new publication, staged put, streamed write, or delete can start. Staged
+/// writers block on the same staging lock they already use for ordinary
+/// publication stalls instead of being queued or rejected differently, and
+/// they resume unchanged once the window is dropped. A window is only handed
+/// out after pending commit batches are drained and the configured
+/// maintenance guard verified the base anchor, so destructive maintenance
+/// never starts against an unverified or half-published world.
+pub struct V2MaintenanceWindow {
+    guard: Arc<dyn V2MaintenanceGuard>,
+    base_anchor: Option<V2AnchorState>,
+    _stage: OwnedMutexGuard<()>,
+}
+
+impl std::fmt::Debug for V2MaintenanceWindow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("V2MaintenanceWindow")
+            .field(
+                "base_sequence",
+                &self.base_anchor.as_ref().map(|anchor| anchor.sequence),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl V2MaintenanceWindow {
+    /// Returns the verified maintenance guard bound to this window.
+    pub fn guard(&self) -> &Arc<dyn V2MaintenanceGuard> {
+        &self.guard
+    }
+
+    /// Returns the anchor state observed when the window was verified.
+    pub fn base_anchor(&self) -> Option<&V2AnchorState> {
+        self.base_anchor.as_ref()
+    }
 }
 
 /// Coordinates v2 repository writes that must not be acknowledged before commit.
@@ -227,6 +268,68 @@ where
     /// Returns the live coordinator status for path-redacted operator reports.
     pub fn status(&self) -> V2CommitCoordinatorStatus {
         self.status.snapshot()
+    }
+
+    /// Returns whether a maintenance guard is configured on this coordinator.
+    ///
+    /// Without a configured guard every maintenance window request fails
+    /// closed, so callers can use this to park automation instead of spinning
+    /// failing runs.
+    pub fn has_maintenance_guard(&self) -> bool {
+        self.maintenance_guard.is_some()
+    }
+
+    /// Opens a drained, guard-verified exclusion window for full maintenance.
+    ///
+    /// This waits for any in-flight batch publication, publishes the pending
+    /// batch, and then holds the staging lock so no new publication can start
+    /// until the returned window is dropped. It fails closed when no
+    /// maintenance guard is configured, when the coordinator is poisoned or
+    /// the pending batch cannot be drained, or when the configured guard
+    /// cannot verify the base anchor.
+    pub async fn begin_maintenance_window(&self) -> Result<V2MaintenanceWindow> {
+        let Some(guard) = self.maintenance_guard.clone() else {
+            return Err(v2_commit_error(V2FormatError::MaintenanceAccessRequired));
+        };
+        let stage = Arc::clone(&self.stage_lock).lock_owned().await;
+        self.publish_locked_batch().await?;
+        guard
+            .verify_v2_maintenance(None)
+            .await
+            .map_err(v2_commit_error)?;
+        let base_anchor = self.anchor.read_v2().await.map_err(v2_commit_error)?;
+        guard
+            .verify_v2_maintenance(base_anchor.as_ref())
+            .await
+            .map_err(v2_commit_error)?;
+        Ok(V2MaintenanceWindow {
+            guard,
+            base_anchor,
+            _stage: stage,
+        })
+    }
+
+    /// Runs budgeted v2 full maintenance inside a drained exclusion window.
+    ///
+    /// The window from [`Self::begin_maintenance_window`] is held for the
+    /// whole run, so client writes wait on the staging lock and resume
+    /// unchanged afterwards. Inside the window the repository service runs the
+    /// budgeted dry run and the destructive apply with the engine's existing
+    /// invariants: renewal strictly before deletion and a maintenance-guard
+    /// plus anchor recheck before every mutation. The cancellation signal is
+    /// honored at mutation boundaries only.
+    pub async fn run_full_maintenance(
+        &self,
+        options: V2FullGcApplyOptions,
+        cancellation: &V2MaintenanceCancellation,
+    ) -> Result<V2FullMaintenanceReport> {
+        let window = self.begin_maintenance_window().await?;
+        let report = self
+            .repository
+            .apply_full_gc_quiesced(self.anchor.as_ref(), window.guard(), options, cancellation)
+            .await;
+        drop(window);
+        report
     }
 
     #[cfg(test)]

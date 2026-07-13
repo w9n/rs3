@@ -4,11 +4,14 @@
 //! integrations. They are intentionally not a complete workflow API; mutating
 //! workflows require a separate authorization and audit model.
 
+use crate::maintenance::MaintenanceStatusSnapshot;
 use crate::{
-    AnchorConfig, BackendConfig, ProviderConformanceConfig, RuntimeConfig, WriterGuardConfig,
+    AnchorConfig, BackendConfig, MaintenanceMode, ProviderConformanceConfig, RuntimeConfig,
+    V2ProviderCheckConfig, WriterGuardConfig,
 };
 use async_trait::async_trait;
 use rs3_crypto::derive_public_fingerprint;
+use rs3_repository::v2::{V2ProviderProfile, required_v2_provider_check_names};
 use rs3_types::RetentionMode;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -16,6 +19,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ADMIN_STATUS_SCHEMA: &str = "rs3.admin-status.preview.v1";
 const ADMIN_POSTURE_SCHEMA: &str = "rs3.admin-posture.preview.v1";
+const PROVIDER_CONFORMANCE_SCHEMA: &str = "rs3.v2-provider-conformance.v2";
+const PROVIDER_EVIDENCE_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
+
+/// Derives the path-safe identity of the exact backend target qualified by a
+/// persisted provider-conformance report.
+pub fn provider_conformance_target_fingerprint(config: &V2ProviderCheckConfig) -> String {
+    derive_public_fingerprint(
+        b"rs3.provider-conformance.target.v1",
+        &[
+            config.backend.endpoint.as_bytes(),
+            config.backend.bucket.as_bytes(),
+            config.backend.prefix.as_deref().unwrap_or("").as_bytes(),
+        ],
+    )
+}
 
 /// Admin report profile.
 #[non_exhaustive]
@@ -85,6 +103,8 @@ pub struct AdminRuntimeFacts {
     pub process_started_at_ms: Option<i64>,
     /// Live repository facts.
     pub repository: AdminRepositoryRuntimeFacts,
+    /// Live maintenance supervisor posture, when the supervisor is running.
+    pub maintenance_supervisor: Option<AdminMaintenanceSupervisorSummary>,
 }
 
 /// Live repository facts safe to surface through admin reports.
@@ -319,6 +339,70 @@ pub struct AdminMaintenanceSummary {
     pub reason_code: Option<&'static str>,
     /// v2 maintenance facts, when the configured repository format is v2.
     pub v2: Option<AdminV2MaintenanceSummary>,
+    /// Live maintenance supervisor posture, when the supervisor is running.
+    pub supervisor: Option<AdminMaintenanceSupervisorSummary>,
+}
+
+/// Path-redacted maintenance supervisor posture and history.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AdminMaintenanceSupervisorSummary {
+    /// Configured supervisor mode.
+    pub mode: &'static str,
+    /// Current supervisor state machine position.
+    pub state: &'static str,
+    /// Stable reason code when the supervisor is parked.
+    pub parked_reason: Option<&'static str>,
+    /// Whether the automatic scheduler is paused by an operator.
+    pub paused: bool,
+    /// Nearest provider retain-until deadline observed by planning.
+    pub nearest_retain_until_ms: Option<i64>,
+    /// Next scheduled trigger time in milliseconds since the Unix epoch.
+    pub next_trigger_at_ms: Option<i64>,
+    /// Reason associated with the next scheduled trigger.
+    pub next_trigger_reason: Option<&'static str>,
+    /// Consecutive failed runs since the last success.
+    pub consecutive_failures: u32,
+    /// Timestamp of the last successful run in milliseconds since the epoch.
+    pub last_success_at_ms: Option<i64>,
+    /// Outcome of the most recent run attempt.
+    pub last_run_outcome: Option<&'static str>,
+    /// Trigger of the most recent run attempt.
+    pub last_run_trigger: Option<&'static str>,
+    /// Start time of the most recent run attempt in milliseconds.
+    pub last_run_started_at_ms: Option<i64>,
+    /// Duration of the most recent run attempt in milliseconds.
+    pub last_run_duration_ms: Option<u64>,
+    /// Objects renewed by the most recent run attempt.
+    pub last_run_renewed_object_count: Option<usize>,
+    /// Bytes renewed by the most recent run attempt.
+    pub last_run_renewed_bytes: Option<u64>,
+    /// Orphans deleted by the most recent run attempt.
+    pub last_run_deleted_object_count: Option<usize>,
+}
+
+impl From<&MaintenanceStatusSnapshot> for AdminMaintenanceSupervisorSummary {
+    fn from(snapshot: &MaintenanceStatusSnapshot) -> Self {
+        let last_run = snapshot.last_run.as_ref();
+        Self {
+            mode: snapshot.mode,
+            state: snapshot.state,
+            parked_reason: snapshot.parked_reason,
+            paused: snapshot.paused,
+            nearest_retain_until_ms: snapshot.nearest_retain_until_ms,
+            next_trigger_at_ms: snapshot.next_trigger_at_ms,
+            next_trigger_reason: snapshot.next_trigger_reason,
+            consecutive_failures: snapshot.consecutive_failures,
+            last_success_at_ms: snapshot.last_success_at_ms,
+            last_run_outcome: last_run.map(|run| run.outcome),
+            last_run_trigger: last_run.map(|run| run.trigger),
+            last_run_started_at_ms: last_run.map(|run| run.started_at_ms),
+            last_run_duration_ms: last_run.map(|run| run.duration_ms),
+            last_run_renewed_object_count: last_run.map(|run| run.renewed_object_count),
+            last_run_renewed_bytes: last_run.map(|run| run.renewed_bytes),
+            last_run_deleted_object_count: last_run.map(|run| run.deleted_object_count),
+        }
+    }
 }
 
 /// Path-redacted v2 maintenance facts.
@@ -390,6 +474,20 @@ impl AdminFinding {
             remediation,
         }
     }
+
+    fn warning(code: &'static str, message: &'static str, remediation: &'static str) -> Self {
+        Self {
+            severity: "warning",
+            code,
+            message,
+            remediation,
+        }
+    }
+
+    /// Returns whether this finding blocks the selected posture.
+    pub fn is_blocking(&self) -> bool {
+        self.severity == "error"
+    }
 }
 
 /// Builds a preview path-redacted status fact report from runtime configuration.
@@ -424,8 +522,11 @@ pub(crate) async fn admin_status_report_with_runtime_facts_and_maintenance(
     config: &RuntimeConfig,
     profile: AdminReportProfile,
     runtime_facts: &AdminRuntimeFacts,
-    maintenance: AdminMaintenanceSummary,
+    mut maintenance: AdminMaintenanceSummary,
 ) -> AdminStatusReport {
+    if maintenance.supervisor.is_none() {
+        maintenance.supervisor = runtime_facts.maintenance_supervisor.clone();
+    }
     let restore = restore_summary(config).await;
     admin_report_builder(config, profile, runtime_facts).status(restore, maintenance)
 }
@@ -670,15 +771,79 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         ));
     }
 
+    if config.mode.allows_mutation()
+        && config.maintenance.mode == MaintenanceMode::Off
+        && config.repository.retention.is_some()
+    {
+        findings.push(AdminFinding::error(
+            "maintenance.disabled",
+            "retention is configured but automatic maintenance is off, so retention renewal will lapse",
+            "set RS3_MAINTENANCE_MODE=auto (or manual with an external renewal process) before serving retained repositories",
+        ));
+    }
+
+    if config.mode.allows_mutation() && config.maintenance.mode == MaintenanceMode::Manual {
+        findings.push(AdminFinding::warning(
+            "maintenance.manual",
+            "maintenance runs only when triggered manually; renewal deadlines and orphan pressure are not serviced automatically",
+            "set RS3_MAINTENANCE_MODE=auto unless an external process owns full maintenance",
+        ));
+    }
+
+    if config.mode.allows_mutation()
+        && config.maintenance.mode != MaintenanceMode::Off
+        && config.writer_guard != WriterGuardConfig::Required
+    {
+        findings.push(AdminFinding::warning(
+            "maintenance.guard-missing",
+            "no maintenance guard is available, so the maintenance supervisor will park instead of running",
+            "set RS3_WRITER_GUARD=required with a Kubernetes Lease anchor so the writer fence can guard maintenance",
+        ));
+    }
+
+    if config.mode.allows_mutation()
+        && config.maintenance.mode != MaintenanceMode::Off
+        && config.repository.retention.is_some()
+        && !provider_conformance_evidence_passed(config)
+    {
+        findings.push(AdminFinding::error(
+            "maintenance.provider-conformance",
+            "retained maintenance requires current provider-conformance evidence for the selected profile",
+            "run rs3 check-v2-provider --format json against the retained backend, store the report outside that backend, and configure RS3_PROVIDER_CONFORMANCE_REPORT_FILE",
+        ));
+    }
+
+    if config.mode.allows_mutation()
+        && config.maintenance.mode == MaintenanceMode::Auto
+        && let Some(retention) = config.repository.retention
+    {
+        let retention_seconds = u64::from(retention.retain_days).saturating_mul(24 * 60 * 60);
+        let automatic_safety_seconds = config
+            .maintenance
+            .max_interval
+            .as_secs()
+            .saturating_add(config.maintenance.renewal_horizon.as_secs());
+        if retention_seconds <= automatic_safety_seconds {
+            findings.push(AdminFinding::error(
+                "maintenance.retention-window",
+                "the retention window does not exceed the automatic maintenance interval plus renewal safety horizon",
+                "increase RS3_REPOSITORY_RETENTION_DAYS or reduce RS3_MAINTENANCE_MAX_INTERVAL_SECONDS after accounting for the longest credible outage and operator response time",
+            ));
+        }
+    }
+
     findings
 }
 
 fn provider_summary(config: &RuntimeConfig) -> AdminProviderSummary {
+    let target_fingerprint =
+        provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(config));
     AdminProviderSummary {
         selected_profile: selected_provider_profile(config),
         conformance: provider_conformance_summary(
             &config.provider_conformance,
             selected_provider_profile(config),
+            &target_fingerprint,
         ),
     }
 }
@@ -700,6 +865,7 @@ fn selected_provider_profile(config: &RuntimeConfig) -> &'static str {
 fn provider_conformance_summary(
     config: &ProviderConformanceConfig,
     selected_profile: &'static str,
+    expected_target_fingerprint: &str,
 ) -> AdminProviderConformanceSummary {
     let Some(path) = config.report_file.as_ref() else {
         return provider_conformance_unavailable("missing", "provider-conformance.not-configured");
@@ -710,8 +876,31 @@ fn provider_conformance_summary(
     let Ok(report) = serde_json::from_str::<ProviderConformanceReportJson>(&body) else {
         return provider_conformance_unavailable("invalid", "provider-conformance.invalid-json");
     };
-    if report.schema != "rs3.v2-provider-conformance.v1" {
+    if report.schema != PROVIDER_CONFORMANCE_SCHEMA {
         return provider_conformance_unavailable("invalid", "provider-conformance.schema");
+    }
+    if report.target_fingerprint != expected_target_fingerprint {
+        return provider_conformance_unavailable("invalid", "provider-conformance.target-mismatch");
+    }
+    let report_profile = match report.profile.as_str() {
+        "dev" => V2ProviderProfile::Dev,
+        "atomic-create" => V2ProviderProfile::AtomicCreate,
+        "retained-version-object-lock" => V2ProviderProfile::RetainedVersionObjectLock,
+        _ => {
+            return provider_conformance_unavailable("invalid", "provider-conformance.profile");
+        }
+    };
+    let required_checks = required_v2_provider_check_names(report_profile);
+    let mut observed_checks = report
+        .checks
+        .iter()
+        .map(|check| check.name.as_str())
+        .collect::<Vec<_>>();
+    observed_checks.sort_unstable();
+    let mut expected_checks = required_checks;
+    expected_checks.sort_unstable();
+    if observed_checks != expected_checks {
+        return provider_conformance_unavailable("invalid", "provider-conformance.check-manifest");
     }
     let failed_check_count = report
         .checks
@@ -736,6 +925,9 @@ fn provider_conformance_summary(
     if report.profile != selected_profile {
         state = "invalid";
         reason_code = Some("provider-conformance.profile-mismatch");
+    } else if provider_conformance_is_from_future(report.generated_at_ms) {
+        state = "invalid";
+        reason_code = Some("provider-conformance.future-timestamp");
     } else if state == "passed" && provider_conformance_is_stale(report.generated_at_ms, config) {
         state = "stale";
         reason_code = Some("provider-conformance.stale");
@@ -761,10 +953,17 @@ fn provider_conformance_is_stale(
         return true;
     };
     let Some(now_ms) = current_time_ms() else {
-        return false;
+        return true;
     };
     let max_age_ms = i64::try_from(config.max_age.as_millis()).unwrap_or(i64::MAX);
     now_ms.saturating_sub(generated_at_ms) > max_age_ms
+}
+
+fn provider_conformance_is_from_future(generated_at_ms: Option<i64>) -> bool {
+    let (Some(generated_at_ms), Some(now_ms)) = (generated_at_ms, current_time_ms()) else {
+        return true;
+    };
+    generated_at_ms > now_ms.saturating_add(PROVIDER_EVIDENCE_MAX_FUTURE_SKEW_MS)
 }
 
 fn provider_conformance_unavailable(
@@ -783,9 +982,10 @@ fn provider_conformance_unavailable(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ProviderConformanceReportJson {
     schema: String,
+    target_fingerprint: String,
     profile: String,
     passed: bool,
     #[serde(default)]
@@ -793,7 +993,7 @@ struct ProviderConformanceReportJson {
     checks: Vec<ProviderConformanceCheckJson>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ProviderConformanceCheckJson {
     name: String,
     status: String,
@@ -849,14 +1049,32 @@ async fn maintenance_summary(config: &RuntimeConfig) -> AdminMaintenanceSummary 
                 retention_renewal_blocked_count: report.retention_renewal_blocked_count,
                 retention_renewal_blocked_bytes: report.retention_renewal_blocked_bytes,
             }),
+            supervisor: None,
         },
         Err(error) => AdminMaintenanceSummary {
             state: "unavailable",
             computed_at_ms,
             reason_code: Some(runtime_error_code(&error)),
             v2: None,
+            supervisor: None,
         },
     }
+}
+
+/// Returns whether persisted provider-conformance evidence currently passes.
+///
+/// The maintenance supervisor re-evaluates this before every destructive run
+/// on retained-version provider profiles.
+pub fn provider_conformance_evidence_passed(config: &RuntimeConfig) -> bool {
+    let target_fingerprint =
+        provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(config));
+    provider_conformance_summary(
+        &config.provider_conformance,
+        selected_provider_profile(config),
+        &target_fingerprint,
+    )
+    .state
+        == "passed"
 }
 
 fn runtime_error_code(error: &crate::S3BoundaryError) -> &'static str {
@@ -1030,15 +1248,17 @@ fn current_time_ms() -> Option<i64> {
 mod tests {
     use super::{
         AdminReportProfile, AdminRepositoryRuntimeFacts, AdminRuntimeFacts,
-        AdminV2CommitCoordinatorSummary, admin_posture_report,
+        AdminV2CommitCoordinatorSummary, ProviderConformanceCheckJson,
+        ProviderConformanceReportJson, admin_posture_report,
         admin_posture_report_with_runtime_facts, admin_status_report,
         admin_status_report_with_runtime_facts, backend_kind, current_time_ms, doctor_findings,
-        runtime_config_profile, runtime_error_code,
+        provider_conformance_target_fingerprint, runtime_config_profile, runtime_error_code,
     };
     use crate::{
-        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MetricsConfig,
-        ProviderConformanceConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
-        RepositoryKeysConfig, RuntimeConfig, StaticCredentials, WriterGuardConfig,
+        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MaintenanceConfig,
+        MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig,
+        RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
+        V2ProviderCheckConfig, WriterGuardConfig,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
@@ -1079,6 +1299,7 @@ mod tests {
                 }),
                 allow_init: true,
             },
+            maintenance: MaintenanceConfig::default(),
             provider_conformance: ProviderConformanceConfig::default(),
             recovery: RecoveryConfig::default(),
             repository_keys: RepositoryKeysConfig {
@@ -1134,6 +1355,147 @@ mod tests {
                 .iter()
                 .all(|finding| !finding.remediation.is_empty())
         );
+    }
+
+    #[test]
+    fn production_doctor_rejects_maintenance_off_with_configured_retention() {
+        let mut config = runtime_config();
+        config.maintenance.mode = crate::MaintenanceMode::Off;
+
+        let findings = doctor_findings(&config, AdminReportProfile::Production);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.code == "maintenance.disabled")
+            .unwrap_or_else(|| panic!("expected maintenance.disabled finding"));
+
+        assert_eq!(finding.severity, "error");
+        assert!(finding.is_blocking());
+
+        // Without configured retention there is no renewal deadline to lapse.
+        config.repository.retention = None;
+        let findings = doctor_findings(&config, AdminReportProfile::Production);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.code != "maintenance.disabled")
+        );
+    }
+
+    #[test]
+    fn production_doctor_requires_retained_provider_evidence() {
+        let config = runtime_config();
+
+        let findings = doctor_findings(&config, AdminReportProfile::Production);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.code == "maintenance.provider-conformance")
+            .unwrap_or_else(|| panic!("expected maintenance.provider-conformance finding"));
+
+        assert_eq!(finding.severity, "error");
+        assert!(finding.is_blocking());
+    }
+
+    #[test]
+    fn production_doctor_rejects_unsafe_automatic_retention_window() {
+        let mut config = runtime_config();
+        config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 14));
+
+        let findings = doctor_findings(&config, AdminReportProfile::Production);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.code == "maintenance.retention-window")
+            .unwrap_or_else(|| panic!("expected maintenance.retention-window finding"));
+
+        assert_eq!(finding.severity, "error");
+        assert!(finding.is_blocking());
+    }
+
+    #[test]
+    fn production_doctor_warns_on_manual_maintenance_mode() {
+        let mut config = runtime_config();
+        config.maintenance.mode = crate::MaintenanceMode::Manual;
+
+        let findings = doctor_findings(&config, AdminReportProfile::Production);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.code == "maintenance.manual")
+            .unwrap_or_else(|| panic!("expected maintenance.manual finding"));
+
+        assert_eq!(finding.severity, "warning");
+        assert!(!finding.is_blocking());
+    }
+
+    #[test]
+    fn production_doctor_warns_when_maintenance_guard_is_unavailable() {
+        let config = runtime_config();
+        assert_eq!(config.writer_guard, WriterGuardConfig::Off);
+
+        let findings = doctor_findings(&config, AdminReportProfile::Production);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.code == "maintenance.guard-missing")
+            .unwrap_or_else(|| panic!("expected maintenance.guard-missing finding"));
+
+        assert_eq!(finding.severity, "warning");
+        assert!(!finding.is_blocking());
+
+        let mut guarded = runtime_config();
+        guarded.writer_guard = WriterGuardConfig::Required;
+        let findings = doctor_findings(&guarded, AdminReportProfile::Production);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.code != "maintenance.guard-missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_status_attaches_maintenance_supervisor_facts() {
+        let config = runtime_config();
+        let runtime_facts = AdminRuntimeFacts {
+            process_started_at_ms: Some(123),
+            repository: AdminRepositoryRuntimeFacts {
+                v2_commit_coordinator: None,
+            },
+            maintenance_supervisor: Some(crate::AdminMaintenanceSupervisorSummary {
+                mode: "auto",
+                state: "parked",
+                parked_reason: Some("maintenance-guard-missing"),
+                paused: false,
+                nearest_retain_until_ms: None,
+                next_trigger_at_ms: None,
+                next_trigger_reason: None,
+                consecutive_failures: 0,
+                last_success_at_ms: None,
+                last_run_outcome: None,
+                last_run_trigger: None,
+                last_run_started_at_ms: None,
+                last_run_duration_ms: None,
+                last_run_renewed_object_count: None,
+                last_run_renewed_bytes: None,
+                last_run_deleted_object_count: None,
+            }),
+        };
+
+        let report = admin_status_report_with_runtime_facts(
+            &config,
+            AdminReportProfile::Production,
+            &runtime_facts,
+        )
+        .await;
+
+        let supervisor = report
+            .maintenance
+            .supervisor
+            .clone()
+            .unwrap_or_else(|| panic!("supervisor facts should be attached"));
+        assert_eq!(supervisor.state, "parked");
+        assert_eq!(supervisor.parked_reason, Some("maintenance-guard-missing"));
+        let json =
+            serde_json::to_string(&report.maintenance).unwrap_or_else(|error| panic!("{error}"));
+        assert!(!json.contains("client-private-bucket"));
+        assert!(!json.contains("backend-secret-bucket"));
+        assert!(!json.contains("tenant/private/prefix"));
     }
 
     #[test]
@@ -1235,6 +1597,7 @@ mod tests {
                     poison_reason: Some("test-poison".to_owned()),
                 }),
             },
+            maintenance_supervisor: None,
         };
 
         let status = admin_status_report_with_runtime_facts(
@@ -1284,18 +1647,9 @@ mod tests {
     fn admin_posture_reports_redacted_provider_conformance_evidence() {
         let mut config = runtime_config();
         config.backend.endpoint = "https://storage.example".to_owned();
+        let evidence = retained_provider_evidence(&config);
         config.provider_conformance.report_file = Some(provider_report_file(
-            r#"{
-              "schema": "rs3.v2-provider-conformance.v1",
-              "generated_at_ms": 9999999999999,
-              "profile": "retained-version-object-lock",
-              "passed": true,
-              "checks": [
-                {"name": "basic-put", "status": "passed", "reason": null},
-                {"name": "legal-hold-verifiable", "status": "passed", "reason": null},
-                {"name": "retained-governance-bypass-review", "status": "passed", "reason": null}
-              ]
-            }"#,
+            &serde_json::to_string(&evidence).unwrap_or_else(|error| panic!("{error}")),
         ));
 
         let report = admin_posture_report(&config, AdminReportProfile::Production);
@@ -1307,12 +1661,50 @@ mod tests {
             "retained-version-object-lock"
         );
         assert_eq!(report.provider.conformance.state, "passed");
-        assert_eq!(report.provider.conformance.check_count, 3);
+        assert_eq!(report.provider.conformance.check_count, 29);
         assert!(report.provider.conformance.legal_hold_checked);
         assert!(report.provider.conformance.governance_bypass_reviewed);
         assert!(!json.contains("storage.example"));
         assert!(!json.contains("backend-secret-bucket"));
         assert!(!json.contains("tenant/private/prefix"));
+    }
+
+    #[test]
+    fn provider_evidence_rejects_incomplete_wrong_target_and_future_reports() {
+        let mut config = runtime_config();
+
+        let mut incomplete = retained_provider_evidence(&config);
+        incomplete.checks.clear();
+        config.provider_conformance.report_file = Some(provider_report_file(
+            &serde_json::to_string(&incomplete).unwrap_or_else(|error| panic!("{error}")),
+        ));
+        let report = admin_posture_report(&config, AdminReportProfile::Production);
+        assert_eq!(
+            report.provider.conformance.reason_code,
+            Some("provider-conformance.check-manifest")
+        );
+
+        let mut wrong_target = retained_provider_evidence(&config);
+        wrong_target.target_fingerprint = "0".repeat(64);
+        config.provider_conformance.report_file = Some(provider_report_file(
+            &serde_json::to_string(&wrong_target).unwrap_or_else(|error| panic!("{error}")),
+        ));
+        let report = admin_posture_report(&config, AdminReportProfile::Production);
+        assert_eq!(
+            report.provider.conformance.reason_code,
+            Some("provider-conformance.target-mismatch")
+        );
+
+        let mut future = retained_provider_evidence(&config);
+        future.generated_at_ms = current_time_ms().map(|now| now.saturating_add(10 * 60 * 1_000));
+        config.provider_conformance.report_file = Some(provider_report_file(
+            &serde_json::to_string(&future).unwrap_or_else(|error| panic!("{error}")),
+        ));
+        let report = admin_posture_report(&config, AdminReportProfile::Production);
+        assert_eq!(
+            report.provider.conformance.reason_code,
+            Some("provider-conformance.future-timestamp")
+        );
     }
 
     #[test]
@@ -1326,6 +1718,7 @@ mod tests {
                     poison_reason: Some("v2 commit batch rollback failed".to_owned()),
                 }),
             },
+            maintenance_supervisor: None,
         };
 
         let report = admin_posture_report_with_runtime_facts(
@@ -1353,5 +1746,27 @@ mod tests {
         ));
         fs::write(&path, body).unwrap_or_else(|error| panic!("{error}"));
         path
+    }
+
+    fn retained_provider_evidence(config: &RuntimeConfig) -> ProviderConformanceReportJson {
+        let target_fingerprint =
+            provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(config));
+        let checks = rs3_repository::v2::required_v2_provider_check_names(
+            rs3_repository::v2::V2ProviderProfile::RetainedVersionObjectLock,
+        )
+        .into_iter()
+        .map(|name| ProviderConformanceCheckJson {
+            name: name.to_owned(),
+            status: "passed".to_owned(),
+        })
+        .collect();
+        ProviderConformanceReportJson {
+            schema: "rs3.v2-provider-conformance.v2".to_owned(),
+            target_fingerprint,
+            profile: "retained-version-object-lock".to_owned(),
+            passed: true,
+            generated_at_ms: current_time_ms(),
+            checks,
+        }
     }
 }

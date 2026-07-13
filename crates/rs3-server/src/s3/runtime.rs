@@ -15,6 +15,7 @@ use crate::admin::{
     AdminRuntimeFactsSource, AdminV2CommitCoordinatorSummary,
 };
 use crate::config::KEYRING_WRAPPING_KEY_HEX_ENV;
+use crate::maintenance::{MaintenanceRunPhase, MaintenanceRuntime};
 use crate::{
     BackendConfig, GatewayMode, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig,
     V2ProviderCheckConfig,
@@ -28,9 +29,12 @@ use rs3_k8s::WriterFence;
 pub use rs3_repository::v2::V2_RESTORE_BUNDLE_SCHEMA;
 use rs3_repository::v2::{
     V2AnchorState, V2AuthenticatedReadBody, V2CommitAnchor, V2CommitCoordinator, V2CommitKey,
-    V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef,
-    V2ProviderConformanceOptions, V2ProviderConformanceReport, V2ProviderProfile, V2RecoveryBundle,
-    V2Repository, V2ResolvedObject, check_v2_provider_conformance, v2_format_object_id,
+    V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot, V2FullGcApplyOptions,
+    V2FullGcDryRunOptions, V2FullGcDryRunReport, V2FullGcPlanPreview, V2FullMaintenanceReport,
+    V2KeyringEnvelopeRootRef, V2MaintenanceCancellation, V2MaintenanceGuard, V2MaintenanceReport,
+    V2ProviderConformanceOptions, V2ProviderConformanceReport, V2ProviderProfile,
+    V2QuickMaintenanceOptions, V2RecoveryBundle, V2Repository, V2ResolvedObject,
+    check_v2_provider_conformance, v2_format_object_id,
 };
 use rs3_repository::{
     DeleteOutcome, RepositoryError, RepositoryListEntry, RepositoryObjectMetadata,
@@ -196,7 +200,7 @@ struct LoadedV2Repository {
 
 impl RuntimeRepository {
     pub(super) async fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
-        Self::from_config_inner(config, None).await
+        Self::from_config_inner(config, None, None).await
     }
 
     #[cfg(feature = "k8s")]
@@ -204,17 +208,24 @@ impl RuntimeRepository {
         config: &RuntimeConfig,
         writer_fence: WriterFence,
     ) -> Result<Self, S3BoundaryError> {
-        Self::from_config_inner(config, Some(writer_fence)).await
+        let maintenance_guard: Arc<dyn V2MaintenanceGuard> = Arc::new(writer_fence.clone());
+        Self::from_config_inner(config, Some(writer_fence), Some(maintenance_guard)).await
+    }
+
+    pub(super) async fn from_config_with_maintenance_guard(
+        config: &RuntimeConfig,
+        maintenance_guard: Arc<dyn V2MaintenanceGuard>,
+    ) -> Result<Self, S3BoundaryError> {
+        Self::from_config_inner(config, None, Some(maintenance_guard)).await
     }
 
     async fn from_config_inner(
         config: &RuntimeConfig,
         #[cfg(feature = "k8s")] writer_fence: Option<WriterFence>,
         #[cfg(not(feature = "k8s"))] _writer_fence: Option<()>,
+        maintenance_guard: Option<Arc<dyn V2MaintenanceGuard>>,
     ) -> Result<Self, S3BoundaryError> {
         let store = build_store(&config.backend).await?;
-        #[cfg(feature = "k8s")]
-        let maintenance_guard = writer_fence.clone();
         #[cfg(feature = "k8s")]
         let anchor = build_v2_anchor_with_writer_fence(&config.anchor, writer_fence)?;
         #[cfg(not(feature = "k8s"))]
@@ -272,7 +283,6 @@ impl RuntimeRepository {
             coordinator_options(config.batching),
         )
         .map_err(repository_init)?;
-        #[cfg(feature = "k8s")]
         let coordinator = match maintenance_guard {
             Some(guard) => coordinator.with_maintenance_guard(guard),
             None => coordinator,
@@ -469,6 +479,10 @@ impl RuntimeRepository {
         self.coordinator.delete_committed(key).await
     }
 
+    pub(super) fn maintenance_runtime(&self) -> Arc<dyn MaintenanceRuntime> {
+        Arc::new(self.clone())
+    }
+
     pub(super) fn admin_facts_source(&self) -> Arc<dyn AdminRuntimeFactsSource> {
         Arc::new(RuntimeRepositoryAdminFacts {
             repository: self.clone(),
@@ -494,6 +508,76 @@ impl RuntimeRepository {
     }
 }
 
+#[async_trait::async_trait]
+impl MaintenanceRuntime for RuntimeRepository {
+    fn maintenance_guard_configured(&self) -> bool {
+        self.coordinator.has_maintenance_guard()
+    }
+
+    async fn quick_maintenance_report(&self) -> Result<V2MaintenanceReport, RepositoryError> {
+        self.repository
+            .commit_store()
+            .quick_maintenance(&self.anchor)
+            .await
+            .map_err(|error| RepositoryError::CommitFailed {
+                reason: error.to_string(),
+            })
+    }
+
+    async fn quick_maintenance_report_with_options(
+        &self,
+        options: V2QuickMaintenanceOptions,
+    ) -> Result<V2MaintenanceReport, RepositoryError> {
+        self.repository
+            .commit_store()
+            .quick_maintenance_with_options(&self.anchor, options)
+            .await
+            .map_err(|error| RepositoryError::CommitFailed {
+                reason: error.to_string(),
+            })
+    }
+
+    async fn full_gc_dry_run(
+        &self,
+        options: V2FullGcDryRunOptions,
+    ) -> Result<V2FullGcDryRunReport, RepositoryError> {
+        self.repository.full_gc_dry_run(&self.anchor, options).await
+    }
+
+    async fn preview_full_gc_plan(
+        &self,
+        options: V2FullGcApplyOptions,
+    ) -> Result<V2FullGcPlanPreview, RepositoryError> {
+        self.repository
+            .preview_full_gc_plan(&self.anchor, options)
+            .await
+    }
+
+    async fn run_full_maintenance(
+        &self,
+        options: V2FullGcApplyOptions,
+        expected_plan_digest: Option<&str>,
+        cancellation: &V2MaintenanceCancellation,
+        on_phase: &(dyn Fn(MaintenanceRunPhase) + Send + Sync),
+    ) -> Result<V2FullMaintenanceReport, RepositoryError> {
+        on_phase(MaintenanceRunPhase::Quiescing);
+        let window = self.coordinator.begin_maintenance_window().await?;
+        on_phase(MaintenanceRunPhase::Applying);
+        let report = self
+            .repository
+            .apply_full_gc_quiesced_expected(
+                &self.anchor,
+                window.guard(),
+                options,
+                expected_plan_digest,
+                cancellation,
+            )
+            .await;
+        drop(window);
+        report
+    }
+}
+
 impl AdminRuntimeFactsSource for RuntimeRepositoryAdminFacts {
     fn snapshot(&self) -> AdminRuntimeFacts {
         let status = self.repository.coordinator.status();
@@ -505,6 +589,7 @@ impl AdminRuntimeFactsSource for RuntimeRepositoryAdminFacts {
                     poison_reason: status.poison_reason,
                 }),
             },
+            maintenance_supervisor: None,
         }
     }
 }
@@ -566,6 +651,44 @@ pub async fn init_v2_repository_from_config(
         initialized: runtime.initialized,
         verified_commit_count: chain.commits_newest_first.len(),
     })
+}
+
+/// Opens the repository maintenance surface for offline break-glass
+/// maintenance with an explicitly supplied maintenance guard.
+///
+/// This path exists for the development memory anchor and tests only, and it
+/// fails closed when the configured anchor is not the memory anchor: every
+/// other anchor backend must acquire a real writer fence and go through
+/// [`offline_maintenance_runtime_from_writer_fence`] so anchor advances stay
+/// fenced in the same compare-and-swap.
+pub async fn offline_maintenance_runtime_from_config(
+    config: &RuntimeConfig,
+    maintenance_guard: Arc<dyn V2MaintenanceGuard>,
+) -> Result<Arc<dyn MaintenanceRuntime>, S3BoundaryError> {
+    if !matches!(config.anchor, crate::AnchorConfig::Memory) {
+        return Err(repository_init(
+            "offline maintenance with an explicit guard supports the memory anchor only; \
+             kubernetes-lease anchors require writer-fence acquisition",
+        ));
+    }
+    let runtime =
+        RuntimeRepository::from_config_with_maintenance_guard(config, maintenance_guard).await?;
+    Ok(runtime.maintenance_runtime())
+}
+
+/// Opens the repository maintenance surface for offline break-glass
+/// maintenance under an acquired Kubernetes writer fence.
+///
+/// The fence is wired into both the commit anchor (so every anchor advance
+/// validates it in the same resourceVersion compare-and-swap) and the
+/// coordinator maintenance guard used for per-mutation rechecks.
+#[cfg(feature = "k8s")]
+pub async fn offline_maintenance_runtime_from_writer_fence(
+    config: &RuntimeConfig,
+    writer_fence: WriterFence,
+) -> Result<Arc<dyn MaintenanceRuntime>, S3BoundaryError> {
+    let runtime = RuntimeRepository::from_config_with_writer_fence(config, writer_fence).await?;
+    Ok(runtime.maintenance_runtime())
 }
 
 /// Runs opt-in live doctor probes against configured runtime dependencies.
@@ -1368,6 +1491,67 @@ mod tests {
             unavailable.reason_code,
             Some("backend.anchor-head-unavailable")
         );
+    }
+
+    #[tokio::test]
+    async fn offline_runtime_from_config_runs_guarded_maintenance_on_memory_anchor() {
+        let runtime = super::offline_maintenance_runtime_from_config(
+            &runtime_config(false),
+            Arc::new(rs3_repository::v2::UnenforcedQuiescedMaintenanceGuard),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(runtime.maintenance_guard_configured());
+
+        let options = rs3_repository::v2::V2FullGcApplyOptions {
+            dry_run: rs3_repository::v2::V2FullGcDryRunOptions::default(),
+            orphan_gc: rs3_repository::v2::V2OrphanGcOptions::new_for_test_rehearsal(
+                Duration::ZERO,
+            ),
+            retained_provider_conformance_passed: true,
+        };
+        let preview = runtime
+            .preview_full_gc_plan(options.clone())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let cancellation = rs3_repository::v2::V2MaintenanceCancellation::new();
+        let report = runtime
+            .run_full_maintenance(
+                options.clone(),
+                Some(&preview.plan_digest),
+                &cancellation,
+                &|_phase| {},
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(report.apply.orphan_gc.aborted.is_none());
+
+        let stale = runtime
+            .run_full_maintenance(options, Some(&"ab".repeat(32)), &cancellation, &|_phase| {})
+            .await;
+        assert!(matches!(
+            stale,
+            Err(rs3_repository::RepositoryError::CommitFailed { reason })
+                if reason == crate::maintenance::MAINTENANCE_PLAN_STALE_REASON
+        ));
+    }
+
+    #[tokio::test]
+    async fn offline_runtime_with_explicit_guard_rejects_non_memory_anchors() {
+        let mut config = runtime_config(false);
+        config.anchor = crate::AnchorConfig::KubernetesLease {
+            namespace: "backup".to_owned(),
+            name: "v2-anchor".to_owned(),
+            field_manager: "rs3-server".to_owned(),
+        };
+
+        let rejected = super::offline_maintenance_runtime_from_config(
+            &config,
+            Arc::new(rs3_repository::v2::UnenforcedQuiescedMaintenanceGuard),
+        )
+        .await;
+
+        assert!(rejected.is_err(), "non-memory anchors must be rejected");
     }
 
     #[tokio::test]

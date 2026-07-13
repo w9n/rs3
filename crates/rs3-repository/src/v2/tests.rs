@@ -3,16 +3,18 @@ use super::{
     UnenforcedQuiescedMaintenanceGuard, V2_INDEX_COMPACTION_PAUSE_RUNS,
     V2_INDEX_COMPACTION_REQUEST_RUNS, V2AnchorState, V2CommitAnchor, V2CommitCoordinator,
     V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite, V2FullGcApplyOptions,
-    V2FullGcDryRunOptions, V2MaintenanceBudgets, V2MaintenanceGuard, V2MemoryAnchor,
-    V2OrphanGcOptions, V2OrphanObjectClass, V2RecoveryBundle, V2ReplayLimits, V2Repository,
+    V2FullGcDryRunOptions, V2MaintenanceBudgets, V2MaintenanceCancellation, V2MaintenanceGuard,
+    V2MemoryAnchor, V2OrphanGcOptions, V2OrphanObjectClass, V2RecoveryBundle, V2ReplayLimits,
+    V2Repository,
 };
 use super::{
     V2_CAPABILITY_STANDALONE_PAYLOADS, V2_RESTORE_BUNDLE_SCHEMA, V2_SECTION_FLAG_MUST_UNDERSTAND,
     V2_SUPPORTED_CAPABILITY_FLAGS, V2Algorithms, V2CommitHeader, V2CommitKey, V2CommitKind,
     V2CommitParentRef, V2CommitSelfRef, V2ErrorClass, V2FormatError, V2FormatRef, V2FormatRoot,
     V2KeyringEnvelopeRef, V2KeyringEnvelopeRootRef, V2ProviderCheckStatus,
-    V2ProviderConformanceOptions, V2ProviderProfile, V2SectionDescriptor, V2SectionType,
-    V2UploadMode, body_digest_for_v2_sections, check_v2_provider_conformance, digest_v2_section,
+    V2ProviderConformanceCheck, V2ProviderConformanceOptions, V2ProviderConformanceReport,
+    V2ProviderProfile, V2SectionDescriptor, V2SectionType, V2UploadMode,
+    body_digest_for_v2_sections, check_v2_provider_conformance, digest_v2_section,
     generate_v2_commit_key, parse_v2_commit_object,
 };
 use super::{open_v2_index_run, seal_v2_index_run};
@@ -591,6 +593,89 @@ impl V2MaintenanceGuard for FailsAfterMaintenanceGuard {
         } else {
             Err(V2FormatError::MaintenanceAccessRequired)
         }
+    }
+}
+
+#[derive(Clone)]
+struct SharedCountdownMaintenanceGuard {
+    remaining_successes: Arc<AtomicUsize>,
+}
+
+impl SharedCountdownMaintenanceGuard {
+    fn new(remaining_successes: usize) -> Self {
+        Self {
+            remaining_successes: Arc::new(AtomicUsize::new(remaining_successes)),
+        }
+    }
+
+    fn set_remaining_successes(&self, remaining_successes: usize) {
+        self.remaining_successes
+            .store(remaining_successes, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl V2MaintenanceGuard for SharedCountdownMaintenanceGuard {
+    async fn verify_v2_maintenance(
+        &self,
+        _base_anchor: Option<&V2AnchorState>,
+    ) -> super::V2Result<()> {
+        let allowed = self
+            .remaining_successes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                if remaining == usize::MAX {
+                    Some(remaining)
+                } else {
+                    remaining.checked_sub(1)
+                }
+            })
+            .is_ok();
+        if allowed {
+            Ok(())
+        } else {
+            Err(V2FormatError::MaintenanceAccessRequired)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CancelAfterVerifiesMaintenanceGuard {
+    remaining_verifies_before_cancel: Arc<AtomicUsize>,
+    cancellation: Arc<V2MaintenanceCancellation>,
+}
+
+impl CancelAfterVerifiesMaintenanceGuard {
+    fn new(remaining_verifies_before_cancel: usize) -> Self {
+        Self {
+            remaining_verifies_before_cancel: Arc::new(AtomicUsize::new(
+                remaining_verifies_before_cancel,
+            )),
+            cancellation: Arc::new(V2MaintenanceCancellation::new()),
+        }
+    }
+
+    fn disarm(&self) {
+        self.remaining_verifies_before_cancel
+            .store(usize::MAX, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl V2MaintenanceGuard for CancelAfterVerifiesMaintenanceGuard {
+    async fn verify_v2_maintenance(
+        &self,
+        _base_anchor: Option<&V2AnchorState>,
+    ) -> super::V2Result<()> {
+        let remaining = self.remaining_verifies_before_cancel.load(Ordering::SeqCst);
+        if remaining != usize::MAX {
+            let next = remaining.saturating_sub(1);
+            self.remaining_verifies_before_cancel
+                .store(next, Ordering::SeqCst);
+            if next == 0 {
+                self.cancellation.cancel();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1700,6 +1785,38 @@ async fn dev_provider_conformance_passes_on_memory_store() {
     assert!(report.checks.iter().any(|check| {
         check.name == "multipart-complete" && check.status == V2ProviderCheckStatus::Passed
     }));
+}
+
+#[test]
+fn provider_conformance_rejects_empty_duplicate_and_unknown_manifests() {
+    let empty = V2ProviderConformanceReport {
+        profile: V2ProviderProfile::Dev,
+        checks: Vec::new(),
+    };
+    assert!(!empty.passed());
+
+    let duplicate = V2ProviderConformanceReport {
+        profile: V2ProviderProfile::Dev,
+        checks: vec![
+            V2ProviderConformanceCheck {
+                name: "basic-put",
+                status: V2ProviderCheckStatus::Passed,
+                reason: None,
+            };
+            11
+        ],
+    };
+    assert!(!duplicate.passed());
+
+    let unknown = V2ProviderConformanceReport {
+        profile: V2ProviderProfile::Dev,
+        checks: vec![V2ProviderConformanceCheck {
+            name: "unknown-check",
+            status: V2ProviderCheckStatus::Passed,
+            reason: None,
+        }],
+    };
+    assert!(!unknown.passed());
 }
 
 #[tokio::test]
@@ -7032,6 +7149,76 @@ async fn v2_full_gc_propagates_request_retention_to_every_restore_dependency() {
 }
 
 #[tokio::test]
+async fn v2_quick_maintenance_exposes_nearest_retain_until_deadline() {
+    let store = MemoryBlobStore::new();
+    let retention = RetentionPolicy::new(RetentionMode::Compliance, 30);
+    let repository = retained_commit_store(store, retention).await;
+    let anchor = V2MemoryAnchor::new();
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+    must_v2(
+        repository
+            .write_child_commit(
+                &anchor,
+                V2CommitWrite::delta(vec![V2CommitSection::new(
+                    V2SectionType::IndexDelta,
+                    0,
+                    Bytes::from_static(b"nearest-deadline-live-commit"),
+                )]),
+            )
+            .await,
+    );
+    let before_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the epoch")
+            .as_millis(),
+    )
+    .expect("current time should fit in i64");
+
+    let report = must_v2(repository.quick_maintenance(&anchor).await);
+
+    let nearest = report
+        .nearest_retain_until_ms
+        .expect("retained live commits should expose a nearest retain-until deadline");
+    let retain_ms = i64::from(retention.retain_days) * 24 * 60 * 60 * 1000;
+    assert!(nearest > before_ms);
+    assert!(nearest <= before_ms.saturating_add(retain_ms).saturating_add(60_000));
+    // The 30-day deadline sits outside the default 7-day renewal horizon.
+    assert_eq!(report.retention_renewal_commit_count, 0);
+}
+
+#[tokio::test]
+async fn v2_full_gc_dry_run_paces_budgeted_operations() {
+    let store = MemoryBlobStore::new();
+    let retention = RetentionPolicy::new(RetentionMode::Compliance, 30);
+    let repository = retained_commit_store(store, retention).await;
+    let anchor = V2MemoryAnchor::new();
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+
+    let started = std::time::Instant::now();
+    let report = must_v2(
+        repository
+            .full_gc_dry_run(
+                &anchor,
+                V2FullGcDryRunOptions {
+                    budgets: V2MaintenanceBudgets {
+                        op_pacing_delay: Some(Duration::from_millis(25)),
+                        ..V2MaintenanceBudgets::default()
+                    },
+                    ..V2FullGcDryRunOptions::default()
+                },
+            )
+            .await,
+    );
+
+    assert!(report.chain_live_commit_count >= 1);
+    assert!(
+        started.elapsed() >= Duration::from_millis(25),
+        "pacing delay should slow at least one budgeted operation"
+    );
+}
+
+#[tokio::test]
 async fn retained_v2_full_gc_dry_run_plans_live_commit_retention_renewal() {
     let store = MemoryBlobStore::new();
     let retention = RetentionPolicy::new(RetentionMode::Compliance, 30);
@@ -7180,6 +7367,60 @@ async fn v2_full_gc_apply_requires_maintenance_guard() {
 
     assert!(matches!(failed, Err(V2FormatError::AnchorAdvanceFailed)));
     assert_eq!(apply, Err(V2FormatError::MaintenanceAccessRequired));
+    assert_eq!(after.candidates.len(), 1);
+}
+
+#[tokio::test]
+async fn v2_prepared_full_gc_apply_does_not_replan_before_mutation() {
+    let store = MemoryBlobStore::new();
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2CommitStore::new(store, signing_keyring(), options);
+    let anchor = V2MemoryAnchor::new();
+    must_v2(repository.write_genesis_snapshot(&anchor).await);
+
+    let apply_options = V2FullGcApplyOptions {
+        dry_run: V2FullGcDryRunOptions::default(),
+        orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+        retained_provider_conformance_passed: false,
+    };
+    let prepared = must_v2(
+        repository
+            .prepare_full_gc_plan(&anchor, apply_options)
+            .await,
+    );
+    assert_eq!(prepared.report().candidate_commit_count, 0);
+
+    let failed = repository
+        .write_child_commit(
+            &FailOnceV2Anchor::new(anchor.clone()),
+            V2CommitWrite::delta(vec![V2CommitSection::new(
+                V2SectionType::IndexDelta,
+                0,
+                Bytes::from_static(b"appeared-after-plan"),
+            )]),
+        )
+        .await;
+    assert!(matches!(failed, Err(V2FormatError::AnchorAdvanceFailed)));
+
+    let applied = must_v2(
+        repository
+            .apply_prepared_full_gc_cancellable(
+                &anchor,
+                &UnenforcedQuiescedMaintenanceGuard,
+                prepared,
+                &V2MaintenanceCancellation::new(),
+            )
+            .await,
+    );
+    let after = must_v2(repository.report_orphans(&anchor).await);
+
+    assert_eq!(applied.orphan_gc.scanned_count, 0);
+    assert_eq!(applied.orphan_gc.deleted_count, 0);
     assert_eq!(after.candidates.len(), 1);
 }
 
@@ -8668,6 +8909,445 @@ async fn v2_coordinator_pauses_before_staging_when_compaction_guard_is_unavailab
                 "snapshots/watermark-blocked.bin"
             )))
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn v2_maintenance_window_requires_configured_maintenance_guard() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store,
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = must_repo(V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        anchor,
+        CommitCoordinatorOptions::new(1, Duration::ZERO).with_max_pending_items(1),
+    ));
+
+    let error = coordinator
+        .begin_maintenance_window()
+        .await
+        .expect_err("maintenance window must fail closed without a configured guard");
+
+    assert!(matches!(error, RepositoryError::CommitFailed { .. }));
+    assert!(!coordinator.status().poisoned);
+    must_repo(
+        coordinator
+            .put_committed(
+                must_type(LogicalPath::new("snapshots/window-no-guard-after.bin")),
+                Bytes::from_static(b"still-writable"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn v2_maintenance_window_drains_pending_batch_before_yielding() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store,
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = Arc::new(
+        must_repo(V2CommitCoordinator::with_options(
+            Arc::clone(&repository),
+            anchor,
+            CommitCoordinatorOptions::new(2, Duration::from_secs(60)),
+        ))
+        .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard),
+    );
+
+    let put = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .put_committed(
+                    must_type(LogicalPath::new("snapshots/window-drain.bin")),
+                    Bytes::from_static(b"window-drain"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while coordinator.pending_item_count_for_tests().await == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("staged put should enqueue into the pending batch");
+
+    let window = must_repo(coordinator.begin_maintenance_window().await);
+    let put = must_repo(put.await.expect("put task should not panic"));
+
+    assert_eq!(coordinator.pending_item_count_for_tests().await, 0);
+    assert_eq!(window.base_anchor(), Some(&put.anchor_state));
+    drop(window);
+    let resumed = must_repo(coordinator.write_index_snapshot().await);
+    assert!(resumed.sequence > put.anchor_state.sequence);
+}
+
+#[tokio::test]
+async fn v2_maintenance_window_waits_for_inflight_publish_and_blocks_new_puts() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let blocking_anchor = BlockingV2Anchor::new(anchor.clone());
+    let coordinator = Arc::new(
+        must_repo(V2CommitCoordinator::with_options(
+            Arc::clone(&repository),
+            blocking_anchor.clone(),
+            CommitCoordinatorOptions::new(1, Duration::ZERO).with_max_pending_items(1),
+        ))
+        .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard),
+    );
+
+    let first = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .put_committed(
+                    must_type(LogicalPath::new("snapshots/window-block-a.bin")),
+                    Bytes::from_static(b"window-block-a"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    });
+    blocking_anchor.wait_until_blocked().await;
+    let mut window_task = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move { coordinator.begin_maintenance_window().await }
+    });
+    let waited = tokio::time::timeout(Duration::from_millis(200), &mut window_task).await;
+    blocking_anchor.release();
+    let first = must_repo(first.await.expect("first put task should not panic"));
+    let window = must_repo(window_task.await.expect("window task should not panic"));
+
+    let mut second = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .put_committed(
+                    must_type(LogicalPath::new("snapshots/window-block-b.bin")),
+                    Bytes::from_static(b"window-block-b"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    });
+    let blocked = tokio::time::timeout(Duration::from_millis(200), &mut second).await;
+    blocking_anchor.release();
+    drop(window);
+    let second = must_repo(second.await.expect("second put task should not panic"));
+
+    assert!(
+        waited.is_err(),
+        "maintenance window must wait for the in-flight publish"
+    );
+    assert!(
+        blocked.is_err(),
+        "new publication must block while the window is held"
+    );
+    assert!(second.anchor_state.sequence > first.anchor_state.sequence);
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    assert_eq!(must_repo(fresh.list("snapshots/")).len(), 2);
+}
+
+#[tokio::test]
+async fn v2_maintenance_window_full_gc_guard_loss_fails_closed_and_rerun_completes() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store,
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    for label in [
+        &b"window-guard-orphan-one"[..],
+        &b"window-guard-orphan-two"[..],
+    ] {
+        let failed = repository
+            .commit_store()
+            .write_child_commit(
+                &FailOnceV2Anchor::new(anchor.clone()),
+                V2CommitWrite::delta(vec![V2CommitSection::new(
+                    V2SectionType::IndexDelta,
+                    0,
+                    Bytes::copy_from_slice(label),
+                )]),
+            )
+            .await;
+        assert!(matches!(failed, Err(V2FormatError::AnchorAdvanceFailed)));
+    }
+    // Window verification consumes two guard checks, the apply preflight two
+    // more, and the first delete one, so the guard is lost right before the
+    // second delete mutation.
+    let guard = SharedCountdownMaintenanceGuard::new(5);
+    let coordinator = must_repo(V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        anchor.clone(),
+        CommitCoordinatorOptions::new(1, Duration::ZERO).with_max_pending_items(1),
+    ))
+    .with_maintenance_guard(guard.clone());
+    let apply_options = V2FullGcApplyOptions {
+        dry_run: V2FullGcDryRunOptions::default(),
+        orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+        retained_provider_conformance_passed: false,
+    };
+
+    let aborted = must_repo(
+        coordinator
+            .run_full_maintenance(apply_options.clone(), &V2MaintenanceCancellation::new())
+            .await,
+    );
+    let after_abort = must_v2(repository.commit_store().report_orphans(&anchor).await);
+    guard.set_remaining_successes(usize::MAX);
+    let completed = must_repo(
+        coordinator
+            .run_full_maintenance(apply_options, &V2MaintenanceCancellation::new())
+            .await,
+    );
+    let after_rerun = must_v2(repository.commit_store().report_orphans(&anchor).await);
+
+    assert_eq!(aborted.dry_run.fully_dead_commit_count, 2);
+    assert_eq!(aborted.apply.orphan_gc.deleted_count, 1);
+    assert_eq!(
+        aborted.apply.orphan_gc.aborted,
+        Some(V2FormatError::MaintenanceAccessRequired)
+    );
+    assert_eq!(after_abort.candidates.len(), 1);
+    assert!(!coordinator.status().poisoned);
+    assert_eq!(completed.apply.orphan_gc.deleted_count, 1);
+    assert_eq!(completed.apply.orphan_gc.aborted, None);
+    assert_eq!(after_rerun.candidates.len(), 0);
+    must_repo(
+        coordinator
+            .put_committed(
+                must_type(LogicalPath::new("snapshots/window-guard-after.bin")),
+                Bytes::from_static(b"after-guard-loss"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn v2_maintenance_window_full_gc_cancellation_stops_at_mutation_boundary() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store,
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    for label in [
+        &b"window-cancel-orphan-one"[..],
+        &b"window-cancel-orphan-two"[..],
+    ] {
+        let failed = repository
+            .commit_store()
+            .write_child_commit(
+                &FailOnceV2Anchor::new(anchor.clone()),
+                V2CommitWrite::delta(vec![V2CommitSection::new(
+                    V2SectionType::IndexDelta,
+                    0,
+                    Bytes::copy_from_slice(label),
+                )]),
+            )
+            .await;
+        assert!(matches!(failed, Err(V2FormatError::AnchorAdvanceFailed)));
+    }
+    // The fifth guard verification is the one right before the first delete,
+    // so cancellation fires while that delete proceeds and the pass must stop
+    // cleanly at the next mutation boundary.
+    let guard = CancelAfterVerifiesMaintenanceGuard::new(5);
+    let cancellation = Arc::clone(&guard.cancellation);
+    let coordinator = must_repo(V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        anchor.clone(),
+        CommitCoordinatorOptions::new(1, Duration::ZERO).with_max_pending_items(1),
+    ))
+    .with_maintenance_guard(guard.clone());
+    let apply_options = V2FullGcApplyOptions {
+        dry_run: V2FullGcDryRunOptions::default(),
+        orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+        retained_provider_conformance_passed: false,
+    };
+
+    let cancelled = must_repo(
+        coordinator
+            .run_full_maintenance(apply_options.clone(), cancellation.as_ref())
+            .await,
+    );
+    let after_cancel = must_v2(repository.commit_store().report_orphans(&anchor).await);
+    guard.disarm();
+    let completed = must_repo(
+        coordinator
+            .run_full_maintenance(apply_options, &V2MaintenanceCancellation::new())
+            .await,
+    );
+    let after_rerun = must_v2(repository.commit_store().report_orphans(&anchor).await);
+
+    assert_eq!(cancelled.apply.orphan_gc.scanned_count, 2);
+    assert_eq!(cancelled.apply.orphan_gc.deleted_count, 1);
+    assert_eq!(
+        cancelled.apply.orphan_gc.aborted,
+        Some(V2FormatError::MaintenanceCancelled)
+    );
+    assert_eq!(after_cancel.candidates.len(), 1);
+    assert_eq!(completed.apply.orphan_gc.deleted_count, 1);
+    assert_eq!(completed.apply.orphan_gc.aborted, None);
+    assert_eq!(after_rerun.candidates.len(), 0);
+}
+
+#[tokio::test]
+async fn v2_maintenance_window_and_watermark_compaction_do_not_deadlock() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options.clone(),
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = Arc::new(
+        must_repo(V2CommitCoordinator::with_options(
+            Arc::clone(&repository),
+            anchor.clone(),
+            CommitCoordinatorOptions::new(1, Duration::ZERO).with_max_pending_items(1),
+        ))
+        .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard),
+    );
+    for index in 0..V2_INDEX_COMPACTION_REQUEST_RUNS {
+        must_repo(
+            coordinator
+                .put_committed(
+                    must_type(LogicalPath::new(format!(
+                        "snapshots/window-watermark-{index:04}.bin"
+                    ))),
+                    Bytes::from(vec![index as u8; 16]),
+                    RepositoryPutOptions::default(),
+                )
+                .await,
+        );
+    }
+    assert!(
+        must_repo(repository.active_index_run_count()) >= V2_INDEX_COMPACTION_REQUEST_RUNS,
+        "run catalog should sit at the compaction request watermark"
+    );
+
+    let maintenance = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            let cancellation = V2MaintenanceCancellation::new();
+            coordinator
+                .run_full_maintenance(
+                    V2FullGcApplyOptions {
+                        dry_run: V2FullGcDryRunOptions::default(),
+                        orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+                        retained_provider_conformance_passed: false,
+                    },
+                    &cancellation,
+                )
+                .await
+        }
+    });
+    let write = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .put_committed(
+                    must_type(LogicalPath::new("snapshots/window-watermark-after.bin")),
+                    Bytes::from_static(b"after-window"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    });
+
+    let (maintenance, write) = tokio::time::timeout(Duration::from_secs(120), async {
+        let maintenance = maintenance
+            .await
+            .expect("maintenance task should not panic");
+        let write = write.await.expect("write task should not panic");
+        (maintenance, write)
+    })
+    .await
+    .expect("maintenance window and watermark compaction must not deadlock");
+    must_repo(maintenance);
+    must_repo(write);
+
+    assert!(must_repo(repository.active_index_run_count()) < V2_INDEX_COMPACTION_REQUEST_RUNS);
+    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    must_repo(fresh.load_chain_from_anchor(&anchor).await);
+    assert_eq!(
+        must_repo(fresh.list("snapshots/")).len(),
+        V2_INDEX_COMPACTION_REQUEST_RUNS + 1
     );
 }
 

@@ -99,6 +99,11 @@ impl GatewayServer {
         self.boundary.admin_readiness_source()
     }
 
+    /// Returns the repository maintenance surface for the supervisor.
+    pub fn maintenance_runtime(&self) -> Arc<dyn crate::MaintenanceRuntime> {
+        self.boundary.maintenance_runtime()
+    }
+
     /// Serves connections until the provided shutdown future resolves.
     ///
     /// Existing connections are given a short graceful shutdown window after
@@ -252,7 +257,7 @@ mod tests {
     use super::{GatewayServer, GatewayServerError};
     use crate::HardeningConfig;
     use crate::{
-        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MetricsConfig,
+        AnchorConfig, BackendConfig, BatchConfig, GatewayMode, MaintenanceConfig, MetricsConfig,
         ProviderConformanceConfig, RecoveryConfig, RepositoryConfig, RepositoryKeysConfig,
         RuntimeConfig, WriterGuardConfig,
     };
@@ -300,6 +305,7 @@ mod tests {
                 retention: None,
                 allow_init: true,
             },
+            maintenance: MaintenanceConfig::default(),
             provider_conformance: ProviderConformanceConfig::default(),
             recovery: RecoveryConfig::default(),
             repository_keys: RepositoryKeysConfig {

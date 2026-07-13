@@ -64,6 +64,7 @@ mod read_stream;
 mod staging;
 
 use super::standalone::{generate_v2_standalone_object_id, validate_v2_standalone_object};
+pub use compaction::V2FullMaintenanceReport;
 pub use read_stream::V2AuthenticatedReadBody;
 use staging::{PendingV2Checkpoint, PendingV2Snapshot, PendingV2State};
 
