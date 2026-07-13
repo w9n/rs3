@@ -440,6 +440,7 @@ pub(crate) fn run_kopia_measured_matrix(args: KopiaMatrixArgs) -> Result<()> {
 
     let summary = serde_json::json!({
         "scenario": "kopia-measured-matrix",
+        "source_revision": option_env!("RS3_BUILD_GIT_SHA").unwrap_or("unknown"),
         "run_id": run_id,
         "runs": args.runs,
         "run_pairs_per_profile": args.runs,

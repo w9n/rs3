@@ -54,15 +54,19 @@ The scale, path-length, filesystem, and standalone recipes embed the selected
 source revision in their reports and append `-dirty` when tracked changes are
 present. Dirty evidence is diagnostic only.
 
-Run the three-sample measured Kopia matrix separately so real-client
-performance is not inferred from adversarial raw-S3 objects:
+Run every three-sample measured Kopia profile separately so each command stays
+bounded and real-client performance is not inferred from adversarial raw-S3
+objects:
 
 ```sh
-cargo run -p xtask --bin xtask --features containers -- \
-  integration kopia-measured-matrix --runs 3 \
-  --profile-set larger-restores --gateway-build-profile release \
-  --enforce-regression-budgets
+for profile in medium-restore kubernetes-objects kubernetes-objects-large \
+  postgres-pgdata postgres-pgdata-large; do
+  just perf-kopia-profile-candidate "$profile"
+done
 ```
+
+Each summary binds the selected source revision and carries three alternating
+direct/gateway run pairs for its profile.
 
 Also preserve current provider-conformance, Kubernetes backup/restore,
 disaster-recovery, and release-profile performance evidence. A disposable

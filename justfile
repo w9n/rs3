@@ -462,6 +462,23 @@ preview-gate-scale-candidate ROOT:
     just perf-scale-fs-100k "{{ROOT}}"
     just perf-scale-fs-1m "{{ROOT}}"
 
+# Run one bounded three-sample real-client profile with revision-bound evidence.
+# Invoke once for each profile listed in the release process.
+perf-kopia-profile-candidate PROFILE:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    build_revision="$(git rev-parse --verify HEAD)"
+    if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then
+      build_revision="${build_revision}-dirty"
+    fi
+    RS3_BUILD_GIT_SHA="${build_revision}" cargo build -p xtask --bin xtask --features containers
+    target/debug/xtask integration kopia-measured-matrix \
+      --runs 3 \
+      --profile-set single \
+      --workload-profile "{{PROFILE}}" \
+      --gateway-build-profile release \
+      --enforce-regression-budgets
+
 # Run performance measurements against an S3 backend.
 perf-s3 *ARGS:
     cargo run -p xtask --bin xtask --features s3 -- perf --backend s3 {{ARGS}}
