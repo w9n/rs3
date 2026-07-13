@@ -8,13 +8,15 @@ use rs3_crypto::{FormatEnvelope, KeyRing, KeyringEnvelope, RepositoryKeyContext,
 #[cfg(feature = "s3")]
 use rs3_repository::store_keyring_envelope;
 #[cfg(feature = "s3")]
+use rs3_repository::v2::v2_format_object_id;
+#[cfg(feature = "s3")]
 use rs3_repository::v2::{
     UnenforcedQuiescedMaintenanceGuard, V2FullGcApplyOptions, V2FullGcDryRunOptions,
     V2MaintenanceBudgets, V2OrphanGcOptions, generate_v2_commit_key,
 };
 use rs3_repository::v2::{
     V2CommitChain, V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot,
-    V2KeyringEnvelopeRootRef, V2ProviderProfile, V2RecoveryBundle, v2_format_object_id,
+    V2KeyringEnvelopeRootRef, V2ProviderProfile, V2RecoveryBundle,
 };
 #[cfg(feature = "s3")]
 use rs3_storage::PutOptions;
@@ -22,7 +24,8 @@ use rs3_storage::{BlobStore, ByteRange, FilesystemBlobStore};
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
 #[cfg(feature = "s3")]
-use rs3_types::{KeyPurpose, RepositoryId, RetentionMode, RetentionPolicy, Sequence};
+use rs3_types::KeyPurpose;
+use rs3_types::{RepositoryId, RetentionMode, RetentionPolicy, Sequence};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
