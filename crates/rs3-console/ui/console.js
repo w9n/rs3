@@ -7,9 +7,11 @@ const state = {
   token: "",
   status: null,
   posture: null,
+  maintenance: null,
   lastError: null,
   lastSuccessAt: null,
   postureError: null,
+  maintenanceError: null,
   refreshInFlight: false,
   autoRefresh: null,
 };
@@ -43,6 +45,9 @@ const nodes = {
   findingsTable: document.getElementById("findings-table"),
   postureState: document.getElementById("posture-state"),
   postureTable: document.getElementById("posture-table"),
+  maintenanceState: document.getElementById("maintenance-state"),
+  maintenanceDetail: document.getElementById("maintenance-detail"),
+  maintenanceRuns: document.getElementById("maintenance-runs"),
 };
 
 nodes.refreshCadence.textContent = autoRefreshLabel(AUTO_REFRESH_INTERVAL_MS);
@@ -57,9 +62,11 @@ nodes.clearTokenButton.addEventListener("click", () => {
   state.token = "";
   state.status = null;
   state.posture = null;
+  state.maintenance = null;
   state.lastError = null;
   state.lastSuccessAt = null;
   state.postureError = null;
+  state.maintenanceError = null;
   nodes.tokenInput.value = "";
   setRefreshInFlight(false);
   setConnection("Disconnected", "neutral");
@@ -90,9 +97,10 @@ async function refreshStatus(options = {}) {
     setConnection("Refreshing", "neutral");
   }
 
-  const [statusResult, postureResult] = await Promise.allSettled([
+  const [statusResult, postureResult, maintenanceResult] = await Promise.allSettled([
     fetchConsoleReport("/api/status", token),
     fetchConsoleReport("/api/posture", token),
+    fetchConsoleReport("/api/maintenance", token),
   ]);
 
   if (token !== state.token) {
@@ -105,6 +113,16 @@ async function refreshStatus(options = {}) {
     state.postureError = null;
   } else {
     state.postureError = errorMessage(postureResult.reason, "Posture refresh failed");
+  }
+
+  if (maintenanceResult.status === "fulfilled") {
+    state.maintenance = maintenanceResult.value;
+    state.maintenanceError = null;
+  } else {
+    state.maintenanceError = errorMessage(
+      maintenanceResult.reason,
+      "Maintenance refresh failed",
+    );
   }
 
   if (statusResult.status === "fulfilled") {
@@ -128,7 +146,99 @@ function render() {
   renderDetails(status);
   renderFindings(findings);
   renderPosture(state.posture);
+  renderMaintenance(state.maintenance);
   renderRefreshState(status);
+}
+
+function renderMaintenance(maintenance) {
+  if (state.maintenanceError) {
+    setMaintenancePill("error", "state-bad");
+    replaceDetails(nodes.maintenanceDetail, [["Error", state.maintenanceError]]);
+    renderPanelMessage(nodes.maintenanceRuns, "Maintenance report unavailable", "error-state");
+    return;
+  }
+  if (!maintenance) {
+    setMaintenancePill("unknown", "state-neutral");
+    replaceDetails(nodes.maintenanceDetail, []);
+    renderPanelMessage(nodes.maintenanceRuns, "Maintenance not loaded", "empty-state");
+    return;
+  }
+
+  const supervisor = maintenance.supervisor || null;
+  const supervisorState = supervisor?.state || "unavailable";
+  setMaintenancePill(supervisorState, maintenancePillClass(supervisorState, supervisor));
+  const nextTrigger = maintenance.next_trigger;
+  replaceDetails(nodes.maintenanceDetail, [
+    ["State", supervisorState],
+    ["Mode", supervisor?.mode || "unknown"],
+    ["Scheduler paused", yesNo(supervisor?.paused)],
+    [
+      "Next trigger",
+      nextTrigger
+        ? `${nextTrigger.reason || "unknown"} at ${formatTimestamp(nextTrigger.at_ms)}`
+        : "none",
+    ],
+    ["Renewal deadline", formatTimestamp(supervisor?.nearest_retain_until_ms)],
+    ["Consecutive failures", supervisor?.consecutive_failures ?? "unknown"],
+    ["Last success", formatTimestamp(supervisor?.last_success_at_ms)],
+    ["Last run outcome", supervisor?.last_run_outcome || "none"],
+  ]);
+  renderMaintenanceRuns(maintenance.operations || []);
+}
+
+function setMaintenancePill(text, kindClass) {
+  nodes.maintenanceState.textContent = text;
+  nodes.maintenanceState.className = `state-pill ${kindClass}`;
+}
+
+function maintenancePillClass(supervisorState, supervisor) {
+  if (supervisorState === "failed" || supervisorState === "parked") {
+    return "state-bad";
+  }
+  if (supervisor?.paused || supervisorState === "cancelled") {
+    return "state-warn";
+  }
+  if (supervisorState === "unavailable") {
+    return "state-neutral";
+  }
+  return "state-good";
+}
+
+function renderMaintenanceRuns(operations) {
+  clear(nodes.maintenanceRuns);
+  const rows = operations.slice(0, 8);
+  if (rows.length === 0) {
+    renderPanelMessage(nodes.maintenanceRuns, "No recorded operations", "empty-state");
+    return;
+  }
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  const tbody = document.createElement("tbody");
+  const header = document.createElement("tr");
+  ["Kind", "Source", "Outcome", "Finished", "Renewed", "Deleted"].forEach((name) => {
+    const th = document.createElement("th");
+    th.textContent = name;
+    header.append(th);
+  });
+  thead.append(header);
+  rows.forEach((operation) => {
+    const row = document.createElement("tr");
+    [
+      operation.kind,
+      operation.source,
+      operation.outcome || "in flight",
+      formatTimestamp(operation.finished_at_ms),
+      operation.renewed_object_count,
+      operation.deleted_object_count,
+    ].forEach((value) => {
+      const td = document.createElement("td");
+      td.textContent = value == null ? "unknown" : String(value);
+      row.append(td);
+    });
+    tbody.append(row);
+  });
+  table.append(thead, tbody);
+  nodes.maintenanceRuns.append(table);
 }
 
 function renderRefreshState(status) {

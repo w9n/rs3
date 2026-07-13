@@ -137,7 +137,7 @@ impl ConsoleHttpService {
         if let Some(response) = ui_asset_response(&parts.method, path) {
             return response;
         }
-        if path == "/api/status" || path == "/api/posture" {
+        if path == "/api/status" || path == "/api/posture" || path == "/api/maintenance" {
             if !self.auth.authorize(&parts.headers) {
                 return unauthorized_response();
             }
@@ -154,6 +154,9 @@ impl ConsoleHttpService {
             }
             if path == "/api/posture" {
                 return self.posture_response().await;
+            }
+            if path == "/api/maintenance" {
+                return self.maintenance_response().await;
             }
             return self.status_response().await;
         }
@@ -173,6 +176,13 @@ impl ConsoleHttpService {
     async fn posture_response(&self) -> Response<Full<Bytes>> {
         match self.admin_client.fetch_posture().await {
             Ok(posture) => json_response(StatusCode::OK, posture),
+            Err(error) => gateway_error_response(&error),
+        }
+    }
+
+    async fn maintenance_response(&self) -> Response<Full<Bytes>> {
+        match self.admin_client.fetch_maintenance().await {
+            Ok(maintenance) => json_response(StatusCode::OK, maintenance),
             Err(error) => gateway_error_response(&error),
         }
     }
@@ -568,6 +578,50 @@ mod tests {
         assert_eq!(body["schema"], "rs3.admin-posture.preview.v1");
         let request = request.await.unwrap_or_else(|error| panic!("{error}"));
         assert!(request.contains("GET /admin/posture HTTP/1.1"));
+    }
+
+    #[tokio::test]
+    async fn api_maintenance_fetches_gateway_admin_maintenance() {
+        let (service, request) = service_with_gateway_body(
+            r#"{"schema":"rs3.admin-maintenance.preview.v1","mutation_enabled":false,"supervisor":{"state":"idle","paused":false},"operations":[]}"#,
+        )
+        .await;
+        let response = service
+            .handle(
+                Request::builder()
+                    .uri("/api/maintenance")
+                    .header(AUTHORIZATION, "Bearer console-token-12345")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap_or_else(|error| panic!("{error}")),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["schema"], "rs3.admin-maintenance.preview.v1");
+        assert_eq!(body["supervisor"]["state"], "idle");
+        let request = request.await.unwrap_or_else(|error| panic!("{error}"));
+        assert!(request.contains("GET /admin/maintenance HTTP/1.1"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer gateway-admin-token-12345")
+        );
+    }
+
+    #[tokio::test]
+    async fn api_maintenance_requires_console_bearer() {
+        let (service, _request) = service().await;
+        let response = service
+            .handle(
+                Request::builder()
+                    .uri("/api/maintenance")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap_or_else(|error| panic!("{error}")),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

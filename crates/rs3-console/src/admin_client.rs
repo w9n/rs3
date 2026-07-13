@@ -15,6 +15,7 @@ use thiserror::Error;
 
 const ADMIN_STATUS_SCHEMA: &str = "rs3.admin-status.preview.v1";
 const ADMIN_POSTURE_SCHEMA: &str = "rs3.admin-posture.preview.v1";
+const ADMIN_MAINTENANCE_SCHEMA: &str = "rs3.admin-maintenance.preview.v1";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 512 * 1024;
 
@@ -70,6 +71,10 @@ impl GatewayAdminEndpoint {
 
     fn posture_uri(&self) -> Result<Uri, GatewayAdminClientError> {
         self.admin_uri("/admin/posture")
+    }
+
+    fn maintenance_uri(&self) -> Result<Uri, GatewayAdminClientError> {
+        self.admin_uri("/admin/maintenance")
     }
 
     fn admin_uri(&self, path: &'static str) -> Result<Uri, GatewayAdminClientError> {
@@ -285,6 +290,23 @@ impl GatewayAdminClient {
     pub async fn fetch_posture(&self) -> Result<Value, GatewayAdminClientError> {
         self.fetch_report(self.config.endpoint.posture_uri()?, ADMIN_POSTURE_SCHEMA)
             .await
+    }
+
+    /// Fetches and validates the read-only gateway maintenance report.
+    ///
+    /// The console holds the read token only, so this stays a GET; maintenance
+    /// mutations are not reachable through the console.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the gateway admin listener is unavailable, rejects
+    /// the request, returns too much data, or returns an unexpected JSON shape.
+    pub async fn fetch_maintenance(&self) -> Result<Value, GatewayAdminClientError> {
+        self.fetch_report(
+            self.config.endpoint.maintenance_uri()?,
+            ADMIN_MAINTENANCE_SCHEMA,
+        )
+        .await
     }
 
     async fn fetch_report(
