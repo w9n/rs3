@@ -11,7 +11,8 @@ flags may override selected listener and gateway-mode settings.
 | `RS3_GATEWAY_MODE` | no | `read-write` | `read-write` accepts committed mutations. `restore-readonly` serves restore reads, rejects supported mutations, refuses bootstrap, and requires an accepted anchor. |
 | `RS3_METRICS_BIND` | no | unset | Prometheus/OpenMetrics listener socket address. |
 | `RS3_ADMIN_BIND` | no | unset | Separate gateway admin listener for path-redacted facts. |
-| `RS3_ADMIN_BEARER_TOKEN` | with admin listener | none | Bearer token for admin routes. Must be at least 16 bytes and separate from backup-client S3 credentials. |
+| `RS3_ADMIN_BEARER_TOKEN` | with admin listener | none | Read bearer token for admin `GET` routes. Must be at least 16 bytes and separate from backup-client S3 credentials. |
+| `RS3_ADMIN_MUTATION_BEARER_TOKEN` | no | none | Distinct bearer token for maintenance mutation routes. Must be at least 16 bytes and differ from the read token. When absent, all maintenance `POST` routes are disabled. |
 | `RS3_ADMIN_PROFILE` | no | `production` | Admin status profile: `local` or `production`. |
 | `RS3_RECOVERY_PUBLIC_KEY` | production recovery | none | `ed25519:<hex-public-key>` used to verify signed v2 restore bundles during `verify-bundle` and `import-v2-anchor`. |
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
@@ -40,16 +41,52 @@ tooling. `GET /admin/posture` is the cheap report for frequent polling: it shows
 runtime posture, selected provider profile, last persisted provider-conformance
 evidence, and profile findings without verifying repository state. `GET
 /admin/status` adds commit trust and maintenance verification and may touch the
-backend. Both reports avoid configured bucket names, backend prefixes,
-repository IDs, client object paths, and secret values. The reports are preview
-fact contracts; workflow APIs need a separate authorization, audit, approval,
-and orchestration model from the gateway data plane.
+backend. `GET /admin/maintenance` reports the live supervisor state and bounded
+in-memory operation history. These reports avoid configured bucket names,
+backend prefixes, repository IDs, client object paths, and secret values.
 
-When `RS3_ADMIN_BIND` is set, `rs3-server serve` exposes `GET /admin/posture`
-and `GET /admin/status` on that separate listener. `GET /healthz` is
-unauthenticated; admin routes require `Authorization: Bearer <token>`. Bind the
-admin listener only to localhost, cluster-internal addresses, or a protected
-internal ingress.
+When `RS3_ADMIN_BIND` is set, `rs3-server serve` exposes `GET /admin/posture`,
+`GET /admin/status`, and `GET /admin/maintenance` on that separate listener.
+`GET /healthz` is unauthenticated. Read routes accept the read or mutation
+token. `POST /admin/maintenance/{dry-run,apply,cancel,pause,resume}` accepts only
+the mutation token and is not registered when that token is absent. Every apply
+must include the lowercase 64-character `plan_digest` returned by dry run; a
+state change before the in-window re-plan returns a conflict. Bind the admin
+listener only to localhost, cluster-internal addresses, or a protected internal
+ingress.
+
+## Maintenance
+
+The maintenance supervisor runs inside a mutation-capable gateway. It uses the
+same fenced repository runtime as normal writes and does not require a separate
+controller or CronJob.
+
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `RS3_MAINTENANCE_MODE` | no | `auto` | `auto` enables scheduled full maintenance, `manual` accepts operator-triggered runs only, and `off` disables the supervisor. Must be unset for `restore-readonly`, which forces maintenance off. |
+| `RS3_MAINTENANCE_RENEWAL_HORIZON_SECONDS` | no | `604800` | Lead time before the nearest retention deadline at which an automatic run becomes due. |
+| `RS3_MAINTENANCE_ORPHAN_PRESSURE_BYTES` | no | `1073741824` | Reclaimable orphan-byte threshold for an automatic run. |
+| `RS3_MAINTENANCE_ORPHAN_PRESSURE_COUNT` | no | `512` | Orphan-candidate count threshold for an automatic run. |
+| `RS3_MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS` | no | `172800` | Oldest orphan-candidate age threshold for an automatic run. |
+| `RS3_MAINTENANCE_MAX_INTERVAL_SECONDS` | no | `604800` | Maximum interval between automatic full-maintenance runs. |
+| `RS3_MAINTENANCE_MIN_COOLDOWN_SECONDS` | no | `3600` | Minimum interval between runs. Must not exceed the maximum interval. |
+| `RS3_MAINTENANCE_PACING_DELAY_MS` | no | unset | Optional positive delay between backend maintenance operations. |
+| `RS3_MAINTENANCE_MAX_INVENTORY_PAGES` | no | `4096` | Maximum provider inventory pages consumed by one plan. |
+| `RS3_MAINTENANCE_MAX_INVENTORY_ITEMS` | no | `2000000` | Maximum raw provider members consumed by one plan, including filtered members such as delete markers. |
+
+For automatic retained serving, the production doctor requires the provider
+retention window to exceed the maximum maintenance interval plus the renewal
+horizon. Size the horizon for the longest credible outage and operator response
+time. It also requires current, passing provider evidence from
+`RS3_PROVIDER_CONFORMANCE_REPORT_FILE`; maintenance rechecks that evidence on
+every run.
+
+The CLI uses `RS3_ADMIN_URL` plus the read token for `maintenance status`, and
+the mutation token for `maintenance dry-run`, `apply`, `cancel`, `pause`, and
+`resume`. `maintenance-offline` instead loads the repository, backend, anchor,
+keyring, retention, and maintenance-budget settings directly. It is a
+break-glass command for a stopped gateway and, in production preview, requires
+the Kubernetes Lease anchor to fence the real writer epoch.
 
 ## Console
 
@@ -116,6 +153,15 @@ provider evidence without running live probes from status.
 The check command loads only backend and repository-retention settings; it does
 not require repository identity, anchor, keyring, public bucket, or gateway
 credential variables.
+
+The current `rs3.v2-provider-conformance.v2` report binds a path-safe
+`target_fingerprint` to the exact endpoint, bucket, and prefix. Its separate
+profile field binds the required provider semantics. Production evidence must contain the complete
+versioned check manifest with no omissions, duplicates, or unknown entries.
+Missing, stale, unreasonably future-dated, failed, profile-mismatched, or
+target-mismatched evidence fails the production doctor and retained
+maintenance. This is an operational evidence boundary, not a cryptographic
+attestation against an operator who can replace both configuration and report.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |

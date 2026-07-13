@@ -95,6 +95,35 @@ and `skip_too_large`. Payload span cache byte counters describe ciphertext span
 bytes. Decrypted segment cache byte counters describe plaintext segment bytes
 retained or served from the process-local cache.
 
+## Maintenance Metrics
+
+The in-gateway supervisor exports path-private scheduling, pressure, and outcome
+facts:
+
+- `rs3_maintenance_seconds_to_nearest_renewal_deadline`
+- `rs3_maintenance_last_success_timestamp_seconds`
+- `rs3_maintenance_orphan_candidate_bytes`
+- `rs3_maintenance_orphan_candidate_count`
+- `rs3_maintenance_consecutive_failures`
+- `rs3_maintenance_runs_total{outcome}`
+- `rs3_maintenance_budget_exceeded_total`
+- `rs3_maintenance_planning_failures_total`
+- `rs3_maintenance_window_duration_seconds`
+- `rs3_maintenance_paused`
+- `rs3_maintenance_parked`
+
+Pressure gauges count deletion-eligible candidates, not retained, held,
+unknown-protection, same-sequence, timestamp-less, or too-young inventory. The
+last-success series is absent until a run actually succeeds; absence is not a
+synthetic success. The Helm stale-success alert therefore treats an absent
+series as unhealthy after its `for` interval, and renders that alert only for
+the automatic maintenance posture. Counters and the paused/parked gauges are
+initialized when the supervisor starts so first events remain observable.
+
+All labels are closed outcome classes or fixed metric dimensions. They do not
+contain plan digests, operation identifiers, repository paths, object IDs, or
+Kubernetes names.
+
 ## Admin-Derived Alert Metrics
 
 The native metrics listener does not currently export accepted-chain age as a

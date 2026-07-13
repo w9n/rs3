@@ -317,6 +317,80 @@ Provider retention is capability-gated. A backend that cannot extend retention
 must return an unsupported operation rather than pretending the object is
 protected.
 
+## Full Maintenance
+
+The read-write gateway runs the v2 full-maintenance supervisor in process. It
+renews retention for the exact restore graph and reclaims exact-version orphans
+from one immutable, budgeted plan. Before apply, the coordinator drains pending
+commit work, excludes new repository mutations with the existing staging lock,
+and verifies the configured maintenance guard. Guard loss, cancellation, stale
+plans, incomplete authority, and exhausted physical budgets fail closed.
+
+`RS3_MAINTENANCE_MODE` selects the trigger policy:
+
+- `auto` is the read-write default. Retention deadlines, orphan byte/count/age
+  pressure, and the maximum interval can trigger a run.
+- `manual` keeps the supervisor available for authenticated operator requests
+  but does not start scheduled runs.
+- `off` disables the supervisor. Restore-readonly gateways force this posture
+  and reject an explicitly configured maintenance mode.
+
+Automatic runs are single-flight, observe the configured minimum cooldown,
+schedule renewal by a bounded early jitter, and use capped exponential backoff
+after a failure without crossing the renewal safety boundary. The supervisor
+parks without polling when no enforced maintenance guard is configured.
+`rs3-server doctor --profile production` reports that posture.
+
+The admin listener has separate read and mutation credentials. The read token
+can call `GET /admin/maintenance`, `/admin/posture`, and `/admin/status`. The
+mutation token can call those routes plus the maintenance `POST` routes. It must
+be at least 16 bytes and must differ from the read token. If
+`RS3_ADMIN_MUTATION_BEARER_TOKEN` is absent, the listener remains read-only.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /admin/maintenance` | Return path-redacted configuration, schedule, state, and bounded in-memory history. |
+| `POST /admin/maintenance/dry-run` | Build a read-only, budgeted plan and return its digest. |
+| `POST /admin/maintenance/apply` | Re-plan inside the exclusion window and apply only when `plan_digest` still matches. |
+| `POST /admin/maintenance/cancel` | Request cancellation at the next mutation boundary. |
+| `POST /admin/maintenance/pause` | Pause automatic triggers. Manual operations remain available. |
+| `POST /admin/maintenance/resume` | Resume automatic triggers. |
+
+Use the CLI rather than composing requests by hand:
+
+```sh
+rs3-server maintenance \
+  --admin-url http://127.0.0.1:9081 \
+  --admin-bearer-token "$RS3_ADMIN_BEARER_TOKEN" \
+  status
+
+rs3-server maintenance \
+  --admin-url http://127.0.0.1:9081 \
+  --admin-mutation-bearer-token "$RS3_ADMIN_MUTATION_BEARER_TOKEN" \
+  dry-run
+
+rs3-server maintenance \
+  --admin-url http://127.0.0.1:9081 \
+  --admin-mutation-bearer-token "$RS3_ADMIN_MUTATION_BEARER_TOKEN" \
+  apply --plan-digest <digest-from-dry-run>
+```
+
+`maintenance-offline` is a break-glass path for a stopped gateway, not a second
+scheduler. With the Kubernetes Lease anchor it fences the real anchor Lease,
+refuses a live writer, renews the fence during the operation, and releases it
+afterward. The memory-anchor path is an explicitly warned, unenforced
+development escape hatch. There is no generic non-Kubernetes production fence.
+Always run an offline dry run first, then pass its digest to apply:
+
+```sh
+rs3-server maintenance-offline dry-run
+rs3-server maintenance-offline apply --plan-digest <digest-from-dry-run>
+```
+
+For Helm deployments, configure the `maintenance` values and source
+`admin.mutationBearerToken` from an external Secret. Optional maintenance alerts
+are rendered only when both `metrics.enabled` and `alerts.enabled` are true.
+
 ## Disaster Recovery Material
 
 Treat the restore bundle as public but integrity-sensitive recovery metadata.
@@ -341,6 +415,13 @@ tenant names, backend object IDs, or secrets as labels.
 Use [Alerting](reference/alerts.md) for starting Prometheus rules covering
 accepted-checkpoint freshness, commit publishing, anchor advance failures, and
 gateway probes.
+
+Maintenance exports the nearest renewal deadline, last successful run time,
+orphan candidate bytes and count, consecutive failures, run outcomes, budget
+exhaustion, and exclusion-window duration under the `rs3_maintenance_*` metric
+prefix. The optional Helm `PrometheusRule` warns on an approaching or critical
+renewal deadline, repeated failures, budget exhaustion, and stale success. The
+rules and metric labels contain no repository paths or object identifiers.
 
 The Helm deployment uses an HTTP startup probe with a ten-minute budget before
 enabling liveness and readiness probes. This lets bounded commit and index

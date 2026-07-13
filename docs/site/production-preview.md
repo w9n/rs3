@@ -234,7 +234,8 @@ At a glance:
 - live provider qualification covered exact-version reads, retained multipart
   completion, and retention behavior
 - provider conformance can be preserved as JSON and surfaced through admin
-  posture without rerunning live probes from status
+  posture without rerunning live probes from status; v2 evidence binds the
+  complete check manifest to a path-safe fingerprint of the qualified target
 - DR rehearsal verified bundle export, missing-Lease rejection without retention
   context, and anchor import into a new cluster
 - 2026-05-18 live checks reran the retained-version gate after adding
@@ -359,6 +360,11 @@ For a controlled prototype deployment only:
 - set a stable, operator-provided `repositoryKeys.saltHex`
 - configure gateway access credentials explicitly
 - configure repository retention when retention evidence is part of the trial
+- leave `maintenance.mode` unset for the default automatic posture on a
+  read-write gateway, or document why `manual` or `off` is operationally safe
+- configure a distinct `admin.mutationBearerToken` from an external Secret when
+  operators need maintenance mutations; omit it to keep the admin listener
+  read-only
 - preserve `rs3 check-v2-provider --format json` output and configure
   `RS3_PROVIDER_CONFORMANCE_REPORT_FILE` when exposing admin posture
 - set gateway hardening limits for maximum `PutObject` size, buffered upload
@@ -408,6 +414,12 @@ compaction errors poison immediately. Three local controlled-filesystem runs
 now qualify the fresh-process mechanism and independent writer/reader RSS.
 Pinned-runner timing and retained-provider restart/fault qualification remain.
 
+The in-gateway maintenance supervisor, enforced writer guard, plan-digest-gated
+admin and CLI workflow, break-glass Lease fence, and explicit inventory ceilings
+close the maintenance trigger and operator-surface implementation blockers.
+Production-cardinality and retained-provider qualification remain release
+evidence, not inferred guarantees.
+
 - finish qualification of the integrated canonical `INDEX_RUN` codec and small
   signed `INDEX_ROOT` catalogs under `commits/v02`;
 - qualify the implemented effective-protection cohort partitioning for the
@@ -418,10 +430,8 @@ Pinned-runner timing and retained-provider restart/fault qualification remain.
 - qualify bounded fenced automatic compaction from the 256-run request
   watermark through missing-guard 64-run retries and the 896-run pause, before
   the 1,024-run ceiling;
-- ship an operator-safe maintenance controller around the implemented single-plan
-  exact mark, restore-dependency renewal, and orphan apply engine;
-- qualify bounded paged inventory at production cardinality and expose its page
-  and item ceilings through the maintenance controller;
+- qualify bounded paged maintenance inventory at production cardinality on the
+  retained-provider profiles;
 - implement dependency-wide legal-hold propagation plus guarded release before
   enabling v02 client holds;
 - implement cross-format protected-root renewal before allowing format/keyring

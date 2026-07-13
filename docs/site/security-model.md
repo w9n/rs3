@@ -174,6 +174,20 @@ and exact live payload references. Descriptor-first recovery verifies that
 graph and rechecks the anchor before installing state. Missing anchor plus
 missing trusted bundle is fail-closed for normal recovery.
 
+### Anchor Lease Annotation Visibility
+
+The Kubernetes Lease anchor stores its state in Lease annotations under the
+`rs3.rs/v2-*` prefix: the accepted sequence, commit object key, commit body
+digest, provider version ID, signing key ID, and format-root reference. Any
+subject with `get` or `list` on that Lease can read these annotations. That
+reveals the current anchor position, the backend commit object keys and digests,
+and, over time, repository write cadence. It does not reveal client paths,
+directory names, Kubernetes namespace or object names, snapshot names, or key
+material. The commit keys and digests are opaque backend identifiers, not client
+paths, so path privacy holds; the exposure is repository activity metadata, not
+protected content. Restrict Lease read access with RBAC to the gateway service
+account and cluster operators who already administer the anchor trust domain.
+
 S3 is not a writer lock. A conditional create can arbitrate one object key but
 cannot fence a stale gateway or establish an order between divergent repository
 roots. Read-write failover is supported only under one Kubernetes Lease
@@ -274,12 +288,19 @@ keys, or raw backend object IDs.
 The current S3, admin, metrics, and console listeners do not terminate TLS
 themselves. Expose them only behind TLS termination or on cluster-local
 networks protected by NetworkPolicy or equivalent controls. The admin listener
-is separate from the S3 data plane and currently exposes path-redacted facts at
-`GET /admin/posture` and `GET /admin/status`; it must use an admin bearer token
-that is separate from backup-client S3 credentials and backend S3 credentials.
-Mutating recovery and maintenance actions need explicit authorization and audit
-controls before they belong in an admin interface. Operator reports should stay
-fact-only until a separate authorization and audit design exists.
+is separate from the S3 data plane. Path-redacted `GET` routes accept the read
+or mutation bearer token. Full-maintenance `POST` routes accept only a distinct
+mutation token; configuring no mutation token leaves the listener read-only.
+Both tokens must remain separate from backup-client and backend S3 credentials.
+
+Maintenance dry run returns aggregates and an opaque digest that binds the
+repository's canonical exact private plan. Apply re-plans after entering the
+guarded exclusion window, rejects a different digest, and consumes that same
+plan instance. Exact backend object/version identities stay inside the
+repository layer. Audit records expose only bounded operation identifiers,
+aggregate counts and bytes, stable outcomes, and the opaque plan digest.
+Recovery, key management, and general storage mutation remain outside the HTTP
+admin surface.
 
 Do not reuse backup-client S3 credentials as admin credentials. S3 client IAM
 controls backup-tool operations on the data plane; admin/operator identity is a
@@ -288,7 +309,8 @@ separate admin boundary.
 The single-gateway console follows the same reporting rule. It may render the
 gateway admin report in a browser, but it must keep the gateway admin bearer
 token server-side, require a separate console bearer token for `GET
-/api/posture` and `GET /api/status`, and stay read-only. It must not add object
+/api/posture`, `GET /api/status`, and `GET /api/maintenance`, and stay
+read-only. It must not add object
 browsing, workflow execution, recovery mutation, key rotation, or backend-object
 inspection. The console-to-gateway admin hop carries the gateway admin bearer
 token, so use `https://` for that hop unless it is restricted to a protected

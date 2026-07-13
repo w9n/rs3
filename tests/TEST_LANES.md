@@ -9,6 +9,7 @@ notes in the specific harness README or code.
 | Preview local gate | `just preview-gate-local` | Default checks, S3-feature checks, and dependency policy checks. | Medium | Preview handoff |
 | S3 storage contract | `just integration-s3-local --mode container` | Storage backend contract against a disposable S3-compatible provider. | Medium | PR when storage changes |
 | Live S3 qualification | `cargo test -p rs3-storage --features s3 --test s3_live -- --ignored --nocapture` with `RS3_TEST_S3_OBJECT_LOCK=true` and `RS3_TEST_S3_QUALIFICATION_PROFILE=<atomic-create\|retained-version>` | Real provider basic S3 operations plus either atomic create or retained-version Object Lock semantics: retention, legal hold, provider version IDs, and exact-version reads after a newer latest version exists. | High | Manual provider qualification |
+| V2 exact-GC rehearsal | `just v2-gc-rehearsal-live "$BACKEND_BUCKET" "$ENDPOINT_URL" "$REGION" "$BACKEND_PREFIX"` with `RS3_V2_REHEARSAL_LEASE_NAMESPACE` set | Retained exact-version dry run and apply through the enforced Kubernetes writer fence. Verifies one protected orphan stays blocked, one unprotected orphan is deleted, and the anchor-selected chain reloads. | High | Before enabling destructive maintenance on a retained provider |
 | Live S3 Kopia gateway restore | `just integration-kopia-gateway --mode provided --backend-prefix <fresh-prefix>` with live `RS3_TEST_S3_*` and AWS credential env vars | Real Kopia repository create, snapshot, and restore through the gateway against a live S3-compatible backend. For retained buckets, also set `RS3_REPOSITORY_RETENTION_MODE=governance` and `RS3_REPOSITORY_RETENTION_DAYS=1`. | Very high | Manual provider qualification |
 | Live S3 Velero gateway restore | `just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke --backend-mode provided --backend-prefix <fresh-prefix>` with live `RS3_TEST_S3_*` and AWS credential env vars | Real kind cluster, Velero node-agent/Kopia dynamic PVC backup, namespace deletion, gateway restart, restore, and restored-byte verification through the gateway against a live S3-compatible backend. For retained buckets, also set `RS3_REPOSITORY_RETENTION_MODE=governance` and `RS3_REPOSITORY_RETENTION_DAYS=1`. | Very high | Manual provider qualification |
 | Gateway S3 contract | `just integration-s3-gateway` | Local gateway process, backend provider, S3 object operations through the gateway. | Medium | PR when gateway/repository changes |
@@ -30,6 +31,9 @@ Rules of thumb:
 - Every compatibility lane must verify restored bytes or Kubernetes object state, not only command success.
 - Expensive lanes emit artifacts under `.local/integration` by default: gateway logs, anchor snapshots, backend operation counts, amplification ratios, latency summaries, and relevant Kubernetes resources.
 - Current local performance baseline results are summarized in `tests/PERFORMANCE_BASELINE.md`.
+- The v2 GC rehearsal uses an enforced guard by default. The xtask
+  `--unenforced-guard` option is restricted to isolated development and cannot
+  qualify a retained provider.
 - The Helm chart is the Kubernetes packaging source; tests should install it instead of duplicating manifests.
 - Local development can pass `--reuse-kind-cluster --cluster-name <name>` to avoid recreating kind on every run; CI should use disposable clusters unless cleanup is owned by the job.
 - CI should use mirrored third-party images through harness image variables instead of relying on anonymous public registry pulls.

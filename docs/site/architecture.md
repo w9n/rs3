@@ -337,6 +337,33 @@ Kubernetes backup and restore workflow through that path. Broader S3
 compatibility should be added behind tests that verify restored bytes and
 privacy invariants.
 
+## Maintenance Supervisor
+
+Full maintenance is supervised inside the mutation-capable gateway. It is not
+a second controller, CronJob, or repository writer. The supervisor depends on
+the provider-neutral commit-anchor and maintenance-guard traits; Kubernetes
+supplies those contracts with the same fenced Lease used by normal writes.
+
+Automatic mode evaluates bounded retention-deadline and reclaimable-orphan
+facts, adds deterministic jitter, and applies cooldown or failure backoff only
+when doing so cannot cross the renewal safety boundary. Manual mode performs no
+background inventory scans and accepts explicit operator runs. Restore-readonly
+mode forces the supervisor off. A missing guard parks the state machine rather
+than retrying or mutating without exclusion.
+
+An operator dry run returns aggregates plus an opaque digest computed by the
+repository over the canonical exact private plan. Apply enters the coordinator
+maintenance window, drains pending commit work, verifies the guard and anchor,
+builds one fresh exact plan, compares its digest, and mutates that same plan
+instance. Object/version identities never cross the repository boundary. A
+different exact delete or renewal target therefore invalidates approval even
+when aggregate counts and bytes happen to match.
+
+The break-glass offline command builds the same repository runtime but first
+fences the real anchor Lease. It refuses a live renewing writer and renews its
+own fence until the run and release complete. This path is for a stopped gateway
+and is not an alternative scheduler.
+
 ## Admin Surface
 
 Core code owns the path-redacted admin report model used by doctor checks,
@@ -348,20 +375,23 @@ In `rs3-server`, `src/admin.rs` contains only the shared report builders and
 serializable summaries. A separate operator UI or platform integration should
 consume those summaries through an explicit admin boundary instead
 of sharing backup-client S3 credentials or browsing repository objects
-directly. The report shape is a preview fact contract, not a complete workflow
-API. Mutating workflows require their own authorization, audit, and
-stabilization decision.
+directly. The report shape remains a preview fact contract. Full maintenance is
+the first narrow workflow API: read routes accept the admin read or mutation
+token, while dry-run, digest-gated apply, cancel, pause, and resume require a
+distinct mutation token and emit path-redacted operation records. Recovery,
+key-management, and arbitrary storage workflows are not exposed.
 
 `rs3-console` is the narrow single-gateway UI for these reports. It serves a
-browser interface and proxies `GET /api/posture` or `GET /api/status` to the
-gateway admin listener. The browser authenticates to the console; the gateway
-admin token remains server-side. The console has no repository browser,
-database, scheduler, work queue, or mutating recovery/key-management routes.
+browser interface and proxies `GET /api/posture`, `GET /api/status`, or `GET
+/api/maintenance` to the gateway admin listener. The browser authenticates to
+the console; the gateway read token remains server-side. The console has no
+repository browser, database, scheduler, work queue, or mutation routes.
 
 Admin and platform surfaces are not part of the S3 data plane and should not
 expose client-visible object browsing, backend object IDs, configured bucket
 names, repository IDs, prefixes, or secret material.
 
-Mutating workflows such as anchor import, recovery apply, key rewrap, data-key
-rotation, compaction, or garbage collection should stay explicit operator
-actions until they have a dedicated authorization and audit model.
+Mutating workflows other than the narrowly authorized maintenance API, such as
+anchor import, recovery apply, key rewrap, data-key rotation, or arbitrary
+compaction, stay explicit local operator actions until they have a dedicated
+authorization and audit model.

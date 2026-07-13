@@ -46,8 +46,10 @@ immutable plan, and fails closed when a page/item budget, exact authority root,
 or protection fact is unavailable.
 The preview library defaults to at most 4,096 inventory pages and 2,000,000
 raw provider inventory members per plan. Filtered members such as S3 delete
-markers consume that item budget too. The future operator controller must
-expose these ceilings and require an explicit increase for larger repositories.
+markers consume that item budget too. The in-gateway maintenance supervisor
+exposes these ceilings as `RS3_MAINTENANCE_MAX_INVENTORY_PAGES` and
+`RS3_MAINTENANCE_MAX_INVENTORY_ITEMS`. Require an explicit, reviewed increase
+for larger repositories.
 
 Full-GC planning wraps its store in a read-only ledger. Every logical provider
 `HEAD`, bounded range `GET`, and LIST page is charged before it is forwarded,
@@ -68,11 +70,27 @@ exported; cross-format renewal is not implemented. v02 also rejects new client
 legal holds and refuses full maintenance for an existing held graph until
 dependency-wide hold propagation and guarded release are implemented.
 
-Renewal is not a background service yet. Keep Object Lock windows longer than
-the maximum interval between guarded maintenance runs plus the maximum outage
-and incident-response interval. A failed apply may already have strengthened
-some exact versions; retention extension is intentionally irreversible and the
-run must be retried from a new dry run.
+The read-write gateway now runs guarded renewal and orphan reclamation as a
+background service when `RS3_MAINTENANCE_MODE=auto`, which is the default.
+`manual` requires an operator trigger and `off` disables renewal, so treat both
+as an explicit operational exception when retention is enabled. The supervisor
+parks rather than running without an enforced maintenance guard.
+
+Size every Object Lock window strictly longer than:
+
+```text
+maximum automatic-maintenance interval
++ renewal safety horizon
+```
+
+Configure the renewal horizon to cover the longest credible gateway or
+control-plane outage plus operator detection and response time. The production
+doctor and Helm production profile reject a window that does not exceed the
+maximum interval plus that horizon. This margin is not optional. A retention
+deadline that lapses during an outage cannot be repaired retroactively. A
+failed apply may already have strengthened some exact versions; retention
+extension is intentionally irreversible and the run must be retried from a new
+dry run.
 
 v2 compaction can rewrite the current live namespace into a protected snapshot
 commit after verifying that snapshot with a fresh reader. Old source commits are
@@ -143,7 +161,10 @@ just v2-gc-rehearsal-live "$BACKEND_BUCKET" "$ENDPOINT_URL" "$REGION" "$BACKEND_
 The rehearsal writes a retained anchor, one protected orphan, and one
 unprotected exact-version orphan. It dry-runs with a one-delete budget, applies
 only the unprotected exact-version delete, verifies the protected candidate
-remains blocked, and reloads the anchor-selected chain.
+remains blocked, and reloads the anchor-selected chain. The command uses the
+dedicated Kubernetes Lease writer fence by default. The xtask
+`--unenforced-guard` escape hatch is only for isolated development and does not
+qualify a retained provider.
 
 ## Incident Rules
 
