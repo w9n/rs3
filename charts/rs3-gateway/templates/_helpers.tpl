@@ -94,6 +94,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and (eq .Values.gateway.mode "read-write") (not .Values.repository.retention.mode) -}}
 {{- fail "admin.profile=production with gateway.mode=read-write requires repository retention" -}}
 {{- end -}}
+{{- if and (eq .Values.gateway.mode "read-write") (not .Values.providerConformance.existingConfigMap) -}}
+{{- fail "admin.profile=production with gateway.mode=read-write requires providerConformance.existingConfigMap with current retained-provider evidence" -}}
+{{- end -}}
 {{- if .Values.repository.allowInit -}}
 {{- fail "admin.profile=production requires repository.allowInit=false outside deliberate bootstrap" -}}
 {{- end -}}
@@ -154,6 +157,25 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and (ne .Values.gateway.mode "read-write") (ne .Values.gateway.mode "restore-readonly") -}}
 {{- fail "gateway.mode must be read-write or restore-readonly" -}}
 {{- end -}}
+{{- if .Values.maintenance.mode -}}
+{{- if eq .Values.gateway.mode "restore-readonly" -}}
+{{- fail "gateway.mode=restore-readonly forces maintenance off and the server rejects RS3_MAINTENANCE_MODE; leave maintenance.mode empty" -}}
+{{- end -}}
+{{- if and (ne .Values.maintenance.mode "auto") (and (ne .Values.maintenance.mode "manual") (ne .Values.maintenance.mode "off")) -}}
+{{- fail "maintenance.mode must be empty, auto, manual, or off" -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.maintenance.minCooldownSeconds .Values.maintenance.maxIntervalSeconds -}}
+{{- if gt (int64 .Values.maintenance.minCooldownSeconds) (int64 .Values.maintenance.maxIntervalSeconds) -}}
+{{- fail "maintenance.minCooldownSeconds must be less than or equal to maintenance.maxIntervalSeconds" -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.providerConformance.existingConfigMap (not .Values.providerConformance.reportKey) -}}
+{{- fail "providerConformance.reportKey is required when providerConformance.existingConfigMap is set" -}}
+{{- end -}}
+{{- if not (gt (int64 .Values.providerConformance.maxAgeSeconds) 0) -}}
+{{- fail "providerConformance.maxAgeSeconds must be greater than zero" -}}
+{{- end -}}
 {{- if and (ne .Values.gateway.writerGuard "required") (ne .Values.gateway.writerGuard "off") -}}
 {{- fail "gateway.writerGuard must be required or off" -}}
 {{- end -}}
@@ -181,6 +203,15 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and .Values.repository.retention.mode (not (gt (int .Values.repository.retention.days) 0)) -}}
 {{- fail "repository.retention.days must be greater than zero when repository.retention.mode is set" -}}
 {{- end -}}
+{{- $maintenanceMode := .Values.maintenance.mode | default "auto" -}}
+{{- $maintenanceHorizon := int64 (.Values.maintenance.renewalHorizonSeconds | default 604800) -}}
+{{- $maintenanceMaxInterval := int64 (.Values.maintenance.maxIntervalSeconds | default 604800) -}}
+{{- $retentionSeconds := mul (int64 .Values.repository.retention.days) 86400 -}}
+{{- if and .Values.repository.retention.mode (and (eq .Values.gateway.mode "read-write") (eq $maintenanceMode "auto")) -}}
+{{- if le $retentionSeconds (add $maintenanceHorizon $maintenanceMaxInterval) -}}
+{{- fail "automatic maintenance requires repository.retention.days to exceed maintenance.maxIntervalSeconds plus maintenance.renewalHorizonSeconds; include additional outage and response margin" -}}
+{{- end -}}
+{{- end -}}
 {{- if and (not .Values.repository.retention.mode) (gt (int .Values.repository.retention.days) 0) -}}
 {{- fail "repository.retention.mode is required when repository.retention.days is set" -}}
 {{- end -}}
@@ -193,6 +224,15 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- if and .Values.admin.createToken (not .Values.admin.bearerToken) -}}
 {{- fail "admin.bearerToken is required when admin.createToken=true" -}}
+{{- end -}}
+{{- if and .Values.admin.mutationBearerToken (not .Values.admin.createToken) -}}
+{{- fail "admin.mutationBearerToken requires admin.createToken=true; otherwise add a mutation-bearer-token key to admin.existingTokenSecret" -}}
+{{- end -}}
+{{- if and .Values.admin.mutationBearerToken (lt (len .Values.admin.mutationBearerToken) 16) -}}
+{{- fail "admin.mutationBearerToken must be at least 16 bytes" -}}
+{{- end -}}
+{{- if and .Values.admin.mutationBearerToken (eq .Values.admin.mutationBearerToken .Values.admin.bearerToken) -}}
+{{- fail "admin.mutationBearerToken must differ from admin.bearerToken" -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.metrics.enabled -}}

@@ -1,0 +1,98 @@
+{{- if and .Values.metrics.enabled .Values.alerts.enabled -}}
+{{- /*
+Thresholds derive from the configured maintenance settings. When a setting is
+left unset the gateway uses its built-in default, so the defaults below mirror
+the server: renewal horizon 604800s (7 days) and max interval 604800s (7 days).
+Rules carry only metric names, numeric thresholds, and severity labels: no
+paths, object keys, namespaces, or snapshot names.
+*/ -}}
+{{- $horizon := int (.Values.maintenance.renewalHorizonSeconds | default 604800) -}}
+{{- $maxInterval := int (.Values.maintenance.maxIntervalSeconds | default 604800) -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "rs3-gateway.fullname" . }}
+  labels:
+    {{- include "rs3-gateway.labels" . | nindent 4 }}
+    {{- with .Values.alerts.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: rs3-maintenance
+      rules:
+        - alert: Rs3MaintenanceRenewalDeadlineApproaching
+          expr: rs3_maintenance_seconds_to_nearest_renewal_deadline < {{ $horizon }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: rs3 retention renewal deadline within the configured horizon
+            description: >-
+              Seconds to the nearest retention renewal deadline dropped below the
+              configured renewal horizon ({{ $horizon }}s).
+        - alert: Rs3MaintenanceRenewalDeadlineCritical
+          expr: rs3_maintenance_seconds_to_nearest_renewal_deadline < {{ div $horizon 4 }}
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: rs3 retention renewal deadline critically close
+            description: >-
+              Seconds to the nearest retention renewal deadline dropped below a
+              quarter of the configured renewal horizon ({{ div $horizon 4 }}s).
+        - alert: Rs3MaintenanceConsecutiveFailures
+          expr: rs3_maintenance_consecutive_failures >= 3
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: rs3 maintenance runs failing repeatedly
+            description: >-
+              The maintenance supervisor reported three or more consecutive
+              failed runs.
+        - alert: Rs3MaintenancePlanningFailures
+          expr: increase(rs3_maintenance_planning_failures_total[1h]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: rs3 maintenance planning failed
+            description: >-
+              At least one bounded maintenance planning pass failed in the last
+              hour. Automatic triggers may be running under failure backoff.
+        - alert: Rs3MaintenanceParked
+          expr: rs3_maintenance_parked == 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: rs3 maintenance supervisor is parked
+            description: >-
+              The maintenance supervisor cannot run because its enforced guard
+              is unavailable.
+        - alert: Rs3MaintenanceBudgetExceeded
+          expr: increase(rs3_maintenance_budget_exceeded_total[6h]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: rs3 maintenance exceeded a physical budget
+            description: >-
+              One or more maintenance passes hit a configured physical budget in
+              the last six hours.
+        {{- if or (not .Values.maintenance.mode) (eq .Values.maintenance.mode "auto") }}
+        - alert: Rs3MaintenanceLastSuccessStale
+          expr: >-
+            (time() - rs3_maintenance_last_success_timestamp_seconds > {{ mul $maxInterval 2 }})
+            or absent(rs3_maintenance_last_success_timestamp_seconds)
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: rs3 maintenance has not succeeded within twice the max interval
+            description: >-
+              No successful maintenance run completed within twice the configured
+              maximum interval ({{ mul $maxInterval 2 }}s).
+        {{- end }}
+{{- end -}}

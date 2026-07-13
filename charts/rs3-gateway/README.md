@@ -13,6 +13,8 @@ deliberately.
 - A bearer token Secret for the admin listener health and operator-fact routes.
 - Repository ID, salt, and keyring wrapping key material.
 - Lease RBAC, either created by this chart or managed externally.
+- A ConfigMap containing current path-redacted provider-conformance JSON for a
+  production read-write deployment.
 
 ## Local Smoke Install
 
@@ -63,6 +65,17 @@ admin:
   enabled: true
   existingTokenSecret: rs3-admin-token
 
+providerConformance:
+  existingConfigMap: rs3-provider-conformance
+  reportKey: report.json
+
+maintenance:
+  # Empty selects the server default, auto, for read-write gateways.
+  mode: ""
+
+alerts:
+  enabled: true
+
 metrics:
   enabled: true
   serviceMonitor:
@@ -105,7 +118,7 @@ repository:
   allowInit: false
   retention:
     mode: governance
-    days: 1
+    days: 30
 
 repositoryKeys:
   existingSecret: rs3-repository-keys
@@ -128,7 +141,7 @@ Expected Secret keys are:
 | --- | --- |
 | `backendCredentials.existingSecret` | `access-key-id`, `secret-access-key` |
 | `credentials.existingSecret` | `access-key-id`, `secret-access-key` |
-| `admin.existingTokenSecret` | `bearer-token` |
+| `admin.existingTokenSecret` | `bearer-token`; optional `mutation-bearer-token` for maintenance `POST` routes |
 | `repositoryKeys.existingSecret` | `salt-hex`, `envelope-object-id`, `wrapping-key-id`, `wrapping-key-hex` |
 
 `envelope-object-id` may be omitted to use the default envelope object.
@@ -144,6 +157,18 @@ Expected Secret keys are:
   briefly run two writers against the same repository.
 - Keep `gateway.writerGuard=required` with `anchor.mode=kubernetes-lease` for
   read-write deployments.
+- Production read-write rendering requires
+  `providerConformance.existingConfigMap`. Generate its `reportKey` with `rs3
+  check-v2-provider --format json` against the selected retained backend and
+  refresh it before `providerConformance.maxAgeSeconds` expires. The production
+  doctor and maintenance engine fail closed on missing, stale, failed, or
+  profile-mismatched evidence. The v2 report also requires the complete check
+  manifest and a target fingerprint matching the configured endpoint, bucket,
+  and prefix.
+- Full maintenance runs inside the gateway. `maintenance.mode=auto` is the
+  read-write default; `manual` disables background triggers, and `off` disables
+  the supervisor. Inventory ceilings and pacing are configured under the
+  `maintenance` values block. Do not deploy a second maintenance writer.
 - Lease fencing coordinates writers that share one Kubernetes apiserver and
   anchor Lease. Disconnected read-write gateways that only share or synchronize
   S3 storage remain unsupported: an eventually consistent or malicious backend
@@ -156,7 +181,8 @@ Expected Secret keys are:
   configured bearer token.
 - `metrics.enabled=true` exposes the gateway metrics listener through the main
   Service. `metrics.serviceMonitor.enabled=true` also renders a Prometheus
-  Operator `ServiceMonitor`.
+  Operator `ServiceMonitor`. With metrics enabled, `alerts.enabled=true` renders
+  path-private maintenance `PrometheusRule` alerts.
 - The container runs with privilege escalation disabled, a read-only root
   filesystem, all Linux capabilities dropped, and a RuntimeDefault seccomp
   profile. The chart mounts an emptyDir at `/tmp` for scratch space, disables

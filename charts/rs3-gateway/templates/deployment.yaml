@@ -63,6 +63,14 @@ spec:
                 secretKeyRef:
                   name: {{ include "rs3-gateway.adminTokenSecretName" . }}
                   key: bearer-token
+            # Optional: POST maintenance mutations stay disabled when the admin
+            # Secret has no mutation-bearer-token key.
+            - name: RS3_ADMIN_MUTATION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rs3-gateway.adminTokenSecretName" . }}
+                  key: mutation-bearer-token
+                  optional: true
             {{- end }}
             - name: RS3_GATEWAY_MODE
               value: {{ .Values.gateway.mode | quote }}
@@ -172,6 +180,52 @@ spec:
             - name: RS3_ANCHOR_FIELD_MANAGER
               value: {{ .Values.anchor.fieldManager | quote }}
             {{- end }}
+            {{- if .Values.maintenance.mode }}
+            - name: RS3_MAINTENANCE_MODE
+              value: {{ .Values.maintenance.mode | quote }}
+            {{- end }}
+            {{- if .Values.maintenance.renewalHorizonSeconds }}
+            - name: RS3_MAINTENANCE_RENEWAL_HORIZON_SECONDS
+              value: {{ .Values.maintenance.renewalHorizonSeconds | quote }}
+            {{- end }}
+            {{- if .Values.maintenance.orphanPressureBytes }}
+            - name: RS3_MAINTENANCE_ORPHAN_PRESSURE_BYTES
+              value: {{ printf "%d" (int64 .Values.maintenance.orphanPressureBytes) | quote }}
+            {{- end }}
+            {{- if .Values.maintenance.orphanPressureCount }}
+            - name: RS3_MAINTENANCE_ORPHAN_PRESSURE_COUNT
+              value: {{ .Values.maintenance.orphanPressureCount | quote }}
+            {{- end }}
+            {{- if .Values.maintenance.orphanPressureMaxAgeSeconds }}
+            - name: RS3_MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS
+              value: {{ .Values.maintenance.orphanPressureMaxAgeSeconds | quote }}
+            {{- end }}
+            {{- if .Values.maintenance.maxIntervalSeconds }}
+            - name: RS3_MAINTENANCE_MAX_INTERVAL_SECONDS
+              value: {{ .Values.maintenance.maxIntervalSeconds | quote }}
+            {{- end }}
+            {{- if .Values.maintenance.minCooldownSeconds }}
+            - name: RS3_MAINTENANCE_MIN_COOLDOWN_SECONDS
+              value: {{ .Values.maintenance.minCooldownSeconds | quote }}
+            {{- end }}
+            {{- if .Values.maintenance.pacingDelayMs }}
+            - name: RS3_MAINTENANCE_PACING_DELAY_MS
+              value: {{ .Values.maintenance.pacingDelayMs | quote }}
+            {{- end }}
+            {{- if .Values.maintenance.maxInventoryPages }}
+            - name: RS3_MAINTENANCE_MAX_INVENTORY_PAGES
+              value: {{ .Values.maintenance.maxInventoryPages | quote }}
+            {{- end }}
+            {{- if .Values.maintenance.maxInventoryItems }}
+            - name: RS3_MAINTENANCE_MAX_INVENTORY_ITEMS
+              value: {{ .Values.maintenance.maxInventoryItems | quote }}
+            {{- end }}
+            {{- if .Values.providerConformance.existingConfigMap }}
+            - name: RS3_PROVIDER_CONFORMANCE_REPORT_FILE
+              value: /etc/rs3/provider-conformance/report.json
+            - name: RS3_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS
+              value: {{ .Values.providerConformance.maxAgeSeconds | quote }}
+            {{- end }}
             - name: RS3_LOG_FORMAT
               value: {{ .Values.logging.format | quote }}
             - name: RS3_ADMIN_PROFILE
@@ -205,6 +259,11 @@ spec:
               mountPath: {{ .Values.persistence.mountPath | quote }}
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.providerConformance.existingConfigMap }}
+            - name: provider-conformance
+              mountPath: /etc/rs3/provider-conformance
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
@@ -217,3 +276,11 @@ spec:
           {{- end }}
         - name: tmp
           emptyDir: {}
+        {{- if .Values.providerConformance.existingConfigMap }}
+        - name: provider-conformance
+          configMap:
+            name: {{ .Values.providerConformance.existingConfigMap | quote }}
+            items:
+              - key: {{ .Values.providerConformance.reportKey | quote }}
+                path: report.json
+        {{- end }}

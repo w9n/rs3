@@ -47,7 +47,10 @@ def production_values() -> dict[str, object]:
         "backend": {"endpoint": "https://s3.example.invalid"},
         "credentials": {"existingSecret": "fixture-client-credentials"},
         "repositoryKeys": {"existingSecret": "fixture-repository-keys"},
-        "repository": {"retention": {"mode": "governance", "days": 1}},
+        "repository": {"retention": {"mode": "governance", "days": 30}},
+        "providerConformance": {
+            "existingConfigMap": "fixture-provider-conformance"
+        },
         "recovery": {"publicKey": f"ed25519:{'0' * 64}"},
         "metrics": {"enabled": True},
         "networkPolicy": {
@@ -181,6 +184,14 @@ def main() -> None:
     backend = mixed_peer["networkPolicy"]["egress"]["backend"]
     backend["to"][0]["namespaceSelector"] = {"matchLabels": {"tenant": "backup"}}
     render(mixed_peer, succeeds=False)
+
+    missing_provider_evidence = copy.deepcopy(production_values())
+    missing_provider_evidence["providerConformance"]["existingConfigMap"] = ""
+    render(missing_provider_evidence, succeeds=False)
+
+    unsafe_retention_window = copy.deepcopy(production_values())
+    unsafe_retention_window["repository"]["retention"]["days"] = 14
+    render(unsafe_retention_window, succeeds=False)
 
 
 if __name__ == "__main__":

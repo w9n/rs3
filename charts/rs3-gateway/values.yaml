@@ -30,6 +30,56 @@ admin:
   createToken: false
   existingTokenSecret: ""
   bearerToken: ""
+  # Optional admin mutation bearer token. State-changing POST maintenance
+  # endpoints (dry-run, apply, cancel, pause, resume) stay disabled unless this
+  # token is present; without it the admin listener serves read-only GETs only.
+  # The server requires it to differ from the read bearer token and to be at
+  # least 16 bytes. When createToken=true the chart stores this value in the
+  # admin Secret under the mutation-bearer-token key. In production (external
+  # Secret references), leave this empty and add a mutation-bearer-token key to
+  # admin.existingTokenSecret instead; the deployment reads that key optionally.
+  mutationBearerToken: ""
+
+# In-process maintenance supervisor. Unset values fall back to the gateway's
+# built-in defaults (shown in parentheses); only explicitly set values render as
+# environment variables so the server stays the single source of truth for
+# defaults. restore-readonly gateways force maintenance off and reject
+# RS3_MAINTENANCE_MODE, so maintenance.mode must stay unset in that mode.
+maintenance:
+  # auto renews retention and reclaims orphans automatically; manual expects an
+  # external process to drive full maintenance; off disables the supervisor.
+  # (default auto). Leave empty for gateway.mode=restore-readonly.
+  mode: ""
+  # Lead time before a retention deadline at which renewal is scheduled, in
+  # seconds. (default 604800, i.e. 7 days)
+  renewalHorizonSeconds: null
+  # Orphan reclamation pressure thresholds. (defaults: 1073741824 bytes = 1 GiB;
+  # 512 objects; 172800 seconds = 2 days max age)
+  orphanPressureBytes: null
+  orphanPressureCount: null
+  orphanPressureMaxAgeSeconds: null
+  # Upper bound between automatic full-maintenance runs, in seconds.
+  # (default 604800, i.e. 7 days)
+  maxIntervalSeconds: null
+  # Minimum cooldown between full-maintenance runs, in seconds. Must be less than
+  # or equal to maxIntervalSeconds. (default 3600, i.e. 1 hour)
+  minCooldownSeconds: null
+  # Optional pacing delay between backend maintenance operations, in
+  # milliseconds. Opt-in with no built-in default; leave unset to run unthrottled.
+  pacingDelayMs: null
+  # Inventory scan caps that bound a single maintenance pass.
+  # (defaults: 4096 pages; 2000000 items)
+  maxInventoryPages: null
+  maxInventoryItems: null
+
+# Persisted output from `rs3 check-v2-provider --format json`. Retained
+# automatic maintenance fails closed without current evidence for the selected
+# provider profile. Store the path-redacted JSON report in a ConfigMap created
+# outside this chart so qualification remains an explicit release operation.
+providerConformance:
+  existingConfigMap: ""
+  reportKey: report.json
+  maxAgeSeconds: 604800
 
 # Optional Prometheus metrics listener. Enable ServiceMonitor only in clusters
 # with the Prometheus Operator CRDs installed.
@@ -38,6 +88,17 @@ metrics:
   port: 9082
   serviceMonitor:
     enabled: false
+
+# Optional Prometheus alerting rules over maintenance health metrics. Rendered
+# only when metrics.enabled=true (the metrics API is available) and
+# alerts.enabled=true, mirroring how the ServiceMonitor is guarded. Requires the
+# Prometheus Operator PrometheusRule CRD. Rules stay path-private: they carry
+# only metric names, numeric thresholds, and severity labels.
+alerts:
+  enabled: false
+  # Extra labels merged onto the PrometheusRule metadata (for example a
+  # Prometheus rule-routing label). Keep these free of paths and object keys.
+  labels: {}
 
 # Optional baseline NetworkPolicy. Empty selectors render deny-all rules in the
 # local profile and fail validation when the production profile enables the
