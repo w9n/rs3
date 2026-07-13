@@ -19,7 +19,14 @@ containers = [
   "dep:rustls",
   "dep:testcontainers",
 ]
-k8s = ["s3", "dep:aws-sdk-s3", "dep:rustls"]
+k8s = [
+  "s3",
+  "dep:aws-sdk-s3",
+  "dep:k8s-openapi",
+  "dep:rs3-k8s",
+  "dep:rustls",
+  "k8s-openapi/v1_35",
+]
 
 [dependencies]
 anyhow.workspace = true
@@ -35,8 +42,10 @@ clap.workspace = true
 getrandom.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+k8s-openapi = { workspace = true, optional = true }
 procfs = { version = "0.18.0", optional = true }
 rs3-crypto = { version = "0.1.0", path = "../crates/rs3-crypto" }
+rs3-k8s = { version = "0.1.0", path = "../crates/rs3-k8s", optional = true }
 rs3-repository = { version = "0.1.0", path = "../crates/rs3-repository" }
 rs3-storage = { version = "0.1.0", path = "../crates/rs3-storage" }
 rs3-types = { version = "0.1.0", path = "../crates/rs3-types" }

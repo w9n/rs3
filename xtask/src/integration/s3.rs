@@ -191,6 +191,9 @@ fn run_container_gc_rehearsal(
         "--retention-days",
         &retention_days,
         "--retained-provider-conformance-passed",
+        // The container bucket is disposable and single-process, so the
+        // isolated rehearsal explicitly opts into the honor-system guard.
+        "--unenforced-guard",
         "--format",
         "json",
     ]);

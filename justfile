@@ -168,9 +168,11 @@ check-v2-provider-v2-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
         --governance-bypass-reviewed \
         --format json
 
-# Rehearse v2 garbage collection against a live backend.
+# Rehearse v2 garbage collection against a live backend through the enforced
+# Kubernetes writer fence. Set RS3_V2_REHEARSAL_LEASE_NAMESPACE (and optionally
+# RS3_V2_REHEARSAL_LEASE_NAME) to name the dedicated rehearsal Lease.
 v2-gc-rehearsal-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
-    cargo run -p xtask --bin xtask --features s3 -- v2 gc-rehearsal --backend s3 --s3-bucket "{{BACKEND_BUCKET}}" --s3-prefix "{{BACKEND_PREFIX}}" --s3-endpoint-url "{{ENDPOINT_URL}}" --s3-region "{{REGION}}" --retained-provider-conformance-passed --format json
+    cargo run -p xtask --bin xtask --features k8s -- v2 gc-rehearsal --backend s3 --s3-bucket "{{BACKEND_BUCKET}}" --s3-prefix "{{BACKEND_PREFIX}}" --s3-endpoint-url "{{ENDPOINT_URL}}" --s3-region "{{REGION}}" --retained-provider-conformance-passed --format json
 
 # Run live S3 storage contract tests against configured credentials.
 integration-s3:
@@ -264,7 +266,8 @@ helm-lint:
         --set admin.existingTokenSecret=fixture-admin-token \
         --set repositoryKeys.existingSecret=fixture-repository-keys \
         --set repository.retention.mode=governance \
-        --set repository.retention.days=1 \
+        --set repository.retention.days=30 \
+        --set providerConformance.existingConfigMap=fixture-provider-conformance \
         --set-string recovery.publicKey=ed25519:0000000000000000000000000000000000000000000000000000000000000000
     python3 tests/helm_network_policy.py
 
