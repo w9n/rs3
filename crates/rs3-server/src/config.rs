@@ -36,6 +36,7 @@ const REPOSITORY_FORMAT_ENV: &str = "RS3_REPOSITORY_FORMAT";
 const ALLOW_REPOSITORY_INIT_ENV: &str = "RS3_ALLOW_REPOSITORY_INIT";
 const PROVIDER_CONFORMANCE_REPORT_FILE_ENV: &str = "RS3_PROVIDER_CONFORMANCE_REPORT_FILE";
 const PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV: &str = "RS3_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS";
+const PROVIDER_PRINCIPAL_FINGERPRINT_ENV: &str = "RS3_PROVIDER_PRINCIPAL_FINGERPRINT";
 pub(crate) const RECOVERY_PUBLIC_KEY_ENV: &str = "RS3_RECOVERY_PUBLIC_KEY";
 
 pub(crate) const REPOSITORY_SALT_HEX_ENV: &str = "RS3_REPOSITORY_SALT_HEX";
@@ -106,6 +107,8 @@ pub struct V2ProviderCheckConfig {
     pub repository_format: RepositoryFormat,
     /// Default provider retention policy for repository-owned objects.
     pub repository_retention: Option<RetentionPolicy>,
+    /// Operator-derived fingerprint of the backend credential principal.
+    pub principal_fingerprint: Option<String>,
 }
 
 /// Minimal repository context needed by operator maintenance tools.
@@ -142,6 +145,7 @@ impl From<&RuntimeConfig> for V2ProviderCheckConfig {
             backend: config.backend.clone(),
             repository_format: config.repository.format,
             repository_retention: config.repository.retention,
+            principal_fingerprint: config.provider_conformance.principal_fingerprint.clone(),
         }
     }
 }
@@ -411,6 +415,8 @@ pub struct ProviderConformanceConfig {
     pub report_file: Option<PathBuf>,
     /// Maximum accepted report age before status marks the evidence stale.
     pub max_age: Duration,
+    /// Operator-derived fingerprint of the backend credential principal.
+    pub principal_fingerprint: Option<String>,
 }
 
 /// Disaster-recovery trust settings.
@@ -425,6 +431,7 @@ impl Default for ProviderConformanceConfig {
         Self {
             report_file: None,
             max_age: Duration::from_secs(DEFAULT_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS),
+            principal_fingerprint: None,
         }
     }
 }
@@ -628,6 +635,8 @@ impl V2ProviderCheckConfig {
         let repository_format = collect_config_error(&mut errors, parse_repository_format(source));
         let repository_retention =
             collect_config_error(&mut errors, parse_retention_policy(source));
+        let principal_fingerprint =
+            collect_config_error(&mut errors, parse_provider_principal_fingerprint(source));
 
         if !errors.is_empty() {
             return Err(config_error_list(errors));
@@ -637,6 +646,7 @@ impl V2ProviderCheckConfig {
             backend: require_collected_config(backend)?,
             repository_format: require_collected_config(repository_format)?,
             repository_retention: require_collected_config(repository_retention)?,
+            principal_fingerprint: require_collected_config(principal_fingerprint)?,
         })
     }
 }
@@ -1157,10 +1167,32 @@ fn parse_provider_conformance_config(
         source.value(PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV),
         DEFAULT_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS,
     )?;
+    let principal_fingerprint = parse_provider_principal_fingerprint(source)?;
     Ok(ProviderConformanceConfig {
         report_file,
         max_age: Duration::from_secs(max_age_seconds),
+        principal_fingerprint,
     })
+}
+
+fn parse_provider_principal_fingerprint(
+    source: &impl ConfigSource,
+) -> Result<Option<String>, ConfigError> {
+    let Some(value) = optional_value(source, PROVIDER_PRINCIPAL_FINGERPRINT_ENV) else {
+        return Ok(None);
+    };
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ConfigError::Invalid {
+            key: PROVIDER_PRINCIPAL_FINGERPRINT_ENV,
+            value: REDACTED_SECRET_VALUE.to_owned(),
+            reason: "expected a lowercase 64-character SHA-256 fingerprint".to_owned(),
+        });
+    }
+    Ok(Some(value))
 }
 
 fn parse_recovery_config(source: &impl ConfigSource) -> Result<RecoveryConfig, ConfigError> {
@@ -2144,7 +2176,11 @@ mod tests {
                 super::PROVIDER_CONFORMANCE_REPORT_FILE_ENV,
                 "/var/lib/rs3/provider-report.json",
             )
-            .with(super::PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV, "3600");
+            .with(super::PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV, "3600")
+            .with(
+                super::PROVIDER_PRINCIPAL_FINGERPRINT_ENV,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            );
 
         let config = RuntimeConfig::from_source(&source);
 
@@ -2157,6 +2193,21 @@ mod tests {
             config.provider_conformance.max_age,
             Duration::from_secs(3600)
         );
+        assert_eq!(
+            config.provider_conformance.principal_fingerprint.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_provider_principal_fingerprint_without_echoing_it() {
+        let source = minimal_source().with(super::PROVIDER_PRINCIPAL_FINGERPRINT_ENV, "tenant-a");
+
+        let error = RuntimeConfig::from_source(&source)
+            .expect_err("malformed principal fingerprint should fail closed");
+
+        assert!(config_error_keys(&error).contains(&super::PROVIDER_PRINCIPAL_FINGERPRINT_ENV));
+        assert!(!error.to_string().contains("tenant-a"));
     }
 
     #[test]

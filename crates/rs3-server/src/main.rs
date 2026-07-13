@@ -1579,7 +1579,7 @@ fn print_v2_provider_conformance_report(
                 })
                 .collect::<Vec<_>>();
             let report_json = serde_json::json!({
-                "schema": "rs3.v2-provider-conformance.v2",
+                "schema": "rs3.v2-provider-conformance.v3",
                 "target_fingerprint": target_fingerprint,
                 "generated_at_ms": current_time_ms().unwrap_or(0),
                 "profile": provider_profile_name(report.profile),
@@ -1589,7 +1589,7 @@ fn print_v2_provider_conformance_report(
             println!("{}", serde_json::to_string_pretty(&report_json)?);
         }
         RecoveryReportFormat::Text => {
-            println!("schema=rs3.v2-provider-conformance.v2");
+            println!("schema=rs3.v2-provider-conformance.v3");
             println!("target_fingerprint={target_fingerprint}");
             println!("generated_at_ms={}", current_time_ms().unwrap_or(0));
             println!("profile={}", provider_profile_name(report.profile));
@@ -2963,7 +2963,7 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let evidence = TestProviderEvidence {
-            schema: "rs3.v2-provider-conformance.v2",
+            schema: "rs3.v2-provider-conformance.v3",
             target_fingerprint,
             generated_at_ms: super::current_time_ms(),
             profile: "retained-version-object-lock",

@@ -63,7 +63,7 @@ fn assert_provider_report_stdout(stdout: &str) {
     let report = serde_json::from_str::<Value>(stdout)
         .unwrap_or_else(|error| panic!("stdout is not a JSON report: {error}\n{stdout}"));
 
-    assert_eq!(report["schema"], "rs3.v2-provider-conformance.v2");
+    assert_eq!(report["schema"], "rs3.v2-provider-conformance.v3");
     assert_eq!(
         report["target_fingerprint"].as_str().map(str::len),
         Some(64)

@@ -154,8 +154,9 @@ The check command loads only backend and repository-retention settings; it does
 not require repository identity, anchor, keyring, public bucket, or gateway
 credential variables.
 
-The current `rs3.v2-provider-conformance.v2` report binds a path-safe
-`target_fingerprint` to the exact endpoint, bucket, and prefix. Its separate
+The current `rs3.v2-provider-conformance.v3` report binds a path-safe
+`target_fingerprint` to the exact endpoint, bucket, prefix, and optional
+credential-principal fingerprint. Its separate
 profile field binds the required provider semantics. Production evidence must contain the complete
 versioned check manifest with no omissions, duplicates, or unknown entries.
 Missing, stale, unreasonably future-dated, failed, profile-mismatched, or
@@ -167,6 +168,7 @@ attestation against an operator who can replace both configuration and report.
 | --- | --- | --- | --- |
 | `RS3_PROVIDER_CONFORMANCE_REPORT_FILE` | no | unset | Local path to a JSON report emitted by `rs3 check-v2-provider --format json`. The path itself is not reported. |
 | `RS3_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS` | no | `604800` | Maximum report age before admin reports mark provider evidence `stale`. |
+| `RS3_PROVIDER_PRINCIPAL_FINGERPRINT` | governance retention | unset | Lowercase 64-character SHA-256 fingerprint of the exact IAM or service-account principal whose governance-bypass permissions were reviewed. The raw principal is not emitted; changing this value invalidates prior evidence. |
 
 ## Anchor
 

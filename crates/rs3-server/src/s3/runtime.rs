@@ -1080,6 +1080,14 @@ pub async fn check_v2_provider_conformance_from_provider_config(
             "v2 provider conformance requires the v2-preview repository format",
         ));
     }
+    if config.repository_retention.is_some_and(|retention| {
+        retention.mode == rs3_types::RetentionMode::Governance && retention.retain_days > 0
+    }) && config.principal_fingerprint.is_none()
+    {
+        return Err(repository_init(
+            "governance provider conformance requires RS3_PROVIDER_PRINCIPAL_FINGERPRINT",
+        ));
+    }
     let store = build_store(&config.backend).await?;
     let profile = v2_provider_profile(&config.backend, config.repository_retention);
     let mut conformance = V2ProviderConformanceOptions::new(

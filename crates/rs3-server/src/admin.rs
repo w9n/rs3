@@ -19,18 +19,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ADMIN_STATUS_SCHEMA: &str = "rs3.admin-status.preview.v1";
 const ADMIN_POSTURE_SCHEMA: &str = "rs3.admin-posture.preview.v1";
-const PROVIDER_CONFORMANCE_SCHEMA: &str = "rs3.v2-provider-conformance.v2";
+const PROVIDER_CONFORMANCE_SCHEMA: &str = "rs3.v2-provider-conformance.v3";
 const PROVIDER_EVIDENCE_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
 
 /// Derives the path-safe identity of the exact backend target qualified by a
 /// persisted provider-conformance report.
 pub fn provider_conformance_target_fingerprint(config: &V2ProviderCheckConfig) -> String {
     derive_public_fingerprint(
-        b"rs3.provider-conformance.target.v1",
+        b"rs3.provider-conformance.target.v2",
         &[
             config.backend.endpoint.as_bytes(),
             config.backend.bucket.as_bytes(),
             config.backend.prefix.as_deref().unwrap_or("").as_bytes(),
+            config
+                .principal_fingerprint
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
         ],
     )
 }
@@ -813,6 +818,17 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         ));
     }
 
+    if config.repository.retention.is_some_and(|retention| {
+        retention.mode == RetentionMode::Governance && retention.retain_days > 0
+    }) && config.provider_conformance.principal_fingerprint.is_none()
+    {
+        findings.push(AdminFinding::error(
+            "provider-conformance.principal-unbound",
+            "governance-mode evidence is not bound to the backend credential principal",
+            "set RS3_PROVIDER_PRINCIPAL_FINGERPRINT to a stable SHA-256 fingerprint of the reviewed credential principal and regenerate provider evidence",
+        ));
+    }
+
     if config.mode.allows_mutation()
         && config.maintenance.mode == MaintenanceMode::Auto
         && let Some(retention) = config.repository.retention
@@ -1396,6 +1412,43 @@ mod tests {
     }
 
     #[test]
+    fn production_doctor_requires_governance_evidence_principal_binding() {
+        let mut config = runtime_config();
+        config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Governance, 30));
+
+        let findings = doctor_findings(&config, AdminReportProfile::Production);
+        let finding = findings
+            .iter()
+            .find(|finding| finding.code == "provider-conformance.principal-unbound")
+            .unwrap_or_else(|| panic!("expected principal binding finding"));
+
+        assert_eq!(finding.severity, "error");
+        assert!(finding.is_blocking());
+
+        config.provider_conformance.principal_fingerprint = Some("a".repeat(64));
+        let findings = doctor_findings(&config, AdminReportProfile::Production);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.code != "provider-conformance.principal-unbound")
+        );
+    }
+
+    #[test]
+    fn provider_target_fingerprint_binds_credential_principal() {
+        let config = runtime_config();
+        let mut first = V2ProviderCheckConfig::from(&config);
+        first.principal_fingerprint = Some("a".repeat(64));
+        let mut second = first.clone();
+        second.principal_fingerprint = Some("b".repeat(64));
+
+        assert_ne!(
+            provider_conformance_target_fingerprint(&first),
+            provider_conformance_target_fingerprint(&second)
+        );
+    }
+
+    #[test]
     fn production_doctor_rejects_unsafe_automatic_retention_window() {
         let mut config = runtime_config();
         config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 14));
@@ -1761,7 +1814,7 @@ mod tests {
         })
         .collect();
         ProviderConformanceReportJson {
-            schema: "rs3.v2-provider-conformance.v2".to_owned(),
+            schema: "rs3.v2-provider-conformance.v3".to_owned(),
             target_fingerprint,
             profile: "retained-version-object-lock".to_owned(),
             passed: true,

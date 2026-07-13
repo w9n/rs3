@@ -226,6 +226,10 @@ spec:
             - name: RS3_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS
               value: {{ .Values.providerConformance.maxAgeSeconds | quote }}
             {{- end }}
+            {{- if .Values.providerConformance.principalFingerprint }}
+            - name: RS3_PROVIDER_PRINCIPAL_FINGERPRINT
+              value: {{ .Values.providerConformance.principalFingerprint | quote }}
+            {{- end }}
             - name: RS3_LOG_FORMAT
               value: {{ .Values.logging.format | quote }}
             - name: RS3_ADMIN_PROFILE

@@ -80,6 +80,10 @@ providerConformance:
   existingConfigMap: ""
   reportKey: report.json
   maxAgeSeconds: 604800
+  # Lowercase SHA-256 fingerprint of the exact IAM/service-account principal
+  # whose governance-bypass permissions were reviewed. Required for governance
+  # retention and bound into the evidence target fingerprint.
+  principalFingerprint: ""
 
 # Optional Prometheus metrics listener. Enable ServiceMonitor only in clusters
 # with the Prometheus Operator CRDs installed.

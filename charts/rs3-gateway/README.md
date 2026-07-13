@@ -164,7 +164,9 @@ Expected Secret keys are:
   doctor and maintenance engine fail closed on missing, stale, failed, or
   profile-mismatched evidence. The v2 report also requires the complete check
   manifest and a target fingerprint matching the configured endpoint, bucket,
-  and prefix.
+  prefix, and `providerConformance.principalFingerprint`. Governance retention
+  requires that fingerprint so rotating to a differently privileged principal
+  invalidates old evidence.
 - Full maintenance runs inside the gateway. `maintenance.mode=auto` is the
   read-write default; `manual` disables background triggers, and `off` disables
   the supervisor. Inventory ceilings and pacing are configured under the

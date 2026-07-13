@@ -49,7 +49,8 @@ def production_values() -> dict[str, object]:
         "repositoryKeys": {"existingSecret": "fixture-repository-keys"},
         "repository": {"retention": {"mode": "governance", "days": 30}},
         "providerConformance": {
-            "existingConfigMap": "fixture-provider-conformance"
+            "existingConfigMap": "fixture-provider-conformance",
+            "principalFingerprint": "a" * 64,
         },
         "recovery": {"publicKey": f"ed25519:{'0' * 64}"},
         "metrics": {"enabled": True},
@@ -188,6 +189,10 @@ def main() -> None:
     missing_provider_evidence = copy.deepcopy(production_values())
     missing_provider_evidence["providerConformance"]["existingConfigMap"] = ""
     render(missing_provider_evidence, succeeds=False)
+
+    missing_principal_binding = copy.deepcopy(production_values())
+    missing_principal_binding["providerConformance"]["principalFingerprint"] = ""
+    render(missing_principal_binding, succeeds=False)
 
     unsafe_retention_window = copy.deepcopy(production_values())
     unsafe_retention_window["repository"]["retention"]["days"] = 14

@@ -97,6 +97,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and (eq .Values.gateway.mode "read-write") (not .Values.providerConformance.existingConfigMap) -}}
 {{- fail "admin.profile=production with gateway.mode=read-write requires providerConformance.existingConfigMap with current retained-provider evidence" -}}
 {{- end -}}
+{{- if and (eq .Values.gateway.mode "read-write") (eq .Values.repository.retention.mode "governance") (not (regexMatch "^[a-f0-9]{64}$" .Values.providerConformance.principalFingerprint)) -}}
+{{- fail "admin.profile=production with governance retention requires providerConformance.principalFingerprint as 64 lowercase hex characters" -}}
+{{- end -}}
 {{- if .Values.repository.allowInit -}}
 {{- fail "admin.profile=production requires repository.allowInit=false outside deliberate bootstrap" -}}
 {{- end -}}
@@ -175,6 +178,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- if not (gt (int64 .Values.providerConformance.maxAgeSeconds) 0) -}}
 {{- fail "providerConformance.maxAgeSeconds must be greater than zero" -}}
+{{- end -}}
+{{- if and .Values.providerConformance.principalFingerprint (not (regexMatch "^[a-f0-9]{64}$" .Values.providerConformance.principalFingerprint)) -}}
+{{- fail "providerConformance.principalFingerprint must be 64 lowercase hex characters" -}}
 {{- end -}}
 {{- if and (ne .Values.gateway.writerGuard "required") (ne .Values.gateway.writerGuard "off") -}}
 {{- fail "gateway.writerGuard must be required or off" -}}
