@@ -696,6 +696,9 @@ impl RunningPerfGateway {
         if args.gateway_build_profile == GatewayBuildProfile::Release {
             child.arg("--release");
         }
+        if let Some(source_revision) = option_env!("RS3_BUILD_GIT_SHA") {
+            child.env("RS3_BUILD_GIT_SHA", source_revision);
+        }
         child
             .args([
                 "--",

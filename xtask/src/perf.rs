@@ -919,6 +919,9 @@ fn run_s3_container_perf(args: &PerfArgs) -> Result<()> {
         "--",
         "perf",
     ]);
+    if let Some(source_revision) = option_env!("RS3_BUILD_GIT_SHA") {
+        command.env("RS3_BUILD_GIT_SHA", source_revision);
+    }
     add_perf_args(&mut command, args, &target);
     command.env("AWS_ACCESS_KEY_ID", &target.access_key_id);
     command.env("AWS_SECRET_ACCESS_KEY", &target.secret_access_key);
