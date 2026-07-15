@@ -1,6 +1,9 @@
 //! Runtime repository construction for the S3 service.
 
 use super::S3BoundaryError;
+use super::bounded_io::{
+    BoundedListing, CONTROL_LIST_BUDGET, prefix_has_any_object, read_bounded_object_at,
+};
 use super::repository_init;
 #[cfg(feature = "k8s")]
 use super::runtime_builders::build_v2_anchor_with_writer_fence;
@@ -22,7 +25,7 @@ use crate::{
 };
 use bytes::Bytes;
 use futures_util::Stream;
-use rs3_crypto::{FormatEnvelope, KeyRing};
+use rs3_crypto::{FormatEnvelope, KeyRing, MAX_FORMAT_ENVELOPE_OBJECT_BYTES};
 use rs3_index::KeyringEnvelopeReference;
 #[cfg(feature = "k8s")]
 use rs3_k8s::WriterFence;
@@ -44,7 +47,7 @@ use rs3_repository::{
 use rs3_storage::MemoryBlobStore;
 #[cfg(feature = "s3")]
 use rs3_storage::S3BlobStore;
-use rs3_storage::{BlobMetadata, BlobStore, ByteRange, PutOptions, StorageError};
+use rs3_storage::{BlobListMode, BlobMetadata, BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{
     BackendObjectId, KeyPurpose, LogicalPath, RetentionMode, RetentionPolicy, Sequence,
 };
@@ -696,7 +699,7 @@ pub async fn doctor_probe_from_config(config: &RuntimeConfig) -> DoctorProbeRepo
     let mut checks = Vec::new();
 
     let store = match build_store(&config.backend).await {
-        Ok(store) => match store.handle().list_prefix("").await {
+        Ok(store) => match prefix_has_any_object(store.handle(), "", BlobListMode::Current).await {
             Ok(_) => {
                 checks.push(DoctorProbeCheck::ok(
                     "probe.backend-reachable",
@@ -1023,22 +1026,26 @@ async fn reject_import_stranding_newer_commits<S>(
 where
     S: BlobStore,
 {
-    let listed = if provider_profile == V2ProviderProfile::RetainedVersionObjectLock {
-        store
-            .list_prefix_versions("commits/v02/")
-            .await
-            .map_err(repository_init)?
+    let mode = if provider_profile == V2ProviderProfile::RetainedVersionObjectLock {
+        BlobListMode::Versions
     } else {
-        store
-            .list_prefix("commits/v02/")
-            .await
-            .map_err(repository_init)?
+        BlobListMode::Current
     };
-    let highest_seen = listed
-        .iter()
-        .filter_map(|metadata| V2CommitKey::parse(&metadata.object_id).ok())
-        .map(|commit_key| commit_key.sequence)
-        .max();
+    let mut listing =
+        BoundedListing::open(store, "commits/v02/", mode, CONTROL_LIST_BUDGET).await?;
+    let mut highest_seen = None;
+    while let Some(page) = listing.next_page().await? {
+        for metadata in page.entries {
+            let Ok(commit_key) = V2CommitKey::parse(&metadata.object_id) else {
+                continue;
+            };
+            highest_seen = Some(
+                highest_seen.map_or(commit_key.sequence, |highest: Sequence| {
+                    highest.max(commit_key.sequence)
+                }),
+            );
+        }
+    }
     if let Some(highest_seen) = highest_seen
         && highest_seen > import_sequence
     {
@@ -1266,10 +1273,13 @@ async fn put_format_envelope(
         Ok(metadata) => Ok(metadata),
         Err(StorageError::AlreadyExists(_)) => {
             let metadata = store.head(object_id).await.map_err(repository_init)?;
-            let existing = store
-                .get_range_at(object_id, metadata.version_id.as_ref(), ByteRange::Full)
-                .await
-                .map_err(repository_init)?;
+            let existing = read_bounded_object_at(
+                store,
+                object_id,
+                metadata.version_id.as_ref(),
+                MAX_FORMAT_ENVELOPE_OBJECT_BYTES,
+            )
+            .await?;
             if existing != body {
                 return Err(repository_init(
                     "v2 format root object conflicts with expected content",
@@ -1286,14 +1296,13 @@ async fn open_format_root(
     keys: &RepositoryKeysConfig,
     reference: &V2FormatRef,
 ) -> Result<V2FormatRoot, S3BoundaryError> {
-    let body = store
-        .get_range_at(
-            &reference.object_id,
-            reference.version_id.as_ref(),
-            ByteRange::Full,
-        )
-        .await
-        .map_err(repository_init)?;
+    let body = read_bounded_object_at(
+        store,
+        &reference.object_id,
+        reference.version_id.as_ref(),
+        MAX_FORMAT_ENVELOPE_OBJECT_BYTES,
+    )
+    .await?;
     let envelope = FormatEnvelope::from_object_bytes(&body).map_err(repository_init)?;
     if envelope.generation != reference.generation
         || envelope.digest().map_err(repository_init)? != reference.digest
@@ -1325,21 +1334,24 @@ where
     // first commit's anchor compare-and-advance remains the bootstrap safety
     // boundary on eventually consistent object stores.
     for prefix in BOOTSTRAP_EMPTY_CHECK_PREFIXES {
-        let objects = if provider_profile == V2ProviderProfile::RetainedVersionObjectLock {
-            store
-                .list_prefix_versions(prefix)
-                .await
-                .map_err(repository_init)?
+        let mode = if provider_profile == V2ProviderProfile::RetainedVersionObjectLock {
+            BlobListMode::Versions
         } else {
-            store.list_prefix(prefix).await.map_err(repository_init)?
+            BlobListMode::Current
         };
-        let has_foreign_object = objects
-            .iter()
-            .any(|metadata| Some(&metadata.object_id) != allowed_keyring);
-        if has_foreign_object {
-            return Err(repository_init(
-                "v2-preview bootstrap requires an empty repository prefix except for the configured keyring envelope",
-            ));
+        let mut listing = BoundedListing::open(store, prefix, mode, CONTROL_LIST_BUDGET).await?;
+        while let Some(page) = listing.next_page().await? {
+            let filtered_provider_members = page.consumed_items > page.entries.len();
+            let has_foreign_object = filtered_provider_members
+                || page
+                    .entries
+                    .iter()
+                    .any(|metadata| Some(&metadata.object_id) != allowed_keyring);
+            if has_foreign_object {
+                return Err(repository_init(
+                    "v2-preview bootstrap requires an empty repository prefix except for the configured keyring envelope",
+                ));
+            }
         }
     }
     Ok(())
@@ -1417,14 +1429,15 @@ mod tests {
     use rs3_repository::RepositoryPutOptions;
     use rs3_repository::v2::{V2AnchorState, V2CommitAnchor, V2FormatRef};
     use rs3_storage::{
-        BlobMetadata, BlobStore, ByteRange, FilesystemBlobStore, MemoryBlobStore, PutOptions,
-        StorageError,
+        BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobStore, ByteRange,
+        FilesystemBlobStore, MemoryBlobStore, PutOptions, StorageError,
     };
     use rs3_types::{
         BackendObjectId, BackendVersionId, KeyId, KeyPurpose, LegalHoldStatus, LogicalPath,
         RepositoryId, RetentionMode, RetentionPolicy, Sequence,
     };
     use secrecy::SecretString;
+    use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::sync::{
         Arc,
@@ -2291,19 +2304,37 @@ mod tests {
         }
 
         async fn list_prefix(&self, _prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
-            self.current_lists.fetch_add(1, Ordering::SeqCst);
-            Ok(Vec::new())
+            unsupported_store_operation()
         }
 
         async fn list_prefix_versions(
             &self,
             prefix: &str,
         ) -> rs3_storage::Result<Vec<BlobMetadata>> {
-            self.version_lists.fetch_add(1, Ordering::SeqCst);
-            if self.object.object_id.as_str().starts_with(prefix) {
-                Ok(vec![self.object.clone()])
-            } else {
-                Ok(Vec::new())
+            let _ = prefix;
+            unsupported_store_operation()
+        }
+
+        async fn open_bounded_list(
+            &self,
+            prefix: &str,
+            mode: BlobListMode,
+        ) -> rs3_storage::Result<Box<dyn BlobList>> {
+            match mode {
+                BlobListMode::Current => {
+                    self.current_lists.fetch_add(1, Ordering::SeqCst);
+                    Ok(Box::new(VersionOnlyList { object: None }))
+                }
+                BlobListMode::Versions => {
+                    self.version_lists.fetch_add(1, Ordering::SeqCst);
+                    let object = self
+                        .object
+                        .object_id
+                        .as_str()
+                        .starts_with(prefix)
+                        .then(|| self.object.clone());
+                    Ok(Box::new(VersionOnlyList { object }))
+                }
             }
         }
 
@@ -2329,6 +2360,25 @@ mod tests {
 
         async fn flush_caches(&self) -> rs3_storage::Result<()> {
             Ok(())
+        }
+    }
+
+    struct VersionOnlyList {
+        object: Option<BlobMetadata>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobList for VersionOnlyList {
+        async fn next_page(
+            &mut self,
+            _max_items: NonZeroUsize,
+        ) -> rs3_storage::Result<BlobListPage> {
+            let entries = self.object.take().into_iter().collect::<Vec<_>>();
+            Ok(BlobListPage {
+                consumed_items: entries.len(),
+                entries,
+                is_complete: true,
+            })
         }
     }
 

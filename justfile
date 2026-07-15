@@ -284,6 +284,7 @@ helm-lint:
         --set-string providerConformance.principalFingerprint=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
         --set-string recovery.publicKey=ed25519:0000000000000000000000000000000000000000000000000000000000000000
     python3 tests/helm_network_policy.py
+    python3 tests/helm_runtime_limits.py
 
 # Run the workspace test suite.
 test:

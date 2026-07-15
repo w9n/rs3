@@ -18,6 +18,9 @@ use zeroize::{Zeroize, Zeroizing};
 /// Current keyring-envelope format version.
 pub const KEYRING_ENVELOPE_VERSION: u16 = 1;
 
+/// Maximum encoded keyring-envelope object accepted by readers and writers.
+pub const MAX_KEYRING_ENVELOPE_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
+
 const ENVELOPE_NONCE_LEN: usize = 12;
 const ENVELOPE_TAG_LEN: usize = 16;
 const ENVELOPE_DIGEST_DOMAIN: &[u8] = b"rs3:keyring-envelope-digest:v1";
@@ -28,6 +31,9 @@ const FORMAT_ENVELOPE_OBJECT_DOMAIN: &[u8] = b"rs3:format-envelope-object:v1\n";
 
 /// Current format-envelope version.
 pub const FORMAT_ENVELOPE_VERSION: u16 = 1;
+
+/// Maximum encoded format-envelope object accepted by readers and writers.
+pub const MAX_FORMAT_ENVELOPE_OBJECT_BYTES: u64 = 1024 * 1024;
 
 /// Encrypted repository keyring stored as public repository metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,11 +206,21 @@ impl FormatEnvelope {
     pub fn to_object_bytes(&self) -> Result<Vec<u8>, CryptoError> {
         let mut bytes = FORMAT_ENVELOPE_OBJECT_DOMAIN.to_vec();
         serde_json::to_writer(&mut bytes, self).map_err(format_envelope_codec_error)?;
+        if object_len_exceeds(&bytes, MAX_FORMAT_ENVELOPE_OBJECT_BYTES) {
+            return Err(invalid_format_envelope(
+                "format envelope object exceeds its maximum encoded size",
+            ));
+        }
         Ok(bytes)
     }
 
     /// Decodes a durable repository format envelope object.
     pub fn from_object_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        if object_len_exceeds(bytes, MAX_FORMAT_ENVELOPE_OBJECT_BYTES) {
+            return Err(invalid_format_envelope(
+                "format envelope object exceeds its maximum encoded size",
+            ));
+        }
         let Some(payload) = bytes.strip_prefix(FORMAT_ENVELOPE_OBJECT_DOMAIN) else {
             return Err(invalid_format_envelope(
                 "missing format envelope object domain",
@@ -312,11 +328,21 @@ impl KeyringEnvelope {
     pub fn to_object_bytes(&self) -> Result<Vec<u8>, CryptoError> {
         let mut bytes = ENVELOPE_OBJECT_DOMAIN.to_vec();
         serde_json::to_writer(&mut bytes, self).map_err(envelope_codec_error)?;
+        if object_len_exceeds(&bytes, MAX_KEYRING_ENVELOPE_OBJECT_BYTES) {
+            return Err(invalid_envelope(
+                "keyring envelope object exceeds its maximum encoded size",
+            ));
+        }
         Ok(bytes)
     }
 
     /// Decodes a durable repository envelope object.
     pub fn from_object_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        if object_len_exceeds(bytes, MAX_KEYRING_ENVELOPE_OBJECT_BYTES) {
+            return Err(invalid_envelope(
+                "keyring envelope object exceeds its maximum encoded size",
+            ));
+        }
         let Some(payload) = bytes.strip_prefix(ENVELOPE_OBJECT_DOMAIN) else {
             return Err(invalid_envelope("missing keyring envelope object domain"));
         };
@@ -476,6 +502,10 @@ fn validate_wrapping_key_id(value: &str) -> Result<(), CryptoError> {
     }
 }
 
+fn object_len_exceeds(bytes: &[u8], maximum: u64) -> bool {
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum
+}
+
 fn envelope_codec_error(error: serde_json::Error) -> CryptoError {
     CryptoError::KeyringEnvelopeCodec {
         reason: error.to_string(),
@@ -503,8 +533,10 @@ fn invalid_format_envelope(reason: &str) -> CryptoError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ENVELOPE_PLAINTEXT_DOMAIN, FormatEnvelope, KEYRING_ENVELOPE_VERSION, KeyringEnvelope,
-        KeyringPlaintext, decode_keyring_plaintext, keyring_plaintext_bytes,
+        ENVELOPE_PLAINTEXT_DOMAIN, FORMAT_ENVELOPE_OBJECT_DOMAIN, FormatEnvelope,
+        KEYRING_ENVELOPE_VERSION, KeyringEnvelope, KeyringPlaintext,
+        MAX_FORMAT_ENVELOPE_OBJECT_BYTES, MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
+        decode_keyring_plaintext, keyring_plaintext_bytes,
     };
     use crate::{CryptoError, KeyRing, RepositoryKeyContext, SecretBytes};
     use rs3_types::RepositoryId;
@@ -678,5 +710,30 @@ mod tests {
             KeyringEnvelope::from_object_bytes(&body).unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn envelope_decoders_reject_oversized_objects_before_json_parsing() {
+        let oversized_keyring = vec![
+            b'x';
+            usize::try_from(MAX_KEYRING_ENVELOPE_OBJECT_BYTES + 1)
+                .unwrap_or(usize::MAX)
+        ];
+        let mut oversized_format = FORMAT_ENVELOPE_OBJECT_DOMAIN.to_vec();
+        oversized_format.resize(
+            usize::try_from(MAX_FORMAT_ENVELOPE_OBJECT_BYTES + 1).unwrap_or(usize::MAX),
+            b'x',
+        );
+
+        assert!(matches!(
+            KeyringEnvelope::from_object_bytes(&oversized_keyring),
+            Err(CryptoError::InvalidKeyringEnvelope { reason })
+                if reason.contains("maximum encoded size")
+        ));
+        assert!(matches!(
+            FormatEnvelope::from_object_bytes(&oversized_format),
+            Err(CryptoError::InvalidFormatEnvelope { reason })
+                if reason.contains("maximum encoded size")
+        ));
     }
 }

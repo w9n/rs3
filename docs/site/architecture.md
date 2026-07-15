@@ -177,7 +177,18 @@ Cold recovery is descriptor-first. It walks bounded signed headers from the
 anchor to the newest catalog, then verifies and applies one encrypted index
 frame at a time. Signed section descriptors let recovery authenticate index
 ranges without downloading unrelated payload sections. The recovered state is
-installed only after a final anchor recheck.
+installed only after a final anchor recheck. The storage boundary also checks
+the declared length of control-plane objects before allocation: format
+envelopes are capped at 1 MiB and keyring envelopes at 16 MiB, then the exact
+stream must terminate at the declared EOF. Provider implementations must opt
+into this pre-allocation-bounded read path; the storage trait fails closed
+rather than adapting through a whole-object buffered read. Bootstrap freshness
+checks and anchor-import commit inventories consume provider-private pages
+under a fixed 4,096-page/2,000,000-member budget. Emptiness probes stop after
+the first raw member and permit at most 4,096 empty pages, while unanchored
+keyring discovery admits at most two raw members. A provider that cannot page
+within the requested bound, returns an oversized page, or exceeds the
+applicable budget causes the control path to fail closed.
 
 Automatic maintenance starts requesting packed-run compaction at 256 active
 runs. With no configured guard it degrades and retries at each additional

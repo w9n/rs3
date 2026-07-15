@@ -2,6 +2,7 @@
 
 mod adapter;
 mod boundary;
+mod bounded_io;
 mod mapping;
 mod recovery_tools;
 mod runtime;
@@ -34,6 +35,12 @@ use thiserror::Error;
 /// S3 boundary construction errors.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum S3BoundaryError {
+    /// Runtime configuration failed invariant validation.
+    #[error("runtime configuration is invalid: {reason}")]
+    InvalidConfiguration {
+        /// Redacted validation failure details.
+        reason: String,
+    },
     /// Static credentials are required before exposing the S3 service.
     #[error("static credentials are required to build the S3 boundary")]
     MissingStaticCredentials,
@@ -89,6 +96,7 @@ pub(super) mod test_support {
                 endpoint: "memory://local".to_owned(),
                 bucket: "backend-bucket".to_owned(),
                 prefix: Some("repo".to_owned()),
+                timeouts: Default::default(),
             },
             anchor: AnchorConfig::Memory,
             writer_guard: WriterGuardConfig::Off,

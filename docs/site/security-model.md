@@ -114,6 +114,7 @@ repository used `v01`, and no migration or dual reader is planned.
 | v2 writes are not acknowledged before signed commit acceptance | The v2 commit coordinator batches staged writes into a signed commit and advances the external v2 anchor before returning success. | v2 coordinator batching, rollback, and snapshot tests. |
 | One process cannot publish another local batch's speculative overlay | Each repository instance grants one atomic RAII mutation lease. Delayed publisher tasks retain the coordinator lease; direct mutation and compaction APIs are rejected until it is released. A post-CAS local installation failure returns an explicit recovery-required error and blocks new mutations. | Duplicate-coordinator, cancelled delayed-publisher, direct-bypass, compaction-bypass, and accepted-but-recovery-required tests. |
 | v2 replay does not read payload ciphertext | Signed per-section digests and an encrypted `INDEX_ROOT` let readers verify exact run sections and replay the post-root tail without reading payload sections. Fixed commit, catalog, object-byte, and retained-index budgets fail closed. | v2 bounded replay, root codec, root-plus-tail, payload-independent request-count, malformed-length, and range-tamper tests. |
+| Hostile backend metadata cannot force unbounded startup allocation or inventory | Format and keyring envelopes are length-checked at 1 MiB and 16 MiB before allocation and must reach exact EOF. Bootstrap, import, doctor, and unanchored-recovery listings use bounded provider pages under fixed page and raw-member totals; partial or over-budget inventory fails closed. | Storage exact-stream and bounded-collector tests, envelope decoder ceilings, bounded-list tests, and startup/recovery call-site coverage. |
 | Create-only writes are not silently downgraded | Atomic-create providers must honor `PutObject` with `If-None-Match: *`; non-atomic `HEAD` before `PUT` is not treated as production create-only. | Storage contract tests and opt-in live S3 tests. |
 | Retained restore reads do not trust mutable latest objects | Retained-version providers must return version IDs for restore-critical writes; anchors bind commit versions and restore reads exact versions. | Memory version-addressed storage tests, v2 retained commit tests, and opt-in live S3 Object Lock tests. |
 | Single-writer read-write serving is guarded in Kubernetes deployments | `RS3_WRITER_GUARD=required` acquires a unique process identity and monotonic fencing token on the anchor Lease before serving. Every anchor advance verifies that live fence in the same resource-version CAS. | Lease skew, handoff, stale-writer, runtime startup guard, and configuration tests. |
@@ -271,9 +272,12 @@ conditional headers.
 
 `rs3 check-v2-provider` currently runs the selected prototype profile probes against the
 configured backend, including multipart upload behavior used by large
-streaming writes. Governance-retention deployments require an explicit operator
-review that gateway credentials cannot bypass retention. It must be extended to
-cover exact compacted sibling-carrier versions before it qualifies `v02`.
+streaming writes. Full probe reads are collected under exact expected-length
+ceilings, and current/version inventories use paged listings with page and raw
+provider-member budgets. Governance-retention deployments require an explicit
+operator review that gateway credentials cannot bypass retention. It must be
+extended to cover exact compacted sibling-carrier versions before it qualifies
+`v02`.
 
 ## Operator Reporting Rule
 

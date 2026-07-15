@@ -180,6 +180,18 @@ impl BlobStore for FilesystemBlobStore {
         }))
     }
 
+    async fn open_bounded_full_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&rs3_types::BackendVersionId>,
+        max_bytes: u64,
+    ) -> Result<Box<dyn BlobRead>> {
+        let read = self
+            .open_range_at(object_id, version_id, ByteRange::Full)
+            .await?;
+        crate::read::enforce_full_read_bound(read, max_bytes)
+    }
+
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {
         let started = Instant::now();
         let kind = object_kind(object_id);

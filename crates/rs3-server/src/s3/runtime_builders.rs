@@ -7,7 +7,7 @@ use rs3_repository::CommitCoordinatorOptions;
 use rs3_repository::v2::V2MemoryAnchor;
 use rs3_storage::{FilesystemBlobStore, MemoryBlobStore};
 #[cfg(feature = "s3")]
-use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
+use rs3_storage::{S3BlobStore, S3BlobStoreConfig, S3ClientTimeoutConfig};
 use std::path::{Component, Path, PathBuf};
 
 pub(super) struct StoreBuild {
@@ -226,7 +226,14 @@ pub(super) fn s3_backend_config(
         .with_endpoint_url(endpoint_url)
         .with_region(None)
         .with_allow_http(allow_http)
-        .with_virtual_hosted_style(false);
+        .with_virtual_hosted_style(false)
+        .with_timeouts(S3ClientTimeoutConfig {
+            connect: config.timeouts.connect,
+            read: config.timeouts.read,
+            operation_attempt: config.timeouts.operation_attempt,
+            operation: config.timeouts.operation,
+            stalled_stream_grace: config.timeouts.stalled_stream_grace,
+        });
 
     Ok(Some(config))
 }
@@ -244,4 +251,37 @@ fn push_relative_component(root: &mut PathBuf, value: &str) -> Result<(), S3Boun
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "s3"))]
+mod tests {
+    use super::s3_backend_config;
+    use crate::{BackendConfig, BackendTimeoutConfig};
+    use std::time::Duration;
+
+    #[test]
+    fn s3_backend_receives_every_runtime_timeout() {
+        let backend = BackendConfig {
+            endpoint: "https://storage.example".to_owned(),
+            bucket: "bucket".to_owned(),
+            prefix: Some("prefix".to_owned()),
+            timeouts: BackendTimeoutConfig {
+                connect: Duration::from_secs(1),
+                read: Duration::from_secs(2),
+                operation_attempt: Duration::from_secs(3),
+                operation: Duration::from_secs(4),
+                stalled_stream_grace: Duration::from_secs(5),
+            },
+        };
+
+        let config = s3_backend_config(&backend)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("expected S3 backend config"));
+
+        assert_eq!(config.timeouts.connect, Duration::from_secs(1));
+        assert_eq!(config.timeouts.read, Duration::from_secs(2));
+        assert_eq!(config.timeouts.operation_attempt, Duration::from_secs(3));
+        assert_eq!(config.timeouts.operation, Duration::from_secs(4));
+        assert_eq!(config.timeouts.stalled_stream_grace, Duration::from_secs(5));
+    }
 }

@@ -191,7 +191,17 @@ Expected Secret keys are:
   Kubernetes service-link environment injection, and mounts a service-account
   token only for Lease-backed deployments.
 - Default resources request 512Mi/250m and limit memory to 1536Mi. There is no
-  CPU limit by default.
+  CPU limit by default. Every gateway hardening limit is rendered explicitly,
+  including buffered and multipart upload thresholds, upload/download
+  admission budgets, connection/request concurrency, request rate, and stream
+  stall timeout. The chart rejects upload budgets that cannot simultaneously
+  cover the buffered prefix plus multipart and payload-segment encoder working
+  sets, enforces S3's 5 MiB through 5 GiB multipart-part range and 10,000-part
+  object ceiling, and rejects concurrency values above the runtime semaphore
+  capacity.
+- Backend connect, first-byte, per-attempt, total-operation, and stalled-stream
+  timeouts are finite under `backend.timeouts`. The chart rejects zero values or
+  attempt/connect/read relationships that cannot fit within the total timeout.
 - `networkPolicy.enabled=true` renders a baseline policy that admits S3 and,
   when enabled, metrics traffic only from their configured selectors. Egress is
   limited to configured backend, Kubernetes API, and cluster-DNS peers; DNS is

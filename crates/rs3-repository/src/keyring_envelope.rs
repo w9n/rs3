@@ -3,9 +3,9 @@
 use crate::error::{RepositoryError, Result};
 use crate::service::{Repository, require_version_for_retained_write};
 use bytes::Bytes;
-use rs3_crypto::KeyringEnvelope;
+use rs3_crypto::{KeyringEnvelope, MAX_KEYRING_ENVELOPE_OBJECT_BYTES};
 use rs3_index::KeyringEnvelopeReference;
-use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
+use rs3_storage::{BlobStore, PutOptions, StorageError, read_bounded_full_at};
 use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionPolicy};
 
 pub(crate) const KEYRING_ENVELOPE_OBJECT_PREFIX: &str = "keyrings/";
@@ -44,7 +44,13 @@ where
         }
         Err(StorageError::AlreadyExists(_)) => {
             let existing_metadata = store.head(&object_id).await?;
-            let existing = store.get_range(&object_id, ByteRange::Full).await?;
+            let existing = read_bounded_full_at(
+                store,
+                &object_id,
+                existing_metadata.version_id.as_ref(),
+                MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
+            )
+            .await?;
             if existing != body {
                 return Err(RepositoryError::KeyringEnvelopeObjectConflict { object_id });
             }
@@ -89,4 +95,61 @@ fn keyring_envelope_object_id(generation: u64, digest: &str) -> Result<BackendOb
         "{KEYRING_ENVELOPE_OBJECT_PREFIX}{generation:020}-{digest}.json"
     ))
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::keyring_envelope::{keyring_envelope_object_id, store_keyring_envelope};
+    use bytes::Bytes;
+    use rs3_crypto::{
+        KeyRing, MAX_KEYRING_ENVELOPE_OBJECT_BYTES, RepositoryKeyContext, SecretBytes,
+    };
+    use rs3_storage::{BlobStore, MemoryBlobStore, PutOptions, StorageError};
+    use rs3_types::RepositoryId;
+
+    fn keyring_envelope() -> rs3_crypto::KeyringEnvelope {
+        let keyring = KeyRing::generate_random().unwrap_or_else(|error| panic!("{error}"));
+        let repository_id =
+            RepositoryId::new("keyring-conflict-test").unwrap_or_else(|error| panic!("{error}"));
+        let context = RepositoryKeyContext::new(repository_id, vec![7; 32])
+            .unwrap_or_else(|error| panic!("{error}"));
+        let wrapping_key = SecretBytes::new(vec![9; SecretBytes::MIN_LEN])
+            .unwrap_or_else(|error| panic!("{error}"));
+        keyring
+            .seal_keyring_envelope(&context, "wrapping-key", &wrapping_key, 1)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[tokio::test]
+    async fn conflict_verification_rejects_oversized_existing_object() {
+        let store = MemoryBlobStore::new();
+        let envelope = keyring_envelope();
+        let digest = envelope.digest().unwrap_or_else(|error| panic!("{error}"));
+        let object_id = keyring_envelope_object_id(envelope.generation, &digest)
+            .unwrap_or_else(|error| panic!("{error}"));
+        store
+            .put(
+                &object_id,
+                Bytes::from(vec![
+                    0;
+                    usize::try_from(MAX_KEYRING_ENVELOPE_OBJECT_BYTES + 1)
+                        .unwrap_or_else(|error| panic!("{error}"))
+                ]),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let result = store_keyring_envelope(&store, &envelope, None, None).await;
+
+        assert!(matches!(
+            result,
+            Err(crate::RepositoryError::Storage(
+                StorageError::BoundedReadExceeded {
+                    max_bytes: MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
+                    ..
+                }
+            ))
+        ));
+    }
 }

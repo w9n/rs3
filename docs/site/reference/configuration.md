@@ -129,12 +129,28 @@ cluster resources.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `RS3_MAX_PUT_OBJECT_BYTES` | no | `5368709120` | Maximum accepted single `PutObject` body. Requests with larger declared bodies fail before a repository commit is staged. |
-| `RS3_BACKEND_MULTIPART_PART_BYTES` | no | `16777216` | Backend multipart part size for large `PutObject` writes. S3-compatible backends require at least `5242880` bytes. |
-| `RS3_STREAM_READ_STALL_TIMEOUT_SECS` | no | `30` | Maximum idle time between chunks while the gateway streams a large `PutObject` request body into a backend multipart standalone payload. Stalled streams fail as incomplete request bodies. |
-| `RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES` | no | `536870912` | Admission budget for request body bytes held by in-flight upload operations. Buffered uploads reserve their full collected body; streaming uploads reserve a bounded working set, not a hard RSS cap for every HTTP chunk. Excess uploads fail with S3 `SlowDown`. |
+| `RS3_MAX_PUT_OBJECT_BYTES` | no | `5368709120` | Maximum accepted single `PutObject` body. Requests with larger declared bodies fail before a repository commit is staged. Must not exceed 10,000 times `RS3_BACKEND_MULTIPART_PART_BYTES`, with an absolute maximum of `53687091200000` bytes. |
+| `RS3_BUFFERED_PUT_OBJECT_BYTES` | no | `67108864` | Largest `PutObject` body collected as one buffered write. Larger known-length bodies use backend multipart streaming. Must not exceed `RS3_MAX_PUT_OBJECT_BYTES`. |
+| `RS3_BACKEND_MULTIPART_PART_BYTES` | no | `16777216` | Backend multipart part size for large `PutObject` writes. S3-compatible backends require between `5242880` bytes (5 MiB) and `5368709120` bytes (5 GiB), inclusive. |
+| `RS3_STREAM_READ_STALL_TIMEOUT_SECS` | no | `30` | Maximum idle time between non-empty body bytes while the gateway reads any `PutObject` request body, including buffered bodies, the unknown-length buffered prefix, and multipart streaming. Empty transport frames do not renew the deadline. Stalled streams fail as incomplete request bodies. |
+| `RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES` | no | `536870912` | Admission budget for request body bytes held by in-flight upload operations. Buffered uploads reserve their full collected body; streaming uploads reserve a working set derived from multipart parts and the effective payload segment size, not a hard RSS cap for every HTTP chunk. Excess uploads fail with S3 `SlowDown`. |
 | `RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES` | no | `536870912` | Admission budget for response memory held by in-flight downloads. Buffered pack and range responses reserve their resolved length. Full streamed-carrier responses reserve a conservative bounded working set derived from the authenticated segment size, while their total response may be larger. Reservations remain until the body is consumed or dropped; excess downloads fail with S3 `SlowDown`. |
+| `RS3_MAX_CONCURRENT_CONNECTIONS` | no | `1024` | Maximum simultaneously open S3 listener connections. Values above the runtime semaphore capacity are rejected during configuration. |
+| `RS3_MAX_CONCURRENT_REQUESTS` | no | `256` | Maximum S3 operations executing concurrently. Values above the runtime semaphore capacity are rejected during configuration. |
 | `RS3_REQUEST_RATE_LIMIT_PER_SECOND` | no | `1024` | Per-process S3 operation admission rate. Bursts up to one second of capacity are allowed; excess operations fail with S3 `SlowDown`. |
+
+When streaming is enabled, configuration requires the upload admission budget
+to cover the buffered threshold plus the larger of the encoder's active and
+finalization peaks. The active estimate is two multipart parts plus three
+payload segments; finalization is three multipart parts plus one payload
+segment. Both include bounded header and framing overhead. The segment term is
+the fixed `RS3_PAYLOAD_SEGMENT_SIZE_BYTES`, or the largest adaptive segment for
+`RS3_MAX_PUT_OBJECT_BYTES`. Unknown-length uploads cap their buffered prefix
+exactly at that threshold before handing the remaining bytes to multipart
+streaming, so the validated peak and runtime reservation agree. Size the pod
+limit above the upload and download budgets, the decrypted-segment cache, and
+normal process overhead; these admission budgets overlap and are not an exact
+RSS formula.
 
 ## Backend Storage
 
@@ -143,6 +159,17 @@ cluster resources.
 | `RS3_BACKEND_ENDPOINT` | yes | none | Backend endpoint. Use `file://<path>` for the local filesystem backend, `memory` for tests, `s3` for default AWS S3, or `http://` / `https://` for S3-compatible stores when the S3 feature is enabled. |
 | `RS3_BACKEND_BUCKET` | yes | none | Backend bucket or local bucket-equivalent repository root. |
 | `RS3_BACKEND_PREFIX` | no | none | Optional backend prefix for repository-owned objects. |
+| `RS3_BACKEND_CONNECT_TIMEOUT_SECS` | no | `5` | Maximum time to establish one backend socket connection. Must not exceed the per-attempt timeout. |
+| `RS3_BACKEND_READ_TIMEOUT_SECS` | no | `30` | Maximum time from request initiation to the first response byte. Must not exceed the per-attempt timeout. |
+| `RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS` | no | `120` | Maximum duration of one provider request attempt. Must not exceed the total operation timeout. |
+| `RS3_BACKEND_OPERATION_TIMEOUT_SECS` | no | `300` | Maximum total duration across all provider attempts and retries. |
+| `RS3_BACKEND_STALLED_STREAM_GRACE_SECS` | no | `30` | Maximum time an S3 upload or download body may stop making progress. |
+
+The operation timeouts bound request processing through response headers;
+stalled-stream protection separately bounds body transfer inactivity. Keeping
+both finite prevents a reachable but non-progressing provider from occupying a
+gateway operation indefinitely. The admin status report exposes these numeric
+values without exposing the endpoint, bucket, or prefix.
 
 ## Provider Conformance Evidence
 
@@ -218,6 +245,13 @@ inventory object versions as well as current objects so data hidden behind
 provider versioning still blocks bootstrap. This LIST is a preflight guard, not
 the serialization boundary: S3-compatible listings can be stale, and the first
 commit's anchor compare-and-advance is the final bootstrap safety check.
+Bootstrap freshness checks and anchor-import commit inventory are paged and
+fail closed after 4,096 pages or 2,000,000 raw provider members. Emptiness
+probes stop after the first raw member and allow at most 4,096 empty pages;
+unanchored keyring discovery admits at most two raw members. Format-envelope
+reads are capped at 1 MiB and keyring envelope reads at 16 MiB before allocation
+or JSON decoding. These ceilings apply to startup, recovery tooling, and
+conflict verification, including exact-version reads.
 
 Minimal first-run settings:
 

@@ -76,10 +76,20 @@ spec:
               value: {{ .Values.gateway.mode | quote }}
             - name: RS3_MAX_PUT_OBJECT_BYTES
               value: {{ printf "%d" (int64 .Values.hardening.maxPutObjectBytes) | quote }}
+            - name: RS3_BUFFERED_PUT_OBJECT_BYTES
+              value: {{ printf "%d" (int64 .Values.hardening.bufferedPutObjectBytes) | quote }}
             - name: RS3_BACKEND_MULTIPART_PART_BYTES
               value: {{ printf "%d" (int64 .Values.hardening.backendMultipartPartBytes) | quote }}
+            - name: RS3_STREAM_READ_STALL_TIMEOUT_SECS
+              value: {{ .Values.hardening.streamReadStallTimeoutSeconds | quote }}
             - name: RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES
               value: {{ printf "%d" (int64 .Values.hardening.maxInFlightUploadBodyBytes) | quote }}
+            - name: RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES
+              value: {{ printf "%d" (int64 .Values.hardening.maxInFlightDownloadBodyBytes) | quote }}
+            - name: RS3_MAX_CONCURRENT_CONNECTIONS
+              value: {{ .Values.hardening.maxConcurrentConnections | quote }}
+            - name: RS3_MAX_CONCURRENT_REQUESTS
+              value: {{ .Values.hardening.maxConcurrentRequests | quote }}
             - name: RS3_REQUEST_RATE_LIMIT_PER_SECOND
               value: {{ .Values.hardening.requestRateLimitPerSecond | quote }}
             - name: RS3_PUBLIC_BUCKET
@@ -90,6 +100,16 @@ spec:
               value: {{ .Values.backend.bucket | quote }}
             - name: RS3_BACKEND_PREFIX
               value: {{ .Values.backend.prefix | quote }}
+            - name: RS3_BACKEND_CONNECT_TIMEOUT_SECS
+              value: {{ .Values.backend.timeouts.connectSeconds | quote }}
+            - name: RS3_BACKEND_READ_TIMEOUT_SECS
+              value: {{ .Values.backend.timeouts.readSeconds | quote }}
+            - name: RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS
+              value: {{ .Values.backend.timeouts.operationAttemptSeconds | quote }}
+            - name: RS3_BACKEND_OPERATION_TIMEOUT_SECS
+              value: {{ .Values.backend.timeouts.operationSeconds | quote }}
+            - name: RS3_BACKEND_STALLED_STREAM_GRACE_SECS
+              value: {{ .Values.backend.timeouts.stalledStreamGraceSeconds | quote }}
             - name: AWS_DEFAULT_REGION
               value: {{ .Values.backend.region | quote }}
             - name: AWS_EC2_METADATA_DISABLED
@@ -126,9 +146,9 @@ spec:
               value: {{ .Values.repository.id | quote }}
             - name: RS3_ALLOW_REPOSITORY_INIT
               value: {{ .Values.repository.allowInit | quote }}
-            {{- if .Values.repository.payloadSegmentSizeBytes }}
+            {{- if ne .Values.repository.payloadSegmentSizeBytes nil }}
             - name: RS3_PAYLOAD_SEGMENT_SIZE_BYTES
-              value: {{ .Values.repository.payloadSegmentSizeBytes | quote }}
+              value: {{ printf "%d" (int64 .Values.repository.payloadSegmentSizeBytes) | quote }}
             {{- end }}
             {{- if .Values.repository.retention.mode }}
             - name: RS3_REPOSITORY_RETENTION_MODE

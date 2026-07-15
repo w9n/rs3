@@ -2,11 +2,20 @@
 
 use super::error::{V2ErrorClass, V2FormatError, V2Result};
 use bytes::Bytes;
-use rs3_storage::{BlobStore, ByteRange, PutOptions, StorageError};
-use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
+use rs3_storage::{
+    BlobListMode, BlobMetadata, BlobStore, ByteRange, PutOptions, StorageError,
+    read_bounded_full_at,
+};
+use rs3_types::{
+    BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionMode, RetentionPolicy,
+};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 
 const S3_MIN_MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
+const PROVIDER_PROBE_LIST_PAGE_ITEMS: usize = 64;
+const PROVIDER_PROBE_LIST_MAX_PAGES: usize = 16;
+const PROVIDER_PROBE_LIST_MAX_MEMBERS: usize = 1_024;
 
 const COMMON_PROVIDER_CHECKS: &[&str] = &[
     "basic-put",
@@ -199,6 +208,73 @@ impl V2ProviderConformanceReport {
     /// Returns the operator-facing class for failed conformance.
     pub const fn failure_class(&self) -> V2ErrorClass {
         V2ErrorClass::ProviderConformance
+    }
+}
+
+async fn read_probe_body_at<S>(
+    store: &S,
+    object_id: &BackendObjectId,
+    version_id: Option<&BackendVersionId>,
+    expected_len: usize,
+) -> rs3_storage::Result<Bytes>
+where
+    S: BlobStore + ?Sized,
+{
+    let max_bytes = u64::try_from(expected_len).map_err(|_| {
+        StorageError::Provider("provider probe body length exceeds platform limits".to_owned())
+    })?;
+    read_bounded_full_at(store, object_id, version_id, max_bytes).await
+}
+
+async fn list_probe_prefix_bounded<S>(
+    store: &S,
+    prefix: &str,
+    mode: BlobListMode,
+) -> rs3_storage::Result<Vec<BlobMetadata>>
+where
+    S: BlobStore + ?Sized,
+{
+    let page_items = NonZeroUsize::new(PROVIDER_PROBE_LIST_PAGE_ITEMS).ok_or_else(|| {
+        StorageError::Provider("provider probe listing page budget is invalid".to_owned())
+    })?;
+    let mut listing = store.open_bounded_list(prefix, mode).await?;
+    let mut entries = Vec::new();
+    let mut pages = 0_usize;
+    let mut consumed_members = 0_usize;
+
+    loop {
+        if pages >= PROVIDER_PROBE_LIST_MAX_PAGES
+            || consumed_members >= PROVIDER_PROBE_LIST_MAX_MEMBERS
+        {
+            return Err(StorageError::Provider(
+                "provider probe listing exceeded its work budget".to_owned(),
+            ));
+        }
+        let remaining_members = PROVIDER_PROBE_LIST_MAX_MEMBERS - consumed_members;
+        let request_items = page_items.get().min(remaining_members);
+        let request_items = NonZeroUsize::new(request_items).ok_or_else(|| {
+            StorageError::Provider("provider probe listing budget was exhausted".to_owned())
+        })?;
+        let page = listing.next_page(request_items).await?;
+        pages += 1;
+
+        if page.consumed_items < page.entries.len()
+            || page.consumed_items > request_items.get()
+            || (!page.is_complete && page.consumed_items == 0)
+        {
+            return Err(StorageError::Provider(
+                "provider returned an invalid bounded listing page".to_owned(),
+            ));
+        }
+        consumed_members = consumed_members
+            .checked_add(page.consumed_items)
+            .ok_or_else(|| {
+                StorageError::Provider("provider probe listing count overflowed".to_owned())
+            })?;
+        entries.extend(page.entries);
+        if page.is_complete {
+            return Ok(entries);
+        }
     }
 }
 
@@ -480,7 +556,7 @@ where
         )),
     }
 
-    match store.get_range(&object_id, ByteRange::Full).await {
+    match read_probe_body_at(store, &object_id, None, original.len()).await {
         Ok(read) if read == original => checks.push(V2ProviderConformanceCheck::passed(
             "multipart-atomic-preserves-existing",
         )),
@@ -547,7 +623,7 @@ where
         )),
     }
 
-    match store.get_range(&object_id, ByteRange::Full).await {
+    match read_probe_body_at(store, &object_id, None, body.len()).await {
         Ok(read) if read == body => checks.push(V2ProviderConformanceCheck::passed("basic-get")),
         Ok(_) => checks.push(V2ProviderConformanceCheck::failed(
             "basic-get",
@@ -578,7 +654,7 @@ where
         )),
     }
 
-    match store.list_prefix(&options.probe_prefix).await {
+    match list_probe_prefix_bounded(store, &options.probe_prefix, BlobListMode::Current).await {
         Ok(entries) if entries.iter().any(|entry| entry.object_id == object_id) => {
             checks.push(V2ProviderConformanceCheck::passed("basic-list"));
         }
@@ -655,7 +731,7 @@ where
         )),
     }
 
-    match store.get_range(&object_id, ByteRange::Full).await {
+    match read_probe_body_at(store, &object_id, None, original.len()).await {
         Ok(read) if read == original => checks.push(V2ProviderConformanceCheck::passed(
             "atomic-create-preserves-existing",
         )),
@@ -727,10 +803,7 @@ where
         )),
     }
 
-    match store
-        .get_range_at(&object_id, Some(&first_version), ByteRange::Full)
-        .await
-    {
+    match read_probe_body_at(store, &object_id, Some(&first_version), first_body.len()).await {
         Ok(read) if read == first_body => {
             checks.push(V2ProviderConformanceCheck::passed("retained-exact-get"));
         }
@@ -802,7 +875,7 @@ where
         )),
     }
 
-    match store.get_range(&object_id, ByteRange::Full).await {
+    match read_probe_body_at(store, &object_id, None, second_body.len()).await {
         Ok(read) if read == second_body => {
             checks.push(V2ProviderConformanceCheck::passed("retained-latest-get"));
         }
@@ -816,10 +889,7 @@ where
         )),
     }
 
-    match store
-        .get_range_at(&object_id, Some(&first_version), ByteRange::Full)
-        .await
-    {
+    match read_probe_body_at(store, &object_id, Some(&first_version), first_body.len()).await {
         Ok(read) if read == first_body => checks.push(V2ProviderConformanceCheck::passed(
             "retained-old-version-survives",
         )),
@@ -833,7 +903,7 @@ where
         )),
     }
 
-    match store.list_prefix_versions(&options.probe_prefix).await {
+    match list_probe_prefix_bounded(store, &options.probe_prefix, BlobListMode::Versions).await {
         Ok(versions)
             if versions
                 .iter()

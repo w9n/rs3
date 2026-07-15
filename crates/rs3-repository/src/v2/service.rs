@@ -27,7 +27,7 @@ use crate::model::{
 use crate::namespace::first_namespace_entry;
 use crate::payload::{
     PayloadHeaderProbe, SegmentedPayloadFormat, SegmentedPayloadHeader, SegmentedPayloadSealer,
-    adaptive_payload_segment_size, open_payload_object, parse_segmented_payload_header,
+    effective_payload_segment_size, open_payload_object, parse_segmented_payload_header,
     parse_segmented_payload_header_with_total_len, probe_payload_header,
     seal_streamable_payload_object, segmented_ciphertext_span, total_segmented_payload_len,
 };
@@ -2923,14 +2923,11 @@ where
     }
 
     fn payload_segment_size_for_object(&self, plaintext_len: usize) -> usize {
-        if self.repository.options.adaptive_payload_segment_size {
-            adaptive_payload_segment_size(
-                plaintext_len,
-                self.repository.options.payload_segment_size,
-            )
-        } else {
-            self.repository.options.payload_segment_size
-        }
+        effective_payload_segment_size(
+            plaintext_len,
+            self.repository.options.payload_segment_size,
+            self.repository.options.adaptive_payload_segment_size,
+        )
     }
 
     fn payload_segment_size_for_object_len(&self, plaintext_len: u64) -> Result<usize> {

@@ -1,12 +1,17 @@
+use super::bounded_io::{
+    BoundedListing, ListBudget, prefix_has_any_object, read_bounded_object_at,
+};
 use super::runtime_handles::RuntimeStore;
 use super::{S3BoundaryError, repository_init};
 use crate::RepositoryKeysConfig;
 use crate::config::{KEYRING_WRAPPING_KEY_HEX_ENV, REPOSITORY_SALT_HEX_ENV};
 use bytes::Bytes;
-use rs3_crypto::{KeyRing, KeyringEnvelope, RepositoryKeyContext, SecretBytes};
+use rs3_crypto::{
+    KeyRing, KeyringEnvelope, MAX_KEYRING_ENVELOPE_OBJECT_BYTES, RepositoryKeyContext, SecretBytes,
+};
 use rs3_index::KeyringEnvelopeReference;
 use rs3_repository::{KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE, store_keyring_envelope};
-use rs3_storage::{BlobMetadata, BlobStore, ByteRange, PutOptions, StorageError};
+use rs3_storage::{BlobListMode, BlobMetadata, BlobStore, PutOptions, StorageError};
 use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
 
@@ -19,10 +24,13 @@ pub(super) async fn unanchored_gateway_keyring(
     if let Some(object_id) = keys.envelope_object_id.as_ref() {
         return match store.head(object_id).await {
             Ok(metadata) => {
-                let body = store
-                    .get_range_at(object_id, metadata.version_id.as_ref(), ByteRange::Full)
-                    .await
-                    .map_err(repository_init)?;
+                let body = read_bounded_object_at(
+                    store,
+                    object_id,
+                    metadata.version_id.as_ref(),
+                    MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
+                )
+                .await?;
                 open_gateway_keyring_object(keys, object_id.clone(), metadata.version_id, body)
             }
             Err(StorageError::NotFound(_)) => {
@@ -50,21 +58,32 @@ pub(super) async fn unanchored_gateway_keyring(
         ));
     }
 
-    let keyrings = store
-        .list_prefix("keyrings/")
-        .await
-        .map_err(repository_init)?;
-    match keyrings.as_slice() {
-        [] => bootstrap_missing_keyring_envelope(store, keys, None, retention).await,
-        [metadata] => {
-            let body = store
-                .get_range_at(
-                    &metadata.object_id,
-                    metadata.version_id.as_ref(),
-                    ByteRange::Full,
-                )
-                .await
-                .map_err(repository_init)?;
+    let mut listing = BoundedListing::open(
+        store,
+        "keyrings/",
+        BlobListMode::Current,
+        ListBudget::new(2, 2, 2),
+    )
+    .await?;
+    let mut keyrings = Vec::with_capacity(2);
+    while let Some(page) = listing.next_page().await? {
+        keyrings.extend(page.entries);
+        if keyrings.len() > 1 {
+            return Err(repository_init(
+                "v2 commit anchor is missing and multiple unanchored keyring envelopes exist; provide an explicit envelope override or recover the anchor",
+            ));
+        }
+    }
+    match keyrings.pop() {
+        None => bootstrap_missing_keyring_envelope(store, keys, None, retention).await,
+        Some(metadata) => {
+            let body = read_bounded_object_at(
+                store,
+                &metadata.object_id,
+                metadata.version_id.as_ref(),
+                MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
+            )
+            .await?;
             open_gateway_keyring_object(
                 keys,
                 metadata.object_id.clone(),
@@ -72,9 +91,6 @@ pub(super) async fn unanchored_gateway_keyring(
                 body,
             )
         }
-        _ => Err(repository_init(
-            "v2 commit anchor is missing and multiple unanchored keyring envelopes exist; provide an explicit envelope override or recover the anchor",
-        )),
     }
 }
 
@@ -116,14 +132,13 @@ pub(super) async fn open_gateway_keyring_reference(
     keys: &RepositoryKeysConfig,
     reference: &KeyringEnvelopeReference,
 ) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
-    let body = store
-        .get_range_at(
-            &reference.object_id,
-            reference.version_id.as_ref(),
-            ByteRange::Full,
-        )
-        .await
-        .map_err(repository_init)?;
+    let body = read_bounded_object_at(
+        store,
+        &reference.object_id,
+        reference.version_id.as_ref(),
+        MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
+    )
+    .await?;
     let envelope = KeyringEnvelope::from_object_bytes(&body).map_err(repository_init)?;
     let digest = envelope.digest().map_err(repository_init)?;
     if envelope.generation != reference.generation || digest != reference.digest {
@@ -212,10 +227,13 @@ async fn store_configured_keyring_envelope(
         }
         Err(StorageError::AlreadyExists(_)) => {
             let metadata = store.head(object_id).await.map_err(repository_init)?;
-            let existing = store
-                .get_range_at(object_id, metadata.version_id.as_ref(), ByteRange::Full)
-                .await
-                .map_err(repository_init)?;
+            let existing = read_bounded_object_at(
+                store,
+                object_id,
+                metadata.version_id.as_ref(),
+                MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
+            )
+            .await?;
             if existing != body {
                 return Err(repository_init(format!(
                     "keyring envelope object conflicts with expected content: {object_id}",
@@ -255,23 +273,14 @@ pub(super) fn retained_version_required(
 }
 
 async fn repository_prefix_has_objects(store: &RuntimeStore) -> Result<bool, S3BoundaryError> {
-    Ok(!store
-        .list_prefix("")
-        .await
-        .map_err(repository_init)?
-        .is_empty())
+    prefix_has_any_object(store, "", BlobListMode::Current).await
 }
 
 async fn repository_has_anchor_bound_objects(
     store: &RuntimeStore,
 ) -> Result<bool, S3BoundaryError> {
     for prefix in ["format/", "commits/"] {
-        if !store
-            .list_prefix(prefix)
-            .await
-            .map_err(repository_init)?
-            .is_empty()
-        {
+        if prefix_has_any_object(store, prefix, BlobListMode::Current).await? {
             return Ok(true);
         }
     }

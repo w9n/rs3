@@ -19,7 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ADMIN_STATUS_SCHEMA: &str = "rs3.admin-status.preview.v1";
 const ADMIN_POSTURE_SCHEMA: &str = "rs3.admin-posture.preview.v1";
-const PROVIDER_CONFORMANCE_SCHEMA: &str = "rs3.v2-provider-conformance.v4";
+/// Schema identifier emitted and accepted for provider-conformance evidence.
+pub const PROVIDER_CONFORMANCE_SCHEMA: &str = "rs3.v2-provider-conformance.v4";
 const PROVIDER_EVIDENCE_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
 
 /// Derives the path-safe identity of the exact backend target qualified by a
@@ -210,6 +211,16 @@ pub struct AdminBackendSummary {
     pub durable: bool,
     /// Provider retention capability from the runtime configuration shape.
     pub retention_capability: &'static str,
+    /// Configured socket-connect timeout in seconds.
+    pub connect_timeout_seconds: u64,
+    /// Configured first-response-byte timeout in seconds.
+    pub read_timeout_seconds: u64,
+    /// Configured timeout for one provider request attempt in seconds.
+    pub operation_attempt_timeout_seconds: u64,
+    /// Configured total timeout across provider retries in seconds.
+    pub operation_timeout_seconds: u64,
+    /// Configured stalled upload/download grace period in seconds.
+    pub stalled_stream_grace_seconds: u64,
 }
 
 /// Provider conformance fields that avoid configured provider names and paths.
@@ -640,6 +651,11 @@ fn backend_summary(backend: &BackendConfig) -> AdminBackendSummary {
         kind: backend_kind(&backend.endpoint),
         durable: backend_is_durable(backend),
         retention_capability: retention_capability(backend),
+        connect_timeout_seconds: backend.timeouts.connect.as_secs(),
+        read_timeout_seconds: backend.timeouts.read.as_secs(),
+        operation_attempt_timeout_seconds: backend.timeouts.operation_attempt.as_secs(),
+        operation_timeout_seconds: backend.timeouts.operation.as_secs(),
+        stalled_stream_grace_seconds: backend.timeouts.stalled_stream_grace.as_secs(),
     }
 }
 
@@ -1107,6 +1123,7 @@ pub fn provider_conformance_evidence_passed(config: &RuntimeConfig) -> bool {
 
 fn runtime_error_code(error: &crate::S3BoundaryError) -> &'static str {
     match error {
+        crate::S3BoundaryError::InvalidConfiguration { .. } => "runtime.invalid-configuration",
         crate::S3BoundaryError::MissingStaticCredentials => "runtime.missing-static-credentials",
         crate::S3BoundaryError::UnsupportedAnchorMode => "runtime.unsupported-anchor-mode",
         crate::S3BoundaryError::UnsupportedBackendMode => "runtime.unsupported-backend-mode",
@@ -1222,6 +1239,11 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
     let max_put_object_bytes = config.hardening.max_put_object_bytes.to_string();
     let buffered_put_object_bytes = config.hardening.buffered_put_object_bytes.to_string();
     let backend_multipart_part_bytes = config.hardening.backend_multipart_part_bytes.to_string();
+    let stream_read_stall_timeout_seconds = config
+        .hardening
+        .stream_read_stall_timeout
+        .as_secs()
+        .to_string();
     let max_in_flight_upload_body_bytes =
         config.hardening.max_in_flight_upload_body_bytes.to_string();
     let max_in_flight_download_body_bytes = config
@@ -1231,6 +1253,21 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
     let max_concurrent_connections = config.hardening.max_concurrent_connections.to_string();
     let max_concurrent_requests = config.hardening.max_concurrent_requests.to_string();
     let request_rate_limit_per_second = config.hardening.request_rate_limit_per_second.to_string();
+    let backend_connect_timeout_seconds = config.backend.timeouts.connect.as_secs().to_string();
+    let backend_read_timeout_seconds = config.backend.timeouts.read.as_secs().to_string();
+    let backend_operation_attempt_timeout_seconds = config
+        .backend
+        .timeouts
+        .operation_attempt
+        .as_secs()
+        .to_string();
+    let backend_operation_timeout_seconds = config.backend.timeouts.operation.as_secs().to_string();
+    let backend_stalled_stream_grace_seconds = config
+        .backend
+        .timeouts
+        .stalled_stream_grace
+        .as_secs()
+        .to_string();
     let fields = [
         anchor.as_bytes(),
         gateway_mode.as_bytes(),
@@ -1254,11 +1291,17 @@ pub fn runtime_config_profile(config: &RuntimeConfig) -> String {
         max_put_object_bytes.as_bytes(),
         buffered_put_object_bytes.as_bytes(),
         backend_multipart_part_bytes.as_bytes(),
+        stream_read_stall_timeout_seconds.as_bytes(),
         max_in_flight_upload_body_bytes.as_bytes(),
         max_in_flight_download_body_bytes.as_bytes(),
         max_concurrent_connections.as_bytes(),
         max_concurrent_requests.as_bytes(),
         request_rate_limit_per_second.as_bytes(),
+        backend_connect_timeout_seconds.as_bytes(),
+        backend_read_timeout_seconds.as_bytes(),
+        backend_operation_attempt_timeout_seconds.as_bytes(),
+        backend_operation_timeout_seconds.as_bytes(),
+        backend_stalled_stream_grace_seconds.as_bytes(),
     ];
 
     derive_public_fingerprint(b"rs3:server-runtime-config-profile:v1", &fields)
@@ -1276,7 +1319,7 @@ fn current_time_ms() -> Option<i64> {
 mod tests {
     use super::{
         AdminReportProfile, AdminRepositoryRuntimeFacts, AdminRuntimeFacts,
-        AdminV2CommitCoordinatorSummary, ProviderConformanceCheckJson,
+        AdminV2CommitCoordinatorSummary, PROVIDER_CONFORMANCE_SCHEMA, ProviderConformanceCheckJson,
         ProviderConformanceReportJson, admin_posture_report,
         admin_posture_report_with_runtime_facts, admin_status_report,
         admin_status_report_with_runtime_facts, backend_kind, current_time_ms, doctor_findings,
@@ -1291,7 +1334,10 @@ mod tests {
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    static NEXT_PROVIDER_REPORT_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn runtime_config() -> RuntimeConfig {
         RuntimeConfig {
@@ -1307,6 +1353,7 @@ mod tests {
                 endpoint: "memory://local-sensitive-endpoint".to_owned(),
                 bucket: "backend-secret-bucket".to_owned(),
                 prefix: Some("tenant/private/prefix".to_owned()),
+                timeouts: Default::default(),
             },
             anchor: AnchorConfig::Memory,
             writer_guard: WriterGuardConfig::Off,
@@ -1629,6 +1676,13 @@ mod tests {
             runtime_config_profile(&first),
             runtime_config_profile(&second)
         );
+
+        let mut changed_stall_timeout = runtime_config();
+        changed_stall_timeout.hardening.stream_read_stall_timeout = Duration::from_secs(31);
+        assert_ne!(
+            runtime_config_profile(&changed_stall_timeout),
+            runtime_config_profile(&runtime_config())
+        );
     }
 
     #[tokio::test]
@@ -1644,6 +1698,11 @@ mod tests {
         assert!(!json.contains("secret-value"));
         assert!(!report.security.path_browsing_enabled);
         assert!(!report.security.secrets_exposed);
+        assert_eq!(report.backend.connect_timeout_seconds, 5);
+        assert_eq!(report.backend.read_timeout_seconds, 30);
+        assert_eq!(report.backend.operation_attempt_timeout_seconds, 120);
+        assert_eq!(report.backend.operation_timeout_seconds, 300);
+        assert_eq!(report.backend.stalled_stream_grace_seconds, 30);
         assert_eq!(report.security.action_posture, "report-only");
         assert_eq!(report.schema, "rs3.admin-status.preview.v1");
         assert!(report.restore.v2_anchor.is_none());
@@ -1818,7 +1877,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "rs3-provider-report-{}-{}.json",
             std::process::id(),
-            current_time_ms().unwrap_or(0)
+            NEXT_PROVIDER_REPORT_FILE_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&path, body).unwrap_or_else(|error| panic!("{error}"));
         path
@@ -1837,7 +1896,7 @@ mod tests {
         })
         .collect();
         ProviderConformanceReportJson {
-            schema: "rs3.v2-provider-conformance.v4".to_owned(),
+            schema: PROVIDER_CONFORMANCE_SCHEMA.to_owned(),
             source_revision: super::build_source_revision().to_owned(),
             target_fingerprint,
             profile: "retained-version-object-lock".to_owned(),

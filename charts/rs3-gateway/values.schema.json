@@ -2,6 +2,61 @@
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
   "properties": {
+    "hardening": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxPutObjectBytes",
+        "bufferedPutObjectBytes",
+        "backendMultipartPartBytes",
+        "streamReadStallTimeoutSeconds",
+        "maxInFlightUploadBodyBytes",
+        "maxInFlightDownloadBodyBytes",
+        "maxConcurrentConnections",
+        "maxConcurrentRequests",
+        "requestRateLimitPerSecond"
+      ],
+      "properties": {
+        "maxPutObjectBytes": { "type": "integer", "minimum": 1, "maximum": 53687091200000 },
+        "bufferedPutObjectBytes": { "type": "integer", "minimum": 1, "maximum": 53687091200000 },
+        "backendMultipartPartBytes": { "type": "integer", "minimum": 5242880, "maximum": 5368709120 },
+        "streamReadStallTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+        "maxInFlightUploadBodyBytes": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+        "maxInFlightDownloadBodyBytes": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+        "maxConcurrentConnections": { "type": "integer", "minimum": 1, "maximum": 2305843009213693951 },
+        "maxConcurrentRequests": { "type": "integer", "minimum": 1, "maximum": 2305843009213693951 },
+        "requestRateLimitPerSecond": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 }
+      }
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpoint", "bucket", "prefix", "region", "timeouts"],
+      "properties": {
+        "endpoint": { "type": "string", "minLength": 1 },
+        "bucket": { "type": "string", "minLength": 1 },
+        "prefix": { "type": "string" },
+        "region": { "type": "string", "minLength": 1 },
+        "timeouts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "connectSeconds",
+            "readSeconds",
+            "operationAttemptSeconds",
+            "operationSeconds",
+            "stalledStreamGraceSeconds"
+          ],
+          "properties": {
+            "connectSeconds": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+            "readSeconds": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+            "operationAttemptSeconds": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+            "operationSeconds": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 },
+            "stalledStreamGraceSeconds": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 }
+          }
+        }
+      }
+    },
     "networkPolicy": {
       "type": "object",
       "additionalProperties": false,

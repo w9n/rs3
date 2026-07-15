@@ -16,8 +16,8 @@ pub use admin::{
     AdminRepositoryRuntimeFacts, AdminRepositorySummary, AdminRestoreSummary, AdminRuntimeFacts,
     AdminRuntimeFactsSource, AdminRuntimeSummary, AdminSecuritySummary, AdminStatusReport,
     AdminV2CommitCoordinatorSummary, AdminV2MaintenanceSummary, AdminV2RestoreSummary,
-    admin_posture_report, admin_posture_report_with_runtime_facts, admin_status_report,
-    admin_status_report_with_runtime_facts, backend_kind, doctor_findings,
+    PROVIDER_CONFORMANCE_SCHEMA, admin_posture_report, admin_posture_report_with_runtime_facts,
+    admin_status_report, admin_status_report_with_runtime_facts, backend_kind, doctor_findings,
     provider_conformance_evidence_passed, provider_conformance_target_fingerprint,
     runtime_config_profile,
 };
@@ -26,10 +26,11 @@ pub use admin_http::{
     AdminHttpServerError, AdminHttpService,
 };
 pub use config::{
-    AnchorConfig, BackendConfig, BatchConfig, ConfigError, GatewayMode, HardeningConfig,
-    MaintenanceConfig, MaintenanceMode, MetricsConfig, ProviderConformanceConfig, RecoveryConfig,
-    RepositoryConfig, RepositoryFormat, RepositoryKeyContextConfig, RepositoryKeysConfig,
-    RepositoryToolConfig, RuntimeConfig, V2ProviderCheckConfig, WriterGuardConfig,
+    AnchorConfig, BackendConfig, BackendTimeoutConfig, BatchConfig, ConfigError, GatewayMode,
+    HardeningConfig, MaintenanceConfig, MaintenanceMode, MetricsConfig, ProviderConformanceConfig,
+    RecoveryConfig, RepositoryConfig, RepositoryFormat, RepositoryKeyContextConfig,
+    RepositoryKeysConfig, RepositoryToolConfig, RuntimeConfig, V2ProviderCheckConfig,
+    WriterGuardConfig,
 };
 pub use identity::{
     AuthError, Authorizer, Identity, IdentityProvider, RequestAction, StaticCredentialProvider,

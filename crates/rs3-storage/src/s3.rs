@@ -32,7 +32,7 @@ mod object_lock;
 mod object_lock_client;
 mod requests;
 
-pub use config::S3BlobStoreConfig;
+pub use config::{S3BlobStoreConfig, S3ClientTimeoutConfig};
 pub use metrics::{S3ProviderMetrics, S3ProviderOperationMetrics};
 
 use client::{
@@ -1113,6 +1113,18 @@ impl BlobStore for S3BlobStore {
             bytes_read: 0,
             terminal: false,
         }))
+    }
+
+    async fn open_bounded_full_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        max_bytes: u64,
+    ) -> Result<Box<dyn BlobRead>> {
+        let read = self
+            .open_range_at(object_id, version_id, ByteRange::Full)
+            .await?;
+        crate::read::enforce_full_read_bound(read, max_bytes)
     }
 
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {

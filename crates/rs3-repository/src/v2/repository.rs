@@ -34,6 +34,32 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_RANDOM_KEY_ATTEMPTS: usize = 3;
 
+#[derive(Debug)]
+struct StreamReadStalled;
+
+async fn next_nonempty_stream_chunk<St>(
+    stream: &mut St,
+    stall_timeout: Duration,
+) -> Result<Option<crate::Result<Bytes>>, StreamReadStalled>
+where
+    St: Stream<Item = crate::Result<Bytes>> + Unpin,
+{
+    let deadline = tokio::time::sleep(stall_timeout);
+    tokio::pin!(deadline);
+
+    loop {
+        let next = tokio::select! {
+            biased;
+            () = &mut deadline => return Err(StreamReadStalled),
+            next = stream.next() => next,
+        };
+        match next {
+            Some(Ok(chunk)) if chunk.is_empty() => tokio::task::yield_now().await,
+            next => return Ok(next),
+        }
+    }
+}
+
 /// Maximum commits traversed during one bounded recovery replay by default.
 pub const DEFAULT_V2_REPLAY_MAX_COMMITS: usize = 4_096;
 /// Maximum cumulative commit-object bytes verified during one recovery replay.
@@ -52,6 +78,41 @@ pub const V2_RESTORE_BUNDLE_SCHEMA: &str = "rs3.restore-bundle.v2-preview.v1";
 
 /// Default idle time allowed between streaming request-body chunks.
 pub const DEFAULT_V2_STREAM_READ_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+const STREAMING_UPLOAD_ACTIVE_MULTIPART_BUFFERS: u64 = 2;
+const STREAMING_UPLOAD_FINALIZATION_MULTIPART_BUFFERS: u64 = 3;
+const STREAMING_UPLOAD_ACTIVE_SEGMENT_BUFFERS: u64 = 3;
+const STREAMING_UPLOAD_FINALIZATION_SEGMENT_BUFFERS: u64 = 1;
+const STREAMING_UPLOAD_AUXILIARY_BYTES: u64 = V2_MAX_HEADER_SIZE as u64 + 4096;
+
+/// Returns a conservative peak working set for one v2 multipart streaming encoder.
+///
+/// The active streaming phase retains the commit assembler's first and current
+/// multipart buffers alongside current, pending, and encrypted payload
+/// segments. Finalization temporarily retains three multipart-sized buffers
+/// while the final segment allocation remains live. Request transport chunks
+/// are owned by the HTTP stack and are not included here.
+pub const fn v2_streaming_upload_working_set_bytes(
+    multipart_part_bytes: u64,
+    payload_segment_bytes: u64,
+) -> u64 {
+    let active_streaming = multipart_part_bytes
+        .saturating_mul(STREAMING_UPLOAD_ACTIVE_MULTIPART_BUFFERS)
+        .saturating_add(
+            payload_segment_bytes.saturating_mul(STREAMING_UPLOAD_ACTIVE_SEGMENT_BUFFERS),
+        );
+    let finalization = multipart_part_bytes
+        .saturating_mul(STREAMING_UPLOAD_FINALIZATION_MULTIPART_BUFFERS)
+        .saturating_add(
+            payload_segment_bytes.saturating_mul(STREAMING_UPLOAD_FINALIZATION_SEGMENT_BUFFERS),
+        );
+    let peak = if active_streaming > finalization {
+        active_streaming
+    } else {
+        finalization
+    };
+    peak.saturating_add(STREAMING_UPLOAD_AUXILIARY_BYTES)
+}
 
 /// Accepted v2 commit anchor state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2015,9 +2076,9 @@ where
             payload_id: &write.payload_id,
         };
         loop {
-            let next_chunk = match tokio::time::timeout(
+            let next_chunk = match next_nonempty_stream_chunk(
+                &mut write.stream,
                 self.options.stream_read_stall_timeout,
-                write.stream.next(),
             )
             .await
             {
@@ -2321,9 +2382,9 @@ where
                     abort_v2_commit_multipart(multipart, "standalone_cancelled").await;
                     return Err(V2FormatError::ObjectBodyReadFailed);
                 }
-                next = tokio::time::timeout(
+                next = next_nonempty_stream_chunk(
+                    &mut stream,
                     self.options.stream_read_stall_timeout,
-                    stream.next(),
                 ) => next,
             } {
                 Ok(next_chunk) => next_chunk,
@@ -2806,7 +2867,9 @@ fn storage_error_class(error: &StorageError) -> &'static str {
         StorageError::LegalHoldUnsupported => "legal_hold_unsupported",
         StorageError::MultipartUnsupported => "multipart_unsupported",
         StorageError::PagedListingUnsupported => "paged_listing_unsupported",
+        StorageError::BoundedReadUnsupported => "bounded_read_unsupported",
         StorageError::InvalidListPage => "invalid_list_page",
+        StorageError::BoundedReadExceeded { .. } => "bounded_read_exceeded",
     }
 }
 
@@ -3078,5 +3141,29 @@ fn retention_mode_strength(mode: rs3_types::RetentionMode) -> u8 {
         rs3_types::RetentionMode::None => 0,
         rs3_types::RetentionMode::Governance => 1,
         rs3_types::RetentionMode::Compliance => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_nonempty_stream_chunk;
+    use bytes::Bytes;
+    use futures_util::{StreamExt, stream};
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_stream_chunks_do_not_refresh_the_progress_deadline() {
+        let delayed_empty = stream::once(async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            Ok::<Bytes, crate::RepositoryError>(Bytes::new())
+        });
+        let stalled = stream::pending::<crate::Result<Bytes>>();
+        let mut stream = Box::pin(delayed_empty.chain(stalled));
+        let started = tokio::time::Instant::now();
+
+        let result = next_nonempty_stream_chunk(&mut stream, Duration::from_secs(1)).await;
+
+        assert!(result.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
     }
 }

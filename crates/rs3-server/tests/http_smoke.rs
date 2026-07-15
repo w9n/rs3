@@ -117,6 +117,7 @@ fn runtime_config() -> RuntimeConfig {
             endpoint: "memory://local".to_owned(),
             bucket: "backend-bucket".to_owned(),
             prefix: Some("repo".to_owned()),
+            timeouts: Default::default(),
         },
         anchor: AnchorConfig::Memory,
         writer_guard: WriterGuardConfig::Off,

@@ -417,8 +417,9 @@ Consequently standalone write-byte amplification should remain near 1.0x,
 while total backend I/O during the write is intentionally near 2.0x. Reporting
 those ratios separately avoids calling an integrity read a write-amplification
 regression.
-`RS3_STREAM_READ_STALL_TIMEOUT_SECS` bounds how long one stalled client body can
-remain open before the request fails as incomplete. Checkpoint and
+`RS3_STREAM_READ_STALL_TIMEOUT_SECS` bounds how long one client body can remain
+open without producing non-empty bytes before the request fails as incomplete.
+Empty transport frames do not count as progress. Checkpoint and
 compaction publication are metadata-only for both packed and streamed carriers;
 they preserve exact historical references instead of copying payload bytes.
 

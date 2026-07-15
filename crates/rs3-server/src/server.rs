@@ -288,6 +288,7 @@ mod tests {
                 endpoint: "memory://local".to_owned(),
                 bucket: "backend-bucket".to_owned(),
                 prefix: Some("repo".to_owned()),
+                timeouts: Default::default(),
             },
             anchor: AnchorConfig::Memory,
             writer_guard: WriterGuardConfig::Off,
@@ -334,6 +335,21 @@ mod tests {
         let server = GatewayServer::bind(runtime_config(false)).await;
 
         assert!(matches!(server, Err(GatewayServerError::Boundary(_))));
+    }
+
+    #[tokio::test]
+    async fn server_rejects_programmatic_connection_limit_before_binding() {
+        let mut config = runtime_config(true);
+        config.hardening.max_concurrent_connections = tokio::sync::Semaphore::MAX_PERMITS + 1;
+
+        let server = GatewayServer::bind(config).await;
+
+        assert!(matches!(
+            server,
+            Err(GatewayServerError::Boundary(
+                crate::S3BoundaryError::InvalidConfiguration { reason }
+            )) if reason.contains("RS3_MAX_CONCURRENT_CONNECTIONS")
+        ));
     }
 
     #[tokio::test]

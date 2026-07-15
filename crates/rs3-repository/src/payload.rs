@@ -200,10 +200,7 @@ pub(crate) fn seal_streamable_payload_object(
 }
 
 /// Selects an adaptive payload segment size for a plaintext object.
-pub(crate) fn adaptive_payload_segment_size(
-    plaintext_len: usize,
-    configured_floor: usize,
-) -> usize {
+fn adaptive_payload_segment_size(plaintext_len: usize, configured_floor: usize) -> usize {
     let target = if plaintext_len < MEDIUM_PAYLOAD_THRESHOLD {
         DEFAULT_PAYLOAD_SEGMENT_SIZE
     } else if plaintext_len < LARGE_PAYLOAD_THRESHOLD {
@@ -212,6 +209,19 @@ pub(crate) fn adaptive_payload_segment_size(
         LARGE_PAYLOAD_SEGMENT_SIZE
     };
     configured_floor.max(target)
+}
+
+/// Returns the payload segment size selected for an object under repository configuration.
+pub fn effective_payload_segment_size(
+    plaintext_len: usize,
+    configured_size: usize,
+    adaptive: bool,
+) -> usize {
+    if adaptive {
+        adaptive_payload_segment_size(plaintext_len, configured_size)
+    } else {
+        configured_size
+    }
 }
 
 /// Opens a durable payload object body and applies a client-visible range.

@@ -11,12 +11,12 @@ use rs3_repository::v2::{
 use rs3_server::{
     AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReadiness,
     AdminReadinessSource, AdminReportProfile, AnchorConfig, GatewayMode, GatewayServer,
-    MaintenanceMode, OfflineMaintenanceEnvironment, OfflineMaintenanceError,
+    MaintenanceConfig, MaintenanceMode, OfflineMaintenanceEnvironment, OfflineMaintenanceError,
     OfflineMaintenanceFence, OfflineMaintenanceOutcome, OfflineMaintenanceRequest,
-    RepositoryToolConfig, RuntimeConfig, RuntimeV2ProviderConformanceOptions,
-    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport, V2ProviderCheckConfig,
-    V2RecoveryBundleVerificationOptions, V2RecoveryBundleVerificationReport,
-    V2RepositoryInitReport, WriterGuardConfig, backend_kind,
+    PROVIDER_CONFORMANCE_SCHEMA, RepositoryToolConfig, RuntimeConfig,
+    RuntimeV2ProviderConformanceOptions, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions,
+    V2AnchorImportReport, V2ProviderCheckConfig, V2RecoveryBundleVerificationOptions,
+    V2RecoveryBundleVerificationReport, V2RepositoryInitReport, WriterGuardConfig, backend_kind,
     check_v2_provider_conformance_from_provider_config, default_maintenance_orphan_gc_options,
     doctor_findings, doctor_probe_from_config, export_v2_recovery_bundle_from_config,
     import_v2_anchor_from_config, init_v2_repository_from_config,
@@ -383,8 +383,9 @@ async fn main() -> Result<()> {
                 config.metrics.bind = Some(metrics_bind);
             }
             if let Some(gateway_mode) = gateway_mode {
-                config.mode = gateway_mode.into();
+                apply_gateway_mode_override(&mut config, gateway_mode);
             }
+            config.validate()?;
             let admin_config = admin_http_config(
                 admin_bind,
                 admin_bearer_token,
@@ -1579,7 +1580,7 @@ fn print_v2_provider_conformance_report(
                 })
                 .collect::<Vec<_>>();
             let report_json = serde_json::json!({
-                "schema": "rs3.v2-provider-conformance.v4",
+                "schema": PROVIDER_CONFORMANCE_SCHEMA,
                 "source_revision": build_source_revision(),
                 "target_fingerprint": target_fingerprint,
                 "generated_at_ms": current_time_ms().unwrap_or(0),
@@ -1590,7 +1591,7 @@ fn print_v2_provider_conformance_report(
             println!("{}", serde_json::to_string_pretty(&report_json)?);
         }
         RecoveryReportFormat::Text => {
-            println!("schema=rs3.v2-provider-conformance.v4");
+            println!("schema={PROVIDER_CONFORMANCE_SCHEMA}");
             println!("source_revision={}", build_source_revision());
             println!("target_fingerprint={target_fingerprint}");
             println!("generated_at_ms={}", current_time_ms().unwrap_or(0));
@@ -2222,6 +2223,21 @@ impl From<GatewayModeArg> for GatewayMode {
     }
 }
 
+fn apply_gateway_mode_override(config: &mut RuntimeConfig, mode: GatewayModeArg) {
+    let previous_mode = config.mode;
+    let mode = mode.into();
+    config.mode = mode;
+    match (previous_mode, mode) {
+        (_, GatewayMode::RestoreReadOnly) => {
+            config.maintenance = MaintenanceConfig::forced_off();
+        }
+        (GatewayMode::RestoreReadOnly, GatewayMode::ReadWrite) => {
+            config.maintenance = MaintenanceConfig::default();
+        }
+        (GatewayMode::ReadWrite, GatewayMode::ReadWrite) => {}
+    }
+}
+
 impl From<DoctorProfile> for AdminReportProfile {
     fn from(value: DoctorProfile) -> Self {
         match value {
@@ -2436,11 +2452,12 @@ fn is_path_safe_tracing_target(target: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DoctorProfile, ImportV2AnchorArgs, MaintenanceArgs, MaintenanceCommand,
-        MaintenanceOutputFormat, RecoveryReportFormat, backend_kind, doctor_findings,
-        enforce_serve_profile, is_path_safe_tracing_target, parse_admin_origin,
-        parse_restore_bundle_json, provider_conformance_target_fingerprint,
-        recovery_bundle_from_import_args, run_maintenance_command, runtime_config_profile,
+        DoctorProfile, GatewayModeArg, ImportV2AnchorArgs, MaintenanceArgs, MaintenanceCommand,
+        MaintenanceOutputFormat, PROVIDER_CONFORMANCE_SCHEMA, RecoveryReportFormat,
+        apply_gateway_mode_override, backend_kind, doctor_findings, enforce_serve_profile,
+        is_path_safe_tracing_target, parse_admin_origin, parse_restore_bundle_json,
+        provider_conformance_target_fingerprint, recovery_bundle_from_import_args,
+        run_maintenance_command, runtime_config_profile,
     };
     use rs3_server::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MaintenanceConfig,
@@ -2478,6 +2495,7 @@ mod tests {
                 endpoint: "https://storage.example".to_owned(),
                 bucket: "tenant-backend-bucket".to_owned(),
                 prefix: Some("tenant/prefix".to_owned()),
+                timeouts: Default::default(),
             },
             anchor: AnchorConfig::Memory,
             writer_guard: WriterGuardConfig::Off,
@@ -2887,6 +2905,30 @@ mod tests {
     }
 
     #[test]
+    fn restore_readonly_cli_override_forces_maintenance_off() {
+        let mut config = runtime_config();
+
+        apply_gateway_mode_override(&mut config, GatewayModeArg::RestoreReadonly);
+
+        assert_eq!(config.mode, GatewayMode::RestoreReadOnly);
+        assert_eq!(config.maintenance.mode, rs3_server::MaintenanceMode::Off);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn read_write_cli_override_restores_the_default_maintenance_posture() {
+        let mut config = runtime_config();
+        config.mode = GatewayMode::RestoreReadOnly;
+        config.maintenance = MaintenanceConfig::forced_off();
+
+        apply_gateway_mode_override(&mut config, GatewayModeArg::ReadWrite);
+
+        assert_eq!(config.mode, GatewayMode::ReadWrite);
+        assert_eq!(config.maintenance, MaintenanceConfig::default());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn local_doctor_allows_local_development_config() {
         let findings = doctor_findings(&runtime_config(), DoctorProfile::Local.into());
 
@@ -2970,7 +3012,7 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let evidence = TestProviderEvidence {
-            schema: "rs3.v2-provider-conformance.v4",
+            schema: PROVIDER_CONFORMANCE_SCHEMA,
             source_revision: super::build_source_revision(),
             target_fingerprint,
             generated_at_ms: super::current_time_ms(),

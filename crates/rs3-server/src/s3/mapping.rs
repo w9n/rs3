@@ -28,12 +28,13 @@ enum ListItem {
 
 #[cfg(test)]
 pub(super) async fn collect_body(body: Option<StreamingBlob>, max_bytes: u64) -> S3Result<Bytes> {
-    collect_body_reserving(body, max_bytes, |_| Ok(())).await
+    collect_body_reserving(body, max_bytes, Duration::from_secs(30), |_| Ok(())).await
 }
 
 pub(super) async fn collect_body_reserving(
     body: Option<StreamingBlob>,
     max_bytes: u64,
+    stall_timeout: Duration,
     mut reserve_for_len: impl FnMut(usize) -> S3Result<()>,
 ) -> S3Result<Bytes> {
     let Some(mut body) = body else {
@@ -41,15 +42,7 @@ pub(super) async fn collect_body_reserving(
     };
     let mut bytes = BytesMut::new();
 
-    while let Some(chunk) = body.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                let mut s3_error = s3s::s3_error!(IncompleteBody, "failed to read request body");
-                s3_error.set_source(error);
-                return Err(s3_error);
-            }
-        };
+    while let Some(chunk) = next_body_chunk(&mut body, stall_timeout).await? {
         let next_len = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
             s3s::s3_error!(
                 EntityTooLarge,
@@ -67,6 +60,37 @@ pub(super) async fn collect_body_reserving(
     }
 
     Ok(bytes.freeze())
+}
+
+pub(super) async fn next_body_chunk(
+    body: &mut StreamingBlob,
+    stall_timeout: Duration,
+) -> S3Result<Option<Bytes>> {
+    let deadline = tokio::time::sleep(stall_timeout);
+    tokio::pin!(deadline);
+
+    loop {
+        let next = tokio::select! {
+            biased;
+            () = &mut deadline => {
+                return Err(s3s::s3_error!(
+                    IncompleteBody,
+                    "request body stopped making progress before completion"
+                ));
+            }
+            next = body.next() => next,
+        };
+        match next {
+            Some(Ok(chunk)) if chunk.is_empty() => tokio::task::yield_now().await,
+            Some(Ok(chunk)) => return Ok(Some(chunk)),
+            Some(Err(error)) => {
+                let mut s3_error = s3s::s3_error!(IncompleteBody, "failed to read request body");
+                s3_error.set_source(error);
+                return Err(s3_error);
+            }
+            None => return Ok(None),
+        }
+    }
 }
 
 pub(super) fn validate_put_object_request(input: &PutObjectInput, max_bytes: u64) -> S3Result<()> {
@@ -501,8 +525,17 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
                 "bounded listing is not supported by this backend"
             )
         }
+        RepositoryError::Storage(StorageError::BoundedReadUnsupported) => {
+            s3s::s3_error!(
+                NotImplemented,
+                "bounded reads are not supported by this backend"
+            )
+        }
         RepositoryError::Storage(StorageError::InvalidListPage) => {
             repository_operation_failed("Storage::InvalidListPage")
+        }
+        RepositoryError::Storage(StorageError::BoundedReadExceeded { .. }) => {
+            repository_operation_failed("Storage::BoundedReadExceeded")
         }
         RepositoryError::Storage(StorageError::MissingVersionId(_)) => {
             warn_repository_internal_error("Storage::MissingVersionId");
@@ -559,9 +592,13 @@ fn warn_repository_internal_error(error_kind: &'static str) {
 
 #[cfg(test)]
 mod tests {
-    use super::list_page;
+    use super::{list_page, next_body_chunk};
+    use bytes::Bytes;
+    use futures_util::{StreamExt, stream};
     use rs3_repository::RepositoryListEntry;
     use rs3_types::LogicalPath;
+    use s3s::dto::StreamingBlob;
+    use std::time::Duration;
 
     fn entry(key: &str) -> RepositoryListEntry {
         RepositoryListEntry {
@@ -569,6 +606,24 @@ mod tests {
             content_len: 1,
             modified_at_ms: 1,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_body_frames_do_not_refresh_the_progress_deadline() {
+        let delayed_empty = stream::once(async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            Ok::<Bytes, std::io::Error>(Bytes::new())
+        });
+        let stalled = stream::pending::<Result<Bytes, std::io::Error>>();
+        let mut body = StreamingBlob::wrap(delayed_empty.chain(stalled));
+        let started = tokio::time::Instant::now();
+
+        let error = next_body_chunk(&mut body, Duration::from_secs(1))
+            .await
+            .expect_err("an empty frame must not count as request-body progress");
+
+        assert_eq!(error.code().as_str(), "IncompleteBody");
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
     }
 
     #[test]

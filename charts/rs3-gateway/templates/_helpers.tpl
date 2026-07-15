@@ -197,14 +197,107 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if not (gt (int64 .Values.hardening.maxPutObjectBytes) 0) -}}
 {{- fail "hardening.maxPutObjectBytes must be greater than zero" -}}
 {{- end -}}
+{{- if gt (int64 .Values.hardening.maxPutObjectBytes) 53687091200000 -}}
+{{- fail "hardening.maxPutObjectBytes must be at most 53687091200000 bytes" -}}
+{{- end -}}
+{{- if not (gt (int64 .Values.hardening.bufferedPutObjectBytes) 0) -}}
+{{- fail "hardening.bufferedPutObjectBytes must be greater than zero" -}}
+{{- end -}}
+{{- if gt (int64 .Values.hardening.bufferedPutObjectBytes) 53687091200000 -}}
+{{- fail "hardening.bufferedPutObjectBytes must be at most 53687091200000 bytes" -}}
+{{- end -}}
 {{- if lt (int64 .Values.hardening.backendMultipartPartBytes) 5242880 -}}
 {{- fail "hardening.backendMultipartPartBytes must be at least 5242880 bytes" -}}
+{{- end -}}
+{{- if gt (int64 .Values.hardening.backendMultipartPartBytes) 5368709120 -}}
+{{- fail "hardening.backendMultipartPartBytes must be at most 5368709120 bytes" -}}
+{{- end -}}
+{{- if not (gt (int64 .Values.hardening.streamReadStallTimeoutSeconds) 0) -}}
+{{- fail "hardening.streamReadStallTimeoutSeconds must be greater than zero" -}}
 {{- end -}}
 {{- if not (gt (int64 .Values.hardening.maxInFlightUploadBodyBytes) 0) -}}
 {{- fail "hardening.maxInFlightUploadBodyBytes must be greater than zero" -}}
 {{- end -}}
+{{- if not (gt (int64 .Values.hardening.maxInFlightDownloadBodyBytes) 0) -}}
+{{- fail "hardening.maxInFlightDownloadBodyBytes must be greater than zero" -}}
+{{- end -}}
+{{- if not (gt (int64 .Values.hardening.maxConcurrentConnections) 0) -}}
+{{- fail "hardening.maxConcurrentConnections must be greater than zero" -}}
+{{- end -}}
+{{- if gt (int64 .Values.hardening.maxConcurrentConnections) 2305843009213693951 -}}
+{{- fail "hardening.maxConcurrentConnections exceeds the runtime semaphore limit" -}}
+{{- end -}}
+{{- if not (gt (int64 .Values.hardening.maxConcurrentRequests) 0) -}}
+{{- fail "hardening.maxConcurrentRequests must be greater than zero" -}}
+{{- end -}}
+{{- if gt (int64 .Values.hardening.maxConcurrentRequests) 2305843009213693951 -}}
+{{- fail "hardening.maxConcurrentRequests exceeds the runtime semaphore limit" -}}
+{{- end -}}
 {{- if not (gt (int .Values.hardening.requestRateLimitPerSecond) 0) -}}
 {{- fail "hardening.requestRateLimitPerSecond must be greater than zero" -}}
+{{- end -}}
+{{- $maxPutObjectBytes := int64 .Values.hardening.maxPutObjectBytes -}}
+{{- $bufferedPutObjectBytes := int64 .Values.hardening.bufferedPutObjectBytes -}}
+{{- $multipartPartBytes := int64 .Values.hardening.backendMultipartPartBytes -}}
+{{- if gt $bufferedPutObjectBytes $maxPutObjectBytes -}}
+{{- fail "hardening.bufferedPutObjectBytes must be less than or equal to hardening.maxPutObjectBytes" -}}
+{{- end -}}
+{{- if gt $maxPutObjectBytes (mul $multipartPartBytes 10000) -}}
+{{- fail "hardening.maxPutObjectBytes must be less than or equal to 10000 * hardening.backendMultipartPartBytes" -}}
+{{- end -}}
+{{- $payloadSegmentBytes := int64 512 -}}
+{{- if ne .Values.repository.payloadSegmentSizeBytes nil -}}
+{{- $payloadSegmentBytes = int64 .Values.repository.payloadSegmentSizeBytes -}}
+{{- if not (gt $payloadSegmentBytes 0) -}}
+{{- fail "repository.payloadSegmentSizeBytes must be greater than zero when set" -}}
+{{- end -}}
+{{- if gt $payloadSegmentBytes 67108864 -}}
+{{- fail "repository.payloadSegmentSizeBytes must be at most 67108864 bytes" -}}
+{{- end -}}
+{{- else if lt $maxPutObjectBytes 8192 -}}
+{{- $payloadSegmentBytes = 512 -}}
+{{- else if lt $maxPutObjectBytes 262144 -}}
+{{- $payloadSegmentBytes = 8192 -}}
+{{- else -}}
+{{- $payloadSegmentBytes = 65536 -}}
+{{- end -}}
+{{- $uploadRequirement := $bufferedPutObjectBytes -}}
+{{- if gt $maxPutObjectBytes $bufferedPutObjectBytes -}}
+{{- $activeStreamingRequirement := add (mul $multipartPartBytes 2) (mul $payloadSegmentBytes 3) -}}
+{{- $finalizationRequirement := add (mul $multipartPartBytes 3) $payloadSegmentBytes -}}
+{{- $streamingRequirement := $activeStreamingRequirement -}}
+{{- if gt $finalizationRequirement $activeStreamingRequirement -}}
+{{- $streamingRequirement = $finalizationRequirement -}}
+{{- end -}}
+{{- $streamingRequirement = add $streamingRequirement 12288 -}}
+{{- $uploadRequirement = add $bufferedPutObjectBytes $streamingRequirement -}}
+{{- end -}}
+{{- if lt (int64 .Values.hardening.maxInFlightUploadBodyBytes) $uploadRequirement -}}
+{{- fail (printf "hardening.maxInFlightUploadBodyBytes must be at least %d bytes for the configured buffered, multipart, and payload-segment PutObject paths" $uploadRequirement) -}}
+{{- end -}}
+{{- if not (gt (int64 .Values.backend.timeouts.connectSeconds) 0) -}}
+{{- fail "backend.timeouts.connectSeconds must be greater than zero" -}}
+{{- end -}}
+{{- if not (gt (int64 .Values.backend.timeouts.readSeconds) 0) -}}
+{{- fail "backend.timeouts.readSeconds must be greater than zero" -}}
+{{- end -}}
+{{- if not (gt (int64 .Values.backend.timeouts.operationAttemptSeconds) 0) -}}
+{{- fail "backend.timeouts.operationAttemptSeconds must be greater than zero" -}}
+{{- end -}}
+{{- if not (gt (int64 .Values.backend.timeouts.operationSeconds) 0) -}}
+{{- fail "backend.timeouts.operationSeconds must be greater than zero" -}}
+{{- end -}}
+{{- if not (gt (int64 .Values.backend.timeouts.stalledStreamGraceSeconds) 0) -}}
+{{- fail "backend.timeouts.stalledStreamGraceSeconds must be greater than zero" -}}
+{{- end -}}
+{{- if gt (int64 .Values.backend.timeouts.connectSeconds) (int64 .Values.backend.timeouts.operationAttemptSeconds) -}}
+{{- fail "backend.timeouts.connectSeconds must be less than or equal to backend.timeouts.operationAttemptSeconds" -}}
+{{- end -}}
+{{- if gt (int64 .Values.backend.timeouts.readSeconds) (int64 .Values.backend.timeouts.operationAttemptSeconds) -}}
+{{- fail "backend.timeouts.readSeconds must be less than or equal to backend.timeouts.operationAttemptSeconds" -}}
+{{- end -}}
+{{- if gt (int64 .Values.backend.timeouts.operationAttemptSeconds) (int64 .Values.backend.timeouts.operationSeconds) -}}
+{{- fail "backend.timeouts.operationAttemptSeconds must be less than or equal to backend.timeouts.operationSeconds" -}}
 {{- end -}}
 {{- if and .Values.repository.retention.mode (not (gt (int .Values.repository.retention.days) 0)) -}}
 {{- fail "repository.retention.days must be greater than zero when repository.retention.mode is set" -}}

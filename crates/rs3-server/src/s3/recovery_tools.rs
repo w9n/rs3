@@ -1,16 +1,20 @@
 //! Operator recovery and keyring maintenance helpers.
 
+use super::bounded_io::read_bounded_object_at;
 use super::runtime::v2_provider_profile;
 use super::runtime_builders::build_store;
 use super::{S3BoundaryError, repository_init};
 use crate::{RepositoryFormat, RepositoryKeyContextConfig, RepositoryToolConfig};
-use rs3_crypto::{FormatEnvelope, KeyRing, KeyringEnvelope, RepositoryKeyContext, SecretBytes};
+use rs3_crypto::{
+    FormatEnvelope, KeyRing, KeyringEnvelope, MAX_FORMAT_ENVELOPE_OBJECT_BYTES,
+    MAX_KEYRING_ENVELOPE_OBJECT_BYTES, RepositoryKeyContext, SecretBytes,
+};
 use rs3_repository::store_keyring_envelope;
 use rs3_repository::v2::{
     V2AnchorState, V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot,
     V2KeyringEnvelopeRootRef, V2ProviderProfile, V2RecoveryBundle, V2ReplayChain,
 };
-use rs3_storage::{BlobStore, ByteRange};
+use rs3_storage::BlobStore;
 use rs3_types::{BackendObjectId, KeyDescriptor, RepositoryId, RetentionPolicy, Sequence};
 
 /// Options for offline v2 restore-bundle verification.
@@ -395,14 +399,13 @@ async fn open_format_root<S>(
 where
     S: BlobStore,
 {
-    let body = store
-        .get_range_at(
-            &reference.object_id,
-            reference.version_id.as_ref(),
-            ByteRange::Full,
-        )
-        .await
-        .map_err(repository_init)?;
+    let body = read_bounded_object_at(
+        store,
+        &reference.object_id,
+        reference.version_id.as_ref(),
+        MAX_FORMAT_ENVELOPE_OBJECT_BYTES,
+    )
+    .await?;
     let envelope = FormatEnvelope::from_object_bytes(body.as_ref()).map_err(repository_init)?;
     if envelope.generation != reference.generation
         || envelope.digest().map_err(repository_init)? != reference.digest
@@ -427,14 +430,13 @@ async fn open_v2_keyring_envelope<S>(
 where
     S: BlobStore,
 {
-    let body = store
-        .get_range_at(
-            &reference.object_id,
-            reference.version_id.as_ref(),
-            ByteRange::Full,
-        )
-        .await
-        .map_err(repository_init)?;
+    let body = read_bounded_object_at(
+        store,
+        &reference.object_id,
+        reference.version_id.as_ref(),
+        MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
+    )
+    .await?;
     let envelope = KeyringEnvelope::from_object_bytes(body.as_ref()).map_err(repository_init)?;
     if envelope.generation != reference.generation
         || envelope.digest().map_err(repository_init)? != reference.digest
@@ -472,10 +474,8 @@ where
             )
         })?;
     let context = repository_key_context(keys)?;
-    let body = store
-        .get_range(&object_id, ByteRange::Full)
-        .await
-        .map_err(repository_init)?;
+    let body =
+        read_bounded_object_at(store, &object_id, None, MAX_KEYRING_ENVELOPE_OBJECT_BYTES).await?;
     let envelope = KeyringEnvelope::from_object_bytes(&body).map_err(repository_init)?;
     let keyring = envelope
         .open(&context, wrapping_key_id, wrapping_key)
@@ -632,6 +632,7 @@ mod tests {
                 endpoint: "memory://local".to_owned(),
                 bucket: "repository".to_owned(),
                 prefix: None,
+                timeouts: Default::default(),
             },
             repository_format: RepositoryFormat::V2Preview,
             repository_retention: None,

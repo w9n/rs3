@@ -504,6 +504,22 @@ where
         finish_success(read, effect)
     }
 
+    async fn open_bounded_full_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        max_bytes: u64,
+    ) -> Result<Box<dyn BlobRead>> {
+        let effect = self
+            .script
+            .begin(FaultOperationKind::GetRangeAt, Some(object_id), None)?;
+        let read = self
+            .inner
+            .open_bounded_full_at(object_id, version_id, max_bytes)
+            .await?;
+        finish_success(read, effect)
+    }
+
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {
         let effect = self
             .script

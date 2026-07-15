@@ -15,7 +15,7 @@ use super::{
     V2ProviderConformanceCheck, V2ProviderConformanceOptions, V2ProviderConformanceReport,
     V2ProviderProfile, V2SectionDescriptor, V2SectionType, V2UploadMode,
     body_digest_for_v2_sections, check_v2_provider_conformance, digest_v2_section,
-    generate_v2_commit_key, parse_v2_commit_object,
+    generate_v2_commit_key, parse_v2_commit_object, v2_streaming_upload_working_set_bytes,
 };
 use super::{open_v2_index_run, seal_v2_index_run};
 use crate::payload::{parse_segmented_payload_header, seal_streamable_payload_object};
@@ -28,17 +28,30 @@ use rs3_index::run::{
     IndexMutation, IndexPayloadPointer, IndexRunLimits, IndexRunStandaloneStreamContainer,
 };
 use rs3_storage::{
-    BlobList, BlobListMode, BlobMetadata, BlobMultipartUpload, BlobStore, ByteRange,
-    CountingBlobStore, MemoryBlobStore, PutOptions,
+    BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore,
+    ByteRange, CountingBlobStore, MemoryBlobStore, PutOptions, StorageError,
 };
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
     LegalHoldStatus, LogicalPath, RepositoryId, RetentionMode, RetentionPolicy, Sequence,
 };
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Barrier, Notify};
+
+#[test]
+fn streaming_upload_working_set_covers_active_and_finalization_peaks() {
+    assert_eq!(
+        v2_streaming_upload_working_set_bytes(5, 100),
+        5 * 2 + 100 * 3 + 12_288
+    );
+    assert_eq!(
+        v2_streaming_upload_working_set_bytes(100, 5),
+        100 * 3 + 5 + 12_288
+    );
+}
 
 fn must_v2<T>(result: super::V2Result<T>) -> T {
     match result {
@@ -1784,6 +1797,163 @@ async fn dev_provider_conformance_passes_on_memory_store() {
     assert!(report.passed());
     assert!(report.checks.iter().any(|check| {
         check.name == "multipart-complete" && check.status == V2ProviderCheckStatus::Passed
+    }));
+}
+
+#[derive(Clone)]
+struct BoundedProviderProbeStore {
+    inner: MemoryBlobStore,
+    endless_listing: bool,
+}
+
+struct EndlessProbeList;
+
+#[async_trait::async_trait]
+impl BlobList for EndlessProbeList {
+    async fn next_page(&mut self, max_items: NonZeroUsize) -> rs3_storage::Result<BlobListPage> {
+        Ok(BlobListPage {
+            entries: Vec::new(),
+            consumed_items: max_items.get(),
+            is_complete: false,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl BlobStore for BoundedProviderProbeStore {
+    async fn put(
+        &self,
+        object_id: &BackendObjectId,
+        body: Bytes,
+        options: PutOptions,
+    ) -> rs3_storage::Result<BlobMetadata> {
+        self.inner.put(object_id, body, options).await
+    }
+
+    fn supports_multipart_upload(&self) -> bool {
+        self.inner.supports_multipart_upload()
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        object_id: &BackendObjectId,
+        options: PutOptions,
+    ) -> rs3_storage::Result<Box<dyn BlobMultipartUpload>> {
+        self.inner.create_multipart_upload(object_id, options).await
+    }
+
+    async fn get_range(
+        &self,
+        object_id: &BackendObjectId,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Bytes> {
+        if range == ByteRange::Full {
+            return Err(StorageError::Provider(
+                "unbounded full reads are disabled for this probe".to_owned(),
+            ));
+        }
+        self.inner.get_range(object_id, range).await
+    }
+
+    async fn get_range_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Bytes> {
+        if range == ByteRange::Full {
+            return Err(StorageError::Provider(
+                "unbounded full reads are disabled for this probe".to_owned(),
+            ));
+        }
+        self.inner.get_range_at(object_id, version_id, range).await
+    }
+
+    async fn open_bounded_full_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        max_bytes: u64,
+    ) -> rs3_storage::Result<Box<dyn BlobRead>> {
+        self.inner
+            .open_bounded_full_at(object_id, version_id, max_bytes)
+            .await
+    }
+
+    async fn head(&self, object_id: &BackendObjectId) -> rs3_storage::Result<BlobMetadata> {
+        self.inner.head(object_id).await
+    }
+
+    async fn list_prefix(&self, _prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {
+        Err(StorageError::Provider(
+            "unbounded listings are disabled for this probe".to_owned(),
+        ))
+    }
+
+    async fn open_bounded_list(
+        &self,
+        prefix: &str,
+        mode: BlobListMode,
+    ) -> rs3_storage::Result<Box<dyn BlobList>> {
+        if self.endless_listing {
+            return Ok(Box::new(EndlessProbeList));
+        }
+        self.inner.open_bounded_list(prefix, mode).await
+    }
+
+    async fn delete(&self, object_id: &BackendObjectId) -> rs3_storage::Result<()> {
+        self.inner.delete(object_id).await
+    }
+
+    async fn extend_retention(
+        &self,
+        object_id: &BackendObjectId,
+        policy: RetentionPolicy,
+    ) -> rs3_storage::Result<()> {
+        self.inner.extend_retention(object_id, policy).await
+    }
+
+    async fn set_legal_hold(
+        &self,
+        object_id: &BackendObjectId,
+        status: LegalHoldStatus,
+    ) -> rs3_storage::Result<()> {
+        self.inner.set_legal_hold(object_id, status).await
+    }
+
+    async fn flush_caches(&self) -> rs3_storage::Result<()> {
+        self.inner.flush_caches().await
+    }
+}
+
+#[tokio::test]
+async fn provider_conformance_uses_only_bounded_full_reads_and_listings() {
+    let store = BoundedProviderProbeStore {
+        inner: MemoryBlobStore::new(),
+        endless_listing: false,
+    };
+    let options =
+        V2ProviderConformanceOptions::new(V2ProviderProfile::Dev, "v2-provider/bounded-only");
+
+    let report = must_v2(check_v2_provider_conformance(&store, &options).await);
+
+    assert!(report.passed());
+}
+
+#[tokio::test]
+async fn provider_conformance_fails_closed_on_an_endless_listing() {
+    let store = BoundedProviderProbeStore {
+        inner: MemoryBlobStore::new(),
+        endless_listing: true,
+    };
+    let options =
+        V2ProviderConformanceOptions::new(V2ProviderProfile::Dev, "v2-provider/endless-list");
+
+    let report = must_v2(check_v2_provider_conformance(&store, &options).await);
+
+    assert!(!report.passed());
+    assert!(report.checks.iter().any(|check| {
+        check.name == "basic-list" && check.status == V2ProviderCheckStatus::Failed
     }));
 }
 

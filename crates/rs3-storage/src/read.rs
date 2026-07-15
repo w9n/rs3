@@ -1,6 +1,6 @@
 use crate::{Result, StorageError};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 /// Maximum bytes emitted by one incremental blob-read chunk.
 pub const MAX_BLOB_READ_CHUNK_BYTES: usize = 1024 * 1024;
@@ -18,6 +18,48 @@ pub trait BlobRead: Send {
 
     /// Returns the next bounded body chunk, or `None` after exact completion.
     async fn next_chunk(&mut self) -> Result<Option<Bytes>>;
+}
+
+/// Collects one incremental read without exceeding `max_bytes`.
+///
+/// The advertised exact length is checked before allocating. The reader is
+/// still consumed through its terminal `None` so truncated and overlong
+/// provider responses cannot be accepted as complete objects.
+pub async fn collect_bounded_blob_read(
+    mut read: Box<dyn BlobRead>,
+    max_bytes: u64,
+) -> Result<Bytes> {
+    let exact_len = read.exact_len();
+    if exact_len > max_bytes {
+        return Err(StorageError::BoundedReadExceeded { max_bytes });
+    }
+    let capacity = usize::try_from(exact_len).map_err(|_| {
+        StorageError::Provider("bounded object length exceeds platform capacity".to_owned())
+    })?;
+    let mut body = BytesMut::with_capacity(capacity);
+
+    while let Some(chunk) = read.next_chunk().await? {
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(StorageError::BoundedReadExceeded { max_bytes })?;
+        if u64::try_from(next_len).unwrap_or(u64::MAX) > max_bytes {
+            return Err(StorageError::BoundedReadExceeded { max_bytes });
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body.freeze())
+}
+
+pub(crate) fn enforce_full_read_bound(
+    read: Box<dyn BlobRead>,
+    max_bytes: u64,
+) -> Result<Box<dyn BlobRead>> {
+    if read.exact_len() > max_bytes {
+        return Err(StorageError::BoundedReadExceeded { max_bytes });
+    }
+    Ok(read)
 }
 
 #[async_trait]
@@ -135,7 +177,7 @@ fn invalid_stream_length(reason: &'static str) -> StorageError {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlobReadSource, bytes_blob_read, exact_blob_read};
+    use super::{BlobReadSource, bytes_blob_read, collect_bounded_blob_read, exact_blob_read};
     use crate::{Result, StorageError};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -277,5 +319,35 @@ mod tests {
         assert_eq!(first.len(), super::MAX_BLOB_READ_CHUNK_BYTES);
         assert_eq!(second.len(), 17);
         assert_eq!(read.next_chunk().await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn bounded_collector_rejects_advertised_length_before_reading() {
+        let read = scripted([Ok(Some(Bytes::from_static(b"abcd"))), Ok(None)], 4);
+
+        let result = collect_bounded_blob_read(read, 3).await;
+
+        assert_eq!(
+            result,
+            Err(StorageError::BoundedReadExceeded { max_bytes: 3 })
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_collector_requires_verified_terminal_eof() {
+        let read = scripted(
+            [
+                Ok(Some(Bytes::from_static(b"abc"))),
+                Ok(Some(Bytes::from_static(b"d"))),
+            ],
+            3,
+        );
+
+        let result = collect_bounded_blob_read(read, 3).await;
+
+        assert!(matches!(
+            result,
+            Err(StorageError::Provider(message)) if message.contains("exceeded its exact length")
+        ));
     }
 }

@@ -1,7 +1,8 @@
 use bytes::Bytes;
 use rs3_repository::v2::{V2AnchorState, V2CommitAnchor, V2Result};
 use rs3_storage::{
-    BlobList, BlobListMode, BlobMetadata, BlobMultipartUpload, BlobStore, ByteRange, PutOptions,
+    BlobList, BlobListMode, BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore, ByteRange,
+    PutOptions,
 };
 use std::sync::Arc;
 
@@ -59,6 +60,26 @@ impl BlobStore for DynBlobStore {
         range: ByteRange,
     ) -> rs3_storage::Result<Bytes> {
         self.inner.get_range_at(object_id, version_id, range).await
+    }
+
+    async fn open_range_at(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        version_id: Option<&rs3_types::BackendVersionId>,
+        range: ByteRange,
+    ) -> rs3_storage::Result<Box<dyn BlobRead>> {
+        self.inner.open_range_at(object_id, version_id, range).await
+    }
+
+    async fn open_bounded_full_at(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        version_id: Option<&rs3_types::BackendVersionId>,
+        max_bytes: u64,
+    ) -> rs3_storage::Result<Box<dyn BlobRead>> {
+        self.inner
+            .open_bounded_full_at(object_id, version_id, max_bytes)
+            .await
     }
 
     async fn head(

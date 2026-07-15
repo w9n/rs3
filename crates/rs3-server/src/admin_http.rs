@@ -1138,6 +1138,7 @@ mod tests {
                 endpoint: "memory://local".to_owned(),
                 bucket: "backend-bucket".to_owned(),
                 prefix: Some("repo-prefix".to_owned()),
+                timeouts: Default::default(),
             },
             anchor: AnchorConfig::Memory,
             writer_guard: WriterGuardConfig::Off,

@@ -3,7 +3,7 @@
 use super::S3BoundaryError;
 use super::mapping::{
     ListPage, collect_body_reserving, content_range, etag, i64_len, legal_hold_header,
-    legal_hold_output, list_page as map_list_page, logical_path, max_keys,
+    legal_hold_output, list_page as map_list_page, logical_path, max_keys, next_body_chunk,
     put_object_legal_hold_request_status, put_object_legal_hold_status,
     put_object_retention_policy, repository_error, resolve_range, retention_headers, timestamp,
     validate_delete_object_request, validate_delete_objects_entry, validate_delete_objects_request,
@@ -11,6 +11,7 @@ use super::mapping::{
     validate_head_object_request, validate_put_object_request,
 };
 use super::runtime::RuntimeRepository;
+use crate::config::configured_streaming_upload_working_set_bytes;
 use crate::{AdminReadinessSource, AdminRuntimeFactsSource, GatewayMode, RuntimeConfig};
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, stream};
@@ -46,6 +47,8 @@ pub(super) struct GatewayS3Service {
     max_put_object_bytes: u64,
     buffered_put_object_bytes: u64,
     backend_multipart_part_bytes: u64,
+    streaming_upload_working_set_bytes: u64,
+    stream_read_stall_timeout: Duration,
     retention_writes_qualified: bool,
     request_slots: Arc<Semaphore>,
     request_rate_limiter: RequestRateLimiter,
@@ -86,6 +89,11 @@ impl GatewayS3Service {
             max_put_object_bytes: config.hardening.max_put_object_bytes,
             buffered_put_object_bytes: config.hardening.buffered_put_object_bytes,
             backend_multipart_part_bytes: config.hardening.backend_multipart_part_bytes,
+            streaming_upload_working_set_bytes: configured_streaming_upload_working_set_bytes(
+                &config.hardening,
+                &config.repository,
+            ),
+            stream_read_stall_timeout: config.hardening.stream_read_stall_timeout,
             retention_writes_qualified: config.repository.retention.is_some_and(|retention| {
                 retention.mode != RetentionMode::None && retention.retain_days > 0
             }),
@@ -798,12 +806,9 @@ impl S3 for GatewayS3Service {
                         "Content-Length is required for large streaming PutObject"
                     )
                 })?;
-                let streaming_budget = self
-                    .backend_multipart_part_bytes
-                    .saturating_mul(3)
-                    .saturating_add(4096);
                 let mut upload_body_reservation = self.upload_body_budget.reservation();
-                upload_body_reservation.reserve_until(OPERATION, streaming_budget)?;
+                upload_body_reservation
+                    .reserve_until(OPERATION, self.streaming_upload_working_set_bytes)?;
                 let body = input
                     .body
                     .unwrap_or_else(|| StreamingBlob::from(Body::from(Bytes::new())));
@@ -849,16 +854,9 @@ impl S3 for GatewayS3Service {
                     .body
                     .unwrap_or_else(|| StreamingBlob::from(Body::from(Bytes::new())));
                 let mut buffered = BytesMut::new();
-                while let Some(chunk) = body.next().await {
-                    let chunk = match chunk {
-                        Ok(chunk) => chunk,
-                        Err(error) => {
-                            let mut s3_error =
-                                s3s::s3_error!(IncompleteBody, "failed to read request body");
-                            s3_error.set_source(error);
-                            return Err(s3_error);
-                        }
-                    };
+                while let Some(chunk) =
+                    next_body_chunk(&mut body, self.stream_read_stall_timeout).await?
+                {
                     let next_len = buffered.len().checked_add(chunk.len()).ok_or_else(|| {
                         s3s::s3_error!(
                             EntityTooLarge,
@@ -871,27 +869,43 @@ impl S3 for GatewayS3Service {
                             "PutObject body exceeds the configured maximum size"
                         ));
                     }
-                    upload_body_reservation.reserve_body_len(OPERATION, next_len)?;
-                    buffered.extend_from_slice(&chunk);
-                    if u64::try_from(buffered.len()).unwrap_or(u64::MAX)
-                        <= self.buffered_put_object_bytes
-                    {
+                    let buffered_len = u64::try_from(buffered.len()).unwrap_or(u64::MAX);
+                    let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                    let remaining_buffer_capacity =
+                        self.buffered_put_object_bytes.saturating_sub(buffered_len);
+                    if chunk_len <= remaining_buffer_capacity {
+                        upload_body_reservation.reserve_body_len(OPERATION, next_len)?;
+                        buffered.extend_from_slice(&chunk);
                         continue;
                     }
 
+                    let prefix_len = usize::try_from(remaining_buffer_capacity).map_err(|_| {
+                        s3s::s3_error!(
+                            InvalidRequest,
+                            "buffered PutObject threshold exceeds platform limits"
+                        )
+                    })?;
+                    let transition_buffered_len =
+                        buffered.len().checked_add(prefix_len).ok_or_else(|| {
+                            s3s::s3_error!(
+                                EntityTooLarge,
+                                "PutObject body exceeds the configured maximum size"
+                            )
+                        })?;
                     let streaming_budget = self
-                        .backend_multipart_part_bytes
-                        .saturating_mul(3)
-                        .saturating_add(4096)
-                        .saturating_add(u64::try_from(buffered.len()).unwrap_or(u64::MAX));
+                        .streaming_upload_working_set_bytes
+                        .saturating_add(u64::try_from(transition_buffered_len).unwrap_or(u64::MAX));
                     upload_body_reservation.reserve_until(OPERATION, streaming_budget)?;
+                    buffered.extend_from_slice(&chunk[..prefix_len]);
                     let prefix = buffered.freeze();
-                    let stream =
-                        stream::iter(std::iter::once(Ok::<Bytes, RepositoryError>(prefix))).chain(
-                            body.map(|chunk| {
-                                chunk.map_err(|_error| RepositoryError::ObjectBodyReadFailed)
-                            }),
-                        );
+                    let remainder = chunk.slice(prefix_len..);
+                    let initial = [prefix, remainder]
+                        .into_iter()
+                        .filter(|chunk| !chunk.is_empty())
+                        .map(Ok::<Bytes, RepositoryError>);
+                    let stream = stream::iter(initial).chain(body.map(|chunk| {
+                        chunk.map_err(|_error| RepositoryError::ObjectBodyReadFailed)
+                    }));
                     let committed = self
                         .repository
                         .put_committed_streaming_unknown_len(
@@ -971,9 +985,12 @@ impl S3 for GatewayS3Service {
             } else {
                 self.buffered_put_object_bytes
             };
-            let body = collect_body_reserving(input.body, collect_limit, |body_len| {
-                upload_body_reservation.reserve_body_len(OPERATION, body_len)
-            })
+            let body = collect_body_reserving(
+                input.body,
+                collect_limit,
+                self.stream_read_stall_timeout,
+                |body_len| upload_body_reservation.reserve_body_len(OPERATION, body_len),
+            )
             .await;
             let body_collect_elapsed = body_collect_started.elapsed();
             record_s3_request_body_collect_metrics(OPERATION, body_collect_elapsed);
@@ -1587,6 +1604,7 @@ mod tests {
         status_code_label,
     };
     use crate::GatewayMode;
+    use crate::config::configured_streaming_upload_working_set_bytes;
     use crate::s3::mapping::collect_body;
     use crate::s3::test_support::runtime_config;
     use bytes::Bytes;
@@ -1666,10 +1684,11 @@ mod tests {
 
     async fn gateway_service_with_stream_read_stall_timeout(
         stream_read_stall_timeout: Duration,
+        buffered_put_object_bytes: u64,
     ) -> GatewayS3Service {
         let mut config = runtime_config(true);
         config.hardening.max_put_object_bytes = 64;
-        config.hardening.buffered_put_object_bytes = 3;
+        config.hardening.buffered_put_object_bytes = buffered_put_object_bytes;
         config.hardening.backend_multipart_part_bytes = 5 * 1024 * 1024;
         config.hardening.stream_read_stall_timeout = stream_read_stall_timeout;
         GatewayS3Service::from_config(&config)
@@ -2297,7 +2316,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn put_object_rejects_stalled_streaming_body_for_declared_length() {
-        let service = gateway_service_with_stream_read_stall_timeout(Duration::from_secs(1)).await;
+        let service =
+            gateway_service_with_stream_read_stall_timeout(Duration::from_secs(1), 3).await;
         let body =
             StreamingBlob::wrap(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
 
@@ -2311,6 +2331,49 @@ mod tests {
             }))
             .await
             .expect_err("stalled streaming PutObject body should be rejected");
+
+        assert_eq!(error.code().as_str(), "IncompleteBody");
+        assert_eq!(accepted_v2_sequence(&service).await, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn put_object_rejects_stalled_buffered_body_for_declared_length() {
+        let service =
+            gateway_service_with_stream_read_stall_timeout(Duration::from_secs(1), 64).await;
+        let body =
+            StreamingBlob::wrap(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+
+        let error = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/stalled-buffered.bin".to_owned(),
+                content_length: Some(4),
+                body: Some(body),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect_err("stalled buffered PutObject body should be rejected");
+
+        assert_eq!(error.code().as_str(), "IncompleteBody");
+        assert_eq!(accepted_v2_sequence(&service).await, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn put_object_rejects_stalled_unknown_length_body_before_streaming_threshold() {
+        let service =
+            gateway_service_with_stream_read_stall_timeout(Duration::from_secs(1), 3).await;
+        let body =
+            StreamingBlob::wrap(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+
+        let error = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/stalled-unknown.bin".to_owned(),
+                body: Some(body),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect_err("stalled unknown-length PutObject body should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
         assert_eq!(accepted_v2_sequence(&service).await, 1);
@@ -2354,6 +2417,91 @@ mod tests {
 
         assert_eq!(response_body(get).await, Bytes::from(vec![7_u8; 512]));
         assert_eq!(counts.multipart_put, 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_length_streaming_uses_the_validated_peak_upload_budget() {
+        let mut config = runtime_config(true);
+        config.hardening.max_put_object_bytes = 1024;
+        config.hardening.buffered_put_object_bytes = 3;
+        config.hardening.backend_multipart_part_bytes = 5 * 1024 * 1024;
+        config.hardening.max_in_flight_upload_body_bytes = config
+            .hardening
+            .buffered_put_object_bytes
+            .saturating_add(configured_streaming_upload_working_set_bytes(
+                &config.hardening,
+                &config.repository,
+            ));
+        let service = GatewayS3Service::from_config(&config)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let store = service
+            .repository
+            .memory_store()
+            .unwrap_or_else(|| panic!("missing memory store"));
+        store
+            .reset_operation_counts()
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let put = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/unknown-budgeted.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from(vec![
+                    7_u8;
+                    512
+                ])))),
+                ..PutObjectInput::default()
+            }))
+            .await;
+
+        assert!(put.is_ok());
+        let counts = store
+            .operation_counts()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(counts.multipart_put, 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_length_streaming_reserves_transition_memory_before_starting_upload() {
+        let mut config = runtime_config(true);
+        config.hardening.max_put_object_bytes = 1024;
+        config.hardening.buffered_put_object_bytes = 3;
+        config.hardening.backend_multipart_part_bytes = 5 * 1024 * 1024;
+        config.hardening.max_in_flight_upload_body_bytes =
+            configured_streaming_upload_working_set_bytes(&config.hardening, &config.repository)
+                .saturating_add(2);
+        let service = GatewayS3Service::from_config(&config)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let store = service
+            .repository
+            .memory_store()
+            .unwrap_or_else(|| panic!("missing memory store"));
+        store
+            .reset_operation_counts()
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let error = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/unknown-over-budget.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"abcdef",
+                )))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect_err("streaming transition above its memory budget must be rejected");
+        let counts = store
+            .operation_counts()
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(error.code().as_str(), "SlowDown");
+        assert_eq!(counts.multipart_create, 0);
+        assert_eq!(counts.multipart_put, 0);
+        assert_eq!(service.upload_body_budget.in_flight_bytes(), 0);
+        assert_eq!(accepted_v2_sequence(&service).await, 1);
     }
 
     #[tokio::test]

@@ -55,6 +55,11 @@ impl GatewayS3Boundary {
         #[cfg(feature = "k8s")] writer_fence: Option<rs3_k8s::WriterFence>,
         #[cfg(not(feature = "k8s"))] _writer_fence: Option<()>,
     ) -> Result<Self, S3BoundaryError> {
+        config
+            .validate()
+            .map_err(|error| S3BoundaryError::InvalidConfiguration {
+                reason: error.to_string(),
+            })?;
         let credentials = config
             .static_credentials
             .clone()
@@ -233,6 +238,20 @@ mod tests {
         assert!(boundary.hardening().request_tracing);
         assert!(boundary.hardening().authentication);
         let _service = boundary.service().clone();
+    }
+
+    #[tokio::test]
+    async fn boundary_rejects_programmatic_config_before_runtime_allocation() {
+        let mut config = runtime_config(true);
+        config.hardening.max_concurrent_requests = tokio::sync::Semaphore::MAX_PERMITS + 1;
+
+        let boundary = GatewayS3Boundary::build(config).await;
+
+        assert!(matches!(
+            boundary,
+            Err(S3BoundaryError::InvalidConfiguration { reason })
+                if reason.contains("RS3_MAX_CONCURRENT_REQUESTS")
+        ));
     }
 
     #[test]

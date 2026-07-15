@@ -1,9 +1,10 @@
-use super::config::{S3BlobStoreConfig, non_blank};
+use super::config::{S3BlobStoreConfig, S3ClientTimeoutConfig, non_blank};
 use crate::{Result, StorageError};
 use aws_sdk_s3::{
     Client as SdkS3Client,
-    config::{BehaviorVersion, Credentials, Region},
+    config::{BehaviorVersion, Credentials, Region, StalledStreamProtectionConfig},
 };
+use aws_smithy_types::timeout::TimeoutConfig;
 use std::sync::Once;
 
 static RUSTLS_PROVIDER: Once = Once::new();
@@ -26,7 +27,9 @@ pub(super) async fn sdk_client_from_environment(config: &S3BlobStoreConfig) -> R
         .load()
         .await;
     let mut builder = aws_sdk_s3::config::Builder::from(&shared_config)
-        .force_path_style(!config.virtual_hosted_style);
+        .force_path_style(!config.virtual_hosted_style)
+        .timeout_config(sdk_timeout_config(config.timeouts))
+        .stalled_stream_protection(stalled_stream_config(config.timeouts));
     if let Some(endpoint_url) = config.endpoint_url.as_deref() {
         builder = builder.endpoint_url(endpoint_url);
     }
@@ -73,13 +76,30 @@ pub(super) fn sdk_client_from_static_environment(
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new(region))
         .force_path_style(!config.virtual_hosted_style)
-        .credentials_provider(credentials);
+        .credentials_provider(credentials)
+        .timeout_config(sdk_timeout_config(config.timeouts))
+        .stalled_stream_protection(stalled_stream_config(config.timeouts));
 
     if let Some(endpoint_url) = config.endpoint_url.as_deref() {
         builder = builder.endpoint_url(endpoint_url);
     }
 
     Ok(SdkS3Client::from_conf(builder.build()))
+}
+
+fn sdk_timeout_config(timeouts: S3ClientTimeoutConfig) -> TimeoutConfig {
+    TimeoutConfig::builder()
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.read)
+        .operation_attempt_timeout(timeouts.operation_attempt)
+        .operation_timeout(timeouts.operation)
+        .build()
+}
+
+fn stalled_stream_config(timeouts: S3ClientTimeoutConfig) -> StalledStreamProtectionConfig {
+    StalledStreamProtectionConfig::enabled()
+        .grace_period(timeouts.stalled_stream_grace)
+        .build()
 }
 
 fn validate_endpoint(config: &S3BlobStoreConfig) -> Result<()> {
@@ -103,5 +123,37 @@ fn optional_env_value(name: &str) -> Result<Option<String>> {
         Err(std::env::VarError::NotUnicode(_)) => Err(StorageError::Provider(format!(
             "{name} must be valid Unicode"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sdk_timeout_config, stalled_stream_config};
+    use crate::S3ClientTimeoutConfig;
+    use std::time::Duration;
+
+    #[test]
+    fn maps_every_finite_timeout_into_the_aws_sdk() {
+        let timeouts = S3ClientTimeoutConfig {
+            connect: Duration::from_secs(1),
+            read: Duration::from_secs(2),
+            operation_attempt: Duration::from_secs(3),
+            operation: Duration::from_secs(4),
+            stalled_stream_grace: Duration::from_secs(5),
+        };
+
+        let sdk = sdk_timeout_config(timeouts);
+        assert_eq!(sdk.connect_timeout(), Some(Duration::from_secs(1)));
+        assert_eq!(sdk.read_timeout(), Some(Duration::from_secs(2)));
+        assert_eq!(
+            sdk.operation_attempt_timeout(),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(sdk.operation_timeout(), Some(Duration::from_secs(4)));
+
+        let stalled = stalled_stream_config(timeouts);
+        assert!(stalled.upload_enabled());
+        assert!(stalled.download_enabled());
+        assert_eq!(stalled.grace_period(), Duration::from_secs(5));
     }
 }

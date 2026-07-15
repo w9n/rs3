@@ -98,10 +98,15 @@ impl<'a, S> V2MaintenanceBudgetedStore<'a, S> {
         charge_maintenance_io(
             self.budgets,
             &self.usage,
+            1,
             head_count,
             range_read_bytes,
             list_mode,
         )
+    }
+
+    fn charge_range_read_bytes(&self, range_read_bytes: u64) -> rs3_storage::Result<()> {
+        charge_maintenance_io(self.budgets, &self.usage, 0, 0, range_read_bytes, None)
     }
 
     fn reject_unbounded_read(&self) -> rs3_storage::Result<()> {
@@ -142,7 +147,7 @@ struct V2MaintenanceBudgetedList {
 #[async_trait]
 impl BlobList for V2MaintenanceBudgetedList {
     async fn next_page(&mut self, max_items: NonZeroUsize) -> rs3_storage::Result<BlobListPage> {
-        charge_maintenance_io(self.budgets, &self.usage, 0, 0, Some(self.mode))?;
+        charge_maintenance_io(self.budgets, &self.usage, 1, 0, 0, Some(self.mode))?;
         pace_maintenance_operation(self.budgets.op_pacing_delay).await;
         let page = self.inner.next_page(max_items).await?;
         if page.consumed_items < page.entries.len() || page.consumed_items > max_items.get() {
@@ -204,6 +209,22 @@ where
         self.charge_range(range)?;
         self.pace().await;
         self.inner.open_range_at(object_id, version_id, range).await
+    }
+
+    async fn open_bounded_full_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        max_bytes: u64,
+    ) -> rs3_storage::Result<Box<dyn BlobRead>> {
+        self.charge(0, 0, None)?;
+        self.pace().await;
+        let read = self
+            .inner
+            .open_bounded_full_at(object_id, version_id, max_bytes)
+            .await?;
+        self.charge_range_read_bytes(read.exact_len())?;
+        Ok(read)
     }
 
     async fn head(&self, object_id: &BackendObjectId) -> rs3_storage::Result<BlobMetadata> {
@@ -302,6 +323,7 @@ fn maintenance_budget_storage_error() -> StorageError {
 fn charge_maintenance_io(
     budgets: V2MaintenanceBudgets,
     usage: &RwLock<V2MaintenanceIoUsage>,
+    request_count: u64,
     head_count: u64,
     range_read_bytes: u64,
     list_mode: Option<BlobListMode>,
@@ -312,7 +334,7 @@ fn charge_maintenance_io(
     if usage.exhausted {
         return Err(maintenance_budget_storage_error());
     }
-    let request_count = usage.request_count.checked_add(1);
+    let request_count = usage.request_count.checked_add(request_count);
     let next_head_count = usage.head_count.checked_add(head_count);
     let next_range_read_bytes = usage.range_read_bytes.checked_add(range_read_bytes);
     let list_page_count = usage
@@ -3167,15 +3189,76 @@ fn payload_section_facts(
 mod tests {
     use super::{
         V2FormatError, V2FullGcApplyOptions, V2FullGcDryRunOptions, V2FullGcDryRunReport,
-        V2FullGcPlan, V2MaintenancePlanCost, V2OrphanCandidate, V2OrphanGcOptions,
-        V2OrphanObjectClass, V2OrphanReport, V2ReachabilityState, V2RetentionRenewalPlan,
-        V2StandalonePayloadRoot, full_gc_plan_digest, validate_standalone_payload_root,
+        V2FullGcPlan, V2MaintenanceBudgetedStore, V2MaintenanceBudgets, V2MaintenancePlanCost,
+        V2OrphanCandidate, V2OrphanGcOptions, V2OrphanObjectClass, V2OrphanReport,
+        V2ReachabilityState, V2RetentionRenewalPlan, V2StandalonePayloadRoot, full_gc_plan_digest,
+        validate_standalone_payload_root,
     };
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use bytes::Bytes;
     use rs3_index::PayloadHeaderReference;
+    use rs3_storage::{BlobStore, MemoryBlobStore, PutOptions, read_bounded_full_at};
     use rs3_types::{BackendObjectId, BackendVersionId, KeyId};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn bounded_full_read_charges_the_declared_object_length() {
+        let store = MemoryBlobStore::new();
+        let object_id = BackendObjectId::new("format/root").expect("object id");
+        store
+            .put(
+                &object_id,
+                Bytes::from_static(b"body"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("store body");
+        let budgeted = V2MaintenanceBudgetedStore::new(
+            &store,
+            V2MaintenanceBudgets {
+                max_range_read_bytes: Some(4),
+                ..V2MaintenanceBudgets::default()
+            },
+        );
+
+        let body = read_bounded_full_at(&budgeted, &object_id, None, 8)
+            .await
+            .expect("bounded read");
+
+        assert_eq!(body, Bytes::from_static(b"body"));
+        let usage = budgeted.usage().expect("usage");
+        assert_eq!(usage.request_count, 1);
+        assert_eq!(usage.range_read_bytes, 4);
+    }
+
+    #[tokio::test]
+    async fn bounded_full_read_reserves_request_budget_before_opening_backend_read() {
+        let store = MemoryBlobStore::new();
+        let object_id = BackendObjectId::new("format/root").expect("object id");
+        store
+            .put(
+                &object_id,
+                Bytes::from_static(b"body"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("store body");
+        store.reset_operation_counts().expect("reset counts");
+        let budgeted = V2MaintenanceBudgetedStore::new(
+            &store,
+            V2MaintenanceBudgets {
+                max_request_count: Some(0),
+                ..V2MaintenanceBudgets::default()
+            },
+        );
+
+        let result = read_bounded_full_at(&budgeted, &object_id, None, 8).await;
+
+        assert!(result.is_err());
+        assert_eq!(store.operation_counts().expect("operation counts").get, 0);
+        assert!(budgeted.usage().expect("usage").exhausted);
+    }
 
     fn standalone_root(byte: u8) -> V2StandalonePayloadRoot {
         V2StandalonePayloadRoot {

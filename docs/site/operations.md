@@ -32,7 +32,7 @@ backend reachability, v2 anchor readability (including Kubernetes Lease access
 when configured), and keyring envelope readability without printing backend
 object names or configured Kubernetes object names.
 
-The gateway enforces finite data-plane limits from its own configuration:
+The gateway enforces finite data-plane and backend limits from its own configuration:
 maximum `PutObject` body size, buffered-body threshold, backend multipart part
 size, in-flight upload body admission budget, open S3 connections, concurrently
 executing S3 operations, and per-process S3 operation rate. Align ingress,
@@ -47,6 +47,12 @@ metadata; an unsigned HTTP chunked request without a length is rejected with
 S3 `411 MissingContentLength`. The lower repository layer still bounds an
 EOF-finalized stream by `RS3_MAX_PUT_OBJECT_BYTES` for internal callers and
 fault testing.
+Backend connect, first-byte, per-attempt, and total-operation timeouts are
+finite and configurable. A separate stalled-stream grace period covers S3 body
+transfer after response headers. Keep the attempt timeout no larger than the
+total timeout, monitor provider latency before tightening defaults, and leave
+enough total time for SDK retries. Timeouts fail the operation; they do not make
+an ambiguous multipart completion safe to retry as a new logical write.
 Operators MUST configure a backend lifecycle rule that aborts incomplete
 multipart uploads, because client disconnects and crashes can leave provider
 temporary parts that repository GC cannot see.
@@ -148,6 +154,11 @@ If the envelope is missing but the prefix already contains repository objects, o
 if the anchor already contains an accepted commit position, startup fails
 closed. This prevents accidental second-repository initialization on top of
 existing backup data.
+
+All format-root and keyring-envelope reads use fixed pre-allocation byte
+ceilings, and startup/import inventory uses bounded provider pages with fixed
+page and raw-member totals. Exceeding a ceiling is a recovery failure, not a
+signal to accept a partial inventory or choose a different backend object.
 
 Operational rules:
 

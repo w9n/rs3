@@ -15,7 +15,9 @@ pub(super) fn storage_error_result(error: &StorageError) -> &'static str {
         StorageError::LegalHoldUnsupported => "legal_hold_unsupported",
         StorageError::MultipartUnsupported => "multipart_unsupported",
         StorageError::PagedListingUnsupported => "paged_listing_unsupported",
+        StorageError::BoundedReadUnsupported => "bounded_read_unsupported",
         StorageError::InvalidListPage => "invalid_list_page",
+        StorageError::BoundedReadExceeded { .. } => "bounded_read_exceeded",
         StorageError::Provider(_) => "error",
     }
 }

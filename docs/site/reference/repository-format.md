@@ -415,6 +415,13 @@ versions, missing frames, malformed records, digest failures, AEAD failures,
 generation conflicts, catalog-count mismatches, resource-ceiling violations,
 or anchor drift all fail closed.
 
+Format-envelope and keyring-envelope objects are control-plane inputs with
+fixed encoded-size ceilings of 1 MiB and 16 MiB respectively. The provider's
+declared response length is checked before allocation, and an exact terminal
+EOF is required. Bootstrap and recovery inventories use provider-private pages
+under fixed total page and raw-member ceilings; a partial or over-budget
+inventory is never interpreted as empty.
+
 The runtime keeps one accepted compact state plus a hard-bounded
 4,096-mutation overlay. Unaccepted writes never mutate accepted state. An
 exclusive publication barrier freezes the overlay from commit snapshot through
@@ -613,7 +620,8 @@ ID.
 Initialization is permitted only on a verified fresh prefix. Detection of
 unsupported `v01` objects, an existing anchor, an existing format root, or
 ambiguous listing state fails closed. There is no automatic import, overwrite,
-or migration behavior.
+or migration behavior. The freshness inventory is paged and capped at 4,096
+pages and 2,000,000 raw provider members, including filtered version members.
 
 Wrapping-key rewrap preserves repository data keys and is not compromise
 recovery. Historical keys may be retired only after reachability and retention

@@ -143,8 +143,13 @@ gateway:
 # checking backend compatibility and memory budgets.
 hardening:
   maxPutObjectBytes: 5368709120
+  bufferedPutObjectBytes: 67108864
   backendMultipartPartBytes: 16777216
+  streamReadStallTimeoutSeconds: 30
   maxInFlightUploadBodyBytes: 536870912
+  maxInFlightDownloadBodyBytes: 536870912
+  maxConcurrentConnections: 1024
+  maxConcurrentRequests: 256
   requestRateLimitPerSecond: 1024
 
 # Public S3 bucket name presented to backup clients. This is not the backend
@@ -158,6 +163,14 @@ backend:
   bucket: backend
   prefix: repository
   region: us-east-1
+  # Total and per-attempt timeouts include retries until response headers are
+  # received. Stalled-stream protection bounds body transfer inactivity.
+  timeouts:
+    connectSeconds: 5
+    readSeconds: 30
+    operationAttemptSeconds: 120
+    operationSeconds: 300
+    stalledStreamGraceSeconds: 30
 
 # Credentials for the backend object store. Prefer existingSecret in production.
 backendCredentials:
@@ -186,7 +199,8 @@ repository:
   id: rs3-repository
   allowInit: false
   # Leave unset to use adaptive per-object segment sizing. Set a positive value
-  # only for fixed-size compatibility or performance sweeps.
+  # only for fixed-size compatibility or performance sweeps. Larger fixed
+  # segments increase the required in-flight upload admission budget.
   payloadSegmentSizeBytes: null
   retention:
     mode: ""

@@ -24,9 +24,12 @@ pub use fault::{
     FaultOperationKind, FaultRule,
 };
 pub use filesystem::FilesystemBlobStore;
-pub use read::{BlobRead, MAX_BLOB_READ_CHUNK_BYTES};
+pub use read::{BlobRead, MAX_BLOB_READ_CHUNK_BYTES, collect_bounded_blob_read};
 #[cfg(feature = "s3")]
-pub use s3::{S3BlobStore, S3BlobStoreConfig, S3ProviderMetrics, S3ProviderOperationMetrics};
+pub use s3::{
+    S3BlobStore, S3BlobStoreConfig, S3ClientTimeoutConfig, S3ProviderMetrics,
+    S3ProviderOperationMetrics,
+};
 
 /// Metadata returned by object-store reads and heads.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,9 +118,18 @@ pub enum StorageError {
     /// The provider cannot expose bounded incremental listings.
     #[error("bounded listing is unsupported")]
     PagedListingUnsupported,
+    /// The provider cannot expose a pre-allocation-bounded full-object read.
+    #[error("bounded full-object read is unsupported")]
+    BoundedReadUnsupported,
     /// A provider returned a listing page that violated the requested bound.
     #[error("provider returned an invalid listing page")]
     InvalidListPage,
+    /// An object body exceeded a caller-selected bounded-read ceiling.
+    #[error("object body exceeds bounded read limit of {max_bytes} bytes")]
+    BoundedReadExceeded {
+        /// Maximum accepted body length for this read.
+        max_bytes: u64,
+    },
 }
 
 /// Convenient result alias for storage operations.
@@ -239,6 +251,22 @@ pub trait BlobStore: Send + Sync {
         Ok(read::bytes_blob_read(body, exact_len))
     }
 
+    /// Opens a full-object read whose declared length is checked before body allocation.
+    ///
+    /// Providers must override this method to opt in. The default fails closed
+    /// rather than adapting through [`Self::get_range_at`], which may already
+    /// have buffered an attacker-controlled body before the caller can apply a
+    /// size ceiling.
+    async fn open_bounded_full_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        max_bytes: u64,
+    ) -> Result<Box<dyn BlobRead>> {
+        let _ = (object_id, version_id, max_bytes);
+        Err(StorageError::BoundedReadUnsupported)
+    }
+
     /// Reads object metadata without fetching the body.
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata>;
 
@@ -345,6 +373,26 @@ pub trait BlobStore: Send + Sync {
 
     /// Flushes implementation-local caches before process shutdown or handoff.
     async fn flush_caches(&self) -> Result<()>;
+}
+
+/// Reads and collects one complete object under an explicit allocation bound.
+///
+/// Providers with streaming response bodies enforce the bound before body
+/// collection. Exact EOF is still required, so a provider cannot truncate or
+/// append bytes relative to its declared response length.
+pub async fn read_bounded_full_at<S>(
+    store: &S,
+    object_id: &BackendObjectId,
+    version_id: Option<&BackendVersionId>,
+    max_bytes: u64,
+) -> Result<Bytes>
+where
+    S: BlobStore + ?Sized,
+{
+    let read = store
+        .open_bounded_full_at(object_id, version_id, max_bytes)
+        .await?;
+    collect_bounded_blob_read(read, max_bytes).await
 }
 
 /// Operation counters reported by instrumented blob-store implementations.
@@ -509,6 +557,25 @@ where
         let inner = self
             .inner
             .open_range_at(object_id, version_id, range)
+            .await?;
+        Ok(Box::new(CountingBlobRead {
+            inner,
+            counts: Arc::clone(&self.counts),
+        }))
+    }
+
+    async fn open_bounded_full_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        max_bytes: u64,
+    ) -> Result<Box<dyn BlobRead>> {
+        self.mutate_counts(|counts| {
+            counts.get = counts.get.saturating_add(1);
+        })?;
+        let inner = self
+            .inner
+            .open_bounded_full_at(object_id, version_id, max_bytes)
             .await?;
         Ok(Box::new(CountingBlobRead {
             inner,
@@ -1162,6 +1229,18 @@ impl BlobStore for MemoryBlobStore {
         }))
     }
 
+    async fn open_bounded_full_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        max_bytes: u64,
+    ) -> Result<Box<dyn BlobRead>> {
+        let read = self
+            .open_range_at(object_id, version_id, ByteRange::Full)
+            .await?;
+        read::enforce_full_read_bound(read, max_bytes)
+    }
+
     async fn head(&self, object_id: &BackendObjectId) -> Result<BlobMetadata> {
         let started = Instant::now();
         let object_kind = object_kind(object_id);
@@ -1724,7 +1803,8 @@ pub(crate) fn elapsed_us(elapsed: Duration) -> u64 {
 mod tests {
     use super::{
         BlobListMode, BlobMetadata, BlobStore, ByteRange, CountingBlobStore, MemoryBlobStore,
-        PutOptions, Result, StorageError, read_range, retention_blocks_delete,
+        PutOptions, Result, StorageError, read_bounded_full_at, read_range,
+        retention_blocks_delete,
     };
     #[cfg(feature = "test-util")]
     use super::{
@@ -2009,6 +2089,29 @@ mod tests {
             listing,
             Err(StorageError::PagedListingUnsupported)
         ));
+    }
+
+    #[tokio::test]
+    async fn bounded_read_fails_closed_without_provider_support_before_buffering() {
+        let inner = MemoryBlobStore::new();
+        let object_id = object_id("format/root");
+        inner
+            .put(
+                &object_id,
+                Bytes::from_static(b"oversized-control-object"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        inner
+            .reset_operation_counts()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let store = LegacyOnlyBlobStore(inner.clone());
+
+        let result = read_bounded_full_at(&store, &object_id, None, 4).await;
+
+        assert_eq!(result, Err(StorageError::BoundedReadUnsupported));
+        assert_eq!(counts(&inner).get, 0);
     }
 
     #[tokio::test]

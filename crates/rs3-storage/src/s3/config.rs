@@ -1,5 +1,33 @@
 use crate::{Result, StorageError};
 use rs3_types::BackendObjectId;
+use std::time::Duration;
+
+/// Finite AWS SDK timeout policy for one S3 client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct S3ClientTimeoutConfig {
+    /// Maximum time to establish a socket connection.
+    pub connect: Duration,
+    /// Maximum time from request initiation to the first response byte.
+    pub read: Duration,
+    /// Maximum duration of one request attempt.
+    pub operation_attempt: Duration,
+    /// Maximum total duration across all attempts and retries.
+    pub operation: Duration,
+    /// Maximum time an upload or download stream may stop making progress.
+    pub stalled_stream_grace: Duration,
+}
+
+impl Default for S3ClientTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(5),
+            read: Duration::from_secs(30),
+            operation_attempt: Duration::from_secs(120),
+            operation: Duration::from_secs(300),
+            stalled_stream_grace: Duration::from_secs(30),
+        }
+    }
+}
 
 /// Configuration for an S3-backed blob store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,6 +44,8 @@ pub struct S3BlobStoreConfig {
     pub allow_http: bool,
     /// Uses virtual-hosted bucket addressing instead of path-style addressing.
     pub virtual_hosted_style: bool,
+    /// Finite connect, attempt, total-operation, and stream-progress timeouts.
+    pub timeouts: S3ClientTimeoutConfig,
 }
 
 impl S3BlobStoreConfig {
@@ -39,6 +69,7 @@ impl S3BlobStoreConfig {
             region: None,
             allow_http: false,
             virtual_hosted_style: false,
+            timeouts: S3ClientTimeoutConfig::default(),
         })
     }
 
@@ -69,6 +100,12 @@ impl S3BlobStoreConfig {
     /// Enables or disables virtual-hosted bucket addressing.
     pub fn with_virtual_hosted_style(mut self, virtual_hosted_style: bool) -> Self {
         self.virtual_hosted_style = virtual_hosted_style;
+        self
+    }
+
+    /// Sets the finite timeout policy used by the AWS SDK client.
+    pub fn with_timeouts(mut self, timeouts: S3ClientTimeoutConfig) -> Self {
+        self.timeouts = timeouts;
         self
     }
 

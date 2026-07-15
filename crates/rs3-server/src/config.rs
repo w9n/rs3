@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 const DEFAULT_BIND: &str = "127.0.0.1:9080";
 const DEFAULT_ANCHOR_FIELD_MANAGER: &str = "rs3-server";
@@ -25,8 +26,14 @@ const DEFAULT_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 256;
 const DEFAULT_REQUEST_RATE_LIMIT_PER_SECOND: u64 = 1024;
+const DEFAULT_BACKEND_CONNECT_TIMEOUT_SECONDS: u64 = 5;
+const DEFAULT_BACKEND_READ_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECONDS: u64 = 120;
+const DEFAULT_BACKEND_OPERATION_TIMEOUT_SECONDS: u64 = 300;
+const DEFAULT_BACKEND_STALLED_STREAM_GRACE_SECONDS: u64 = 30;
 const DEFAULT_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 const MIN_BACKEND_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_BACKEND_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const REDACTED_SECRET_VALUE: &str = "<redacted>";
 const MIN_REPOSITORY_KEY_HEX_LEN: usize = SecretBytes::MIN_LEN * 2;
 const MIN_REPOSITORY_SALT_HEX_LEN: usize = MIN_REPOSITORY_SALT_LEN * 2;
@@ -34,6 +41,12 @@ const REPOSITORY_RETENTION_MODE_ENV: &str = "RS3_REPOSITORY_RETENTION_MODE";
 const REPOSITORY_RETENTION_DAYS_ENV: &str = "RS3_REPOSITORY_RETENTION_DAYS";
 const REPOSITORY_FORMAT_ENV: &str = "RS3_REPOSITORY_FORMAT";
 const ALLOW_REPOSITORY_INIT_ENV: &str = "RS3_ALLOW_REPOSITORY_INIT";
+const BACKEND_PREFIX_ENV: &str = "RS3_BACKEND_PREFIX";
+const ANCHOR_NAMESPACE_ENV: &str = "RS3_ANCHOR_NAMESPACE";
+const ANCHOR_NAME_ENV: &str = "RS3_ANCHOR_NAME";
+const ANCHOR_FIELD_MANAGER_ENV: &str = "RS3_ANCHOR_FIELD_MANAGER";
+const STATIC_ACCESS_KEY_ID_ENV: &str = "RS3_STATIC_ACCESS_KEY_ID";
+const STATIC_SECRET_ACCESS_KEY_ENV: &str = "RS3_STATIC_SECRET_ACCESS_KEY";
 const PROVIDER_CONFORMANCE_REPORT_FILE_ENV: &str = "RS3_PROVIDER_CONFORMANCE_REPORT_FILE";
 const PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV: &str = "RS3_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS";
 const PROVIDER_PRINCIPAL_FINGERPRINT_ENV: &str = "RS3_PROVIDER_PRINCIPAL_FINGERPRINT";
@@ -229,6 +242,37 @@ pub struct BackendConfig {
     pub bucket: String,
     /// Optional backend prefix for repository-owned objects.
     pub prefix: Option<String>,
+    /// Finite provider operation and stream-progress timeouts.
+    pub timeouts: BackendTimeoutConfig,
+}
+
+/// Provider-neutral timeout policy for backend operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackendTimeoutConfig {
+    /// Maximum time to establish a backend socket connection.
+    pub connect: Duration,
+    /// Maximum time from request initiation to the first response byte.
+    pub read: Duration,
+    /// Maximum duration of one backend request attempt.
+    pub operation_attempt: Duration,
+    /// Maximum total duration across all attempts and retries.
+    pub operation: Duration,
+    /// Maximum time an upload or download stream may stop making progress.
+    pub stalled_stream_grace: Duration,
+}
+
+impl Default for BackendTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(DEFAULT_BACKEND_CONNECT_TIMEOUT_SECONDS),
+            read: Duration::from_secs(DEFAULT_BACKEND_READ_TIMEOUT_SECONDS),
+            operation_attempt: Duration::from_secs(
+                DEFAULT_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECONDS,
+            ),
+            operation: Duration::from_secs(DEFAULT_BACKEND_OPERATION_TIMEOUT_SECONDS),
+            stalled_stream_grace: Duration::from_secs(DEFAULT_BACKEND_STALLED_STREAM_GRACE_SECONDS),
+        }
+    }
 }
 
 /// Metrics exporter settings.
@@ -555,6 +599,33 @@ impl RuntimeConfig {
         Self::from_source(&ProcessEnv)
     }
 
+    /// Validates invariants required by every runtime construction path.
+    ///
+    /// This must be called for programmatically assembled configurations as
+    /// well as environment-derived configurations. Public server constructors
+    /// enforce it before allocating runtime resources.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let mut errors = Vec::new();
+        validate_runtime_backend(&mut errors, &self.backend);
+        validate_runtime_anchor(&mut errors, &self.anchor);
+        validate_runtime_hardening(&mut errors, &self.hardening);
+        validate_runtime_batching(&mut errors, &self.batching);
+        validate_runtime_repository(&mut errors, &self.repository);
+        validate_runtime_maintenance(&mut errors, self.mode, &self.maintenance);
+        validate_runtime_provider_conformance(&mut errors, &self.provider_conformance);
+        validate_runtime_writer_guard(&mut errors, &self.anchor, self.writer_guard);
+        validate_runtime_repository_keys(&mut errors, &self.repository_keys);
+        validate_runtime_recovery(&mut errors, &self.recovery);
+        validate_runtime_static_credentials(&mut errors, self.static_credentials.as_ref());
+        validate_upload_memory_budget(&mut errors, &self.hardening, &self.repository);
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(config_error_list(errors))
+        }
+    }
+
     fn from_source(source: &impl ConfigSource) -> Result<Self, ConfigError> {
         let mut errors = Vec::new();
         let mode = collect_config_error(&mut errors, parse_gateway_mode(source));
@@ -603,7 +674,7 @@ impl RuntimeConfig {
             return Err(config_error_list(errors));
         }
 
-        Ok(Self {
+        let config = Self {
             mode: require_collected_config(mode)?,
             bind: require_collected_config(bind)?,
             metrics: require_collected_config(metrics)?,
@@ -619,7 +690,9 @@ impl RuntimeConfig {
             recovery: require_collected_config(recovery)?,
             repository_keys: require_collected_config(repository_keys)?,
             static_credentials: require_collected_config(static_credentials)?,
-        })
+        };
+        config.validate()?;
+        Ok(config)
     }
 }
 
@@ -711,6 +784,7 @@ fn parse_backend_config(source: &impl ConfigSource) -> Result<BackendConfig, Con
     let endpoint =
         collect_config_error(&mut errors, required_value(source, "RS3_BACKEND_ENDPOINT"));
     let bucket = collect_config_error(&mut errors, required_value(source, "RS3_BACKEND_BUCKET"));
+    let timeouts = collect_config_error(&mut errors, parse_backend_timeout_config(source));
 
     if !errors.is_empty() {
         return Err(config_error_list(errors));
@@ -719,7 +793,96 @@ fn parse_backend_config(source: &impl ConfigSource) -> Result<BackendConfig, Con
     Ok(BackendConfig {
         endpoint: require_collected_config(endpoint)?,
         bucket: require_collected_config(bucket)?,
-        prefix: optional_value(source, "RS3_BACKEND_PREFIX"),
+        prefix: optional_value(source, BACKEND_PREFIX_ENV),
+        timeouts: require_collected_config(timeouts)?,
+    })
+}
+
+fn parse_backend_timeout_config(
+    source: &impl ConfigSource,
+) -> Result<BackendTimeoutConfig, ConfigError> {
+    let mut errors = Vec::new();
+    let connect = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            "RS3_BACKEND_CONNECT_TIMEOUT_SECS",
+            source.value("RS3_BACKEND_CONNECT_TIMEOUT_SECS"),
+            DEFAULT_BACKEND_CONNECT_TIMEOUT_SECONDS,
+        ),
+    );
+    let read = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            "RS3_BACKEND_READ_TIMEOUT_SECS",
+            source.value("RS3_BACKEND_READ_TIMEOUT_SECS"),
+            DEFAULT_BACKEND_READ_TIMEOUT_SECONDS,
+        ),
+    );
+    let operation_attempt = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            "RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS",
+            source.value("RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS"),
+            DEFAULT_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECONDS,
+        ),
+    );
+    let operation = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            "RS3_BACKEND_OPERATION_TIMEOUT_SECS",
+            source.value("RS3_BACKEND_OPERATION_TIMEOUT_SECS"),
+            DEFAULT_BACKEND_OPERATION_TIMEOUT_SECONDS,
+        ),
+    );
+    let stalled_stream_grace = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            "RS3_BACKEND_STALLED_STREAM_GRACE_SECS",
+            source.value("RS3_BACKEND_STALLED_STREAM_GRACE_SECS"),
+            DEFAULT_BACKEND_STALLED_STREAM_GRACE_SECONDS,
+        ),
+    );
+
+    if let (Some(connect), Some(operation_attempt)) = (connect, operation_attempt)
+        && connect > operation_attempt
+    {
+        errors.push(ConfigError::Invalid {
+            key: "RS3_BACKEND_CONNECT_TIMEOUT_SECS",
+            value: connect.to_string(),
+            reason: "must be less than or equal to RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS"
+                .to_owned(),
+        });
+    }
+    if let (Some(read), Some(operation_attempt)) = (read, operation_attempt)
+        && read > operation_attempt
+    {
+        errors.push(ConfigError::Invalid {
+            key: "RS3_BACKEND_READ_TIMEOUT_SECS",
+            value: read.to_string(),
+            reason: "must be less than or equal to RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS"
+                .to_owned(),
+        });
+    }
+    if let (Some(operation_attempt), Some(operation)) = (operation_attempt, operation)
+        && operation_attempt > operation
+    {
+        errors.push(ConfigError::Invalid {
+            key: "RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS",
+            value: operation_attempt.to_string(),
+            reason: "must be less than or equal to RS3_BACKEND_OPERATION_TIMEOUT_SECS".to_owned(),
+        });
+    }
+
+    if !errors.is_empty() {
+        return Err(config_error_list(errors));
+    }
+
+    Ok(BackendTimeoutConfig {
+        connect: Duration::from_secs(require_collected_config(connect)?),
+        read: Duration::from_secs(require_collected_config(read)?),
+        operation_attempt: Duration::from_secs(require_collected_config(operation_attempt)?),
+        operation: Duration::from_secs(require_collected_config(operation)?),
+        stalled_stream_grace: Duration::from_secs(require_collected_config(stalled_stream_grace)?),
     })
 }
 
@@ -755,6 +918,14 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
             DEFAULT_MAX_PUT_OBJECT_BYTES,
         ),
     );
+    let buffered_put_object_bytes = collect_config_error(
+        &mut errors,
+        parse_positive_u64(
+            "RS3_BUFFERED_PUT_OBJECT_BYTES",
+            source.value("RS3_BUFFERED_PUT_OBJECT_BYTES"),
+            DEFAULT_BUFFERED_PUT_OBJECT_BYTES,
+        ),
+    );
     let backend_multipart_part_bytes = collect_config_error(
         &mut errors,
         parse_positive_u64(
@@ -770,6 +941,15 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
             key: "RS3_BACKEND_MULTIPART_PART_BYTES",
             value: backend_multipart_part_bytes.to_string(),
             reason: "must be at least 5 MiB (5242880 bytes)".to_owned(),
+        });
+    }
+    if let Some(backend_multipart_part_bytes) = backend_multipart_part_bytes
+        && backend_multipart_part_bytes > MAX_BACKEND_MULTIPART_PART_BYTES
+    {
+        errors.push(ConfigError::Invalid {
+            key: "RS3_BACKEND_MULTIPART_PART_BYTES",
+            value: backend_multipart_part_bytes.to_string(),
+            reason: "must be at most 5 GiB (5368709120 bytes)".to_owned(),
         });
     }
     if let (Some(max_put_object_bytes), Some(backend_multipart_part_bytes)) =
@@ -818,24 +998,566 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
             DEFAULT_REQUEST_RATE_LIMIT_PER_SECOND,
         ),
     );
+    let max_concurrent_connections = collect_config_error(
+        &mut errors,
+        parse_positive_usize(
+            "RS3_MAX_CONCURRENT_CONNECTIONS",
+            source.value("RS3_MAX_CONCURRENT_CONNECTIONS"),
+            DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+        ),
+    );
+    let max_concurrent_requests = collect_config_error(
+        &mut errors,
+        parse_positive_usize(
+            "RS3_MAX_CONCURRENT_REQUESTS",
+            source.value("RS3_MAX_CONCURRENT_REQUESTS"),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
+        ),
+    );
 
+    for (key, value) in [
+        ("RS3_MAX_CONCURRENT_CONNECTIONS", max_concurrent_connections),
+        ("RS3_MAX_CONCURRENT_REQUESTS", max_concurrent_requests),
+    ] {
+        if let Some(value) = value
+            && value > Semaphore::MAX_PERMITS
+        {
+            errors.push(ConfigError::Invalid {
+                key,
+                value: value.to_string(),
+                reason: format!("must be less than or equal to {}", Semaphore::MAX_PERMITS),
+            });
+        }
+    }
+
+    if let (Some(buffered), Some(max_put)) = (buffered_put_object_bytes, max_put_object_bytes)
+        && buffered > max_put
+    {
+        errors.push(ConfigError::Invalid {
+            key: "RS3_BUFFERED_PUT_OBJECT_BYTES",
+            value: buffered.to_string(),
+            reason: "must be less than or equal to RS3_MAX_PUT_OBJECT_BYTES".to_owned(),
+        });
+    }
     if !errors.is_empty() {
         return Err(config_error_list(errors));
     }
 
     Ok(HardeningConfig {
         max_put_object_bytes: require_collected_config(max_put_object_bytes)?,
-        buffered_put_object_bytes: DEFAULT_BUFFERED_PUT_OBJECT_BYTES,
+        buffered_put_object_bytes: require_collected_config(buffered_put_object_bytes)?,
         backend_multipart_part_bytes: require_collected_config(backend_multipart_part_bytes)?,
         stream_read_stall_timeout: require_collected_config(stream_read_stall_timeout)?,
         max_in_flight_upload_body_bytes: require_collected_config(max_in_flight_upload_body_bytes)?,
         max_in_flight_download_body_bytes: require_collected_config(
             max_in_flight_download_body_bytes,
         )?,
-        max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
-        max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+        max_concurrent_connections: require_collected_config(max_concurrent_connections)?,
+        max_concurrent_requests: require_collected_config(max_concurrent_requests)?,
         request_rate_limit_per_second: require_collected_config(request_rate_limit_per_second)?,
     })
+}
+
+fn push_runtime_invalid(
+    errors: &mut Vec<ConfigError>,
+    key: &'static str,
+    value: impl ToString,
+    reason: impl Into<String>,
+) {
+    errors.push(ConfigError::Invalid {
+        key,
+        value: value.to_string(),
+        reason: reason.into(),
+    });
+}
+
+fn validate_runtime_backend(errors: &mut Vec<ConfigError>, backend: &BackendConfig) {
+    if backend.endpoint.trim().is_empty() {
+        push_runtime_invalid(
+            errors,
+            "RS3_BACKEND_ENDPOINT",
+            REDACTED_SECRET_VALUE,
+            "must not be blank",
+        );
+    }
+    if backend.bucket.trim().is_empty() {
+        push_runtime_invalid(
+            errors,
+            "RS3_BACKEND_BUCKET",
+            REDACTED_SECRET_VALUE,
+            "must not be blank",
+        );
+    }
+    if backend
+        .prefix
+        .as_deref()
+        .is_some_and(|prefix| prefix.trim().is_empty())
+    {
+        push_runtime_invalid(
+            errors,
+            BACKEND_PREFIX_ENV,
+            REDACTED_SECRET_VALUE,
+            "must be omitted or nonblank",
+        );
+    }
+
+    let timeouts = backend.timeouts;
+    for (key, value) in [
+        ("RS3_BACKEND_CONNECT_TIMEOUT_SECS", timeouts.connect),
+        ("RS3_BACKEND_READ_TIMEOUT_SECS", timeouts.read),
+        (
+            "RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS",
+            timeouts.operation_attempt,
+        ),
+        ("RS3_BACKEND_OPERATION_TIMEOUT_SECS", timeouts.operation),
+        (
+            "RS3_BACKEND_STALLED_STREAM_GRACE_SECS",
+            timeouts.stalled_stream_grace,
+        ),
+    ] {
+        if value.is_zero() {
+            push_runtime_invalid(
+                errors,
+                key,
+                format!("{value:?}"),
+                "must be greater than zero",
+            );
+        }
+    }
+    if timeouts.connect > timeouts.operation_attempt {
+        push_runtime_invalid(
+            errors,
+            "RS3_BACKEND_CONNECT_TIMEOUT_SECS",
+            format!("{:?}", timeouts.connect),
+            "must be less than or equal to RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS",
+        );
+    }
+    if timeouts.read > timeouts.operation_attempt {
+        push_runtime_invalid(
+            errors,
+            "RS3_BACKEND_READ_TIMEOUT_SECS",
+            format!("{:?}", timeouts.read),
+            "must be less than or equal to RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS",
+        );
+    }
+    if timeouts.operation_attempt > timeouts.operation {
+        push_runtime_invalid(
+            errors,
+            "RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS",
+            format!("{:?}", timeouts.operation_attempt),
+            "must be less than or equal to RS3_BACKEND_OPERATION_TIMEOUT_SECS",
+        );
+    }
+}
+
+fn validate_runtime_anchor(errors: &mut Vec<ConfigError>, anchor: &AnchorConfig) {
+    let AnchorConfig::KubernetesLease {
+        namespace,
+        name,
+        field_manager,
+    } = anchor
+    else {
+        return;
+    };
+
+    for (key, value) in [
+        (ANCHOR_NAMESPACE_ENV, namespace),
+        (ANCHOR_NAME_ENV, name),
+        (ANCHOR_FIELD_MANAGER_ENV, field_manager),
+    ] {
+        if value.trim().is_empty() {
+            push_runtime_invalid(errors, key, REDACTED_SECRET_VALUE, "must not be blank");
+        }
+    }
+}
+
+fn validate_runtime_hardening(errors: &mut Vec<ConfigError>, hardening: &HardeningConfig) {
+    for (key, value) in [
+        ("RS3_MAX_PUT_OBJECT_BYTES", hardening.max_put_object_bytes),
+        (
+            "RS3_BUFFERED_PUT_OBJECT_BYTES",
+            hardening.buffered_put_object_bytes,
+        ),
+        (
+            "RS3_BACKEND_MULTIPART_PART_BYTES",
+            hardening.backend_multipart_part_bytes,
+        ),
+        (
+            "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES",
+            hardening.max_in_flight_upload_body_bytes,
+        ),
+        (
+            "RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES",
+            hardening.max_in_flight_download_body_bytes,
+        ),
+        (
+            "RS3_REQUEST_RATE_LIMIT_PER_SECOND",
+            hardening.request_rate_limit_per_second,
+        ),
+    ] {
+        if value == 0 {
+            push_runtime_invalid(errors, key, value, "must be greater than zero");
+        }
+    }
+    if hardening.stream_read_stall_timeout.is_zero() {
+        push_runtime_invalid(
+            errors,
+            "RS3_STREAM_READ_STALL_TIMEOUT_SECS",
+            format!("{:?}", hardening.stream_read_stall_timeout),
+            "must be greater than zero",
+        );
+    }
+    if hardening.backend_multipart_part_bytes < MIN_BACKEND_MULTIPART_PART_BYTES {
+        push_runtime_invalid(
+            errors,
+            "RS3_BACKEND_MULTIPART_PART_BYTES",
+            hardening.backend_multipart_part_bytes,
+            "must be at least 5 MiB (5242880 bytes)",
+        );
+    }
+    if hardening.backend_multipart_part_bytes > MAX_BACKEND_MULTIPART_PART_BYTES {
+        push_runtime_invalid(
+            errors,
+            "RS3_BACKEND_MULTIPART_PART_BYTES",
+            hardening.backend_multipart_part_bytes,
+            "must be at most 5 GiB (5368709120 bytes)",
+        );
+    }
+    if hardening.max_put_object_bytes
+        > hardening
+            .backend_multipart_part_bytes
+            .saturating_mul(10_000)
+    {
+        push_runtime_invalid(
+            errors,
+            "RS3_MAX_PUT_OBJECT_BYTES",
+            hardening.max_put_object_bytes,
+            "must be less than or equal to 10000 * RS3_BACKEND_MULTIPART_PART_BYTES",
+        );
+    }
+    if hardening.buffered_put_object_bytes > hardening.max_put_object_bytes {
+        push_runtime_invalid(
+            errors,
+            "RS3_BUFFERED_PUT_OBJECT_BYTES",
+            hardening.buffered_put_object_bytes,
+            "must be less than or equal to RS3_MAX_PUT_OBJECT_BYTES",
+        );
+    }
+    for (key, value) in [
+        (
+            "RS3_MAX_CONCURRENT_CONNECTIONS",
+            hardening.max_concurrent_connections,
+        ),
+        (
+            "RS3_MAX_CONCURRENT_REQUESTS",
+            hardening.max_concurrent_requests,
+        ),
+    ] {
+        if value == 0 {
+            push_runtime_invalid(errors, key, value, "must be greater than zero");
+        } else if value > Semaphore::MAX_PERMITS {
+            push_runtime_invalid(
+                errors,
+                key,
+                value,
+                format!("must be less than or equal to {}", Semaphore::MAX_PERMITS),
+            );
+        }
+    }
+}
+
+fn validate_runtime_batching(errors: &mut Vec<ConfigError>, batching: &BatchConfig) {
+    for (key, value) in [
+        ("RS3_COMMIT_MAX_BATCH_ITEMS", batching.max_items),
+        ("RS3_COMMIT_MAX_PENDING_ITEMS", batching.max_pending_items),
+    ] {
+        if value == 0 {
+            push_runtime_invalid(errors, key, value, "must be greater than zero");
+        }
+    }
+}
+
+fn validate_runtime_repository(errors: &mut Vec<ConfigError>, repository: &RepositoryConfig) {
+    if repository.payload_segment_size == 0
+        || repository.payload_segment_size > rs3_repository::MAX_PAYLOAD_SEGMENT_SIZE
+    {
+        push_runtime_invalid(
+            errors,
+            "RS3_PAYLOAD_SEGMENT_SIZE_BYTES",
+            repository.payload_segment_size,
+            format!(
+                "must be between 1 and {} bytes",
+                rs3_repository::MAX_PAYLOAD_SEGMENT_SIZE
+            ),
+        );
+    }
+    if let Some(retention) = repository.retention {
+        if retention.mode == RetentionMode::None {
+            push_runtime_invalid(
+                errors,
+                REPOSITORY_RETENTION_MODE_ENV,
+                "none",
+                "expected governance or compliance when retention is configured",
+            );
+        }
+        if retention.retain_days == 0 {
+            push_runtime_invalid(
+                errors,
+                REPOSITORY_RETENTION_DAYS_ENV,
+                retention.retain_days,
+                "must be greater than zero when retention is configured",
+            );
+        }
+    }
+}
+
+fn validate_runtime_maintenance(
+    errors: &mut Vec<ConfigError>,
+    mode: GatewayMode,
+    maintenance: &MaintenanceConfig,
+) {
+    if mode == GatewayMode::RestoreReadOnly && maintenance.mode != MaintenanceMode::Off {
+        push_runtime_invalid(
+            errors,
+            MAINTENANCE_MODE_ENV,
+            maintenance.mode.as_str(),
+            "restore-readonly gateways require maintenance to be off",
+        );
+    }
+    for (key, value) in [
+        (
+            MAINTENANCE_RENEWAL_HORIZON_SECONDS_ENV,
+            maintenance.renewal_horizon,
+        ),
+        (
+            MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS_ENV,
+            maintenance.orphan_pressure_max_age,
+        ),
+        (
+            MAINTENANCE_MAX_INTERVAL_SECONDS_ENV,
+            maintenance.max_interval,
+        ),
+        (
+            MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV,
+            maintenance.min_cooldown,
+        ),
+    ] {
+        if value.is_zero() {
+            push_runtime_invalid(
+                errors,
+                key,
+                format!("{value:?}"),
+                "must be greater than zero",
+            );
+        }
+    }
+    for (key, value) in [
+        (
+            MAINTENANCE_ORPHAN_PRESSURE_BYTES_ENV,
+            maintenance.orphan_pressure_bytes,
+        ),
+        (
+            MAINTENANCE_ORPHAN_PRESSURE_COUNT_ENV,
+            maintenance.orphan_pressure_count,
+        ),
+        (
+            MAINTENANCE_MAX_INVENTORY_PAGES_ENV,
+            maintenance.max_inventory_pages,
+        ),
+        (
+            MAINTENANCE_MAX_INVENTORY_ITEMS_ENV,
+            maintenance.max_inventory_items,
+        ),
+    ] {
+        if value == 0 {
+            push_runtime_invalid(errors, key, value, "must be greater than zero");
+        }
+    }
+    if maintenance.min_cooldown > maintenance.max_interval {
+        push_runtime_invalid(
+            errors,
+            MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV,
+            format!("{:?}", maintenance.min_cooldown),
+            format!("must be less than or equal to {MAINTENANCE_MAX_INTERVAL_SECONDS_ENV}"),
+        );
+    }
+    if maintenance
+        .pacing_delay
+        .is_some_and(|delay| delay.is_zero())
+    {
+        push_runtime_invalid(
+            errors,
+            MAINTENANCE_PACING_DELAY_MS_ENV,
+            "0ns",
+            "must be greater than zero when configured",
+        );
+    }
+}
+
+fn validate_runtime_provider_conformance(
+    errors: &mut Vec<ConfigError>,
+    provider: &ProviderConformanceConfig,
+) {
+    if provider
+        .report_file
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        push_runtime_invalid(
+            errors,
+            PROVIDER_CONFORMANCE_REPORT_FILE_ENV,
+            REDACTED_SECRET_VALUE,
+            "must be omitted or nonblank",
+        );
+    }
+    if provider.max_age.is_zero() {
+        push_runtime_invalid(
+            errors,
+            PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV,
+            format!("{:?}", provider.max_age),
+            "must be greater than zero",
+        );
+    }
+    if let Some(fingerprint) = provider.principal_fingerprint.as_deref()
+        && (fingerprint.len() != 64
+            || !fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        push_runtime_invalid(
+            errors,
+            PROVIDER_PRINCIPAL_FINGERPRINT_ENV,
+            REDACTED_SECRET_VALUE,
+            "expected a lowercase 64-character SHA-256 fingerprint",
+        );
+    }
+}
+
+fn validate_runtime_static_credentials(
+    errors: &mut Vec<ConfigError>,
+    credentials: Option<&StaticCredentials>,
+) {
+    let Some(credentials) = credentials else {
+        return;
+    };
+    if credentials.access_key_id.trim().is_empty() {
+        push_runtime_invalid(
+            errors,
+            STATIC_ACCESS_KEY_ID_ENV,
+            REDACTED_SECRET_VALUE,
+            "must not be blank",
+        );
+    }
+    if credentials
+        .secret_access_key
+        .expose_secret()
+        .trim()
+        .is_empty()
+    {
+        push_runtime_invalid(
+            errors,
+            STATIC_SECRET_ACCESS_KEY_ENV,
+            REDACTED_SECRET_VALUE,
+            "must not be blank",
+        );
+    }
+}
+
+fn validate_runtime_writer_guard(
+    errors: &mut Vec<ConfigError>,
+    anchor: &AnchorConfig,
+    writer_guard: WriterGuardConfig,
+) {
+    if writer_guard == WriterGuardConfig::Required
+        && !matches!(anchor, AnchorConfig::KubernetesLease { .. })
+    {
+        push_runtime_invalid(
+            errors,
+            WRITER_GUARD_ENV,
+            writer_guard.as_str(),
+            "required needs RS3_ANCHOR_MODE=kubernetes-lease",
+        );
+    }
+}
+
+fn validate_runtime_repository_keys(errors: &mut Vec<ConfigError>, keys: &RepositoryKeysConfig) {
+    if let Err(error) =
+        validate_repository_salt_hex(REPOSITORY_SALT_HEX_ENV, &keys.repository_salt_hex)
+    {
+        errors.push(error);
+    }
+    if let Err(error) = validate_repository_key_hex(
+        KEYRING_WRAPPING_KEY_HEX_ENV,
+        keys.wrapping_key_hex.expose_secret(),
+    ) {
+        errors.push(error);
+    }
+    if keys.wrapping_key_id.trim().is_empty() {
+        push_runtime_invalid(
+            errors,
+            KEYRING_WRAPPING_KEY_ID_ENV,
+            REDACTED_SECRET_VALUE,
+            "must not be blank",
+        );
+    }
+}
+
+fn validate_runtime_recovery(errors: &mut Vec<ConfigError>, recovery: &RecoveryConfig) {
+    if let Some(public_key) = recovery.public_key.as_deref()
+        && let Err(error) = validate_recovery_public_key(public_key)
+    {
+        push_runtime_invalid(
+            errors,
+            RECOVERY_PUBLIC_KEY_ENV,
+            public_key,
+            error.to_string(),
+        );
+    }
+}
+
+fn validate_upload_memory_budget(
+    errors: &mut Vec<ConfigError>,
+    hardening: &HardeningConfig,
+    repository: &RepositoryConfig,
+) {
+    let required = required_upload_memory_budget(hardening, repository);
+    if hardening.max_in_flight_upload_body_bytes < required {
+        errors.push(ConfigError::Invalid {
+            key: "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES",
+            value: hardening.max_in_flight_upload_body_bytes.to_string(),
+            reason: format!(
+                "must be at least {required} bytes for the configured buffered, multipart, and payload-segment PutObject paths"
+            ),
+        });
+    }
+}
+
+fn required_upload_memory_budget(
+    hardening: &HardeningConfig,
+    repository: &RepositoryConfig,
+) -> u64 {
+    if hardening.max_put_object_bytes <= hardening.buffered_put_object_bytes {
+        return hardening.buffered_put_object_bytes;
+    }
+    hardening.buffered_put_object_bytes.saturating_add(
+        configured_streaming_upload_working_set_bytes(hardening, repository),
+    )
+}
+
+pub(crate) fn configured_streaming_upload_working_set_bytes(
+    hardening: &HardeningConfig,
+    repository: &RepositoryConfig,
+) -> u64 {
+    let max_plaintext_len = usize::try_from(hardening.max_put_object_bytes).unwrap_or(usize::MAX);
+    let payload_segment_bytes = rs3_repository::effective_payload_segment_size(
+        max_plaintext_len,
+        repository.payload_segment_size,
+        repository.adaptive_payload_segment_size,
+    );
+    rs3_repository::v2::v2_streaming_upload_working_set_bytes(
+        hardening.backend_multipart_part_bytes,
+        u64::try_from(payload_segment_bytes).unwrap_or(u64::MAX),
+    )
 }
 
 fn parse_anchor_config(source: &impl ConfigSource) -> Result<AnchorConfig, ConfigError> {
@@ -860,15 +1582,15 @@ fn parse_anchor_config(source: &impl ConfigSource) -> Result<AnchorConfig, Confi
         "kubernetes-lease" => {
             let mut errors = Vec::new();
             let namespace =
-                collect_config_error(&mut errors, required_value(source, "RS3_ANCHOR_NAMESPACE"));
-            let name = collect_config_error(&mut errors, required_value(source, "RS3_ANCHOR_NAME"));
+                collect_config_error(&mut errors, required_value(source, ANCHOR_NAMESPACE_ENV));
+            let name = collect_config_error(&mut errors, required_value(source, ANCHOR_NAME_ENV));
             if !errors.is_empty() {
                 return Err(config_error_list(errors));
             }
             Ok(AnchorConfig::KubernetesLease {
                 namespace: require_collected_config(namespace)?,
                 name: require_collected_config(name)?,
-                field_manager: optional_value(source, "RS3_ANCHOR_FIELD_MANAGER")
+                field_manager: optional_value(source, ANCHOR_FIELD_MANAGER_ENV)
                     .unwrap_or_else(|| DEFAULT_ANCHOR_FIELD_MANAGER.to_owned()),
             })
         }
@@ -1411,8 +2133,8 @@ fn invalid_repository_key(key: &'static str, reason: &str) -> ConfigError {
 fn parse_static_credentials(
     source: &impl ConfigSource,
 ) -> Result<Option<StaticCredentials>, ConfigError> {
-    let access_key_id = optional_value(source, "RS3_STATIC_ACCESS_KEY_ID");
-    let secret_access_key = optional_value(source, "RS3_STATIC_SECRET_ACCESS_KEY");
+    let access_key_id = optional_value(source, STATIC_ACCESS_KEY_ID_ENV);
+    let secret_access_key = optional_value(source, STATIC_SECRET_ACCESS_KEY_ENV);
 
     match (access_key_id, secret_access_key) {
         (Some(access_key_id), Some(secret_access_key)) => Ok(Some(StaticCredentials {
@@ -1421,8 +2143,8 @@ fn parse_static_credentials(
         })),
         (None, None) => Ok(None),
         _ => Err(ConfigError::PartialStaticCredentials {
-            access_key_id: "RS3_STATIC_ACCESS_KEY_ID",
-            secret_access_key: "RS3_STATIC_SECRET_ACCESS_KEY",
+            access_key_id: STATIC_ACCESS_KEY_ID_ENV,
+            secret_access_key: STATIC_SECRET_ACCESS_KEY_ENV,
         }),
     }
 }
@@ -1587,11 +2309,12 @@ mod tests {
         AnchorConfig, BatchConfig, ConfigError, ConfigSource, GatewayMode, HardeningConfig,
         MaintenanceConfig, MetricsConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
         RepositoryKeyContextConfig, RepositoryKeysConfig, RepositoryToolConfig, RuntimeConfig,
-        V2ProviderCheckConfig, WriterGuardConfig,
+        StaticCredentials, V2ProviderCheckConfig, WriterGuardConfig,
     };
     use rs3_types::{RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     const WRAPPING_KEY_HEX: &str =
@@ -1599,7 +2322,7 @@ mod tests {
     const REPOSITORY_SALT_HEX: &str =
         "2222222222222222222222222222222222222222222222222222222222222222";
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct TestSource(BTreeMap<&'static str, String>);
 
     impl TestSource {
@@ -1880,10 +2603,13 @@ mod tests {
     fn parses_hardening_limits() {
         let source = minimal_source()
             .with("RS3_MAX_PUT_OBJECT_BYTES", "8388608")
+            .with("RS3_BUFFERED_PUT_OBJECT_BYTES", "1048576")
             .with("RS3_BACKEND_MULTIPART_PART_BYTES", "5242880")
             .with("RS3_STREAM_READ_STALL_TIMEOUT_SECS", "2")
-            .with("RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES", "2097152")
+            .with("RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES", "20971520")
             .with("RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES", "3145728")
+            .with("RS3_MAX_CONCURRENT_CONNECTIONS", "64")
+            .with("RS3_MAX_CONCURRENT_REQUESTS", "32")
             .with("RS3_REQUEST_RATE_LIMIT_PER_SECOND", "128");
 
         let config = RuntimeConfig::from_source(&source);
@@ -1892,13 +2618,13 @@ mod tests {
             config.map(|config| config.hardening),
             Ok(HardeningConfig {
                 max_put_object_bytes: 8_388_608,
-                buffered_put_object_bytes: super::DEFAULT_BUFFERED_PUT_OBJECT_BYTES,
+                buffered_put_object_bytes: 1_048_576,
                 backend_multipart_part_bytes: 5_242_880,
                 stream_read_stall_timeout: Duration::from_secs(2),
-                max_in_flight_upload_body_bytes: 2_097_152,
+                max_in_flight_upload_body_bytes: 20_971_520,
                 max_in_flight_download_body_bytes: 3_145_728,
-                max_concurrent_connections: super::DEFAULT_MAX_CONCURRENT_CONNECTIONS,
-                max_concurrent_requests: super::DEFAULT_MAX_CONCURRENT_REQUESTS,
+                max_concurrent_connections: 64,
+                max_concurrent_requests: 32,
                 request_rate_limit_per_second: 128,
             })
         );
@@ -1908,10 +2634,13 @@ mod tests {
     fn rejects_zero_hardening_limits() {
         for key in [
             "RS3_MAX_PUT_OBJECT_BYTES",
+            "RS3_BUFFERED_PUT_OBJECT_BYTES",
             "RS3_BACKEND_MULTIPART_PART_BYTES",
             "RS3_STREAM_READ_STALL_TIMEOUT_SECS",
             "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES",
             "RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES",
+            "RS3_MAX_CONCURRENT_CONNECTIONS",
+            "RS3_MAX_CONCURRENT_REQUESTS",
             "RS3_REQUEST_RATE_LIMIT_PER_SECOND",
         ] {
             let source = minimal_source().with(key, "0");
@@ -1933,6 +2662,13 @@ mod tests {
             matches!(part, Err(ConfigError::Invalid { key, .. }) if key == "RS3_BACKEND_MULTIPART_PART_BYTES")
         );
 
+        let oversized_part = RuntimeConfig::from_source(
+            &minimal_source().with("RS3_BACKEND_MULTIPART_PART_BYTES", "5368709121"),
+        );
+        assert!(
+            matches!(oversized_part, Err(ConfigError::Invalid { key, .. }) if key == "RS3_BACKEND_MULTIPART_PART_BYTES")
+        );
+
         let max_put = RuntimeConfig::from_source(
             &minimal_source()
                 .with("RS3_BACKEND_MULTIPART_PART_BYTES", "5242880")
@@ -1941,6 +2677,164 @@ mod tests {
         assert!(
             matches!(max_put, Err(ConfigError::Invalid { key, .. }) if key == "RS3_MAX_PUT_OBJECT_BYTES")
         );
+
+        let buffered = RuntimeConfig::from_source(
+            &minimal_source()
+                .with("RS3_MAX_PUT_OBJECT_BYTES", "8388608")
+                .with("RS3_BUFFERED_PUT_OBJECT_BYTES", "8388609"),
+        );
+        assert!(
+            matches!(buffered, Err(ConfigError::Invalid { key, .. }) if key == "RS3_BUFFERED_PUT_OBJECT_BYTES")
+        );
+
+        let upload_budget = RuntimeConfig::from_source(
+            &minimal_source().with("RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES", "16777215"),
+        );
+        assert!(
+            matches!(upload_budget, Err(ConfigError::Invalid { key, .. }) if key == "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES")
+        );
+
+        let overlapping_buffer_and_streaming_budget = RuntimeConfig::from_source(
+            &minimal_source()
+                .with("RS3_MAX_PUT_OBJECT_BYTES", "104857600")
+                .with("RS3_BUFFERED_PUT_OBJECT_BYTES", "10485760")
+                .with("RS3_BACKEND_MULTIPART_PART_BYTES", "5242880")
+                .with("RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES", "20971520"),
+        );
+        assert!(
+            matches!(overlapping_buffer_and_streaming_budget, Err(ConfigError::Invalid { key, .. }) if key == "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES")
+        );
+
+        let excessive_permits = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        for key in [
+            "RS3_MAX_CONCURRENT_CONNECTIONS",
+            "RS3_MAX_CONCURRENT_REQUESTS",
+        ] {
+            let config = RuntimeConfig::from_source(
+                &minimal_source().with(key, &excessive_permits.to_string()),
+            );
+            assert!(
+                matches!(config, Err(ConfigError::Invalid { key: invalid_key, .. }) if invalid_key == key)
+            );
+        }
+    }
+
+    #[test]
+    fn validates_programmatically_assembled_runtime_config() {
+        let mut config =
+            RuntimeConfig::from_source(&minimal_source()).unwrap_or_else(|error| panic!("{error}"));
+        config.hardening.max_concurrent_requests = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        config.hardening.backend_multipart_part_bytes = super::MAX_BACKEND_MULTIPART_PART_BYTES + 1;
+        config.backend.prefix = Some(" ".to_owned());
+        config.anchor = AnchorConfig::KubernetesLease {
+            namespace: " ".to_owned(),
+            name: String::new(),
+            field_manager: "\t".to_owned(),
+        };
+        config.repository.retention = Some(RetentionPolicy::new(RetentionMode::None, 0));
+        config.provider_conformance.report_file = Some(PathBuf::new());
+        config.static_credentials = Some(StaticCredentials {
+            access_key_id: " ".to_owned(),
+            secret_access_key: SecretString::from("\t"),
+        });
+
+        let error = config
+            .validate()
+            .expect_err("invalid programmatic fields must be rejected");
+
+        let keys = config_error_keys(&error);
+        for key in [
+            "RS3_MAX_CONCURRENT_REQUESTS",
+            "RS3_BACKEND_MULTIPART_PART_BYTES",
+            super::BACKEND_PREFIX_ENV,
+            super::ANCHOR_NAMESPACE_ENV,
+            super::ANCHOR_NAME_ENV,
+            super::ANCHOR_FIELD_MANAGER_ENV,
+            super::REPOSITORY_RETENTION_MODE_ENV,
+            super::REPOSITORY_RETENTION_DAYS_ENV,
+            super::PROVIDER_CONFORMANCE_REPORT_FILE_ENV,
+            super::STATIC_ACCESS_KEY_ID_ENV,
+            super::STATIC_SECRET_ACCESS_KEY_ENV,
+        ] {
+            assert!(
+                keys.contains(&key),
+                "missing programmatic validation for {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_budget_accounts_for_configured_payload_segment_buffers() {
+        const REQUIRED_UPLOAD_BUDGET: u64 = 212_873_216;
+        let source = minimal_source()
+            .with("RS3_MAX_PUT_OBJECT_BYTES", "104857600")
+            .with("RS3_BUFFERED_PUT_OBJECT_BYTES", "1048576")
+            .with("RS3_BACKEND_MULTIPART_PART_BYTES", "5242880")
+            .with("RS3_PAYLOAD_SEGMENT_SIZE_BYTES", "67108864");
+
+        let insufficient = RuntimeConfig::from_source(&source.clone().with(
+            "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES",
+            &(REQUIRED_UPLOAD_BUDGET - 1).to_string(),
+        ));
+        assert!(
+            matches!(insufficient, Err(ConfigError::Invalid { key, .. }) if key == "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES")
+        );
+
+        let exact = RuntimeConfig::from_source(&source.with(
+            "RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES",
+            &REQUIRED_UPLOAD_BUDGET.to_string(),
+        ));
+        assert!(exact.is_ok());
+    }
+
+    #[test]
+    fn parses_backend_timeouts() {
+        let source = minimal_source()
+            .with("RS3_BACKEND_CONNECT_TIMEOUT_SECS", "2")
+            .with("RS3_BACKEND_READ_TIMEOUT_SECS", "10")
+            .with("RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS", "40")
+            .with("RS3_BACKEND_OPERATION_TIMEOUT_SECS", "90")
+            .with("RS3_BACKEND_STALLED_STREAM_GRACE_SECS", "12");
+
+        let config = RuntimeConfig::from_source(&source).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(config.backend.timeouts.connect, Duration::from_secs(2));
+        assert_eq!(config.backend.timeouts.read, Duration::from_secs(10));
+        assert_eq!(
+            config.backend.timeouts.operation_attempt,
+            Duration::from_secs(40)
+        );
+        assert_eq!(config.backend.timeouts.operation, Duration::from_secs(90));
+        assert_eq!(
+            config.backend.timeouts.stalled_stream_grace,
+            Duration::from_secs(12)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_and_incoherent_backend_timeouts() {
+        for key in [
+            "RS3_BACKEND_CONNECT_TIMEOUT_SECS",
+            "RS3_BACKEND_READ_TIMEOUT_SECS",
+            "RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS",
+            "RS3_BACKEND_OPERATION_TIMEOUT_SECS",
+            "RS3_BACKEND_STALLED_STREAM_GRACE_SECS",
+        ] {
+            let config = RuntimeConfig::from_source(&minimal_source().with(key, "0"));
+            assert!(
+                matches!(config, Err(ConfigError::Invalid { key: invalid_key, .. }) if invalid_key == key)
+            );
+        }
+
+        for (key, value) in [
+            ("RS3_BACKEND_CONNECT_TIMEOUT_SECS", "121"),
+            ("RS3_BACKEND_READ_TIMEOUT_SECS", "121"),
+            ("RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS", "301"),
+        ] {
+            let config = RuntimeConfig::from_source(&minimal_source().with(key, value));
+            assert!(
+                matches!(config, Err(ConfigError::Invalid { key: invalid_key, .. }) if invalid_key == key)
+            );
+        }
     }
 
     #[test]
