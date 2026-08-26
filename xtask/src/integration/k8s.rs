@@ -110,6 +110,7 @@ mod imp {
                 .unwrap_or_else(|| "kind".to_owned());
             KindCluster::reuse(
                 args.kind_bin.clone(),
+                args.docker_bin.clone(),
                 cluster_name,
                 workspace.kubeconfig_path(),
             )?
@@ -120,6 +121,7 @@ mod imp {
                 .unwrap_or_else(|| default_cluster_name("rs3-ci"));
             KindCluster::create(
                 args.kind_bin.clone(),
+                args.docker_bin.clone(),
                 cluster_name,
                 workspace.kubeconfig_path(),
                 args.keep_cluster,

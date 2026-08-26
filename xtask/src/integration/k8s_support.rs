@@ -418,6 +418,7 @@ fn reserve_local_port() -> Result<u16> {
 
 pub(crate) struct KindCluster {
     kind_bin: String,
+    docker_bin: String,
     name: String,
     kubeconfig_path: PathBuf,
     keep: bool,
@@ -427,6 +428,7 @@ pub(crate) struct KindCluster {
 impl KindCluster {
     pub(crate) fn create(
         kind_bin: String,
+        docker_bin: String,
         name: String,
         kubeconfig_path: PathBuf,
         keep: bool,
@@ -450,6 +452,7 @@ impl KindCluster {
 
         Ok(Self {
             kind_bin,
+            docker_bin,
             name,
             kubeconfig_path,
             keep,
@@ -457,7 +460,12 @@ impl KindCluster {
         })
     }
 
-    pub(crate) fn reuse(kind_bin: String, name: String, kubeconfig_path: PathBuf) -> Result<Self> {
+    pub(crate) fn reuse(
+        kind_bin: String,
+        docker_bin: String,
+        name: String,
+        kubeconfig_path: PathBuf,
+    ) -> Result<Self> {
         let kubeconfig =
             run_command_capture(&kind_bin, &["get", "kubeconfig", "--name", name.as_str()])
                 .with_context(|| {
@@ -468,6 +476,7 @@ impl KindCluster {
 
         Ok(Self {
             kind_bin,
+            docker_bin,
             name,
             kubeconfig_path,
             keep: true,
@@ -483,13 +492,49 @@ impl KindCluster {
         &self.name
     }
 
+    /// Load a locally available image into the cluster.
+    ///
+    /// `kind load docker-image` exports a manifest list and imports it with
+    /// `--all-platforms`. Docker's containerd image store keeps only the host
+    /// platform's blobs, so that import fails on a digest the archive never
+    /// carried. Export one platform explicitly and load the archive instead.
     pub(crate) fn load_image(&self, image: &str) -> Result<()> {
-        run_command(
-            &self.kind_bin,
-            &["load", "docker-image", image, "--name", self.name.as_str()],
+        let archive = std::env::temp_dir().join(format!(
+            "rs3-kind-{}-{}.tar",
+            image
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect::<String>(),
+            std::process::id(),
+        ));
+        let archive_path = path_str(&archive)?;
+        let outcome = run_command(
+            &self.docker_bin,
+            &[
+                "save",
+                "--platform",
+                host_docker_platform()?,
+                image,
+                "-o",
+                archive_path,
+            ],
         )
-        .with_context(|| format!("failed to load image `{image}` into kind"))?;
-        Ok(())
+        .with_context(|| format!("failed to export image `{image}` for kind"))
+        .and_then(|()| {
+            run_command(
+                &self.kind_bin,
+                &[
+                    "load",
+                    "image-archive",
+                    archive_path,
+                    "--name",
+                    self.name.as_str(),
+                ],
+            )
+            .with_context(|| format!("failed to load image `{image}` into kind"))
+        });
+        let _ = fs::remove_file(&archive);
+        outcome
     }
 
     pub(crate) fn delete(&mut self) -> Result<()> {
@@ -564,6 +609,15 @@ pub(crate) fn now_millis() -> u128 {
 
 pub(crate) fn build_source_revision() -> &'static str {
     option_env!("RS3_BUILD_GIT_SHA").unwrap_or("unknown")
+}
+
+/// Docker platform for the host, for single-platform image export.
+fn host_docker_platform() -> Result<&'static str> {
+    match std::env::consts::ARCH {
+        "x86_64" => Ok("linux/amd64"),
+        "aarch64" => Ok("linux/arm64"),
+        other => bail!("unsupported host architecture `{other}` for kind image loading"),
+    }
 }
 
 pub(crate) fn path_str(path: &Path) -> Result<&str> {
