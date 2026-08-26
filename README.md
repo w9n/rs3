@@ -123,3 +123,15 @@ tradeoff is useful.
 - `xtask`: local automation used by `just`.
 
 Start with `docs/site/index.md` for the curated project map.
+
+## License
+
+`rs3` is licensed under the GNU Affero General Public License v3.0 only
+(`AGPL-3.0-only`). See `LICENSE` for the full text.
+
+The AGPL covers network use. If you run a modified `rs3` gateway and let others
+interact with it over a network, section 13 requires you to offer those users
+the corresponding source of your modified version.
+
+Security reports go through GitHub private vulnerability reporting; see
+`SECURITY.md`.
