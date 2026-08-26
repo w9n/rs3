@@ -59,10 +59,11 @@ pub(crate) fn helm_install_gateway(
 ) -> Result<()> {
     let kubeconfig = path_str(kubeconfig_path)?;
     let timeout = format!("{}s", values.wait_secs);
+    // An unset size must reach Helm as null. An empty --set-string leaves the
+    // value as "", which the chart reads as set-to-zero and rejects.
     let payload_segment_size = values
         .payload_segment_size
-        .map(|value| value.to_string())
-        .unwrap_or_default();
+        .map_or_else(|| "null".to_string(), |value| value.to_string());
     run_command(
         helm_bin,
         &[
@@ -131,8 +132,8 @@ pub(crate) fn helm_install_gateway(
             &helm_set_string("logging.rustLog", values.rust_log),
             "--set",
             "repository.allowInit=true",
-            "--set-string",
-            &helm_set_string("repository.payloadSegmentSizeBytes", &payload_segment_size),
+            "--set",
+            &format!("repository.payloadSegmentSizeBytes={payload_segment_size}"),
             "--set-string",
             &helm_set_string(
                 "repository.retention.mode",
