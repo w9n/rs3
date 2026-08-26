@@ -189,7 +189,7 @@ level-1 shards. Scale reports include `active_index_runs` after fresh recovery
 and fail above 255 after the final checkpoint. The harness also records process
 high-water RSS and aggregates all gate failures after printing the report.
 
-On 2026-07-12 revision `7023c65` passed three release runs with
+On 2026-07-12 revision `ae03c1c` passed three release runs with
 1,000,000 512 B objects, batch and concurrency 1,024:
 
 | Run | Elapsed | Recovery | Reload total | Peak RSS | PUT | GET | HEAD | Active runs | Write amplification | Cold read |
@@ -224,7 +224,7 @@ separate-process repository RSS excluding an in-memory backend, not an HTTP
 gateway measurement, pinned release-runner timing, or retained-provider
 qualification.
 
-Revision `b8b78be` raises the bounded payload-pack and speculative-
+Revision `8f99a8a` raises the bounded payload-pack and speculative-
 overlay ceiling to 4,096 records. At one million unique 512 B objects this
 produces 245 runs, below the 256-run compaction trigger, and avoids rewriting
 index metadata merely to satisfy the 255-run recovery gate. Three in-memory
@@ -245,7 +245,7 @@ repetition.
 
 ### Bounded HTTP full-read evidence
 
-Revision `c51aa24` adds a Docker-free real HTTP gateway lane whose RSS field is
+Revision `765229e` adds a Docker-free real HTTP gateway lane whose RSS field is
 the release gateway child, not the xtask driver. Three runs of three complete
 256 MiB restores produced:
 
@@ -287,7 +287,7 @@ target/release/xtask perf --scenario write-committed-parallel --objects 1024 --o
 
 ## Current July 2026 Larger Restore Matrix
 
-Run date: 2026-07-13. Clean revision: `e35545f`. Gateway profile: release.
+Run date: 2026-07-13. Clean revision: `7d87f90`. Gateway profile: release.
 Payload segment lane: adaptive writer default. Each row is the average of three
 alternating direct/gateway pairs from one bounded candidate profile.
 

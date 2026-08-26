@@ -110,7 +110,7 @@ and length fields, and validates catalog-only rewrites by reading back the exact
 signed root and new run bytes. It does not rebuild a second complete namespace
 to prove that an immutable catalog still names the same state.
 
-On 2026-07-12 the automatic-compaction 1M lane at revision `0c8ce72`
+On 2026-07-12 the automatic-compaction 1M lane at revision `6bb07ea`
 passed three release runs with 512 B values, batch and concurrency 1,024, the
 180-second elapsed gate, a 30-second same-process reload gate, and the 4 GiB
 process high-water gate:
@@ -126,7 +126,7 @@ records. This is a low-amplification bulk policy, not the 64-record low-latency
 default. At one million unique 512 B objects it creates 245 foreground runs,
 stays below the 256-run compaction trigger, and therefore avoids rewriting the
 index merely to satisfy the 255-run recovery gate. Three release runs at
-revision `b8b78be` on 2026-07-12 produced identical physical accounting:
+revision `8f99a8a` on 2026-07-12 produced identical physical accounting:
 
 | Run | Elapsed | Recovery | Reload total | Peak RSS | PUT | GET | HEAD | Active runs | Write amp | Cold read |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -165,7 +165,7 @@ recovered run count, and cold-read shape remained exact. The in-memory scale
 process also retains the complete simulated backend, so its high-water mark is
 not gateway-only memory.
 
-Revision `647db90` passed three earlier ext4 runs with a writer process that exited
+Revision `3c70d99` passed three earlier ext4 runs with a writer process that exited
 before a fresh reader process started:
 
 | Run | Writer elapsed | Checkpoint | Writer RSS | Reader recovery | Reader verification | Reader RSS |
@@ -183,7 +183,7 @@ backend on that local filesystem. It is not an HTTP gateway measurement, the
 pinned release-runner timing qualification, or a retained-provider
 qualification, and the fresh process does not imply a cold kernel page cache.
 
-Historical revision `b8b78be` passed three equivalent fresh-process ext4 runs using
+Historical revision `8f99a8a` passed three equivalent fresh-process ext4 runs using
 4,096-record batches:
 
 | Run | Writer elapsed | Checkpoint | Writer RSS | Reader recovery | Reader verification | Reader RSS | Write amp | Active runs |
@@ -195,7 +195,7 @@ Historical revision `b8b78be` passed three equivalent fresh-process ext4 runs us
 Every run recovered exactly one million entries after writer exit, verified all
 three sentinels, and kept one exact 528 B range `GET` per 512 B cold read.
 
-Clean revision `dc7f1b9` passed the complete candidate-shaped filesystem gate
+Clean revision `f4d05b0` passed the complete candidate-shaped filesystem gate
 on 2026-07-13. Its three 1M writers completed in 59.589-60.105 s at
 955,781,120-956,370,944 B RSS and 1.268284240x writes. Fresh readers recovered
 in 5.324-5.482 s at 1,009,922,048-1,010,692,096 B RSS, listed exactly one
@@ -310,7 +310,7 @@ pinned-runner procedure actually enforces that condition.
 
 ## Current Release Matrix
 
-On 2026-07-13, clean revision `e35545f` passed five separately bounded
+On 2026-07-13, clean revision `7d87f90` passed five separately bounded
 `perf-kopia-profile-candidate` runs. Each row is the average of three
 alternating direct/gateway pairs using a release gateway and the adaptive
 segment default. The direct baseline is the straight RustFS measurement proxy.
@@ -435,7 +435,7 @@ bounded by the authenticated segment size and a roughly 1 MiB grouping target,
 not object length. Reader and writer segment sizes have a 64 MiB hard ceiling;
 the normal adaptive large-object segment remains 64 KiB.
 
-On 2026-07-12 revision `c51aa24` passed three release-gateway runs with one
+On 2026-07-12 revision `765229e` passed three release-gateway runs with one
 256 MiB object and three full HTTP restores per run. The Docker-free harness
 measures the gateway child rather than the driver process:
 
@@ -499,7 +499,7 @@ standalone objects and all nine gateway reads matched the source checksum.
 
 After the host Docker bridge was repaired, the exact
 `just perf-standalone-gate` recipe passed against disposable RustFS on
-2026-07-12 at revision `ebcdfe9`, with the same eight-object, 512 MiB plaintext
+2026-07-12 at revision `e16c418`, with the same eight-object, 512 MiB plaintext
 workload at every concurrency. Release-gateway throughput at concurrency
 1/2/4/8 was 82.77/151.73/238.85/326.09 MiB/s, so the eight-writer point reached
 3.94x the single-writer baseline. Peak gateway RSS was 205,455,360/355,057,664/

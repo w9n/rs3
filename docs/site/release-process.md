@@ -5,10 +5,10 @@ It does not turn `v2-preview` into a stable repository-format promise.
 
 ## Owner-Controlled Prerequisites
 
+The private vulnerability-reporting route is configured; see `SECURITY.md`.
+
 Do not publish a release until project owners have configured all of these:
 
-- an actionable private vulnerability-reporting route in a top-level
-  `SECURITY.md`
 - a container registry and immutable repository name
 - a release-signing identity and verification policy
 - an artifact retention policy for source, binaries, images, Helm charts,

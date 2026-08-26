@@ -1,17 +1,39 @@
+# Build and tooling output
 /target/
+**/target/
 /.direnv/
-/.env
-/.claude/
+.direnv/
+.devenv/
+result
+result-*
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/target/
+
+# Local, untracked working context
+.claude/
+.local/
+scratch/
+
+# Environment and credentials (mirrors .dockerignore)
+.env
+.env.*
+*.pem
+*.key
+*.kubeconfig
+*.p12
+*.pfx
+
+# Editor and OS noise
 /.idea/
 /.vscode/
 *.swp
 *.swo
 *.tmp
 *.log
-result
-result-*
-/.local/
-/scratch/
-/fuzz/artifacts/
-/fuzz/coverage/
-/fuzz/target/
+*.bak
+*.orig
+*.rej
+*~
+.DS_Store
+Thumbs.db
