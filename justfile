@@ -119,8 +119,8 @@ preview-gate-local:
 preview-gate-release:
     just perf-standalone-gate
     just integration-kopia-gateway
-    just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke
-    just integration-velero-kopia-postgres-smoke
+    just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image
+    just integration-velero-kopia-postgres-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image
 
 # Expensive local v2 gate for scheduled CI or release-candidate hardening.
 preview-gate-v2-nightly:
@@ -132,8 +132,8 @@ preview-gate-v2-nightly:
     just preview-gate-v2-retained-local
     just integration-kopia-gateway
     just integration-k8s-gateway-v2 --wait-secs 240
-    just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke
-    just integration-velero-kopia-postgres-smoke
+    just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image
+    just integration-velero-kopia-postgres-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image
 
 # Live retained-backend v2 gate. Credentials are read from the normal AWS/S3 env.
 preview-gate-v2-live BACKEND_BUCKET ENDPOINT_URL REGION:
@@ -148,8 +148,8 @@ preview-gate-v2-live BACKEND_BUCKET ENDPOINT_URL REGION:
     just integration-s3-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/b"
     just integration-kopia-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/c"
     just integration-k8s-gateway-v2 --wait-secs 240
-    just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/d"
-    just integration-velero-kopia-postgres-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/e"
+    just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/d" --pull-velero-images --pull-openebs-images --pull-postgres-image
+    just integration-velero-kopia-postgres-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/e" --pull-velero-images --pull-openebs-images --pull-postgres-image
 
 # Check a live v2 backend for retained-version and object-lock behavior.
 check-v2-provider-v2-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
