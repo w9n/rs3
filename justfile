@@ -305,7 +305,7 @@ perf-commit-parallel *ARGS:
 # Run the fixed release-profile object-count scale tiers. Set
 # RS3_SCALE_GATE_RUNS to change the default three-run stability sample.
 [private]
-perf-scale-tier OBJECTS:
+perf-scale-tier OBJECTS BATCH="0" MIN_COMPACTIONS="0" OBJECT_SIZE="512":
     #!/usr/bin/env bash
     set -euo pipefail
     runs="${RS3_SCALE_GATE_RUNS:-3}"
@@ -327,12 +327,18 @@ perf-scale-tier OBJECTS:
       concurrency=4096
       max_write_amp=1.30
     fi
+    if (( {{BATCH}} > 0 )); then
+      batch_items={{BATCH}}
+      concurrency={{BATCH}}
+    fi
+    report="$(mktemp)"
+    trap 'rm -f "${report}"' EXIT
     for ((run = 1; run <= runs; run++)); do
       echo "scale gate run ${run}/${runs}: {{OBJECTS}} objects" >&2
       target/release/xtask perf \
         --scenario write-committed-parallel \
         --objects "{{OBJECTS}}" \
-        --object-size 512 \
+        --object-size "{{OBJECT_SIZE}}" \
         --commit-batch-items "${batch_items}" \
         --commit-max-pending-items "${batch_items}" \
         --concurrency "${concurrency}" \
@@ -345,11 +351,15 @@ perf-scale-tier OBJECTS:
         --max-cold-read-amp 1.04 \
         --max-cold-read-requests-per-read 1.0 \
         --max-active-index-runs 255 \
-        --format jsonl
+        --format jsonl | tee "${report}"
+      python3 -c 'import json, sys; rows = [json.loads(line) for line in open(sys.argv[1])]; assert len(rows) == 1, "missing scale report"; count = rows[0]["observed_compactions"]; assert count >= int(sys.argv[2]), f"observed only {count} compactions"' "${report}" "{{MIN_COMPACTIONS}}"
     done
 
 # Fast scale gate for pull requests and local development.
 perf-scale-10k: (perf-scale-tier "10000")
+
+# Exercise automatic compaction with one 16-object run per write wave.
+perf-scale-10k-compaction: (perf-scale-tier "10000" "16" "1" "1024")
 
 # Release-candidate scale gate.
 perf-scale-100k: (perf-scale-tier "100000")

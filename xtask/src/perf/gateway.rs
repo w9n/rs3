@@ -395,6 +395,7 @@ async fn gateway_full_read(
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }
@@ -468,6 +469,7 @@ async fn gateway_range_read(
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }
@@ -501,6 +503,7 @@ fn gateway_write_report(
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }

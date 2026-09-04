@@ -1125,6 +1125,7 @@ where
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }
@@ -1202,6 +1203,7 @@ where
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }
@@ -1278,6 +1280,7 @@ struct ParallelWriteMeasurement<S> {
     elapsed: Duration,
     counts: BlobOperationCounts,
     checkpoint: Option<CheckpointMeasurement>,
+    observed_compactions: usize,
 }
 
 async fn perform_parallel_writes<S>(
@@ -1290,7 +1293,7 @@ where
     let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
     let verification_anchor = anchor.clone();
     let coordinator = Arc::new(
-        V2CommitCoordinator::with_options(repo, anchor, commit_options(args))?
+        V2CommitCoordinator::with_options(Arc::clone(&repo), anchor, commit_options(args))?
             .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard),
     );
     store
@@ -1302,6 +1305,8 @@ where
     let mut latencies = Vec::with_capacity(args.objects);
     let started = Instant::now();
     let mut checkpoint = None;
+    let mut previous_runs = repo.active_index_run_count()?;
+    let mut observed_compactions = 0;
 
     let mut next = 0;
     while next < args.objects {
@@ -1342,6 +1347,12 @@ where
                 .context("committed write task did not complete")??;
             latencies.push(latency);
         }
+        // A strict decrease between completed waves proves an accepted compaction.
+        // This is a lower bound for arbitrary concurrency; the batch-16 scale lane
+        // publishes one foreground run per wave and observes every pass.
+        let active_runs = repo.active_index_run_count()?;
+        observed_compactions += usize::from(active_runs < previous_runs);
+        previous_runs = active_runs;
         next = end;
         if let Some(requested_after_objects) =
             checkpoint_due(args.checkpoint_after_objects, checkpoint.is_some(), next)
@@ -1373,6 +1384,7 @@ where
         elapsed,
         counts,
         checkpoint,
+        observed_compactions,
     })
 }
 
@@ -1405,6 +1417,7 @@ fn parallel_write_report<S>(
         elapsed: written.elapsed,
         counts: written.counts,
         checkpoint: written.checkpoint,
+        observed_compactions: Some(written.observed_compactions),
         reload_verification,
     })
 }
@@ -1825,6 +1838,7 @@ where
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }
@@ -1912,6 +1926,7 @@ where
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }
@@ -1936,6 +1951,7 @@ struct PerfReport {
     elapsed: Duration,
     counts: BlobOperationCounts,
     checkpoint: Option<CheckpointMeasurement>,
+    observed_compactions: Option<usize>,
     reload_verification: Option<ReloadVerification>,
 }
 
@@ -2455,6 +2471,7 @@ impl PerfReport {
                 self.counts.bytes_read,
                 self.requested_plaintext_read_bytes as u64,
             ),
+            "observed_compactions": self.observed_compactions,
             "checkpoint": self.checkpoint.map(CheckpointMeasurement::report),
             "reload_verification": self.reload_verification.as_ref().map(ReloadVerification::report),
         })
@@ -3008,6 +3025,34 @@ mod tests {
     use rs3_types::{BackendObjectId, KeyId, Sequence};
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn final_checkpoint_does_not_count_as_automatic_compaction() {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "perf",
+            "--scenario",
+            "write-committed-parallel",
+            "--objects",
+            "8",
+            "--commit-batch-items",
+            "2",
+            "--concurrency",
+            "2",
+            "--verify-reload",
+            "--checkpoint-after-objects",
+            "8",
+        ])
+        .expect("parse small scale workload");
+        let Some(Commands::Perf(args)) = cli.command else {
+            panic!("expected perf command");
+        };
+        let written = super::perform_parallel_writes(&args, super::memory_store())
+            .await
+            .expect("write and checkpoint below the compaction watermark");
+        assert!(written.checkpoint.is_some());
+        assert_eq!(written.observed_compactions, 0);
+    }
 
     fn fresh_process_args() -> PerfArgs {
         let cli = Cli::try_parse_from([
