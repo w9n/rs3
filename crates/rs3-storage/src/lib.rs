@@ -948,44 +948,46 @@ impl BlobList for MemoryBlobList {
         let mut entries = Vec::with_capacity(limit.min(1_024));
         let mut has_more = false;
         let mut consumed_items = 0;
+        use std::ops::Bound::{Excluded, Included, Unbounded};
         match self.mode {
             BlobListMode::Current => {
-                for (object_id, versions) in &state.objects {
-                    if self
-                        .current_after
-                        .as_ref()
-                        .is_some_and(|after| object_id <= after)
-                        || !object_id.as_str().starts_with(&self.prefix)
-                    {
-                        continue;
+                let after = self.current_after.clone();
+                let start = after
+                    .as_ref()
+                    .map_or(Included(self.prefix.as_str()), |id| Excluded(id.as_str()));
+                for (object_id, versions) in state.objects.range::<str, _>((start, Unbounded)) {
+                    if !object_id.as_str().starts_with(&self.prefix) {
+                        break;
                     }
-                    let Some(object) = memory_object_at(versions, None) else {
-                        continue;
-                    };
                     if consumed_items == limit {
                         has_more = true;
                         break;
                     }
                     consumed_items += 1;
                     self.current_after = Some(object_id.clone());
-                    entries.push(object.metadata.clone());
+                    if let Some(object) = memory_object_at(versions, None) {
+                        entries.push(object.metadata.clone());
+                    }
                 }
             }
             BlobListMode::Versions => {
-                for (object_id, versions) in &state.objects {
+                let after = self.version_after.clone();
+                let start = after
+                    .as_ref()
+                    .map_or(self.prefix.as_str(), |(id, _)| id.as_str());
+                for (object_id, versions) in
+                    state.objects.range::<str, _>((Included(start), Unbounded))
+                {
                     if !object_id.as_str().starts_with(&self.prefix) {
-                        continue;
+                        break;
                     }
-                    for object in versions {
-                        if self.version_after.as_ref().is_some_and(
-                            |(after_object_id, after_revision)| {
-                                object_id < after_object_id
-                                    || (object_id == after_object_id
-                                        && object.revision <= *after_revision)
-                            },
-                        ) {
-                            continue;
-                        }
+                    let first = after.as_ref().filter(|(id, _)| id == object_id).map_or(
+                        0,
+                        |(_, revision)| {
+                            versions.partition_point(|object| object.revision <= *revision)
+                        },
+                    );
+                    for object in &versions[first..] {
                         if consumed_items == limit {
                             has_more = true;
                             break;

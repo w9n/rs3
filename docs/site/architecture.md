@@ -54,6 +54,14 @@ Tools can store keyring envelopes through
 policy explicitly. The keyring, cache and runtime options shared by repository
 operations are private implementation resources.
 
+The local filesystem backend runs asynchronous read, write and inventory I/O
+on blocking workers. It publishes synced temporary files by rename or an
+exclusive hard link, then syncs directory entries before acknowledging writes
+and deletions. This requires a filesystem that supports hard links and directory
+syncs; it does not provide versioning or Object Lock. Construction is synchronous.
+A canceled filesystem read or listing must be reopened, because reusing its
+cursor fails rather than silently skipping work completed by a detached worker.
+
 ## Repository State
 
 !!! warning "Format implementation status"

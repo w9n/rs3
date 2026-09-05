@@ -160,6 +160,12 @@ impl fmt::Display for BackendObjectId {
     }
 }
 
+impl Borrow<str> for BackendObjectId {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
 /// Opaque provider version identifier for a backend object.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BackendVersionId(Arc<str>);

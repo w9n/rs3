@@ -12,6 +12,52 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[tokio::test]
+async fn memory_current_inventory_bounds_hidden_history_and_accepts_partial_prefixes() {
+    use rs3_storage::BlobListMode;
+    use std::num::NonZeroUsize;
+    let store = MemoryBlobStore::new();
+    for index in 0..10 {
+        let id = common::object_id(&format!(" hidden-{index:02}"));
+        store
+            .put(&id, Bytes::from_static(b"old"), PutOptions::default())
+            .await
+            .expect("put");
+        store.delete(&id).await.expect("logical delete");
+    }
+    let visible = common::object_id(" visible");
+    store
+        .put(&visible, Bytes::from_static(b"live"), PutOptions::default())
+        .await
+        .expect("live object");
+    store
+        .put(
+            &common::object_id("outside"),
+            Bytes::new(),
+            PutOptions::default(),
+        )
+        .await
+        .expect("outside prefix");
+    // A whitespace-only prefix is valid even though it cannot be an object ID.
+    let mut inventory = store
+        .open_bounded_list(" ", BlobListMode::Current)
+        .await
+        .expect("inventory");
+    let limit = NonZeroUsize::new(3).expect("positive limit");
+    let mut consumed = 0;
+    let mut listed = Vec::new();
+    for page_index in 0..4 {
+        let page = inventory.next_page(limit).await.expect("bounded page");
+        assert!(page.consumed_items <= limit.get());
+        assert!(page.entries.len() <= page.consumed_items);
+        assert_eq!(page.is_complete, page_index == 3);
+        consumed += page.consumed_items;
+        listed.extend(page.entries.into_iter().map(|entry| entry.object_id));
+    }
+    assert_eq!(consumed, 11);
+    assert_eq!(listed, vec![visible]);
+}
+
+#[tokio::test]
 async fn memory_store_satisfies_core_contract() {
     let store = MemoryBlobStore::new();
 
