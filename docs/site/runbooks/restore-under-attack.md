@@ -68,7 +68,7 @@ From a healthy cluster or regular operations job, export a trusted bundle and
 store it outside the object-store account.
 
 ```sh
-cargo run -p rs3-server -- export-restore-bundle --format json > rs3-restore-bundle.json
+cargo run -p rs3-server --features s3,k8s -- export-restore-bundle --format json > rs3-restore-bundle.json
 ```
 
 Machine-readable commands reserve stdout for the report or bundle payload and
@@ -90,7 +90,7 @@ RS3_BACKEND_PREFIX=<repository-prefix> \
 RS3_REPOSITORY_ID=<repository-id> \
 RS3_REPOSITORY_SALT_HEX=<repository-salt-hex> \
 RS3_RECOVERY_PUBLIC_KEY=ed25519:<recovery-public-key-hex> \
-cargo run -p rs3-server -- verify-bundle \
+cargo run -p rs3-server --features s3,k8s -- verify-bundle \
   --bundle-file rs3-restore-bundle.json \
   --min-sequence <external-floor-sequence> \
   --wrapping-key-hex-file <wrapping-key-hex-file>
@@ -101,7 +101,7 @@ after configuring the same repository ID, salt, wrapping-key source, backend,
 and retention settings.
 
 ```sh
-cargo run -p rs3-server -- import-v2-anchor \
+cargo run -p rs3-server --features s3,k8s -- import-v2-anchor \
   --bundle-file rs3-restore-bundle.json \
   --min-sequence <external-floor-sequence>
 ```
@@ -115,6 +115,78 @@ below the operator-supplied `--min-sequence`.
 It also lists stored v2 commits and refuses to import when it sees a higher
 commit sequence than the bundle names. Use `--force-rollback` only after an
 explicit rollback review accepts stranding those newer commits.
+
+### Recover an older view with a separate Lease
+
+To recover a known earlier state, import its bundle into a separate Kubernetes
+Lease and serve that anchor from a second `restore-readonly` gateway. Keep the
+production Lease unchanged. This provides the logical namespace selected by
+that bundle; it does not expose S3 object versions or select arbitrary times.
+
+Before starting:
+
+- Preserve a trusted, signed bundle from before the unwanted writes, with the
+  matching repository ID, salt, wrapping key and recovery public key.
+- Verify that every referenced commit, index, payload, format root and keyring
+  version is still readable and protected through the expected restore duration.
+  The configured retention duration alone does not prove this.
+- Pause destructive gateway and offline maintenance for this repository. A side
+  Lease does not register a protected historical root with production GC. Keep
+  writes isolated as described in step 1 and monitor protection deadlines while
+  renewal is paused.
+- Choose an unused recovery Lease name, preferably in an isolated namespace.
+  Give the import identity permission to create that Lease without permission
+  to change the production Lease. The serving identity needs read access to the
+  recovery Lease and backend; use read-only backend credentials where practical.
+- Review a historical `--min-sequence` floor appropriate to the selected bundle.
+  Do not lower the production recovery floor. The offline signature covers the
+  repository ID and anchor; the outer export timestamp is informational and
+  does not prove which state predates the incident.
+
+Use the existing repository, backend, retention, authentication and key-source
+configuration from the verified recovery setup. The example runs in a subshell
+so the recovery anchor and mode do not replace your normal shell settings.
+Replace the namespace, bundle path and historical floor before running it:
+
+```sh
+(
+  set -eu
+  export RS3_ANCHOR_MODE=kubernetes-lease
+  export RS3_ANCHOR_NAMESPACE='<recovery-namespace>'
+  export RS3_ANCHOR_NAME=rs3-incident-restore
+  export RS3_GATEWAY_MODE=restore-readonly
+  unset RS3_MAINTENANCE_MODE
+  export RS3_ALLOW_REPOSITORY_INIT=false
+
+  cargo run -p rs3-server --features s3,k8s -- import-v2-anchor \
+    --bundle-file '<pre-incident-bundle.json>' \
+    --min-sequence '<reviewed-historical-floor>' \
+    --force-rollback
+
+  cargo run -p rs3-server --features s3,k8s -- serve \
+    --gateway-mode restore-readonly \
+    --bind 127.0.0.1:9081
+)
+```
+
+The import scan looks for newer commits in the backing repository independently
+of the Lease name. `--force-rollback` is therefore required when those commits
+exist, even for an unused recovery Lease. It only acknowledges that older view:
+import still verifies the signature, external floor and graph, and refuses to
+replace a different existing anchor. Stop on any such refusal; do not delete a
+Lease to bypass it.
+
+The second gateway listens on a separate loopback port. Also choose separate
+admin and metrics listeners if those are configured. For a Kubernetes deployment,
+use a separate release and Service with the same repository configuration,
+`gateway.mode=restore-readonly`, and the recovery `anchor.namespace` and
+`anchor.name`. Never start a read-write gateway against the side Lease.
+
+Point the restore client's S3 endpoint at this isolated view and copy the needed
+data to an isolated destination. Verify restored bytes or application state as
+in steps 5 and 6. Recovery does not modify the production namespace; any later
+copy back is a separately reviewed normal write. Keep the production anchor and
+its floor unchanged throughout.
 
 ## 4. If No Bundle Exists, Stop
 
