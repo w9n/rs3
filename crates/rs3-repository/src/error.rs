@@ -17,12 +17,6 @@ pub enum RepositoryError {
     /// The client-visible object already exists and create-only mode was requested.
     #[error("object already exists")]
     AlreadyExists(LogicalPath),
-    /// The selected repository format cannot serve this operation yet.
-    #[error("repository format is not supported by this operation: {format}")]
-    UnsupportedRepositoryFormat {
-        /// Repository format spelling.
-        format: &'static str,
-    },
     /// The object exceeds a configured size limit.
     #[error("object exceeds configured maximum size")]
     ObjectTooLarge,
@@ -68,12 +62,6 @@ pub enum RepositoryError {
     /// A stored keyring envelope object has different content than expected.
     #[error("keyring envelope object conflicts with expected content: {object_id}")]
     KeyringEnvelopeObjectConflict {
-        /// Conflicting backend object ID.
-        object_id: BackendObjectId,
-    },
-    /// A stored index delta object has different content than expected.
-    #[error("index delta object conflicts with expected content: {object_id}")]
-    IndexDeltaObjectConflict {
         /// Conflicting backend object ID.
         object_id: BackendObjectId,
     },

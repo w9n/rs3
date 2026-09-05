@@ -229,28 +229,6 @@ impl fmt::Display for ManifestId {
     }
 }
 
-/// Identifier for a signed checkpoint.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct CheckpointId(String);
-
-impl CheckpointId {
-    /// Creates a validated checkpoint identifier.
-    pub fn new(value: impl Into<String>) -> Result<Self> {
-        validate_non_empty("checkpoint id", value.into()).map(Self)
-    }
-
-    /// Returns the identifier as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for CheckpointId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
 /// Identifier for a repository root.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RepositoryId(String);

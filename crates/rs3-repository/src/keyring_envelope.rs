@@ -1,7 +1,7 @@
 //! Keyring envelope object storage.
 
 use crate::error::{RepositoryError, Result};
-use crate::service::{Repository, require_version_for_retained_write};
+use crate::service::require_version_for_retained_write;
 use bytes::Bytes;
 use rs3_crypto::{KeyringEnvelope, MAX_KEYRING_ENVELOPE_OBJECT_BYTES};
 use rs3_index::KeyringEnvelopeReference;
@@ -70,24 +70,6 @@ where
         object_id,
         version_id,
     })
-}
-
-impl<S> Repository<S>
-where
-    S: BlobStore,
-{
-    /// Stores an encrypted keyring envelope and records its reference for new checkpoints.
-    pub async fn store_keyring_envelope(
-        &self,
-        envelope: &KeyringEnvelope,
-    ) -> Result<KeyringEnvelopeReference> {
-        let retention = self.checkpoint_retention_policy()?;
-        let legal_hold = self.checkpoint_legal_hold()?;
-        let reference =
-            store_keyring_envelope(&self.store, envelope, retention, legal_hold).await?;
-        self.set_keyring_envelope_reference(Some(reference.clone()))?;
-        Ok(reference)
-    }
 }
 
 fn keyring_envelope_object_id(generation: u64, digest: &str) -> Result<BackendObjectId> {

@@ -1,46 +1,18 @@
 //! Repository index and manifest object helpers.
 
 use crate::error::Result;
-use crate::service::{Repository, strongest_retention_policy};
+use crate::service::RepositoryResources;
 use crate::state::{RepositoryState, TrustedManifest};
 use rs3_crypto::KeyRing;
 use rs3_index::{
     INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta, IndexDeltaObject, MANIFEST_PLAINTEXT_DOMAIN,
     ManifestObject, SealedIndexDeltaObject, index_delta_plaintext_bytes, manifest_plaintext_bytes,
 };
-use rs3_storage::BlobStore;
 use rs3_types::{BackendObjectId, ManifestId};
 
 const INDEX_DELTA_ASSOCIATED_DATA: &[u8] = b"rs3:index-delta-object:v1";
 
-impl<S> Repository<S>
-where
-    S: BlobStore,
-{
-    pub(crate) fn checkpoint_retention_policy(&self) -> Result<Option<rs3_types::RetentionPolicy>> {
-        let state = self.read_state()?;
-        let mut retention = self.options.default_retention;
-        for delta in &state.pending_index_deltas {
-            if let IndexDelta::Upsert { entry, .. } = delta {
-                retention = strongest_retention_policy(retention, entry.retention);
-            }
-        }
-        Ok(retention)
-    }
-
-    pub(crate) fn checkpoint_legal_hold(&self) -> Result<Option<rs3_types::LegalHoldStatus>> {
-        let state = self.read_state()?;
-        Ok(state
-            .pending_index_deltas
-            .iter()
-            .find_map(|delta| match delta {
-                IndexDelta::Upsert { entry, .. } => entry
-                    .legal_hold
-                    .filter(|status| *status == rs3_types::LegalHoldStatus::On),
-                IndexDelta::Tombstone { .. } => None,
-            }))
-    }
-
+impl RepositoryResources {
     pub(crate) fn load_embedded_manifest_records(
         &self,
         state: &mut RepositoryState,

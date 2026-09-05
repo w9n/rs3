@@ -32,7 +32,7 @@ use crate::payload::{
     seal_streamable_payload_object, segmented_ciphertext_span, total_segmented_payload_len,
 };
 use crate::service::{
-    DecryptedSegmentIdentity, Repository, RepositoryOptions, strongest_retention_policy,
+    DecryptedSegmentIdentity, RepositoryOptions, RepositoryResources, strongest_retention_policy,
 };
 use crate::state::{RepositoryState, TrustedManifest, apply_index_delta_object, object_material};
 use bytes::Bytes;
@@ -78,7 +78,7 @@ const V2_MAX_PAYLOAD_HEADER_SIZE: u64 = 4 * 1024;
 /// semantics. v2 only changes how the pending sealed index delta becomes
 /// durable: it is embedded in a signed v2 commit instead of a v1 checkpoint.
 pub struct V2Repository<S> {
-    repository: Repository<S>,
+    repository: RepositoryResources,
     commit_store: V2CommitStore<S>,
     commit_upload_mode: V2UploadMode,
     accepted: StdRwLock<V2AcceptedState>,
@@ -152,7 +152,6 @@ enum PendingV2InstallMutation {
     },
     Tombstone {
         blind_key: rs3_types::BlindIndexKey,
-        generation: Sequence,
     },
 }
 
@@ -280,11 +279,7 @@ where
         let payload_section_cache_max_bytes = repository_options.decrypted_segment_cache_max_bytes;
         let commit_upload_mode = commit_options.upload_mode;
         Self {
-            repository: Repository::with_keyring_and_options(
-                store.clone(),
-                keyring.clone(),
-                repository_options,
-            ),
+            repository: RepositoryResources::new(keyring.clone(), repository_options),
             commit_store: V2CommitStore::new(store, keyring, commit_options),
             commit_upload_mode,
             accepted: StdRwLock::new(V2AcceptedState::default()),
@@ -2588,14 +2583,11 @@ where
                         manifest: (*manifest).clone(),
                     });
                 }
-                IndexDelta::Tombstone {
-                    blind_key,
-                    generation,
-                    ..
-                } => mutations.push(PendingV2InstallMutation::Tombstone {
-                    blind_key: blind_key.clone(),
-                    generation: *generation,
-                }),
+                IndexDelta::Tombstone { blind_key, .. } => {
+                    mutations.push(PendingV2InstallMutation::Tombstone {
+                        blind_key: blind_key.clone(),
+                    })
+                }
             }
         }
         let accepted = self
@@ -2647,12 +2639,9 @@ where
                         .repository
                         .upsert_namespace_entry_without_prefixes(*entry);
                 }
-                PendingV2InstallMutation::Tombstone {
-                    blind_key,
-                    generation,
-                } => accepted
-                    .repository
-                    .tombstone_namespace_entry(blind_key, generation),
+                PendingV2InstallMutation::Tombstone { blind_key } => {
+                    accepted.repository.remove_namespace_entry(blind_key)
+                }
             }
         }
         accepted.repository.next_sequence = install.sequence;

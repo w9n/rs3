@@ -593,7 +593,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
 
         let payload = keyring
-            .seal_payload(b"associated-data", b"payload")
+            .seal_payload_with_nonce(b"associated-data", b"payload", &[7; 24])
             .unwrap_or_else(|error| panic!("{error}"));
         let opened = rewrapped
             .open(&context, "wrap-v2", &secret(10))

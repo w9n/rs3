@@ -1,6 +1,5 @@
 //! In-memory trusted repository state.
 
-use crate::error::{RepositoryError, Result};
 use crate::model::{RepositoryListEntry, RepositoryObjectMetadata};
 use rs3_index::{
     DurableManifest, IndexDelta, IndexDeltaObject, NamespaceEntry, NamespaceIndex,
@@ -38,12 +37,8 @@ pub(crate) struct RepositoryState {
     pub(crate) manifests: BTreeMap<ManifestId, TrustedManifest>,
     /// Trusted list entries keyed by plaintext path inside the trusted boundary.
     pub(crate) list_entries: BTreeMap<LogicalPath, RepositoryListEntry>,
-    /// Next logical sequence to allocate.
+    /// Highest applied logical mutation generation.
     pub(crate) next_sequence: Sequence,
-    /// Durable index mutations not yet covered by an accepted checkpoint.
-    pub(crate) pending_index_deltas: Vec<IndexDelta>,
-    /// Stable timestamp for the current unaccepted checkpoint draft.
-    pub(crate) pending_checkpoint_published_at_ms: Option<i64>,
     /// Exact standalone carrier facts interned during v2 replay.
     pub(crate) v2_standalone_carriers: BTreeMap<
         (BackendObjectId, Option<BackendVersionId>),
@@ -58,8 +53,6 @@ impl Default for RepositoryState {
             manifests: BTreeMap::new(),
             list_entries: BTreeMap::new(),
             next_sequence: Sequence::ZERO,
-            pending_index_deltas: Vec::new(),
-            pending_checkpoint_published_at_ms: None,
             v2_standalone_carriers: BTreeMap::new(),
         }
     }
@@ -110,17 +103,13 @@ impl RepositoryState {
         self.namespace.upsert(entry, prefix_tokens);
     }
 
-    pub(crate) fn tombstone_namespace_entry(
-        &mut self,
-        blind_key: BlindIndexKey,
-        generation: Sequence,
-    ) {
+    pub(crate) fn remove_namespace_entry(&mut self, blind_key: BlindIndexKey) {
         let affected_key = self
             .namespace
             .head(&blind_key)
             .and_then(|entry| self.manifests.get(&entry.manifest_id))
             .map(|manifest| manifest.key.clone());
-        self.namespace.tombstone(blind_key, generation);
+        self.namespace.remove(&blind_key);
         if let Some(key) = affected_key {
             self.refresh_list_entry(&key);
         }
@@ -225,16 +214,6 @@ impl TrustedManifest {
     }
 }
 
-/// Allocates the next repository sequence.
-pub(crate) fn next_sequence(state: &mut RepositoryState) -> Result<Sequence> {
-    let next = state
-        .next_sequence
-        .checked_next()
-        .ok_or(RepositoryError::SequenceOverflow)?;
-    state.next_sequence = next;
-    Ok(next)
-}
-
 /// Builds deterministic material for opaque object IDs in the prototype model.
 pub(crate) fn object_material(key: &str, sequence: Sequence) -> Vec<u8> {
     format!("{key}\0{}", sequence.get()).into_bytes()
@@ -249,11 +228,7 @@ pub(crate) fn apply_index_delta_object(state: &mut RepositoryState, delta: Index
                 prefix_tokens,
                 sealed_manifest: _,
             } => state.upsert_namespace_entry(*entry, prefix_tokens),
-            IndexDelta::Tombstone {
-                blind_key,
-                generation,
-                ..
-            } => state.tombstone_namespace_entry(blind_key, generation),
+            IndexDelta::Tombstone { blind_key, .. } => state.remove_namespace_entry(blind_key),
         }
     }
 

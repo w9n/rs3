@@ -1265,7 +1265,6 @@ mod tests {
     };
     use bytes::Bytes;
     use rs3_crypto::{FormatEnvelope, KeyRing, RepositoryKeyContext};
-    use rs3_repository::Repository;
     use rs3_repository::v2::{
         V2CommitStore, V2CommitStoreOptions, V2FormatRoot, V2KeyringEnvelopeRootRef,
         V2MemoryAnchor, V2ProviderProfile, V2RecoveryBundle, v2_format_object_id,
@@ -1536,9 +1535,7 @@ mod tests {
         let envelope = keyring
             .seal_keyring_envelope(context, "wrap-v1", wrapping_key, 1)
             .unwrap_or_else(|error| panic!("{error}"));
-        let repository = Repository::with_keyring(store.clone(), keyring.clone());
-        let reference = repository
-            .store_keyring_envelope(&envelope)
+        let reference = rs3_repository::store_keyring_envelope(store, &envelope, None, None)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         V2KeyringEnvelopeRootRef {

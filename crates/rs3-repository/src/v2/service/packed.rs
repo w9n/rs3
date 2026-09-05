@@ -983,7 +983,7 @@ pub(in crate::v2) fn apply_packed_index_run(
                     &tombstone.path,
                     &blind_key,
                 )?;
-                state.tombstone_namespace_entry(blind_key, tombstone.generation);
+                state.remove_namespace_entry(blind_key);
             }
         }
     }

@@ -45,6 +45,12 @@ state.
 Cryptographic operations stay behind `rs3-crypto`; higher-level crates should
 not add ad hoc hashing, MAC, encryption, or key derivation logic.
 
+The repository API entrypoint is `rs3_repository::v2::V2Repository`.
+Tools can store keyring envelopes through
+`rs3_repository::store_keyring_envelope`, passing retention and legal-hold
+policy explicitly. The keyring, cache and runtime options shared by repository
+operations are private implementation resources.
+
 ## Repository State
 
 !!! warning "Format implementation status"

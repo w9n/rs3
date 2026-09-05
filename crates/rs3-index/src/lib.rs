@@ -1,25 +1,15 @@
-//! Append-friendly index and checkpoint model.
+//! Append-friendly namespace and authenticated index-run model.
 
 pub mod run;
 
 use rs3_types::{
-    BackendObjectId, BackendObjectRef, BackendVersionId, BlindIndexKey, CheckpointId,
-    KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LegalHoldStatus, LogicalPath, ManifestId,
-    PrefixToken, RetentionPolicy, Sequence,
+    BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LegalHoldStatus, LogicalPath,
+    ManifestId, PrefixToken, RetentionPolicy, Sequence,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
-
-/// Domain separator prepended to canonical checkpoint payload bytes.
-pub const CHECKPOINT_RECORD_DOMAIN: &[u8] = b"rs3:checkpoint-record:v1\n";
-
-/// Domain separator prepended to durable checkpoint objects.
-pub const CHECKPOINT_OBJECT_DOMAIN: &[u8] = b"rs3:checkpoint-object:v1\n";
-
-/// Domain separator prepended to durable checkpoint evidence objects.
-pub const CHECKPOINT_EVIDENCE_DOMAIN: &[u8] = b"rs3:checkpoint-evidence:v1\n";
 
 /// Domain separator prepended to durable index delta objects.
 pub const INDEX_DELTA_OBJECT_DOMAIN: &[u8] = b"rs3:index-delta-object:v1\n";
@@ -321,41 +311,7 @@ pub struct ManifestObject {
     pub tag: Vec<u8>,
 }
 
-/// Public keyring metadata captured in a checkpoint.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeyringSnapshot {
-    /// Public descriptors for repository keys.
-    pub keys: Vec<KeyDescriptor>,
-}
-
-impl KeyringSnapshot {
-    /// Creates a deterministic keyring snapshot.
-    pub fn new(mut keys: Vec<KeyDescriptor>) -> Self {
-        keys.sort_by(|left, right| {
-            left.purpose
-                .cmp(&right.purpose)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        Self { keys }
-    }
-
-    /// Finds the primary key descriptor for a purpose.
-    pub fn primary_for(&self, purpose: KeyPurpose) -> Option<&KeyDescriptor> {
-        self.keys
-            .iter()
-            .find(|key| key.purpose == purpose && key.status == KeyStatus::Primary)
-    }
-
-    /// Returns descriptors enabled for read, verify, or lookup for a purpose.
-    pub fn enabled_for(&self, purpose: KeyPurpose) -> Vec<&KeyDescriptor> {
-        self.keys
-            .iter()
-            .filter(|key| key.purpose == purpose && key.status.is_enabled_for_lookup())
-            .collect()
-    }
-}
-
-/// Public reference to the encrypted keyring envelope active for a checkpoint.
+/// Exact reference to an encrypted keyring envelope used by the repository.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyringEnvelopeReference {
     /// Envelope generation assigned by the operator workflow.
@@ -367,104 +323,6 @@ pub struct KeyringEnvelopeReference {
     /// Provider version identifier for the encrypted envelope, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<BackendVersionId>,
-}
-
-/// Signed checkpoint payload before signature wrapping.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitRecord {
-    /// Checkpoint sequence.
-    pub sequence: Sequence,
-    /// Checkpoint publish timestamp in milliseconds since the Unix epoch.
-    pub published_at_ms: i64,
-    /// Previous checkpoint, if any.
-    pub parent: Option<CheckpointId>,
-    /// Provider version identifier for the previous checkpoint object, when available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_checkpoint_version_id: Option<BackendVersionId>,
-    /// Referenced durable index delta objects.
-    pub index_deltas: Vec<BackendObjectRef>,
-    /// Sealed index delta embedded directly in this checkpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inline_index_delta: Option<SealedIndexDeltaObject>,
-    /// Referenced compacted manifest objects.
-    pub compacted_manifests: Vec<ManifestId>,
-    /// Public keyring metadata active for this checkpoint.
-    pub keyring: KeyringSnapshot,
-    /// Encrypted keyring envelope active for this checkpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keyring_envelope: Option<KeyringEnvelopeReference>,
-}
-
-impl CommitRecord {
-    /// Returns a normalized copy for deterministic checkpoint encoding.
-    pub fn canonicalized(&self) -> Self {
-        let mut record = self.clone();
-        record.index_deltas.sort();
-        record.compacted_manifests.sort();
-        record.keyring = KeyringSnapshot::new(record.keyring.keys);
-        record
-    }
-}
-
-/// Published checkpoint with signature material.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Checkpoint {
-    /// Checkpoint identifier.
-    pub id: CheckpointId,
-    /// Signed checkpoint payload.
-    pub record: CommitRecord,
-    /// Key that produced the signature.
-    pub signature_key_id: KeyId,
-    /// Signature bytes over the canonical checkpoint payload.
-    pub signature: Vec<u8>,
-}
-
-impl Checkpoint {
-    /// Returns the checkpoint sequence.
-    pub const fn sequence(&self) -> Sequence {
-        self.record.sequence
-    }
-}
-
-/// Storage-side evidence that a checkpoint was published.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CheckpointEvidence {
-    /// Checkpoint sequence.
-    pub sequence: Sequence,
-    /// Checkpoint identifier.
-    pub checkpoint_id: CheckpointId,
-    /// Digest of the canonical checkpoint payload.
-    pub checkpoint_digest: String,
-    /// Backend object that stores the signed checkpoint.
-    pub checkpoint_object_id: BackendObjectId,
-    /// Provider version identifier for the signed checkpoint object, when available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkpoint_object_version_id: Option<BackendVersionId>,
-}
-
-/// Encodes a checkpoint payload into deterministic signed bytes.
-pub fn canonical_commit_record_bytes(record: &CommitRecord) -> Result<Vec<u8>, serde_json::Error> {
-    let mut bytes = CHECKPOINT_RECORD_DOMAIN.to_vec();
-    serde_json::to_writer(&mut bytes, &record.canonicalized())?;
-    Ok(bytes)
-}
-
-/// Encodes a durable checkpoint object.
-pub fn checkpoint_object_bytes(checkpoint: &Checkpoint) -> Result<Vec<u8>, serde_json::Error> {
-    let mut checkpoint = checkpoint.clone();
-    checkpoint.record = checkpoint.record.canonicalized();
-    let mut bytes = CHECKPOINT_OBJECT_DOMAIN.to_vec();
-    serde_json::to_writer(&mut bytes, &checkpoint)?;
-    Ok(bytes)
-}
-
-/// Encodes durable checkpoint evidence.
-pub fn checkpoint_evidence_bytes(
-    evidence: &CheckpointEvidence,
-) -> Result<Vec<u8>, serde_json::Error> {
-    let mut bytes = CHECKPOINT_EVIDENCE_DOMAIN.to_vec();
-    serde_json::to_writer(&mut bytes, evidence)?;
-    Ok(bytes)
 }
 
 /// Encodes a durable sealed index delta object.
@@ -520,15 +378,6 @@ pub struct NamespaceEntry {
     pub legal_hold: Option<LegalHoldStatus>,
 }
 
-/// Tombstone for a removed namespace entry.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NamespaceTombstone {
-    /// Blind key removed by this tombstone.
-    pub blind_key: BlindIndexKey,
-    /// Repository generation that made the tombstone visible.
-    pub generation: Sequence,
-}
-
 /// In-memory trusted namespace index.
 ///
 /// This is not the durable encrypted index format. It is the query model used
@@ -539,7 +388,6 @@ pub struct NamespaceIndex {
     entries: BTreeMap<BlindIndexKey, NamespaceEntry>,
     entry_prefixes: BTreeMap<BlindIndexKey, BTreeSet<PrefixToken>>,
     prefixes: BTreeMap<PrefixToken, BTreeSet<BlindIndexKey>>,
-    tombstones: BTreeMap<BlindIndexKey, NamespaceTombstone>,
 }
 
 /// Opaque snapshot of one namespace-index key for transactional rollback.
@@ -551,7 +399,6 @@ pub struct NamespaceIndexKeySnapshot {
     blind_key: BlindIndexKey,
     entry: Option<NamespaceEntry>,
     prefix_tokens: Vec<PrefixToken>,
-    tombstone: Option<NamespaceTombstone>,
 }
 
 impl NamespaceIndex {
@@ -563,7 +410,6 @@ impl NamespaceIndex {
     /// Inserts or replaces an entry and associates it with prefix tokens.
     pub fn upsert(&mut self, entry: NamespaceEntry, prefix_tokens: Vec<PrefixToken>) {
         self.remove_prefix_membership(&entry.blind_key);
-        self.tombstones.remove(&entry.blind_key);
 
         let prefix_set = prefix_tokens.into_iter().collect::<BTreeSet<_>>();
         for prefix_token in &prefix_set {
@@ -604,7 +450,7 @@ impl NamespaceIndex {
         self.entry_prefixes.get(blind_key).into_iter().flatten()
     }
 
-    /// Captures one key's live entry, prefix membership, and tombstone.
+    /// Captures one key's live entry and prefix membership.
     pub fn snapshot_key(&self, blind_key: &BlindIndexKey) -> NamespaceIndexKeySnapshot {
         NamespaceIndexKeySnapshot {
             blind_key: blind_key.clone(),
@@ -614,7 +460,6 @@ impl NamespaceIndex {
                 .get(blind_key)
                 .map(|tokens| tokens.iter().cloned().collect())
                 .unwrap_or_default(),
-            tombstone: self.tombstones.get(blind_key).cloned(),
         }
     }
 
@@ -622,13 +467,9 @@ impl NamespaceIndex {
     pub fn restore_key(&mut self, snapshot: NamespaceIndexKeySnapshot) {
         self.entries.remove(&snapshot.blind_key);
         self.remove_prefix_membership(&snapshot.blind_key);
-        self.tombstones.remove(&snapshot.blind_key);
 
         if let Some(entry) = snapshot.entry {
             self.upsert(entry, snapshot.prefix_tokens);
-        }
-        if let Some(tombstone) = snapshot.tombstone {
-            self.tombstones.insert(snapshot.blind_key, tombstone);
         }
     }
 
@@ -642,22 +483,11 @@ impl NamespaceIndex {
             .collect()
     }
 
-    /// Writes a tombstone and removes the live entry from prefix lists.
-    pub fn tombstone(&mut self, blind_key: BlindIndexKey, generation: Sequence) {
-        self.entries.remove(&blind_key);
-        self.remove_prefix_membership(&blind_key);
-        self.tombstones.insert(
-            blind_key.clone(),
-            NamespaceTombstone {
-                blind_key,
-                generation,
-            },
-        );
-    }
-
-    /// Looks up a tombstone by blind key.
-    pub fn tombstone_for(&self, blind_key: &BlindIndexKey) -> Option<&NamespaceTombstone> {
-        self.tombstones.get(blind_key)
+    /// Removes an entry from the live query index and its prefix lists.
+    /// Durable tombstones and generation checks belong to authenticated index runs.
+    pub fn remove(&mut self, blind_key: &BlindIndexKey) {
+        self.entries.remove(blind_key);
+        self.remove_prefix_membership(blind_key);
     }
 
     fn remove_prefix_membership(&mut self, blind_key: &BlindIndexKey) {
@@ -684,18 +514,15 @@ impl NamespaceIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECKPOINT_EVIDENCE_DOMAIN, CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CheckpointEvidence,
-        CommitRecord, INDEX_DELTA_OBJECT_DOMAIN, INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta,
-        IndexDeltaObject, KeyringSnapshot, MANIFEST_PLAINTEXT_DOMAIN, ManifestObject,
-        NamespaceEntry, NamespaceIndex, PayloadReference, SealedIndexDeltaObject,
-        V2CommitStreamCarrierReference, V2PackCarrierReference, V2PackRecordReference,
-        V2StandaloneStreamCarrierReference, canonical_commit_record_bytes,
-        checkpoint_evidence_bytes, checkpoint_object_bytes, index_delta_object_bytes,
-        index_delta_plaintext_bytes, manifest_plaintext_bytes,
+        INDEX_DELTA_OBJECT_DOMAIN, INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta, IndexDeltaObject,
+        MANIFEST_PLAINTEXT_DOMAIN, ManifestObject, NamespaceEntry, NamespaceIndex,
+        PayloadReference, SealedIndexDeltaObject, V2CommitStreamCarrierReference,
+        V2PackCarrierReference, V2PackRecordReference, V2StandaloneStreamCarrierReference,
+        index_delta_object_bytes, index_delta_plaintext_bytes, manifest_plaintext_bytes,
     };
     use rs3_types::{
-        BackendObjectId, BackendVersionId, BlindIndexKey, CheckpointId, KeyDescriptor, KeyId,
-        KeyPurpose, KeyStatus, LogicalPath, ManifestId, PrefixToken, Sequence,
+        BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LogicalPath, ManifestId,
+        PrefixToken, Sequence,
     };
     use serde::Serialize;
     use std::sync::Arc;
@@ -739,27 +566,6 @@ mod tests {
         match LogicalPath::new(value) {
             Ok(value) => value,
             Err(error) => panic!("{error}"),
-        }
-    }
-
-    fn checkpoint_id(value: &str) -> CheckpointId {
-        match CheckpointId::new(value) {
-            Ok(value) => value,
-            Err(error) => panic!("{error}"),
-        }
-    }
-
-    fn key_descriptor(id: &str, purpose: KeyPurpose, status: KeyStatus) -> KeyDescriptor {
-        KeyDescriptor {
-            id: key_id(id),
-            purpose,
-            algorithm: "hmac-sha256".to_string(),
-            status,
-            created_at_ms: 0,
-            not_before_ms: None,
-            not_after_ms: None,
-            public_key: None,
-            external_kms_uri: None,
         }
     }
 
@@ -815,145 +621,6 @@ mod tests {
     }
 
     #[test]
-    fn commit_record_starts_without_parent() {
-        let record = CommitRecord {
-            sequence: Sequence::ZERO,
-            published_at_ms: 0,
-            parent: None,
-            parent_checkpoint_version_id: None,
-            index_deltas: Vec::new(),
-            inline_index_delta: None,
-            compacted_manifests: Vec::new(),
-            keyring: KeyringSnapshot::default(),
-            keyring_envelope: None,
-        };
-
-        assert!(record.parent.is_none());
-    }
-
-    #[test]
-    fn canonical_commit_record_encoding_is_stable() {
-        let unsorted = CommitRecord {
-            sequence: Sequence::new(3),
-            published_at_ms: 123,
-            parent: None,
-            parent_checkpoint_version_id: None,
-            index_deltas: vec![
-                object_id("segments/b").into(),
-                object_id("segments/a").into(),
-            ],
-            inline_index_delta: None,
-            compacted_manifests: vec![manifest_id("manifest-b"), manifest_id("manifest-a")],
-            keyring: KeyringSnapshot::new(vec![
-                key_descriptor("old", KeyPurpose::Namespace, KeyStatus::Enabled),
-                key_descriptor("new", KeyPurpose::Namespace, KeyStatus::Primary),
-            ]),
-            keyring_envelope: None,
-        };
-        let sorted = CommitRecord {
-            sequence: Sequence::new(3),
-            published_at_ms: 123,
-            parent: None,
-            parent_checkpoint_version_id: None,
-            index_deltas: vec![
-                object_id("segments/a").into(),
-                object_id("segments/b").into(),
-            ],
-            inline_index_delta: None,
-            compacted_manifests: vec![manifest_id("manifest-a"), manifest_id("manifest-b")],
-            keyring: KeyringSnapshot::new(vec![
-                key_descriptor("new", KeyPurpose::Namespace, KeyStatus::Primary),
-                key_descriptor("old", KeyPurpose::Namespace, KeyStatus::Enabled),
-            ]),
-            keyring_envelope: None,
-        };
-
-        let left = canonical_commit_record_bytes(&unsorted);
-        let right = canonical_commit_record_bytes(&sorted);
-
-        assert!(left.is_ok());
-        assert_eq!(left.ok(), right.ok());
-    }
-
-    #[test]
-    fn canonical_commit_record_encoding_changes_with_sequence() {
-        let first = CommitRecord {
-            sequence: Sequence::new(1),
-            published_at_ms: 123,
-            parent: None,
-            parent_checkpoint_version_id: None,
-            index_deltas: Vec::new(),
-            inline_index_delta: None,
-            compacted_manifests: Vec::new(),
-            keyring: KeyringSnapshot::default(),
-            keyring_envelope: None,
-        };
-        let second = CommitRecord {
-            sequence: Sequence::new(2),
-            published_at_ms: 123,
-            parent: None,
-            parent_checkpoint_version_id: None,
-            index_deltas: Vec::new(),
-            inline_index_delta: None,
-            compacted_manifests: Vec::new(),
-            keyring: KeyringSnapshot::default(),
-            keyring_envelope: None,
-        };
-
-        let first_bytes = canonical_commit_record_bytes(&first);
-        let second_bytes = canonical_commit_record_bytes(&second);
-
-        assert!(first_bytes.is_ok());
-        assert!(second_bytes.is_ok());
-        assert_ne!(first_bytes.ok(), second_bytes.ok());
-    }
-
-    #[test]
-    fn checkpoint_object_encoding_has_domain_prefix() {
-        let checkpoint = Checkpoint {
-            id: checkpoint_id("checkpoint-a"),
-            record: CommitRecord {
-                sequence: Sequence::new(1),
-                published_at_ms: 123,
-                parent: None,
-                parent_checkpoint_version_id: None,
-                index_deltas: Vec::new(),
-                inline_index_delta: None,
-                compacted_manifests: Vec::new(),
-                keyring: KeyringSnapshot::default(),
-                keyring_envelope: None,
-            },
-            signature_key_id: key_id("signing"),
-            signature: vec![1, 2, 3],
-        };
-
-        let encoded = checkpoint_object_bytes(&checkpoint);
-
-        assert!(matches!(
-            encoded,
-            Ok(bytes) if bytes.starts_with(CHECKPOINT_OBJECT_DOMAIN)
-        ));
-    }
-
-    #[test]
-    fn checkpoint_evidence_encoding_has_domain_prefix() {
-        let evidence = CheckpointEvidence {
-            sequence: Sequence::new(1),
-            checkpoint_id: checkpoint_id("checkpoint-a"),
-            checkpoint_digest: "digest-a".to_owned(),
-            checkpoint_object_id: object_id("checkpoints/checkpoint-a"),
-            checkpoint_object_version_id: None,
-        };
-
-        let encoded = checkpoint_evidence_bytes(&evidence);
-
-        assert!(matches!(
-            encoded,
-            Ok(bytes) if bytes.starts_with(CHECKPOINT_EVIDENCE_DOMAIN)
-        ));
-    }
-
-    #[test]
     fn index_delta_object_encoding_has_domain_prefix() {
         let delta = SealedIndexDeltaObject {
             key_id: key_id("metadata"),
@@ -1005,30 +672,6 @@ mod tests {
             plaintext,
             Ok(bytes) if bytes.starts_with(MANIFEST_PLAINTEXT_DOMAIN)
         ));
-    }
-
-    #[test]
-    fn keyring_snapshot_tracks_primary_and_enabled_keys() {
-        let snapshot = KeyringSnapshot::new(vec![
-            key_descriptor("old", KeyPurpose::Namespace, KeyStatus::Enabled),
-            key_descriptor("new", KeyPurpose::Namespace, KeyStatus::Primary),
-            key_descriptor("disabled", KeyPurpose::Namespace, KeyStatus::Disabled),
-        ]);
-
-        assert_eq!(
-            snapshot
-                .primary_for(KeyPurpose::Namespace)
-                .map(|key| key.id.clone()),
-            Some(key_id("new"))
-        );
-        assert_eq!(
-            snapshot
-                .enabled_for(KeyPurpose::Namespace)
-                .into_iter()
-                .map(|key| key.id.clone())
-                .collect::<Vec<_>>(),
-            vec![key_id("new"), key_id("old")]
-        );
     }
 
     #[test]
@@ -1289,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_tombstone_removes_live_entry_from_prefix() {
+    fn namespace_removal_clears_live_entry_and_prefix() {
         let mut index = NamespaceIndex::new();
         let blind_key = blind_key("blind-a");
         let prefix_token = prefix_token("prefix-p");
@@ -1298,20 +941,14 @@ mod tests {
             entry(blind_key.clone(), object_id("segments/opaque-a")),
             vec![prefix_token.clone()],
         );
-        index.tombstone(blind_key.clone(), Sequence::new(2));
+        index.remove(&blind_key);
 
         assert!(index.head(&blind_key).is_none());
         assert!(index.list_prefix(&prefix_token).is_empty());
-        assert_eq!(
-            index
-                .tombstone_for(&blind_key)
-                .map(|tombstone| tombstone.generation),
-            Some(Sequence::new(2))
-        );
     }
 
     #[test]
-    fn namespace_key_snapshot_restores_entry_prefixes_and_tombstone() {
+    fn namespace_key_snapshot_restores_entry_and_prefixes_after_removal() {
         let mut index = NamespaceIndex::new();
         let blind_key = blind_key("blind-a");
         let old_prefix = prefix_token("prefix-old");
@@ -1329,7 +966,7 @@ mod tests {
             entry(blind_key.clone(), object_id("segments/opaque-new")),
             vec![new_prefix.clone()],
         );
-        index.tombstone(blind_key.clone(), Sequence::new(9));
+        index.remove(&blind_key);
         index.restore_key(snapshot);
 
         assert_eq!(
@@ -1338,7 +975,6 @@ mod tests {
         );
         assert_eq!(index.list_prefix(&old_prefix).len(), 1);
         assert!(index.list_prefix(&new_prefix).is_empty());
-        assert!(index.tombstone_for(&blind_key).is_none());
     }
 
     #[test]
@@ -1366,5 +1002,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![object_id("segments/opaque-b")]
         );
+    }
+
+    #[test]
+    fn absent_key_snapshot_rollback_preserves_unrelated_changes() {
+        let mut index = NamespaceIndex::new();
+        let staged = blind_key("staged");
+        let unrelated = blind_key("unrelated");
+        let prefix = prefix_token("shared-prefix");
+        let snapshot = index.snapshot_key(&staged);
+        index.upsert(
+            entry(staged.clone(), object_id("objects/staged")),
+            vec![prefix.clone()],
+        );
+        index.upsert(
+            entry(unrelated.clone(), object_id("objects/accepted")),
+            vec![prefix.clone()],
+        );
+
+        index.restore_key(snapshot);
+
+        assert!(index.head(&staged).is_none());
+        assert_eq!(
+            index.list_prefix(&prefix),
+            vec![index.head(&unrelated).expect("unrelated entry")]
+        );
+        assert_eq!(index.live_entries().count(), 1);
     }
 }

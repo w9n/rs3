@@ -5,7 +5,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use rs3_crypto::{
     KeyRing, KeyringEnvelope, MIN_REPOSITORY_SALT_LEN, RepositoryKeyContext, SecretBytes,
 };
-use rs3_repository::{Repository, RepositoryOptions};
+use rs3_repository::store_keyring_envelope;
 use rs3_storage::{BlobStore, ByteRange, FilesystemBlobStore};
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig};
@@ -317,8 +317,7 @@ where
         args.generation,
     )?;
     let envelope_retention = args.retention.policy()?;
-    let repository = repository_with_keyring(store, keyring, envelope_retention);
-    let reference = repository.store_keyring_envelope(&envelope).await?;
+    let reference = store_keyring_envelope(&store, &envelope, envelope_retention, None).await?;
 
     Ok(KeyringReport {
         repository_id: context.repository_id().as_str().to_owned(),
@@ -390,14 +389,13 @@ where
         &new_wrapping_key.secret,
         new_generation,
     )?;
-    let keyring = rewrapped.open(
+    rewrapped.open(
         &context,
         &args.new_wrapping_key_id,
         &new_wrapping_key.secret,
     )?;
     let envelope_retention = args.retention.policy()?;
-    let repository = repository_with_keyring(store, keyring, envelope_retention);
-    let reference = repository.store_keyring_envelope(&rewrapped).await?;
+    let reference = store_keyring_envelope(&store, &rewrapped, envelope_retention, None).await?;
 
     Ok(KeyringReport {
         repository_id: context.repository_id().as_str().to_owned(),
@@ -449,24 +447,6 @@ where
         wrapping_key_id: args.wrapping_key_id,
         keys: opened.keyring.descriptors(),
     })
-}
-
-fn repository_with_keyring<S>(
-    store: S,
-    keyring: KeyRing,
-    default_retention: Option<RetentionPolicy>,
-) -> Repository<S>
-where
-    S: BlobStore,
-{
-    Repository::with_keyring_and_options(
-        store,
-        keyring,
-        RepositoryOptions {
-            default_retention,
-            ..RepositoryOptions::default()
-        },
-    )
 }
 
 struct OpenedKeyringEnvelope {

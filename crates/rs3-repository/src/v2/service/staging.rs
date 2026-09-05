@@ -681,7 +681,7 @@ mod tests {
                             if *live {
                                 accepted.namespace.upsert(entry(blind_key(&key.to_string()), "published", Sequence::new(*generation)), Vec::new());
                             } else {
-                                accepted.namespace.tombstone(blind_key(&key.to_string()), Sequence::new(*generation));
+                                accepted.namespace.remove(&blind_key(&key.to_string()));
                             }
                         }
                         invalidates_snapshot = !mutations.is_empty();

@@ -31,16 +31,6 @@ pub struct PayloadPackSegmentSeal {
 }
 
 impl KeyRing {
-    /// Encrypts payload bytes with the primary content key.
-    pub fn seal_payload(
-        &self,
-        associated_data: &[u8],
-        plaintext: &[u8],
-    ) -> Result<PayloadSeal, CryptoError> {
-        let nonce = random_payload_nonce()?;
-        self.seal_payload_with_nonce(associated_data, plaintext, &nonce)
-    }
-
     /// Encrypts payload bytes with the primary content key and a caller-provided nonce.
     ///
     /// The caller must guarantee nonce uniqueness for the active content key.
@@ -181,12 +171,6 @@ fn decrypt_payload_with_key(
         .map_err(|_| CryptoError::AeadOperationFailed)
 }
 
-fn random_payload_nonce() -> Result<[u8; XCHACHA20_NONCE_LEN], CryptoError> {
-    let mut nonce = [0_u8; XCHACHA20_NONCE_LEN];
-    getrandom::fill(&mut nonce).map_err(|_| CryptoError::RandomnessUnavailable)?;
-    Ok(nonce)
-}
-
 fn payload_cipher(secret: &crate::SecretBytes) -> Result<XChaCha20Poly1305, CryptoError> {
     let key = derive_hmac(secret, b"rs3:payload-aead-key:v1", b"xchacha20poly1305")?;
     XChaCha20Poly1305::new_from_slice(&key).map_err(|_| CryptoError::AeadOperationFailed)
@@ -258,7 +242,8 @@ mod tests {
     #[test]
     fn payload_seal_round_trips() {
         let keyring = keyring(2);
-        let sealed = match keyring.seal_payload(b"object-a", b"payload bytes") {
+        let sealed = match keyring.seal_payload_with_nonce(b"object-a", b"payload bytes", &[7; 24])
+        {
             Ok(sealed) => sealed,
             Err(error) => panic!("{error}"),
         };
@@ -276,7 +261,8 @@ mod tests {
     #[test]
     fn payload_seal_rejects_associated_data_tampering() {
         let keyring = keyring(2);
-        let sealed = match keyring.seal_payload(b"object-a", b"payload bytes") {
+        let sealed = match keyring.seal_payload_with_nonce(b"object-a", b"payload bytes", &[7; 24])
+        {
             Ok(sealed) => sealed,
             Err(error) => panic!("{error}"),
         };
@@ -295,7 +281,7 @@ mod tests {
     fn payload_seal_rejects_wrong_key_material() {
         let writer = keyring(2);
         let reader = keyring(3);
-        let sealed = match writer.seal_payload(b"object-a", b"payload bytes") {
+        let sealed = match writer.seal_payload_with_nonce(b"object-a", b"payload bytes", &[7; 24]) {
             Ok(sealed) => sealed,
             Err(error) => panic!("{error}"),
         };

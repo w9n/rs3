@@ -15,13 +15,11 @@ mod primitives;
 mod secret;
 
 pub use checkpoint::{
-    CheckpointSignature, derive_checkpoint_id, derive_checkpoint_payload_digest,
-    derive_index_delta_object_id, validate_recovery_public_key, verify_recovery_signature,
+    CheckpointSignature, validate_recovery_public_key, verify_recovery_signature,
 };
 pub use constant_time::ct_eq;
 pub use derive::{
-    NamespaceBlindKey, NamespacePrefixToken, derive_backend_object_id, derive_blind_index_key,
-    derive_manifest_id, derive_prefix_token,
+    NamespaceBlindKey, derive_backend_object_id, derive_blind_index_key, derive_manifest_id,
 };
 pub use envelope::{
     FormatEnvelope, KEYRING_ENVELOPE_VERSION, KeyringEnvelope, MAX_FORMAT_ENVELOPE_OBJECT_BYTES,

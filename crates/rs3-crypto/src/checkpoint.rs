@@ -5,8 +5,7 @@ use crate::SecretBytes;
 use crate::keyring::KeyRing;
 use crate::primitives::derive_hmac;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
-use rs3_types::{BackendObjectId, CheckpointId, KeyId, KeyPurpose};
-use sha2::{Digest, Sha256};
+use rs3_types::{KeyId, KeyPurpose};
 
 const CHECKPOINT_PUBLIC_KEY_HEX_LEN: usize = 64;
 const CHECKPOINT_PUBLIC_KEY_PREFIX: &str = "ed25519:";
@@ -113,45 +112,9 @@ fn prefixed_ed25519_public_key_bytes(public_key: &str) -> Result<Vec<u8>, ()> {
     hex::decode(hex_key).map_err(|_| ())
 }
 
-/// Derives a stable checkpoint identifier from signed checkpoint bytes.
-pub fn derive_checkpoint_id(
-    canonical_payload: &[u8],
-    signature: &[u8],
-) -> Result<CheckpointId, CryptoError> {
-    let mut digest = Sha256::new();
-    digest.update(b"rs3:checkpoint-id:v1");
-    digest.update([0]);
-    digest.update(canonical_payload);
-    digest.update([0]);
-    digest.update(signature);
-    CheckpointId::new(hex::encode(digest.finalize())).map_err(CryptoError::from)
-}
-
-/// Derives a stable digest for canonical checkpoint payload bytes.
-pub fn derive_checkpoint_payload_digest(canonical_payload: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"rs3:checkpoint-payload-digest:v1");
-    digest.update([0]);
-    digest.update(canonical_payload);
-    hex::encode(digest.finalize())
-}
-
-/// Derives an opaque backend object ID for an encoded index delta object.
-pub fn derive_index_delta_object_id(delta_object: &[u8]) -> Result<BackendObjectId, CryptoError> {
-    let mut digest = Sha256::new();
-    digest.update(b"rs3:index-delta-object-id:v1");
-    digest.update([0]);
-    digest.update(delta_object);
-    BackendObjectId::new(format!("index/{}", hex::encode(digest.finalize())))
-        .map_err(CryptoError::from)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        derive_checkpoint_id, derive_checkpoint_payload_digest, derive_index_delta_object_id,
-        validate_recovery_public_key, verify_recovery_signature,
-    };
+    use super::{validate_recovery_public_key, verify_recovery_signature};
     use crate::{KeyMaterial, KeyRing, SecretBytes};
     use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus};
 
@@ -428,33 +391,5 @@ mod tests {
         );
 
         assert!(verified.is_err());
-    }
-
-    #[test]
-    fn checkpoint_id_changes_with_signature() {
-        let first = derive_checkpoint_id(b"canonical checkpoint", b"signature-a");
-        let second = derive_checkpoint_id(b"canonical checkpoint", b"signature-b");
-
-        assert!(first.is_ok());
-        assert!(second.is_ok());
-        assert_ne!(first.ok(), second.ok());
-    }
-
-    #[test]
-    fn checkpoint_payload_digest_ignores_signature() {
-        let first = derive_checkpoint_payload_digest(b"canonical checkpoint");
-        let second = derive_checkpoint_payload_digest(b"canonical checkpoint");
-
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn index_delta_object_id_uses_index_prefix() {
-        let object_id = derive_index_delta_object_id(b"delta bytes");
-
-        assert!(matches!(
-            object_id,
-            Ok(object_id) if object_id.as_str().starts_with("index/")
-        ));
     }
 }

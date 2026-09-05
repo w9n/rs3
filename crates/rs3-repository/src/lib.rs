@@ -25,4 +25,4 @@ pub use model::{
 pub use payload::{
     DEFAULT_PAYLOAD_SEGMENT_SIZE, MAX_PAYLOAD_SEGMENT_SIZE, effective_payload_segment_size,
 };
-pub use service::{DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES, Repository, RepositoryOptions};
+pub use service::{DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES, RepositoryOptions};
