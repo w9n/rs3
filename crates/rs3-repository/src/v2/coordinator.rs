@@ -1,7 +1,7 @@
 //! Commit coordination for preview v2 repository writes.
 
 use super::repository::{
-    V2AnchorState, V2CommitAnchor, V2ReplayChain, V2StandaloneUploadCancellation,
+    V2AnchorState, V2CommitAnchor, V2ReplayChain, V2StandaloneUploadCancellation, V2StoredCommit,
 };
 use super::service::{
     V2CoordinatedMutation, V2CoordinatorLease, V2FullMaintenanceReport, V2Repository,
@@ -17,7 +17,7 @@ use rs3_storage::BlobStore;
 use rs3_types::{LegalHoldStatus, LogicalPath, RetentionPolicy};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, oneshot};
 use tokio::time::sleep;
 
 /// Active-run count at which a guarded coordinator first requests compaction.
@@ -49,6 +49,7 @@ pub struct V2MaintenanceWindow {
     guard: Arc<dyn V2MaintenanceGuard>,
     base_anchor: Option<V2AnchorState>,
     _stage: OwnedMutexGuard<()>,
+    _publisher: OwnedMutexGuard<()>,
 }
 
 impl std::fmt::Debug for V2MaintenanceWindow {
@@ -81,6 +82,8 @@ pub struct V2CommitCoordinator<S, A> {
     anchor: Arc<A>,
     options: CommitCoordinatorOptions,
     stage_lock: Arc<Mutex<()>>,
+    publisher: Arc<Mutex<()>>,
+    capacity_changed: Arc<Notify>,
     batch: Arc<Mutex<PendingBatch>>,
     status: Arc<CoordinatorStatus>,
     lease: Arc<V2CoordinatorLease>,
@@ -92,6 +95,7 @@ struct PendingBatch {
     waiters: Vec<CommitWaiter>,
     rollback_log: Vec<V2StagedPutRollback>,
     publishing: bool,
+    publishing_items: usize,
     generation: u64,
     failed: Option<String>,
     protection: Option<V2ProtectionCohort>,
@@ -239,6 +243,8 @@ where
             anchor: Arc::new(anchor),
             options: options.normalized(),
             stage_lock: Arc::new(Mutex::new(())),
+            publisher: Arc::new(Mutex::new(())),
+            capacity_changed: Arc::new(Notify::new()),
             batch: Arc::new(Mutex::new(PendingBatch::default())),
             status: Arc::new(CoordinatorStatus::default()),
             lease,
@@ -291,6 +297,7 @@ where
         let Some(guard) = self.maintenance_guard.clone() else {
             return Err(v2_commit_error(V2FormatError::MaintenanceAccessRequired));
         };
+        let publisher = Arc::clone(&self.publisher).lock_owned().await;
         let stage = Arc::clone(&self.stage_lock).lock_owned().await;
         self.publish_locked_batch().await?;
         guard
@@ -306,6 +313,7 @@ where
             guard,
             base_anchor,
             _stage: stage,
+            _publisher: publisher,
         })
     }
 
@@ -343,10 +351,25 @@ where
             anchor: Arc::clone(&self.anchor),
             options: self.options,
             stage_lock: Arc::clone(&self.stage_lock),
+            publisher: Arc::clone(&self.publisher),
+            capacity_changed: Arc::clone(&self.capacity_changed),
             batch: Arc::clone(&self.batch),
             status: Arc::clone(&self.status),
             lease: Arc::clone(&self.lease),
             maintenance_guard: self.maintenance_guard.clone(),
+        }
+    }
+
+    fn publication_context(&self) -> PublicationContext<S, A> {
+        PublicationContext {
+            repository: Arc::clone(&self.repository),
+            anchor: Arc::clone(&self.anchor),
+            stage_lock: Arc::clone(&self.stage_lock),
+            publisher: Arc::clone(&self.publisher),
+            capacity_changed: Arc::clone(&self.capacity_changed),
+            batch: Arc::clone(&self.batch),
+            status: Arc::clone(&self.status),
+            lease: Arc::clone(&self.lease),
         }
     }
 
@@ -363,18 +386,44 @@ where
             retention,
             legal_hold,
         };
-        let (metadata, rx, delayed_publish_generation, should_publish_now) = {
+        let (metadata, rx, publish_generation, should_publish_now) = {
             let stage_lock_started = Instant::now();
-            let _stage = self.stage_lock.lock().await;
-            record_v2_commit_put_phase_duration("stage_lock_wait", stage_lock_started.elapsed());
-            let incompatible_pending = {
-                let batch = self.batch.lock().await;
-                !batch.waiters.is_empty() && batch.protection != Some(protection)
+            let _stage = loop {
+                // Register before checking capacity, so publication cannot signal
+                // between releasing staging and starting the wait.
+                let changed = self.capacity_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let mut stage = self.stage_lock.lock().await;
+                let (wait_for_capacity, needs_barrier) = {
+                    let batch = self.batch.lock().await;
+                    let occupied = batch.publishing || !batch.waiters.is_empty();
+                    let wait_for_capacity = batch.failed.is_none()
+                        && ((batch.publishing
+                            && batch.waiters.len().saturating_add(batch.publishing_items)
+                                >= self.options.max_pending_items)
+                            || batch.waiters.len() >= self.options.max_batch_items);
+                    (
+                        wait_for_capacity,
+                        (occupied && batch.protection != Some(protection))
+                            || index_compaction_due(self.repository.active_index_run_count()?),
+                    )
+                };
+                if wait_for_capacity {
+                    drop(stage);
+                    changed.await;
+                    continue;
+                }
+                if needs_barrier {
+                    drop(stage);
+                    let _publisher = self.publisher.lock().await;
+                    stage = self.stage_lock.lock().await;
+                    self.publish_locked_batch().await?;
+                    self.prepare_index_catalog_for_growth_locked().await?;
+                }
+                break stage;
             };
-            if incompatible_pending {
-                self.publish_locked_batch().await?;
-            }
-            self.prepare_index_catalog_for_growth_locked().await?;
+            record_v2_commit_put_phase_duration("stage_lock_wait", stage_lock_started.elapsed());
             let should_start_timer = {
                 let batch = self.batch.lock().await;
                 if let Some(reason) = batch.failed.as_ref() {
@@ -389,12 +438,13 @@ where
                         reason: reason.clone(),
                     });
                 }
-                if batch.waiters.len() >= self.options.max_pending_items {
-                    record_v2_commit_enqueue("backpressure", batch.waiters.len());
+                let pending_items = batch.waiters.len().saturating_add(batch.publishing_items);
+                if pending_items >= self.options.max_pending_items {
+                    record_v2_commit_enqueue("backpressure", pending_items);
                     tracing::warn!(
                         target: "rs3_repository",
                         operation = "v2_put_committed_enqueue",
-                        pending_items = batch.waiters.len(),
+                        pending_items,
                         max_pending_items = self.options.max_pending_items,
                         result = "backpressure",
                         "v2 commit coordinator rejected write",
@@ -410,7 +460,7 @@ where
             let (metadata, rollback) = staged?;
             let (tx, rx) = oneshot::channel();
             let mut batch = self.batch.lock().await;
-            if batch.waiters.is_empty() {
+            if batch.waiters.is_empty() && !batch.publishing {
                 batch.protection = Some(protection);
             } else if batch.protection != Some(protection) {
                 return Err(commit_failed(
@@ -439,33 +489,21 @@ where
 
             if let Some(generation) = delayed_publish_generation.filter(|_| !should_publish_now) {
                 spawn_delayed_v2_publish(
-                    DelayedPublishContext {
-                        repository: Arc::clone(&self.repository),
-                        anchor: Arc::clone(&self.anchor),
-                        stage_lock: Arc::clone(&self.stage_lock),
-                        batch: Arc::clone(&self.batch),
-                        status: Arc::clone(&self.status),
-                        lease: Arc::clone(&self.lease),
-                    },
+                    self.publication_context(),
                     generation,
                     self.options.max_batch_delay,
                 );
             }
 
-            (metadata, rx, delayed_publish_generation, should_publish_now)
+            (metadata, rx, Some(batch.generation), should_publish_now)
         };
 
         let commit_wait_started = Instant::now();
         if should_publish_now {
-            publish_pending_v2_batch(
-                Arc::clone(&self.repository),
-                Arc::clone(&self.anchor),
-                Arc::clone(&self.stage_lock),
-                Arc::clone(&self.batch),
-                Arc::clone(&self.status),
-                delayed_publish_generation,
-            )
-            .await;
+            tokio::spawn(publish_pending_v2_batch(
+                self.publication_context(),
+                publish_generation,
+            ));
         }
 
         let anchor_state = match rx.await {
@@ -523,6 +561,7 @@ where
             .map_err(|_| commit_failed("v2 standalone upload task failed"))??;
         let owned = self.clone_for_owned_task();
         let publication_task = tokio::spawn(async move {
+            let _publisher = owned.publisher.lock().await;
             let _stage = owned.stage_lock.lock().await;
             owned.publish_locked_batch().await?;
             owned.prepare_index_catalog_for_growth_locked().await?;
@@ -566,6 +605,7 @@ where
         St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
         self.repository.validate_client_object_lock(&options)?;
+        let _publisher = self.publisher.lock().await;
         let _stage = self.stage_lock.lock().await;
         self.publish_locked_batch().await?;
         self.prepare_index_catalog_for_growth_locked().await?;
@@ -594,6 +634,7 @@ where
 
     /// Deletes an object after flushing any pending staged v2 write batch.
     pub async fn delete_committed(&self, key: LogicalPath) -> Result<DeleteOutcome> {
+        let _publisher = self.publisher.lock().await;
         let _stage = self.stage_lock.lock().await;
         self.publish_locked_batch().await?;
         self.prepare_index_catalog_for_growth_locked().await?;
@@ -622,6 +663,7 @@ where
 
     /// Flushes pending writes and publishes a full v2 index snapshot commit.
     pub async fn write_index_snapshot(&self) -> Result<V2AnchorState> {
+        let _publisher = self.publisher.lock().await;
         let _stage = self.stage_lock.lock().await;
         self.publish_locked_batch().await?;
         if self.prepare_index_catalog_for_growth_locked().await? {
@@ -643,6 +685,7 @@ where
 
     /// Flushes pending writes and reloads accepted state from the external anchor.
     pub async fn reload_from_anchor(&self) -> Result<Option<V2ReplayChain>> {
+        let _publisher = self.publisher.lock().await;
         let _stage = self.stage_lock.lock().await;
         self.publish_locked_batch().await?;
         self.repository
@@ -665,22 +708,30 @@ where
                 return Ok(());
             }
             batch.publishing = true;
+            batch.publishing_items = batch.waiters.len();
             PendingPublish {
                 waiters: std::mem::take(&mut batch.waiters),
                 rollback_log: std::mem::take(&mut batch.rollback_log),
             }
         };
 
-        let result = publish_v2_waiters(
+        let started = Instant::now();
+        let published = self
+            .repository
+            .publish_pending_index_delta(self.anchor.as_ref())
+            .await;
+        let result = finish_v2_waiters(
             &self.repository,
-            self.anchor.as_ref(),
             pending.waiters,
             pending.rollback_log,
-        )
-        .await;
+            published,
+            started,
+        );
         let mut batch = self.batch.lock().await;
         batch.publishing = false;
+        batch.publishing_items = 0;
         batch.protection = None;
+        self.capacity_changed.notify_waiters();
         if let Err(failure) = result {
             if let Some(poison_reason) = failure.poison_reason.clone() {
                 batch.failed = Some(poison_reason.clone());
@@ -701,9 +752,7 @@ where
         if initial_count < V2_INDEX_COMPACTION_REQUEST_RUNS {
             return Ok(false);
         }
-        let should_attempt = initial_count >= V2_INDEX_COMPACTION_PAUSE_RUNS
-            || initial_count % V2_INDEX_COMPACTION_RETRY_INTERVAL_RUNS == 0;
-        if !should_attempt {
+        if !index_compaction_due(initial_count) {
             return Ok(false);
         }
 
@@ -778,17 +827,19 @@ struct PendingPublish {
     rollback_log: Vec<V2StagedPutRollback>,
 }
 
-struct DelayedPublishContext<S, A> {
+struct PublicationContext<S, A> {
     repository: Arc<V2Repository<S>>,
     anchor: Arc<A>,
     stage_lock: Arc<Mutex<()>>,
+    publisher: Arc<Mutex<()>>,
+    capacity_changed: Arc<Notify>,
     batch: Arc<Mutex<PendingBatch>>,
     status: Arc<CoordinatorStatus>,
     lease: Arc<V2CoordinatorLease>,
 }
 
 fn spawn_delayed_v2_publish<S, A>(
-    context: DelayedPublishContext<S, A>,
+    context: PublicationContext<S, A>,
     generation: u64,
     delay: Duration,
 ) where
@@ -796,33 +847,31 @@ fn spawn_delayed_v2_publish<S, A>(
     A: V2CommitAnchor + 'static,
 {
     tokio::spawn(async move {
-        let _lease = context.lease;
         sleep(delay).await;
-        publish_pending_v2_batch(
-            context.repository,
-            context.anchor,
-            context.stage_lock,
-            context.batch,
-            context.status,
-            Some(generation),
-        )
-        .await;
+        publish_pending_v2_batch(context, Some(generation)).await;
     });
 }
 
 async fn publish_pending_v2_batch<S, A>(
-    repository: Arc<V2Repository<S>>,
-    anchor: Arc<A>,
-    stage_lock: Arc<Mutex<()>>,
-    batch: Arc<Mutex<PendingBatch>>,
-    status: Arc<CoordinatorStatus>,
+    context: PublicationContext<S, A>,
     expected_generation: Option<u64>,
 ) where
     S: BlobStore + Clone + 'static,
     A: V2CommitAnchor + 'static,
 {
-    let _stage = stage_lock.lock().await;
-    let pending = {
+    let PublicationContext {
+        repository,
+        anchor,
+        stage_lock,
+        publisher,
+        capacity_changed,
+        batch,
+        status,
+        lease: _lease,
+    } = context;
+    let _publisher = publisher.lock().await;
+    let stage = stage_lock.lock().await;
+    let mut pending = {
         let mut batch = batch.lock().await;
         if expected_generation.is_some_and(|expected| batch.generation != expected) {
             return;
@@ -831,22 +880,45 @@ async fn publish_pending_v2_batch<S, A>(
             return;
         }
         batch.publishing = true;
+        batch.publishing_items = batch.waiters.len();
         PendingPublish {
             waiters: std::mem::take(&mut batch.waiters),
             rollback_log: std::mem::take(&mut batch.rollback_log),
         }
     };
-
-    let result = publish_v2_waiters(
+    let publication = repository.freeze_pending_publication();
+    drop(stage);
+    capacity_changed.notify_waiters();
+    let started = Instant::now();
+    let published = match publication {
+        Ok(publication) => {
+            repository
+                .publish_frozen_pending_index_delta(anchor.as_ref(), publication)
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    let _stage = stage_lock.lock().await;
+    let mut batch = batch.lock().await;
+    if !matches!(&published, Ok(Some(_))) {
+        // A successor's conditions were evaluated against the failed prefix.
+        // Reject and roll back both drafts before another writer is admitted.
+        pending.waiters.append(&mut batch.waiters);
+        pending.rollback_log.append(&mut batch.rollback_log);
+    }
+    let result = finish_v2_waiters(
         &repository,
-        anchor.as_ref(),
         pending.waiters,
         pending.rollback_log,
-    )
-    .await;
-    let mut batch = batch.lock().await;
+        published,
+        started,
+    );
     batch.publishing = false;
-    batch.protection = None;
+    batch.publishing_items = 0;
+    capacity_changed.notify_waiters();
+    if batch.waiters.is_empty() {
+        batch.protection = None;
+    }
     if let Err(failure) = result {
         if let Some(poison_reason) = failure.poison_reason {
             batch.failed = Some(poison_reason.clone());
@@ -865,19 +937,17 @@ struct PublishFailure {
     poison_reason: Option<String>,
 }
 
-async fn publish_v2_waiters<S, A>(
+fn finish_v2_waiters<S>(
     repository: &V2Repository<S>,
-    anchor: &A,
     waiters: Vec<CommitWaiter>,
     rollback_log: Vec<V2StagedPutRollback>,
+    published: Result<Option<V2StoredCommit>>,
+    started: Instant,
 ) -> std::result::Result<(), PublishFailure>
 where
     S: BlobStore + Clone + 'static,
-    A: V2CommitAnchor + 'static,
 {
     let waiter_count = waiters.len();
-    let started = Instant::now();
-    let published = repository.publish_pending_index_delta(anchor).await;
     let accepted_recovery_required =
         matches!(&published, Err(RepositoryError::AcceptedRecoveryRequired));
     let result = match published {
@@ -911,7 +981,7 @@ where
         }
     });
     if accepted_recovery_required {
-        let reason = "v2 commit was accepted but local state recovery is required".to_owned();
+        let reason = "v2 publication requires recovery before further mutations".to_owned();
         record_v2_commit_batch_publish_failure("local_install");
         failure = Some(PublishFailure {
             reason: reason.clone(),
@@ -950,6 +1020,12 @@ where
         Some(failure) => Err(failure),
         None => Ok(()),
     }
+}
+
+fn index_compaction_due(count: usize) -> bool {
+    count >= V2_INDEX_COMPACTION_REQUEST_RUNS
+        && (count >= V2_INDEX_COMPACTION_PAUSE_RUNS
+            || count.is_multiple_of(V2_INDEX_COMPACTION_RETRY_INTERVAL_RUNS))
 }
 
 fn commit_failed(reason: &str) -> RepositoryError {

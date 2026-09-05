@@ -136,6 +136,9 @@ pub enum V2FormatError {
     /// The v2 commit anchor could not be advanced.
     #[error("v2 commit anchor advance failed")]
     AnchorAdvanceFailed,
+    /// An attempted advance could not be reconciled with the exact trusted state.
+    #[error("v2 anchor publication outcome requires recovery")]
+    AnchorReconciliationRequired,
     /// The v2 commit anchor was missing for an operation that requires it.
     #[error("v2 commit anchor is missing")]
     MissingAnchor,
@@ -226,6 +229,7 @@ impl V2FormatError {
             | Self::TypeValidation
             | Self::AnchorReadFailed
             | Self::AnchorAdvanceFailed
+            | Self::AnchorReconciliationRequired
             | Self::MissingAnchor
             | Self::StaleAnchor
             | Self::StorageOperationFailed

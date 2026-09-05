@@ -19,11 +19,18 @@ pub(super) const V2_MAX_PENDING_OPERATIONS: usize = rs3_index::run::INDEX_PACK_M
 ///
 /// Sequence allocation is deliberately absent. Failed writes may leave gaps,
 /// but a sequence allocated in this process is never reused by rollback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct PendingV2Checkpoint {
     deltas_len: usize,
     manifests_len: usize,
     payloads_len: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrozenPrefix {
+    revision: u64,
+    end: PendingV2Checkpoint,
+    sequence: Option<Sequence>,
 }
 
 /// Result of resolving a namespace key through the speculative overlay.
@@ -140,6 +147,9 @@ impl PendingV2Snapshot {
 #[derive(Debug)]
 pub(super) struct PendingV2State {
     revision: u64,
+    base: PendingV2Checkpoint,
+    end: PendingV2Checkpoint,
+    frozen: Option<FrozenPrefix>,
     allocation_sequence: Sequence,
     deltas: Vec<IndexDelta>,
     manifests: Vec<(ManifestId, TrustedManifest)>,
@@ -150,6 +160,9 @@ impl PendingV2State {
     pub(super) fn new(accepted_sequence: Sequence) -> Self {
         Self {
             revision: 0,
+            base: PendingV2Checkpoint::default(),
+            end: PendingV2Checkpoint::default(),
+            frozen: None,
             allocation_sequence: accepted_sequence,
             deltas: Vec::new(),
             manifests: Vec::new(),
@@ -185,11 +198,21 @@ impl PendingV2State {
     }
 
     pub(super) fn checkpoint(&self) -> PendingV2Checkpoint {
-        PendingV2Checkpoint {
-            deltas_len: self.deltas.len(),
-            manifests_len: self.manifests.len(),
-            payloads_len: self.payloads.len(),
+        self.end
+    }
+
+    /// Freezes the current prefix while allowing bounded successor appends.
+    pub(super) fn freeze(&mut self) -> Result<PendingV2Snapshot> {
+        if self.frozen.is_some() || self.is_empty() {
+            return Err(RepositoryError::StatePoisoned);
         }
+        let snapshot = self.snapshot();
+        self.frozen = Some(FrozenPrefix {
+            revision: snapshot.revision,
+            end: self.end,
+            sequence: snapshot.commit_sequence(),
+        });
+        Ok(snapshot)
     }
 
     /// Appends one logical staged operation atomically.
@@ -212,37 +235,98 @@ impl PendingV2State {
             .checked_add(1)
             .ok_or(RepositoryError::StatePoisoned)?;
 
+        let end = PendingV2Checkpoint {
+            deltas_len: self
+                .end
+                .deltas_len
+                .checked_add(deltas.len())
+                .ok_or(RepositoryError::StatePoisoned)?,
+            manifests_len: self
+                .end
+                .manifests_len
+                .checked_add(usize::from(manifest.is_some()))
+                .ok_or(RepositoryError::StatePoisoned)?,
+            payloads_len: self
+                .end
+                .payloads_len
+                .checked_add(usize::from(payload.is_some()))
+                .ok_or(RepositoryError::StatePoisoned)?,
+        };
         self.deltas.extend(deltas);
         self.manifests.extend(manifest);
         self.payloads.extend(payload);
         self.revision = next_revision;
+        self.end = end;
         Ok(checkpoint)
     }
 
     /// Restores a prior vector position without rolling sequence allocation back.
     pub(super) fn rollback(&mut self, checkpoint: PendingV2Checkpoint) -> Result<()> {
-        if checkpoint.deltas_len > self.deltas.len()
-            || checkpoint.manifests_len > self.manifests.len()
-            || checkpoint.payloads_len > self.payloads.len()
-        {
-            return Err(RepositoryError::StatePoisoned);
-        }
+        let relative = self.relative_position(checkpoint)?;
         let next_revision = self
             .revision
             .checked_add(1)
             .ok_or(RepositoryError::StatePoisoned)?;
-        self.deltas.truncate(checkpoint.deltas_len);
-        self.manifests.truncate(checkpoint.manifests_len);
-        self.payloads.truncate(checkpoint.payloads_len);
+        self.deltas.truncate(relative.deltas_len);
+        self.manifests.truncate(relative.manifests_len);
+        self.payloads.truncate(relative.payloads_len);
         self.revision = next_revision;
+        self.end = checkpoint;
+        self.frozen = None;
         Ok(())
     }
 
     pub(super) fn validate_snapshot(&self, snapshot: &PendingV2Snapshot) -> Result<()> {
-        if self.revision != snapshot.revision
-            || maximum_delta_generation(&self.deltas) != snapshot.commit_sequence()
-        {
+        let (revision, sequence) = match self.frozen {
+            Some(frozen) => {
+                self.relative_position(frozen.end)?;
+                (frozen.revision, frozen.sequence)
+            }
+            None => (self.revision, maximum_delta_generation(&self.deltas)),
+        };
+        if revision != snapshot.revision || sequence != snapshot.commit_sequence() {
             return Err(RepositoryError::StatePoisoned);
+        }
+        Ok(())
+    }
+
+    fn relative_position(&self, position: PendingV2Checkpoint) -> Result<PendingV2Checkpoint> {
+        fn relative(value: usize, base: usize, end: usize) -> Result<usize> {
+            value
+                .checked_sub(base)
+                .filter(|_| value <= end)
+                .ok_or(RepositoryError::StatePoisoned)
+        }
+        Ok(PendingV2Checkpoint {
+            deltas_len: relative(
+                position.deltas_len,
+                self.base.deltas_len,
+                self.end.deltas_len,
+            )?,
+            manifests_len: relative(
+                position.manifests_len,
+                self.base.manifests_len,
+                self.end.manifests_len,
+            )?,
+            payloads_len: relative(
+                position.payloads_len,
+                self.base.payloads_len,
+                self.end.payloads_len,
+            )?,
+        })
+    }
+
+    /// Consumes only the validated prefix; successor checkpoints stay absolute.
+    pub(super) fn finish_publication(&mut self) -> Result<()> {
+        if let Some(frozen) = self.frozen {
+            let prefix = self.relative_position(frozen.end)?;
+            self.deltas.drain(..prefix.deltas_len);
+            self.manifests.drain(..prefix.manifests_len);
+            self.payloads.drain(..prefix.payloads_len);
+            self.base = frozen.end;
+            self.frozen = None;
+        } else {
+            self.clear_after_validated_publication();
         }
         Ok(())
     }
@@ -252,6 +336,8 @@ impl PendingV2State {
         self.deltas.clear();
         self.manifests.clear();
         self.payloads.clear();
+        self.base = self.end;
+        self.frozen = None;
     }
 
     /// Synchronizes an already-empty overlay after recovery or initialization.
@@ -352,6 +438,7 @@ mod tests {
     use super::{
         PendingV2EffectiveHead, PendingV2State, V2_MAX_PENDING_OPERATIONS, maximum_delta_generation,
     };
+    use crate::error::RepositoryError;
     use crate::state::{RepositoryState, TrustedManifest};
     use crate::v2::service::PendingV2Payload;
     use bytes::Bytes;
@@ -402,6 +489,101 @@ mod tests {
                 .live()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn frozen_coalesced_prefix_preserves_successor_and_absolute_rollback() {
+        let mut pending = PendingV2State::new(Sequence::ZERO);
+        let append = |pending: &mut PendingV2State, label: &str| {
+            let sequence = pending.allocate_sequence().expect("allocate");
+            let id = manifest_id(label);
+            pending
+                .append_operation(
+                    vec![upsert(entry(blind_key("shared"), label, sequence))],
+                    Some((id.clone(), manifest("objects/shared"))),
+                    Some(PendingV2Payload {
+                        manifest_id: id,
+                        body: Bytes::from(label.to_owned()),
+                    }),
+                )
+                .expect("append")
+        };
+        let retired = append(&mut pending, "superseded");
+        append(&mut pending, "published");
+        let frozen = pending.freeze().expect("freeze prefix");
+        assert_eq!(
+            frozen.deltas().len(),
+            1,
+            "frozen snapshot coalesces the two raw entries"
+        );
+        assert_eq!(frozen.payloads().len(), 1);
+        let successor_checkpoint = append(&mut pending, "successor");
+        pending
+            .validate_snapshot(&frozen)
+            .expect("append preserves frozen snapshot");
+        assert!(pending.freeze().is_err(), "one publisher only");
+        pending
+            .finish_publication()
+            .expect("consume frozen raw prefix");
+        assert_eq!(pending.deltas().len(), 1);
+        assert_eq!(pending.payloads.len(), 1);
+        assert_eq!(pending.payloads[0].body, Bytes::from_static(b"successor"));
+        assert!(
+            pending.rollback(retired).is_err(),
+            "cannot roll back an accepted prefix"
+        );
+        pending
+            .rollback(successor_checkpoint)
+            .expect("checkpoint survives prefix removal");
+        assert!(pending.is_empty());
+        assert_eq!(
+            pending.allocate_sequence().expect("burned generations"),
+            Sequence::new(4)
+        );
+        assert!(pending.validate_snapshot(&frozen).is_err());
+    }
+
+    #[test]
+    fn frozen_prefix_and_successor_share_the_service_limit() {
+        let mut pending = PendingV2State::new(Sequence::ZERO);
+        let half = V2_MAX_PENDING_OPERATIONS / 2;
+        let append = |pending: &mut PendingV2State, start: usize| {
+            let deltas = (start..start + half)
+                .map(|n| {
+                    upsert(entry(
+                        blind_key(&format!("key-{n}")),
+                        "value",
+                        Sequence::new(n as u64 + 1),
+                    ))
+                })
+                .collect();
+            pending
+                .append_operation(deltas, None, None)
+                .expect("bounded append")
+        };
+        let rollback = append(&mut pending, 0);
+        let frozen = pending.freeze().expect("freeze");
+        append(&mut pending, half);
+        assert!(matches!(
+            pending.append_operation(
+                vec![upsert(entry(
+                    blind_key("overflow"),
+                    "extra",
+                    Sequence::new(10_000)
+                ))],
+                None,
+                None
+            ),
+            Err(RepositoryError::CommitBackpressure)
+        ));
+        pending
+            .validate_snapshot(&frozen)
+            .expect("failed append is atomic");
+        pending
+            .rollback(rollback)
+            .expect("reject failed prefix and dependent suffix");
+        assert!(pending.is_empty());
+        assert!(pending.validate_snapshot(&frozen).is_err());
     }
 
     #[test]

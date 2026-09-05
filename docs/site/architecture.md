@@ -175,10 +175,12 @@ packs. It uses canonical bounded varints for generation and content length in
 both projections.
 
 The runtime keeps one accepted compact state plus a hard-bounded 4,096-mutation
-overlay. An exclusive publication barrier freezes that overlay from pre-CAS
-validation through accepted-state installation. Publication failure discards
-the overlay instead of rolling back a second full state copy. This preserves
-commit atomicity without doubling steady-state namespace memory.
+overlay. Publication freezes a prefix while the next bounded batch can stage
+behind it. Both share the pending-item limit. Accepting a commit installs only
+its frozen prefix; a failed publication rejects that prefix and its dependent
+staged successor. Sequence allocations are not reused. Reads continue to resolve
+against accepted state. Only one carrier publication and anchor transition run
+at a time; maintenance drains both batches before entering its exclusion window.
 
 The bounded compaction path follows the same memory invariant. It does not clone
 the full accepted state before planning, verifies each source run with
@@ -306,9 +308,11 @@ owner. A commit coordinator holds an RAII lease that is also retained by every
 delayed publisher task; direct mutation and maintenance entry points fail while
 that lease exists. This prevents a cancelled request or a second local API path
 from publishing and clearing another batch's speculative overlay. All semantic
-installation checks occur before anchor CAS. If the anchor advances but local
-lock installation fails, callers receive an explicit recovery-required error,
-new mutations stop, and the process must restart from the accepted anchor.
+installation checks occur before anchor CAS. A lost CAS reply is reconciled by
+reading the exact anchor. A matching accepted child completes normally; an
+unchanged parent permits failure rollback. If the outcome cannot be resolved,
+or local installation fails after acceptance, callers receive a recovery-required
+error and new mutations stop until restart from the trusted anchor.
 
 The single owner does not serialize large request bodies. Distinct declared-
 length standalone uploads run concurrently, then queue for the short stage,

@@ -138,6 +138,11 @@ struct V2AcceptedState {
     anchor: Option<super::repository::V2AnchorState>,
 }
 
+/// Immutable publication input captured before successor staging is admitted.
+pub(crate) struct V2PendingPublication {
+    snapshot: PendingV2Snapshot,
+}
+
 struct PendingV2Install {
     sequence: Sequence,
     mutations: Vec<PendingV2InstallMutation>,
@@ -227,6 +232,7 @@ where
     S: BlobStore + Clone,
 {
     pub(super) fn validate_client_object_lock(&self, options: &RepositoryPutOptions) -> Result<()> {
+        self.ensure_local_state_ready()?;
         let (retention, legal_hold) = self.effective_put_protection(options);
         if legal_hold == Some(LegalHoldStatus::On) {
             return Err(StorageError::LegalHoldUnsupported.into());
@@ -820,7 +826,7 @@ where
             .commit_store
             .adopt_verified_unanchored_child(anchor, base_anchor, &uploaded)
             .await
-            .map_err(v2_repository_error)?;
+            .map_err(|error| self.publication_error(error))?;
         if let Err(error) = self.install_pending_commit(install, adopted.anchor_state) {
             self.mark_local_recovery_required();
             tracing::error!(
@@ -983,7 +989,7 @@ where
             .commit_store
             .adopt_verified_unanchored_child(anchor, &base_anchor, &uploaded.stored)
             .await
-            .map_err(v2_repository_error)
+            .map_err(|error| self.publication_error(error))
         {
             Ok(stored) => stored,
             Err(error) => {
@@ -1229,7 +1235,7 @@ where
             .commit_store
             .adopt_verified_unanchored_child(anchor, &base_anchor, &uploaded.stored)
             .await
-            .map_err(v2_repository_error)
+            .map_err(|error| self.publication_error(error))
         {
             Ok(stored) => stored,
             Err(error) => {
@@ -1266,7 +1272,6 @@ where
         body: Bytes,
         options: RepositoryPutOptions,
     ) -> Result<(RepositoryObjectMetadata, V2StagedPutRollback)> {
-        let _publication_guard = self.publication_lock.read().await;
         self.stage_put_unlocked(key, body, options)
     }
 
@@ -2341,6 +2346,37 @@ where
             .map_err(|_| RepositoryError::StatePoisoned)
     }
 
+    fn publication_error(&self, error: V2FormatError) -> RepositoryError {
+        if error == V2FormatError::AnchorReconciliationRequired {
+            self.mark_local_recovery_required();
+            RepositoryError::AcceptedRecoveryRequired
+        } else {
+            v2_repository_error(error)
+        }
+    }
+
+    pub(crate) fn freeze_pending_publication(&self) -> Result<V2PendingPublication> {
+        let snapshot = self
+            .pending
+            .lock()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .freeze()?;
+        Ok(V2PendingPublication { snapshot })
+    }
+
+    pub(crate) async fn publish_frozen_pending_index_delta<A>(
+        &self,
+        anchor: &A,
+        publication: V2PendingPublication,
+    ) -> Result<Option<V2StoredCommit>>
+    where
+        A: V2CommitAnchor,
+    {
+        let _publication_guard = self.publication_lock.write().await;
+        self.publish_pending_snapshot(anchor, publication.snapshot)
+            .await
+    }
+
     pub(crate) async fn publish_pending_index_delta<A>(
         &self,
         anchor: &A,
@@ -2359,7 +2395,18 @@ where
     where
         A: V2CommitAnchor,
     {
-        let mut pending = self.pending_snapshot()?;
+        self.publish_pending_snapshot(anchor, self.pending_snapshot()?)
+            .await
+    }
+
+    async fn publish_pending_snapshot<A>(
+        &self,
+        anchor: &A,
+        mut pending: PendingV2Snapshot,
+    ) -> Result<Option<V2StoredCommit>>
+    where
+        A: V2CommitAnchor,
+    {
         let Some(sequence) = pending.commit_sequence() else {
             return Ok(None);
         };
@@ -2423,7 +2470,7 @@ where
             .commit_store
             .adopt_verified_unanchored_child(anchor, &base_anchor, &uploaded)
             .await
-            .map_err(v2_repository_error)?;
+            .map_err(|error| self.publication_error(error))?;
         if let Err(error) = self.install_pending_commit(install, stored.anchor_state.clone()) {
             self.mark_local_recovery_required();
             tracing::error!(
@@ -2625,8 +2672,9 @@ where
             .pending
             .lock()
             .map_err(|_| RepositoryError::StatePoisoned)?;
-        // The exclusive publication barrier prevents any staged or accepted
-        // mutation between pre-CAS validation and this local installation.
+        // A frozen prefix may have bounded successors appended after pre-CAS
+        // validation. Consume only that prefix while both state locks are held.
+        pending.finish_publication()?;
         for mutation in install.mutations {
             match mutation {
                 PendingV2InstallMutation::Upsert { entry, manifest } => {
@@ -2648,7 +2696,6 @@ where
             accepted.runs.push(run);
         }
         accepted.anchor = Some(anchor);
-        pending.clear_after_validated_publication();
         Ok(())
     }
 

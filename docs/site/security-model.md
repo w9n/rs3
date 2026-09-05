@@ -49,6 +49,13 @@ Do not expose these outside encrypted and authenticated payloads:
 This applies to object keys, tags, unauthenticated metadata, logs, metrics
 labels, traces, commit headers, and error messages.
 
+Buffered publication keeps its frozen prefix and staged successor within the
+same admission and overlay bounds. It does not expose unaccepted namespace state
+or upload a successor carrier before its parent is resolved. A lost anchor-CAS
+reply requires exact-state reconciliation; an unresolved outcome stops further
+mutations. Backend-visible classes and identifiers are unchanged, while request
+cadence and batch sizes may change when staging overlaps upload.
+
 ## Accepted Leakage
 
 The replacement `v02` design accepts specific backend-visible leakage:

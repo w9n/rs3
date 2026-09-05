@@ -1777,9 +1777,23 @@ where
             uploaded.version_id.as_ref(),
         )
         .await?;
-        anchor
+        let advance = anchor
             .compare_and_advance_v2(Some(expected_parent), uploaded.anchor_state.clone())
-            .await?;
+            .await;
+        match advance {
+            Ok(accepted) if accepted == uploaded.anchor_state => {}
+            result => {
+                // A lost CAS reply may still cover an accepted publication.
+                // Resolve the exact state before any caller retries or rolls back.
+                match anchor.read_v2().await {
+                    Ok(Some(accepted)) if accepted == uploaded.anchor_state => {}
+                    Ok(Some(current)) if current == *expected_parent => {
+                        return Err(result.err().unwrap_or(V2FormatError::StaleAnchor));
+                    }
+                    _ => return Err(V2FormatError::AnchorReconciliationRequired),
+                }
+            }
+        }
         Ok(uploaded.clone())
     }
 

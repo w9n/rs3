@@ -295,7 +295,7 @@ where practical, and backend credentials that cannot write.
 | `RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES` | no | `268435456` | Maximum plaintext bytes retained in the process-local decrypted segment LRU cache. Set to `0` to disable the cache. |
 | `RS3_COMMIT_MAX_BATCH_ITEMS` | no | `64` | Maximum staged writes covered by one commit batch. |
 | `RS3_COMMIT_MAX_BATCH_DELAY_MS` | no | `25` | Maximum delay before publishing a partial commit batch. |
-| `RS3_COMMIT_MAX_PENDING_ITEMS` | no | batch item limit | Maximum writes waiting for commit before backpressure. |
+| `RS3_COMMIT_MAX_PENDING_ITEMS` | no | batch item limit | Maximum staged writes across the publishing prefix and its successor. Full publishing capacity waits without staging more writes; an unfilled batch at this limit applies backpressure. |
 | `RS3_REPOSITORY_RETENTION_MODE` | no | unset | `governance` or `compliance` when repository retention is enabled. |
 | `RS3_REPOSITORY_RETENTION_DAYS` | with retention mode | unset | Positive retention duration in days. |
 

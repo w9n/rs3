@@ -1,3 +1,5 @@
+mod publication_overlap;
+
 use super::service::packed::repository_context_from_refs;
 use super::{
     UnenforcedQuiescedMaintenanceGuard, V2_INDEX_COMPACTION_PAUSE_RUNS,
@@ -1011,8 +1013,17 @@ impl BlobStore for TrackedMultipartStore {
     }
 }
 
+#[derive(Default)]
+struct CommitPutPause {
+    mode: AtomicUsize,
+    attempts: AtomicUsize,
+    entered: Notify,
+    release: Notify,
+}
+
 #[derive(Clone)]
 struct SlowCommitGetStore {
+    commit_put_pause: Arc<CommitPutPause>,
     inner: MemoryBlobStore,
     delay: Duration,
     full_commit_gets: Arc<AtomicUsize>,
@@ -1028,6 +1039,7 @@ struct SlowCommitGetStore {
 impl SlowCommitGetStore {
     fn new(inner: MemoryBlobStore, delay: Duration) -> Self {
         Self {
+            commit_put_pause: Arc::new(CommitPutPause::default()),
             inner,
             delay,
             full_commit_gets: Arc::new(AtomicUsize::new(0)),
@@ -1158,6 +1170,21 @@ impl BlobStore for SlowCommitGetStore {
         body: Bytes,
         options: PutOptions,
     ) -> rs3_storage::Result<BlobMetadata> {
+        if object_id.as_str().starts_with("commits/v02/") {
+            self.commit_put_pause
+                .attempts
+                .fetch_add(1, Ordering::SeqCst);
+            let mode = self.commit_put_pause.mode.swap(0, Ordering::SeqCst);
+            if mode != 0 {
+                self.commit_put_pause.entered.notify_one();
+                self.commit_put_pause.release.notified().await;
+                if mode == 2 {
+                    return Err(StorageError::Provider(
+                        "injected commit upload failure".to_owned(),
+                    ));
+                }
+            }
+        }
         if object_id.as_str().starts_with("objects/v02/") {
             self.standalone_puts.fetch_add(1, Ordering::SeqCst);
         }

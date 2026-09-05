@@ -423,16 +423,19 @@ under fixed total page and raw-member ceilings; a partial or over-budget
 inventory is never interpreted as empty.
 
 The runtime keeps one accepted compact state plus a hard-bounded
-4,096-mutation overlay. Unaccepted writes never mutate accepted state. An
-exclusive publication barrier freezes the overlay from commit snapshot through
-the anchor CAS and local install. Successful anchor publication applies the
-validated overlay once; failed publication discards it. Startup must not clone
-a second complete repository state. One atomic RAII mutation lease owns this
-overlay per service instance; delayed publishers retain the lease, and direct
-mutation or maintenance APIs cannot bypass an active coordinator. Semantic
-installation checks complete before CAS. If local lock installation alone
-fails after CAS, the caller receives a recovery-required result and all further
-mutations fail until restart from the accepted anchor.
+4,096-mutation overlay. Unaccepted writes never mutate accepted state. Publication
+freezes a prefix and permits bounded successor staging within the same total
+pending-item limit. Accepting the prefix preserves the successor and its
+allocation high-water mark. A failed prefix rejects dependent staged successors.
+Startup does not clone a second complete repository state. One atomic RAII
+mutation lease owns the overlay; timed and immediate owned publishers retain it.
+Direct mutations and maintenance cannot bypass an active coordinator.
+
+Semantic installation checks complete before CAS. A lost CAS reply is reconciled
+against the exact child and parent anchors before a successor can publish. An
+unresolved outcome or a post-CAS local installation failure requires local
+recovery and prevents further mutations until restart from the trusted anchor.
+These runtime changes do not alter the repository wire format.
 
 ## Automatic Catalog Watermarks
 
