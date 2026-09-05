@@ -599,6 +599,14 @@ impl RuntimeConfig {
         Self::from_source(&ProcessEnv)
     }
 
+    /// Loads the environment using an explicit CLI mode before parsing maintenance.
+    ///
+    /// Read-write overrides preserve configured maintenance settings. An explicit
+    /// restore-readonly override forces maintenance off regardless of those settings.
+    pub fn from_env_with_mode_override(mode: Option<GatewayMode>) -> Result<Self, ConfigError> {
+        Self::from_source_with_mode_override(&ProcessEnv, mode)
+    }
+
     /// Validates invariants required by every runtime construction path.
     ///
     /// This must be called for programmatically assembled configurations as
@@ -627,8 +635,18 @@ impl RuntimeConfig {
     }
 
     fn from_source(source: &impl ConfigSource) -> Result<Self, ConfigError> {
+        Self::from_source_with_mode_override(source, None)
+    }
+
+    fn from_source_with_mode_override(
+        source: &impl ConfigSource,
+        mode_override: Option<GatewayMode>,
+    ) -> Result<Self, ConfigError> {
         let mut errors = Vec::new();
-        let mode = collect_config_error(&mut errors, parse_gateway_mode(source));
+        let mode = collect_config_error(
+            &mut errors,
+            mode_override.map_or_else(|| parse_gateway_mode(source), Ok),
+        );
         let bind = collect_config_error(
             &mut errors,
             parse_socket_addr(
@@ -660,7 +678,11 @@ impl RuntimeConfig {
         let repository = collect_config_error(&mut errors, parse_repository_config(source));
         let maintenance = collect_config_error(
             &mut errors,
-            parse_maintenance_config(source, mode.unwrap_or(GatewayMode::ReadWrite)),
+            if mode_override == Some(GatewayMode::RestoreReadOnly) {
+                Ok(MaintenanceConfig::forced_off())
+            } else {
+                parse_maintenance_config(source, mode.unwrap_or(GatewayMode::ReadWrite))
+            },
         );
         let provider_conformance =
             collect_config_error(&mut errors, parse_provider_conformance_config(source));
@@ -2941,6 +2963,62 @@ mod tests {
         assert_eq!(
             budgets.max_inventory_item_count,
             rs3_repository::v2::V2MaintenanceBudgets::default().max_inventory_item_count
+        );
+    }
+
+    #[test]
+    fn read_write_mode_override_preserves_maintenance_environment() {
+        for maintenance_mode in ["auto", "manual", "off"] {
+            let source = minimal_source()
+                .with("RS3_GATEWAY_MODE", "restore-readonly")
+                .with(super::MAINTENANCE_MODE_ENV, maintenance_mode)
+                .with(super::MAINTENANCE_MAX_INTERVAL_SECONDS_ENV, "86400")
+                .with(super::MAINTENANCE_ORPHAN_PRESSURE_COUNT_ENV, "19");
+            let expected =
+                RuntimeConfig::from_source(&source.clone().with("RS3_GATEWAY_MODE", "read-write"))
+                    .expect("equivalent read-write environment");
+            let actual = RuntimeConfig::from_source_with_mode_override(
+                &source,
+                Some(GatewayMode::ReadWrite),
+            )
+            .expect("read-write CLI override");
+            assert_eq!(actual.mode, GatewayMode::ReadWrite);
+            assert_eq!(actual.maintenance, expected.maintenance);
+            assert_eq!(actual.maintenance.max_interval, Duration::from_secs(86400));
+            assert_eq!(actual.maintenance.orphan_pressure_count, 19);
+        }
+    }
+
+    #[test]
+    fn read_write_mode_override_validates_previously_inactive_settings() {
+        let source = minimal_source()
+            .with("RS3_GATEWAY_MODE", "restore-readonly")
+            .with(super::MAINTENANCE_MAX_INTERVAL_SECONDS_ENV, "invalid");
+        assert!(RuntimeConfig::from_source(&source).is_ok());
+        let error =
+            RuntimeConfig::from_source_with_mode_override(&source, Some(GatewayMode::ReadWrite))
+                .expect_err("invalid active interval must reject");
+        assert!(
+            error
+                .to_string()
+                .contains(super::MAINTENANCE_MAX_INTERVAL_SECONDS_ENV)
+        );
+    }
+
+    #[test]
+    fn explicit_readonly_override_forces_maintenance_off() {
+        let source = minimal_source().with(super::MAINTENANCE_MODE_ENV, "manual");
+        let actual = RuntimeConfig::from_source_with_mode_override(
+            &source,
+            Some(GatewayMode::RestoreReadOnly),
+        )
+        .expect("readonly override");
+        assert_eq!(actual.mode, GatewayMode::RestoreReadOnly);
+        assert_eq!(actual.maintenance, MaintenanceConfig::forced_off());
+        // Environment-only readonly configuration retains its strict validation.
+        assert!(
+            RuntimeConfig::from_source(&source.with("RS3_GATEWAY_MODE", "restore-readonly"))
+                .is_err()
         );
     }
 

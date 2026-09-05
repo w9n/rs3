@@ -44,11 +44,11 @@ pub enum S3BoundaryError {
     /// Static credentials are required before exposing the S3 service.
     #[error("static credentials are required to build the S3 boundary")]
     MissingStaticCredentials,
-    /// The configured v2 commit anchor is not wired into the S3 adapter yet.
-    #[error("configured v2 commit anchor mode is not supported by the S3 adapter yet")]
+    /// The configured v2 commit anchor is unavailable in this build.
+    #[error("configured v2 commit anchor mode is unavailable in this build")]
     UnsupportedAnchorMode,
-    /// The configured backend object store is not wired into the runtime yet.
-    #[error("configured backend object store is not supported by the S3 runtime yet")]
+    /// The configured backend object store is unavailable in this build.
+    #[error("configured backend object store is unavailable in this build")]
     UnsupportedBackendMode,
     /// Repository state initialization failed.
     #[error("failed to initialize repository state: {reason}")]

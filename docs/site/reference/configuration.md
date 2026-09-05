@@ -3,6 +3,11 @@
 The gateway reads runtime configuration from environment variables. Command-line
 flags may override selected listener and gateway-mode settings.
 
+`serve --gateway-mode read-write` selects the mode before maintenance settings
+are parsed, preserving configured intervals, budgets and auto/manual/off policy.
+Invalid settings become configuration errors when maintenance is activated.
+An explicit `--gateway-mode restore-readonly` forces maintenance off.
+
 ## Server
 
 | Variable | Required | Default | Description |
