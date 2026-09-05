@@ -742,3 +742,397 @@ impl V2CommitAnchor for BarrierAdvanceAnchor {
         self.inner.compare_and_advance_v2(expected, next).await
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+enum CompactionFault {
+    None,
+    Storage { offset: u64, after_write: bool },
+    Guard(usize),
+    AnchorRead(usize),
+    AnchorCas,
+}
+
+struct CompactionAuthority {
+    inner: V2MemoryAnchor,
+    fault: CompactionFault,
+    reads: std::sync::atomic::AtomicUsize,
+    guards: std::sync::atomic::AtomicUsize,
+    advances: std::sync::atomic::AtomicUsize,
+    failures: std::sync::atomic::AtomicUsize,
+}
+
+impl CompactionAuthority {
+    fn reject(&self) -> rs3_repository::v2::V2Result<()> {
+        self.failures
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(V2FormatError::StaleAnchor)
+    }
+}
+
+#[async_trait]
+impl V2CommitAnchor for CompactionAuthority {
+    async fn read_v2(
+        &self,
+    ) -> rs3_repository::v2::V2Result<Option<rs3_repository::v2::V2AnchorState>> {
+        let call = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if matches!(self.fault, CompactionFault::AnchorRead(target) if target == call) {
+            self.reject()?;
+        }
+        self.inner.read_v2().await
+    }
+
+    async fn compare_and_advance_v2(
+        &self,
+        expected: Option<&rs3_repository::v2::V2AnchorState>,
+        next: rs3_repository::v2::V2AnchorState,
+    ) -> rs3_repository::v2::V2Result<rs3_repository::v2::V2AnchorState> {
+        let call = self
+            .advances
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if matches!(self.fault, CompactionFault::AnchorCas) && call == 0 {
+            self.reject()?;
+        }
+        self.inner.compare_and_advance_v2(expected, next).await
+    }
+}
+
+#[async_trait]
+impl rs3_repository::v2::V2MaintenanceGuard for CompactionAuthority {
+    async fn verify_v2_maintenance(
+        &self,
+        _base: Option<&rs3_repository::v2::V2AnchorState>,
+    ) -> rs3_repository::v2::V2Result<()> {
+        let call = self
+            .guards
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if matches!(self.fault, CompactionFault::Guard(target) if target == call) {
+            self.reject()?;
+        }
+        Ok(())
+    }
+}
+
+struct CompactionTrace {
+    operations: Vec<rs3_storage::FaultEvent>,
+    anchor_reads: usize,
+    guard_checks: usize,
+}
+
+#[tokio::test]
+async fn compaction_publish_fault_sweep_preserves_base_and_retry_converges() {
+    // Discover the real publication trace, so new storage boundaries are swept
+    // automatically instead of silently falling outside a fixed offset range.
+    let trace = compaction_fault_case(CompactionFault::None).await;
+    assert_eq!(
+        trace
+            .operations
+            .iter()
+            .filter(|event| event.kind == FaultOperationKind::Put)
+            .count(),
+        2,
+        "fixture must publish a sibling carrier and a root"
+    );
+    assert_eq!(trace.guard_checks, 3, "include the final fence recheck");
+    assert!(
+        trace.anchor_reads >= 2,
+        "include the unchanged-base recheck"
+    );
+    for (offset, event) in trace.operations.iter().enumerate() {
+        compaction_fault_case(CompactionFault::Storage {
+            offset: offset as u64,
+            after_write: false,
+        })
+        .await;
+        if event.kind == FaultOperationKind::Put {
+            compaction_fault_case(CompactionFault::Storage {
+                offset: offset as u64,
+                after_write: true,
+            })
+            .await;
+        }
+    }
+    for call in 1..=trace.guard_checks {
+        compaction_fault_case(CompactionFault::Guard(call)).await;
+    }
+    for call in 1..=trace.anchor_reads {
+        compaction_fault_case(CompactionFault::AnchorRead(call)).await;
+    }
+    compaction_fault_case(CompactionFault::AnchorCas).await;
+    eprintln!(
+        "compaction sweep: {} storage boundaries, 2 ambiguous writes, {} fence checks, {} anchor reads, 1 CAS",
+        trace.operations.len(),
+        trace.guard_checks,
+        trace.anchor_reads
+    );
+}
+
+async fn compaction_fault_case(fault: CompactionFault) -> CompactionTrace {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let inner = MemoryBlobStore::new();
+    let keyring = signing_keyring();
+    let options = commit_options();
+    let anchor = V2MemoryAnchor::new();
+    let setup = make_repository(inner.clone(), keyring.clone(), options.clone());
+    setup
+        .write_genesis_snapshot(&anchor)
+        .await
+        .expect("genesis");
+    let mut expected = BTreeMap::new();
+    for index in 0..4 {
+        let key = logical_path(&format!("compaction/key-{index}"));
+        let body = Bytes::from(vec![index; 1024]);
+        setup
+            .put_committed(
+                &anchor,
+                key.clone(),
+                body.clone(),
+                RepositoryPutOptions::default(),
+            )
+            .await
+            .expect("seed payload run");
+        expected.insert(key, body);
+    }
+    let key = logical_path("compaction/key-0");
+    let body = Bytes::from_static(b"newest value");
+    setup
+        .put_committed(
+            &anchor,
+            key.clone(),
+            body.clone(),
+            RepositoryPutOptions::default(),
+        )
+        .await
+        .expect("overwrite payload");
+    expected.insert(key, body);
+    let deleted = logical_path("compaction/key-1");
+    setup
+        .delete_committed(&anchor, deleted.clone())
+        .await
+        .expect("stage tombstone");
+    expected.remove(&deleted);
+    let base = anchor
+        .read_v2()
+        .await
+        .expect("read base")
+        .expect("base exists");
+    let before = inner.list_prefix("").await.expect("fixture inventory");
+    let before_ids = before
+        .iter()
+        .map(|entry| entry.object_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut payload_spans = BTreeMap::new();
+    for object in &before {
+        let bytes = inner
+            .get_range(&object.object_id, ByteRange::Full)
+            .await
+            .expect("fixture bytes");
+        let parsed =
+            rs3_repository::v2::parse_v2_commit_header(&object.object_id, &bytes, &keyring)
+                .expect("fixture signed header");
+        let spans = parsed
+            .header
+            .section_index
+            .iter()
+            .filter(|section| {
+                matches!(
+                    section.section_type,
+                    V2SectionType::PayloadPack | V2SectionType::Payload
+                )
+            })
+            .map(|section| {
+                let start = parsed.sections_start as u64 + section.offset;
+                start..start + section.length
+            })
+            .collect::<Vec<_>>();
+        payload_spans.insert(object.object_id.clone(), spans);
+    }
+    drop(setup);
+    let store = FaultInjectingBlobStore::new(inner.clone(), Vec::new());
+    let repository = make_repository(store.clone(), keyring.clone(), options.clone());
+    repository
+        .load_chain_from_anchor(&anchor)
+        .await
+        .expect("load base");
+    let start = store.next_operation_index().expect("trace start");
+    if let CompactionFault::Storage {
+        offset,
+        after_write,
+    } = fault
+    {
+        let action = if after_write {
+            FaultAction::error_after_write("compaction ambiguous write")
+        } else {
+            FaultAction::return_error("compaction boundary")
+        };
+        store
+            .push_rule(FaultRule::new(
+                FaultMatcher::operation_index(start + offset),
+                action,
+            ))
+            .expect("install boundary fault");
+    }
+    let authority = CompactionAuthority {
+        inner: anchor.clone(),
+        fault,
+        reads: AtomicUsize::new(0),
+        guards: AtomicUsize::new(0),
+        advances: AtomicUsize::new(0),
+        failures: AtomicUsize::new(0),
+    };
+    let result = repository
+        .compact_packed_index_runs(&authority, &authority)
+        .await;
+    let operations = store.operation_log().expect("publication trace")[start as usize..].to_vec();
+    assert_compaction_does_not_read_payload(&operations, &payload_spans);
+    let trace = CompactionTrace {
+        operations,
+        anchor_reads: authority.reads.load(Ordering::SeqCst),
+        guard_checks: authority.guards.load(Ordering::SeqCst),
+    };
+    if matches!(fault, CompactionFault::None) {
+        result.expect("unfaulted compaction");
+        assert_eq!(authority.advances.load(Ordering::SeqCst), 1);
+    } else {
+        assert!(
+            result.is_err(),
+            "fault must be reached and reject publication: {fault:?}"
+        );
+        if let CompactionFault::Storage { offset, .. } = fault {
+            assert_eq!(
+                trace
+                    .operations
+                    .last()
+                    .expect("fault event")
+                    .operation_index,
+                start + offset
+            );
+        } else {
+            assert_eq!(
+                authority.failures.load(Ordering::SeqCst),
+                1,
+                "authority fault must fire"
+            );
+        }
+        assert_eq!(
+            anchor.read_v2().await.expect("base after fault"),
+            Some(base.clone())
+        );
+        let inventory = inner.list_prefix("").await.expect("post-failure inventory");
+        let abandoned = inventory
+            .iter()
+            .filter(|entry| !before_ids.contains(&entry.object_id))
+            .map(|entry| entry.object_id.clone())
+            .collect::<BTreeSet<_>>();
+        let report = repository
+            .commit_store()
+            .report_orphans(&anchor)
+            .await
+            .expect("classify abandoned candidates");
+        let candidates = report
+            .candidates
+            .iter()
+            .map(|entry| entry.object_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            candidates, abandoned,
+            "only abandoned siblings/root are orphans: {fault:?}"
+        );
+        let recovered = make_repository(inner.clone(), keyring.clone(), options.clone());
+        recovered
+            .load_chain_from_anchor(&anchor)
+            .await
+            .expect("restart at unchanged base");
+        assert_compaction_visible_state(&recovered, &expected, &deleted).await;
+        // Retry on the original service too, proving failed compaction installed
+        // neither a candidate catalog nor a poisoned mutation/publication lease.
+        let retry_start = store.next_operation_index().expect("retry trace start");
+        repository
+            .compact_packed_index_runs(&authority, &authority)
+            .await
+            .expect("one-shot fault retry converges");
+        let retry_events = store.operation_log().expect("retry trace");
+        assert_compaction_does_not_read_payload(
+            &retry_events[retry_start as usize..],
+            &payload_spans,
+        );
+    }
+    let accepted = anchor
+        .read_v2()
+        .await
+        .expect("accepted anchor")
+        .expect("anchor exists");
+    assert_eq!(
+        accepted.sequence,
+        base.sequence.checked_next().expect("next sequence")
+    );
+    assert_eq!(
+        repository
+            .active_index_run_count()
+            .expect("compacted run count"),
+        1
+    );
+    let recovered = make_repository(inner, keyring, options);
+    recovered
+        .load_chain_from_anchor(&anchor)
+        .await
+        .expect("restart after compaction");
+    assert_compaction_visible_state(&recovered, &expected, &deleted).await;
+    trace
+}
+
+fn assert_compaction_does_not_read_payload(
+    events: &[rs3_storage::FaultEvent],
+    payload_spans: &std::collections::BTreeMap<BackendObjectId, Vec<std::ops::Range<u64>>>,
+) {
+    for event in events {
+        if !matches!(
+            event.kind,
+            FaultOperationKind::GetRange | FaultOperationKind::GetRangeAt
+        ) {
+            continue;
+        }
+        let range = event.range.expect("read events must record ranges");
+        if let Some(spans) = event
+            .object_id
+            .as_ref()
+            .and_then(|key| payload_spans.get(key))
+        {
+            for payload in spans {
+                let ByteRange::Slice { offset, len } = range else {
+                    panic!("compaction must not read a full payload-bearing commit");
+                };
+                assert!(
+                    offset + len <= payload.start || offset >= payload.end,
+                    "compaction read intersects payload ciphertext: {event:?}"
+                );
+            }
+        }
+    }
+}
+
+async fn assert_compaction_visible_state<S: BlobStore + Clone>(
+    repository: &rs3_repository::v2::V2Repository<S>,
+    expected: &std::collections::BTreeMap<LogicalPath, Bytes>,
+    deleted: &LogicalPath,
+) {
+    assert_eq!(
+        repository.list("compaction/").expect("list state").len(),
+        expected.len()
+    );
+    for (key, body) in expected {
+        assert_eq!(
+            &repository
+                .get_range(key, ByteRange::Full)
+                .await
+                .expect("exact restored bytes"),
+            body
+        );
+    }
+    assert!(matches!(
+        repository.get_range(deleted, ByteRange::Full).await,
+        Err(RepositoryError::NotFound(_))
+    ));
+}

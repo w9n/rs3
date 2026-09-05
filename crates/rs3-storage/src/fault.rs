@@ -70,6 +70,8 @@ pub struct FaultEvent {
     pub object_id: Option<BackendObjectId>,
     /// Prefix string, when the operation lists a prefix.
     pub prefix: Option<String>,
+    /// Requested read range, including streams; absent for non-read operations.
+    pub range: Option<ByteRange>,
 }
 
 /// Match criteria for a one-shot injected fault.
@@ -329,6 +331,16 @@ impl FaultScript {
         object_id: Option<&BackendObjectId>,
         prefix: Option<&str>,
     ) -> Result<FaultEffect> {
+        self.begin_with_range(kind, object_id, prefix, None)
+    }
+
+    fn begin_with_range(
+        &self,
+        kind: FaultOperationKind,
+        object_id: Option<&BackendObjectId>,
+        prefix: Option<&str>,
+        range: Option<ByteRange>,
+    ) -> Result<FaultEffect> {
         let (event, action) = {
             let mut state = self.write_state()?;
             let event = FaultEvent {
@@ -336,6 +348,7 @@ impl FaultScript {
                 kind,
                 object_id: object_id.cloned(),
                 prefix: prefix.map(ToOwned::to_owned),
+                range,
             };
             state.next_operation_index = state.next_operation_index.saturating_add(1);
             state.events.push(event.clone());
@@ -465,9 +478,12 @@ where
     }
 
     async fn get_range(&self, object_id: &BackendObjectId, range: ByteRange) -> Result<Bytes> {
-        let effect = self
-            .script
-            .begin(FaultOperationKind::GetRange, Some(object_id), None)?;
+        let effect = self.script.begin_with_range(
+            FaultOperationKind::GetRange,
+            Some(object_id),
+            None,
+            Some(range),
+        )?;
         let body = self.inner.get_range(object_id, range).await?;
         finish_success(body, effect)
     }
@@ -478,9 +494,12 @@ where
         version_id: Option<&BackendVersionId>,
         range: ByteRange,
     ) -> Result<Bytes> {
-        let effect = self
-            .script
-            .begin(FaultOperationKind::GetRangeAt, Some(object_id), None)?;
+        let effect = self.script.begin_with_range(
+            FaultOperationKind::GetRangeAt,
+            Some(object_id),
+            None,
+            Some(range),
+        )?;
         let body = self
             .inner
             .get_range_at(object_id, version_id, range)
@@ -494,9 +513,12 @@ where
         version_id: Option<&BackendVersionId>,
         range: ByteRange,
     ) -> Result<Box<dyn BlobRead>> {
-        let effect = self
-            .script
-            .begin(FaultOperationKind::GetRangeAt, Some(object_id), None)?;
+        let effect = self.script.begin_with_range(
+            FaultOperationKind::GetRangeAt,
+            Some(object_id),
+            None,
+            Some(range),
+        )?;
         let read = self
             .inner
             .open_range_at(object_id, version_id, range)
@@ -510,9 +532,12 @@ where
         version_id: Option<&BackendVersionId>,
         max_bytes: u64,
     ) -> Result<Box<dyn BlobRead>> {
-        let effect = self
-            .script
-            .begin(FaultOperationKind::GetRangeAt, Some(object_id), None)?;
+        let effect = self.script.begin_with_range(
+            FaultOperationKind::GetRangeAt,
+            Some(object_id),
+            None,
+            Some(ByteRange::Full),
+        )?;
         let read = self
             .inner
             .open_bounded_full_at(object_id, version_id, max_bytes)
