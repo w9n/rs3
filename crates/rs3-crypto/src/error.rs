@@ -81,6 +81,9 @@ pub enum CryptoError {
     /// Checkpoint public verification key is malformed.
     #[error("checkpoint public verification key is malformed")]
     CheckpointPublicKeyMalformed,
+    /// A signing descriptor's public key does not match its secret material.
+    #[error("checkpoint public key does not match secret material")]
+    CheckpointPublicKeyMismatch,
     /// Recovery public verification key is malformed.
     #[error("recovery public verification key is malformed")]
     RecoveryPublicKeyMalformed,

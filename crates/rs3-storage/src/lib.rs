@@ -4,14 +4,13 @@
 mod fault;
 mod filesystem;
 mod read;
+mod retention;
 #[cfg(feature = "s3")]
 mod s3;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use rs3_types::{
-    BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionMode, RetentionPolicy,
-};
+use rs3_types::{BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionPolicy};
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -25,6 +24,8 @@ pub use fault::{
 };
 pub use filesystem::FilesystemBlobStore;
 pub use read::{BlobRead, MAX_BLOB_READ_CHUNK_BYTES, collect_bounded_blob_read};
+pub use retention::{active_retention, retention_satisfies, strongest_retention_policy};
+use retention::{retention_is_active, stronger_retention_mode};
 #[cfg(feature = "s3")]
 pub use s3::{
     S3BlobStore, S3BlobStoreConfig, S3ClientTimeoutConfig, S3ProviderMetrics,
@@ -1814,10 +1815,6 @@ fn retain_until_ms(policy: Option<RetentionPolicy>) -> Option<i64> {
     now_ms.checked_add(retain_ms)
 }
 
-fn retention_is_active(policy: &RetentionPolicy) -> bool {
-    policy.mode != RetentionMode::None && policy.retain_days > 0
-}
-
 fn merge_retain_until(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.max(right)),
@@ -1833,18 +1830,6 @@ fn merge_retention(existing: Option<&RetentionPolicy>, next: RetentionPolicy) ->
             retain_days: existing.retain_days.max(next.retain_days),
         },
         None => next,
-    }
-}
-
-fn stronger_retention_mode(left: RetentionMode, right: RetentionMode) -> RetentionMode {
-    match (left, right) {
-        (RetentionMode::Compliance, _) | (_, RetentionMode::Compliance) => {
-            RetentionMode::Compliance
-        }
-        (RetentionMode::Governance, _) | (_, RetentionMode::Governance) => {
-            RetentionMode::Governance
-        }
-        (RetentionMode::None, RetentionMode::None) => RetentionMode::None,
     }
 }
 

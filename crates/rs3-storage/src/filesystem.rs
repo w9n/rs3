@@ -1,6 +1,7 @@
 //! Local filesystem `BlobStore` implementation.
 
 use crate::read::{BLOB_READ_CHUNK_BYTES, BlobReadSource, exact_blob_read};
+use crate::retention::retention_is_active;
 use crate::{
     BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobRead, BlobStore, ByteRange, PutOptions,
     Result, StorageError, object_kind, prefix_kind, record_blob_delete,
@@ -9,7 +10,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
+use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionPolicy};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
@@ -753,10 +754,6 @@ fn temp_file_name() -> String {
 fn system_time_millis(time: SystemTime) -> Option<i64> {
     let millis = time.duration_since(UNIX_EPOCH).ok()?.as_millis();
     i64::try_from(millis).ok()
-}
-
-fn retention_is_active(policy: &RetentionPolicy) -> bool {
-    policy.mode != RetentionMode::None && policy.retain_days > 0
 }
 
 fn map_read_error(path: &Path, error: std::io::Error) -> StorageError {

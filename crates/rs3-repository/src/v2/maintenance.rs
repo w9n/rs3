@@ -26,6 +26,9 @@ use rs3_storage::{
     BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore,
     ByteRange, PutOptions, StorageError,
 };
+use rs3_storage::{
+    active_retention, retention_satisfies, strongest_retention_policy as strongest_retention,
+};
 use rs3_types::{
     BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionMode, RetentionPolicy, Sequence,
 };
@@ -3025,10 +3028,6 @@ fn ensure_next_budgeted_operation(limit: Option<u64>, used: u64) -> V2Result<()>
     Ok(())
 }
 
-fn active_retention(policy: Option<RetentionPolicy>) -> Option<RetentionPolicy> {
-    policy.filter(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
-}
-
 fn retention_renewal_needed(
     metadata: &BlobMetadata,
     requested: RetentionPolicy,
@@ -3038,40 +3037,6 @@ fn retention_renewal_needed(
         || metadata
             .retain_until_ms
             .is_none_or(|retain_until_ms| retain_until_ms <= renew_before_ms)
-}
-
-fn retention_satisfies(actual: Option<&RetentionPolicy>, requested: &RetentionPolicy) -> bool {
-    let Some(actual) = actual else {
-        return false;
-    };
-    retention_mode_strength(actual.mode) >= retention_mode_strength(requested.mode)
-        && actual.retain_days >= requested.retain_days
-}
-
-fn retention_mode_strength(mode: RetentionMode) -> u8 {
-    match mode {
-        RetentionMode::None => 0,
-        RetentionMode::Governance => 1,
-        RetentionMode::Compliance => 2,
-    }
-}
-
-fn strongest_retention(
-    left: Option<RetentionPolicy>,
-    right: Option<RetentionPolicy>,
-) -> Option<RetentionPolicy> {
-    match (active_retention(left), active_retention(right)) {
-        (Some(left), Some(right)) => Some(RetentionPolicy::new(
-            if retention_mode_strength(left.mode) >= retention_mode_strength(right.mode) {
-                left.mode
-            } else {
-                right.mode
-            },
-            left.retain_days.max(right.retain_days),
-        )),
-        (Some(policy), None) | (None, Some(policy)) => Some(policy),
-        (None, None) => None,
-    }
 }
 
 fn retention_blocks_delete(

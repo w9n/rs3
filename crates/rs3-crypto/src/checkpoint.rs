@@ -6,6 +6,7 @@ use crate::keyring::KeyRing;
 use crate::primitives::derive_hmac;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use rs3_types::{KeyId, KeyPurpose};
+use zeroize::Zeroizing;
 
 const CHECKPOINT_PUBLIC_KEY_HEX_LEN: usize = 64;
 const CHECKPOINT_PUBLIC_KEY_PREFIX: &str = "ed25519:";
@@ -87,12 +88,16 @@ pub(crate) fn derive_checkpoint_public_key_descriptor(
 }
 
 fn checkpoint_signing_key(secret: &SecretBytes) -> Result<Ed25519KeyPair, CryptoError> {
-    let seed = derive_hmac(secret, b"rs3:checkpoint-ed25519-seed:v1", b"ed25519")?;
+    let seed = Zeroizing::new(derive_hmac(
+        secret,
+        b"rs3:checkpoint-ed25519-seed:v1",
+        b"ed25519",
+    )?);
     Ed25519KeyPair::from_seed_unchecked(&seed)
         .map_err(|_| CryptoError::CheckpointSigningKeyRejected)
 }
 
-fn checkpoint_public_key_bytes(public_key: &str) -> Result<Vec<u8>, CryptoError> {
+pub(crate) fn checkpoint_public_key_bytes(public_key: &str) -> Result<Vec<u8>, CryptoError> {
     prefixed_ed25519_public_key_bytes(public_key)
         .map_err(|_| CryptoError::CheckpointPublicKeyMalformed)
 }
@@ -256,110 +261,6 @@ mod tests {
         );
 
         assert!(verified.is_err());
-    }
-
-    #[test]
-    fn checkpoint_signature_verification_rejects_wrong_public_key_metadata() {
-        let signer = match KeyRing::new(vec![
-            namespace_key("namespace", KeyStatus::Primary, 1),
-            key_material(
-                "signing",
-                KeyPurpose::CheckpointSigning,
-                KeyStatus::Primary,
-                "ed25519",
-                2,
-            ),
-        ]) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
-        let verifier = match KeyRing::new(vec![
-            namespace_key("namespace", KeyStatus::Primary, 1),
-            KeyMaterial::new(
-                KeyDescriptor {
-                    id: key_id("signing"),
-                    purpose: KeyPurpose::CheckpointSigning,
-                    algorithm: "ed25519".to_owned(),
-                    status: KeyStatus::Primary,
-                    created_at_ms: 0,
-                    not_before_ms: None,
-                    not_after_ms: None,
-                    public_key: Some(
-                        "ed25519:0000000000000000000000000000000000000000000000000000000000000000"
-                            .to_owned(),
-                    ),
-                    external_kms_uri: None,
-                },
-                secret(2),
-            ),
-        ]) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
-
-        let signature = match signer.sign_checkpoint_payload(b"canonical checkpoint") {
-            Ok(signature) => signature,
-            Err(error) => panic!("{error}"),
-        };
-        let verified = verifier.verify_checkpoint_payload(
-            &signature.key_id,
-            b"canonical checkpoint",
-            &signature.signature,
-        );
-
-        assert!(verified.is_err());
-    }
-
-    #[test]
-    fn checkpoint_signature_verification_rejects_malformed_public_key_metadata() {
-        let signer = match KeyRing::new(vec![
-            namespace_key("namespace", KeyStatus::Primary, 1),
-            key_material(
-                "signing",
-                KeyPurpose::CheckpointSigning,
-                KeyStatus::Primary,
-                "ed25519",
-                2,
-            ),
-        ]) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
-        let verifier = match KeyRing::new(vec![
-            namespace_key("namespace", KeyStatus::Primary, 1),
-            KeyMaterial::new(
-                KeyDescriptor {
-                    id: key_id("signing"),
-                    purpose: KeyPurpose::CheckpointSigning,
-                    algorithm: "ed25519".to_owned(),
-                    status: KeyStatus::Primary,
-                    created_at_ms: 0,
-                    not_before_ms: None,
-                    not_after_ms: None,
-                    public_key: Some("ed25519:not-hex".to_owned()),
-                    external_kms_uri: None,
-                },
-                secret(2),
-            ),
-        ]) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
-
-        let signature = match signer.sign_checkpoint_payload(b"canonical checkpoint") {
-            Ok(signature) => signature,
-            Err(error) => panic!("{error}"),
-        };
-        let verified = verifier.verify_checkpoint_payload(
-            &signature.key_id,
-            b"canonical checkpoint",
-            &signature.signature,
-        );
-
-        assert!(matches!(
-            verified,
-            Err(crate::CryptoError::CheckpointPublicKeyMalformed)
-        ));
     }
 
     #[test]

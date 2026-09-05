@@ -159,29 +159,29 @@ impl FormatEnvelope {
         };
         let associated_data = envelope.associated_data()?;
         let cipher = format_envelope_cipher(wrapping_key)?;
-        let mut ciphertext = plaintext.to_vec();
+        let mut ciphertext = Zeroizing::new(plaintext.to_vec());
         let tag = cipher
             .encrypt_in_place_detached(Nonce::from_slice(&nonce), &associated_data, &mut ciphertext)
             .map_err(|_| CryptoError::AeadOperationFailed)?;
-        envelope.ciphertext = ciphertext;
+        envelope.ciphertext = std::mem::take(&mut *ciphertext);
         envelope.tag = tag.to_vec();
         Ok(envelope)
     }
 
-    /// Opens this format envelope into plaintext bytes.
+    /// Opens this format envelope into plaintext bytes that zeroize on drop.
     pub fn open(
         &self,
         expected_context: &RepositoryKeyContext,
         wrapping_key_id: &str,
         wrapping_key: &SecretBytes,
-    ) -> Result<Vec<u8>, CryptoError> {
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         self.validate_public_fields(expected_context, wrapping_key_id)?;
         if self.tag.len() != ENVELOPE_TAG_LEN || self.nonce.len() != ENVELOPE_NONCE_LEN {
             return Err(CryptoError::AeadOperationFailed);
         }
         let associated_data = self.associated_data()?;
         let cipher = format_envelope_cipher(wrapping_key)?;
-        let mut plaintext = self.ciphertext.clone();
+        let mut plaintext = Zeroizing::new(self.ciphertext.clone());
         cipher
             .decrypt_in_place_detached(
                 Nonce::from_slice(&self.nonce),
@@ -633,9 +633,29 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("{error}"));
 
-        assert_eq!(opened, plaintext);
+        assert_eq!(opened.as_slice(), plaintext);
         assert!(decoded.digest().is_ok());
         assert!(decoded.open(&wrong, "wrap-v1", &secret(9)).is_err());
+    }
+
+    #[test]
+    fn format_envelope_rejects_ciphertext_nonce_and_tag_tampering() {
+        let context = context("repo-a", 2);
+        let envelope =
+            FormatEnvelope::seal(&context, "wrap-v1", &secret(9), 1, b"format plaintext")
+                .expect("seal format");
+        for field in 0..3 {
+            let mut tampered = envelope.clone();
+            match field {
+                0 => tampered.ciphertext[0] ^= 1,
+                1 => tampered.nonce[0] ^= 1,
+                _ => tampered.tag[0] ^= 1,
+            }
+            assert!(matches!(
+                tampered.open(&context, "wrap-v1", &secret(9)),
+                Err(crate::CryptoError::AeadOperationFailed)
+            ));
+        }
     }
 
     #[test]

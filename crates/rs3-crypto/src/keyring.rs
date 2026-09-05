@@ -1,10 +1,14 @@
 //! Purpose-specific repository keyrings.
 
-use crate::checkpoint::derive_checkpoint_public_key_descriptor;
+use crate::checkpoint::{
+    checkpoint_public_key_bytes, derive_checkpoint_public_key,
+    derive_checkpoint_public_key_descriptor,
+};
 use crate::{CryptoError, SecretBytes};
 use getrandom::fill as fill_random;
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, RepositoryId};
 use std::collections::BTreeSet;
+use zeroize::Zeroizing;
 
 const NAMESPACE_ALGORITHM: &str = "hmac-sha256";
 const CONTENT_ALGORITHM: &str = "xchacha20poly1305";
@@ -227,6 +231,15 @@ fn validate_keyring(keys: &[KeyMaterial]) -> Result<(), CryptoError> {
                 key_id: key.descriptor.id.clone(),
             });
         }
+        if key.descriptor.purpose == KeyPurpose::CheckpointSigning
+            && let Some(public_key) = key.descriptor.public_key.as_deref()
+        {
+            let declared = checkpoint_public_key_bytes(public_key)?;
+            let derived = derive_checkpoint_public_key(&key.secret)?;
+            if !crate::ct_eq(&declared, &derived) {
+                return Err(CryptoError::CheckpointPublicKeyMismatch);
+            }
+        }
     }
 
     for purpose in [
@@ -256,8 +269,8 @@ fn validate_keyring(keys: &[KeyMaterial]) -> Result<(), CryptoError> {
 }
 
 fn random_secret() -> Result<SecretBytes, CryptoError> {
-    let mut secret = [0_u8; SecretBytes::MIN_LEN];
-    fill_random(&mut secret).map_err(|_| CryptoError::RandomnessUnavailable)?;
+    let mut secret = Zeroizing::new([0_u8; SecretBytes::MIN_LEN]);
+    fill_random(secret.as_mut()).map_err(|_| CryptoError::RandomnessUnavailable)?;
     SecretBytes::new(secret.to_vec())
 }
 
@@ -373,6 +386,37 @@ mod tests {
         match RepositoryId::new(value) {
             Ok(repository_id) => repository_id,
             Err(error) => panic!("{error}"),
+        }
+    }
+
+    #[test]
+    fn signing_public_key_validation_applies_to_every_status() {
+        let correct =
+            super::derive_checkpoint_public_key_descriptor(&secret(2)).expect("descriptor");
+        let wrong =
+            super::derive_checkpoint_public_key_descriptor(&secret(3)).expect("other descriptor");
+        for status in [KeyStatus::Primary, KeyStatus::Enabled, KeyStatus::Disabled] {
+            let make_keyring = |public_key: Option<String>| {
+                let mut signing = namespace_key("signing", status, 2);
+                signing.descriptor.purpose = KeyPurpose::CheckpointSigning;
+                signing.descriptor.algorithm = "ed25519".to_owned();
+                signing.descriptor.public_key = public_key;
+                KeyRing::new(vec![
+                    namespace_key("namespace", KeyStatus::Primary, 1),
+                    signing,
+                ])
+            };
+            assert!(make_keyring(None).is_ok());
+            assert!(make_keyring(Some(correct.clone())).is_ok());
+            assert!(make_keyring(Some(format!("ed25519:{}", correct[8..].to_uppercase()))).is_ok());
+            assert!(matches!(
+                make_keyring(Some(wrong.clone())),
+                Err(crate::CryptoError::CheckpointPublicKeyMismatch)
+            ));
+            assert!(matches!(
+                make_keyring(Some("ed25519:not-hex".to_owned())),
+                Err(crate::CryptoError::CheckpointPublicKeyMalformed)
+            ));
         }
     }
 

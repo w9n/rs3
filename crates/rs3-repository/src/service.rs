@@ -10,10 +10,9 @@ use crate::payload::{
 };
 use bytes::Bytes;
 use rs3_crypto::KeyRing;
-use rs3_storage::{ByteRange, StorageError};
+use rs3_storage::{ByteRange, StorageError, active_retention};
 use rs3_types::{
-    BackendObjectId, BackendObjectRef, BackendVersionId, LegalHoldStatus, RetentionMode,
-    RetentionPolicy,
+    BackendObjectId, BackendObjectRef, BackendVersionId, LegalHoldStatus, RetentionPolicy,
 };
 use std::sync::{Arc, RwLock};
 
@@ -430,20 +429,6 @@ fn record_decrypted_segment_cache_many(result: &'static str, events: u64, bytes:
     .increment(bytes);
 }
 
-pub(crate) fn strongest_retention_policy(
-    left: Option<RetentionPolicy>,
-    right: Option<RetentionPolicy>,
-) -> Option<RetentionPolicy> {
-    match (active_retention(left), active_retention(right)) {
-        (Some(left), Some(right)) => Some(RetentionPolicy::new(
-            stronger_retention_mode(left.mode, right.mode),
-            left.retain_days.max(right.retain_days),
-        )),
-        (Some(policy), None) | (None, Some(policy)) => Some(policy),
-        (None, None) => None,
-    }
-}
-
 pub(crate) fn require_version_for_retained_write(
     object_id: &BackendObjectId,
     metadata: &rs3_storage::BlobMetadata,
@@ -461,22 +446,6 @@ pub(crate) fn version_binding_required(
     legal_hold: Option<LegalHoldStatus>,
 ) -> bool {
     active_retention(retention).is_some() || legal_hold == Some(LegalHoldStatus::On)
-}
-
-fn active_retention(policy: Option<RetentionPolicy>) -> Option<RetentionPolicy> {
-    policy.filter(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
-}
-
-fn stronger_retention_mode(left: RetentionMode, right: RetentionMode) -> RetentionMode {
-    match (left, right) {
-        (RetentionMode::Compliance, _) | (_, RetentionMode::Compliance) => {
-            RetentionMode::Compliance
-        }
-        (RetentionMode::Governance, _) | (_, RetentionMode::Governance) => {
-            RetentionMode::Governance
-        }
-        (RetentionMode::None, RetentionMode::None) => RetentionMode::None,
-    }
 }
 
 #[cfg(test)]

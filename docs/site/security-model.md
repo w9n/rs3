@@ -100,6 +100,12 @@ repository used `v01`, and no migration or dual reader is planned.
 
 ## Control Map
 
+Keyring loading rejects supplied signing public keys that disagree with their
+secret material, including inactive keys. Temporary random secrets, derived
+signing seeds and format-envelope plaintext buffers use zeroization on drop.
+Opened format plaintext retains that protection while held by the caller;
+this does not erase copies a caller creates separately.
+
 | Requirement | Mechanism | Current Evidence |
 | --- | --- | --- |
 | Backend keys do not reveal client paths | Opaque backend object IDs and path privacy property tests. | `crates/rs3-repository/tests/path_invariants.rs` |

@@ -2,6 +2,7 @@
 
 use super::error::{V2ErrorClass, V2FormatError, V2Result};
 use bytes::Bytes;
+use rs3_storage::retention_satisfies;
 use rs3_storage::{
     BlobListMode, BlobMetadata, BlobStore, ByteRange, PutOptions, StorageError,
     read_bounded_full_at,
@@ -1162,20 +1163,4 @@ fn probe_object_id(
 
 fn retention_for_profile(options: &V2ProviderConformanceOptions) -> Option<RetentionPolicy> {
     (options.profile == V2ProviderProfile::RetainedVersionObjectLock).then_some(options.retention)
-}
-
-fn retention_satisfies(actual: Option<&RetentionPolicy>, requested: &RetentionPolicy) -> bool {
-    let Some(actual) = actual else {
-        return false;
-    };
-    retention_mode_strength(actual.mode) >= retention_mode_strength(requested.mode)
-        && actual.retain_days >= requested.retain_days
-}
-
-fn retention_mode_strength(mode: RetentionMode) -> u8 {
-    match mode {
-        RetentionMode::None => 0,
-        RetentionMode::Governance => 1,
-        RetentionMode::Compliance => 2,
-    }
 }

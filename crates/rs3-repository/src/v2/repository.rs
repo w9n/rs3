@@ -21,6 +21,7 @@ use rs3_crypto::Sha256Hasher;
 use rs3_storage::{
     BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore, ByteRange, PutOptions, StorageError,
 };
+use rs3_storage::{retention_satisfies, strongest_retention_policy};
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyId, LegalHoldStatus, RepositoryId, RetentionMode,
     RetentionPolicy, Sequence,
@@ -3094,13 +3095,6 @@ impl MultipartCommitAssembler {
     }
 }
 
-fn strongest_retention_policy(
-    left: Option<RetentionPolicy>,
-    right: Option<RetentionPolicy>,
-) -> Option<RetentionPolicy> {
-    crate::service::strongest_retention_policy(left, right)
-}
-
 fn strongest_legal_hold(
     left: Option<LegalHoldStatus>,
     right: Option<LegalHoldStatus>,
@@ -3126,22 +3120,6 @@ fn required_retain_until_ms(retention: Option<RetentionPolicy>) -> Option<i64> {
         return None;
     }
     current_time_ms().checked_add(i64::from(retention.retain_days).checked_mul(86_400_000)?)
-}
-
-fn retention_satisfies(actual: Option<&RetentionPolicy>, requested: &RetentionPolicy) -> bool {
-    let Some(actual) = actual else {
-        return false;
-    };
-    retention_mode_strength(actual.mode) >= retention_mode_strength(requested.mode)
-        && actual.retain_days >= requested.retain_days
-}
-
-fn retention_mode_strength(mode: rs3_types::RetentionMode) -> u8 {
-    match mode {
-        rs3_types::RetentionMode::None => 0,
-        rs3_types::RetentionMode::Governance => 1,
-        rs3_types::RetentionMode::Compliance => 2,
-    }
 }
 
 #[cfg(test)]

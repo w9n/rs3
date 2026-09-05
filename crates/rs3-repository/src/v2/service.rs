@@ -31,9 +31,7 @@ use crate::payload::{
     parse_segmented_payload_header_with_total_len, probe_payload_header,
     seal_streamable_payload_object, segmented_ciphertext_span, total_segmented_payload_len,
 };
-use crate::service::{
-    DecryptedSegmentIdentity, RepositoryOptions, RepositoryResources, strongest_retention_policy,
-};
+use crate::service::{DecryptedSegmentIdentity, RepositoryOptions, RepositoryResources};
 use crate::state::{RepositoryState, TrustedManifest, apply_index_delta_object, object_material};
 use bytes::Bytes;
 use futures_util::Stream;
@@ -44,6 +42,7 @@ use rs3_index::{
     PayloadHeaderReference, PayloadReference, V2CommitStreamCarrierReference,
     V2StandaloneStreamCarrierReference, index_delta_object_bytes,
 };
+use rs3_storage::strongest_retention_policy;
 use rs3_storage::{BlobStore, ByteRange, StorageError};
 use rs3_types::{
     BackendObjectId, BackendObjectRef, BackendVersionId, LegalHoldStatus, LogicalPath, ManifestId,

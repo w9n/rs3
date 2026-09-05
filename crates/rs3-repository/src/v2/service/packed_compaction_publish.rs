@@ -6,7 +6,6 @@ use super::packed::{
 use super::packed_compaction::{PackedCompactionSourceRun, plan_packed_run_compaction};
 use super::{V2CoordinatedMutation, V2Repository, v2_repository_error};
 use crate::error::{RepositoryError, Result};
-use crate::service::strongest_retention_policy;
 use crate::state::RepositoryState;
 use crate::v2::{
     V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitAnchor, V2CommitParentRef, V2CommitSection,
@@ -18,6 +17,7 @@ use rs3_index::run::{
     IndexRun, IndexRunContainer, IndexRunKeyringRef, IndexRunLimits, IndexRunStreamContainer,
 };
 use rs3_storage::BlobStore;
+use rs3_storage::strongest_retention_policy;
 use rs3_types::{LegalHoldStatus, RetentionPolicy};
 
 const V2_PACKED_COMPACTION_MAX_SOURCE_RUNS: usize = 128;
