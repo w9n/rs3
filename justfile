@@ -111,7 +111,6 @@ console-local:
 # Cheap production-preview gate for local handoff.
 preview-gate-local:
     just check
-    just check-s3
     just deny
     just deny-s3
 
@@ -131,7 +130,7 @@ preview-gate-v2-nightly:
     just integration-s3-gateway --tooling-smoke
     just preview-gate-v2-retained-local
     just integration-kopia-gateway
-    just integration-k8s-gateway-v2 --wait-secs 240
+    just integration-k8s-gateway --wait-secs 240
     just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image
     just integration-velero-kopia-postgres-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image
 
@@ -147,7 +146,7 @@ preview-gate-v2-live BACKEND_BUCKET ENDPOINT_URL REGION:
     just check-v2-provider-v2-live "{{BACKEND_BUCKET}}" "{{ENDPOINT_URL}}" "{{REGION}}" "${base}/a" > ".local/integration/${timestamp}.json"
     just integration-s3-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/b"
     just integration-kopia-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/c"
-    just integration-k8s-gateway-v2 --wait-secs 240
+    just integration-k8s-gateway --wait-secs 240
     just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/d" --pull-velero-images --pull-openebs-images --pull-postgres-image
     just integration-velero-kopia-postgres-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/e" --pull-velero-images --pull-openebs-images --pull-postgres-image
 
@@ -222,10 +221,6 @@ integration-kopia-gateway-v2-live *ARGS:
 
 # Run the Kubernetes gateway integration harness.
 integration-k8s-gateway *ARGS:
-    RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway {{ARGS}}
-
-# Run the v2 Kubernetes gateway integration harness.
-integration-k8s-gateway-v2 *ARGS:
     RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway {{ARGS}}
 
 # Run the Velero Kopia smoke test.

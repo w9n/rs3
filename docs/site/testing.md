@@ -1,5 +1,10 @@
 # Testing
 
+Use `just check` for workspace checks and `just fmt` for formatting. Operator
+keyring inspection, rewrap and bundle verification live in `rs3-server`;
+repository initialization uses `rs3-server init`. The xtask CLI contains
+integration lanes, performance tools and the isolated `v2 gc-rehearsal` command.
+
 Testing is part of the architecture because privacy and rollback behavior are
 product requirements.
 
@@ -27,8 +32,7 @@ This runs formatting, clippy with warnings denied, and workspace tests.
 | Live v2 Gateway S3 | `just integration-s3-gateway-v2-live --backend-bucket <bucket> --endpoint-url <endpoint> --region <region> --backend-prefix <fresh-prefix>` | v2-preview gateway smoke against an existing retained S3-compatible backend, including `mc`, default `rclone lsf`, and backend key privacy checks. |
 | Kopia | `just integration-kopia-gateway` | Real Kopia create, snapshot, and restore through the gateway. |
 | Live v2 Kopia | `just integration-kopia-gateway-v2-live --backend-bucket <bucket> --endpoint-url <endpoint> --region <region> --backend-prefix <fresh-prefix>` | Real Kopia create, snapshot, and restore through a v2-preview gateway against an existing retained backend. |
-| Kubernetes | `just integration-k8s-gateway` | Image build, kind cluster, Helm install, readiness, S3 smoke. |
-| Kubernetes v2 Lease | `just integration-k8s-gateway-v2` | v2-preview Helm deployment using a Kubernetes Lease anchor, with an assertion that v2 anchor annotations are written. |
+| Kubernetes v2 Lease | `just integration-k8s-gateway` | Image build, kind cluster, Helm install, readiness and S3 smoke, including verification that v2 anchor annotations are written. |
 | Velero/Kopia | `just integration-velero-kopia-smoke` | Velero node-agent/Kopia backup and restore smoke. |
 | Live v2 Velero dynamic PVC | `just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-bucket <bucket> --backend-endpoint-url <endpoint> --backend-region <region> --backend-prefix <fresh-prefix>` | Velero/Kopia dynamic-PVC backup and restore through a v2-preview gateway after a gateway restart, against an existing retained backend. |
 | Live v2 Velero Postgres | `just integration-velero-kopia-postgres-v2-live --backend-bucket <bucket> --backend-endpoint-url <endpoint> --backend-region <region> --backend-prefix <fresh-prefix>` | Velero/Kopia Postgres backup and restore through a v2-preview gateway against an existing retained backend. |

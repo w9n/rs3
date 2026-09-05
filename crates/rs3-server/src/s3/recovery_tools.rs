@@ -570,8 +570,9 @@ mod tests {
         assert_eq!(inspect.keys, keyring.descriptors());
     }
 
-    #[tokio::test]
-    async fn verify_bundle_checks_format_root_keyring_and_commit_chain() {
+    async fn verification_fixture(
+        profile: V2ProviderProfile,
+    ) -> (MemoryBlobStore, V2RecoveryBundle, SecretBytes) {
         let store = MemoryBlobStore::new();
         let repository_id = repository_id();
         let context = crypto_context();
@@ -585,7 +586,7 @@ mod tests {
             repository_id.clone(),
             keyring_ref,
             signing_key_id,
-            V2ProviderProfile::Dev,
+            profile,
             None,
         );
         let format_ref = write_format_root(&store, &context, &wrapping_key, &format_root).await;
@@ -594,7 +595,7 @@ mod tests {
             .commit_ref()
             .unwrap_or_else(|error| panic!("{error}"));
         let commit_options = V2CommitStoreOptions::for_profile(
-            V2ProviderProfile::Dev,
+            profile,
             repository_id.clone(),
             commit_ref,
             format_ref,
@@ -609,6 +610,12 @@ mod tests {
         bundle.repository_id = Some(repository_id);
         bundle.exported_at_ms = 42;
 
+        (store, bundle, wrapping_key)
+    }
+
+    #[tokio::test]
+    async fn verify_bundle_checks_format_root_keyring_and_commit_chain() {
+        let (store, bundle, wrapping_key) = verification_fixture(V2ProviderProfile::Dev).await;
         let report = verify_v2_recovery_bundle_with_store(
             store,
             &tool_config(),
@@ -624,6 +631,71 @@ mod tests {
         assert_eq!(report.verified_commit_count, 1);
         assert_eq!(report.snapshot_sequence, Sequence::new(1));
         assert_eq!(report.provider_profile, V2ProviderProfile::Dev);
+    }
+
+    #[tokio::test]
+    async fn verify_bundle_rejects_anchor_below_external_floor() {
+        let (store, bundle, wrapping_key) = verification_fixture(V2ProviderProfile::Dev).await;
+        let error = verify_v2_recovery_bundle_with_store(
+            store,
+            &tool_config(),
+            bundle,
+            V2RecoveryBundleVerificationOptions {
+                min_sequence: Sequence::new(2),
+                wrapping_key,
+            },
+        )
+        .await
+        .expect_err("external floor must reject older anchor");
+        assert!(error.to_string().contains("below --min-sequence"));
+    }
+
+    #[tokio::test]
+    async fn verify_bundle_requires_a_valid_offline_signature_for_production() {
+        let (store, mut bundle, wrapping_key) =
+            verification_fixture(V2ProviderProfile::AtomicCreate).await;
+        let signer = KeyRing::generate_random().expect("recovery signer");
+        let public_key = signer
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.purpose == KeyPurpose::CheckpointSigning)
+            .and_then(|descriptor| descriptor.public_key)
+            .expect("recovery public key");
+        let mut config = tool_config();
+        config.backend.endpoint = "https://storage.example.invalid".to_owned();
+        config.recovery.public_key = Some(public_key);
+        let verify = |bundle| {
+            verify_v2_recovery_bundle_with_store(
+                store.clone(),
+                &config,
+                bundle,
+                V2RecoveryBundleVerificationOptions {
+                    min_sequence: Sequence::new(1),
+                    wrapping_key: wrapping_key.clone(),
+                },
+            )
+        };
+        assert!(
+            verify(bundle.clone()).await.is_err(),
+            "unsigned production bundle"
+        );
+        bundle.offline_signature = Some(
+            signer
+                .sign_checkpoint_payload(
+                    &bundle
+                        .offline_signature_payload()
+                        .expect("signature payload"),
+                )
+                .expect("sign bundle")
+                .signature,
+        );
+        let report = verify(bundle.clone())
+            .await
+            .expect("valid signed production bundle");
+        assert_eq!(report.provider_profile, V2ProviderProfile::AtomicCreate);
+        assert_eq!(report.verified_commit_count, 1);
+        bundle.anchor.body_digest[0] ^= 1;
+        assert!(verify(bundle).await.is_err(), "tampered signed anchor");
     }
 
     fn tool_config() -> RepositoryToolConfig {
