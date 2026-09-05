@@ -36,9 +36,12 @@ where
     S: BlobStore + ?Sized,
 {
     let mut listing =
-        BoundedListing::open(store, prefix, mode, ListBudget::new(1, 4_096, 1)).await?;
+        BoundedListing::open(store, prefix, mode, ListBudget::new(1, 4_096, 4_096)).await?;
     while let Some(page) = listing.next_page().await? {
-        if page.consumed_items != 0 {
+        // Current inventories can consume traversal work without finding an
+        // object. Version inventories also count hidden delete markers.
+        if !page.entries.is_empty() || (mode == BlobListMode::Versions && page.consumed_items != 0)
+        {
             return Ok(true);
         }
     }

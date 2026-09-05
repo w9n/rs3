@@ -172,6 +172,8 @@ pub trait BlobList: Send {
 #[async_trait]
 pub trait BlobMultipartUpload: Send {
     /// Uploads one zero-based part. Parts may be uploaded out of order.
+    /// Indices must be below 10,000. Reusing an accepted index fails without
+    /// replacing its data; client-facing S3 part replacement is a separate API.
     async fn put_part(&mut self, part_index: usize, body: Bytes) -> Result<()>;
 
     /// Completes the upload and returns final object metadata.
@@ -832,6 +834,8 @@ pub struct MemoryBlobStore {
 #[derive(Clone, Debug)]
 struct MemoryObject {
     body: Bytes,
+    delete_marker: bool,
+    revision: u64,
     metadata: BlobMetadata,
 }
 
@@ -886,6 +890,7 @@ fn memory_object_at<'a>(
             .find(|object| object.metadata.version_id.as_ref() == Some(version_id)),
         None => versions.last(),
     }
+    .filter(|object| !object.delete_marker)
 }
 
 fn memory_object_at_mut<'a>(
@@ -898,6 +903,7 @@ fn memory_object_at_mut<'a>(
             .find(|object| object.metadata.version_id.as_ref() == Some(version_id)),
         None => versions.last_mut(),
     }
+    .filter(|object| !object.delete_marker)
 }
 
 impl Default for MemoryBlobStore {
@@ -918,7 +924,7 @@ struct MemoryBlobList {
     prefix: String,
     mode: BlobListMode,
     current_after: Option<BackendObjectId>,
-    version_after: Option<(BackendObjectId, usize)>,
+    version_after: Option<(BackendObjectId, u64)>,
     complete: bool,
 }
 
@@ -941,6 +947,7 @@ impl BlobList for MemoryBlobList {
         let limit = max_items.get();
         let mut entries = Vec::with_capacity(limit.min(1_024));
         let mut has_more = false;
+        let mut consumed_items = 0;
         match self.mode {
             BlobListMode::Current => {
                 for (object_id, versions) in &state.objects {
@@ -952,13 +959,14 @@ impl BlobList for MemoryBlobList {
                     {
                         continue;
                     }
-                    let Some(object) = versions.last() else {
+                    let Some(object) = memory_object_at(versions, None) else {
                         continue;
                     };
-                    if entries.len() == limit {
+                    if consumed_items == limit {
                         has_more = true;
                         break;
                     }
+                    consumed_items += 1;
                     self.current_after = Some(object_id.clone());
                     entries.push(object.metadata.clone());
                 }
@@ -968,22 +976,25 @@ impl BlobList for MemoryBlobList {
                     if !object_id.as_str().starts_with(&self.prefix) {
                         continue;
                     }
-                    for (version_index, object) in versions.iter().enumerate() {
+                    for object in versions {
                         if self.version_after.as_ref().is_some_and(
-                            |(after_object_id, after_version_index)| {
+                            |(after_object_id, after_revision)| {
                                 object_id < after_object_id
                                     || (object_id == after_object_id
-                                        && version_index <= *after_version_index)
+                                        && object.revision <= *after_revision)
                             },
                         ) {
                             continue;
                         }
-                        if entries.len() == limit {
+                        if consumed_items == limit {
                             has_more = true;
                             break;
                         }
-                        self.version_after = Some((object_id.clone(), version_index));
-                        entries.push(object.metadata.clone());
+                        consumed_items += 1;
+                        self.version_after = Some((object_id.clone(), object.revision));
+                        if !object.delete_marker {
+                            entries.push(object.metadata.clone());
+                        }
                     }
                     if has_more {
                         break;
@@ -994,7 +1005,6 @@ impl BlobList for MemoryBlobList {
 
         self.complete = !has_more;
         record_blob_list(object_kind, entries.len(), "ok", started.elapsed());
-        let consumed_items = entries.len();
         Ok(BlobListPage {
             entries,
             consumed_items,
@@ -1006,11 +1016,13 @@ impl BlobList for MemoryBlobList {
 #[async_trait]
 impl BlobMultipartUpload for MemoryMultipartUpload {
     async fn put_part(&mut self, part_index: usize, body: Bytes) -> Result<()> {
-        if self.parts.insert(part_index, body).is_some() {
+        validate_multipart_part_index(part_index)?;
+        if self.parts.contains_key(&part_index) {
             return Err(StorageError::Provider(
                 "multipart part was uploaded twice".to_owned(),
             ));
         }
+        self.parts.insert(part_index, body);
         Ok(())
     }
 
@@ -1039,6 +1051,15 @@ impl BlobMultipartUpload for MemoryMultipartUpload {
     }
 }
 
+fn validate_multipart_part_index(part_index: usize) -> Result<()> {
+    if part_index >= 10_000 {
+        return Err(StorageError::Provider(
+            "multipart part number is out of range".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl BlobStore for MemoryBlobStore {
     async fn put(
@@ -1056,7 +1077,13 @@ impl BlobStore for MemoryBlobStore {
         let mut state = self.write_state()?;
         state.counts.put = state.counts.put.saturating_add(1);
 
-        if options.do_not_recreate && state.objects.contains_key(object_id) {
+        if options.do_not_recreate
+            && state
+                .objects
+                .get(object_id)
+                .and_then(|versions| memory_object_at(versions, None))
+                .is_some()
+        {
             record_blob_put(
                 object_kind,
                 requested_len,
@@ -1088,12 +1115,15 @@ impl BlobStore for MemoryBlobStore {
         };
         state.counts.bytes_written = state.counts.bytes_written.saturating_add(content_len);
 
+        let revision = state.next_version;
         state
             .objects
             .entry(object_id.clone())
             .or_default()
             .push(MemoryObject {
                 body,
+                delete_marker: false,
+                revision,
                 metadata: metadata.clone(),
             });
 
@@ -1133,7 +1163,7 @@ impl BlobStore for MemoryBlobStore {
         let Some(object) = state
             .objects
             .get(object_id)
-            .and_then(|versions| versions.last())
+            .and_then(|versions| memory_object_at(versions, None))
         else {
             record_blob_get(object_kind, range, 0, "not_found", started.elapsed());
             return Err(StorageError::NotFound(object_id.clone()));
@@ -1250,7 +1280,7 @@ impl BlobStore for MemoryBlobStore {
         match state
             .objects
             .get(object_id)
-            .and_then(|versions| versions.last())
+            .and_then(|versions| memory_object_at(versions, None))
         {
             Some(object) => {
                 record_blob_head(object_kind, "ok", started.elapsed());
@@ -1299,7 +1329,7 @@ impl BlobStore for MemoryBlobStore {
             .objects
             .iter()
             .filter(|(object_id, _)| object_id.as_str().starts_with(prefix))
-            .filter_map(|(_, versions)| versions.last())
+            .filter_map(|(_, versions)| memory_object_at(versions, None))
             .map(|object| object.metadata.clone())
             .collect::<Vec<_>>();
         record_blob_list(object_kind, entries.len(), "ok", started.elapsed());
@@ -1317,7 +1347,12 @@ impl BlobStore for MemoryBlobStore {
             .objects
             .iter()
             .filter(|(object_id, _)| object_id.as_str().starts_with(prefix))
-            .flat_map(|(_, versions)| versions.iter().map(|object| object.metadata.clone()))
+            .flat_map(|(_, versions)| {
+                versions
+                    .iter()
+                    .filter(|object| !object.delete_marker)
+                    .map(|object| object.metadata.clone())
+            })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| {
             left.object_id
@@ -1353,7 +1388,7 @@ impl BlobStore for MemoryBlobStore {
         let Some(object) = state
             .objects
             .get(object_id)
-            .and_then(|versions| versions.last())
+            .and_then(|versions| memory_object_at(versions, None))
         else {
             record_blob_delete(object_kind, "not_found", started.elapsed());
             return Err(StorageError::NotFound(object_id.clone()));
@@ -1368,7 +1403,31 @@ impl BlobStore for MemoryBlobStore {
             return Err(StorageError::LegalHoldBlocked);
         }
 
-        state.objects.remove(object_id);
+        state.next_modified_at_ms = state.next_modified_at_ms.saturating_add(1);
+        state.next_version = state.next_version.saturating_add(1);
+        let marker = MemoryObject {
+            body: Bytes::new(),
+            delete_marker: true,
+            revision: state.next_version,
+            metadata: BlobMetadata {
+                object_id: object_id.clone(),
+                content_len: 0,
+                modified_at_ms: Some(state.next_modified_at_ms),
+                etag: None,
+                version_id: Some(
+                    BackendVersionId::new(format!("mem-v{}", state.next_version))
+                        .map_err(|error| StorageError::Provider(error.to_string()))?,
+                ),
+                retention: None,
+                retain_until_ms: None,
+                legal_hold: None,
+            },
+        };
+        state
+            .objects
+            .entry(object_id.clone())
+            .or_default()
+            .push(marker);
         record_blob_delete(object_kind, "ok", started.elapsed());
         Ok(())
     }
@@ -1430,7 +1489,7 @@ impl BlobStore for MemoryBlobStore {
         let Some(object) = state
             .objects
             .get_mut(object_id)
-            .and_then(|versions| versions.last_mut())
+            .and_then(|versions| memory_object_at_mut(versions, None))
         else {
             record_blob_extend_retention(object_kind, "not_found", started.elapsed());
             return Err(StorageError::NotFound(object_id.clone()));
@@ -1491,7 +1550,7 @@ impl BlobStore for MemoryBlobStore {
         let Some(object) = state
             .objects
             .get_mut(object_id)
-            .and_then(|versions| versions.last_mut())
+            .and_then(|versions| memory_object_at_mut(versions, None))
         else {
             record_blob_set_legal_hold(object_kind, "not_found", started.elapsed());
             return Err(StorageError::NotFound(object_id.clone()));

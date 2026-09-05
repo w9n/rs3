@@ -235,6 +235,13 @@ providers that do not support atomic create, the writer performs a preflight
 or orphaned retained commit is reported and skipped by automatic GC until
 retention, legal-hold, and age checks allow safe cleanup.
 
+A provider delete marker hides the current object without erasing its older
+versions. The in-memory versioned backend models this behavior as well. Anchored
+reads and readiness checks use the accepted exact version, so a current delete
+marker alone does not make that version unavailable. Exact-version deletion
+remains subject to retention and legal-hold checks. These are backend storage
+semantics; client logical deletion publishes a repository tombstone.
+
 Non-retained development backends may omit version IDs. In that mode `rs3` can
 still authenticate object bytes and detect tampering of the bytes it reads, but
 it cannot force the provider to return an older exact version after a newer

@@ -26,6 +26,8 @@ use std::time::Instant;
 
 mod client;
 mod config;
+#[cfg(test)]
+mod contract_tests;
 mod errors;
 mod metrics;
 mod object_lock;
@@ -165,35 +167,24 @@ impl Drop for ObservedS3Read {
     }
 }
 
-async fn collect_get_body(mut body: SdkByteStream, range: ByteRange) -> Result<Bytes> {
-    let ByteRange::Slice { len, .. } = range else {
-        return body
-            .collect()
-            .await
-            .map_err(provider_error)
-            .map(|body| body.into_bytes());
+async fn collect_get_body(
+    body: SdkByteStream,
+    range: ByteRange,
+    content_length: Option<i64>,
+) -> Result<Bytes> {
+    let len = match range {
+        ByteRange::Full => content_length
+            .and_then(|len| u64::try_from(len).ok())
+            .ok_or_else(|| {
+                StorageError::Provider("S3 response has no valid Content-Length".to_owned())
+            })?,
+        ByteRange::Slice { len, .. } => len,
     };
-    let capacity = usize::try_from(len).map_err(|_| StorageError::InvalidRange)?;
-    let mut collected = Vec::with_capacity(capacity);
-    let mut received = 0_u64;
-    while let Some(chunk) = body.try_next().await.map_err(provider_error)? {
-        let chunk_len = u64::try_from(chunk.len()).map_err(|_| {
-            StorageError::Provider("S3 range response length is out of range".to_owned())
-        })?;
-        received = received.checked_add(chunk_len).ok_or_else(|| {
-            StorageError::Provider("S3 range response length is out of range".to_owned())
-        })?;
-        if received > len {
-            return Err(StorageError::Provider(
-                "S3 provider returned more bytes than the requested range".to_owned(),
-            ));
-        }
+    let mut read = exact_blob_read(S3ReadSource { body }, len);
+    // Do not preallocate from an untrusted full-object Content-Length.
+    let mut collected = Vec::new();
+    while let Some(chunk) = read.next_chunk().await? {
         collected.extend_from_slice(&chunk);
-    }
-    if received != len {
-        return Err(StorageError::Provider(
-            "S3 provider returned fewer bytes than the requested range".to_owned(),
-        ));
     }
     Ok(Bytes::from(collected))
 }
@@ -215,6 +206,19 @@ struct S3BlobList {
     key_marker: Option<String>,
     version_id_marker: Option<String>,
     complete: bool,
+}
+
+impl S3BlobList {
+    fn object_id(&self, key: Option<&str>) -> Result<BackendObjectId> {
+        let key = key.ok_or(StorageError::InvalidListPage)?;
+        if !key.starts_with(&self.key_prefix) {
+            return Err(StorageError::InvalidListPage);
+        }
+        self.store
+            .config
+            .object_id_from_key(key)?
+            .ok_or(StorageError::InvalidListPage)
+    }
 }
 
 #[async_trait]
@@ -285,17 +289,17 @@ impl BlobList for S3BlobList {
                     page_limit,
                     &[output.contents().len(), output.common_prefixes().len()],
                 )?;
+                // Requests do not use a delimiter, so grouped prefixes would
+                // conceal object members from a supposedly complete inventory.
+                if !output.common_prefixes().is_empty() {
+                    return Err(StorageError::InvalidListPage);
+                }
                 for object in output.contents() {
-                    let Some(key) = object.key() else {
-                        continue;
-                    };
-                    let Some(object_id) = self.store.config.object_id_from_key(key)? else {
-                        continue;
-                    };
+                    let object_id = self.object_id(object.key())?;
                     let content_len = object
                         .size()
                         .and_then(|size| u64::try_from(size).ok())
-                        .unwrap_or_default();
+                        .ok_or(StorageError::InvalidListPage)?;
                     let modified_at_ms = object
                         .last_modified()
                         .map(|modified_at| modified_at.to_millis())
@@ -312,7 +316,7 @@ impl BlobList for S3BlobList {
                         legal_hold: None,
                     });
                 }
-                self.complete = !output.is_truncated().unwrap_or(false);
+                self.complete = !output.is_truncated().ok_or(StorageError::InvalidListPage)?;
                 let next_token = output.next_continuation_token().map(str::to_owned);
                 if !self.complete && (next_token.is_none() || next_token == self.continuation_token)
                 {
@@ -378,20 +382,16 @@ impl BlobList for S3BlobList {
                         output.common_prefixes().len(),
                     ],
                 )?;
+                if !output.common_prefixes().is_empty() {
+                    return Err(StorageError::InvalidListPage);
+                }
                 for version in output.versions() {
-                    let Some(key) = version.key() else {
-                        continue;
-                    };
-                    let Some(object_id) = self.store.config.object_id_from_key(key)? else {
-                        continue;
-                    };
-                    let Some(version_id) = version.version_id() else {
-                        continue;
-                    };
+                    let object_id = self.object_id(version.key())?;
+                    let version_id = version.version_id().ok_or(StorageError::InvalidListPage)?;
                     let content_len = version
                         .size()
                         .and_then(|size| u64::try_from(size).ok())
-                        .unwrap_or_default();
+                        .ok_or(StorageError::InvalidListPage)?;
                     let modified_at_ms = version
                         .last_modified()
                         .map(|modified_at| modified_at.to_millis())
@@ -408,7 +408,7 @@ impl BlobList for S3BlobList {
                         legal_hold: None,
                     });
                 }
-                self.complete = !output.is_truncated().unwrap_or(false);
+                self.complete = !output.is_truncated().ok_or(StorageError::InvalidListPage)?;
                 let next_key_marker = output.next_key_marker().map(str::to_owned);
                 let next_version_id_marker = output.next_version_id_marker().map(str::to_owned);
                 if !self.complete
@@ -436,6 +436,25 @@ impl BlobList for S3BlobList {
 }
 
 impl S3BlobStore {
+    async fn collect_prefix(&self, prefix: &str, mode: BlobListMode) -> Result<Vec<BlobMetadata>> {
+        let mut listing = self.open_bounded_list(prefix, mode).await?;
+        let page_limit = NonZeroUsize::new(1_000).ok_or(StorageError::InvalidListPage)?;
+        let mut entries = Vec::new();
+        loop {
+            let page = listing.next_page(page_limit).await?;
+            entries.extend(page.entries);
+            if page.is_complete {
+                break;
+            }
+        }
+        entries.sort_by(|left, right| {
+            left.object_id
+                .cmp(&right.object_id)
+                .then_with(|| left.version_id.cmp(&right.version_id))
+        });
+        Ok(entries)
+    }
+
     /// Builds an S3 store from the supported AWS environment/config chain.
     ///
     /// # Errors
@@ -511,7 +530,13 @@ struct S3MultipartUpload {
 #[async_trait]
 impl BlobMultipartUpload for S3MultipartUpload {
     async fn put_part(&mut self, part_index: usize, body: Bytes) -> Result<()> {
-        let part_number = i32::try_from(part_index.saturating_add(1)).map_err(|_| {
+        crate::validate_multipart_part_index(part_index)?;
+        if self.parts.get(part_index).is_some_and(Option::is_some) {
+            return Err(StorageError::Provider(
+                "multipart part was uploaded twice".to_owned(),
+            ));
+        }
+        let part_number = i32::try_from(part_index + 1).map_err(|_| {
             StorageError::Provider("multipart part number is out of range".to_owned())
         })?;
         let len = u64::try_from(body.len()).map_err(|_| {
@@ -538,11 +563,7 @@ impl BlobMultipartUpload for S3MultipartUpload {
             self.parts
                 .resize_with(part_index.saturating_add(1), || None);
         }
-        if self.parts[part_index].replace(completed).is_some() {
-            return Err(StorageError::Provider(
-                "multipart part was uploaded twice".to_owned(),
-            ));
-        }
+        self.parts[part_index] = Some(completed);
         self.content_len = self.content_len.saturating_add(len);
         Ok(())
     }
@@ -902,7 +923,7 @@ impl BlobStore for S3BlobStore {
         }
         match request.send().await {
             Ok(output) => {
-                let body = collect_get_body(output.body, range).await?;
+                let body = collect_get_body(output.body, range, output.content_length).await?;
                 let bytes_read = u64::try_from(body.len()).map_err(|_| {
                     StorageError::Provider("read length does not fit in u64".to_owned())
                 })?;
@@ -984,7 +1005,7 @@ impl BlobStore for S3BlobStore {
 
         match request.send().await {
             Ok(output) => {
-                let body = collect_get_body(output.body, range).await?;
+                let body = collect_get_body(output.body, range, output.content_length).await?;
                 let bytes_read = u64::try_from(body.len()).map_err(|_| {
                     StorageError::Provider("read length does not fit in u64".to_owned())
                 })?;
@@ -1193,201 +1214,11 @@ impl BlobStore for S3BlobStore {
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
-        let started = Instant::now();
-        let object_kind = prefix_kind(prefix);
-        let key_prefix = self.config.list_key_prefix(prefix);
-        let mut continuation_token = None;
-        let mut entries = Vec::new();
-
-        loop {
-            let mut request = self
-                .client
-                .list_objects_v2()
-                .bucket(self.config.bucket.as_str());
-            if !key_prefix.is_empty() {
-                request = request.prefix(key_prefix.as_str());
-            }
-            if let Some(token) = continuation_token.as_deref() {
-                request = request.continuation_token(token);
-            }
-            match request
-                .customize()
-                .interceptor(LimitListResponseBody)
-                .send()
-                .await
-            {
-                Ok(page) => {
-                    self.record_provider_operation(
-                        S3ProviderOperation::List,
-                        object_kind,
-                        "ok",
-                        0,
-                        0,
-                        started.elapsed(),
-                    )?;
-                    for object in page.contents() {
-                        let Some(key) = object.key() else {
-                            continue;
-                        };
-                        let Some(object_id) = self.config.object_id_from_key(key)? else {
-                            continue;
-                        };
-                        let content_len = object
-                            .size()
-                            .and_then(|size| u64::try_from(size).ok())
-                            .unwrap_or_default();
-                        let modified_at_ms = object
-                            .last_modified()
-                            .map(|modified_at| modified_at.to_millis())
-                            .transpose()
-                            .map_err(provider_error)?;
-                        entries.push(BlobMetadata {
-                            object_id,
-                            content_len,
-                            modified_at_ms,
-                            etag: object.e_tag().map(str::to_owned),
-                            version_id: None,
-                            retention: None,
-                            retain_until_ms: None,
-                            legal_hold: None,
-                        });
-                    }
-
-                    if !page.is_truncated().unwrap_or(false) {
-                        break;
-                    }
-                    continuation_token = page.next_continuation_token().map(str::to_owned);
-                    if continuation_token.is_none() {
-                        let error = StorageError::Provider(
-                            "S3 truncated LIST response omitted the continuation token".to_owned(),
-                        );
-                        let result = storage_error_result(&error);
-                        record_blob_list(object_kind, entries.len(), result, started.elapsed());
-                        return Err(error);
-                    }
-                }
-                Err(error) => {
-                    let storage_error = StorageError::Provider(error.to_string());
-                    let result = storage_error_result(&storage_error);
-                    self.record_provider_operation(
-                        S3ProviderOperation::List,
-                        object_kind,
-                        result,
-                        0,
-                        0,
-                        started.elapsed(),
-                    )?;
-                    record_blob_list(object_kind, entries.len(), result, started.elapsed());
-                    return Err(storage_error);
-                }
-            }
-        }
-
-        entries.sort_by(|left, right| left.object_id.cmp(&right.object_id));
-        record_blob_list(object_kind, entries.len(), "ok", started.elapsed());
-        Ok(entries)
+        self.collect_prefix(prefix, BlobListMode::Current).await
     }
 
     async fn list_prefix_versions(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
-        let started = Instant::now();
-        let object_kind = prefix_kind(prefix);
-        let key_prefix = self.config.list_key_prefix(prefix);
-        let mut key_marker = None;
-        let mut version_id_marker = None;
-        let mut entries = Vec::new();
-
-        loop {
-            let mut request = self
-                .client
-                .list_object_versions()
-                .bucket(self.config.bucket.as_str());
-            if !key_prefix.is_empty() {
-                request = request.prefix(key_prefix.as_str());
-            }
-            if let Some(marker) = key_marker.as_deref() {
-                request = request.key_marker(marker);
-            }
-            if let Some(marker) = version_id_marker.as_deref() {
-                request = request.version_id_marker(marker);
-            }
-
-            let output = match request
-                .customize()
-                .interceptor(LimitListResponseBody)
-                .send()
-                .await
-            {
-                Ok(output) => output,
-                Err(error) => {
-                    let storage_error =
-                        StorageError::Provider(format!("failed to list object versions: {error}"));
-                    let result = storage_error_result(&storage_error);
-                    self.record_provider_operation(
-                        S3ProviderOperation::List,
-                        object_kind,
-                        result,
-                        0,
-                        0,
-                        started.elapsed(),
-                    )?;
-                    record_blob_list(object_kind, entries.len(), result, started.elapsed());
-                    return Err(storage_error);
-                }
-            };
-            self.record_provider_operation(
-                S3ProviderOperation::List,
-                object_kind,
-                "ok",
-                0,
-                0,
-                started.elapsed(),
-            )?;
-
-            for version in output.versions() {
-                let Some(key) = version.key() else {
-                    continue;
-                };
-                let Some(object_id) = self.config.object_id_from_key(key)? else {
-                    continue;
-                };
-                let Some(version_id) = version.version_id() else {
-                    continue;
-                };
-                let content_len = version
-                    .size()
-                    .and_then(|size| u64::try_from(size).ok())
-                    .unwrap_or_default();
-                let modified_at_ms = version
-                    .last_modified()
-                    .map(|modified_at| modified_at.to_millis())
-                    .transpose()
-                    .map_err(provider_error)?;
-                entries.push(BlobMetadata {
-                    object_id,
-                    content_len,
-                    modified_at_ms,
-                    etag: version.e_tag().map(str::to_owned),
-                    version_id: Some(backend_version_id_from_str(version_id)?),
-                    retention: None,
-                    retain_until_ms: None,
-                    legal_hold: None,
-                });
-            }
-
-            key_marker = output.next_key_marker().map(str::to_owned);
-            version_id_marker = output.next_version_id_marker().map(str::to_owned);
-            if key_marker.is_none() && version_id_marker.is_none() {
-                break;
-            }
-        }
-
-        entries.sort_by(|left, right| {
-            left.object_id
-                .cmp(&right.object_id)
-                .then_with(|| left.version_id.cmp(&right.version_id))
-        });
-        record_blob_list(object_kind, entries.len(), "ok", started.elapsed());
-        Ok(entries)
+        self.collect_prefix(prefix, BlobListMode::Versions).await
     }
 
     async fn delete(&self, object_id: &BackendObjectId) -> Result<()> {
@@ -1696,6 +1527,7 @@ mod tests {
         let body = collect_get_body(
             ByteStream::from(Bytes::from_static(b"exact")),
             ByteRange::Slice { offset: 7, len: 5 },
+            Some(5),
         )
         .await
         .unwrap_or_else(|error| panic!("{error}"));
@@ -1708,6 +1540,7 @@ mod tests {
         let result = collect_get_body(
             ByteStream::from(Bytes::from_static(b"too long")),
             ByteRange::Slice { offset: 0, len: 3 },
+            Some(8),
         )
         .await;
 
@@ -1719,6 +1552,7 @@ mod tests {
         let result = collect_get_body(
             ByteStream::from(Bytes::from_static(b"short")),
             ByteRange::Slice { offset: 0, len: 8 },
+            Some(5),
         )
         .await;
 

@@ -1341,7 +1341,12 @@ where
         };
         let mut listing = BoundedListing::open(store, prefix, mode, CONTROL_LIST_BUDGET).await?;
         while let Some(page) = listing.next_page().await? {
-            let filtered_provider_members = page.consumed_items > page.entries.len();
+            // Version inventories may hide delete markers, which still prove
+            // prior repository activity. Current inventories also count local
+            // traversal work (directories and temporary files); that count is
+            // a work budget, not evidence of an addressable object or version.
+            let filtered_provider_members =
+                mode == BlobListMode::Versions && page.consumed_items > page.entries.len();
             let has_foreign_object = filtered_provider_members
                 || page
                     .entries
@@ -1505,6 +1510,14 @@ mod tests {
             .delete(&anchor.commit_key)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(readiness.check_readiness().await.ready);
+        runtime
+            .memory_store()
+            .expect("memory store")
+            .delete_at(&anchor.commit_key, anchor.version_id.as_ref())
+            .await
+            .expect("delete exact anchored version");
 
         let unavailable = readiness.check_readiness().await;
         assert!(!unavailable.ready);
@@ -1800,6 +1813,17 @@ mod tests {
             .delete(&accepted.commit_key)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
+
+        runtime
+            .load_accepted_anchor(GatewayMode::ReadWrite)
+            .await
+            .expect("a delete marker cannot hide the exact accepted version");
+        runtime
+            .memory_store()
+            .expect("memory store")
+            .delete_at(&accepted.commit_key, accepted.version_id.as_ref())
+            .await
+            .expect("delete exact accepted version");
 
         let loaded = runtime.load_accepted_anchor(GatewayMode::ReadWrite).await;
 
@@ -2241,6 +2265,74 @@ mod tests {
         assert!(error.to_string().contains("empty repository prefix"));
         assert_eq!(store.current_list_count(), 0);
         assert_eq!(store.version_list_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_empty_check_rejects_a_prefix_containing_only_a_delete_marker() {
+        let store = MemoryBlobStore::new();
+        let key = commit_object_id(8);
+        let object = store
+            .put(&key, Bytes::from_static(b"old"), PutOptions::default())
+            .await
+            .expect("old version");
+        store.delete(&key).await.expect("delete marker");
+        store
+            .delete_at(&key, object.version_id.as_ref())
+            .await
+            .expect("remove old version");
+        assert!(
+            store
+                .list_prefix_versions("")
+                .await
+                .expect("no live versions")
+                .is_empty()
+        );
+
+        assert!(
+            super::prefix_has_any_object(&store, "", BlobListMode::Versions)
+                .await
+                .expect("version history probe")
+        );
+        assert!(
+            !super::prefix_has_any_object(&store, "", BlobListMode::Current)
+                .await
+                .expect("current object probe")
+        );
+
+        let result = reject_v2_bootstrap_with_foreign_objects(
+            &store,
+            V2ProviderProfile::RetainedVersionObjectLock,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(S3BoundaryError::RepositoryInit { reason })
+            if reason.contains("empty repository prefix"))
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_presence_probe_skips_directories_and_temporary_files() {
+        let dir = TestDir::new();
+        let store = FilesystemBlobStore::new(dir.path()).expect("filesystem store");
+        std::fs::create_dir_all(dir.path().join("objects/empty")).expect("empty directory");
+        std::fs::write(dir.path().join("objects/.rs3-tmp-fixture"), b"incomplete")
+            .expect("temporary file");
+        assert!(
+            !super::prefix_has_any_object(&store, "", BlobListMode::Current)
+                .await
+                .expect("empty object inventory")
+        );
+        let key = BackendObjectId::new("objects/empty/object").expect("key");
+        store
+            .put(&key, Bytes::from_static(b"complete"), PutOptions::default())
+            .await
+            .expect("object");
+        assert!(
+            super::prefix_has_any_object(&store, "", BlobListMode::Current)
+                .await
+                .expect("object behind directory traversal")
+        );
     }
 
     #[derive(Clone)]

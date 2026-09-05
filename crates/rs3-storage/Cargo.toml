@@ -47,10 +47,8 @@ rustls = { version = "0.23", default-features = false, features = [
   "aws_lc_rs",
 ], optional = true }
 thiserror.workspace = true
-tracing.workspace = true
-
-[dev-dependencies]
 tokio.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

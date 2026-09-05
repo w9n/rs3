@@ -219,13 +219,9 @@ impl BlobStore for FilesystemBlobStore {
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
         let started = Instant::now();
         let kind = prefix_kind(prefix);
-        let prefix_path = if prefix.is_empty() {
-            self.root.clone()
-        } else {
-            self.root.join(safe_relative_path(prefix)?)
-        };
+        let prefix_path = prefix_search_root(&self.root, prefix)?;
 
-        if !prefix_path.exists() {
+        if !prefix_path.is_dir() {
             record_blob_list(kind, 0, "ok", started.elapsed());
             return Ok(Vec::new());
         }
@@ -246,11 +242,7 @@ impl BlobStore for FilesystemBlobStore {
         if mode == BlobListMode::Versions {
             return Err(StorageError::VersionUnsupported);
         }
-        let prefix_path = if prefix.is_empty() {
-            self.root.clone()
-        } else {
-            self.root.join(safe_relative_path(prefix)?)
-        };
+        let prefix_path = prefix_search_root(&self.root, prefix)?;
         Ok(Box::new(FilesystemBlobList {
             root: self.root.clone(),
             prefix: prefix.to_owned(),
@@ -349,6 +341,7 @@ impl BlobList for FilesystemBlobList {
         let started = Instant::now();
         let kind = prefix_kind(&self.prefix);
         let mut entries = Vec::with_capacity(max_items.get().min(1_024));
+        let mut consumed_items = 0;
         if let Some(root) = self.pending_root.take() {
             match fs::metadata(&root) {
                 Ok(metadata) if metadata.is_dir() => {
@@ -356,6 +349,7 @@ impl BlobList for FilesystemBlobList {
                         .push(fs::read_dir(root).map_err(provider_error)?);
                 }
                 Ok(metadata) if metadata.is_file() => {
+                    consumed_items += 1;
                     let object_id = object_id_from_path(&self.root, &root)?;
                     if object_id.as_str().starts_with(&self.prefix) {
                         entries.push(blob_metadata(object_id, metadata));
@@ -370,7 +364,7 @@ impl BlobList for FilesystemBlobList {
             }
         }
 
-        while entries.len() < max_items.get() && !self.complete {
+        while consumed_items < max_items.get() && !self.complete {
             let Some(directory) = self.directories.last_mut() else {
                 self.complete = true;
                 break;
@@ -380,6 +374,10 @@ impl BlobList for FilesystemBlobList {
                 continue;
             };
             let entry = entry.map_err(provider_error)?;
+            consumed_items += 1;
+            if is_temporary_name(&entry.file_name()) {
+                continue;
+            }
             let file_type = entry.file_type().map_err(provider_error)?;
             if file_type.is_dir() {
                 self.directories
@@ -396,7 +394,6 @@ impl BlobList for FilesystemBlobList {
         }
 
         record_blob_list(kind, entries.len(), "ok", started.elapsed());
-        let consumed_items = entries.len();
         Ok(BlobListPage {
             entries,
             consumed_items,
@@ -561,6 +558,20 @@ fn open_file_range(path: &Path, range: ByteRange) -> Result<(FileReadSource, u64
     ))
 }
 
+fn prefix_search_root(root: &Path, prefix: &str) -> Result<PathBuf> {
+    // A string prefix may end in the middle of a filename or directory name.
+    // Start at its last complete directory component and filter actual keys.
+    safe_relative_path(prefix)?;
+    match prefix.rfind('/') {
+        Some(index) => Ok(root.join(safe_relative_path(&prefix[..index])?)),
+        None => Ok(root.to_path_buf()),
+    }
+}
+
+fn is_temporary_name(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with(".rs3-tmp-")
+}
+
 fn collect_files(
     root: &Path,
     directory: &Path,
@@ -569,6 +580,9 @@ fn collect_files(
 ) -> Result<()> {
     for entry in fs::read_dir(directory).map_err(provider_error)? {
         let entry = entry.map_err(provider_error)?;
+        if is_temporary_name(&entry.file_name()) {
+            continue;
+        }
         let path = entry.path();
         let file_type = entry.file_type().map_err(provider_error)?;
         if file_type.is_dir() {

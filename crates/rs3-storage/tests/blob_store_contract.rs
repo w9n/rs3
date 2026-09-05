@@ -172,6 +172,55 @@ async fn filesystem_store_rejects_exact_version_inventory() {
     );
 }
 
+#[tokio::test]
+async fn filesystem_inventory_excludes_temporary_files_and_counts_filtered_members() {
+    use rs3_storage::BlobListMode;
+    use std::num::NonZeroUsize;
+    let dir = TestDir::new("temporary-inventory");
+    let store = FilesystemBlobStore::new(dir.path()).expect("store");
+    let key = common::object_id("segments/visible");
+    store
+        .put(&key, Bytes::from_static(b"value"), PutOptions::default())
+        .await
+        .expect("object");
+    std::fs::write(dir.path().join("segments/.rs3-tmp-fixture"), b"incomplete")
+        .expect("temporary file");
+    assert_eq!(
+        store
+            .list_prefix("segments/")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|m| m.object_id)
+            .collect::<Vec<_>>(),
+        vec![key.clone()]
+    );
+    let mut pages = store
+        .open_bounded_list("segments/", BlobListMode::Current)
+        .await
+        .expect("pages");
+    let mut items = Vec::new();
+    let mut consumed = 0;
+    let mut complete = false;
+    for _ in 0..4 {
+        let page = pages
+            .next_page(NonZeroUsize::new(1).expect("nonzero"))
+            .await
+            .expect("page");
+        assert!(page.entries.len() <= page.consumed_items);
+        assert!(page.consumed_items <= 1);
+        consumed += page.consumed_items;
+        items.extend(page.entries.into_iter().map(|entry| entry.object_id));
+        if page.is_complete {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert_eq!(consumed, 2);
+    assert_eq!(items, vec![key]);
+}
+
 async fn assert_inactive_retention_put_is_unretained<S>(store: &S, prefix: &str)
 where
     S: BlobStore,
@@ -203,6 +252,59 @@ where
 
 struct TestDir {
     path: PathBuf,
+}
+
+#[tokio::test]
+async fn current_delete_preserves_protected_older_versions_and_allows_recreation() {
+    common::assert_current_delete_preserves_protected_versions(&MemoryBlobStore::new(), "memory")
+        .await;
+}
+
+#[tokio::test]
+async fn rejected_multipart_parts_preserve_the_upload() {
+    common::assert_multipart_rejection_preserves_parts(&MemoryBlobStore::new(), "memory").await;
+}
+
+#[tokio::test]
+async fn version_pages_count_delete_markers_and_survive_earlier_version_deletion() {
+    use rs3_storage::BlobListMode;
+    use std::num::NonZeroUsize;
+    let store = MemoryBlobStore::new();
+    let key = common::object_id("paged-history/object");
+    let first = store
+        .put(&key, Bytes::from_static(b"one"), PutOptions::default())
+        .await
+        .expect("first");
+    let second = store
+        .put(&key, Bytes::from_static(b"two"), PutOptions::default())
+        .await
+        .expect("second");
+    store.delete(&key).await.expect("marker");
+    let mut list = store
+        .open_bounded_list("paged-history/", BlobListMode::Versions)
+        .await
+        .expect("list");
+    let one = NonZeroUsize::new(1).expect("nonzero");
+    let page = list.next_page(one).await.expect("first page");
+    assert_eq!(page.entries, vec![first.clone()]);
+    assert_eq!(page.consumed_items, 1);
+    assert!(!page.is_complete);
+    store
+        .delete_at(&key, first.version_id.as_ref())
+        .await
+        .expect("remove emitted version");
+    let page = list.next_page(one).await.expect("second page");
+    assert_eq!(page.entries, vec![second]);
+    assert_eq!(page.consumed_items, 1);
+    assert!(!page.is_complete);
+    let page = list.next_page(one).await.expect("marker page");
+    assert!(page.entries.is_empty());
+    assert_eq!(page.consumed_items, 1);
+    assert!(page.is_complete);
+    let page = list.next_page(one).await.expect("terminal page");
+    assert_eq!(page.consumed_items, 0);
+    assert!(page.entries.is_empty());
+    assert!(page.is_complete);
 }
 
 impl TestDir {

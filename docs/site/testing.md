@@ -106,6 +106,20 @@ trial must choose and verify one storage safety profile:
   gateway verifies multipart postconditions immediately and fails closed when
   it cannot read the completed version.
 
+The shared memory, filesystem and live S3 contract checks string prefixes,
+complete inventory under raw-member page limits, and consistent range errors.
+The versioned tests also delete an unprotected current value above a protected
+older version, verify that the older exact version remains readable and cannot
+be deleted, and count delete markers when paging the inventory. Multipart tests
+check that duplicate or out-of-range internal parts fail without changing the
+accepted upload. These internal parts are distinct from client-facing S3
+multipart sessions.
+
+SDK response fixtures cover missing or non-advancing pagination cursors,
+missing completion flags, delete-marker-only pages and exact full-read lengths.
+A successful container run is local provider evidence; repeat these tests on
+the configured provider before qualifying a deployment.
+
 `HEAD` before `PUT` is not the production fallback for create-only writes. It is
 non-atomic and only useful for a deliberately degraded compatibility mode, which
 is not part of the production-preview contract.
