@@ -604,6 +604,127 @@ mod tests {
         assert_eq!(pending.allocation_sequence(), Sequence::new(9));
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 128,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn random_staging_rollback_preserves_burned_generations(
+            history in proptest::collection::vec((0_u8..6, 0_u8..8), 1..96)
+        ) {
+            use proptest::prelude::*;
+            use std::collections::BTreeMap;
+
+            let mut accepted = RepositoryState::default();
+            let mut accepted_model = BTreeMap::new();
+            for key in 0_u8..8 {
+                accepted.namespace.upsert(entry(blind_key(&key.to_string()), "base", Sequence::new(7)), Vec::new());
+                accepted_model.insert(key, (7_u64, true));
+            }
+            let mut pending = PendingV2State::new(Sequence::new(7));
+            let mut allocated = 7_u64;
+            let mut mutations = Vec::<(u8, u64, bool)>::new();
+            let mut checkpoints = Vec::new();
+            for (operation, key) in history {
+                let previous = pending.snapshot();
+                let mut invalidates_snapshot = false;
+                match operation {
+                    0 | 1 => {
+                        allocated += 1;
+                        let generation = pending.allocate_sequence().expect("allocate mutation");
+                        prop_assert_eq!(generation.get(), allocated);
+                        let live = operation == 0;
+                        let name = format!("manifest-{allocated}");
+                        let delta = if live {
+                            upsert(entry(blind_key(&key.to_string()), &name, generation))
+                        } else {
+                            IndexDelta::Tombstone {
+                                namespace_key_id: key_id(),
+                                blind_key: blind_key(&key.to_string()),
+                                path: path(&format!("objects/{key}")),
+                                generation,
+                            }
+                        };
+                        let id = manifest_id(&name);
+                        let checkpoint = pending.append_operation(
+                            vec![delta],
+                            live.then(|| (id.clone(), manifest(&format!("objects/{key}")))),
+                            live.then(|| PendingV2Payload { manifest_id: id, body: Bytes::from(vec![key]) }),
+                        ).expect("append mutation");
+                        checkpoints.push((checkpoint, mutations.len()));
+                        mutations.push((key, allocated, live));
+                        invalidates_snapshot = true;
+                    }
+                    2 => {
+                        // An operation can fail after reserving its generation
+                        // and before it appends any speculative vectors.
+                        allocated += 1;
+                        prop_assert_eq!(pending.allocate_sequence().expect("burn failed allocation").get(), allocated);
+                    }
+                    3 if !checkpoints.is_empty() => {
+                        let index = usize::from(key) % checkpoints.len();
+                        let (checkpoint, length) = checkpoints[index];
+                        pending.rollback(checkpoint).expect("rollback a speculative suffix");
+                        mutations.truncate(length);
+                        checkpoints.truncate(index);
+                        invalidates_snapshot = true;
+                    }
+                    4 => {
+                        // Model ordinary accepted publication, which clears the
+                        // overlay without rewinding its allocation cursor.
+                        let snapshot = pending.snapshot();
+                        pending.validate_snapshot(&snapshot).expect("current publication snapshot");
+                        for (key, generation, live) in &mutations {
+                            accepted_model.insert(*key, (*generation, *live));
+                            if *live {
+                                accepted.namespace.upsert(entry(blind_key(&key.to_string()), "published", Sequence::new(*generation)), Vec::new());
+                            } else {
+                                accepted.namespace.tombstone(blind_key(&key.to_string()), Sequence::new(*generation));
+                            }
+                        }
+                        invalidates_snapshot = !mutations.is_empty();
+                        pending.clear_after_validated_publication();
+                        mutations.clear();
+                        checkpoints.clear();
+                    }
+                    _ => {}
+                }
+                prop_assert_eq!(pending.validate_snapshot(&previous).is_err(), invalidates_snapshot);
+                prop_assert_eq!(pending.allocation_sequence().get(), allocated);
+                prop_assert_eq!(pending.deltas().len(), mutations.len());
+                let mut winners = BTreeMap::new();
+                for (key, generation, live) in &mutations {
+                    winners.insert(*key, (*generation, *live));
+                }
+                let snapshot = pending.snapshot();
+                prop_assert_eq!(snapshot.deltas().len(), winners.len());
+                prop_assert_eq!(snapshot.commit_sequence().map(Sequence::get),
+                    mutations.iter().map(|(_, generation, _)| *generation).max());
+                let live_count = winners.values().filter(|(_, live)| *live).count();
+                prop_assert_eq!(snapshot.manifests().len(), live_count);
+                prop_assert_eq!(snapshot.payloads().len(), live_count);
+                let expected_ids = winners.values().filter(|(_, live)| *live)
+                    .map(|(generation, _)| manifest_id(&format!("manifest-{generation}")))
+                    .collect::<std::collections::BTreeSet<_>>();
+                prop_assert_eq!(snapshot.manifests().iter().map(|(id, _)| id.clone()).collect::<std::collections::BTreeSet<_>>(), expected_ids.clone());
+                prop_assert_eq!(snapshot.payloads().iter().map(|payload| payload.manifest_id.clone()).collect::<std::collections::BTreeSet<_>>(), expected_ids);
+                for key in 0_u8..8 {
+                    let (_, live) = winners.get(&key).or_else(|| accepted_model.get(&key)).expect("model key");
+                    let head = pending.effective_head(&accepted, &blind_key(&key.to_string()));
+                    prop_assert_eq!(head.live().is_some(), *live);
+                    if let Some(entry) = head.live() {
+                        prop_assert_eq!(entry.generation.get(), winners.get(&key).or_else(|| accepted_model.get(&key)).expect("model generation").0);
+                    }
+                    if winners.get(&key).is_some_and(|(_, live)| !live) {
+                        prop_assert_eq!(head, PendingV2EffectiveHead::Tombstoned);
+                    }
+                }
+            }
+        }
+    }
+
     fn upsert(entry: NamespaceEntry) -> IndexDelta {
         IndexDelta::Upsert {
             entry: Box::new(entry),
