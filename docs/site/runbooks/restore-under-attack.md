@@ -121,7 +121,7 @@ explicit rollback review accepts stranding those newer commits.
 To recover a known earlier state, import its bundle into a separate Kubernetes
 Lease and serve that anchor from a second `restore-readonly` gateway. Keep the
 production Lease unchanged. This provides the logical namespace selected by
-that bundle; it does not expose S3 object versions or select arbitrary times.
+that bundle; it does not expose historical S3 object versions or select arbitrary times.
 
 Before starting:
 

@@ -201,6 +201,12 @@ roots. Read-write failover is supported only under one Kubernetes Lease
 coordination domain. Disconnected S3-only writers are rejected; safely adding
 them would require authenticated branches and merge semantics outside `v02`.
 
+Client version probes expose only the authenticated current namespace. Their
+`null` version label identifies the current value and can change on overwrite;
+it does not expose backend version IDs, retained commit history or a stable
+historical reference. These probes add no backend key class or plaintext
+metadata. Historical version requests remain unsupported.
+
 ## Object Lock Rule
 
 Object Lock protects object versions from deletion or overwrite before their

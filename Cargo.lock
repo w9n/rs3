@@ -3199,6 +3199,7 @@ dependencies = [
  "k8s-openapi",
  "metrics",
  "metrics-exporter-prometheus",
+ "percent-encoding",
  "rs3-crypto",
  "rs3-index",
  "rs3-k8s",

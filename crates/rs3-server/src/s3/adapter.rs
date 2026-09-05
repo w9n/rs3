@@ -3,12 +3,12 @@
 use super::S3BoundaryError;
 use super::mapping::{
     ListPage, collect_body_reserving, content_range, etag, i64_len, legal_hold_header,
-    legal_hold_output, list_page as map_list_page, logical_path, max_keys, next_body_chunk,
-    put_object_legal_hold_request_status, put_object_legal_hold_status,
+    legal_hold_output, list_page as map_list_page, list_versions_output, logical_path, max_keys,
+    next_body_chunk, put_object_legal_hold_request_status, put_object_legal_hold_status,
     put_object_retention_policy, repository_error, resolve_range, retention_headers, timestamp,
     validate_delete_object_request, validate_delete_objects_entry, validate_delete_objects_request,
     validate_get_object_legal_hold_request, validate_get_object_request,
-    validate_head_object_request, validate_put_object_request,
+    validate_head_object_request, validate_list_versions_request, validate_put_object_request,
 };
 use super::runtime::RuntimeRepository;
 use crate::config::configured_streaming_upload_working_set_bytes;
@@ -22,9 +22,10 @@ use rs3_types::{PublicBucket, RetentionMode};
 use s3s::dto::{
     Bucket, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
     DeletedObject, Error as DeleteObjectError, GetBucketLocationInput, GetBucketLocationOutput,
-    GetObjectInput, GetObjectLegalHoldInput, GetObjectLegalHoldOutput, GetObjectOutput,
-    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
-    ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+    GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectLegalHoldInput,
+    GetObjectLegalHoldOutput, GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
+    HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectVersionsInput,
+    ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
     ListObjectsV2Output, ObjectIdentifier, Owner, PutObjectInput, PutObjectLegalHoldInput,
     PutObjectLegalHoldOutput, PutObjectOutput, StreamingBlob,
 };
@@ -674,6 +675,41 @@ impl S3 for GatewayS3Service {
         result
     }
 
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        const OPERATION: &str = "GetBucketVersioning";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
+
+        let result = async {
+            let _admission = self.admit_request(OPERATION)?;
+            self.check_bucket(&input.bucket)?;
+            if input.expected_bucket_owner.is_some() {
+                return Err(s3s::s3_error!(
+                    NotImplemented,
+                    "expected owner is not supported"
+                ));
+            }
+            Ok(S3Response::new(GetBucketVersioningOutput::default()))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
+    }
+
     async fn list_buckets(
         &self,
         _req: S3Request<ListBucketsInput>,
@@ -1279,6 +1315,44 @@ impl S3 for GatewayS3Service {
         result
     }
 
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        const OPERATION: &str = "ListObjectVersions";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
+
+        let result = async {
+            let _admission = self.admit_request(OPERATION)?;
+            self.check_bucket(&input.bucket)?;
+            validate_list_versions_request(&input)?;
+            let prefix = input.prefix.clone().unwrap_or_default();
+            let max_keys = max_keys(input.max_keys)?;
+            let page = self.list_page(
+                &prefix,
+                input.delimiter.as_deref(),
+                input.key_marker.as_deref(),
+                max_keys,
+            )?;
+            Ok(S3Response::new(list_versions_output(input, page, max_keys)))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
+    }
+
     async fn list_objects(
         &self,
         req: S3Request<ListObjectsInput>,
@@ -1821,6 +1895,288 @@ mod tests {
         assert_eq!(service.bucket_scope(None), "none");
         assert_eq!(service.bucket_scope(Some("client-bucket")), "configured");
         assert_eq!(service.bucket_scope(Some("tenant-a")), "other");
+    }
+
+    fn version_list_input() -> s3s::dto::ListObjectVersionsInput {
+        s3s::dto::ListObjectVersionsInput {
+            bucket: "client-bucket".to_owned(),
+            ..s3s::dto::ListObjectVersionsInput::default()
+        }
+    }
+
+    async fn put_version_fixture(service: &GatewayS3Service, key: &str, body: &'static [u8]) {
+        service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: key.to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(body)))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect("fixture put");
+    }
+
+    #[tokio::test]
+    async fn versioning_probes_are_unversioned_readonly_and_bucket_scoped() {
+        let mut service = gateway_service().await;
+        service.mode = crate::GatewayMode::RestoreReadOnly;
+        let input = s3s::dto::GetBucketVersioningInput {
+            bucket: "client-bucket".to_owned(),
+            ..s3s::dto::GetBucketVersioningInput::default()
+        };
+        let response = service
+            .get_bucket_versioning(s3_request(input.clone()))
+            .await
+            .expect("probe");
+        assert!(response.output.status.is_none());
+        assert!(response.output.mfa_delete.is_none());
+        let empty = service
+            .list_object_versions(s3_request(version_list_input()))
+            .await
+            .expect("readonly list");
+        assert!(empty.output.versions.is_none());
+        assert!(empty.output.delete_markers.is_none());
+        assert_eq!(empty.output.is_truncated, Some(false));
+        let mut foreign = input;
+        foreign.bucket = "private-other".to_owned();
+        let error = service
+            .get_bucket_versioning(s3_request(foreign))
+            .await
+            .expect_err("foreign bucket");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::AccessDenied);
+        let mut foreign = version_list_input();
+        foreign.bucket = "private-other".to_owned();
+        let error = service
+            .list_object_versions(s3_request(foreign))
+            .await
+            .expect_err("foreign list");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::AccessDenied);
+        assert!(!error.to_string().contains("private-other"));
+    }
+
+    #[tokio::test]
+    async fn version_listing_exposes_only_current_values_and_null_is_readable() {
+        let service = gateway_service().await;
+        put_version_fixture(&service, "current", b"old").await;
+        put_version_fixture(&service, "current", b"replacement").await;
+        put_version_fixture(&service, "deleted", b"hidden").await;
+        service
+            .delete_object(s3_request(DeleteObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "deleted".to_owned(),
+                ..DeleteObjectInput::default()
+            }))
+            .await
+            .expect("logical delete");
+        let listed = service
+            .list_object_versions(s3_request(version_list_input()))
+            .await
+            .expect("versions")
+            .output;
+        assert!(listed.delete_markers.is_none());
+        let versions = listed.versions.expect("one current version");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].key.as_deref(), Some("current"));
+        assert_eq!(versions[0].version_id.as_deref(), Some("null"));
+        assert_eq!(versions[0].is_latest, Some(true));
+        assert_eq!(versions[0].size, Some(11));
+        let head = service
+            .head_object(s3_request(HeadObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "current".to_owned(),
+                version_id: Some("null".to_owned()),
+                ..HeadObjectInput::default()
+            }))
+            .await
+            .expect("null current head");
+        assert_eq!(versions[0].e_tag, head.output.e_tag);
+        let get = service
+            .get_object(s3_request(GetObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "current".to_owned(),
+                version_id: Some("null".to_owned()),
+                ..GetObjectInput::default()
+            }))
+            .await
+            .expect("null current get");
+        assert_eq!(response_body(get).await, Bytes::from_static(b"replacement"));
+        service
+            .get_object_legal_hold(s3_request(GetObjectLegalHoldInput {
+                bucket: "client-bucket".to_owned(),
+                key: "current".to_owned(),
+                version_id: Some("null".to_owned()),
+                ..GetObjectLegalHoldInput::default()
+            }))
+            .await
+            .expect("null current hold metadata");
+        put_version_fixture(&service, "batch-current", b"batch").await;
+        let mut identifier = delete_object_identifier("batch-current");
+        identifier.version_id = Some("null".to_owned());
+        let batch = service
+            .delete_objects(s3_request(delete_objects_input(vec![identifier], None)))
+            .await
+            .expect("null batch delete");
+        assert!(batch.output.errors.is_none());
+        for version in ["historical-version", ""] {
+            let error = service
+                .get_object(s3_request(GetObjectInput {
+                    bucket: "client-bucket".to_owned(),
+                    key: "current".to_owned(),
+                    version_id: Some(version.to_owned()),
+                    ..GetObjectInput::default()
+                }))
+                .await
+                .expect_err("historical read refused");
+            assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
+            assert!(
+                service
+                    .head_object(s3_request(HeadObjectInput {
+                        bucket: "client-bucket".to_owned(),
+                        key: "current".to_owned(),
+                        version_id: Some(version.to_owned()),
+                        ..HeadObjectInput::default()
+                    }))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                service
+                    .delete_object(s3_request(DeleteObjectInput {
+                        bucket: "client-bucket".to_owned(),
+                        key: "current".to_owned(),
+                        version_id: Some(version.to_owned()),
+                        ..DeleteObjectInput::default()
+                    }))
+                    .await
+                    .is_err()
+            );
+        }
+        service
+            .delete_object(s3_request(DeleteObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "current".to_owned(),
+                version_id: Some("null".to_owned()),
+                ..DeleteObjectInput::default()
+            }))
+            .await
+            .expect("null logical delete");
+        let listed = service
+            .list_object_versions(s3_request(version_list_input()))
+            .await
+            .expect("after delete")
+            .output;
+        assert!(listed.versions.is_none());
+        assert!(listed.delete_markers.is_none());
+    }
+
+    #[tokio::test]
+    async fn version_listing_paginates_encoded_objects_and_common_prefixes() {
+        let service = gateway_service().await;
+        for key in ["p/a/one", "p/a/two", "p/b", "p/c/one", "p/d"] {
+            put_version_fixture(&service, key, b"x").await;
+        }
+        let mut input = version_list_input();
+        input.prefix = Some("p/".to_owned());
+        input.delimiter = Some("/".to_owned());
+        input.max_keys = Some(1);
+        input.encoding_type = Some(s3s::dto::EncodingType::from_static("url"));
+        for (index, expected) in ["p%2Fa%2F", "p%2Fb", "p%2Fc%2F", "p%2Fd"]
+            .into_iter()
+            .enumerate()
+        {
+            let output = service
+                .list_object_versions(s3_request(input.clone()))
+                .await
+                .expect("version page")
+                .output;
+            assert_eq!(output.prefix.as_deref(), Some("p%2F"));
+            assert_eq!(output.delimiter.as_deref(), Some("%2F"));
+            assert_eq!(output.max_keys, Some(1));
+            let actual = output
+                .versions
+                .as_ref()
+                .and_then(|versions| versions.first())
+                .and_then(|version| version.key.as_deref())
+                .or_else(|| {
+                    output
+                        .common_prefixes
+                        .as_ref()
+                        .and_then(|prefixes| prefixes.first())
+                        .and_then(|prefix| prefix.prefix.as_deref())
+                });
+            assert_eq!(actual, Some(expected));
+            assert_eq!(output.is_truncated, Some(index < 3));
+            if index < 3 {
+                assert_eq!(output.next_key_marker.as_deref(), Some(expected));
+                assert_eq!(
+                    output.next_version_id_marker.as_deref(),
+                    (index == 1).then_some("null")
+                );
+                input.key_marker = output.next_key_marker.map(|key| {
+                    percent_encoding::percent_decode_str(&key)
+                        .decode_utf8()
+                        .expect("UTF-8 key")
+                        .into_owned()
+                });
+                input.version_id_marker = output.next_version_id_marker;
+            } else {
+                assert!(output.next_key_marker.is_none());
+                assert!(output.next_version_id_marker.is_none());
+            }
+        }
+        put_version_fixture(&service, "space /%猫&.bin", b"special").await;
+        let mut input = version_list_input();
+        input.prefix = Some("space ".to_owned());
+        input.encoding_type = Some(s3s::dto::EncodingType::from_static("url"));
+        let output = service
+            .list_object_versions(s3_request(input))
+            .await
+            .expect("encoded special key")
+            .output;
+        assert_eq!(
+            output.versions.expect("version")[0].key.as_deref(),
+            Some("space%20%2F%25%E7%8C%AB%26.bin")
+        );
+    }
+
+    #[tokio::test]
+    async fn version_listing_rejects_unknown_markers_options_and_invalid_limits() {
+        let service = gateway_service().await;
+        put_version_fixture(&service, "current", b"x").await;
+        let mut cases = Vec::new();
+        let mut input = version_list_input();
+        input.version_id_marker = Some("old".to_owned());
+        input.key_marker = Some("current".to_owned());
+        cases.push(input);
+        let mut input = version_list_input();
+        input.version_id_marker = Some("null".to_owned());
+        cases.push(input);
+        let mut input = version_list_input();
+        input.encoding_type = Some(s3s::dto::EncodingType::from_static("unknown"));
+        cases.push(input);
+        let mut input = version_list_input();
+        input.expected_bucket_owner = Some("unknown".to_owned());
+        cases.push(input);
+        let mut input = version_list_input();
+        input.max_keys = Some(-1);
+        cases.push(input);
+        for input in cases {
+            assert!(
+                service
+                    .list_object_versions(s3_request(input))
+                    .await
+                    .is_err()
+            );
+        }
+        let mut input = version_list_input();
+        input.max_keys = Some(0);
+        let output = service
+            .list_object_versions(s3_request(input))
+            .await
+            .expect("zero limit")
+            .output;
+        assert!(output.versions.is_none());
+        assert_eq!(output.is_truncated, Some(false));
     }
 
     #[tokio::test]

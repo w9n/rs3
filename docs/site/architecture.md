@@ -347,6 +347,7 @@ The first gateway surface focuses on the operations backup clients need:
 - `GET Object`, including ranges
 - `HEAD Object`
 - `ListObjectsV2`
+- unversioned `GetBucketVersioning` and current-only `ListObjectVersions`
 - `DELETE Object`
 - native conditional create behavior (`PutObject` with `If-None-Match: *`)
 - retention and legal-hold plumbing where the backend supports it

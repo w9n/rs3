@@ -86,7 +86,7 @@ pub(crate) struct S3GatewayArgs {
     /// Repository retention duration in days.
     #[arg(long, env = "RS3_REPOSITORY_RETENTION_DAYS")]
     retention_days: Option<u32>,
-    /// Also exercise common operator tools (`mc` and default `rclone lsf`).
+    /// Also exercise mc and rclone current/unversioned listing and reads.
     #[arg(long, default_value_t = false)]
     tooling_smoke: bool,
 }
@@ -535,25 +535,70 @@ async fn assert_operator_tooling_smoke(gateway: &RunningGateway) -> Result<()> {
         anyhow::bail!("mc cat returned a different body than mc cp wrote");
     }
 
-    let rclone_list = run_output(
-        Command::new("rclone")
+    let rclone_command = || {
+        let mut command = Command::new("rclone");
+        command
             .env("RCLONE_CONFIG_GW_TYPE", "s3")
             .env("RCLONE_CONFIG_GW_PROVIDER", "Other")
             .env("RCLONE_CONFIG_GW_ACCESS_KEY_ID", ACCESS_KEY_ID)
             .env("RCLONE_CONFIG_GW_SECRET_ACCESS_KEY", SECRET_ACCESS_KEY)
-            .env("RCLONE_CONFIG_GW_ENDPOINT", endpoint)
+            .env("RCLONE_CONFIG_GW_ENDPOINT", &endpoint)
             .env("RCLONE_CONFIG_GW_REGION", "us-east-1")
-            .env("RCLONE_CONFIG_GW_NO_CHECK_BUCKET", "true")
-            .args([
-                "lsf",
-                &format!("gw:{PUBLIC_BUCKET}/smoke"),
-                "--s3-no-check-bucket",
-            ]),
+            .env("RCLONE_CONFIG_GW_NO_CHECK_BUCKET", "true");
+        command
+    };
+    let rclone_list = run_output(
+        rclone_command().args([
+            "lsf",
+            &format!("gw:{PUBLIC_BUCKET}/smoke"),
+            "--s3-no-check-bucket",
+        ]),
         "rclone lsf",
     )?;
     let rclone_list = String::from_utf8(rclone_list).context("rclone lsf output was not UTF-8")?;
     if !rclone_list.lines().any(|line| line == "path-private.txt") {
         anyhow::bail!("rclone lsf did not list the object written by mc");
+    }
+
+    let version_dirs = run_output(
+        rclone_command().args(["lsd", &format!("gw:{PUBLIC_BUCKET}"), "--s3-versions"]),
+        "rclone lsd --s3-versions",
+    )?;
+    let version_dirs =
+        String::from_utf8(version_dirs).context("rclone version directories were not UTF-8")?;
+    if !version_dirs
+        .lines()
+        .any(|line| line.split_whitespace().last() == Some("smoke"))
+    {
+        anyhow::bail!("rclone version listing did not expose the current common prefix");
+    }
+    let versions = run_output(
+        rclone_command().args([
+            "lsf",
+            &format!("gw:{PUBLIC_BUCKET}/smoke"),
+            "--s3-versions",
+            "--s3-list-chunk",
+            "1",
+        ]),
+        "rclone lsf --s3-versions",
+    )?;
+    if String::from_utf8(versions)
+        .context("rclone versions were not UTF-8")?
+        .trim()
+        != "path-private.txt"
+    {
+        anyhow::bail!("rclone version listing did not return exactly the current object");
+    }
+    let version_body = run_output(
+        rclone_command().args([
+            "cat",
+            &format!("gw:{PUBLIC_BUCKET}/smoke/path-private.txt"),
+            "--s3-versions",
+        ]),
+        "rclone cat --s3-versions",
+    )?;
+    if version_body.as_slice() != body {
+        anyhow::bail!("rclone version-mode read returned a different current body");
     }
 
     let _ = fs::remove_file(body_path);

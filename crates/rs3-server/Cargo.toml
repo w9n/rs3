@@ -28,6 +28,7 @@ hyper-util.workspace = true
 k8s-openapi = { workspace = true, optional = true }
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+percent-encoding.workspace = true
 rs3-crypto.workspace = true
 rs3-index.workspace = true
 rs3-k8s = { workspace = true, optional = true }
