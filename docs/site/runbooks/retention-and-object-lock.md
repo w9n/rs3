@@ -10,7 +10,9 @@ When retention is enabled, protect every object needed for restore:
 
 - keyring envelopes
 - format roots
-- signed commits, including payload and index-delta sections
+- signed commits, including embedded payload and index sections
+- referenced catalog and index runs
+- referenced payload packs and standalone streams
 
 If one class is missing, the backup may become retained but unrestorable.
 
@@ -25,7 +27,55 @@ Use `compliance` where the provider supports it. Use `governance` only when
 privileged bypass is intentional. Normal gateway credentials should not carry
 governance bypass permission.
 
-## Dedup Rule
+## Kopia and Velero retention
+
+Keep snapshot retention and backup TTLs configured in the client. In a
+read-write rs3 gateway, client DELETE removes the logical object from the
+current namespace even while its backing versions remain protected. The
+client policy does not schedule physical deletion of rs3's encrypted objects.
+
+| Setting or action | Responsibility and effect |
+| --- | --- |
+| Kopia snapshot retention | Kopia expires snapshots and performs its own repository maintenance through the gateway. |
+| Velero backup TTL | Velero makes an expired backup eligible for garbage collection and requests deletion through the gateway. |
+| `RS3_REPOSITORY_RETENTION_*` | rs3 applies the repository protection policy to restore-critical backend versions. |
+| rs3 guarded maintenance | Renews reachable versions and reclaims eligible unreachable versions within its budgets. |
+| Backing bucket Lifecycle | A separate provider deletion policy; it cannot determine rs3 graph reachability. |
+
+When Kopia connects to rs3, leave Kopia's S3 Object Lock mode and
+`--extend-object-locks` disabled. rs3 does not implement the client
+`PutObjectRetention` API, so Kopia cannot renew locks through that interface.
+Use rs3's backing-store retention and renewal instead. Kopia's
+[Object Lock instructions](https://kopia.io/docs/advanced/ransomware-protection/)
+apply to a direct storage connection; do not copy their bucket Lifecycle advice
+to rs3's backing repository.
+
+Different Velero TTLs control which backups remain visible to Velero; they do
+not configure separate per-backup WORM windows in rs3. Continue running Velero's
+[backup garbage collection](https://velero.io/docs/main/how-velero-works/)
+and Kopia maintenance. These client jobs and rs3's backend maintenance serve
+different purposes and both are needed.
+
+## Backing Object Lock and Lifecycle
+
+Enable and qualify Object Lock on the backing bucket, and configure rs3's
+retention policy explicitly. Bucket defaults alone do not renew old shared
+objects or prove the effective protection of the complete restore graph.
+
+Object Lock expiry makes a version eligible for deletion; it does not itself
+delete that version. S3 Lifecycle expiration is a separate action. With
+versioning, expiration can create delete markers, and noncurrent-version
+expiration can later remove unlocked versions. See the
+[S3 Object Lock considerations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock-managing.html).
+
+Do not apply blanket age-based expiration to rs3's repository prefix, including
+noncurrent-version expiration. A long-lived format root, keyring or payload can
+still be required by the current anchor. An expired lock does not prove that
+an object is unreachable. Let guarded rs3 maintenance evaluate reachability
+and protection before physical deletion. Configure backing storage through its
+operator interface; rs3 does not expose client bucket Lifecycle management.
+
+## Reused data and renewal
 
 Retention follows the newest protected reference:
 
@@ -64,7 +114,11 @@ deserialization and rejects returned member counts above the requested
 an unbounded allocation.
 
 The gateway does not expose historical-root registration or in-place format or
-data-key rotation. Automatic maintenance protects the current anchor graph.
+data-key rotation. Automatic maintenance protects the current anchor graph. It does not maintain
+an automatic history of every acknowledged state for a configured recovery
+window. A retained object alone is insufficient historical recovery authority;
+preserve trusted bundles and verify their complete graphs before relying on
+[isolated incident recovery](restore-under-attack.md).
 Repository-level maintenance rejects foreign-format protected roots before any
 storage read, and v02 rejects client legal holds. Treat those as unsupported
 capabilities. Do not bypass the rejection by omitting a root or mutating Object
@@ -74,7 +128,10 @@ The read-write gateway now runs guarded renewal and orphan reclamation as a
 background service when `RS3_MAINTENANCE_MODE=auto`, which is the default.
 `manual` requires an operator trigger and `off` disables renewal, so treat both
 as an explicit operational exception when retention is enabled. The supervisor
-parks rather than running without an enforced maintenance guard.
+parks rather than running without an enforced maintenance guard. While parked,
+it performs neither renewal nor reclamation: locks can expire and garbage can
+accumulate. Alert on parked or failed maintenance and on approaching retention
+deadlines; a running gateway is not evidence that renewal succeeded.
 
 Size every Object Lock window strictly longer than:
 
@@ -100,6 +157,26 @@ roots that have not been explicitly discarded. The legacy mixed-commit snapshot
 publisher has a data-dependent write and fresh-reader verification shape, so it
 fails finite request, HEAD, range-read, or write-byte ceilings until that
 mutation path has its own end-to-end ledger.
+
+## Storage cost and reclamation
+
+For capacity planning, use this rough estimate:
+
+```text
+stored bytes ≈ live restore graph + obsolete bytes per day × locked days
+```
+
+Count newly written and superseded backend bytes, not just changes in source
+file sizes. Shared packs can keep dead records pinned by one live record;
+metadata, compaction copies, renewal margins and longer existing locks add
+cost. A retention period is a minimum protection duration, not a storage-size
+ceiling or a promise to delete on a specific day.
+
+Client expiry alone does not shrink backing storage. Data must become
+unreachable, any required compaction must succeed, all protection must permit
+deletion, and a guarded maintenance pass must finish within its budgets.
+Protecting selected historical roots can keep additional objects reachable;
+the current automatic supervisor does not register those roots for you.
 
 ## Cluster Takeover
 
