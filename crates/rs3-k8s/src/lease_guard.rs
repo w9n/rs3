@@ -830,74 +830,15 @@ fn duration_seconds_i32(duration: Duration) -> Result<i32, LeaseGuardError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LeaseGuard, LeaseGuardApi, LeaseGuardError, WriterFenceClaim,
-        lease_has_writer_coordination, lease_with_guard_state,
+        LeaseGuard, LeaseGuardError, WriterFenceClaim, lease_has_writer_coordination,
+        lease_with_guard_state,
     };
     use crate::LeaseSettings;
-    use async_trait::async_trait;
     use k8s_openapi::api::coordination::v1::Lease;
     use k8s_openapi::jiff::{SignedDuration, Timestamp};
-    use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::Mutex;
 
-    #[derive(Clone, Default)]
-    struct FakeLeaseApi {
-        lease: Arc<Mutex<Option<Lease>>>,
-    }
-
-    #[async_trait]
-    impl LeaseGuardApi for FakeLeaseApi {
-        async fn get_lease(
-            &self,
-            _namespace: &str,
-            _name: &str,
-        ) -> Result<Option<Lease>, LeaseGuardError> {
-            Ok(self.lease.lock().await.clone())
-        }
-
-        async fn create_lease(
-            &self,
-            _namespace: &str,
-            lease: &Lease,
-        ) -> Result<Lease, LeaseGuardError> {
-            let mut current = self.lease.lock().await;
-            if current.is_some() {
-                return Err(LeaseGuardError::Conflict);
-            }
-            let mut created = lease.clone();
-            created.metadata.resource_version = Some("1".to_owned());
-            *current = Some(created.clone());
-            Ok(created)
-        }
-
-        async fn replace_lease(
-            &self,
-            _namespace: &str,
-            _name: &str,
-            lease: &Lease,
-        ) -> Result<Lease, LeaseGuardError> {
-            let mut current = self.lease.lock().await;
-            let Some(stored) = current.as_ref() else {
-                return Err(LeaseGuardError::Conflict);
-            };
-            if lease.metadata.resource_version != stored.metadata.resource_version {
-                return Err(LeaseGuardError::Conflict);
-            }
-            let next_version = stored
-                .metadata
-                .resource_version
-                .as_deref()
-                .unwrap_or("0")
-                .parse::<u64>()
-                .unwrap_or(0)
-                .saturating_add(1);
-            let mut replaced = lease.clone();
-            replaced.metadata.resource_version = Some(next_version.to_string());
-            *current = Some(replaced.clone());
-            Ok(replaced)
-        }
-    }
+    use crate::test_support::FakeLeaseApi;
 
     fn lease_guard(api: FakeLeaseApi, holder_identity: &str) -> LeaseGuard<FakeLeaseApi> {
         LeaseGuard::new(

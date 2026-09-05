@@ -1,23 +1,26 @@
 //! Kubernetes checkpoint anchoring integration.
 
+#[cfg(test)]
+mod anchor_tests;
 mod lease_guard;
+#[cfg(test)]
+mod test_support;
 
 use async_trait::async_trait;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::PostParams;
-use kube::{Api, Client};
 use rs3_repository::v2::{
     V2AnchorState, V2CommitAnchor, V2FormatError, V2FormatRef, V2MaintenanceGuard, V2Result,
 };
 use rs3_types::{BackendObjectId, BackendVersionId, KeyId, Sequence};
 use std::collections::BTreeMap;
-use tokio::sync::OnceCell;
 
 pub use lease_guard::{
     KubernetesLeaseGuard, LeaseGuard, LeaseGuardApi, LeaseGuardError, LeaseGuardState, WriterFence,
 };
-use lease_guard::{WriterFenceClaim, lease_has_writer_coordination, lease_holds_claim};
+use lease_guard::{
+    KubernetesLeaseGuardApi, WriterFenceClaim, lease_has_writer_coordination, lease_holds_claim,
+};
 
 const V2_SEQUENCE_ANNOTATION: &str = "rs3.rs/v2-sequence";
 const V2_COMMIT_KEY_ANNOTATION: &str = "rs3.rs/v2-commit-key";
@@ -49,7 +52,7 @@ pub struct LeaseSettings {
 pub struct KubernetesLeaseAnchor {
     settings: LeaseSettings,
     writer_fence: Option<WriterFence>,
-    client: OnceCell<Client>,
+    api: KubernetesLeaseGuardApi,
 }
 
 impl KubernetesLeaseAnchor {
@@ -58,7 +61,7 @@ impl KubernetesLeaseAnchor {
         Self {
             settings,
             writer_fence: None,
-            client: OnceCell::new(),
+            api: KubernetesLeaseGuardApi::default(),
         }
     }
 
@@ -68,20 +71,8 @@ impl KubernetesLeaseAnchor {
         Self {
             settings,
             writer_fence: Some(writer_fence),
-            client: OnceCell::new(),
+            api: KubernetesLeaseGuardApi::default(),
         }
-    }
-
-    async fn api(&self) -> V2Result<Api<Lease>> {
-        let client = self
-            .client
-            .get_or_try_init(|| async {
-                Client::try_default()
-                    .await
-                    .map_err(|_| V2FormatError::AnchorReadFailed)
-            })
-            .await?;
-        Ok(Api::namespaced(client.clone(), &self.settings.namespace))
     }
 }
 
@@ -99,10 +90,13 @@ impl V2MaintenanceGuard for WriterFence {
 #[async_trait]
 impl V2CommitAnchor for KubernetesLeaseAnchor {
     async fn read_v2(&self) -> V2Result<Option<V2AnchorState>> {
-        let api = self.api().await?;
-        let lease = match api.get(&self.settings.name).await {
-            Ok(lease) => lease,
-            Err(error) if is_kube_status(&error, 404) => return Ok(None),
+        let lease = match self
+            .api
+            .get_lease(&self.settings.namespace, &self.settings.name)
+            .await
+        {
+            Ok(Some(lease)) => lease,
+            Ok(None) => return Ok(None),
             Err(_) => return Err(V2FormatError::AnchorReadFailed),
         };
         v2_anchor_state_from_lease_optional(&lease)
@@ -113,55 +107,67 @@ impl V2CommitAnchor for KubernetesLeaseAnchor {
         expected: Option<&V2AnchorState>,
         next: V2AnchorState,
     ) -> V2Result<V2AnchorState> {
-        let api = self
-            .api()
-            .await
-            .map_err(|_| V2FormatError::AnchorAdvanceFailed)?;
-
-        for _attempt in 0..MAX_ADVANCE_ATTEMPTS {
-            match api.get(&self.settings.name).await {
-                Ok(lease) => {
-                    let current = v2_anchor_state_from_lease_optional(&lease)?;
-                    if expected != current.as_ref() {
-                        return Err(V2FormatError::StaleAnchor);
-                    }
-                    if current.as_ref().is_some_and(|current| {
-                        next != *current && next.sequence <= current.sequence
-                    }) {
-                        return Err(V2FormatError::StaleAnchor);
-                    }
-
-                    let updated =
-                        v2_lease_for_anchor_advance(lease, &next, self.writer_fence.as_ref())?;
-                    match api
-                        .replace(&self.settings.name, &PostParams::default(), &updated)
-                        .await
-                    {
-                        Ok(lease) => return v2_anchor_state_from_lease(&lease),
-                        Err(error) if is_kube_status(&error, 409) => continue,
-                        Err(_) => return Err(V2FormatError::AnchorAdvanceFailed),
-                    }
-                }
-                Err(error) if is_kube_status(&error, 404) => {
-                    if expected.is_some() {
-                        return Err(V2FormatError::StaleAnchor);
-                    }
-                    if self.writer_fence.is_some() {
-                        return Err(V2FormatError::AnchorAdvanceFailed);
-                    }
-                    let lease = new_v2_lease(&self.settings.name, &next);
-                    match api.create(&PostParams::default(), &lease).await {
-                        Ok(lease) => return v2_anchor_state_from_lease(&lease),
-                        Err(error) if is_kube_status(&error, 409) => continue,
-                        Err(_) => return Err(V2FormatError::AnchorAdvanceFailed),
-                    }
-                }
-                Err(_) => return Err(V2FormatError::AnchorReadFailed),
-            }
-        }
-
-        Err(V2FormatError::AnchorAdvanceFailed)
+        compare_and_advance_lease(
+            &self.api,
+            &self.settings,
+            self.writer_fence.as_ref(),
+            expected,
+            next,
+        )
+        .await
     }
+}
+
+async fn compare_and_advance_lease(
+    api: &impl LeaseGuardApi,
+    settings: &LeaseSettings,
+    writer_fence: Option<&WriterFence>,
+    expected: Option<&V2AnchorState>,
+    next: V2AnchorState,
+) -> V2Result<V2AnchorState> {
+    for _attempt in 0..MAX_ADVANCE_ATTEMPTS {
+        match api.get_lease(&settings.namespace, &settings.name).await {
+            Ok(Some(lease)) => {
+                let current = v2_anchor_state_from_lease_optional(&lease)?;
+                if expected != current.as_ref() {
+                    return Err(V2FormatError::StaleAnchor);
+                }
+                if current
+                    .as_ref()
+                    .is_some_and(|current| next != *current && next.sequence <= current.sequence)
+                {
+                    return Err(V2FormatError::StaleAnchor);
+                }
+
+                let updated = v2_lease_for_anchor_advance(lease, &next, writer_fence)?;
+                match api
+                    .replace_lease(&settings.namespace, &settings.name, &updated)
+                    .await
+                {
+                    Ok(lease) => return v2_anchor_state_from_lease(&lease),
+                    Err(LeaseGuardError::Conflict) => continue,
+                    Err(_) => return Err(V2FormatError::AnchorAdvanceFailed),
+                }
+            }
+            Ok(None) => {
+                if expected.is_some() {
+                    return Err(V2FormatError::StaleAnchor);
+                }
+                if writer_fence.is_some() {
+                    return Err(V2FormatError::AnchorAdvanceFailed);
+                }
+                let lease = new_v2_lease(&settings.name, &next);
+                match api.create_lease(&settings.namespace, &lease).await {
+                    Ok(lease) => return v2_anchor_state_from_lease(&lease),
+                    Err(LeaseGuardError::Conflict) => continue,
+                    Err(_) => return Err(V2FormatError::AnchorAdvanceFailed),
+                }
+            }
+            Err(_) => return Err(V2FormatError::AnchorReadFailed),
+        }
+    }
+
+    Err(V2FormatError::AnchorAdvanceFailed)
 }
 
 fn new_v2_lease(name: &str, state: &V2AnchorState) -> Lease {
@@ -391,7 +397,7 @@ mod tests {
     use rs3_repository::v2::{V2AnchorState, V2FormatError, V2FormatRef};
     use rs3_types::{BackendObjectId, BackendVersionId, KeyId, Sequence};
 
-    fn v2_state(sequence: u64) -> V2AnchorState {
+    pub(super) fn v2_state(sequence: u64) -> V2AnchorState {
         V2AnchorState {
             sequence: Sequence::new(sequence),
             commit_key: BackendObjectId::new(format!(
