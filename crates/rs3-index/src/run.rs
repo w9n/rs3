@@ -1371,38 +1371,14 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
     })?;
     validate_count("total frame bytes", total_bytes, limits.max_total_bytes)?;
 
+    let mut decoder = IndexRunFrameDecoder::default();
+    let mut metadata_total = None;
     let mut sequence = None;
     let mut mutation_count = None;
-    let mut self_pack = None;
-    let mut self_stream = None;
-    let mut saw_self_payload_fact = false;
-    let mut containers = Vec::new();
-    let mut stream_containers = Vec::new();
-    let mut standalone_stream_containers = Vec::new();
-    let mut namespace_key_ids: Vec<KeyId> = Vec::new();
-    let mut declared_namespace_key_count = None;
-    let mut namespace: Vec<Option<NamespaceProjection>> = Vec::new();
-    let mut mutations: Vec<Option<IndexMutation>> = Vec::new();
-    let mut previous_container = None;
-    let mut previous_stream_container = None;
-    let mut previous_standalone_stream_container = None;
-    let mut saw_stream_container = false;
-    let mut saw_standalone_stream_container = false;
-    let mut saw_namespace_key_id = false;
-    let mut previous_namespace_key = None;
-    let mut previous_listing_key: Option<(LogicalPath, u32)> = None;
-    let mut used_containers = BTreeSet::new();
-    let mut used_stream_containers = BTreeSet::new();
-    let mut used_standalone_stream_containers = BTreeSet::new();
-    let mut used_namespace_key_ids = BTreeSet::new();
-    let mut uses_self_pack = false;
-    let mut self_stream_uses = 0_usize;
     let mut expected_role = IndexRunFrameRole::Metadata;
     let mut expected_role_ordinal = 0_u32;
     let mut role_total = None;
     let mut role_seen = 0_usize;
-    let mut saw_namespace = false;
-    let mut saw_listing = false;
 
     for encoded in frames {
         validate_count(
@@ -1458,254 +1434,14 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
 
         match header.role {
             IndexRunFrameRole::Metadata => {
-                let frame_namespace_key_count = header
-                    .namespace_key_count
-                    .ok_or(IndexRunError::FrameFactsMismatch)?;
-                if frame_namespace_key_count > header.role_record_count
-                    || frame_namespace_key_count
-                        > usize::try_from(header.mutation_count)
-                            .map_err(|_| IndexRunError::IntegerOverflow)?
-                {
-                    return Err(IndexRunError::FrameFactsMismatch);
-                }
-                match declared_namespace_key_count {
-                    None => {
-                        declared_namespace_key_count = Some(frame_namespace_key_count);
-                        namespace_key_ids = Vec::with_capacity(frame_namespace_key_count);
-                    }
-                    Some(count) if count == frame_namespace_key_count => {}
-                    Some(_) => return Err(IndexRunError::FrameFactsMismatch),
-                }
-                let frame_self_pack = header.self_pack.ok_or(IndexRunError::FrameFactsMismatch)?;
-                let frame_self_stream = header
-                    .self_stream
-                    .ok_or(IndexRunError::FrameFactsMismatch)?;
-                if saw_self_payload_fact
-                    && (self_pack != frame_self_pack || self_stream != frame_self_stream)
-                {
-                    return Err(IndexRunError::FrameFactsMismatch);
-                }
-                self_pack = frame_self_pack;
-                self_stream = frame_self_stream;
-                saw_self_payload_fact = true;
-                for _ in 0..header.frame_record_count {
-                    let mut record = reader.record(limits.max_record_bytes)?;
-                    match record.u8()? {
-                        0 => {
-                            if saw_stream_container
-                                || saw_standalone_stream_container
-                                || saw_namespace_key_id
-                            {
-                                return Err(IndexRunError::InvalidContainerOrder);
-                            }
-                            validate_next_container_count(
-                                &containers,
-                                &stream_containers,
-                                &standalone_stream_containers,
-                                limits,
-                            )?;
-                            let container = decode_container(&mut record, limits)?;
-                            let key = (container.object_id.clone(), container.version_id.clone());
-                            if let Some(previous) = &previous_container {
-                                if previous == &key {
-                                    return Err(IndexRunError::DuplicateContainer);
-                                }
-                                if previous > &key {
-                                    return Err(IndexRunError::InvalidContainerOrder);
-                                }
-                            }
-                            previous_container = Some(key);
-                            containers.push(container);
-                        }
-                        1 => {
-                            if saw_standalone_stream_container || saw_namespace_key_id {
-                                return Err(IndexRunError::InvalidContainerOrder);
-                            }
-                            validate_next_container_count(
-                                &containers,
-                                &stream_containers,
-                                &standalone_stream_containers,
-                                limits,
-                            )?;
-                            saw_stream_container = true;
-                            let container = decode_stream_container(&mut record, limits)?;
-                            let key = (container.object_id.clone(), container.version_id.clone());
-                            if let Some(previous) = &previous_stream_container {
-                                if previous == &key {
-                                    return Err(IndexRunError::DuplicateContainer);
-                                }
-                                if previous > &key {
-                                    return Err(IndexRunError::InvalidContainerOrder);
-                                }
-                            }
-                            previous_stream_container = Some(key);
-                            stream_containers.push(container);
-                        }
-                        2 => {
-                            if saw_namespace_key_id {
-                                return Err(IndexRunError::InvalidContainerOrder);
-                            }
-                            validate_next_container_count(
-                                &containers,
-                                &stream_containers,
-                                &standalone_stream_containers,
-                                limits,
-                            )?;
-                            saw_standalone_stream_container = true;
-                            let container =
-                                decode_standalone_stream_container(&mut record, limits)?;
-                            let key = (container.object_id.clone(), container.version_id.clone());
-                            if let Some(previous) = &previous_standalone_stream_container {
-                                if previous == &key {
-                                    return Err(IndexRunError::DuplicateContainer);
-                                }
-                                if previous > &key {
-                                    return Err(IndexRunError::InvalidContainerOrder);
-                                }
-                            }
-                            previous_standalone_stream_container = Some(key);
-                            standalone_stream_containers.push(container);
-                        }
-                        3 => {
-                            saw_namespace_key_id = true;
-                            let declared = declared_namespace_key_count
-                                .ok_or(IndexRunError::FrameFactsMismatch)?;
-                            if namespace_key_ids.len() >= declared {
-                                return Err(IndexRunError::FrameFactsMismatch);
-                            }
-                            let namespace_key_id = record.typed_string(
-                                "namespace key id",
-                                limits.max_key_id_bytes,
-                                KeyId::new,
-                            )?;
-                            if let Some(previous) = namespace_key_ids.last() {
-                                match previous.cmp(&namespace_key_id) {
-                                    std::cmp::Ordering::Less => {}
-                                    std::cmp::Ordering::Equal => {
-                                        return Err(IndexRunError::DuplicateNamespaceKey);
-                                    }
-                                    std::cmp::Ordering::Greater => {
-                                        return Err(IndexRunError::InvalidNamespaceKeyOrder);
-                                    }
-                                }
-                            }
-                            namespace_key_ids.push(namespace_key_id);
-                        }
-                        value => {
-                            return Err(IndexRunError::InvalidTag {
-                                field: "container type",
-                                value,
-                            });
-                        }
-                    }
-                    record.finish_record()?;
-                }
+                metadata_total = Some(header.role_record_count);
+                decoder.decode_metadata(header, &mut reader, limits)?;
             }
             IndexRunFrameRole::Namespace => {
-                let declared =
-                    declared_namespace_key_count.ok_or(IndexRunError::FrameFactsMismatch)?;
-                if namespace_key_ids.len() != declared {
-                    return Err(IndexRunError::FrameFactsMismatch);
-                }
-                if header.role_record_count
-                    != usize::try_from(header.mutation_count)
-                        .map_err(|_| IndexRunError::IntegerOverflow)?
-                {
-                    return Err(IndexRunError::FrameFactsMismatch);
-                }
-                if !saw_namespace {
-                    let count = usize::try_from(header.mutation_count)
-                        .map_err(|_| IndexRunError::IntegerOverflow)?;
-                    namespace.resize_with(count, || None);
-                    mutations.resize_with(count, || None);
-                    saw_namespace = true;
-                }
-                for _ in 0..header.frame_record_count {
-                    let mut record = reader.record(limits.max_record_bytes)?;
-                    let ordinal = record.u32_varint()?;
-                    let (projection, namespace_key_ordinal) = decode_namespace_projection(
-                        &mut record,
-                        &namespace_key_ids,
-                        &containers,
-                        self_pack.as_ref(),
-                        &stream_containers,
-                        self_stream.as_ref(),
-                        &standalone_stream_containers,
-                    )?;
-                    used_namespace_key_ids.insert(namespace_key_ordinal);
-                    if let NamespaceProjection::Upsert { payload, .. } = &projection {
-                        match payload {
-                            IndexPayloadPointer::Empty => {}
-                            IndexPayloadPointer::SelfPack { .. } => uses_self_pack = true,
-                            IndexPayloadPointer::ExternalPack {
-                                container_ordinal, ..
-                            } => {
-                                used_containers.insert(*container_ordinal);
-                            }
-                            IndexPayloadPointer::SelfStream => {
-                                self_stream_uses = self_stream_uses.saturating_add(1);
-                            }
-                            IndexPayloadPointer::ExternalStream { container_ordinal } => {
-                                used_stream_containers.insert(*container_ordinal);
-                            }
-                            IndexPayloadPointer::ExternalStandaloneStream { container_ordinal } => {
-                                used_standalone_stream_containers.insert(*container_ordinal);
-                            }
-                        }
-                    }
-                    record.finish_record()?;
-                    let sort_key = (projection.blind_key(), ordinal);
-                    if previous_namespace_key.is_some_and(|previous| previous >= sort_key) {
-                        return Err(IndexRunError::InvalidProjectionOrder {
-                            projection: "namespace",
-                        });
-                    }
-                    previous_namespace_key = Some(sort_key);
-                    let slot = projection_slot(&mut namespace, "namespace", ordinal)?;
-                    if slot.is_some() {
-                        return Err(IndexRunError::DuplicateProjectionOrdinal {
-                            projection: "namespace",
-                            ordinal,
-                        });
-                    }
-                    *slot = Some(projection);
-                }
+                decoder.decode_namespace(header, &mut reader, limits)?;
             }
             IndexRunFrameRole::Listing => {
-                saw_listing = true;
-                if header.role_record_count
-                    != usize::try_from(header.mutation_count)
-                        .map_err(|_| IndexRunError::IntegerOverflow)?
-                {
-                    return Err(IndexRunError::FrameFactsMismatch);
-                }
-                for _ in 0..header.frame_record_count {
-                    let mut record = reader.record(limits.max_record_bytes)?;
-                    let ordinal = record.u32_varint()?;
-                    let listing = decode_listing_projection(&mut record, limits)?;
-                    record.finish_record()?;
-                    let sort_key = (listing.path(), ordinal);
-                    if previous_listing_key
-                        .as_ref()
-                        .is_some_and(|previous| previous >= &sort_key)
-                    {
-                        return Err(IndexRunError::InvalidProjectionOrder {
-                            projection: "listing",
-                        });
-                    }
-                    previous_listing_key = Some(sort_key);
-                    let mutation_slot = projection_slot(&mut mutations, "listing", ordinal)?;
-                    if mutation_slot.is_some() {
-                        return Err(IndexRunError::DuplicateProjectionOrdinal {
-                            projection: "listing",
-                            ordinal,
-                        });
-                    }
-                    let namespace_mutation = projection_slot(&mut namespace, "namespace", ordinal)?
-                        .take()
-                        .ok_or(IndexRunError::ProjectionMismatch { ordinal })?;
-                    *mutation_slot = Some(pair_projections(ordinal, namespace_mutation, listing)?);
-                }
+                decoder.decode_listing(header, &mut reader, limits)?;
             }
         }
         if !reader.is_empty() {
@@ -1717,66 +1453,373 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
     }
     let count = usize::try_from(mutation_count.ok_or(IndexRunError::InvalidFrameOrder)?)
         .map_err(|_| IndexRunError::IntegerOverflow)?;
-    if count > 0 && (!saw_namespace || !saw_listing) {
-        return Err(IndexRunError::InvalidFrameOrder);
-    }
-    if count == 0 && (saw_namespace || saw_listing) {
-        return Err(IndexRunError::FrameFactsMismatch);
-    }
-    let declared_namespace_key_count =
-        declared_namespace_key_count.ok_or(IndexRunError::FrameFactsMismatch)?;
-    if namespace_key_ids.len() != declared_namespace_key_count {
-        return Err(IndexRunError::FrameFactsMismatch);
-    }
-    if containers
-        .len()
-        .checked_add(stream_containers.len())
-        .and_then(|count| count.checked_add(standalone_stream_containers.len()))
-        .and_then(|count| count.checked_add(namespace_key_ids.len()))
-        .ok_or(IndexRunError::IntegerOverflow)?
-        != frames_metadata_total(frames, limits)?
-    {
-        return Err(IndexRunError::FrameFactsMismatch);
+    decoder.finish(
+        sequence.ok_or(IndexRunError::InvalidFrameOrder)?,
+        count,
+        metadata_total,
+    )
+}
+
+#[derive(Default)]
+struct IndexRunFrameDecoder {
+    self_pack: Option<IndexRunSelfPack>,
+    self_stream: Option<IndexRunSelfStream>,
+    saw_self_payload_fact: bool,
+    containers: Vec<IndexRunContainer>,
+    stream_containers: Vec<IndexRunStreamContainer>,
+    standalone_stream_containers: Vec<IndexRunStandaloneStreamContainer>,
+    namespace_key_ids: Vec<KeyId>,
+    declared_namespace_key_count: Option<usize>,
+    namespace: Vec<Option<NamespaceProjection>>,
+    mutations: Vec<Option<IndexMutation>>,
+    saw_stream_container: bool,
+    saw_standalone_stream_container: bool,
+    saw_namespace_key_id: bool,
+    previous_namespace_key: Option<(IndexBlindKey, u32)>,
+    previous_listing_key: Option<(LogicalPath, u32)>,
+    used_containers: BTreeSet<u32>,
+    used_stream_containers: BTreeSet<u32>,
+    used_standalone_stream_containers: BTreeSet<u32>,
+    used_namespace_key_ids: BTreeSet<u32>,
+    uses_self_pack: bool,
+    self_stream_uses: usize,
+    saw_namespace: bool,
+    saw_listing: bool,
+}
+
+impl IndexRunFrameDecoder {
+    fn decode_metadata(
+        &mut self,
+        header: DecodedFrameHeader,
+        reader: &mut Reader<'_>,
+        limits: &IndexRunLimits,
+    ) -> Result<(), IndexRunError> {
+        let frame_namespace_key_count = header
+            .namespace_key_count
+            .ok_or(IndexRunError::FrameFactsMismatch)?;
+        if frame_namespace_key_count > header.role_record_count
+            || frame_namespace_key_count
+                > usize::try_from(header.mutation_count)
+                    .map_err(|_| IndexRunError::IntegerOverflow)?
+        {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        match self.declared_namespace_key_count {
+            None => {
+                self.declared_namespace_key_count = Some(frame_namespace_key_count);
+                self.namespace_key_ids = Vec::with_capacity(frame_namespace_key_count);
+            }
+            Some(count) if count == frame_namespace_key_count => {}
+            Some(_) => return Err(IndexRunError::FrameFactsMismatch),
+        }
+        let frame_self_pack = header.self_pack.ok_or(IndexRunError::FrameFactsMismatch)?;
+        let frame_self_stream = header
+            .self_stream
+            .ok_or(IndexRunError::FrameFactsMismatch)?;
+        if self.saw_self_payload_fact
+            && (self.self_pack != frame_self_pack || self.self_stream != frame_self_stream)
+        {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        self.self_pack = frame_self_pack;
+        self.self_stream = frame_self_stream;
+        self.saw_self_payload_fact = true;
+        for _ in 0..header.frame_record_count {
+            let mut record = reader.record(limits.max_record_bytes)?;
+            match record.u8()? {
+                0 => {
+                    if self.saw_stream_container
+                        || self.saw_standalone_stream_container
+                        || self.saw_namespace_key_id
+                    {
+                        return Err(IndexRunError::InvalidContainerOrder);
+                    }
+                    validate_next_container_count(
+                        &self.containers,
+                        &self.stream_containers,
+                        &self.standalone_stream_containers,
+                        limits,
+                    )?;
+                    let container = decode_container(&mut record, limits)?;
+                    validate_container_order(
+                        self.containers
+                            .last()
+                            .map(|previous| (&previous.object_id, &previous.version_id)),
+                        (&container.object_id, &container.version_id),
+                    )?;
+                    self.containers.push(container);
+                }
+                1 => {
+                    if self.saw_standalone_stream_container || self.saw_namespace_key_id {
+                        return Err(IndexRunError::InvalidContainerOrder);
+                    }
+                    validate_next_container_count(
+                        &self.containers,
+                        &self.stream_containers,
+                        &self.standalone_stream_containers,
+                        limits,
+                    )?;
+                    self.saw_stream_container = true;
+                    let container = decode_stream_container(&mut record, limits)?;
+                    validate_container_order(
+                        self.stream_containers
+                            .last()
+                            .map(|previous| (&previous.object_id, &previous.version_id)),
+                        (&container.object_id, &container.version_id),
+                    )?;
+                    self.stream_containers.push(container);
+                }
+                2 => {
+                    if self.saw_namespace_key_id {
+                        return Err(IndexRunError::InvalidContainerOrder);
+                    }
+                    validate_next_container_count(
+                        &self.containers,
+                        &self.stream_containers,
+                        &self.standalone_stream_containers,
+                        limits,
+                    )?;
+                    self.saw_standalone_stream_container = true;
+                    let container = decode_standalone_stream_container(&mut record, limits)?;
+                    validate_container_order(
+                        self.standalone_stream_containers
+                            .last()
+                            .map(|previous| (&previous.object_id, &previous.version_id)),
+                        (&container.object_id, &container.version_id),
+                    )?;
+                    self.standalone_stream_containers.push(container);
+                }
+                3 => {
+                    self.saw_namespace_key_id = true;
+                    let declared = self
+                        .declared_namespace_key_count
+                        .ok_or(IndexRunError::FrameFactsMismatch)?;
+                    if self.namespace_key_ids.len() >= declared {
+                        return Err(IndexRunError::FrameFactsMismatch);
+                    }
+                    let namespace_key_id = record.typed_string(
+                        "namespace key id",
+                        limits.max_key_id_bytes,
+                        KeyId::new,
+                    )?;
+                    if let Some(previous) = self.namespace_key_ids.last() {
+                        match previous.cmp(&namespace_key_id) {
+                            std::cmp::Ordering::Less => {}
+                            std::cmp::Ordering::Equal => {
+                                return Err(IndexRunError::DuplicateNamespaceKey);
+                            }
+                            std::cmp::Ordering::Greater => {
+                                return Err(IndexRunError::InvalidNamespaceKeyOrder);
+                            }
+                        }
+                    }
+                    self.namespace_key_ids.push(namespace_key_id);
+                }
+                value => {
+                    return Err(IndexRunError::InvalidTag {
+                        field: "container type",
+                        value,
+                    });
+                }
+            }
+            record.finish_record()?;
+        }
+        Ok(())
     }
 
-    validate_distinct_container_objects(
-        &containers,
-        &stream_containers,
-        &standalone_stream_containers,
-    )?;
-
-    validate_container_use(
-        containers.len(),
-        &used_containers,
-        uses_self_pack,
-        self_pack.as_ref(),
-    )?;
-    validate_stream_container_use(
-        stream_containers.len(),
-        &used_stream_containers,
-        self_stream_uses,
-        self_stream.as_ref(),
-    )?;
-    validate_standalone_stream_container_use(
-        standalone_stream_containers.len(),
-        &used_standalone_stream_containers,
-    )?;
-    validate_namespace_key_use(namespace_key_ids.len(), &used_namespace_key_ids)?;
-    let mut ordered_mutations = Vec::with_capacity(mutations.len());
-    for (index, mutation) in mutations.into_iter().enumerate() {
-        let ordinal = u32::try_from(index).map_err(|_| IndexRunError::IntegerOverflow)?;
-        ordered_mutations.push(mutation.ok_or(IndexRunError::ProjectionMismatch { ordinal })?);
+    fn decode_namespace(
+        &mut self,
+        header: DecodedFrameHeader,
+        reader: &mut Reader<'_>,
+        limits: &IndexRunLimits,
+    ) -> Result<(), IndexRunError> {
+        let declared = self
+            .declared_namespace_key_count
+            .ok_or(IndexRunError::FrameFactsMismatch)?;
+        if self.namespace_key_ids.len() != declared {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        if header.role_record_count
+            != usize::try_from(header.mutation_count).map_err(|_| IndexRunError::IntegerOverflow)?
+        {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        if !self.saw_namespace {
+            let count = usize::try_from(header.mutation_count)
+                .map_err(|_| IndexRunError::IntegerOverflow)?;
+            self.namespace.resize_with(count, || None);
+            self.mutations.resize_with(count, || None);
+            self.saw_namespace = true;
+        }
+        for _ in 0..header.frame_record_count {
+            let mut record = reader.record(limits.max_record_bytes)?;
+            let ordinal = record.u32_varint()?;
+            let (projection, namespace_key_ordinal) = decode_namespace_projection(
+                &mut record,
+                &self.namespace_key_ids,
+                &self.containers,
+                self.self_pack.as_ref(),
+                &self.stream_containers,
+                self.self_stream.as_ref(),
+                &self.standalone_stream_containers,
+            )?;
+            self.used_namespace_key_ids.insert(namespace_key_ordinal);
+            if let NamespaceProjection::Upsert { payload, .. } = &projection {
+                match payload {
+                    IndexPayloadPointer::Empty => {}
+                    IndexPayloadPointer::SelfPack { .. } => self.uses_self_pack = true,
+                    IndexPayloadPointer::ExternalPack {
+                        container_ordinal, ..
+                    } => {
+                        self.used_containers.insert(*container_ordinal);
+                    }
+                    IndexPayloadPointer::SelfStream => {
+                        self.self_stream_uses = self.self_stream_uses.saturating_add(1);
+                    }
+                    IndexPayloadPointer::ExternalStream { container_ordinal } => {
+                        self.used_stream_containers.insert(*container_ordinal);
+                    }
+                    IndexPayloadPointer::ExternalStandaloneStream { container_ordinal } => {
+                        self.used_standalone_stream_containers
+                            .insert(*container_ordinal);
+                    }
+                }
+            }
+            record.finish_record()?;
+            let sort_key = (projection.blind_key(), ordinal);
+            if self
+                .previous_namespace_key
+                .is_some_and(|previous| previous >= sort_key)
+            {
+                return Err(IndexRunError::InvalidProjectionOrder {
+                    projection: "namespace",
+                });
+            }
+            self.previous_namespace_key = Some(sort_key);
+            let slot = projection_slot(&mut self.namespace, "namespace", ordinal)?;
+            if slot.is_some() {
+                return Err(IndexRunError::DuplicateProjectionOrdinal {
+                    projection: "namespace",
+                    ordinal,
+                });
+            }
+            *slot = Some(projection);
+        }
+        Ok(())
     }
-    validate_repeated_record_facts(&ordered_mutations, self_pack.as_ref(), &containers)?;
-    Ok(IndexRun {
-        sequence: sequence.ok_or(IndexRunError::InvalidFrameOrder)?,
-        self_pack,
-        self_stream,
-        containers,
-        stream_containers,
-        standalone_stream_containers,
-        mutations: ordered_mutations,
-    })
+
+    fn decode_listing(
+        &mut self,
+        header: DecodedFrameHeader,
+        reader: &mut Reader<'_>,
+        limits: &IndexRunLimits,
+    ) -> Result<(), IndexRunError> {
+        self.saw_listing = true;
+        if header.role_record_count
+            != usize::try_from(header.mutation_count).map_err(|_| IndexRunError::IntegerOverflow)?
+        {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        for _ in 0..header.frame_record_count {
+            let mut record = reader.record(limits.max_record_bytes)?;
+            let ordinal = record.u32_varint()?;
+            let listing = decode_listing_projection(&mut record, limits)?;
+            record.finish_record()?;
+            let sort_key = (listing.path(), ordinal);
+            if self
+                .previous_listing_key
+                .as_ref()
+                .is_some_and(|previous| previous >= &sort_key)
+            {
+                return Err(IndexRunError::InvalidProjectionOrder {
+                    projection: "listing",
+                });
+            }
+            self.previous_listing_key = Some(sort_key);
+            let mutation_slot = projection_slot(&mut self.mutations, "listing", ordinal)?;
+            if mutation_slot.is_some() {
+                return Err(IndexRunError::DuplicateProjectionOrdinal {
+                    projection: "listing",
+                    ordinal,
+                });
+            }
+            let namespace_mutation = projection_slot(&mut self.namespace, "namespace", ordinal)?
+                .take()
+                .ok_or(IndexRunError::ProjectionMismatch { ordinal })?;
+            *mutation_slot = Some(pair_projections(ordinal, namespace_mutation, listing)?);
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        sequence: Sequence,
+        count: usize,
+        metadata_total: Option<usize>,
+    ) -> Result<IndexRun, IndexRunError> {
+        if count > 0 && (!self.saw_namespace || !self.saw_listing) {
+            return Err(IndexRunError::InvalidFrameOrder);
+        }
+        if count == 0 && (self.saw_namespace || self.saw_listing) {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        let declared = self
+            .declared_namespace_key_count
+            .ok_or(IndexRunError::FrameFactsMismatch)?;
+        if self.namespace_key_ids.len() != declared {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        if self
+            .containers
+            .len()
+            .checked_add(self.stream_containers.len())
+            .and_then(|count| count.checked_add(self.standalone_stream_containers.len()))
+            .and_then(|count| count.checked_add(self.namespace_key_ids.len()))
+            .ok_or(IndexRunError::IntegerOverflow)?
+            != metadata_total.ok_or(IndexRunError::InvalidFrameOrder)?
+        {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+
+        validate_distinct_container_objects(
+            &self.containers,
+            &self.stream_containers,
+            &self.standalone_stream_containers,
+        )?;
+
+        validate_container_use(
+            self.containers.len(),
+            &self.used_containers,
+            self.uses_self_pack,
+            self.self_pack.as_ref(),
+        )?;
+        validate_stream_container_use(
+            self.stream_containers.len(),
+            &self.used_stream_containers,
+            self.self_stream_uses,
+            self.self_stream.as_ref(),
+        )?;
+        validate_standalone_stream_container_use(
+            self.standalone_stream_containers.len(),
+            &self.used_standalone_stream_containers,
+        )?;
+        validate_namespace_key_use(self.namespace_key_ids.len(), &self.used_namespace_key_ids)?;
+        let mut ordered_mutations = Vec::with_capacity(self.mutations.len());
+        for (index, mutation) in self.mutations.into_iter().enumerate() {
+            let ordinal = u32::try_from(index).map_err(|_| IndexRunError::IntegerOverflow)?;
+            ordered_mutations.push(mutation.ok_or(IndexRunError::ProjectionMismatch { ordinal })?);
+        }
+        validate_repeated_record_facts(&ordered_mutations)?;
+        Ok(IndexRun {
+            sequence,
+            self_pack: self.self_pack,
+            self_stream: self.self_stream,
+            containers: self.containers,
+            stream_containers: self.stream_containers,
+            standalone_stream_containers: self.standalone_stream_containers,
+            mutations: ordered_mutations,
+        })
+    }
 }
 
 struct DecodedFrameHeader {
@@ -1886,19 +1929,6 @@ fn decode_frame_header<'a>(
         },
         reader,
     ))
-}
-
-fn frames_metadata_total<B: AsRef<[u8]>>(
-    frames: &[B],
-    limits: &IndexRunLimits,
-) -> Result<usize, IndexRunError> {
-    for frame in frames {
-        let (header, _) = decode_frame_header(frame.as_ref(), limits)?;
-        if header.role == IndexRunFrameRole::Metadata {
-            return Ok(header.role_record_count);
-        }
-    }
-    Err(IndexRunError::InvalidFrameOrder)
 }
 
 fn decode_container(
@@ -2405,6 +2435,17 @@ fn validate_count(field: &'static str, actual: usize, maximum: usize) -> Result<
     Ok(())
 }
 
+fn validate_container_order(
+    previous: Option<(&BackendObjectId, &Option<BackendVersionId>)>,
+    key: (&BackendObjectId, &Option<BackendVersionId>),
+) -> Result<(), IndexRunError> {
+    match previous.map(|previous| previous.cmp(&key)) {
+        Some(std::cmp::Ordering::Equal) => Err(IndexRunError::DuplicateContainer),
+        Some(std::cmp::Ordering::Greater) => Err(IndexRunError::InvalidContainerOrder),
+        _ => Ok(()),
+    }
+}
+
 fn validate_containers(
     containers: &[IndexRunContainer],
     limits: &IndexRunLimits,
@@ -2435,14 +2476,7 @@ fn validate_containers(
         )?;
         validate_container_range(container)?;
         let key = (&container.object_id, &container.version_id);
-        if let Some(previous_key) = previous {
-            if previous_key == key {
-                return Err(IndexRunError::DuplicateContainer);
-            }
-            if previous_key > key {
-                return Err(IndexRunError::InvalidContainerOrder);
-            }
-        }
+        validate_container_order(previous, key)?;
         previous = Some(key);
     }
     Ok(())
@@ -2462,14 +2496,7 @@ fn validate_stream_containers(
         )?;
         validate_stream_container(container, limits)?;
         let key = (&container.object_id, &container.version_id);
-        if let Some(previous_key) = previous {
-            if previous_key == key {
-                return Err(IndexRunError::DuplicateContainer);
-            }
-            if previous_key > key {
-                return Err(IndexRunError::InvalidContainerOrder);
-            }
-        }
+        validate_container_order(previous, key)?;
         previous = Some(key);
     }
     Ok(())
@@ -2489,14 +2516,7 @@ fn validate_standalone_stream_containers(
         )?;
         validate_standalone_stream_container(container, limits)?;
         let key = (&container.object_id, &container.version_id);
-        if let Some(previous_key) = previous {
-            if previous_key == key {
-                return Err(IndexRunError::DuplicateContainer);
-            }
-            if previous_key > key {
-                return Err(IndexRunError::InvalidContainerOrder);
-            }
-        }
+        validate_container_order(previous, key)?;
         previous = Some(key);
     }
     Ok(())
@@ -2786,7 +2806,7 @@ fn validate_mutations(run: &IndexRun, limits: &IndexRunLimits) -> Result<(), Ind
         run.standalone_stream_containers.len(),
         &used_standalone_stream_containers,
     )?;
-    validate_repeated_record_facts(&run.mutations, run.self_pack.as_ref(), &run.containers)
+    validate_repeated_record_facts(&run.mutations)
 }
 
 fn validate_empty_payload(
@@ -2880,11 +2900,8 @@ fn derived_record_stored_len(content_len: u64) -> Result<u64, IndexRunError> {
         .ok_or(IndexRunError::InvalidPackRecordRange)
 }
 
-fn validate_repeated_record_facts(
-    mutations: &[IndexMutation],
-    self_pack: Option<&IndexRunSelfPack>,
-    containers: &[IndexRunContainer],
-) -> Result<(), IndexRunError> {
+fn validate_repeated_record_facts(mutations: &[IndexMutation]) -> Result<(), IndexRunError> {
+    // Both callers validate individual pointers before checking cross-record facts.
     let mut facts = BTreeMap::new();
     let mut spans = Vec::new();
     for mutation in mutations {
@@ -2907,15 +2924,6 @@ fn validate_repeated_record_facts(
                 record,
             ),
         };
-        validate_payload_pointer(
-            upsert.payload,
-            upsert.content_len,
-            self_pack,
-            containers,
-            None,
-            &[],
-            &[],
-        )?;
         let key = (source, record.record_ordinal);
         let value = (record, upsert.content_len);
         match facts.get(&key) {
@@ -4138,6 +4146,103 @@ mod tests {
         assert!(!debug.contains("tenant/snapshot/chunk"));
         assert!(!debug.contains("tenant/deleted"));
         assert!(!debug.contains("plaintext: ["));
+    }
+
+    fn multi_frame_fixture() -> IndexRun {
+        let mut run = fixture();
+        let container = run.containers.remove(0);
+        let IndexMutation::Upsert(upsert) = run.mutations.remove(0) else {
+            panic!("fixture starts with an upsert");
+        };
+        run.mutations.clear();
+        for ordinal in 0_u8..12 {
+            let mut container = container.clone();
+            container.object_id = BackendObjectId::new(format!("objects/pack-{ordinal:02}"))
+                .expect("container object id");
+            run.containers.push(container);
+            let mut upsert = upsert.clone();
+            upsert.mutation_ordinal = u32::from(ordinal);
+            upsert.blind_key = IndexBlindKey::from_bytes([ordinal; 32]);
+            upsert.path = LogicalPath::new(format!("tenant/object-{ordinal:02}")).expect("path");
+            if let IndexPayloadPointer::ExternalPack {
+                container_ordinal, ..
+            } = &mut upsert.payload
+            {
+                *container_ordinal = u32::from(ordinal);
+            }
+            run.mutations.push(IndexMutation::Upsert(upsert));
+        }
+        run
+    }
+
+    #[test]
+    fn rejects_missing_repeated_or_reordered_frames_across_all_roles() {
+        let limits = IndexRunLimits {
+            max_frame_bytes: 300,
+            ..IndexRunLimits::default()
+        };
+        let run = multi_frame_fixture();
+        let encoded = encode_index_run_frames(&run, &limits).expect("multi-frame run");
+        for role in [
+            IndexRunFrameRole::Metadata,
+            IndexRunFrameRole::Namespace,
+            IndexRunFrameRole::Listing,
+        ] {
+            assert!(
+                encoded
+                    .frames
+                    .iter()
+                    .filter(|frame| frame.role == role)
+                    .count()
+                    > 1
+            );
+        }
+        let frames = frame_bytes(encoded);
+        assert_eq!(decode_index_run_frames(&frames, &limits), Ok(run));
+        for index in 0..frames.len() {
+            let mut missing = frames.clone();
+            missing.remove(index);
+            assert!(
+                decode_index_run_frames(&missing, &limits).is_err(),
+                "missing frame {index}"
+            );
+            let mut repeated = frames.clone();
+            repeated.insert(index, frames[index].clone());
+            assert!(
+                decode_index_run_frames(&repeated, &limits).is_err(),
+                "repeated frame {index}"
+            );
+            if index + 1 < frames.len() {
+                let mut reordered = frames.clone();
+                reordered.swap(index, index + 1);
+                assert!(
+                    decode_index_run_frames(&reordered, &limits).is_err(),
+                    "reordered frame {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn container_order_is_enforced_between_metadata_frames() {
+        let limits = IndexRunLimits {
+            max_frame_bytes: 300,
+            ..IndexRunLimits::default()
+        };
+        let frames =
+            frame_bytes(encode_index_run_frames(&multi_frame_fixture(), &limits).expect("encode"));
+        let mut duplicate = frames.clone();
+        replace_frame_bytes(&mut duplicate, b"objects/pack-01", b"objects/pack-00");
+        assert_eq!(
+            decode_index_run_frames(&duplicate, &limits),
+            Err(IndexRunError::DuplicateContainer)
+        );
+        let mut reversed = frames;
+        replace_frame_bytes(&mut reversed, b"objects/pack-00", b"objects/pack-99");
+        assert_eq!(
+            decode_index_run_frames(&reversed, &limits),
+            Err(IndexRunError::InvalidContainerOrder)
+        );
     }
 
     #[test]
