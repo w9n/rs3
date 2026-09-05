@@ -1,7 +1,7 @@
 use crate::v2::{V2FormatError, V2Result};
+use rs3_crypto::Sha256Hasher;
 use rs3_index::PayloadHeaderReference;
 use rs3_types::{BackendObjectId, BackendObjectRef, BackendVersionId};
-use sha2::{Digest, Sha256};
 
 const V2_STREAM_PAYLOAD_CACHE_DOMAIN: &[u8] = b"rs3:v02-stream-segment-cache:v1\n";
 
@@ -44,7 +44,7 @@ impl V2StreamPayloadCacheIdentity<'_> {
             return Err(V2FormatError::InvalidHeaderField);
         }
 
-        let mut digest = Sha256::new();
+        let mut digest = Sha256Hasher::new();
         digest.update(V2_STREAM_PAYLOAD_CACHE_DOMAIN);
         update_digest_field(&mut digest, self.repository_keyring_context)?;
         let cache_version_id = match &self.carrier {
@@ -111,7 +111,10 @@ impl V2StreamPayloadCacheIdentity<'_> {
     }
 }
 
-fn update_version_id(digest: &mut Sha256, version_id: Option<&BackendVersionId>) -> V2Result<()> {
+fn update_version_id(
+    digest: &mut Sha256Hasher,
+    version_id: Option<&BackendVersionId>,
+) -> V2Result<()> {
     match version_id {
         None => digest.update([0]),
         Some(version_id) => {
@@ -141,7 +144,7 @@ pub(crate) fn validated_v2_stream_payload_start(
     Ok(payload_start)
 }
 
-fn update_digest_field(digest: &mut Sha256, value: &[u8]) -> V2Result<()> {
+fn update_digest_field(digest: &mut Sha256Hasher, value: &[u8]) -> V2Result<()> {
     let length = u64::try_from(value.len()).map_err(|_| V2FormatError::SectionBounds)?;
     digest.update(length.to_be_bytes());
     digest.update(value);

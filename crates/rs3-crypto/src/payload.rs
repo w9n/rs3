@@ -7,7 +7,33 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rs3_types::{KeyId, KeyPurpose};
 
-const XCHACHA20_NONCE_LEN: usize = 24;
+use rs3_types::{PAYLOAD_NONCE_LEN as XCHACHA20_NONCE_LEN, PAYLOAD_NONCE_PREFIX_LEN};
+
+/// Encodes a segmented payload nonce, reserving the counter's high bit for EOF.
+///
+/// Returns `None` when the segment index would overlap the EOF bit. A prefix
+/// must be fresh for each payload encrypted with the same content key, and a
+/// segment position must not be reused for different plaintext.
+pub fn payload_segment_nonce(
+    prefix: &[u8; PAYLOAD_NONCE_PREFIX_LEN],
+    segment_index: u64,
+    is_final: bool,
+) -> Option<[u8; XCHACHA20_NONCE_LEN]> {
+    const FINAL_SEGMENT_NONCE_FLAG: u64 = 1 << 63;
+    if segment_index >= FINAL_SEGMENT_NONCE_FLAG {
+        return None;
+    }
+    let mut nonce = [0_u8; XCHACHA20_NONCE_LEN];
+    nonce[..PAYLOAD_NONCE_PREFIX_LEN].copy_from_slice(prefix);
+    let counter = if is_final {
+        segment_index | FINAL_SEGMENT_NONCE_FLAG
+    } else {
+        segment_index
+    };
+    nonce[PAYLOAD_NONCE_PREFIX_LEN..].copy_from_slice(&counter.to_be_bytes());
+    Some(nonce)
+}
+
 const PAYLOAD_PACK_SEGMENT_NONCE_DOMAIN: &[u8] = b"rs3:payload-pack-segment-nonce:v2";
 
 /// Encrypted payload bytes and the key that produced them.
@@ -178,6 +204,25 @@ fn payload_cipher(secret: &crate::SecretBytes) -> Result<XChaCha20Poly1305, Cryp
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn segmented_nonce_preserves_counter_and_final_bit_encoding() {
+        let prefix = [0x91; rs3_types::PAYLOAD_NONCE_PREFIX_LEN];
+        for index in [0, 1, 255, 256, (1_u64 << 63) - 1] {
+            for is_final in [false, true] {
+                let nonce =
+                    super::payload_segment_nonce(&prefix, index, is_final).expect("valid counter");
+                assert_eq!(&nonce[..16], &prefix);
+                let counter = u64::from_be_bytes(nonce[16..].try_into().expect("counter"));
+                assert_eq!(counter & ((1_u64 << 63) - 1), index);
+                assert_eq!(counter >> 63, u64::from(is_final));
+            }
+        }
+        for index in [1_u64 << 63, u64::MAX] {
+            assert!(super::payload_segment_nonce(&prefix, index, false).is_none());
+            assert!(super::payload_segment_nonce(&prefix, index, true).is_none());
+        }
+    }
+
     use crate::{KeyMaterial, KeyRing, SecretBytes};
     use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus};
 

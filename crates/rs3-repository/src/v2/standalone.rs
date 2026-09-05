@@ -12,8 +12,8 @@ const V2_STANDALONE_OBJECT_ID_B64_LEN: usize = 43;
 
 /// Generates a fresh path-private identity for one immutable standalone object.
 pub(in crate::v2) fn generate_v2_standalone_object_id() -> V2Result<BackendObjectId> {
-    let mut random_id = [0_u8; V2_STANDALONE_OBJECT_ID_BYTES];
-    getrandom::fill(&mut random_id).map_err(|_| V2FormatError::RandomnessUnavailable)?;
+    let random_id =
+        rs3_crypto::random_carrier_id().map_err(|_| V2FormatError::RandomnessUnavailable)?;
     BackendObjectId::new(format!(
         "{V2_STANDALONE_OBJECT_PREFIX}{}",
         URL_SAFE_NO_PAD.encode(random_id)

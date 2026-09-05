@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use rs3_crypto::KeyRing;
+use rs3_crypto::Sha256Hasher;
 use rs3_storage::{
     BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore, ByteRange, PutOptions, StorageError,
 };
@@ -25,7 +26,6 @@ use rs3_types::{
     RetentionPolicy, Sequence,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1381,7 +1381,7 @@ where
             let capacity =
                 usize::try_from(section.length).map_err(|_| V2FormatError::ReplayBudgetExceeded)?;
             let mut retained = Vec::with_capacity(capacity);
-            let mut section_digest = Sha256::new();
+            let mut section_digest = Sha256Hasher::new();
             let mut offset = sections_start
                 .checked_add(section.offset)
                 .ok_or(V2FormatError::SectionBounds)?;
@@ -1410,7 +1410,7 @@ where
                 remaining -= read_len;
             }
 
-            let actual: [u8; 32] = section_digest.finalize().into();
+            let actual: [u8; 32] = section_digest.finalize();
             if actual != section.digest {
                 return Err(V2FormatError::SectionDigestMismatch);
             }
@@ -1431,10 +1431,10 @@ where
         }
         let sections_start = u64::try_from(parsed_header.sections_start)
             .map_err(|_| V2FormatError::SectionBounds)?;
-        let mut body_digest = Sha256::new();
+        let mut body_digest = Sha256Hasher::new();
 
         for section in &parsed_header.header.section_index {
-            let mut section_digest = Sha256::new();
+            let mut section_digest = Sha256Hasher::new();
             let mut offset = sections_start
                 .checked_add(section.offset)
                 .ok_or(V2FormatError::SectionBounds)?;
@@ -1461,13 +1461,13 @@ where
                     .ok_or(V2FormatError::SectionBounds)?;
                 remaining -= read_len;
             }
-            let actual: [u8; 32] = section_digest.finalize().into();
+            let actual: [u8; 32] = section_digest.finalize();
             if actual != section.digest {
                 return Err(V2FormatError::SectionDigestMismatch);
             }
         }
 
-        let actual: [u8; 32] = body_digest.finalize().into();
+        let actual: [u8; 32] = body_digest.finalize();
         if actual != parsed_header.header.body_digest {
             return Err(V2FormatError::BodyDigestMismatch);
         }
@@ -2052,8 +2052,8 @@ where
             .create_commit_multipart_upload(&commit_key.object_id, retention, legal_hold)
             .await
             .map_err(storage_to_v2)?;
-        let mut body_digest = Sha256::new();
-        let mut payload_digest = Sha256::new();
+        let mut body_digest = Sha256Hasher::new();
+        let mut payload_digest = Sha256Hasher::new();
         let payload_header = write.payload_sealer.header();
         body_digest.update(&payload_header);
         payload_digest.update(&payload_header);
@@ -2243,7 +2243,7 @@ where
         let finalized = match (write.finalize)(V2StreamingPayloadFinalizationInput {
             plaintext_len: plaintext_seen,
             payload_len,
-            payload_digest: payload_digest.clone().finalize().into(),
+            payload_digest: payload_digest.clone().finalize(),
             payload_header,
         }) {
             Ok(finalized) => finalized,
@@ -2263,7 +2263,7 @@ where
             offset: 0,
             length: payload_len,
             flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-            digest: payload_digest.finalize().into(),
+            digest: payload_digest.finalize(),
         };
         let index_run_section = V2SectionDescriptor {
             section_type: V2SectionType::IndexRun,
@@ -2283,7 +2283,7 @@ where
             abort_v2_commit_multipart(multipart, "index_run").await;
             return Err(V2FormatError::StorageOperationFailed);
         }
-        let body_digest = body_digest.finalize().into();
+        let body_digest = body_digest.finalize();
         let header = match self.build_header(
             commit_key,
             parent,
@@ -2351,7 +2351,7 @@ where
             .create_standalone_multipart_upload(&object_id, retention, legal_hold)
             .await
             .map_err(storage_to_v2)?;
-        let mut object_digest = Sha256::new();
+        let mut object_digest = Sha256Hasher::new();
         let payload_header = payload_sealer.header();
         object_digest.update(&payload_header);
         if assembler
@@ -2548,7 +2548,7 @@ where
                 .await
                 .map_err(storage_to_v2)?;
         }
-        let object_digest: [u8; 32] = object_digest.finalize().into();
+        let object_digest: [u8; 32] = object_digest.finalize();
         let version_id = self
             .verify_commit_postconditions(
                 &object_id,
@@ -2737,7 +2737,7 @@ where
         expected_object_len: u64,
         expected_digest: [u8; 32],
     ) -> V2Result<()> {
-        let mut digest = Sha256::new();
+        let mut digest = Sha256Hasher::new();
         let mut reader = self
             .store
             .open_range_at(object_id, version_id, ByteRange::Full)
@@ -2765,7 +2765,7 @@ where
             }
             digest.update(&bytes);
         }
-        let actual_digest: [u8; 32] = digest.finalize().into();
+        let actual_digest: [u8; 32] = digest.finalize();
         if bytes_read != expected_object_len || actual_digest != expected_digest {
             return Err(V2FormatError::ProviderProfileFailed);
         }
@@ -2884,14 +2884,14 @@ struct StreamingPayloadSegmentAuth<'a> {
 }
 
 struct StreamingPayloadSegmentWriter<'a> {
-    body_digest: &'a mut Sha256,
-    payload_digest: &'a mut Sha256,
+    body_digest: &'a mut Sha256Hasher,
+    payload_digest: &'a mut Sha256Hasher,
     assembler: &'a mut MultipartCommitAssembler,
     multipart: &'a mut Box<dyn rs3_storage::BlobMultipartUpload>,
 }
 
 struct StandalonePayloadSegmentWriter<'a> {
-    object_digest: &'a mut Sha256,
+    object_digest: &'a mut Sha256Hasher,
     assembler: &'a mut MultipartObjectAssembler,
     multipart: &'a mut Box<dyn BlobMultipartUpload>,
 }

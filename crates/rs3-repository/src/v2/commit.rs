@@ -5,11 +5,10 @@ use super::error::{V2FormatError, V2Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
-use getrandom::fill as fill_random;
 use rs3_crypto::KeyRing;
+use rs3_crypto::Sha256Hasher;
 use rs3_types::{BackendObjectId, BackendVersionId, KeyId, KeyPurpose, Sequence};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 /// Fixed byte length of a v2 random commit identifier.
 pub const V2_COMMIT_RANDOM_ID_LEN: usize = 32;
@@ -241,8 +240,8 @@ impl V2CommitKey {
 
 /// Generates a fresh random v2 commit key for one upload attempt.
 pub fn generate_v2_commit_key(sequence: Sequence) -> V2Result<V2CommitKey> {
-    let mut random_id = [0_u8; V2_COMMIT_RANDOM_ID_LEN];
-    fill_random(&mut random_id).map_err(|_| V2FormatError::RandomnessUnavailable)?;
+    let random_id =
+        rs3_crypto::random_carrier_id().map_err(|_| V2FormatError::RandomnessUnavailable)?;
     V2CommitKey::from_parts(sequence, random_id)
 }
 
@@ -385,7 +384,7 @@ impl V2CommitHeader {
         }
 
         let mut span = header_span(self, upload_mode, SignatureMode::Actual)?;
-        let digest = Sha256::digest(&span);
+        let digest = Sha256Hasher::digest(&span);
         span[HEADER_DIGEST_START..HEADER_DIGEST_END].copy_from_slice(&digest);
         span.extend_from_slice(section_region);
         Ok(Bytes::from(span))
@@ -395,7 +394,7 @@ impl V2CommitHeader {
     pub(crate) fn encode_header_span(&self, upload_mode: V2UploadMode) -> V2Result<Bytes> {
         validate_commit_section_semantics(self)?;
         let mut span = header_span(self, upload_mode, SignatureMode::Actual)?;
-        let digest = Sha256::digest(&span);
+        let digest = Sha256Hasher::digest(&span);
         span[HEADER_DIGEST_START..HEADER_DIGEST_END].copy_from_slice(&digest);
         Ok(Bytes::from(span))
     }
@@ -566,7 +565,7 @@ pub fn body_digest_for_v2_sections(
     let section_region_len =
         u64::try_from(section_region.len()).map_err(|_| V2FormatError::SectionBounds)?;
     validate_section_layout(section_index, section_region_len)?;
-    let mut digest = Sha256::new();
+    let mut digest = Sha256Hasher::new();
     for section in section_index {
         let start = usize::try_from(section.offset).map_err(|_| V2FormatError::SectionBounds)?;
         let length = usize::try_from(section.length).map_err(|_| V2FormatError::SectionBounds)?;
@@ -579,12 +578,12 @@ pub fn body_digest_for_v2_sections(
         }
         digest.update(section_bytes);
     }
-    Ok(digest.finalize().into())
+    Ok(digest.finalize())
 }
 
 /// Computes the digest authenticated by one v02 section descriptor.
 pub fn digest_v2_section(section_bytes: &[u8]) -> [u8; V2_DIGEST_LEN] {
-    Sha256::digest(section_bytes).into()
+    Sha256Hasher::digest(section_bytes)
 }
 
 /// Validates the signed section layout against provider-reported object length.
@@ -687,7 +686,7 @@ fn verify_header_digest(header_span_bytes: &[u8]) -> V2Result<()> {
     let declared = &header_span_bytes[HEADER_DIGEST_START..HEADER_DIGEST_END];
     let mut digest_input = header_span_bytes.to_vec();
     digest_input[HEADER_DIGEST_START..HEADER_DIGEST_END].fill(0);
-    let actual = Sha256::digest(&digest_input);
+    let actual = Sha256Hasher::digest(&digest_input);
     if actual.as_slice() == declared {
         Ok(())
     } else {

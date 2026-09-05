@@ -8,7 +8,6 @@
 
 use super::{V2FormatError, V2Result, digest_v2_section};
 use bytes::Bytes;
-use getrandom::fill as fill_random;
 use rs3_crypto::KeyRing;
 use rs3_index::run::{
     EncodedIndexRunFrame, IndexBlindKey, IndexRun, IndexRunFrameRole, IndexRunLimits,
@@ -59,8 +58,8 @@ impl V2IndexRunId {
     }
 
     fn generate() -> V2Result<Self> {
-        let mut bytes = [0_u8; V2_INDEX_RUN_ID_LEN];
-        fill_random(&mut bytes).map_err(|_| V2FormatError::RandomnessUnavailable)?;
+        let bytes =
+            rs3_crypto::random_carrier_id().map_err(|_| V2FormatError::RandomnessUnavailable)?;
         Ok(Self(bytes))
     }
 }

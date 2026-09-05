@@ -9,7 +9,6 @@ use super::{
     V2FormatRef, V2KeyringEnvelopeRef, V2Result,
 };
 use bytes::Bytes;
-use getrandom::fill as fill_random;
 use rs3_crypto::KeyRing;
 use rs3_index::run::IndexBlindKey;
 use rs3_types::{BackendObjectId, BackendVersionId, KeyId, KeyPurpose, LogicalPath, Sequence};
@@ -65,8 +64,8 @@ impl V2IndexRootId {
     }
 
     fn generate() -> V2Result<Self> {
-        let mut bytes = [0_u8; V2_INDEX_ROOT_ID_LEN];
-        fill_random(&mut bytes).map_err(|_| V2FormatError::RandomnessUnavailable)?;
+        let bytes =
+            rs3_crypto::random_carrier_id().map_err(|_| V2FormatError::RandomnessUnavailable)?;
         Ok(Self(bytes))
     }
 }
@@ -1081,13 +1080,13 @@ mod tests {
         seal_v2_index_root,
     };
     use crate::v2::{V2FormatError, V2FormatRef, V2KeyringEnvelopeRef};
+    use rs3_crypto::Sha256Hasher;
     use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
     use rs3_index::run::IndexBlindKey;
     use rs3_types::{
         BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
         LogicalPath, Sequence,
     };
-    use sha2::{Digest, Sha256};
 
     const REPOSITORY_CONTEXT: &[u8] = b"repository-context-v02";
 
@@ -1242,7 +1241,7 @@ mod tests {
     #[test]
     fn canonical_logical_encoding_is_stable() {
         let encoded = must(super::encode_root(&fixture()));
-        let digest: [u8; 32] = Sha256::digest(encoded).into();
+        let digest: [u8; 32] = Sha256Hasher::digest(encoded);
         assert_eq!(
             hex::encode(digest),
             "35f15d7fc27f058c963bb8c2df350e9875bf94fe1705b785f06324ed3de168f5"
@@ -1281,7 +1280,7 @@ mod tests {
         );
 
         let encoded = must(super::encode_root(&root));
-        let digest: [u8; 32] = Sha256::digest(encoded).into();
+        let digest: [u8; 32] = Sha256Hasher::digest(encoded);
         assert_eq!(
             hex::encode(digest),
             "6a6f0ff7f0436fdee46eb25454dddbe3d85fb3a9ed3702464885a17c59697b8e"

@@ -24,10 +24,9 @@ const LARGE_PAYLOAD_SEGMENT_SIZE: usize = 64 * 1024;
 const MEDIUM_PAYLOAD_THRESHOLD: usize = 8 * 1024;
 const LARGE_PAYLOAD_THRESHOLD: usize = 256 * 1024;
 const U64_LEN: usize = 8;
-const AEAD_TAG_LEN: u64 = 16;
-const NONCE_PREFIX_LEN: usize = 16;
-const XCHACHA20_NONCE_LEN: usize = 24;
-const FINAL_SEGMENT_NONCE_FLAG: u64 = 1 << 63;
+const AEAD_TAG_LEN: u64 = rs3_types::PAYLOAD_AEAD_TAG_LEN as u64;
+const NONCE_PREFIX_LEN: usize = rs3_types::PAYLOAD_NONCE_PREFIX_LEN;
+const XCHACHA20_NONCE_LEN: usize = rs3_types::PAYLOAD_NONCE_LEN;
 
 /// Result of a short payload header probe.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -883,10 +882,8 @@ fn segment_plaintext_len(header: &SegmentedPayloadHeader, segment_index: usize) 
 }
 
 fn random_nonce_prefix() -> Result<[u8; NONCE_PREFIX_LEN]> {
-    let mut prefix = [0_u8; NONCE_PREFIX_LEN];
-    getrandom::fill(&mut prefix)
-        .map_err(|_| StorageError::Provider("system randomness unavailable".to_owned()))?;
-    Ok(prefix)
+    rs3_crypto::random_payload_nonce_prefix()
+        .map_err(|_| StorageError::Provider("system randomness unavailable".to_owned()).into())
 }
 
 fn segment_nonce(
@@ -894,18 +891,8 @@ fn segment_nonce(
     segment_index: u64,
     is_final: bool,
 ) -> Result<[u8; XCHACHA20_NONCE_LEN]> {
-    if segment_index >= FINAL_SEGMENT_NONCE_FLAG {
-        return Err(StorageError::InvalidRange.into());
-    }
-    let mut nonce = [0_u8; XCHACHA20_NONCE_LEN];
-    nonce[..NONCE_PREFIX_LEN].copy_from_slice(nonce_prefix);
-    let counter = if is_final {
-        segment_index | FINAL_SEGMENT_NONCE_FLAG
-    } else {
-        segment_index
-    };
-    nonce[NONCE_PREFIX_LEN..].copy_from_slice(&counter.to_be_bytes());
-    Ok(nonce)
+    rs3_crypto::payload_segment_nonce(nonce_prefix, segment_index, is_final)
+        .ok_or_else(|| StorageError::InvalidRange.into())
 }
 
 fn segment_associated_data_capacity(object_id: &BackendObjectId) -> usize {

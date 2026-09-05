@@ -44,6 +44,9 @@ state.
 
 Cryptographic operations stay behind `rs3-crypto`; higher-level crates should
 not add ad hoc hashing, MAC, encryption, or key derivation logic.
+Repository streaming hashes, random carrier identities and payload nonce
+construction use that boundary. Shared payload layout constants in
+`rs3-types` keep index validation and payload writers aligned.
 
 The repository API entrypoint is `rs3_repository::v2::V2Repository`.
 Tools can store keyring envelopes through

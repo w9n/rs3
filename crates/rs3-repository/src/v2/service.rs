@@ -38,6 +38,7 @@ use crate::state::{RepositoryState, TrustedManifest, apply_index_delta_object, o
 use bytes::Bytes;
 use futures_util::Stream;
 use rs3_crypto::KeyRing;
+use rs3_crypto::Sha256Hasher;
 use rs3_index::{
     INDEX_DELTA_OBJECT_DOMAIN, IndexDelta, IndexDeltaObject, NamespaceEntry,
     PayloadHeaderReference, PayloadReference, V2CommitStreamCarrierReference,
@@ -48,7 +49,6 @@ use rs3_types::{
     BackendObjectId, BackendObjectRef, BackendVersionId, LegalHoldStatus, LogicalPath, ManifestId,
     RetentionMode, RetentionPolicy, Sequence,
 };
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -2125,7 +2125,7 @@ where
     fn v2_payload_id(commit_key: &V2CommitKey, ordinal: usize) -> Result<BackendObjectId> {
         let ordinal = u64::try_from(ordinal)
             .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?;
-        let mut digest = Sha256::new();
+        let mut digest = Sha256Hasher::new();
         digest.update(b"rs3:v2-payload-id:v1\n");
         digest.update(commit_key.object_id.as_str().as_bytes());
         digest.update(ordinal.to_be_bytes());
@@ -3407,7 +3407,7 @@ fn payload_header_from_reference(
 }
 
 fn payload_fill_lock_index(payload_id: &BackendObjectId, start_segment: usize) -> usize {
-    let mut digest = Sha256::new();
+    let mut digest = Sha256Hasher::new();
     digest.update(payload_id.as_str().as_bytes());
     digest.update((start_segment as u64).to_be_bytes());
     let digest = digest.finalize();
@@ -3647,7 +3647,7 @@ fn pack_payload_cache_ref(
     pack: &V2CommitPackRead,
     repository_context: &[u8],
 ) -> Result<BackendObjectRef> {
-    let mut digest = Sha256::new();
+    let mut digest = Sha256Hasher::new();
     digest.update(b"rs3:v02-pack-segment-cache:v2\n");
     update_cache_digest_field(&mut digest, repository_context)?;
     update_cache_digest_field(&mut digest, pack.commit_key.as_str().as_bytes())?;
@@ -3676,7 +3676,7 @@ fn pack_payload_cache_ref(
     })
 }
 
-fn update_cache_digest_field(digest: &mut Sha256, value: &[u8]) -> Result<()> {
+fn update_cache_digest_field(digest: &mut Sha256Hasher, value: &[u8]) -> Result<()> {
     let length = u64::try_from(value.len())
         .map_err(|_| v2_repository_error(V2FormatError::InvalidPayloadPack))?;
     digest.update(length.to_be_bytes());

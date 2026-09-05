@@ -7,7 +7,6 @@
 
 use super::{V2FormatError, V2Result};
 use bytes::Bytes;
-use getrandom::fill as fill_random;
 use rs3_crypto::KeyRing;
 use rs3_types::{BackendObjectId, KeyId};
 use std::fmt;
@@ -18,13 +17,13 @@ pub const V2_PAYLOAD_PACK_MAX_RECORDS: usize = rs3_index::run::INDEX_PACK_MAX_RE
 /// Maximum complete pack bytes accepted by the bounded in-memory codec.
 pub const V2_PAYLOAD_PACK_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// Canonical independently authenticated plaintext segment size.
-pub const V2_PAYLOAD_PACK_SEGMENT_BYTES: usize = 64 * 1024;
+pub const V2_PAYLOAD_PACK_SEGMENT_BYTES: usize = rs3_types::PAYLOAD_PACK_SEGMENT_BYTES;
 /// Random pack identifier bytes.
 pub const V2_PAYLOAD_PACK_ID_LEN: usize = 32;
 
 const PAYLOAD_PACK_SEGMENT_AAD_DOMAIN: &[u8] = b"rs3:payload-pack-segment-aad:v3\n";
 const PAYLOAD_PACK_SEGMENT_NONCE_CONTEXT_DOMAIN: &[u8] = b"rs3:payload-pack-segment-context:v3\n";
-const AEAD_TAG_LEN: u64 = 16;
+const AEAD_TAG_LEN: u64 = rs3_types::PAYLOAD_AEAD_TAG_LEN as u64;
 const MAX_CONTEXT_LEN: usize = 1024;
 const MAX_OBJECT_KEY_LEN: usize = 1024;
 const MAX_KEY_ID_LEN: usize = 255;
@@ -412,8 +411,8 @@ pub fn seal_v2_payload_pack(
     section_ordinal: u32,
     records: &[V2PayloadPackRecordInput],
 ) -> V2Result<V2SealedPayloadPack> {
-    let mut pack_id = [0_u8; V2_PAYLOAD_PACK_ID_LEN];
-    fill_random(&mut pack_id).map_err(|_| V2FormatError::RandomnessUnavailable)?;
+    let pack_id =
+        rs3_crypto::random_carrier_id().map_err(|_| V2FormatError::RandomnessUnavailable)?;
     let order = random_physical_order(records.len())?;
     seal_v2_payload_pack_with_layout(
         keyring,
@@ -932,8 +931,8 @@ fn random_physical_order(record_count: usize) -> V2Result<Vec<usize>> {
     }
     let mut keyed = Vec::with_capacity(record_count);
     for ordinal in 0..record_count {
-        let mut key = [0_u8; 16];
-        fill_random(&mut key).map_err(|_| V2FormatError::RandomnessUnavailable)?;
+        let key = rs3_crypto::random_physical_order_key()
+            .map_err(|_| V2FormatError::RandomnessUnavailable)?;
         keyed.push((key, ordinal));
     }
     keyed.sort_unstable();

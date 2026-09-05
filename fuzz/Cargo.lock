@@ -476,7 +476,6 @@ dependencies = [
  "base64",
  "bytes",
  "futures-util",
- "getrandom 0.3.4",
  "hex",
  "metrics",
  "rs3-crypto",
@@ -485,7 +484,6 @@ dependencies = [
  "rs3-types",
  "serde",
  "serde_json",
- "sha2",
  "thiserror",
  "tokio",
  "tracing",
@@ -499,6 +497,7 @@ dependencies = [
  "bytes",
  "rs3-types",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

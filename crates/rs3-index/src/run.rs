@@ -20,9 +20,9 @@ pub const INDEX_PACK_MAX_STORED_BYTES: u64 = 32 * 1024 * 1024;
 /// Maximum number of records in one v02 payload pack.
 pub const INDEX_PACK_MAX_RECORDS: u32 = 4_096;
 
-const INDEX_PACK_SEGMENT_BYTES: u64 = 64 * 1024;
-const INDEX_PACK_SEGMENT_TAG_BYTES: u64 = 16;
-const INDEX_STREAM_SEGMENT_TAG_BYTES: u64 = 16;
+const INDEX_PACK_SEGMENT_BYTES: u64 = rs3_types::PAYLOAD_PACK_SEGMENT_BYTES as u64;
+const INDEX_PACK_SEGMENT_TAG_BYTES: u64 = rs3_types::PAYLOAD_AEAD_TAG_LEN as u64;
+const INDEX_STREAM_SEGMENT_TAG_BYTES: u64 = rs3_types::PAYLOAD_AEAD_TAG_LEN as u64;
 const INDEX_STREAM_MAX_HEADER_BYTES: u64 = 4 * 1024;
 
 /// Decoder and encoder resource limits.
@@ -1334,8 +1334,8 @@ fn decode_payload_header(
         plaintext_len: reader.varint()?,
         key_id: reader.typed_string("content key id", limits.max_key_id_bytes, KeyId::new)?,
         nonce_prefix: {
-            let mut nonce_prefix = [0_u8; 16];
-            nonce_prefix.copy_from_slice(reader.bytes(16)?);
+            let mut nonce_prefix = [0_u8; rs3_types::PAYLOAD_NONCE_PREFIX_LEN];
+            nonce_prefix.copy_from_slice(reader.bytes(rs3_types::PAYLOAD_NONCE_PREFIX_LEN)?);
             nonce_prefix
         },
         header_len: reader.varint()?,
@@ -1351,7 +1351,7 @@ fn payload_header_encoded_len(header: &PayloadHeaderReference) -> Result<usize, 
             value.checked_add(varint_len(usize_to_u64(header.key_id.as_str().len()).ok()?))
         })
         .and_then(|value| value.checked_add(header.key_id.as_str().len()))
-        .and_then(|value| value.checked_add(16))
+        .and_then(|value| value.checked_add(rs3_types::PAYLOAD_NONCE_PREFIX_LEN))
         .and_then(|value| value.checked_add(varint_len(header.header_len)))
         .ok_or(IndexRunError::IntegerOverflow)
 }

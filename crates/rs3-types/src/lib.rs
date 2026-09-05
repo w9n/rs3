@@ -6,6 +6,15 @@ use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Authentication tag bytes in the XChaCha20-Poly1305 payload wire formats.
+pub const PAYLOAD_AEAD_TAG_LEN: usize = 16;
+/// Plaintext bytes per independently authenticated v02 payload-pack segment.
+pub const PAYLOAD_PACK_SEGMENT_BYTES: usize = 64 * 1024;
+/// Random prefix bytes in a segmented or streamable payload's nonce context.
+pub const PAYLOAD_NONCE_PREFIX_LEN: usize = 16;
+/// Bytes in the complete XChaCha20 nonce used for payload encryption.
+pub const PAYLOAD_NONCE_LEN: usize = 24;
+
 /// Result alias for type validation.
 pub type Result<T> = std::result::Result<T, TypeError>;
 

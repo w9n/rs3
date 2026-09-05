@@ -9,9 +9,9 @@ use crate::payload::{
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, stream};
 use rs3_crypto::KeyRing;
+use rs3_crypto::Sha256Hasher;
 use rs3_storage::{BlobRead, ByteRange};
 use rs3_types::BackendObjectId;
-use sha2::{Digest, Sha256};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -92,7 +92,7 @@ pub(super) async fn open_authenticated_payload_stream(
         .and_then(|bytes| bytes.checked_add(TARGET_PLAINTEXT_CHUNK_BYTES))
         .ok_or_else(|| invalid_payload(&payload_id))?;
 
-    let mut digest = Sha256::new();
+    let mut digest = Sha256Hasher::new();
     digest.update(&header_bytes);
     let state = AuthenticatedReadState {
         cursor,
@@ -144,7 +144,7 @@ pub(super) async fn open_authenticated_payload_stream(
 
         if state.next_segment == state.total_segments {
             state.cursor.finish_exact().await?;
-            let actual: [u8; 32] = state.digest.clone().finalize().into();
+            let actual: [u8; 32] = state.digest.clone().finalize();
             if actual != state.expected_section_digest {
                 return Err(invalid_payload(&state.payload_id));
             }
@@ -166,7 +166,7 @@ struct AuthenticatedReadState {
     payload_id: BackendObjectId,
     header: SegmentedPayloadHeader,
     expected_section_digest: [u8; 32],
-    digest: Sha256,
+    digest: Sha256Hasher,
     next_segment: u64,
     total_segments: u64,
     segments_per_chunk: u64,
@@ -250,8 +250,8 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures_util::StreamExt;
+    use rs3_crypto::Sha256Hasher;
     use rs3_storage::BlobRead;
-    use sha2::{Digest, Sha256};
     use std::collections::VecDeque;
     use std::sync::Arc;
 
@@ -290,7 +290,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         let header = parse_segmented_payload_header(&payload_id, &sealed)
             .unwrap_or_else(|error| panic!("{error}"));
-        let mut wrong_digest: [u8; 32] = Sha256::digest(&sealed).into();
+        let mut wrong_digest: [u8; 32] = Sha256Hasher::digest(&sealed);
         wrong_digest[0] ^= 0x80;
         let mut body = open_authenticated_payload_stream(
             chunked(&sealed),
@@ -329,7 +329,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         let header = parse_segmented_payload_header(&payload_id, &sealed)
             .unwrap_or_else(|error| panic!("{error}"));
-        let digest: [u8; 32] = Sha256::digest(&sealed).into();
+        let digest: [u8; 32] = Sha256Hasher::digest(&sealed);
         let mut corrupted = sealed.to_vec();
         let affected = header.header_len + 1024 * 1024 + 16 * 16 + 17;
         corrupted[affected] ^= 0x80;
@@ -366,7 +366,7 @@ mod tests {
         let mut header = parse_segmented_payload_header(&payload_id, &sealed)
             .unwrap_or_else(|error| panic!("{error}"));
         header.nonce_prefix[0] ^= 0x80;
-        let digest: [u8; 32] = Sha256::digest(&sealed).into();
+        let digest: [u8; 32] = Sha256Hasher::digest(&sealed);
 
         let body = open_authenticated_payload_stream(
             chunked(&sealed),

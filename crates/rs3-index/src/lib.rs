@@ -201,7 +201,7 @@ pub struct PayloadHeaderReference {
     /// Content-encryption key identifier.
     pub key_id: KeyId,
     /// Per-payload nonce prefix used for segment nonce derivation.
-    pub nonce_prefix: [u8; 16],
+    pub nonce_prefix: [u8; rs3_types::PAYLOAD_NONCE_PREFIX_LEN],
     /// Encoded payload-header byte length.
     pub header_len: u64,
 }
