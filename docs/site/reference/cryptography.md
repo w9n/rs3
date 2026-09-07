@@ -39,7 +39,7 @@ KDF before it is provided as `RS3_KEYRING_WRAPPING_KEY_HEX`.
 
 - blind path lookup tokens
 - prefix lookup tokens
-- opaque backend object IDs
+- opaque manifest IDs
 - AEAD subkeys
 - deterministic metadata nonces
 - Ed25519 signing seeds

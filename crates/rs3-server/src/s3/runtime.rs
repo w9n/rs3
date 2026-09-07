@@ -2184,10 +2184,10 @@ mod tests {
         assert_eq!(
             opened
                 .keyring
-                .derive_backend_object_id("commits", b"same")
+                .derive_primary_blind_index_key(&rs3_types::LogicalPath::new("same").expect("path"))
                 .unwrap_or_else(|error| panic!("{error}")),
             keyring
-                .derive_backend_object_id("commits", b"same")
+                .derive_primary_blind_index_key(&rs3_types::LogicalPath::new("same").expect("path"))
                 .unwrap_or_else(|error| panic!("{error}"))
         );
         assert_eq!(

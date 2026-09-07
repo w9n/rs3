@@ -3,7 +3,7 @@
 use crate::keyring::KeyRing;
 use crate::primitives::derive_hmac;
 use crate::{CryptoError, SecretBytes};
-use rs3_types::{BackendObjectId, BlindIndexKey, KeyId, KeyPurpose, LogicalPath, ManifestId};
+use rs3_types::{BlindIndexKey, KeyId, KeyPurpose, LogicalPath, ManifestId};
 
 /// Blind key derivation result tied to the namespace key that produced it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,16 +43,6 @@ impl KeyRing {
             .collect()
     }
 
-    /// Derives an opaque backend object identifier with the primary namespace key.
-    pub fn derive_backend_object_id(
-        &self,
-        object_class: &str,
-        material: &[u8],
-    ) -> Result<BackendObjectId, CryptoError> {
-        let key = self.primary_key(KeyPurpose::Namespace)?;
-        derive_backend_object_id(&key.secret, object_class, material)
-    }
-
     /// Derives an opaque manifest identifier with the primary namespace key.
     pub fn derive_manifest_id(&self, material: &[u8]) -> Result<ManifestId, CryptoError> {
         let key = self.primary_key(KeyPurpose::Namespace)?;
@@ -73,17 +63,6 @@ pub fn derive_blind_index_key(
     BlindIndexKey::new(hex::encode(bytes.as_slice())).map_err(CryptoError::from)
 }
 
-/// Derives an opaque backend object identifier for a durable object class.
-pub fn derive_backend_object_id(
-    repository_secret: &SecretBytes,
-    object_class: &str,
-    material: &[u8],
-) -> Result<BackendObjectId, CryptoError> {
-    let bytes = derive_hmac(repository_secret, b"rs3:backend-object-id:v1", material)?;
-    BackendObjectId::new(format!("{object_class}/{}", hex::encode(bytes.as_slice())))
-        .map_err(CryptoError::from)
-}
-
 /// Derives an opaque manifest identifier.
 pub fn derive_manifest_id(
     repository_secret: &SecretBytes,
@@ -95,7 +74,7 @@ pub fn derive_manifest_id(
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_backend_object_id, derive_blind_index_key, derive_manifest_id};
+    use super::{derive_blind_index_key, derive_manifest_id};
     use crate::{KeyMaterial, KeyRing, SecretBytes};
     use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath};
 
@@ -148,17 +127,9 @@ mod tests {
     #[test]
     fn opaque_ids_do_not_include_material() {
         let secret = secret(7);
-        let object_id = derive_backend_object_id(&secret, "segments", b"p/12/abcdef:1");
         let manifest_id = derive_manifest_id(&secret, b"p/12/abcdef:1");
 
-        assert!(object_id.is_ok());
         assert!(manifest_id.is_ok());
-        assert!(
-            !object_id
-                .map(|value| value.to_string())
-                .unwrap_or_default()
-                .contains("abcdef")
-        );
         assert!(
             !manifest_id
                 .map(|value| value.to_string())
