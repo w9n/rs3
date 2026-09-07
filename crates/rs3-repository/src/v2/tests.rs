@@ -8700,7 +8700,7 @@ async fn v2_packed_run_compaction_loses_final_cas_without_local_adoption() {
 }
 
 #[tokio::test]
-async fn v2_packed_run_compaction_preserves_older_tier_across_cycles() {
+async fn v2_packed_run_compaction_merges_older_tier_across_cycles() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
@@ -8740,11 +8740,11 @@ async fn v2_packed_run_compaction_preserves_older_tier_across_cycles() {
         );
     }
 
-    assert_eq!(must_repo(repository.active_index_run_count()), 2);
+    assert_eq!(must_repo(repository.active_index_run_count()), 1);
     assert_eq!(must_repo(repository.active_level_zero_index_run_count()), 0);
     let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
     must_repo(fresh.load_chain_from_anchor(&anchor).await);
-    assert_eq!(must_repo(fresh.active_index_run_count()), 2);
+    assert_eq!(must_repo(fresh.active_index_run_count()), 1);
     assert_eq!(must_repo(fresh.list("snapshots/")).len(), 4);
     for cycle in 0..2 {
         for index in 0..2 {

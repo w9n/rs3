@@ -415,26 +415,35 @@ listing visibility and ordering are not part of recovery.
 
 `INDEX_ROOT` names index runs, not every payload carrier. Effective highest-
 generation namespace records are the authoritative pack and stream reachability
-map. Foreground runs are level 0. The current run compactor selects at
-most the oldest 128 level-0 runs, chooses the newest mutation for each blinded
-key in that bounded window, and retains a winning tombstone just like a winning
-upsert. Newer level-0 runs and every existing level-1 shard remain
-exact-referenced and unchanged. Level is a storage tier, never a compaction
-epoch; every foreground compaction emits level 1 instead of incrementing a
-level counter. The decoder accepts only levels 0 and 1. Supporting another tier
-requires an explicit future capability and hostile-input review. Different
-mutations for the same key and generation are
-corruption. Source-relative self-pack pointers are normalized to
-exact external historical commit, version, section, payload, and
-keyring-envelope facts before source-run boundaries disappear. The result is
-split into the fewest bounded
-generation-range shards the canonical run codec accepts. Every equal-generation
-group stays indivisible, even when that means rejecting an oversized generation
-instead of partially publishing it. A level-1 tombstone continues to mask older
-values in preserved level-1 shards. Reclaiming bottom-tier tombstones and
-records they mask requires a separate future guarded or offline merge with
-protected-root and GC proof. Foreground compaction is metadata-only and never
-reads, decrypts, or rewrites payload ciphertext.
+map. Foreground runs are level 0. The compactor selects at most 128
+active runs, regardless of level, as a contiguous generation window, capped at
+131,072 source mutations and 16 MiB of stored index-run sections. Catalog facts
+select the window with the most runs; ties prefer fewer mutations, fewer stored
+bytes, then the oldest window. This avoids stalling behind full live older
+shards when newer churn can reduce the catalog. Both maximum-size runs fit
+these ceilings. The compactor validates every source and selects the newest
+mutation for each blinded key.
+The already accepted namespace proves an upsert obsolete when that blinded key
+is absent or has a newer generation. Those upserts are omitted; winning
+tombstones remain. A namespace generation behind a source or inconsistent
+same-generation namespace-key identity fails closed. Different mutations for
+the same blinded key and generation fail before pruning, even if obsolete.
+
+Runs outside the window remain exact-referenced and unchanged. Output is level
+1, never an incrementing compaction epoch. The decoder accepts only levels 0
+and 1. Source-relative self-pack pointers become exact historical commit,
+version, section, payload and keyring-envelope facts. All other winning mutation
+metadata is preserved. The output uses the fewest generation-range shards
+accepted by the canonical run codec, preserving each equal-generation group.
+A fully obsolete window emits no replacement carrier; otherwise output must
+contain fewer runs than the source window. The root preserves the accepted
+coverage generation, logical object count and completion receipts.
+
+Compaction is metadata-only: it never reads, decrypts or rewrites payload
+ciphertext. It does not delete replaced runs or payloads. Protected historical
+roots still name their original exact dependencies, and guarded GC marks those
+roots independently. Winning tombstone reclamation remains future guarded
+work; this merge changes neither the wire encoding nor history retention policy.
 
 An index root is bounded to 8 MiB and 1,024 active runs, with aggregate
 ceilings of 16,777,216 mutations and 8 GiB of stored run bytes. Per-run limits
@@ -579,15 +588,15 @@ Compaction and catalog publication use this order:
 
 1. Capture the accepted anchor and live Kubernetes `WriterFence` with no
    pending mutations.
-2. Select and verify at most the oldest 128 level-0 runs, then merge that
-   bounded foreground window newest-wins while retaining tombstones and
-   normalizing self-pack references. Preserve newer level-0 and
-   every existing level-1 reference unchanged.
+2. Select and verify at most 128 active runs across levels 0 and 1.
+   Merge this contiguous window newest-wins, prune upserts proven obsolete by
+   the accepted blinded-key namespace, retain winning tombstones and normalize
+   self-pack references. Preserve every run outside the window unchanged.
 3. Shard the result on generation boundaries and write each metadata-only run
    in an unanchored delta-carrier commit that is a direct child of the captured
    base.
 4. Write an unanchored signed `INDEX_ROOT`, also a direct child of that base,
-   that exact-references every new sibling carrier plus the preserved level-1
+   that exact-references every new sibling carrier plus the preserved run
    inventory. New shards have level 1 and a compaction generation equal to the
    sibling commit sequence.
 5. Read back the exact candidate root and every new sibling carrier, verify

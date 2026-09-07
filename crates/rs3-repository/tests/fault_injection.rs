@@ -1102,3 +1102,453 @@ async fn assert_compaction_visible_state<S: BlobStore + Clone>(
         Err(RepositoryError::NotFound(_))
     ));
 }
+
+mod sustained_churn {
+    use super::*;
+    use rs3_repository::v2::{V2_INDEX_COMPACTION_PAUSE_RUNS, V2AnchorState};
+    use std::collections::BTreeMap;
+
+    async fn restore(
+        inner: &MemoryBlobStore,
+        keys: &KeyRing,
+        options: &V2CommitStoreOptions,
+        anchor: &V2AnchorState,
+        model: &BTreeMap<LogicalPath, Bytes>,
+    ) -> (usize, rs3_storage::BlobOperationCounts) {
+        let fresh = make_repository(inner.clone(), keys.clone(), options.clone());
+        inner.reset_operation_counts().expect("reset replay counts");
+        let replay = fresh
+            .load_chain_from_anchor(&V2MemoryAnchor::with_state(anchor.clone()))
+            .await
+            .expect("fresh replay")
+            .expect("accepted root");
+        let counts = inner.operation_counts().expect("replay counters");
+        assert_eq!(replay.commits_newest_first.len(), 1);
+        assert!(
+            counts.get <= 12 && counts.head <= 4,
+            "bounded replay requests: {counts:?}"
+        );
+        assert!(
+            counts.bytes_read <= 32_768,
+            "bounded replay metadata: {counts:?}"
+        );
+        assert_eq!(fresh.active_index_run_count().expect("fresh runs"), 1);
+        assert_eq!(fresh.list("churn/").expect("fresh list").len(), model.len());
+        for (key, body) in model {
+            assert_eq!(
+                fresh
+                    .get_range(key, ByteRange::Full)
+                    .await
+                    .expect("fresh bytes"),
+                *body
+            );
+        }
+        for name in ["a", "b", "stable"] {
+            let key = logical_path(&format!("churn/{name}"));
+            if !model.contains_key(&key) {
+                assert!(
+                    matches!(fresh.head(&key), Err(RepositoryError::NotFound(_))),
+                    "tombstone masks old data"
+                );
+            }
+        }
+        (replay.commits_newest_first.len(), counts)
+    }
+
+    #[tokio::test]
+    async fn fixed_live_set_churn_keeps_catalog_bounded() {
+        run_churn(64).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "sustained scale lane; run with just test-churn-scale"]
+    async fn fixed_live_set_churn_scale() {
+        run_churn(V2_INDEX_COMPACTION_PAUSE_RUNS + 128).await;
+    }
+
+    async fn run_churn(cycles: usize) {
+        let inner = MemoryBlobStore::new();
+        let keys = signing_keyring();
+        let options = commit_options();
+        let anchor = V2MemoryAnchor::new();
+        let mut model = BTreeMap::new();
+        let initial = make_repository(inner.clone(), keys.clone(), options.clone());
+        initial
+            .write_genesis_snapshot(&anchor)
+            .await
+            .expect("genesis");
+        let stable = logical_path("churn/stable");
+        let stable_bytes = Bytes::from_static(b"stable historical payload");
+        initial
+            .put_committed(
+                &anchor,
+                stable.clone(),
+                stable_bytes.clone(),
+                RepositoryPutOptions::default(),
+            )
+            .await
+            .expect("stable put");
+        model.insert(stable, stable_bytes);
+        drop(initial);
+        let mut payload_spans = BTreeMap::new();
+        for metadata in inner
+            .list_prefix("")
+            .await
+            .expect("initial fixture inventory")
+        {
+            let bytes = inner
+                .get_range(&metadata.object_id, ByteRange::Full)
+                .await
+                .expect("initial fixture bytes");
+            let parsed =
+                rs3_repository::v2::parse_v2_commit_header(&metadata.object_id, &bytes, &keys)
+                    .expect("initial header");
+            let spans = parsed
+                .header
+                .section_index
+                .iter()
+                .filter(|s| matches!(s.section_type, V2SectionType::PayloadPack))
+                .map(|s| {
+                    let start = parsed.sections_start as u64 + s.offset;
+                    start..start + s.length
+                })
+                .collect::<Vec<_>>();
+            payload_spans.insert(metadata.object_id, spans);
+        }
+        let mut historical = Vec::new();
+        let started = std::time::Instant::now();
+        for cycle in 1..=cycles {
+            let store = FaultInjectingBlobStore::new(inner.clone(), Vec::new());
+            let repository = make_repository(store.clone(), keys.clone(), options.clone());
+            repository
+                .load_chain_from_anchor(&anchor)
+                .await
+                .expect("cycle base replay");
+            for name in ["a", "b"] {
+                let key = logical_path(&format!("churn/{name}"));
+                let body = Bytes::from(format!("{cycle}:{name}"));
+                repository
+                    .put_committed(
+                        &anchor,
+                        key.clone(),
+                        body.clone(),
+                        RepositoryPutOptions::default(),
+                    )
+                    .await
+                    .expect("overwrite");
+                model.insert(key, body);
+            }
+            let deleted = logical_path("churn/b");
+            repository
+                .delete_committed(&anchor, deleted.clone())
+                .await
+                .expect("delete");
+            model.remove(&deleted);
+            if cycle % 2 == 0 {
+                let body = Bytes::from(format!("{cycle}:recreated"));
+                repository
+                    .put_committed(
+                        &anchor,
+                        deleted.clone(),
+                        body.clone(),
+                        RepositoryPutOptions::default(),
+                    )
+                    .await
+                    .expect("recreate");
+                model.insert(deleted, body);
+            }
+            // Decode fixture headers through the untraced store before measuring
+            // compaction, recording exact ciphertext spans, not size estimates.
+            for event in store.operation_log().expect("write trace") {
+                if event.kind != FaultOperationKind::Put {
+                    continue;
+                }
+                let Some(id) = event.object_id else {
+                    continue;
+                };
+                let bytes = inner
+                    .get_range(&id, ByteRange::Full)
+                    .await
+                    .expect("fixture object");
+                let parsed = rs3_repository::v2::parse_v2_commit_header(&id, &bytes, &keys)
+                    .expect("signed fixture header");
+                let spans = parsed
+                    .header
+                    .section_index
+                    .iter()
+                    .filter(|s| matches!(s.section_type, V2SectionType::PayloadPack))
+                    .map(|s| {
+                        let start = parsed.sections_start as u64 + s.offset;
+                        start..start + s.length
+                    })
+                    .collect::<Vec<_>>();
+                payload_spans.insert(id, spans);
+            }
+            inner.reset_operation_counts().expect("reset counts");
+            let trace_start = store.operation_log().expect("trace start").len();
+            let before = repository.active_index_run_count().expect("before runs");
+            repository
+                .compact_packed_index_runs(&anchor, &UnenforcedQuiescedMaintenanceGuard)
+                .await
+                .expect("metadata compaction");
+            let counts = inner.operation_counts().expect("compaction counters");
+            let events = store.operation_log().expect("compaction trace")[trace_start..].to_vec();
+            assert_compaction_does_not_read_payload(&events, &payload_spans);
+            let mut payload_write_bytes = 0;
+            for event in &events {
+                if event.kind != FaultOperationKind::Put {
+                    continue;
+                }
+                let id = event.object_id.as_ref().expect("put id");
+                let bytes = inner
+                    .get_range(id, ByteRange::Full)
+                    .await
+                    .expect("compaction object");
+                let parsed = rs3_repository::v2::parse_v2_commit_header(id, &bytes, &keys)
+                    .expect("compaction header");
+                payload_write_bytes += parsed
+                    .header
+                    .section_index
+                    .iter()
+                    .filter(|s| matches!(s.section_type, V2SectionType::PayloadPack))
+                    .map(|s| s.length)
+                    .sum::<u64>();
+            }
+            assert_eq!(payload_write_bytes, 0);
+            assert_eq!(counts.put, 2);
+            assert_eq!(counts.delete, 0);
+            assert!(
+                counts.get <= 32 && counts.head <= 12,
+                "bounded compaction requests: {counts:?}"
+            );
+            assert!(
+                counts.bytes_read <= 65_536,
+                "bounded metadata reads: {counts:?}"
+            );
+            assert!(
+                counts.bytes_written <= 16_384,
+                "bounded metadata writes: {counts:?}"
+            );
+            let after = repository.active_index_run_count().expect("after runs");
+            assert_eq!(after, 1, "one active run independent of churn age");
+            let state = anchor.read_v2().await.expect("anchor").expect("state");
+            let replay = restore(&inner, &keys, &options, &state, &model).await;
+            if cycle == 1 || cycle == 32 {
+                historical.push((state.clone(), model.clone()));
+            }
+            println!(
+                "CHURN {}",
+                serde_json::json!({"cycle":cycle,"live_keys":model.len(),"runs_before":before,"runs_after":after,"replay_commits":replay.0,"replay_get":replay.1.get,"replay_head":replay.1.head,"replay_read_bytes":replay.1.bytes_read,"compaction_get":counts.get,"compaction_head":counts.head,"compaction_put":counts.put,"compaction_read_bytes":counts.bytes_read,"compaction_write_bytes":counts.bytes_written,"payload_read_bytes":0,"payload_write_bytes":payload_write_bytes,"elapsed_ms":started.elapsed().as_millis()})
+            );
+        }
+        let gc = make_repository(inner.clone(), keys.clone(), options.clone());
+        let protected_roots = historical
+            .iter()
+            .map(|(state, _)| state.clone())
+            .collect::<Vec<_>>();
+        let unprotected = gc
+            .commit_store()
+            .report_orphans(&anchor)
+            .await
+            .expect("unprotected inventory");
+        let protected = gc
+            .commit_store()
+            .report_orphans_with_protected_roots(&anchor, &protected_roots)
+            .await
+            .expect("protected inventory");
+        assert!(
+            protected.candidates.len() < unprotected.candidates.len(),
+            "historical dependencies leave candidate set"
+        );
+        for root in &protected_roots {
+            assert!(
+                unprotected
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.object_id == root.commit_key)
+            );
+            assert!(
+                !protected
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.object_id == root.commit_key)
+            );
+        }
+        let apply = gc
+            .commit_store()
+            .apply_full_gc(
+                &anchor,
+                &UnenforcedQuiescedMaintenanceGuard,
+                V2FullGcApplyOptions {
+                    dry_run: V2FullGcDryRunOptions {
+                        protected_roots,
+                        ..V2FullGcDryRunOptions::default()
+                    },
+                    orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+                    retained_provider_conformance_passed: false,
+                },
+            )
+            .await
+            .expect("guarded exact-version GC");
+        assert!(
+            apply.orphan_gc.deleted_count > 0,
+            "GC actually reclaims obsolete versions"
+        );
+        let current = anchor
+            .read_v2()
+            .await
+            .expect("current anchor")
+            .expect("root");
+        restore(&inner, &keys, &options, &current, &model).await;
+        for (state, expected) in &historical {
+            restore(&inner, &keys, &options, state, expected).await;
+        }
+        println!(
+            "CHURN_GC {}",
+            serde_json::json!({"deleted_versions":apply.orphan_gc.deleted_count,"protected_roots":historical.len(),"current_restore":true,"historical_restores":historical.len()})
+        );
+        let repository = Arc::new(make_repository(
+            inner.clone(),
+            keys.clone(),
+            options.clone(),
+        ));
+        repository
+            .load_chain_from_anchor(&anchor)
+            .await
+            .expect("writer restart");
+        let runs = repository.active_index_run_count().expect("terminal runs");
+        let coordinator = V2CommitCoordinator::new(Arc::clone(&repository), anchor.clone())
+            .expect("coordinator")
+            .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard);
+        let result = coordinator
+            .put_committed(
+                logical_path("churn/a"),
+                Bytes::from_static(b"next overwrite"),
+                RepositoryPutOptions::default(),
+            )
+            .await;
+        println!(
+            "CHURN_FINAL {}",
+            serde_json::json!({"cycles":cycles,"runs":runs,"historical_restores":historical.len(),"next_write_ok":result.is_ok(),"next_write_error":result.as_ref().err().map(ToString::to_string)})
+        );
+        assert!(
+            result.is_ok(),
+            "fixed-key churn must not exhaust the catalog: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fully_obsolete_window_publishes_only_a_root_and_preserves_newer_runs() {
+    let inner = MemoryBlobStore::new();
+    let keys = signing_keyring();
+    let options = commit_options();
+    let store = FaultInjectingBlobStore::new(inner.clone(), Vec::new());
+    let repository = make_repository(store.clone(), keys.clone(), options.clone());
+    let anchor = V2MemoryAnchor::new();
+    repository
+        .write_genesis_snapshot(&anchor)
+        .await
+        .expect("genesis");
+    let key = logical_path("window/current");
+    for _ in 0..128 {
+        repository
+            .put_committed(
+                &anchor,
+                key.clone(),
+                Bytes::new(),
+                RepositoryPutOptions::default(),
+            )
+            .await
+            .expect("old value");
+    }
+    repository
+        .put_committed(
+            &anchor,
+            key.clone(),
+            Bytes::from_static(b"tail winner"),
+            RepositoryPutOptions::default(),
+        )
+        .await
+        .expect("new value outside window");
+    let deleted = logical_path("window/deleted");
+    repository
+        .put_committed(
+            &anchor,
+            deleted.clone(),
+            Bytes::from_static(b"tail deleted"),
+            RepositoryPutOptions::default(),
+        )
+        .await
+        .expect("tail value");
+    repository
+        .delete_committed(&anchor, deleted.clone())
+        .await
+        .expect("tail tombstone");
+    assert_eq!(repository.active_index_run_count().expect("before"), 131);
+    inner.reset_operation_counts().expect("reset");
+    let start = store.operation_log().expect("trace").len();
+    repository
+        .compact_packed_index_runs(&anchor, &UnenforcedQuiescedMaintenanceGuard)
+        .await
+        .expect("root-only compaction");
+    let counts = inner.operation_counts().expect("counters");
+    assert_eq!(counts.put, 1, "no replacement carrier for obsolete window");
+    assert_eq!(counts.delete, 0);
+    assert_eq!(repository.active_index_run_count().expect("after"), 3);
+    let events = store.operation_log().expect("trace");
+    for event in &events[start..] {
+        if event.kind == FaultOperationKind::Put {
+            let id = event.object_id.as_ref().expect("put id");
+            let bytes = inner
+                .get_range(id, ByteRange::Full)
+                .await
+                .expect("root object");
+            let parsed =
+                rs3_repository::v2::parse_v2_commit_header(id, &bytes, &keys).expect("signed root");
+            assert_eq!(parsed.header.section_index.len(), 1);
+            assert_eq!(
+                parsed.header.section_index[0].section_type,
+                V2SectionType::IndexRoot
+            );
+        }
+    }
+    let fresh = make_repository(inner.clone(), keys.clone(), options.clone());
+    fresh
+        .load_chain_from_anchor(&anchor)
+        .await
+        .expect("fresh root-only recovery");
+    assert_eq!(fresh.active_index_run_count().expect("fresh runs"), 3);
+    assert_eq!(
+        fresh
+            .get_range(&key, ByteRange::Full)
+            .await
+            .expect("tail value"),
+        Bytes::from_static(b"tail winner")
+    );
+    assert!(matches!(
+        fresh.head(&deleted),
+        Err(RepositoryError::NotFound(_))
+    ));
+    fresh
+        .compact_packed_index_runs(&anchor, &UnenforcedQuiescedMaintenanceGuard)
+        .await
+        .expect("subsequent tail merge");
+    assert_eq!(fresh.active_index_run_count().expect("final runs"), 1);
+    let final_fresh = make_repository(inner, keys, options);
+    final_fresh
+        .load_chain_from_anchor(&anchor)
+        .await
+        .expect("final recovery");
+    assert_eq!(
+        final_fresh
+            .get_range(&key, ByteRange::Full)
+            .await
+            .expect("final value"),
+        Bytes::from_static(b"tail winner")
+    );
+    assert!(matches!(
+        final_fresh.head(&deleted),
+        Err(RepositoryError::NotFound(_))
+    ));
+}

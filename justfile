@@ -82,6 +82,10 @@ fuzz-smoke:
 fault-injection-sweep:
     RS3_FAULT_INJECTION_FULL_SWEEP=1 cargo test -p rs3-repository --test fault_injection
 
+# Verify 1,024 fixed-key churn cycles, metadata IO and protected-root GC.
+test-churn-scale:
+    cargo test -p rs3-repository --test fault_injection fixed_live_set_churn_scale -- --ignored --nocapture
+
 # Run a local filesystem-backed gateway with fixture credentials.
 serve-local:
     #!/usr/bin/env bash

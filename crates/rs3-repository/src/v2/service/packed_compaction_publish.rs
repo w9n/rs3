@@ -19,12 +19,62 @@ use rs3_storage::strongest_retention_policy;
 use rs3_types::{LegalHoldStatus, RetentionPolicy};
 
 const V2_PACKED_COMPACTION_MAX_SOURCE_RUNS: usize = 128;
+const V2_PACKED_COMPACTION_MAX_SOURCE_MUTATIONS: u64 = 131_072;
+const V2_PACKED_COMPACTION_MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Choose a contiguous window using authenticated catalog facts only. Prefer
+/// more source runs, then fewer mutations and bytes, then the oldest window.
+/// Full live older shards must not starve reducible newer churn. Two maximum
+/// runs fit the byte/mutation ceilings, so even full obsolete shards can merge.
+fn compaction_window(sizes: &[(u32, u64)]) -> crate::v2::V2Result<std::ops::Range<usize>> {
+    // The production caller already validated the accepted root. Keep this
+    // planning boundary fail-closed too, before selecting or skipping any run.
+    if sizes.iter().any(|&(mutations, bytes)| {
+        mutations == 0
+            || u64::from(mutations) > V2_PACKED_COMPACTION_MAX_SOURCE_MUTATIONS / 2
+            || bytes == 0
+            || bytes > V2_PACKED_COMPACTION_MAX_SOURCE_BYTES / 2
+    }) {
+        return Err(V2FormatError::InvalidIndexRoot);
+    }
+    let mut best = 0..0;
+    let mut best_cost = (u64::MAX, u64::MAX);
+    for start in 0..sizes.len() {
+        let mut mutations = 0_u64;
+        let mut bytes = 0_u64;
+        for (offset, &(run_mutations, run_bytes)) in sizes[start..]
+            .iter()
+            .take(V2_PACKED_COMPACTION_MAX_SOURCE_RUNS)
+            .enumerate()
+        {
+            mutations = mutations
+                .checked_add(u64::from(run_mutations))
+                .ok_or(V2FormatError::IndexRootLimitExceeded)?;
+            bytes = bytes
+                .checked_add(run_bytes)
+                .ok_or(V2FormatError::IndexRootLimitExceeded)?;
+            if mutations > V2_PACKED_COMPACTION_MAX_SOURCE_MUTATIONS
+                || bytes > V2_PACKED_COMPACTION_MAX_SOURCE_BYTES
+            {
+                break;
+            }
+            let candidate = start..start + offset + 1;
+            if candidate.len() > best.len()
+                || (candidate.len() == best.len() && (mutations, bytes) < best_cost)
+            {
+                best = candidate;
+                best_cost = (mutations, bytes);
+            }
+        }
+    }
+    Ok(best)
+}
 
 impl<S> V2Repository<S>
 where
     S: BlobStore + Clone,
 {
-    /// Replaces a bounded oldest window of foreground runs with fewer metadata-only runs.
+    /// Replaces a bounded contiguous window of active runs with fewer metadata-only runs.
     ///
     /// Candidate run commits and the candidate root are direct siblings of the
     /// accepted base. Exact read-back authenticates every new run and the root
@@ -104,15 +154,13 @@ where
             .clone();
         let mut ordered_refs = accepted_refs.clone();
         ordered_refs.sort_by_key(|run| (run.minimum_generation, run.run_sequence, run.run_id));
-        let mut source_refs = Vec::with_capacity(V2_PACKED_COMPACTION_MAX_SOURCE_RUNS);
-        let mut retained_refs = Vec::new();
-        for run in ordered_refs {
-            if run.level == 0 && source_refs.len() < V2_PACKED_COMPACTION_MAX_SOURCE_RUNS {
-                source_refs.push(run);
-            } else {
-                retained_refs.push(run);
-            }
-        }
+        let sizes = ordered_refs
+            .iter()
+            .map(|run| (run.mutation_count, run.location.section_len))
+            .collect::<Vec<_>>();
+        let window = compaction_window(&sizes).map_err(v2_repository_error)?;
+        let source_refs = ordered_refs.drain(window).collect::<Vec<_>>();
+        let retained_refs = ordered_refs;
         if source_refs.len() < 2 {
             return Err(v2_repository_error(
                 V2FormatError::MaintenanceBudgetExceeded,
@@ -123,16 +171,27 @@ where
         let sources = self
             .load_compaction_sources(keyring.as_ref(), &source_refs)
             .await?;
-        let output_runs = match plan_packed_run_compaction(sources, &IndexRunLimits::default()) {
+        let plan = {
+            let accepted = self
+                .accepted
+                .read()
+                .map_err(|_| RepositoryError::StatePoisoned)?;
+            plan_packed_run_compaction(
+                sources,
+                &IndexRunLimits::default(),
+                Some(&accepted.repository.namespace),
+            )
+        };
+        let output_runs = match plan {
             Ok(runs) => runs,
             Err(V2FormatError::MaintenanceBudgetExceeded) => {
                 return Err(RepositoryError::MaintenanceNotBeneficial);
             }
             Err(error) => return Err(v2_repository_error(error)),
         };
-        // Level is a storage tier, not a compaction epoch. Foreground level-zero
-        // runs are normalized exactly once into level one. Older level-one
-        // shards stay referenced instead of being rewritten at every watermark.
+        // Level is a storage tier, not a compaction epoch. Both foreground and
+        // older compacted runs share this bounded contiguous generation window;
+        // every output stays level one. Other exact run references are unchanged.
         let output_level = 1;
         let compaction_generation = base_anchor
             .sequence
@@ -509,4 +568,48 @@ fn represented_state_protection(
                 },
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_live_older_shards_do_not_starve_newer_churn() {
+        let full = (65_536, 8 * 1024 * 1024);
+        let small = (1, 1024);
+        assert_eq!(
+            compaction_window(&[full, full, small, small, small]),
+            Ok(1..5)
+        );
+        // One full shard plus the small tail still reduces; the full prefix
+        // pair cannot prevent that larger, bounded window from being selected.
+        assert_eq!(compaction_window(&[full, full, small, small]), Ok(1..4));
+        assert_eq!(compaction_window(&[full, full, small]), Ok(1..3));
+        assert_eq!(compaction_window(&[full, full]), Ok(0..2));
+    }
+
+    #[test]
+    fn invalid_catalog_costs_fail_before_any_window_is_selected() {
+        assert_eq!(
+            compaction_window(&[(1, u64::MAX), (1, 1024), (1, 1024)]),
+            Err(V2FormatError::InvalidIndexRoot)
+        );
+        assert_eq!(
+            compaction_window(&[(u32::MAX, 1024)]),
+            Err(V2FormatError::InvalidIndexRoot)
+        );
+    }
+
+    #[test]
+    fn selection_respects_all_budgets_and_never_skips_an_interior_run() {
+        let small = (1, 1024);
+        assert_eq!(compaction_window(&vec![small; 256]), Ok(0..128));
+        assert_eq!(compaction_window(&[(65_536, 1024); 3]), Ok(0..2));
+        assert_eq!(compaction_window(&[(1, 8 * 1024 * 1024); 3]), Ok(0..2));
+        assert_eq!(
+            compaction_window(&[small, (65_536, 8 * 1024 * 1024), small]),
+            Ok(0..3)
+        );
+    }
 }

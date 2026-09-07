@@ -132,22 +132,28 @@ deduplication for the primary client workload.
 
 `v03` replaces monolithic index snapshots with an encrypted LSM-style index.
 Recent immutable foreground runs are level 0. Each compaction selects at most
-the oldest 128 level-0 runs, merges that bounded window newest-wins, retains
-tombstones, and emits fewer bounded level-1 generation-range shards. Newer
-level-0 runs and existing level-1 shards remain exact-referenced and are not
-rewritten. Level is a storage tier, never a compaction epoch. The preview
-format accepts only level 0 and level 1, rejecting higher values until a future
-capability explicitly defines another tier. Equal-generation mutations remain
-indivisible so a root cannot
-publish half of one logical generation. Pointers to packs or streams embedded
-beside a source run are normalized to exact external historical commit,
-section, and keyring-envelope references before source boundaries are
-discarded. A retained
-level-1 tombstone masks older records in earlier level-1 shards. Reclaiming
-those bottom-tier tombstones and the records they mask remains future guarded
-or offline maintenance. A small signed `INDEX_ROOT` catalog names the complete
-active run set. It does not serialize every live path, and compaction never
-reads or rewrites payload ciphertext.
+128 active runs, including older level-1 shards, as one contiguous
+generation window with at most 131,072 mutations and 16 MiB of stored run
+sections. Selection prefers more source runs, then lower mutation/byte cost,
+then older windows, so full live older shards cannot starve smaller newer
+churn. After validating every source, it selects newest mutations
+and discards upserts proven obsolete by the accepted blinded-key namespace.
+Winning tombstones remain to mask older values. This prevents overwritten or
+deleted versions from filling the catalog indefinitely, including when full
+older shards precede later churn. Runs outside the window retain their exact
+references. The output contains fewer bounded level-1 generation-range shards;
+an entirely obsolete window needs no replacement run. Level is a storage tier,
+never a compaction epoch. The format accepts only levels 0 and 1.
+
+Equal-generation mutations remain indivisible. Source-relative payload pointers
+become exact external historical object, section and keyring-envelope references
+before source boundaries disappear. A small signed `INDEX_ROOT` catalog names
+the complete active run set and preserves accepted completion receipts. One
+fenced anchor CAS publishes the candidate after exact read-back. Compaction
+never reads or rewrites payload ciphertext or deletes source objects. Protected
+historical roots continue to reach their original exact versions through GC;
+compaction does not change history retention policy. Tombstone reclamation
+remains future guarded work.
 
 Runs contain two specialized encrypted binary projections linked by mutation
 ordinal. The blinded namespace projection answers `HEAD` and `GET`; the

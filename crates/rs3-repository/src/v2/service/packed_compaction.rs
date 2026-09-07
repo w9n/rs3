@@ -51,11 +51,21 @@ impl ResolvedMutation {
 /// payload pointers are first resolved to exact external containers, winners
 /// are selected by generation, and the result is adaptively sharded on whole
 /// generation groups so a generation can never be partially published.
+/// When supplied, `current_namespace` must be the complete accepted namespace
+/// held under the caller's publication lock and bound to its accepted anchor.
+/// It permits pruning obsolete upserts, including an empty replacement set;
+/// winning tombstones and all source validation remain mandatory.
 pub(super) fn plan_packed_run_compaction(
     sources: Vec<PackedCompactionSourceRun>,
     limits: &IndexRunLimits,
+    current_namespace: Option<&rs3_index::NamespaceIndex>,
 ) -> V2Result<Vec<IndexRun>> {
-    plan_packed_run_compaction_counted(sources, limits, &EncodeAttemptCounter::default())
+    plan_packed_run_compaction_counted(
+        sources,
+        limits,
+        &EncodeAttemptCounter::default(),
+        current_namespace,
+    )
 }
 
 #[derive(Default)]
@@ -82,6 +92,7 @@ fn plan_packed_run_compaction_counted(
     sources: Vec<PackedCompactionSourceRun>,
     limits: &IndexRunLimits,
     encode_attempts: &EncodeAttemptCounter,
+    current_namespace: Option<&rs3_index::NamespaceIndex>,
 ) -> V2Result<Vec<IndexRun>> {
     if sources.is_empty() {
         return Err(V2FormatError::InvalidIndexRun);
@@ -157,7 +168,34 @@ fn plan_packed_run_compaction_counted(
         return Err(V2FormatError::InvalidIndexRun);
     }
 
-    let mut ordered = winners.into_values().collect::<Vec<_>>();
+    // Validate and resolve every source before pruning, including conflicting
+    // generations and carrier facts. The caller holds the accepted state and
+    // publication locks: a different accepted generation (or no live entry)
+    // proves an upsert obsolete. Tombstones remain even when no key is live,
+    // because they can still mask values outside this bounded source window.
+    let mut ordered = Vec::with_capacity(winners.len());
+    for winner in winners.into_values() {
+        if let (Some(namespace), IndexMutation::Upsert(upsert)) =
+            (current_namespace, &winner.mutation)
+        {
+            let blind_key = upsert
+                .blind_key
+                .to_blind_index_key()
+                .map_err(|_| V2FormatError::InvalidIndexRun)?;
+            match namespace.head(&blind_key) {
+                None => continue,
+                Some(entry) if entry.generation > upsert.generation => continue,
+                Some(entry)
+                    if entry.generation == upsert.generation
+                        && entry.namespace_key_id == upsert.namespace_key_id => {}
+                Some(_) => return Err(V2FormatError::InvalidIndexRun),
+            }
+        }
+        ordered.push(winner);
+    }
+    // An entirely obsolete source window needs no replacement run. The newer
+    // retained runs still carry the accepted coverage generation and deletes.
+
     ordered.sort_by(|left, right| {
         left.generation()
             .cmp(&right.generation())
@@ -496,12 +534,19 @@ mod tests {
         IndexBlindKey::from_bytes(bytes)
     }
 
+    fn plan_packed_run_compaction(
+        sources: Vec<PackedCompactionSourceRun>,
+        limits: &IndexRunLimits,
+    ) -> V2Result<Vec<IndexRun>> {
+        super::plan_packed_run_compaction(sources, limits, None)
+    }
+
     fn plan_with_attempt_count(
         sources: Vec<PackedCompactionSourceRun>,
         limits: &IndexRunLimits,
     ) -> (V2Result<Vec<IndexRun>>, usize) {
         let counter = EncodeAttemptCounter::default();
-        let result = plan_packed_run_compaction_counted(sources, limits, &counter);
+        let result = plan_packed_run_compaction_counted(sources, limits, &counter, None);
         (result, counter.get())
     }
 
@@ -728,6 +773,182 @@ mod tests {
                     external_standalone_stream_source(4, key(4), 4, conflicting),
                 ],
                 &IndexRunLimits::default(),
+            ),
+            Err(V2FormatError::InvalidIndexRun)
+        );
+    }
+
+    fn accepted_entry(blind_key: IndexBlindKey, generation: u64) -> rs3_index::NamespaceEntry {
+        rs3_index::NamespaceEntry {
+            namespace_key_id: key_id("namespace-key"),
+            blind_key: must(blind_key.to_blind_index_key()),
+            object_id: object_id("objects/current"),
+            object_version_id: None,
+            payload_ref: None,
+            manifest_id: must(rs3_types::ManifestId::new("current-manifest")),
+            content_len: 0,
+            modified_at_ms: 1,
+            generation: sequence(generation),
+            retention: None,
+            legal_hold: None,
+        }
+    }
+
+    #[test]
+    fn full_older_shards_cannot_starve_later_fixed_key_churn() {
+        let limits = IndexRunLimits::default();
+        let count = limits.max_mutations as u64;
+        let full_sources = || {
+            (0..2)
+                .map(|shard| {
+                    let mutations = (0..count)
+                        .map(|index| {
+                            let generation = shard * count + index + 1;
+                            upsert(
+                                index as u32,
+                                numbered_key(generation),
+                                generation,
+                                IndexPayloadPointer::Empty,
+                            )
+                        })
+                        .collect();
+                    source(run((shard + 1) * count, mutations))
+                })
+                .collect::<Vec<_>>()
+        };
+        // These are two genuinely full canonical runs, with disjoint keys.
+        // Merging them alone cannot reduce the catalog without liveness proof.
+        assert_eq!(
+            plan_packed_run_compaction(full_sources(), &limits),
+            Err(V2FormatError::MaintenanceBudgetExceeded)
+        );
+        let mut namespace = rs3_index::NamespaceIndex::new();
+        // Later accepted runs deleted every old key except this overwritten key.
+        namespace.upsert_without_prefixes(accepted_entry(numbered_key(1), 2 * count + 1));
+        let compacted = must(super::plan_packed_run_compaction(
+            full_sources(),
+            &limits,
+            Some(&namespace),
+        ));
+        assert!(
+            compacted.is_empty(),
+            "fully obsolete oldest window needs only a new root"
+        );
+
+        let mut catalog = vec![source(run(
+            2 * count + 1,
+            vec![upsert(
+                0,
+                numbered_key(1),
+                2 * count + 1,
+                IndexPayloadPointer::Empty,
+            )],
+        ))];
+        for cycle in 1..=32 {
+            let deleted_generation = 2 * count + 2 * cycle;
+            catalog.push(source(run(
+                deleted_generation,
+                vec![tombstone(0, numbered_key(1), deleted_generation)],
+            )));
+            namespace.remove(&must(numbered_key(1).to_blind_index_key()));
+            let deleted = must(super::plan_packed_run_compaction(
+                catalog,
+                &limits,
+                Some(&namespace),
+            ));
+            assert_eq!(deleted.len(), 1);
+            assert!(matches!(
+                deleted[0].mutations.as_slice(),
+                [IndexMutation::Tombstone(_)]
+            ));
+            let generation = deleted_generation + 1;
+            namespace.upsert_without_prefixes(accepted_entry(numbered_key(1), generation));
+            catalog = deleted.into_iter().map(source).collect();
+            catalog.push(source(run(
+                generation,
+                vec![upsert(
+                    0,
+                    numbered_key(1),
+                    generation,
+                    IndexPayloadPointer::Empty,
+                )],
+            )));
+            let recreated = must(super::plan_packed_run_compaction(
+                catalog,
+                &limits,
+                Some(&namespace),
+            ));
+            assert_eq!(recreated.len(), 1);
+            assert_eq!(recreated[0].mutations.len(), 1);
+            catalog = recreated.into_iter().map(source).collect();
+        }
+    }
+
+    #[test]
+    fn accepted_blind_key_generation_controls_pruning_not_plaintext_path() {
+        let mut namespace = rs3_index::NamespaceIndex::new();
+        namespace.upsert_without_prefixes(accepted_entry(key(1), 8));
+        let mut old_namespace_mutation = upsert(0, key(2), 7, IndexPayloadPointer::Empty);
+        let IndexMutation::Upsert(old) = &mut old_namespace_mutation else {
+            panic!("upsert");
+        };
+        old.path = path("same/path");
+        let mut current_mutation = upsert(0, key(1), 8, IndexPayloadPointer::Empty);
+        let IndexMutation::Upsert(current) = &mut current_mutation else {
+            panic!("upsert");
+        };
+        current.path = path("same/path");
+        let sources = vec![
+            source(run(7, vec![old_namespace_mutation])),
+            source(run(8, vec![current_mutation])),
+            source(run(9, vec![tombstone(0, key(3), 9)])),
+        ];
+        let result = must(super::plan_packed_run_compaction(
+            sources,
+            &IndexRunLimits::default(),
+            Some(&namespace),
+        ));
+        assert_eq!(result[0].mutations.len(), 2);
+        assert_eq!(mutation_blind_key(&result[0].mutations[0]), key(1));
+        assert!(matches!(
+            &result[0].mutations[1],
+            IndexMutation::Tombstone(_)
+        ));
+    }
+
+    #[test]
+    fn obsolete_conflicts_are_validated_before_pruning() {
+        let left = source(run(3, vec![tombstone(0, key(1), 3)]));
+        let right = source(run(
+            4,
+            vec![upsert(0, key(1), 3, IndexPayloadPointer::Empty)],
+        ));
+        assert_eq!(
+            super::plan_packed_run_compaction(
+                vec![left, right],
+                &IndexRunLimits::default(),
+                Some(&rs3_index::NamespaceIndex::new())
+            ),
+            Err(V2FormatError::InvalidIndexRun)
+        );
+    }
+
+    #[test]
+    fn accepted_generation_behind_a_source_fails_closed() {
+        let mut namespace = rs3_index::NamespaceIndex::new();
+        namespace.upsert_without_prefixes(accepted_entry(key(1), 2));
+        let sources = vec![
+            source(run(
+                3,
+                vec![upsert(0, key(1), 3, IndexPayloadPointer::Empty)],
+            )),
+            source(run(4, vec![tombstone(0, key(2), 4)])),
+        ];
+        assert_eq!(
+            super::plan_packed_run_compaction(
+                sources,
+                &IndexRunLimits::default(),
+                Some(&namespace)
             ),
             Err(V2FormatError::InvalidIndexRun)
         );

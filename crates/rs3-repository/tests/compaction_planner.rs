@@ -43,7 +43,7 @@ proptest! {
         for (generation, _) in expected.values() {
             *group_sizes.entry(*generation).or_insert(0_usize) += 1;
         }
-        let planned = plan_packed_run_compaction(sources, &limits);
+        let planned = plan_packed_run_compaction(sources, &limits, None);
         if group_sizes.values().any(|count| *count > shard_limit) {
             prop_assert_eq!(planned, Err(v2::V2FormatError::IndexRunLimitExceeded));
         } else {
@@ -105,7 +105,7 @@ proptest! {
     ) {
         let mut sources = vec![source(mutation(key, generation, true)), source(mutation(key, generation, false))];
         if reverse { sources.reverse(); }
-        prop_assert_eq!(plan_packed_run_compaction(sources, &IndexRunLimits::default()),
+        prop_assert_eq!(plan_packed_run_compaction(sources, &IndexRunLimits::default(), None),
             Err(v2::V2FormatError::InvalidIndexRun));
     }
 }

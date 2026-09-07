@@ -103,8 +103,11 @@ the cold-read counters separately from recovery.
 These lightweight lanes qualify write amplification, bounded recovery, direct
 cold sentinel reads, sentinel correctness, and the recovered active-run budget.
 Automatic compaction performs bounded passes beginning at 256 active runs,
-each selecting at most the oldest 128 level-0 runs while preserving newer
-level-0 and prior level-1 shards. A missing guard or fully validated
+each selecting at most 128 active runs across levels 0 and 1.
+Each window is also capped at 131,072 mutations and 16 MiB of stored run
+sections; catalog-only selection favors more runs and lower rewrite cost.
+Accepted blinded-key generations identify obsolete upserts after source
+validation; winning tombstones and references outside the window remain. A missing guard or fully validated
 nonreducing bounded plan may defer and retry at later 64-run boundaries before
 pausing at 896. Configured-guard, corruption, storage, anchor, and other
 compaction errors poison immediately. The current 4,096-record
@@ -112,6 +115,17 @@ low-amplification 1M lane finishes at 245 runs without crossing the trigger.
 The earlier 1,024-record adversarial lane crossed six compaction windows and
 recovered 233 runs. Keep both lanes; one does not prove the other. Release
 timing still requires the documented pinned runner.
+
+`just test-churn-scale` runs 1,024 overwrite/delete/recreate cycles against an
+independent fixed-key model. Every cycle asserts one active run after
+compaction and fresh recovery, one replay commit, at most 32 compaction GETs,
+12 HEADs, 64 KiB read and 16 KiB written. Signed section spans prove zero
+payload reads or writes during compaction. Guarded exact-version GC reclaims
+obsolete objects while fresh current and protected historical roots still
+restore. A 64-cycle variant runs in `just check`. Planner regressions also cover
+full older shards that would otherwise block later churn, tombstone masking
+and invalid obsolete source facts. These deterministic memory-store checks do
+not qualify retained providers or production timing.
 
 The filesystem lane proves a fresh application process with empty rs3 caches;
 it does not claim a cold kernel page cache. Use a pinned local-disk mount rather
