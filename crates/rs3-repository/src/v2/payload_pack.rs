@@ -1,4 +1,4 @@
-//! Compact authenticated payload packs for bounded v02 commit batches.
+//! Compact authenticated payload packs for bounded v03 commit batches.
 //!
 //! A stored payload pack has no self-describing header. Its bytes are only
 //! independently authenticated record segments, in a randomized physical
@@ -12,7 +12,7 @@ use rs3_types::{BackendObjectId, KeyId};
 use std::fmt;
 use std::ops::Range;
 
-/// Maximum logical records in one v02 payload pack.
+/// Maximum logical records in one v03 payload pack.
 pub const V2_PAYLOAD_PACK_MAX_RECORDS: usize = rs3_index::run::INDEX_PACK_MAX_RECORDS as usize;
 /// Maximum complete pack bytes accepted by the bounded in-memory codec.
 pub const V2_PAYLOAD_PACK_MAX_BYTES: usize = 32 * 1024 * 1024;

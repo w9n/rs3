@@ -7,8 +7,8 @@ use super::commit::{
     V2_COMMIT_CONTENT_TYPE, V2_HEADER_META_LEN, V2_MAX_HEADER_SIZE,
     V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitHeader, V2CommitKey, V2CommitKind, V2CommitParentRef,
     V2CommitSelfRef, V2KeyringEnvelopeRef, V2ParsedCommit, V2ParsedCommitHeader,
-    V2SectionDescriptor, V2SectionType, V2UploadMode, body_digest_for_v2_sections,
-    digest_v2_section, generate_v2_commit_key, parse_v2_commit_header, parse_v2_commit_object,
+    V2SectionDescriptor, V2SectionType, body_digest_for_v2_sections, digest_v2_section,
+    generate_v2_commit_key, parse_v2_commit_header, parse_v2_commit_object,
     v2_commit_header_span_len, validate_commit_section_semantics, validate_v2_commit_object_len,
 };
 use super::error::{V2FormatError, V2Result};
@@ -151,6 +151,7 @@ impl<'de> Deserialize<'de> for V2AnchorState {
 
 #[derive(Serialize, Deserialize)]
 struct V2AnchorStateWire {
+    format_generation: u32,
     sequence: u64,
     commit_key: String,
     body_digest: String,
@@ -163,6 +164,7 @@ struct V2AnchorStateWire {
 impl From<&V2AnchorState> for V2AnchorStateWire {
     fn from(anchor: &V2AnchorState) -> Self {
         Self {
+            format_generation: super::V2_FORMAT_VERSION,
             sequence: anchor.sequence.get(),
             commit_key: anchor.commit_key.as_str().to_owned(),
             body_digest: encode_digest_32(anchor.body_digest),
@@ -180,6 +182,11 @@ impl TryFrom<V2AnchorStateWire> for V2AnchorState {
     type Error = de::value::Error;
 
     fn try_from(wire: V2AnchorStateWire) -> Result<Self, Self::Error> {
+        if wire.format_generation != super::V2_FORMAT_VERSION {
+            return Err(de::Error::custom(
+                "unsupported repository format generation",
+            ));
+        }
         Ok(Self {
             sequence: Sequence::new(wire.sequence),
             commit_key: BackendObjectId::new(wire.commit_key).map_err(de::Error::custom)?,
@@ -305,8 +312,6 @@ impl V2CommitAnchor for V2MemoryAnchor {
 pub struct V2CommitStoreOptions {
     /// Immutable repository identity bound into framed-section AEAD contexts.
     pub repository_id: RepositoryId,
-    /// Commit upload mode to use for new writes.
-    pub upload_mode: V2UploadMode,
     /// Provider profile selected for post-write checks.
     pub provider_profile: V2ProviderProfile,
     /// Maximum idle time allowed while reading streamed payload chunks.
@@ -335,7 +340,6 @@ impl V2CommitStoreOptions {
     ) -> Self {
         Self {
             repository_id,
-            upload_mode: V2UploadMode::SinglePut,
             provider_profile: profile,
             stream_read_stall_timeout: DEFAULT_V2_STREAM_READ_STALL_TIMEOUT,
             retention: match profile {
@@ -351,12 +355,6 @@ impl V2CommitStoreOptions {
             maintenance_keyring_envelope_ref: None,
             replay_limits: V2ReplayLimits::default(),
         }
-    }
-
-    /// Uses a specific upload mode for new commits.
-    pub const fn with_upload_mode(mut self, upload_mode: V2UploadMode) -> Self {
-        self.upload_mode = upload_mode;
-        self
     }
 
     /// Uses a specific idle timeout for streamed request-body reads.
@@ -1511,24 +1509,14 @@ where
             self.validate_write_protection_profile(commit_retention, commit_legal_hold)?;
             let (section_index, section_region) = build_section_region(&write.sections)?;
             let body_digest = body_digest_for_v2_sections(&section_index, &section_region)?;
-            let upload_mode = if write
-                .sections
-                .iter()
-                .any(|section| section.section_type == V2SectionType::IndexRun)
-            {
-                V2UploadMode::SinglePut
-            } else {
-                self.options.upload_mode
-            };
             let header = self.build_header(
                 &commit_key,
                 parent.clone(),
                 &write,
                 section_index.clone(),
                 body_digest,
-                upload_mode,
             )?;
-            let object_body = header.encode_object(upload_mode, &section_region)?;
+            let object_body = header.encode_object(&section_region)?;
             let object_len =
                 u64::try_from(object_body.len()).map_err(|_| V2FormatError::SectionBounds)?;
             let sections_start = object_len
@@ -1594,7 +1582,6 @@ where
         write: &V2CommitWrite,
         section_index: Vec<V2SectionDescriptor>,
         body_digest: [u8; 32],
-        upload_mode: V2UploadMode,
     ) -> V2Result<V2CommitHeader> {
         let header = V2CommitHeader {
             self_ref: V2CommitSelfRef {
@@ -1614,7 +1601,7 @@ where
                 .primary_key_id(rs3_types::KeyPurpose::CheckpointSigning)?,
         };
         validate_commit_section_semantics(&header)?;
-        header.sign_with_keyring(&self.keyring, upload_mode)
+        header.sign_with_keyring(&self.keyring)
     }
 
     /// Encrypts and uploads one immutable standalone payload without touching repository state.

@@ -52,7 +52,7 @@ pub(super) fn run_s3_gateway_container_perf(args: &PerfArgs) -> Result<()> {
             .s3_prefix
             .clone()
             .unwrap_or_else(default_gateway_prefix);
-        let standalone_prefix = format!("{}/objects/v02/", backend_prefix.trim_end_matches('/'));
+        let standalone_prefix = format!("{}/objects/v03/", backend_prefix.trim_end_matches('/'));
         let backend_client = s3_container::s3_client_with_timeout(
             &target.endpoint_url,
             &target.region,

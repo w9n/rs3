@@ -290,7 +290,7 @@ mod tests {
     const DAY_MS: i64 = 86_400_000;
 
     fn object_id() -> BackendObjectId {
-        BackendObjectId::new("objects/v02/retention-test").unwrap_or_else(|error| panic!("{error}"))
+        BackendObjectId::new("objects/v03/retention-test").unwrap_or_else(|error| panic!("{error}"))
     }
 
     fn version_id(value: &str) -> BackendVersionId {

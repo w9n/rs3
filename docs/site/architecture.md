@@ -88,7 +88,7 @@ Normal writes are append-friendly and value-separated:
 1. Put every non-empty bounded value in the batch into one encrypted payload
    pack and stage one compact framed binary index run. Empty bounded values are
    index-only. Nonempty large streams use the detached carrier flow below.
-2. Publish a signed `v02` commit under a random path-private key.
+2. Publish a signed `v03` commit under a random path-private key.
 3. Advance the external commit anchor.
 4. Acknowledge the client write only after the covering commit is accepted.
 
@@ -109,7 +109,7 @@ directory first. Retention mode, expiry horizon, and legal-hold requirement
 define protection cohorts because the backend protects the containing object.
 
 For a nonempty large stream, the preview uploads one encrypted
-segmented `objects/v02/` carrier outside the publication lock. It verifies the
+segmented `objects/v03/` carrier outside the publication lock. It verifies the
 completed exact version, length, post-completion retention horizon, EOF, and full ciphertext
 digest before a short fenced commit publishes the encrypted reference. This
 allows distinct large uploads to overlap while keeping repository ordering at
@@ -119,7 +119,7 @@ races, or anchor failure can leave an invisible opaque orphan, which guarded
 maintenance reports and later reclaims. Same-process GC excludes registered
 in-flight carriers even with a zero minimum age.
 
-The v02 preview does not publish new legal holds. It rejects client hold
+The v03 preview does not publish new legal holds. It rejects client hold
 requests until every catalog, chain, format, and keyring dependency can be held
 and later released through one guarded lifecycle. The storage conformance layer
 still tests provider legal-hold mechanics independently. This is an explicit
@@ -130,7 +130,7 @@ The gateway does not deduplicate payloads. Deduplication would add equality
 leakage and shared-liveness policy; Kopia already performs chunking and
 deduplication for the primary client workload.
 
-`v02` replaces monolithic index snapshots with an encrypted LSM-style index.
+`v03` replaces monolithic index snapshots with an encrypted LSM-style index.
 Recent immutable foreground runs are level 0. Each compaction selects at most
 the oldest 128 level-0 runs, merges that bounded window newest-wins, retains
 tombstones, and emits fewer bounded level-1 generation-range shards. Newer
@@ -154,7 +154,7 @@ ordinal. The blinded namespace projection answers `HEAD` and `GET`; the
 path-sorted listing projection answers prefix listings. Frame-local container
 tables share exact object references. Values never live in an index frame, so
 LSM compaction is metadata-only and cold recovery does not read user data. Run
-wire version 6 includes exact detached-payload references,
+wire version 7 includes exact detached-payload references,
 an authenticated namespace-key table, and larger bounded small-object
 packs. It uses canonical bounded varints for generation and content length in
 both projections.
@@ -223,7 +223,7 @@ required, verifies AEAD segments, and returns restored bytes.
   <a class="rv-lightbox" href="../assets/architecture-state-flow.png" aria-label="Enlarge rs3 write and restore state flow diagram" aria-haspopup="dialog" data-rv-title="Write and restore flow">
     <picture>
       <source srcset="../assets/architecture-state-flow.webp" type="image/webp">
-      <img class="rv-diagram" src="../assets/architecture-state-flow.png" width="1692" height="930" loading="lazy" decoding="async" alt="Write and restore flow showing committed writes through signed v2 commits and anchored restore reads through verified commit state.">
+      <img class="rv-diagram" src="../assets/architecture-state-flow.png" width="1692" height="930" loading="lazy" decoding="async" alt="Write and restore flow showing committed writes through signed v03 commits and anchored restore reads through verified commit state.">
     </picture>
   </a>
 </figure>
@@ -238,10 +238,10 @@ Logical lookup uses secret-derived namespace tokens inside the trusted gateway.
 Directory listing is answered from repository index state, not by exposing
 client paths as backend object keys.
 
-In `v02`, encrypted runs carry a blinded lookup projection and a plaintext-path
+In `v03`, encrypted runs carry a blinded lookup projection and a plaintext-path
 listing projection inside authenticated ciphertext. Run keys, public metadata,
 and signed headers expose neither paths nor plaintext projection bounds. The
-v02 runtime does not persist the legacy durable prefix-token representation.
+v03 runtime does not persist the legacy durable prefix-token representation.
 
 ## Rollback Resistance
 
@@ -258,7 +258,7 @@ from latest-state authority:
 Provider retention and Object Lock are useful for preventing deletion of object
 versions. They do not replace commit signatures or external anchors.
 
-For `v02`, the external anchor stores the accepted commit key, body digest,
+For `v03`, the external anchor stores the accepted commit key, body digest,
 provider version ID when needed, signing key ID, and active format-root
 reference. Recovery derives the exact catalog, run, and payload graph from that
 root. Anchor import from a trusted bundle verifies the graph before recreating

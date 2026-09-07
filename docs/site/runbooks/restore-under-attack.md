@@ -113,18 +113,18 @@ after configuring the same repository ID, salt, wrapping-key source, backend,
 and retention settings.
 
 ```sh
-cargo run -p rs3-server --features s3,k8s -- import-v2-anchor \
+cargo run -p rs3-server --features s3,k8s -- import-anchor \
   --bundle-file rs3-restore-bundle.cbor \
   --min-sequence <external-floor-sequence>
 ```
 
-`verify-bundle` does not write storage or anchors. `import-v2-anchor` repeats
+`verify-bundle` does not write storage or anchors. `import-anchor` repeats
 the named signed commit-chain, format-root, and keyring-envelope checks before
 writing the missing anchor. Anchor import reads repository, anchor, format-root,
 and recovery-signature fields only from `--bundle-file`. Production import also
 requires `RS3_RECOVERY_PUBLIC_KEY` and refuses a bundle whose anchor sequence is
 below the operator-supplied `--min-sequence`.
-It also lists stored v2 commits and refuses to import when it sees a higher
+It also lists stored v03 commits and refuses to import when it sees a higher
 commit sequence than the bundle names. Use `--force-rollback` only after an
 explicit rollback review accepts stranding those newer commits.
 
@@ -170,7 +170,7 @@ Replace the namespace, bundle path and historical floor before running it:
   unset RS3_MAINTENANCE_MODE
   export RS3_ALLOW_REPOSITORY_INIT=false
 
-  cargo run -p rs3-server --features s3,k8s -- import-v2-anchor \
+  cargo run -p rs3-server --features s3,k8s -- import-anchor \
     --bundle-file '<pre-incident-bundle.cbor>' \
     --min-sequence '<reviewed-historical-floor>' \
     --force-rollback

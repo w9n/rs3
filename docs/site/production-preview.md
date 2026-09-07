@@ -11,7 +11,7 @@ repository-format promise.
 !!! danger "Repository release is currently blocked"
     `commits/v01` has been removed and is unsupported; it had no production
     repositories. The runtime now reads and writes the preview-scoped
-    `commits/v02` envelope with framed index runs, signed catalogs,
+    `commits/v03` envelope with framed index runs, signed catalogs,
     payload-skipping replay, guarded metadata-only packed-run compaction, and
     automatic active-run watermarks. Existing compatibility and provider
     results are useful gateway regression evidence. New-write protection
@@ -96,7 +96,7 @@ one. The backend can still deny service by hiding required objects.
 | --- | --- |
 | Empty backend prefix and no anchor | Startup may initialize one generated keyring envelope only when repository initialization is explicitly enabled using the supplied repository ID, salt, and wrapping-key source. An envelope object ID is optional override state, not normal Helm state. |
 | Existing backend prefix and matching anchor | Open after signed commit-chain, format-root, and envelope validation. |
-| Fresh initialization finds unsupported `commits/v01` objects or ambiguous existing state | Fail closed. `v02` initialization does not import, migrate, overwrite, or adopt the old generation. |
+| Fresh initialization finds unsupported `commits/v01`, `commits/v02` or `objects/v02` objects or ambiguous existing state | Fail closed. `v03` initialization does not import, migrate, overwrite, or adopt the old generation. |
 | Backend serves an older commit than the Lease anchor | Fail closed as rollback. |
 | Backend hides the commit named by the Lease anchor | Fail closed as unavailable or tampered. |
 | Backend adds unrelated objects | Ignore them unless signed and reachable from anchored state. |
@@ -210,7 +210,7 @@ Recovery bundles are weak-subjectivity inputs. Import requires an
 operator-supplied `--min-sequence` floor external to the bundle and refuses
 older valid bundles below that floor. The portable production bundle-import path also requires an
 offline Ed25519 bundle signature verified by `RS3_RECOVERY_PUBLIC_KEY`.
-Import scans stored v2 commits and refuses to strand higher commit sequences
+Import scans stored v03 commits and refuses to strand higher commit sequences
 unless the operator passes the explicit `--force-rollback` override after
 rollback review.
 Preserve fresh signed bundles outside the backend and compare the sequence and
@@ -223,7 +223,7 @@ chain and therefore to the repository state reachable from it.
 ## Current Evidence
 
 Release evidence below is maintainer-run evidence. Unless a row explicitly
-identifies the current `v02` format, treat it as compatibility,
+identifies the current `v03` format and source revision, treat it as historical compatibility,
 storage-contract, and gateway regression evidence for the deprecated preview
 implementation. Those historical rows predate the generation switch and do not
 exercise the current packed-run compaction schedule, automatic watermark
@@ -266,12 +266,12 @@ At a glance:
 | Live retained-backend v2 Velero dynamic-PVC gateway-restart restore | Passed on 2026-05-18 with `just preview-gate-v2-live` against an Object Lock bucket with repository governance retention enabled; backup and restore completed, restored bytes matched, and v2 Lease assertions passed after backup, after gateway restart, and after restore. |
 | Live retained-backend v2 Velero/Postgres restore | Passed on 2026-05-18 with `just preview-gate-v2-live` against an Object Lock bucket with repository governance retention enabled; Postgres rows were backed up and restored, and v2 Lease assertions passed after backup and after restore. |
 | Live retained-backend v2 Kopia gateway backup/restore | Passed on 2026-05-18 as part of `just preview-gate-v2-live` against an Object Lock bucket with repository governance retention enabled; restored bytes matched. |
-| Live retained-backend v2 gateway smoke | Passed on 2026-05-18 as part of `just preview-gate-v2-live` through the local gateway using `mc` and default `rclone lsf` for `PUT`, `HEAD`, `GET`, and prefix listing with governance retention. |
-| v2 Kubernetes Lease gateway smoke | Passed on 2026-05-18 as part of `just preview-gate-v2-live`; Helm deployed the default v2-preview gateway with Kubernetes Lease anchoring, the S3 smoke passed, and the harness verified v2 Lease annotations. |
+| Live retained-backend v03 gateway smoke | Passed on 2026-05-18 as part of `just preview-gate-v2-live` through the local gateway using `mc` and default `rclone lsf` for `PUT`, `HEAD`, `GET`, and prefix listing with governance retention. |
+| v2 Kubernetes Lease gateway smoke | Passed on 2026-05-18 as part of `just preview-gate-v2-live`; Helm deployed the default v3-preview gateway with Kubernetes Lease anchoring, the S3 smoke passed, and the harness verified v2 Lease annotations. |
 | Local v2 streamable payload checks | Passed on 2026-07-11 with focused repository and gateway tests plus `just check-s3`. These checks cover canonical framed known-length, repository-layer EOF-finalized and zero-length streams, signed payload-section validation, checkpoint/reload, metadata-only compaction, GC reachability, and retained multipart Object Lock compile coverage. The public S3 boundary requires a declared or SigV4-decoded length; unsigned HTTP chunked PUT is rejected with `411 MissingContentLength`. |
 | Local v2 Velero dynamic-PVC gateway-restart smoke | Passed on 2026-05-17 with `just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke` on a fresh kind cluster. Backup completed, the gateway deployment was restarted, restore completed, restored pod data was verified, and the cluster was deleted. |
 | Local v2 Velero/Postgres RustFS smoke | Passed on 2026-05-16 after v2 concurrent payload-section cache fills were coalesced. The gateway run completed backup and restore, wrote no backend `segments/` objects, read 29.0 MB versus 28.9 MB for the direct RustFS baseline, and used 57 backend requests versus 708 for direct RustFS. |
-| Local v2 gateway perf baseline | Refreshed on 2026-05-16 with `just perf-s3-gateway --objects 16 --object-size 4096 --reads 16 --range-len 512 --commit-batch-items 8 --concurrency 8 --format jsonl`. Sequential writes emitted one backend commit PUT per client object, parallel writes batched to 2 PUTs for 16 objects, and repeated full/range reads of one object reused a verified payload-section cache after the first commit GET. |
+| Local v03 gateway perf baseline | Refreshed on 2026-05-16 with `just perf-s3-gateway --objects 16 --object-size 4096 --reads 16 --range-len 512 --commit-batch-items 8 --concurrency 8 --format jsonl`. Sequential writes emitted one backend commit PUT per client object, parallel writes batched to 2 PUTs for 16 objects, and repeated full/range reads of one object reused a verified payload-section cache after the first commit GET. |
 | Local v2 S3 and Kopia gateway smokes | Passed on 2026-05-16 with `just integration-s3-gateway` and `just integration-kopia-gateway` after the v2 read-cache and measurement-surface repairs. |
 | Live retained-version S3 qualification | Passed on 2026-05-16 with `xtask integration s3-local --qualification-profile retained-version --object-lock`; Object Lock retention and legal hold checks passed with versioned delete blocking. |
 
@@ -301,7 +301,7 @@ The current preview implementation is suitable for controlled Velero/Kopia,
 provider, and gateway evaluation. Do not initialize it for production data
 until one exact candidate passes the pinned scale, current retained-provider,
 production-cardinality maintenance, disaster-recovery, and external-review
-gates. The local implementation blockers for the scoped `commits/v02` contract
+gates. The local implementation blockers for the scoped `commits/v03` contract
 are closed; qualification and release authority are not.
 
 Governance-bypass IAM review remains operator-owned, live provider gates must be
@@ -346,7 +346,7 @@ verify the restored bytes against the application workload.
 
 For disaster-recovery evidence, export a trusted restore bundle with
 `rs3-server export-restore-bundle` and verify anchor import with
-`rs3-server import-v2-anchor` in a new cluster. For retained-version
+`rs3-server import-anchor` in a new cluster. For retained-version
 repositories, first verify that the same bundle is rejected when the matching
 retention context is omitted, then import with the configured retention mode
 and verify the recovered bundle with `rs3 verify-bundle`.
@@ -410,7 +410,7 @@ Preview evidence should show:
   baseline
 - accepted leakage is documented in the security model
 
-## `v02` Release Blockers
+## `v03` Release Blockers
 
 The replacement repository generation must complete all of these together:
 

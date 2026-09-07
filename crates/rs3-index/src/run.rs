@@ -1,4 +1,4 @@
-//! Canonical bounded plaintext encoding for v02 index runs.
+//! Canonical bounded plaintext encoding for v03 index runs.
 
 use crate::PayloadLayout;
 use rs3_types::{
@@ -12,12 +12,12 @@ use std::fmt;
 pub const INDEX_RUN_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-run-frame-plaintext:v2\n";
 
 /// Version of the canonical index-run wire encoding.
-pub const INDEX_RUN_WIRE_VERSION: u16 = 6;
+pub const INDEX_RUN_WIRE_VERSION: u16 = 7;
 
-/// Maximum stored size of one v02 payload pack.
+/// Maximum stored size of one v03 payload pack.
 pub const INDEX_PACK_MAX_STORED_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Maximum number of records in one v02 payload pack.
+/// Maximum number of records in one v03 payload pack.
 pub const INDEX_PACK_MAX_RECORDS: u32 = 4_096;
 
 const INDEX_PACK_SEGMENT_BYTES: u64 = rs3_types::PAYLOAD_PACK_SEGMENT_BYTES as u64;
@@ -49,7 +49,7 @@ pub struct IndexRunLimits {
 impl Default for IndexRunLimits {
     fn default() -> Self {
         Self {
-            // The physical v02 run envelope is 8 MiB and adds an authenticated
+            // The physical v03 run envelope is 8 MiB and adds an authenticated
             // header plus framing around these plaintext bytes.
             max_total_bytes: 7 * 1024 * 1024,
             max_frame_bytes: 1024 * 1024 - 1024,
@@ -64,7 +64,7 @@ impl Default for IndexRunLimits {
     }
 }
 
-/// Raw fixed-width blind index key used by the v02 wire format.
+/// Raw fixed-width blind index key used by the v03 wire format.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IndexBlindKey([u8; 32]);
 
@@ -3086,7 +3086,7 @@ mod tests {
                 .div_ceil(payload_layout.chunk_size)
                 * 16;
         IndexRunStandaloneStreamContainer {
-            object_id: BackendObjectId::new(format!("objects/v02/standalone-{byte}"))
+            object_id: BackendObjectId::new(format!("objects/v03/standalone-{byte}"))
                 .expect("object id"),
             version_id: Some(
                 BackendVersionId::new(format!("version-standalone-{byte}")).expect("version id"),
@@ -3680,7 +3680,7 @@ mod tests {
         let encoded = encode_index_run(&fixture(), &IndexRunLimits::default()).expect("encode run");
         assert_eq!(
             hex(&encoded),
-            "039b027273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006000000000000000000000000090202020001d601000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c232323232323232323232323232323232323232323232323232323232323232300000003000000000000020000000000000008001111111111111111111111111111111111111111111111111111111111111111a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a309636f6e74656e742d31080d030b6e616d6573706163652d3192017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006010000000000000000000000090202023900003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901020000001e02240101444444444444444444444444444444444444444444444444444444444444444400126a7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006020000000000000000000000090202021201010e74656e616e742f64656c65746564122300001574656e616e742f736e617073686f742f6368756e6b11d209ffffffffffffffc9"
+            "039b027273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0007000000000000000000000000090202020001d601000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c232323232323232323232323232323232323232323232323232323232323232300000003000000000000020000000000000008001111111111111111111111111111111111111111111111111111111111111111a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a309636f6e74656e742d31080d030b6e616d6573706163652d3192017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0007010000000000000000000000090202023900003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901020000001e02240101444444444444444444444444444444444444444444444444444444444444444400126a7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0007020000000000000000000000090202021201010e74656e616e742f64656c65746564122300001574656e616e742f736e617073686f742f6368756e6b11d209ffffffffffffffc9"
         );
     }
 

@@ -1,7 +1,7 @@
 # Repository Format Reference
 
 The repository format is draft. This page is the design contract for
-`commits/v02`. It is not a compatibility promise. The gateway reads and writes
+`commits/v03`. It is not a compatibility promise. The gateway reads and writes
 bounded payload packs, encrypted index runs, signed index-root checkpoints, and
 ciphertext-only detached payloads with guarded metadata-only compaction.
 New bounded writes are partitioned by effective protection cohort, and exact
@@ -9,18 +9,25 @@ full-GC planning plus guarded retention renewal are implemented. Live-provider
 restart/fault qualification and final release qualification are not complete.
 
 !!! warning "Implementation status"
-    `commits/v01` has been removed and is unsupported. No production repository
-    depends on it, so `rs3` will not add a migration path or a dual reader. The
-    current `v02` envelope authenticates every stored section with a signed
+    `commits/v01` and `commits/v02` have been removed and are unsupported. No production repository
+    depends on them, so `rs3` will not add a migration path or a dual reader. The
+    current `v03` envelope authenticates every stored section with a signed
     digest. Bounded normal writes use ciphertext-only `PAYLOAD_PACK` sections,
     authenticated `INDEX_RUN` record descriptors, and signed `INDEX_ROOT`
     checkpoints; recovery rebuilds namespace state without reading payload
-    ciphertext. Nonempty large streams use a standalone `objects/v02` payload
+    ciphertext. Nonempty large streams use a standalone `objects/v03` payload
     plus `[INDEX_RUN]`; empty streams are index-only. Exact carriers survive
     checkpoints, metadata-only compaction, and GC marking. Guarded compaction,
     automatic active-run watermarks, and new-write protection cohorts are
     implemented. Live retained-provider and final recovery qualification remain.
     Until those gates pass, the runtime is evaluation-only.
+
+A v03 gateway refuses v02 commit/object prefixes, version-2 commit and format
+roots, and JSON keyring artifacts. Bootstrap requires a fresh prefix. Old
+Kubernetes anchor annotations fail closed instead of appearing to be a missing
+anchor. Evaluation repositories must be recreated; no migration or dual reader
+is provided. Current anchor records explicitly carry repository format
+generation 3, distinct from format-root envelope rotation generations.
 
 ## Invariants
 
@@ -48,23 +55,23 @@ The existing prototype uses keys of this form:
 commits/v01/<20-digit-sequence>/<32-byte-random-id-base64url>
 ```
 
-That generation is removed and unsupported. It is not an input to the `v02`
-design, and initialization of a `v02` repository must fail if the chosen backend
+That generation is removed and unsupported. It is not an input to the `v03`
+design, and initialization of a `v03` repository must fail if the chosen backend
 prefix is not demonstrably fresh. Importing or converting a `v01` repository is
 outside the product contract.
 
 The current preview runtime and catalog format use:
 
 ```text
-commits/v02/<20-digit-sequence>/<32-byte-random-id-base64url>
-objects/v02/<32-byte-random-id-base64url>
+commits/v03/<20-digit-sequence>/<32-byte-random-id-base64url>
+objects/v03/<32-byte-random-id-base64url>
 ```
 
 The sequence component bounds commit discovery and operational analysis. The
 random component prevents paths, namespace equality, and content identity from
 appearing in keys. The current compactor stores index shards in sibling
-`commits/v02/` delta carriers so the existing signed commit and exact-version
-machinery authenticates them. `objects/v02/` stores independently sealed
+`commits/v03/` delta carriers so the existing signed commit and exact-version
+machinery authenticates them. `objects/v03/` stores independently sealed
 streamed payloads with known or unknown lengths.
 Reserved keys do not distinguish object type, index level, tenant, path, or
 workload.
@@ -82,7 +89,7 @@ levels, logical object counts, paths, and payload identities remain encrypted.
 
 Bounded nonempty writes publish `[PAYLOAD_PACK, INDEX_RUN]`; all-delete or
 all-empty batches publish `[INDEX_RUN]`. Large streams first seal one random
-`objects/v02/` payload and then publish an `[INDEX_RUN]` commit with its encrypted
+`objects/v03/` payload and then publish an `[INDEX_RUN]` commit with its encrypted
 exact reference. Empty streams are index-only. Signed `[INDEX_ROOT]` checkpoints
 replace the replay boundary with an exact catalog of accepted runs. Genesis is
 an authenticated empty index root. Recreate evaluation repositories when the
@@ -94,32 +101,38 @@ The accepted head is the external anchor's exact commit key, body digest,
 provider version ID when required, signing key ID, and format-root reference.
 A newest-looking key returned by `LIST` has no authority.
 
-A `v02` commit has a bounded fixed prefix followed by a canonical signed header
-and encrypted sections. The signed header covers:
+A `v03` commit starts with the eight-byte magic `rs3:cmt\n`, followed by
+32 fixed-field bytes and a canonical CBOR signed header. The complete fixed
+prelude is 40 bytes:
 
-- the format generation and required reader capabilities;
-- the commit sequence and exact self key;
-- the exact parent commit reference;
-- the active format-root and keyring-envelope references;
-- each section's type, ordinal, offset, encrypted length, and digest;
-- the complete commit-object length and body digest; and
-- the signing-key identifier and Ed25519 signature.
+| Object offset | Field | Required value |
+| --- | --- | --- |
+| 8..12 | Format version, u32 big-endian | 3 |
+| 12..16 | Minimum reader, u32 big-endian | 3 |
+| 16..20 | CBOR header length, u32 big-endian | Exact canonical length |
+| 20..28 | Capability word, u64 big-endian | 0 |
+| 28..40 | Reserved bytes | All zero |
+
+The signed header records the commit sequence and self key, exact parent
+reference, publish time, kind, algorithm identifiers, keyring-envelope
+reference, ordered section descriptors and digests, body digest, signing-key
+ID, and Ed25519 signature. The format-root reference belongs to the anchor and
+index root. Exact stored lengths are checked against postconditions and signed
+section coverage. Signature input is the complete prelude and canonical header
+with the signature field zeroed. There is no separate header digest.
 
 The complete header span is limited to 8 KiB and a reader accepts at most two
 sections. Delta commits contain `[INDEX_RUN]` or `[PAYLOAD_PACK, INDEX_RUN]`;
 root commits contain exactly `[INDEX_ROOT]`. Every section must carry the
-must-understand flag, with no compression. Every commit uses a single PUT with
-its canonical encoded header length. Upload mode zero is the only accepted
-mode. Retired section codes `0x0001` through `0x0004`, nonzero upload modes,
-noncanonical encodings, overlapping sections, arithmetic overflow, and trailing
-bytes outside the signed layout fail closed.
+must-understand flag, with no compression. Every commit uses a single PUT;
+there is no upload-mode field or padded header. Retired section codes
+`0x0001` through `0x0004`, nonzero reserved bytes or capabilities, noncanonical
+encodings, overlapping sections, arithmetic overflow, and trailing bytes
+outside the signed layout fail closed. Signed section digests, framed indices,
+compacted runs and detached payloads are intrinsic to format 3; no capability
+bits are assigned. Root catalogs accept levels zero and one.
 
-Capability bits currently authenticate signed section digests (`0x01`), framed
-index sections (`0x02`), compacted-run roots (`0x04`), and standalone references
-(`0x08`). Delta headers advertise `0x0b`; root headers advertise `0x0f`. Roots
-accept tiers zero and one. Unknown required capabilities fail closed.
-
-The current framed index plaintext is wire version 6. Mutation ordinals,
+The current framed index plaintext is wire version 7. Mutation ordinals,
 generations, content lengths, and bounded counts use canonical varints; readers
 reject overlong encodings. Generation and content length appear in both the
 namespace and listing projections because each projection must be independently
@@ -185,9 +198,9 @@ therefore use one protection cohort, or be partitioned by retention mode,
 retain-until horizon, and legal-hold requirement. Reusing or repacking a value
 must never weaken the strongest logical protection that reaches it.
 The format retains the hold dimension for fail-closed parsing of historical
-state, but the v02 gateway currently rejects new client legal holds.
+state, but the v03 gateway currently rejects new client legal holds.
 
-Padding is not part of the first `v02` contract. Content-defined chunking,
+Padding is not part of the first `v03` contract. Content-defined chunking,
 gateway-level deduplication, and compression are also outside the baseline
 format until their equality leakage, liveness, range-read, and amplification
 costs have explicit security modes and qualification evidence. Kopia already
@@ -198,7 +211,7 @@ in [Deduplication](deduplication.md).
 ## Detached Payload Carriers
 
 Large streams upload encrypted segmented ciphertext under a fresh random
-`objects/v02/` key before publication. Known-length and unknown-length bodies
+`objects/v03/` key before publication. Known-length and unknown-length bodies
 use the same writer. Empty streams publish only metadata. The S3 listener still
 requires a length from `Content-Length` or valid SigV4 streaming metadata;
 unsigned HTTP chunked `PutObject` receives `411 MissingContentLength`.
@@ -299,12 +312,12 @@ repeated per-record identifiers. Projection record counts and mutation-ordinal
 pairing are authenticated and validated.
 
 Logical paths and projection bounds exist only in authenticated ciphertext.
-`v02` does not persist prefix-token objects or path-shaped keys. A reader may
+`v03` does not persist prefix-token objects or path-shaped keys. A reader may
 initially materialize a compact in-memory state, but the durable layout must
 also permit a future bounded local cache and range-selected frames without a
 format change.
 
-Wire version 4 uses canonical length-delimited records and no compression. Each
+Wire version 7 uses canonical length-delimited records and no compression. Each
 ciphertext frame and run has an explicit record and byte
 limit; the target maximum encrypted run object is 8 MiB. Index-frame associated
 data binds at least the immutable repository identity, exact historical
@@ -330,7 +343,7 @@ namespace. It records:
 - required reader capabilities and absolute resource ceilings.
 
 Recent runs may be sections of exact accepted commit versions. Current
-compacted runs are sealed sections in exact sibling `commits/v02/` delta-carrier
+compacted runs are sealed sections in exact sibling `commits/v03/` delta-carrier
 versions. The catalog authenticates the complete active run set, so backend
 listing visibility and ordering are not part of recovery.
 
@@ -412,11 +425,13 @@ Provider profiles are development 0, atomic-create 1, and retained-version
 Object Lock 2. Retention is null or `[mode, retain_days]`, with modes none 0,
 governance 1, and compliance 2. Days are an unsigned 32-bit duration. The unused
 snapshot-cadence fields have been removed. The outer commit and format-root
-version are currently 2, separate from envelope and recovery-bundle version 3.
+version are 3. Envelope generations still count key or format-root rotations.
 
 Portable recovery bundles use the version-3 array
 `[3, repository_id_or_null, salt_digest_or_null, anchor, floor, exported_at_ms, signature_or_null]`.
-The anchor is `[sequence, commit_key, body_digest_bytes_32, version_or_null, signing_key_id, format_ref]`.
+The anchor is `[3, sequence, commit_key, body_digest_bytes_32, version_or_null, signing_key_id, format_ref]`.
+The first field is the repository format generation, independent of the format
+envelope reference generation.
 The format reference occurs once. The optional signature is exactly 64 bytes.
 The signature payload is the canonical two-element array containing
 `rs3:v3-recovery-bundle-offline-signature:v1` and the six-element unsigned
@@ -566,7 +581,7 @@ Protected historical anchors must bind the active exact format-root reference.
 Supplying a root from another format generation fails before object-store
 reads. The gateway does not expose historical-root registration, in-place
 format/data-key rotation, or cross-format protected-root renewal. Existing held
-graphs also fail full maintenance. New v02 legal holds are disabled until hold
+graphs also fail full maintenance. New v03 legal holds are disabled until hold
 propagation and guarded release cover every restore dependency.
 
 Payload-pack cleaning is a separate space-reclamation operation, not part of
@@ -605,7 +620,7 @@ repository-wide state, fence a stale writer, or safely merge two encrypted
 namespace histories. Object-store listing and timestamps cannot fill that gap.
 A future disconnected multi-writer mode would require explicit branches,
 authenticated merge semantics, deterministic conflict policy, and a different
-repository contract. `v02` has no such mode.
+repository contract. `v03` has no such mode.
 
 Anchors fail closed. If an anchor cannot be read, renewed, advanced, or matched
 to the verified graph, the gateway must not accept newer-looking repository
@@ -621,7 +636,7 @@ protected root requires them.
 
 Initialization creates random purpose-specific keys, seals them in a keyring
 envelope under an external high-entropy wrapping-key source, writes an encrypted
-`v02` format root, and publishes a genesis catalog commit. The format root binds
+`v03` format root, and publishes a genesis catalog commit. The format root binds
 the exact envelope generation, key, provider version, and digest. In retained
 mode, every restore-critical initialization write must return a provider version
 ID.
@@ -654,7 +669,7 @@ prove that no protected root requires them.
 
 ## Implementation and Qualification Gates
 
-Before `commits/v02` can qualify as the repository format, implementation must
+Before `commits/v03` can qualify as the repository format, implementation must
 include:
 
 - canonical encoding, crypto, corruption, and cross-object transplant vectors;
@@ -697,7 +712,7 @@ amplification ceilings apply everywhere.
 
 There is no stable repository-format promise yet. `commits/v01` is removed and
 unsupported without migration support. The gateway reads and writes the preview
-`commits/v02` envelope with index-run wire version 6. The current reader rejects
+`commits/v03` envelope with index-run wire version 7. The current reader rejects
 retired streamed-commit pointers and earlier preview layouts. Recreate evaluation
 repositories when the preview wire changes. Catalog, exact descriptors,
 framed streaming, and guarded metadata-only mixed-carrier compaction are

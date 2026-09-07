@@ -10,10 +10,7 @@ use super::service::packed::{
     V2PackedIndexRunReplay, apply_packed_index_run, repository_context_from_refs,
 };
 use super::standalone::validate_v2_standalone_object;
-use super::{
-    V2_CAPABILITY_COMPACTED_INDEX_RUNS, V2_CAPABILITY_FRAMED_INDEX, V2_SUPPORTED_CAPABILITY_FLAGS,
-    V2CommitKind, V2IndexRoot, V2IndexRootRunRef, V2SectionType, open_v2_index_root,
-};
+use super::{V2CommitKind, V2IndexRoot, V2IndexRootRunRef, V2SectionType, open_v2_index_root};
 use crate::state::RepositoryState;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -40,7 +37,7 @@ const MIN_ORPHAN_GC_AGE: Duration = Duration::from_secs(60 * 60);
 const MAINTENANCE_LIST_PAGE_ITEMS: usize = 1_000;
 const DEFAULT_MAX_INVENTORY_PAGES: u64 = 4_096;
 const DEFAULT_MAX_INVENTORY_ITEMS: u64 = 2_000_000;
-const FULL_GC_PLAN_DIGEST_DOMAIN: &[u8] = b"rs3.full-gc.plan.v2-preview.v1";
+const FULL_GC_PLAN_DIGEST_DOMAIN: &[u8] = b"rs3.full-gc.plan.v3-preview.v1";
 
 /// Path-safe reason returned when an apply digest does not match its exact plan.
 pub const V2_MAINTENANCE_PLAN_STALE_REASON: &str =
@@ -379,9 +376,9 @@ fn maintenance_read_only_storage_error() -> StorageError {
 /// Broad path-private class of one v2 orphan candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum V2OrphanObjectClass {
-    /// Signed commit object under `commits/v02/`.
+    /// Signed commit object under `commits/v03/`.
     Commit,
-    /// Opaque independently sealed object under `objects/v02/`.
+    /// Opaque independently sealed object under `objects/v03/`.
     Object,
 }
 
@@ -1318,9 +1315,7 @@ where
         )?;
         if root.keyring_envelope_ref() != &header.keyring_envelope_ref
             || root.format_ref() != &self.options().format_ref
-            || root.required_capabilities() & !V2_SUPPORTED_CAPABILITY_FLAGS != 0
-            || root.required_capabilities() & V2_CAPABILITY_FRAMED_INDEX == 0
-            || root.required_capabilities() & V2_CAPABILITY_COMPACTED_INDEX_RUNS == 0
+            || root.required_capabilities() != 0
         {
             return Err(V2FormatError::InvalidIndexRoot);
         }
@@ -1509,8 +1504,8 @@ where
         let mut head_count = reachability.graph_head_count;
         let now_ms = current_time_ms();
         for (prefix, object_class) in [
-            ("commits/v02/", V2OrphanObjectClass::Commit),
-            ("objects/v02/", V2OrphanObjectClass::Object),
+            ("commits/v03/", V2OrphanObjectClass::Commit),
+            ("objects/v03/", V2OrphanObjectClass::Object),
         ] {
             let mode = if retained_profile {
                 BlobListMode::Versions
@@ -3074,7 +3069,7 @@ mod tests {
     fn standalone_root(byte: u8) -> V2StandalonePayloadRoot {
         V2StandalonePayloadRoot {
             object_id: BackendObjectId::new(format!(
-                "objects/v02/{}",
+                "objects/v03/{}",
                 URL_SAFE_NO_PAD.encode([byte; 32])
             ))
             .expect("standalone object id"),
@@ -3170,8 +3165,8 @@ mod tests {
 
     #[test]
     fn exact_plan_digest_rejects_aggregate_collisions_and_ignores_inventory_order() {
-        let first = digest_plan(["objects/v02/a", "objects/v02/b"]);
-        let collision = digest_plan(["objects/v02/c", "objects/v02/d"]);
+        let first = digest_plan(["objects/v03/a", "objects/v03/b"]);
+        let collision = digest_plan(["objects/v03/c", "objects/v03/d"]);
         assert_eq!(first.report, collision.report);
         assert_ne!(
             full_gc_plan_digest(&first, &digest_options()),
@@ -3227,11 +3222,11 @@ mod tests {
         assert!(validate_standalone_payload_root(&valid).is_ok());
 
         for invalid in [
-            "objects/v02/short",
-            "objects/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-            "objects/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+",
-            "objects/v02/AAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAA",
-            "commits/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "objects/v03/short",
+            "objects/v03/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "objects/v03/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+",
+            "objects/v03/AAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAA",
+            "commits/v03/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         ] {
             let mut root = valid.clone();
             root.object_id = BackendObjectId::new(invalid).expect("syntactically valid object id");
@@ -3250,7 +3245,7 @@ mod tests {
     fn renewal_targets_scale_with_unique_exact_versions_and_reject_conflicts() {
         let mut reachability = V2ReachabilityState::default();
         for ordinal in 0..4_096_u64 {
-            let object_id = BackendObjectId::new(format!("objects/v02/{ordinal:020}"))
+            let object_id = BackendObjectId::new(format!("objects/v03/{ordinal:020}"))
                 .expect("bounded object ID");
             reachability
                 .include_renewal_target(object_id, None, ordinal + 1, None, None)
@@ -3259,7 +3254,7 @@ mod tests {
         assert_eq!(reachability.renewal_targets.len(), 4_096);
 
         let object_id =
-            BackendObjectId::new("objects/v02/00000000000000000000").expect("bounded object ID");
+            BackendObjectId::new("objects/v03/00000000000000000000").expect("bounded object ID");
         assert_eq!(
             reachability.include_renewal_target(object_id, None, 2, None, None),
             Err(V2FormatError::ProviderProfileFailed)

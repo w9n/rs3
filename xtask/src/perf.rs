@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
-pub(super) const PERF_REPOSITORY_FORMAT: &str = "v2-preview";
+pub(super) const PERF_REPOSITORY_FORMAT: &str = "v3-preview";
 const FRESH_PROCESS_HANDOFF_SCHEMA: &str = "rs3.perf-fresh-process-handoff.v2";
 const FRESH_PROCESS_REPORT_SCHEMA: &str = "rs3.perf-fresh-process-report.v2";
 const PERF_BODY_PATTERN_VERSION: u32 = 1;
@@ -3098,7 +3098,7 @@ mod tests {
         let backend_dir = PathBuf::from("/tmp/rs3-perf-test-backend");
         let anchor = V2AnchorState {
             sequence: Sequence::new(9),
-            commit_key: BackendObjectId::new("commits/v02/test")
+            commit_key: BackendObjectId::new("commits/v03/test")
                 .unwrap_or_else(|error| panic!("commit key: {error}")),
             body_digest: [3; 32],
             version_id: None,

@@ -1529,7 +1529,7 @@ mod tests {
                 max_pending_items: 64,
             },
             repository: RepositoryConfig {
-                format: RepositoryFormat::V2Preview,
+                format: RepositoryFormat::V3Preview,
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:
@@ -1803,7 +1803,7 @@ mod tests {
     fn runtime_error_code_splits_repository_init_failures() {
         assert_eq!(
             runtime_error_code(&crate::S3BoundaryError::RepositoryInit {
-                reason: "v2-preview maintenance requires an accepted anchor".to_owned(),
+                reason: "v3-preview maintenance requires an accepted anchor".to_owned(),
             }),
             "runtime.anchor-missing"
         );

@@ -1,7 +1,7 @@
 # Release Process
 
 This checklist defines the minimum evidence for a production-preview release.
-It does not turn `v2-preview` into a stable repository-format promise.
+It does not turn `v3-preview` into a stable repository-format promise.
 
 ## Owner-Controlled Prerequisites
 

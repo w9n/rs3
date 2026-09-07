@@ -27,15 +27,16 @@ use lease_guard::{
     KubernetesLeaseGuardApi, WriterFenceClaim, lease_has_writer_coordination, lease_holds_claim,
 };
 
-const V2_SEQUENCE_ANNOTATION: &str = "rs3.rs/v2-sequence";
-const V2_COMMIT_KEY_ANNOTATION: &str = "rs3.rs/v2-commit-key";
-const V2_BODY_DIGEST_ANNOTATION: &str = "rs3.rs/v2-body-digest";
-const V2_VERSION_ID_ANNOTATION: &str = "rs3.rs/v2-version-id";
-const V2_SIGNING_KEY_ID_ANNOTATION: &str = "rs3.rs/v2-signing-key-id";
-const V2_FORMAT_GENERATION_ANNOTATION: &str = "rs3.rs/v2-format-generation";
-const V2_FORMAT_DIGEST_ANNOTATION: &str = "rs3.rs/v2-format-digest";
-const V2_FORMAT_OBJECT_ID_ANNOTATION: &str = "rs3.rs/v2-format-object-id";
-const V2_FORMAT_VERSION_ID_ANNOTATION: &str = "rs3.rs/v2-format-version-id";
+const REPOSITORY_FORMAT_ANNOTATION: &str = "rs3.rs/repository-format-generation";
+const V2_SEQUENCE_ANNOTATION: &str = "rs3.rs/v3-sequence";
+const V2_COMMIT_KEY_ANNOTATION: &str = "rs3.rs/v3-commit-key";
+const V2_BODY_DIGEST_ANNOTATION: &str = "rs3.rs/v3-body-digest";
+const V2_VERSION_ID_ANNOTATION: &str = "rs3.rs/v3-version-id";
+const V2_SIGNING_KEY_ID_ANNOTATION: &str = "rs3.rs/v3-signing-key-id";
+const V2_FORMAT_GENERATION_ANNOTATION: &str = "rs3.rs/v3-format-generation";
+const V2_FORMAT_DIGEST_ANNOTATION: &str = "rs3.rs/v3-format-digest";
+const V2_FORMAT_OBJECT_ID_ANNOTATION: &str = "rs3.rs/v3-format-object-id";
+const V2_FORMAT_VERSION_ID_ANNOTATION: &str = "rs3.rs/v3-format-version-id";
 const MAX_ADVANCE_ATTEMPTS: usize = 16;
 
 /// Kubernetes object settings used for checkpoint anchoring.
@@ -242,6 +243,10 @@ fn v2_lease_with_claim(
 fn v2_lease_with_state(mut lease: Lease, state: &V2AnchorState) -> Lease {
     let annotations = lease.metadata.annotations.get_or_insert_with(BTreeMap::new);
     annotations.insert(
+        REPOSITORY_FORMAT_ANNOTATION.to_owned(),
+        rs3_repository::v2::V2_FORMAT_VERSION.to_string(),
+    );
+    annotations.insert(
         V2_SEQUENCE_ANNOTATION.to_owned(),
         state.sequence.get().to_string(),
     );
@@ -299,7 +304,11 @@ fn v2_anchor_state_from_lease_optional(lease: &Lease) -> V2Result<Option<V2Ancho
     let Some(annotations) = lease.metadata.annotations.as_ref() else {
         return Ok(None);
     };
+    if annotations.keys().any(|key| key.starts_with("rs3.rs/v2-")) {
+        return Err(V2FormatError::AnchorReadFailed);
+    }
     const ANCHOR_ANNOTATIONS: &[&str] = &[
+        REPOSITORY_FORMAT_ANNOTATION,
         V2_SEQUENCE_ANNOTATION,
         V2_COMMIT_KEY_ANNOTATION,
         V2_BODY_DIGEST_ANNOTATION,
@@ -325,6 +334,11 @@ fn v2_anchor_state_from_lease(lease: &Lease) -> V2Result<V2AnchorState> {
         .annotations
         .as_ref()
         .ok_or(V2FormatError::AnchorReadFailed)?;
+    if v2_annotation(annotations, REPOSITORY_FORMAT_ANNOTATION)? != "3"
+        || annotations.keys().any(|key| key.starts_with("rs3.rs/v2-"))
+    {
+        return Err(V2FormatError::AnchorReadFailed);
+    }
     let sequence = v2_annotation(annotations, V2_SEQUENCE_ANNOTATION)?
         .parse::<u64>()
         .map_err(|_| V2FormatError::AnchorReadFailed)?;
@@ -406,7 +420,7 @@ mod tests {
         V2AnchorState {
             sequence: Sequence::new(sequence),
             commit_key: BackendObjectId::new(format!(
-                "commits/v02/{sequence:020}/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                "commits/v03/{sequence:020}/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
             ))
             .expect("valid backend object id"),
             body_digest: [sequence as u8; 32],
@@ -471,6 +485,45 @@ mod tests {
         let actual = v2_anchor_state_from_lease(&lease);
 
         assert!(matches!(actual, Err(V2FormatError::AnchorReadFailed)));
+    }
+
+    #[test]
+    fn anchors_require_current_repository_generation_and_reject_old_annotations() {
+        let state = v2_state(7);
+        let lease = super::new_v2_lease("anchor", &state);
+        for generation in [None, Some("2"), Some("4"), Some("03")] {
+            let mut changed = lease.clone();
+            let annotations = changed.metadata.annotations.as_mut().expect("annotations");
+            match generation {
+                None => {
+                    annotations.remove(super::REPOSITORY_FORMAT_ANNOTATION);
+                }
+                Some(value) => {
+                    annotations.insert(
+                        super::REPOSITORY_FORMAT_ANNOTATION.to_owned(),
+                        value.to_owned(),
+                    );
+                }
+            }
+            assert!(super::v2_anchor_state_from_lease_optional(&changed).is_err());
+        }
+        let mut old = Lease::default();
+        old.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            "rs3.rs/v2-sequence".to_owned(),
+            "7".to_owned(),
+        )]));
+        assert!(
+            super::v2_anchor_state_from_lease_optional(&old).is_err(),
+            "old authority is not absent authority"
+        );
+        let mut mixed = lease;
+        mixed
+            .metadata
+            .annotations
+            .as_mut()
+            .expect("annotations")
+            .insert("rs3.rs/v2-sequence".to_owned(), "7".to_owned());
+        assert!(super::v2_anchor_state_from_lease_optional(&mixed).is_err());
     }
 
     #[test]

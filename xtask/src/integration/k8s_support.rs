@@ -270,11 +270,11 @@ pub(crate) fn assert_v2_lease_anchor(
         .context("Lease anchor is missing annotations")?;
 
     for key in [
-        "rs3.rs/v2-commit-key",
-        "rs3.rs/v2-body-digest",
-        "rs3.rs/v2-signing-key-id",
-        "rs3.rs/v2-format-digest",
-        "rs3.rs/v2-format-object-id",
+        "rs3.rs/v3-commit-key",
+        "rs3.rs/v3-body-digest",
+        "rs3.rs/v3-signing-key-id",
+        "rs3.rs/v3-format-digest",
+        "rs3.rs/v3-format-object-id",
     ] {
         let Some(value) = annotations.get(key).and_then(serde_json::Value::as_str) else {
             bail!("Lease anchor is missing `{key}`");
@@ -284,11 +284,14 @@ pub(crate) fn assert_v2_lease_anchor(
         }
     }
 
-    let sequence = required_u64_annotation(annotations, "rs3.rs/v2-sequence")?;
+    if required_u64_annotation(annotations, "rs3.rs/repository-format-generation")? != 3 {
+        bail!("Lease anchor repository format generation must be 3");
+    }
+    let sequence = required_u64_annotation(annotations, "rs3.rs/v3-sequence")?;
     if sequence == 0 {
         bail!("Lease anchor v2 sequence must be greater than zero");
     }
-    let generation = required_u64_annotation(annotations, "rs3.rs/v2-format-generation")?;
+    let generation = required_u64_annotation(annotations, "rs3.rs/v3-format-generation")?;
     if generation == 0 {
         bail!("Lease anchor v2 format generation must be greater than zero");
     }

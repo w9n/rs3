@@ -334,9 +334,9 @@ fn require_v2_preview(
     format: RepositoryFormat,
     operation: &'static str,
 ) -> Result<(), S3BoundaryError> {
-    if format != RepositoryFormat::V2Preview {
+    if format != RepositoryFormat::V3Preview {
         return Err(repository_init(format!(
-            "{operation} requires the v2-preview repository format",
+            "{operation} requires the v3-preview repository format",
         )));
     }
     Ok(())
@@ -432,6 +432,9 @@ async fn open_v2_keyring_envelope<S>(
 where
     S: BlobStore,
 {
+    if reference.object_id.as_str().ends_with(".json") {
+        return Err(repository_init("retired keyring object format"));
+    }
     let body = read_bounded_object_at(
         store,
         &reference.object_id,
@@ -477,6 +480,9 @@ where
                 "keyring envelope object id is required via --envelope-object-id or RS3_KEYRING_ENVELOPE_OBJECT_ID",
             )
         })?;
+    if object_id.as_str().ends_with(".json") {
+        return Err(repository_init("retired keyring object format"));
+    }
     let context = repository_key_context(keys)?;
     let body =
         read_bounded_object_at(store, &object_id, None, MAX_KEYRING_ENVELOPE_OBJECT_BYTES).await?;
@@ -712,7 +718,7 @@ mod tests {
                 prefix: None,
                 timeouts: Default::default(),
             },
-            repository_format: RepositoryFormat::V2Preview,
+            repository_format: RepositoryFormat::V3Preview,
             repository_retention: None,
             recovery: RecoveryConfig::default(),
             repository_keys: key_context(),

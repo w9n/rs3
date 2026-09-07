@@ -2690,7 +2690,7 @@ mod tests {
 
     fn sample_pack_read() -> V2CommitPackRead {
         V2CommitPackRead {
-            commit_key: object_id("commits/v02/opaque"),
+            commit_key: object_id("commits/v03/opaque"),
             commit_version_id: Some(
                 BackendVersionId::new("version-1").expect("test version ID should be valid"),
             ),

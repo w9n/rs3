@@ -101,6 +101,9 @@ fn open_gateway_keyring(
     version_id: Option<rs3_types::BackendVersionId>,
     envelope: RepositoryEnvelope,
 ) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
+    if object_id.as_str().ends_with(".json") {
+        return Err(repository_init("retired keyring object format"));
+    }
     let context = repository_key_context(keys)?;
     let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
     let keyring = envelope

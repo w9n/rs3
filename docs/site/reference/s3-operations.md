@@ -22,7 +22,7 @@ reports, and stored metadata remain path-private.
 | `DeleteObject` | Implemented | Performs a logical tombstone commit. Accepts current `versionId=null`; rejects historical IDs and conditional deletes. | Clients can delete current logical objects; retained backend versions remain protected until maintenance can remove eligible garbage. |
 | `DeleteObjects` | Implemented | Performs per-key logical tombstone commits, returns per-key `Deleted` or `Error` entries, and honors quiet mode. Historical version IDs or conditional entries return per-key errors; current `versionId=null` is accepted. | Batch-delete clients such as barman-cloud can clean up logical keys without losing per-object failure detail. |
 | `GetObjectLegalHold` | Implemented | Reads the current logical object's legal-hold status. Accepts current `versionId=null`; rejects historical IDs. | Object Lock aware clients can inspect legal hold. |
-| `PutObjectLegalHold` | Not implemented | Both setting and clearing legal hold are refused for v02. Restore dependencies do not yet have a complete hold-propagation and guarded-release lifecycle. | Clients must use finite repository retention; legal-hold publication is unavailable in the preview. |
+| `PutObjectLegalHold` | Not implemented | Both setting and clearing legal hold are refused for v03. Restore dependencies do not yet have a complete hold-propagation and guarded-release lifecycle. | Clients must use finite repository retention; legal-hold publication is unavailable in the preview. |
 
 ## Guarded Partials
 

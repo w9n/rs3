@@ -58,6 +58,6 @@ Stop the review if a change:
 - adds plaintext names to backend keys, telemetry, tags, or errors
 - treats Object Lock as the only latest-state authority
 - falls back from external anchor to memory
-- retires keys without retained v2 commit-chain analysis
+- retires keys without retained v03 commit-chain analysis
 - optimizes reads through path-indexed backend objects
 - adds provider behavior without a capability test or documented contract

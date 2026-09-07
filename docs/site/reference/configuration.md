@@ -22,17 +22,17 @@ An explicit `--gateway-mode restore-readonly` forces maintenance off.
 | `RS3_INIT_PROFILE` | no | `production` | One-shot init posture: `local` or `production`. Production permits deliberate bootstrap; journaled S3 init may qualify provider evidence before repository publication. Other production checks apply before backend access. |
 | `RS3_INIT_JOURNAL_SECRET` | for writable Kubernetes init | unset | Declared bootstrap Secret in the anchor namespace; equivalent to `init --journal-secret`. Persists unfinished initialization under the writer Lease. Not used by serve or read-only verification. |
 | `RS3_INIT_GOVERNANCE_BYPASS_REVIEWED` | automatic governance qualification | `false` | Explicit review that the serving principal cannot bypass retention; equivalent to `init --governance-bypass-reviewed`. Requires a principal fingerprint. Existing matching evidence retains its recorded review. |
-| `RS3_RECOVERY_PUBLIC_KEY` | production bundle verification/import only | none | `ed25519:<hex-public-key>` used to verify signed v2 restore bundles during `verify-bundle` and `import-v2-anchor`. |
+| `RS3_RECOVERY_PUBLIC_KEY` | production bundle verification/import only | none | `ed25519:<hex-public-key>` used to verify signed v2 restore bundles during `verify-bundle` and `import-anchor`. |
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
 | `RUST_LOG` | no | `info` | Tracing filter for `rs3` application targets. Dependency targets are always disabled because upstream HTTP and S3 traces can contain object paths or authentication headers. |
 
-`init`, `export-restore-bundle`, and `import-v2-anchor` use the same repository, backend, anchor, and keyring
+`init`, `export-restore-bundle`, and `import-anchor` use the same repository, backend, anchor, and keyring
 settings as `serve`.
 `verify-bundle` and `keyring inspect`/`keyring rewrap` use the same repository
 and backend settings, but take wrapping-key material from their own flags or
 environment. The exported bundle contains public but integrity-sensitive
 restore metadata; keep wrapping-key material in the configured secret source.
-Prefer `import-v2-anchor --bundle-file <bundle.cbor>` over manually transcribing anchor fields
+Prefer `import-anchor --bundle-file <bundle.cbor>` over manually transcribing anchor fields
 from the exported bundle. Normal Kubernetes initialization and serving do not require a recovery signing
 key. Portable production bundle import requires an external
 `--min-sequence` floor and `RS3_RECOVERY_PUBLIC_KEY`. `export-restore-bundle`
@@ -41,7 +41,7 @@ report containing `offline_signature_payload_hex`. Sign those canonical bytes
 offline with the matching Ed25519 recovery key. Use `attach-bundle-signature`
 to verify and attach that signature to a new CBOR artifact before import; this
 command needs no backend, Kubernetes, or private signing-key access. JSON reports
-cannot be imported. `import-v2-anchor` also refuses when stored
+cannot be imported. `import-anchor` also refuses when stored
 commit keys contain a sequence higher than the imported anchor; `--force-rollback`
 is an explicit rollback override for that condition.
 Machine-readable command output is written to stdout; tracing logs are written
@@ -250,7 +250,7 @@ outside the chart. If `serviceAccount.create=false`, set `serviceAccount.name`.
 | `RS3_ALLOW_REPOSITORY_INIT` | no | `false` | Allows first-run initialization when the configured anchor is missing. Set only for deliberate new-repository bootstrap on a fresh prefix, preferably with `rs3 init`; leave unset for existing repositories and use anchor import for recovery. |
 | `RS3_REPOSITORY_ID` | yes | none | Stable repository context. Keep it with trusted restore metadata. |
 | `RS3_REPOSITORY_SALT_HEX` | yes | none | Stable operator-provided 32-byte public salt, hex-encoded. Generate once per repository and keep with trusted public restore metadata. |
-| `RS3_KEYRING_ENVELOPE_OBJECT_ID` | no | unset | Bootstrap or recovery override for a specific encrypted keyring envelope object. Existing anchored repositories use the envelope reference bound through the v2 format root. |
+| `RS3_KEYRING_ENVELOPE_OBJECT_ID` | no | unset | Bootstrap or recovery override for a specific encrypted keyring envelope object. Existing anchored repositories use the envelope reference bound through the v03 format root. |
 | `RS3_KEYRING_WRAPPING_KEY_ID` | no | `wrap-v1` | Operator-visible wrapping key identifier expected by the envelope. |
 | `RS3_KEYRING_WRAPPING_KEY_HEX` | yes | none | Hex-encoded high-entropy wrapping key used to open or initialize the envelope. KMS/HSM/Vault integration should replace this for hardened deployments. |
 
@@ -259,7 +259,7 @@ commit chain and format root, and opens the format-bound envelope. It does not
 list S3 and guess a latest envelope.
 
 The gateway no longer exposes a repository-format selector. Legacy
-`RS3_REPOSITORY_FORMAT=v2-preview` is accepted for migration friendliness; any
+`RS3_REPOSITORY_FORMAT=v3-preview` is accepted for migration friendliness; any
 other value is rejected.
 
 For a first empty repository, startup creates a random purpose-specific keyring
@@ -269,7 +269,7 @@ under the default counted `keyrings/` object name. If
 bootstrap override. A missing anchor with committed repository objects is a
 recovery error, not an invitation to pick backend state.
 
-Before creating the v2 format root, startup performs a defensive repository
+Before creating the v03 format root, startup performs a defensive repository
 inventory and rejects foreign objects. Retained-version object-lock profiles
 inventory object versions as well as current objects so data hidden behind
 provider versioning still blocks bootstrap. This LIST is a preflight guard, not

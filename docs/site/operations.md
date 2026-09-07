@@ -699,7 +699,7 @@ bundle after configuring the same repository ID, salt, wrapping-key source,
 backend, and retention settings:
 
 ```sh
-cargo run -p rs3-server -- import-v2-anchor \
+cargo run -p rs3-server -- import-anchor \
   --bundle-file rs3-restore-bundle.cbor \
   --min-sequence <external-floor-sequence>
 ```
@@ -709,7 +709,7 @@ fields only from `--bundle-file`. The import verifies the named signed commit
 chain, format root, recovery signature, and keyring envelope before writing the
 missing anchor. Production import requires `RS3_RECOVERY_PUBLIC_KEY` and refuses
 an anchor sequence below the operator-supplied `--min-sequence`.
-It also lists stored v2 commits and refuses to import when it sees a higher
+It also lists stored v03 commits and refuses to import when it sees a higher
 commit sequence than the bundle names. Use `--force-rollback` only after an
 explicit rollback review accepts stranding those newer commits.
 

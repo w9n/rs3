@@ -11,12 +11,11 @@ use super::{
     V2Repository,
 };
 use super::{
-    V2_CAPABILITY_STANDALONE_PAYLOADS, V2_RESTORE_BUNDLE_SCHEMA, V2_SECTION_FLAG_MUST_UNDERSTAND,
-    V2_SUPPORTED_CAPABILITY_FLAGS, V2Algorithms, V2CommitHeader, V2CommitKey, V2CommitKind,
-    V2CommitParentRef, V2CommitSelfRef, V2ErrorClass, V2FormatError, V2FormatRef, V2FormatRoot,
-    V2KeyringEnvelopeRef, V2KeyringEnvelopeRootRef, V2ProviderCheckStatus,
-    V2ProviderConformanceCheck, V2ProviderConformanceOptions, V2ProviderConformanceReport,
-    V2ProviderProfile, V2SectionDescriptor, V2SectionType, V2UploadMode,
+    V2_RESTORE_BUNDLE_SCHEMA, V2_SECTION_FLAG_MUST_UNDERSTAND, V2Algorithms, V2CommitHeader,
+    V2CommitKey, V2CommitKind, V2CommitParentRef, V2CommitSelfRef, V2ErrorClass, V2FormatError,
+    V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRef, V2KeyringEnvelopeRootRef,
+    V2ProviderCheckStatus, V2ProviderConformanceCheck, V2ProviderConformanceOptions,
+    V2ProviderConformanceReport, V2ProviderProfile, V2SectionDescriptor, V2SectionType,
     body_digest_for_v2_sections, check_v2_provider_conformance, digest_v2_section,
     generate_v2_commit_key, parse_v2_commit_object, v2_streaming_upload_working_set_bytes,
 };
@@ -223,7 +222,7 @@ async fn standalone_read_fixture(
         &IndexRunLimits::default(),
     ));
 
-    let object_id = object_id("objects/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    let object_id = object_id("objects/v03/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     let (stored_body, header) = must_repo(seal_payload_object(
         &keyring,
         &object_id,
@@ -327,7 +326,7 @@ fn sample_sections() -> (Vec<V2SectionDescriptor>, Bytes, [u8; 32]) {
     (section_index, section_region, digest)
 }
 
-fn sample_header(upload_mode: V2UploadMode) -> (V2CommitKey, V2CommitHeader, Bytes) {
+fn sample_header() -> (V2CommitKey, V2CommitHeader, Bytes) {
     let keyring = signing_keyring();
     let commit_key = sample_commit_key();
     let parent_key = must_v2(V2CommitKey::from_parts(Sequence::new(6), [8_u8; 32]));
@@ -345,7 +344,7 @@ fn sample_header(upload_mode: V2UploadMode) -> (V2CommitKey, V2CommitHeader, Byt
         }),
         publish_time_ms: 1_765_000_000_000,
         kind: V2CommitKind::Root,
-        algorithms: V2Algorithms::v02(),
+        algorithms: V2Algorithms::v03(),
         keyring_envelope_ref: V2KeyringEnvelopeRef {
             object_id: object_id("keyrings/00000000000000000001-deadbeef"),
             digest: [4_u8; 32],
@@ -355,7 +354,7 @@ fn sample_header(upload_mode: V2UploadMode) -> (V2CommitKey, V2CommitHeader, Byt
         signature: [0_u8; 64],
         signing_key_id: key_id("signing"),
     };
-    let header = must_v2(header.sign_with_keyring(&keyring, upload_mode));
+    let header = must_v2(header.sign_with_keyring(&keyring));
     (commit_key, header, section_region)
 }
 
@@ -556,6 +555,36 @@ fn recovery_bundle_cbor_round_trips_and_json_is_only_a_report() {
     );
 
     assert_eq!(decoded, bundle);
+}
+
+#[test]
+fn anchor_wire_requires_repository_generation_separate_from_envelope_rotation() {
+    let anchor = V2AnchorState {
+        sequence: Sequence::new(7),
+        commit_key: sample_commit_key().object_id,
+        body_digest: [8; 32],
+        version_id: None,
+        signing_key_id: key_id("signing"),
+        format_ref: sample_format_ref(),
+    };
+    let value = serde_json::to_value(&anchor).expect("anchor report");
+    assert_eq!(value["format_generation"], 3);
+    assert_eq!(value["format"]["generation"], anchor.format_ref.generation);
+    assert_eq!(
+        serde_json::from_value::<V2AnchorState>(value.clone()).expect("decode"),
+        anchor
+    );
+    let mut missing = value.clone();
+    missing
+        .as_object_mut()
+        .expect("map")
+        .remove("format_generation");
+    assert!(serde_json::from_value::<V2AnchorState>(missing).is_err());
+    for generation in [0, 1, 2, 4] {
+        let mut wrong = value.clone();
+        wrong["format_generation"] = serde_json::json!(generation);
+        assert!(serde_json::from_value::<V2AnchorState>(wrong).is_err());
+    }
 }
 
 struct FailOnceV2Anchor {
@@ -912,7 +941,7 @@ impl BlobStore for TrackedMultipartStore {
             .inner
             .create_multipart_upload(object_id, options)
             .await?;
-        if !object_id.as_str().starts_with("objects/v02/") {
+        if !object_id.as_str().starts_with("objects/v03/") {
             return Ok(inner);
         }
         let active = self
@@ -1146,7 +1175,7 @@ impl SlowCommitGetStore {
         range: ByteRange,
         body: Bytes,
     ) -> Bytes {
-        let corrupt_standalone = object_id.as_str().starts_with("objects/v02/")
+        let corrupt_standalone = object_id.as_str().starts_with("objects/v03/")
             && self.corrupt_standalone_reads.load(Ordering::SeqCst);
         if matches!(range, ByteRange::Full) && !corrupt_standalone {
             return body;
@@ -1199,7 +1228,7 @@ impl BlobStore for SlowCommitGetStore {
         body: Bytes,
         options: PutOptions,
     ) -> rs3_storage::Result<BlobMetadata> {
-        if object_id.as_str().starts_with("commits/v02/") {
+        if object_id.as_str().starts_with("commits/v03/") {
             self.commit_put_pause
                 .attempts
                 .fetch_add(1, Ordering::SeqCst);
@@ -1214,7 +1243,7 @@ impl BlobStore for SlowCommitGetStore {
                 }
             }
         }
-        if object_id.as_str().starts_with("objects/v02/") {
+        if object_id.as_str().starts_with("objects/v03/") {
             self.standalone_puts.fetch_add(1, Ordering::SeqCst);
         }
         self.inner.put(object_id, body, options).await
@@ -1237,7 +1266,7 @@ impl BlobStore for SlowCommitGetStore {
         object_id: &BackendObjectId,
         range: ByteRange,
     ) -> rs3_storage::Result<Bytes> {
-        if object_id.as_str().starts_with("objects/v02/") {
+        if object_id.as_str().starts_with("objects/v03/") {
             self.standalone_gets.fetch_add(1, Ordering::SeqCst);
         }
         self.record_commit_get(object_id, range).await;
@@ -1251,7 +1280,7 @@ impl BlobStore for SlowCommitGetStore {
         version_id: Option<&BackendVersionId>,
         range: ByteRange,
     ) -> rs3_storage::Result<Bytes> {
-        if object_id.as_str().starts_with("objects/v02/") {
+        if object_id.as_str().starts_with("objects/v03/") {
             self.standalone_gets.fetch_add(1, Ordering::SeqCst);
         }
         self.record_commit_get(object_id, range).await;
@@ -1387,9 +1416,9 @@ impl V2CommitAnchor for StaleOnAdvanceV2Anchor {
     }
 }
 
-fn sample_object(upload_mode: V2UploadMode) -> (V2CommitKey, V2CommitHeader, Bytes) {
-    let (commit_key, header, section_region) = sample_header(upload_mode);
-    let body = must_v2(header.encode_object(upload_mode, section_region.as_ref()));
+fn sample_object() -> (V2CommitKey, V2CommitHeader, Bytes) {
+    let (commit_key, header, section_region) = sample_header();
+    let body = must_v2(header.encode_object(section_region.as_ref()));
     (commit_key, header, body)
 }
 
@@ -1398,7 +1427,7 @@ fn commit_key_round_trips_and_rejects_non_v2_shapes() {
     let key = sample_commit_key();
     assert_eq!(
         key.object_id.as_str().len(),
-        "commits/v02/".len() + 20 + 1 + 43
+        "commits/v03/".len() + 20 + 1 + 43
     );
 
     let parsed = must_v2(V2CommitKey::parse(&key.object_id));
@@ -1407,9 +1436,9 @@ fn commit_key_round_trips_and_rejects_non_v2_shapes() {
 
     for invalid in [
         "checkpoints/not-v2",
-        "commits/v02/00000000000000000007/short",
-        "commits/v02/0000000000000000007/not-wide-enough",
-        "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "commits/v03/00000000000000000007/short",
+        "commits/v03/0000000000000000007/not-wide-enough",
+        "commits/v03/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
     ] {
         let object_id = object_id(invalid);
         assert!(matches!(
@@ -1422,14 +1451,13 @@ fn commit_key_round_trips_and_rejects_non_v2_shapes() {
 #[test]
 fn single_put_commit_round_trips_with_verified_header_and_body() {
     let keyring = signing_keyring();
-    let (commit_key, header, body) = sample_object(V2UploadMode::SinglePut);
+    let (commit_key, header, body) = sample_object();
 
     let parsed = must_v2(parse_v2_commit_object(
         &commit_key.object_id,
         body,
         &keyring,
     ));
-    assert_eq!(parsed.parsed_header.upload_mode, V2UploadMode::SinglePut);
     assert_eq!(
         parsed.parsed_header.header.self_ref.sequence,
         Sequence::new(7)
@@ -1443,60 +1471,54 @@ fn single_put_commit_round_trips_with_verified_header_and_body() {
 
 #[test]
 fn retired_section_codes_fail_closed_even_without_required_flag() {
-    let (_, mut header, region) = sample_header(V2UploadMode::SinglePut);
+    let (_, mut header, region) = sample_header();
     for code in 1..=4 {
         for flags in [0, V2_SECTION_FLAG_MUST_UNDERSTAND] {
             header.section_index[0].section_type = V2SectionType::Unknown(code);
             header.section_index[0].flags = flags;
             assert!(super::commit::validate_commit_section_semantics(&header).is_err());
-            assert!(
-                header
-                    .encode_object(V2UploadMode::SinglePut, &region)
-                    .is_err()
-            );
+            assert!(header.encode_object(&region).is_err());
         }
     }
 }
 
 #[test]
-fn commit_rejects_every_retired_upload_mode() {
-    let keyring = signing_keyring();
-    let (key, _, body) = sample_object(V2UploadMode::SinglePut);
-    for mode in 1..=u8::MAX {
-        let mut invalid = body.to_vec();
-        invalid[24] = mode;
-        assert!(matches!(
-            parse_v2_commit_object(&key.object_id, Bytes::from(invalid), &keyring),
-            Err(V2FormatError::UnsupportedUploadMode)
-        ));
-    }
-}
-
-#[test]
-fn v02_wire_codes_and_required_capabilities_are_closed() {
-    assert_eq!(V2_CAPABILITY_STANDALONE_PAYLOADS, 8);
-    assert_eq!(V2_SUPPORTED_CAPABILITY_FLAGS, 15);
+fn v03_fixed_fields_and_capabilities_are_closed() {
     assert_eq!(V2CommitKind::Delta.to_wire(), 1);
     assert_eq!(V2CommitKind::Root.to_wire(), 2);
     assert_eq!(V2SectionType::IndexRun.to_wire(), 5);
     assert_eq!(V2SectionType::IndexRoot.to_wire(), 6);
     assert_eq!(V2SectionType::PayloadPack.to_wire(), 7);
-
     let keyring = signing_keyring();
-    let (commit_key, _, body) = sample_object(V2UploadMode::SinglePut);
-    assert_eq!(&body[16..24], &15_u64.to_be_bytes());
-    for capability_flags in [0_u8, 2, 0x81] {
-        let mut tampered = body.to_vec();
-        tampered[23] = capability_flags;
-        let error = parse_v2_commit_object(&commit_key.object_id, Bytes::from(tampered), &keyring);
-        assert!(matches!(error, Err(V2FormatError::UnsupportedCapabilities)));
+    let (key, _, body) = sample_object();
+    assert_eq!(&body[8..12], &3_u32.to_be_bytes());
+    assert_eq!(&body[12..16], &3_u32.to_be_bytes());
+    assert_eq!(&body[20..40], &[0; 20]);
+    assert_eq!(super::V2_HEADER_META_LEN, 40);
+    for offset in 20..40 {
+        for bit in 0..8 {
+            let mut invalid = body.to_vec();
+            invalid[offset] = 1 << bit;
+            let expected = if offset < 28 {
+                V2FormatError::UnsupportedCapabilities
+            } else {
+                V2FormatError::NonzeroReserved
+            };
+            assert_eq!(
+                parse_v2_commit_object(&key.object_id, Bytes::from(invalid), &keyring),
+                Err(expected)
+            );
+        }
     }
-    let mut tampered = body.to_vec();
-    tampered[23] = 11;
-    assert!(matches!(
-        parse_v2_commit_object(&commit_key.object_id, Bytes::from(tampered), &keyring),
-        Err(V2FormatError::HeaderDigestMismatch)
-    ));
+    for offset in [8, 12] {
+        for version in [0_u32, 1, 2, 4, u32::MAX] {
+            let mut invalid = body.to_vec();
+            invalid[offset..offset + 4].copy_from_slice(&version.to_be_bytes());
+            assert!(
+                parse_v2_commit_object(&key.object_id, Bytes::from(invalid), &keyring).is_err()
+            );
+        }
+    }
 }
 
 #[test]
@@ -1554,16 +1576,16 @@ fn framed_delta_section_shapes_round_trip() {
     ];
 
     for (section_region, section_index) in cases {
-        let (commit_key, mut header, _) = sample_header(V2UploadMode::SinglePut);
+        let (commit_key, mut header, _) = sample_header();
         header.kind = V2CommitKind::Delta;
         header.body_digest = must_v2(body_digest_for_v2_sections(
             &section_index,
             section_region.as_ref(),
         ));
         header.section_index = section_index.clone();
-        header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::SinglePut));
-        let body = must_v2(header.encode_object(V2UploadMode::SinglePut, &section_region));
-        assert_eq!(&body[16..24], &11_u64.to_be_bytes());
+        header = must_v2(header.sign_with_keyring(&keyring));
+        let body = must_v2(header.encode_object(&section_region));
+        assert_eq!(&body[20..28], &[0; 8]);
         let parsed = must_v2(parse_v2_commit_object(
             &commit_key.object_id,
             body,
@@ -1575,7 +1597,7 @@ fn framed_delta_section_shapes_round_trip() {
 
 #[test]
 fn framed_section_semantics_reject_noncanonical_shapes() {
-    let (_, mut header, _) = sample_header(V2UploadMode::SinglePut);
+    let (_, mut header, _) = sample_header();
     header.kind = V2CommitKind::Delta;
 
     let invalid_shapes = [
@@ -1640,7 +1662,7 @@ fn framed_section_semantics_reject_noncanonical_shapes() {
 
 #[test]
 fn framed_sections_reject_commit_level_compression() {
-    let (_, mut header, _) = sample_header(V2UploadMode::SinglePut);
+    let (_, mut header, _) = sample_header();
     header.kind = V2CommitKind::Delta;
     header.section_index = vec![V2SectionDescriptor {
         section_type: V2SectionType::IndexRun,
@@ -1658,7 +1680,7 @@ fn framed_sections_reject_commit_level_compression() {
 #[test]
 fn copied_commit_under_a_different_key_is_rejected() {
     let keyring = signing_keyring();
-    let (_, _, body) = sample_object(V2UploadMode::SinglePut);
+    let (_, _, body) = sample_object();
     let wrong_key = must_v2(V2CommitKey::from_parts(Sequence::new(7), [3_u8; 32]));
 
     let error = parse_v2_commit_object(&wrong_key.object_id, body, &keyring);
@@ -1666,22 +1688,22 @@ fn copied_commit_under_a_different_key_is_rejected() {
 }
 
 #[test]
-fn header_digest_tampering_is_rejected_before_trusting_cbor() {
+fn corrupt_header_is_rejected_before_sections_are_trusted() {
     let keyring = signing_keyring();
-    let (commit_key, _, body) = sample_object(V2UploadMode::SinglePut);
+    let (commit_key, _, body) = sample_object();
     let mut tampered = body.to_vec();
     tampered[63] ^= 0x80;
 
     let error = parse_v2_commit_object(&commit_key.object_id, Bytes::from(tampered), &keyring);
-    assert!(matches!(error, Err(V2FormatError::HeaderDigestMismatch)));
+    assert!(error.is_err());
 }
 
 #[test]
-fn signature_tampering_is_rejected_with_valid_header_digest() {
+fn signature_tampering_is_rejected() {
     let keyring = signing_keyring();
-    let (commit_key, mut header, section_region) = sample_header(V2UploadMode::SinglePut);
+    let (commit_key, mut header, section_region) = sample_header();
     header.signature[0] ^= 0x80;
-    let body = must_v2(header.encode_object(V2UploadMode::SinglePut, section_region.as_ref()));
+    let body = must_v2(header.encode_object(section_region.as_ref()));
 
     let error = parse_v2_commit_object(&commit_key.object_id, body, &keyring);
     assert!(matches!(error, Err(V2FormatError::SignatureVerification)));
@@ -1690,7 +1712,7 @@ fn signature_tampering_is_rejected_with_valid_header_digest() {
 #[test]
 fn section_digest_tampering_is_rejected_after_header_verification() {
     let keyring = signing_keyring();
-    let (commit_key, _, body) = sample_object(V2UploadMode::SinglePut);
+    let (commit_key, _, body) = sample_object();
     let mut tampered = body.to_vec();
     let last = tampered.len() - 1;
     tampered[last] ^= 0x80;
@@ -1702,10 +1724,10 @@ fn section_digest_tampering_is_rejected_after_header_verification() {
 #[test]
 fn signed_body_digest_must_match_authenticated_sections() {
     let keyring = signing_keyring();
-    let (commit_key, mut header, section_region) = sample_header(V2UploadMode::SinglePut);
+    let (commit_key, mut header, section_region) = sample_header();
     header.body_digest[0] ^= 0x80;
-    header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::SinglePut));
-    let mut body = must_v2(header.encode_header_span(V2UploadMode::SinglePut)).to_vec();
+    header = must_v2(header.sign_with_keyring(&keyring));
+    let mut body = must_v2(header.encode_header_span()).to_vec();
     body.extend_from_slice(&section_region);
 
     let error = parse_v2_commit_object(&commit_key.object_id, Bytes::from(body), &keyring);
@@ -1715,10 +1737,10 @@ fn signed_body_digest_must_match_authenticated_sections() {
 #[test]
 fn signed_section_digest_must_match_stored_section() {
     let keyring = signing_keyring();
-    let (commit_key, mut header, section_region) = sample_header(V2UploadMode::SinglePut);
+    let (commit_key, mut header, section_region) = sample_header();
     header.section_index[0].digest[0] ^= 0x80;
-    header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::SinglePut));
-    let mut body = must_v2(header.encode_header_span(V2UploadMode::SinglePut)).to_vec();
+    header = must_v2(header.sign_with_keyring(&keyring));
+    let mut body = must_v2(header.encode_header_span()).to_vec();
     body.extend_from_slice(&section_region);
 
     let error = parse_v2_commit_object(&commit_key.object_id, Bytes::from(body), &keyring);
@@ -1728,7 +1750,7 @@ fn signed_section_digest_must_match_stored_section() {
 #[test]
 fn maximum_section_batch_fits_bounded_header() {
     let keyring = signing_keyring();
-    let (commit_key, mut header, _) = sample_header(V2UploadMode::SinglePut);
+    let (commit_key, mut header, _) = sample_header();
     header.kind = V2CommitKind::Delta;
     header.section_index = [V2SectionType::PayloadPack, V2SectionType::IndexRun]
         .into_iter()
@@ -1741,8 +1763,8 @@ fn maximum_section_batch_fits_bounded_header() {
         })
         .collect();
     header.body_digest = digest_v2_section(&[]);
-    header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::SinglePut));
-    let body = must_v2(header.encode_object(V2UploadMode::SinglePut, &[]));
+    header = must_v2(header.sign_with_keyring(&keyring));
+    let body = must_v2(header.encode_object(&[]));
     assert!(body.len() <= super::commit::V2_MAX_HEADER_SIZE);
     let parsed = must_v2(parse_v2_commit_object(
         &commit_key.object_id,
@@ -1790,10 +1812,10 @@ fn section_layout_rejects_reserved_flags_and_unauthenticated_gaps() {
 #[test]
 fn commit_rejects_snapshot_section_mismatch() {
     let keyring = signing_keyring();
-    let (_commit_key, mut header, section_region) = sample_header(V2UploadMode::SinglePut);
+    let (_commit_key, mut header, section_region) = sample_header();
     header.kind = V2CommitKind::Delta;
-    header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::SinglePut));
-    let error = header.encode_object(V2UploadMode::SinglePut, section_region.as_ref());
+    header = must_v2(header.sign_with_keyring(&keyring));
+    let error = header.encode_object(section_region.as_ref());
 
     assert!(matches!(error, Err(V2FormatError::InvalidHeaderField)));
 }
@@ -2558,9 +2580,11 @@ async fn bounded_replay_rejects_range_tampering() {
     let stored = must_v2(repository.write_genesis_snapshot(&anchor).await);
     store.corrupt_ranged_commit_gets_for(stored.commit_key.object_id);
 
-    assert_eq!(
-        repository.load_replay_chain_from_anchor(&anchor).await,
-        Err(V2FormatError::HeaderDigestMismatch)
+    assert!(
+        repository
+            .load_replay_chain_from_anchor(&anchor)
+            .await
+            .is_err()
     );
 }
 
@@ -3751,7 +3775,7 @@ async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
     let listed = must_repo(fresh.list("snapshots/"));
     let commits = must_v2(
         store
-            .list_prefix("commits/v02/")
+            .list_prefix("commits/v03/")
             .await
             .map_err(|_| V2FormatError::StorageOperationFailed),
     );
@@ -3808,7 +3832,6 @@ async fn v2_commit_coordinator_batches_concurrent_puts_into_one_commit() {
     assert_eq!(retired_manifests.len(), 0);
     assert_eq!(retired_checkpoints.len(), 0);
     assert_eq!(retired_evidence.len(), 0);
-    assert_eq!(batched_commit.upload_mode, V2UploadMode::SinglePut);
     assert_eq!(payload_pack_count, 1);
     assert_eq!(index_run_count, 1);
     assert_eq!(
@@ -3888,7 +3911,7 @@ async fn v2_commit_coordinator_publishes_known_length_stream_as_standalone_objec
         "post-write verification must use one full streaming read"
     );
     let standalone_objects = store
-        .list_prefix("objects/v02/")
+        .list_prefix("objects/v03/")
         .await
         .expect("list standalone objects");
     assert_eq!(standalone_objects.len(), 1);
@@ -3986,7 +4009,7 @@ async fn v2_standalone_concurrent_uploads_overlap_and_publications_serialize() {
         assert_eq!(store.maximum_standalone_uploads(), concurrency);
         assert_eq!(
             store
-                .list_prefix("objects/v02/")
+                .list_prefix("objects/v03/")
                 .await
                 .expect("list standalone objects")
                 .len(),
@@ -4171,7 +4194,7 @@ async fn v2_standalone_same_path_create_only_race_has_exactly_one_winner() {
     );
     assert_eq!(
         store
-            .list_prefix("objects/v02/")
+            .list_prefix("objects/v03/")
             .await
             .expect("list race objects")
             .len(),
@@ -4246,7 +4269,7 @@ async fn v2_post_backend_complete_pre_return_cancellation_leaves_nonvisible_orph
     assert!(repository.head(&key).is_err());
     assert_eq!(
         store
-            .list_prefix("objects/v02/")
+            .list_prefix("objects/v03/")
             .await
             .expect("list completed orphan")
             .len(),
@@ -4317,7 +4340,7 @@ async fn v2_full_gc_zero_age_skips_registered_inflight_standalone_object() {
     assert_eq!(report.dry_run.candidate_commit_count, 0);
     assert_eq!(
         store
-            .list_prefix("objects/v02/")
+            .list_prefix("objects/v03/")
             .await
             .expect("list protected inflight object")
             .len(),
@@ -4396,7 +4419,7 @@ async fn v2_standalone_anchor_failure_leaves_reclaimable_nonvisible_orphan() {
     assert!(gc.deleted_count >= 1);
     assert!(
         store
-            .list_prefix("objects/v02/")
+            .list_prefix("objects/v03/")
             .await
             .expect("list reclaimed standalone objects")
             .is_empty()
@@ -4472,7 +4495,7 @@ async fn v2_writer_standalone_survives_compaction_checkpoint_and_full_gc() {
     );
     assert_eq!(
         store
-            .list_prefix("objects/v02/")
+            .list_prefix("objects/v03/")
             .await
             .expect("list live standalone object")
             .len(),
@@ -4582,7 +4605,7 @@ async fn v2_commit_coordinator_cancellation_aborts_unfinished_standalone_upload(
     assert!(repository.head(&key).is_err());
     assert!(
         store
-            .list_prefix("objects/v02/")
+            .list_prefix("objects/v03/")
             .await
             .expect("list standalone objects")
             .is_empty()
@@ -4631,7 +4654,7 @@ async fn v2_standalone_readback_digest_mismatch_fails_before_anchor_advance() {
     assert!(repository.head(&key).is_err());
     assert_eq!(
         store
-            .list_prefix("objects/v02/")
+            .list_prefix("objects/v03/")
             .await
             .expect("list standalone orphan")
             .len(),
@@ -4684,7 +4707,7 @@ async fn v2_retained_standalone_requires_absolute_deadline() {
     );
 
     let objects = store
-        .list_prefix_versions("objects/v02/")
+        .list_prefix_versions("objects/v03/")
         .await
         .expect("list retained standalone object");
     assert_eq!(objects.len(), 1);
@@ -5594,7 +5617,7 @@ async fn v2_commit_coordinator_applies_backpressure_before_payload_write() {
         .await;
     let commits_after_rejection = must_v2(
         store
-            .list_prefix("commits/v02/")
+            .list_prefix("commits/v03/")
             .await
             .map_err(|_| V2FormatError::StorageOperationFailed),
     );
@@ -5742,12 +5765,6 @@ async fn v2_framed_streaming_known_and_unknown_lengths_checkpoint_and_reload() {
             .section_index
             .iter()
             .all(|section| section.flags == V2_SECTION_FLAG_MUST_UNDERSTAND)
-    );
-    assert_eq!(
-        known_chain.commits_newest_first[0]
-            .parsed_header
-            .upload_mode,
-        V2UploadMode::SinglePut
     );
 
     must_repo(
@@ -6398,7 +6415,7 @@ async fn v2_orphan_gc_keeps_streamed_carrier_referenced_by_compacted_catalog() {
             .await,
     );
     let carriers = store
-        .list_prefix("objects/v02/")
+        .list_prefix("objects/v03/")
         .await
         .expect("list detached carriers");
     assert_eq!(carriers.len(), 1);
@@ -6737,7 +6754,7 @@ async fn v2_orphan_inventory_classifies_and_budgets_standalone_objects() {
     let repository = V2CommitStore::new(store.clone(), signing_keyring(), options);
     let anchor = V2MemoryAnchor::new();
     must_v2(repository.write_genesis_snapshot(&anchor).await);
-    let object_id = object_id("objects/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    let object_id = object_id("objects/v03/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     store
         .put(
             &object_id,
@@ -6849,7 +6866,7 @@ async fn v2_orphan_gc_skips_retained_or_held_candidates() {
         .expect("genesis anchor")
         .commit_key;
     let held_orphan = held_store
-        .list_prefix("commits/v02/")
+        .list_prefix("commits/v03/")
         .await
         .expect("list held orphan")
         .into_iter()
@@ -7144,7 +7161,7 @@ async fn retained_v2_full_gc_rejects_a_swallowed_candidate_head_budget_failure()
     let anchor = V2MemoryAnchor::new();
     store
         .put(
-            &object_id("objects/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            &object_id("objects/v03/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
             Bytes::from_static(b"retained-budgeted-orphan"),
             PutOptions::default(),
         )
@@ -8072,7 +8089,7 @@ async fn v2_framed_streaming_run_compaction_preserves_payload_without_rewrite() 
             .await,
     );
     let carriers = store
-        .list_prefix("objects/v02/")
+        .list_prefix("objects/v03/")
         .await
         .expect("list detached carriers");
     assert_eq!(carriers.len(), 1);
@@ -8469,7 +8486,7 @@ async fn v2_packed_run_compaction_recovery_rejects_a_tampered_sibling() {
     );
     let root = must_v2(anchor.read_v2().await).expect("compacted root should be anchored");
     let sibling = store
-        .list_prefix("commits/v02/")
+        .list_prefix("commits/v03/")
         .await
         .expect("memory store listing should succeed")
         .into_iter()
@@ -9565,7 +9582,7 @@ async fn detached_unknown_length_empty_value_writes_only_index_metadata() {
     assert_eq!(after.put - before.put, 1);
     assert!(
         store
-            .list_prefix("objects/v02/")
+            .list_prefix("objects/v03/")
             .await
             .expect("carriers")
             .is_empty()
@@ -9623,7 +9640,7 @@ async fn detached_unknown_length_overflow_preserves_the_previous_value_and_ancho
         );
         assert!(
             store
-                .list_prefix("objects/v02/")
+                .list_prefix("objects/v03/")
                 .await
                 .expect("carriers")
                 .is_empty()

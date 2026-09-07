@@ -10,7 +10,7 @@ use thiserror::Error;
 
 /// Authentication tag bytes in the XChaCha20-Poly1305 payload wire formats.
 pub const PAYLOAD_AEAD_TAG_LEN: usize = 16;
-/// Plaintext bytes per independently authenticated v02 payload-pack segment.
+/// Plaintext bytes per independently authenticated v03 payload-pack segment.
 pub const PAYLOAD_PACK_SEGMENT_BYTES: usize = 64 * 1024;
 /// Bytes in the complete XChaCha20 nonce used for payload encryption.
 pub const PAYLOAD_NONCE_LEN: usize = 24;

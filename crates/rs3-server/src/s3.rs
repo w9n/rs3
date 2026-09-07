@@ -46,7 +46,7 @@ pub enum S3BoundaryError {
     #[error("static credentials are required to build the S3 boundary")]
     MissingStaticCredentials,
     /// The configured v2 commit anchor is unavailable in this build.
-    #[error("configured v2 commit anchor mode is unavailable in this build")]
+    #[error("configured v03 commit anchor mode is unavailable in this build")]
     UnsupportedAnchorMode,
     /// The configured backend object store is unavailable in this build.
     #[error("configured backend object store is unavailable in this build")]
@@ -107,7 +107,7 @@ pub(super) mod test_support {
                 max_pending_items: 64,
             },
             repository: RepositoryConfig {
-                format: crate::RepositoryFormat::V2Preview,
+                format: crate::RepositoryFormat::V3Preview,
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:

@@ -11,7 +11,7 @@ Kubernetes Lease anchoring, restore-bundle workflows, production posture checks,
 and Kopia-focused performance measurement. The current release target is a
 production preview: suitable for controlled evaluation, not yet a stable
 repository-format or security guarantee. New preview repositories use the
-`v2-preview` repository format; it is the only format accepted by the current
+`v3-preview` repository format; it is the only format accepted by the current
 gateway.
 
 Large known-length and chunked uploads use the same catalogued state model as

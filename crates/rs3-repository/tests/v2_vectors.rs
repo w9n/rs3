@@ -5,8 +5,8 @@ use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
 use rs3_repository::v2::{
     V2_HEADER_META_LEN, V2_SECTION_FLAG_MUST_UNDERSTAND, V2Algorithms, V2CommitHeader, V2CommitKey,
     V2CommitKind, V2CommitParentRef, V2CommitSelfRef, V2ErrorClass, V2FormatError,
-    V2KeyringEnvelopeRef, V2SectionDescriptor, V2SectionType, V2UploadMode,
-    body_digest_for_v2_sections, digest_v2_section, parse_v2_commit_object,
+    V2KeyringEnvelopeRef, V2SectionDescriptor, V2SectionType, body_digest_for_v2_sections,
+    digest_v2_section, parse_v2_commit_object,
 };
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, Sequence,
@@ -20,7 +20,7 @@ struct V2VectorFixture {
 }
 
 impl V2VectorFixture {
-    fn new(upload_mode: V2UploadMode) -> Self {
+    fn new() -> Self {
         let keyring = signing_keyring();
         let commit_key = must_v2(V2CommitKey::from_parts(Sequence::new(42), [0x42; 32]));
         let parent_key = must_v2(V2CommitKey::from_parts(Sequence::new(41), [0x41; 32]));
@@ -49,7 +49,7 @@ impl V2VectorFixture {
             }),
             publish_time_ms: 1_765_000_123_456,
             kind: V2CommitKind::Root,
-            algorithms: V2Algorithms::v02(),
+            algorithms: V2Algorithms::v03(),
             keyring_envelope_ref: V2KeyringEnvelopeRef {
                 object_id: object_id("keyrings/00000000000000000042-vector"),
                 digest: [0x24; 32],
@@ -59,7 +59,7 @@ impl V2VectorFixture {
             signature: [0_u8; 64],
             signing_key_id: key_id("signing"),
         };
-        let header = must_v2(header.sign_with_keyring(&keyring, upload_mode));
+        let header = must_v2(header.sign_with_keyring(&keyring));
 
         Self {
             keyring,
@@ -69,18 +69,15 @@ impl V2VectorFixture {
         }
     }
 
-    fn encode(&self, upload_mode: V2UploadMode) -> Bytes {
-        must_v2(
-            self.header
-                .encode_object(upload_mode, self.section_region.as_ref()),
-        )
+    fn encode(&self) -> Bytes {
+        must_v2(self.header.encode_object(self.section_region.as_ref()))
     }
 }
 
 #[test]
 fn vector_valid_single_put() {
-    let fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
-    let body = fixture.encode(V2UploadMode::SinglePut);
+    let fixture = V2VectorFixture::new();
+    let body = fixture.encode();
 
     let parsed = must_v2(parse_v2_commit_object(
         &fixture.commit_key.object_id,
@@ -88,7 +85,6 @@ fn vector_valid_single_put() {
         &fixture.keyring,
     ));
 
-    assert_eq!(parsed.parsed_header.upload_mode, V2UploadMode::SinglePut);
     assert_eq!(
         parsed.parsed_header.sections_start,
         V2_HEADER_META_LEN + parsed.parsed_header.header_len
@@ -96,9 +92,9 @@ fn vector_valid_single_put() {
 }
 
 #[test]
-fn vector_rejects_retired_multipart_mode() {
-    let fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
-    let mut body = fixture.encode(V2UploadMode::SinglePut).to_vec();
+fn vector_rejects_nonzero_capability() {
+    let fixture = V2VectorFixture::new();
+    let mut body = fixture.encode().to_vec();
     body[24] = 1;
     assert!(matches!(
         parse_v2_commit_object(
@@ -106,7 +102,7 @@ fn vector_rejects_retired_multipart_mode() {
             Bytes::from(body),
             &fixture.keyring
         ),
-        Err(V2FormatError::UnsupportedUploadMode)
+        Err(V2FormatError::UnsupportedCapabilities)
     ));
 }
 
@@ -114,11 +110,11 @@ fn vector_rejects_retired_multipart_mode() {
 fn vector_invalid_cases_have_expected_classes() {
     let cases = [
         invalid_case_wrong_object_key(),
-        invalid_case_bad_header_digest(),
+        invalid_case_old_format_version(),
         invalid_case_bad_signature(),
         invalid_case_bad_body_digest(),
         invalid_case_bad_algorithm(),
-        invalid_case_missing_required_capability(),
+        invalid_case_old_reader_version(),
         invalid_case_unsupported_capability(),
         invalid_case_reserved_fixed_header(),
     ];
@@ -143,9 +139,9 @@ struct InvalidVectorCase {
 }
 
 fn invalid_case_wrong_object_key() -> InvalidVectorCase {
-    let fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
+    let fixture = V2VectorFixture::new();
     let wrong_key = must_v2(V2CommitKey::from_parts(Sequence::new(42), [0x11; 32]));
-    let body = fixture.encode(V2UploadMode::SinglePut);
+    let body = fixture.encode();
     InvalidVectorCase {
         name: "wrong-object-key",
         keyring: fixture.keyring,
@@ -155,23 +151,23 @@ fn invalid_case_wrong_object_key() -> InvalidVectorCase {
     }
 }
 
-fn invalid_case_bad_header_digest() -> InvalidVectorCase {
-    let fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
-    let mut body = fixture.encode(V2UploadMode::SinglePut).to_vec();
-    body[63] ^= 0x01;
+fn invalid_case_old_format_version() -> InvalidVectorCase {
+    let fixture = V2VectorFixture::new();
+    let mut body = fixture.encode().to_vec();
+    body[8..12].copy_from_slice(&2_u32.to_be_bytes());
     InvalidVectorCase {
-        name: "bad-header-digest",
+        name: "old-format-version",
         keyring: fixture.keyring,
         object_id: fixture.commit_key.object_id,
         body: Bytes::from(body),
-        expected_error: V2FormatError::HeaderDigestMismatch,
+        expected_error: V2FormatError::UnsupportedFormatVersion,
     }
 }
 
 fn invalid_case_bad_signature() -> InvalidVectorCase {
-    let mut fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
+    let mut fixture = V2VectorFixture::new();
     fixture.header.signature[0] ^= 0x01;
-    let body = fixture.encode(V2UploadMode::SinglePut);
+    let body = fixture.encode();
     InvalidVectorCase {
         name: "bad-signature",
         keyring: fixture.keyring,
@@ -182,8 +178,8 @@ fn invalid_case_bad_signature() -> InvalidVectorCase {
 }
 
 fn invalid_case_bad_body_digest() -> InvalidVectorCase {
-    let fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
-    let mut body = fixture.encode(V2UploadMode::SinglePut).to_vec();
+    let fixture = V2VectorFixture::new();
+    let mut body = fixture.encode().to_vec();
     let last = body.len() - 1;
     body[last] ^= 0x01;
     InvalidVectorCase {
@@ -196,14 +192,10 @@ fn invalid_case_bad_body_digest() -> InvalidVectorCase {
 }
 
 fn invalid_case_bad_algorithm() -> InvalidVectorCase {
-    let mut fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
+    let mut fixture = V2VectorFixture::new();
     fixture.header.algorithms.digest = "SHA-512".to_owned();
-    fixture.header = must_v2(
-        fixture
-            .header
-            .sign_with_keyring(&fixture.keyring, V2UploadMode::SinglePut),
-    );
-    let body = fixture.encode(V2UploadMode::SinglePut);
+    fixture.header = must_v2(fixture.header.sign_with_keyring(&fixture.keyring));
+    let body = fixture.encode();
     InvalidVectorCase {
         name: "bad-algorithm",
         keyring: fixture.keyring,
@@ -214,8 +206,8 @@ fn invalid_case_bad_algorithm() -> InvalidVectorCase {
 }
 
 fn invalid_case_unsupported_capability() -> InvalidVectorCase {
-    let fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
-    let mut body = fixture.encode(V2UploadMode::SinglePut).to_vec();
+    let fixture = V2VectorFixture::new();
+    let mut body = fixture.encode().to_vec();
     body[23] = 0x81;
     InvalidVectorCase {
         name: "unsupported-capability",
@@ -226,23 +218,23 @@ fn invalid_case_unsupported_capability() -> InvalidVectorCase {
     }
 }
 
-fn invalid_case_missing_required_capability() -> InvalidVectorCase {
-    let fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
-    let mut body = fixture.encode(V2UploadMode::SinglePut).to_vec();
-    body[23] = 0;
+fn invalid_case_old_reader_version() -> InvalidVectorCase {
+    let fixture = V2VectorFixture::new();
+    let mut body = fixture.encode().to_vec();
+    body[12..16].copy_from_slice(&2_u32.to_be_bytes());
     InvalidVectorCase {
-        name: "missing-required-capability",
+        name: "old-reader-version",
         keyring: fixture.keyring,
         object_id: fixture.commit_key.object_id,
         body: Bytes::from(body),
-        expected_error: V2FormatError::UnsupportedCapabilities,
+        expected_error: V2FormatError::UnsupportedReaderVersion,
     }
 }
 
 fn invalid_case_reserved_fixed_header() -> InvalidVectorCase {
-    let fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
-    let mut body = fixture.encode(V2UploadMode::SinglePut).to_vec();
-    body[27] = 1;
+    let fixture = V2VectorFixture::new();
+    let mut body = fixture.encode().to_vec();
+    body[28] = 1;
     InvalidVectorCase {
         name: "reserved-fixed-header",
         keyring: fixture.keyring,

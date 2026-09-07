@@ -6,7 +6,7 @@ deeper technical trial.
 ## What rs3 Is
 
 `rs3` is an S3-compatible gateway that sits between backup clients and object
-storage. It owns repository privacy, v2 commit publication, retention-aware
+storage. It owns repository privacy, v03 commit publication, retention-aware
 storage behavior, and observability at the gateway boundary.
 
 The preview compatibility targets are Kopia and Velero with the Kopia uploader.
@@ -56,7 +56,7 @@ Use this ladder to avoid mistaking a green smoke test for a production decision:
 - Encrypted payload segments with authenticated object context.
 - Random purpose-specific keys sealed in an encrypted keyring envelope, with
   repository ID and public salt bound into the unwrap context.
-- Signed v2 commit shape and external-anchor model.
+- Signed v03 commit shape and external-anchor model.
 - Kubernetes Lease anchor for the preview deployment model.
 - Restore-bundle verification for the signed commit chain, format-root binding,
   keyring envelope binding, and retention evidence.

@@ -66,7 +66,7 @@ path-free repository metadata.
 
 Payload authentication fails if a backend tampers with ciphertext, changes the
 segment context, or moves encrypted segment bytes into a different authenticated
-payload identity. For commit-embedded `v2-preview` payloads, the payload
+payload identity. For commit-embedded `v3-preview` payloads, the payload
 identity is derived from the signed commit key and payload ordinal; the bytes
 are physically stored inside the commit object.
 
@@ -120,7 +120,7 @@ associated data binds:
 - wrapping-key ID
 - envelope nonce
 
-The encrypted v2 format root and signed commits bind the active envelope by
+The encrypted v03 format root and signed commits bind the active envelope by
 generation, object ID, and digest. The backend cannot silently swap a different
 envelope into accepted repository state without breaking that binding.
 

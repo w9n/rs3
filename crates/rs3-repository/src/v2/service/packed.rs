@@ -1,4 +1,4 @@
-//! Compact payload-pack and framed index-run publication for bounded v02 batches.
+//! Compact payload-pack and framed index-run publication for bounded v03 batches.
 
 use super::{PendingV2Snapshot, V2Repository, commit_protection_for_deltas, v2_repository_error};
 use crate::error::{RepositoryError, Result};
@@ -987,7 +987,7 @@ mod tests {
     fn carrier() -> V2StandaloneStreamCarrierReference {
         V2StandaloneStreamCarrierReference {
             object_id: BackendObjectId::new(
-                "objects/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "objects/v03/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             )
             .expect("object id"),
             version_id: Some(BackendVersionId::new("version-1").expect("version id")),

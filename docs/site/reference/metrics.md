@@ -72,7 +72,7 @@ Repository metrics cover:
 
 The labels describe behavior without exposing logical names.
 
-Native v2 commit-coordinator series commonly used in alerting and triage:
+Native v03 commit-coordinator series commonly used in alerting and triage:
 
 - `rs3_repository_v2_commit_enqueues_total`
 - `rs3_repository_v2_commit_enqueue_pending_items_total`

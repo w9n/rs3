@@ -246,7 +246,7 @@ where
     S: BlobStore + Clone,
 {
     let retention = RetentionPolicy::new(retention_mode(args.retention_mode), args.retention_days);
-    for prefix in ["commits/v02/", "objects/v02/", "keyrings/", "format/"] {
+    for prefix in ["commits/v03/", "objects/v03/", "keyrings/", "format/"] {
         let existing = store
             .list_prefix(prefix)
             .await

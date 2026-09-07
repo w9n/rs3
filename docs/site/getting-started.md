@@ -76,7 +76,7 @@ cargo run -p rs3-server -- serve --bind 127.0.0.1:9080
 
 On first start with an empty backend prefix, `RS3_ALLOW_REPOSITORY_INIT=true`
 lets the gateway write an encrypted keyring envelope under `keyrings/` and use
-`v2-preview` by default. Leave that switch unset for existing repositories and
+`v3-preview` by default. Leave that switch unset for existing repositories and
 recover a missing anchor from a trusted bundle instead. The memory anchor is
 only for local development; it is not a production rollback boundary.
 

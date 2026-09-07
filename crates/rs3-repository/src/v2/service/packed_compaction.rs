@@ -1,4 +1,4 @@
-//! Pure planning for metadata-only compaction of packed v02 index runs.
+//! Pure planning for metadata-only compaction of packed v03 index runs.
 
 use crate::v2::{V2FormatError, V2Result};
 use rs3_index::run::encode_index_run_frames;
@@ -558,7 +558,7 @@ mod tests {
         let payload_layout = stream_header();
         IndexRunStandaloneStreamContainer {
             object_id: object_id(&format!(
-                "objects/v02/{}",
+                "objects/v03/{}",
                 URL_SAFE_NO_PAD.encode([byte; 32])
             )),
             version_id: Some(must(BackendVersionId::new(format!(

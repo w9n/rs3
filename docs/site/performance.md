@@ -1,5 +1,9 @@
 # Performance
 
+Measurements below predate the v03 format cut unless their source revision
+explicitly identifies v03. They do not establish v03 performance or release
+qualification; the matched final validation report is still pending.
+
 Performance work in `rs3` is evidence-driven. Claims should be tied to measured
 artifacts and compared to a straight proxy baseline.
 
@@ -285,9 +289,9 @@ against the direct path.
 
 The earlier prototype 100k and 1M tiers failed closed at the replay budget.
 Those measurements used the removed `commits/v01` generation. The v02 reader's
-signed `INDEX_ROOT` path now has passing in-memory 100k and 1M evidence,
+signed `INDEX_ROOT` path has passing in-memory 100k and 1M evidence,
 including the current automatic-compaction schedule. A successful same-process
-run is not final production qualification. Final `v02` qualification must also
+run is not final production qualification. Final `v03` qualification must also
 use a fresh process and filesystem backend, and verify exact
 listing cardinality plus first, middle, and last object bytes.
 Its descriptor-first reader must retain no cumulative encrypted delta set, read
@@ -395,7 +399,7 @@ The current writer default is adaptive: small objects keep 512 B segments,
 medium objects use 8 KiB segments, and larger objects use 64 KiB segments. The
 historical fixed-size matrix below still explains the byte/request tradeoff.
 
-For `v2-preview`, bounded payload packs live inside signed commit objects.
+For `v3-preview`, bounded payload packs live inside signed commit objects.
 Nonempty large streams seal a random standalone payload, verify its complete
 stored bytes, and publish an `[INDEX_RUN]` exact reference. Empty streams publish
 only metadata. These paths share checkpoint, compaction, recovery, and GC.
@@ -452,7 +456,7 @@ was attempted separately, but both local RustFS and MinIO containers failed
 their readiness timeout before rs3 started; no result from those failed runs is
 treated as product evidence.
 
-The 2026-05 measurements below predate the current index-run wire version 6
+The 2026-05 measurements below predate the current index-run wire version 7
 self/external stream-carrier model. They remain historical payload segmentation
 and request-shape evidence, not performance qualification for the completed
 framed-stream series. The known-length gateway rerun below checks the new write
@@ -524,7 +528,7 @@ evidence and should be copied to release assets only after review.
 
 A local Velero/Postgres smoke on 2026-05-16 exercised the concurrent restore
 path after v2 payload-section cache fills were coalesced. The gateway run
-completed backup and restore with `v2-preview`, emitted no backend `segments/`
+completed backup and restore with `v3-preview`, emitted no backend `segments/`
 objects, and read 29.0 MB from the backend versus 28.9 MB for the direct RustFS
 baseline. Backend request count was lower through the gateway in that smoke:
 57 requests versus 708 for direct RustFS. Raw local summaries remain ignored
@@ -586,7 +590,7 @@ and host load can dominate.
 - Keep run order alternating between direct and gateway lanes.
 - Keep measuring variability with at least three runs for release claims.
 - Rerun known-length streamed uploads, post-checkpoint cold ranges,
-  and mixed pack/stream compaction under wire version 6; report request, byte,
+  and mixed pack/stream compaction under wire version 7; report request, byte,
   elapsed, CPU, and RSS results separately from the historical May artifacts.
 - Reduce commit stage-lock and commit-wait time without allowing commits to
   race writes whose sequence state is not yet indexed.

@@ -73,14 +73,7 @@ where
         )]);
         let (section_index, section_region) = build_section_region(&write.sections)?;
         let body_digest = body_digest_for_v2_sections(&section_index, &section_region)?;
-        let header = self.build_header(
-            &commit_key,
-            None,
-            &write,
-            section_index,
-            body_digest,
-            self.options.upload_mode,
-        )?;
+        let header = self.build_header(&commit_key, None, &write, section_index, body_digest)?;
         Ok(V2PreparedGenesis {
             record: GenesisRecord {
                 schema: JOURNAL_SCHEMA.to_owned(),
@@ -91,9 +84,7 @@ where
                 format_ref: self.options.format_ref.clone(),
                 keyring_envelope_ref: self.options.keyring_envelope_ref.clone(),
                 object_id: commit_key.object_id,
-                body: header
-                    .encode_object(self.options.upload_mode, &section_region)?
-                    .to_vec(),
+                body: header.encode_object(&section_region)?.to_vec(),
             },
         })
     }

@@ -31,7 +31,10 @@ impl V2RecoveryBundle {
         } else {
             Some(wire::read_digest(&mut reader)?)
         };
-        wire::require(reader.read_array_len()? == 6)?;
+        wire::require(
+            reader.read_array_len()? == 7
+                && reader.read_u64()? == u64::from(super::V2_FORMAT_VERSION),
+        )?;
         let sequence = Sequence::new(reader.read_u64()?);
         let commit_key = BackendObjectId::new(reader.read_text_bounded(wire::MAX_WIRE_TEXT)?)?;
         let body_digest = wire::read_digest(&mut reader)?;
@@ -96,7 +99,8 @@ impl V2RecoveryBundle {
             None => cbor::write_null(out),
         }
         let anchor = &self.anchor;
-        cbor::write_array_len(out, 6);
+        cbor::write_array_len(out, 7);
+        cbor::write_u64(out, u64::from(super::V2_FORMAT_VERSION));
         cbor::write_u64(out, anchor.sequence.get());
         wire::write_text(out, anchor.commit_key.as_str(), wire::MAX_WIRE_TEXT)?;
         cbor::write_bytes(out, &anchor.body_digest);
@@ -156,9 +160,9 @@ mod tests {
     fn canonical_bundle_has_pinned_bytes_and_rejects_malformed_encodings() {
         let bundle = bundle();
         let bytes = bundle.to_object_bytes().expect("encode");
-        // Independently specified CBOR: array7, version, repo, salt, anchor6, floor, time, signature.
+        // Independently specified CBOR: array7, version, repo, salt, anchor7, floor, time, signature.
         let expected = format!(
-            "87036172f6860761635820{}f6617384015820{}6166f60520f6",
+            "87036172f687030761635820{}f6617384015820{}6166f60520f6",
             "11".repeat(32),
             "22".repeat(32)
         );

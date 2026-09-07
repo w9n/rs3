@@ -801,7 +801,7 @@ impl S3 for GatewayS3Service {
             if legal_hold.is_some() {
                 return Err(s3s::s3_error!(
                     NotImplemented,
-                    "v02 legal hold publication is not supported"
+                    "v03 legal hold publication is not supported"
                 ));
             }
             let key = logical_path(input.key)?;
@@ -1296,7 +1296,7 @@ impl S3 for GatewayS3Service {
             let _ = put_object_legal_hold_request_status(&input)?;
             Err(s3s::s3_error!(
                 NotImplemented,
-                "v02 legal hold publication is not supported"
+                "v03 legal hold publication is not supported"
             ))
         }
         .instrument(span)
@@ -2264,7 +2264,7 @@ mod tests {
             .repository
             .memory_store()
             .unwrap_or_else(|| panic!("missing memory store"))
-            .list_prefix("commits/v02/")
+            .list_prefix("commits/v03/")
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(backend_objects.len(), 2);

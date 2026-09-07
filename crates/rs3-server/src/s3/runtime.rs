@@ -393,7 +393,7 @@ impl RuntimeRepository {
         _mode: GatewayMode,
     ) -> Result<(), S3BoundaryError> {
         let Some(anchor_state) = self.anchor.read_v2().await.map_err(repository_init)? else {
-            return Err(repository_init("v2-preview repository anchor is missing"));
+            return Err(repository_init("v3-preview repository anchor is missing"));
         };
         if self.require_anchor_version && anchor_state.version_id.is_none() {
             return Err(repository_init(
@@ -404,7 +404,7 @@ impl RuntimeRepository {
             .reload_from_anchor()
             .await
             .map_err(repository_init)?
-            .ok_or_else(|| repository_init("v2-preview repository anchor is missing"))?;
+            .ok_or_else(|| repository_init("v3-preview repository anchor is missing"))?;
         Ok(())
     }
 
@@ -718,9 +718,9 @@ pub fn v2_bootstrap_journal_is_initialized(
 impl V2PreparedRepositoryInit {
     /// Checks repository format and backend write policy without initialization.
     pub async fn prepare(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
-        if config.repository.format != RepositoryFormat::V2Preview {
+        if config.repository.format != RepositoryFormat::V3Preview {
             return Err(repository_init(
-                "v2 repository initialization requires the v2-preview repository format",
+                "v2 repository initialization requires the v3-preview repository format",
             ));
         }
         let store = build_store(&config.backend).await?;
@@ -985,9 +985,9 @@ pub async fn doctor_probe_from_config(config: &RuntimeConfig) -> DoctorProbeRepo
 pub(crate) async fn v2_quick_maintenance_from_config(
     config: &RuntimeConfig,
 ) -> Result<rs3_repository::v2::V2MaintenanceReport, S3BoundaryError> {
-    if config.repository.format != RepositoryFormat::V2Preview {
+    if config.repository.format != RepositoryFormat::V3Preview {
         return Err(repository_init(
-            "v2 maintenance requires the v2-preview repository format",
+            "v2 maintenance requires the v3-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;
@@ -995,7 +995,7 @@ pub(crate) async fn v2_quick_maintenance_from_config(
     let anchor_handle = anchor.handle().clone();
     let Some(anchor_state) = anchor_handle.read_v2().await.map_err(repository_init)? else {
         return Err(repository_init(
-            "v2-preview maintenance requires an accepted anchor",
+            "v3-preview maintenance requires an accepted anchor",
         ));
     };
     let provider_profile = v2_provider_profile(&config.backend, config.repository.retention);
@@ -1027,9 +1027,9 @@ pub(crate) async fn v2_quick_maintenance_from_config(
 pub async fn export_v2_recovery_bundle_from_config(
     config: &RuntimeConfig,
 ) -> Result<V2RecoveryBundle, S3BoundaryError> {
-    if config.repository.format != RepositoryFormat::V2Preview {
+    if config.repository.format != RepositoryFormat::V3Preview {
         return Err(repository_init(
-            "v2 recovery bundle export requires the v2-preview repository format",
+            "v2 recovery bundle export requires the v3-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;
@@ -1037,7 +1037,7 @@ pub async fn export_v2_recovery_bundle_from_config(
     let anchor_handle = anchor.handle().clone();
     let Some(anchor_state) = anchor_handle.read_v2().await.map_err(repository_init)? else {
         return Err(repository_init(
-            "v2-preview recovery bundle export requires an accepted anchor",
+            "v3-preview recovery bundle export requires an accepted anchor",
         ));
     };
     let provider_profile = v2_provider_profile(&config.backend, config.repository.retention);
@@ -1075,9 +1075,9 @@ pub async fn import_v2_anchor_from_config(
     bundle: V2RecoveryBundle,
     options: V2AnchorImportOptions,
 ) -> Result<V2AnchorImportReport, S3BoundaryError> {
-    if config.repository.format != RepositoryFormat::V2Preview {
+    if config.repository.format != RepositoryFormat::V3Preview {
         return Err(repository_init(
-            "v2 anchor import requires the v2-preview repository format",
+            "v2 anchor import requires the v3-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;
@@ -1195,7 +1195,7 @@ where
         BlobListMode::Current
     };
     let mut listing =
-        BoundedListing::open(store, "commits/v02/", mode, CONTROL_LIST_BUDGET).await?;
+        BoundedListing::open(store, "commits/v03/", mode, CONTROL_LIST_BUDGET).await?;
     let mut highest_seen = None;
     while let Some(page) = listing.next_page().await? {
         for metadata in page.entries {
@@ -1254,9 +1254,9 @@ async fn check_v2_provider_conformance_with_store(
     options: RuntimeV2ProviderConformanceOptions,
     store: &StoreBuild,
 ) -> Result<V2ProviderConformanceReport, S3BoundaryError> {
-    if config.repository_format != RepositoryFormat::V2Preview {
+    if config.repository_format != RepositoryFormat::V3Preview {
         return Err(repository_init(
-            "v2 provider conformance requires the v2-preview repository format",
+            "v2 provider conformance requires the v3-preview repository format",
         ));
     }
     if config.repository_retention.is_some_and(|retention| {
@@ -1359,7 +1359,7 @@ async fn bootstrap_v2_repository(
 
     tracing::info!(
         target: "rs3_repository",
-        repository_format = "v2-preview",
+        repository_format = "v3-preview",
         format_generation = format_ref.generation,
         "initialized v2 format root in empty repository",
     );
@@ -1525,6 +1525,9 @@ async fn reject_v2_bootstrap_with_foreign_objects<S>(
 where
     S: BlobStore,
 {
+    if allowed_keyring.is_some_and(|key| key.as_str().ends_with(".json")) {
+        return Err(repository_init("retired keyring object format"));
+    }
     const BOOTSTRAP_EMPTY_CHECK_PREFIXES: &[&str] =
         &["", "format/", "commits/", "keyrings/", "checkpoints/"];
 
@@ -1552,7 +1555,7 @@ where
                     .any(|metadata| Some(&metadata.object_id) != allowed_keyring);
             if has_foreign_object {
                 return Err(repository_init(
-                    "v2-preview bootstrap requires an empty repository prefix except for the configured keyring envelope",
+                    "v3-preview bootstrap requires an empty repository prefix except for the configured keyring envelope",
                 ));
             }
         }
@@ -1892,7 +1895,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_factory_builds_v2_preview_repository() {
         let mut config = runtime_config(true);
-        config.repository.format = RepositoryFormat::V2Preview;
+        config.repository.format = RepositoryFormat::V3Preview;
         let runtime = RuntimeRepository::from_config(&config)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
@@ -1904,7 +1907,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let commits = store
-            .list_prefix("commits/v02/")
+            .list_prefix("commits/v03/")
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let v2_anchor = runtime
@@ -1926,7 +1929,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
 
         let key =
-            LogicalPath::new("snapshots/v2-preview.bin").unwrap_or_else(|error| panic!("{error}"));
+            LogicalPath::new("snapshots/v3-preview.bin").unwrap_or_else(|error| panic!("{error}"));
         let committed = runtime
             .put_committed(
                 key.clone(),
@@ -1944,7 +1947,7 @@ mod tests {
             .list_page("snapshots/", None, 1000)
             .unwrap_or_else(|error| panic!("{error}"));
         let commits = store
-            .list_prefix("commits/v02/")
+            .list_prefix("commits/v03/")
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let backend_objects = store
@@ -1960,7 +1963,7 @@ mod tests {
         assert_eq!(commits.len(), 2);
         for metadata in backend_objects {
             assert!(!metadata.object_id.as_str().contains("snapshots"));
-            assert!(!metadata.object_id.as_str().contains("v2-preview"));
+            assert!(!metadata.object_id.as_str().contains("v3-preview"));
         }
     }
 
@@ -2335,7 +2338,7 @@ mod tests {
             .join("backend-bucket")
             .join("repo")
             .join("commits")
-            .join("v02");
+            .join("v03");
 
         assert_eq!(head.content_len, 16);
         assert!(commits_root.is_dir());
@@ -2530,6 +2533,39 @@ mod tests {
         assert!(error.to_string().contains("empty repository prefix"));
         assert_eq!(store.current_list_count(), 0);
         assert_eq!(store.version_list_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_refuses_every_retired_object_class_including_allowed_json_keyring() {
+        for profile in [
+            V2ProviderProfile::Dev,
+            V2ProviderProfile::RetainedVersionObjectLock,
+        ] {
+            for key in ["commits/v02/old", "objects/v02/old", "keyrings/old.json"] {
+                let store = MemoryBlobStore::new();
+                let object_id = BackendObjectId::new(key).expect("object key");
+                store
+                    .put(
+                        &object_id,
+                        Bytes::from_static(b"retired"),
+                        PutOptions::default(),
+                    )
+                    .await
+                    .expect("fixture");
+                assert!(
+                    reject_v2_bootstrap_with_foreign_objects(&store, profile, None)
+                        .await
+                        .is_err()
+                );
+                if key.ends_with(".json") {
+                    assert!(
+                        reject_v2_bootstrap_with_foreign_objects(&store, profile, Some(&object_id))
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2754,7 +2790,7 @@ mod tests {
             anchor: V2AnchorState {
                 sequence: Sequence::new(7),
                 commit_key: BackendObjectId::new(
-                    "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "commits/v03/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 )
                 .unwrap_or_else(|error| panic!("{error}")),
                 body_digest: [0x11; 32],
@@ -2807,7 +2843,7 @@ mod tests {
 
     fn commit_object_id(sequence: u64) -> BackendObjectId {
         BackendObjectId::new(format!(
-            "commits/v02/{sequence:020}/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            "commits/v03/{sequence:020}/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         ))
         .unwrap_or_else(|error| panic!("{error}"))
     }

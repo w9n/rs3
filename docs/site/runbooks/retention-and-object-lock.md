@@ -157,7 +157,7 @@ window. A retained object alone is insufficient historical recovery authority;
 preserve trusted bundles and verify their complete graphs before relying on
 [isolated incident recovery](restore-under-attack.md).
 Repository-level maintenance rejects foreign-format protected roots before any
-storage read, and v02 rejects client legal holds. Treat those as unsupported
+storage read, and v03 rejects client legal holds. Treat those as unsupported
 capabilities. Do not bypass the rejection by omitting a root or mutating Object
 Lock metadata outside the documented provider qualification workflow.
 

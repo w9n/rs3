@@ -79,7 +79,7 @@ impl V2FormatRoot {
         retention: Option<RetentionPolicy>,
     ) -> Self {
         Self {
-            format_version: 2,
+            format_version: 3,
             repository_id,
             active_keyring_envelope_ref,
             signing_key_id,
@@ -90,7 +90,7 @@ impl V2FormatRoot {
 
     /// Encodes a fixed canonical CBOR format-root schema.
     pub fn to_plaintext_bytes(&self) -> V2Result<Vec<u8>> {
-        wire::require(self.format_version == 2)?;
+        wire::require(self.format_version == 3)?;
         let mut out = Vec::new();
         cbor::write_array_len(&mut out, 6);
         cbor::write_u64(&mut out, u64::from(self.format_version));
@@ -139,7 +139,7 @@ impl V2FormatRoot {
     pub fn from_plaintext_bytes(bytes: &[u8]) -> V2Result<Self> {
         wire::require(bytes.len() <= MAX_FORMAT_ROOT_BYTES)?;
         let mut reader = cbor::Reader::new(bytes);
-        wire::require(reader.read_array_len()? == 6 && reader.read_u64()? == 2)?;
+        wire::require(reader.read_array_len()? == 6 && reader.read_u64()? == 3)?;
         let repository_id = RepositoryId::new(reader.read_text_bounded(wire::MAX_WIRE_TEXT)?)?;
         let (generation, digest, object_id, version_id) = wire::read_envelope_ref(&mut reader)?;
         let active_keyring_envelope_ref = V2KeyringEnvelopeRootRef {
@@ -172,7 +172,7 @@ impl V2FormatRoot {
         };
         wire::require(reader.is_finished())?;
         Ok(Self {
-            format_version: 2,
+            format_version: 3,
             repository_id,
             active_keyring_envelope_ref,
             signing_key_id,

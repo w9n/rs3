@@ -161,7 +161,7 @@ enum Commands {
         format: RecoveryReportFormat,
     },
     /// Import a trusted v2 anchor after operator recovery review.
-    ImportV2Anchor(Box<ImportV2AnchorArgs>),
+    ImportAnchor(Box<ImportAnchorArgs>),
     /// Operate the in-gateway maintenance supervisor over the admin API.
     Maintenance(Box<MaintenanceArgs>),
     /// Break-glass maintenance for when the gateway cannot run.
@@ -254,7 +254,7 @@ enum MaintenanceOutputFormat {
 }
 
 #[derive(Debug, Args)]
-struct ImportV2AnchorArgs {
+struct ImportAnchorArgs {
     /// CBOR artifact from `export-restore-bundle --output`; use `-` for stdin.
     #[arg(long)]
     bundle_file: String,
@@ -524,7 +524,7 @@ async fn main() -> Result<()> {
                 anyhow::bail!("v2 provider conformance failed");
             }
         }
-        Commands::ImportV2Anchor(args) => {
+        Commands::ImportAnchor(args) => {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
             let format = args.format;
@@ -856,7 +856,7 @@ async fn run_keyring_command(args: KeyringArgs) -> Result<()> {
 
 fn recovery_bundle_from_import_args(
     config: &RuntimeConfig,
-    args: ImportV2AnchorArgs,
+    args: ImportAnchorArgs,
 ) -> Result<(V2RecoveryBundle, V2AnchorImportOptions)> {
     let options = V2AnchorImportOptions {
         min_sequence: Sequence::new(args.min_sequence),
@@ -1688,7 +1688,7 @@ fn is_path_safe_tracing_target(target: &str) -> bool {
 mod tests {
     use super::cli_serve::enforce_serve_profile;
     use super::{
-        DoctorProfile, ImportV2AnchorArgs, MaintenanceArgs, MaintenanceCommand,
+        DoctorProfile, ImportAnchorArgs, MaintenanceArgs, MaintenanceCommand,
         MaintenanceOutputFormat, PROVIDER_CONFORMANCE_SCHEMA, RecoveryReportFormat, backend_kind,
         doctor_findings, is_path_safe_tracing_target, parse_admin_origin, parse_restore_bundle,
         provider_conformance_target_fingerprint, recovery_bundle_from_import_args,
@@ -1740,7 +1740,7 @@ mod tests {
                 max_pending_items: 64,
             },
             repository: RepositoryConfig {
-                format: RepositoryFormat::V2Preview,
+                format: RepositoryFormat::V3Preview,
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:
@@ -2361,7 +2361,7 @@ mod tests {
         let anchor = rs3_repository::v2::V2AnchorState {
             sequence: rs3_types::Sequence::new(7),
             commit_key: BackendObjectId::new(
-                "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "commits/v03/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             )
             .expect("commit key"),
             body_digest: [0x11; 32],
@@ -2497,11 +2497,11 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"))
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "rs3-import-v2-anchor-test-{}-{unique}.cbor",
+            "rs3-import-anchor-test-{}-{unique}.cbor",
             std::process::id()
         ));
         std::fs::write(&path, input).unwrap_or_else(|error| panic!("{error}"));
-        let args = ImportV2AnchorArgs {
+        let args = ImportAnchorArgs {
             bundle_file: path.to_string_lossy().into_owned(),
             min_sequence: 5,
             force_rollback: true,

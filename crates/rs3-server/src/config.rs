@@ -493,14 +493,14 @@ impl Default for ProviderConformanceConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepositoryFormat {
     /// Production-preview format for new repositories.
-    V2Preview,
+    V3Preview,
 }
 
 impl RepositoryFormat {
     /// Returns the environment/configuration spelling.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::V2Preview => "v2-preview",
+            Self::V3Preview => "v3-preview",
         }
     }
 }
@@ -1964,14 +1964,14 @@ fn parse_recovery_config(source: &impl ConfigSource) -> Result<RecoveryConfig, C
 
 fn parse_repository_format(source: &impl ConfigSource) -> Result<RepositoryFormat, ConfigError> {
     match optional_value(source, REPOSITORY_FORMAT_ENV) {
-        None => Ok(RepositoryFormat::V2Preview),
-        Some(value) if value == RepositoryFormat::V2Preview.as_str() => {
-            Ok(RepositoryFormat::V2Preview)
+        None => Ok(RepositoryFormat::V3Preview),
+        Some(value) if value == RepositoryFormat::V3Preview.as_str() => {
+            Ok(RepositoryFormat::V3Preview)
         }
         Some(value) => Err(ConfigError::Invalid {
             key: REPOSITORY_FORMAT_ENV,
             value,
-            reason: "omit this compatibility variable or set v2-preview".to_owned(),
+            reason: "omit this compatibility variable or set v3-preview".to_owned(),
         }),
     }
 }
@@ -2436,7 +2436,7 @@ mod tests {
         assert_eq!(
             config.repository,
             RepositoryConfig {
-                format: RepositoryFormat::V2Preview,
+                format: RepositoryFormat::V3Preview,
                 payload_segment_size: 512,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:
@@ -2469,7 +2469,7 @@ mod tests {
         assert_eq!(config.backend.endpoint, "https://object.example");
         assert_eq!(config.backend.bucket, "backend-bucket");
         assert_eq!(config.backend.prefix.as_deref(), Some("provider-check"));
-        assert_eq!(config.repository_format, RepositoryFormat::V2Preview);
+        assert_eq!(config.repository_format, RepositoryFormat::V3Preview);
         assert_eq!(
             config.repository_retention,
             Some(RetentionPolicy::new(RetentionMode::Governance, 7))
@@ -2513,7 +2513,7 @@ mod tests {
         assert_eq!(config.backend.endpoint, "https://object.example");
         assert_eq!(config.backend.bucket, "backend-bucket");
         assert_eq!(config.backend.prefix.as_deref(), Some("repository"));
-        assert_eq!(config.repository_format, RepositoryFormat::V2Preview);
+        assert_eq!(config.repository_format, RepositoryFormat::V3Preview);
         assert_eq!(
             config.repository_retention,
             Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
@@ -2555,13 +2555,13 @@ mod tests {
 
     #[test]
     fn accepts_legacy_repository_format_v2_preview() {
-        let source = minimal_source().with(super::REPOSITORY_FORMAT_ENV, "v2-preview");
+        let source = minimal_source().with(super::REPOSITORY_FORMAT_ENV, "v3-preview");
 
         let config = RuntimeConfig::from_source(&source);
 
         assert_eq!(
             config.map(|config| config.repository.format),
-            Ok(RepositoryFormat::V2Preview)
+            Ok(RepositoryFormat::V3Preview)
         );
     }
 
@@ -2877,7 +2877,7 @@ mod tests {
         assert_eq!(
             config.map(|config| config.repository),
             Ok(RepositoryConfig {
-                format: RepositoryFormat::V2Preview,
+                format: RepositoryFormat::V3Preview,
                 payload_segment_size: 65536,
                 adaptive_payload_segment_size: false,
                 decrypted_segment_cache_max_bytes:

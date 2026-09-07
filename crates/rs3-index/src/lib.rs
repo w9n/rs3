@@ -666,7 +666,7 @@ mod tests {
     fn standalone_stream_reference_round_trips_its_distinct_typed_shape() {
         let reference = PayloadReference::V2StandaloneStream {
             carrier: Arc::new(V2StandaloneStreamCarrierReference {
-                object_id: object_id("objects/v02/standalone-stream"),
+                object_id: object_id("objects/v03/standalone-stream"),
                 version_id: Some(BackendVersionId::new("version-3").expect("version id")),
                 object_digest: [0x71; 32],
                 stored_len: 131_233,

@@ -12,8 +12,8 @@ use crate::v2::{
     V2CommitParentRef, V2CommitSelfRef, V2EmbeddedIndexRunLocation, V2FormatError, V2FormatRef,
     V2IndexRoot, V2IndexRootRunRef, V2KeyringEnvelopeRef, V2PayloadPackFacts, V2PayloadPackId,
     V2PayloadPackRecordContext, V2PayloadPackRecordInput, V2PayloadPackRecordRef, V2Result,
-    V2SectionDescriptor, V2SectionType, V2UploadMode, body_digest_for_v2_sections,
-    digest_v2_section, open_v2_index_root, open_v2_payload_pack_record, parse_v2_commit_header,
+    V2SectionDescriptor, V2SectionType, body_digest_for_v2_sections, digest_v2_section,
+    open_v2_index_root, open_v2_payload_pack_record, parse_v2_commit_header,
     parse_v2_commit_object, plan_v2_payload_pack_record_range, seal_v2_index_root,
     seal_v2_payload_pack, validate_v2_payload_pack_record_ref,
 };
@@ -48,13 +48,12 @@ pub fn parse_v2_commit_header_bytes(input: &[u8]) {
 
     let encoded = parsed
         .header
-        .encode_header_span(parsed.upload_mode)
+        .encode_header_span()
         .unwrap_or_else(|error| panic!("parsed v2 commit header failed to re-encode: {error}"));
     let reparsed = parse_v2_commit_header(&object_id, &encoded, &keyring)
         .unwrap_or_else(|error| panic!("re-encoded v2 commit header failed to parse: {error}"));
 
     assert_eq!(reparsed.header, parsed.header);
-    assert_eq!(reparsed.upload_mode, parsed.upload_mode);
     assert_eq!(reparsed.header_len, parsed.header_len);
     assert_eq!(reparsed.sections_start, parsed.sections_start);
 }
@@ -76,7 +75,7 @@ pub fn parse_v2_commit_object_bytes(input: &[u8]) {
     let encoded = parsed
         .parsed_header
         .header
-        .encode_object(parsed.parsed_header.upload_mode, section_region)
+        .encode_object(section_region)
         .unwrap_or_else(|error| panic!("parsed v2 commit object failed to re-encode: {error}"));
 
     assert_eq!(encoded, parsed.body);
@@ -98,7 +97,6 @@ pub fn round_trip_v2_commit_structure(input: &[u8]) {
     } else {
         V2CommitKind::Delta
     };
-    let upload_mode = V2UploadMode::SinglePut;
     let commit_key = if kind == V2CommitKind::Root {
         V2CommitKey::from_parts(Sequence::new(1), [0x42; 32])
             .unwrap_or_else(|error| panic!("{error}"))
@@ -176,7 +174,7 @@ pub fn round_trip_v2_commit_structure(input: &[u8]) {
         }),
         publish_time_ms: 0,
         kind,
-        algorithms: V2Algorithms::v02(),
+        algorithms: V2Algorithms::v03(),
         keyring_envelope_ref: V2KeyringEnvelopeRef {
             object_id: object_id("keyrings/fuzz"),
             digest: [0x24; 32],
@@ -186,10 +184,10 @@ pub fn round_trip_v2_commit_structure(input: &[u8]) {
         signature: [0; 64],
         signing_key_id: key_id("signing"),
     }
-    .sign_with_keyring(&keyring, upload_mode)
+    .sign_with_keyring(&keyring)
     .unwrap_or_else(|error| panic!("{error}"));
     let encoded = header
-        .encode_object(upload_mode, section_region)
+        .encode_object(section_region)
         .unwrap_or_else(|error| panic!("{error}"));
     let parsed = parse_v2_commit_object(&commit_key.object_id, encoded.clone(), &keyring)
         .unwrap_or_else(|error| panic!("{error}"));
@@ -231,7 +229,7 @@ pub fn open_v2_index_root_object(input: &[u8]) {
     let _ = decode_v2_index_root_plaintext_for_fuzzing(input);
 
     let keyring = signing_keyring();
-    let containing_object = object_id("commits/v02/fuzz-index-root");
+    let containing_object = object_id("commits/v03/fuzz-index-root");
     let _ = open_v2_index_root(&keyring, b"fuzz-repository", &containing_object, 3, input);
 
     let root = index_root_fixture();
@@ -276,7 +274,7 @@ pub fn open_v2_payload_pack(input: &[u8]) {
     }
 
     let keyring = signing_keyring();
-    let containing_object = object_id("commits/v02/fuzz-payload-pack");
+    let containing_object = object_id("commits/v03/fuzz-payload-pack");
     let plaintext = input.get(..MAX_STRUCTURED_PAYLOAD_LEN).unwrap_or(input);
     let records = [V2PayloadPackRecordInput {
         plaintext: Bytes::copy_from_slice(plaintext),
@@ -315,7 +313,7 @@ pub fn parse_segmented_payload(input: &[u8]) {
     if input.is_empty() || input.len() > MAX_FUZZ_INPUT_LEN {
         return;
     }
-    let object = object_id("objects/v02/fuzz-standalone");
+    let object = object_id("objects/v03/fuzz-standalone");
     let keyring = signing_keyring();
     let plaintext = input.get(..MAX_STRUCTURED_PAYLOAD_LEN).unwrap_or(input);
     let chunk_size = usize::from(input[0]) + 1;
@@ -362,7 +360,7 @@ fn standalone_index_run_fixture() -> IndexRun {
         containers: Vec::new(),
 
         standalone_stream_containers: vec![IndexRunStandaloneStreamContainer {
-            object_id: object_id("objects/v02/fuzz-standalone"),
+            object_id: object_id("objects/v03/fuzz-standalone"),
             version_id: Some(version_id("fuzz-version")),
             stored_len,
             object_digest: [0x51; 32],
@@ -422,7 +420,7 @@ fn index_root_fixture() -> V2IndexRoot {
         ),
         keyring_envelope_ref: keyring_ref.clone(),
         location: V2EmbeddedIndexRunLocation {
-            commit_key: object_id("commits/v02/fuzz-run"),
+            commit_key: object_id("commits/v03/fuzz-run"),
             version_id: Some(version_id("fuzz-version")),
             commit_stored_len: 16_384,
             commit_body_digest: [0x63; 32],

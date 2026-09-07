@@ -1,4 +1,4 @@
-//! Authenticated physical framing for canonical v02 index-run projections.
+//! Authenticated physical framing for canonical v03 index-run projections.
 //!
 //! `rs3-index` owns the canonical plaintext records. This module owns their
 //! exact immutable repository context, encrypted range directory, and frame
@@ -18,7 +18,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::ops::Range;
 
-/// Byte length of a random v02 index-run identity.
+/// Byte length of a random v03 index-run identity.
 pub const V2_INDEX_RUN_ID_LEN: usize = 32;
 /// Maximum number of independently authenticated data frames in one run.
 pub const V2_INDEX_RUN_MAX_FRAME_COUNT: usize = 4_096;
@@ -64,7 +64,7 @@ impl V2IndexRunId {
     }
 }
 
-/// Complete encrypted bytes and random identity of a v02 framed index run.
+/// Complete encrypted bytes and random identity of a v03 framed index run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V2SealedIndexRun {
     run_id: V2IndexRunId,
@@ -1394,7 +1394,7 @@ mod tests {
             }),
 
             containers: vec![IndexRunContainer {
-                object_id: object_id("objects/v02/pack-a"),
+                object_id: object_id("objects/v03/pack-a"),
                 version_id: Some(must(BackendVersionId::new("version-3"))),
                 stored_len: 4_096,
                 commit_body_digest: [0x22; 32],
@@ -1498,7 +1498,7 @@ mod tests {
 
             containers: Vec::new(),
             standalone_stream_containers: vec![IndexRunStandaloneStreamContainer {
-                object_id: object_id("commits/v02/external-stream"),
+                object_id: object_id("commits/v03/external-stream"),
                 version_id: Some(must(BackendVersionId::new("stream-version-4"))),
                 stored_len: payload_section_len,
                 object_digest: [0x93; 32],
@@ -1527,7 +1527,7 @@ mod tests {
 
     fn sealed() -> (KeyRing, BackendObjectId, IndexRunLimits, IndexRun, Bytes) {
         let keyring = keyring();
-        let object = object_id("commits/v02/framed-example");
+        let object = object_id("commits/v03/framed-example");
         let limits = limits();
         let run = fixture();
         let sealed = must(seal_v2_index_run(
@@ -1600,7 +1600,7 @@ mod tests {
         let limits = IndexRunLimits::default();
         {
             let (name, run) = ("standalone", standalone_stream_fixture());
-            let object = object_id(&format!("commits/v02/{name}-stream-run"));
+            let object = object_id(&format!("commits/v03/{name}-stream-run"));
             let sealed = must(seal_v2_index_run(
                 &keyring,
                 REPOSITORY_CONTEXT,
@@ -1639,7 +1639,7 @@ mod tests {
         let limits = IndexRunLimits::default();
         {
             let (name, run) = ("standalone", standalone_stream_fixture());
-            let object = object_id(&format!("commits/v02/{name}-stream-tamper"));
+            let object = object_id(&format!("commits/v03/{name}-stream-tamper"));
             let sealed = must(seal_v2_index_run(
                 &keyring,
                 REPOSITORY_CONTEXT,
@@ -1676,7 +1676,7 @@ mod tests {
     #[test]
     fn round_trips_an_all_delete_run_without_any_payload_pack() {
         let keyring = keyring();
-        let object = object_id("commits/v02/delete-only");
+        let object = object_id("commits/v03/delete-only");
         let limits = limits();
         let run = IndexRun {
             sequence: Sequence::new(21),
@@ -1757,7 +1757,7 @@ mod tests {
             open_v2_index_run_directory(
                 &keyring,
                 REPOSITORY_CONTEXT,
-                &object_id("commits/v02/other"),
+                &object_id("commits/v03/other"),
                 2,
                 &stored,
                 &limits,
@@ -1866,7 +1866,7 @@ mod tests {
             open_v2_index_run_frame(
                 &keyring,
                 REPOSITORY_CONTEXT,
-                &object_id("commits/v02/other"),
+                &object_id("commits/v03/other"),
                 2,
                 &directory,
                 first.ordinal(),

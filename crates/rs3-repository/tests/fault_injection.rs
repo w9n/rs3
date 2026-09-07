@@ -392,7 +392,7 @@ async fn ambiguous_retention_renewal_aborts_before_any_orphan_delete() {
         .await
         .expect("retained genesis should write");
     let orphan =
-        object_id("commits/v02/00000000000000000099/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        object_id("commits/v03/00000000000000000099/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     inner
         .put(
             &orphan,

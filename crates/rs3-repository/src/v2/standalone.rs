@@ -6,7 +6,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rs3_types::BackendObjectId;
 
 /// Backend prefix reserved for independently sealed v2 objects.
-pub(in crate::v2) const V2_STANDALONE_OBJECT_PREFIX: &str = "objects/v02/";
+pub(in crate::v2) const V2_STANDALONE_OBJECT_PREFIX: &str = "objects/v03/";
 const V2_STANDALONE_OBJECT_ID_BYTES: usize = 32;
 const V2_STANDALONE_OBJECT_ID_B64_LEN: usize = 43;
 

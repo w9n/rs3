@@ -1,13 +1,9 @@
-//! Canonical encrypted catalog for embedded v02 index-run sections.
+//! Canonical encrypted catalog for embedded v03 index-run sections.
 //!
 //! Run references name exact accepted foreground commits or exact
 //! metadata-only sibling commits published by guarded compaction.
 
-use super::{
-    V2_CAPABILITY_COMPACTED_INDEX_RUNS, V2_CAPABILITY_FRAMED_INDEX,
-    V2_CAPABILITY_SIGNED_SECTION_DIGESTS, V2_CAPABILITY_STANDALONE_PAYLOADS, V2FormatError,
-    V2FormatRef, V2KeyringEnvelopeRef, V2Result,
-};
+use super::{V2FormatError, V2FormatRef, V2KeyringEnvelopeRef, V2Result};
 use bytes::Bytes;
 use rs3_crypto::KeyRing;
 use rs3_index::run::IndexBlindKey;
@@ -34,7 +30,7 @@ const INDEX_ROOT_MAGIC: &[u8; 8] = b"rs3:irt\n";
 const INDEX_ROOT_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-root-plaintext:v02\n";
 const INDEX_ROOT_AAD_DOMAIN: &[u8] = b"rs3:index-root-aad:v02\n";
 const INDEX_ROOT_FORMAT_GENERATION: u16 = 2;
-const INDEX_ROOT_WIRE_VERSION: u16 = 2;
+const INDEX_ROOT_WIRE_VERSION: u16 = 3;
 const INDEX_ROOT_NONCE_LEN: usize = 12;
 const INDEX_ROOT_TAG_LEN: usize = 16;
 const INDEX_ROOT_SEAL_OVERHEAD: usize = INDEX_ROOT_NONCE_LEN + INDEX_ROOT_TAG_LEN;
@@ -47,10 +43,7 @@ const INDEX_ROOT_MAX_RUN_RECORD_LEN: usize = 8 * 1_024;
 const INDEX_ROOT_MAX_RUN_BYTES: u64 = 8 * 1024 * 1024;
 const INDEX_ROOT_MAX_FRAMES_PER_RUN: u32 = 4_096;
 const INDEX_ROOT_MAX_MUTATIONS_PER_RUN: u32 = 65_536;
-const INDEX_ROOT_REQUIRED_CAPABILITIES: u64 = V2_CAPABILITY_SIGNED_SECTION_DIGESTS
-    | V2_CAPABILITY_FRAMED_INDEX
-    | V2_CAPABILITY_COMPACTED_INDEX_RUNS
-    | V2_CAPABILITY_STANDALONE_PAYLOADS;
+const INDEX_ROOT_REQUIRED_CAPABILITIES: u64 = 0;
 
 /// Random identity authenticated by the index-root envelope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1164,7 +1157,7 @@ mod tests {
             listing_bounds: (logical_path(path), logical_path(path)),
             keyring_envelope_ref: keyring_ref(),
             location: V2EmbeddedIndexRunLocation {
-                commit_key: object_id(&format!("commits/v02/{sequence:020}/opaque-{id}")),
+                commit_key: object_id(&format!("commits/v03/{sequence:020}/opaque-{id}")),
                 version_id: Some(version_id(&format!("commit-version-{id}"))),
                 commit_stored_len: 16_384,
                 commit_body_digest: [id.wrapping_add(1); 32],
@@ -1206,7 +1199,7 @@ mod tests {
     #[test]
     fn encrypted_root_round_trips_and_sorts_runs() {
         let keyring = keyring();
-        let object = object_id("commits/v02/00000000000000000010/root");
+        let object = object_id("commits/v03/00000000000000000010/root");
         let root = fixture();
         assert_eq!(root.runs()[0].run_id, [1; 32]);
         let sealed = must(seal_v2_index_root(
@@ -1240,7 +1233,7 @@ mod tests {
         let digest: [u8; 32] = Sha256Hasher::digest(encoded);
         assert_eq!(
             hex::encode(digest),
-            "35f15d7fc27f058c963bb8c2df350e9875bf94fe1705b785f06324ed3de168f5"
+            "a8e7c6f14dc1308308734d00898342272e660859f12c9f77702cc055b832f305"
         );
     }
 
@@ -1254,7 +1247,7 @@ mod tests {
     #[test]
     fn compacted_levels_round_trip_canonically() {
         let keyring = keyring();
-        let object = object_id("commits/v02/00000000000000000012/compacted-root");
+        let object = object_id("commits/v03/00000000000000000012/compacted-root");
         let root = compacted_fixture();
         assert_eq!(root.claims().maximum_level(), V2_INDEX_ROOT_MAX_LEVEL);
         let sealed = must(seal_v2_index_root(
@@ -1279,14 +1272,14 @@ mod tests {
         let digest: [u8; 32] = Sha256Hasher::digest(encoded);
         assert_eq!(
             hex::encode(digest),
-            "6a6f0ff7f0436fdee46eb25454dddbe3d85fb3a9ed3702464885a17c59697b8e"
+            "80b1976e3363ecf97096721ca03e3c6ebd46c966388d9dbaa67a54f17d06ea48"
         );
     }
 
     #[test]
     fn empty_genesis_root_round_trips() {
         let keyring = keyring();
-        let object = object_id("commits/v02/00000000000000000001/genesis");
+        let object = object_id("commits/v03/00000000000000000001/genesis");
         let root = must(V2IndexRoot::new(
             Sequence::ZERO,
             0,
@@ -1316,7 +1309,7 @@ mod tests {
     #[test]
     fn rejects_context_object_ordinal_and_ciphertext_transplants() {
         let keyring = keyring();
-        let object = object_id("commits/v02/00000000000000000010/root");
+        let object = object_id("commits/v03/00000000000000000010/root");
         let sealed = must(seal_v2_index_root(
             &keyring,
             REPOSITORY_CONTEXT,
@@ -1332,7 +1325,7 @@ mod tests {
             open_v2_index_root(
                 &keyring,
                 REPOSITORY_CONTEXT,
-                &object_id("commits/v02/00000000000000000010/other"),
+                &object_id("commits/v03/00000000000000000010/other"),
                 3,
                 sealed.bytes()
             ),
@@ -1351,7 +1344,7 @@ mod tests {
     #[test]
     fn rejects_every_truncation_and_trailing_bytes() {
         let keyring = keyring();
-        let object = object_id("commits/v02/00000000000000000010/root");
+        let object = object_id("commits/v03/00000000000000000010/root");
         let sealed = must(seal_v2_index_root(
             &keyring,
             REPOSITORY_CONTEXT,
@@ -1408,7 +1401,7 @@ mod tests {
                 let mut run = run_ref(1, 8, "private/a");
                 run.run_id[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
                 run.location.section_ordinal = u32::try_from(index % 64).unwrap_or(0);
-                run.location.commit_key = object_id(&format!("commits/v02/{index:020}/run"));
+                run.location.commit_key = object_id(&format!("commits/v03/{index:020}/run"));
                 run
             })
             .collect();
@@ -1464,7 +1457,7 @@ mod tests {
     #[test]
     fn rejects_legacy_root_wire_version() {
         let keyring = keyring();
-        let object = object_id("commits/v02/00000000000000000010/root");
+        let object = object_id("commits/v03/00000000000000000010/root");
         let sealed = must(seal_v2_index_root(
             &keyring,
             REPOSITORY_CONTEXT,
@@ -1483,7 +1476,7 @@ mod tests {
     #[test]
     fn rejects_noncanonical_run_order() {
         let keyring = keyring();
-        let object = object_id("commits/v02/00000000000000000010/root");
+        let object = object_id("commits/v03/00000000000000000010/root");
         let mut root = fixture();
         root.runs.reverse();
         assert!(matches!(
@@ -1505,7 +1498,7 @@ mod tests {
     #[test]
     fn rejects_fixed_header_tampering() {
         let keyring = keyring();
-        let object = object_id("commits/v02/00000000000000000010/root");
+        let object = object_id("commits/v03/00000000000000000010/root");
         let sealed = must(seal_v2_index_root(
             &keyring,
             REPOSITORY_CONTEXT,

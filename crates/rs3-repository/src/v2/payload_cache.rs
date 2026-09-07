@@ -139,7 +139,7 @@ mod tests {
     fn fixture() -> Fixture {
         Fixture {
             context: b"repository-and-keyring-context".to_vec(),
-            commit_key: object_id("commits/v02/42/commit"),
+            commit_key: object_id("commits/v03/42/commit"),
             version_id: Some(
                 BackendVersionId::new("version-1").unwrap_or_else(|error| panic!("{error}")),
             ),
@@ -177,7 +177,7 @@ mod tests {
             },
             {
                 let mut value = fixture();
-                value.commit_key = object_id("commits/v02/42/other");
+                value.commit_key = object_id("commits/v03/42/other");
                 value
             },
             {
