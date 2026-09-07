@@ -23,8 +23,8 @@ pub use derive::{
     NamespaceBlindKey, derive_backend_object_id, derive_blind_index_key, derive_manifest_id,
 };
 pub use envelope::{
-    FormatEnvelope, KEYRING_ENVELOPE_VERSION, KeyringEnvelope, MAX_FORMAT_ENVELOPE_OBJECT_BYTES,
-    MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
+    EnvelopePurpose, MAX_FORMAT_ENVELOPE_OBJECT_BYTES, MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
+    REPOSITORY_ENVELOPE_VERSION, RepositoryEnvelope,
 };
 pub use error::CryptoError;
 pub use fingerprint::{Sha256Hasher, derive_public_fingerprint};

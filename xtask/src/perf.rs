@@ -2712,34 +2712,15 @@ fn concurrency(args: &PerfArgs) -> usize {
 
 fn keyring() -> Result<KeyRing> {
     KeyRing::new(vec![
-        key_material(
-            "namespace",
-            KeyPurpose::Namespace,
-            KeyStatus::Primary,
-            "hmac-sha256",
-            1,
-        )?,
-        key_material(
-            "metadata",
-            KeyPurpose::Metadata,
-            KeyStatus::Primary,
-            "aes-256-gcm-siv-hmac-sha256-nonce-v1",
-            2,
-        )?,
+        key_material("namespace", KeyPurpose::Namespace, KeyStatus::Primary, 1)?,
+        key_material("metadata", KeyPurpose::Metadata, KeyStatus::Primary, 2)?,
         key_material(
             "signing",
             KeyPurpose::CheckpointSigning,
             KeyStatus::Primary,
-            "ed25519",
             3,
         )?,
-        key_material(
-            "content",
-            KeyPurpose::Content,
-            KeyStatus::Primary,
-            "xchacha20poly1305",
-            4,
-        )?,
+        key_material("content", KeyPurpose::Content, KeyStatus::Primary, 4)?,
     ])
     .map_err(Into::into)
 }
@@ -2748,20 +2729,15 @@ fn key_material(
     value: &str,
     purpose: KeyPurpose,
     status: KeyStatus,
-    algorithm: &str,
     secret_byte: u8,
 ) -> Result<KeyMaterial> {
     Ok(KeyMaterial::new(
         KeyDescriptor {
             id: KeyId::new(value.to_owned())?,
             purpose,
-            algorithm: algorithm.to_owned(),
             status,
             created_at_ms: 0,
-            not_before_ms: None,
-            not_after_ms: None,
             public_key: None,
-            external_kms_uri: None,
         },
         SecretBytes::new(vec![secret_byte; SecretBytes::MIN_LEN])?,
     ))

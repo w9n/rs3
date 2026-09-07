@@ -1052,12 +1052,7 @@ mod tests {
         }
     }
 
-    fn key_material(
-        id: &str,
-        purpose: KeyPurpose,
-        algorithm: &str,
-        secret_byte: u8,
-    ) -> KeyMaterial {
+    fn key_material(id: &str, purpose: KeyPurpose, secret_byte: u8) -> KeyMaterial {
         let id = match KeyId::new(id.to_owned()) {
             Ok(id) => id,
             Err(error) => panic!("{error}"),
@@ -1070,13 +1065,9 @@ mod tests {
             KeyDescriptor {
                 id,
                 purpose,
-                algorithm: algorithm.to_owned(),
                 status: KeyStatus::Primary,
                 created_at_ms: 0,
-                not_before_ms: None,
-                not_after_ms: None,
                 public_key: None,
-                external_kms_uri: None,
             },
             secret,
         )
@@ -1655,19 +1646,9 @@ mod tests {
     fn writer_rejects_content_key_ids_the_reader_cannot_encode() {
         let long_content_id = "c".repeat(MAX_KEY_ID_LEN + 1);
         let keyring = match KeyRing::new(vec![
-            key_material("namespace", KeyPurpose::Namespace, "hmac-sha256", 1),
-            key_material(
-                &long_content_id,
-                KeyPurpose::Content,
-                "xchacha20poly1305",
-                2,
-            ),
-            key_material(
-                "metadata",
-                KeyPurpose::Metadata,
-                "aes-256-gcm-siv-hmac-sha256-nonce-v1",
-                3,
-            ),
+            key_material("namespace", KeyPurpose::Namespace, 1),
+            key_material(&long_content_id, KeyPurpose::Content, 2),
+            key_material("metadata", KeyPurpose::Metadata, 3),
         ]) {
             Ok(keyring) => keyring,
             Err(error) => panic!("{error}"),

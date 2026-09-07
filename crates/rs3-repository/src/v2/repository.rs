@@ -3,7 +3,6 @@
 mod genesis;
 pub use genesis::V2PreparedGenesis;
 
-use super::cbor;
 use super::commit::{
     V2_COMMIT_CONTENT_TYPE, V2_HEADER_META_LEN, V2_MAX_HEADER_SIZE,
     V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitHeader, V2CommitKey, V2CommitKind, V2CommitParentRef,
@@ -73,7 +72,7 @@ pub const DEFAULT_V2_REPLAY_MAX_RETAINED_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_V2_REPLAY_READ_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Schema marker for trusted v2 recovery bundles.
-pub const V2_RESTORE_BUNDLE_SCHEMA: &str = "rs3.restore-bundle.v2-preview.v1";
+pub const V2_RESTORE_BUNDLE_SCHEMA: &str = "rs3.restore-bundle.v3-preview.v1";
 
 /// Default idle time allowed between streaming request-body chunks.
 pub const DEFAULT_V2_STREAM_READ_STALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -599,10 +598,6 @@ pub struct V2RecoveryBundle {
     pub repository_salt_digest: Option<[u8; 32]>,
     /// Anchor state exported from a trusted anchor authority.
     pub anchor: V2AnchorState,
-    /// Optional active format blob digest.
-    pub format_digest: Option<[u8; 32]>,
-    /// Optional active format generation.
-    pub format_generation: Option<u64>,
     /// Minimum sequence this bundle allows normal DR to recreate.
     pub weak_subjectivity_floor_sequence: Sequence,
     /// Bundle export timestamp in milliseconds since Unix epoch.
@@ -641,8 +636,8 @@ impl Serialize for V2RecoveryBundle {
             repository,
             anchor: V2AnchorStateWire::from(&self.anchor),
             weak_subjectivity_floor_sequence: self.weak_subjectivity_floor_sequence.get(),
-            format_digest: self.format_digest.map(encode_digest_32),
-            format_generation: self.format_generation,
+            format_digest: Some(self.anchor.format_ref.digest.clone()),
+            format_generation: Some(self.anchor.format_ref.generation),
             exported_at_ms: self.exported_at_ms,
             offline_signature_payload_hex,
             offline_signature: self.offline_signature.as_ref().map(hex::encode),
@@ -652,78 +647,7 @@ impl Serialize for V2RecoveryBundle {
     }
 }
 
-impl<'de> Deserialize<'de> for V2RecoveryBundle {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = V2RecoveryBundleWire::deserialize(deserializer)?;
-        if wire.schema != V2_RESTORE_BUNDLE_SCHEMA {
-            return Err(de::Error::custom(format!(
-                "unsupported restore bundle schema {}",
-                wire.schema
-            )));
-        }
-
-        let repository_id = wire
-            .repository
-            .as_ref()
-            .map(|repository| RepositoryId::new(repository.id.clone()))
-            .transpose()
-            .map_err(de::Error::custom)?;
-        let repository_salt_digest = wire
-            .repository_salt_digest
-            .as_deref()
-            .or_else(|| {
-                wire.repository
-                    .as_ref()
-                    .and_then(|repository| repository.salt_digest.as_deref())
-            })
-            .map(|digest| decode_digest_32("repository salt digest", digest))
-            .transpose()?;
-        let anchor: V2AnchorState = wire.anchor.try_into().map_err(de::Error::custom)?;
-        if let Some(format_generation) = wire.format_generation
-            && format_generation != anchor.format_ref.generation
-        {
-            return Err(de::Error::custom(
-                "bundle format_generation does not match anchor format generation",
-            ));
-        }
-        if let Some(format_digest) = wire.format_digest.as_ref()
-            && format_digest != &anchor.format_ref.digest
-        {
-            return Err(de::Error::custom(
-                "bundle format_digest does not match anchor format digest",
-            ));
-        }
-        let format_digest = wire
-            .format_digest
-            .as_deref()
-            .map(|digest| decode_digest_32("format digest", digest))
-            .transpose()?;
-        let offline_signature = wire
-            .offline_signature
-            .as_deref()
-            .map(|signature| {
-                hex::decode(signature)
-                    .map_err(|_| de::Error::custom("offline signature must be hex encoded"))
-            })
-            .transpose()?;
-
-        Ok(Self {
-            repository_id,
-            repository_salt_digest,
-            anchor,
-            format_digest,
-            format_generation: wire.format_generation,
-            weak_subjectivity_floor_sequence: Sequence::new(wire.weak_subjectivity_floor_sequence),
-            exported_at_ms: wire.exported_at_ms,
-            offline_signature,
-        })
-    }
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 struct V2RecoveryBundleWire {
     schema: String,
     #[serde(default)]
@@ -743,7 +667,7 @@ struct V2RecoveryBundleWire {
     repository_salt_digest: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 struct V2RecoveryBundleRepositoryWire {
     id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -753,32 +677,14 @@ struct V2RecoveryBundleRepositoryWire {
 impl V2RecoveryBundle {
     /// Creates a recovery bundle from an accepted anchor state.
     pub fn from_anchor(anchor: V2AnchorState, floor: Sequence) -> Self {
-        let format_digest = hex::decode(&anchor.format_ref.digest)
-            .ok()
-            .and_then(|digest| digest.try_into().ok());
-        let format_generation = Some(anchor.format_ref.generation);
         Self {
             repository_id: None,
             repository_salt_digest: None,
             anchor,
-            format_digest,
-            format_generation,
             weak_subjectivity_floor_sequence: floor,
             exported_at_ms: current_time_ms(),
             offline_signature: None,
         }
-    }
-
-    /// Returns the canonical bytes covered by the offline recovery signature.
-    pub fn offline_signature_payload(&self) -> V2Result<Vec<u8>> {
-        let repository_id = self
-            .repository_id
-            .as_ref()
-            .ok_or(V2FormatError::RecoveryBundleRequired)?;
-        Ok(canonical_recovery_signature_payload(
-            repository_id,
-            &self.anchor,
-        ))
     }
 
     /// Verifies the offline recovery signature with an operator recovery key.
@@ -793,44 +699,6 @@ impl V2RecoveryBundle {
             signature,
         )
         .map_err(|_| V2FormatError::SignatureVerification)
-    }
-}
-
-fn canonical_recovery_signature_payload(
-    repository_id: &RepositoryId,
-    anchor: &V2AnchorState,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    cbor::write_array_len(&mut out, 8);
-    cbor::write_text(&mut out, "rs3:v2-recovery-bundle-offline-signature:v1");
-    cbor::write_text(&mut out, repository_id.as_str());
-    cbor::write_u64(&mut out, anchor.sequence.get());
-    cbor::write_text(&mut out, anchor.commit_key.as_str());
-    write_optional_text(
-        &mut out,
-        anchor.version_id.as_ref().map(BackendVersionId::as_str),
-    );
-    cbor::write_bytes(&mut out, &anchor.body_digest);
-    cbor::write_text(&mut out, anchor.signing_key_id.as_str());
-    cbor::write_array_len(&mut out, 4);
-    cbor::write_u64(&mut out, anchor.format_ref.generation);
-    cbor::write_text(&mut out, &anchor.format_ref.digest);
-    cbor::write_text(&mut out, anchor.format_ref.object_id.as_str());
-    write_optional_text(
-        &mut out,
-        anchor
-            .format_ref
-            .version_id
-            .as_ref()
-            .map(BackendVersionId::as_str),
-    );
-    out
-}
-
-fn write_optional_text(out: &mut Vec<u8>, value: Option<&str>) {
-    match value {
-        Some(value) => cbor::write_text(out, value),
-        None => cbor::write_null(out),
     }
 }
 

@@ -371,6 +371,7 @@ impl V2CommitHeader {
     }
 
     /// Encodes the bounded signed header span without section bytes.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn encode_header_span(&self, upload_mode: V2UploadMode) -> V2Result<Bytes> {
         validate_commit_section_semantics(self)?;
         let mut span = header_span(self, upload_mode, SignatureMode::Actual)?;

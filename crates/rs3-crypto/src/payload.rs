@@ -387,13 +387,9 @@ mod tests {
             KeyDescriptor {
                 id: key_id(value),
                 purpose: KeyPurpose::Content,
-                algorithm: "xchacha20poly1305".to_string(),
                 status,
                 created_at_ms: 0,
-                not_before_ms: None,
-                not_after_ms: None,
                 public_key: None,
-                external_kms_uri: None,
             },
             secret(secret_byte),
         )
@@ -404,13 +400,9 @@ mod tests {
             KeyDescriptor {
                 id: key_id("namespace"),
                 purpose: KeyPurpose::Namespace,
-                algorithm: "hmac-sha256".to_string(),
                 status: KeyStatus::Primary,
                 created_at_ms: 0,
-                not_before_ms: None,
-                not_after_ms: None,
                 public_key: None,
-                external_kms_uri: None,
             },
             secret(1),
         )

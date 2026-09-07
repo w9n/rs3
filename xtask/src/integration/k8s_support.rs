@@ -14,7 +14,7 @@ pub(crate) const CHART_NAME: &str = "rs3-gateway";
 pub(crate) const CHART_PATH: &str = "charts/rs3-gateway";
 pub(crate) const DEFAULT_PUBLIC_BUCKET: &str = "client-bucket";
 pub(crate) const GATEWAY_PORT: u16 = 9080;
-pub(crate) const KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.json";
+pub(crate) const KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.cbor";
 pub(crate) const KEYRING_WRAPPING_KEY_HEX: &str =
     "3333333333333333333333333333333333333333333333333333333333333333";
 pub(crate) const KEYRING_WRAPPING_KEY_ID: &str = "wrap-integration";

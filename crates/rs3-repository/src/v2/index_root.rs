@@ -1111,26 +1111,22 @@ mod tests {
     }
 
     fn keyring() -> KeyRing {
-        let material = |id: &str, purpose: KeyPurpose, algorithm: &str, byte: u8| {
+        let material = |id: &str, purpose: KeyPurpose, byte: u8| {
             KeyMaterial::new(
                 KeyDescriptor {
                     id: key_id(id),
                     purpose,
-                    algorithm: algorithm.to_owned(),
                     status: KeyStatus::Primary,
                     created_at_ms: 0,
-                    not_before_ms: None,
-                    not_after_ms: None,
                     public_key: None,
-                    external_kms_uri: None,
                 },
                 SecretBytes::new(vec![byte; SecretBytes::MIN_LEN])
                     .unwrap_or_else(|error| panic!("{error}")),
             )
         };
         KeyRing::new(vec![
-            material("namespace", KeyPurpose::Namespace, "hmac-sha256", 6),
-            material("metadata", KeyPurpose::Metadata, "aes-256-gcm-siv", 7),
+            material("namespace", KeyPurpose::Namespace, 6),
+            material("metadata", KeyPurpose::Metadata, 7),
         ])
         .unwrap_or_else(|error| panic!("{error}"))
     }

@@ -6,8 +6,8 @@ use super::runtime_builders::build_store;
 use super::{S3BoundaryError, repository_init};
 use crate::{RepositoryFormat, RepositoryKeyContextConfig, RepositoryToolConfig};
 use rs3_crypto::{
-    FormatEnvelope, KeyRing, KeyringEnvelope, MAX_FORMAT_ENVELOPE_OBJECT_BYTES,
-    MAX_KEYRING_ENVELOPE_OBJECT_BYTES, RepositoryKeyContext, SecretBytes,
+    KeyRing, MAX_FORMAT_ENVELOPE_OBJECT_BYTES, MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
+    RepositoryEnvelope, RepositoryKeyContext, SecretBytes,
 };
 use rs3_repository::store_keyring_envelope;
 use rs3_repository::v2::{
@@ -309,7 +309,7 @@ where
         )
         .map_err(repository_init)?;
     rewrapped
-        .open(
+        .open_keyring(
             &context,
             &options.new_wrapping_key_id,
             &options.new_wrapping_key,
@@ -406,7 +406,9 @@ where
         MAX_FORMAT_ENVELOPE_OBJECT_BYTES,
     )
     .await?;
-    let envelope = FormatEnvelope::from_object_bytes(body.as_ref()).map_err(repository_init)?;
+    let envelope =
+        RepositoryEnvelope::from_object_bytes(body.as_ref(), rs3_crypto::EnvelopePurpose::Format)
+            .map_err(repository_init)?;
     if envelope.generation != reference.generation
         || envelope.digest().map_err(repository_init)? != reference.digest
     {
@@ -415,7 +417,7 @@ where
         ));
     }
     let plaintext = envelope
-        .open(context, wrapping_key_id, wrapping_key)
+        .open_format(context, wrapping_key_id, wrapping_key)
         .map_err(repository_init)?;
     V2FormatRoot::from_plaintext_bytes(&plaintext).map_err(repository_init)
 }
@@ -437,7 +439,9 @@ where
         MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
     )
     .await?;
-    let envelope = KeyringEnvelope::from_object_bytes(body.as_ref()).map_err(repository_init)?;
+    let envelope =
+        RepositoryEnvelope::from_object_bytes(body.as_ref(), rs3_crypto::EnvelopePurpose::Keyring)
+            .map_err(repository_init)?;
     if envelope.generation != reference.generation
         || envelope.digest().map_err(repository_init)? != reference.digest
     {
@@ -446,13 +450,13 @@ where
         ));
     }
     envelope
-        .open(context, wrapping_key_id, wrapping_key)
+        .open_keyring(context, wrapping_key_id, wrapping_key)
         .map_err(repository_init)
 }
 
 struct OpenedKeyringEnvelope {
     object_id: BackendObjectId,
-    envelope: KeyringEnvelope,
+    envelope: RepositoryEnvelope,
     keyring: KeyRing,
 }
 
@@ -476,9 +480,11 @@ where
     let context = repository_key_context(keys)?;
     let body =
         read_bounded_object_at(store, &object_id, None, MAX_KEYRING_ENVELOPE_OBJECT_BYTES).await?;
-    let envelope = KeyringEnvelope::from_object_bytes(&body).map_err(repository_init)?;
+    let envelope =
+        RepositoryEnvelope::from_object_bytes(&body, rs3_crypto::EnvelopePurpose::Keyring)
+            .map_err(repository_init)?;
     let keyring = envelope
-        .open(&context, wrapping_key_id, wrapping_key)
+        .open_keyring(&context, wrapping_key_id, wrapping_key)
         .map_err(repository_init)?;
 
     Ok(OpenedKeyringEnvelope {
@@ -511,7 +517,7 @@ mod tests {
         RepositoryToolConfig,
     };
     use bytes::Bytes;
-    use rs3_crypto::{FormatEnvelope, KeyRing, RepositoryKeyContext, SecretBytes};
+    use rs3_crypto::{KeyRing, RepositoryEnvelope, RepositoryKeyContext, SecretBytes};
     use rs3_repository::store_keyring_envelope;
     use rs3_repository::v2::{
         V2CommitStore, V2CommitStoreOptions, V2FormatRoot, V2KeyringEnvelopeRootRef,
@@ -768,8 +774,9 @@ mod tests {
         let plaintext = root
             .to_plaintext_bytes()
             .unwrap_or_else(|error| panic!("{error}"));
-        let envelope = FormatEnvelope::seal(context, "wrap-v1", wrapping_key, 1, &plaintext)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let envelope =
+            RepositoryEnvelope::seal_format(context, "wrap-v1", wrapping_key, 1, &plaintext)
+                .unwrap_or_else(|error| panic!("{error}"));
         let digest = envelope.digest().unwrap_or_else(|error| panic!("{error}"));
         let object_id = v2_format_object_id(envelope.generation, &digest)
             .unwrap_or_else(|error| panic!("{error}"));

@@ -95,24 +95,14 @@ fn secret(byte: u8) -> SecretBytes {
     must_crypto(SecretBytes::new(vec![byte; SecretBytes::MIN_LEN]))
 }
 
-fn key_material(
-    id: &str,
-    purpose: KeyPurpose,
-    status: KeyStatus,
-    algorithm: &str,
-    byte: u8,
-) -> KeyMaterial {
+fn key_material(id: &str, purpose: KeyPurpose, status: KeyStatus, byte: u8) -> KeyMaterial {
     KeyMaterial::new(
         KeyDescriptor {
             id: key_id(id),
             purpose,
-            algorithm: algorithm.to_owned(),
             status,
             created_at_ms: 0,
-            not_before_ms: None,
-            not_after_ms: None,
             public_key: None,
-            external_kms_uri: None,
         },
         secret(byte),
     )
@@ -120,27 +110,14 @@ fn key_material(
 
 fn signing_keyring() -> KeyRing {
     must_crypto(KeyRing::new(vec![
-        key_material(
-            "namespace",
-            KeyPurpose::Namespace,
-            KeyStatus::Primary,
-            "hmac-sha256",
-            1,
-        ),
+        key_material("namespace", KeyPurpose::Namespace, KeyStatus::Primary, 1),
         key_material(
             "signing",
             KeyPurpose::CheckpointSigning,
             KeyStatus::Primary,
-            "ed25519",
             2,
         ),
-        key_material(
-            "metadata",
-            KeyPurpose::Metadata,
-            KeyStatus::Primary,
-            "aes-256-gcm-siv",
-            3,
-        ),
+        key_material("metadata", KeyPurpose::Metadata, KeyStatus::Primary, 3),
     ]))
 }
 
@@ -547,7 +524,7 @@ async fn commit_store_options_with_maintenance_roots(
 }
 
 #[test]
-fn recovery_bundle_json_round_trips_shared_wire_shape() {
+fn recovery_bundle_cbor_round_trips_and_json_is_only_a_report() {
     let anchor = V2AnchorState {
         sequence: Sequence::new(7),
         commit_key: sample_commit_key().object_id,
@@ -571,44 +548,14 @@ fn recovery_bundle_json_round_trips_shared_wire_shape() {
     assert!(value["offline_signature_payload_hex"].as_str().is_some());
     assert_eq!(value["offline_signature"], hex::encode([4_u8; 64]));
 
-    let decoded: V2RecoveryBundle =
-        serde_json::from_value(value).unwrap_or_else(|error| panic!("{error}"));
+    let encoded = bundle.to_object_bytes().expect("encode CBOR");
+    let decoded = V2RecoveryBundle::from_object_bytes(&encoded).expect("decode CBOR");
+    assert_eq!(decoded.to_object_bytes().expect("canonical bytes"), encoded);
+    assert!(
+        V2RecoveryBundle::from_object_bytes(&serde_json::to_vec(&value).expect("report")).is_err()
+    );
 
     assert_eq!(decoded, bundle);
-}
-
-#[test]
-fn recovery_bundle_json_accepts_root_repository_salt_digest() {
-    let input = serde_json::json!({
-        "schema": V2_RESTORE_BUNDLE_SCHEMA,
-        "repository": {
-            "id": "repo-a"
-        },
-        "repository_salt_digest": "03".repeat(32),
-        "anchor": {
-            "sequence": 7,
-            "commit_key": sample_commit_key().object_id.as_str(),
-            "body_digest": "08".repeat(32),
-            "version_id": "commit-version-1",
-            "signing_key_id": "signing",
-            "format": {
-                "generation": 1,
-                "digest": "07".repeat(32),
-                "object_id": "format/00000000000000000001/legacy",
-                "version_id": "format-version-1"
-            }
-        },
-        "weak_subjectivity_floor_sequence": 7,
-        "format_digest": "07".repeat(32),
-        "format_generation": 1,
-        "exported_at_ms": 42,
-        "offline_signature": null
-    });
-
-    let decoded: V2RecoveryBundle =
-        serde_json::from_value(input).unwrap_or_else(|error| panic!("{error}"));
-
-    assert_eq!(decoded.repository_salt_digest, Some([3_u8; 32]));
 }
 
 struct FailOnceV2Anchor {

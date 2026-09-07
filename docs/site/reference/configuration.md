@@ -32,13 +32,16 @@ settings as `serve`.
 and backend settings, but take wrapping-key material from their own flags or
 environment. The exported bundle contains public but integrity-sensitive
 restore metadata; keep wrapping-key material in the configured secret source.
-Prefer `import-v2-anchor --bundle-file <json>` over manually transcribing anchor fields
+Prefer `import-v2-anchor --bundle-file <bundle.cbor>` over manually transcribing anchor fields
 from the exported bundle. Normal Kubernetes initialization and serving do not require a recovery signing
 key. Portable production bundle import requires an external
 `--min-sequence` floor and `RS3_RECOVERY_PUBLIC_KEY`. `export-restore-bundle`
-prints `offline_signature_payload_hex`; sign those canonical bytes offline with
-the matching Ed25519 recovery key and store the hex signature in
-`offline_signature` before import. `import-v2-anchor` also refuses when stored
+writes a CBOR artifact to its required `--output` path and prints an inspection
+report containing `offline_signature_payload_hex`. Sign those canonical bytes
+offline with the matching Ed25519 recovery key. Use `attach-bundle-signature`
+to verify and attach that signature to a new CBOR artifact before import; this
+command needs no backend, Kubernetes, or private signing-key access. JSON reports
+cannot be imported. `import-v2-anchor` also refuses when stored
 commit keys contain a sequence higher than the imported anchor; `--force-rollback`
 is an explicit rollback override for that condition.
 Machine-readable command output is written to stdout; tracing logs are written

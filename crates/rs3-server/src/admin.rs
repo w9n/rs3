@@ -1549,7 +1549,7 @@ mod tests {
                 repository_salt_hex:
                     "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
                 envelope_object_id: Some(
-                    BackendObjectId::new("keyrings/test-envelope.json")
+                    BackendObjectId::new("keyrings/test-envelope.cbor")
                         .unwrap_or_else(|error| panic!("{error}")),
                 ),
                 wrapping_key_id: "wrap-v1".to_owned(),

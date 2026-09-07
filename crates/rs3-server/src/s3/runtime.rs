@@ -25,7 +25,7 @@ use crate::{
 };
 use bytes::Bytes;
 use futures_util::Stream;
-use rs3_crypto::{FormatEnvelope, KeyRing, MAX_FORMAT_ENVELOPE_OBJECT_BYTES};
+use rs3_crypto::{KeyRing, MAX_FORMAT_ENVELOPE_OBJECT_BYTES, RepositoryEnvelope};
 use rs3_index::KeyringEnvelopeReference;
 #[cfg(feature = "k8s")]
 use rs3_k8s::WriterFence;
@@ -57,7 +57,7 @@ mod bootstrap;
 #[cfg(feature = "k8s")]
 mod onboarding;
 
-const V2_FORMAT_ENVELOPE_CONTENT_TYPE: &str = "application/vnd.rs3.v2-format-envelope+json";
+const V2_FORMAT_ENVELOPE_CONTENT_TYPE: &str = "application/vnd.rs3.format-envelope+cbor";
 
 /// Result of importing a trusted v2 anchor bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1425,11 +1425,11 @@ async fn store_format_root(
 fn prepare_format_root(
     keys: &RepositoryKeysConfig,
     root: &V2FormatRoot,
-) -> Result<FormatEnvelope, S3BoundaryError> {
+) -> Result<RepositoryEnvelope, S3BoundaryError> {
     let context = repository_key_context(keys)?;
     let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
     let plaintext = root.to_plaintext_bytes().map_err(repository_init)?;
-    let envelope = FormatEnvelope::seal(
+    let envelope = RepositoryEnvelope::seal_format(
         &context,
         &keys.wrapping_key_id,
         &wrapping_key,
@@ -1500,7 +1500,8 @@ fn open_format_root_body(
     reference: &V2FormatRef,
     body: &[u8],
 ) -> Result<V2FormatRoot, S3BoundaryError> {
-    let envelope = FormatEnvelope::from_object_bytes(body).map_err(repository_init)?;
+    let envelope = RepositoryEnvelope::from_object_bytes(body, rs3_crypto::EnvelopePurpose::Format)
+        .map_err(repository_init)?;
     if envelope.generation != reference.generation
         || envelope.digest().map_err(repository_init)? != reference.digest
     {
@@ -1511,7 +1512,7 @@ fn open_format_root_body(
     let context = repository_key_context(keys)?;
     let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
     let plaintext = envelope
-        .open(&context, &keys.wrapping_key_id, &wrapping_key)
+        .open_format(&context, &keys.wrapping_key_id, &wrapping_key)
         .map_err(repository_init)?;
     V2FormatRoot::from_plaintext_bytes(&plaintext).map_err(repository_init)
 }
@@ -2142,7 +2143,7 @@ mod tests {
         let envelope = keyring
             .seal_keyring_envelope(&context, "wrap-v1", &wrapping_key, 1)
             .unwrap_or_else(|error| panic!("{error}"));
-        let object_id = BackendObjectId::new("keyrings/test-envelope.json")
+        let object_id = BackendObjectId::new("keyrings/test-envelope.cbor")
             .unwrap_or_else(|error| panic!("{error}"));
         let memory = MemoryBlobStore::new();
         memory
@@ -2220,7 +2221,7 @@ mod tests {
         let envelope = keyring
             .seal_keyring_envelope(&context, "wrap-v1", &wrapping_key, 7)
             .unwrap_or_else(|error| panic!("{error}"));
-        let envelope_object_id = BackendObjectId::new("keyrings/runtime-envelope.json")
+        let envelope_object_id = BackendObjectId::new("keyrings/runtime-envelope.cbor")
             .unwrap_or_else(|error| panic!("{error}"));
         config.repository_keys.envelope_object_id = Some(envelope_object_id.clone());
         config.repository_keys.wrapping_key_id = "wrap-v1".to_owned();
@@ -2274,12 +2275,15 @@ mod tests {
             .get_range(&accepted.format_ref.object_id, ByteRange::Full)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        let format_envelope =
-            rs3_crypto::FormatEnvelope::from_object_bytes(&body).unwrap_or_else(|error| {
-                panic!("{error}");
-            });
+        let format_envelope = rs3_crypto::RepositoryEnvelope::from_object_bytes(
+            &body,
+            rs3_crypto::EnvelopePurpose::Format,
+        )
+        .unwrap_or_else(|error| {
+            panic!("{error}");
+        });
         let plaintext = format_envelope
-            .open(
+            .open_format(
                 &context,
                 &config.repository_keys.wrapping_key_id,
                 &wrapping_key,
@@ -2772,8 +2776,6 @@ mod tests {
                     ),
                 },
             },
-            format_digest: Some([0x22; 32]),
-            format_generation: Some(1),
             weak_subjectivity_floor_sequence: Sequence::new(7),
             exported_at_ms: 42,
             offline_signature: None,

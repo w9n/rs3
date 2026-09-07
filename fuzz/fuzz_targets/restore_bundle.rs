@@ -10,12 +10,12 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    let Ok(bundle) = serde_json::from_slice::<V2RecoveryBundle>(data) else {
+    let Ok(bundle) = V2RecoveryBundle::from_object_bytes(data) else {
         return;
     };
-    let encoded = serde_json::to_vec(&bundle)
+    let encoded = bundle.to_object_bytes()
         .unwrap_or_else(|error| panic!("parsed restore bundle failed to re-encode: {error}"));
-    let decoded = serde_json::from_slice::<V2RecoveryBundle>(&encoded)
+    let decoded = V2RecoveryBundle::from_object_bytes(&encoded)
         .unwrap_or_else(|error| panic!("re-encoded restore bundle failed to parse: {error}"));
     assert_eq!(decoded, bundle);
 });

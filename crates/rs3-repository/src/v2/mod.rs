@@ -5,7 +5,7 @@
 //! writers and readers use these helpers so ambiguous object-store behavior
 //! fails closed before repository state is trusted.
 
-mod cbor;
+pub(super) use rs3_types::cbor;
 mod commit;
 mod coordinator;
 mod error;
@@ -42,9 +42,7 @@ pub use coordinator::{
     V2CommitCoordinatorStatus, V2CommittedPut, V2MaintenanceWindow,
 };
 pub use error::{V2ErrorClass, V2FormatError, V2Result};
-pub use format::{
-    V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef, V2MaintenanceConfig, v2_format_object_id,
-};
+pub use format::{V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef, v2_format_object_id};
 pub use index_root::{
     V2_INDEX_ROOT_FIXED_HEADER_BYTES, V2_INDEX_ROOT_ID_LEN, V2_INDEX_ROOT_MAX_BYTES,
     V2_INDEX_ROOT_MAX_LEVEL, V2_INDEX_ROOT_MAX_RUNS, V2_INDEX_ROOT_MAX_TOTAL_MUTATIONS,
@@ -94,3 +92,7 @@ pub use repository::{
 pub use service::{
     V2AuthenticatedReadBody, V2FullMaintenanceReport, V2Repository, V2ResolvedObject,
 };
+
+mod recovery_bundle;
+mod wire;
+pub use recovery_bundle::MAX_RECOVERY_BUNDLE_BYTES;

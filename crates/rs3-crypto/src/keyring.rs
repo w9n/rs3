@@ -10,11 +10,6 @@ use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, RepositoryId};
 use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
-const NAMESPACE_ALGORITHM: &str = "hmac-sha256";
-const CONTENT_ALGORITHM: &str = "xchacha20poly1305";
-const METADATA_ALGORITHM: &str = "aes-256-gcm-siv-hmac-sha256-nonce-v1";
-const CHECKPOINT_ALGORITHM: &str = "ed25519";
-
 /// Minimum public repository salt length accepted by the production KDF path.
 pub const MIN_REPOSITORY_SALT_LEN: usize = 32;
 
@@ -286,13 +281,9 @@ fn default_namespace_descriptor() -> KeyDescriptor {
     KeyDescriptor {
         id: static_key_id("namespace-v1"),
         purpose: KeyPurpose::Namespace,
-        algorithm: NAMESPACE_ALGORITHM.to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
-        not_before_ms: None,
-        not_after_ms: None,
         public_key: None,
-        external_kms_uri: None,
     }
 }
 
@@ -300,13 +291,9 @@ fn default_metadata_descriptor() -> KeyDescriptor {
     KeyDescriptor {
         id: static_key_id("metadata-v1"),
         purpose: KeyPurpose::Metadata,
-        algorithm: METADATA_ALGORITHM.to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
-        not_before_ms: None,
-        not_after_ms: None,
         public_key: None,
-        external_kms_uri: None,
     }
 }
 
@@ -314,13 +301,9 @@ fn default_content_descriptor() -> KeyDescriptor {
     KeyDescriptor {
         id: static_key_id("content-v1"),
         purpose: KeyPurpose::Content,
-        algorithm: CONTENT_ALGORITHM.to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
-        not_before_ms: None,
-        not_after_ms: None,
         public_key: None,
-        external_kms_uri: None,
     }
 }
 
@@ -328,13 +311,9 @@ fn default_checkpoint_descriptor(secret: &SecretBytes) -> Result<KeyDescriptor, 
     Ok(KeyDescriptor {
         id: static_key_id("checkpoint-v1"),
         purpose: KeyPurpose::CheckpointSigning,
-        algorithm: CHECKPOINT_ALGORITHM.to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
-        not_before_ms: None,
-        not_after_ms: None,
         public_key: Some(derive_checkpoint_public_key_descriptor(secret)?),
-        external_kms_uri: None,
     })
 }
 
@@ -370,13 +349,9 @@ mod tests {
             KeyDescriptor {
                 id: key_id(value),
                 purpose: KeyPurpose::Namespace,
-                algorithm: "hmac-sha256".to_string(),
                 status,
                 created_at_ms: 0,
-                not_before_ms: None,
-                not_after_ms: None,
                 public_key: None,
-                external_kms_uri: None,
             },
             secret(secret_byte),
         )
@@ -399,7 +374,6 @@ mod tests {
             let make_keyring = |public_key: Option<String>| {
                 let mut signing = namespace_key("signing", status, 2);
                 signing.descriptor.purpose = KeyPurpose::CheckpointSigning;
-                signing.descriptor.algorithm = "ed25519".to_owned();
                 signing.descriptor.public_key = public_key;
                 KeyRing::new(vec![
                     namespace_key("namespace", KeyStatus::Primary, 1),

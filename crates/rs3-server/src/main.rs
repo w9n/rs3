@@ -29,7 +29,7 @@ use rs3_server::{
 };
 use rs3_types::{BackendObjectId, KeyDescriptor, KeyPurpose, KeyStatus, RetentionMode, Sequence};
 use secrecy::{ExposeSecret, SecretString};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "s3", feature = "k8s"))]
@@ -94,10 +94,28 @@ enum Commands {
         #[arg(long)]
         probe: bool,
     },
-    /// Export a signed restore bundle for offline recovery.
+    /// Export a canonical CBOR restore bundle for offline signing and recovery.
     ExportRestoreBundle {
+        /// Destination for the canonical CBOR recovery artifact (must not exist).
+        #[arg(long)]
+        output: std::path::PathBuf,
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
+    },
+    /// Verify and attach an externally produced signature to a CBOR bundle, offline.
+    AttachBundleSignature {
+        /// Existing unsigned CBOR artifact; use `-` for stdin.
+        #[arg(long)]
+        bundle_file: String,
+        /// Ed25519 signature as 128 hexadecimal characters.
+        #[arg(long)]
+        signature_hex: String,
+        /// Independent recovery public key, in ed25519:<hex> form.
+        #[arg(long)]
+        public_key: String,
+        /// Destination for the signed CBOR artifact (must not exist).
+        #[arg(long)]
+        output: std::path::PathBuf,
     },
     /// Verify a trusted v2 restore bundle without writing an anchor.
     VerifyBundle(Box<VerifyBundleArgs>),
@@ -237,7 +255,7 @@ enum MaintenanceOutputFormat {
 
 #[derive(Debug, Args)]
 struct ImportV2AnchorArgs {
-    /// JSON bundle from `export-restore-bundle`; use `-` for stdin.
+    /// CBOR artifact from `export-restore-bundle --output`; use `-` for stdin.
     #[arg(long)]
     bundle_file: String,
     /// External weak-subjectivity floor accepted by the operator.
@@ -253,7 +271,7 @@ struct ImportV2AnchorArgs {
 
 #[derive(Debug, Args)]
 struct VerifyBundleArgs {
-    /// JSON bundle from `export-restore-bundle`; use `-` for stdin.
+    /// CBOR artifact from `export-restore-bundle --output`; use `-` for stdin.
     #[arg(long)]
     bundle_file: String,
     /// External weak-subjectivity floor accepted by the operator.
@@ -403,11 +421,22 @@ async fn main() -> Result<()> {
             log_runtime_config(&config);
             run_doctor(&config, profile, probe).await?;
         }
-        Commands::ExportRestoreBundle { format } => {
+        Commands::ExportRestoreBundle { output, format } => {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
             let bundle = export_v2_recovery_bundle_from_config(&config).await?;
+            write_restore_bundle(&output, &bundle)?;
             print_v2_restore_bundle(&bundle, format)?;
+        }
+        Commands::AttachBundleSignature {
+            bundle_file,
+            signature_hex,
+            public_key,
+            output,
+        } => {
+            let mut bundle = read_v2_recovery_bundle(&bundle_file)?;
+            attach_bundle_signature(&mut bundle, &signature_hex, &public_key)?;
+            write_restore_bundle(&output, &bundle)?;
         }
         Commands::VerifyBundle(args) => {
             let VerifyBundleArgs {
@@ -426,7 +455,7 @@ async fn main() -> Result<()> {
                     .clone_from(wrapping_key_id);
             }
             log_repository_tool_config(&config);
-            let bundle = read_v2_recovery_bundle_json(&bundle_file)?;
+            let bundle = read_v2_recovery_bundle(&bundle_file)?;
             let wrapping_key = required_wrapping_key_input(
                 wrapping_key_hex,
                 wrapping_key_hex_file.as_deref(),
@@ -833,48 +862,76 @@ fn recovery_bundle_from_import_args(
         min_sequence: Sequence::new(args.min_sequence),
         force_rollback: args.force_rollback,
     };
-    let bundle = read_restore_bundle_json(&args.bundle_file, config)?;
+    let bundle = parse_restore_bundle(&read_bundle_bytes(&args.bundle_file)?, config)?;
     Ok((bundle, options))
 }
 
-fn read_restore_bundle_json(path: &str, config: &RuntimeConfig) -> Result<V2RecoveryBundle> {
-    let mut input = String::new();
-    if path == "-" {
-        std::io::stdin()
-            .read_to_string(&mut input)
-            .context("failed to read restore bundle from stdin")?;
+fn read_bundle_bytes(path: &str) -> Result<Vec<u8>> {
+    let source: Box<dyn Read> = if path == "-" {
+        Box::new(std::io::stdin())
     } else {
-        input = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read restore bundle {path}"))?;
-    }
-    parse_restore_bundle_json(&input, config)
+        Box::new(std::fs::File::open(path).context("failed to open restore bundle")?)
+    };
+    read_bounded_bundle(source)
 }
 
-fn read_v2_recovery_bundle_json(path: &str) -> Result<V2RecoveryBundle> {
-    let mut input = String::new();
-    if path == "-" {
-        std::io::stdin()
-            .read_to_string(&mut input)
-            .context("failed to read restore bundle from stdin")?;
-    } else {
-        input = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read restore bundle {path}"))?;
+fn read_bounded_bundle(source: impl Read) -> Result<Vec<u8>> {
+    let maximum = rs3_repository::v2::MAX_RECOVERY_BUNDLE_BYTES;
+    let mut input = Vec::new();
+    source
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut input)
+        .context("failed to read restore bundle")?;
+    if input.len() > maximum {
+        bail!("restore bundle exceeds size limit");
     }
-    serde_json::from_str(&input).context("failed to parse v2 restore bundle JSON")
+    Ok(input)
 }
 
-fn parse_restore_bundle_json(input: &str, config: &RuntimeConfig) -> Result<V2RecoveryBundle> {
-    let mut bundle: V2RecoveryBundle =
-        serde_json::from_str(input).context("failed to parse v2 restore bundle JSON")?;
-    if let Some(repository_id) = bundle.repository_id.as_ref()
-        && repository_id != &config.repository_keys.repository_id
-    {
+fn read_v2_recovery_bundle(path: &str) -> Result<V2RecoveryBundle> {
+    V2RecoveryBundle::from_object_bytes(&read_bundle_bytes(path)?)
+        .context("failed to parse restore bundle CBOR")
+}
+
+fn parse_restore_bundle(input: &[u8], config: &RuntimeConfig) -> Result<V2RecoveryBundle> {
+    let bundle = V2RecoveryBundle::from_object_bytes(input)
+        .context("failed to parse restore bundle CBOR")?;
+    if bundle.repository_id.as_ref() != Some(&config.repository_keys.repository_id) {
         bail!("restore bundle repository ID does not match configured repository ID");
     }
-    if bundle.repository_id.is_none() {
-        bundle.repository_id = Some(config.repository_keys.repository_id.clone());
-    }
     Ok(bundle)
+}
+
+fn write_restore_bundle(path: &std::path::Path, bundle: &V2RecoveryBundle) -> Result<()> {
+    let bytes = bundle.to_object_bytes()?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .context("failed to create restore bundle; destination must not exist")?;
+    file.write_all(&bytes)
+        .context("failed to write restore bundle")?;
+    file.sync_all().context("failed to sync restore bundle")?;
+    Ok(())
+}
+
+fn attach_bundle_signature(
+    bundle: &mut V2RecoveryBundle,
+    signature_hex: &str,
+    public_key: &str,
+) -> Result<()> {
+    if signature_hex.len() != 128 {
+        bail!("recovery signature must contain 128 hexadecimal characters");
+    }
+    let signature = hex::decode(signature_hex).context("invalid recovery signature encoding")?;
+    rs3_crypto::verify_recovery_signature(
+        public_key,
+        &bundle.offline_signature_payload()?,
+        &signature,
+    )
+    .context("recovery signature verification failed")?;
+    bundle.offline_signature = Some(signature);
+    Ok(())
 }
 
 fn optional_backend_object_id(
@@ -1155,11 +1212,10 @@ fn print_keyring_inspect_report(
             println!("wrapping_key_id={}", report.wrapping_key_id);
             for key in &report.keys {
                 println!(
-                    "key id={} purpose={} status={} algorithm={}",
+                    "key id={} purpose={} status={}",
                     key.id.as_str(),
                     key_purpose_name(key.purpose),
-                    key_status_name(key.status),
-                    key.algorithm
+                    key_status_name(key.status)
                 );
             }
         }
@@ -1346,13 +1402,9 @@ fn key_descriptor_json(descriptor: &KeyDescriptor) -> serde_json::Value {
     serde_json::json!({
         "id": descriptor.id.as_str(),
         "purpose": key_purpose_name(descriptor.purpose),
-        "algorithm": descriptor.algorithm.as_str(),
         "status": key_status_name(descriptor.status),
         "created_at_ms": descriptor.created_at_ms,
-        "not_before_ms": descriptor.not_before_ms,
-        "not_after_ms": descriptor.not_after_ms,
         "public_key": descriptor.public_key.as_deref(),
-        "external_kms_uri": descriptor.external_kms_uri.as_deref(),
     })
 }
 
@@ -1638,9 +1690,9 @@ mod tests {
     use super::{
         DoctorProfile, ImportV2AnchorArgs, MaintenanceArgs, MaintenanceCommand,
         MaintenanceOutputFormat, PROVIDER_CONFORMANCE_SCHEMA, RecoveryReportFormat, backend_kind,
-        doctor_findings, is_path_safe_tracing_target, parse_admin_origin,
-        parse_restore_bundle_json, provider_conformance_target_fingerprint,
-        recovery_bundle_from_import_args, run_maintenance_command, runtime_config_profile,
+        doctor_findings, is_path_safe_tracing_target, parse_admin_origin, parse_restore_bundle,
+        provider_conformance_target_fingerprint, recovery_bundle_from_import_args,
+        run_maintenance_command, runtime_config_profile,
     };
     use rs3_server::{
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MaintenanceConfig,
@@ -1704,7 +1756,7 @@ mod tests {
                 repository_salt_hex:
                     "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
                 envelope_object_id: Some(
-                    BackendObjectId::new("keyrings/00000000000000000001-digest.json")
+                    BackendObjectId::new("keyrings/00000000000000000001-digest.cbor")
                         .unwrap_or_else(|error| panic!("{error}")),
                 ),
                 wrapping_key_id: "wrap-v1".to_owned(),
@@ -2305,45 +2357,113 @@ mod tests {
         assert!(enforce_serve_profile(&runtime_config(), DoctorProfile::Local, false).is_ok());
     }
 
+    fn sample_restore_bundle(repository_id: &str) -> rs3_repository::v2::V2RecoveryBundle {
+        let anchor = rs3_repository::v2::V2AnchorState {
+            sequence: rs3_types::Sequence::new(7),
+            commit_key: BackendObjectId::new(
+                "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            )
+            .expect("commit key"),
+            body_digest: [0x11; 32],
+            version_id: Some(rs3_types::BackendVersionId::new("version-a").expect("version")),
+            signing_key_id: rs3_types::KeyId::new("checkpoint-v1").expect("key"),
+            format_ref: rs3_repository::v2::V2FormatRef {
+                generation: 1,
+                digest: "22".repeat(32),
+                object_id: BackendObjectId::new("format/00000000000000000001/abc")
+                    .expect("format key"),
+                version_id: Some(
+                    rs3_types::BackendVersionId::new("format-version-a").expect("version"),
+                ),
+            },
+        };
+        let mut bundle =
+            rs3_repository::v2::V2RecoveryBundle::from_anchor(anchor, rs3_types::Sequence::new(7));
+        bundle.repository_id = Some(RepositoryId::new(repository_id).expect("repo ID"));
+        bundle.repository_salt_digest = Some([0x33; 32]);
+        bundle.exported_at_ms = 42;
+        bundle
+    }
+
+    #[test]
+    fn portable_bundle_files_preserve_signatures_and_refuse_overwrite() {
+        let mut bundle = sample_restore_bundle("tenant-repository");
+        let signer = rs3_crypto::KeyRing::generate_random().expect("signer");
+        let public_key = signer
+            .descriptors()
+            .into_iter()
+            .find(|key| key.purpose == rs3_types::KeyPurpose::CheckpointSigning)
+            .and_then(|key| key.public_key)
+            .expect("public key");
+        let signature = signer
+            .sign_checkpoint_payload(&bundle.offline_signature_payload().expect("payload"))
+            .expect("signature")
+            .signature;
+        super::attach_bundle_signature(&mut bundle, &hex::encode(&signature), &public_key)
+            .expect("attach");
+        let before = bundle.clone();
+        assert!(
+            super::attach_bundle_signature(&mut bundle, &"00".repeat(64), &public_key).is_err()
+        );
+        assert_eq!(
+            bundle, before,
+            "failed attachment preserves existing signature"
+        );
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rs3-signed-bundle-{}-{unique}.cbor",
+            std::process::id()
+        ));
+        super::write_restore_bundle(&path, &bundle).expect("write");
+        let read = super::read_v2_recovery_bundle(path.to_str().expect("path")).expect("read");
+        assert_eq!(read, bundle);
+        read.verify_offline_signature(&public_key).expect("verify");
+        assert!(super::write_restore_bundle(&path, &bundle).is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("bytes"),
+            bundle.to_object_bytes().expect("encode")
+        );
+        std::fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn bundle_input_is_bounded_and_import_requires_repository_identity() {
+        let maximum = rs3_repository::v2::MAX_RECOVERY_BUNDLE_BYTES;
+        assert!(super::read_bounded_bundle(std::io::repeat(0)).is_err());
+        assert_eq!(
+            super::read_bounded_bundle(&vec![0; maximum][..])
+                .expect("at bound")
+                .len(),
+            maximum
+        );
+        let mut bundle = sample_restore_bundle("tenant-repository");
+        bundle.repository_id = None;
+        assert!(
+            parse_restore_bundle(&bundle.to_object_bytes().expect("bytes"), &runtime_config())
+                .is_err()
+        );
+        assert!(parse_restore_bundle(b"{}", &runtime_config()).is_err());
+    }
+
     #[test]
     fn import_bundle_parser_accepts_export_restore_bundle_shape() {
         let config = runtime_config();
-        let input = serde_json::json!({
-            "schema": "rs3.restore-bundle.v2-preview.v1",
-            "repository": {
-                "id": "tenant-repository",
-                "salt_digest": "33".repeat(32)
-            },
-            "anchor": {
-                "sequence": 7,
-                "commit_key": "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "body_digest": "11".repeat(32),
-                "version_id": "version-a",
-                "signing_key_id": "checkpoint-v1",
-                "format": {
-                    "generation": 1,
-                    "digest": "22".repeat(32),
-                    "object_id": "format/00000000000000000001/abc",
-                    "version_id": "format-version-a"
-                }
-            },
-            "weak_subjectivity_floor_sequence": 7,
-            "format_digest": "22".repeat(32),
-            "format_generation": 1,
-            "exported_at_ms": 42,
-            "offline_signature": null
-        })
-        .to_string();
+        let input = sample_restore_bundle("tenant-repository")
+            .to_object_bytes()
+            .expect("bundle bytes");
 
         let bundle =
-            parse_restore_bundle_json(&input, &config).unwrap_or_else(|error| panic!("{error}"));
+            parse_restore_bundle(&input, &config).unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(bundle.anchor.sequence.get(), 7);
         assert_eq!(
             bundle.repository_id.as_ref().map(RepositoryId::as_str),
             Some("tenant-repository")
         );
-        assert_eq!(bundle.format_generation, Some(1));
+        assert_eq!(bundle.anchor.format_ref.generation, 1);
         assert_eq!(
             bundle.anchor.version_id.as_ref().map(|id| id.as_str()),
             Some("version-a")
@@ -2354,31 +2474,11 @@ mod tests {
     #[test]
     fn import_bundle_parser_rejects_wrong_repository() {
         let config = runtime_config();
-        let input = serde_json::json!({
-            "schema": "rs3.restore-bundle.v2-preview.v1",
-            "repository": {
-                "id": "other-repository"
-            },
-            "anchor": {
-                "sequence": 7,
-                "commit_key": "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "body_digest": "11".repeat(32),
-                "signing_key_id": "checkpoint-v1",
-                "format": {
-                    "generation": 1,
-                    "digest": "22".repeat(32),
-                    "object_id": "format/00000000000000000001/abc"
-                }
-            },
-            "weak_subjectivity_floor_sequence": 7,
-            "format_digest": "22".repeat(32),
-            "format_generation": 1,
-            "exported_at_ms": 42,
-            "offline_signature": null
-        })
-        .to_string();
+        let input = sample_restore_bundle("other-repository")
+            .to_object_bytes()
+            .expect("bundle bytes");
 
-        let error = match parse_restore_bundle_json(&input, &config) {
+        let error = match parse_restore_bundle(&input, &config) {
             Ok(_) => panic!("wrong-repository restore bundle should be rejected"),
             Err(error) => error,
         };
@@ -2389,35 +2489,15 @@ mod tests {
     #[test]
     fn import_v2_anchor_reads_bundle_file_and_preserves_operator_options() {
         let config = runtime_config();
-        let input = serde_json::json!({
-            "schema": "rs3.restore-bundle.v2-preview.v1",
-            "repository": {
-                "id": "tenant-repository"
-            },
-            "anchor": {
-                "sequence": 7,
-                "commit_key": "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "body_digest": "11".repeat(32),
-                "signing_key_id": "checkpoint-v1",
-                "format": {
-                    "generation": 1,
-                    "digest": "22".repeat(32),
-                    "object_id": "format/00000000000000000001/abc"
-                }
-            },
-            "weak_subjectivity_floor_sequence": 7,
-            "format_digest": "22".repeat(32),
-            "format_generation": 1,
-            "exported_at_ms": 42,
-            "offline_signature": null
-        })
-        .to_string();
+        let input = sample_restore_bundle("tenant-repository")
+            .to_object_bytes()
+            .expect("bundle bytes");
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_else(|error| panic!("{error}"))
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "rs3-import-v2-anchor-test-{}-{unique}.json",
+            "rs3-import-v2-anchor-test-{}-{unique}.cbor",
             std::process::id()
         ));
         std::fs::write(&path, input).unwrap_or_else(|error| panic!("{error}"));

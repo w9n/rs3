@@ -387,6 +387,49 @@ EOF is required. Bootstrap and recovery inventories use provider-private pages
 under fixed total page and raw-member ceilings; a partial or over-budget
 inventory is never interpreted as empty.
 
+Both encrypted envelopes use one version-3 canonical CBOR map. Integer keys
+0 through 8 encode, in order: version, purpose, generation, repository ID,
+public salt, wrapping-key ID, nonce, ciphertext, and authentication tag.
+Purpose is 0 for keyrings and 1 for format roots. AEAD associated data is the
+seven-field map containing keys 0 through 6. The nonce is 12 random bytes;
+the detached AES-256-GCM-SIV tag is 16 bytes. Each purpose derives a separate
+AEAD key from the wrapping key. SHA-256 covers the exact complete canonical
+envelope bytes, including the public fields. Keyring objects end in `.cbor`.
+
+Keyring plaintext is `[3, keys]`, with keys sorted by purpose and key ID. Each
+key is `[id, purpose, status, created_at_ms, public_key_or_null, secret_bytes]`.
+Purpose tags are namespace 0, content 1, metadata 2, and signing 3. Status tags
+are primary 0, enabled 1, disabled 2, and retired 3. Signing public keys are raw
+32-byte Ed25519 values. Secret serialization and decrypted plaintext use
+zeroizing buffers. Limits are 4,096 keys, 255 bytes per key ID, and 4,096 bytes
+per secret. Algorithm, validity-window, and external-KMS descriptor fields are
+absent.
+
+The encrypted format-root plaintext is a six-element canonical array:
+`[format_version, repository_id, keyring_ref, signing_key_id, provider_profile, retention]`.
+An envelope reference is `[generation, digest_bytes_32, object_id, version_or_null]`.
+Provider profiles are development 0, atomic-create 1, and retained-version
+Object Lock 2. Retention is null or `[mode, retain_days]`, with modes none 0,
+governance 1, and compliance 2. Days are an unsigned 32-bit duration. The unused
+snapshot-cadence fields have been removed. The outer commit and format-root
+version are currently 2, separate from envelope and recovery-bundle version 3.
+
+Portable recovery bundles use the version-3 array
+`[3, repository_id_or_null, salt_digest_or_null, anchor, floor, exported_at_ms, signature_or_null]`.
+The anchor is `[sequence, commit_key, body_digest_bytes_32, version_or_null, signing_key_id, format_ref]`.
+The format reference occurs once. The optional signature is exactly 64 bytes.
+The signature payload is the canonical two-element array containing
+`rs3:v3-recovery-bundle-offline-signature:v1` and the six-element unsigned
+bundle, omitting the signature slot. Signing requires a repository ID. Thus
+the signature binds the salt digest, recovery floor and export time as well
+as every accepted-anchor field.
+
+Bundle readers cap input at 16 KiB. Envelope and bundle text fields are capped
+at 1,024 bytes, with the narrower key-ID limit above; envelope salts are 32 to
+4,096 bytes. All these codecs reject indefinite lengths, nonminimal integers,
+unexpected fields or order, and trailing bytes. JSON remains an operator
+report format; retired JSON envelopes and recovery artifacts are not accepted.
+
 The runtime keeps one accepted compact state plus a hard-bounded
 4,096-mutation overlay. Unaccepted writes never mutate accepted state. Publication
 freezes a prefix and permits bounded successor staging within the same total

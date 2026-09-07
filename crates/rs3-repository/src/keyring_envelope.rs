@@ -3,28 +3,34 @@
 use crate::error::{RepositoryError, Result};
 use crate::service::require_version_for_retained_write;
 use bytes::Bytes;
-use rs3_crypto::{KeyringEnvelope, MAX_KEYRING_ENVELOPE_OBJECT_BYTES};
+use rs3_crypto::{MAX_KEYRING_ENVELOPE_OBJECT_BYTES, RepositoryEnvelope};
 use rs3_index::KeyringEnvelopeReference;
 use rs3_storage::{BlobStore, PutOptions, StorageError, read_bounded_full_at};
 use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionPolicy};
 
 pub(crate) const KEYRING_ENVELOPE_OBJECT_PREFIX: &str = "keyrings/";
 /// Content type for serialized keyring envelope objects.
-pub const KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.keyring-envelope+json";
+pub const KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE: &str = "application/vnd.rs3.keyring-envelope+cbor";
 
 /// Stores an encrypted keyring envelope object and returns its durable reference.
 pub async fn store_keyring_envelope<S>(
     store: &S,
-    envelope: &KeyringEnvelope,
+    envelope: &RepositoryEnvelope,
     retention: Option<RetentionPolicy>,
     legal_hold: Option<LegalHoldStatus>,
 ) -> Result<KeyringEnvelopeReference>
 where
     S: BlobStore,
 {
-    let digest = envelope.digest()?;
-    let object_id = keyring_envelope_object_id(envelope.generation, &digest)?;
+    if envelope.purpose != rs3_crypto::EnvelopePurpose::Keyring {
+        return Err(rs3_crypto::CryptoError::InvalidRepositoryEnvelope {
+            reason: "keyring storage requires keyring purpose".to_owned(),
+        }
+        .into());
+    }
     let body = Bytes::from(envelope.to_object_bytes()?);
+    let digest = hex::encode(rs3_crypto::Sha256Hasher::digest(&body));
+    let object_id = keyring_envelope_object_id(envelope.generation, &digest)?;
     let put = store
         .put(
             &object_id,
@@ -75,7 +81,7 @@ where
 /// Returns the canonical preview object identity for an encrypted envelope.
 pub fn keyring_envelope_object_id(generation: u64, digest: &str) -> Result<BackendObjectId> {
     BackendObjectId::new(format!(
-        "{KEYRING_ENVELOPE_OBJECT_PREFIX}{generation:020}-{digest}.json"
+        "{KEYRING_ENVELOPE_OBJECT_PREFIX}{generation:020}-{digest}.cbor"
     ))
     .map_err(Into::into)
 }
@@ -90,7 +96,26 @@ mod tests {
     use rs3_storage::{BlobStore, MemoryBlobStore, PutOptions, StorageError};
     use rs3_types::RepositoryId;
 
-    fn keyring_envelope() -> rs3_crypto::KeyringEnvelope {
+    #[tokio::test]
+    async fn keyring_storage_rejects_format_purpose_before_writing() {
+        let store = MemoryBlobStore::new();
+        let mut envelope = keyring_envelope();
+        envelope.purpose = rs3_crypto::EnvelopePurpose::Format;
+        assert!(
+            store_keyring_envelope(&store, &envelope, None, None)
+                .await
+                .is_err()
+        );
+        let object_id =
+            keyring_envelope_object_id(envelope.generation, &envelope.digest().expect("digest"))
+                .expect("object key");
+        assert!(matches!(
+            store.head(&object_id).await,
+            Err(StorageError::NotFound(_))
+        ));
+    }
+
+    fn keyring_envelope() -> rs3_crypto::RepositoryEnvelope {
         let keyring = KeyRing::generate_random().unwrap_or_else(|error| panic!("{error}"));
         let repository_id =
             RepositoryId::new("keyring-conflict-test").unwrap_or_else(|error| panic!("{error}"));

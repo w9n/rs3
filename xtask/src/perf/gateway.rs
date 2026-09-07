@@ -23,7 +23,7 @@ use tokio::net::TcpStream;
 const GATEWAY_PUBLIC_BUCKET: &str = "client-bucket";
 const GATEWAY_ACCESS_KEY_ID: &str = "rs3-fixture-access-key";
 const GATEWAY_SECRET_ACCESS_KEY: &str = "rs3-fixture-secret-key";
-const GATEWAY_KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.json";
+const GATEWAY_KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.cbor";
 const GATEWAY_KEYRING_WRAPPING_KEY_HEX: &str =
     "3333333333333333333333333333333333333333333333333333333333333333";
 const GATEWAY_KEYRING_WRAPPING_KEY_ID: &str = "wrap-integration";

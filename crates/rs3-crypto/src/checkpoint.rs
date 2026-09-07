@@ -9,7 +9,7 @@ use rs3_types::{KeyId, KeyPurpose};
 use zeroize::Zeroizing;
 
 const CHECKPOINT_PUBLIC_KEY_HEX_LEN: usize = 64;
-const CHECKPOINT_PUBLIC_KEY_PREFIX: &str = "ed25519:";
+pub(crate) const CHECKPOINT_PUBLIC_KEY_PREFIX: &str = "ed25519:";
 
 /// Checkpoint signature and the key that produced it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,7 +107,7 @@ fn recovery_public_key_bytes(public_key: &str) -> Result<Vec<u8>, CryptoError> {
         .map_err(|_| CryptoError::RecoveryPublicKeyMalformed)
 }
 
-fn prefixed_ed25519_public_key_bytes(public_key: &str) -> Result<Vec<u8>, ()> {
+pub(crate) fn prefixed_ed25519_public_key_bytes(public_key: &str) -> Result<Vec<u8>, ()> {
     let Some(hex_key) = public_key.strip_prefix(CHECKPOINT_PUBLIC_KEY_PREFIX) else {
         return Err(());
     };
@@ -138,43 +138,26 @@ mod tests {
     }
 
     fn namespace_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMaterial {
-        key_material(
-            value,
-            KeyPurpose::Namespace,
-            status,
-            "hmac-sha256",
-            secret_byte,
-        )
+        key_material(value, KeyPurpose::Namespace, status, secret_byte)
     }
 
     fn checkpoint_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMaterial {
-        key_material(
-            value,
-            KeyPurpose::CheckpointSigning,
-            status,
-            "ed25519",
-            secret_byte,
-        )
+        key_material(value, KeyPurpose::CheckpointSigning, status, secret_byte)
     }
 
     fn key_material(
         value: &str,
         purpose: KeyPurpose,
         status: KeyStatus,
-        algorithm: &str,
         secret_byte: u8,
     ) -> KeyMaterial {
         KeyMaterial::new(
             KeyDescriptor {
                 id: key_id(value),
                 purpose,
-                algorithm: algorithm.to_string(),
                 status,
                 created_at_ms: 0,
-                not_before_ms: None,
-                not_after_ms: None,
                 public_key: None,
-                external_kms_uri: None,
             },
             secret(secret_byte),
         )

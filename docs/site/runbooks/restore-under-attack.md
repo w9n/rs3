@@ -68,20 +68,32 @@ From a healthy cluster or regular operations job, export a trusted bundle and
 store it outside the object-store account.
 
 ```sh
-cargo run -p rs3-server --features s3,k8s -- export-restore-bundle --format json > rs3-restore-bundle.json
+cargo run -p rs3-server --features s3,k8s -- export-restore-bundle --output rs3-restore-bundle-unsigned.cbor --format json > rs3-restore-report.json
 ```
 
-Machine-readable commands reserve stdout for the report or bundle payload and
-write logs to stderr. Do not redirect stderr into preserved JSON artifacts.
+The CBOR artifact is written to `--output`, which must not already exist.
+JSON stdout is an inspection report, not an importable bundle. Logs go to stderr.
 
 Export a new bundle after each successful backup window or at least before
 declaring a repository trial ready for incident restore. The bundle contains
 public but integrity-sensitive restore metadata, not wrapping-key material.
 Store it outside the object-store account and outside the cluster whose Lease it
 may need to recreate. Export prints `offline_signature_payload_hex`; sign those
-canonical bytes with an offline Ed25519 recovery key and store the resulting hex
-signature in `offline_signature` before production import. Verify the preserved
-bundle before anchor import:
+canonical bytes with an offline Ed25519 recovery key. Attach and verify the resulting signature before
+production import:
+
+```sh
+cargo run -p rs3-server -- attach-bundle-signature \
+  --bundle-file rs3-restore-bundle-unsigned.cbor \
+  --signature-hex <128-hex-character-signature> \
+  --public-key ed25519:<recovery-public-key-hex> \
+  --output rs3-restore-bundle.cbor
+```
+
+This command runs offline and verifies the signature before writing the signed
+CBOR artifact. The signature binds the repository, salt digest, complete anchor,
+recovery floor, and export time. Keep the signer private key outside the gateway.
+
 
 ```sh
 RS3_BACKEND_ENDPOINT=s3 \
@@ -91,7 +103,7 @@ RS3_REPOSITORY_ID=<repository-id> \
 RS3_REPOSITORY_SALT_HEX=<repository-salt-hex> \
 RS3_RECOVERY_PUBLIC_KEY=ed25519:<recovery-public-key-hex> \
 cargo run -p rs3-server --features s3,k8s -- verify-bundle \
-  --bundle-file rs3-restore-bundle.json \
+  --bundle-file rs3-restore-bundle.cbor \
   --min-sequence <external-floor-sequence> \
   --wrapping-key-hex-file <wrapping-key-hex-file>
 ```
@@ -102,7 +114,7 @@ and retention settings.
 
 ```sh
 cargo run -p rs3-server --features s3,k8s -- import-v2-anchor \
-  --bundle-file rs3-restore-bundle.json \
+  --bundle-file rs3-restore-bundle.cbor \
   --min-sequence <external-floor-sequence>
 ```
 
@@ -159,7 +171,7 @@ Replace the namespace, bundle path and historical floor before running it:
   export RS3_ALLOW_REPOSITORY_INIT=false
 
   cargo run -p rs3-server --features s3,k8s -- import-v2-anchor \
-    --bundle-file '<pre-incident-bundle.json>' \
+    --bundle-file '<pre-incident-bundle.cbor>' \
     --min-sequence '<reviewed-historical-floor>' \
     --force-rollback
 

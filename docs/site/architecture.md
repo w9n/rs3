@@ -194,6 +194,12 @@ keyring discovery admits at most two raw members. A provider that cannot page
 within the requested bound, returns an oversized page, or exceeds the
 applicable budget causes the control path to fail closed.
 
+Format roots and keyrings share a canonical CBOR envelope implemented in
+`rs3-crypto`, using bounded CBOR primitives from `rs3-types`. An authenticated
+purpose and separate derived AEAD key distinguish the two uses. Portable
+recovery artifacts use a bounded canonical CBOR schema in `rs3-repository`;
+the CLI keeps JSON inspection reports separate from importable artifact bytes.
+
 Automatic maintenance starts requesting packed-run compaction at 256 active
 runs. With no configured guard it degrades and retries at each additional
 64-run boundary, then pauses new mutations at 896. The immutable format ceiling

@@ -1,5 +1,7 @@
 //! Shared strongly typed identifiers and policy types.
 
+pub mod cbor;
+
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::fmt;
@@ -349,22 +351,13 @@ pub struct KeyDescriptor {
     pub id: KeyId,
     /// Cryptographic purpose of the key.
     pub purpose: KeyPurpose,
-    /// Algorithm or provider-specific suite identifier.
-    pub algorithm: String,
     /// Key lifecycle state.
     pub status: KeyStatus,
     /// Creation timestamp in milliseconds since the Unix epoch.
     pub created_at_ms: i64,
-    /// Optional lower validity bound in milliseconds since the Unix epoch.
-    pub not_before_ms: Option<i64>,
-    /// Optional upper validity bound in milliseconds since the Unix epoch.
-    pub not_after_ms: Option<i64>,
     /// Optional hex-encoded public verification key for asymmetric keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
-    /// Optional external KMS key URI when material is provider-managed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_kms_uri: Option<String>,
 }
 
 /// Monotonic checkpoint sequence.

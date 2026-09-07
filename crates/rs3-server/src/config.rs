@@ -2497,7 +2497,7 @@ mod tests {
             .with(super::REPOSITORY_SALT_HEX_ENV, REPOSITORY_SALT_HEX)
             .with(
                 super::KEYRING_ENVELOPE_OBJECT_ID_ENV,
-                "keyrings/bootstrap-envelope.json",
+                "keyrings/bootstrap-envelope.cbor",
             )
             .with(super::KEYRING_WRAPPING_KEY_ID_ENV, "wrap-custom")
             .with(super::REPOSITORY_RETENTION_MODE_ENV, "compliance")
@@ -2529,7 +2529,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{error}")),
                 repository_salt_hex: REPOSITORY_SALT_HEX.to_owned(),
                 envelope_object_id: Some(
-                    rs3_types::BackendObjectId::new("keyrings/bootstrap-envelope.json")
+                    rs3_types::BackendObjectId::new("keyrings/bootstrap-envelope.cbor")
                         .unwrap_or_else(|error| panic!("{error}")),
                 ),
                 wrapping_key_id: "wrap-custom".to_owned(),
@@ -3254,7 +3254,7 @@ mod tests {
         let source = minimal_source()
             .with(
                 super::KEYRING_ENVELOPE_OBJECT_ID_ENV,
-                "keyrings/bootstrap-envelope.json",
+                "keyrings/bootstrap-envelope.cbor",
             )
             .with(super::KEYRING_WRAPPING_KEY_ID_ENV, "wrap-custom");
 
@@ -3266,7 +3266,7 @@ mod tests {
         };
         assert_eq!(
             keys.envelope_object_id.as_ref().map(|id| id.as_str()),
-            Some("keyrings/bootstrap-envelope.json")
+            Some("keyrings/bootstrap-envelope.cbor")
         );
         assert_eq!(keys.wrapping_key_id, "wrap-custom");
     }

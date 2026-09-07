@@ -254,3 +254,9 @@ impl From<TypeError> for V2FormatError {
         Self::TypeValidation
     }
 }
+
+impl From<rs3_types::cbor::CborError> for V2FormatError {
+    fn from(_: rs3_types::cbor::CborError) -> Self {
+        Self::MalformedCbor
+    }
+}

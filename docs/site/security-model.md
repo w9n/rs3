@@ -208,6 +208,16 @@ Losing that cluster can lose the keys and accepted-state authority. Portable
 signed bundle import remains an explicit recovery operation and does not allow
 a completed bootstrap journal to recreate an absent anchor.
 
+Portable bundle signatures cover every unsigned canonical CBOR field, including
+the repository salt digest, complete anchor and format reference, recovery floor,
+and export time. Import requires the configured repository identity and retains
+the independent signature and operator-floor checks. JSON inspection reports
+are not accepted as recovery artifacts. The encoding changes no leakage:
+repository identity, opaque object references, sequences and export cadence are
+public; paths and key material remain absent. Format and keyring envelope
+purposes are authenticated under separate derived keys, and plaintext is
+zeroized after use.
+
 Provider evidence is projected in the same Secret revision as journal state.
 Reserving a new qualification attempt removes the prior projection. The chart's
 read-only startup wait requires matching completed state and current evidence;

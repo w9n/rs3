@@ -1,17 +1,26 @@
-//! Minimal canonical CBOR support for the fixed v2 header schema.
+//! Bounded canonical CBOR primitives for fixed repository wire schemas.
+//!
+//! Schema decoders enforce field order, cardinality and purpose-specific bounds.
+//! The reader rejects nonminimal integers and indefinite-length values.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum CborError {
+/// Malformed, noncanonical or out-of-bounds CBOR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CborError {
+    /// Input does not match the canonical bounded schema.
+    #[error("invalid canonical CBOR")]
     Invalid,
 }
 
-pub(super) type CborResult<T> = std::result::Result<T, CborError>;
+/// Result of canonical CBOR decoding.
+pub type CborResult<T> = std::result::Result<T, CborError>;
 
-pub(super) fn write_u64(out: &mut Vec<u8>, value: u64) {
+/// Writes a minimally encoded unsigned integer.
+pub fn write_u64(out: &mut Vec<u8>, value: u64) {
     write_type_len(out, 0, value);
 }
 
-pub(super) fn write_i64(out: &mut Vec<u8>, value: i64) {
+/// Writes a minimally encoded signed integer.
+pub fn write_i64(out: &mut Vec<u8>, value: i64) {
     if value >= 0 {
         write_type_len(out, 0, value as u64);
     } else {
@@ -19,25 +28,30 @@ pub(super) fn write_i64(out: &mut Vec<u8>, value: i64) {
     }
 }
 
-pub(super) fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+/// Writes one definite-length byte string.
+pub fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     write_type_len(out, 2, bytes.len() as u64);
     out.extend_from_slice(bytes);
 }
 
-pub(super) fn write_text(out: &mut Vec<u8>, text: &str) {
+/// Writes one definite-length UTF-8 string.
+pub fn write_text(out: &mut Vec<u8>, text: &str) {
     write_type_len(out, 3, text.len() as u64);
     out.extend_from_slice(text.as_bytes());
 }
 
-pub(super) fn write_array_len(out: &mut Vec<u8>, len: usize) {
+/// Writes a definite-length array prefix.
+pub fn write_array_len(out: &mut Vec<u8>, len: usize) {
     write_type_len(out, 4, len as u64);
 }
 
-pub(super) fn write_map_len(out: &mut Vec<u8>, len: usize) {
+/// Writes a definite-length map prefix; callers emit canonical key order.
+pub fn write_map_len(out: &mut Vec<u8>, len: usize) {
     write_type_len(out, 5, len as u64);
 }
 
-pub(super) fn write_null(out: &mut Vec<u8>) {
+/// Writes the canonical null value.
+pub fn write_null(out: &mut Vec<u8>) {
     out.push(0xf6);
 }
 
@@ -64,21 +78,25 @@ fn write_type_len(out: &mut Vec<u8>, major: u8, value: u64) {
     }
 }
 
-pub(super) struct Reader<'a> {
+/// Cursor over borrowed CBOR input, with explicit per-field bounds.
+pub struct Reader<'a> {
     input: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    pub(super) const fn new(input: &'a [u8]) -> Self {
+    /// Creates a cursor without allocating.
+    pub const fn new(input: &'a [u8]) -> Self {
         Self { input, pos: 0 }
     }
 
-    pub(super) fn is_finished(&self) -> bool {
+    /// Returns whether the cursor consumed the exact input.
+    pub fn is_finished(&self) -> bool {
         self.pos == self.input.len()
     }
 
-    pub(super) fn read_u64(&mut self) -> CborResult<u64> {
+    /// Reads a canonical unsigned integer.
+    pub fn read_u64(&mut self) -> CborResult<u64> {
         let (major, additional) = self.read_initial()?;
         if major != 0 {
             return Err(CborError::Invalid);
@@ -86,7 +104,8 @@ impl<'a> Reader<'a> {
         self.read_len(additional)
     }
 
-    pub(super) fn read_i64(&mut self) -> CborResult<i64> {
+    /// Reads a canonical signed integer.
+    pub fn read_i64(&mut self) -> CborResult<i64> {
         let (major, additional) = self.read_initial()?;
         let value = self.read_len(additional)?;
         match major {
@@ -99,43 +118,51 @@ impl<'a> Reader<'a> {
         }
     }
 
-    pub(super) fn read_bytes(&mut self) -> CborResult<Vec<u8>> {
+    /// Reads a byte string bounded by the remaining input.
+    pub fn read_bytes(&mut self) -> CborResult<Vec<u8>> {
         self.read_bytes_bounded(usize::MAX)
     }
 
-    pub(super) fn read_bytes_bounded(&mut self, max_len: usize) -> CborResult<Vec<u8>> {
+    /// Checks the declared byte length against the bound before allocating.
+    pub fn read_bytes_bounded(&mut self, max_len: usize) -> CborResult<Vec<u8>> {
         let len = self.read_len_for_major_bounded(2, max_len)?;
         let bytes = self.take(len)?;
         Ok(bytes.to_vec())
     }
 
-    pub(super) fn read_text(&mut self) -> CborResult<String> {
+    /// Reads UTF-8 text bounded by the remaining input.
+    pub fn read_text(&mut self) -> CborResult<String> {
         self.read_text_bounded(usize::MAX)
     }
 
-    pub(super) fn read_text_bounded(&mut self, max_len: usize) -> CborResult<String> {
+    /// Checks the declared text length and UTF-8 before allocating.
+    pub fn read_text_bounded(&mut self, max_len: usize) -> CborResult<String> {
         let len = self.read_len_for_major_bounded(3, max_len)?;
         let bytes = self.take(len)?;
         let text = std::str::from_utf8(bytes).map_err(|_| CborError::Invalid)?;
         Ok(text.to_owned())
     }
 
-    pub(super) fn read_array_len(&mut self) -> CborResult<usize> {
+    /// Reads an array length; the schema must bound cardinality before allocation.
+    pub fn read_array_len(&mut self) -> CborResult<usize> {
         self.read_len_for_major(4)
     }
 
-    pub(super) fn read_map_len(&mut self) -> CborResult<usize> {
+    /// Reads a map length; the schema must bound cardinality before allocation.
+    pub fn read_map_len(&mut self) -> CborResult<usize> {
         self.read_len_for_major(5)
     }
 
-    pub(super) fn read_null(&mut self) -> CborResult<()> {
+    /// Reads exactly one canonical null.
+    pub fn read_null(&mut self) -> CborResult<()> {
         match self.read_byte()? {
             0xf6 => Ok(()),
             _ => Err(CborError::Invalid),
         }
     }
 
-    pub(super) fn next_is_null(&self) -> bool {
+    /// Checks whether the next byte is a canonical null.
+    pub fn next_is_null(&self) -> bool {
         self.input.get(self.pos).copied() == Some(0xf6)
     }
 
@@ -222,7 +249,8 @@ impl<'a> Reader<'a> {
 }
 
 #[cfg(feature = "fuzzing")]
-pub(super) fn fuzz_decode_one(input: &[u8]) -> CborResult<()> {
+/// Exercises a single canonical value with fixed depth and item bounds.
+pub fn fuzz_decode_one(input: &[u8]) -> CborResult<()> {
     const MAX_DEPTH: usize = 16;
 
     let mut reader = Reader::new(input);
@@ -291,7 +319,7 @@ fn fuzz_read_value(reader: &mut Reader<'_>, depth: usize, max_depth: usize) -> C
 
 #[cfg(test)]
 mod tests {
-    use crate::v2::cbor::{CborError, Reader};
+    use crate::cbor::{CborError, Reader};
 
     #[test]
     fn bounded_bytes_accept_exact_limit() {

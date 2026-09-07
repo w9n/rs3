@@ -10,7 +10,7 @@ description = "Trusted repository workflow for rs3"
 
 [features]
 default = []
-fuzzing = []
+fuzzing = ["rs3-types/fuzzing"]
 
 [dependencies]
 async-trait.workspace = true

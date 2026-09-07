@@ -1,191 +1,218 @@
-//! Encrypted repository keyring envelopes.
-//!
-//! The envelope lets operators rotate a wrapping-key source, such as a
-//! KMS/HSM/Vault-derived key or other high-entropy key, without rewriting
-//! payload objects. The repository stores only encrypted key material; the
-//! wrapping-key source stays outside the object store.
+//! Purpose-bound canonical CBOR envelopes for repository metadata and keys.
 
-use crate::fingerprint::derive_public_fingerprint;
 use crate::keyring::{KeyMaterial, KeyRing, RepositoryKeyContext};
 use crate::primitives::derive_hmac;
-use crate::{CryptoError, SecretBytes};
+use crate::{CryptoError, SecretBytes, Sha256Hasher};
 use aes_gcm_siv::aead::{AeadInPlace, KeyInit};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce, Tag};
-use rs3_types::{KeyDescriptor, RepositoryId};
-use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
+use rs3_types::cbor::{self, Reader};
+use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, RepositoryId};
+use zeroize::Zeroizing;
 
-/// Current keyring-envelope format version.
-pub const KEYRING_ENVELOPE_VERSION: u16 = 1;
-
-/// Maximum encoded keyring-envelope object accepted by readers and writers.
+/// Current canonical envelope and keyring plaintext version.
+pub const REPOSITORY_ENVELOPE_VERSION: u16 = 3;
+/// Maximum complete encrypted keyring envelope bytes.
 pub const MAX_KEYRING_ENVELOPE_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
-
-const ENVELOPE_NONCE_LEN: usize = 12;
-const ENVELOPE_TAG_LEN: usize = 16;
-const ENVELOPE_DIGEST_DOMAIN: &[u8] = b"rs3:keyring-envelope-digest:v1";
-const ENVELOPE_OBJECT_DOMAIN: &[u8] = b"rs3:keyring-envelope-object:v1\n";
-const ENVELOPE_PLAINTEXT_DOMAIN: &[u8] = b"rs3:keyring-envelope-plaintext:v1\n";
-const FORMAT_ENVELOPE_DIGEST_DOMAIN: &[u8] = b"rs3:format-envelope-digest:v1";
-const FORMAT_ENVELOPE_OBJECT_DOMAIN: &[u8] = b"rs3:format-envelope-object:v1\n";
-
-/// Current format-envelope version.
-pub const FORMAT_ENVELOPE_VERSION: u16 = 1;
-
-/// Maximum encoded format-envelope object accepted by readers and writers.
+/// Maximum complete encrypted format envelope bytes.
 pub const MAX_FORMAT_ENVELOPE_OBJECT_BYTES: u64 = 1024 * 1024;
+const NONCE_LEN: usize = 12;
+const TAG_LEN: usize = 16;
+const MAX_PUBLIC_TEXT: usize = 1024;
+const MAX_SALT: usize = 4096;
+const MAX_KEYS: usize = 4096;
+const MAX_SECRET: usize = 4096;
 
-/// Encrypted repository keyring stored as public repository metadata.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeyringEnvelope {
-    /// Envelope format version.
-    pub version: u16,
-    /// Monotonic envelope generation assigned by the operator workflow.
-    pub generation: u64,
-    /// Repository ID this envelope is bound to.
-    pub repository_id: RepositoryId,
-    /// Public repository salt this envelope is bound to.
-    pub repository_salt: Vec<u8>,
-    /// Operator-visible wrapping key identifier.
-    pub wrapping_key_id: String,
-    /// Random AEAD nonce.
-    pub nonce: Vec<u8>,
-    /// Encrypted keyring plaintext.
-    pub ciphertext: Vec<u8>,
-    /// AEAD authentication tag.
-    pub tag: Vec<u8>,
+/// Authenticated purpose, selecting an independent AEAD key and object limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvelopePurpose {
+    /// Encrypted repository key material.
+    Keyring,
+    /// Encrypted repository format root.
+    Format,
 }
 
-/// Encrypted v2 format-root metadata stored in the repository.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FormatEnvelope {
-    /// Envelope format version.
+impl EnvelopePurpose {
+    const fn tag(self) -> u64 {
+        match self {
+            Self::Keyring => 0,
+            Self::Format => 1,
+        }
+    }
+    const fn maximum(self) -> u64 {
+        match self {
+            Self::Keyring => MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
+            Self::Format => MAX_FORMAT_ENVELOPE_OBJECT_BYTES,
+        }
+    }
+    const fn key_domain(self) -> &'static [u8] {
+        match self {
+            Self::Keyring => b"rs3:keyring-envelope-aead-key:v1",
+            Self::Format => b"rs3:format-envelope-aead-key:v1",
+        }
+    }
+}
+
+/// One purpose-bound encrypted envelope, encoded as a fixed canonical CBOR map.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryEnvelope {
+    /// Wire version, checked before cryptographic use.
     pub version: u16,
-    /// Monotonic format generation assigned by the operator workflow.
+    /// Authenticated envelope purpose.
+    pub purpose: EnvelopePurpose,
+    /// Monotonic generation assigned by the operator workflow.
     pub generation: u64,
-    /// Repository ID this format root is bound to.
+    /// Bound public repository identity.
     pub repository_id: RepositoryId,
-    /// Public repository salt this format root is bound to.
+    /// Bound public repository salt.
     pub repository_salt: Vec<u8>,
     /// Operator-visible wrapping key identifier.
     pub wrapping_key_id: String,
-    /// Random AEAD nonce.
+    /// Random 12-byte AES-GCM-SIV nonce.
     pub nonce: Vec<u8>,
-    /// Encrypted format-root plaintext.
+    /// Encrypted plaintext bytes.
     pub ciphertext: Vec<u8>,
-    /// AEAD authentication tag.
+    /// Detached 16-byte authentication tag.
     pub tag: Vec<u8>,
 }
 
 impl KeyRing {
-    /// Encrypts this keyring into a repository-bound envelope.
+    /// Encrypts purpose-sorted key material without exposing plaintext serialization.
     pub fn seal_keyring_envelope(
         &self,
         context: &RepositoryKeyContext,
         wrapping_key_id: &str,
         wrapping_key: &SecretBytes,
         generation: u64,
-    ) -> Result<KeyringEnvelope, CryptoError> {
-        let nonce = random_envelope_nonce()?;
-        self.seal_keyring_envelope_with_nonce(
+    ) -> Result<RepositoryEnvelope, CryptoError> {
+        let plaintext = keyring_plaintext_bytes(self)?;
+        RepositoryEnvelope::seal(
+            EnvelopePurpose::Keyring,
             context,
             wrapping_key_id,
             wrapping_key,
             generation,
-            &nonce,
+            &plaintext,
         )
-    }
-
-    fn seal_keyring_envelope_with_nonce(
-        &self,
-        context: &RepositoryKeyContext,
-        wrapping_key_id: &str,
-        wrapping_key: &SecretBytes,
-        generation: u64,
-        nonce: &[u8],
-    ) -> Result<KeyringEnvelope, CryptoError> {
-        validate_wrapping_key_id(wrapping_key_id)?;
-        if nonce.len() != ENVELOPE_NONCE_LEN {
-            return Err(CryptoError::AeadOperationFailed);
-        }
-
-        let mut plaintext = Zeroizing::new(keyring_plaintext_bytes(self)?);
-        let mut envelope = KeyringEnvelope {
-            version: KEYRING_ENVELOPE_VERSION,
-            generation,
-            repository_id: context.repository_id().clone(),
-            repository_salt: context.salt().to_vec(),
-            wrapping_key_id: wrapping_key_id.to_owned(),
-            nonce: nonce.to_vec(),
-            ciphertext: Vec::new(),
-            tag: Vec::new(),
-        };
-        let associated_data = envelope.associated_data()?;
-        let cipher = envelope_cipher(wrapping_key)?;
-        let tag = cipher
-            .encrypt_in_place_detached(
-                Nonce::from_slice(nonce),
-                &associated_data,
-                plaintext.as_mut(),
-            )
-            .map_err(|_| CryptoError::AeadOperationFailed)?;
-        envelope.ciphertext = plaintext.to_vec();
-        envelope.tag = tag.to_vec();
-
-        Ok(envelope)
     }
 }
 
-impl FormatEnvelope {
-    /// Encrypts a v2 format-root plaintext with the operator wrapping key.
-    pub fn seal(
+impl RepositoryEnvelope {
+    /// Seals a format root with a fresh nonce and format-specific key.
+    pub fn seal_format(
         context: &RepositoryKeyContext,
         wrapping_key_id: &str,
         wrapping_key: &SecretBytes,
         generation: u64,
         plaintext: &[u8],
     ) -> Result<Self, CryptoError> {
-        validate_wrapping_key_id(wrapping_key_id)?;
-        let nonce = random_envelope_nonce()?;
+        Self::seal(
+            EnvelopePurpose::Format,
+            context,
+            wrapping_key_id,
+            wrapping_key,
+            generation,
+            plaintext,
+        )
+    }
+
+    fn seal(
+        purpose: EnvelopePurpose,
+        context: &RepositoryKeyContext,
+        wrapping_key_id: &str,
+        wrapping_key: &SecretBytes,
+        generation: u64,
+        plaintext: &[u8],
+    ) -> Result<Self, CryptoError> {
+        if plaintext.len() as u64 > purpose.maximum()
+            || context.repository_id().as_str().len() > MAX_PUBLIC_TEXT
+            || context.salt().len() > MAX_SALT
+            || wrapping_key_id.len() > MAX_PUBLIC_TEXT
+        {
+            return Err(invalid("maximum encoded size exceeded"));
+        }
+        let mut nonce = vec![0; NONCE_LEN];
+        getrandom::fill(&mut nonce).map_err(|_| CryptoError::RandomnessUnavailable)?;
         let mut envelope = Self {
-            version: FORMAT_ENVELOPE_VERSION,
+            version: REPOSITORY_ENVELOPE_VERSION,
+            purpose,
             generation,
             repository_id: context.repository_id().clone(),
             repository_salt: context.salt().to_vec(),
             wrapping_key_id: wrapping_key_id.to_owned(),
-            nonce: nonce.to_vec(),
+            nonce,
             ciphertext: Vec::new(),
-            tag: Vec::new(),
+            tag: vec![0; TAG_LEN],
         };
-        let associated_data = envelope.associated_data()?;
-        let cipher = format_envelope_cipher(wrapping_key)?;
+        envelope.validate_shape()?;
+        let aad = envelope.associated_data();
+        // Check the complete encoded size before allocating the plaintext copy.
+        let overhead = envelope.to_object_bytes()?.len() as u64 + 8;
+        if (plaintext.len() as u64)
+            .checked_add(overhead)
+            .is_none_or(|len| len > purpose.maximum())
+        {
+            return Err(invalid("maximum encoded size exceeded"));
+        }
         let mut ciphertext = Zeroizing::new(plaintext.to_vec());
-        let tag = cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &associated_data, &mut ciphertext)
+        let tag = envelope_cipher(wrapping_key, purpose)?
+            .encrypt_in_place_detached(Nonce::from_slice(&envelope.nonce), &aad, &mut ciphertext)
             .map_err(|_| CryptoError::AeadOperationFailed)?;
         envelope.ciphertext = std::mem::take(&mut *ciphertext);
         envelope.tag = tag.to_vec();
         Ok(envelope)
     }
 
-    /// Opens this format envelope into plaintext bytes that zeroize on drop.
-    pub fn open(
+    /// Opens a format envelope into plaintext that zeroizes on drop.
+    pub fn open_format(
         &self,
-        expected_context: &RepositoryKeyContext,
+        context: &RepositoryKeyContext,
         wrapping_key_id: &str,
         wrapping_key: &SecretBytes,
     ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
-        self.validate_public_fields(expected_context, wrapping_key_id)?;
-        if self.tag.len() != ENVELOPE_TAG_LEN || self.nonce.len() != ENVELOPE_NONCE_LEN {
-            return Err(CryptoError::AeadOperationFailed);
+        self.open(
+            EnvelopePurpose::Format,
+            context,
+            wrapping_key_id,
+            wrapping_key,
+        )
+    }
+
+    /// Opens a keyring envelope and validates its bounded canonical key material.
+    pub fn open_keyring(
+        &self,
+        context: &RepositoryKeyContext,
+        wrapping_key_id: &str,
+        wrapping_key: &SecretBytes,
+    ) -> Result<KeyRing, CryptoError> {
+        let plaintext = self.open(
+            EnvelopePurpose::Keyring,
+            context,
+            wrapping_key_id,
+            wrapping_key,
+        )?;
+        decode_keyring_plaintext(&plaintext)
+    }
+
+    fn open(
+        &self,
+        purpose: EnvelopePurpose,
+        context: &RepositoryKeyContext,
+        wrapping_key_id: &str,
+        wrapping_key: &SecretBytes,
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        self.validate_shape()?;
+        if self.purpose != purpose
+            || self.repository_id != *context.repository_id()
+            || self.repository_salt != context.salt()
+            || self.wrapping_key_id != wrapping_key_id
+        {
+            return Err(invalid("envelope purpose or public context mismatch"));
         }
-        let associated_data = self.associated_data()?;
-        let cipher = format_envelope_cipher(wrapping_key)?;
         let mut plaintext = Zeroizing::new(self.ciphertext.clone());
-        cipher
+        envelope_cipher(wrapping_key, purpose)?
             .decrypt_in_place_detached(
                 Nonce::from_slice(&self.nonce),
-                &associated_data,
+                &self.associated_data(),
                 &mut plaintext,
                 Tag::from_slice(&self.tag),
             )
@@ -193,575 +220,540 @@ impl FormatEnvelope {
         Ok(plaintext)
     }
 
-    /// Returns a public digest suitable for anchor binding.
-    pub fn digest(&self) -> Result<String, CryptoError> {
-        let bytes = serde_json::to_vec(self).map_err(format_envelope_codec_error)?;
-        Ok(derive_public_fingerprint(
-            FORMAT_ENVELOPE_DIGEST_DOMAIN,
-            &[bytes.as_slice()],
-        ))
-    }
-
-    /// Encodes this envelope as a durable repository object.
-    pub fn to_object_bytes(&self) -> Result<Vec<u8>, CryptoError> {
-        let mut bytes = FORMAT_ENVELOPE_OBJECT_DOMAIN.to_vec();
-        serde_json::to_writer(&mut bytes, self).map_err(format_envelope_codec_error)?;
-        if object_len_exceeds(&bytes, MAX_FORMAT_ENVELOPE_OBJECT_BYTES) {
-            return Err(invalid_format_envelope(
-                "format envelope object exceeds its maximum encoded size",
-            ));
-        }
-        Ok(bytes)
-    }
-
-    /// Decodes a durable repository format envelope object.
-    pub fn from_object_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
-        if object_len_exceeds(bytes, MAX_FORMAT_ENVELOPE_OBJECT_BYTES) {
-            return Err(invalid_format_envelope(
-                "format envelope object exceeds its maximum encoded size",
-            ));
-        }
-        let Some(payload) = bytes.strip_prefix(FORMAT_ENVELOPE_OBJECT_DOMAIN) else {
-            return Err(invalid_format_envelope(
-                "missing format envelope object domain",
-            ));
-        };
-        serde_json::from_slice(payload).map_err(format_envelope_codec_error)
-    }
-
-    fn validate_public_fields(
-        &self,
-        expected_context: &RepositoryKeyContext,
-        wrapping_key_id: &str,
-    ) -> Result<(), CryptoError> {
-        validate_wrapping_key_id(wrapping_key_id)?;
-        if self.version != FORMAT_ENVELOPE_VERSION {
-            return Err(invalid_format_envelope("unsupported envelope version"));
-        }
-        if self.repository_id != *expected_context.repository_id()
-            || self.repository_salt != expected_context.salt()
-        {
-            return Err(invalid_format_envelope(
-                "repository context does not match format envelope",
-            ));
-        }
-        if self.wrapping_key_id != wrapping_key_id {
-            return Err(invalid_format_envelope(
-                "wrapping key id does not match format envelope",
-            ));
-        }
-        Ok(())
-    }
-
-    fn associated_data(&self) -> Result<Vec<u8>, CryptoError> {
-        let fields = EnvelopeAssociatedData {
-            version: self.version,
-            generation: self.generation,
-            repository_id: self.repository_id.clone(),
-            repository_salt: self.repository_salt.clone(),
-            wrapping_key_id: self.wrapping_key_id.clone(),
-            nonce: self.nonce.clone(),
-        };
-        serde_json::to_vec(&fields).map_err(format_envelope_codec_error)
-    }
-}
-
-impl KeyringEnvelope {
-    /// Opens this envelope into a validated repository keyring.
-    pub fn open(
-        &self,
-        expected_context: &RepositoryKeyContext,
-        wrapping_key_id: &str,
-        wrapping_key: &SecretBytes,
-    ) -> Result<KeyRing, CryptoError> {
-        self.validate_public_fields(expected_context, wrapping_key_id)?;
-        let associated_data = self.associated_data()?;
-        let cipher = envelope_cipher(wrapping_key)?;
-        if self.tag.len() != ENVELOPE_TAG_LEN || self.nonce.len() != ENVELOPE_NONCE_LEN {
-            return Err(CryptoError::AeadOperationFailed);
-        }
-        let mut plaintext = Zeroizing::new(self.ciphertext.clone());
-        cipher
-            .decrypt_in_place_detached(
-                Nonce::from_slice(&self.nonce),
-                &associated_data,
-                plaintext.as_mut(),
-                Tag::from_slice(&self.tag),
-            )
-            .map_err(|_| CryptoError::AeadOperationFailed)?;
-
-        decode_keyring_plaintext(&plaintext)
-    }
-
-    /// Re-encrypts this envelope with a new wrapping-key source.
-    ///
-    /// The repository data keys are preserved. Payload and metadata objects do
-    /// not need to be rewritten for normal wrapping-key rewrap.
+    /// Rewraps a keyring while preserving all repository data keys.
     pub fn rewrap(
         &self,
-        expected_context: &RepositoryKeyContext,
+        context: &RepositoryKeyContext,
         old_wrapping_key_id: &str,
         old_wrapping_key: &SecretBytes,
         new_wrapping_key_id: &str,
         new_wrapping_key: &SecretBytes,
         new_generation: u64,
     ) -> Result<Self, CryptoError> {
-        let keyring = self.open(expected_context, old_wrapping_key_id, old_wrapping_key)?;
-        keyring.seal_keyring_envelope(
-            expected_context,
-            new_wrapping_key_id,
-            new_wrapping_key,
-            new_generation,
-        )
+        self.open_keyring(context, old_wrapping_key_id, old_wrapping_key)?
+            .seal_keyring_envelope(
+                context,
+                new_wrapping_key_id,
+                new_wrapping_key,
+                new_generation,
+            )
     }
 
-    /// Returns a public digest suitable for checkpoint binding.
+    /// SHA-256 of the exact canonical envelope bytes used for anchor binding.
     pub fn digest(&self) -> Result<String, CryptoError> {
-        let bytes = serde_json::to_vec(self).map_err(envelope_codec_error)?;
-        Ok(derive_public_fingerprint(
-            ENVELOPE_DIGEST_DOMAIN,
-            &[bytes.as_slice()],
-        ))
+        Ok(hex::encode(Sha256Hasher::digest(&self.to_object_bytes()?)))
     }
 
-    /// Encodes this envelope as a durable repository object.
+    /// Encodes the complete canonical envelope with no JSON or textual prefix.
     pub fn to_object_bytes(&self) -> Result<Vec<u8>, CryptoError> {
-        let mut bytes = ENVELOPE_OBJECT_DOMAIN.to_vec();
-        serde_json::to_writer(&mut bytes, self).map_err(envelope_codec_error)?;
-        if object_len_exceeds(&bytes, MAX_KEYRING_ENVELOPE_OBJECT_BYTES) {
-            return Err(invalid_envelope(
-                "keyring envelope object exceeds its maximum encoded size",
-            ));
+        self.validate_shape()?;
+        let mut bytes = Vec::new();
+        cbor::write_map_len(&mut bytes, 9);
+        self.write_public_fields(&mut bytes);
+        cbor::write_u64(&mut bytes, 7);
+        let mut length_header = Vec::new();
+        cbor::write_u64(&mut length_header, self.ciphertext.len() as u64);
+        // Byte strings and unsigned integers use the same canonical length width.
+        // Include the tag key, its one-byte string header and its fixed body.
+        if bytes.len() as u64
+            + length_header.len() as u64
+            + self.ciphertext.len() as u64
+            + 2
+            + TAG_LEN as u64
+            > self.purpose.maximum()
+        {
+            return Err(invalid("maximum encoded size exceeded"));
         }
+        cbor::write_bytes(&mut bytes, &self.ciphertext);
+        cbor::write_u64(&mut bytes, 8);
+        cbor::write_bytes(&mut bytes, &self.tag);
         Ok(bytes)
     }
 
-    /// Decodes a durable repository envelope object.
-    pub fn from_object_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
-        if object_len_exceeds(bytes, MAX_KEYRING_ENVELOPE_OBJECT_BYTES) {
-            return Err(invalid_envelope(
-                "keyring envelope object exceeds its maximum encoded size",
-            ));
+    /// Decodes the requested purpose, bounding fields before allocation and requiring exact EOF.
+    pub fn from_object_bytes(bytes: &[u8], purpose: EnvelopePurpose) -> Result<Self, CryptoError> {
+        if bytes.len() as u64 > purpose.maximum() {
+            return Err(invalid("maximum encoded size exceeded"));
         }
-        let Some(payload) = bytes.strip_prefix(ENVELOPE_OBJECT_DOMAIN) else {
-            return Err(invalid_envelope("missing keyring envelope object domain"));
-        };
-        serde_json::from_slice(payload).map_err(envelope_codec_error)
+        let mut reader = Reader::new(bytes);
+        let decoded = (|| -> Result<Self, rs3_types::cbor::CborError> {
+            require(reader.read_map_len()? == 9)?;
+            field(&mut reader, 0)?;
+            let version = reader.read_u64()?;
+            require(version == u64::from(REPOSITORY_ENVELOPE_VERSION))?;
+            field(&mut reader, 1)?;
+            require(reader.read_u64()? == purpose.tag())?;
+            field(&mut reader, 2)?;
+            let generation = reader.read_u64()?;
+            field(&mut reader, 3)?;
+            let repository_id = RepositoryId::new(reader.read_text_bounded(MAX_PUBLIC_TEXT)?)
+                .map_err(|_| rs3_types::cbor::CborError::Invalid)?;
+            field(&mut reader, 4)?;
+            let repository_salt = reader.read_bytes_bounded(MAX_SALT)?;
+            field(&mut reader, 5)?;
+            let wrapping_key_id = reader.read_text_bounded(MAX_PUBLIC_TEXT)?;
+            field(&mut reader, 6)?;
+            let nonce = reader.read_bytes_bounded(NONCE_LEN)?;
+            field(&mut reader, 7)?;
+            let ciphertext = reader.read_bytes_bounded(purpose.maximum() as usize)?;
+            field(&mut reader, 8)?;
+            let tag = reader.read_bytes_bounded(TAG_LEN)?;
+            require(reader.is_finished())?;
+            Ok(Self {
+                version: REPOSITORY_ENVELOPE_VERSION,
+                purpose,
+                generation,
+                repository_id,
+                repository_salt,
+                wrapping_key_id,
+                nonce,
+                ciphertext,
+                tag,
+            })
+        })()
+        .map_err(|_| invalid("invalid canonical CBOR envelope"))?;
+        decoded.validate_shape()?;
+        Ok(decoded)
     }
 
-    fn validate_public_fields(
-        &self,
-        expected_context: &RepositoryKeyContext,
-        wrapping_key_id: &str,
-    ) -> Result<(), CryptoError> {
-        validate_wrapping_key_id(wrapping_key_id)?;
-        if self.version != KEYRING_ENVELOPE_VERSION {
-            return Err(invalid_envelope("unsupported envelope version"));
-        }
-        if self.repository_id != *expected_context.repository_id()
-            || self.repository_salt != expected_context.salt()
+    fn validate_shape(&self) -> Result<(), CryptoError> {
+        if self.version != REPOSITORY_ENVELOPE_VERSION
+            || self.repository_id.as_str().len() > MAX_PUBLIC_TEXT
+            || self.repository_salt.len() < crate::MIN_REPOSITORY_SALT_LEN
+            || self.repository_salt.len() > MAX_SALT
+            || self.wrapping_key_id.trim().is_empty()
+            || self.wrapping_key_id.len() > MAX_PUBLIC_TEXT
+            || self.nonce.len() != NONCE_LEN
+            || self.tag.len() != TAG_LEN
+            || self.ciphertext.len() as u64 > self.purpose.maximum()
         {
-            return Err(invalid_envelope(
-                "repository context does not match keyring envelope",
-            ));
-        }
-        if self.wrapping_key_id != wrapping_key_id {
-            return Err(invalid_envelope("wrapping key id does not match envelope"));
+            return Err(invalid("invalid envelope field or bound"));
         }
         Ok(())
     }
 
-    fn associated_data(&self) -> Result<Vec<u8>, CryptoError> {
-        let fields = EnvelopeAssociatedData {
-            version: self.version,
-            generation: self.generation,
-            repository_id: self.repository_id.clone(),
-            repository_salt: self.repository_salt.clone(),
-            wrapping_key_id: self.wrapping_key_id.clone(),
-            nonce: self.nonce.clone(),
-        };
-        serde_json::to_vec(&fields).map_err(envelope_codec_error)
+    fn associated_data(&self) -> Vec<u8> {
+        let mut aad = Vec::new();
+        cbor::write_map_len(&mut aad, 7);
+        self.write_public_fields(&mut aad);
+        aad
+    }
+
+    fn write_public_fields(&self, out: &mut Vec<u8>) {
+        cbor::write_u64(out, 0);
+        cbor::write_u64(out, u64::from(self.version));
+        cbor::write_u64(out, 1);
+        cbor::write_u64(out, self.purpose.tag());
+        cbor::write_u64(out, 2);
+        cbor::write_u64(out, self.generation);
+        cbor::write_u64(out, 3);
+        cbor::write_text(out, self.repository_id.as_str());
+        cbor::write_u64(out, 4);
+        cbor::write_bytes(out, &self.repository_salt);
+        cbor::write_u64(out, 5);
+        cbor::write_text(out, &self.wrapping_key_id);
+        cbor::write_u64(out, 6);
+        cbor::write_bytes(out, &self.nonce);
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct EnvelopeAssociatedData {
-    version: u16,
-    generation: u64,
-    repository_id: RepositoryId,
-    repository_salt: Vec<u8>,
-    wrapping_key_id: String,
-    nonce: Vec<u8>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct KeyringPlaintext {
-    version: u16,
-    keys: Vec<PlaintextKeyMaterial>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PlaintextKeyMaterial {
-    descriptor: KeyDescriptor,
-    secret_hex: String,
-}
-
-impl Drop for PlaintextKeyMaterial {
-    fn drop(&mut self) {
-        self.secret_hex.zeroize();
+fn keyring_plaintext_bytes(keyring: &KeyRing) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    let materials = keyring.key_materials();
+    if materials.len() > MAX_KEYS {
+        return Err(invalid("key count exceeds bound"));
     }
-}
-
-fn keyring_plaintext_bytes(keyring: &KeyRing) -> Result<Vec<u8>, CryptoError> {
-    let mut keys = keyring
-        .key_materials()
-        .iter()
-        .map(|key| PlaintextKeyMaterial {
-            descriptor: key.descriptor().clone(),
-            secret_hex: hex::encode(key.secret.expose()),
-        })
-        .collect::<Vec<_>>();
-    keys.sort_by(|left, right| {
-        left.descriptor
-            .purpose
-            .cmp(&right.descriptor.purpose)
-            .then_with(|| left.descriptor.id.cmp(&right.descriptor.id))
-    });
-    let mut plaintext = KeyringPlaintext {
-        version: KEYRING_ENVELOPE_VERSION,
-        keys,
-    };
-    let mut bytes = ENVELOPE_PLAINTEXT_DOMAIN.to_vec();
-    serde_json::to_writer(&mut bytes, &plaintext).map_err(envelope_codec_error)?;
-    for key in &mut plaintext.keys {
-        key.secret_hex.zeroize();
+    let mut keys = materials.iter().collect::<Vec<_>>();
+    keys.sort_by_key(|key| (key.descriptor().purpose, &key.descriptor().id));
+    // Reserve an upper bound before writing secrets so growth never leaves
+    // secret plaintext in an abandoned allocation. Counts and field sizes are
+    // bounded before computing this capacity.
+    let mut capacity = 16;
+    for key in &keys {
+        let id_len = key.descriptor().id.as_str().len();
+        let secret_len = key.secret.expose().len();
+        if id_len > 255 || secret_len > MAX_SECRET {
+            return Err(invalid("key material exceeds bound"));
+        }
+        capacity += 64 + id_len + secret_len;
     }
-    Ok(bytes)
+    if capacity as u64 > MAX_KEYRING_ENVELOPE_OBJECT_BYTES {
+        return Err(invalid("key material exceeds bound"));
+    }
+    let mut out = Zeroizing::new(Vec::with_capacity(capacity));
+    cbor::write_array_len(&mut out, 2);
+    cbor::write_u64(&mut out, u64::from(REPOSITORY_ENVELOPE_VERSION));
+    cbor::write_array_len(&mut out, keys.len());
+    for key in keys {
+        let descriptor = key.descriptor();
+        cbor::write_array_len(&mut out, 6);
+        cbor::write_text(&mut out, descriptor.id.as_str());
+        cbor::write_u64(&mut out, purpose_tag(descriptor.purpose));
+        cbor::write_u64(
+            &mut out,
+            match descriptor.status {
+                KeyStatus::Primary => 0,
+                KeyStatus::Enabled => 1,
+                KeyStatus::Disabled => 2,
+                KeyStatus::Retired => 3,
+            },
+        );
+        cbor::write_i64(&mut out, descriptor.created_at_ms);
+        match &descriptor.public_key {
+            None => cbor::write_null(&mut out),
+            Some(value) => {
+                if descriptor.purpose != KeyPurpose::CheckpointSigning {
+                    return Err(invalid("public verification key has wrong purpose"));
+                }
+                let bytes = crate::checkpoint::prefixed_ed25519_public_key_bytes(value)
+                    .map_err(|_| invalid("invalid public verification key"))?;
+                cbor::write_bytes(&mut out, &bytes);
+            }
+        }
+        cbor::write_bytes(&mut out, key.secret.expose());
+        if out.len() as u64 > MAX_KEYRING_ENVELOPE_OBJECT_BYTES {
+            return Err(invalid("key material exceeds bound"));
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn decode_keyring_plaintext(plaintext: &[u8]) -> Result<KeyRing, CryptoError> {
-    let Some(json) = plaintext.strip_prefix(ENVELOPE_PLAINTEXT_DOMAIN) else {
-        return Err(invalid_envelope("missing keyring plaintext domain"));
-    };
-    let mut plaintext: KeyringPlaintext =
-        serde_json::from_slice(json).map_err(envelope_codec_error)?;
-    if plaintext.version != KEYRING_ENVELOPE_VERSION {
-        return Err(invalid_envelope("unsupported plaintext version"));
+    if plaintext.len() as u64 > MAX_KEYRING_ENVELOPE_OBJECT_BYTES {
+        return Err(invalid("key material exceeds bound"));
     }
+    let mut reader = Reader::new(plaintext);
+    let decode = (|| -> Result<Vec<KeyMaterial>, CryptoError> {
+        require(reader.read_array_len()? == 2)?;
+        require(reader.read_u64()? == u64::from(REPOSITORY_ENVELOPE_VERSION))?;
+        let count = reader.read_array_len()?;
+        require(count > 0 && count <= MAX_KEYS && count <= plaintext.len() / 7)?;
+        let mut keys = Vec::with_capacity(count);
+        let mut previous = None;
+        for _ in 0..count {
+            require(reader.read_array_len()? == 6)?;
+            let id = KeyId::new(reader.read_text_bounded(255)?)
+                .map_err(|_| invalid("invalid key id"))?;
+            let purpose = match reader.read_u64()? {
+                0 => KeyPurpose::Namespace,
+                1 => KeyPurpose::Content,
+                2 => KeyPurpose::Metadata,
+                3 => KeyPurpose::CheckpointSigning,
+                _ => return Err(invalid("invalid key purpose")),
+            };
+            let status = match reader.read_u64()? {
+                0 => KeyStatus::Primary,
+                1 => KeyStatus::Enabled,
+                2 => KeyStatus::Disabled,
+                3 => KeyStatus::Retired,
+                _ => return Err(invalid("invalid key status")),
+            };
+            let created_at_ms = reader.read_i64()?;
+            let public_key = if reader.next_is_null() {
+                reader.read_null()?;
+                None
+            } else {
+                let bytes = reader.read_bytes_bounded(32)?;
+                require(bytes.len() == 32 && purpose == KeyPurpose::CheckpointSigning)?;
+                Some(format!(
+                    "{}{}",
+                    crate::checkpoint::CHECKPOINT_PUBLIC_KEY_PREFIX,
+                    hex::encode(bytes)
+                ))
+            };
+            let identity = (purpose, id.clone());
+            require(previous.as_ref().is_none_or(|old| old < &identity))?;
+            previous = Some(identity);
+            let secret = Zeroizing::new(reader.read_bytes_bounded(MAX_SECRET)?);
+            keys.push(KeyMaterial::new(
+                KeyDescriptor {
+                    id,
+                    purpose,
+                    status,
+                    created_at_ms,
+                    public_key,
+                },
+                SecretBytes::from_zeroizing(secret)?,
+            ));
+        }
+        require(reader.is_finished())?;
+        Ok(keys)
+    })()?;
+    KeyRing::new(decode)
+}
 
-    let mut keys = Vec::with_capacity(plaintext.keys.len());
-    for key in &mut plaintext.keys {
-        let secret = match hex::decode(&key.secret_hex) {
-            Ok(secret) => Zeroizing::new(secret),
-            Err(_error) => {
-                key.secret_hex.zeroize();
-                return Err(invalid_envelope(
-                    "keyring plaintext contains non-hex secret material",
-                ));
-            }
-        };
-        key.secret_hex.zeroize();
-        keys.push(KeyMaterial::new(
-            key.descriptor.clone(),
-            SecretBytes::from_zeroizing(secret)?,
-        ));
+impl From<rs3_types::cbor::CborError> for CryptoError {
+    fn from(_: rs3_types::cbor::CborError) -> Self {
+        invalid("invalid canonical CBOR")
     }
-
-    KeyRing::new(keys)
 }
 
-fn envelope_cipher(wrapping_key: &SecretBytes) -> Result<Aes256GcmSiv, CryptoError> {
-    let key = derive_hmac(
-        wrapping_key,
-        b"rs3:keyring-envelope-aead-key:v1",
-        b"aes-256-gcm-siv",
-    )?;
-    Aes256GcmSiv::new_from_slice(&key).map_err(|_| CryptoError::AeadOperationFailed)
+fn purpose_tag(purpose: KeyPurpose) -> u64 {
+    match purpose {
+        KeyPurpose::Namespace => 0,
+        KeyPurpose::Content => 1,
+        KeyPurpose::Metadata => 2,
+        KeyPurpose::CheckpointSigning => 3,
+    }
 }
-
-fn format_envelope_cipher(wrapping_key: &SecretBytes) -> Result<Aes256GcmSiv, CryptoError> {
-    let key = derive_hmac(
-        wrapping_key,
-        b"rs3:format-envelope-aead-key:v1",
-        b"aes-256-gcm-siv",
-    )?;
-    Aes256GcmSiv::new_from_slice(&key).map_err(|_| CryptoError::AeadOperationFailed)
-}
-
-fn random_envelope_nonce() -> Result<[u8; ENVELOPE_NONCE_LEN], CryptoError> {
-    let mut nonce = [0_u8; ENVELOPE_NONCE_LEN];
-    getrandom::fill(&mut nonce).map_err(|_| CryptoError::RandomnessUnavailable)?;
-    Ok(nonce)
-}
-
-fn validate_wrapping_key_id(value: &str) -> Result<(), CryptoError> {
-    if value.trim().is_empty() {
-        Err(invalid_envelope("wrapping key id must not be empty"))
-    } else {
+fn require(condition: bool) -> Result<(), rs3_types::cbor::CborError> {
+    if condition {
         Ok(())
+    } else {
+        Err(rs3_types::cbor::CborError::Invalid)
     }
 }
-
-fn object_len_exceeds(bytes: &[u8], maximum: u64) -> bool {
-    u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum
+fn field(reader: &mut Reader<'_>, key: u64) -> Result<(), rs3_types::cbor::CborError> {
+    require(reader.read_u64()? == key)
 }
-
-fn envelope_codec_error(error: serde_json::Error) -> CryptoError {
-    CryptoError::KeyringEnvelopeCodec {
-        reason: error.to_string(),
-    }
+fn envelope_cipher(
+    wrapping_key: &SecretBytes,
+    purpose: EnvelopePurpose,
+) -> Result<Aes256GcmSiv, CryptoError> {
+    let key = derive_hmac(wrapping_key, purpose.key_domain(), b"aes-256-gcm-siv")?;
+    Aes256GcmSiv::new_from_slice(&key).map_err(|_| CryptoError::AeadOperationFailed)
 }
-
-fn format_envelope_codec_error(error: serde_json::Error) -> CryptoError {
-    CryptoError::FormatEnvelopeCodec {
-        reason: error.to_string(),
-    }
-}
-
-fn invalid_envelope(reason: &str) -> CryptoError {
-    CryptoError::InvalidKeyringEnvelope {
-        reason: reason.to_owned(),
-    }
-}
-
-fn invalid_format_envelope(reason: &str) -> CryptoError {
-    CryptoError::InvalidFormatEnvelope {
+fn invalid(reason: &str) -> CryptoError {
+    CryptoError::InvalidRepositoryEnvelope {
         reason: reason.to_owned(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ENVELOPE_PLAINTEXT_DOMAIN, FORMAT_ENVELOPE_OBJECT_DOMAIN, FormatEnvelope,
-        KEYRING_ENVELOPE_VERSION, KeyringEnvelope, KeyringPlaintext,
-        MAX_FORMAT_ENVELOPE_OBJECT_BYTES, MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
-        decode_keyring_plaintext, keyring_plaintext_bytes,
-    };
-    use crate::{CryptoError, KeyRing, RepositoryKeyContext, SecretBytes};
-    use rs3_types::RepositoryId;
-    use zeroize::Zeroize;
+    use super::*;
 
     fn secret(byte: u8) -> SecretBytes {
-        SecretBytes::new(vec![byte; SecretBytes::MIN_LEN]).unwrap_or_else(|error| panic!("{error}"))
+        SecretBytes::new(vec![byte; 32]).expect("secret")
     }
-
-    fn context(repository_id: &str, salt_byte: u8) -> RepositoryKeyContext {
-        let repository_id =
-            RepositoryId::new(repository_id).unwrap_or_else(|error| panic!("{error}"));
-        RepositoryKeyContext::new(repository_id, vec![salt_byte; 32])
-            .unwrap_or_else(|error| panic!("{error}"))
+    fn context() -> RepositoryKeyContext {
+        RepositoryKeyContext::new(RepositoryId::new("repo-a").expect("id"), vec![2; 32])
+            .expect("context")
     }
-
-    fn keyring() -> KeyRing {
-        KeyRing::generate_random().unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    #[test]
-    fn keyring_envelope_round_trips_repository_keys() {
-        let context = context("repo-a", 2);
-        let keyring = keyring();
-        let envelope = keyring
-            .seal_keyring_envelope(&context, "wrap-v1", &secret(9), 1)
-            .unwrap_or_else(|error| panic!("{error}"));
-
-        let opened = envelope
-            .open(&context, "wrap-v1", &secret(9))
-            .unwrap_or_else(|error| panic!("{error}"));
-
-        assert_eq!(envelope.version, KEYRING_ENVELOPE_VERSION);
-        assert_eq!(opened.descriptors(), keyring.descriptors());
-        assert_eq!(
-            opened
-                .derive_backend_object_id("segments", b"same")
-                .unwrap_or_else(|error| panic!("{error}")),
-            keyring
-                .derive_backend_object_id("segments", b"same")
-                .unwrap_or_else(|error| panic!("{error}"))
-        );
-    }
-
-    #[test]
-    fn keyring_envelope_rewrap_preserves_data_keys() {
-        let context = context("repo-a", 2);
-        let keyring = keyring();
-        let envelope = keyring
-            .seal_keyring_envelope(&context, "wrap-v1", &secret(9), 1)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let rewrapped = envelope
-            .rewrap(&context, "wrap-v1", &secret(9), "wrap-v2", &secret(10), 2)
-            .unwrap_or_else(|error| panic!("{error}"));
-
-        let object = rs3_types::BackendObjectId::new("opaque-payload").expect("object");
-        let segment_context = crate::PayloadSegmentContext {
-            repository_context: b"repository/keyring",
-            containing_object: &object,
-            section_ordinal: None,
-            carrier_id: &[7; 32],
-            attempt_id: rs3_types::PayloadAttemptId::from_bytes([8; 32]),
-            part_ordinal: 1,
-            segment_ordinal: 0,
-            plaintext_len: 7,
-            is_final: true,
-            layout_context: b"layout",
-        };
-        let payload = keyring
-            .seal_payload_segment(segment_context, b"payload")
-            .unwrap_or_else(|error| panic!("{error}"));
-        let opened = rewrapped
-            .open(&context, "wrap-v2", &secret(10))
-            .unwrap_or_else(|error| panic!("{error}"));
-        let plaintext = opened
-            .open_payload_segment(&payload.key_id, segment_context, &payload.ciphertext)
-            .unwrap_or_else(|error| panic!("{error}"));
-
-        assert_eq!(rewrapped.generation, 2);
-        assert_eq!(rewrapped.wrapping_key_id, "wrap-v2");
-        assert_eq!(plaintext, b"payload");
-    }
-
-    #[test]
-    fn format_envelope_round_trips_and_rejects_wrong_context() {
-        let context = context("repo-a", 2);
-        let plaintext = b"rs3-format-root";
-        let envelope = FormatEnvelope::seal(&context, "wrap-v1", &secret(9), 1, plaintext)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let bytes = envelope
-            .to_object_bytes()
-            .unwrap_or_else(|error| panic!("{error}"));
-        let decoded =
-            FormatEnvelope::from_object_bytes(&bytes).unwrap_or_else(|error| panic!("{error}"));
-
-        let opened = decoded
-            .open(&context, "wrap-v1", &secret(9))
-            .unwrap_or_else(|error| panic!("{error}"));
-        let wrong = RepositoryKeyContext::new(
-            RepositoryId::new("other-repository").unwrap_or_else(|error| panic!("{error}")),
-            vec![7; 32],
-        )
-        .unwrap_or_else(|error| panic!("{error}"));
-
-        assert_eq!(opened.as_slice(), plaintext);
-        assert!(decoded.digest().is_ok());
-        assert!(decoded.open(&wrong, "wrap-v1", &secret(9)).is_err());
-    }
-
-    #[test]
-    fn format_envelope_rejects_ciphertext_nonce_and_tag_tampering() {
-        let context = context("repo-a", 2);
-        let envelope =
-            FormatEnvelope::seal(&context, "wrap-v1", &secret(9), 1, b"format plaintext")
-                .expect("seal format");
-        for field in 0..3 {
-            let mut tampered = envelope.clone();
-            match field {
-                0 => tampered.ciphertext[0] ^= 1,
-                1 => tampered.nonce[0] ^= 1,
-                _ => tampered.tag[0] ^= 1,
-            }
-            assert!(matches!(
-                tampered.open(&context, "wrap-v1", &secret(9)),
-                Err(crate::CryptoError::AeadOperationFailed)
-            ));
+    fn seal(purpose: EnvelopePurpose) -> RepositoryEnvelope {
+        match purpose {
+            EnvelopePurpose::Keyring => KeyRing::generate_random()
+                .expect("keyring")
+                .seal_keyring_envelope(&context(), "wrap-v1", &secret(9), 1)
+                .expect("seal keyring"),
+            EnvelopePurpose::Format => RepositoryEnvelope::seal_format(
+                &context(),
+                "wrap-v1",
+                &secret(9),
+                1,
+                b"format plaintext",
+            )
+            .expect("seal format"),
         }
     }
 
     #[test]
-    fn keyring_envelope_rejects_wrong_wrapping_key() {
-        let context = context("repo-a", 2);
-        let envelope = keyring()
-            .seal_keyring_envelope(&context, "wrap-v1", &secret(9), 1)
-            .unwrap_or_else(|error| panic!("{error}"));
-
-        let opened = envelope.open(&context, "wrap-v1", &secret(8));
-
-        assert!(opened.is_err());
+    fn canonical_envelopes_round_trip_with_separate_purposes() {
+        for purpose in [EnvelopePurpose::Keyring, EnvelopePurpose::Format] {
+            let envelope = seal(purpose);
+            let bytes = envelope.to_object_bytes().expect("encode");
+            let decoded = RepositoryEnvelope::from_object_bytes(&bytes, purpose).expect("decode");
+            assert_eq!(decoded, envelope);
+            let plaintext: Zeroizing<Vec<u8>> = decoded
+                .open(purpose, &context(), "wrap-v1", &secret(9))
+                .expect("open");
+            match purpose {
+                EnvelopePurpose::Keyring => {
+                    decode_keyring_plaintext(&plaintext).expect("keys");
+                }
+                EnvelopePurpose::Format => assert_eq!(plaintext.as_slice(), b"format plaintext"),
+            }
+            let other = match purpose {
+                EnvelopePurpose::Keyring => EnvelopePurpose::Format,
+                EnvelopePurpose::Format => EnvelopePurpose::Keyring,
+            };
+            assert!(RepositoryEnvelope::from_object_bytes(&bytes, other).is_err());
+            assert!(
+                decoded
+                    .open(other, &context(), "wrap-v1", &secret(9))
+                    .is_err()
+            );
+        }
     }
 
     #[test]
-    fn keyring_envelope_rejects_wrong_context() {
-        let expected_context = context("repo-a", 2);
-        let envelope = keyring()
-            .seal_keyring_envelope(&expected_context, "wrap-v1", &secret(9), 1)
-            .unwrap_or_else(|error| panic!("{error}"));
-
-        let opened = envelope.open(&context("repo-b", 2), "wrap-v1", &secret(9));
-
-        assert!(opened.is_err());
+    fn public_binding_and_ciphertext_tampering_fail_for_both_purposes() {
+        for purpose in [EnvelopePurpose::Keyring, EnvelopePurpose::Format] {
+            let envelope = seal(purpose);
+            for field in 0..8 {
+                let mut changed = envelope.clone();
+                match field {
+                    0 => changed.generation += 1,
+                    1 => changed.repository_id = RepositoryId::new("other").expect("id"),
+                    2 => changed.repository_salt[0] ^= 1,
+                    3 => changed.wrapping_key_id.push('x'),
+                    4 => changed.nonce[0] ^= 1,
+                    5 => changed.ciphertext[0] ^= 1,
+                    6 => changed.tag[0] ^= 1,
+                    _ => changed.version += 1,
+                }
+                assert!(
+                    changed
+                        .open(purpose, &context(), "wrap-v1", &secret(9))
+                        .is_err()
+                );
+            }
+            assert!(
+                envelope
+                    .open(purpose, &context(), "wrap-v1", &secret(8))
+                    .is_err()
+            );
+            let wrong_context = RepositoryKeyContext::new(
+                RepositoryId::new("other-repo").expect("id"),
+                vec![2; 32],
+            )
+            .expect("context");
+            assert!(
+                envelope
+                    .open(purpose, &wrong_context, "wrap-v1", &secret(9))
+                    .is_err()
+            );
+        }
     }
 
     #[test]
-    fn keyring_plaintext_rejects_short_decoded_secret() {
-        let plaintext =
-            keyring_plaintext_bytes(&keyring()).unwrap_or_else(|error| panic!("{error}"));
-        let json = plaintext
-            .strip_prefix(ENVELOPE_PLAINTEXT_DOMAIN)
-            .unwrap_or_else(|| panic!("plaintext should include domain"));
-        let mut decoded: KeyringPlaintext =
-            serde_json::from_slice(json).unwrap_or_else(|error| panic!("{error}"));
-        decoded.keys[0].secret_hex.zeroize();
-        decoded.keys[0].secret_hex = "00".to_owned();
-        let mut body = ENVELOPE_PLAINTEXT_DOMAIN.to_vec();
-        serde_json::to_writer(&mut body, &decoded).unwrap_or_else(|error| panic!("{error}"));
-
-        let result = decode_keyring_plaintext(&body);
-
-        assert!(matches!(result, Err(CryptoError::SecretTooShort { .. })));
-    }
-
-    #[test]
-    fn keyring_envelope_digest_changes_when_public_binding_changes() {
-        let context = context("repo-a", 2);
-        let envelope = keyring()
-            .seal_keyring_envelope(&context, "wrap-v1", &secret(9), 1)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let mut changed: KeyringEnvelope = envelope.clone();
-        changed.generation = 2;
-
+    fn rewrap_preserves_data_keys_and_canonical_key_order() {
+        let keyring = KeyRing::generate_random().expect("keyring");
+        let reversed = KeyRing::new(keyring.key_materials().iter().rev().cloned().collect())
+            .expect("reordered keys");
+        assert_eq!(
+            keyring_plaintext_bytes(&keyring).expect("encode"),
+            keyring_plaintext_bytes(&reversed).expect("reordered encode")
+        );
+        let envelope = keyring
+            .seal_keyring_envelope(&context(), "wrap-v1", &secret(9), 1)
+            .expect("seal");
+        let rewrapped = envelope
+            .rewrap(&context(), "wrap-v1", &secret(9), "wrap-v2", &secret(10), 2)
+            .expect("rewrap");
+        let opened = rewrapped
+            .open_keyring(&context(), "wrap-v2", &secret(10))
+            .expect("open");
+        assert_eq!(
+            keyring_plaintext_bytes(&opened).expect("opened"),
+            keyring_plaintext_bytes(&keyring).expect("original")
+        );
         assert_ne!(
-            envelope.digest().unwrap_or_else(|error| panic!("{error}")),
-            changed.digest().unwrap_or_else(|error| panic!("{error}"))
+            rewrapped.digest().expect("digest"),
+            envelope.digest().expect("digest")
         );
     }
 
     #[test]
-    fn keyring_envelope_object_encoding_has_domain_prefix() {
-        let context = context("repo-a", 2);
-        let envelope = keyring()
-            .seal_keyring_envelope(&context, "wrap-v1", &secret(9), 1)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let body = envelope
+    fn canonical_digest_is_independent_of_struct_field_order() {
+        let envelope = seal(EnvelopePurpose::Format);
+        let reordered = RepositoryEnvelope {
+            tag: envelope.tag.clone(),
+            ciphertext: envelope.ciphertext.clone(),
+            nonce: envelope.nonce.clone(),
+            wrapping_key_id: envelope.wrapping_key_id.clone(),
+            repository_salt: envelope.repository_salt.clone(),
+            repository_id: envelope.repository_id.clone(),
+            generation: envelope.generation,
+            purpose: envelope.purpose,
+            version: envelope.version,
+        };
+        let bytes = reordered.to_object_bytes().expect("encode");
+        assert_eq!(
+            envelope.digest().expect("digest"),
+            hex::encode(Sha256Hasher::digest(&bytes))
+        );
+        assert_eq!(bytes, envelope.to_object_bytes().expect("encode"));
+    }
+
+    #[test]
+    fn reject_noncanonical_unknown_duplicate_truncated_and_trailing_fields() {
+        let bytes = seal(EnvelopePurpose::Format)
             .to_object_bytes()
-            .unwrap_or_else(|error| panic!("{error}"));
-
-        let decoded =
-            KeyringEnvelope::from_object_bytes(&body).unwrap_or_else(|error| panic!("{error}"));
-
-        assert_eq!(decoded, envelope);
+            .expect("encode");
+        for length in 0..bytes.len() {
+            assert!(
+                RepositoryEnvelope::from_object_bytes(&bytes[..length], EnvelopePurpose::Format)
+                    .is_err()
+            );
+        }
+        let mut candidates = Vec::new();
+        let mut duplicate = bytes.clone();
+        duplicate[3] = 0;
+        candidates.push(duplicate);
+        let mut unknown = bytes.clone();
+        unknown[1] = 9;
+        candidates.push(unknown);
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        candidates.push(trailing);
+        let mut nonminimal = bytes[..2].to_vec();
+        nonminimal.extend_from_slice(&[0x18, 3]);
+        nonminimal.extend_from_slice(&bytes[3..]);
+        candidates.push(nonminimal);
+        for candidate in candidates {
+            assert!(
+                RepositoryEnvelope::from_object_bytes(&candidate, EnvelopePurpose::Format).is_err()
+            );
+        }
+        assert!(
+            RepositoryEnvelope::from_object_bytes(br#"{"version":1}"#, EnvelopePurpose::Format)
+                .is_err()
+        );
     }
 
     #[test]
-    fn envelope_decoders_reject_oversized_objects_before_json_parsing() {
-        let oversized_keyring = vec![
-            b'x';
-            usize::try_from(MAX_KEYRING_ENVELOPE_OBJECT_BYTES + 1)
-                .unwrap_or(usize::MAX)
-        ];
-        let mut oversized_format = FORMAT_ENVELOPE_OBJECT_DOMAIN.to_vec();
-        oversized_format.resize(
-            usize::try_from(MAX_FORMAT_ENVELOPE_OBJECT_BYTES + 1).unwrap_or(usize::MAX),
-            b'x',
-        );
+    fn envelopes_reject_oversized_objects_and_declared_ciphertext_before_copying() {
+        for purpose in [EnvelopePurpose::Keyring, EnvelopePurpose::Format] {
+            let oversized = vec![0; purpose.maximum() as usize + 1];
+            assert!(RepositoryEnvelope::from_object_bytes(&oversized, purpose).is_err());
+            let envelope = seal(purpose);
+            let mut declared = Vec::new();
+            cbor::write_map_len(&mut declared, 9);
+            envelope.write_public_fields(&mut declared);
+            cbor::write_u64(&mut declared, 7);
+            // Canonical byte-string length beyond either object ceiling, without a body.
+            declared.extend_from_slice(&[0x5a, 0x01, 0x00, 0x00, 0x01]);
+            assert!(RepositoryEnvelope::from_object_bytes(&declared, purpose).is_err());
+        }
+    }
 
+    #[test]
+    fn keyring_plaintext_rejects_short_secrets_and_unsorted_or_duplicate_keys() {
+        let mut short = Vec::new();
+        cbor::write_array_len(&mut short, 2);
+        cbor::write_u64(&mut short, 3);
+        cbor::write_array_len(&mut short, 1);
+        cbor::write_array_len(&mut short, 6);
+        cbor::write_text(&mut short, "namespace");
+        cbor::write_u64(&mut short, 0);
+        cbor::write_u64(&mut short, 0);
+        cbor::write_i64(&mut short, 0);
+        cbor::write_null(&mut short);
+        cbor::write_bytes(&mut short, &[0]);
         assert!(matches!(
-            KeyringEnvelope::from_object_bytes(&oversized_keyring),
-            Err(CryptoError::InvalidKeyringEnvelope { reason })
-                if reason.contains("maximum encoded size")
+            decode_keyring_plaintext(&short),
+            Err(CryptoError::SecretTooShort { .. })
         ));
-        assert!(matches!(
-            FormatEnvelope::from_object_bytes(&oversized_format),
-            Err(CryptoError::InvalidFormatEnvelope { reason })
-                if reason.contains("maximum encoded size")
-        ));
+        let keyring = KeyRing::generate_random().expect("keyring");
+        let encoded = keyring_plaintext_bytes(&keyring).expect("encode");
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode_keyring_plaintext(&trailing).is_err());
+        for purposes in [[0, 0], [1, 0]] {
+            let mut invalid_order = vec![0x82, 0x03, 0x82];
+            for purpose in purposes {
+                cbor::write_array_len(&mut invalid_order, 6);
+                cbor::write_text(&mut invalid_order, "same-id");
+                cbor::write_u64(&mut invalid_order, purpose);
+                cbor::write_u64(&mut invalid_order, 0);
+                cbor::write_i64(&mut invalid_order, 0);
+                cbor::write_null(&mut invalid_order);
+                cbor::write_bytes(&mut invalid_order, &[5; 32]);
+            }
+            assert!(decode_keyring_plaintext(&invalid_order).is_err());
+        }
+        let mut oversized_count = vec![0x82, 0x03];
+        cbor::write_array_len(&mut oversized_count, MAX_KEYS + 1);
+        assert!(decode_keyring_plaintext(&oversized_count).is_err());
     }
 }

@@ -3,7 +3,7 @@
 use super::*;
 use crate::admin::provider_conformance_target_fingerprint;
 use crate::s3::runtime_keyring::{open_gateway_keyring_object, prepare_gateway_keyring};
-use rs3_crypto::{KeyringEnvelope, derive_public_fingerprint};
+use rs3_crypto::derive_public_fingerprint;
 use rs3_k8s::{KubernetesBootstrapJournal, MAX_BOOTSTRAP_JOURNAL_BYTES};
 use rs3_repository::v2::V2FormatError;
 use rs3_repository::{KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE, keyring_envelope_object_id};
@@ -271,8 +271,11 @@ impl<J: Journal> Bootstrap<'_, J> {
             match record.phase.clone() {
                 Phase::Keyring { artifact } => {
                     self.require_unaccepted().await?;
-                    let envelope = KeyringEnvelope::from_object_bytes(&artifact.body)
-                        .map_err(repository_init)?;
+                    let envelope = RepositoryEnvelope::from_object_bytes(
+                        &artifact.body,
+                        rs3_crypto::EnvelopePurpose::Keyring,
+                    )
+                    .map_err(repository_init)?;
                     if artifact.object_id != self.keyring_id(&envelope)? {
                         return Err(invalid());
                     }
@@ -321,8 +324,11 @@ impl<J: Journal> Bootstrap<'_, J> {
                 }
                 Phase::Format { keyring, artifact } => {
                     self.require_unaccepted().await?;
-                    let envelope = FormatEnvelope::from_object_bytes(&artifact.body)
-                        .map_err(repository_init)?;
+                    let envelope = RepositoryEnvelope::from_object_bytes(
+                        &artifact.body,
+                        rs3_crypto::EnvelopePurpose::Format,
+                    )
+                    .map_err(repository_init)?;
                     let digest = envelope.digest().map_err(repository_init)?;
                     if artifact.object_id
                         != v2_format_object_id(envelope.generation, &digest)
@@ -429,7 +435,10 @@ impl<J: Journal> Bootstrap<'_, J> {
         Ok(())
     }
 
-    fn keyring_id(&self, envelope: &KeyringEnvelope) -> Result<BackendObjectId, S3BoundaryError> {
+    fn keyring_id(
+        &self,
+        envelope: &RepositoryEnvelope,
+    ) -> Result<BackendObjectId, S3BoundaryError> {
         match &self.config.repository_keys.envelope_object_id {
             Some(id) => Ok(id.clone()),
             None => keyring_envelope_object_id(

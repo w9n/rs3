@@ -254,41 +254,24 @@ fn invalid_case_reserved_fixed_header() -> InvalidVectorCase {
 
 fn signing_keyring() -> KeyRing {
     must_crypto(KeyRing::new(vec![
-        key_material(
-            "namespace",
-            KeyPurpose::Namespace,
-            KeyStatus::Primary,
-            "hmac-sha256",
-            0x01,
-        ),
+        key_material("namespace", KeyPurpose::Namespace, KeyStatus::Primary, 0x01),
         key_material(
             "signing",
             KeyPurpose::CheckpointSigning,
             KeyStatus::Primary,
-            "ed25519",
             0x02,
         ),
     ]))
 }
 
-fn key_material(
-    id: &str,
-    purpose: KeyPurpose,
-    status: KeyStatus,
-    algorithm: &str,
-    byte: u8,
-) -> KeyMaterial {
+fn key_material(id: &str, purpose: KeyPurpose, status: KeyStatus, byte: u8) -> KeyMaterial {
     KeyMaterial::new(
         KeyDescriptor {
             id: key_id(id),
             purpose,
-            algorithm: algorithm.to_owned(),
             status,
             created_at_ms: 0,
-            not_before_ms: None,
-            not_after_ms: None,
             public_key: None,
-            external_kms_uri: None,
         },
         secret(byte),
     )

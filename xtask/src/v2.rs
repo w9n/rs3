@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::{Args, Subcommand, ValueEnum};
 #[cfg(feature = "s3")]
-use rs3_crypto::{FormatEnvelope, KeyRing, KeyringEnvelope, RepositoryKeyContext, SecretBytes};
+use rs3_crypto::{KeyRing, RepositoryEnvelope, RepositoryKeyContext, SecretBytes};
 #[cfg(feature = "s3")]
 use rs3_repository::store_keyring_envelope;
 #[cfg(feature = "s3")]
@@ -294,7 +294,7 @@ where
     let format_plaintext = format_root
         .to_plaintext_bytes()
         .context("failed to encode rehearsal format root")?;
-    let format_envelope = FormatEnvelope::seal(
+    let format_envelope = RepositoryEnvelope::seal_format(
         &context,
         "gc-rehearsal-wrap",
         &wrapping_key,
@@ -734,13 +734,14 @@ where
         )
         .await
         .context("failed to read v2 format root envelope")?;
-    let envelope = FormatEnvelope::from_object_bytes(body.as_ref())
-        .context("failed to decode v2 format root envelope")?;
+    let envelope =
+        RepositoryEnvelope::from_object_bytes(body.as_ref(), rs3_crypto::EnvelopePurpose::Format)
+            .context("failed to decode v2 format root envelope")?;
     if envelope.generation != reference.generation || envelope.digest()? != reference.digest {
         bail!("v2 format root object does not match the bundle reference");
     }
     let plaintext = envelope
-        .open(context, wrapping_key_id, wrapping_key)
+        .open_format(context, wrapping_key_id, wrapping_key)
         .context("failed to open v2 format root envelope")?;
     V2FormatRoot::from_plaintext_bytes(&plaintext).context("failed to decode v2 format root")
 }
@@ -764,13 +765,14 @@ where
         )
         .await
         .context("failed to read v2 keyring envelope")?;
-    let envelope = KeyringEnvelope::from_object_bytes(body.as_ref())
-        .context("failed to decode keyring envelope")?;
+    let envelope =
+        RepositoryEnvelope::from_object_bytes(body.as_ref(), rs3_crypto::EnvelopePurpose::Keyring)
+            .context("failed to decode keyring envelope")?;
     if envelope.generation != reference.generation || envelope.digest()? != reference.digest {
         bail!("v2 keyring envelope does not match the format-root reference");
     }
     envelope
-        .open(context, wrapping_key_id, wrapping_key)
+        .open_keyring(context, wrapping_key_id, wrapping_key)
         .context("failed to open v2 keyring envelope")
 }
 

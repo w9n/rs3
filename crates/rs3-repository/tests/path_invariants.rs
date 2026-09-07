@@ -152,32 +152,13 @@ fn object_id(value: &str) -> Result<BackendObjectId, String> {
 
 fn signing_keyring() -> KeyRing {
     keyring(vec![
-        key_material(
-            "namespace",
-            KeyPurpose::Namespace,
-            KeyStatus::Primary,
-            "hmac-sha256",
-            1,
-        ),
-        key_material(
-            "metadata",
-            KeyPurpose::Metadata,
-            KeyStatus::Primary,
-            "aes-256-gcm-siv-hmac-sha256-nonce-v1",
-            2,
-        ),
-        key_material(
-            "content",
-            KeyPurpose::Content,
-            KeyStatus::Primary,
-            "xchacha20poly1305",
-            4,
-        ),
+        key_material("namespace", KeyPurpose::Namespace, KeyStatus::Primary, 1),
+        key_material("metadata", KeyPurpose::Metadata, KeyStatus::Primary, 2),
+        key_material("content", KeyPurpose::Content, KeyStatus::Primary, 4),
         key_material(
             "signing",
             KeyPurpose::CheckpointSigning,
             KeyStatus::Primary,
-            "ed25519",
             3,
         ),
     ])
@@ -194,20 +175,15 @@ fn key_material(
     value: &str,
     purpose: KeyPurpose,
     status: KeyStatus,
-    algorithm: &str,
     secret_byte: u8,
 ) -> KeyMaterial {
     KeyMaterial::new(
         KeyDescriptor {
             id: key_id(value),
             purpose,
-            algorithm: algorithm.to_owned(),
             status,
             created_at_ms: 0,
-            not_before_ms: None,
-            not_after_ms: None,
             public_key: None,
-            external_kms_uri: None,
         },
         secret(secret_byte),
     )
