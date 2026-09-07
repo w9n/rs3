@@ -502,6 +502,8 @@ pub enum IndexRunError {
     TrailingBytes,
     /// An integer used a longer varint representation than necessary.
     NonCanonicalVarint,
+    /// A path prefix exceeds its predecessor or is not the longest shared prefix.
+    InvalidPathPrefix,
     /// An encoded integer cannot be represented by the target type.
     IntegerOverflow,
     /// A byte or record limit was exceeded.
@@ -616,6 +618,7 @@ impl fmt::Display for IndexRunError {
             Self::UnexpectedEof => formatter.write_str("truncated index run"),
             Self::TrailingBytes => formatter.write_str("trailing bytes after index run"),
             Self::NonCanonicalVarint => formatter.write_str("non-canonical varint"),
+            Self::InvalidPathPrefix => formatter.write_str("invalid listing path prefix"),
             Self::IntegerOverflow => formatter.write_str("encoded integer overflow"),
             Self::LimitExceeded {
                 field,
@@ -781,7 +784,7 @@ pub fn encode_index_run_frames(
             &container.keyring_envelope,
             limits,
         )?;
-        record.u32(container.pack_section_ordinal)?;
+        record.varint(u64::from(container.pack_section_ordinal))?;
         record.u64(container.pack_section_offset)?;
         record.u64(container.pack_section_len)?;
         record.bytes(&container.pack_id)?;
@@ -880,18 +883,12 @@ pub fn encode_index_run_frames(
         match mutation {
             IndexMutation::Upsert(upsert) => {
                 record.u8(0)?;
-                record.string(upsert.path.as_str(), limits.max_path_bytes, "logical path")?;
                 record.varint(upsert.generation.get())?;
                 record.varint(upsert.content_len)?;
                 record.i64(upsert.modified_at_ms)?;
             }
             IndexMutation::Tombstone(tombstone) => {
                 record.u8(1)?;
-                record.string(
-                    tombstone.path.as_str(),
-                    limits.max_path_bytes,
-                    "logical path",
-                )?;
                 record.varint(tombstone.generation.get())?;
             }
         }
@@ -951,6 +948,45 @@ impl PreparedRecord {
     fn metadata(bytes: Vec<u8>) -> Self {
         Self { bytes, bound: None }
     }
+
+    fn listing_path(&self) -> Option<&[u8]> {
+        match &self.bound {
+            Some(IndexRunSearchBound::Listing { path, .. }) => Some(path.as_str().as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn encoded_len(&self, previous_path: &[u8]) -> Result<usize, IndexRunError> {
+        let Some(path) = self.listing_path() else {
+            return Ok(self.bytes.len());
+        };
+        let prefix_len = shared_prefix_len(previous_path, path);
+        let suffix_len = path.len() - prefix_len;
+        self.bytes
+            .len()
+            .checked_add(varint_len(usize_to_u64(prefix_len)?))
+            .and_then(|len| len.checked_add(varint_len(usize_to_u64(suffix_len).ok()?)))
+            .and_then(|len| len.checked_add(suffix_len))
+            .ok_or(IndexRunError::IntegerOverflow)
+    }
+
+    fn encode(&self, writer: &mut Writer, previous_path: &[u8]) -> Result<(), IndexRunError> {
+        if let Some(path) = self.listing_path() {
+            let prefix_len = shared_prefix_len(previous_path, path);
+            writer.varint(usize_to_u64(prefix_len)?)?;
+            writer.varint(usize_to_u64(path.len() - prefix_len)?)?;
+            writer.bytes(&path[prefix_len..])?;
+        }
+        writer.bytes(&self.bytes)
+    }
+}
+
+fn shared_prefix_len(previous: &[u8], current: &[u8]) -> usize {
+    previous
+        .iter()
+        .zip(current)
+        .take_while(|(a, b)| a == b)
+        .count()
 }
 
 #[derive(Clone, Copy)]
@@ -974,11 +1010,15 @@ fn pack_prepared_frames(
     let mut frames = Vec::new();
     let mut start = 0_usize;
     loop {
+        let role_ordinal =
+            u32::try_from(frames.len()).map_err(|_| IndexRunError::IntegerOverflow)?;
         let mut end = start;
         let mut payload_len = 0_usize;
+        let mut previous_path = &[][..];
         while let Some(record) = records.get(end) {
-            let framed_len = varint_len(usize_to_u64(record.bytes.len())?)
-                .checked_add(record.bytes.len())
+            let record_len = record.encoded_len(previous_path)?;
+            let framed_len = varint_len(usize_to_u64(record_len)?)
+                .checked_add(record_len)
                 .ok_or(IndexRunError::IntegerOverflow)?;
             let candidate_payload = payload_len
                 .checked_add(framed_len)
@@ -986,6 +1026,8 @@ fn pack_prepared_frames(
             let candidate_count = end - start + 1;
             if frame_header_len(
                 role,
+                role_ordinal,
+                mutation_count,
                 records.len(),
                 candidate_count,
                 self_payload,
@@ -998,6 +1040,7 @@ fn pack_prepared_frames(
                 break;
             }
             payload_len = candidate_payload;
+            previous_path = record.listing_path().unwrap_or_default();
             end += 1;
         }
         if end == start && !records.is_empty() {
@@ -1007,8 +1050,6 @@ fn pack_prepared_frames(
                 maximum: limits.max_frame_bytes,
             });
         }
-        let role_ordinal =
-            u32::try_from(frames.len()).map_err(|_| IndexRunError::IntegerOverflow)?;
         let frame_records = &records[start..end];
         let mut writer = Writer::new(limits.max_frame_bytes);
         encode_frame_header(
@@ -1024,11 +1065,13 @@ fn pack_prepared_frames(
                 namespace_key_count,
             },
         )?;
+        let mut previous_path = &[][..];
         for record in frame_records {
             let mut encoded_record =
                 Writer::new(record_limit(role, record.bytes.first().copied(), limits));
-            encoded_record.bytes(&record.bytes)?;
+            record.encode(&mut encoded_record, previous_path)?;
             writer.record(encoded_record)?;
+            previous_path = record.listing_path().unwrap_or_default();
         }
         frames.push(EncodedIndexRunFrame {
             role,
@@ -1067,7 +1110,7 @@ fn encode_frame_header(
     writer.bytes(INDEX_RUN_PLAINTEXT_DOMAIN)?;
     writer.u16(INDEX_RUN_WIRE_VERSION)?;
     writer.u8(frame_role_tag(facts.role))?;
-    writer.u32(facts.role_ordinal)?;
+    writer.varint(u64::from(facts.role_ordinal))?;
     writer.u64(facts.sequence.get())?;
     writer.varint(u64::from(facts.mutation_count))?;
     writer.varint(usize_to_u64(facts.role_record_count)?)?;
@@ -1091,12 +1134,19 @@ fn encode_frame_header(
 
 fn frame_header_len(
     role: IndexRunFrameRole,
+    role_ordinal: u32,
+    mutation_count: u32,
     role_record_count: usize,
     frame_record_count: usize,
     self_payload: IndexRunSelfPayload<'_>,
     namespace_key_count: usize,
 ) -> Result<usize, IndexRunError> {
-    let base = INDEX_RUN_PLAINTEXT_DOMAIN.len() + 2 + 1 + 4 + 8 + 5;
+    let base = INDEX_RUN_PLAINTEXT_DOMAIN.len()
+        + 2
+        + 1
+        + varint_len(u64::from(role_ordinal))
+        + 8
+        + varint_len(u64::from(mutation_count));
     let mut length = base
         .checked_add(varint_len(usize_to_u64(role_record_count)?))
         .and_then(|value| value.checked_add(varint_len(usize_to_u64(frame_record_count).ok()?)))
@@ -1561,10 +1611,19 @@ impl IndexRunFrameDecoder {
         {
             return Err(IndexRunError::FrameFactsMismatch);
         }
+        let mut previous_path: Option<LogicalPath> = None;
         for _ in 0..header.frame_record_count {
             let mut record = reader.record(limits.max_record_bytes)?;
+            let path = decode_listing_path(
+                &mut record,
+                previous_path
+                    .as_ref()
+                    .map_or(&[], |path| path.as_str().as_bytes()),
+                limits,
+            )?;
+            previous_path = Some(path.clone());
             let ordinal = record.u32_varint()?;
-            let listing = decode_listing_projection(&mut record, limits)?;
+            let listing = decode_listing_projection(&mut record, path)?;
             record.finish_record()?;
             let sort_key = (listing.path(), ordinal);
             if self
@@ -1687,7 +1746,7 @@ fn decode_frame_header<'a>(
             });
         }
     };
-    let role_ordinal = reader.u32()?;
+    let role_ordinal = reader.u32_varint()?;
     let sequence = Sequence::new(reader.u64()?);
     let mutation_count = reader.u32_varint()?;
     let role_record_limit = if role == IndexRunFrameRole::Metadata {
@@ -1769,7 +1828,7 @@ fn decode_container(
         stored_len: exact.stored_len,
         commit_body_digest: exact.object_digest,
         keyring_envelope: exact.keyring_envelope,
-        pack_section_ordinal: record.u32()?,
+        pack_section_ordinal: record.u32_varint()?,
         pack_section_offset: record.u64()?,
         pack_section_len: record.u64()?,
         pack_id: {
@@ -1935,12 +1994,46 @@ fn decode_namespace_key_reference(
     Ok((ordinal, namespace_key_id))
 }
 
+fn decode_listing_path(
+    record: &mut Reader<'_>,
+    previous: &[u8],
+    limits: &IndexRunLimits,
+) -> Result<LogicalPath, IndexRunError> {
+    let prefix_len = record.bounded_count("logical path", limits.max_path_bytes)?;
+    let prefix = previous
+        .get(..prefix_len)
+        .ok_or(IndexRunError::InvalidPathPrefix)?;
+    let suffix_len = record.bounded_count("logical path", limits.max_path_bytes)?;
+    let path_len = prefix_len
+        .checked_add(suffix_len)
+        .ok_or(IndexRunError::IntegerOverflow)?;
+    validate_count("logical path", path_len, limits.max_path_bytes)?;
+    let suffix = record.bytes(suffix_len)?;
+    // A byte prefix may end within a UTF-8 code point. Validate the reconstructed
+    // path, and reject a shorter representation of the same shared prefix.
+    if previous
+        .get(prefix_len)
+        .zip(suffix.first())
+        .is_some_and(|(a, b)| a == b)
+    {
+        return Err(IndexRunError::InvalidPathPrefix);
+    }
+    let mut path = Vec::with_capacity(path_len);
+    path.extend_from_slice(prefix);
+    path.extend_from_slice(suffix);
+    let path = String::from_utf8(path).map_err(|_| IndexRunError::InvalidUtf8 {
+        field: "logical path",
+    })?;
+    LogicalPath::new(path).map_err(|_| IndexRunError::InvalidValue {
+        field: "logical path",
+    })
+}
+
 fn decode_listing_projection(
     record: &mut Reader<'_>,
-    limits: &IndexRunLimits,
+    path: LogicalPath,
 ) -> Result<ListingProjection, IndexRunError> {
     let tag = record.u8()?;
-    let path = record.typed_string("logical path", limits.max_path_bytes, LogicalPath::new)?;
     let generation = Sequence::new(record.varint()?);
     match tag {
         0 => Ok(ListingProjection::Upsert {
@@ -2719,7 +2812,7 @@ fn encode_retention(
                 RetentionMode::Governance => 1,
                 RetentionMode::Compliance => 2,
             })?;
-            writer.u32(retention.retain_days)
+            writer.varint(u64::from(retention.retain_days))
         }
     }
 }
@@ -2739,7 +2832,7 @@ fn decode_retention(reader: &mut Reader<'_>) -> Result<Option<RetentionPolicy>, 
                     });
                 }
             };
-            Ok(Some(RetentionPolicy::new(mode, reader.u32()?)))
+            Ok(Some(RetentionPolicy::new(mode, reader.u32_varint()?)))
         }
         value => Err(IndexRunError::InvalidTag {
             field: "retention option",
@@ -2830,10 +2923,6 @@ impl Writer {
         self.bytes(&value.to_be_bytes())
     }
 
-    fn u32(&mut self, value: u32) -> Result<(), IndexRunError> {
-        self.bytes(&value.to_be_bytes())
-    }
-
     fn u64(&mut self, value: u64) -> Result<(), IndexRunError> {
         self.bytes(&value.to_be_bytes())
     }
@@ -2903,12 +2992,6 @@ impl<'a> Reader<'a> {
         let mut bytes = [0_u8; 2];
         bytes.copy_from_slice(self.bytes(2)?);
         Ok(u16::from_be_bytes(bytes))
-    }
-
-    fn u32(&mut self) -> Result<u32, IndexRunError> {
-        let mut bytes = [0_u8; 4];
-        bytes.copy_from_slice(self.bytes(4)?);
-        Ok(u32::from_be_bytes(bytes))
     }
 
     fn u64(&mut self) -> Result<u64, IndexRunError> {
@@ -3227,7 +3310,7 @@ mod tests {
         };
         let encoded = encode_index_run_frames(&fixture(), &limits).expect("encode key table");
         let mut excessive_count = frame_bytes(encoded);
-        let table_count_offset = INDEX_RUN_PLAINTEXT_DOMAIN.len() + 2 + 1 + 4 + 8 + 3 + 1;
+        let table_count_offset = INDEX_RUN_PLAINTEXT_DOMAIN.len() + 2 + 1 + 1 + 8 + 3 + 1;
         excessive_count[0][table_count_offset] = 3;
         assert_eq!(
             decode_index_run_frames(&excessive_count, &limits),
@@ -3562,11 +3645,159 @@ mod tests {
     }
 
     #[test]
+    fn listing_prefixes_reset_at_frame_boundaries_and_preserve_duplicate_paths() {
+        let limits = IndexRunLimits {
+            max_frame_bytes: 300,
+            ..IndexRunLimits::default()
+        };
+        let mut run = multi_frame_fixture();
+        // These UTF-8 paths share a byte inside a multi-byte character. Pairs
+        // repeat the exact path at distinct ordinals, requiring an empty suffix.
+        for (index, mutation) in run.mutations.iter_mut().enumerate() {
+            if let IndexMutation::Upsert(upsert) = mutation {
+                upsert.path = LogicalPath::new(format!(
+                    "tenant/{}",
+                    if index / 2 % 2 == 0 { "é" } else { "ê" }
+                ))
+                .expect("UTF-8 path");
+            }
+        }
+        let encoded = encode_index_run_frames(&run, &limits).expect("front-coded frames");
+        let listing: Vec<_> = encoded
+            .frames
+            .iter()
+            .filter(|frame| frame.role == IndexRunFrameRole::Listing)
+            .collect();
+        assert!(listing.len() > 1, "exercise frame reset");
+        for frame in listing {
+            assert!(frame.bytes.len() <= limits.max_frame_bytes);
+            let (header, mut reader) =
+                super::decode_frame_header(&frame.bytes, &limits).expect("frame header");
+            let mut previous = None::<LogicalPath>;
+            for index in 0..header.frame_record_count {
+                let mut record = reader.record(limits.max_record_bytes).expect("record");
+                if index == 0 {
+                    assert_eq!(record.remaining[0], 0, "first path is independent");
+                }
+                let path = super::decode_listing_path(
+                    &mut record,
+                    previous
+                        .as_ref()
+                        .map_or(&[], |path| path.as_str().as_bytes()),
+                    &limits,
+                )
+                .expect("independent path decode");
+                previous = Some(path);
+            }
+        }
+        assert_eq!(
+            decode_index_run_frames(&frame_bytes(encoded), &limits),
+            Ok(run)
+        );
+    }
+
+    #[test]
+    fn listing_path_decoder_rejects_noncanonical_and_oversized_prefixes() {
+        let limits = IndexRunLimits {
+            max_path_bytes: 8,
+            ..IndexRunLimits::default()
+        };
+        let decode = |bytes: &[u8], previous: &[u8]| {
+            super::decode_listing_path(&mut super::Reader::new(bytes), previous, &limits)
+        };
+        assert_eq!(
+            decode(&[1, 1, b'x'], b""),
+            Err(IndexRunError::InvalidPathPrefix)
+        );
+        assert_eq!(
+            decode(&[4, 1, b'x'], b"abc"),
+            Err(IndexRunError::InvalidPathPrefix)
+        );
+        assert_eq!(
+            decode(&[1, 2, b'b', b'x'], b"abc"),
+            Err(IndexRunError::InvalidPathPrefix)
+        );
+        assert_eq!(
+            decode(&[0x80, 0, 1, b'x'], b""),
+            Err(IndexRunError::NonCanonicalVarint)
+        );
+        assert_eq!(
+            decode(&[0, 0x81, 0, b'x'], b""),
+            Err(IndexRunError::NonCanonicalVarint)
+        );
+        assert_eq!(
+            decode(&[0, 1, 0xff], b""),
+            Err(IndexRunError::InvalidUtf8 {
+                field: "logical path"
+            })
+        );
+        assert_eq!(
+            decode(&[0, 0], b""),
+            Err(IndexRunError::InvalidValue {
+                field: "logical path"
+            })
+        );
+        assert!(matches!(
+            decode(&[8, 1, b'x'], b"12345678"),
+            Err(IndexRunError::LimitExceeded {
+                field: "logical path",
+                actual: 9,
+                maximum: 8
+            })
+        ));
+        assert_eq!(
+            decode(&[0, 2, b'x'], b""),
+            Err(IndexRunError::UnexpectedEof)
+        );
+        // Sharing only the leading byte of a UTF-8 code point is canonical.
+        assert_eq!(
+            decode(&[1, 1, 0xaa], "é".as_bytes()),
+            LogicalPath::new("ê").map_err(|_| IndexRunError::InvalidPathPrefix)
+        );
+    }
+
+    #[test]
+    fn front_coding_reduces_repeated_path_bytes_without_changing_search_bounds() {
+        let mut run = multi_frame_fixture();
+        for mutation in &mut run.mutations {
+            if let IndexMutation::Upsert(upsert) = mutation {
+                upsert.path = LogicalPath::new(format!(
+                    "{}/object-{:04}",
+                    "shared/".repeat(100),
+                    upsert.mutation_ordinal
+                ))
+                .expect("long path");
+            }
+        }
+        let full_path_bytes: usize = run
+            .mutations
+            .iter()
+            .map(|mutation| super::mutation_path(mutation).as_str().len())
+            .sum();
+        let limits = IndexRunLimits::default();
+        let encoded = encode_index_run_frames(&run, &limits).expect("compressed listing");
+        let listing_bytes: usize = encoded
+            .frames
+            .iter()
+            .filter(|frame| frame.role == IndexRunFrameRole::Listing)
+            .map(|frame| frame.bytes.len())
+            .sum();
+        assert!(
+            listing_bytes < full_path_bytes / 4,
+            "shared prefix must not repeat per record"
+        );
+        assert_eq!(
+            decode_index_run_frames(&frame_bytes(encoded), &limits),
+            Ok(run)
+        );
+    }
+
+    #[test]
     fn rejects_noncanonical_varint() {
         let limits = IndexRunLimits::default();
         let mut frames =
             frame_bytes(encode_index_run_frames(&fixture(), &limits).expect("encode framed run"));
-        let mutation_count_offset = INDEX_RUN_PLAINTEXT_DOMAIN.len() + 2 + 1 + 4 + 8;
+        let mutation_count_offset = INDEX_RUN_PLAINTEXT_DOMAIN.len() + 2 + 1 + 1 + 8;
         frames[0].splice(mutation_count_offset..=mutation_count_offset, [0x82, 0x00]);
 
         assert_eq!(
@@ -3680,7 +3911,7 @@ mod tests {
         let encoded = encode_index_run(&fixture(), &IndexRunLimits::default()).expect("encode run");
         assert_eq!(
             hex(&encoded),
-            "039b027273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0007000000000000000000000000090202020001d601000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c232323232323232323232323232323232323232323232323232323232323232300000003000000000000020000000000000008001111111111111111111111111111111111111111111111111111111111111111a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a309636f6e74656e742d31080d030b6e616d6573706163652d3192017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0007010000000000000000000000090202023900003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901020000001e02240101444444444444444444444444444444444444444444444444444444444444444400126a7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0007020000000000000000000000090202021201010e74656e616e742f64656c65746564122300001574656e616e742f736e617073686f742f6368756e6b11d209ffffffffffffffc9"
+            "0395027273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0007000000000000000000090202020001d301000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c232323232323232323232323232323232323232323232323232323232323232303000000000000020000000000000008001111111111111111111111111111111111111111111111111111111111111111a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a309636f6e74656e742d31080d030b6e616d6573706163652d318c017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0007010000000000000000090202023600003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901021e0224010144444444444444444444444444444444444444444444444444444444444444440012627273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00070200000000000000000902020213000e74656e616e742f64656c657465640101121d070e736e617073686f742f6368756e6b000011d209ffffffffffffffc9"
         );
     }
 
@@ -3709,7 +3940,7 @@ mod tests {
             panic!("fixture starts with an upsert");
         };
         run.mutations.clear();
-        for ordinal in 0_u8..12 {
+        for ordinal in 0_u8..24 {
             let mut container = container.clone();
             container.object_id = BackendObjectId::new(format!("objects/pack-{ordinal:02}"))
                 .expect("container object id");
@@ -3860,7 +4091,7 @@ mod tests {
         );
 
         let mut duplicate = frame_bytes(encoded);
-        let upsert_prefix = [0_u8, 0_u8, 21_u8];
+        let upsert_prefix = [0_u8, 0_u8, 0x11_u8, 0xd2, 0x09];
         let ordinal_offset = duplicate[listing_index]
             .windows(upsert_prefix.len())
             .position(|window| window == upsert_prefix)

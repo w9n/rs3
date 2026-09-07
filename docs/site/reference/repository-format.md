@@ -132,11 +132,26 @@ outside the signed layout fail closed. Signed section digests, framed indices,
 compacted runs and detached payloads are intrinsic to format 3; no capability
 bits are assigned. Root catalogs accept levels zero and one.
 
-The current framed index plaintext is wire version 7. Mutation ordinals,
-generations, content lengths, and bounded counts use canonical varints; readers
-reject overlong encodings. Generation and content length appear in both the
-namespace and listing projections because each projection must be independently
-validated before the two records are paired.
+The current framed index plaintext is wire version 7. Frame, section and mutation
+ordinals, generations, content lengths, retention days, and bounded counts use
+canonical unsigned varints; readers reject overlong encodings. Generation and
+content length appear in both the namespace and listing projections because each
+projection must be independently validated before the two records are paired.
+
+Listing records start with a shared-prefix byte count, suffix byte count and
+suffix bytes, followed by the mutation ordinal, kind and listing facts. The
+prefix is the longest byte prefix shared with the preceding path in that frame.
+The first record always has prefix zero and carries its full path. Identical
+paths at distinct ordinals use the full predecessor length and an empty suffix.
+Frames reset the prefix context and can be decoded independently. Prefixes may
+split a UTF-8 code point, but the complete reconstructed path must be valid UTF-8
+and satisfy the path-byte limit. Readers reject nonmaximal or out-of-bounds
+prefixes and oversized reconstructed paths before allocating path storage.
+Namespace projections retain their full 32-byte blinded keys.
+
+Frame ciphertext lengths reflect compressed metadata, including aggregate path
+lengths and shared-prefix structure. Front coding reduces stored and transferred
+index bytes; recovery still holds complete logical paths in trusted memory.
 
 Signed per-section descriptors are required for descriptor-first recovery. A
 reader can authenticate an index range without downloading unrelated payload

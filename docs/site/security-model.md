@@ -516,3 +516,10 @@ schema-v5 evidence and rejects mismatched or retired reports. These bindings
 prevent accidental reuse across changes; they do not attest the host, cloud
 principal or future provider behavior. The qualification process and serving
 process must use the same executable.
+
+Index listing frames use byte-prefix compression within each encrypted frame.
+The backend sees the resulting aggregate ciphertext lengths, which depend on
+path lengths and shared-prefix structure. It does not receive the plaintext
+prefixes or record boundaries. Decoders reset at each frame and bound both
+encoded records and reconstructed paths before allocating memory. This encoding
+does not remove full paths from the trusted in-memory namespace.
