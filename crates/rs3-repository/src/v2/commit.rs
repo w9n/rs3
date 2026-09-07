@@ -254,7 +254,7 @@ pub struct V2Algorithms {
     pub signature: String,
     /// Payload AEAD algorithm identifier.
     pub payload_aead: String,
-    /// Index metadata AEAD and deterministic nonce suite identifier.
+    /// Index metadata AEAD and random nonce suite identifier.
     pub index_aead: String,
     /// Digest algorithm identifier.
     pub digest: String,
@@ -268,7 +268,7 @@ impl V2Algorithms {
         Self {
             signature: "Ed25519".to_owned(),
             payload_aead: "XChaCha20-Poly1305".to_owned(),
-            index_aead: "AES-256-GCM-SIV-HMAC-SHA256-Nonce-v1".to_owned(),
+            index_aead: "AES-256-GCM-SIV-Random-Nonce-v1".to_owned(),
             digest: "SHA-256".to_owned(),
             kdf: "HMAC-SHA256".to_owned(),
         }

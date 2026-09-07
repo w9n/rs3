@@ -72,7 +72,7 @@ The replacement `v02` design accepts specific backend-visible leakage:
 | Compaction cadence | The provider sees sibling delta-carrier and root writes, plus later cleanup. | Compact at bounded active-run watermarks and consider optional jitter; never include paths in scheduling telemetry. |
 | Payload-pack shape and access | A commit exposes aggregate pack size, and exact range reads reveal ciphertext span and access patterns. | Batch by bounded protection cohort, randomize record order, keep record descriptors inside encrypted authenticated index runs, and consider optional padding only with measured budgets. |
 | Streamed-payload shape and access | A standalone `objects/v02/` payload followed by `[INDEX_RUN]` reveals ciphertext size, write cadence, publication delay, concurrency, and range-access spans. Empty values are index-only. | Encrypt carrier references, use random opaque object keys, and authenticate segments before release. |
-| Deterministic metadata equality | Stable metadata sealing can produce identical sealed bytes for identical metadata under identical associated data. | Bind framed ciphertext to a unique run and frame context; complete equality analysis before format freeze. |
+| Exact retry equality | Reusing prepared ciphertext for a publication retry reveals that the same opaque bytes were sent again. | Fresh random metadata nonces prevent intentional equality across independent seals; retain unique authenticated run/frame context. |
 
 Optional mitigations include padding, pack-size normalization, commit batching,
 compaction jitter, and stricter telemetry redaction.
@@ -453,8 +453,9 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
   outstanding.
 - Durable format compatibility is not promised yet.
 - The cryptographic design has not had an external review.
-- Metadata sealing uses a standard misuse-resistant AEAD, but deterministic
-  sealing leaks equality for identical metadata under identical associated data.
+- Metadata sealing uses fresh random 96-bit nonces with a standard misuse-resistant
+  AEAD. Exact retry bytes remain linkable. Aggregate key-use and rotation limits
+  still need production qualification.
 - The v02 runtime omits the legacy durable prefix-token projection. Encrypted
   index shape, object counts, ciphertext sizes, and operation timing remain
   observable as documented in the leakage table.

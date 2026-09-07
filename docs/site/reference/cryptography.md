@@ -41,7 +41,6 @@ KDF before it is provided as `RS3_KEYRING_WRAPPING_KEY_HEX`.
 - prefix lookup tokens
 - opaque manifest IDs
 - AEAD subkeys
-- deterministic metadata nonces
 - Ed25519 signing seeds
 
 New derivations must use a unique `rs3:` domain string. When a derivation input
@@ -91,14 +90,15 @@ unchanged.
 
 ## Metadata
 
-Manifest and index metadata are sealed with AES-256-GCM-SIV. The metadata nonce
-is deterministic: it is derived from the metadata key, associated data, and
-plaintext. This makes retrying the same metadata write stable.
+Manifest and index metadata are sealed with AES-256-GCM-SIV and a fresh random
+96-bit nonce from the operating system for each seal. The existing stored nonce
+and 16-byte authentication tag travel with the ciphertext. Randomness failure
+aborts sealing. Independent seals of equal metadata do not intentionally produce
+equal ciphertext. Exact publication retries reuse prepared ciphertext bytes;
+resealing the same plaintext is a new encryption, not a request identity.
 
-Deterministic sealing intentionally leaks equality for the same metadata key,
-associated data, and plaintext. The design accepts that leakage for the preview
-because the plaintext metadata is path-sensitive and encrypted, while the
-remaining equality signal is narrower than exposing paths or Kubernetes names.
+AES-GCM-SIV and existing bounded-frame limits remain in force. Aggregate key-use
+and rotation limits still require production qualification and external review.
 
 Metadata associated data is object-type specific:
 
@@ -165,7 +165,7 @@ Before adding or changing crypto-sensitive code:
 The current design has not had an external cryptographic review. Before a stable
 repository format, the project still needs final review of:
 
-- deterministic metadata sealing and accepted equality leakage
+- random metadata nonces, aggregate key-use limits, and retry equality leakage
 - prefix-token structure and namespace-shape leakage
 - padding and pack-size policy
 - KMS/HSM/Vault wrapping-key workflow
