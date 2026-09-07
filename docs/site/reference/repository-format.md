@@ -232,7 +232,11 @@ requires a length from `Content-Length` or valid SigV4 streaming metadata;
 unsigned HTTP chunked `PutObject` receives `411 MissingContentLength`.
 
 The writer verifies the completed exact object version, length, post-completion
-retention deadline, exact EOF, and full ciphertext digest. A short fenced
+retention deadline, exact EOF, and full ciphertext digest. Readback requires the
+bounded full-object provider interface with an expected-length ceiling checked
+before consuming the body. Verification holds one chunk of at most 1 MiB plus
+digest state, and refuses providers without that interface. There is no sampling
+or buffered-read fallback. A short fenced
 `[INDEX_RUN]` commit then publishes the encrypted reference. Payload storage
 alone does not make a value visible. A stalled, truncated, oversized, or failed
 body does not publish a value. A failed publication can leave an opaque orphan

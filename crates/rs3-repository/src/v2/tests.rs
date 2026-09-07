@@ -1,5 +1,8 @@
 mod prepared_genesis;
 mod publication_overlap;
+mod standalone_verification;
+
+use standalone_verification::{ObservedReadback, ReadbackFault, ReadbackProbe};
 
 use super::service::packed::repository_context_from_refs;
 use super::{
@@ -979,6 +982,17 @@ impl BlobStore for TrackedMultipartStore {
         self.inner.open_range_at(object_id, version_id, range).await
     }
 
+    async fn open_bounded_full_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        max_bytes: u64,
+    ) -> rs3_storage::Result<Box<dyn BlobRead>> {
+        self.inner
+            .open_bounded_full_at(object_id, version_id, max_bytes)
+            .await
+    }
+
     async fn get_range_at(
         &self,
         object_id: &BackendObjectId,
@@ -1090,6 +1104,7 @@ struct SlowCommitGetStore {
     max_in_flight_ranged_commit_gets: Arc<AtomicUsize>,
     corrupt_ranged_commit_gets_for: Arc<Mutex<Option<BackendObjectId>>>,
     corrupt_standalone_reads: Arc<std::sync::atomic::AtomicBool>,
+    readback_probe: Arc<ReadbackProbe>,
     standalone_gets: Arc<AtomicUsize>,
     standalone_puts: Arc<AtomicUsize>,
 }
@@ -1106,6 +1121,7 @@ impl SlowCommitGetStore {
             max_in_flight_ranged_commit_gets: Arc::new(AtomicUsize::new(0)),
             corrupt_ranged_commit_gets_for: Arc::new(Mutex::new(None)),
             corrupt_standalone_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            readback_probe: Arc::new(ReadbackProbe::default()),
             standalone_gets: Arc::new(AtomicUsize::new(0)),
             standalone_puts: Arc::new(AtomicUsize::new(0)),
         }
@@ -1258,6 +1274,12 @@ impl BlobStore for SlowCommitGetStore {
         object_id: &BackendObjectId,
         options: PutOptions,
     ) -> rs3_storage::Result<Box<dyn rs3_storage::BlobMultipartUpload>> {
+        if object_id.as_str().starts_with("objects/v03/") {
+            assert_eq!(
+                options.content_type.as_deref(),
+                Some("application/vnd.rs3.payload.v3")
+            );
+        }
         self.inner.create_multipart_upload(object_id, options).await
     }
 
@@ -1291,6 +1313,36 @@ impl BlobStore for SlowCommitGetStore {
         Ok(self.maybe_corrupt_commit_range(object_id, range, body))
     }
 
+    async fn open_bounded_full_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+        max_bytes: u64,
+    ) -> rs3_storage::Result<Box<dyn BlobRead>> {
+        let standalone = object_id.as_str().starts_with("objects/v03/");
+        if standalone && self.readback_probe.fault() == ReadbackFault::Unsupported {
+            return Err(StorageError::BoundedReadUnsupported);
+        }
+        let reader = self
+            .inner
+            .open_bounded_full_at(object_id, version_id, max_bytes)
+            .await?;
+        if !standalone {
+            return Ok(reader);
+        }
+        self.standalone_gets.fetch_add(1, Ordering::SeqCst);
+        self.readback_probe.opens.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            version_id.is_some(),
+            "readback must select the completed exact version"
+        );
+        Ok(Box::new(ObservedReadback::new(
+            reader,
+            Arc::clone(&self.readback_probe),
+            self.corrupt_standalone_reads.load(Ordering::SeqCst),
+        )))
+    }
+
     async fn head(&self, object_id: &BackendObjectId) -> rs3_storage::Result<BlobMetadata> {
         self.inner.head(object_id).await
     }
@@ -1300,7 +1352,14 @@ impl BlobStore for SlowCommitGetStore {
         object_id: &BackendObjectId,
         version_id: Option<&BackendVersionId>,
     ) -> rs3_storage::Result<BlobMetadata> {
-        self.inner.head_at(object_id, version_id).await
+        let mut metadata = self.inner.head_at(object_id, version_id).await?;
+        if object_id.as_str().starts_with("objects/v03/")
+            && self.readback_probe.fault() == ReadbackFault::WrongVersion
+        {
+            metadata.version_id =
+                Some(BackendVersionId::new("wrong-version").expect("fixture version"));
+        }
+        Ok(metadata)
     }
 
     async fn list_prefix(&self, prefix: &str) -> rs3_storage::Result<Vec<BlobMetadata>> {

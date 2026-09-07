@@ -30,6 +30,10 @@ impl ScriptedProvider {
     }
 
     async fn with_status(status: u16, responses: Vec<String>) -> Self {
+        Self::with_headers(status, responses, "").await
+    }
+
+    async fn with_headers(status: u16, responses: Vec<String>, headers: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let endpoint = format!("http://{}", listener.local_addr().expect("address"));
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -49,7 +53,7 @@ impl ScriptedProvider {
                     .expect("requests")
                     .push(header.lines().next().expect("request line").to_owned());
                 let response = format!(
-                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
                     body.len(),
                 );
                 stream
@@ -671,4 +675,47 @@ async fn valid_multipart_completion_publishes_without_aborting() {
         "POST /bucket/objects/multipart?uploadId=fixture-upload HTTP/1.1",
     );
     assert_eq!(requests[1], "HEAD /bucket/objects/multipart HTTP/1.1");
+}
+
+#[tokio::test]
+async fn exact_version_reads_reject_missing_and_mismatched_response_versions() {
+    let object = rs3_types::BackendObjectId::new("objects/exact").expect("object");
+    let version = rs3_types::BackendVersionId::new("accepted-version").expect("version");
+    for (headers, accepted) in [
+        ("", false),
+        ("x-amz-version-id: wrong-version\r\n", false),
+        ("x-amz-version-id: accepted-version\r\n", true),
+    ] {
+        let provider =
+            ScriptedProvider::with_headers(200, vec!["abc".to_owned(); 2], headers).await;
+        let buffered = provider
+            .store
+            .get_range_at(&object, Some(&version), ByteRange::Full)
+            .await;
+        assert_eq!(buffered.is_ok(), accepted);
+        let streamed = provider
+            .store
+            .open_bounded_full_at(&object, Some(&version), 3)
+            .await;
+        assert_eq!(streamed.is_ok(), accepted);
+        if accepted {
+            assert_eq!(
+                buffered.expect("exact buffered read"),
+                Bytes::from_static(b"abc")
+            );
+            assert_eq!(
+                crate::collect_bounded_blob_read(streamed.expect("exact stream"), 3)
+                    .await
+                    .expect("complete stream"),
+                Bytes::from_static(b"abc")
+            );
+        }
+        let requests = provider.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains("versionId=accepted-version"))
+        );
+    }
 }

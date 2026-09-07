@@ -57,6 +57,16 @@ Operators MUST configure a backend lifecycle rule that aborts incomplete
 multipart uploads, because client disconnects and crashes can leave provider
 temporary parts that repository GC cannot see.
 
+Each nonempty standalone upload incurs one complete ciphertext upload and one
+complete readback before publication. The gateway checks the returned exact
+version, length, required protection and complete ciphertext digest through EOF.
+Verification uses the provider's bounded streaming interface, consumes chunks
+of at most 1 MiB and fails closed if that interface is unavailable; it does not
+sample bytes or fall back to buffering the whole object. Account for this full
+readback when estimating backend transfer cost and upload latency. Versioned
+S3 GET responses must echo the requested version ID; missing or different IDs
+are rejected before the body is consumed.
+
 A completed standalone object remains invisible until its exact encrypted
 reference is anchored. Ambiguous multipart completion or a later publication
 failure can therefore leave an opaque repository orphan. Status and guarded

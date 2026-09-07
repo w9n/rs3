@@ -81,6 +81,18 @@ fn limit_metadata_response_body(body: SdkBody, max_bytes: usize) -> SdkBody {
     SdkBody::from_body_1_x(Limited::new(body, max_bytes))
 }
 
+fn validate_read_version(
+    requested: Option<&BackendVersionId>,
+    returned: Option<&str>,
+) -> Result<()> {
+    if requested.is_some_and(|version| returned != Some(version.as_str())) {
+        return Err(StorageError::Provider(
+            "S3 GET response version did not match the requested version".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_list_response_members(page_limit: usize, member_counts: &[usize]) -> Result<usize> {
     let returned_count = member_counts.iter().try_fold(0_usize, |total, count| {
         total
@@ -1018,6 +1030,7 @@ impl BlobStore for S3BlobStore {
 
         match request.send().await {
             Ok(output) => {
+                validate_read_version(Some(version_id), output.version_id())?;
                 let body = collect_get_body(output.body, range, output.content_length).await?;
                 let bytes_read = u64::try_from(body.len()).map_err(|_| {
                     StorageError::Provider("read length does not fit in u64".to_owned())
@@ -1092,6 +1105,7 @@ impl BlobStore for S3BlobStore {
                 return Err(storage_error);
             }
         };
+        validate_read_version(version_id, output.version_id())?;
         let declared_len = output
             .content_length()
             .ok_or_else(|| {

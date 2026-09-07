@@ -1878,7 +1878,7 @@ where
                 PutOptions {
                     retention,
                     legal_hold,
-                    content_type: Some("application/vnd.rs3.payload.v02".to_owned()),
+                    content_type: Some("application/vnd.rs3.payload.v3".to_owned()),
                     do_not_recreate: self.options.provider_profile
                         != V2ProviderProfile::RetainedVersionObjectLock,
                 },
@@ -2001,7 +2001,7 @@ where
         let mut digest = Sha256Hasher::new();
         let mut reader = self
             .store
-            .open_range_at(object_id, version_id, ByteRange::Full)
+            .open_bounded_full_at(object_id, version_id, expected_object_len)
             .await
             .map_err(|_| V2FormatError::ProviderProfileFailed)?;
         if reader.exact_len() != expected_object_len {
@@ -2015,7 +2015,7 @@ where
         {
             let chunk_len =
                 u64::try_from(bytes.len()).map_err(|_| V2FormatError::ProviderProfileFailed)?;
-            if chunk_len == 0 {
+            if chunk_len == 0 || bytes.len() > rs3_storage::MAX_BLOB_READ_CHUNK_BYTES {
                 return Err(V2FormatError::ProviderProfileFailed);
             }
             bytes_read = bytes_read
