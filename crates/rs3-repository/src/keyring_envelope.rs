@@ -72,7 +72,8 @@ where
     })
 }
 
-fn keyring_envelope_object_id(generation: u64, digest: &str) -> Result<BackendObjectId> {
+/// Returns the canonical preview object identity for an encrypted envelope.
+pub fn keyring_envelope_object_id(generation: u64, digest: &str) -> Result<BackendObjectId> {
     BackendObjectId::new(format!(
         "{KEYRING_ENVELOPE_OBJECT_PREFIX}{generation:020}-{digest}.json"
     ))

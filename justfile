@@ -175,7 +175,6 @@ check-v2-provider-v2-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
     RS3_REPOSITORY_SALT_HEX=2222222222222222222222222222222222222222222222222222222222222222 \
     RS3_KEYRING_WRAPPING_KEY_HEX=3333333333333333333333333333333333333333333333333333333333333333 \
       cargo run -p rs3-server --features s3 -- check-v2-provider \
-        --probe-prefix "{{BACKEND_PREFIX}}/p" \
         --legal-hold \
         --governance-bypass-reviewed \
         --format json
@@ -276,10 +275,10 @@ helm-lint:
         --set repository.retention.mode=governance \
         --set repository.retention.days=30 \
         --set providerConformance.existingConfigMap=fixture-provider-conformance \
-        --set-string providerConformance.principalFingerprint=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-        --set-string recovery.publicKey=ed25519:0000000000000000000000000000000000000000000000000000000000000000
+        --set-string providerConformance.principalFingerprint=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     python3 tests/helm_network_policy.py
     python3 tests/helm_runtime_limits.py
+    python3 -B tests/helm_bootstrap.py
 
 # Run the workspace test suite.
 test:

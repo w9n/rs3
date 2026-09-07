@@ -29,9 +29,11 @@ mod config;
 #[cfg(test)]
 mod contract_tests;
 mod errors;
+mod lifecycle;
 mod metrics;
 mod object_lock;
 mod object_lock_client;
+mod provider_probe;
 mod requests;
 
 pub use config::{S3BlobStoreConfig, S3ClientTimeoutConfig};
@@ -52,14 +54,14 @@ use object_lock::{
 };
 use requests::sdk_range_header;
 
-const MAX_LIST_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_METADATA_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
-struct LimitListResponseBody;
+struct LimitMetadataResponseBody;
 
-impl Intercept for LimitListResponseBody {
+impl Intercept for LimitMetadataResponseBody {
     fn name(&self) -> &'static str {
-        "LimitListResponseBody"
+        "LimitMetadataResponseBody"
     }
 
     fn modify_before_deserialization(
@@ -70,12 +72,12 @@ impl Intercept for LimitListResponseBody {
     ) -> std::result::Result<(), BoxError> {
         let body = context.response_mut().take_body();
         *context.response_mut().body_mut() =
-            limit_list_response_body(body, MAX_LIST_RESPONSE_BODY_BYTES);
+            limit_metadata_response_body(body, MAX_METADATA_RESPONSE_BODY_BYTES);
         Ok(())
     }
 }
 
-fn limit_list_response_body(body: SdkBody, max_bytes: usize) -> SdkBody {
+fn limit_metadata_response_body(body: SdkBody, max_bytes: usize) -> SdkBody {
     SdkBody::from_body_1_x(Limited::new(body, max_bytes))
 }
 
@@ -195,6 +197,7 @@ pub struct S3BlobStore {
     client: SdkS3Client,
     config: S3BlobStoreConfig,
     metrics: Arc<S3ProviderMetricCounters>,
+    provider_probe: bool,
 }
 
 struct S3BlobList {
@@ -254,7 +257,7 @@ impl BlobList for S3BlobList {
                 }
                 let output = match request
                     .customize()
-                    .interceptor(LimitListResponseBody)
+                    .interceptor(LimitMetadataResponseBody)
                     .send()
                     .await
                 {
@@ -342,7 +345,7 @@ impl BlobList for S3BlobList {
                 }
                 let output = match request
                     .customize()
-                    .interceptor(LimitListResponseBody)
+                    .interceptor(LimitMetadataResponseBody)
                     .send()
                     .await
                 {
@@ -467,6 +470,7 @@ impl S3BlobStore {
             client,
             config,
             metrics: Arc::new(S3ProviderMetricCounters::default()),
+            provider_probe: false,
         })
     }
 
@@ -486,6 +490,7 @@ impl S3BlobStore {
             client,
             config,
             metrics: Arc::new(S3ProviderMetricCounters::default()),
+            provider_probe: false,
         })
     }
 
@@ -495,6 +500,7 @@ impl S3BlobStore {
             client,
             config,
             metrics: Arc::new(S3ProviderMetricCounters::default()),
+            provider_probe: false,
         }
     }
 
@@ -809,6 +815,10 @@ impl BlobStore for S3BlobStore {
                 Err(storage_error)
             }
         }
+    }
+
+    fn supports_provider_delete_probe(&self) -> bool {
+        self.provider_probe
     }
 
     fn supports_multipart_upload(&self) -> bool {
@@ -1323,6 +1333,10 @@ impl BlobStore for S3BlobStore {
             return self.delete(object_id).await;
         };
 
+        if self.provider_probe {
+            return self.probe_provider_delete(object_id, version_id).await;
+        }
+
         let started = Instant::now();
         let object_kind = object_kind(object_id);
         let metadata = self.head_with_sdk(object_id, Some(version_id)).await?;
@@ -1485,7 +1499,7 @@ impl BlobStore for S3BlobStore {
 mod tests {
     use super::requests::sdk_range_header;
     use super::{
-        S3BlobStore, S3BlobStoreConfig, collect_get_body, limit_list_response_body,
+        S3BlobStore, S3BlobStoreConfig, collect_get_body, limit_metadata_response_body,
         validate_list_response_members,
     };
     use crate::{ByteRange, StorageError};
@@ -1564,7 +1578,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_response_body_limit_accepts_exact_length_and_rejects_overrun() {
-        let exact = limit_list_response_body(
+        let exact = limit_metadata_response_body(
             aws_smithy_types::body::SdkBody::from_body_1_x(Full::new(Bytes::from_static(b"exact"))),
             5,
         )
@@ -1572,7 +1586,7 @@ mod tests {
         .await
         .unwrap_or_else(|error| panic!("{error}"))
         .to_bytes();
-        let overrun = limit_list_response_body(
+        let overrun = limit_metadata_response_body(
             aws_smithy_types::body::SdkBody::from_body_1_x(Full::new(Bytes::from_static(
                 b"too long",
             ))),

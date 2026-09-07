@@ -7,7 +7,7 @@ use super::bounded_io::{
 use super::repository_init;
 #[cfg(feature = "k8s")]
 use super::runtime_builders::build_v2_anchor_with_writer_fence;
-use super::runtime_builders::{build_store, build_v2_anchor, coordinator_options};
+use super::runtime_builders::{StoreBuild, build_store, build_v2_anchor, coordinator_options};
 use super::runtime_handles::{RuntimeStore, RuntimeV2Anchor};
 use super::runtime_keyring::{
     open_gateway_keyring_reference, repository_key_context, retained_version_id,
@@ -45,14 +45,17 @@ use rs3_repository::{
 };
 #[cfg(test)]
 use rs3_storage::MemoryBlobStore;
-#[cfg(feature = "s3")]
-use rs3_storage::S3BlobStore;
 use rs3_storage::{BlobListMode, BlobMetadata, BlobStore, ByteRange, PutOptions, StorageError};
 use rs3_types::{
     BackendObjectId, KeyPurpose, LogicalPath, RetentionMode, RetentionPolicy, Sequence,
 };
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(feature = "k8s")]
+mod bootstrap;
+#[cfg(feature = "k8s")]
+mod onboarding;
 
 const V2_FORMAT_ENVELOPE_CONTENT_TYPE: &str = "application/vnd.rs3.v2-format-envelope+json";
 
@@ -72,10 +75,51 @@ pub struct V2AnchorImportReport {
 pub struct V2RepositoryInitReport {
     /// Anchor state verified after initialization.
     pub anchor: V2AnchorState,
-    /// True when this run created the initial anchor and genesis commit.
+    /// True when this run completed an unfinished repository initialization.
     pub initialized: bool,
     /// Number of commits verified from the anchor to the nearest snapshot.
     pub verified_commit_count: usize,
+    /// Complete provider-probe runs durably reserved by this onboarding journal.
+    pub probe_attempts: u8,
+    /// Whether journaled bootstrap verified and removed its synthetic payload.
+    pub payload_restore_verified: bool,
+    /// Last bounded observation of synthetic probe versions, if available.
+    pub probe_observation: Option<V2ProbeObservation>,
+}
+
+/// Advisory, path-redacted facts about a bounded synthetic probe inventory.
+/// Counts are observations, never completeness or deletion authority. Incomplete
+/// multipart sessions are not covered by object-version listing.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V2ProbeObservation {
+    /// Reserved attempts included in this observation's namespace.
+    pub attempts_covered: u8,
+    /// Time of observation, in Unix milliseconds; reused reports keep this time.
+    pub observed_at_ms: i64,
+    /// Whether the provider's bounded listing ended, not proof of completeness.
+    pub listing_exhausted: bool,
+    /// Distinct versions observed through LIST.
+    pub observed_versions: u32,
+    /// Versions whose exact HEAD identity was verified.
+    pub verified_metadata_versions: u32,
+    /// Sum of lengths from verified metadata, excluding unavailable versions.
+    pub observed_bytes: u64,
+    /// Versions with a reported retention mode and absolute deadline.
+    pub retention_reported_versions: u32,
+    /// Versions reporting legal hold ON, potentially indefinitely protected.
+    pub legal_hold_on_versions: u32,
+    /// Versions without an observed retention deadline or legal hold ON,
+    /// including unavailable exact HEAD metadata.
+    pub unknown_protection_versions: u32,
+    /// Earliest reported retention deadline, which alone does not permit deletion.
+    pub earliest_retain_until_ms: Option<i64>,
+    /// Latest reported retention deadline, excluding indefinite legal holds.
+    pub latest_retain_until_ms: Option<i64>,
+    /// Explicitly false: object-version listing cannot inventory unfinished MPUs.
+    pub multipart_sessions_observed: bool,
+    /// Bounded warning code when the observation is interrupted or incomplete.
+    pub warning: Option<String>,
 }
 
 /// Result of an opt-in live doctor probe.
@@ -150,7 +194,7 @@ pub struct V2AnchorImportOptions {
 /// Runtime options for v2 provider conformance probes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeV2ProviderConformanceOptions {
-    /// Opaque probe object prefix. If absent, a run-specific prefix is used.
+    /// Disjoint S3 backend prefix for synthetic probes. A random prefix is the default.
     pub probe_prefix: Option<String>,
     /// Whether legal-hold add/verify probes should run.
     pub legal_hold: bool,
@@ -166,8 +210,6 @@ pub(super) struct RuntimeRepository {
     anchor: RuntimeV2Anchor,
     initialized: bool,
     require_anchor_version: bool,
-    #[cfg(feature = "s3")]
-    s3_store: Option<S3BlobStore>,
     #[cfg(test)]
     memory_store: Option<MemoryBlobStore>,
     #[cfg(test)]
@@ -201,6 +243,21 @@ struct LoadedV2Repository {
     anchor_present: bool,
 }
 
+fn bootstrap_commit_options(
+    config: &RuntimeConfig,
+    loaded: &LoadedV2Repository,
+) -> Result<V2CommitStoreOptions, S3BoundaryError> {
+    Ok(V2CommitStoreOptions::for_profile(
+        v2_provider_profile(&config.backend, config.repository.retention),
+        config.repository_keys.repository_id.clone(),
+        loaded.keyring_ref.commit_ref().map_err(repository_init)?,
+        loaded.format_ref.clone(),
+    )
+    .with_maintenance_keyring_envelope_ref(loaded.keyring_ref.clone())
+    .with_retention(config.repository.retention)
+    .with_stream_read_stall_timeout(config.hardening.stream_read_stall_timeout))
+}
+
 impl RuntimeRepository {
     pub(super) async fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
         Self::from_config_inner(config, None, None).await
@@ -229,6 +286,36 @@ impl RuntimeRepository {
         maintenance_guard: Option<Arc<dyn V2MaintenanceGuard>>,
     ) -> Result<Self, S3BoundaryError> {
         let store = build_store(&config.backend).await?;
+        store
+            .validate_write_policy(config.mode, config.repository.retention)
+            .await?;
+        #[cfg(not(feature = "k8s"))]
+        let writer_fence = _writer_fence;
+        Self::from_preflighted_store(config, store, writer_fence, maintenance_guard).await
+    }
+
+    async fn from_preflighted_store(
+        config: &RuntimeConfig,
+        store: StoreBuild,
+        #[cfg(feature = "k8s")] writer_fence: Option<WriterFence>,
+        #[cfg(not(feature = "k8s"))] _writer_fence: Option<()>,
+        maintenance_guard: Option<Arc<dyn V2MaintenanceGuard>>,
+    ) -> Result<Self, S3BoundaryError> {
+        #[cfg(feature = "k8s")]
+        if config.mode.allows_mutation()
+            && config.repository.allow_init
+            && matches!(config.anchor, crate::AnchorConfig::KubernetesLease { .. })
+        {
+            return Err(repository_init(
+                "Kubernetes initialization requires journaled init; disable initialization for serving",
+            ));
+        }
+        if let Some(guard) = maintenance_guard.as_ref() {
+            guard
+                .verify_v2_maintenance(None)
+                .await
+                .map_err(repository_init)?;
+        }
         #[cfg(feature = "k8s")]
         let anchor = build_v2_anchor_with_writer_fence(&config.anchor, writer_fence)?;
         #[cfg(not(feature = "k8s"))]
@@ -244,17 +331,7 @@ impl RuntimeRepository {
         )
         .await?;
         let initialized = !loaded.anchor_present;
-        let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
-        let maintenance_keyring_ref = loaded.keyring_ref.clone();
-        let commit_options = V2CommitStoreOptions::for_profile(
-            provider_profile,
-            config.repository_keys.repository_id.clone(),
-            commit_ref,
-            loaded.format_ref,
-        )
-        .with_maintenance_keyring_envelope_ref(maintenance_keyring_ref)
-        .with_retention(config.repository.retention)
-        .with_stream_read_stall_timeout(config.hardening.stream_read_stall_timeout);
+        let commit_options = bootstrap_commit_options(config, &loaded)?;
         let repository = Arc::new(V2Repository::new(
             store_handle.clone(),
             loaded.keyring,
@@ -292,8 +369,6 @@ impl RuntimeRepository {
         };
         let coordinator = Arc::new(coordinator);
 
-        #[cfg(feature = "s3")]
-        let s3_store = store.s3_store().cloned();
         #[cfg(test)]
         let memory_store = store.memory_store().cloned();
         #[cfg(test)]
@@ -306,8 +381,6 @@ impl RuntimeRepository {
             anchor: anchor_handle,
             initialized,
             require_anchor_version: retained_version_required(config.repository.retention, None),
-            #[cfg(feature = "s3")]
-            s3_store,
             #[cfg(test)]
             memory_store,
             #[cfg(test)]
@@ -332,22 +405,6 @@ impl RuntimeRepository {
             .await
             .map_err(repository_init)?
             .ok_or_else(|| repository_init("v2-preview repository anchor is missing"))?;
-        Ok(())
-    }
-
-    pub(super) async fn validate_backend_retention(
-        &self,
-        retention: Option<RetentionPolicy>,
-    ) -> Result<(), S3BoundaryError> {
-        #[cfg(feature = "s3")]
-        if let Some(store) = self.s3_store.as_ref() {
-            return store
-                .validate_retention_support(retention.as_ref())
-                .await
-                .map_err(repository_init);
-        }
-
-        let _ = retention;
         Ok(())
     }
 
@@ -626,16 +683,144 @@ impl AdminReadinessSource for RuntimeRepositoryAdminFacts {
     }
 }
 
-/// Initializes a v2 repository when missing, then verifies the accepted chain and exits.
+/// Storage preflight and immutable settings for one preview initialization.
+///
+/// Prepare before acquiring the writer Lease, then consume under that fence.
+/// This handle neither creates repository objects nor changes the anchor.
+pub struct V2PreparedRepositoryInit {
+    config: RuntimeConfig,
+    store: StoreBuild,
+}
+
+/// Checks a trusted projected S3 onboarding journal without backend or Lease IO.
+/// True means initialization finished with current matching provider evidence;
+/// normal serving must still verify its live anchor and accepted repository.
+pub fn v2_bootstrap_journal_is_initialized(
+    config: &RuntimeConfig,
+    bytes: &[u8],
+) -> Result<bool, S3BoundaryError> {
+    if !config.backend.is_s3()
+        || !matches!(config.anchor, crate::AnchorConfig::KubernetesLease { .. })
+    {
+        return Err(repository_init(
+            "projected onboarding state requires S3 and a Kubernetes anchor",
+        ));
+    }
+    #[cfg(feature = "k8s")]
+    return onboarding::is_initialized(config, bytes);
+    #[cfg(not(feature = "k8s"))]
+    {
+        let _ = bytes;
+        Err(S3BoundaryError::UnsupportedAnchorMode)
+    }
+}
+
+impl V2PreparedRepositoryInit {
+    /// Checks repository format and backend write policy without initialization.
+    pub async fn prepare(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
+        if config.repository.format != RepositoryFormat::V2Preview {
+            return Err(repository_init(
+                "v2 repository initialization requires the v2-preview repository format",
+            ));
+        }
+        let store = build_store(&config.backend).await?;
+        store
+            .validate_write_policy(config.mode, config.repository.retention)
+            .await?;
+        Ok(Self {
+            config: config.clone(),
+            store,
+        })
+    }
+
+    /// Initializes local development storage, or verifies a read-only repository.
+    /// Mutation-capable Kubernetes initialization requires the fenced method.
+    pub async fn initialize(self) -> Result<V2RepositoryInitReport, S3BoundaryError> {
+        if self.config.mode.allows_mutation()
+            && !matches!(self.config.anchor, crate::AnchorConfig::Memory)
+        {
+            return Err(repository_init(
+                "Kubernetes repository initialization requires an acquired writer fence",
+            ));
+        }
+        let runtime =
+            RuntimeRepository::from_preflighted_store(&self.config, self.store, None, None).await?;
+        verified_init_report(runtime).await
+    }
+
+    /// Resumes initialization through a declared journal under the writer fence.
+    /// The Secret must be in the anchor namespace and owned by bootstrap.
+    #[cfg(feature = "k8s")]
+    pub async fn initialize_with_writer_fence(
+        self,
+        writer_fence: WriterFence,
+        journal_secret: &str,
+        governance_bypass_reviewed: bool,
+    ) -> Result<V2RepositoryInitReport, S3BoundaryError> {
+        let crate::AnchorConfig::KubernetesLease {
+            namespace,
+            name,
+            field_manager,
+        } = &self.config.anchor
+        else {
+            return Err(repository_init(
+                "fenced repository initialization requires a Kubernetes anchor",
+            ));
+        };
+        if !self.config.mode.allows_mutation() || journal_secret.is_empty() {
+            return Err(repository_init(
+                "journaled initialization requires writable mode and a declared journal Secret",
+            ));
+        }
+        let mut journal = rs3_k8s::KubernetesBootstrapJournal::claim(
+            rs3_k8s::LeaseSettings {
+                namespace: namespace.clone(),
+                name: name.clone(),
+                field_manager: field_manager.clone(),
+            },
+            journal_secret.to_owned(),
+            writer_fence.clone(),
+        )
+        .await
+        .map_err(repository_init)?;
+        let anchor =
+            build_v2_anchor_with_writer_fence(&self.config.anchor, Some(writer_fence.clone()))?;
+        if self.config.backend.is_s3() {
+            return onboarding::initialize(
+                &self.config,
+                &self.store,
+                anchor.handle(),
+                &writer_fence,
+                &mut journal,
+                governance_bypass_reviewed,
+            )
+            .await;
+        }
+        bootstrap::initialize(
+            &self.config,
+            self.store.handle(),
+            anchor.handle(),
+            &writer_fence,
+            &mut journal,
+        )
+        .await
+    }
+}
+
+/// Initializes a local v2 repository, then verifies its accepted chain.
+/// Kubernetes writers must prepare and initialize under an acquired fence.
 pub async fn init_v2_repository_from_config(
     config: &RuntimeConfig,
 ) -> Result<V2RepositoryInitReport, S3BoundaryError> {
-    if config.repository.format != RepositoryFormat::V2Preview {
-        return Err(repository_init(
-            "v2 repository initialization requires the v2-preview repository format",
-        ));
-    }
-    let runtime = RuntimeRepository::from_config(config).await?;
+    V2PreparedRepositoryInit::prepare(config)
+        .await?
+        .initialize()
+        .await
+}
+
+async fn verified_init_report(
+    runtime: RuntimeRepository,
+) -> Result<V2RepositoryInitReport, S3BoundaryError> {
     let Some(anchor) = runtime.anchor.read_v2().await.map_err(repository_init)? else {
         return Err(repository_init(
             "v2 repository initialization did not produce an accepted anchor",
@@ -653,6 +838,9 @@ pub async fn init_v2_repository_from_config(
         anchor,
         initialized: runtime.initialized,
         verified_commit_count: chain.commits_newest_first.len(),
+        probe_attempts: 0,
+        payload_restore_verified: false,
+        probe_observation: None,
     })
 }
 
@@ -897,9 +1085,6 @@ pub async fn write_v2_index_snapshot_from_config(
     }
     let repository = RuntimeRepository::from_config(config).await?;
     repository
-        .validate_backend_retention(config.repository.retention)
-        .await?;
-    repository
         .coordinator
         .write_index_snapshot()
         .await
@@ -1082,6 +1267,15 @@ pub async fn check_v2_provider_conformance_from_provider_config(
     config: &V2ProviderCheckConfig,
     options: RuntimeV2ProviderConformanceOptions,
 ) -> Result<V2ProviderConformanceReport, S3BoundaryError> {
+    let store = build_store(&config.backend).await?;
+    check_v2_provider_conformance_with_store(config, options, &store).await
+}
+
+async fn check_v2_provider_conformance_with_store(
+    config: &V2ProviderCheckConfig,
+    options: RuntimeV2ProviderConformanceOptions,
+    store: &StoreBuild,
+) -> Result<V2ProviderConformanceReport, S3BoundaryError> {
     if config.repository_format != RepositoryFormat::V2Preview {
         return Err(repository_init(
             "v2 provider conformance requires the v2-preview repository format",
@@ -1095,20 +1289,29 @@ pub async fn check_v2_provider_conformance_from_provider_config(
             "governance provider conformance requires RS3_PROVIDER_PRINCIPAL_FINGERPRINT",
         ));
     }
-    let store = build_store(&config.backend).await?;
+    store
+        .validate_write_policy(GatewayMode::ReadWrite, config.repository_retention)
+        .await?;
     let profile = v2_provider_profile(&config.backend, config.repository_retention);
-    let mut conformance = V2ProviderConformanceOptions::new(
-        profile,
-        options
-            .probe_prefix
-            .unwrap_or_else(default_v2_provider_probe_prefix),
-    )
-    .with_legal_hold(options.legal_hold)
-    .with_governance_bypass_reviewed(options.governance_bypass_reviewed);
+    let prefix = match options.probe_prefix {
+        Some(prefix) => prefix,
+        None => default_v2_provider_probe_prefix()?,
+    };
+    let probe = store
+        .provider_probe_store(prefix.clone(), config.repository_retention)
+        .await?;
+    let relative_prefix = if config.backend.is_s3() {
+        "checks".to_owned()
+    } else {
+        prefix
+    };
+    let mut conformance = V2ProviderConformanceOptions::new(profile, relative_prefix)
+        .with_legal_hold(options.legal_hold)
+        .with_governance_bypass_reviewed(options.governance_bypass_reviewed);
     if let Some(retention) = config.repository_retention {
         conformance = conformance.with_retention(retention);
     }
-    check_v2_provider_conformance(store.handle(), &conformance)
+    check_v2_provider_conformance(&probe, &conformance)
         .await
         .map_err(repository_init)
 }
@@ -1225,17 +1428,7 @@ async fn store_format_root(
     root: &V2FormatRoot,
     retention: Option<RetentionPolicy>,
 ) -> Result<V2FormatRef, S3BoundaryError> {
-    let context = repository_key_context(keys)?;
-    let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
-    let plaintext = root.to_plaintext_bytes().map_err(repository_init)?;
-    let envelope = FormatEnvelope::seal(
-        &context,
-        &keys.wrapping_key_id,
-        &wrapping_key,
-        1,
-        &plaintext,
-    )
-    .map_err(repository_init)?;
+    let envelope = prepare_format_root(keys, root)?;
     let digest = envelope.digest().map_err(repository_init)?;
     let object_id = v2_format_object_id(envelope.generation, &digest).map_err(repository_init)?;
     let body = Bytes::from(envelope.to_object_bytes().map_err(repository_init)?);
@@ -1249,6 +1442,24 @@ async fn store_format_root(
         object_id,
         version_id,
     })
+}
+
+fn prepare_format_root(
+    keys: &RepositoryKeysConfig,
+    root: &V2FormatRoot,
+) -> Result<FormatEnvelope, S3BoundaryError> {
+    let context = repository_key_context(keys)?;
+    let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
+    let plaintext = root.to_plaintext_bytes().map_err(repository_init)?;
+    let envelope = FormatEnvelope::seal(
+        &context,
+        &keys.wrapping_key_id,
+        &wrapping_key,
+        1,
+        &plaintext,
+    )
+    .map_err(repository_init)?;
+    Ok(envelope)
 }
 
 async fn put_format_envelope(
@@ -1303,7 +1514,15 @@ async fn open_format_root(
         MAX_FORMAT_ENVELOPE_OBJECT_BYTES,
     )
     .await?;
-    let envelope = FormatEnvelope::from_object_bytes(&body).map_err(repository_init)?;
+    open_format_root_body(keys, reference, &body)
+}
+
+fn open_format_root_body(
+    keys: &RepositoryKeysConfig,
+    reference: &V2FormatRef,
+    body: &[u8],
+) -> Result<V2FormatRoot, S3BoundaryError> {
+    let envelope = FormatEnvelope::from_object_bytes(body).map_err(repository_init)?;
     if envelope.generation != reference.generation
         || envelope.digest().map_err(repository_init)? != reference.digest
     {
@@ -1387,22 +1606,18 @@ pub(super) fn v2_provider_profile(
     if retention.is_some_and(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
     {
         V2ProviderProfile::RetainedVersionObjectLock
-    } else if is_s3_backend(backend) {
+    } else if backend.is_s3() {
         V2ProviderProfile::AtomicCreate
     } else {
         V2ProviderProfile::Dev
     }
 }
 
-fn is_s3_backend(config: &BackendConfig) -> bool {
-    matches!(config.endpoint.as_str(), "s3" | "s3://" | "s3://aws")
-        || config.endpoint.starts_with("https://")
-        || config.endpoint.starts_with("http://")
-}
-
-fn default_v2_provider_probe_prefix() -> String {
-    let millis = current_time_ms();
-    format!("v2-provider/{millis}-{}", std::process::id())
+fn default_v2_provider_probe_prefix() -> Result<String, S3BoundaryError> {
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|_| repository_init("provider probe identity generation failed"))?;
+    Ok(format!("rs3-probes/{}", hex::encode(nonce)))
 }
 
 fn current_time_ms() -> i64 {
@@ -1450,12 +1665,12 @@ mod tests {
     };
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    struct TestDir {
+    pub(super) struct TestDir {
         path: PathBuf,
     }
 
     impl TestDir {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO)
@@ -1467,7 +1682,7 @@ mod tests {
             Self { path }
         }
 
-        fn path(&self) -> &Path {
+        pub(super) fn path(&self) -> &Path {
             &self.path
         }
     }
@@ -1476,6 +1691,74 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_init_is_read_only_until_consumed_and_keeps_its_configuration() {
+        let mut config = runtime_config(true);
+        let prepared = super::V2PreparedRepositoryInit::prepare(&config)
+            .await
+            .expect("preflight");
+        let store = prepared
+            .store
+            .memory_store()
+            .expect("memory fixture")
+            .clone();
+        assert!(store.list_prefix("").await.expect("inventory").is_empty());
+        config.repository.allow_init = false;
+        config.backend.endpoint = "invalid://changed-after-preflight".to_owned();
+        let report = prepared
+            .initialize()
+            .await
+            .expect("consume original settings");
+        assert!(report.initialized);
+        assert!(report.verified_commit_count > 0);
+        assert!(!store.list_prefix("").await.expect("inventory").is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_init_rejects_unfenced_kubernetes_writes_without_repository_objects() {
+        let mut config = runtime_config(true);
+        config.anchor = crate::AnchorConfig::KubernetesLease {
+            namespace: "fixture".to_owned(),
+            name: "fixture".to_owned(),
+            field_manager: "fixture".to_owned(),
+        };
+        let prepared = super::V2PreparedRepositoryInit::prepare(&config)
+            .await
+            .expect("storage preflight");
+        let store = prepared
+            .store
+            .memory_store()
+            .expect("memory fixture")
+            .clone();
+        let error = prepared.initialize().await.expect_err("missing fence");
+        assert!(error.to_string().contains("acquired writer fence"));
+        assert!(store.list_prefix("").await.expect("no writes").is_empty());
+        let prepared = super::V2PreparedRepositoryInit::prepare(&config)
+            .await
+            .expect("preflight again");
+        let store = prepared
+            .store
+            .memory_store()
+            .expect("memory fixture")
+            .clone();
+        let error =
+            RuntimeRepository::from_preflighted_store(&prepared.config, prepared.store, None, None)
+                .await
+                .err()
+                .expect("common runtime cannot bypass journaled bootstrap");
+        #[cfg(feature = "k8s")]
+        assert!(error.to_string().contains("journaled init"));
+        #[cfg(not(feature = "k8s"))]
+        assert!(matches!(error, S3BoundaryError::UnsupportedAnchorMode));
+        assert!(
+            store
+                .list_prefix("")
+                .await
+                .expect("no bypass writes")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2549,3 +2832,7 @@ mod tests {
         .unwrap_or_else(|error| panic!("{error}"))
     }
 }
+
+#[cfg(all(test, feature = "s3"))]
+#[path = "preflight_tests.rs"]
+mod preflight_tests;

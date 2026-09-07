@@ -1,6 +1,6 @@
 use super::runtime_handles::{RuntimeStore, RuntimeV2Anchor};
 use super::{S3BoundaryError, repository_init};
-use crate::{AnchorConfig, BackendConfig, BatchConfig};
+use crate::{AnchorConfig, BackendConfig, BatchConfig, GatewayMode};
 #[cfg(feature = "k8s")]
 use rs3_k8s::{KubernetesLeaseAnchor, LeaseSettings, WriterFence};
 use rs3_repository::CommitCoordinatorOptions;
@@ -8,6 +8,7 @@ use rs3_repository::v2::V2MemoryAnchor;
 use rs3_storage::{FilesystemBlobStore, MemoryBlobStore};
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig, S3ClientTimeoutConfig};
+use rs3_types::RetentionPolicy;
 use std::path::{Component, Path, PathBuf};
 
 pub(super) struct StoreBuild {
@@ -33,9 +34,43 @@ impl StoreBuild {
         self.handle
     }
 
-    #[cfg(feature = "s3")]
-    pub(super) fn s3_store(&self) -> Option<&S3BlobStore> {
-        self.s3_store.as_ref()
+    /// Check write protection before keyring, format, genesis or anchor writes.
+    pub(super) async fn validate_write_policy(
+        &self,
+        mode: GatewayMode,
+        retention: Option<RetentionPolicy>,
+    ) -> Result<(), S3BoundaryError> {
+        if mode == GatewayMode::RestoreReadOnly {
+            return Ok(());
+        }
+        #[cfg(feature = "s3")]
+        if let Some(store) = self.s3_store.as_ref() {
+            store
+                .validate_repository_write_policy(retention.as_ref())
+                .await
+                .map_err(repository_init)?;
+        }
+        let _ = retention;
+        Ok(())
+    }
+
+    /// Isolate S3 probes while retaining this store's effective SDK credentials.
+    pub(super) async fn provider_probe_store(
+        &self,
+        prefix: String,
+        retention: Option<RetentionPolicy>,
+    ) -> Result<RuntimeStore, S3BoundaryError> {
+        #[cfg(feature = "s3")]
+        if let Some(store) = self.s3_store.as_ref() {
+            let probe = store.for_provider_probe(prefix).map_err(repository_init)?;
+            probe
+                .validate_repository_write_policy(retention.as_ref())
+                .await
+                .map_err(repository_init)?;
+            return Ok(RuntimeStore::new(probe));
+        }
+        let _ = (prefix, retention);
+        Ok(self.handle.clone())
     }
 
     #[cfg(test)]

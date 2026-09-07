@@ -33,6 +33,10 @@ impl BlobStore for DynBlobStore {
         self.inner.put(object_id, body, options).await
     }
 
+    fn supports_provider_delete_probe(&self) -> bool {
+        self.inner.supports_provider_delete_probe()
+    }
+
     fn supports_multipart_upload(&self) -> bool {
         self.inner.supports_multipart_upload()
     }

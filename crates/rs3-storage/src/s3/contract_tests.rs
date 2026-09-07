@@ -333,6 +333,251 @@ async fn malformed_inventory_members_cannot_be_interpreted_as_an_empty_prefix() 
     );
 }
 
+#[tokio::test]
+async fn repository_lifecycle_rules_preserve_direct_reads_and_live_versions() {
+    let cases = [
+        (
+            "<Status>Disabled</Status><Expiration><Days>1</Days></Expiration>",
+            true,
+        ),
+        ("<Status>FutureStatus</Status>", false),
+        (
+            "<Status>Enabled</Status><Expiration><Days>1</Days></Expiration>",
+            false,
+        ),
+        (
+            "<Status>Enabled</Status><Expiration><Date>2030-01-01T00:00:00Z</Date></Expiration>",
+            false,
+        ),
+        (
+            "<Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration>",
+            false,
+        ),
+        (
+            "<Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>",
+            true,
+        ),
+        (
+            "<Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload>",
+            true,
+        ),
+        (
+            "<Status>Enabled</Status><Filter><Prefix>other/</Prefix></Filter><Expiration><Days>1</Days></Expiration>",
+            true,
+        ),
+        (
+            "<Status>Enabled</Status><Filter><Prefix>repo-other/</Prefix></Filter><Expiration><Days>1</Days></Expiration>",
+            true,
+        ),
+        (
+            "<Status>Enabled</Status><Prefix>other/</Prefix><Expiration><Days>1</Days></Expiration>",
+            true,
+        ),
+        (
+            "<Status>Enabled</Status><Filter><Prefix>repo/commits/</Prefix></Filter><Expiration><Days>1</Days></Expiration>",
+            false,
+        ),
+        (
+            "<Status>Enabled</Status><Filter><Prefix>rep</Prefix></Filter><Expiration><Days>1</Days></Expiration>",
+            false,
+        ),
+        (
+            "<Status>Enabled</Status><Filter><And><Prefix>other/</Prefix><Tag><Key>x</Key><Value>y</Value></Tag></And></Filter><Expiration><Days>1</Days></Expiration>",
+            true,
+        ),
+        (
+            "<Status>Enabled</Status><Filter><Tag><Key>x</Key><Value>y</Value></Tag></Filter><Expiration><Days>1</Days></Expiration>",
+            false,
+        ),
+        (
+            "<Status>Enabled</Status><Filter><ObjectSizeGreaterThan>1024</ObjectSizeGreaterThan></Filter><Expiration><Days>1</Days></Expiration>",
+            false,
+        ),
+        (
+            "<Status>Enabled</Status><Prefix>other/</Prefix><Filter><Prefix>repo/</Prefix></Filter><Expiration><Days>1</Days></Expiration>",
+            false,
+        ),
+        (
+            "<Status>Enabled</Status><Transition><Days>30</Days><StorageClass>STANDARD_IA</StorageClass></Transition>",
+            true,
+        ),
+        (
+            "<Status>Enabled</Status><Transition><Days>30</Days><StorageClass>ONEZONE_IA</StorageClass></Transition>",
+            true,
+        ),
+        (
+            "<Status>Enabled</Status><Transition><Days>30</Days><StorageClass>GLACIER_IR</StorageClass></Transition>",
+            true,
+        ),
+        (
+            "<Status>Enabled</Status><Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition>",
+            false,
+        ),
+        (
+            "<Status>Enabled</Status><NoncurrentVersionTransition><NoncurrentDays>30</NoncurrentDays><StorageClass>DEEP_ARCHIVE</StorageClass></NoncurrentVersionTransition>",
+            false,
+        ),
+        (
+            "<Status>Enabled</Status><Transition><Days>30</Days><StorageClass>INTELLIGENT_TIERING</StorageClass></Transition>",
+            false,
+        ),
+        (
+            "<Status>Enabled</Status><Transition><Days>30</Days><StorageClass>FUTURE_CLASS</StorageClass></Transition>",
+            false,
+        ),
+    ];
+    for (rule, allowed) in cases {
+        let body = format!(
+            "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>{rule}</Rule></LifecycleConfiguration>"
+        );
+        let mut provider = ScriptedProvider::new(vec![body]).await;
+        provider.store.config = provider
+            .store
+            .config
+            .clone()
+            .with_prefix(Some("repo".to_owned()));
+        let result = provider.store.validate_repository_write_policy(None).await;
+        assert_eq!(result.is_ok(), allowed, "lifecycle fixture: {rule}");
+        let requests = provider.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("?lifecycle"));
+    }
+}
+
+#[tokio::test]
+async fn repository_lifecycle_whole_bucket_and_rule_budget_fail_closed() {
+    let rule = "<Rule><Status>Enabled</Status><Filter><Prefix>other/</Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule>";
+    for body in [
+        format!("<LifecycleConfiguration>{rule}</LifecycleConfiguration>"),
+        format!(
+            "<LifecycleConfiguration>{}</LifecycleConfiguration>",
+            "<Rule><Status>Disabled</Status></Rule>".repeat(1_001)
+        ),
+    ] {
+        let provider = ScriptedProvider::new(vec![body]).await;
+        assert!(
+            provider
+                .store
+                .validate_repository_write_policy(None)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn protected_put_does_not_retry_inside_sdk_but_read_retries_remain_enabled() {
+    use crate::PutOptions;
+    use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
+
+    for options in [
+        PutOptions {
+            retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 1)),
+            ..PutOptions::default()
+        },
+        PutOptions {
+            legal_hold: Some(LegalHoldStatus::On),
+            ..PutOptions::default()
+        },
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            // A PUT failure may represent a lost reply after durable storage.
+            // The following read is a positive control for configured retries.
+            for status in [
+                "503 Service Unavailable",
+                "503 Service Unavailable",
+                "200 OK",
+            ] {
+                let (mut stream, _) = listener.accept().await.expect("request");
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    assert!(header.len() < 16 * 1024, "header budget");
+                    header.push(stream.read_u8().await.expect("header byte"));
+                }
+                let header = String::from_utf8(header).expect("UTF-8 header");
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("length"))
+                    })
+                    .unwrap_or(0);
+                assert!(length < 16 * 1024, "body budget");
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.expect("body");
+                received
+                    .lock()
+                    .expect("requests")
+                    .push(header.lines().next().expect("request line").to_owned());
+                let body = if status.starts_with("503") {
+                    "<Error><Code>ServiceUnavailable</Code></Error>"
+                } else {
+                    "<VersioningConfiguration/>"
+                };
+                stream.write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
+                ).as_bytes()).await.expect("response");
+                stream.shutdown().await.expect("close");
+            }
+        });
+        let sdk = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url(&endpoint)
+            .force_path_style(true)
+            .credentials_provider(Credentials::new(
+                "fixture", "fixture", None, None, "fixture",
+            ))
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(3))
+            .timeout_config(
+                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                    .operation_timeout(Duration::from_secs(5))
+                    .build(),
+            )
+            .build();
+        let client = Client::from_conf(sdk);
+        let store = S3BlobStore::from_client(
+            client.clone(),
+            S3BlobStoreConfig::new("bucket")
+                .expect("config")
+                .with_endpoint_url(Some(endpoint))
+                .with_allow_http(true),
+        );
+        let result = store
+            .put(
+                &BackendObjectId::new("opaque").expect("id"),
+                Bytes::from_static(b"abc"),
+                options,
+            )
+            .await;
+        // Stop the server even if the assertion fails below.
+        if result.is_ok() || requests.lock().expect("requests").len() != 1 {
+            server.abort();
+            panic!("protected PUT must return the first ambiguous result without retry");
+        }
+        client
+            .get_bucket_versioning()
+            .bucket("bucket")
+            .send()
+            .await
+            .expect("read retry");
+        server.await.expect("scripted server");
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("PUT "));
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.starts_with("GET "))
+        );
+    }
+}
+
 fn upload_with_parts(
     store: &S3BlobStore,
     parts: Vec<Option<aws_sdk_s3::types::CompletedPart>>,

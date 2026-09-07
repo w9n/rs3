@@ -125,10 +125,6 @@ repositoryKeys:
   envelopeObjectId: ""
   wrappingKeyId: wrap-v1
 
-recovery:
-  # Public half of an offline Ed25519 recovery-signing key.
-  publicKey: ed25519:<replace-with-64-hex-character-public-key>
-
 anchor:
   mode: kubernetes-lease
   namespace: ""
@@ -146,6 +142,14 @@ Expected Secret keys are:
 
 `envelope-object-id` may be omitted to use the default envelope object.
 
+Kubernetes onboarding and normal serving do not require `recovery.publicKey`.
+They use the declared repository-key Secret and live Lease, and bootstrap
+verifies a fresh payload restore before admission. `recovery.publicKey` is
+optional configuration for portable signed-bundle recovery commands. Preserve
+keys, repository configuration and a trusted checkpoint outside the cluster
+when total-cluster-loss recovery is required; the bootstrap journal alone does
+not provide that capability.
+
 ## Operational Notes
 
 - `admin.profile=production` makes chart rendering fail unless the image is
@@ -157,8 +161,8 @@ Expected Secret keys are:
   briefly run two writers against the same repository.
 - Keep `gateway.writerGuard=required` with `anchor.mode=kubernetes-lease` for
   read-write deployments.
-- Production read-write rendering requires
-  `providerConformance.existingConfigMap`. Generate its `reportKey` with `rs3
+- Production read-write rendering requires `bootstrap.enabled=true` or
+  `providerConformance.existingConfigMap`. For external evidence, generate its `reportKey` with `rs3
   check-v2-provider --format json` against the selected retained backend and
   refresh it before `providerConformance.maxAgeSeconds` expires. The production
   doctor and maintenance engine fail closed on missing, stale, failed, or
@@ -232,3 +236,38 @@ Render with your values before rollout:
 ```sh
 helm template rs3 charts/rs3-gateway -f values.production.yaml
 ```
+
+## Journaled S3 initialization
+
+Set `bootstrap.enabled=true` to qualify the configured S3 backend and initialize
+an empty repository through a chart-managed Job. Keep `repository.allowInit=false`
+for serving. The anchor must use a Kubernetes Lease in the release namespace.
+Governance qualification requires `bootstrap.governanceBypassReviewed=true` after
+reviewing the configured principal; compliance mode does not use that assertion.
+
+The Job and gateway share the same image, service account, backend credential
+references and runtime policy. A read-only init container waits for completed
+journal state, a verified and logically removed synthetic restore fixture, and
+current evidence before the gateway starts. Evidence projects
+from the journal Secret automatically; `providerConformance.existingConfigMap`
+continues to select externally managed evidence and is never overwritten.
+
+Repeated installs preserve the journal and completed Job. Configuration changes
+create a new Job, which reuses matching qualification and verifies the existing
+repository. The journal permits at most three complete probe runs across retries
+and upgrades. An ambiguous run consumes a reservation; exhaustion requires
+reviewed matching external evidence. Retained probe versions, including legal
+holds, can remain outside the repository prefix.
+The init Job's JSON report and journal retain timestamped aggregate observations
+of these versions and their reported protection deadlines. Warnings and
+`multipart_sessions_observed=false` expose observation limits. The report is
+not a complete inventory or cleanup authorization.
+
+The chart declares a stable journal Secret without templating its runtime data.
+It is retained on Helm uninstall. Preserve it and its ownership annotations in
+GitOps pruning policies. To use a predeclared dedicated Secret, set
+`bootstrap.existingJournalSecret` and annotate it `rs3.rs/bootstrap-journal: v1`.
+
+This opt-in flow automates provider qualification, initialization and a fresh
+payload round trip. Independent
+off-cluster recovery export and verification remain separate requirements.

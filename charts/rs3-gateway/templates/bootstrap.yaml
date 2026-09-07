@@ -1,0 +1,66 @@
+{{- if .Values.bootstrap.enabled -}}
+{{- if not .Values.bootstrap.existingJournalSecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "rs3-gateway.bootstrapJournalName" . }}
+  annotations:
+    rs3.rs/bootstrap-journal: v1
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "rs3-gateway.labels" . | nindent 4 }}
+type: Opaque
+---
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-init-%s" (include "rs3-gateway.fullname" . | trunc 40 | trimSuffix "-") (.Values | toJson | sha256sum | trunc 12) }}
+  labels:
+    {{- include "rs3-gateway.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: {{ .Values.bootstrap.timeoutSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "rs3-gateway.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: bootstrap
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      serviceAccountName: {{ include "rs3-gateway.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: initialize
+          image: {{ include "rs3-gateway.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          args: ["init", "--format", "json"]
+          env:
+            {{- include "rs3-gateway.environment" (dict "root" . "bootstrap" true) | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.providerConformance.existingConfigMap }}
+            - name: provider-conformance
+              mountPath: /etc/rs3/provider-conformance
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.providerConformance.existingConfigMap }}
+        - name: provider-conformance
+          configMap:
+            name: {{ .Values.providerConformance.existingConfigMap | quote }}
+            items:
+              - key: {{ .Values.providerConformance.reportKey | quote }}
+                path: report.json
+        {{- end }}
+{{- end -}}

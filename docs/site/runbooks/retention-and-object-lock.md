@@ -27,6 +27,43 @@ Use `compliance` where the provider supports it. Use `governance` only when
 privileged bypass is intentional. Normal gateway credentials should not carry
 governance bypass permission.
 
+S3 init and read-write startup inspect bucket Lifecycle before writing repository
+metadata or genesis. Retained repositories also require enabled Versioning and
+Object Lock. Denied or unknown policy inspection stops initialization. The
+explicit S3 `NoSuchLifecycleConfiguration` response means no lifecycle policy
+is configured. See [GetBucketLifecycleConfiguration](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketLifecycleConfiguration.html)
+for the required bucket-policy read permission.
+
+Enabled expiration rules that overlap repository storage are rejected, including
+noncurrent-version expiration. A disjoint rule prefix is allowed; tag and size
+filters alone cannot prove that future repository objects are excluded.
+Expired-delete-marker cleanup and incomplete-multipart cleanup are permitted.
+Their presence does not establish a suitable upload timeout or cleanup budget.
+
+Transitions to Standard-IA, One Zone-IA and Glacier Instant Retrieval preserve
+direct reads and are permitted. Glacier Flexible Retrieval, Deep Archive,
+unknown targets and unqualified Intelligent-Tiering transitions are rejected.
+Intelligent-Tiering can include archive tiers that require a separate restore
+operation. See [S3 storage classes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html).
+These checks do not qualify renewal permissions, governance bypass or provider
+durability; provider conformance and policy review remain required.
+
+Run `rs3 check-v2-provider --legal-hold --format json` with the serving binary
+and backend credentials. S3 qualification uses a separate probe prefix in the
+same bucket, leaving the repository namespace available for fresh initialization.
+Both prefixes must pass Lifecycle inspection. The retained profile sends actual
+exact-version DELETE requests for synthetic protected objects and checks an
+unprotected deletion control. Bucket default retention can prevent that control
+from passing; do not weaken shared bucket protection merely to pass a probe.
+Retained and legal-hold probe versions can remain after the command exits.
+See [provider evidence configuration](../reference/configuration.md#provider-conformance-evidence)
+for prefix constraints and evidence binding. Governance mode additionally needs
+the explicit `--governance-bypass-reviewed` policy-review marker.
+
+Restore-only access skips write-policy inspection so recovery credentials do
+not need bucket-administration permissions. Exact-version reads and accepted
+anchor verification still apply.
+
 ## Kopia and Velero retention
 
 Keep snapshot retention and backup TTLs configured in the client. In a
@@ -222,11 +259,13 @@ verifies retained writes, retained exact-version reads, retention extension,
 legal hold, and delete blocking without bypass headers; it does not replace an
 IAM or bucket policy review.
 
-Preserve the schema-v4 report produced by the exact release candidate. The
-gateway rejects evidence from another source revision, backend target,
-qualification profile, or principal fingerprint. Rebuilds, credential
-rotations, endpoint or prefix changes, and candidate changes require a fresh
-provider run.
+Preserve the schema-v5 report produced by the exact Linux executable being
+deployed. The gateway checks its executable digest as well as the source
+revision, backend target, qualification profile, principal fingerprint and
+requested retention mode/days. A different executable or changed qualification
+context requires a fresh provider run; sharing a Git revision is insufficient.
+The principal fingerprint is operator-declared, not cloud identity attestation.
+Retired report schemas are rejected.
 
 During restore verification, `rs3` reports how many verified restore-critical
 objects expose retention or legal-hold metadata. Treat that as repository

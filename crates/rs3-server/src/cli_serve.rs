@@ -1,18 +1,12 @@
-//! Serve startup, writer fencing and orderly listener shutdown.
+//! Serve startup and orderly listener shutdown.
 
+use super::cli_writer_guard::{WriterGuardRuntime, acquire};
 use super::{DoctorProfile, GatewayModeArg, log_runtime_config};
-#[cfg(feature = "k8s")]
-use super::{WRITER_LEASE_DURATION, WRITER_LEASE_RENEW_INTERVAL, random_hex};
-#[cfg(feature = "k8s")]
-use anyhow::Context;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use metrics_exporter_prometheus::PrometheusBuilder;
-#[cfg(feature = "k8s")]
-use rs3_k8s::{KubernetesLeaseGuard, LeaseGuardError, LeaseSettings, WriterFence};
 use rs3_server::{
-    AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReadiness,
-    AdminReadinessSource, AdminReportProfile, AnchorConfig, GatewayServer, MaintenanceMode,
-    RuntimeConfig, WriterGuardConfig, doctor_findings,
+    AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReportProfile,
+    GatewayServer, MaintenanceMode, RuntimeConfig, doctor_findings,
 };
 use std::net::SocketAddr;
 use tokio::sync::watch;
@@ -43,7 +37,7 @@ pub(super) async fn run(
     enforce_serve_profile(&config, admin_profile, admin_config.is_some())?;
     install_metrics(config.metrics.bind)?;
     log_runtime_config(&config);
-    let writer_guard = start_writer_guard(&config).await?;
+    let writer_guard = acquire(&config).await?;
     let server = match bind_gateway(config.clone(), &writer_guard).await {
         Ok(server) => server,
         Err(error) => {
@@ -178,63 +172,6 @@ fn admin_http_config(
     Ok(Some(AdminHttpConfig::new(bind, auth, profile.into())))
 }
 
-struct WriterGuardRuntime {
-    shutdown: Option<watch::Receiver<bool>>,
-    held: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    required: bool,
-    #[cfg(feature = "k8s")]
-    writer_fence: Option<WriterFence>,
-    #[cfg(feature = "k8s")]
-    lease_guard: Option<std::sync::Arc<KubernetesLeaseGuard>>,
-    renew_task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl WriterGuardRuntime {
-    fn disabled() -> Self {
-        Self {
-            shutdown: None,
-            held: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            required: false,
-            #[cfg(feature = "k8s")]
-            writer_fence: None,
-            #[cfg(feature = "k8s")]
-            lease_guard: None,
-            renew_task: None,
-        }
-    }
-
-    fn shutdown(&self) -> Option<watch::Receiver<bool>> {
-        self.shutdown.clone()
-    }
-
-    fn readiness_source(
-        &self,
-        repository: std::sync::Arc<dyn AdminReadinessSource>,
-    ) -> std::sync::Arc<dyn AdminReadinessSource> {
-        std::sync::Arc::new(ServeReadinessSource {
-            repository,
-            writer_guard_held: std::sync::Arc::clone(&self.held),
-            writer_guard_required: self.required,
-            #[cfg(feature = "k8s")]
-            writer_fence: self.writer_fence.clone(),
-        })
-    }
-
-    async fn release(&self) -> Result<()> {
-        if let Some(renew_task) = self.renew_task.as_ref() {
-            renew_task.abort();
-        }
-        #[cfg(feature = "k8s")]
-        if let Some(lease_guard) = self.lease_guard.as_ref() {
-            lease_guard
-                .release()
-                .await
-                .context("failed to release writer fence during orderly shutdown")?;
-        }
-        Ok(())
-    }
-}
-
 /// Starts the in-gateway maintenance supervisor for mutation-capable modes.
 ///
 /// Restore-readonly gateways force maintenance off at configuration time, and
@@ -300,7 +237,7 @@ async fn bind_gateway(
     _writer_guard: &WriterGuardRuntime,
 ) -> Result<GatewayServer> {
     #[cfg(feature = "k8s")]
-    if let Some(writer_fence) = _writer_guard.writer_fence.clone() {
+    if let Some(writer_fence) = _writer_guard.writer_fence() {
         return GatewayServer::bind_with_writer_fence(config, writer_fence)
             .await
             .map_err(anyhow::Error::from);
@@ -308,154 +245,6 @@ async fn bind_gateway(
     GatewayServer::bind(config)
         .await
         .map_err(anyhow::Error::from)
-}
-
-struct ServeReadinessSource {
-    repository: std::sync::Arc<dyn AdminReadinessSource>,
-    writer_guard_held: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    writer_guard_required: bool,
-    #[cfg(feature = "k8s")]
-    writer_fence: Option<WriterFence>,
-}
-
-#[async_trait::async_trait]
-impl AdminReadinessSource for ServeReadinessSource {
-    async fn check_readiness(&self) -> AdminReadiness {
-        if self.writer_guard_required
-            && (!self
-                .writer_guard_held
-                .load(std::sync::atomic::Ordering::Acquire)
-                || !writer_fence_is_live(self))
-        {
-            return AdminReadiness::unavailable("writer-guard.not-held");
-        }
-        self.repository.check_readiness().await
-    }
-}
-
-fn writer_fence_is_live(_readiness: &ServeReadinessSource) -> bool {
-    #[cfg(feature = "k8s")]
-    {
-        _readiness
-            .writer_fence
-            .as_ref()
-            .is_some_and(WriterFence::is_live)
-    }
-    #[cfg(not(feature = "k8s"))]
-    {
-        true
-    }
-}
-
-async fn start_writer_guard(config: &RuntimeConfig) -> Result<WriterGuardRuntime> {
-    if !config.mode.allows_mutation() || config.writer_guard == WriterGuardConfig::Off {
-        return Ok(WriterGuardRuntime::disabled());
-    }
-
-    let AnchorConfig::KubernetesLease {
-        namespace,
-        name,
-        field_manager,
-    } = &config.anchor
-    else {
-        bail!("RS3_WRITER_GUARD=required needs RS3_ANCHOR_MODE=kubernetes-lease");
-    };
-
-    #[cfg(feature = "k8s")]
-    {
-        let hostname = std::env::var("HOSTNAME")
-            .context("RS3_WRITER_GUARD=required needs HOSTNAME to identify this writer pod")?;
-        let holder_identity = format!("{hostname}/{}", random_hex(16)?);
-        let lease_guard = KubernetesLeaseGuard::new(
-            LeaseSettings {
-                namespace: namespace.clone(),
-                name: name.clone(),
-                field_manager: field_manager.clone(),
-            },
-            holder_identity,
-            WRITER_LEASE_DURATION,
-        )
-        .context("failed to configure writer lease guard")?;
-
-        lease_guard
-            .acquire()
-            .await
-            .context("failed to acquire writer lease guard")?;
-        let writer_fence = lease_guard
-            .writer_fence()
-            .context("failed to establish writer fencing token")?;
-        tracing::info!("writer lease guard acquired");
-
-        let lease_guard = std::sync::Arc::new(lease_guard);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let renew_task = tokio::spawn(renew_writer_guard(
-            std::sync::Arc::clone(&lease_guard),
-            shutdown_tx,
-            std::sync::Arc::clone(&held),
-        ));
-
-        Ok(WriterGuardRuntime {
-            shutdown: Some(shutdown_rx),
-            held,
-            required: true,
-            writer_fence: Some(writer_fence),
-            lease_guard: Some(lease_guard),
-            renew_task: Some(renew_task),
-        })
-    }
-
-    #[cfg(not(feature = "k8s"))]
-    {
-        let _ = namespace;
-        let _ = name;
-        let _ = field_manager;
-        bail!("RS3_WRITER_GUARD=required needs the k8s feature");
-    }
-}
-
-#[cfg(feature = "k8s")]
-async fn renew_writer_guard(
-    lease_guard: std::sync::Arc<KubernetesLeaseGuard>,
-    shutdown_tx: watch::Sender<bool>,
-    held: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    let mut last_success = std::time::Instant::now();
-    loop {
-        tokio::time::sleep(WRITER_LEASE_RENEW_INTERVAL).await;
-        match lease_guard.renew().await {
-            Ok(_) => {
-                last_success = std::time::Instant::now();
-            }
-            Err(error) => {
-                let elapsed = last_success.elapsed();
-                tracing::warn!(
-                    %error,
-                    elapsed_ms = elapsed.as_millis(),
-                    "writer lease renewal failed",
-                );
-                if matches!(
-                    error,
-                    LeaseGuardError::HeldByOther | LeaseGuardError::LostLease
-                ) {
-                    held.store(false, std::sync::atomic::Ordering::Release);
-                    tracing::error!(
-                        "writer lease is held by another live identity; initiating graceful shutdown",
-                    );
-                    let _ = shutdown_tx.send(true);
-                    break;
-                }
-                if elapsed >= WRITER_LEASE_DURATION {
-                    held.store(false, std::sync::atomic::Ordering::Release);
-                    tracing::error!(
-                        "writer lease renewal failed past the lease duration; initiating graceful shutdown",
-                    );
-                    let _ = shutdown_tx.send(true);
-                    break;
-                }
-            }
-        }
-    }
 }
 
 async fn run_gateway_and_admin(

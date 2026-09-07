@@ -3156,6 +3156,7 @@ dependencies = [
  "kube",
  "rs3-repository",
  "rs3-types",
+ "rustls",
  "tokio",
 ]
 

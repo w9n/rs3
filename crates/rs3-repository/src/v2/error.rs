@@ -145,6 +145,9 @@ pub enum V2FormatError {
     /// The v2 commit anchor no longer matched the expected state.
     #[error("v2 commit anchor is stale")]
     StaleAnchor,
+    /// An unfinished genesis needs a durably reserved physical upload attempt.
+    #[error("v2 bootstrap requires an upload allowance")]
+    BootstrapUploadRequired,
     /// The backing object store failed a v2 operation.
     #[error("v2 storage operation failed")]
     StorageOperationFailed,
@@ -232,6 +235,7 @@ impl V2FormatError {
             | Self::AnchorReconciliationRequired
             | Self::MissingAnchor
             | Self::StaleAnchor
+            | Self::BootstrapUploadRequired
             | Self::StorageOperationFailed
             | Self::FormatEncoding
             | Self::InvalidFormatRoot => V2ErrorClass::FailClosedSecurity,

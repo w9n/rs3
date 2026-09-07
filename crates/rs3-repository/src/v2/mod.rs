@@ -92,8 +92,8 @@ pub use repository::{
     DEFAULT_V2_REPLAY_MAX_TOTAL_COMMIT_BYTES, DEFAULT_V2_REPLAY_READ_CHUNK_BYTES,
     DEFAULT_V2_STREAM_READ_STALL_TIMEOUT, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorState, V2CommitAnchor,
     V2CommitChain, V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite,
-    V2MemoryAnchor, V2RecoveryBundle, V2ReplayChain, V2ReplayCommit, V2ReplayLimits,
-    V2StoredCommit, v2_streaming_upload_working_set_bytes,
+    V2MemoryAnchor, V2PreparedGenesis, V2RecoveryBundle, V2ReplayChain, V2ReplayCommit,
+    V2ReplayLimits, V2StoredCommit, v2_streaming_upload_working_set_bytes,
 };
 pub use service::{
     V2AuthenticatedReadBody, V2FullMaintenanceReport, V2Repository, V2ResolvedObject,

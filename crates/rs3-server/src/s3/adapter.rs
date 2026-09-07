@@ -77,9 +77,6 @@ impl GatewayS3Service {
         config: &RuntimeConfig,
         repository: RuntimeRepository,
     ) -> Result<Self, S3BoundaryError> {
-        repository
-            .validate_backend_retention(config.repository.retention)
-            .await?;
         repository.load_accepted_anchor(config.mode).await?;
 
         Ok(Self {

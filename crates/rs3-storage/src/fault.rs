@@ -451,6 +451,10 @@ where
         finish_success(metadata, effect)
     }
 
+    fn supports_provider_delete_probe(&self) -> bool {
+        self.inner.supports_provider_delete_probe()
+    }
+
     fn supports_multipart_upload(&self) -> bool {
         self.inner.supports_multipart_upload()
     }

@@ -2,6 +2,17 @@
 # should use restore-readonly mode with separate coordination.
 replicaCount: 1
 
+# Opt-in journaled S3 initialization with Kubernetes key custody and Lease
+# authority. Verifies a fresh payload restore before admitting clients.
+bootstrap:
+  enabled: false
+  # The same service account/backend credentials qualify and serve the repository.
+  governanceBypassReviewed: false
+  timeoutSeconds: 1800
+  # Optional predeclared, dedicated Secret in this release namespace. Must carry
+  # rs3.rs/bootstrap-journal: v1. Otherwise the chart declares its stable Secret.
+  existingJournalSecret: ""
+
 # Gateway container image. Override repository/tag for published images or
 # integration-test images built by xtask.
 image:
@@ -74,8 +85,8 @@ maintenance:
 
 # Persisted output from `rs3 check-v2-provider --format json`. Retained
 # automatic maintenance fails closed without current evidence for the selected
-# provider profile. Store the path-redacted JSON report in a ConfigMap created
-# outside this chart so qualification remains an explicit release operation.
+# provider profile. bootstrap.enabled can generate and project evidence through
+# its declared Secret; an existing ConfigMap remains externally owned and read-only.
 providerConformance:
   existingConfigMap: ""
   reportKey: report.json
@@ -216,7 +227,8 @@ repositoryKeys:
   wrappingKeyId: wrap-v1
   wrappingKeyHex: ""
 
-# Offline disaster-recovery verification key. This is public key material and
+# Optional portable bundle-import verification key, not required for bootstrap
+# or serving with the live Kubernetes anchor. This is public key material and
 # may be stored in Helm values; keep the corresponding signing key offline.
 recovery:
   publicKey: ""

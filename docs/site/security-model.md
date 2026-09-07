@@ -167,6 +167,63 @@ versions are useful history, not latest-state authority. A missing, older, or
 newer-looking backend commit is not a reason to trust storage; it is a reason to
 stop and recover from an explicitly trusted anchor bundle.
 
+Genesis publication verifies the full exact stored object before anchor CAS.
+Prepared genesis retries reuse the same signed bytes and reconcile ambiguous
+acceptance against that candidate. They cannot replace a different accepted
+anchor. Bootstrap intent must come from trusted unfinished-bootstrap state,
+never backend discovery; an old intent is not authorization to recreate an
+anchor lost after completed onboarding. Kubernetes CLI resumption uses that
+trusted intent and introduces no new backend-visible object class.
+
+Prepared publication can reconcile without an upload allowance. A missing
+unaccepted object requires a new, durably reserved attempt; absence alone is
+not permission to consume another retained version. Protected S3 PUTs use one
+SDK attempt even when the client enables retries. Read operations retain their
+configured retry policy. This lets a durable caller bound physical upload
+attempts across ambiguous responses and restarts.
+
+The Kubernetes bootstrap-journal primitive stores bounded progress in a
+dedicated, explicitly declared Secret. It binds ownership to the Secret and
+anchor Lease UIDs plus the writer epoch, checks the live Lease claim, and uses
+resource-version CAS for updates. Conflicts and cancelled updates invalidate
+the local handle. The primitive keeps process names out of its annotations and
+shares the cluster trust domain. Writable Kubernetes init requires this journal
+and persists artifact bytes and bounded upload reservations before backend PUTs.
+Context binding covers the configured backend target and principal fingerprint,
+repository identity, salt, wrapping-key ID and retention policy. Opening the
+planned artifacts also checks the actual wrapping key. This binds the declared
+principal fingerprint; it does not discover or independently attest the effective
+cloud identity. A completed journal cannot recreate a lost anchor. Independent
+off-cluster recovery is a separate deployment capability, not an onboarding
+prerequisite. The initial custody path uses declared Kubernetes Secrets and
+the live Lease; no offline recovery signer is required to initialize or serve.
+Losing that cluster can lose the keys and accepted-state authority. Portable
+signed bundle import remains an explicit recovery operation and does not allow
+a completed bootstrap journal to recreate an absent anchor.
+
+Provider evidence is projected in the same Secret revision as journal state.
+Reserving a new qualification attempt removes the prior projection. The chart's
+read-only startup wait requires matching completed state and current evidence;
+it neither acquires a writer Lease nor treats that journal as a replacement for
+live anchor verification. Bootstrap and serving use the same service account
+and backend credential references. Secret access is scoped to the declared
+journal; externally supplied evidence ConfigMaps are never updated by init.
+
+Journaled S3 bootstrap verifies a synthetic payload through authenticated
+repository publication and fresh recovery, then tombstones it before the startup
+wait passes. Bounded, persisted write reservations survive ambiguous replies;
+recovery of the accepted anchor precedes retries. Only its opaque fixture key
+enters encrypted repository metadata. Its encrypted payload and tombstone remain
+subject to retention and normal graph reclamation. This checks the gateway's
+initial restore path, not off-cluster recovery authority or future durability.
+
+Probe-leftover observations read only the reserved synthetic namespace, using
+bounded version listings and exact-version HEADs. They expose aggregate counts,
+lengths, retention deadlines, legal-hold counts and bounded warning codes, never
+listed object/version identifiers or provider error bodies. Reused observations
+retain their timestamp. Missing or delayed versions and unfinished multipart
+sessions can remain unobserved; neither counts nor deadlines authorize deletion.
+
 For read-write Kubernetes deployments, the writer guard records ownership on
 the anchor Lease itself before serving and renews it while the process runs.
 Each process identity is random-suffixed, every ownership transfer increments a
@@ -300,7 +357,16 @@ conditional headers.
 configured backend, including multipart upload behavior used by large
 streaming writes. Full probe reads are collected under exact expected-length
 ceilings, and current/version inventories use paged listings with page and raw
-provider-member budgets. Governance-retention deployments require an explicit
+provider-member budgets. S3 probes use a disjoint synthetic namespace in the
+same bucket and the same SDK credential provider, with one SDK attempt per
+operation. Their object counts, sizes, timing and probe names are observable;
+they contain no client data or client paths.
+
+Retained qualification requires `protected-delete-provider-probe`: exact-version
+DELETE checks reach the provider without governance-bypass headers. A local
+adapter refusal alone cannot satisfy this requirement. An unprotected-delete
+control is also required. An access denial does not establish its IAM versus
+Object Lock cause or prove equivalent prefix-specific policies. Governance-retention deployments require an explicit
 operator review that gateway credentials cannot bypass retention. It must be
 extended to cover exact compacted sibling-carrier versions before it qualifies
 `v02`.
@@ -419,3 +485,13 @@ reviewers should ask:
 - Which runbook explains recovery when the object store or anchor service is
   hostile?
 - Does the change preserve fail-closed anchor behavior?
+
+
+Provider qualification evidence is bound to the executing Linux binary digest,
+source revision, backend target, declared principal fingerprint, repository
+format and exact requested retention policy. The executable digest distinguishes
+different dirty builds with the same Git revision. The gateway reads bounded
+schema-v5 evidence and rejects mismatched or retired reports. These bindings
+prevent accidental reuse across changes; they do not attest the host, cloud
+principal or future provider behavior. The qualification process and serving
+process must use the same executable.

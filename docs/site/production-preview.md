@@ -188,6 +188,11 @@ Startup bootstrap behavior is:
 
 ## Disaster Recovery
 
+Initial onboarding uses Kubernetes Secret custody and the live Lease anchor.
+It verifies a fresh payload restore before admitting clients, without requiring
+an offline signer. This proves the configured local recovery path; independent
+custody and recovery after total cluster loss are not established by onboarding.
+
 A new cluster needs more than backend credentials:
 
 - repository ID
@@ -203,7 +208,7 @@ can hide newer valid commits or replay older valid commits.
 
 Recovery bundles are weak-subjectivity inputs. Import requires an
 operator-supplied `--min-sequence` floor external to the bundle and refuses
-older valid bundles below that floor. Production recovery also requires an
+older valid bundles below that floor. The portable production bundle-import path also requires an
 offline Ed25519 bundle signature verified by `RS3_RECOVERY_PUBLIC_KEY`.
 Import scans stored v2 commits and refuses to strand higher commit sequences
 unless the operator passes the explicit `--force-rollback` override after
@@ -236,6 +241,9 @@ At a glance:
 - provider conformance can be preserved as JSON and surfaced through admin
   posture without rerunning live probes from status; v2 evidence binds the
   complete check manifest to a path-safe fingerprint of the qualified target
+- current retained qualification additionally requires actual provider DELETE
+  probes from a separate synthetic namespace; historical local-guard deletion
+  checks do not satisfy this requirement
 - DR rehearsal verified bundle export, missing-Lease rejection without retention
   context, and anchor import into a new cluster
 - 2026-05-18 live checks reran the retained-version gate after adding
@@ -250,7 +258,7 @@ At a glance:
 | Historical standalone S3 and gateway baseline | Revision `f4d05b0` passed the equal-work `just perf-standalone-gate` against disposable RustFS on 2026-07-13. Release-gateway throughput at concurrency 1/2/4/8 was 98.50/190.33/281.76/401.28 MiB/s, or 4.07x scaling. Every point stayed at 1.000270x writes, 1.000246x verification reads, and 2.000515x total verified I/O. Peak RSS was 223,387,648/397,221,888/631,521,280/1,006,772,224 B. |
 | Historical bounded full-restore HTTP baseline | Revision `765229e` passed three release-gateway runs of three complete 256 MiB restores. Average read latency was 581.727-664.972 ms, plaintext throughput was 373.240-428.565 MiB/s, gateway peak RSS was 564,342,784-564,801,536 B including the in-process ciphertext backend and preceding upload, and every restore used one backend GET at 1.000244420x read amplification. The final candidate must rerun this lane. |
 | Historical local Kubernetes release gate | Revision `e16c418` passed the standalone gate, direct Kopia, fresh-kind Velero/Kopia dynamic-PVC gateway-restart restore, and Velero/Postgres restore on 2026-07-12. This remains behavior evidence, but its Kubernetes summaries predate source-bound nested-image reporting and cannot qualify a later candidate. |
-| Historical local retained-version and exact-GC gate | Revision `80a51b2` passed `just preview-gate-v2-retained-local` against disposable Object-Lock-enabled RustFS on 2026-07-12. All four live storage tests and the isolated exact-GC rehearsal passed. This remains local regression evidence, not current schema-v4 external-provider, restart, or fault qualification. |
+| Historical local retained-version and exact-GC gate | Revision `80a51b2` passed `just preview-gate-v2-retained-local` against disposable Object-Lock-enabled RustFS on 2026-07-12. All four live storage tests and the isolated exact-GC rehearsal passed. This remains local regression evidence, not current schema-v5 external-provider, restart, or fault qualification. |
 | Live retained-backend v2 preview gate | Passed on 2026-05-18 with `just preview-gate-v2-live`. S3 gateway/tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes all passed against fresh opaque backend prefixes. |
 | Live retained-backend v2 GC rehearsal | Passed on 2026-05-21 with `just v2-gc-rehearsal-live` against a fresh Object Lock prefix. The dry run found two orphan candidates, planned one exact-version delete, treated the retained orphan as protected, applied one unprotected exact-version delete, left the protected candidate blocked, and reloaded the anchor-selected chain. |
 | Live retained-backend v2 DR anchor import/export | Passed on 2026-05-18 against fresh v2 Velero dynamic-PVC gateway-restart output. The source backup/restore lane passed, the source bundle verified 34 commits, a new kind cluster with a missing Lease rejected import when the retention context was omitted, import with governance retention recreated the Lease, and the recovered bundle verified the same anchor. |
@@ -423,7 +431,7 @@ evidence, not inferred guarantees.
 - qualify bounded paged maintenance inventory at production cardinality and
   exact compacted sibling versions, restart, checkpoint crash, stale fencing,
   delayed visibility, retention renewal, GC, and writer handoff on a real
-  retained provider using schema-v4 candidate- and principal-bound evidence;
+  retained provider using schema-v5 executable-, policy- and principal-bound evidence;
 - document and approve the preview capability, key-provider, and compatibility
   policy without implying in-place rotation or cross-format recovery;
 - configure the owner-controlled signing identity, registry, artifact

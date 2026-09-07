@@ -42,6 +42,7 @@ const ATOMIC_CREATE_PROVIDER_CHECKS: &[&str] = &[
     "multipart-atomic-preserves-existing",
 ];
 const RETAINED_PROVIDER_CHECKS: &[&str] = &[
+    "protected-delete-provider-probe",
     "multipart-retained-version-id",
     "multipart-retained-exact-head",
     "retained-put-version-id",
@@ -288,6 +289,22 @@ where
     S: BlobStore,
 {
     let mut checks = Vec::new();
+    if options.profile == V2ProviderProfile::RetainedVersionObjectLock {
+        checks.push(if store.supports_provider_delete_probe() {
+            V2ProviderConformanceCheck::passed("protected-delete-provider-probe")
+        } else {
+            V2ProviderConformanceCheck::failed(
+                "protected-delete-provider-probe",
+                "provider delete probes require an isolated capable handle",
+            )
+        });
+        if !store.supports_provider_delete_probe() {
+            return Ok(V2ProviderConformanceReport {
+                profile: options.profile,
+                checks,
+            });
+        }
+    }
     run_basic_surface_checks(store, options, &mut checks).await?;
     run_multipart_checks(store, options, &mut checks).await?;
 
@@ -1131,7 +1148,7 @@ where
         )),
     }
 
-    match store.delete(&object_id).await {
+    match store.delete_at(&object_id, Some(&version_id)).await {
         Err(StorageError::LegalHoldBlocked | StorageError::RetentionBlocked) => {
             checks.push(V2ProviderConformanceCheck::passed(
                 "legal-hold-delete-blocked",
@@ -1154,6 +1171,19 @@ fn probe_object_id(
     options: &V2ProviderConformanceOptions,
     name: &'static str,
 ) -> V2Result<BackendObjectId> {
+    if options.probe_prefix.is_empty()
+        || options.probe_prefix.len() > 512
+        || options.probe_prefix.split('/').any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+    {
+        return Err(V2FormatError::ProviderProfileFailed);
+    }
     BackendObjectId::new(format!(
         "{}/{name}",
         options.probe_prefix.trim_end_matches('/')

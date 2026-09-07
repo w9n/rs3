@@ -196,12 +196,127 @@ repository and recover a missing anchor from a trusted restore bundle.
 For a one-shot bootstrap, run the configured binary with initialization enabled:
 
 ```sh
-RS3_ALLOW_REPOSITORY_INIT=true cargo run -p rs3-server -- init --format json
+RS3_ALLOW_REPOSITORY_INIT=true cargo run -p rs3-server -- init --profile local --format json
 ```
 
-The command writes the initial keyring, format root, genesis commit, and anchor,
-then reloads the accepted chain before exiting. Keep `repository.allowInit=false`
-for normal gateway serving after bootstrap.
+Init defaults to the `production` posture profile. The example selects `local`
+for development; retained deployments should keep the production default.
+This checks the production configuration before backend or Lease access while
+allowing deliberate initialization. Retention, the serving writer guard,
+renewal margins and current provider-conformance evidence
+remain required. Journaled S3 init can generate matching provider evidence before
+repository publication; configured external evidence must already pass. Init
+does not start an admin listener. Normal production serving continues to reject
+initialization permission.
+
+The command checks S3 retention and lifecycle policy before initialization.
+For a Kubernetes anchor, it then acquires and renews the writer Lease, including
+when the serving writer-guard setting is off. Genesis publication checks that
+fence in the anchor CAS. The binary needs the `s3` and `k8s` features for that
+deployment; the example above uses the local development defaults.
+
+Init writes the initial keyring, format root, genesis commit, and anchor, then
+reloads the accepted chain and releases the Lease before exiting. Cancellation
+stops renewal and lets the Lease expire. If another gateway owns the Lease,
+init waits without writing repository objects until ownership is available.
+Keep `repository.allowInit=false` for
+normal serving. Kubernetes runtime construction also refuses initialization
+permission; use the journaled init command before starting the gateway.
+
+Writable Kubernetes init requires `--journal-secret NAME` (or
+`RS3_INIT_JOURNAL_SECRET`) in the anchor namespace. Declare an empty Secret
+annotated `rs3.rs/bootstrap-journal: v1` and grant the init principal `get` and
+`update` on that Secret, in addition to the writer Lease permissions. The chart
+can declare this journal with `bootstrap.enabled=true`. Read-only verification and local memory
+anchors do not use a journal.
+
+For S3, the journal also stores the qualification report and one random probe
+root outside the repository prefix. It reserves at most three complete probe
+runs across retries, with a distinct suffix for each attempt and one SDK attempt
+per operation. An ambiguous run consumes its reservation. Matching, current
+evidence is reused; expired or changed-build evidence needs another reservation.
+Exhaustion requires reviewed matching external evidence, not a reset journal.
+Governance qualification additionally requires the explicit bypass-review flag
+and configured principal fingerprint. Retained or indefinitely held probe
+objects may remain after any attempt. The report is stored in the journal's
+`state.evidence` JSON field and projected as `provider-conformance.json` in the
+same Secret revision. Externally provided reports are read and validated,
+never overwritten.
+
+For journaled S3 initialization, bootstrap then publishes one small synthetic
+object through the normal repository API. A fresh repository instance reopens
+the accepted keyring and chain with empty decrypted caches and checks its exact
+bytes. Bootstrap publishes a logical tombstone and verifies the key is absent
+before its initialization gate can pass. The journal records up to three PUT
+and three DELETE attempts before calls; accepted state reconciles lost replies.
+Retries reuse the same opaque fixture identity, and a completed step does not
+write another fixture. The encrypted fixture and tombstone obey normal retention
+and GC rules; logical cleanup does not immediately erase physical ciphertext.
+
+Kubernetes onboarding uses the declared repository-key Secret and the live Lease
+as its custody and accepted-state authority. It does not require an offline
+recovery signer or `RS3_RECOVERY_PUBLIC_KEY`. Bootstrap reopens the encrypted
+keyring using the configured wrapping key and verifies real payload bytes before
+admission. Back up the key Secret, repository configuration and trusted anchor
+outside the cluster if recovery after total cluster loss is required. The
+bootstrap journal is progress evidence, not a replacement anchor. A completed
+journal with a missing anchor still refuses initialization.
+
+The separate portable bundle verification/import commands require their explicit
+recovery trust inputs. Those requirements do not apply to normal Kubernetes
+onboarding or reopening a repository with its live trusted anchor.
+
+Init JSON uses `rs3.v2-init.v2`. `payload_restore_verified` reports whether this
+journaled fixture step completed. It does not attest independent off-cluster
+recovery. Its `probe_attempts` field reports consumed
+qualification reservations, and `probe_observation` reports the last bounded
+observation of the reserved probe namespace. The observation includes its time
+and covered attempts, distinct observed versions, bytes from verified exact
+HEADs, reported retention deadlines, legal holds and unavailable protection
+metadata. It uses at most four LIST pages, 128 raw members and 32 exact HEADs,
+with no payload reads or backend mutations. A matching repeat init reuses that
+timestamped observation rather than rescanning. Failed runs preserve available
+observations in the journal too.
+
+These counts are observations, not proof that all leftovers are visible. Even
+`listing_exhausted=true` only describes the provider's returned pagination;
+eventual consistency can hide versions. A warning identifies denied, malformed
+or budget-limited observations. `multipart_sessions_observed=false` means
+unfinished multipart sessions were not inventoried, not that none remain.
+Legal holds may protect versions indefinitely. Retention deadlines alone never
+authorize deletion, and the report does not perform cleanup.
+
+For an S3 gateway with a Kubernetes anchor in the release namespace, enable
+`bootstrap.enabled` in the chart and keep `repository.allowInit=false`.
+The chart declares a normal initialization Job plus a read-only deployment
+init container, sharing the serving image, backend credentials and service
+account. No manual report transfer is required. The startup wait reads projected
+journal state and the configured evidence file before starting the gateway;
+the gateway then verifies the live anchor normally. Repeated installs reuse
+the completed Job and journal. A changed configuration creates a new Job;
+qualification is reused only when its bound implementation and policy match.
+This orchestrates initialization, provider evidence and the bootstrap payload
+round trip. Independently verified
+off-cluster recovery export is still a separate requirement.
+
+The journal Secret is retained on Helm uninstall. Preserve it with the anchor
+when configuring GitOps pruning; do not remove its runtime-managed data or
+ownership annotations from a declarative manifest. An existing dedicated
+Secret can be selected through `bootstrap.existingJournalSecret`. The bootstrap
+principal receives `get`/`update` on that exact Secret; it receives no permission
+to create or enumerate Secrets.
+
+The journal persists the exact encrypted keyring, format root and signed genesis
+before their uploads. Repeating init with the same configuration resumes the
+unfinished stage and verifies the accepted chain. Each artifact has three
+persisted upload allowances; a lost reply is reconciled before another allowance
+is reserved. Exhaustion stops new uploads but still permits reconciliation of
+an existing exact object. Do not delete or reset the journal to retry.
+
+A completed journal with a missing anchor requires explicit recovery. Existing
+backend data without a matching unfinished journal also requires recovery;
+init does not silently start a second repository. The journal is part of the
+trusted Kubernetes state and does not replace off-cluster recovery material.
 
 Inspect an existing envelope when auditing key lifecycle state:
 

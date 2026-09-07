@@ -55,6 +55,27 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- define "rs3-gateway.validateValues" -}}
+{{- if .Values.bootstrap.enabled -}}
+{{- if or (ne .Values.anchor.mode "kubernetes-lease") (ne .Values.gateway.mode "read-write") (ne .Values.gateway.writerGuard "required") -}}
+{{- fail "bootstrap requires a read-write Kubernetes gateway with required writer guard" -}}
+{{- end -}}
+{{- if ne (include "rs3-gateway.anchorNamespace" .) .Release.Namespace -}}
+{{- fail "bootstrap journal and anchor must be in the release namespace" -}}
+{{- end -}}
+{{- if not (or (hasPrefix "https://" .Values.backend.endpoint) (hasPrefix "http://" .Values.backend.endpoint) (has .Values.backend.endpoint (list "s3" "s3://" "s3://aws"))) -}}
+{{- fail "bootstrap requires an S3 backend" -}}
+{{- end -}}
+{{- if or (not .Values.backend.prefix) .Values.repository.allowInit -}}
+{{- fail "bootstrap requires a nonempty backend.prefix and repository.allowInit=false for serving" -}}
+{{- end -}}
+{{- if or (lt (int64 .Values.bootstrap.timeoutSeconds) 1) (gt (int64 .Values.bootstrap.timeoutSeconds) 3600) -}}
+{{- fail "bootstrap.timeoutSeconds must be between 1 and 3600" -}}
+{{- end -}}
+{{- if and (eq .Values.repository.retention.mode "governance") (not .Values.providerConformance.existingConfigMap) (not .Values.bootstrap.governanceBypassReviewed) -}}
+{{- fail "automatic governance bootstrap requires bootstrap.governanceBypassReviewed after principal policy review" -}}
+{{- end -}}
+{{- end -}}
+
 {{- if and (ne .Values.admin.profile "local") (ne .Values.admin.profile "production") -}}
 {{- fail "admin.profile must be local or production" -}}
 {{- end -}}
@@ -94,7 +115,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and (eq .Values.gateway.mode "read-write") (not .Values.repository.retention.mode) -}}
 {{- fail "admin.profile=production with gateway.mode=read-write requires repository retention" -}}
 {{- end -}}
-{{- if and (eq .Values.gateway.mode "read-write") (not .Values.providerConformance.existingConfigMap) -}}
+{{- if and (eq .Values.gateway.mode "read-write") (not .Values.providerConformance.existingConfigMap) (not .Values.bootstrap.enabled) -}}
 {{- fail "admin.profile=production with gateway.mode=read-write requires providerConformance.existingConfigMap with current retained-provider evidence" -}}
 {{- end -}}
 {{- if and (eq .Values.gateway.mode "read-write") (eq .Values.repository.retention.mode "governance") (not (regexMatch "^[a-f0-9]{64}$" .Values.providerConformance.principalFingerprint)) -}}
@@ -103,8 +124,8 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if .Values.repository.allowInit -}}
 {{- fail "admin.profile=production requires repository.allowInit=false outside deliberate bootstrap" -}}
 {{- end -}}
-{{- if not (regexMatch "^ed25519:[a-fA-F0-9]{64}$" .Values.recovery.publicKey) -}}
-{{- fail "admin.profile=production requires recovery.publicKey as ed25519:<64 hex characters>" -}}
+{{- if and .Values.recovery.publicKey (not (regexMatch "^ed25519:[a-fA-F0-9]{64}$" .Values.recovery.publicKey)) -}}
+{{- fail "recovery.publicKey must be ed25519:<64 hex characters> when configured" -}}
 {{- end -}}
 {{- if .Values.networkPolicy.enabled -}}
 {{- $ingressNamespaceSelector := default (dict) .Values.networkPolicy.ingress.namespaceSelector -}}
@@ -377,4 +398,16 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 
 {{- define "rs3-gateway.anchorNamespace" -}}
 {{- default .Release.Namespace .Values.anchor.namespace -}}
+{{- end -}}
+
+{{- define "rs3-gateway.bootstrapJournalName" -}}
+{{- default (printf "%s-bootstrap" (include "rs3-gateway.fullname" . | trunc 53 | trimSuffix "-")) .Values.bootstrap.existingJournalSecret -}}
+{{- end -}}
+
+{{- define "rs3-gateway.image" -}}
+{{- if .Values.image.digest -}}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" .Values.image.repository .Values.image.tag -}}
+{{- end -}}
 {{- end -}}

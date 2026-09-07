@@ -19,7 +19,10 @@ An explicit `--gateway-mode restore-readonly` forces maintenance off.
 | `RS3_ADMIN_BEARER_TOKEN` | with admin listener | none | Read bearer token for admin `GET` routes. Must be at least 16 bytes and separate from backup-client S3 credentials. |
 | `RS3_ADMIN_MUTATION_BEARER_TOKEN` | no | none | Distinct bearer token for maintenance mutation routes. Must be at least 16 bytes and differ from the read token. When absent, all maintenance `POST` routes are disabled. |
 | `RS3_ADMIN_PROFILE` | no | `production` | Admin status profile: `local` or `production`. |
-| `RS3_RECOVERY_PUBLIC_KEY` | production recovery | none | `ed25519:<hex-public-key>` used to verify signed v2 restore bundles during `verify-bundle` and `import-v2-anchor`. |
+| `RS3_INIT_PROFILE` | no | `production` | One-shot init posture: `local` or `production`. Production permits deliberate bootstrap; journaled S3 init may qualify provider evidence before repository publication. Other production checks apply before backend access. |
+| `RS3_INIT_JOURNAL_SECRET` | for writable Kubernetes init | unset | Declared bootstrap Secret in the anchor namespace; equivalent to `init --journal-secret`. Persists unfinished initialization under the writer Lease. Not used by serve or read-only verification. |
+| `RS3_INIT_GOVERNANCE_BYPASS_REVIEWED` | automatic governance qualification | `false` | Explicit review that the serving principal cannot bypass retention; equivalent to `init --governance-bypass-reviewed`. Requires a principal fingerprint. Existing matching evidence retains its recorded review. |
+| `RS3_RECOVERY_PUBLIC_KEY` | production bundle verification/import only | none | `ed25519:<hex-public-key>` used to verify signed v2 restore bundles during `verify-bundle` and `import-v2-anchor`. |
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
 | `RUST_LOG` | no | `info` | Tracing filter for `rs3` application targets. Dependency targets are always disabled because upstream HTTP and S3 traces can contain object paths or authentication headers. |
 
@@ -31,7 +34,8 @@ and backend settings, but take wrapping-key material from their own flags or
 environment. The exported bundle contains public but integrity-sensitive
 restore metadata; keep wrapping-key material in the configured secret source.
 Prefer `import-v2-anchor --bundle-file <json>` over manually transcribing anchor fields
-from the exported bundle. Production recovery requires an external
+from the exported bundle. Normal Kubernetes initialization and serving do not require a recovery signing
+key. Portable production bundle import requires an external
 `--min-sequence` floor and `RS3_RECOVERY_PUBLIC_KEY`. `export-restore-bundle`
 prints `offline_signature_payload_hex`; sign those canonical bytes offline with
 the matching Ed25519 recovery key and store the hex signature in
@@ -186,16 +190,35 @@ The check command loads only backend and repository-retention settings; it does
 not require repository identity, anchor, keyring, public bucket, or gateway
 credential variables.
 
-The current `rs3.v2-provider-conformance.v4` report binds its
-`source_revision` to the exact running gateway build and a path-safe
-`target_fingerprint` to the endpoint, bucket, prefix, and optional
-credential-principal fingerprint. Its separate profile field binds the
-required provider semantics. Production evidence must contain the complete
-versioned check manifest with no omissions, duplicates, or unknown entries.
-Missing, stale, unreasonably future-dated, failed, profile-mismatched, or
-source- or target-mismatched evidence fails the production doctor and retained
-maintenance. This is an operational evidence boundary, not a cryptographic
-attestation against an operator who can replace both configuration and report.
+For S3, configure a nonempty repository prefix. Probes use a random
+`rs3-probes/<opaque-id>` prefix in the same bucket; `--probe-prefix` overrides
+that backing prefix. Repository and probe prefixes must be disjoint canonical
+paths: nonempty slash-separated components containing only ASCII letters,
+digits, hyphens, underscores or periods, with no `.` or `..` component.
+The probe handle shares the configured SDK credential provider and disables
+SDK retries for every probe operation. Both namespaces undergo Lifecycle
+inspection; separately review any prefix-specific IAM or bucket policies.
+The standalone command is not resumable. Each invocation can leave retained
+versions, including indefinitely held legal-hold probes, outside the repository
+namespace. Preserve and manage these synthetic objects separately.
+
+The current `rs3.v2-provider-conformance.v5` report binds
+`implementation_fingerprint` to the SHA-256 of the executing Linux binary,
+including uncommitted build changes. It reads `/proc/self/exe` once per process
+with bounded memory; unavailable executable identity fails qualification closed.
+Use the same executable for qualification and serving. `source_revision` also
+records and checks the embedded Git revision; it is not sufficient by itself.
+
+The path-safe `target_fingerprint` binds the endpoint, bucket, prefix, optional
+credential-principal fingerprint, repository format and exact requested retention
+mode/days. The report also records the retention policy explicitly. Its profile
+selects the required provider semantics. Reports are capped at 64 KiB and must
+contain the complete versioned check manifest without omissions, duplicates or
+unknown fields. Missing, stale, future-dated, failed or context-mismatched evidence
+fails the production doctor and retained maintenance. Retired report schemas
+are rejected; regenerate evidence instead of converting an old report. This is
+an operational evidence boundary, not host attestation or protection against an
+operator who can replace both configuration and report.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |

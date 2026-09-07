@@ -1,5 +1,8 @@
 //! Preview v2 commit-store workflow.
 
+mod genesis;
+pub use genesis::V2PreparedGenesis;
+
 use super::cbor;
 use super::commit::{
     V2_COMMIT_CONTENT_TYPE, V2_HEADER_META_LEN, V2_MAX_HEADER_SIZE,
@@ -569,7 +572,7 @@ impl V2WritePostconditions {
         }
     }
 
-    fn standalone(
+    fn verified_object(
         expected_object_len: u64,
         required_retention: Option<RetentionPolicy>,
         required_retain_until_ms: Option<i64>,
@@ -1057,13 +1060,8 @@ where
         if current.is_some() {
             return Err(V2FormatError::StaleAnchor);
         }
-        let write = V2CommitWrite::snapshot(vec![V2CommitSection::new(
-            V2SectionType::IndexSnapshot,
-            V2_SECTION_FLAG_MUST_UNDERSTAND,
-            Bytes::new(),
-        )]);
-        self.write_commit_with_expected_anchor(anchor, None, Sequence::new(1), write)
-            .await
+        let prepared = self.prepare_genesis_snapshot()?;
+        self.publish_prepared_genesis(anchor, &prepared, true).await
     }
 
     /// Writes and anchors a child commit from the current anchor.
@@ -2568,7 +2566,7 @@ where
             .verify_commit_postconditions(
                 &object_id,
                 &metadata,
-                V2WritePostconditions::standalone(
+                V2WritePostconditions::verified_object(
                     object_len,
                     retention,
                     required_retain_until_ms,

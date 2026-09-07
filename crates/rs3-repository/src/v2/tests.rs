@@ -1,3 +1,4 @@
+mod prepared_genesis;
 mod publication_overlap;
 
 use super::service::packed::repository_context_from_refs;
@@ -2031,6 +2032,26 @@ async fn atomic_provider_conformance_checks_multipart_create_only() {
         check.name == "multipart-atomic-complete-rejected"
             && check.status == V2ProviderCheckStatus::Passed
     }));
+}
+
+#[tokio::test]
+async fn retained_provider_conformance_requires_provider_probe_capability_before_writes() {
+    let store = CountingBlobStore::new(BoundedProviderProbeStore {
+        inner: MemoryBlobStore::new(),
+        endless_listing: false,
+    });
+    let options =
+        V2ProviderConformanceOptions::new(V2ProviderProfile::RetainedVersionObjectLock, "checks")
+            .with_legal_hold(true)
+            .with_governance_bypass_reviewed(true);
+    let report = must_v2(check_v2_provider_conformance(&store, &options).await);
+    assert!(!report.passed());
+    assert_eq!(report.checks.len(), 1);
+    assert_eq!(report.checks[0].name, "protected-delete-provider-probe");
+    assert_eq!(
+        store.operation_counts().expect("counts"),
+        Default::default()
+    );
 }
 
 #[tokio::test]

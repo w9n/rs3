@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 mod anchor_tests;
+mod bootstrap_journal;
 mod lease_guard;
 #[cfg(test)]
 mod test_support;
@@ -14,6 +15,10 @@ use rs3_repository::v2::{
 };
 use rs3_types::{BackendObjectId, BackendVersionId, KeyId, Sequence};
 use std::collections::BTreeMap;
+
+pub use bootstrap_journal::{
+    BootstrapJournalError, KubernetesBootstrapJournal, MAX_BOOTSTRAP_JOURNAL_BYTES,
+};
 
 pub use lease_guard::{
     KubernetesLeaseGuard, LeaseGuard, LeaseGuardApi, LeaseGuardError, LeaseGuardState, WriterFence,

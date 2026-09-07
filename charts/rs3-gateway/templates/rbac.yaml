@@ -7,6 +7,13 @@ metadata:
   labels:
     {{- include "rs3-gateway.labels" . | nindent 4 }}
 rules:
+  {{- if .Values.bootstrap.enabled }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ include "rs3-gateway.bootstrapJournalName" . | quote }}
+    verbs: ["get", "update"]
+  {{- end }}
   - apiGroups:
       - coordination.k8s.io
     resources:

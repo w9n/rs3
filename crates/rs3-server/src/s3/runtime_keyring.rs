@@ -117,7 +117,7 @@ fn open_gateway_keyring(
     })
 }
 
-fn open_gateway_keyring_object(
+pub(super) fn open_gateway_keyring_object(
     keys: &RepositoryKeysConfig,
     object_id: BackendObjectId,
     version_id: Option<rs3_types::BackendVersionId>,
@@ -167,12 +167,7 @@ async fn bootstrap_missing_keyring_envelope(
         ));
     }
 
-    let context = repository_key_context(keys)?;
-    let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
-    let keyring = KeyRing::generate_random().map_err(repository_init)?;
-    let envelope = keyring
-        .seal_keyring_envelope(&context, &keys.wrapping_key_id, &wrapping_key, 1)
-        .map_err(repository_init)?;
+    let (keyring, envelope) = prepare_gateway_keyring(keys)?;
     let reference = if let Some(object_id) = configured_object_id {
         store_configured_keyring_envelope(store, &object_id, &envelope, retention).await?
     } else {
@@ -191,6 +186,18 @@ async fn bootstrap_missing_keyring_envelope(
         keyring,
         envelope_reference: Some(reference),
     })
+}
+
+pub(super) fn prepare_gateway_keyring(
+    keys: &RepositoryKeysConfig,
+) -> Result<(KeyRing, KeyringEnvelope), S3BoundaryError> {
+    let context = repository_key_context(keys)?;
+    let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
+    let keyring = KeyRing::generate_random().map_err(repository_init)?;
+    let envelope = keyring
+        .seal_keyring_envelope(&context, &keys.wrapping_key_id, &wrapping_key, 1)
+        .map_err(repository_init)?;
+    Ok((keyring, envelope))
 }
 
 async fn store_configured_keyring_envelope(

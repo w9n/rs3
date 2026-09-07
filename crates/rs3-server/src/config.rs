@@ -246,6 +246,15 @@ pub struct BackendConfig {
     pub timeouts: BackendTimeoutConfig,
 }
 
+impl BackendConfig {
+    /// Whether this endpoint selects the S3 adapter.
+    pub fn is_s3(&self) -> bool {
+        matches!(self.endpoint.as_str(), "s3" | "s3://" | "s3://aws")
+            || self.endpoint.starts_with("https://")
+            || self.endpoint.starts_with("http://")
+    }
+}
+
 /// Provider-neutral timeout policy for backend operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackendTimeoutConfig {

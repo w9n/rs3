@@ -1,7 +1,9 @@
 //! Command-line entry point for the rs3 gateway.
 
+mod cli_init;
 mod cli_offline;
 mod cli_serve;
+mod cli_writer_guard;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -17,10 +19,10 @@ use rs3_server::{
     V2RecoveryBundleVerificationOptions, V2RecoveryBundleVerificationReport,
     V2RepositoryInitReport, backend_kind, check_v2_provider_conformance_from_provider_config,
     doctor_findings, doctor_probe_from_config, export_v2_recovery_bundle_from_config,
-    import_v2_anchor_from_config, init_v2_repository_from_config,
-    inspect_keyring_envelope_from_tool_config, provider_conformance_target_fingerprint,
-    rewrap_keyring_envelope_from_tool_config, runtime_config_profile,
-    verify_v2_recovery_bundle_from_tool_config, write_v2_index_snapshot_from_config,
+    import_v2_anchor_from_config, inspect_keyring_envelope_from_tool_config,
+    provider_conformance_target_fingerprint, rewrap_keyring_envelope_from_tool_config,
+    runtime_config_profile, verify_v2_recovery_bundle_from_tool_config,
+    write_v2_index_snapshot_from_config,
 };
 use rs3_server::{
     KeyringEnvelopeInspectOptions, KeyringEnvelopeInspectReport, KeyringEnvelopeRewrapOptions,
@@ -104,8 +106,30 @@ enum Commands {
     Keyring(Box<KeyringArgs>),
     /// Initialize a missing v2 repository, verify it, then exit.
     Init {
+        /// Production checks permit deliberate bootstrap with journaled provider qualification.
+        #[arg(long, env = "RS3_INIT_PROFILE", value_enum, default_value_t = DoctorProfile::Production)]
+        profile: DoctorProfile,
+        /// Declared bootstrap journal Secret in the anchor namespace.
+        #[arg(long, env = "RS3_INIT_JOURNAL_SECRET")]
+        journal_secret: Option<String>,
+        /// Reviewed that the serving principal cannot bypass governance retention.
+        #[arg(
+            long,
+            env = "RS3_INIT_GOVERNANCE_BYPASS_REVIEWED",
+            default_value_t = false
+        )]
+        governance_bypass_reviewed: bool,
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
+    },
+    /// Wait read-only for projected S3 initialization and matching evidence.
+    WaitForInit {
+        /// Read-only projected journal state from the declared bootstrap Secret.
+        #[arg(long)]
+        journal_file: PathBuf,
+        /// Maximum time to wait for initialization and current qualification.
+        #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
     },
     /// Write a v2 index snapshot and report the accepted anchor state.
     WriteIndexSnapshot {
@@ -114,6 +138,7 @@ enum Commands {
     },
     /// Probe v2 object-store behavior required by the repository format.
     CheckV2Provider {
+        /// Synthetic backing prefix, disjoint from the repository prefix on S3.
         #[arg(long)]
         probe_prefix: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -428,11 +453,29 @@ async fn main() -> Result<()> {
         Commands::Keyring(args) => {
             run_keyring_command(*args).await?;
         }
-        Commands::Init { format } => {
+        Commands::Init {
+            profile,
+            journal_secret,
+            governance_bypass_reviewed,
+            format,
+        } => {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
-            let report = init_v2_repository_from_config(&config).await?;
+            let report = cli_init::run(
+                &config,
+                profile,
+                journal_secret.as_deref(),
+                governance_bypass_reviewed,
+            )
+            .await?;
             print_v2_repository_init_report(&report, format)?;
+        }
+        Commands::WaitForInit {
+            journal_file,
+            timeout_seconds,
+        } => {
+            let config = RuntimeConfig::from_env()?;
+            cli_init::wait_for_journal(&config, &journal_file, timeout_seconds).await?;
         }
         Commands::WriteIndexSnapshot { format } => {
             let config = RuntimeConfig::from_env()?;
@@ -458,8 +501,7 @@ async fn main() -> Result<()> {
             )
             .await?;
             let passed = report.passed();
-            let target_fingerprint = provider_conformance_target_fingerprint(&config);
-            print_v2_provider_conformance_report(&report, &target_fingerprint, format)?;
+            print_v2_provider_conformance_report(&report, &config, format)?;
             if !passed {
                 anyhow::bail!("v2 provider conformance failed");
             }
@@ -976,17 +1018,29 @@ fn print_v2_repository_init_report(
     match format {
         RecoveryReportFormat::Json => {
             let report_json = serde_json::json!({
-                "schema": "rs3.v2-init.v1",
+                "schema": "rs3.v2-init.v2",
                 "initialized": report.initialized,
                 "verified_commit_count": report.verified_commit_count,
                 "anchor": serde_json::to_value(&report.anchor)?,
+                "probe_attempts": report.probe_attempts,
+                "payload_restore_verified": report.payload_restore_verified,
+                "probe_observation": report.probe_observation,
             });
             println!("{}", serde_json::to_string_pretty(&report_json)?);
         }
         RecoveryReportFormat::Text => {
-            println!("schema=rs3.v2-init.v1");
+            println!("schema=rs3.v2-init.v2");
             println!("initialized={}", report.initialized);
             println!("verified_commit_count={}", report.verified_commit_count);
+            println!("probe_attempts={}", report.probe_attempts);
+            println!(
+                "payload_restore_verified={}",
+                report.payload_restore_verified
+            );
+            println!(
+                "probe_observation={}",
+                serde_json::to_string(&report.probe_observation)?
+            );
             print_v2_anchor_text(&report.anchor);
         }
     }
@@ -1178,36 +1232,25 @@ fn print_keyring_rewrap_report(
 
 fn print_v2_provider_conformance_report(
     report: &V2ProviderConformanceReport,
-    target_fingerprint: &str,
+    config: &V2ProviderCheckConfig,
     format: RecoveryReportFormat,
 ) -> Result<()> {
+    let target_fingerprint = provider_conformance_target_fingerprint(config);
     match format {
         RecoveryReportFormat::Json => {
-            let checks = report
-                .checks
-                .iter()
-                .map(|check| {
-                    serde_json::json!({
-                        "name": check.name,
-                        "status": provider_check_status_name(check.status),
-                        "reason": check.reason,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let report_json = serde_json::json!({
-                "schema": PROVIDER_CONFORMANCE_SCHEMA,
-                "source_revision": build_source_revision(),
-                "target_fingerprint": target_fingerprint,
-                "generated_at_ms": current_time_ms().unwrap_or(0),
-                "profile": provider_profile_name(report.profile),
-                "passed": report.passed(),
-                "checks": checks,
-            });
-            println!("{}", serde_json::to_string_pretty(&report_json)?);
+            println!(
+                "{}",
+                rs3_server::encode_provider_conformance_evidence(config, report)?
+            );
         }
         RecoveryReportFormat::Text => {
             println!("schema={PROVIDER_CONFORMANCE_SCHEMA}");
             println!("source_revision={}", build_source_revision());
+            println!(
+                "implementation_fingerprint={}",
+                rs3_server::provider_conformance_implementation_fingerprint()
+                    .unwrap_or("unavailable")
+            );
             println!("target_fingerprint={target_fingerprint}");
             println!("generated_at_ms={}", current_time_ms().unwrap_or(0));
             println!("profile={}", provider_profile_name(report.profile));
@@ -1709,7 +1752,9 @@ mod tests {
     struct TestProviderEvidence {
         schema: &'static str,
         source_revision: &'static str,
+        implementation_fingerprint: &'static str,
         target_fingerprint: String,
+        retention: Option<RetentionPolicy>,
         generated_at_ms: Option<i64>,
         profile: &'static str,
         passed: bool,
@@ -2094,7 +2139,7 @@ mod tests {
         assert!(codes.contains(&"anchor.memory"));
         assert!(codes.contains(&"retention.missing"));
         assert!(codes.contains(&"auth.credentials-missing"));
-        assert!(codes.contains(&"recovery.public-key"));
+        assert!(!codes.contains(&"recovery.public-key"));
         assert!(codes.contains(&"repository.init-enabled"));
         assert!(codes.contains(&"writer-guard.required"));
     }
@@ -2162,7 +2207,11 @@ mod tests {
         let evidence = TestProviderEvidence {
             schema: PROVIDER_CONFORMANCE_SCHEMA,
             source_revision: super::build_source_revision(),
+            implementation_fingerprint:
+                rs3_server::provider_conformance_implementation_fingerprint()
+                    .expect("executable fingerprint"),
             target_fingerprint,
+            retention: config.repository.retention,
             generated_at_ms: super::current_time_ms(),
             profile: "retained-version-object-lock",
             passed: true,
@@ -2179,7 +2228,92 @@ mod tests {
 
         assert!(findings.is_empty());
         assert!(enforce_serve_profile(&config, DoctorProfile::Production, true).is_ok());
+        config.repository.allow_init = true;
+        assert!(
+            super::cli_init::enforce_profile(&config, DoctorProfile::Production, false).is_ok()
+        );
+        assert!(
+            config.repository.allow_init,
+            "init validation preserves the config"
+        );
+        let serve_error = enforce_serve_profile(&config, DoctorProfile::Production, true)
+            .expect_err("serving must still reject bootstrap permission");
+        assert!(serve_error.to_string().contains("repository.init-enabled"));
+
+        config.repository.retention = None;
+        let error = super::cli_init::enforce_profile(&config, DoctorProfile::Production, false)
+            .expect_err("production init still requires retention");
+        assert!(error.to_string().contains("retention.missing"));
+        config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 30));
         fs::remove_file(provider_report).unwrap_or_else(|error| panic!("{error}"));
+        let error = super::cli_init::enforce_profile(&config, DoctorProfile::Production, false)
+            .expect_err("production init still requires qualified evidence");
+        assert!(
+            error
+                .to_string()
+                .contains("maintenance.provider-conformance")
+        );
+        config.provider_conformance.report_file = None;
+        assert!(super::cli_init::enforce_profile(&config, DoctorProfile::Production, true).is_ok());
+        config.static_credentials = None;
+        let error = super::cli_init::enforce_profile(&config, DoctorProfile::Production, true)
+            .expect_err("qualification does not exempt other production requirements");
+        assert!(error.to_string().contains("auth.credentials-missing"));
+    }
+
+    #[tokio::test]
+    async fn production_init_rejects_posture_before_backend_access() {
+        let config = runtime_config();
+        let error = super::cli_init::run(&config, DoctorProfile::Production, None, false)
+            .await
+            .expect_err("invalid production configuration must fail preflight")
+            .to_string();
+        assert!(error.contains("anchor.memory"));
+        assert!(error.contains("retention.missing"));
+        assert!(!error.contains("repository.init-enabled"));
+        assert!(!error.contains("tenant"));
+        assert!(super::cli_init::enforce_profile(&config, DoctorProfile::Local, false).is_ok());
+    }
+
+    #[test]
+    fn init_parses_explicit_posture_profiles() {
+        use clap::Parser;
+
+        for (name, expected) in [
+            ("local", DoctorProfile::Local),
+            ("production", DoctorProfile::Production),
+        ] {
+            let cli = super::Cli::try_parse_from(["rs3", "init", "--profile", name])
+                .expect("init profile parses");
+            assert!(
+                matches!(cli.command, super::Commands::Init { profile, .. } if profile == expected)
+            );
+        }
+        assert!(super::Cli::try_parse_from(["rs3", "init", "--profile", "unknown"]).is_err());
+        let cli = super::Cli::try_parse_from(["rs3", "init", "--journal-secret", "bootstrap"])
+            .expect("journal option parses");
+        assert!(
+            matches!(cli.command, super::Commands::Init { journal_secret, .. } if journal_secret.as_deref() == Some("bootstrap"))
+        );
+    }
+
+    #[tokio::test]
+    async fn init_rejects_missing_or_inapplicable_journal_before_io() {
+        let mut config = runtime_config();
+        config.anchor = AnchorConfig::KubernetesLease {
+            namespace: "fixture".to_owned(),
+            name: "fixture".to_owned(),
+            field_manager: "fixture".to_owned(),
+        };
+        let error = super::cli_init::run(&config, DoctorProfile::Local, None, false)
+            .await
+            .expect_err("missing declared journal");
+        assert!(error.to_string().contains("requires --journal-secret"));
+        config.mode = rs3_server::GatewayMode::RestoreReadOnly;
+        let error = super::cli_init::run(&config, DoctorProfile::Local, Some("bootstrap"), false)
+            .await
+            .expect_err("readonly must not claim a journal");
+        assert!(error.to_string().contains("applies only"));
     }
 
     #[test]

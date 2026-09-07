@@ -17,7 +17,9 @@ mod test_support;
 
 pub use commit_options::CommitCoordinatorOptions;
 pub use error::{RepositoryError, Result};
-pub use keyring_envelope::{KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE, store_keyring_envelope};
+pub use keyring_envelope::{
+    KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE, keyring_envelope_object_id, store_keyring_envelope,
+};
 pub use model::{
     DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry, RepositoryObjectMetadata,
     RepositoryPutOptions,

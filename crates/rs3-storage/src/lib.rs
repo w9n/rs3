@@ -198,6 +198,13 @@ pub trait BlobStore: Send + Sync {
         options: PutOptions,
     ) -> Result<BlobMetadata>;
 
+    /// Whether exact-version delete probes reach the provider's enforcement
+    /// boundary rather than being refused by a local adapter guard.
+    /// Only isolated probe handles and in-memory provider models opt in.
+    fn supports_provider_delete_probe(&self) -> bool {
+        false
+    }
+
     /// Returns whether this store can create provider-side multipart uploads.
     fn supports_multipart_upload(&self) -> bool {
         false
@@ -511,6 +518,10 @@ where
             counts.bytes_written = counts.bytes_written.saturating_add(metadata.content_len);
         })?;
         Ok(metadata)
+    }
+
+    fn supports_provider_delete_probe(&self) -> bool {
+        self.inner.supports_provider_delete_probe()
     }
 
     fn supports_multipart_upload(&self) -> bool {
@@ -1138,6 +1149,10 @@ impl BlobStore for MemoryBlobStore {
             started.elapsed(),
         );
         Ok(metadata)
+    }
+
+    fn supports_provider_delete_probe(&self) -> bool {
+        true
     }
 
     fn supports_multipart_upload(&self) -> bool {

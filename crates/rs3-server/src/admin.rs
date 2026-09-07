@@ -10,24 +10,40 @@ use crate::{
     V2ProviderCheckConfig, WriterGuardConfig,
 };
 use async_trait::async_trait;
+#[cfg(target_os = "linux")]
+use rs3_crypto::Sha256Hasher;
 use rs3_crypto::derive_public_fingerprint;
 use rs3_repository::v2::{V2ProviderProfile, required_v2_provider_check_names};
-use rs3_types::RetentionMode;
+use rs3_types::{RetentionMode, RetentionPolicy};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Read;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ADMIN_STATUS_SCHEMA: &str = "rs3.admin-status.preview.v1";
 const ADMIN_POSTURE_SCHEMA: &str = "rs3.admin-posture.preview.v1";
 /// Schema identifier emitted and accepted for provider-conformance evidence.
-pub const PROVIDER_CONFORMANCE_SCHEMA: &str = "rs3.v2-provider-conformance.v4";
+pub const PROVIDER_CONFORMANCE_SCHEMA: &str = "rs3.v2-provider-conformance.v5";
+const MAX_PROVIDER_EVIDENCE_BYTES: u64 = 64 * 1024;
 const PROVIDER_EVIDENCE_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
 
 /// Derives the path-safe identity of the exact backend target qualified by a
 /// persisted provider-conformance report.
 pub fn provider_conformance_target_fingerprint(config: &V2ProviderCheckConfig) -> String {
+    let (retention_mode, retention_days) = match config.repository_retention {
+        None => ("unset", 0),
+        Some(policy) => (
+            match policy.mode {
+                RetentionMode::None => "none",
+                RetentionMode::Governance => "governance",
+                RetentionMode::Compliance => "compliance",
+            },
+            policy.retain_days,
+        ),
+    };
     derive_public_fingerprint(
-        b"rs3.provider-conformance.target.v2",
+        b"rs3.provider-conformance.target.v3",
         &[
             config.backend.endpoint.as_bytes(),
             config.backend.bucket.as_bytes(),
@@ -37,8 +53,101 @@ pub fn provider_conformance_target_fingerprint(config: &V2ProviderCheckConfig) -
                 .as_deref()
                 .unwrap_or("")
                 .as_bytes(),
+            config.repository_format.as_str().as_bytes(),
+            retention_mode.as_bytes(),
+            &retention_days.to_be_bytes(),
         ],
     )
+}
+
+/// SHA-256 of the running Linux executable, cached once per process.
+///
+/// This binds evidence to executable bytes even for different dirty builds of
+/// one Git revision. Unavailable outside Linux or when the executable cannot be
+/// read; production qualification then fails closed. It is not host attestation.
+pub fn provider_conformance_implementation_fingerprint() -> Option<&'static str> {
+    static FINGERPRINT: OnceLock<Option<String>> = OnceLock::new();
+    FINGERPRINT
+        .get_or_init(|| {
+            #[cfg(target_os = "linux")]
+            {
+                // Open the executing inode through procfs, not a pathname that an
+                // upgrade could have replaced since this process was launched.
+                let mut file = fs::File::open("/proc/self/exe").ok()?;
+                let expected_len = file.metadata().ok()?.len();
+                if expected_len == 0 || expected_len > 2 * 1024 * 1024 * 1024 {
+                    return None;
+                }
+                let mut hash = Sha256Hasher::new();
+                let mut buffer = [0; 64 * 1024];
+                let mut read = 0_u64;
+                loop {
+                    let len = file.read(&mut buffer).ok()?;
+                    if len == 0 {
+                        break;
+                    }
+                    read = read.checked_add(len as u64)?;
+                    if read > expected_len {
+                        return None;
+                    }
+                    hash.update(&buffer[..len]);
+                }
+                (read == expected_len).then(|| hex::encode(hash.finalize()))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None
+            }
+        })
+        .as_deref()
+}
+
+/// Encodes bounded preview qualification evidence for the running executable.
+/// Both the check command and deployment onboarding use this representation.
+pub fn encode_provider_conformance_evidence(
+    config: &V2ProviderCheckConfig,
+    report: &rs3_repository::v2::V2ProviderConformanceReport,
+) -> Result<String, crate::S3BoundaryError> {
+    let implementation = provider_conformance_implementation_fingerprint().ok_or_else(|| {
+        crate::s3::repository_init("provider evidence cannot identify the running executable")
+    })?;
+    let profile = match report.profile {
+        V2ProviderProfile::Dev => "dev",
+        V2ProviderProfile::AtomicCreate => "atomic-create",
+        V2ProviderProfile::RetainedVersionObjectLock => "retained-version-object-lock",
+    };
+    let evidence = ProviderConformanceReportJson {
+        schema: PROVIDER_CONFORMANCE_SCHEMA.to_owned(),
+        source_revision: build_source_revision().to_owned(),
+        implementation_fingerprint: implementation.to_owned(),
+        target_fingerprint: provider_conformance_target_fingerprint(config),
+        retention: config.repository_retention,
+        profile: profile.to_owned(),
+        passed: report.passed(),
+        generated_at_ms: current_time_ms(),
+        checks: report
+            .checks
+            .iter()
+            .map(|check| ProviderConformanceCheckJson {
+                name: check.name.to_owned(),
+                status: if check.status == rs3_repository::v2::V2ProviderCheckStatus::Passed {
+                    "passed"
+                } else {
+                    "failed"
+                }
+                .to_owned(),
+                reason: check.reason.map(str::to_owned),
+            })
+            .collect(),
+    };
+    let bytes = serde_json::to_string_pretty(&evidence)
+        .map_err(|_| crate::s3::repository_init("provider evidence encoding failed"))?;
+    if bytes.len() as u64 > MAX_PROVIDER_EVIDENCE_BYTES {
+        return Err(crate::s3::repository_init(
+            "provider evidence exceeds its byte budget",
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Admin report profile.
@@ -784,14 +893,6 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         ));
     }
 
-    if config.recovery.public_key.is_none() {
-        findings.push(AdminFinding::error(
-            "recovery.public-key",
-            "production profile requires RS3_RECOVERY_PUBLIC_KEY for signed restore bundles",
-            "configure RS3_RECOVERY_PUBLIC_KEY with the trusted offline signing key before production restore workflows",
-        ));
-    }
-
     if config.mode.allows_mutation()
         && config.maintenance.mode == MaintenanceMode::Off
         && config.repository.retention.is_some()
@@ -876,18 +977,19 @@ fn provider_summary(config: &RuntimeConfig) -> AdminProviderSummary {
             &config.provider_conformance,
             selected_provider_profile(config),
             &target_fingerprint,
+            config.repository.retention,
         ),
     }
 }
 
-fn selected_provider_profile(config: &RuntimeConfig) -> &'static str {
+pub(crate) fn selected_provider_profile(config: &RuntimeConfig) -> &'static str {
     if config
         .repository
         .retention
         .is_some_and(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
     {
         "retained-version-object-lock"
-    } else if backend_kind(&config.backend.endpoint) == "s3-compatible" {
+    } else if config.backend.is_s3() {
         "atomic-create"
     } else {
         "dev"
@@ -898,14 +1000,54 @@ fn provider_conformance_summary(
     config: &ProviderConformanceConfig,
     selected_profile: &'static str,
     expected_target_fingerprint: &str,
+    expected_retention: Option<RetentionPolicy>,
 ) -> AdminProviderConformanceSummary {
     let Some(path) = config.report_file.as_ref() else {
         return provider_conformance_unavailable("missing", "provider-conformance.not-configured");
     };
-    let Ok(body) = fs::read_to_string(path) else {
-        return provider_conformance_unavailable("missing", "provider-conformance.unreadable");
+    let body = match read_provider_conformance_evidence(path) {
+        Ok(body) => body,
+        Err(summary) => return summary,
     };
-    let Ok(report) = serde_json::from_str::<ProviderConformanceReportJson>(&body) else {
+    provider_conformance_summary_from_bytes(
+        config,
+        selected_profile,
+        expected_target_fingerprint,
+        expected_retention,
+        &body,
+    )
+}
+
+pub(crate) fn read_provider_conformance_evidence(
+    path: &std::path::Path,
+) -> Result<Vec<u8>, AdminProviderConformanceSummary> {
+    let unreadable =
+        || provider_conformance_unavailable("missing", "provider-conformance.unreadable");
+    let file = fs::File::open(path).map_err(|_| unreadable())?;
+    let mut body = Vec::new();
+    file.take(MAX_PROVIDER_EVIDENCE_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| unreadable())?;
+    if body.len() as u64 > MAX_PROVIDER_EVIDENCE_BYTES {
+        return Err(provider_conformance_unavailable(
+            "invalid",
+            "provider-conformance.byte-budget",
+        ));
+    }
+    Ok(body)
+}
+
+pub(crate) fn provider_conformance_summary_from_bytes(
+    config: &ProviderConformanceConfig,
+    selected_profile: &str,
+    expected_target_fingerprint: &str,
+    expected_retention: Option<RetentionPolicy>,
+    body: &[u8],
+) -> AdminProviderConformanceSummary {
+    if body.len() as u64 > MAX_PROVIDER_EVIDENCE_BYTES {
+        return provider_conformance_unavailable("invalid", "provider-conformance.byte-budget");
+    }
+    let Ok(report) = serde_json::from_slice::<ProviderConformanceReportJson>(body) else {
         return provider_conformance_unavailable("invalid", "provider-conformance.invalid-json");
     };
     if report.schema != PROVIDER_CONFORMANCE_SCHEMA {
@@ -917,6 +1059,24 @@ fn provider_conformance_summary(
     }
     if report.source_revision != expected_source_revision {
         return provider_conformance_unavailable("invalid", "provider-conformance.source-mismatch");
+    }
+    let Some(implementation) = provider_conformance_implementation_fingerprint() else {
+        return provider_conformance_unavailable(
+            "invalid",
+            "provider-conformance.implementation-unbound",
+        );
+    };
+    if report.implementation_fingerprint != implementation {
+        return provider_conformance_unavailable(
+            "invalid",
+            "provider-conformance.implementation-mismatch",
+        );
+    }
+    if report.retention != expected_retention {
+        return provider_conformance_unavailable(
+            "invalid",
+            "provider-conformance.retention-mismatch",
+        );
     }
     if report.target_fingerprint != expected_target_fingerprint {
         return provider_conformance_unavailable("invalid", "provider-conformance.target-mismatch");
@@ -1022,10 +1182,13 @@ fn provider_conformance_unavailable(
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ProviderConformanceReportJson {
     schema: String,
     source_revision: String,
+    implementation_fingerprint: String,
     target_fingerprint: String,
+    retention: Option<RetentionPolicy>,
     profile: String,
     passed: bool,
     #[serde(default)]
@@ -1038,9 +1201,11 @@ fn build_source_revision() -> &'static str {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ProviderConformanceCheckJson {
     name: String,
     status: String,
+    reason: Option<String>,
 }
 
 async fn restore_summary(config: &RuntimeConfig) -> AdminRestoreSummary {
@@ -1116,6 +1281,7 @@ pub fn provider_conformance_evidence_passed(config: &RuntimeConfig) -> bool {
         &config.provider_conformance,
         selected_provider_profile(config),
         &target_fingerprint,
+        config.repository.retention,
     )
     .state
         == "passed"
@@ -1422,7 +1588,7 @@ mod tests {
         assert!(codes.contains(&"retention.missing"));
         assert!(codes.contains(&"backend.memory"));
         assert!(codes.contains(&"auth.credentials-missing"));
-        assert!(codes.contains(&"recovery.public-key"));
+        assert!(!codes.contains(&"recovery.public-key"));
         assert!(codes.contains(&"repository.init-enabled"));
         assert!(codes.contains(&"writer-guard.required"));
         assert!(
@@ -1785,7 +1951,7 @@ mod tests {
             "retained-version-object-lock"
         );
         assert_eq!(report.provider.conformance.state, "passed");
-        assert_eq!(report.provider.conformance.check_count, 29);
+        assert_eq!(report.provider.conformance.check_count, 30);
         assert!(report.provider.conformance.legal_hold_checked);
         assert!(report.provider.conformance.governance_bypass_reviewed);
         assert!(!json.contains("storage.example"));
@@ -1873,6 +2039,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_evidence_binds_executable_and_exact_policy_and_bounds_input() {
+        let mut config = runtime_config();
+        let original = retained_provider_evidence(&config);
+        let target = original.target_fingerprint.clone();
+        let inspect = |body: &[u8], config: &RuntimeConfig| {
+            super::provider_conformance_summary_from_bytes(
+                &config.provider_conformance,
+                "retained-version-object-lock",
+                &provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(config)),
+                config.repository.retention,
+                body,
+            )
+        };
+        let bytes = serde_json::to_vec(&original).expect("evidence");
+        assert_eq!(inspect(&bytes, &config).state, "passed");
+        for (field, value, expected) in [
+            (
+                "implementation_fingerprint",
+                serde_json::json!("00".repeat(32)),
+                "provider-conformance.implementation-mismatch",
+            ),
+            (
+                "schema",
+                serde_json::json!("rs3.v2-provider-conformance.v4"),
+                "provider-conformance.schema",
+            ),
+            (
+                "unexpected",
+                serde_json::json!(true),
+                "provider-conformance.invalid-json",
+            ),
+        ] {
+            let mut changed = serde_json::to_value(&original).expect("evidence");
+            changed[field] = value;
+            assert_eq!(
+                inspect(&serde_json::to_vec(&changed).expect("bytes"), &config).reason_code,
+                Some(expected)
+            );
+        }
+        for policy in [
+            RetentionPolicy::new(RetentionMode::Governance, 30),
+            RetentionPolicy::new(RetentionMode::Compliance, 31),
+        ] {
+            config.repository.retention = Some(policy);
+            assert_ne!(
+                provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(&config)),
+                target
+            );
+            assert_eq!(
+                inspect(&bytes, &config).reason_code,
+                Some("provider-conformance.retention-mismatch")
+            );
+            let mut changed = serde_json::to_value(&original).expect("evidence");
+            changed["retention"] = serde_json::to_value(policy).expect("policy");
+            assert_eq!(
+                inspect(&serde_json::to_vec(&changed).expect("bytes"), &config).reason_code,
+                Some("provider-conformance.target-mismatch")
+            );
+        }
+        let oversized = vec![b' '; super::MAX_PROVIDER_EVIDENCE_BYTES as usize + 1];
+        assert_eq!(
+            inspect(&oversized, &config).reason_code,
+            Some("provider-conformance.byte-budget")
+        );
+        config.provider_conformance.report_file = Some(provider_report_file(
+            std::str::from_utf8(&oversized).expect("UTF-8"),
+        ));
+        assert_eq!(
+            admin_posture_report(&config, AdminReportProfile::Production)
+                .provider
+                .conformance
+                .reason_code,
+            Some("provider-conformance.byte-budget")
+        );
+    }
+
     fn provider_report_file(body: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "rs3-provider-report-{}-{}.json",
@@ -1893,12 +2136,17 @@ mod tests {
         .map(|name| ProviderConformanceCheckJson {
             name: name.to_owned(),
             status: "passed".to_owned(),
+            reason: None,
         })
         .collect();
         ProviderConformanceReportJson {
             schema: PROVIDER_CONFORMANCE_SCHEMA.to_owned(),
             source_revision: super::build_source_revision().to_owned(),
+            implementation_fingerprint: super::provider_conformance_implementation_fingerprint()
+                .expect("executable fingerprint")
+                .to_owned(),
             target_fingerprint,
+            retention: config.repository.retention,
             profile: "retained-version-object-lock".to_owned(),
             passed: true,
             generated_at_ms: current_time_ms(),

@@ -620,6 +620,22 @@ the exact envelope generation, key, provider version, and digest. In retained
 mode, every restore-critical initialization write must return a provider version
 ID.
 
+Genesis preparation produces exact signed bytes before publication. Publication
+reads back the complete stored object and reconciles an ambiguous anchor reply
+against that exact candidate. A repeated prepared operation reads an already
+accepted provider version and refuses a different or newer anchor. Its bounded
+journal representation belongs in trusted bootstrap storage; it is not authority
+to recreate a lost anchor after completed initialization. The prepared publisher
+requires an explicit upload allowance to create a missing object; without one,
+it can verify and anchor an existing exact candidate. Durable retry callers must
+reserve that allowance before publication. Protected S3 PUTs disable SDK retries
+so a lost reply returns to the publication caller before another version is
+created. Kubernetes init persists keyring, format and genesis intent in its
+declared bootstrap Secret before their writes, with three upload allowances per
+artifact. Retries use the verified exact provider versions of their dependencies.
+A matching unfinished journal can resume without an anchor; a completed or
+missing journal with existing backend data requires explicit recovery.
+
 Initialization is permitted only on a verified fresh prefix. Detection of
 unsupported `v01` objects, an existing anchor, an existing format root, or
 ambiguous listing state fails closed. There is no automatic import, overwrite,

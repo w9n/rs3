@@ -24,11 +24,12 @@ pub use runtime::offline_maintenance_runtime_from_writer_fence;
 pub(crate) use runtime::v2_quick_maintenance_from_config;
 pub use runtime::{
     DoctorProbeCheck, DoctorProbeReport, RuntimeV2ProviderConformanceOptions,
-    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport, V2RepositoryInitReport,
+    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport,
+    V2PreparedRepositoryInit, V2ProbeObservation, V2RepositoryInitReport,
     check_v2_provider_conformance_from_config, check_v2_provider_conformance_from_provider_config,
     doctor_probe_from_config, export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
     init_v2_repository_from_config, offline_maintenance_runtime_from_config,
-    write_v2_index_snapshot_from_config,
+    v2_bootstrap_journal_is_initialized, write_v2_index_snapshot_from_config,
 };
 use thiserror::Error;
 
