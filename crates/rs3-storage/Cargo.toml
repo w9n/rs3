@@ -16,6 +16,7 @@ s3 = [
   "dep:aws-sdk-s3",
   "dep:aws-smithy-runtime-api",
   "dep:aws-smithy-types",
+  "dep:http-body",
   "dep:http-body-util",
   "dep:metrics",
   "dep:rustls",
@@ -40,6 +41,7 @@ aws-smithy-types = { version = "1.5.0", features = [
   "http-body-1-x",
 ], optional = true }
 bytes.workspace = true
+http-body = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 metrics = { workspace = true, optional = true }
 rs3-types.workspace = true

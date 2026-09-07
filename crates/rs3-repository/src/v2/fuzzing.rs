@@ -354,6 +354,7 @@ fn standalone_index_run_fixture() -> IndexRun {
     let header = payload_layout();
     let stored_len = header.plaintext_len + header.plaintext_len.div_ceil(header.chunk_size) * 16;
     IndexRun {
+        completion_receipt: None,
         sequence: Sequence::new(7),
         self_pack: None,
 

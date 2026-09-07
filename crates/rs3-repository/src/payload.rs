@@ -209,6 +209,10 @@ impl SegmentedPayloadSealer {
         })
     }
 
+    pub(crate) fn attempt_id(&self) -> PayloadAttemptId {
+        self.attempt_id
+    }
+
     pub(crate) fn layout_reference(&self, plaintext_len: u64) -> Result<SegmentedPayloadLayout> {
         SegmentedPayloadLayout::new(
             PayloadLayout {

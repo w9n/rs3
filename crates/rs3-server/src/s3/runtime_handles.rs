@@ -49,6 +49,16 @@ impl BlobStore for DynBlobStore {
         self.inner.create_multipart_upload(object_id, options).await
     }
 
+    async fn create_multipart_session(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        options: PutOptions,
+    ) -> rs3_storage::Result<Box<dyn rs3_storage::BlobMultipartSession>> {
+        self.inner
+            .create_multipart_session(object_id, options)
+            .await
+    }
+
     async fn get_range(
         &self,
         object_id: &rs3_types::BackendObjectId,

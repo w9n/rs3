@@ -264,7 +264,15 @@ where
             self.commit_store.options().keyring_envelope_ref.clone(),
             candidate_refs.clone(),
         )
-        .map_err(v2_repository_error)?;
+        .map_err(v2_repository_error)?
+        .with_completion_receipts(
+            self.accepted
+                .read()
+                .map_err(|_| RepositoryError::StatePoisoned)?
+                .repository
+                .completion_receipts
+                .clone(),
+        );
         let root_anchor = V2MemoryAnchor::with_state(base_anchor.clone());
         let uploaded_root = self
             .commit_store

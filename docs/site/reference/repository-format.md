@@ -126,7 +126,7 @@ local clock, and replay does not yet enforce a timestamp greater than the
 parent's. Strict chronology and its clock/handoff tests remain required before
 retention-history qualification. Sequence order is independently validated.
 
-The current framed index plaintext is wire version 7. Frame, section and mutation
+The current framed index plaintext is wire version 8. Frame, section and mutation
 ordinals, generations, content lengths, retention days, and bounded counts use
 canonical unsigned varints; readers reject overlong encodings. Generation and
 content length appear in both the namespace and listing projections because each
@@ -245,9 +245,9 @@ contain only concatenated ciphertext and 16-byte tags. There is no payload heade
 The descriptor accepts at most 10,000 positive-length parts in strictly increasing
 original part-number order. Each part records its number, fresh 32-byte attempt ID
 and plaintext length. Every part ends on its own segment boundary, so completion
-can assemble independently sealed parts without re-encryption. This is a format
-capability; client multipart endpoints remain deferred. The current writer emits
-one part. Ordinary metadata records retain their 16 KiB cap; only a standalone
+can assemble independently sealed parts without re-encryption. Client multipart
+writes use this layout; ordinary single-stream writes emit one part. Ordinary
+metadata records retain their 16 KiB cap; only a standalone
 container record can use up to 512 KiB, within the existing bounded index frame.
 
 Readers validate lengths, bounds and ordering, then derive part offsets once.
@@ -330,7 +330,7 @@ initially materialize a compact in-memory state, but the durable layout must
 also permit a future bounded local cache and range-selected frames without a
 format change.
 
-Wire version 7 uses canonical length-delimited records and no compression. Each
+Wire version 8 uses canonical length-delimited records and no compression. Each
 ciphertext frame and run has an explicit record and byte
 limit; the maximum encrypted run object is 8 MiB. Index-frame associated
 data binds at least the immutable repository identity, exact historical
@@ -353,6 +353,45 @@ Default plaintext and framing bounds are distinct:
 | Logical path | 1,024 bytes |
 | Physical run envelope | 8 MiB |
 | Frames per physical run | 4,096 |
+
+## Multipart Completion Receipts
+
+The repository publication API binds each accepted multipart completion to one
+receipt inside its encrypted index run. Metadata record tag 4 follows all
+container and namespace-key records and occurs at most once. It uses the
+canonical CBOR array `[upload_id, commit_sequence, selection_digest,
+attempts_digest, logical_key, content_len, response_etag]`. IDs and digests are
+32-byte strings. Commit sequence is the enclosing accepted commit sequence,
+independent of namespace mutation generations. The receipt binds the run's
+single upsert key and plaintext length. The run may also carry stale namespace
+tombstones for the same key and generation; they do not change the receipt
+binding. Each receipt is capped at 2,048 bytes, with a 1,024-byte key and a
+128-byte printable ASCII ETag.
+
+The client-selection digest uses SHA-256 over
+`rs3:v3-multipart-client-selection:v1` followed by a zero byte, a big-endian
+u64 part count, then each big-endian u32 part number, big-endian u16 unquoted
+ETag length and exact ETag bytes. The selected-attempt digest uses the domain
+`rs3:v3-multipart-selected-attempts:v1` followed by a zero byte and big-endian
+u64 count, then each big-endian u32 part number, 32-byte attempt ID,
+big-endian u64 plaintext length and 32-byte expected ciphertext digest.
+
+Root plaintext wire version 4 appends a big-endian u32 receipt count after the
+run catalog, followed by big-endian u32 lengths and canonical receipt bytes,
+sorted by upload ID. The latest 1,024 accepted completion results survive
+checkpoint, compaction and replay. A root snapshot replaces receipt state
+reconstructed from its named runs, so old runs cannot resurrect evicted results.
+Post-root accepted deltas update that bounded set. Root receipts must precede
+the root's commit sequence. Compacted runs carry no completion record.
+
+Receipt eviction is count-based and has no payload-retention meaning. Lookup
+requires the original upload ID, logical destination and exact selected-part
+digest; it can return the original result after a later overwrite without
+publishing again. An unknown or evicted ID never authorizes a new write.
+Receipt preparation precedes the anchor CAS, and installation accompanies the
+accepted namespace change. Unresolved anchor outcomes require recovery before
+receipt lookup or another write. The client-facing multipart routes use these primitives; see
+[Supported S3 operations](s3-operations.md) for current option and session limits.
 
 ## Small Signed Index Roots
 
@@ -698,7 +737,7 @@ do not qualify v03. See [Production Preview](../production-preview.md) and
 
 There is no stable repository-format promise yet. `commits/v01` is removed and
 unsupported, as is `commits/v02`, without migration support. The gateway reads
-and writes the preview `commits/v03` envelope with index-run wire version 7. The current reader rejects
+and writes the preview `commits/v03` envelope with index-run wire version 8. The current reader rejects
 retired streamed-commit pointers and earlier preview layouts. Recreate evaluation
 repositories when the preview wire changes. Catalog, exact descriptors,
 framed streaming, and guarded metadata-only mixed-carrier compaction are

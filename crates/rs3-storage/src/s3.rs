@@ -31,6 +31,7 @@ mod contract_tests;
 mod errors;
 mod lifecycle;
 mod metrics;
+mod multipart;
 mod object_lock;
 mod object_lock_client;
 mod provider_probe;
@@ -533,6 +534,64 @@ impl S3BlobStore {
     }
 }
 
+impl S3BlobStore {
+    async fn start_multipart_upload(
+        &self,
+        object_id: &BackendObjectId,
+        options: PutOptions,
+    ) -> Result<S3MultipartUpload> {
+        let client = self.client.clone();
+        if options.do_not_recreate {
+            match self.head(object_id).await {
+                Ok(_) => return Err(StorageError::AlreadyExists(object_id.clone())),
+                Err(StorageError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let key = self.config.object_key(object_id);
+        let retention = options
+            .retention
+            .as_ref()
+            .filter(|policy| retention_is_active(policy));
+        let legal_hold = provider_legal_hold(options.legal_hold);
+        let mut request = client
+            .create_multipart_upload()
+            .bucket(self.config.bucket.as_str())
+            .key(key.clone());
+        if let Some(content_type) = options.content_type.as_deref() {
+            request = request.content_type(content_type);
+        }
+        if let Some(retention) = retention {
+            request = request
+                .object_lock_mode(sdk_object_lock_mode(retention)?)
+                .object_lock_retain_until_date(retain_until_date(retention)?);
+        }
+        if let Some(legal_hold) = legal_hold {
+            request = request.object_lock_legal_hold_status(sdk_legal_hold_status(legal_hold));
+        }
+
+        let output = request.send().await.map_err(|error| {
+            StorageError::Provider(format!("failed to create multipart upload: {error}"))
+        })?;
+        let upload_id = output.upload_id().ok_or_else(|| {
+            StorageError::Provider("S3 CreateMultipartUpload omitted upload id".to_owned())
+        })?;
+
+        Ok(S3MultipartUpload {
+            store: self.clone(),
+            client,
+            object_id: object_id.clone(),
+            key,
+            upload_id: upload_id.to_owned(),
+            options,
+            parts: Vec::new(),
+            content_len: 0,
+            started: Instant::now(),
+        })
+    }
+}
+
 struct S3MultipartUpload {
     store: S3BlobStore,
     client: SdkS3Client,
@@ -842,54 +901,19 @@ impl BlobStore for S3BlobStore {
         object_id: &BackendObjectId,
         options: PutOptions,
     ) -> Result<Box<dyn BlobMultipartUpload>> {
-        let client = self.client.clone();
-        if options.do_not_recreate {
-            match self.head(object_id).await {
-                Ok(_) => return Err(StorageError::AlreadyExists(object_id.clone())),
-                Err(StorageError::NotFound(_)) => {}
-                Err(error) => return Err(error),
-            }
-        }
+        Ok(Box::new(
+            self.start_multipart_upload(object_id, options).await?,
+        ))
+    }
 
-        let key = self.config.object_key(object_id);
-        let retention = options
-            .retention
-            .as_ref()
-            .filter(|policy| retention_is_active(policy));
-        let legal_hold = provider_legal_hold(options.legal_hold);
-        let mut request = client
-            .create_multipart_upload()
-            .bucket(self.config.bucket.as_str())
-            .key(key.clone());
-        if let Some(content_type) = options.content_type.as_deref() {
-            request = request.content_type(content_type);
-        }
-        if let Some(retention) = retention {
-            request = request
-                .object_lock_mode(sdk_object_lock_mode(retention)?)
-                .object_lock_retain_until_date(retain_until_date(retention)?);
-        }
-        if let Some(legal_hold) = legal_hold {
-            request = request.object_lock_legal_hold_status(sdk_legal_hold_status(legal_hold));
-        }
-
-        let output = request.send().await.map_err(|error| {
-            StorageError::Provider(format!("failed to create multipart upload: {error}"))
-        })?;
-        let upload_id = output.upload_id().ok_or_else(|| {
-            StorageError::Provider("S3 CreateMultipartUpload omitted upload id".to_owned())
-        })?;
-
-        Ok(Box::new(S3MultipartUpload {
-            store: self.clone(),
-            client,
-            object_id: object_id.clone(),
-            key,
-            upload_id: upload_id.to_owned(),
-            options,
-            parts: Vec::new(),
-            content_len: 0,
-            started: Instant::now(),
+    async fn create_multipart_session(
+        &self,
+        object_id: &BackendObjectId,
+        options: PutOptions,
+    ) -> Result<Box<dyn crate::BlobMultipartSession>> {
+        Ok(Box::new(multipart::S3MultipartSession {
+            inner: self.start_multipart_upload(object_id, options).await?,
+            scope: Arc::new(()),
         }))
     }
 

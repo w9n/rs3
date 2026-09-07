@@ -30,7 +30,7 @@ const INDEX_ROOT_MAGIC: &[u8; 8] = b"rs3:irt\n";
 const INDEX_ROOT_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-root-plaintext:v02\n";
 const INDEX_ROOT_AAD_DOMAIN: &[u8] = b"rs3:index-root-aad:v02\n";
 const INDEX_ROOT_FORMAT_GENERATION: u16 = 2;
-const INDEX_ROOT_WIRE_VERSION: u16 = 3;
+const INDEX_ROOT_WIRE_VERSION: u16 = 4;
 const INDEX_ROOT_NONCE_LEN: usize = 12;
 const INDEX_ROOT_TAG_LEN: usize = 16;
 const INDEX_ROOT_SEAL_OVERHEAD: usize = INDEX_ROOT_NONCE_LEN + INDEX_ROOT_TAG_LEN;
@@ -179,6 +179,7 @@ impl V2IndexRootClaims {
 /// Canonical logical index-root catalog.
 #[derive(Clone, PartialEq, Eq)]
 pub struct V2IndexRoot {
+    completion_receipts: rs3_index::completion::CompletionReceipts,
     covered_generation: Sequence,
     expected_live_object_count: u64,
     required_capabilities: u64,
@@ -202,6 +203,10 @@ impl fmt::Debug for V2IndexRoot {
             .field("keyring_envelope_ref", &self.keyring_envelope_ref)
             .field("claims", &self.claims)
             .field("run_count", &self.runs.len())
+            .field(
+                "completion_receipt_count",
+                &self.completion_receipts.iter().count(),
+            )
             .field("run_projection_bounds", &"<redacted>")
             .finish()
     }
@@ -221,6 +226,7 @@ impl V2IndexRoot {
         validate_format_ref(&format_ref)?;
         validate_keyring_ref(&keyring_envelope_ref)?;
         let root = Self {
+            completion_receipts: Default::default(),
             covered_generation,
             expected_live_object_count,
             required_capabilities: INDEX_ROOT_REQUIRED_CAPABILITIES,
@@ -231,6 +237,20 @@ impl V2IndexRoot {
         };
         validate_root(&root)?;
         Ok(root)
+    }
+
+    /// Attaches the bounded accepted completion snapshot to this encrypted root.
+    pub fn with_completion_receipts(
+        mut self,
+        receipts: rs3_index::completion::CompletionReceipts,
+    ) -> Self {
+        self.completion_receipts = receipts;
+        self
+    }
+
+    /// Returns durable completion results authenticated by this root.
+    pub fn completion_receipts(&self) -> &rs3_index::completion::CompletionReceipts {
+        &self.completion_receipts
     }
 
     /// Returns the repository sequence covered by this catalog.
@@ -644,6 +664,17 @@ fn encode_root(root: &V2IndexRoot) -> V2Result<Vec<u8>> {
         push_u32(&mut output, to_u32(record.len())?);
         output.extend_from_slice(&record);
     }
+    push_u32(
+        &mut output,
+        to_u32(root.completion_receipts.iter().count())?,
+    );
+    for receipt in root.completion_receipts.iter() {
+        let bytes = receipt
+            .encode()
+            .map_err(|_| V2FormatError::InvalidIndexRoot)?;
+        push_u32(&mut output, to_u32(bytes.len())?);
+        output.extend_from_slice(&bytes);
+    }
     if output.len() > V2_INDEX_ROOT_MAX_BYTES {
         return Err(V2FormatError::IndexRootLimitExceeded);
     }
@@ -730,8 +761,26 @@ fn decode_root(input: &[u8]) -> V2Result<V2IndexRoot> {
         }
         runs.push(decode_run_ref(reader.take(record_len)?)?);
     }
+    let receipt_count = reader.u32()? as usize;
+    if receipt_count > rs3_index::completion::MAX_COMPLETION_RECEIPTS {
+        return Err(V2FormatError::IndexRootLimitExceeded);
+    }
+    let mut receipts = Vec::with_capacity(receipt_count);
+    for _ in 0..receipt_count {
+        let len = reader.u32()? as usize;
+        if len == 0 || len > rs3_index::completion::MAX_COMPLETION_RECEIPT_BYTES {
+            return Err(V2FormatError::IndexRootLimitExceeded);
+        }
+        receipts.push(
+            rs3_index::completion::CompletionReceipt::decode(reader.take(len)?)
+                .map_err(|_| V2FormatError::InvalidIndexRoot)?,
+        );
+    }
+    let completion_receipts = rs3_index::completion::CompletionReceipts::from_snapshot(receipts)
+        .map_err(|_| V2FormatError::InvalidIndexRoot)?;
     reader.finish()?;
     let root = V2IndexRoot {
+        completion_receipts,
         covered_generation,
         expected_live_object_count,
         required_capabilities,
@@ -1227,13 +1276,69 @@ mod tests {
         );
     }
 
+    fn completion_fixture() -> V2IndexRoot {
+        let receipt = rs3_index::completion::CompletionReceipt {
+            upload_id: rs3_types::MultipartUploadId::from_bytes([0x71; 32]),
+            commit_sequence: Sequence::new(7),
+            selection_digest: [0x72; 32],
+            attempts_digest: [0x73; 32],
+            key: logical_path("private/deleted"),
+            content_len: 42,
+            etag: "original-result".to_owned(),
+        };
+        fixture().with_completion_receipts(
+            rs3_index::completion::CompletionReceipts::from_snapshot(vec![receipt])
+                .expect("receipt set"),
+        )
+    }
+
+    #[test]
+    fn completion_root_rejects_missing_oversized_and_duplicate_receipts() {
+        let plain = must(super::encode_root(&completion_fixture()));
+        let empty = must(super::encode_root(&fixture()));
+        let count_offset = empty.len() - 4;
+        let record = &plain[count_offset + 4..];
+        // A repeated result is not a canonical root snapshot.
+        let mut duplicate = plain.clone();
+        duplicate[count_offset..count_offset + 4].copy_from_slice(&2_u32.to_be_bytes());
+        duplicate.extend_from_slice(record);
+        assert!(super::decode_root(&duplicate).is_err());
+        for end in count_offset..plain.len() {
+            assert!(super::decode_root(&plain[..end]).is_err());
+        }
+        for count in [0, 1025, u32::MAX] {
+            let mut wrong = plain.clone();
+            wrong[count_offset..count_offset + 4].copy_from_slice(&count.to_be_bytes());
+            assert!(super::decode_root(&wrong).is_err());
+        }
+        let mut oversized = plain;
+        oversized[count_offset + 4..count_offset + 8].copy_from_slice(&2049_u32.to_be_bytes());
+        assert!(super::decode_root(&oversized).is_err());
+    }
+
     #[test]
     fn frozen_root_plaintext_preserves_canonical_bytes() {
-        let expected = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../test-vectors/v03/v03_index_root/root.bin"
-        ));
-        assert_eq!(must(super::encode_root(&fixture())), expected);
+        for (root, expected) in [
+            (
+                fixture(),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../test-vectors/v03/v03_index_root/root.bin"
+                ))
+                .as_slice(),
+            ),
+            (
+                completion_fixture(),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../test-vectors/v03/v03_index_root/completion.bin"
+                ))
+                .as_slice(),
+            ),
+        ] {
+            assert_eq!(must(super::encode_root(&root)), expected);
+            assert_eq!(must(super::decode_root(expected)), root);
+        }
     }
 
     #[test]
@@ -1242,7 +1347,7 @@ mod tests {
         let digest: [u8; 32] = Sha256Hasher::digest(encoded);
         assert_eq!(
             hex::encode(digest),
-            "a8e7c6f14dc1308308734d00898342272e660859f12c9f77702cc055b832f305"
+            "69882ab1453c8c144fe0a63050223e78c2019239effa5d43efae1a2304850919"
         );
     }
 
@@ -1281,7 +1386,7 @@ mod tests {
         let digest: [u8; 32] = Sha256Hasher::digest(encoded);
         assert_eq!(
             hex::encode(digest),
-            "80b1976e3363ecf97096721ca03e3c6ebd46c966388d9dbaa67a54f17d06ea48"
+            "1ed26e1cf318df3dc2ffb152c3cd2bb4fd714d5e1173d3962faea4a00e742b86"
         );
     }
 

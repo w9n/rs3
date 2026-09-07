@@ -1,7 +1,9 @@
 //! Preview v2 commit-store workflow.
 
 mod genesis;
+mod multipart;
 pub use genesis::V2PreparedGenesis;
+pub use multipart::{V3MultipartUpload, V3UploadedPart, V3VerifiedMultipartUpload};
 
 use super::commit::{
     V2_COMMIT_CONTENT_TYPE, V2_HEADER_META_LEN, V2_MAX_HEADER_SIZE,
@@ -505,6 +507,7 @@ pub(crate) struct V2StandalonePayloadWrite<St> {
     pub(crate) cancellation: Arc<V2StandaloneUploadCancellation>,
 }
 
+#[derive(Clone, Copy)]
 struct V2WritePostconditions {
     expected_object_len: u64,
     required_retention: Option<RetentionPolicy>,
@@ -1921,6 +1924,40 @@ where
         metadata: &BlobMetadata,
         postconditions: V2WritePostconditions,
     ) -> V2Result<Option<BackendVersionId>> {
+        let version_id = self
+            .verify_commit_protection_postconditions(object_id, metadata, postconditions)
+            .await?;
+        if let Some(expected_digest) = postconditions.expected_stored_digest {
+            self.verify_exact_stored_object_digest(
+                object_id,
+                version_id.as_ref(),
+                postconditions.expected_object_len,
+                expected_digest,
+            )
+            .await?;
+        } else {
+            let visible = self
+                .store
+                .get_range_at(
+                    object_id,
+                    version_id.as_ref(),
+                    ByteRange::Slice { offset: 0, len: 1 },
+                )
+                .await
+                .map_err(|_| V2FormatError::ProviderProfileFailed)?;
+            if visible.len() != 1 {
+                return Err(V2FormatError::ProviderProfileFailed);
+            }
+        }
+        Ok(version_id)
+    }
+
+    async fn verify_commit_protection_postconditions(
+        &self,
+        object_id: &BackendObjectId,
+        metadata: &BlobMetadata,
+        postconditions: V2WritePostconditions,
+    ) -> V2Result<Option<BackendVersionId>> {
         if metadata.content_len != postconditions.expected_object_len
             || postconditions.expected_object_len == 0
         {
@@ -1936,28 +1973,6 @@ where
             || exact.content_len != postconditions.expected_object_len
         {
             return Err(V2FormatError::ProviderProfileFailed);
-        }
-        if let Some(expected_digest) = postconditions.expected_stored_digest {
-            self.verify_exact_stored_object_digest(
-                object_id,
-                exact.version_id.as_ref(),
-                postconditions.expected_object_len,
-                expected_digest,
-            )
-            .await?;
-        } else {
-            let visible = self
-                .store
-                .get_range_at(
-                    object_id,
-                    exact.version_id.as_ref(),
-                    ByteRange::Slice { offset: 0, len: 1 },
-                )
-                .await
-                .map_err(|_| V2FormatError::ProviderProfileFailed)?;
-            if visible.len() != 1 {
-                return Err(V2FormatError::ProviderProfileFailed);
-            }
         }
         if postconditions
             .required_retain_until_ms
@@ -2096,22 +2111,23 @@ fn build_section_region(
 
 async fn abort_v2_commit_multipart(multipart: Box<dyn BlobMultipartUpload>, phase: &'static str) {
     if let Err(error) = multipart.abort().await {
-        let error_class = storage_error_class(&error);
-        metrics::counter!(
-            "rs3_repository_v2_multipart_abort_failures_total",
-            "phase" => phase,
-            "error_class" => error_class,
-        )
-        .increment(1);
-        tracing::warn!(
-            target: "rs3_repository",
-            operation = "v2_multipart_abort",
-            phase,
-            error_class,
-            result = "failed",
-            "failed to abort incomplete v2 multipart upload",
-        );
+        record_multipart_abort_failure(&error, phase);
     }
+}
+
+fn record_multipart_abort_failure(error: &StorageError, phase: &'static str) {
+    let error_class = storage_error_class(error);
+    metrics::counter!(
+        "rs3_repository_v2_multipart_abort_failures_total",
+        "phase" => phase,
+        "error_class" => error_class,
+    )
+    .increment(1);
+    tracing::warn!(
+        target: "rs3_repository", operation = "v2_multipart_abort",
+        phase, error_class, result = "failed",
+        "failed to abort incomplete multipart upload",
+    );
 }
 
 fn storage_error_class(error: &StorageError) -> &'static str {

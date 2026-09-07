@@ -30,6 +30,8 @@ pub(crate) struct TrustedManifest {
 /// Mutable repository state guarded by the repository lock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RepositoryState {
+    /// Accepted bounded multipart results, independent of namespace liveness.
+    pub(crate) completion_receipts: rs3_index::completion::CompletionReceipts,
     /// Trusted namespace query model.
     pub(crate) namespace: NamespaceIndex,
     /// Trusted manifests keyed by opaque manifest ID.
@@ -49,6 +51,7 @@ impl Default for RepositoryState {
     fn default() -> Self {
         Self {
             namespace: NamespaceIndex::new(),
+            completion_receipts: Default::default(),
             manifests: BTreeMap::new(),
             list_entries: BTreeMap::new(),
             next_sequence: Sequence::ZERO,

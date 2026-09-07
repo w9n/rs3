@@ -79,7 +79,11 @@ impl GatewayS3Boundary {
         let maintenance_runtime = adapter.maintenance_runtime();
         let mut builder = S3ServiceBuilder::new(adapter);
 
-        let s3_config = Arc::new(S3Config::default());
+        // Enough for 10,000 bounded completion entries, while bounding XML
+        // allocation before the typed adapter can enforce its part-count limit.
+        let mut s3_config = S3Config::default();
+        s3_config.xml_max_body_size = 4 * 1024 * 1024;
+        let s3_config = Arc::new(s3_config);
         builder.set_config(Arc::new(StaticConfigProvider::new(s3_config)));
         builder.set_auth(SimpleAuth::from_single(
             credentials.access_key_id,

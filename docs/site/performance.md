@@ -456,7 +456,7 @@ was attempted separately, but both local RustFS and MinIO containers failed
 their readiness timeout before rs3 started; no result from those failed runs is
 treated as product evidence.
 
-The 2026-05 measurements below predate the current index-run wire version 7
+The 2026-05 measurements below predate the current index-run wire version 8
 self/external stream-carrier model. They remain historical payload segmentation
 and request-shape evidence, not performance qualification for the completed
 framed-stream series. The known-length gateway rerun below checks the new write
@@ -590,7 +590,7 @@ and host load can dominate.
 - Keep run order alternating between direct and gateway lanes.
 - Keep measuring variability with at least three runs for release claims.
 - Rerun known-length streamed uploads, post-checkpoint cold ranges,
-  and mixed pack/stream compaction under wire version 7; report request, byte,
+  and mixed pack/stream compaction under wire version 8; report request, byte,
   elapsed, CPU, and RSS results separately from the historical May artifacts.
 - Reduce commit stage-lock and commit-wait time without allowing commits to
   race writes whose sequence state is not yet indexed.

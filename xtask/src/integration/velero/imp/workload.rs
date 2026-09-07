@@ -6,6 +6,7 @@ use super::{kubectl, kubectl_capture, timeout_arg};
 use crate::integration::k8s_support::{K8sWorkspace, path_str, run_command};
 use crate::integration::velero::VeleroKopiaSmokeArgs;
 use anyhow::{Context, Result, bail};
+use rs3_crypto::Sha256Hasher;
 use std::fs;
 use std::path::Path;
 use std::thread;
@@ -20,6 +21,130 @@ const POSTGRES_DATA_PATH: &str = "/var/lib/postgresql/data";
 const POSTGRES_DUMP_PATH: &str = "/var/lib/postgresql/data/rs3-proof.sql";
 const POSTGRES_DB: &str = "rs3";
 const EXPECTED_CONTENT: &str = "rs3 velero kopia smoke\n";
+const BACKUP_FIXTURE_NAME_PREFIX: &str = "rs3-velero-multipart";
+const BACKUP_FIXTURE_CHUNK_BYTES: usize = 700 * 1024;
+const MAX_BACKUP_FIXTURE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BACKUP_FIXTURE_CHUNKS: usize = 24;
+
+pub(super) struct BackupFixture {
+    chunks: Vec<BackupFixtureChunk>,
+}
+
+struct BackupFixtureChunk {
+    name: String,
+    payload_digest: String,
+}
+
+impl BackupFixture {
+    fn new(bytes: usize) -> Result<(Self, String)> {
+        if bytes > MAX_BACKUP_FIXTURE_BYTES {
+            bail!(
+                "Velero backup fixture exceeds the bounded {} MiB limit",
+                MAX_BACKUP_FIXTURE_BYTES / (1024 * 1024)
+            );
+        }
+        if bytes == 0 {
+            return Ok((Self { chunks: Vec::new() }, String::new()));
+        }
+
+        let chunk_count = bytes.div_ceil(BACKUP_FIXTURE_CHUNK_BYTES);
+        if chunk_count > MAX_BACKUP_FIXTURE_CHUNKS {
+            bail!("Velero backup fixture exceeds the bounded ConfigMap count");
+        }
+
+        let mut remaining = bytes;
+        let mut chunks = Vec::with_capacity(chunk_count);
+        let mut documents = Vec::with_capacity(chunk_count);
+        for index in 0..chunk_count {
+            let len = remaining.min(BACKUP_FIXTURE_CHUNK_BYTES);
+            remaining = remaining.saturating_sub(len);
+            let payload = deterministic_fixture_payload(index, len);
+            let name = format!("{BACKUP_FIXTURE_NAME_PREFIX}-{index:02}");
+            chunks.push(BackupFixtureChunk {
+                name: name.clone(),
+                payload_digest: hex::encode(Sha256Hasher::digest(payload.as_bytes())),
+            });
+            documents.push(format!(
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\n  namespace: {{namespace}}\n  labels:\n    app.kubernetes.io/name: {BACKUP_FIXTURE_NAME_PREFIX}\ndata:\n  payload: {payload}\n"
+            ));
+        }
+        Ok((Self { chunks }, documents.join("---\n")))
+    }
+
+    pub(super) fn is_enabled(&self) -> bool {
+        !self.chunks.is_empty()
+    }
+}
+
+pub(super) fn apply_backup_fixture(
+    args: &VeleroKopiaSmokeArgs,
+    kubeconfig_path: &Path,
+    workspace: &K8sWorkspace,
+) -> Result<BackupFixture> {
+    let (fixture, manifest) = BackupFixture::new(args.velero_backup_fixture_bytes)?;
+    if !fixture.is_enabled() {
+        return Ok(fixture);
+    }
+    let manifest_path = workspace.path("velero-backup-fixture.yaml");
+    let manifest = manifest.replace("{namespace}", &args.workload_namespace);
+    fs::write(&manifest_path, manifest)
+        .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+    kubectl(
+        &args.kubectl_bin,
+        kubeconfig_path,
+        &[
+            "apply",
+            "--server-side",
+            "--field-manager=rs3-velero-fixture",
+            "-f",
+            path_str(&manifest_path)?,
+        ],
+    )
+    .context("failed to apply bounded Velero backup fixture")?;
+    assert_backup_fixture(args, kubeconfig_path, &fixture)?;
+    Ok(fixture)
+}
+
+pub(super) fn assert_backup_fixture(
+    args: &VeleroKopiaSmokeArgs,
+    kubeconfig_path: &Path,
+    fixture: &BackupFixture,
+) -> Result<()> {
+    for chunk in &fixture.chunks {
+        let payload = kubectl_capture(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &[
+                "-n",
+                &args.workload_namespace,
+                "get",
+                "configmap",
+                &chunk.name,
+                "-o",
+                "jsonpath={.data.payload}",
+            ],
+        )
+        .context("failed to read a bounded Velero backup fixture ConfigMap")?;
+        if hex::encode(Sha256Hasher::digest(payload.as_bytes())) != chunk.payload_digest {
+            bail!("restored Velero backup fixture digest mismatch");
+        }
+    }
+    Ok(())
+}
+
+fn deterministic_fixture_payload(index: usize, len: usize) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut state = (index as u64).wrapping_add(1);
+    let mut payload = String::with_capacity(len);
+    for _ in 0..len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let alphabet_index = (state & 63) as usize;
+        payload.push(char::from(ALPHABET[alphabet_index]));
+    }
+    payload
+}
 
 pub(super) fn prepare_local_pv_path(args: &VeleroKopiaSmokeArgs, cluster_name: &str) -> Result<()> {
     let node_container = format!("{cluster_name}-control-plane");
@@ -554,7 +679,10 @@ fn proof_matches(workload: WorkloadKind, actual: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{postgres_verify_script, postgres_write_script};
+    use super::{
+        BACKUP_FIXTURE_CHUNK_BYTES, BackupFixture, MAX_BACKUP_FIXTURE_BYTES,
+        deterministic_fixture_payload, postgres_verify_script, postgres_write_script,
+    };
 
     #[test]
     fn postgres_scripts_scale_rows_and_padding() {
@@ -565,5 +693,19 @@ mod tests {
         let verify = postgres_verify_script(1024, 16);
         assert!(verify.contains("(SELECT count(*) FROM proof) = 1024"));
         assert!(verify.contains("length(padding)), 0) FROM proof) = 512"));
+    }
+
+    #[test]
+    fn backup_fixture_is_bounded_and_deterministic() {
+        let (fixture, manifest) =
+            BackupFixture::new(BACKUP_FIXTURE_CHUNK_BYTES + 1).expect("bounded fixture");
+        assert!(fixture.is_enabled());
+        assert_eq!(fixture.chunks.len(), 2);
+        assert!(manifest.contains("{namespace}"));
+        assert_eq!(
+            deterministic_fixture_payload(3, 128),
+            deterministic_fixture_payload(3, 128)
+        );
+        assert!(BackupFixture::new(MAX_BACKUP_FIXTURE_BYTES + 1).is_err());
     }
 }

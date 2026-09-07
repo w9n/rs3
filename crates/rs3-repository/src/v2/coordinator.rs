@@ -592,6 +592,36 @@ where
             .map_err(|_| commit_failed("v2 standalone publication task failed"))?
     }
 
+    /// Completes and verifies the detached carrier, then owns the short fenced
+    /// publication even if the waiting client disconnects. Retry callers first
+    /// consult the repository's authenticated completion receipt.
+    pub async fn complete_multipart_upload(
+        &self,
+        upload: super::V3ClientMultipartUpload,
+        selection: super::V3MultipartSelection,
+    ) -> Result<rs3_index::completion::CompletionReceipt> {
+        let owned = self.clone_for_owned_task();
+        tokio::spawn(async move {
+            let prepared = owned
+                .repository
+                .prepare_multipart_completion(upload, selection)
+                .await?;
+            let _publisher = owned.publisher.lock().await;
+            let _stage = owned.stage_lock.lock().await;
+            owned.publish_locked_batch().await?;
+            owned.prepare_index_catalog_for_growth_locked().await?;
+            owned
+                .repository
+                .publish_multipart_completion(
+                    V2CoordinatedMutation::new(&owned.lease, owned.anchor.as_ref()),
+                    prepared,
+                )
+                .await
+        })
+        .await
+        .map_err(|_| commit_failed("multipart completion task failed"))?
+    }
+
     /// Writes one unknown-length streamed object after flushing pending batches.
     pub async fn put_committed_streaming_unknown_len<St>(
         &self,

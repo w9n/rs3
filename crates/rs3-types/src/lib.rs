@@ -15,6 +15,21 @@ pub const PAYLOAD_PACK_SEGMENT_BYTES: usize = 64 * 1024;
 /// Bytes in the complete XChaCha20 nonce used for payload encryption.
 pub const PAYLOAD_NONCE_LEN: usize = 24;
 
+/// Opaque identity for one client multipart upload, unrelated to a logical path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MultipartUploadId([u8; 32]);
+
+impl MultipartUploadId {
+    /// Reconstructs an ID from bounded decoded client input or authenticated state.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    /// Returns the fixed-width opaque identity.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 /// Fresh identity for one immutable payload sealing attempt.
 ///
 /// Reusing an identity is permitted only when retrying already sealed bytes.

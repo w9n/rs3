@@ -12,7 +12,7 @@ use std::fmt;
 pub const INDEX_RUN_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-run-frame-plaintext:v2\n";
 
 /// Version of the canonical index-run wire encoding.
-pub const INDEX_RUN_WIRE_VERSION: u16 = 7;
+pub const INDEX_RUN_WIRE_VERSION: u16 = 8;
 
 /// Maximum stored size of one v03 payload pack.
 pub const INDEX_PACK_MAX_STORED_BYTES: u64 = 32 * 1024 * 1024;
@@ -387,6 +387,8 @@ impl IndexMutation {
 /// Canonical bounded plaintext index run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexRun {
+    /// One completion accepted with this mutation, encrypted in run metadata.
+    pub completion_receipt: Option<crate::completion::CompletionReceipt>,
     /// Repository sequence represented by this batch.
     pub sequence: Sequence,
     /// Exact shared facts for the payload pack carried by this run's commit.
@@ -770,6 +772,7 @@ pub fn encode_index_run_frames(
 
     let metadata_count = container_count
         .checked_add(namespace_key_ids.len())
+        .and_then(|count| count.checked_add(usize::from(run.completion_receipt.is_some())))
         .ok_or(IndexRunError::IntegerOverflow)?;
     let mut metadata = Vec::with_capacity(metadata_count);
     for container in &run.containers {
@@ -820,6 +823,17 @@ pub fn encode_index_run_frames(
             namespace_key_id.as_str(),
             limits.max_key_id_bytes,
             "namespace key id",
+        )?;
+        metadata.push(PreparedRecord::metadata(record.finish()));
+    }
+
+    if let Some(receipt) = &run.completion_receipt {
+        let mut record = Writer::new(limits.max_record_bytes);
+        record.u8(4)?;
+        record.bytes(
+            &receipt
+                .encode()
+                .map_err(|_| IndexRunError::FrameFactsMismatch)?,
         )?;
         metadata.push(PreparedRecord::metadata(record.finish()));
     }
@@ -1381,6 +1395,7 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
 
 #[derive(Default)]
 struct IndexRunFrameDecoder {
+    completion_receipt: Option<crate::completion::CompletionReceipt>,
     self_pack: Option<IndexRunSelfPack>,
 
     saw_self_payload_fact: bool,
@@ -1438,6 +1453,9 @@ impl IndexRunFrameDecoder {
         self.self_pack = frame_self_pack;
         self.saw_self_payload_fact = true;
         for _ in 0..header.frame_record_count {
+            if self.completion_receipt.is_some() {
+                return Err(IndexRunError::InvalidContainerOrder);
+            }
             let mut record = reader.record(
                 STANDALONE_CONTAINER_MAX_BYTES
                     .min(limits.max_frame_bytes)
@@ -1512,6 +1530,13 @@ impl IndexRunFrameDecoder {
                         }
                     }
                     self.namespace_key_ids.push(namespace_key_id);
+                }
+                4 => {
+                    self.completion_receipt = Some(
+                        crate::completion::CompletionReceipt::decode(record.remaining)
+                            .map_err(|_| IndexRunError::FrameFactsMismatch)?,
+                    );
+                    record.remaining = &[];
                 }
                 value => {
                     return Err(IndexRunError::InvalidTag {
@@ -1674,6 +1699,7 @@ impl IndexRunFrameDecoder {
             .len()
             .checked_add(self.standalone_stream_containers.len())
             .and_then(|count| count.checked_add(self.namespace_key_ids.len()))
+            .and_then(|count| count.checked_add(usize::from(self.completion_receipt.is_some())))
             .ok_or(IndexRunError::IntegerOverflow)?
             != metadata_total.ok_or(IndexRunError::InvalidFrameOrder)?
         {
@@ -1699,7 +1725,8 @@ impl IndexRunFrameDecoder {
             ordered_mutations.push(mutation.ok_or(IndexRunError::ProjectionMismatch { ordinal })?);
         }
         validate_repeated_record_facts(&ordered_mutations)?;
-        Ok(IndexRun {
+        let run = IndexRun {
+            completion_receipt: self.completion_receipt,
             sequence,
             self_pack: self.self_pack,
 
@@ -1707,7 +1734,9 @@ impl IndexRunFrameDecoder {
 
             standalone_stream_containers: self.standalone_stream_containers,
             mutations: ordered_mutations,
-        })
+        };
+        validate_completion_receipt(&run)?;
+        Ok(run)
     }
 }
 
@@ -1753,6 +1782,7 @@ fn decode_frame_header<'a>(
         limits
             .max_containers
             .checked_add(limits.max_mutations)
+            .and_then(|count| count.checked_add(1)) // Optional completion receipt.
             .ok_or(IndexRunError::IntegerOverflow)?
     } else {
         limits.max_mutations
@@ -2484,7 +2514,42 @@ fn stream_payload_stored_len(header: &PayloadLayout) -> Result<u64, IndexRunErro
         .ok_or(IndexRunError::InvalidStandaloneStreamContainer)
 }
 
+fn validate_completion_receipt(run: &IndexRun) -> Result<(), IndexRunError> {
+    if let Some(receipt) = &run.completion_receipt {
+        receipt
+            .validate()
+            .map_err(|_| IndexRunError::FrameFactsMismatch)?;
+        let mut upserts = run.mutations.iter().filter_map(|mutation| match mutation {
+            IndexMutation::Upsert(upsert) => Some(upsert),
+            IndexMutation::Tombstone(_) => None,
+        });
+        let upsert = upserts.next().ok_or(IndexRunError::FrameFactsMismatch)?;
+        if upserts.next().is_some()
+            || upsert.path != receipt.key
+            || upsert.content_len != receipt.content_len
+        {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        // One logical overwrite can retire the same path under old namespace
+        // keys. The receipt must not authorize any unrelated mutation.
+        let mut namespaces = BTreeSet::from([&upsert.namespace_key_id]);
+        let mut blind_keys = BTreeSet::from([upsert.blind_key]);
+        for mutation in &run.mutations {
+            if let IndexMutation::Tombstone(tombstone) = mutation
+                && (tombstone.path != upsert.path
+                    || tombstone.generation != upsert.generation
+                    || !namespaces.insert(&tombstone.namespace_key_id)
+                    || !blind_keys.insert(tombstone.blind_key))
+            {
+                return Err(IndexRunError::FrameFactsMismatch);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_mutations(run: &IndexRun, limits: &IndexRunLimits) -> Result<(), IndexRunError> {
+    validate_completion_receipt(run)?;
     let mut used_containers = BTreeSet::new();
     let mut used_standalone_stream_containers = BTreeSet::new();
     let mut uses_self_pack = false;
@@ -3082,6 +3147,7 @@ mod tests {
 
     fn fixture() -> IndexRun {
         IndexRun {
+            completion_receipt: None,
             sequence: Sequence::new(9),
             self_pack: None,
 
@@ -3200,6 +3266,90 @@ mod tests {
         run
     }
 
+    fn completion_fixture() -> IndexRun {
+        let mut run = standalone_stream_fixture();
+        run.mutations.truncate(1);
+        let IndexMutation::Upsert(upsert) = &run.mutations[0] else {
+            panic!("upsert");
+        };
+        run.completion_receipt = Some(crate::completion::CompletionReceipt {
+            upload_id: rs3_types::MultipartUploadId::from_bytes([0x71; 32]),
+            commit_sequence: Sequence::new(12),
+            selection_digest: [0x72; 32],
+            attempts_digest: [0x73; 32],
+            key: upsert.path.clone(),
+            content_len: upsert.content_len,
+            etag: "multipart-result".to_owned(),
+        });
+        run
+    }
+
+    #[test]
+    fn completion_receipt_binds_the_only_upsert() {
+        let limits = IndexRunLimits::default();
+        let run = completion_fixture();
+        let bytes = encode_index_run(&run, &limits).expect("encode receipt run");
+        assert_eq!(decode_index_run(&bytes, &limits), Ok(run.clone()));
+        for field in 0..3 {
+            let mut wrong = run.clone();
+            let receipt = wrong.completion_receipt.as_mut().expect("receipt");
+            match field {
+                0 => receipt.key = LogicalPath::new("different/key").expect("path"),
+                1 => receipt.content_len += 1,
+                _ => wrong.mutations.push(fixture().mutations[1].clone()),
+            }
+            assert!(encode_index_run(&wrong, &limits).is_err());
+        }
+        // Receipt-only metadata cannot authorize a publication without a value.
+        let mut missing = run;
+        missing.mutations.clear();
+        assert!(encode_index_run(&missing, &limits).is_err());
+    }
+
+    #[test]
+    fn completion_receipt_allows_only_stale_namespace_tombstones() {
+        let limits = IndexRunLimits::default();
+        let mut run = completion_fixture();
+        let IndexMutation::Upsert(upsert) = &run.mutations[0] else {
+            panic!("upsert");
+        };
+        run.mutations.push(IndexMutation::Tombstone(IndexTombstone {
+            mutation_ordinal: 1,
+            blind_key: IndexBlindKey::from_bytes([0x44; 32]),
+            namespace_key_id: KeyId::new("namespace-old").expect("key id"),
+            path: upsert.path.clone(),
+            generation: upsert.generation,
+        }));
+        let bytes = encode_index_run(&run, &limits).expect("encode rotated namespace");
+        assert_eq!(decode_index_run(&bytes, &limits), Ok(run.clone()));
+        for field in 0..6 {
+            let mut wrong = run.clone();
+            let IndexMutation::Upsert(upsert) = &run.mutations[0] else {
+                panic!("upsert");
+            };
+            let IndexMutation::Tombstone(tombstone) = &mut wrong.mutations[1] else {
+                panic!("tombstone");
+            };
+            match field {
+                0 => tombstone.path = LogicalPath::new("unrelated/key").expect("path"),
+                1 => tombstone.generation = Sequence::new(99),
+                2 => tombstone.namespace_key_id = upsert.namespace_key_id.clone(),
+                3 => tombstone.blind_key = upsert.blind_key,
+                4 => {
+                    let mut duplicate = tombstone.clone();
+                    duplicate.mutation_ordinal = 2;
+                    wrong.mutations.push(IndexMutation::Tombstone(duplicate));
+                }
+                _ => {
+                    let mut duplicate = upsert.clone();
+                    duplicate.mutation_ordinal = 2;
+                    wrong.mutations.push(IndexMutation::Upsert(duplicate));
+                }
+            }
+            assert!(encode_index_run(&wrong, &limits).is_err(), "field {field}");
+        }
+    }
+
     #[test]
     fn frozen_container_tables_preserve_canonical_wire_bytes() {
         for (run, expected) in [
@@ -3216,6 +3366,14 @@ mod tests {
                 include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/../../test-vectors/v03/v03_index_run/standalone.bin"
+                ))
+                .as_slice(),
+            ),
+            (
+                completion_fixture(),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../test-vectors/v03/v03_index_run/completion.bin"
                 ))
                 .as_slice(),
             ),
@@ -3940,7 +4098,7 @@ mod tests {
         let encoded = encode_index_run(&fixture(), &IndexRunLimits::default()).expect("encode run");
         assert_eq!(
             hex(&encoded),
-            "0395027273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0007000000000000000000090202020001d301000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c232323232323232323232323232323232323232323232323232323232323232303000000000000020000000000000008001111111111111111111111111111111111111111111111111111111111111111a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a309636f6e74656e742d31080d030b6e616d6573706163652d318c017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0007010000000000000000090202023600003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901021e0224010144444444444444444444444444444444444444444444444444444444444444440012627273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00070200000000000000000902020213000e74656e616e742f64656c657465640101121d070e736e617073686f742f6368756e6b000011d209ffffffffffffffc9"
+            "0395027273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0008000000000000000000090202020001d301000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c232323232323232323232323232323232323232323232323232323232323232303000000000000020000000000000008001111111111111111111111111111111111111111111111111111111111111111a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a309636f6e74656e742d31080d030b6e616d6573706163652d318c017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0008010000000000000000090202023600003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901021e0224010144444444444444444444444444444444444444444444444444444444444444440012627273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00080200000000000000000902020213000e74656e616e742f64656c657465640101121d070e736e617073686f742f6368756e6b000011d209ffffffffffffffc9"
         );
     }
 

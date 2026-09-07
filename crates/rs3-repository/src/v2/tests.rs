@@ -1,3 +1,4 @@
+mod multipart_completion;
 mod prepared_genesis;
 mod publication_overlap;
 mod standalone_verification;
@@ -436,6 +437,7 @@ async fn write_empty_metadata_child<S: BlobStore, A: V2CommitAnchor>(
                         generation: key.sequence,
                     });
                 let run = rs3_index::run::IndexRun {
+                    completion_receipt: None,
                     sequence: key.sequence,
                     self_pack: None,
                     containers: Vec::new(),

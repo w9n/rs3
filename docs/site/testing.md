@@ -26,6 +26,14 @@ repository envelopes and recovery bundles against `test-vectors/v03/`.
 That directory documents fixture keys, fixed test-only nonces and the named
 rejection tests. Fixed fixtures do not change production nonce generation.
 
+Repository multipart completion tests cover empty and detached values, receipt
+lookup after overwrite, checkpoint, compaction and restart, publication-time
+create-only checks, failed anchor advancement, lost anchor replies and local
+installation failure. Adapter tests also cover the five multipart routes, replacement serialization,
+parallel parts, completion freeze, duplicate completion, monotonic expiry,
+admission limits, cancellation, readonly mode and invalid selected/body facts.
+Live-provider and default-checksum qualification remain separate.
+
 `just fuzz-smoke` exercises commit headers/objects, canonical CBOR, both
 repository-envelope purposes, recovery bundles, index runs/roots, format roots,
 payload packs and detached single-part payloads. It copies raw seeds and frozen

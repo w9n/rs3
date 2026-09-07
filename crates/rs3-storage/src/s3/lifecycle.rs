@@ -84,6 +84,16 @@ fn validate_rules(rules: &[LifecycleRule], repository_prefix: &str) -> Result<()
         {
             continue;
         }
+        // Gateway client sessions live for at most 24 hours. Leave another day
+        // for admitted part/completion calls instead of racing provider cleanup.
+        if rule
+            .abort_incomplete_multipart_upload()
+            .is_some_and(|abort| abort.days_after_initiation().is_none_or(|days| days < 2))
+        {
+            return Err(policy_error(
+                "S3 incomplete-upload cleanup must allow at least two days",
+            ));
+        }
         if rule.noncurrent_version_expiration().is_some()
             || rule.expiration().is_some_and(|expiry| {
                 expiry.days().is_some()

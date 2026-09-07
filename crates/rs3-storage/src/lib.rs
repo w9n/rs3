@@ -3,6 +3,7 @@
 #[cfg(feature = "test-util")]
 mod fault;
 mod filesystem;
+mod multipart;
 mod read;
 mod retention;
 #[cfg(feature = "s3")]
@@ -23,6 +24,10 @@ pub use fault::{
     FaultOperationKind, FaultRule,
 };
 pub use filesystem::FilesystemBlobStore;
+pub use multipart::{
+    BlobMultipartPart, BlobMultipartSession, MULTIPART_MAX_PART_BYTES, MULTIPART_MAX_PARTS,
+    MULTIPART_MIN_PART_BYTES,
+};
 pub use read::{BlobRead, MAX_BLOB_READ_CHUNK_BYTES, collect_bounded_blob_read};
 pub use retention::{active_retention, retention_satisfies, strongest_retention_policy};
 use retention::{retention_is_active, stronger_retention_mode};
@@ -218,6 +223,17 @@ pub trait BlobStore: Send + Sync {
     ) -> Result<Box<dyn BlobMultipartUpload>> {
         let _ = object_id;
         let _ = options;
+        Err(StorageError::MultipartUnsupported)
+    }
+
+    /// Starts a client-driven upload supporting streamed replacement parts.
+    /// Unsupported providers fail explicitly instead of buffering whole parts.
+    async fn create_multipart_session(
+        &self,
+        object_id: &BackendObjectId,
+        options: PutOptions,
+    ) -> Result<Box<dyn BlobMultipartSession>> {
+        let _ = (object_id, options);
         Err(StorageError::MultipartUnsupported)
     }
 
@@ -541,6 +557,24 @@ where
             .create_multipart_upload(object_id, options)
             .await?;
         Ok(Box::new(CountingMultipartUpload {
+            inner: upload,
+            counts: Arc::clone(&self.counts),
+        }))
+    }
+
+    async fn create_multipart_session(
+        &self,
+        object_id: &BackendObjectId,
+        options: PutOptions,
+    ) -> Result<Box<dyn BlobMultipartSession>> {
+        self.mutate_counts(|counts| {
+            counts.multipart_create = counts.multipart_create.saturating_add(1);
+        })?;
+        let upload = self
+            .inner
+            .create_multipart_session(object_id, options)
+            .await?;
+        Ok(Box::new(multipart::CountingMultipartSession {
             inner: upload,
             counts: Arc::clone(&self.counts),
         }))
@@ -1076,6 +1110,20 @@ fn validate_multipart_part_index(part_index: usize) -> Result<()> {
 
 #[async_trait]
 impl BlobStore for MemoryBlobStore {
+    async fn create_multipart_session(
+        &self,
+        object_id: &BackendObjectId,
+        options: PutOptions,
+    ) -> Result<Box<dyn BlobMultipartSession>> {
+        Ok(Box::new(multipart::MemoryMultipartSession {
+            store: self.clone(),
+            object_id: object_id.clone(),
+            options,
+            scope: Arc::new(()),
+            state: std::sync::Mutex::new(Default::default()),
+        }))
+    }
+
     async fn put(
         &self,
         object_id: &BackendObjectId,

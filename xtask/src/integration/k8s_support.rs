@@ -64,6 +64,12 @@ pub(crate) fn helm_install_gateway(
     let payload_segment_size = values
         .payload_segment_size
         .map_or_else(|| "null".to_string(), |value| value.to_string());
+    let bootstrap = values.gateway_mode == "read-write"
+        && values.anchor_mode == "kubernetes-lease"
+        && (values.backend_endpoint == "s3"
+            || values.backend_endpoint.starts_with("http://")
+            || values.backend_endpoint.starts_with("https://"));
+    let allow_init = !bootstrap && values.gateway_mode != "restore-readonly";
     run_command(
         helm_bin,
         &[
@@ -131,7 +137,9 @@ pub(crate) fn helm_install_gateway(
             "--set-string",
             &helm_set_string("logging.rustLog", values.rust_log),
             "--set",
-            "repository.allowInit=true",
+            &format!("bootstrap.enabled={bootstrap}"),
+            "--set",
+            &format!("repository.allowInit={allow_init}"),
             "--set",
             &format!("repository.payloadSegmentSizeBytes={payload_segment_size}"),
             "--set-string",

@@ -132,7 +132,10 @@ Production-preview retained S3-compatible buckets MUST configure a lifecycle
 rule that aborts incomplete multipart uploads. Client disconnects, pod crashes,
 or provider-side abort failures can leave temporary multipart parts that are
 not committed repository objects, so rs3 repository GC cannot discover or clean
-them.
+them. Use at least two days after initiation: the gateway permits a 24-hour
+client session and needs additional margin for admitted parts and completion.
+Read-write S3 startup rejects a shorter overlapping rule, and it also rejects
+ordinary age-based expiration that overlaps repository storage.
 
 Example lifecycle shape, adapting the prefix syntax to the selected provider:
 
@@ -146,7 +149,7 @@ Example lifecycle shape, adapting the prefix syntax to the selected provider:
         "Prefix": "<backend-prefix>/"
       },
       "AbortIncompleteMultipartUpload": {
-        "DaysAfterInitiation": 1
+        "DaysAfterInitiation": 2
       }
     }
   ]

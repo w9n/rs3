@@ -57,6 +57,7 @@ impl<'a> PendingV2EffectiveHead<'a> {
 /// Immutable bounded input used while constructing and publishing one commit.
 #[derive(Clone, Debug)]
 pub(super) struct PendingV2Snapshot {
+    pub(super) completion_receipt: Option<rs3_index::completion::CompletionReceipt>,
     revision: u64,
     #[cfg(test)]
     allocation_sequence: Sequence,
@@ -358,6 +359,7 @@ impl PendingV2State {
 
     pub(super) fn snapshot(&self) -> PendingV2Snapshot {
         let mut snapshot = PendingV2Snapshot {
+            completion_receipt: None,
             revision: self.revision,
             #[cfg(test)]
             allocation_sequence: self.allocation_sequence,

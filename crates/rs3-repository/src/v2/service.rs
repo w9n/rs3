@@ -49,6 +49,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock as TokioRwLock};
 
 mod compaction;
+mod multipart;
+pub use multipart::{V3ClientMultipartUpload, V3MultipartSelection};
 pub(super) mod packed;
 mod packed_compaction;
 mod packed_compaction_publish;
@@ -134,6 +136,7 @@ pub(crate) struct V2PendingPublication {
 }
 
 struct PendingV2Install {
+    completion_receipts: Option<(Sequence, rs3_index::completion::CompletionReceipts)>,
     sequence: Sequence,
     mutations: Vec<PendingV2InstallMutation>,
     run: Option<V2IndexRootRunRef>,
@@ -345,7 +348,7 @@ where
         {
             return Err(v2_repository_error(V2FormatError::StaleAnchor));
         }
-        let (covered_generation, expected_live_object_count, expected_runs) = {
+        let (covered_generation, expected_live_object_count, expected_runs, receipts) = {
             let accepted = self
                 .accepted
                 .read()
@@ -355,6 +358,7 @@ where
                 u64::try_from(accepted.repository.list_entries.len())
                     .map_err(|_| v2_repository_error(V2FormatError::IndexRootLimitExceeded))?,
                 accepted.runs.clone(),
+                accepted.repository.completion_receipts.clone(),
             )
         };
         let root = V2IndexRoot::new(
@@ -364,7 +368,8 @@ where
             self.commit_store.options().keyring_envelope_ref.clone(),
             expected_runs.clone(),
         )
-        .map_err(v2_repository_error)?;
+        .map_err(v2_repository_error)?
+        .with_completion_receipts(receipts);
         let temporary_anchor = V2MemoryAnchor::with_state(base_anchor.clone());
         let keyring = self.repository.keyring()?;
         let context = packed::repository_context_from_refs(
@@ -536,6 +541,20 @@ where
             );
         }
         Ok((rebuilt, accepted_runs))
+    }
+
+    /// Returns a completion result from the authenticated accepted state.
+    /// Missing IDs never authorize creating a replacement publication.
+    pub fn completion_receipt(
+        &self,
+        id: &rs3_types::MultipartUploadId,
+    ) -> Result<Option<rs3_index::completion::CompletionReceipt>> {
+        self.ensure_local_state_ready()?;
+        let accepted = self
+            .accepted
+            .read()
+            .map_err(|_| RepositoryError::StatePoisoned)?;
+        Ok(accepted.repository.completion_receipts.get(id).cloned())
     }
 
     /// Writes an object and returns after the covering v2 commit is accepted.
@@ -2073,12 +2092,22 @@ where
         if sequence <= accepted.repository.next_sequence {
             return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
         }
+        let completion_receipts = if let Some(receipt) = &pending.completion_receipt {
+            let mut receipts = accepted.repository.completion_receipts.clone();
+            receipts
+                .insert(receipt.clone())
+                .map_err(|_| v2_repository_error(V2FormatError::InvalidIndexRun))?;
+            Some((receipt.commit_sequence, receipts))
+        } else {
+            None
+        };
         drop(accepted);
         self.pending
             .lock()
             .map_err(|_| RepositoryError::StatePoisoned)?
             .validate_snapshot(pending)?;
         Ok(PendingV2Install {
+            completion_receipts,
             sequence,
             mutations,
             run,
@@ -2102,6 +2131,13 @@ where
             .pending
             .lock()
             .map_err(|_| RepositoryError::StatePoisoned)?;
+        if install
+            .completion_receipts
+            .as_ref()
+            .is_some_and(|(sequence, _)| *sequence != anchor.sequence)
+        {
+            return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+        }
         // A frozen prefix may have bounded successors appended after pre-CAS
         // validation. Consume only that prefix while both state locks are held.
         pending.finish_publication()?;
@@ -2120,6 +2156,9 @@ where
                     accepted.repository.remove_namespace_entry(blind_key)
                 }
             }
+        }
+        if let Some((_, receipts)) = install.completion_receipts {
+            accepted.repository.completion_receipts = receipts;
         }
         accepted.repository.next_sequence = install.sequence;
         if let Some(run) = install.run {

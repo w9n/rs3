@@ -1363,6 +1363,13 @@ where
             }
             _ => return Err(V2FormatError::InvalidIndexRoot),
         };
+        if root
+            .completion_receipts()
+            .iter()
+            .any(|receipt| receipt.commit_sequence >= header.self_ref.sequence)
+        {
+            return Err(V2FormatError::InvalidIndexRoot);
+        }
         let mut ordered_runs = root.runs().to_vec();
         ordered_runs.sort_by_key(|run| (run.minimum_generation, run.run_sequence, run.run_id));
         *state = RepositoryState::default();
@@ -1444,6 +1451,9 @@ where
         {
             return Err(V2FormatError::InvalidIndexRoot);
         }
+        // The snapshot is authoritative. Receipts found in old catalog-named
+        // runs must not resurrect results already evicted from the accepted set.
+        state.completion_receipts = root.completion_receipts().clone();
         Ok(V2ResolvedIndexRoot {
             runs,
             referenced_commits,

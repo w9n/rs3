@@ -56,6 +56,13 @@ reply requires exact-state reconciliation; an unresolved outcome stops further
 mutations. Backend-visible classes and identifiers are unchanged, while request
 cadence and batch sizes may change when staging overlaps upload.
 
+Multipart completion receipts keep upload identity, destination and selected-part
+facts inside encrypted runs and root catalogs. They add bounded metadata bytes
+and can therefore affect observed index sizes. Their count-based eviction does
+not delete payloads or promise historical recovery. Unknown upload IDs cannot
+create a new publication, and an unresolved anchor result blocks receipt lookup
+until trusted recovery.
+
 ## Accepted Leakage
 
 The replacement `v03` design accepts specific backend-visible leakage:
@@ -150,7 +157,9 @@ content key match. Repository/keyring, object, section, carrier, attempt, part,
 segment length and EOF are authenticated. Layout and attempt identities live in
 encrypted index metadata; detached objects expose no self-describing header.
 Full publication readback remains mandatory. Multipart-boundary range and tamper
-tests cover the format capability; client multipart API qualification is deferred.
+tests cover the format capability and the gateway adapter covers the client
+multipart routes. Live-provider and default-request-checksum qualification remain
+separate from those local checks.
 
 ## Rollback Rule
 

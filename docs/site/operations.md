@@ -86,7 +86,7 @@ provider:
         "Prefix": "<backend-prefix>/"
       },
       "AbortIncompleteMultipartUpload": {
-        "DaysAfterInitiation": 1
+        "DaysAfterInitiation": 2
       }
     }
   ]

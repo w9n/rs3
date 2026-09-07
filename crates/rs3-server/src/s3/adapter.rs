@@ -39,8 +39,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
+mod multipart;
+
 #[derive(Clone)]
 pub(super) struct GatewayS3Service {
+    multipart: multipart::MultipartSessions,
     mode: GatewayMode,
     public_bucket: PublicBucket,
     repository: RuntimeRepository,
@@ -80,6 +83,7 @@ impl GatewayS3Service {
         repository.load_accepted_anchor(config.mode).await?;
 
         Ok(Self {
+            multipart: multipart::MultipartSessions::new(),
             mode: config.mode,
             public_bucket: config.public_bucket.clone(),
             repository,
@@ -643,6 +647,37 @@ impl RequestRateLimiter {
 
 #[async_trait::async_trait]
 impl S3 for GatewayS3Service {
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<s3s::dto::CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<s3s::dto::CreateMultipartUploadOutput>> {
+        self.multipart_create(req.input).await
+    }
+    async fn upload_part(
+        &self,
+        req: S3Request<s3s::dto::UploadPartInput>,
+    ) -> S3Result<S3Response<s3s::dto::UploadPartOutput>> {
+        self.multipart_upload_part(req.input).await
+    }
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<s3s::dto::CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
+        self.multipart_complete(req.input).await
+    }
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<s3s::dto::AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<s3s::dto::AbortMultipartUploadOutput>> {
+        self.multipart_abort(req.input).await
+    }
+    async fn list_parts(
+        &self,
+        req: S3Request<s3s::dto::ListPartsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListPartsOutput>> {
+        self.multipart_list(req.input).await
+    }
+
     async fn head_bucket(
         &self,
         req: S3Request<HeadBucketInput>,
@@ -1670,6 +1705,7 @@ fn record_s3_response_body_bytes(operation: &'static str, len: usize) {
 
 #[cfg(test)]
 mod tests {
+    mod multipart;
     use super::{
         DownloadBodyBudget, GatewayS3Service, RequestRateLimiter, UploadBodyBudget,
         status_code_label,

@@ -1058,6 +1058,7 @@ fn validate_directory_layout(
     }
     let maximum_metadata_records = u64::from(container_count)
         .checked_add(u64::from(mutation_count))
+        .and_then(|count| count.checked_add(1)) // Optional multipart completion receipt.
         .ok_or(V2FormatError::InvalidIndexRun)?;
     if expected_offset != stored_len
         || metadata_records < u64::from(container_count)
@@ -1384,6 +1385,7 @@ mod tests {
 
     fn fixture() -> IndexRun {
         IndexRun {
+            completion_receipt: None,
             sequence: Sequence::new(9),
             self_pack: Some(IndexRunSelfPack {
                 pack_id: [0x11; 32],
@@ -1493,6 +1495,7 @@ mod tests {
                 .div_ceil(payload_layout.chunk_size)
                 * 16;
         IndexRun {
+            completion_receipt: None,
             sequence: Sequence::new(32),
             self_pack: None,
 
@@ -1679,6 +1682,7 @@ mod tests {
         let object = object_id("commits/v03/delete-only");
         let limits = limits();
         let run = IndexRun {
+            completion_receipt: None,
             sequence: Sequence::new(21),
             self_pack: None,
 

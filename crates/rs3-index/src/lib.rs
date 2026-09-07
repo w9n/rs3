@@ -1,5 +1,7 @@
 //! Append-friendly namespace and authenticated index-run model.
 
+pub mod completion;
+
 pub mod run;
 
 use rs3_types::{

@@ -422,6 +422,34 @@ impl RuntimeRepository {
             })
     }
 
+    pub(super) async fn create_multipart_upload(
+        &self,
+        key: LogicalPath,
+        options: RepositoryPutOptions,
+    ) -> Result<rs3_repository::v2::V3ClientMultipartUpload, RepositoryError> {
+        self.repository.create_multipart_upload(key, options).await
+    }
+
+    pub(super) fn accepted_multipart_completion(
+        &self,
+        id: &rs3_types::MultipartUploadId,
+        key: &LogicalPath,
+        selection: &rs3_repository::v2::V3MultipartSelection,
+    ) -> Result<Option<rs3_index::completion::CompletionReceipt>, RepositoryError> {
+        self.repository
+            .accepted_multipart_completion(id, key, selection)
+    }
+
+    pub(super) async fn complete_multipart_upload(
+        &self,
+        upload: rs3_repository::v2::V3ClientMultipartUpload,
+        selection: rs3_repository::v2::V3MultipartSelection,
+    ) -> Result<rs3_index::completion::CompletionReceipt, RepositoryError> {
+        self.coordinator
+            .complete_multipart_upload(upload, selection)
+            .await
+    }
+
     pub(super) fn supports_streaming_put(&self) -> bool {
         self.repository
             .commit_store()

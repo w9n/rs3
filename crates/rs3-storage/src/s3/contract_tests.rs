@@ -15,6 +15,7 @@ use tokio::net::TcpListener;
 struct ScriptedProvider {
     store: S3BlobStore,
     requests: Arc<Mutex<Vec<String>>>,
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -34,10 +35,21 @@ impl ScriptedProvider {
     }
 
     async fn with_headers(status: u16, responses: Vec<String>, headers: &'static str) -> Self {
+        Self::with_body_capture(status, responses, headers, false).await
+    }
+
+    async fn with_body_capture(
+        status: u16,
+        responses: Vec<String>,
+        headers: &'static str,
+        capture: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let endpoint = format!("http://{}", listener.local_addr().expect("address"));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let received = requests.clone();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let received_bodies = Arc::clone(&bodies);
         let server = tokio::spawn(async move {
             for body in responses {
                 let (mut stream, _) = listener.accept().await.expect("request");
@@ -52,6 +64,26 @@ impl ScriptedProvider {
                     .lock()
                     .expect("requests")
                     .push(header.lines().next().expect("request line").to_owned());
+                if capture {
+                    assert!(
+                        !header
+                            .to_ascii_lowercase()
+                            .contains("transfer-encoding: chunked"),
+                        "fixture requires Content-Length"
+                    );
+                    let len = header
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().expect("body length"))
+                        })
+                        .unwrap_or(0);
+                    assert!(len <= 8 * 1024 * 1024, "fixture body budget");
+                    let mut body = vec![0; len];
+                    stream.read_exact(&mut body).await.expect("request body");
+                    received_bodies.lock().expect("bodies").push(body);
+                }
                 let response = format!(
                     "HTTP/1.1 {status} Fixture\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
                     body.len(),
@@ -85,6 +117,7 @@ impl ScriptedProvider {
         Self {
             store: S3BlobStore::from_client(Client::from_conf(sdk_config), config),
             requests,
+            bodies,
             server,
         }
     }
@@ -364,6 +397,18 @@ async fn repository_lifecycle_rules_preserve_direct_reads_and_live_versions() {
         (
             "<Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload>",
             true,
+        ),
+        (
+            "<Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload>",
+            false,
+        ),
+        (
+            "<Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>2</DaysAfterInitiation></AbortIncompleteMultipartUpload>",
+            true,
+        ),
+        (
+            "<Status>Enabled</Status><AbortIncompleteMultipartUpload/>",
+            false,
         ),
         (
             "<Status>Enabled</Status><Filter><Prefix>other/</Prefix></Filter><Expiration><Days>1</Days></Expiration>",
@@ -718,4 +763,54 @@ async fn exact_version_reads_reject_missing_and_mismatched_response_versions() {
                 .all(|request| request.contains("versionId=accepted-version"))
         );
     }
+}
+
+#[tokio::test]
+async fn selected_multipart_streams_parts_and_sends_only_selected_tokens() {
+    let provider = ScriptedProvider::with_body_capture(200, vec![
+        "<InitiateMultipartUploadResult><UploadId>fixture-upload</UploadId></InitiateMultipartUploadResult>".to_owned(),
+        String::new(), String::new(), String::new(),
+        "<CompleteMultipartUploadResult><ETag>fixture-object</ETag></CompleteMultipartUploadResult>".to_owned(),
+        String::new(),
+    ], "ETag: fixture-part\r\n", true).await;
+    let key = rs3_types::BackendObjectId::new("objects/multipart").expect("key");
+    let upload = provider
+        .store
+        .create_multipart_session(&key, crate::PutOptions::default())
+        .await
+        .expect("start");
+    for (index, value) in [(8, "old"), (4, "omitted")] {
+        let bytes = bytes::Bytes::from(value);
+        upload
+            .upload_part(
+                index,
+                crate::read::bytes_blob_read(bytes.clone(), bytes.len() as u64),
+            )
+            .await
+            .expect("part");
+    }
+    let part = upload
+        .upload_part(
+            8,
+            crate::read::bytes_blob_read(bytes::Bytes::from_static(b"new"), 3),
+        )
+        .await
+        .expect("replacement");
+    let metadata = upload
+        .complete(vec![part])
+        .await
+        .expect("selected completion");
+    assert_eq!(metadata.content_len, 3);
+    let requests = provider.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 6);
+    assert!(requests[1].contains("partNumber=9"));
+    assert!(requests[2].contains("partNumber=5"));
+    assert!(requests[3].contains("partNumber=9"));
+    let bodies = provider.bodies.lock().expect("bodies");
+    let completion = std::str::from_utf8(&bodies[4]).expect("XML");
+    assert!(completion.contains("<PartNumber>9</PartNumber>"));
+    assert!(!completion.contains("<PartNumber>5</PartNumber>"));
+    assert!(completion.contains("<ETag>fixture-part</ETag>"));
+    // The SDK may add aws-chunked checksum framing; the original body must be present.
+    assert!(bodies[3].windows(3).any(|window| window == b"new"));
 }

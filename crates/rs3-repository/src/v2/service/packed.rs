@@ -75,6 +75,13 @@ where
         commit_key: &V2CommitKey,
         pending: &PendingV2Snapshot,
     ) -> Result<Option<PendingV2PackedCommitSections>> {
+        if pending
+            .completion_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.commit_sequence != commit_key.sequence)
+        {
+            return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+        }
         let keyring = self.repository.keyring()?;
         let accepted = self
             .accepted
@@ -315,6 +322,7 @@ where
         let mutation_count = u32::try_from(mutations.len())
             .map_err(|_| v2_repository_error(V2FormatError::IndexRunLimitExceeded))?;
         let run = IndexRun {
+            completion_receipt: pending.completion_receipt.clone(),
             sequence: run_sequence,
             self_pack: locations.iter().find_map(|location| location.pack.clone()),
 
@@ -501,6 +509,17 @@ pub(in crate::v2) fn apply_packed_index_run(
         {
             return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
         }
+    }
+    if let Some(receipt) = &run.completion_receipt {
+        if receipt.commit_sequence != replay.parsed_header.header.self_ref.sequence
+            || replay.level != 0
+        {
+            return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
+        }
+        state
+            .completion_receipts
+            .validate_insert(receipt)
+            .map_err(|_| v2_repository_error(V2FormatError::InvalidIndexRun))?;
     }
     let directory = open_v2_index_run_directory(
         keyring,
@@ -765,6 +784,12 @@ pub(in crate::v2) fn apply_packed_index_run(
                 state.remove_namespace_entry(blind_key);
             }
         }
+    }
+    if let Some(receipt) = run.completion_receipt {
+        state
+            .completion_receipts
+            .insert(receipt)
+            .map_err(|_| v2_repository_error(V2FormatError::InvalidIndexRun))?;
     }
     state.next_sequence = state.next_sequence.max(run.sequence);
     Ok(accepted_run)

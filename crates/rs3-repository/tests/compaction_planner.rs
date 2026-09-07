@@ -143,6 +143,7 @@ fn source(mutation: IndexMutation) -> PackedCompactionSourceRun {
     let (_, generation, _, _) = facts(&mutation);
     PackedCompactionSourceRun {
         run: IndexRun {
+            completion_receipt: None,
             sequence: Sequence::new(generation),
             self_pack: None,
 

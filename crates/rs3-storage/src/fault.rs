@@ -1,8 +1,8 @@
 //! Fault-injecting `BlobStore` test utilities.
 
 use crate::{
-    BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore,
-    ByteRange, PutOptions, Result, StorageError,
+    BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobMultipartPart, BlobMultipartSession,
+    BlobMultipartUpload, BlobRead, BlobStore, ByteRange, PutOptions, Result, StorageError,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -481,6 +481,28 @@ where
         finish_success(upload as Box<dyn BlobMultipartUpload>, effect)
     }
 
+    async fn create_multipart_session(
+        &self,
+        object_id: &BackendObjectId,
+        options: PutOptions,
+    ) -> Result<Box<dyn BlobMultipartSession>> {
+        let effect = self.script.begin(
+            FaultOperationKind::CreateMultipartUpload,
+            Some(object_id),
+            None,
+        )?;
+        let upload = self
+            .inner
+            .create_multipart_session(object_id, options)
+            .await?;
+        let upload = Box::new(FaultInjectingMultipartSession {
+            inner: upload,
+            script: self.script.clone(),
+            object_id: object_id.clone(),
+        });
+        finish_success(upload as Box<dyn BlobMultipartSession>, effect)
+    }
+
     async fn get_range(&self, object_id: &BackendObjectId, range: ByteRange) -> Result<Bytes> {
         let effect = self.script.begin_with_range(
             FaultOperationKind::GetRange,
@@ -749,6 +771,55 @@ impl BlobMultipartUpload for FaultInjectingMultipartUpload {
             None,
         )?;
         let metadata = inner.complete().await?;
+        finish_success(metadata, effect)
+    }
+
+    async fn abort(self: Box<Self>) -> Result<()> {
+        let Self {
+            inner,
+            script,
+            object_id,
+        } = *self;
+        let effect = script.begin(FaultOperationKind::MultipartAbort, Some(&object_id), None)?;
+        inner.abort().await?;
+        finish_success((), effect)
+    }
+}
+
+struct FaultInjectingMultipartSession {
+    inner: Box<dyn BlobMultipartSession>,
+    script: FaultScript,
+    object_id: BackendObjectId,
+}
+
+#[async_trait]
+impl BlobMultipartSession for FaultInjectingMultipartSession {
+    async fn upload_part(
+        &self,
+        part_index: usize,
+        body: Box<dyn BlobRead>,
+    ) -> Result<BlobMultipartPart> {
+        let effect = self.script.begin(
+            FaultOperationKind::MultipartPutPart,
+            Some(&self.object_id),
+            None,
+        )?;
+        let part = self.inner.upload_part(part_index, body).await?;
+        finish_success(part, effect)
+    }
+
+    async fn complete(self: Box<Self>, parts: Vec<BlobMultipartPart>) -> Result<BlobMetadata> {
+        let Self {
+            inner,
+            script,
+            object_id,
+        } = *self;
+        let effect = script.begin(
+            FaultOperationKind::MultipartComplete,
+            Some(&object_id),
+            None,
+        )?;
+        let metadata = inner.complete(parts).await?;
         finish_success(metadata, effect)
     }
 

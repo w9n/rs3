@@ -432,6 +432,7 @@ fn build_and_validate_run(
     }
 
     let run = IndexRun {
+        completion_receipt: None,
         sequence,
         self_pack: None,
 
@@ -613,6 +614,7 @@ mod tests {
 
     fn run(sequence_value: u64, mutations: Vec<IndexMutation>) -> IndexRun {
         IndexRun {
+            completion_receipt: None,
             sequence: sequence(sequence_value),
             self_pack: None,
 
@@ -638,6 +640,7 @@ mod tests {
     ) -> PackedCompactionSourceRun {
         PackedCompactionSourceRun {
             run: IndexRun {
+                completion_receipt: None,
                 sequence: sequence(sequence_value),
                 self_pack: None,
 
@@ -666,6 +669,7 @@ mod tests {
     ) -> PackedCompactionSourceRun {
         PackedCompactionSourceRun {
             run: IndexRun {
+                completion_receipt: None,
                 sequence: sequence(sequence_value),
                 self_pack: None,
 
@@ -791,6 +795,7 @@ mod tests {
         };
         let source_with_pack = PackedCompactionSourceRun {
             run: IndexRun {
+                completion_receipt: None,
                 sequence: sequence(3),
                 self_pack: Some(self_pack),
 
@@ -834,6 +839,7 @@ mod tests {
         let low = container(2);
         let high_source = PackedCompactionSourceRun {
             run: IndexRun {
+                completion_receipt: None,
                 sequence: sequence(4),
                 self_pack: None,
 
@@ -854,6 +860,7 @@ mod tests {
         };
         let low_source = PackedCompactionSourceRun {
             run: IndexRun {
+                completion_receipt: None,
                 sequence: sequence(5),
                 self_pack: None,
 
@@ -942,6 +949,7 @@ mod tests {
         let record = record(1);
         let self_source = PackedCompactionSourceRun {
             run: IndexRun {
+                completion_receipt: None,
                 sequence: sequence(6),
                 self_pack: Some(IndexRunSelfPack {
                     pack_id: exact_container.pack_id,
@@ -965,6 +973,7 @@ mod tests {
         };
         let external_source = PackedCompactionSourceRun {
             run: IndexRun {
+                completion_receipt: None,
                 sequence: sequence(7),
                 self_pack: None,
 

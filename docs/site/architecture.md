@@ -154,7 +154,7 @@ ordinal. The blinded namespace projection answers `HEAD` and `GET`; the
 path-sorted listing projection answers prefix listings. Frame-local container
 tables share exact object references. Values never live in an index frame, so
 LSM compaction is metadata-only and cold recovery does not read user data. Run
-wire version 7 includes exact detached-payload references,
+wire version 8 includes exact detached-payload references,
 an authenticated namespace-key table, and larger bounded small-object
 packs. It uses canonical bounded varints for generation and content length in
 both projections.
