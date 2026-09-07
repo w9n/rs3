@@ -145,14 +145,13 @@ fn source(mutation: IndexMutation) -> PackedCompactionSourceRun {
         run: IndexRun {
             sequence: Sequence::new(generation),
             self_pack: None,
-            self_stream: None,
+
             containers: Vec::new(),
-            stream_containers: Vec::new(),
+
             standalone_stream_containers: Vec::new(),
             mutations: vec![mutation],
         },
         self_pack_container: None,
-        self_stream_container: None,
     }
 }
 

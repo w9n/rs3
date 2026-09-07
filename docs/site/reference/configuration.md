@@ -26,8 +26,7 @@ An explicit `--gateway-mode restore-readonly` forces maintenance off.
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
 | `RUST_LOG` | no | `info` | Tracing filter for `rs3` application targets. Dependency targets are always disabled because upstream HTTP and S3 traces can contain object paths or authentication headers. |
 
-`init`, `export-restore-bundle`, `import-v2-anchor`, and
-`write-index-snapshot` use the same repository, backend, anchor, and keyring
+`init`, `export-restore-bundle`, and `import-v2-anchor` use the same repository, backend, anchor, and keyring
 settings as `serve`.
 `verify-bundle` and `keyring inspect`/`keyring rewrap` use the same repository
 and backend settings, but take wrapping-key material from their own flags or

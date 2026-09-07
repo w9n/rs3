@@ -122,8 +122,8 @@ async fn prepared_genesis_reconciles_lost_anchor_reply_without_overwriting_newer
                 .write_child_commit(
                     &anchor.inner,
                     V2CommitWrite::delta(vec![V2CommitSection::new(
-                        V2SectionType::IndexDelta,
-                        0,
+                        V2SectionType::IndexRun,
+                        V2_SECTION_FLAG_MUST_UNDERSTAND,
                         Bytes::from_static(b"new state"),
                     )]),
                 )

@@ -23,7 +23,7 @@ pub const V2_HEADER_META_LEN: usize = 64;
 /// Maximum complete v2 commit header span.
 pub const V2_MAX_HEADER_SIZE: usize = 8192;
 /// Maximum number of physical sections in one v02 commit.
-pub const V2_MAX_COMMIT_SECTIONS: usize = 65;
+pub const V2_MAX_COMMIT_SECTIONS: usize = 2;
 /// Magic bytes at the start of every v2 commit object.
 pub const V2_COMMIT_MAGIC: &[u8; 8] = b"rs3:cmt\n";
 /// v02 commit format version.
@@ -63,8 +63,6 @@ const MAX_HEADER_CBOR_LEN: usize = V2_MAX_HEADER_SIZE - V2_HEADER_META_LEN;
 pub enum V2UploadMode {
     /// Header is immediately followed by sections.
     SinglePut,
-    /// Header is padded to the fixed v02 header span for multipart assembly.
-    MultipartPadded,
 }
 
 impl V2UploadMode {
@@ -72,14 +70,12 @@ impl V2UploadMode {
     pub const fn to_wire(self) -> u8 {
         match self {
             Self::SinglePut => 0,
-            Self::MultipartPadded => 1,
         }
     }
 
     fn from_wire(value: u8) -> V2Result<Self> {
         match value {
             0 => Ok(Self::SinglePut),
-            1 => Ok(Self::MultipartPadded),
             _ => Err(V2FormatError::UnsupportedUploadMode),
         }
     }
@@ -115,14 +111,6 @@ impl V2CommitKind {
 /// v02 commit section type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum V2SectionType {
-    /// Encrypted incremental namespace mutation section.
-    IndexDelta,
-    /// Encrypted full live namespace snapshot section.
-    IndexSnapshot,
-    /// Encrypted payload bytes stored in this commit.
-    Payload,
-    /// Encrypted maintenance directive section.
-    Directives,
     /// Framed encrypted namespace mutation run.
     IndexRun,
     /// Encrypted catalog of the index runs that form a repository root.
@@ -137,10 +125,6 @@ impl V2SectionType {
     /// Converts a section type to its wire-code value.
     pub const fn to_wire(self) -> u16 {
         match self {
-            Self::IndexDelta => 0x0001,
-            Self::IndexSnapshot => 0x0002,
-            Self::Payload => 0x0003,
-            Self::Directives => 0x0004,
             Self::IndexRun => 0x0005,
             Self::IndexRoot => 0x0006,
             Self::PayloadPack => 0x0007,
@@ -150,10 +134,6 @@ impl V2SectionType {
 
     fn from_wire(value: u16) -> Self {
         match value {
-            0x0001 => Self::IndexDelta,
-            0x0002 => Self::IndexSnapshot,
-            0x0003 => Self::Payload,
-            0x0004 => Self::Directives,
             0x0005 => Self::IndexRun,
             0x0006 => Self::IndexRoot,
             0x0007 => Self::PayloadPack,
@@ -390,7 +370,7 @@ impl V2CommitHeader {
         Ok(Bytes::from(span))
     }
 
-    /// Encodes only the signed fixed/header span for multipart assembly.
+    /// Encodes the bounded signed header span without section bytes.
     pub(crate) fn encode_header_span(&self, upload_mode: V2UploadMode) -> V2Result<Bytes> {
         validate_commit_section_semantics(self)?;
         let mut span = header_span(self, upload_mode, SignatureMode::Actual)?;
@@ -435,15 +415,6 @@ pub fn parse_v2_commit_header(
         .get(..fixed.header_span_len)
         .ok_or(V2FormatError::TruncatedHeader)?;
     verify_header_digest(header_span_bytes)?;
-    if fixed.upload_mode == V2UploadMode::MultipartPadded {
-        let padding_start = V2_HEADER_META_LEN + fixed.header_len;
-        if header_span_bytes[padding_start..]
-            .iter()
-            .any(|byte| *byte != 0)
-        {
-            return Err(V2FormatError::HeaderDigestMismatch);
-        }
-    }
 
     let header_cbor = &header_span_bytes[HEADER_CBOR_START..HEADER_CBOR_START + fixed.header_len];
     let header = decode_header_cbor(header_cbor)?;
@@ -531,7 +502,6 @@ pub(crate) fn v2_commit_header_span_len(input: &[u8]) -> V2Result<usize> {
         V2UploadMode::SinglePut => V2_HEADER_META_LEN
             .checked_add(header_len)
             .ok_or(V2FormatError::HeaderTooLarge),
-        V2UploadMode::MultipartPadded => Ok(V2_MAX_HEADER_SIZE),
     }
 }
 
@@ -668,7 +638,6 @@ fn parse_fixed_header(input: &[u8]) -> V2Result<FixedHeader> {
         V2UploadMode::SinglePut => V2_HEADER_META_LEN
             .checked_add(header_len)
             .ok_or(V2FormatError::HeaderTooLarge)?,
-        V2UploadMode::MultipartPadded => V2_MAX_HEADER_SIZE,
     };
     if input.len() < header_span_len {
         return Err(V2FormatError::TruncatedHeader);
@@ -706,7 +675,6 @@ fn header_span(
 
     let header_span_len = match upload_mode {
         V2UploadMode::SinglePut => V2_HEADER_META_LEN + cbor.len(),
-        V2UploadMode::MultipartPadded => V2_MAX_HEADER_SIZE,
     };
     let mut out = vec![0_u8; header_span_len];
     out[..V2_COMMIT_MAGIC.len()].copy_from_slice(V2_COMMIT_MAGIC);
@@ -1209,105 +1177,31 @@ pub(crate) fn validate_commit_section_semantics(header: &V2CommitHeader) -> V2Re
         }
         _ => {}
     }
-    let snapshot_count = header
+    if header
         .section_index
         .iter()
-        .filter(|section| section.section_type == V2SectionType::IndexSnapshot)
-        .count();
-    let delta_count = header
-        .section_index
-        .iter()
-        .filter(|section| section.section_type == V2SectionType::IndexDelta)
-        .count();
-
-    for section in &header.section_index {
-        if matches!(
-            section.section_type,
-            V2SectionType::IndexDelta
-                | V2SectionType::IndexSnapshot
-                | V2SectionType::IndexRun
-                | V2SectionType::IndexRoot
-                | V2SectionType::PayloadPack
-        ) && section.flags & V2_SECTION_FLAG_COMPRESSED != 0
-        {
-            return Err(V2FormatError::InvalidHeaderField);
-        }
+        .any(|section| section.flags != V2_SECTION_FLAG_MUST_UNDERSTAND)
+    {
+        return Err(V2FormatError::InvalidHeaderField);
     }
-
-    if header.kind == V2CommitKind::Root {
-        let legacy_root = snapshot_count == 1
-            && delta_count == 0
-            && header
-                .section_index
-                .last()
-                .map(|section| section.section_type)
-                == Some(V2SectionType::IndexSnapshot)
-            && header.section_index[..header.section_index.len().saturating_sub(1)]
-                .iter()
-                .all(|section| section.section_type == V2SectionType::Payload);
-        let framed_root = matches!(
-            header.section_index.as_slice(),
-            [V2SectionDescriptor {
-                section_type: V2SectionType::IndexRoot,
-                ..
-            }]
-        );
-        if delta_count != 0
-            || (!legacy_root && !framed_root)
-            || (framed_root && snapshot_count != 0)
-            || (!framed_root && snapshot_count != 1)
-            || header
-                .section_index
-                .iter()
-                .any(|section| section.section_type == V2SectionType::IndexRun)
-            || (framed_root && header.section_index[0].flags != V2_SECTION_FLAG_MUST_UNDERSTAND)
-        {
-            return Err(V2FormatError::InvalidHeaderField);
+    let types = header
+        .section_index
+        .iter()
+        .map(|section| section.section_type)
+        .collect::<Vec<_>>();
+    let valid = match header.kind {
+        V2CommitKind::Root => types.as_slice() == [V2SectionType::IndexRoot],
+        V2CommitKind::Delta => {
+            header.parent.is_some()
+                && matches!(
+                    types.as_slice(),
+                    [V2SectionType::IndexRun]
+                        | [V2SectionType::PayloadPack, V2SectionType::IndexRun]
+                )
         }
-    } else {
-        let transitional_delta = snapshot_count == 0
-            && delta_count == 1
-            && header
-                .section_index
-                .last()
-                .map(|section| section.section_type)
-                == Some(V2SectionType::IndexDelta)
-            && header.section_index[..header.section_index.len().saturating_sub(1)]
-                .iter()
-                .all(|section| section.section_type == V2SectionType::Payload);
-        let framed_delta = matches!(
-            header.section_index.as_slice(),
-            [V2SectionDescriptor {
-                section_type: V2SectionType::IndexRun,
-                flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-                ..
-            }] | [
-                V2SectionDescriptor {
-                    section_type: V2SectionType::PayloadPack,
-                    flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-                    ..
-                },
-                V2SectionDescriptor {
-                    section_type: V2SectionType::IndexRun,
-                    flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-                    ..
-                }
-            ] | [
-                V2SectionDescriptor {
-                    section_type: V2SectionType::Payload,
-                    flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-                    ..
-                },
-                V2SectionDescriptor {
-                    section_type: V2SectionType::IndexRun,
-                    flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-                    ..
-                }
-            ]
-        );
-        if header.parent.is_none() || (!transitional_delta && !framed_delta) {
-            return Err(V2FormatError::InvalidHeaderField);
-        }
+    };
+    if !valid {
+        return Err(V2FormatError::InvalidHeaderField);
     }
 
     Ok(())

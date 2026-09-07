@@ -30,13 +30,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "index_delta"
-path = "fuzz_targets/index_delta.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "keyring_envelope"
 path = "fuzz_targets/keyring_envelope.rs"
 test = false

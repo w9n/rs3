@@ -14,14 +14,10 @@ use super::{
     V2_CAPABILITY_COMPACTED_INDEX_RUNS, V2_CAPABILITY_FRAMED_INDEX, V2_SUPPORTED_CAPABILITY_FLAGS,
     V2CommitKind, V2IndexRoot, V2IndexRootRunRef, V2SectionType, open_v2_index_root,
 };
-use crate::checkpoint::open_index_delta_object;
-use crate::state::{RepositoryState, apply_index_delta_object};
+use crate::state::RepositoryState;
 use async_trait::async_trait;
 use bytes::Bytes;
-use rs3_index::{
-    INDEX_DELTA_OBJECT_DOMAIN, IndexDelta, IndexDeltaObject, PayloadReference,
-    SealedIndexDeltaObject, V2CommitStreamCarrierReference, V2StandaloneStreamCarrierReference,
-};
+use rs3_index::{PayloadReference, V2StandaloneStreamCarrierReference};
 use rs3_storage::{
     BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore,
     ByteRange, PutOptions, StorageError,
@@ -2123,15 +2119,6 @@ where
         for entry in state.namespace.live_entries() {
             represented_retention = strongest_retention(represented_retention, entry.retention);
             let root = match &entry.payload_ref {
-                Some(PayloadReference::V2CommitStream { carrier }) => commit_payload_root(
-                    carrier.commit_key.clone(),
-                    carrier.commit_version_id.clone(),
-                    carrier.body_digest,
-                    &signing_key_id,
-                    self.options().format_ref.clone(),
-                    entry.retention,
-                    entry.legal_hold,
-                )?,
                 Some(PayloadReference::V2Pack { carrier, .. }) => commit_payload_root(
                     carrier.commit_key.clone(),
                     carrier.commit_version_id.clone(),
@@ -2149,7 +2136,7 @@ where
                     }
                 }
                 None => continue,
-                Some(PayloadReference::V2Self { .. } | PayloadReference::V2PackSelf { .. }) => {
+                Some(PayloadReference::Pending | PayloadReference::V2PackSelf { .. }) => {
                     return Err(V2FormatError::InvalidHeaderField);
                 }
             };
@@ -2190,42 +2177,7 @@ where
         let mut referenced_run_commits = Vec::new();
         for (index, section) in commit.parsed_header.header.section_index.iter().enumerate() {
             match section.section_type {
-                V2SectionType::IndexDelta => {
-                    let section_bytes = commit_section_bytes(commit, index)?;
-                    let mut delta = self.open_index_delta_section(
-                        &commit.parsed_header.header.self_ref.commit_key,
-                        index,
-                        section_bytes,
-                        section.flags,
-                    )?;
-                    if let Some(delta) = delta.as_mut() {
-                        resolve_self_payload_refs(delta, commit)?;
-                    }
-                    if let Some(delta) = delta {
-                        apply_index_delta_object(state, delta);
-                    }
-                }
-                V2SectionType::IndexSnapshot => {
-                    let section_bytes = commit_section_bytes(commit, index)?;
-                    if section_bytes.is_empty() {
-                        *state = RepositoryState::default();
-                        continue;
-                    }
-                    let mut snapshot = self.open_index_delta_section(
-                        &commit.parsed_header.header.self_ref.commit_key,
-                        index,
-                        section_bytes,
-                        section.flags,
-                    )?;
-                    if let Some(snapshot) = snapshot.as_mut() {
-                        resolve_self_payload_refs(snapshot, commit)?;
-                    }
-                    if let Some(snapshot) = snapshot {
-                        *state = RepositoryState::default();
-                        apply_index_delta_object(state, snapshot);
-                    }
-                }
-                V2SectionType::Payload | V2SectionType::PayloadPack => {}
+                V2SectionType::PayloadPack => {}
                 V2SectionType::IndexRun => {
                     let section_bytes = commit_section_bytes(commit, index)?;
                     apply_packed_index_run(
@@ -2259,40 +2211,10 @@ where
                         .await?;
                     referenced_run_commits.extend(resolved.referenced_commits);
                 }
-                V2SectionType::Directives | V2SectionType::Unknown(_) => {
-                    if section.flags & V2_SECTION_FLAG_MUST_UNDERSTAND != 0 {
-                        return Err(V2FormatError::UnsupportedSection);
-                    }
-                }
+                _ => return Err(V2FormatError::UnsupportedSection),
             }
         }
         Ok(referenced_run_commits)
-    }
-
-    fn open_index_delta_section(
-        &self,
-        commit_key: &BackendObjectId,
-        section_index: usize,
-        bytes: &[u8],
-        flags: u8,
-    ) -> V2Result<Option<IndexDeltaObject>> {
-        let Some(payload) = bytes.strip_prefix(INDEX_DELTA_OBJECT_DOMAIN) else {
-            return if flags & V2_SECTION_FLAG_MUST_UNDERSTAND != 0 {
-                Err(V2FormatError::InvalidHeaderField)
-            } else {
-                Ok(None)
-            };
-        };
-        let sealed_delta = serde_json::from_slice::<SealedIndexDeltaObject>(payload)
-            .map_err(|_| V2FormatError::InvalidHeaderField)?;
-        let object_id = BackendObjectId::new(format!(
-            "{}/index-delta-{section_index}",
-            commit_key.as_str()
-        ))
-        .map_err(|_| V2FormatError::TypeValidation)?;
-        open_index_delta_object(self.keyring(), &object_id, &sealed_delta)
-            .map_err(|_| V2FormatError::InvalidHeaderField)
-            .map(Some)
     }
 
     /// Runs read-only quick maintenance checks.
@@ -3071,82 +2993,6 @@ fn commit_section_bytes(commit: &V2ReplayCommit, index: usize) -> V2Result<&[u8]
         .retained_sections
         .get(index)
         .and_then(Option::as_deref)
-        .ok_or(V2FormatError::SectionBounds)
-}
-
-fn resolve_self_payload_refs(
-    delta: &mut IndexDeltaObject,
-    commit: &V2ReplayCommit,
-) -> V2Result<()> {
-    for mutation in &mut delta.deltas {
-        let IndexDelta::Upsert { entry, .. } = mutation else {
-            continue;
-        };
-        let Some(PayloadReference::V2Self {
-            payload_id,
-            payload_header,
-            sections_start: _,
-            offset,
-            length,
-        }) = entry.payload_ref.clone()
-        else {
-            continue;
-        };
-        let (payload_section_ordinal, payload_section_digest) =
-            payload_section_facts(commit, offset, length)?;
-        let sections_start = u64::try_from(commit.parsed_header.sections_start)
-            .map_err(|_| V2FormatError::SectionBounds)?;
-        let commit_key = commit.parsed_header.header.self_ref.commit_key.clone();
-        entry.object_id = commit_key.clone();
-        entry.object_version_id = commit.version_id.clone();
-        entry.payload_ref = Some(PayloadReference::V2CommitStream {
-            carrier: Arc::new(V2CommitStreamCarrierReference {
-                commit_key,
-                commit_version_id: commit.version_id.clone(),
-                body_digest: commit.parsed_header.header.body_digest,
-                commit_stored_len: commit.object_len,
-                keyring_envelope_object_id: commit
-                    .parsed_header
-                    .header
-                    .keyring_envelope_ref
-                    .object_id
-                    .clone(),
-                keyring_envelope_digest: commit.parsed_header.header.keyring_envelope_ref.digest,
-                payload_section_ordinal,
-                payload_section_digest,
-                payload_id,
-                payload_header,
-                sections_start: Some(sections_start),
-                offset,
-                length,
-            }),
-        });
-    }
-    Ok(())
-}
-
-fn payload_section_facts(
-    commit: &V2ReplayCommit,
-    offset: u64,
-    length: u64,
-) -> V2Result<(u32, [u8; 32])> {
-    commit
-        .parsed_header
-        .header
-        .section_index
-        .iter()
-        .enumerate()
-        .find(|(_, section)| {
-            section.section_type == V2SectionType::Payload
-                && section.offset == offset
-                && section.length == length
-        })
-        .map(|(ordinal, section)| {
-            u32::try_from(ordinal)
-                .map(|ordinal| (ordinal, section.digest))
-                .map_err(|_| V2FormatError::SectionBounds)
-        })
-        .transpose()?
         .ok_or(V2FormatError::SectionBounds)
 }
 

@@ -74,10 +74,9 @@ cursor fails rather than silently skipping work completed by a detached worker.
     new compacted run before anchor adoption. They also drive exact maintenance
     reachability. Guarded metadata-only compaction and automatic active-run
     watermarks are implemented for packed and streamed payload carriers.
-    Unknown-length and zero-length streaming writes publish the canonical
-    `[PAYLOAD, INDEX_RUN]` shape. Large known-length requests publish an opaque
-    standalone payload carrier plus a short `[INDEX_RUN]` commit containing its
-    encrypted exact reference. Both participate in the same catalog, compaction,
+    Nonempty large streams publish an opaque standalone payload carrier plus a
+    short `[INDEX_RUN]` commit containing its encrypted exact reference. Empty
+    streams are index-only. Both participate in the same catalog, compaction,
     and GC graph. New bounded writes are partitioned by effective protection
     cohort, and guarded full GC renews exact restore dependencies before orphan
     deletion. Retained-provider restart/fault qualification and pinned-runner
@@ -88,9 +87,7 @@ Normal writes are append-friendly and value-separated:
 
 1. Put every non-empty bounded value in the batch into one encrypted payload
    pack and stage one compact framed binary index run. Empty bounded values are
-   index-only. An unknown-length or zero-length streamed request instead writes
-   one encrypted `PAYLOAD` followed by its `INDEX_RUN`; large known-length
-   requests use the standalone carrier flow described below.
+   index-only. Nonempty large streams use the detached carrier flow below.
 2. Publish a signed `v02` commit under a random path-private key.
 3. Advance the external commit anchor.
 4. Acknowledge the client write only after the covering commit is accepted.
@@ -111,19 +108,7 @@ This lets a cold read issue one exact range `GET` instead of fetching a pack
 directory first. Retention mode, expiry horizon, and legal-hold requirement
 define protection cohorts because the backend protects the containing object.
 
-A streamed value is also immutable and value-separated. Unknown-length streams
-keep ciphertext in the `PAYLOAD` section of the same commit as the foreground
-run. While that run
-is embedded, a self-stream pointer carries the authenticated payload identity,
-section ordinal, and segmented-payload header. Before compaction removes the
-source-run boundary, the pointer is normalized to an exact external carrier:
-commit key and provider version, stored object length and body digest,
-historical keyring-envelope reference, section start, ordinal, offset, length,
-and digest, plus the payload identity and header. Compaction and checkpoints
-therefore move metadata references only. They do not read or rewrite streamed
-payload ciphertext.
-
-For a known-length large request, the preview instead uploads one encrypted
+For a nonempty large stream, the preview uploads one encrypted
 segmented `objects/v02/` carrier outside the publication lock. It verifies the
 completed exact version, length, post-completion retention horizon, EOF, and full ciphertext
 digest before a short fenced commit publishes the encrypted reference. This
@@ -169,8 +154,8 @@ ordinal. The blinded namespace projection answers `HEAD` and `GET`; the
 path-sorted listing projection answers prefix listings. Frame-local container
 tables share exact object references. Values never live in an index frame, so
 LSM compaction is metadata-only and cold recovery does not read user data. Run
-wire version 6 includes canonical self-stream and exact external-stream
-carriers, an authenticated namespace-key table, and larger bounded small-object
+wire version 6 includes exact detached-payload references,
+an authenticated namespace-key table, and larger bounded small-object
 packs. It uses canonical bounded varints for generation and content length in
 both projections.
 
@@ -278,9 +263,7 @@ catalogs name index runs only; effective highest-generation records name exact
 payload-pack or streamed-payload carriers. Maintenance marks the exact catalog
 and run versions plus the exact payload-containing object versions selected by
 live records. A payload reference does not keep its commit's entire ancestry
-reachable. This rule also protects a zero-length streamed carrier even though a
-client read can return an empty body without fetching payload bytes. GC
-completes a fail-closed mark before any deletion and rechecks both the
+reachable. Empty foreground values have no payload dependency. GC completes a fail-closed mark before any deletion and rechecks both the
 maintenance fence and anchor before deleting an exact version.
 
 Payload-pack cleaning is separate from index compaction. It rewrites live

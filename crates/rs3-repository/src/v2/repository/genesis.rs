@@ -1,6 +1,8 @@
 //! Exact genesis preparation for a trusted, unfinished bootstrap journal.
 
 use super::*;
+use crate::v2::service::packed::repository_context_from_refs;
+use crate::v2::{V2IndexRoot, open_v2_index_root, seal_v2_index_root};
 
 const JOURNAL_SCHEMA: &str = "rs3.prepared-genesis.v1";
 const MAX_JOURNAL_BYTES: usize = 64 * 1024;
@@ -51,10 +53,23 @@ where
     pub fn prepare_genesis_snapshot(&self) -> V2Result<V2PreparedGenesis> {
         self.validate_write_protection_profile(self.options.retention, self.options.legal_hold)?;
         let commit_key = generate_v2_commit_key(Sequence::new(1))?;
+        let root = V2IndexRoot::new(
+            Sequence::new(0),
+            0,
+            self.options.format_ref.clone(),
+            self.options.keyring_envelope_ref.clone(),
+            Vec::new(),
+        )?;
+        let context = repository_context_from_refs(
+            &self.options.repository_id,
+            &self.options.keyring_envelope_ref,
+        )
+        .map_err(|_| V2FormatError::InvalidHeaderField)?;
+        let sealed = seal_v2_index_root(&self.keyring, &context, &commit_key.object_id, 0, &root)?;
         let write = V2CommitWrite::snapshot(vec![V2CommitSection::new(
-            V2SectionType::IndexSnapshot,
+            V2SectionType::IndexRoot,
             V2_SECTION_FLAG_MUST_UNDERSTAND,
-            Bytes::new(),
+            sealed.bytes().clone(),
         )]);
         let (section_index, section_region) = build_section_region(&write.sections)?;
         let body_digest = body_digest_for_v2_sections(&section_index, &section_region)?;
@@ -105,7 +120,7 @@ where
             || record.legal_hold != self.options.legal_hold
             || record.format_ref != self.options.format_ref
             || record.keyring_envelope_ref != self.options.keyring_envelope_ref
-            || record.body.len() > V2_MAX_HEADER_SIZE
+            || record.body.len() > MAX_JOURNAL_BYTES
         {
             return Err(V2FormatError::InvalidHeaderField);
         }
@@ -121,9 +136,30 @@ where
             || header.kind != V2CommitKind::Root
             || header.keyring_envelope_ref != record.keyring_envelope_ref
             || header.section_index.len() != 1
-            || header.section_index[0].section_type != V2SectionType::IndexSnapshot
-            || parsed.parsed_header.sections_start != record.body.len()
+            || header.section_index[0].section_type != V2SectionType::IndexRoot
         {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
+        let context = repository_context_from_refs(
+            &self.options.repository_id,
+            &self.options.keyring_envelope_ref,
+        )
+        .map_err(|_| V2FormatError::InvalidHeaderField)?;
+        let root = open_v2_index_root(
+            &self.keyring,
+            &context,
+            &record.object_id,
+            0,
+            &record.body[parsed.parsed_header.sections_start..],
+        )?;
+        let expected = V2IndexRoot::new(
+            Sequence::new(0),
+            0,
+            self.options.format_ref.clone(),
+            self.options.keyring_envelope_ref.clone(),
+            Vec::new(),
+        )?;
+        if root != expected {
             return Err(V2FormatError::InvalidHeaderField);
         }
         Ok(parsed)

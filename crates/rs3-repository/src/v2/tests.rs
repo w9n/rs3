@@ -135,6 +135,13 @@ fn signing_keyring() -> KeyRing {
             "ed25519",
             2,
         ),
+        key_material(
+            "metadata",
+            KeyPurpose::Metadata,
+            KeyStatus::Primary,
+            "aes-256-gcm-siv",
+            3,
+        ),
     ]))
 }
 
@@ -259,7 +266,6 @@ async fn standalone_read_fixture(
         )
         .await
         .expect("write standalone payload");
-    run.self_stream = None;
     let mut payload_header = PayloadHeaderReference {
         chunk_size: header.chunk_size,
         plaintext_len: header.plaintext_len,
@@ -337,7 +343,7 @@ async fn standalone_read_fixture(
 fn sample_sections() -> (Vec<V2SectionDescriptor>, Bytes, [u8; 32]) {
     let section_region = Bytes::from_static(b"snapshot-delta");
     let section_index = vec![V2SectionDescriptor {
-        section_type: V2SectionType::IndexSnapshot,
+        section_type: V2SectionType::IndexRoot,
         offset: 0,
         length: section_region.len() as u64,
         flags: super::commit::V2_SECTION_FLAG_MUST_UNDERSTAND,
@@ -409,6 +415,87 @@ fn sample_format_ref() -> V2FormatRef {
         object_id: object_id(&format!("format/{:020}-{}", 1_u64, hex::encode([7_u8; 32]))),
         version_id: Some(must_type(BackendVersionId::new("format-version-1"))),
     }
+}
+
+// Real encrypted metadata fixtures for maintenance tests, without payload dependencies.
+async fn write_empty_metadata_child<S: BlobStore, A: V2CommitAnchor>(
+    repository: &V2CommitStore<S>,
+    anchor: &A,
+    root: bool,
+) -> super::V2Result<super::V2StoredCommit> {
+    let options = repository.options();
+    let context =
+        repository_context_from_refs(&options.repository_id, &options.keyring_envelope_ref)
+            .map_err(|_| V2FormatError::InvalidHeaderField)?;
+    repository
+        .write_child_commit_with(anchor, |key| {
+            let (kind, section_type, bytes) = if root {
+                let root = super::V2IndexRoot::new(
+                    Sequence::ZERO,
+                    0,
+                    options.format_ref.clone(),
+                    options.keyring_envelope_ref.clone(),
+                    Vec::new(),
+                )?;
+                (
+                    V2CommitKind::Root,
+                    V2SectionType::IndexRoot,
+                    super::seal_v2_index_root(
+                        repository.keyring(),
+                        &context,
+                        &key.object_id,
+                        0,
+                        &root,
+                    )?
+                    .bytes()
+                    .clone(),
+                )
+            } else {
+                let path = LogicalPath::new("maintenance/absent").expect("fixture path");
+                let blind = repository.keyring().derive_primary_blind_index_key(&path)?;
+                let mutation =
+                    rs3_index::run::IndexMutation::Tombstone(rs3_index::run::IndexTombstone {
+                        mutation_ordinal: 0,
+                        blind_key: rs3_index::run::IndexBlindKey::try_from(&blind.blind_key)
+                            .expect("canonical blind key"),
+                        namespace_key_id: blind.key_id,
+                        path,
+                        generation: key.sequence,
+                    });
+                let run = rs3_index::run::IndexRun {
+                    sequence: key.sequence,
+                    self_pack: None,
+                    containers: Vec::new(),
+                    standalone_stream_containers: Vec::new(),
+                    mutations: vec![mutation],
+                };
+                (
+                    V2CommitKind::Delta,
+                    V2SectionType::IndexRun,
+                    seal_v2_index_run(
+                        repository.keyring(),
+                        &context,
+                        &key.object_id,
+                        0,
+                        &run,
+                        &IndexRunLimits::default(),
+                    )?
+                    .bytes()
+                    .clone(),
+                )
+            };
+            let sections = vec![V2CommitSection::new(
+                section_type,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
+                bytes,
+            )];
+            Ok(if kind == V2CommitKind::Root {
+                V2CommitWrite::snapshot(sections)
+            } else {
+                V2CommitWrite::delta(sections)
+            })
+        })
+        .await
 }
 
 async fn retained_commit_store(
@@ -1414,23 +1501,34 @@ fn single_put_commit_round_trips_with_verified_header_and_body() {
 }
 
 #[test]
-fn multipart_commit_round_trips_with_padded_header() {
-    let keyring = signing_keyring();
-    let (commit_key, _, body) = sample_object(V2UploadMode::MultipartPadded);
+fn retired_section_codes_fail_closed_even_without_required_flag() {
+    let (_, mut header, region) = sample_header(V2UploadMode::SinglePut);
+    for code in 1..=4 {
+        for flags in [0, V2_SECTION_FLAG_MUST_UNDERSTAND] {
+            header.section_index[0].section_type = V2SectionType::Unknown(code);
+            header.section_index[0].flags = flags;
+            assert!(super::commit::validate_commit_section_semantics(&header).is_err());
+            assert!(
+                header
+                    .encode_object(V2UploadMode::SinglePut, &region)
+                    .is_err()
+            );
+        }
+    }
+}
 
-    let parsed = must_v2(parse_v2_commit_object(
-        &commit_key.object_id,
-        body,
-        &keyring,
-    ));
-    assert_eq!(
-        parsed.parsed_header.upload_mode,
-        V2UploadMode::MultipartPadded
-    );
-    assert_eq!(
-        parsed.parsed_header.sections_start,
-        super::commit::V2_MAX_HEADER_SIZE
-    );
+#[test]
+fn commit_rejects_every_retired_upload_mode() {
+    let keyring = signing_keyring();
+    let (key, _, body) = sample_object(V2UploadMode::SinglePut);
+    for mode in 1..=u8::MAX {
+        let mut invalid = body.to_vec();
+        invalid[24] = mode;
+        assert!(matches!(
+            parse_v2_commit_object(&key.object_id, Bytes::from(invalid), &keyring),
+            Err(V2FormatError::UnsupportedUploadMode)
+        ));
+    }
 }
 
 #[test]
@@ -1439,17 +1537,13 @@ fn v02_wire_codes_and_required_capabilities_are_closed() {
     assert_eq!(V2_SUPPORTED_CAPABILITY_FLAGS, 15);
     assert_eq!(V2CommitKind::Delta.to_wire(), 1);
     assert_eq!(V2CommitKind::Root.to_wire(), 2);
-    assert_eq!(V2SectionType::IndexDelta.to_wire(), 1);
-    assert_eq!(V2SectionType::IndexSnapshot.to_wire(), 2);
-    assert_eq!(V2SectionType::Payload.to_wire(), 3);
-    assert_eq!(V2SectionType::Directives.to_wire(), 4);
     assert_eq!(V2SectionType::IndexRun.to_wire(), 5);
     assert_eq!(V2SectionType::IndexRoot.to_wire(), 6);
     assert_eq!(V2SectionType::PayloadPack.to_wire(), 7);
 
     let keyring = signing_keyring();
     let (commit_key, _, body) = sample_object(V2UploadMode::SinglePut);
-    assert_eq!(&body[16..24], &1_u64.to_be_bytes());
+    assert_eq!(&body[16..24], &15_u64.to_be_bytes());
     for capability_flags in [0_u8, 2, 0x81] {
         let mut tampered = body.to_vec();
         tampered[23] = capability_flags;
@@ -1457,7 +1551,7 @@ fn v02_wire_codes_and_required_capabilities_are_closed() {
         assert!(matches!(error, Err(V2FormatError::UnsupportedCapabilities)));
     }
     let mut tampered = body.to_vec();
-    tampered[23] = 3;
+    tampered[23] = 11;
     assert!(matches!(
         parse_v2_commit_object(&commit_key.object_id, Bytes::from(tampered), &keyring),
         Err(V2FormatError::HeaderDigestMismatch)
@@ -1501,7 +1595,7 @@ fn framed_delta_section_shapes_round_trip() {
             Bytes::from_static(b"payloadindex-run"),
             vec![
                 V2SectionDescriptor {
-                    section_type: V2SectionType::Payload,
+                    section_type: V2SectionType::PayloadPack,
                     offset: 0,
                     length: 7,
                     flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
@@ -1551,18 +1645,18 @@ fn framed_section_semantics_reject_noncanonical_shapes() {
             V2SectionType::PayloadPack,
             V2SectionType::IndexRun,
         ],
-        vec![V2SectionType::IndexRun, V2SectionType::Payload],
+        vec![V2SectionType::IndexRun, V2SectionType::PayloadPack],
         vec![
-            V2SectionType::Payload,
-            V2SectionType::Payload,
+            V2SectionType::PayloadPack,
+            V2SectionType::PayloadPack,
             V2SectionType::IndexRun,
         ],
         vec![
-            V2SectionType::Payload,
+            V2SectionType::PayloadPack,
             V2SectionType::IndexRun,
             V2SectionType::IndexRun,
         ],
-        vec![V2SectionType::IndexDelta, V2SectionType::IndexRun],
+        vec![V2SectionType::IndexRun, V2SectionType::IndexRun],
     ];
     for shape in invalid_shapes {
         header.section_index = shape
@@ -1693,44 +1787,31 @@ fn signed_section_digest_must_match_stored_section() {
 #[test]
 fn maximum_section_batch_fits_bounded_header() {
     let keyring = signing_keyring();
-    let (commit_key, mut header, _) = sample_header(V2UploadMode::MultipartPadded);
-    let empty_digest = digest_v2_section(&[]);
-    header.section_index = (0..64)
-        .map(|_| V2SectionDescriptor {
-            section_type: V2SectionType::Payload,
+    let (commit_key, mut header, _) = sample_header(V2UploadMode::SinglePut);
+    header.kind = V2CommitKind::Delta;
+    header.section_index = [V2SectionType::PayloadPack, V2SectionType::IndexRun]
+        .into_iter()
+        .map(|section_type| V2SectionDescriptor {
+            section_type,
             offset: 0,
             length: 0,
             flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-            digest: empty_digest,
+            digest: digest_v2_section(&[]),
         })
-        .chain(std::iter::once(V2SectionDescriptor {
-            section_type: V2SectionType::IndexSnapshot,
-            offset: 0,
-            length: 0,
-            flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-            digest: empty_digest,
-        }))
         .collect();
     header.body_digest = digest_v2_section(&[]);
-    header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::MultipartPadded));
-    let body = must_v2(header.encode_object(V2UploadMode::MultipartPadded, &[]));
+    header = must_v2(header.sign_with_keyring(&keyring, V2UploadMode::SinglePut));
+    let body = must_v2(header.encode_object(V2UploadMode::SinglePut, &[]));
+    assert!(body.len() <= super::commit::V2_MAX_HEADER_SIZE);
     let parsed = must_v2(parse_v2_commit_object(
         &commit_key.object_id,
         body,
         &keyring,
     ));
-    assert_eq!(parsed.parsed_header.header.section_index.len(), 65);
-
-    header.section_index.insert(
-        0,
-        V2SectionDescriptor {
-            section_type: V2SectionType::Payload,
-            offset: 0,
-            length: 0,
-            flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-            digest: empty_digest,
-        },
-    );
+    assert_eq!(parsed.parsed_header.header.section_index.len(), 2);
+    header
+        .section_index
+        .insert(0, header.section_index[0].clone());
     assert!(matches!(
         body_digest_for_v2_sections(&header.section_index, &[]),
         Err(V2FormatError::InvalidHeaderField)
@@ -1741,7 +1822,7 @@ fn maximum_section_batch_fits_bounded_header() {
 fn section_layout_rejects_reserved_flags_and_unauthenticated_gaps() {
     let section_region = Bytes::from_static(b"abcdef");
     let reserved = vec![V2SectionDescriptor {
-        section_type: V2SectionType::IndexDelta,
+        section_type: V2SectionType::IndexRun,
         offset: 0,
         length: 6,
         flags: 0x04,
@@ -1753,7 +1834,7 @@ fn section_layout_rejects_reserved_flags_and_unauthenticated_gaps() {
     ));
 
     let gap = vec![V2SectionDescriptor {
-        section_type: V2SectionType::IndexDelta,
+        section_type: V2SectionType::IndexRun,
         offset: 1,
         length: 5,
         flags: 0,
@@ -2144,8 +2225,8 @@ async fn v2_commit_store_writes_genesis_child_and_loads_chain() {
             .write_child_commit(
                 &anchor,
                 V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
+                    V2SectionType::IndexRun,
+                    V2_SECTION_FLAG_MUST_UNDERSTAND,
                     Bytes::from_static(b"opaque-index-delta"),
                 )]),
             )
@@ -2173,7 +2254,7 @@ async fn bounded_replay_uses_only_fixed_size_range_reads() {
     let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
     let keyring = signing_keyring();
     let limits = V2ReplayLimits {
-        max_retained_bytes: 64,
+        max_retained_bytes: 4096,
         read_chunk_bytes: 4 * 1024,
         ..V2ReplayLimits::default()
     };
@@ -2194,13 +2275,13 @@ async fn bounded_replay_uses_only_fixed_size_range_reads() {
                 &anchor,
                 V2CommitWrite::delta(vec![
                     V2CommitSection::new(
-                        V2SectionType::Payload,
-                        0,
+                        V2SectionType::PayloadPack,
+                        V2_SECTION_FLAG_MUST_UNDERSTAND,
                         Bytes::from(vec![0x5a; 256 * 1024]),
                     ),
                     V2CommitSection::new(
-                        V2SectionType::IndexDelta,
-                        0,
+                        V2SectionType::IndexRun,
+                        V2_SECTION_FLAG_MUST_UNDERSTAND,
                         Bytes::from_static(b"bounded-index"),
                     ),
                 ]),
@@ -2215,7 +2296,7 @@ async fn bounded_replay_uses_only_fixed_size_range_reads() {
     assert_eq!(chain.commits_newest_first.len(), 2);
     assert_eq!(store.full_commit_get_count(), 0);
     let ranged_gets = store.ranged_commit_get_count();
-    assert!((2..=5).contains(&ranged_gets), "ranged gets: {ranged_gets}");
+    assert!((2..=6).contains(&ranged_gets), "ranged gets: {ranged_gets}");
     assert_eq!(
         chain.commits_newest_first[0].retained_sections[1].as_deref(),
         Some(b"bounded-index".as_slice())
@@ -2285,13 +2366,13 @@ async fn replay_skips_tampered_payload_but_adoption_verifies_it() {
                 &anchor,
                 V2CommitWrite::delta(vec![
                     V2CommitSection::new(
-                        V2SectionType::Payload,
-                        0,
+                        V2SectionType::PayloadPack,
+                        V2_SECTION_FLAG_MUST_UNDERSTAND,
                         Bytes::from_static(b"payload-ciphertext"),
                     ),
                     V2CommitSection::new(
-                        V2SectionType::IndexDelta,
-                        0,
+                        V2SectionType::IndexRun,
+                        V2_SECTION_FLAG_MUST_UNDERSTAND,
                         Bytes::from_static(b"authenticated-index"),
                     ),
                 ]),
@@ -2367,8 +2448,8 @@ async fn bounded_replay_rejects_a_chain_deeper_than_its_commit_budget() {
                 .write_child_commit(
                     &anchor,
                     V2CommitWrite::delta(vec![V2CommitSection::new(
-                        V2SectionType::IndexDelta,
-                        0,
+                        V2SectionType::IndexRun,
+                        V2_SECTION_FLAG_MUST_UNDERSTAND,
                         Bytes::from(vec![byte]),
                     )]),
                 )
@@ -2446,8 +2527,8 @@ async fn bounded_replay_rejects_index_bytes_over_its_retention_budget() {
             .write_child_commit(
                 &anchor,
                 V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
+                    V2SectionType::IndexRun,
+                    V2_SECTION_FLAG_MUST_UNDERSTAND,
                     Bytes::from(vec![0x44; 65]),
                 )]),
             )
@@ -2486,8 +2567,8 @@ async fn bounded_replay_rejects_provider_length_shorter_than_signed_layout() {
             .write_child_commit(
                 &anchor,
                 V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
+                    V2SectionType::IndexRun,
+                    V2_SECTION_FLAG_MUST_UNDERSTAND,
                     Bytes::from_static(b"signed-layout"),
                 )]),
             )
@@ -2540,141 +2621,6 @@ async fn bounded_replay_rejects_range_tampering() {
         repository.load_replay_chain_from_anchor(&anchor).await,
         Err(V2FormatError::HeaderDigestMismatch)
     );
-}
-
-#[tokio::test]
-async fn legacy_full_commit_reader_checks_length_before_body_allocation() {
-    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
-    let keyring = signing_keyring();
-    let options = V2CommitStoreOptions::for_profile(
-        V2ProviderProfile::Dev,
-        sample_repository_id(),
-        sample_keyring_envelope_ref(),
-        sample_format_ref(),
-    );
-    let writer = V2CommitStore::new(store.clone(), keyring.clone(), options.clone());
-    let anchor = V2MemoryAnchor::new();
-    let stored = must_v2(writer.write_genesis_snapshot(&anchor).await);
-    let object_len = must_v2(
-        store
-            .head(&stored.commit_key.object_id)
-            .await
-            .map_err(|_| V2FormatError::StorageOperationFailed),
-    )
-    .content_len;
-    store.reset_operation_counts();
-
-    let reader = V2CommitStore::new(
-        store.clone(),
-        keyring,
-        options.with_replay_limits(V2ReplayLimits {
-            max_full_commit_bytes: object_len.saturating_sub(1),
-            ..V2ReplayLimits::default()
-        }),
-    );
-
-    assert_eq!(
-        reader.load_chain_from_anchor(&anchor).await,
-        Err(V2FormatError::ReplayBudgetExceeded)
-    );
-    assert_eq!(store.full_commit_get_count(), 0);
-    assert_eq!(store.ranged_commit_get_count(), 0);
-}
-
-#[tokio::test]
-async fn legacy_full_chain_reader_checks_depth_before_next_object_read() {
-    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
-    let keyring = signing_keyring();
-    let options = V2CommitStoreOptions::for_profile(
-        V2ProviderProfile::Dev,
-        sample_repository_id(),
-        sample_keyring_envelope_ref(),
-        sample_format_ref(),
-    );
-    let writer = V2CommitStore::new(store.clone(), keyring.clone(), options.clone());
-    let anchor = V2MemoryAnchor::new();
-    must_v2(writer.write_genesis_snapshot(&anchor).await);
-    must_v2(
-        writer
-            .write_child_commit(
-                &anchor,
-                V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
-                    Bytes::from_static(b"one-child"),
-                )]),
-            )
-            .await,
-    );
-    store.reset_operation_counts();
-
-    let reader = V2CommitStore::new(
-        store.clone(),
-        keyring,
-        options.with_replay_limits(V2ReplayLimits {
-            max_commits: 1,
-            ..V2ReplayLimits::default()
-        }),
-    );
-
-    assert_eq!(
-        reader.load_chain_from_anchor(&anchor).await,
-        Err(V2FormatError::ReplayBudgetExceeded)
-    );
-    assert_eq!(store.full_commit_get_count(), 0);
-    assert_eq!(store.operation_counts().head, 1);
-}
-
-#[tokio::test]
-async fn legacy_full_chain_reader_checks_cumulative_bytes_before_next_allocation() {
-    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
-    let keyring = signing_keyring();
-    let options = V2CommitStoreOptions::for_profile(
-        V2ProviderProfile::Dev,
-        sample_repository_id(),
-        sample_keyring_envelope_ref(),
-        sample_format_ref(),
-    );
-    let writer = V2CommitStore::new(store.clone(), keyring.clone(), options.clone());
-    let anchor = V2MemoryAnchor::new();
-    must_v2(writer.write_genesis_snapshot(&anchor).await);
-    let child = must_v2(
-        writer
-            .write_child_commit(
-                &anchor,
-                V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
-                    Bytes::from_static(b"one-child"),
-                )]),
-            )
-            .await,
-    );
-    let child_len = must_v2(
-        store
-            .head(&child.commit_key.object_id)
-            .await
-            .map_err(|_| V2FormatError::StorageOperationFailed),
-    )
-    .content_len;
-    store.reset_operation_counts();
-
-    let reader = V2CommitStore::new(
-        store.clone(),
-        keyring,
-        options.with_replay_limits(V2ReplayLimits {
-            max_full_chain_bytes: child_len,
-            ..V2ReplayLimits::default()
-        }),
-    );
-
-    assert_eq!(
-        reader.load_chain_from_anchor(&anchor).await,
-        Err(V2FormatError::ReplayBudgetExceeded)
-    );
-    assert_eq!(store.full_commit_get_count(), 0);
-    assert_eq!(store.ranged_commit_get_count(), 1);
-    assert_eq!(store.operation_counts().head, 2);
 }
 
 #[tokio::test]
@@ -2769,7 +2715,7 @@ async fn v2_repository_startup_replay_never_fetches_full_commit_objects() {
 
     assert_eq!(store.full_commit_get_count(), 0);
     let ranged_gets = store.ranged_commit_get_count();
-    assert!((2..=5).contains(&ranged_gets), "ranged gets: {ranged_gets}");
+    assert!((2..=6).contains(&ranged_gets), "ranged gets: {ranged_gets}");
     assert_eq!(must_repo(fresh.head(&key)).content_len, 256 * 1024);
 }
 
@@ -4900,17 +4846,7 @@ async fn v2_repository_admits_only_one_commit_coordinator_instance() {
             .await,
         Err(crate::RepositoryError::CommitFailed { .. })
     ));
-    assert!(matches!(
-        repository
-            .write_compaction_snapshot(
-                &anchor,
-                &UnenforcedQuiescedMaintenanceGuard,
-                V2FullGcDryRunOptions::default(),
-                false,
-            )
-            .await,
-        Err(crate::RepositoryError::CommitFailed { .. })
-    ));
+
     assert_eq!(must_repo(repository.pending_operation_count_for_tests()), 0);
 
     drop(first);
@@ -5856,7 +5792,7 @@ async fn v2_framed_streaming_known_and_unknown_lengths_checkpoint_and_reload() {
             .iter()
             .map(|section| section.section_type)
             .collect::<Vec<_>>(),
-        vec![V2SectionType::Payload, V2SectionType::IndexRun]
+        vec![V2SectionType::IndexRun]
     );
     assert!(
         known_chain.commits_newest_first[0]
@@ -5870,7 +5806,7 @@ async fn v2_framed_streaming_known_and_unknown_lengths_checkpoint_and_reload() {
         known_chain.commits_newest_first[0]
             .parsed_header
             .upload_mode,
-        V2UploadMode::MultipartPadded
+        V2UploadMode::SinglePut
     );
 
     must_repo(
@@ -5903,7 +5839,7 @@ async fn v2_framed_streaming_known_and_unknown_lengths_checkpoint_and_reload() {
             .iter()
             .map(|section| section.section_type)
             .collect::<Vec<_>>(),
-        vec![V2SectionType::Payload, V2SectionType::IndexRun]
+        vec![V2SectionType::IndexRun]
     );
     assert!(
         unknown_chain.commits_newest_first[0]
@@ -5941,7 +5877,7 @@ async fn v2_framed_streaming_known_and_unknown_lengths_checkpoint_and_reload() {
             .iter()
             .map(|section| section.section_type)
             .collect::<Vec<_>>(),
-        vec![V2SectionType::Payload, V2SectionType::IndexRun]
+        vec![V2SectionType::IndexRun]
     );
     assert!(
         empty_chain.commits_newest_first[0]
@@ -6520,7 +6456,12 @@ async fn v2_orphan_gc_keeps_streamed_carrier_referenced_by_compacted_catalog() {
             )
             .await,
     );
-    let streamed_carrier = must_v2(anchor.read_v2().await).expect("stream carrier anchor");
+    let carriers = store
+        .list_prefix("objects/v02/")
+        .await
+        .expect("list detached carriers");
+    assert_eq!(carriers.len(), 1);
+    let carrier = carriers[0].clone();
     must_repo(
         repository
             .put_committed(
@@ -6543,7 +6484,7 @@ async fn v2_orphan_gc_keeps_streamed_carrier_referenced_by_compacted_catalog() {
         report
             .candidates
             .iter()
-            .all(|candidate| candidate.object_id != streamed_carrier.commit_key)
+            .all(|candidate| candidate.object_id != carrier.object_id)
     );
     let gc = must_v2(
         repository
@@ -6558,10 +6499,7 @@ async fn v2_orphan_gc_keeps_streamed_carrier_referenced_by_compacted_catalog() {
     assert!(gc.deleted_count > 0);
     must_v2(
         store
-            .head_at(
-                &streamed_carrier.commit_key,
-                streamed_carrier.version_id.as_ref(),
-            )
+            .head_at(&carrier.object_id, carrier.version_id.as_ref())
             .await
             .map_err(|_| V2FormatError::StorageOperationFailed),
     );
@@ -6821,8 +6759,8 @@ async fn v2_orphan_gc_deletes_expired_unprotected_commit() {
         .write_child_commit(
             &FailOnceV2Anchor::new(anchor.clone()),
             V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexDelta,
-                0,
+                V2SectionType::IndexRun,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"orphan-delta"),
             )]),
         )
@@ -6886,7 +6824,7 @@ async fn v2_orphan_inventory_classifies_and_budgets_standalone_objects() {
     assert_eq!(orphans.candidates[0].sequence, None);
     assert_eq!(dry_run.planned_cost.version_list_count, 0);
     assert_eq!(dry_run.planned_cost.delete_count, 1);
-    assert_eq!(dry_run.planned_cost.request_count, 6);
+    assert_eq!(dry_run.planned_cost.request_count, 7);
 }
 
 #[test]
@@ -6919,8 +6857,8 @@ async fn v2_orphan_gc_skips_retained_or_held_candidates() {
         .write_child_commit(
             &FailOnceV2Anchor::new(retained_anchor.clone()),
             V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexDelta,
-                0,
+                V2SectionType::IndexRun,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"retained-orphan"),
             )]),
         )
@@ -6960,8 +6898,8 @@ async fn v2_orphan_gc_skips_retained_or_held_candidates() {
         .write_child_commit(
             &FailOnceV2Anchor::new(held_anchor.clone()),
             V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexDelta,
-                0,
+                V2SectionType::IndexRun,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"held-orphan"),
             )]),
         )
@@ -7018,8 +6956,8 @@ async fn v2_full_gc_dry_run_reports_unanchored_commit_budget() {
         .write_child_commit(
             &FailOnceV2Anchor::new(anchor.clone()),
             V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexDelta,
-                0,
+                V2SectionType::IndexRun,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"dry-run-orphan"),
             )]),
         )
@@ -7223,8 +7161,8 @@ async fn retained_v2_full_gc_dry_run_reports_version_inventory_and_blocked_bytes
         .write_child_commit(
             &FailOnceV2Anchor::new(anchor.clone()),
             V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexDelta,
-                0,
+                V2SectionType::IndexRun,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"retained-dry-run-orphan"),
             )]),
         )
@@ -7373,18 +7311,7 @@ async fn v2_quick_maintenance_exposes_nearest_retain_until_deadline() {
     let repository = retained_commit_store(store, retention).await;
     let anchor = V2MemoryAnchor::new();
     must_v2(repository.write_genesis_snapshot(&anchor).await);
-    must_v2(
-        repository
-            .write_child_commit(
-                &anchor,
-                V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
-                    Bytes::from_static(b"nearest-deadline-live-commit"),
-                )]),
-            )
-            .await,
-    );
+    must_v2(write_empty_metadata_child(&repository, &anchor, false).await);
     let before_ms = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7444,18 +7371,7 @@ async fn retained_v2_full_gc_dry_run_plans_live_commit_retention_renewal() {
     let anchor = V2MemoryAnchor::new();
 
     must_v2(repository.write_genesis_snapshot(&anchor).await);
-    must_v2(
-        repository
-            .write_child_commit(
-                &anchor,
-                V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
-                    Bytes::from_static(b"retention-renewal-live-commit"),
-                )]),
-            )
-            .await,
-    );
+    must_v2(write_empty_metadata_child(&repository, &anchor, false).await);
 
     let default_report = must_v2(
         repository
@@ -7497,32 +7413,10 @@ async fn retained_v2_full_gc_dry_run_plans_protected_root_retention_renewal() {
     let anchor = V2MemoryAnchor::new();
 
     must_v2(repository.write_genesis_snapshot(&anchor).await);
-    must_v2(
-        repository
-            .write_child_commit(
-                &anchor,
-                V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
-                    Bytes::from_static(b"retained-historical-root-delta"),
-                )]),
-            )
-            .await,
-    );
+    must_v2(write_empty_metadata_child(&repository, &anchor, false).await);
     let historical_root =
         must_v2(anchor.read_v2().await).expect("retained historical root should exist");
-    must_v2(
-        repository
-            .write_child_commit(
-                &anchor,
-                V2CommitWrite::snapshot(vec![V2CommitSection::new(
-                    V2SectionType::IndexSnapshot,
-                    0,
-                    Bytes::new(),
-                )]),
-            )
-            .await,
-    );
+    must_v2(write_empty_metadata_child(&repository, &anchor, true).await);
 
     let report = must_v2(
         repository
@@ -7564,8 +7458,8 @@ async fn v2_full_gc_apply_requires_maintenance_guard() {
         .write_child_commit(
             &FailOnceV2Anchor::new(anchor.clone()),
             V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexDelta,
-                0,
+                V2SectionType::IndexRun,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"guarded-orphan"),
             )]),
         )
@@ -7617,8 +7511,8 @@ async fn v2_prepared_full_gc_apply_does_not_replan_before_mutation() {
         .write_child_commit(
             &FailOnceV2Anchor::new(anchor.clone()),
             V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexDelta,
-                0,
+                V2SectionType::IndexRun,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"appeared-after-plan"),
             )]),
         )
@@ -7660,8 +7554,8 @@ async fn v2_full_gc_apply_deletes_only_fully_dead_orphans_after_dry_run() {
         .write_child_commit(
             &FailOnceV2Anchor::new(anchor.clone()),
             V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexDelta,
-                0,
+                V2SectionType::IndexRun,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"apply-orphan"),
             )]),
         )
@@ -7705,8 +7599,8 @@ async fn v2_full_gc_apply_returns_partial_report_on_mid_pass_guard_abort() {
         .write_child_commit(
             &FailOnceV2Anchor::new(anchor.clone()),
             V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexDelta,
-                0,
+                V2SectionType::IndexRun,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"partial-apply-orphan-one"),
             )]),
         )
@@ -7715,8 +7609,8 @@ async fn v2_full_gc_apply_returns_partial_report_on_mid_pass_guard_abort() {
         .write_child_commit(
             &FailOnceV2Anchor::new(anchor.clone()),
             V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexDelta,
-                0,
+                V2SectionType::IndexRun,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"partial-apply-orphan-two"),
             )]),
         )
@@ -7802,31 +7696,9 @@ async fn v2_full_gc_apply_preserves_supplied_historical_roots() {
     let anchor = V2MemoryAnchor::new();
 
     must_v2(repository.write_genesis_snapshot(&anchor).await);
-    must_v2(
-        repository
-            .write_child_commit(
-                &anchor,
-                V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
-                    Bytes::from_static(b"historical-root-delta"),
-                )]),
-            )
-            .await,
-    );
+    must_v2(write_empty_metadata_child(&repository, &anchor, false).await);
     let historical_root = must_v2(anchor.read_v2().await).expect("historical root should exist");
-    must_v2(
-        repository
-            .write_child_commit(
-                &anchor,
-                V2CommitWrite::snapshot(vec![V2CommitSection::new(
-                    V2SectionType::IndexSnapshot,
-                    0,
-                    Bytes::new(),
-                )]),
-            )
-            .await,
-    );
+    must_v2(write_empty_metadata_child(&repository, &anchor, true).await);
 
     let unprotected = must_v2(repository.report_orphans(&anchor).await);
     let protected = must_v2(
@@ -7954,18 +7826,7 @@ async fn retained_v2_full_gc_renews_exact_live_versions_before_deleting() {
     let anchor = V2MemoryAnchor::new();
 
     must_v2(repository.write_genesis_snapshot(&anchor).await);
-    let child = must_v2(
-        repository
-            .write_child_commit(
-                &anchor,
-                V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
-                    Bytes::from_static(b"renew-live-exact-version"),
-                )]),
-            )
-            .await,
-    );
+    let child = must_v2(write_empty_metadata_child(&repository, &anchor, false).await);
     store
         .put(
             &child.commit_key.object_id,
@@ -8227,81 +8088,6 @@ async fn v2_full_gc_dry_run_does_not_discard_concurrent_staged_delta() {
 }
 
 #[tokio::test]
-async fn v2_compaction_snapshot_rejects_packed_state_until_index_root_exists() {
-    let store = MemoryBlobStore::new();
-    let keyring = must_crypto(KeyRing::generate_random());
-    let options = V2CommitStoreOptions::for_profile(
-        V2ProviderProfile::Dev,
-        sample_repository_id(),
-        sample_keyring_envelope_ref(),
-        sample_format_ref(),
-    );
-    let repository = V2Repository::new(
-        store.clone(),
-        keyring.clone(),
-        RepositoryOptions::default(),
-        options.clone(),
-    );
-    let anchor = V2MemoryAnchor::new();
-    let live_key = must_type(LogicalPath::new("snapshots/live-after-compaction.bin"));
-    let deleted_key = must_type(LogicalPath::new("snapshots/deleted-before-compaction.bin"));
-    let live_body = Bytes::from(vec![7_u8; 2048]);
-
-    must_repo(repository.write_genesis_snapshot(&anchor).await);
-    must_repo(
-        repository
-            .stage_put(
-                live_key.clone(),
-                live_body.clone(),
-                RepositoryPutOptions::default(),
-            )
-            .await,
-    );
-    must_repo(
-        repository
-            .stage_put(
-                deleted_key.clone(),
-                Bytes::from(vec![8_u8; 4096]),
-                RepositoryPutOptions::default(),
-            )
-            .await,
-    );
-    must_repo(repository.publish_pending_index_delta(&anchor).await);
-    must_repo(
-        repository
-            .delete_committed(&anchor, deleted_key.clone())
-            .await,
-    );
-
-    let before = must_repo(
-        repository
-            .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
-            .await,
-    );
-    let compaction = repository
-        .write_compaction_snapshot(
-            &anchor,
-            &UnenforcedQuiescedMaintenanceGuard,
-            V2FullGcDryRunOptions::default(),
-            false,
-        )
-        .await;
-    let fresh = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
-    must_repo(fresh.load_chain_from_anchor(&anchor).await);
-    let restored = must_repo(fresh.get_range(&live_key, ByteRange::Full).await);
-    let deleted = fresh.head(&deleted_key);
-
-    assert_eq!(before.mixed_commit_count, 1);
-    assert!(before.live_bytes_to_copy > 0);
-    assert!(matches!(
-        compaction,
-        Err(RepositoryError::CommitFailed { .. })
-    ));
-    assert_eq!(restored, live_body);
-    assert!(matches!(deleted, Err(RepositoryError::NotFound(_))));
-}
-
-#[tokio::test]
 async fn v2_framed_streaming_run_compaction_preserves_payload_without_rewrite() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
@@ -8344,7 +8130,12 @@ async fn v2_framed_streaming_run_compaction_preserves_payload_without_rewrite() 
             )
             .await,
     );
-    let streamed_carrier = must_v2(anchor.read_v2().await).expect("stream carrier anchor");
+    let carriers = store
+        .list_prefix("objects/v02/")
+        .await
+        .expect("list detached carriers");
+    assert_eq!(carriers.len(), 1);
+    let carrier = carriers[0].clone();
     must_repo(
         repository
             .put_committed(
@@ -8396,10 +8187,7 @@ async fn v2_framed_streaming_run_compaction_preserves_payload_without_rewrite() 
     assert!(must_repo(repository.active_index_run_count()) < source_run_count);
     must_v2(
         store
-            .head_at(
-                &streamed_carrier.commit_key,
-                streamed_carrier.version_id.as_ref(),
-            )
+            .head_at(&carrier.object_id, carrier.version_id.as_ref())
             .await
             .map_err(|_| V2FormatError::StorageOperationFailed),
     );
@@ -9337,8 +9125,8 @@ async fn v2_maintenance_window_full_gc_guard_loss_fails_closed_and_rerun_complet
             .write_child_commit(
                 &FailOnceV2Anchor::new(anchor.clone()),
                 V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
+                    V2SectionType::IndexRun,
+                    V2_SECTION_FLAG_MUST_UNDERSTAND,
                     Bytes::copy_from_slice(label),
                 )]),
             )
@@ -9424,8 +9212,8 @@ async fn v2_maintenance_window_full_gc_cancellation_stops_at_mutation_boundary()
             .write_child_commit(
                 &FailOnceV2Anchor::new(anchor.clone()),
                 V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
+                    V2SectionType::IndexRun,
+                    V2_SECTION_FLAG_MUST_UNDERSTAND,
                     Bytes::copy_from_slice(label),
                 )]),
             )
@@ -9587,8 +9375,8 @@ async fn v2_commit_store_preserves_stale_anchor_error_class() {
         .write_child_commit(
             &StaleOnAdvanceV2Anchor::new(anchor),
             V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexDelta,
-                0,
+                V2SectionType::IndexRun,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"stale-writer"),
             )]),
         )
@@ -9618,8 +9406,8 @@ async fn v2_commit_store_rejects_child_write_without_anchor() {
         .write_child_commit(
             &anchor,
             V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexDelta,
-                0,
+                V2SectionType::IndexRun,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"opaque-index-delta"),
             )]),
         )
@@ -9669,8 +9457,8 @@ async fn v2_commit_store_adopts_strict_unanchored_child() {
             .write_child_commit(
                 &ambiguous_anchor,
                 V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
+                    V2SectionType::IndexRun,
+                    V2_SECTION_FLAG_MUST_UNDERSTAND,
                     Bytes::from_static(b"ambiguous-upload-delta"),
                 )]),
             )
@@ -9789,30 +9577,9 @@ async fn v2_orphan_report_surfaces_same_sequence_candidates() {
 
     let genesis = must_v2(repository.write_genesis_snapshot(&anchor).await);
     let ambiguous_anchor = V2MemoryAnchor::with_state(genesis.anchor_state.clone());
-    let _uploaded = must_v2(
-        repository
-            .write_child_commit(
-                &ambiguous_anchor,
-                V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
-                    Bytes::from_static(b"same-sequence-orphan"),
-                )]),
-            )
-            .await,
-    );
-    let _accepted = must_v2(
-        repository
-            .write_child_commit(
-                &anchor,
-                V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
-                    Bytes::from_static(b"accepted-sequence-delta"),
-                )]),
-            )
-            .await,
-    );
+    let _uploaded =
+        must_v2(write_empty_metadata_child(&repository, &ambiguous_anchor, false).await);
+    let _accepted = must_v2(write_empty_metadata_child(&repository, &anchor, false).await);
 
     let report = must_v2(repository.report_orphans(&anchor).await);
     let maintenance = must_v2(repository.quick_maintenance(&anchor).await);
@@ -9821,4 +9588,104 @@ async fn v2_orphan_report_surfaces_same_sequence_candidates() {
     assert!(report.candidates[0].same_sequence_as_anchor);
     assert_eq!(maintenance.orphan_candidate_count, 1);
     assert_eq!(maintenance.verified_commit_count, 2);
+}
+
+#[tokio::test]
+async fn detached_unknown_length_empty_value_writes_only_index_metadata() {
+    let store = CountingBlobStore::new(MemoryBlobStore::new());
+    let repository = V2Repository::new(
+        store.clone(),
+        signing_keyring(),
+        RepositoryOptions::default(),
+        V2CommitStoreOptions::for_profile(
+            V2ProviderProfile::Dev,
+            sample_repository_id(),
+            sample_keyring_envelope_ref(),
+            sample_format_ref(),
+        ),
+    );
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let before = store.operation_counts().expect("counts");
+    let key = must_type(LogicalPath::new("empty/stream"));
+    must_repo(
+        repository
+            .put_committed_streaming_unknown_len(
+                &anchor,
+                key.clone(),
+                stream::iter([Ok(Bytes::new()), Ok(Bytes::new())]),
+                RepositoryPutOptions::default(),
+                64 * 1024,
+                0,
+            )
+            .await,
+    );
+    let after = store.operation_counts().expect("counts");
+    assert_eq!(after.put - before.put, 1);
+    assert!(
+        store
+            .list_prefix("objects/v02/")
+            .await
+            .expect("carriers")
+            .is_empty()
+    );
+    assert_eq!(must_repo(repository.head(&key)).content_len, 0);
+}
+
+#[tokio::test]
+async fn detached_unknown_length_overflow_preserves_the_previous_value_and_anchor() {
+    for chunks in [
+        vec![Bytes::from_static(b"12345")],
+        vec![Bytes::from_static(b"123"), Bytes::from_static(b"45")],
+    ] {
+        let store = MemoryBlobStore::new();
+        let repository = V2Repository::new(
+            store.clone(),
+            must_crypto(KeyRing::generate_random()),
+            RepositoryOptions::default(),
+            V2CommitStoreOptions::for_profile(
+                V2ProviderProfile::Dev,
+                sample_repository_id(),
+                sample_keyring_envelope_ref(),
+                sample_format_ref(),
+            ),
+        );
+        let anchor = V2MemoryAnchor::new();
+        must_repo(repository.write_genesis_snapshot(&anchor).await);
+        let key = must_type(LogicalPath::new("bounded/stream"));
+        must_repo(
+            repository
+                .put_committed(
+                    &anchor,
+                    key.clone(),
+                    Bytes::from_static(b"accepted"),
+                    RepositoryPutOptions::default(),
+                )
+                .await,
+        );
+        let accepted = must_v2(anchor.read_v2().await);
+        let result = repository
+            .put_committed_streaming_unknown_len(
+                &anchor,
+                key.clone(),
+                stream::iter(chunks.into_iter().map(Ok)),
+                RepositoryPutOptions::default(),
+                64 * 1024,
+                4,
+            )
+            .await;
+        assert!(matches!(result, Err(RepositoryError::ObjectTooLarge)));
+        assert_eq!(must_v2(anchor.read_v2().await), accepted);
+        assert_eq!(
+            must_repo(repository.get_range(&key, ByteRange::Full).await),
+            Bytes::from_static(b"accepted")
+        );
+        assert!(
+            store
+                .list_prefix("objects/v02/")
+                .await
+                .expect("carriers")
+                .is_empty()
+        );
+    }
 }

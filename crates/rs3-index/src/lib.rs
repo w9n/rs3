@@ -11,12 +11,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
-/// Domain separator prepended to durable index delta objects.
-pub const INDEX_DELTA_OBJECT_DOMAIN: &[u8] = b"rs3:index-delta-object:v1\n";
-
-/// Domain separator prepended to plaintext index delta payloads before sealing.
-pub const INDEX_DELTA_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-delta-plaintext:v1\n";
-
 /// Domain separator prepended to plaintext manifest payloads before sealing.
 pub const MANIFEST_PLAINTEXT_DOMAIN: &[u8] = b"rs3:manifest-plaintext:v1\n";
 
@@ -69,27 +63,8 @@ pub enum PayloadReference {
         #[serde(flatten)]
         record: V2PackRecordReference,
     },
-    /// Payload bytes are in the current commit that carries this index delta.
-    V2Self {
-        /// Opaque payload identity used as the AEAD associated-data object id.
-        payload_id: BackendObjectId,
-        /// Parsed segmented-payload header needed for direct range reads.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        payload_header: Option<PayloadHeaderReference>,
-        /// Absolute byte offset where the containing commit's section region starts.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sections_start: Option<u64>,
-        /// Byte offset relative to the commit section region.
-        offset: u64,
-        /// Encrypted payload-section byte length.
-        length: u64,
-    },
-    /// Payload bytes are in a resolved v2 commit object.
-    V2CommitStream {
-        /// Exact carrier facts shared by every reference to this streamed payload.
-        #[serde(flatten)]
-        carrier: Arc<V2CommitStreamCarrierReference>,
-    },
+    /// Staged value awaiting an authenticated carrier reference; never persisted.
+    Pending,
     /// Streamed payload bytes stored in one exact standalone object.
     V2StandaloneStream {
         /// Exact carrier facts shared by every reference to this streamed payload.
@@ -135,40 +110,6 @@ pub struct V2PackRecordReference {
     pub record_ordinal: u32,
     /// Absolute ciphertext offset from the start of the payload-pack section.
     pub record_offset: u32,
-}
-
-/// Exact accepted commit and section facts for a streamed payload.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct V2CommitStreamCarrierReference {
-    /// Commit object key containing the payload section.
-    pub commit_key: BackendObjectId,
-    /// Provider version identifier for exact-version reads, when available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub commit_version_id: Option<BackendVersionId>,
-    /// Commit body digest from the signed header.
-    pub body_digest: [u8; 32],
-    /// Provider-reported complete commit-object length.
-    pub commit_stored_len: u64,
-    /// Historical encrypted-keyring envelope object bound into payload AEAD context.
-    pub keyring_envelope_object_id: BackendObjectId,
-    /// SHA-256 digest of that encrypted-keyring envelope.
-    pub keyring_envelope_digest: [u8; 32],
-    /// Signed section ordinal containing the streamed payload.
-    pub payload_section_ordinal: u32,
-    /// Signed digest of the complete streamed payload section.
-    pub payload_section_digest: [u8; 32],
-    /// Opaque payload identity used as the AEAD associated-data object id.
-    pub payload_id: BackendObjectId,
-    /// Parsed segmented-payload header needed for direct range reads.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload_header: Option<PayloadHeaderReference>,
-    /// Absolute byte offset where the containing commit's section region starts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sections_start: Option<u64>,
-    /// Byte offset relative to the commit section region.
-    pub offset: u64,
-    /// Encrypted payload-section byte length.
-    pub length: u64,
 }
 
 /// Exact accepted standalone object facts for a streamed payload.
@@ -260,28 +201,6 @@ impl fmt::Debug for IndexDelta {
     }
 }
 
-/// Durable index delta object referenced by a checkpoint.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexDeltaObject {
-    /// Repository sequence represented by this delta batch.
-    pub sequence: Sequence,
-    /// Ordered index mutations to replay.
-    pub deltas: Vec<IndexDelta>,
-}
-
-/// Sealed index delta object stored in the backend and referenced by a checkpoint.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SealedIndexDeltaObject {
-    /// Metadata key that sealed the payload.
-    pub key_id: KeyId,
-    /// Nonce used for the sealed payload.
-    pub nonce: Vec<u8>,
-    /// Sealed index delta payload.
-    pub ciphertext: Vec<u8>,
-    /// Authentication tag over the index delta object context.
-    pub tag: Vec<u8>,
-}
-
 /// Client-visible metadata stored in a sealed manifest object.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableManifest {
@@ -323,22 +242,6 @@ pub struct KeyringEnvelopeReference {
     /// Provider version identifier for the encrypted envelope, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<BackendVersionId>,
-}
-
-/// Encodes a durable sealed index delta object.
-pub fn index_delta_object_bytes(
-    delta: &SealedIndexDeltaObject,
-) -> Result<Vec<u8>, serde_json::Error> {
-    let mut bytes = INDEX_DELTA_OBJECT_DOMAIN.to_vec();
-    serde_json::to_writer(&mut bytes, delta)?;
-    Ok(bytes)
-}
-
-/// Encodes index delta plaintext before sealing.
-pub fn index_delta_plaintext_bytes(delta: &IndexDeltaObject) -> Result<Vec<u8>, serde_json::Error> {
-    let mut bytes = INDEX_DELTA_PLAINTEXT_DOMAIN.to_vec();
-    serde_json::to_writer(&mut bytes, delta)?;
-    Ok(bytes)
 }
 
 /// Encodes manifest plaintext before sealing.
@@ -514,17 +417,14 @@ impl NamespaceIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        INDEX_DELTA_OBJECT_DOMAIN, INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta, IndexDeltaObject,
-        MANIFEST_PLAINTEXT_DOMAIN, ManifestObject, NamespaceEntry, NamespaceIndex,
-        PayloadReference, SealedIndexDeltaObject, V2CommitStreamCarrierReference,
+        IndexDelta, MANIFEST_PLAINTEXT_DOMAIN, NamespaceEntry, NamespaceIndex, PayloadReference,
         V2PackCarrierReference, V2PackRecordReference, V2StandaloneStreamCarrierReference,
-        index_delta_object_bytes, index_delta_plaintext_bytes, manifest_plaintext_bytes,
+        manifest_plaintext_bytes,
     };
     use rs3_types::{
         BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LogicalPath, ManifestId,
         PrefixToken, Sequence,
     };
-    use serde::Serialize;
     use std::sync::Arc;
 
     fn blind_key(value: &str) -> BlindIndexKey {
@@ -585,15 +485,6 @@ mod tests {
         }
     }
 
-    fn sealed_manifest() -> ManifestObject {
-        ManifestObject {
-            key_id: key_id("metadata"),
-            nonce: vec![1, 2, 3],
-            ciphertext: vec![4, 5, 6],
-            tag: vec![7, 8, 9],
-        }
-    }
-
     #[test]
     fn tombstone_keeps_generation() {
         let blind_key = blind_key("abc");
@@ -618,42 +509,6 @@ mod tests {
             }
             IndexDelta::Upsert { .. } => panic!("unexpected upsert"),
         }
-    }
-
-    #[test]
-    fn index_delta_object_encoding_has_domain_prefix() {
-        let delta = SealedIndexDeltaObject {
-            key_id: key_id("metadata"),
-            nonce: vec![1; 24],
-            ciphertext: vec![2; 32],
-            tag: vec![3; 16],
-        };
-
-        let encoded = index_delta_object_bytes(&delta);
-
-        assert!(matches!(
-            encoded,
-            Ok(bytes) if bytes.starts_with(INDEX_DELTA_OBJECT_DOMAIN)
-        ));
-    }
-
-    #[test]
-    fn index_delta_plaintext_encoding_has_domain_prefix() {
-        let delta = IndexDeltaObject {
-            sequence: Sequence::new(1),
-            deltas: vec![IndexDelta::Upsert {
-                entry: Box::new(entry(blind_key("blind-a"), object_id("segments/opaque-a"))),
-                prefix_tokens: vec![prefix_token("prefix-a")],
-                sealed_manifest: Box::new(sealed_manifest()),
-            }],
-        };
-
-        let encoded = index_delta_plaintext_bytes(&delta);
-
-        assert!(matches!(
-            encoded,
-            Ok(bytes) if bytes.starts_with(INDEX_DELTA_PLAINTEXT_DOMAIN)
-        ));
     }
 
     #[test]
@@ -718,47 +573,8 @@ mod tests {
         }
     }
 
-    #[derive(Serialize)]
-    enum LegacyPayloadReference<'a> {
-        V2Pack {
-            commit_key: &'a BackendObjectId,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            commit_version_id: &'a Option<BackendVersionId>,
-            body_digest: [u8; 32],
-            commit_stored_len: u64,
-            pack_section_ordinal: u32,
-            pack_offset: u64,
-            length: u64,
-            pack_id: [u8; 32],
-            content_key_id: &'a KeyId,
-            keyring_envelope_object_id: &'a BackendObjectId,
-            keyring_envelope_digest: [u8; 32],
-            pack_record_count: u32,
-            record_ordinal: u32,
-            record_offset: u32,
-        },
-        V2CommitStream {
-            commit_key: &'a BackendObjectId,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            commit_version_id: &'a Option<BackendVersionId>,
-            body_digest: [u8; 32],
-            commit_stored_len: u64,
-            keyring_envelope_object_id: &'a BackendObjectId,
-            keyring_envelope_digest: [u8; 32],
-            payload_section_ordinal: u32,
-            payload_section_digest: [u8; 32],
-            payload_id: &'a BackendObjectId,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            payload_header: &'a Option<super::PayloadHeaderReference>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            sections_start: &'a Option<u64>,
-            offset: u64,
-            length: u64,
-        },
-    }
-
     #[test]
-    fn shared_payload_pack_reference_preserves_the_flat_serialized_shape() {
+    fn shared_payload_pack_reference_round_trips() {
         let carrier = Arc::new(V2PackCarrierReference {
             commit_key: object_id("commits/opaque"),
             commit_version_id: Some(BackendVersionId::new("version-1").expect("version id")),
@@ -781,74 +597,10 @@ mod tests {
             carrier: Arc::clone(&carrier),
             record,
         };
-        let legacy = LegacyPayloadReference::V2Pack {
-            commit_key: &carrier.commit_key,
-            commit_version_id: &carrier.commit_version_id,
-            body_digest: carrier.body_digest,
-            commit_stored_len: carrier.commit_stored_len,
-            pack_section_ordinal: carrier.pack_section_ordinal,
-            pack_offset: carrier.pack_offset,
-            length: carrier.length,
-            pack_id: carrier.pack_id,
-            content_key_id: &carrier.content_key_id,
-            keyring_envelope_object_id: &carrier.keyring_envelope_object_id,
-            keyring_envelope_digest: carrier.keyring_envelope_digest,
-            pack_record_count: carrier.pack_record_count,
-            record_ordinal: record.record_ordinal,
-            record_offset: record.record_offset,
-        };
-
+        let bytes = serde_json::to_vec(&shared).expect("encode pack reference");
         assert_eq!(
-            serde_json::to_vec(&shared).expect("serialize shared payload reference"),
-            serde_json::to_vec(&legacy).expect("serialize legacy payload reference")
-        );
-    }
-
-    #[test]
-    fn shared_stream_reference_preserves_the_flat_serialized_shape() {
-        let carrier = Arc::new(V2CommitStreamCarrierReference {
-            commit_key: object_id("commits/stream"),
-            commit_version_id: Some(BackendVersionId::new("version-2").expect("version id")),
-            body_digest: [0x61; 32],
-            commit_stored_len: 65_536,
-            keyring_envelope_object_id: object_id("keyrings/stream"),
-            keyring_envelope_digest: [0x62; 32],
-            payload_section_ordinal: 3,
-            payload_section_digest: [0x63; 32],
-            payload_id: object_id("payloads/stream"),
-            payload_header: Some(super::PayloadHeaderReference {
-                chunk_size: 64 * 1024,
-                plaintext_len: 123_456,
-                key_id: key_id("stream-content"),
-                nonce_prefix: [0x64; 16],
-                header_len: 96,
-            }),
-            sections_start: Some(8_192),
-            offset: 17,
-            length: 123_789,
-        });
-        let shared = PayloadReference::V2CommitStream {
-            carrier: Arc::clone(&carrier),
-        };
-        let legacy = LegacyPayloadReference::V2CommitStream {
-            commit_key: &carrier.commit_key,
-            commit_version_id: &carrier.commit_version_id,
-            body_digest: carrier.body_digest,
-            commit_stored_len: carrier.commit_stored_len,
-            keyring_envelope_object_id: &carrier.keyring_envelope_object_id,
-            keyring_envelope_digest: carrier.keyring_envelope_digest,
-            payload_section_ordinal: carrier.payload_section_ordinal,
-            payload_section_digest: carrier.payload_section_digest,
-            payload_id: &carrier.payload_id,
-            payload_header: &carrier.payload_header,
-            sections_start: &carrier.sections_start,
-            offset: carrier.offset,
-            length: carrier.length,
-        };
-
-        assert_eq!(
-            serde_json::to_vec(&shared).expect("serialize shared stream reference"),
-            serde_json::to_vec(&legacy).expect("serialize legacy stream reference")
+            serde_json::from_slice::<PayloadReference>(&bytes).expect("decode pack reference"),
+            shared
         );
     }
 

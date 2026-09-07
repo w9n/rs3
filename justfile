@@ -51,7 +51,6 @@ fuzz-smoke:
     for target in \
       v2_commit \
       v2_cbor \
-      index_delta \
       keyring_envelope \
       restore_bundle \
       v6_index_run \

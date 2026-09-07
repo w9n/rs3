@@ -2,12 +2,11 @@
 
 use crate::model::{RepositoryListEntry, RepositoryObjectMetadata};
 use rs3_index::{
-    DurableManifest, IndexDelta, IndexDeltaObject, NamespaceEntry, NamespaceIndex,
-    V2StandaloneStreamCarrierReference,
+    DurableManifest, NamespaceEntry, NamespaceIndex, V2StandaloneStreamCarrierReference,
 };
 use rs3_types::{
     BackendObjectId, BackendVersionId, BlindIndexKey, LegalHoldStatus, LogicalPath, ManifestId,
-    PrefixToken, RetentionPolicy, Sequence,
+    RetentionPolicy, Sequence,
 };
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -59,16 +58,6 @@ impl Default for RepositoryState {
 }
 
 impl RepositoryState {
-    pub(crate) fn upsert_namespace_entry(
-        &mut self,
-        entry: NamespaceEntry,
-        prefix_tokens: Vec<PrefixToken>,
-    ) {
-        let affected_manifest = self.manifests.get(&entry.manifest_id).cloned();
-        self.namespace.upsert(entry, prefix_tokens);
-        self.update_list_entry(affected_manifest);
-    }
-
     /// Inserts an entry for a repository generation whose listing projection
     /// is maintained separately from the legacy prefix-token index.
     pub(crate) fn upsert_namespace_entry_without_prefixes(&mut self, entry: NamespaceEntry) {
@@ -98,7 +87,7 @@ impl RepositoryState {
     pub(crate) fn replace_namespace_entry(
         &mut self,
         entry: NamespaceEntry,
-        prefix_tokens: Vec<PrefixToken>,
+        prefix_tokens: Vec<rs3_types::PrefixToken>,
     ) {
         self.namespace.upsert(entry, prefix_tokens);
     }
@@ -201,36 +190,9 @@ impl TrustedManifest {
             legal_hold: self.legal_hold,
         }
     }
-
-    /// Converts durable manifest metadata into trusted manifest metadata.
-    pub(crate) fn from_durable(manifest: DurableManifest) -> Self {
-        Self {
-            key: manifest.key,
-            content_len: manifest.content_len,
-            modified_at_ms: manifest.modified_at_ms,
-            retention: manifest.retention,
-            legal_hold: manifest.legal_hold,
-        }
-    }
 }
 
 /// Builds deterministic material for opaque object IDs in the prototype model.
 pub(crate) fn object_material(key: &str, sequence: Sequence) -> Vec<u8> {
     format!("{key}\0{}", sequence.get()).into_bytes()
-}
-
-/// Applies a durable index delta object to trusted query state.
-pub(crate) fn apply_index_delta_object(state: &mut RepositoryState, delta: IndexDeltaObject) {
-    for delta in delta.deltas {
-        match delta {
-            IndexDelta::Upsert {
-                entry,
-                prefix_tokens,
-                sealed_manifest: _,
-            } => state.upsert_namespace_entry(*entry, prefix_tokens),
-            IndexDelta::Tombstone { blind_key, .. } => state.remove_namespace_entry(blind_key),
-        }
-    }
-
-    state.next_sequence = state.next_sequence.max(delta.sequence);
 }

@@ -15,9 +15,8 @@ restart/fault qualification and final release qualification are not complete.
     digest. Bounded normal writes use ciphertext-only `PAYLOAD_PACK` sections,
     authenticated `INDEX_RUN` record descriptors, and signed `INDEX_ROOT`
     checkpoints; recovery rebuilds namespace state without reading payload
-    ciphertext. Unknown-length and zero-length streams use
-    `[PAYLOAD, INDEX_RUN]`; large known-length writes use a standalone
-    `objects/v02` payload plus `[INDEX_RUN]`. Exact stream carriers survive
+    ciphertext. Nonempty large streams use a standalone `objects/v02` payload
+    plus `[INDEX_RUN]`; empty streams are index-only. Exact carriers survive
     checkpoints, metadata-only compaction, and GC marking. Guarded compaction,
     automatic active-run watermarks, and new-write protection cohorts are
     implemented. Live retained-provider and final recovery qualification remain.
@@ -66,8 +65,7 @@ random component prevents paths, namespace equality, and content identity from
 appearing in keys. The current compactor stores index shards in sibling
 `commits/v02/` delta carriers so the existing signed commit and exact-version
 machinery authenticates them. `objects/v02/` stores independently sealed
-known-length streamed payloads and remains the namespace for possible payload
-packs created by later cleaning.
+streamed payloads with known or unknown lengths.
 Reserved keys do not distinguish object type, index level, tenant, path, or
 workload.
 
@@ -82,14 +80,13 @@ These class names, object counts, ciphertext sizes, provider version IDs, and
 write/compaction timing are accepted leakage. Plaintext catalog bounds, run
 levels, logical object counts, paths, and payload identities remain encrypted.
 
-Bounded writes publish `[PAYLOAD_PACK, INDEX_RUN]`; all-delete or all-empty
-bounded batches may publish `[INDEX_RUN]`. Unknown-length streams publish
-exactly `[PAYLOAD, INDEX_RUN]`, including zero-length streams. Known-length
-large streams first seal one random `objects/v02/` payload, then publish an
-`[INDEX_RUN]` commit that exact-references it. Signed `INDEX_ROOT`
-checkpoints replace the parent-chain replay boundary with an exact catalog of
-accepted run sections. All current v02 repositories remain evaluation data and
-may need recreation.
+Bounded nonempty writes publish `[PAYLOAD_PACK, INDEX_RUN]`; all-delete or
+all-empty batches publish `[INDEX_RUN]`. Large streams first seal one random
+`objects/v02/` payload and then publish an `[INDEX_RUN]` commit with its encrypted
+exact reference. Empty streams are index-only. Signed `[INDEX_ROOT]` checkpoints
+replace the replay boundary with an exact catalog of accepted runs. Genesis is
+an authenticated empty index root. Recreate evaluation repositories when the
+preview wire changes.
 
 ## Signed Commits
 
@@ -108,36 +105,19 @@ and encrypted sections. The signed header covers:
 - the complete commit-object length and body digest; and
 - the signing-key identifier and Ed25519 signature.
 
-The complete header span is limited to 8 KiB and a reader accepts at most 65
-sections so the preview envelope remains bounded. The completed normal writer
-emits `[INDEX_RUN]`, `[PAYLOAD_PACK, INDEX_RUN]`, or `[PAYLOAD, INDEX_RUN]`; an
-`[INDEX_RUN]` may carry an encrypted exact reference to one separately sealed
-standalone payload. A catalog checkpoint contains exactly one `INDEX_ROOT`.
-Multipart commits reserve
-the fixed header span only when the body is genuinely streamed. Bounded commits
-use one `PutObject` and the canonical encoded header length, without 8 KiB
-padding.
-Readers reject non-canonical encodings, unknown required capabilities,
-out-of-order or overlapping sections, arithmetic overflow, duplicate ordinals,
-lengths outside the object, and trailing data not covered by the signed layout.
+The complete header span is limited to 8 KiB and a reader accepts at most two
+sections. Delta commits contain `[INDEX_RUN]` or `[PAYLOAD_PACK, INDEX_RUN]`;
+root commits contain exactly `[INDEX_ROOT]`. Every section must carry the
+must-understand flag, with no compression. Every commit uses a single PUT with
+its canonical encoded header length. Upload mode zero is the only accepted
+mode. Retired section codes `0x0001` through `0x0004`, nonzero upload modes,
+noncanonical encodings, overlapping sections, arithmetic overflow, and trailing
+bytes outside the signed layout fail closed.
 
-Capability bit `0x01` requires signed per-section digests. Bit `0x02` identifies
-framed index sections. Bit `0x04` requires compacted-run root semantics,
-including authenticated run level and compaction generation. This preview
-capability accepts only tier 0 and tier 1; higher level values fail closed until
-a future capability defines their semantics. The fixed header
-advertises `0x01` for transitional delta/snapshot commits, `0x03` for framed
-pack, stream, or index-run carriers, and `0x07` for `INDEX_ROOT` commits; the
-signed section shape must agree with those bits. Readers support these shapes
-during the preview transition and fail closed on unknown required capabilities.
-
-Normal commits contain one encrypted `INDEX_RUN` and exactly the carrier
-permitted by their canonical shape. An all-delete or all-empty bounded batch
-needs no payload pack, while a zero-length streamed request deliberately keeps
-its authenticated `PAYLOAD` carrier. A catalog checkpoint commit contains an
-encrypted `INDEX_ROOT`. A checkpoint may
-also cover a final bounded mutation batch, but the catalog must describe the
-exact resulting state.
+Capability bits currently authenticate signed section digests (`0x01`), framed
+index sections (`0x02`), compacted-run roots (`0x04`), and standalone references
+(`0x08`). Delta headers advertise `0x0b`; root headers advertise `0x0f`. Roots
+accept tiers zero and one. Unknown required capabilities fail closed.
 
 The current framed index plaintext is wire version 6. Mutation ordinals,
 generations, content lengths, and bounded counts use canonical varints; readers
@@ -214,80 +194,30 @@ performs its own chunking and packing, so duplicating that work in the gateway
 is not a baseline optimization. The researched extension boundary is recorded
 in [Deduplication](deduplication.md).
 
-## Streamed Payload Carriers
+## Detached Payload Carriers
 
-A known-length or chunked unknown-length upload that exceeds the bounded pack
-path is one multipart-padded commit with exactly two required sections:
+Large streams upload encrypted segmented ciphertext under a fresh random
+`objects/v02/` key before publication. Known-length and unknown-length bodies
+use the same writer. Empty streams publish only metadata. The S3 listener still
+requires a length from `Content-Length` or valid SigV4 streaming metadata;
+unsigned HTTP chunked `PutObject` receives `411 MissingContentLength`.
 
-```text
-0  PAYLOAD
-1  INDEX_RUN
-```
+The writer verifies the completed exact object version, length, post-completion
+retention deadline, exact EOF, and full ciphertext digest. A short fenced
+`[INDEX_RUN]` commit then publishes the encrypted reference. Payload storage
+alone does not make a value visible. A stalled, truncated, oversized, or failed
+body does not publish a value. A failed publication can leave an opaque orphan
+for later guarded reclamation. Registered in-flight objects are protected from
+same-process GC; maintenance across processes still requires external quiescence.
 
-The writer encrypts authenticated payload segments as the request body arrives,
-then finalizes and seals the covering run at EOF. It advances the anchor only
-after the complete commit version, object length, retention posture, and signed
-layout have been verified. A stalled or truncated request fails before
-publication.
-
-This is a repository-layer format capability. The current S3 listener supplies
-the length from `Content-Length` or valid SigV4 streaming metadata and rejects
-unsigned HTTP chunked `PutObject` without a length as `411 MissingContentLength`.
-The EOF-finalized path remains directly tested but is not currently a public
-unknown-length S3 operation.
-
-The embedded run uses a self-stream pointer. Its shared facts are the signed
-payload-section ordinal, opaque payload identity, and authenticated segmented
-header. The containing signed commit supplies the exact section offset, length,
-and digest. The run codec permits a zero-plaintext stream to keep this carrier:
-the payload section still contains an authenticated header, its run remains
-catalogued, and GC must retain the exact commit. This is distinct from an empty
-bounded value, which is index-only.
-
-Replay materializes a self-stream pointer into an exact commit reference.
-Compaction performs the same normalization before discarding the source-run
-boundary. An external stream carrier records:
-
-- exact commit key and provider version;
-- complete stored commit length and signed body digest;
-- historical keyring-envelope object and digest;
-- section-region start plus payload ordinal, offset, length, and digest; and
-- opaque payload identity and authenticated segmented-payload header.
-
-These facts are encrypted inside the run. The decoder rejects missing, unused,
-duplicate, out-of-order, mismatched-length, or out-of-object carriers. A
-compacted run has no self carrier: both embedded packs and streams become exact
-external references. Checkpointing and compaction therefore write index
-metadata only and never read, decrypt, or copy the streamed payload.
-
-A partial read derives the minimal complete ciphertext-segment span from the
-authenticated header and section facts, bounds it against the exact stored
-commit length, and issues an exact-version range `GET` when the provider supplies
-versions. A full streamed-carrier read opens one exact provider stream, validates
-the authenticated header before returning a response, authenticates bounded
-segment groups before releasing them, and verifies exact EOF plus the aggregate
-signed section digest before releasing the final group. A failure may leave the
-client with an authentic prefix but never forged plaintext or a falsely complete
-object. Decrypted range segments are cached under a process-local opaque digest
-of repository/keyring context,
-commit key/version/body/stored length, section ordinal/digest/start/offset/length,
-payload identity/header, and content length. The actual payload identity remains
-the AEAD associated-data identity. The synthetic cache identity is never written
-to the backend and adds no backend-visible name, although the provider still
-observes range offsets, lengths, timing, and cache misses.
-
-Known-length large payloads use a foreground standalone carrier. The gateway
-uploads encrypted segmented ciphertext under a fresh random `objects/v02/` key
-without holding the publication lock, renews the exact completed version's
-effective retention horizon from a post-completion clock capture, and verifies
-exact object identity, version, length, retention deadline, legal
-hold, exact EOF, and a complete ciphertext digest before publication. A short
-fenced publication then commits only the encrypted exact reference. Until that
-anchor transition succeeds the object is an invisible orphan. Process-local
-in-flight roots protect it from same-process GC; destructive maintenance across
-processes still requires the documented external quiescence guard. An
-ambiguous multipart completion or failed anchor transition can leave an opaque
-orphan for later report and guarded reclamation.
+The encrypted carrier record binds the exact object key and version, stored
+length, ciphertext digest, historical keyring envelope, and segmented header.
+Compaction and checkpoints preserve those facts without copying payloads.
+Partial reads fetch the exact ciphertext segments selected by the authenticated
+header. Full reads validate the header and each bounded segment group before
+release, then withhold the final group until exact EOF and the aggregate digest
+match. Cache identities bind repository/keyring context and all carrier, header,
+and content-length facts; decryption still uses the real payload identity.
 
 Gateway deduplication remains deferred because it adds equality and
 shared-liveness leakage; Kopia already chunks, packs, and deduplicates its own
@@ -298,9 +228,8 @@ and its own security and GC qualification.
 
 `INDEX_RUN` is the append-friendly unit for namespace mutations. Runs are
 immutable, sorted, encrypted, and divided into independently authenticated
-bounded frames. A normal commit embeds one recent run. Compaction may write a
-run as an exact-version `objects/v02/` object and later make it reachable from
-an accepted catalog.
+bounded frames. A normal commit embeds one recent run. Compaction writes metadata-only sibling commits and makes their exact run
+sections reachable from an accepted catalog.
 
 Each mutation carries a monotonic logical generation and is one of:
 
@@ -323,11 +252,10 @@ Runs contain two encrypted projections linked by mutation ordinal:
 The namespace projection stores the raw 32-byte blinded key, generation,
 compact payload pointer, trusted `HEAD` metadata, and retention state. The
 listing projection stores the encrypted logical path once together with
-generation, size, and modification time. Wire version 4 frame-local container
-tables separately dedupe exact pack and stream carriers, including commit keys,
-provider versions, stored lengths, signed digests, historical keyring context,
-and carrier-specific section facts. One run may carry either a self pack or a
-self stream, never both. Canonical varints and fixed-width binary fields replace
+generation, size, and modification time. Frame-local tables deduplicate exact
+pack and detached carriers, including object keys, provider versions, stored
+lengths, authenticated digests, and historical keyring context. A run may carry
+one self-pack declaration. Canonical varints and fixed-width binary fields replace
 JSON, hex,
 decimal byte arrays, durable prefix tokens, nested sealed manifests, and
 repeated per-record identifiers. Projection record counts and mutation-ordinal
@@ -380,7 +308,7 @@ epoch; every foreground compaction emits level 1 instead of incrementing a
 level counter. The decoder accepts only levels 0 and 1. Supporting another tier
 requires an explicit future capability and hostile-input review. Different
 mutations for the same key and generation are
-corruption. Source-relative self-pack and self-stream pointers are normalized to
+corruption. Source-relative self-pack pointers are normalized to
 exact external historical commit, version, section, payload, and
 keyring-envelope facts before source-run boundaries disappear. The result is
 split into the fewest bounded
@@ -483,7 +411,7 @@ Compaction and catalog publication use this order:
    pending mutations.
 2. Select and verify at most the oldest 128 level-0 runs, then merge that
    bounded foreground window newest-wins while retaining tombstones and
-   normalizing self-pack and self-stream references. Preserve newer level-0 and
+   normalizing self-pack references. Preserve newer level-0 and
    every existing level-1 reference unchanged.
 3. Shard the result on generation boundaries and write each metadata-only run
    in an unanchored delta-carrier commit that is a direct child of the captured
@@ -534,12 +462,10 @@ explicitly protected historical anchor. For each root it includes:
 - the active format root and keyring envelopes; and
 - keys needed to authenticate or decrypt those objects.
 
-A live payload reference protects its exact containing commit version. It does
+A live payload reference protects its exact pack commit or detached object version. It does
 not recursively protect every ancestor merely because the payload was first
 written in an old commit. GC resolves active runs by generation before deriving
-these exact payload roots. This includes streamed carriers normalized by
-compaction and zero-length streamed carriers whose payload section need not be
-read to answer the client. Conservative over-retention is permitted when a mark
+these exact payload roots. Empty foreground values have no payload dependency. Conservative over-retention is permitted when a mark
 cannot be proven complete; deletion on an incomplete or ambiguous mark is not.
 
 GC must finish the whole mark phase before deleting, fail closed on missing or
@@ -691,11 +617,8 @@ amplification ceilings apply everywhere.
 
 There is no stable repository-format promise yet. `commits/v01` is removed and
 unsupported without migration support. The gateway reads and writes the preview
-`commits/v02` envelope with index-run wire version 6. Version 4 introduced exact
-self/external streamed carriers, version 5 interns namespace-key identifiers,
-and version 6 raises the authenticated bounded pack capacity for high-throughput
-small-object batches. The current reader does not promise to open earlier
-preview run wires. Recreate evaluation
+`commits/v02` envelope with index-run wire version 6. The current reader rejects
+retired streamed-commit pointers and earlier preview layouts. Recreate evaluation
 repositories when the preview wire changes. Catalog, exact descriptors,
 framed streaming, and guarded metadata-only mixed-carrier compaction are
 integrated, while retained-provider restart/fault GC qualification and final

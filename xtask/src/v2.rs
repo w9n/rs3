@@ -478,7 +478,7 @@ where
     .context("failed to reopen renewed keyring envelope")?;
     let fresh_repository = V2CommitStore::new(store.clone(), reopened_keyring, commit_options);
     let verified = fresh_repository
-        .load_chain_from_anchor(&anchor)
+        .load_replay_chain_from_anchor(&anchor)
         .await
         .context("failed to verify anchor chain through renewed restore roots")?
         .map(|chain| chain.commits_newest_first.len())

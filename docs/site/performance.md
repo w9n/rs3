@@ -395,19 +395,15 @@ The current writer default is adaptive: small objects keep 512 B segments,
 medium objects use 8 KiB segments, and larger objects use 64 KiB segments. The
 historical fixed-size matrix below still explains the byte/request tradeoff.
 
-For `v2-preview`, bounded payload packs and unknown-length streamed payloads live
-inside signed commit objects. An unknown-length streamed write has the canonical
-section shape `[PAYLOAD, INDEX_RUN]`. A declared-length large write seals a
-random standalone payload concurrently, verifies the complete stored object,
-then publishes an `[INDEX_RUN]` exact reference. Both paths enter the same
-checkpoint, compaction, recovery, and GC graph. Payload carriers have
-authenticated per-payload identities and segmented-header facts, so range reads
-can verify and decrypt the requested segments without reading unrelated
-ciphertext.
+For `v2-preview`, bounded payload packs live inside signed commit objects.
+Nonempty large streams seal a random standalone payload, verify its complete
+stored bytes, and publish an `[INDEX_RUN]` exact reference. Empty streams publish
+only metadata. These paths share checkpoint, compaction, recovery, and GC.
+Authenticated segmented-header facts allow range reads without unrelated bytes.
 
 Repeated or concurrent overlapping streamed ranges reuse the decrypted-segment
 cache behind a striped per-payload fill gate. Its in-memory cache identity binds
-repository/keyring context and the exact commit, version, body, section,
+repository/keyring context and the exact object, version, digest,
 payload-header, and content-length facts, while AEAD still uses the actual
 payload ID. This hardening changes cache correctness, not the amount of backend
 data required for a cache miss. Large declared-length PUT bodies can overlap;

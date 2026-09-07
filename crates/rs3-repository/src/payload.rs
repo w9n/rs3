@@ -11,6 +11,7 @@ const PAYLOAD_SEGMENT_AAD_DOMAIN: &[u8] = b"rs3:payload-segment-associated-data:
 const STREAMABLE_PAYLOAD_OBJECT_DOMAIN: &[u8] = b"rs3:payload-object:v2-streamable\n";
 const STREAMABLE_PAYLOAD_SEGMENT_AAD_DOMAIN: &[u8] =
     b"rs3:payload-segment-associated-data:v2-streamable\n";
+#[cfg(test)]
 pub(crate) const PAYLOAD_HEADER_PROBE_LEN: u64 = 128;
 /// Default plaintext bytes per independently encrypted payload segment.
 pub const DEFAULT_PAYLOAD_SEGMENT_SIZE: usize = 512;

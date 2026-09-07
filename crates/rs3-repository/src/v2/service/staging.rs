@@ -351,11 +351,6 @@ impl PendingV2State {
         Ok(())
     }
 
-    /// Advances an empty overlay already validated under the publication barrier.
-    pub(super) fn reset_after_validated_publication(&mut self, accepted_sequence: Sequence) {
-        self.allocation_sequence = accepted_sequence;
-    }
-
     #[cfg(test)]
     pub(super) fn manifests(&self) -> &[(ManifestId, TrustedManifest)] {
         &self.manifests
@@ -926,13 +921,7 @@ mod tests {
             blind_key,
             object_id: object_id("pending"),
             object_version_id: None,
-            payload_ref: Some(PayloadReference::V2Self {
-                payload_id: object_id("pending-payload"),
-                payload_header: None,
-                sections_start: None,
-                offset: 0,
-                length: 0,
-            }),
+            payload_ref: Some(PayloadReference::Pending),
             manifest_id: manifest_id(manifest),
             content_len: 1,
             modified_at_ms: i64::try_from(generation.get()).expect("generation fits"),

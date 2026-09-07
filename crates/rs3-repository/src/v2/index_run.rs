@@ -371,8 +371,7 @@ pub fn seal_v2_index_run(
     let container_count = run
         .containers
         .len()
-        .checked_add(run.stream_containers.len())
-        .and_then(|count| count.checked_add(run.standalone_stream_containers.len()))
+        .checked_add(run.standalone_stream_containers.len())
         .ok_or(V2FormatError::IndexRunLimitExceeded)?;
     let container_count = to_u32(container_count)?;
     let run_id = V2IndexRunId::generate()?;
@@ -665,8 +664,7 @@ fn verify_logical_directory_match(
     let container_count = run
         .containers
         .len()
-        .checked_add(run.stream_containers.len())
-        .and_then(|count| count.checked_add(run.standalone_stream_containers.len()))
+        .checked_add(run.standalone_stream_containers.len())
         .ok_or(V2FormatError::IndexRunLimitExceeded)?;
     if run.sequence != directory.sequence
         || run.mutations.len() != directory.mutation_count as usize
@@ -1330,8 +1328,8 @@ mod tests {
     use rs3_index::run::{
         IndexBlindKey, IndexMutation, IndexPackRecordPointer, IndexPayloadPointer, IndexRun,
         IndexRunContainer, IndexRunFrameRole, IndexRunKeyringRef, IndexRunLimits,
-        IndexRunSearchBound, IndexRunSelfPack, IndexRunSelfStream, IndexRunStreamContainer,
-        IndexTombstone, IndexUpsert, encode_index_run_frames,
+        IndexRunSearchBound, IndexRunSelfPack, IndexRunStandaloneStreamContainer, IndexTombstone,
+        IndexUpsert, encode_index_run_frames,
     };
     use rs3_types::{
         BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus,
@@ -1401,7 +1399,7 @@ mod tests {
                 stored_len: 128,
                 record_count: 4,
             }),
-            self_stream: None,
+
             containers: vec![IndexRunContainer {
                 object_id: object_id("objects/v02/pack-a"),
                 version_id: Some(must(BackendVersionId::new("version-3"))),
@@ -1418,7 +1416,7 @@ mod tests {
                 content_key_id: must(KeyId::new("content-v0")),
                 pack_record_count: 8,
             }],
-            stream_containers: Vec::new(),
+
             standalone_stream_containers: Vec::new(),
             mutations: vec![
                 IndexMutation::Upsert(IndexUpsert {
@@ -1489,34 +1487,7 @@ mod tests {
         }
     }
 
-    fn self_stream_fixture() -> IndexRun {
-        IndexRun {
-            sequence: Sequence::new(31),
-            self_pack: None,
-            self_stream: Some(IndexRunSelfStream {
-                payload_section_ordinal: 0,
-                payload_id: object_id("payloads/v02/self-stream"),
-                payload_header: stream_header(),
-            }),
-            containers: Vec::new(),
-            stream_containers: Vec::new(),
-            standalone_stream_containers: Vec::new(),
-            mutations: vec![IndexMutation::Upsert(IndexUpsert {
-                mutation_ordinal: 0,
-                blind_key: IndexBlindKey::from_bytes([0x92; 32]),
-                namespace_key_id: must(KeyId::new("namespace")),
-                path: must(LogicalPath::new("tenant/self-stream")),
-                generation: Sequence::new(31),
-                payload: IndexPayloadPointer::SelfStream,
-                content_len: stream_header().plaintext_len,
-                modified_at_ms: 31,
-                retention: None,
-                legal_hold: None,
-            })],
-        }
-    }
-
-    fn external_stream_fixture() -> IndexRun {
+    fn standalone_stream_fixture() -> IndexRun {
         let payload_header = stream_header();
         let payload_section_len = payload_header.header_len
             + payload_header.plaintext_len
@@ -1527,33 +1498,26 @@ mod tests {
         IndexRun {
             sequence: Sequence::new(32),
             self_pack: None,
-            self_stream: None,
+
             containers: Vec::new(),
-            stream_containers: vec![IndexRunStreamContainer {
+            standalone_stream_containers: vec![IndexRunStandaloneStreamContainer {
                 object_id: object_id("commits/v02/external-stream"),
                 version_id: Some(must(BackendVersionId::new("stream-version-4"))),
-                stored_len: 200_000,
-                commit_body_digest: [0x93; 32],
+                stored_len: payload_section_len,
+                object_digest: [0x93; 32],
                 keyring_envelope: IndexRunKeyringRef {
                     object_id: object_id("metadata/v02/stream-keyring"),
                     digest: [0x94; 32],
                 },
-                sections_start: 8_192,
-                payload_section_ordinal: 0,
-                payload_section_offset: 512,
-                payload_section_len,
-                payload_section_digest: [0x95; 32],
-                payload_id: object_id("payloads/v02/external-stream"),
                 payload_header,
             }],
-            standalone_stream_containers: Vec::new(),
             mutations: vec![IndexMutation::Upsert(IndexUpsert {
                 mutation_ordinal: 0,
                 blind_key: IndexBlindKey::from_bytes([0x96; 32]),
                 namespace_key_id: must(KeyId::new("namespace")),
                 path: must(LogicalPath::new("tenant/external-stream")),
                 generation: Sequence::new(32),
-                payload: IndexPayloadPointer::ExternalStream {
+                payload: IndexPayloadPointer::ExternalStandaloneStream {
                     container_ordinal: 0,
                 },
                 content_len: stream_header().plaintext_len,
@@ -1637,10 +1601,8 @@ mod tests {
     fn streamed_payload_carriers_round_trip_through_outer_framing() {
         let keyring = keyring();
         let limits = IndexRunLimits::default();
-        for (name, run) in [
-            ("self", self_stream_fixture()),
-            ("external", external_stream_fixture()),
-        ] {
+        {
+            let (name, run) = ("standalone", standalone_stream_fixture());
             let object = object_id(&format!("commits/v02/{name}-stream-run"));
             let sealed = must(seal_v2_index_run(
                 &keyring,
@@ -1678,10 +1640,8 @@ mod tests {
     fn streamed_payload_carrier_frames_reject_tampering() {
         let keyring = keyring();
         let limits = IndexRunLimits::default();
-        for (name, run) in [
-            ("self", self_stream_fixture()),
-            ("external", external_stream_fixture()),
-        ] {
+        {
+            let (name, run) = ("standalone", standalone_stream_fixture());
             let object = object_id(&format!("commits/v02/{name}-stream-tamper"));
             let sealed = must(seal_v2_index_run(
                 &keyring,
@@ -1724,9 +1684,9 @@ mod tests {
         let run = IndexRun {
             sequence: Sequence::new(21),
             self_pack: None,
-            self_stream: None,
+
             containers: Vec::new(),
-            stream_containers: Vec::new(),
+
             standalone_stream_containers: Vec::new(),
             mutations: vec![IndexMutation::Tombstone(IndexTombstone {
                 mutation_ordinal: 0,

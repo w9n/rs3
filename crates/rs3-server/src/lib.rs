@@ -66,6 +66,6 @@ pub use s3::{
     inspect_keyring_envelope_with_store, offline_maintenance_runtime_from_config,
     rewrap_keyring_envelope_from_tool_config, rewrap_keyring_envelope_with_store,
     v2_bootstrap_journal_is_initialized, verify_v2_recovery_bundle_from_tool_config,
-    verify_v2_recovery_bundle_with_store, write_v2_index_snapshot_from_config,
+    verify_v2_recovery_bundle_with_store,
 };
 pub use server::{GatewayServer, GatewayServerError};

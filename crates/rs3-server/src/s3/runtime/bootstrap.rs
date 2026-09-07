@@ -195,7 +195,7 @@ impl<J: Journal> Bootstrap<'_, J> {
         let options = bootstrap_commit_options(self.config, &loaded)?;
         let commits = V2CommitStore::new(self.store.clone(), loaded.keyring, options);
         let chain = commits
-            .load_chain_from_state(&anchor)
+            .load_replay_chain_from_state(&anchor)
             .await
             .map_err(repository_init)?;
         Ok(V2RepositoryInitReport {

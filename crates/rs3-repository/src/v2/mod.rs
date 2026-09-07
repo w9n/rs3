@@ -67,10 +67,7 @@ pub use maintenance::{
     V2OrphanCandidate, V2OrphanGcOptions, V2OrphanGcReport, V2OrphanObjectClass, V2OrphanReport,
     V2QuickMaintenanceOptions,
 };
-pub(crate) use payload_cache::{
-    V2StreamPayloadCacheIdentity, V2StreamPayloadCarrierCacheIdentity,
-    validated_v2_stream_payload_start,
-};
+pub(crate) use payload_cache::{V2StreamPayloadCacheIdentity, V2StreamPayloadCarrierCacheIdentity};
 pub use payload_pack::{
     V2_PAYLOAD_PACK_ID_LEN, V2_PAYLOAD_PACK_MAX_BYTES, V2_PAYLOAD_PACK_MAX_RECORDS,
     V2_PAYLOAD_PACK_SEGMENT_BYTES, V2OpenedPayloadPackRecordSpan, V2PayloadPackFacts,
@@ -87,13 +84,12 @@ pub use provider::{
     required_v2_provider_check_names,
 };
 pub use repository::{
-    DEFAULT_V2_FULL_CHAIN_MAX_BYTES, DEFAULT_V2_FULL_COMMIT_MAX_BYTES,
     DEFAULT_V2_REPLAY_MAX_COMMITS, DEFAULT_V2_REPLAY_MAX_RETAINED_BYTES,
     DEFAULT_V2_REPLAY_MAX_TOTAL_COMMIT_BYTES, DEFAULT_V2_REPLAY_READ_CHUNK_BYTES,
     DEFAULT_V2_STREAM_READ_STALL_TIMEOUT, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorState, V2CommitAnchor,
-    V2CommitChain, V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite,
-    V2MemoryAnchor, V2PreparedGenesis, V2RecoveryBundle, V2ReplayChain, V2ReplayCommit,
-    V2ReplayLimits, V2StoredCommit, v2_streaming_upload_working_set_bytes,
+    V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite, V2MemoryAnchor,
+    V2PreparedGenesis, V2RecoveryBundle, V2ReplayChain, V2ReplayCommit, V2ReplayLimits,
+    V2StoredCommit, v2_streaming_upload_working_set_bytes,
 };
 pub use service::{
     V2AuthenticatedReadBody, V2FullMaintenanceReport, V2Repository, V2ResolvedObject,

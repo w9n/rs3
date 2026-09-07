@@ -456,8 +456,8 @@ async fn weak_subjectivity_floor_rejects_rollback_before_storage_faults() {
         .write_child_commit(
             &anchor,
             V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexDelta,
-                0,
+                V2SectionType::IndexRun,
+                rs3_repository::v2::V2_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"newer state blocks rollback"),
             )]),
         )
@@ -520,8 +520,8 @@ async fn anchor_cas_conflict_storm_accepts_one_child_per_sequence() {
                     .write_child_commit(
                         &anchor,
                         V2CommitWrite::delta(vec![V2CommitSection::new(
-                            V2SectionType::IndexDelta,
-                            0,
+                            V2SectionType::IndexRun,
+                            rs3_repository::v2::V2_SECTION_FLAG_MUST_UNDERSTAND,
                             Bytes::from(format!("round-{round}-contender-{contender}")),
                         )]),
                     )
@@ -544,7 +544,7 @@ async fn anchor_cas_conflict_storm_accepts_one_child_per_sequence() {
             .expect("anchor should read")
             .expect("anchor should exist");
         let chain = repository
-            .load_chain_from_anchor(&anchor)
+            .load_replay_chain_from_anchor(&anchor)
             .await
             .expect("anchor-selected chain should verify")
             .expect("anchor-selected chain should exist");
@@ -936,12 +936,7 @@ async fn compaction_fault_case(fault: CompactionFault) -> CompactionTrace {
             .header
             .section_index
             .iter()
-            .filter(|section| {
-                matches!(
-                    section.section_type,
-                    V2SectionType::PayloadPack | V2SectionType::Payload
-                )
-            })
+            .filter(|section| matches!(section.section_type, V2SectionType::PayloadPack))
             .map(|section| {
                 let start = parsed.sections_start as u64 + section.offset;
                 start..start + section.length

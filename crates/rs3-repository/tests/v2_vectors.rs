@@ -26,7 +26,7 @@ impl V2VectorFixture {
         let parent_key = must_v2(V2CommitKey::from_parts(Sequence::new(41), [0x41; 32]));
         let section_region = Bytes::from_static(b"v2-vector-section-bytes");
         let section_index = vec![V2SectionDescriptor {
-            section_type: V2SectionType::IndexSnapshot,
+            section_type: V2SectionType::IndexRoot,
             offset: 0,
             length: section_region.len() as u64,
             flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
@@ -96,20 +96,18 @@ fn vector_valid_single_put() {
 }
 
 #[test]
-fn vector_valid_multipart_padded() {
-    let fixture = V2VectorFixture::new(V2UploadMode::MultipartPadded);
-    let body = fixture.encode(V2UploadMode::MultipartPadded);
-
-    let parsed = must_v2(parse_v2_commit_object(
-        &fixture.commit_key.object_id,
-        body,
-        &fixture.keyring,
+fn vector_rejects_retired_multipart_mode() {
+    let fixture = V2VectorFixture::new(V2UploadMode::SinglePut);
+    let mut body = fixture.encode(V2UploadMode::SinglePut).to_vec();
+    body[24] = 1;
+    assert!(matches!(
+        parse_v2_commit_object(
+            &fixture.commit_key.object_id,
+            Bytes::from(body),
+            &fixture.keyring
+        ),
+        Err(V2FormatError::UnsupportedUploadMode)
     ));
-
-    assert_eq!(
-        parsed.parsed_header.upload_mode,
-        V2UploadMode::MultipartPadded
-    );
 }
 
 #[test]

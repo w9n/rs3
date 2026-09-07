@@ -1069,28 +1069,6 @@ pub async fn export_v2_recovery_bundle_from_config(
     Ok(bundle)
 }
 
-/// Writes a full v2 index snapshot from the configured repository state.
-pub async fn write_v2_index_snapshot_from_config(
-    config: &RuntimeConfig,
-) -> Result<V2AnchorState, S3BoundaryError> {
-    if config.repository.format != RepositoryFormat::V2Preview {
-        return Err(repository_init(
-            "v2 index snapshots require the v2-preview repository format",
-        ));
-    }
-    if config.mode == GatewayMode::RestoreReadOnly {
-        return Err(repository_init(
-            "restore-readonly gateway mode cannot write a v2 index snapshot",
-        ));
-    }
-    let repository = RuntimeRepository::from_config(config).await?;
-    repository
-        .coordinator
-        .write_index_snapshot()
-        .await
-        .map_err(repository_init)
-}
-
 /// Imports a trusted v2 recovery bundle when the configured anchor is missing.
 pub async fn import_v2_anchor_from_config(
     config: &RuntimeConfig,

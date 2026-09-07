@@ -1,6 +1,5 @@
 //! Fuzz-only adapters for backend-controlled v2 parser inputs.
 
-use crate::checkpoint::open_index_delta_object;
 use crate::payload::{
     open_payload_object, parse_segmented_payload_header_with_total_len,
     seal_streamable_payload_object, segmented_ciphertext_span, total_segmented_payload_len,
@@ -20,12 +19,12 @@ use crate::v2::{
 };
 use bytes::Bytes;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
+use rs3_index::PayloadHeaderReference;
 use rs3_index::run::{
     IndexBlindKey, IndexMutation, IndexPayloadPointer, IndexRun, IndexRunKeyringRef,
     IndexRunLimits, IndexRunStandaloneStreamContainer, IndexTombstone, IndexUpsert,
     decode_index_run, encode_index_run,
 };
-use rs3_index::{PayloadHeaderReference, SealedIndexDeltaObject};
 use rs3_storage::ByteRange;
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath,
@@ -99,11 +98,7 @@ pub fn round_trip_v2_commit_structure(input: &[u8]) {
     } else {
         V2CommitKind::Delta
     };
-    let upload_mode = if selector & 2 == 0 {
-        V2UploadMode::SinglePut
-    } else {
-        V2UploadMode::MultipartPadded
-    };
+    let upload_mode = V2UploadMode::SinglePut;
     let commit_key = if kind == V2CommitKind::Root {
         V2CommitKey::from_parts(Sequence::new(1), [0x42; 32])
             .unwrap_or_else(|error| panic!("{error}"))
@@ -114,7 +109,7 @@ pub fn round_trip_v2_commit_structure(input: &[u8]) {
         .unwrap_or_else(|error| panic!("{error}"));
     let sections = if kind == V2CommitKind::Root {
         vec![V2SectionDescriptor {
-            section_type: V2SectionType::IndexSnapshot,
+            section_type: V2SectionType::IndexRoot,
             offset: 0,
             length: section_region.len() as u64,
             flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
@@ -124,14 +119,14 @@ pub fn round_trip_v2_commit_structure(input: &[u8]) {
         let payload_len = section_region.len() / 2;
         vec![
             V2SectionDescriptor {
-                section_type: V2SectionType::Payload,
+                section_type: V2SectionType::PayloadPack,
                 offset: 0,
                 length: payload_len as u64,
                 flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
                 digest: digest_v2_section(&section_region[..payload_len]),
             },
             V2SectionDescriptor {
-                section_type: V2SectionType::IndexDelta,
+                section_type: V2SectionType::IndexRun,
                 offset: payload_len as u64,
                 length: (section_region.len() - payload_len) as u64,
                 flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
@@ -205,18 +200,6 @@ pub fn round_trip_v2_commit_structure(input: &[u8]) {
 /// Decodes one canonical CBOR value with the same primitive reader used by commits.
 pub fn decode_canonical_cbor(input: &[u8]) -> V2Result<()> {
     super::cbor::fuzz_decode_one(input).map_err(|_| V2FormatError::MalformedCbor)
-}
-
-/// Decodes the sealed index-delta object shape used by v2 commit replay.
-pub fn decode_index_delta_object(input: &[u8]) {
-    if input.len() > MAX_FUZZ_INPUT_LEN {
-        return;
-    }
-
-    let Ok(sealed_delta) = serde_json::from_slice::<SealedIndexDeltaObject>(input) else {
-        return;
-    };
-    let _ = open_index_delta_object(&signing_keyring(), &object_id("index/fuzz"), &sealed_delta);
 }
 
 /// Exercises the current v6 plaintext index-run parser with raw and near-valid inputs.
@@ -361,9 +344,9 @@ fn standalone_index_run_fixture() -> IndexRun {
     IndexRun {
         sequence: Sequence::new(7),
         self_pack: None,
-        self_stream: None,
+
         containers: Vec::new(),
-        stream_containers: Vec::new(),
+
         standalone_stream_containers: vec![IndexRunStandaloneStreamContainer {
             object_id: object_id("objects/v02/fuzz-standalone"),
             version_id: Some(version_id("fuzz-version")),

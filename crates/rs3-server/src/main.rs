@@ -22,7 +22,6 @@ use rs3_server::{
     import_v2_anchor_from_config, inspect_keyring_envelope_from_tool_config,
     provider_conformance_target_fingerprint, rewrap_keyring_envelope_from_tool_config,
     runtime_config_profile, verify_v2_recovery_bundle_from_tool_config,
-    write_v2_index_snapshot_from_config,
 };
 use rs3_server::{
     KeyringEnvelopeInspectOptions, KeyringEnvelopeInspectReport, KeyringEnvelopeRewrapOptions,
@@ -130,11 +129,6 @@ enum Commands {
         /// Maximum time to wait for initialization and current qualification.
         #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
-    },
-    /// Write a v2 index snapshot and report the accepted anchor state.
-    WriteIndexSnapshot {
-        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
-        format: RecoveryReportFormat,
     },
     /// Probe v2 object-store behavior required by the repository format.
     CheckV2Provider {
@@ -477,12 +471,7 @@ async fn main() -> Result<()> {
             let config = RuntimeConfig::from_env()?;
             cli_init::wait_for_journal(&config, &journal_file, timeout_seconds).await?;
         }
-        Commands::WriteIndexSnapshot { format } => {
-            let config = RuntimeConfig::from_env()?;
-            log_runtime_config(&config);
-            let anchor = write_v2_index_snapshot_from_config(&config).await?;
-            print_v2_anchor_state("rs3.v2-index-snapshot.v1", &anchor, format)?;
-        }
+
         Commands::CheckV2Provider {
             probe_prefix,
             legal_hold,
@@ -1302,27 +1291,6 @@ fn print_v2_restore_bundle(bundle: &V2RecoveryBundle, format: RecoveryReportForm
             if let Some(signature) = bundle.offline_signature.as_ref() {
                 println!("offline_signature={}", hex::encode(signature));
             }
-        }
-    }
-    Ok(())
-}
-
-fn print_v2_anchor_state(
-    schema: &'static str,
-    anchor: &V2AnchorState,
-    format: RecoveryReportFormat,
-) -> Result<()> {
-    match format {
-        RecoveryReportFormat::Json => {
-            let report = serde_json::json!({
-                "schema": schema,
-                "anchor": serde_json::to_value(anchor)?,
-            });
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        RecoveryReportFormat::Text => {
-            println!("schema={schema}");
-            print_v2_anchor_text(anchor);
         }
     }
     Ok(())

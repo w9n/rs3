@@ -480,8 +480,8 @@ mod tests {
                     inner: V2MemoryAnchor::with_state(forked),
                 },
                 V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
+                    V2SectionType::IndexRun,
+                    rs3_repository::v2::V2_SECTION_FLAG_MUST_UNDERSTAND,
                     Bytes::from_static(b"offline-orphan"),
                 )]),
             )
