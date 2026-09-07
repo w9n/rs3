@@ -569,6 +569,14 @@ impl BlobMultipartUpload for S3MultipartUpload {
     }
 
     async fn complete(self: Box<Self>) -> Result<BlobMetadata> {
+        if self.parts.is_empty() || self.parts.iter().any(Option::is_none) {
+            if self.abort().await.is_err() {
+                record_s3_multipart_abort_failure("validation_failed", "provider");
+            }
+            return Err(StorageError::Provider(
+                "multipart upload has missing parts".to_owned(),
+            ));
+        }
         let Self {
             store,
             client,
@@ -580,12 +588,7 @@ impl BlobMultipartUpload for S3MultipartUpload {
             content_len,
             started,
         } = *self;
-        let mut completed = Vec::with_capacity(parts.len());
-        for part in parts {
-            completed.push(part.ok_or_else(|| {
-                StorageError::Provider("multipart upload has missing parts".to_owned())
-            })?);
-        }
+        let completed = parts.into_iter().flatten().collect();
         let multipart = CompletedMultipartUpload::builder()
             .set_parts(Some(completed))
             .build();

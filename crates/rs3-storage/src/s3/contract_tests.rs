@@ -26,6 +26,10 @@ impl Drop for ScriptedProvider {
 
 impl ScriptedProvider {
     async fn new(responses: Vec<String>) -> Self {
+        Self::with_status(200, responses).await
+    }
+
+    async fn with_status(status: u16, responses: Vec<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let endpoint = format!("http://{}", listener.local_addr().expect("address"));
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -45,7 +49,7 @@ impl ScriptedProvider {
                     .expect("requests")
                     .push(header.lines().next().expect("request line").to_owned());
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len(),
                 );
                 stream
@@ -327,4 +331,99 @@ async fn malformed_inventory_members_cannot_be_interpreted_as_an_empty_prefix() 
         provider.store.list_prefix_versions("objects/").await,
         Err(StorageError::InvalidListPage)
     );
+}
+
+fn upload_with_parts(
+    store: &S3BlobStore,
+    parts: Vec<Option<aws_sdk_s3::types::CompletedPart>>,
+) -> Box<dyn crate::BlobMultipartUpload> {
+    Box::new(super::S3MultipartUpload {
+        store: store.clone(),
+        client: store.client.clone(),
+        object_id: rs3_types::BackendObjectId::new("objects/multipart").expect("object ID"),
+        key: "objects/multipart".to_owned(),
+        upload_id: "fixture-upload".to_owned(),
+        options: crate::PutOptions::default(),
+        content_len: 1,
+        parts,
+        started: std::time::Instant::now(),
+    })
+}
+
+#[tokio::test]
+async fn invalid_multipart_completion_aborts_without_publishing() {
+    for status in [200, 403] {
+        for parts in [
+            Vec::new(),
+            vec![
+                None,
+                Some(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(2)
+                        .build(),
+                ),
+            ],
+        ] {
+            let provider = ScriptedProvider::with_status(
+                status,
+                vec![if status == 200 {
+                    String::new()
+                } else {
+                    "<Error><Code>AccessDenied</Code><Message>fixture denied</Message></Error>"
+                        .to_owned()
+                }],
+            )
+            .await;
+            let error = upload_with_parts(&provider.store, parts)
+                .complete()
+                .await
+                .expect_err("invalid upload must not complete");
+            assert_eq!(
+                error,
+                StorageError::Provider("multipart upload has missing parts".to_owned()),
+                "cleanup failure must not replace the validation error",
+            );
+            let requests = provider.requests.lock().expect("requests");
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("DELETE /bucket/objects/multipart?"));
+            let target = requests[0].split_whitespace().nth(1).expect("target");
+            let (_, query) = target.split_once('?').expect("upload query");
+            assert!(
+                query
+                    .split('&')
+                    .any(|pair| pair == "uploadId=fixture-upload")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn valid_multipart_completion_publishes_without_aborting() {
+    let provider = ScriptedProvider::new(vec![
+        "<CompleteMultipartUploadResult><ETag>fixture-etag</ETag></CompleteMultipartUploadResult>"
+            .to_owned(),
+        String::new(),
+    ])
+    .await;
+    let metadata = upload_with_parts(
+        &provider.store,
+        vec![Some(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(1)
+                .e_tag("fixture-part")
+                .build(),
+        )],
+    )
+    .complete()
+    .await
+    .expect("valid completion");
+    assert_eq!(metadata.content_len, 1);
+    assert_eq!(metadata.etag.as_deref(), Some("fixture-etag"));
+    let requests = provider.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0],
+        "POST /bucket/objects/multipart?uploadId=fixture-upload HTTP/1.1",
+    );
+    assert_eq!(requests[1], "HEAD /bucket/objects/multipart HTTP/1.1");
 }

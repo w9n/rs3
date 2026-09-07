@@ -117,7 +117,10 @@ older version, verify that the older exact version remains readable and cannot
 be deleted, and count delete markers when paging the inventory. Multipart tests
 check that duplicate or out-of-range internal parts fail without changing the
 accepted upload. These internal parts are distinct from client-facing S3
-multipart sessions.
+multipart sessions. SDK request fixtures verify that empty or missing-part
+completion attempts abort the internal upload without publishing it, including
+when cleanup is denied. Cleanup remains best effort; these tests do not prove
+cleanup after process cancellation.
 
 SDK response fixtures cover missing or non-advancing pagination cursors,
 missing completion flags, delete-marker-only pages and exact full-read lengths.
