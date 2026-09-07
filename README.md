@@ -37,6 +37,11 @@ See `docs/site/production-preview.md` for the preview contract and release
 gates, and `docs/site/release-process.md` for the artifact and publication
 checklist.
 
+The separate `rs3-console` crate is experimental operator tooling outside the
+production-preview gateway deployment contract. The gateway image and
+`rs3-gateway` Helm chart do not include or deploy it; run it separately for
+local or controlled inspection.
+
 ## Development
 
 This project is Nix-first.
@@ -108,7 +113,9 @@ tradeoff is useful.
 
 ## Workspace Layout
 
-- `crates/rs3-console`: read-only single-gateway operations console.
+- `crates/rs3-console`: experimental, read-only single-gateway operations
+  console. It is outside the gateway image, Helm chart, and production-preview
+  deployment contract.
 - `crates/rs3-types`: shared strongly typed identifiers and policy types.
 - `crates/rs3-crypto`: cryptographic primitives, envelopes, and key derivation
   boundaries.

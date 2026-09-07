@@ -361,9 +361,10 @@ For a controlled prototype deployment only:
 
 - use `RS3_ANCHOR_MODE=kubernetes-lease`
 - leave `RS3_WRITER_GUARD=required` enabled for read-write gateways
-- place the S3, admin, and console listeners behind TLS termination, or keep
-  them on cluster-local networks protected by NetworkPolicy or equivalent
-  controls
+- place the S3 and admin listeners behind TLS termination, or keep them on
+  cluster-local networks protected by NetworkPolicy or equivalent controls
+- if you run the separate experimental console, protect its listener and its
+  console-to-gateway admin hop with the same controls
 - use `repositoryKeys.create=true` or `repositoryKeys.existingSecret` in Helm
 - set `repository.allowInit=true` only for deliberate first initialization on a
   fresh backend prefix; turn it off for normal existing-repository serving
