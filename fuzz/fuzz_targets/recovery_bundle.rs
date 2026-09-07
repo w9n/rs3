@@ -13,7 +13,8 @@ fuzz_target!(|data: &[u8]| {
     let Ok(bundle) = V2RecoveryBundle::from_object_bytes(data) else {
         return;
     };
-    let encoded = bundle.to_object_bytes()
+    let encoded = bundle
+        .to_object_bytes()
         .unwrap_or_else(|error| panic!("parsed restore bundle failed to re-encode: {error}"));
     let decoded = V2RecoveryBundle::from_object_bytes(&encoded)
         .unwrap_or_else(|error| panic!("re-encoded restore bundle failed to parse: {error}"));

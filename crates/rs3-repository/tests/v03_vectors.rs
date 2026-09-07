@@ -1,4 +1,4 @@
-//! Executable repository-format v2 vectors.
+//! Executable repository-format v03 vectors.
 
 use bytes::Bytes;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
@@ -12,19 +12,19 @@ use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, Sequence,
 };
 
-struct V2VectorFixture {
+struct CommitVectorFixture {
     keyring: KeyRing,
     commit_key: V2CommitKey,
     header: V2CommitHeader,
     section_region: Bytes,
 }
 
-impl V2VectorFixture {
+impl CommitVectorFixture {
     fn new() -> Self {
         let keyring = signing_keyring();
         let commit_key = must_v2(V2CommitKey::from_parts(Sequence::new(42), [0x42; 32]));
         let parent_key = must_v2(V2CommitKey::from_parts(Sequence::new(41), [0x41; 32]));
-        let section_region = Bytes::from_static(b"v2-vector-section-bytes");
+        let section_region = Bytes::from_static(b"v03-vector-section-bytes");
         let section_index = vec![V2SectionDescriptor {
             section_type: V2SectionType::IndexRoot,
             offset: 0,
@@ -76,7 +76,7 @@ impl V2VectorFixture {
 
 #[test]
 fn vector_valid_single_put() {
-    let fixture = V2VectorFixture::new();
+    let fixture = CommitVectorFixture::new();
     let body = fixture.encode();
 
     let parsed = must_v2(parse_v2_commit_object(
@@ -93,7 +93,7 @@ fn vector_valid_single_put() {
 
 #[test]
 fn vector_rejects_nonzero_capability() {
-    let fixture = V2VectorFixture::new();
+    let fixture = CommitVectorFixture::new();
     let mut body = fixture.encode().to_vec();
     body[24] = 1;
     assert!(matches!(
@@ -139,7 +139,7 @@ struct InvalidVectorCase {
 }
 
 fn invalid_case_wrong_object_key() -> InvalidVectorCase {
-    let fixture = V2VectorFixture::new();
+    let fixture = CommitVectorFixture::new();
     let wrong_key = must_v2(V2CommitKey::from_parts(Sequence::new(42), [0x11; 32]));
     let body = fixture.encode();
     InvalidVectorCase {
@@ -152,7 +152,7 @@ fn invalid_case_wrong_object_key() -> InvalidVectorCase {
 }
 
 fn invalid_case_old_format_version() -> InvalidVectorCase {
-    let fixture = V2VectorFixture::new();
+    let fixture = CommitVectorFixture::new();
     let mut body = fixture.encode().to_vec();
     body[8..12].copy_from_slice(&2_u32.to_be_bytes());
     InvalidVectorCase {
@@ -165,7 +165,7 @@ fn invalid_case_old_format_version() -> InvalidVectorCase {
 }
 
 fn invalid_case_bad_signature() -> InvalidVectorCase {
-    let mut fixture = V2VectorFixture::new();
+    let mut fixture = CommitVectorFixture::new();
     fixture.header.signature[0] ^= 0x01;
     let body = fixture.encode();
     InvalidVectorCase {
@@ -178,7 +178,7 @@ fn invalid_case_bad_signature() -> InvalidVectorCase {
 }
 
 fn invalid_case_bad_body_digest() -> InvalidVectorCase {
-    let fixture = V2VectorFixture::new();
+    let fixture = CommitVectorFixture::new();
     let mut body = fixture.encode().to_vec();
     let last = body.len() - 1;
     body[last] ^= 0x01;
@@ -192,7 +192,7 @@ fn invalid_case_bad_body_digest() -> InvalidVectorCase {
 }
 
 fn invalid_case_bad_algorithm() -> InvalidVectorCase {
-    let mut fixture = V2VectorFixture::new();
+    let mut fixture = CommitVectorFixture::new();
     fixture.header.algorithms.digest = "SHA-512".to_owned();
     fixture.header = must_v2(fixture.header.sign_with_keyring(&fixture.keyring));
     let body = fixture.encode();
@@ -206,7 +206,7 @@ fn invalid_case_bad_algorithm() -> InvalidVectorCase {
 }
 
 fn invalid_case_unsupported_capability() -> InvalidVectorCase {
-    let fixture = V2VectorFixture::new();
+    let fixture = CommitVectorFixture::new();
     let mut body = fixture.encode().to_vec();
     body[23] = 0x81;
     InvalidVectorCase {
@@ -219,7 +219,7 @@ fn invalid_case_unsupported_capability() -> InvalidVectorCase {
 }
 
 fn invalid_case_old_reader_version() -> InvalidVectorCase {
-    let fixture = V2VectorFixture::new();
+    let fixture = CommitVectorFixture::new();
     let mut body = fixture.encode().to_vec();
     body[12..16].copy_from_slice(&2_u32.to_be_bytes());
     InvalidVectorCase {
@@ -232,7 +232,7 @@ fn invalid_case_old_reader_version() -> InvalidVectorCase {
 }
 
 fn invalid_case_reserved_fixed_header() -> InvalidVectorCase {
-    let fixture = V2VectorFixture::new();
+    let fixture = CommitVectorFixture::new();
     let mut body = fixture.encode().to_vec();
     body[28] = 1;
     InvalidVectorCase {
@@ -251,7 +251,7 @@ fn signing_keyring() -> KeyRing {
             "signing",
             KeyPurpose::CheckpointSigning,
             KeyStatus::Primary,
-            0x02,
+            0x03,
         ),
     ]))
 }
@@ -299,5 +299,90 @@ fn must_crypto<T>(result: std::result::Result<T, rs3_crypto::CryptoError>) -> T 
     match result {
         Ok(value) => value,
         Err(error) => panic!("{error}"),
+    }
+}
+
+impl CommitVectorFixture {
+    fn shape(shape: u8) -> Self {
+        let mut fixture = Self::new();
+        let bytes = fixture.section_region.as_ref();
+        let descriptor = |section_type, offset: usize, length: usize| V2SectionDescriptor {
+            section_type,
+            offset: offset as u64,
+            length: length as u64,
+            flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+            digest: digest_v2_section(&bytes[offset..offset + length]),
+        };
+        fixture.header.kind = if shape == 0 {
+            V2CommitKind::Root
+        } else {
+            V2CommitKind::Delta
+        };
+        fixture.header.section_index = match shape {
+            0 => vec![descriptor(V2SectionType::IndexRoot, 0, bytes.len())],
+            1 => vec![descriptor(V2SectionType::IndexRun, 0, bytes.len())],
+            2 => vec![
+                descriptor(V2SectionType::PayloadPack, 0, 8),
+                descriptor(V2SectionType::IndexRun, 8, bytes.len() - 8),
+            ],
+            _ => panic!("unknown fixture shape"),
+        };
+        fixture.header.body_digest = must_v2(body_digest_for_v2_sections(
+            &fixture.header.section_index,
+            bytes,
+        ));
+        fixture.header = must_v2(fixture.header.sign_with_keyring(&fixture.keyring));
+        fixture
+    }
+}
+
+#[test]
+fn frozen_commit_shapes_verify_and_reject_every_truncation() {
+    let vectors = [
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-vectors/v03/v03_commit/commit-root.bin"
+        ))
+        .as_slice(),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-vectors/v03/v03_commit/commit-delta.bin"
+        ))
+        .as_slice(),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-vectors/v03/v03_commit/commit-pack.bin"
+        ))
+        .as_slice(),
+    ];
+    for (shape, expected) in vectors.into_iter().enumerate() {
+        let fixture = CommitVectorFixture::shape(shape as u8);
+        assert_eq!(fixture.encode().as_ref(), expected);
+        must_v2(parse_v2_commit_object(
+            &fixture.commit_key.object_id,
+            Bytes::copy_from_slice(expected),
+            &fixture.keyring,
+        ));
+        for length in 0..expected.len() {
+            assert!(
+                parse_v2_commit_object(
+                    &fixture.commit_key.object_id,
+                    Bytes::copy_from_slice(&expected[..length]),
+                    &fixture.keyring
+                )
+                .is_err(),
+                "shape {shape}, truncation {length}"
+            );
+        }
+        let mut trailing = expected.to_vec();
+        trailing.push(0);
+        assert!(
+            parse_v2_commit_object(
+                &fixture.commit_key.object_id,
+                Bytes::from(trailing),
+                &fixture.keyring
+            )
+            .is_err()
+        );
     }
 }

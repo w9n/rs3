@@ -35,7 +35,7 @@ const MAX_FUZZ_INPUT_LEN: usize = 1024 * 1024;
 const MAX_STRUCTURED_PAYLOAD_LEN: usize = 64 * 1024;
 
 /// Parses a candidate v2 commit header and round-trips successful decodes.
-pub fn parse_v2_commit_header_bytes(input: &[u8]) {
+pub fn parse_v03_commit_header_bytes(input: &[u8]) {
     if input.len() > MAX_FUZZ_INPUT_LEN {
         return;
     }
@@ -59,7 +59,7 @@ pub fn parse_v2_commit_header_bytes(input: &[u8]) {
 }
 
 /// Parses a candidate v2 commit object and round-trips successful decodes.
-pub fn parse_v2_commit_object_bytes(input: &[u8]) {
+pub fn parse_v03_commit_object_bytes(input: &[u8]) {
     if input.len() > MAX_FUZZ_INPUT_LEN {
         return;
     }
@@ -82,7 +82,7 @@ pub fn parse_v2_commit_object_bytes(input: &[u8]) {
 }
 
 /// Builds a bounded signed commit from fuzz bytes and exercises the reachable parser path.
-pub fn round_trip_v2_commit_structure(input: &[u8]) {
+pub fn round_trip_v03_commit_structure(input: &[u8]) {
     if input.len() > MAX_FUZZ_INPUT_LEN {
         return;
     }
@@ -201,7 +201,7 @@ pub fn decode_canonical_cbor(input: &[u8]) -> V2Result<()> {
 }
 
 /// Exercises the current v6 plaintext index-run parser with raw and near-valid inputs.
-pub fn decode_v6_index_run(input: &[u8]) {
+pub fn decode_v03_index_run(input: &[u8]) {
     if input.len() > MAX_FUZZ_INPUT_LEN {
         return;
     }
@@ -221,7 +221,7 @@ pub fn decode_v6_index_run(input: &[u8]) {
 }
 
 /// Exercises the authenticated index-root envelope and its current canonical decoder.
-pub fn open_v2_index_root_object(input: &[u8]) {
+pub fn open_v03_index_root_object(input: &[u8]) {
     if input.len() > MAX_FUZZ_INPUT_LEN {
         return;
     }
@@ -263,7 +263,7 @@ pub fn open_v2_index_root_object(input: &[u8]) {
 }
 
 /// Exercises payload-pack fact validation, exact range planning, and segment AEAD opening.
-pub fn open_v2_payload_pack(input: &[u8]) {
+pub fn open_v03_payload_pack(input: &[u8]) {
     if input.len() > MAX_FUZZ_INPUT_LEN {
         return;
     }
@@ -309,7 +309,7 @@ pub fn open_v2_payload_pack(input: &[u8]) {
 }
 
 /// Exercises authenticated standalone layout bounds, spans and ciphertext tampering.
-pub fn parse_segmented_payload(input: &[u8]) {
+pub fn open_v03_standalone_single(input: &[u8]) {
     if input.is_empty() || input.len() > MAX_FUZZ_INPUT_LEN {
         return;
     }

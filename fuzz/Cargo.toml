@@ -13,60 +13,66 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 rs3-crypto = { path = "../crates/rs3-crypto", features = ["fuzzing"] }
 rs3-repository = { path = "../crates/rs3-repository", features = ["fuzzing"] }
-serde_json = "1.0.140"
 
 [[bin]]
-name = "v2_commit"
-path = "fuzz_targets/v2_commit.rs"
+name = "v03_commit"
+path = "fuzz_targets/v03_commit.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "v2_cbor"
-path = "fuzz_targets/v2_cbor.rs"
+name = "canonical_cbor"
+path = "fuzz_targets/canonical_cbor.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "keyring_envelope"
-path = "fuzz_targets/keyring_envelope.rs"
+name = "repository_envelope"
+path = "fuzz_targets/repository_envelope.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "restore_bundle"
-path = "fuzz_targets/restore_bundle.rs"
+name = "recovery_bundle"
+path = "fuzz_targets/recovery_bundle.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "v6_index_run"
-path = "fuzz_targets/v6_index_run.rs"
+name = "v03_index_run"
+path = "fuzz_targets/v03_index_run.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "v2_index_root"
-path = "fuzz_targets/v2_index_root.rs"
+name = "v03_index_root"
+path = "fuzz_targets/v03_index_root.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "v2_payload_pack"
-path = "fuzz_targets/v2_payload_pack.rs"
+name = "v03_payload_pack"
+path = "fuzz_targets/v03_payload_pack.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "segmented_payload"
-path = "fuzz_targets/segmented_payload.rs"
+name = "v03_standalone_single"
+path = "fuzz_targets/v03_standalone_single.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v03_format_root"
+path = "fuzz_targets/v03_format_root.rs"
 test = false
 doc = false
 bench = false

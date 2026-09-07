@@ -546,6 +546,107 @@ mod tests {
         }
     }
 
+    // Fixed nonce and public keys are solely for reproducible protocol test vectors.
+    fn fixed_envelope(purpose: EnvelopePurpose) -> RepositoryEnvelope {
+        let plaintext = match purpose {
+            EnvelopePurpose::Keyring => keyring_plaintext_bytes(
+                &KeyRing::new(vec![KeyMaterial::new(
+                    KeyDescriptor {
+                        id: KeyId::new("namespace").expect("id"),
+                        purpose: KeyPurpose::Namespace,
+                        status: KeyStatus::Primary,
+                        created_at_ms: 0,
+                        public_key: None,
+                    },
+                    secret(4),
+                )])
+                .expect("fixture keyring"),
+            )
+            .expect("plaintext")
+            .to_vec(),
+            EnvelopePurpose::Format => b"format plaintext".to_vec(),
+        };
+        let mut envelope = RepositoryEnvelope {
+            version: 3,
+            purpose,
+            generation: 1,
+            repository_id: context().repository_id().clone(),
+            repository_salt: vec![2; 32],
+            wrapping_key_id: "wrap-v1".to_owned(),
+            nonce: vec![3; 12],
+            ciphertext: plaintext,
+            tag: vec![0; 16],
+        };
+        let aad = envelope.associated_data();
+        let tag = envelope_cipher(&secret(9), purpose)
+            .expect("fixture cipher")
+            .encrypt_in_place_detached(
+                Nonce::from_slice(&envelope.nonce),
+                &aad,
+                &mut envelope.ciphertext,
+            )
+            .expect("fixture encryption");
+        envelope.tag = tag.to_vec();
+        envelope
+    }
+
+    #[test]
+    fn frozen_canonical_envelopes_authenticate_and_reject_every_truncation() {
+        for (purpose, expected) in [
+            (
+                EnvelopePurpose::Keyring,
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../test-vectors/v03/repository_envelope/keyring.cbor"
+                ))
+                .as_slice(),
+            ),
+            (
+                EnvelopePurpose::Format,
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../test-vectors/v03/repository_envelope/format.cbor"
+                ))
+                .as_slice(),
+            ),
+        ] {
+            let envelope = fixed_envelope(purpose);
+            assert_eq!(envelope.to_object_bytes().expect("encode"), expected);
+            let parsed = RepositoryEnvelope::from_object_bytes(expected, purpose)
+                .expect("canonical envelope");
+            let plaintext = parsed
+                .open(purpose, &context(), "wrap-v1", &secret(9))
+                .expect("authenticate");
+            if purpose == EnvelopePurpose::Keyring {
+                let keyring = decode_keyring_plaintext(&plaintext).expect("valid keyring");
+                assert_eq!(
+                    keyring.primary_namespace_key_id().expect("namespace"),
+                    KeyId::new("namespace").expect("id")
+                );
+            } else {
+                assert_eq!(&*plaintext, b"format plaintext");
+            }
+            for length in 0..expected.len() {
+                assert!(
+                    RepositoryEnvelope::from_object_bytes(&expected[..length], purpose).is_err()
+                );
+            }
+            assert!(
+                parsed
+                    .open(purpose, &context(), "wrong-wrap", &secret(9))
+                    .is_err()
+            );
+            let wrong_salt =
+                RepositoryKeyContext::new(context().repository_id().clone(), vec![4; 32])
+                    .expect("context");
+            assert!(
+                parsed
+                    .open(purpose, &wrong_salt, "wrap-v1", &secret(9))
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn canonical_envelopes_round_trip_with_separate_purposes() {
         for purpose in [EnvelopePurpose::Keyring, EnvelopePurpose::Format] {

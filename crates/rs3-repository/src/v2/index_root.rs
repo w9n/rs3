@@ -1228,6 +1228,15 @@ mod tests {
     }
 
     #[test]
+    fn frozen_root_plaintext_preserves_canonical_bytes() {
+        let expected = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-vectors/v03/v03_index_root/root.bin"
+        ));
+        assert_eq!(must(super::encode_root(&fixture())), expected);
+    }
+
+    #[test]
     fn canonical_logical_encoding_is_stable() {
         let encoded = must(super::encode_root(&fixture()));
         let digest: [u8; 32] = Sha256Hasher::digest(encoded);

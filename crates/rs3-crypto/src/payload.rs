@@ -235,6 +235,48 @@ mod tests {
     }
 
     #[test]
+    fn frozen_pack_and_standalone_segments_pin_domain_separation() {
+        let object = rs3_types::BackendObjectId::new("opaque-a").expect("object");
+        for (section, expected) in [
+            (
+                Some(0),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../test-vectors/v03/v03_payload_pack/segment.bin"
+                ))
+                .as_slice(),
+            ),
+            (
+                None,
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../test-vectors/v03/v03_standalone_single/segment.bin"
+                ))
+                .as_slice(),
+            ),
+        ] {
+            let context = super::PayloadSegmentContext {
+                section_ordinal: section,
+                ..segment_context(&object)
+            };
+            let ring = keyring(2);
+            let sealed = ring.seal_payload_segment(context, b"hello").expect("seal");
+            assert_eq!(sealed.ciphertext, expected);
+            assert_eq!(
+                ring.open_payload_segment(&sealed.key_id, context, expected)
+                    .expect("open"),
+                b"hello"
+            );
+            for length in 0..expected.len() {
+                assert!(
+                    ring.open_payload_segment(&sealed.key_id, context, &expected[..length])
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn shared_segment_nonce_matches_independent_hmac_vector() {
         let object = rs3_types::BackendObjectId::new("opaque-a").expect("object");
         let context = segment_context(&object);

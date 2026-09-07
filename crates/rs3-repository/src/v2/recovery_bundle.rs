@@ -168,6 +168,13 @@ mod tests {
         );
         assert_eq!(hex::encode(&bytes), expected);
         assert_eq!(
+            bytes.as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../test-vectors/v03/recovery_bundle/unsigned.cbor"
+            ))
+        );
+        assert_eq!(
             V2RecoveryBundle::from_object_bytes(&bytes).expect("decode"),
             bundle
         );

@@ -18,6 +18,25 @@ just check
 
 This runs formatting, clippy with warnings denied, and workspace tests.
 
+## v03 Codec Fixtures
+
+`cargo test -p rs3-repository --test v03_vectors` checks the signed commit
+fixtures. Workspace tests also pin index tables, roots, payload segments,
+repository envelopes and recovery bundles against `test-vectors/v03/`.
+That directory documents fixture keys, fixed test-only nonces and the named
+rejection tests. Fixed fixtures do not change production nonce generation.
+
+`just fuzz-smoke` exercises commit headers/objects, canonical CBOR, both
+repository-envelope purposes, recovery bundles, index runs/roots, format roots,
+payload packs and detached single-part payloads. It copies raw seeds and frozen
+vectors to temporary corpora so fuzzing does not modify the fixtures. Defaults
+are 60 seconds per target and a 512 MiB per-target RSS ceiling; use
+`RS3_FUZZ_SMOKE_SECONDS` and `RS3_FUZZ_RSS_LIMIT_MB` for an explicit local override.
+
+Strict parent-relative publication-time validation remains unimplemented.
+Codec vectors do not establish that runtime history guarantee or replace
+retained-provider and complete recovery qualification.
+
 ## Important Lanes
 
 | Lane | Command | Scope |

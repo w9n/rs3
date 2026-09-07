@@ -49,19 +49,23 @@ fuzz-smoke:
     RUSTC_BOOTSTRAP=1 cargo fuzz build --sanitizer none
     pids=()
     for target in \
-      v2_commit \
-      v2_cbor \
-      keyring_envelope \
-      restore_bundle \
-      v6_index_run \
-      v2_index_root \
-      v2_payload_pack \
-      segmented_payload
+      v03_commit \
+      canonical_cbor \
+      repository_envelope \
+      recovery_bundle \
+      v03_index_run \
+      v03_index_root \
+      v03_format_root \
+      v03_payload_pack \
+      v03_standalone_single
     do
       corpus="${tmpdir}/${target}"
       mkdir -p "${corpus}"
       if [[ -d "fuzz/corpus/${target}" ]]; then
         cp -R "fuzz/corpus/${target}/." "${corpus}/"
+      fi
+      if [[ -d "test-vectors/v03/${target}" ]]; then
+        cp -R "test-vectors/v03/${target}/." "${corpus}/"
       fi
       RUSTC_BOOTSTRAP=1 cargo fuzz run --sanitizer none "${target}" "${corpus}" -- -max_total_time="${seconds}" -rss_limit_mb="${rss_limit_mb}" &
       pids+=("$!")

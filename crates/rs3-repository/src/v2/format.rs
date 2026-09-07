@@ -193,6 +193,26 @@ mod tests {
     use rs3_types::RetentionMode;
 
     #[test]
+    fn frozen_retained_format_root_has_exact_canonical_bytes() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-vectors/v03/v03_format_root/retained.cbor"
+        ));
+        let root = V2FormatRoot::from_plaintext_bytes(bytes).expect("format fixture");
+        assert_eq!(root.format_version, 3);
+        assert_eq!(root.repository_id.as_str(), "r");
+        assert_eq!(
+            root.provider_profile,
+            V2ProviderProfile::RetainedVersionObjectLock
+        );
+        assert_eq!(
+            root.retention,
+            Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
+        );
+        assert_eq!(root.to_plaintext_bytes().expect("encode"), bytes);
+    }
+
+    #[test]
     fn format_root_cbor_preserves_provider_and_retention_duration() {
         for profile in [
             V2ProviderProfile::Dev,

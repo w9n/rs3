@@ -3201,6 +3201,35 @@ mod tests {
     }
 
     #[test]
+    fn frozen_container_tables_preserve_canonical_wire_bytes() {
+        for (run, expected) in [
+            (
+                fixture(),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../test-vectors/v03/v03_index_run/external-pack.bin"
+                ))
+                .as_slice(),
+            ),
+            (
+                standalone_stream_fixture(),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../test-vectors/v03/v03_index_run/standalone.bin"
+                ))
+                .as_slice(),
+            ),
+        ] {
+            let limits = IndexRunLimits::default();
+            assert_eq!(encode_index_run(&run, &limits).expect("encode"), expected);
+            assert_eq!(decode_index_run(expected, &limits).expect("decode"), run);
+            for length in 0..expected.len() {
+                assert!(decode_index_run(&expected[..length], &limits).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn retired_commit_stream_pointer_tags_fail_closed() {
         for tag in [3, 4] {
             assert_eq!(
