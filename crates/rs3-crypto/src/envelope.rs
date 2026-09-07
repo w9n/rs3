@@ -592,19 +592,27 @@ mod tests {
             .rewrap(&context, "wrap-v1", &secret(9), "wrap-v2", &secret(10), 2)
             .unwrap_or_else(|error| panic!("{error}"));
 
+        let object = rs3_types::BackendObjectId::new("opaque-payload").expect("object");
+        let segment_context = crate::PayloadSegmentContext {
+            repository_context: b"repository/keyring",
+            containing_object: &object,
+            section_ordinal: None,
+            carrier_id: &[7; 32],
+            attempt_id: rs3_types::PayloadAttemptId::from_bytes([8; 32]),
+            part_ordinal: 1,
+            segment_ordinal: 0,
+            plaintext_len: 7,
+            is_final: true,
+            layout_context: b"layout",
+        };
         let payload = keyring
-            .seal_payload_with_nonce(b"associated-data", b"payload", &[7; 24])
+            .seal_payload_segment(segment_context, b"payload")
             .unwrap_or_else(|error| panic!("{error}"));
         let opened = rewrapped
             .open(&context, "wrap-v2", &secret(10))
             .unwrap_or_else(|error| panic!("{error}"));
         let plaintext = opened
-            .open_payload(
-                &payload.key_id,
-                b"associated-data",
-                &payload.nonce,
-                &payload.ciphertext,
-            )
+            .open_payload_segment(&payload.key_id, segment_context, &payload.ciphertext)
             .unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(rewrapped.generation, 2);

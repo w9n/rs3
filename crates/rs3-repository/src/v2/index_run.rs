@@ -1324,7 +1324,7 @@ mod tests {
     };
     use bytes::Bytes;
     use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-    use rs3_index::PayloadHeaderReference;
+    use rs3_index::PayloadLayout;
     use rs3_index::run::{
         IndexBlindKey, IndexMutation, IndexPackRecordPointer, IndexPayloadPointer, IndexRun,
         IndexRunContainer, IndexRunFrameRole, IndexRunKeyringRef, IndexRunLimits,
@@ -1395,6 +1395,7 @@ mod tests {
             sequence: Sequence::new(9),
             self_pack: Some(IndexRunSelfPack {
                 pack_id: [0x11; 32],
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
                 content_key_id: must(KeyId::new("content-v1")),
                 stored_len: 128,
                 record_count: 4,
@@ -1413,6 +1414,7 @@ mod tests {
                 pack_section_offset: 512,
                 pack_section_len: 2_048,
                 pack_id: [0x44; 32],
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
                 content_key_id: must(KeyId::new("content-v0")),
                 pack_record_count: 8,
             }],
@@ -1477,23 +1479,26 @@ mod tests {
         }
     }
 
-    fn stream_header() -> PayloadHeaderReference {
-        PayloadHeaderReference {
+    fn stream_header() -> PayloadLayout {
+        PayloadLayout {
             chunk_size: 64 * 1024,
             plaintext_len: 131_089,
             key_id: must(KeyId::new("stream-content-v1")),
-            nonce_prefix: [0x91; 16],
-            header_len: 73,
+            carrier_id: [0x91; 32],
+            parts: vec![rs3_index::PayloadPart {
+                part_number: 1,
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x81; 32]),
+                plaintext_len: 131_089,
+            }],
         }
     }
 
     fn standalone_stream_fixture() -> IndexRun {
-        let payload_header = stream_header();
-        let payload_section_len = payload_header.header_len
-            + payload_header.plaintext_len
-            + payload_header
+        let payload_layout = stream_header();
+        let payload_section_len = payload_layout.plaintext_len
+            + payload_layout
                 .plaintext_len
-                .div_ceil(payload_header.chunk_size)
+                .div_ceil(payload_layout.chunk_size)
                 * 16;
         IndexRun {
             sequence: Sequence::new(32),
@@ -1509,7 +1514,7 @@ mod tests {
                     object_id: object_id("metadata/v02/stream-keyring"),
                     digest: [0x94; 32],
                 },
-                payload_header,
+                payload_layout,
             }],
             mutations: vec![IndexMutation::Upsert(IndexUpsert {
                 mutation_ordinal: 0,

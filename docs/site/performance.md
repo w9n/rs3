@@ -399,12 +399,12 @@ For `v2-preview`, bounded payload packs live inside signed commit objects.
 Nonempty large streams seal a random standalone payload, verify its complete
 stored bytes, and publish an `[INDEX_RUN]` exact reference. Empty streams publish
 only metadata. These paths share checkpoint, compaction, recovery, and GC.
-Authenticated segmented-header facts allow range reads without unrelated bytes.
+Authenticated selected-part layout facts allow range reads without unrelated bytes.
 
 Repeated or concurrent overlapping streamed ranges reuse the decrypted-segment
 cache behind a striped per-payload fill gate. Its in-memory cache identity binds
 repository/keyring context and the exact object, version, digest,
-payload-header, and content-length facts, while AEAD still uses the actual
+payload-layout, and content-length facts, while AEAD still uses the actual
 payload ID. This hardening changes cache correctness, not the amount of backend
 data required for a cache miss. Large declared-length PUT bodies can overlap;
 only their short reference publication is serialized and fenced. The writer

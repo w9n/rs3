@@ -41,6 +41,8 @@ pub enum PayloadReference {
         pack_section_ordinal: u32,
         /// Random pack identity bound into every record AEAD operation.
         pack_id: [u8; 32],
+        /// Fresh encryption attempt for this immutable pack.
+        attempt_id: rs3_types::PayloadAttemptId,
         /// Historical content-encryption key needed to open the record.
         content_key_id: KeyId,
         /// Current commit's encrypted-keyring envelope object bound into payload AEAD context.
@@ -93,6 +95,8 @@ pub struct V2PackCarrierReference {
     pub length: u64,
     /// Random pack identity bound into every record AEAD operation.
     pub pack_id: [u8; 32],
+    /// Fresh sealing attempt shared by this immutable pack.
+    pub attempt_id: rs3_types::PayloadAttemptId,
     /// Historical content-encryption key needed to open the record.
     pub content_key_id: KeyId,
     /// Historical encrypted-keyring envelope object bound into payload AEAD context.
@@ -128,23 +132,74 @@ pub struct V2StandaloneStreamCarrierReference {
     pub keyring_envelope_object_id: BackendObjectId,
     /// SHA-256 digest of that encrypted-keyring envelope.
     pub keyring_envelope_digest: [u8; 32],
-    /// Parsed segmented-payload header needed for direct range reads.
-    pub payload_header: PayloadHeaderReference,
+    /// Authenticated selected-part layout needed for direct range reads.
+    pub payload_layout: PayloadLayout,
 }
 
-/// Signed/encrypted payload-header facts used to plan direct range reads.
+/// Maximum independently sealed parts in a detached payload.
+pub const MAX_PAYLOAD_PARTS: usize = 10_000;
+
+/// One selected independently sealed part, in original part-number order.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct PayloadHeaderReference {
-    /// Plaintext bytes per independently encrypted segment.
-    pub chunk_size: u64,
-    /// Total plaintext payload length.
+pub struct PayloadPart {
+    /// Original positive client part number, at most 10,000.
+    pub part_number: u32,
+    /// Fresh identity for this exact sealing attempt.
+    pub attempt_id: rs3_types::PayloadAttemptId,
+    /// Positive plaintext length of this selected part.
     pub plaintext_len: u64,
-    /// Content-encryption key identifier.
+}
+
+/// Authenticated encrypted layout of a ciphertext-only detached payload.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PayloadLayout {
+    /// Plaintext bytes per segment, except the final segment of each part.
+    pub chunk_size: u64,
+    /// Sum of all selected part lengths.
+    pub plaintext_len: u64,
+    /// Historical content-encryption key identifier.
     pub key_id: KeyId,
-    /// Per-payload nonce prefix used for segment nonce derivation.
-    pub nonce_prefix: [u8; rs3_types::PAYLOAD_NONCE_PREFIX_LEN],
-    /// Encoded payload-header byte length.
-    pub header_len: u64,
+    /// Random immutable carrier identity.
+    pub carrier_id: [u8; 32],
+    /// Ordered selected parts. Zero-length values have no backend carrier.
+    pub parts: Vec<PayloadPart>,
+}
+
+impl PayloadLayout {
+    /// Validates bounds, part order and lengths, returning exact ciphertext bytes.
+    /// Invalid layouts and arithmetic overflow return `None`.
+    #[must_use]
+    pub fn stored_len(&self) -> Option<u64> {
+        if self.chunk_size == 0
+            || self.chunk_size > 64 * 1024 * 1024
+            || self.plaintext_len == 0
+            || self.parts.is_empty()
+            || self.parts.len() > MAX_PAYLOAD_PARTS
+            || self.key_id.as_str().is_empty()
+            || self.key_id.as_str().len() > 255
+        {
+            return None;
+        }
+        let mut previous = 0;
+        let mut plaintext = 0_u64;
+        let mut stored = 0_u64;
+        for part in &self.parts {
+            if part.part_number <= previous
+                || part.part_number > MAX_PAYLOAD_PARTS as u32
+                || part.plaintext_len == 0
+            {
+                return None;
+            }
+            previous = part.part_number;
+            plaintext = plaintext.checked_add(part.plaintext_len)?;
+            let tags = part
+                .plaintext_len
+                .div_ceil(self.chunk_size)
+                .checked_mul(rs3_types::PAYLOAD_AEAD_TAG_LEN as u64)?;
+            stored = stored.checked_add(part.plaintext_len.checked_add(tags)?)?;
+        }
+        (plaintext == self.plaintext_len).then_some(stored)
+    }
 }
 
 /// A single index mutation.
@@ -541,6 +596,7 @@ mod tests {
                 pack_offset: 8_192,
                 length: 16_384,
                 pack_id: [0x44; 32],
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
                 content_key_id: key_id("older-content"),
                 keyring_envelope_object_id: object_id("keyrings/historical"),
                 keyring_envelope_digest: [0x45; 32],
@@ -555,6 +611,7 @@ mod tests {
             PayloadReference::V2PackSelf {
                 pack_section_ordinal: 2,
                 pack_id: [0x11; 32],
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
                 content_key_id: key_id("historical-content"),
                 keyring_envelope_object_id: object_id("keyrings/current"),
                 keyring_envelope_digest: [0x12; 32],
@@ -584,6 +641,7 @@ mod tests {
             pack_offset: 8_192,
             length: 16_384,
             pack_id: [0x44; 32],
+            attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
             content_key_id: key_id("older-content"),
             keyring_envelope_object_id: object_id("keyrings/historical"),
             keyring_envelope_digest: [0x45; 32],
@@ -614,12 +672,16 @@ mod tests {
                 stored_len: 131_233,
                 keyring_envelope_object_id: object_id("keyrings/standalone"),
                 keyring_envelope_digest: [0x72; 32],
-                payload_header: super::PayloadHeaderReference {
+                payload_layout: super::PayloadLayout {
                     chunk_size: 64 * 1024,
                     plaintext_len: 131_072,
                     key_id: key_id("standalone-content"),
-                    nonce_prefix: [0x73; 16],
-                    header_len: 113,
+                    carrier_id: [0x73; 32],
+                    parts: vec![crate::PayloadPart {
+                        part_number: 1,
+                        attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x81; 32]),
+                        plaintext_len: 131_072,
+                    }],
                 },
             }),
         };

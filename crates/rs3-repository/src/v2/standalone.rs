@@ -26,13 +26,18 @@ pub(in crate::v2) fn validate_v2_standalone_object(
     object_id: &BackendObjectId,
     stored_len: u64,
 ) -> V2Result<()> {
+    if stored_len == 0 {
+        return Err(V2FormatError::InvalidHeaderField);
+    }
+    standalone_carrier_id(object_id).map(|_| ())
+}
+
+/// Returns the canonical random identity already present in an opaque object key.
+pub(in crate::v2) fn standalone_carrier_id(object_id: &BackendObjectId) -> V2Result<[u8; 32]> {
     let Some(encoded_id) = object_id.as_str().strip_prefix(V2_STANDALONE_OBJECT_PREFIX) else {
         return Err(V2FormatError::InvalidHeaderField);
     };
-    if encoded_id.len() != V2_STANDALONE_OBJECT_ID_B64_LEN
-        || encoded_id.contains(['=', '/', '+'])
-        || stored_len == 0
-    {
+    if encoded_id.len() != V2_STANDALONE_OBJECT_ID_B64_LEN || encoded_id.contains(['=', '/', '+']) {
         return Err(V2FormatError::InvalidHeaderField);
     }
     let decoded = URL_SAFE_NO_PAD
@@ -45,5 +50,5 @@ pub(in crate::v2) fn validate_v2_standalone_object(
     if URL_SAFE_NO_PAD.encode(random_id) != encoded_id {
         return Err(V2FormatError::InvalidHeaderField);
     }
-    Ok(())
+    Ok(random_id)
 }

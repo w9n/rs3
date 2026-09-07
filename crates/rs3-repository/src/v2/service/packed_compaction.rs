@@ -475,7 +475,7 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use rs3_index::PayloadHeaderReference;
+    use rs3_index::PayloadLayout;
     use rs3_index::run::{
         IndexPackRecordPointer, IndexRunKeyringRef, IndexRunSelfPack, IndexTombstone, IndexUpsert,
     };
@@ -534,23 +534,28 @@ mod tests {
             pack_section_ordinal: 0,
             pack_section_len: 1_024,
             pack_id: [byte.wrapping_add(2); 32],
+            attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
             content_key_id: key_id("content-key"),
             pack_record_count: 4,
         }
     }
 
-    fn stream_header() -> PayloadHeaderReference {
-        PayloadHeaderReference {
+    fn stream_header() -> PayloadLayout {
+        PayloadLayout {
             chunk_size: 64 * 1024,
             plaintext_len: 32,
             key_id: key_id("stream-content-key"),
-            nonce_prefix: [0x51; 16],
-            header_len: 73,
+            carrier_id: [0x51; 32],
+            parts: vec![rs3_index::PayloadPart {
+                part_number: 1,
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x81; 32]),
+                plaintext_len: 32,
+            }],
         }
     }
 
     fn standalone_stream_container(byte: u8) -> IndexRunStandaloneStreamContainer {
-        let payload_header = stream_header();
+        let payload_layout = stream_header();
         IndexRunStandaloneStreamContainer {
             object_id: object_id(&format!(
                 "objects/v02/{}",
@@ -559,13 +564,13 @@ mod tests {
             version_id: Some(must(BackendVersionId::new(format!(
                 "standalone-version-{byte}"
             )))),
-            stored_len: payload_header.header_len + payload_header.plaintext_len + 16,
+            stored_len: payload_layout.plaintext_len + 16,
             object_digest: [byte; 32],
             keyring_envelope: IndexRunKeyringRef {
                 object_id: object_id(&format!("keys/standalone-{byte}")),
                 digest: [byte.wrapping_add(1); 32],
             },
-            payload_header,
+            payload_layout,
         }
     }
 
@@ -779,6 +784,7 @@ mod tests {
         let exact_container = container(7);
         let self_pack = IndexRunSelfPack {
             pack_id: exact_container.pack_id,
+            attempt_id: exact_container.attempt_id,
             content_key_id: exact_container.content_key_id.clone(),
             stored_len: exact_container.pack_section_len,
             record_count: exact_container.pack_record_count,
@@ -939,6 +945,7 @@ mod tests {
                 sequence: sequence(6),
                 self_pack: Some(IndexRunSelfPack {
                     pack_id: exact_container.pack_id,
+                    attempt_id: exact_container.attempt_id,
                     content_key_id: exact_container.content_key_id.clone(),
                     stored_len: exact_container.pack_section_len,
                     record_count: exact_container.pack_record_count,

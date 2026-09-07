@@ -1,6 +1,6 @@
 use crate::v2::{V2FormatError, V2Result};
 use rs3_crypto::Sha256Hasher;
-use rs3_index::PayloadHeaderReference;
+use rs3_index::PayloadLayout;
 use rs3_types::{BackendObjectId, BackendObjectRef, BackendVersionId};
 
 const V2_STREAM_PAYLOAD_CACHE_DOMAIN: &[u8] = b"rs3:v02-stream-segment-cache:v1\n";
@@ -13,7 +13,7 @@ pub(crate) struct V2StreamPayloadCacheIdentity<'a> {
     pub(crate) repository_keyring_context: &'a [u8],
     pub(crate) carrier: V2StreamPayloadCarrierCacheIdentity<'a>,
     pub(crate) payload_id: &'a BackendObjectId,
-    pub(crate) payload_header: &'a PayloadHeaderReference,
+    pub(crate) payload_layout: &'a PayloadLayout,
     pub(crate) content_len: u64,
 }
 
@@ -29,7 +29,7 @@ pub(crate) enum V2StreamPayloadCarrierCacheIdentity<'a> {
 impl V2StreamPayloadCacheIdentity<'_> {
     /// Validates the exact carrier range and derives its plaintext-cache identity.
     pub(crate) fn cache_ref(&self) -> V2Result<BackendObjectRef> {
-        if self.payload_header.plaintext_len != self.content_len {
+        if self.payload_layout.plaintext_len != self.content_len {
             return Err(V2FormatError::InvalidHeaderField);
         }
 
@@ -52,11 +52,16 @@ impl V2StreamPayloadCacheIdentity<'_> {
             }
         };
         update_digest_field(&mut digest, self.payload_id.as_str().as_bytes())?;
-        digest.update(self.payload_header.chunk_size.to_be_bytes());
-        digest.update(self.payload_header.plaintext_len.to_be_bytes());
-        update_digest_field(&mut digest, self.payload_header.key_id.as_str().as_bytes())?;
-        digest.update(self.payload_header.nonce_prefix);
-        digest.update(self.payload_header.header_len.to_be_bytes());
+        digest.update(self.payload_layout.chunk_size.to_be_bytes());
+        digest.update(self.payload_layout.plaintext_len.to_be_bytes());
+        update_digest_field(&mut digest, self.payload_layout.key_id.as_str().as_bytes())?;
+        digest.update(self.payload_layout.carrier_id);
+        digest.update((self.payload_layout.parts.len() as u64).to_be_bytes());
+        for part in &self.payload_layout.parts {
+            digest.update(part.part_number.to_be_bytes());
+            digest.update(part.attempt_id.as_bytes());
+            digest.update(part.plaintext_len.to_be_bytes());
+        }
         digest.update(self.content_len.to_be_bytes());
 
         let object_id = BackendObjectId::new(format!(
@@ -96,7 +101,7 @@ fn update_digest_field(digest: &mut Sha256Hasher, value: &[u8]) -> V2Result<()> 
 mod tests {
     use super::{V2StreamPayloadCacheIdentity, V2StreamPayloadCarrierCacheIdentity};
     use crate::v2::V2FormatError;
-    use rs3_index::PayloadHeaderReference;
+    use rs3_index::PayloadLayout;
     use rs3_types::{BackendObjectId, BackendVersionId, KeyId};
 
     struct Fixture {
@@ -106,7 +111,7 @@ mod tests {
         body_digest: [u8; 32],
         stored_len: u64,
         payload_id: BackendObjectId,
-        header: PayloadHeaderReference,
+        header: PayloadLayout,
         content_len: u64,
     }
 
@@ -121,7 +126,7 @@ mod tests {
                     stored_len: self.stored_len,
                 },
                 payload_id: &self.payload_id,
-                payload_header: &self.header,
+                payload_layout: &self.header,
                 content_len: self.content_len,
             }
         }
@@ -141,12 +146,16 @@ mod tests {
             body_digest: [1; 32],
             stored_len: 16_384,
             payload_id: object_id("v2-payload/payload-1"),
-            header: PayloadHeaderReference {
+            header: PayloadLayout {
                 chunk_size: 65_536,
                 plaintext_len: 8_000,
                 key_id: KeyId::new("content-key-1").unwrap_or_else(|error| panic!("{error}")),
-                nonce_prefix: [3; 16],
-                header_len: 96,
+                carrier_id: [3; 32],
+                parts: vec![rs3_index::PayloadPart {
+                    part_number: 1,
+                    attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x81; 32]),
+                    plaintext_len: 8_000,
+                }],
             },
             content_len: 8_000,
         }
@@ -210,12 +219,23 @@ mod tests {
             },
             {
                 let mut value = fixture();
-                value.header.nonce_prefix[0] ^= 1;
+                value.header.carrier_id[0] ^= 1;
                 value
             },
             {
                 let mut value = fixture();
-                value.header.header_len += 1;
+                value.header.parts[0].part_number += 1;
+                value
+            },
+            {
+                let mut value = fixture();
+                value.header.parts[0].attempt_id =
+                    rs3_types::PayloadAttemptId::from_bytes([0x82; 32]);
+                value
+            },
+            {
+                let mut value = fixture();
+                value.header.parts[0].plaintext_len += 1;
                 value
             },
         ];

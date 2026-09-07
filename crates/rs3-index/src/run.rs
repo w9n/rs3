@@ -1,6 +1,6 @@
 //! Canonical bounded plaintext encoding for v02 index runs.
 
-use crate::PayloadHeaderReference;
+use crate::PayloadLayout;
 use rs3_types::{
     BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LegalHoldStatus, LogicalPath,
     RetentionMode, RetentionPolicy, Sequence,
@@ -22,8 +22,6 @@ pub const INDEX_PACK_MAX_RECORDS: u32 = 4_096;
 
 const INDEX_PACK_SEGMENT_BYTES: u64 = rs3_types::PAYLOAD_PACK_SEGMENT_BYTES as u64;
 const INDEX_PACK_SEGMENT_TAG_BYTES: u64 = rs3_types::PAYLOAD_AEAD_TAG_LEN as u64;
-const INDEX_STREAM_SEGMENT_TAG_BYTES: u64 = rs3_types::PAYLOAD_AEAD_TAG_LEN as u64;
-const INDEX_STREAM_MAX_HEADER_BYTES: u64 = 4 * 1024;
 
 /// Decoder and encoder resource limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,7 +30,7 @@ pub struct IndexRunLimits {
     pub max_total_bytes: usize,
     /// Maximum plaintext bytes in one independently authenticated frame.
     pub max_frame_bytes: usize,
-    /// Maximum encoded size of one container or mutation record.
+    /// Maximum ordinary record size; standalone part tables have a separate 512 KiB cap.
     pub max_record_bytes: usize,
     /// Maximum combined number of external payload containers.
     pub max_containers: usize,
@@ -149,6 +147,8 @@ pub struct IndexRunContainer {
     pub pack_section_len: u64,
     /// Random identity bound into every payload-pack AEAD operation.
     pub pack_id: [u8; 32],
+    /// Fresh sealing attempt shared by this immutable pack.
+    pub attempt_id: rs3_types::PayloadAttemptId,
     /// Historical content-encryption key needed to open payload records.
     pub content_key_id: KeyId,
     /// Authenticated number of records in the payload-pack directory.
@@ -169,7 +169,7 @@ pub struct IndexRunStandaloneStreamContainer {
     /// Historical encrypted-keyring envelope selected when the payload was sealed.
     pub keyring_envelope: IndexRunKeyringRef,
     /// Authenticated header facts needed for direct range reads.
-    pub payload_header: PayloadHeaderReference,
+    pub payload_layout: PayloadLayout,
 }
 
 impl fmt::Debug for IndexRunStandaloneStreamContainer {
@@ -181,7 +181,7 @@ impl fmt::Debug for IndexRunStandaloneStreamContainer {
             .field("stored_len", &self.stored_len)
             .field("object_digest", &"<redacted>")
             .field("keyring_envelope", &self.keyring_envelope)
-            .field("payload_header", &"<redacted>")
+            .field("payload_layout", &"<redacted>")
             .finish()
     }
 }
@@ -229,6 +229,8 @@ impl fmt::Debug for IndexRunKeyringRef {
 pub struct IndexRunSelfPack {
     /// Random identity bound into every payload-pack AEAD operation.
     pub pack_id: [u8; 32],
+    /// Fresh sealing attempt shared by this immutable pack.
+    pub attempt_id: rs3_types::PayloadAttemptId,
     /// Historical content-encryption key needed to open payload records.
     pub content_key_id: KeyId,
     /// Exact stored payload-pack section length.
@@ -783,6 +785,7 @@ pub fn encode_index_run_frames(
         record.u64(container.pack_section_offset)?;
         record.u64(container.pack_section_len)?;
         record.bytes(&container.pack_id)?;
+        record.bytes(container.attempt_id.as_bytes())?;
         record.string(
             container.content_key_id.as_str(),
             limits.max_key_id_bytes,
@@ -793,7 +796,7 @@ pub fn encode_index_run_frames(
     }
 
     for container in &run.standalone_stream_containers {
-        let mut record = Writer::new(limits.max_record_bytes);
+        let mut record = Writer::new(STANDALONE_CONTAINER_MAX_BYTES.min(limits.max_frame_bytes));
         record.u8(2)?;
         encode_exact_container(
             &mut record,
@@ -804,7 +807,7 @@ pub fn encode_index_run_frames(
             &container.keyring_envelope,
             limits,
         )?;
-        encode_payload_header(&mut record, &container.payload_header)?;
+        encode_payload_layout(&mut record, &container.payload_layout)?;
         metadata.push(PreparedRecord::metadata(record.finish()));
     }
     for namespace_key_id in &namespace_key_ids {
@@ -1022,7 +1025,8 @@ fn pack_prepared_frames(
             },
         )?;
         for record in frame_records {
-            let mut encoded_record = Writer::new(limits.max_record_bytes);
+            let mut encoded_record =
+                Writer::new(record_limit(role, record.bytes.first().copied(), limits));
             encoded_record.bytes(&record.bytes)?;
             writer.record(encoded_record)?;
         }
@@ -1074,6 +1078,7 @@ fn encode_frame_header(
             IndexRunSelfPayload::Pack(pack) => {
                 writer.u8(1)?;
                 writer.bytes(&pack.pack_id)?;
+                writer.bytes(pack.attempt_id.as_bytes())?;
                 writer.string(pack.content_key_id.as_str(), usize::MAX, "content key id")?;
                 writer.u64(pack.stored_len)?;
                 writer.varint(u64::from(pack.record_count))?;
@@ -1103,7 +1108,7 @@ fn frame_header_len(
         match self_payload {
             IndexRunSelfPayload::Pack(pack) => {
                 length = length
-                    .checked_add(32)
+                    .checked_add(64)
                     .and_then(|value| {
                         value.checked_add(varint_len(
                             usize_to_u64(pack.content_key_id.as_str().len()).ok()?,
@@ -1163,34 +1168,61 @@ fn encode_exact_container(
     writer.bytes(&keyring_envelope.digest)
 }
 
-fn encode_payload_header(
-    writer: &mut Writer,
-    header: &PayloadHeaderReference,
-) -> Result<(), IndexRunError> {
-    writer.varint(header.chunk_size)?;
-    writer.varint(header.plaintext_len)?;
-    writer.string(header.key_id.as_str(), usize::MAX, "content key id")?;
-    writer.bytes(&header.nonce_prefix)?;
-    writer.varint(header.header_len)
+const STANDALONE_CONTAINER_MAX_BYTES: usize = 512 * 1024;
+
+fn record_limit(role: IndexRunFrameRole, tag: Option<u8>, limits: &IndexRunLimits) -> usize {
+    if role == IndexRunFrameRole::Metadata && tag == Some(2) {
+        STANDALONE_CONTAINER_MAX_BYTES.min(limits.max_frame_bytes)
+    } else {
+        limits.max_record_bytes
+    }
 }
 
-fn decode_payload_header(
+fn encode_payload_layout(writer: &mut Writer, layout: &PayloadLayout) -> Result<(), IndexRunError> {
+    writer.varint(layout.chunk_size)?;
+    writer.varint(layout.plaintext_len)?;
+    writer.string(layout.key_id.as_str(), 255, "content key id")?;
+    writer.bytes(&layout.carrier_id)?;
+    writer.varint(usize_to_u64(layout.parts.len())?)?;
+    for part in &layout.parts {
+        writer.varint(u64::from(part.part_number))?;
+        writer.bytes(part.attempt_id.as_bytes())?;
+        writer.varint(part.plaintext_len)?;
+    }
+    Ok(())
+}
+
+fn decode_payload_layout(
     reader: &mut Reader<'_>,
     limits: &IndexRunLimits,
-) -> Result<PayloadHeaderReference, IndexRunError> {
-    let header = PayloadHeaderReference {
-        chunk_size: reader.varint()?,
-        plaintext_len: reader.varint()?,
-        key_id: reader.typed_string("content key id", limits.max_key_id_bytes, KeyId::new)?,
-        nonce_prefix: {
-            let mut nonce_prefix = [0_u8; rs3_types::PAYLOAD_NONCE_PREFIX_LEN];
-            nonce_prefix.copy_from_slice(reader.bytes(rs3_types::PAYLOAD_NONCE_PREFIX_LEN)?);
-            nonce_prefix
-        },
-        header_len: reader.varint()?,
+) -> Result<PayloadLayout, IndexRunError> {
+    let chunk_size = reader.varint()?;
+    let plaintext_len = reader.varint()?;
+    let key_id = reader.typed_string("content key id", limits.max_key_id_bytes, KeyId::new)?;
+    let mut carrier_id = [0; 32];
+    carrier_id.copy_from_slice(reader.bytes(32)?);
+    let count = reader.bounded_count("payload part count", crate::MAX_PAYLOAD_PARTS)?;
+    // Require enough remaining bytes before allocating, even for truncated input.
+    if count > reader.remaining.len() / 34 {
+        return Err(IndexRunError::InvalidStandaloneStreamContainer);
+    }
+    let mut parts = Vec::with_capacity(count);
+    for _ in 0..count {
+        parts.push(crate::PayloadPart {
+            part_number: reader.u32_varint()?,
+            attempt_id: decode_attempt_id(reader)?,
+            plaintext_len: reader.varint()?,
+        });
+    }
+    let layout = PayloadLayout {
+        chunk_size,
+        plaintext_len,
+        key_id,
+        carrier_id,
+        parts,
     };
-    validate_payload_header(&header, limits)?;
-    Ok(header)
+    validate_payload_layout(&layout, limits)?;
+    Ok(layout)
 }
 
 /// Decodes and pairs independently authenticated index-run plaintext frames.
@@ -1356,7 +1388,17 @@ impl IndexRunFrameDecoder {
         self.self_pack = frame_self_pack;
         self.saw_self_payload_fact = true;
         for _ in 0..header.frame_record_count {
-            let mut record = reader.record(limits.max_record_bytes)?;
+            let mut record = reader.record(
+                STANDALONE_CONTAINER_MAX_BYTES
+                    .min(limits.max_frame_bytes)
+                    .max(limits.max_record_bytes),
+            )?;
+            let tag = record.remaining.first().copied();
+            validate_count(
+                "metadata record bytes",
+                record.remaining.len(),
+                record_limit(IndexRunFrameRole::Metadata, tag, limits),
+            )?;
             match record.u8()? {
                 0 => {
                     if self.saw_standalone_stream_container || self.saw_namespace_key_id {
@@ -1664,12 +1706,14 @@ fn decode_frame_header<'a>(
             1 => {
                 let mut pack_id = [0_u8; 32];
                 pack_id.copy_from_slice(reader.bytes(32)?);
+                let attempt_id = decode_attempt_id(&mut reader)?;
                 let content_key_id =
                     reader.typed_string("content key id", limits.max_key_id_bytes, KeyId::new)?;
                 let stored_len = reader.u64()?;
                 let record_count = reader.u32_varint()?;
                 let pack = IndexRunSelfPack {
                     pack_id,
+                    attempt_id,
                     content_key_id,
                     stored_len,
                     record_count,
@@ -1706,6 +1750,14 @@ fn decode_frame_header<'a>(
     ))
 }
 
+fn decode_attempt_id(
+    reader: &mut Reader<'_>,
+) -> Result<rs3_types::PayloadAttemptId, IndexRunError> {
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(reader.bytes(32)?);
+    Ok(rs3_types::PayloadAttemptId::from_bytes(bytes))
+}
+
 fn decode_container(
     record: &mut Reader<'_>,
     limits: &IndexRunLimits,
@@ -1725,6 +1777,7 @@ fn decode_container(
             pack_id.copy_from_slice(record.bytes(32)?);
             pack_id
         },
+        attempt_id: decode_attempt_id(record)?,
         content_key_id: record.typed_string(
             "content key id",
             limits.max_key_id_bytes,
@@ -1747,7 +1800,7 @@ fn decode_standalone_stream_container(
         stored_len: exact.stored_len,
         object_digest: exact.object_digest,
         keyring_envelope: exact.keyring_envelope,
-        payload_header: decode_payload_header(record, limits)?,
+        payload_layout: decode_payload_layout(record, limits)?,
     };
     validate_standalone_stream_container(&container, limits)?;
     Ok(container)
@@ -2306,9 +2359,9 @@ fn validate_standalone_stream_container(
     container: &IndexRunStandaloneStreamContainer,
     limits: &IndexRunLimits,
 ) -> Result<(), IndexRunError> {
-    validate_payload_header(&container.payload_header, limits)
+    validate_payload_layout(&container.payload_layout, limits)
         .map_err(|_| IndexRunError::InvalidStandaloneStreamContainer)?;
-    if stream_payload_stored_len(&container.payload_header)
+    if stream_payload_stored_len(&container.payload_layout)
         .map_err(|_| IndexRunError::InvalidStandaloneStreamContainer)?
         != container.stored_len
     {
@@ -2317,8 +2370,8 @@ fn validate_standalone_stream_container(
     Ok(())
 }
 
-fn validate_payload_header(
-    header: &PayloadHeaderReference,
+fn validate_payload_layout(
+    header: &PayloadLayout,
     limits: &IndexRunLimits,
 ) -> Result<(), IndexRunError> {
     validate_count(
@@ -2326,25 +2379,15 @@ fn validate_payload_header(
         header.key_id.as_str().len(),
         limits.max_key_id_bytes,
     )?;
-    if header.chunk_size == 0
-        || header.header_len == 0
-        || header.header_len > INDEX_STREAM_MAX_HEADER_BYTES
-    {
-        return Err(IndexRunError::InvalidStandaloneStreamContainer);
-    }
-    stream_payload_stored_len(header).map(|_| ())
+    header
+        .stored_len()
+        .ok_or(IndexRunError::InvalidStandaloneStreamContainer)
+        .map(|_| ())
 }
 
-fn stream_payload_stored_len(header: &PayloadHeaderReference) -> Result<u64, IndexRunError> {
-    let segment_count = header.plaintext_len.div_ceil(header.chunk_size);
+fn stream_payload_stored_len(header: &PayloadLayout) -> Result<u64, IndexRunError> {
     header
-        .plaintext_len
-        .checked_add(
-            segment_count
-                .checked_mul(INDEX_STREAM_SEGMENT_TAG_BYTES)
-                .ok_or(IndexRunError::InvalidStandaloneStreamContainer)?,
-        )
-        .and_then(|ciphertext_len| header.header_len.checked_add(ciphertext_len))
+        .stored_len()
         .ok_or(IndexRunError::InvalidStandaloneStreamContainer)
 }
 
@@ -2486,7 +2529,7 @@ fn validate_payload_pointer(
             validate_container_ordinal(container_ordinal, standalone_stream_containers.len())?;
             let container = &standalone_stream_containers
                 [usize::try_from(container_ordinal).map_err(|_| IndexRunError::IntegerOverflow)?];
-            if container.payload_header.plaintext_len != content_len {
+            if container.payload_layout.plaintext_len != content_len {
                 return Err(IndexRunError::InvalidStandaloneStreamContainer);
             }
             return Ok(());
@@ -2941,7 +2984,7 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::PayloadHeaderReference;
+    use crate::PayloadLayout;
     use crate::run::{
         INDEX_RUN_PLAINTEXT_DOMAIN, IndexBlindKey, IndexMutation, IndexPackRecordPointer,
         IndexPayloadPointer, IndexRun, IndexRunContainer, IndexRunError, IndexRunFrameRole,
@@ -2972,6 +3015,7 @@ mod tests {
                 pack_section_offset: 512,
                 pack_section_len: 2_048,
                 pack_id: [0x11; 32],
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
                 content_key_id: KeyId::new("content-1").expect("key id"),
                 pack_record_count: 8,
             }],
@@ -3020,23 +3064,26 @@ mod tests {
         run
     }
 
-    fn stream_header() -> PayloadHeaderReference {
-        PayloadHeaderReference {
+    fn stream_header() -> PayloadLayout {
+        PayloadLayout {
             chunk_size: 64 * 1024,
             plaintext_len: 131_089,
             key_id: KeyId::new("stream-content-1").expect("content key id"),
-            nonce_prefix: [0x91; 16],
-            header_len: 73,
+            carrier_id: [0x91; 32],
+            parts: vec![crate::PayloadPart {
+                part_number: 1,
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x81; 32]),
+                plaintext_len: 131_089,
+            }],
         }
     }
 
     fn standalone_stream_container(byte: u8) -> IndexRunStandaloneStreamContainer {
-        let payload_header = stream_header();
-        let stored_len = payload_header.header_len
-            + payload_header.plaintext_len
-            + payload_header
+        let payload_layout = stream_header();
+        let stored_len = payload_layout.plaintext_len
+            + payload_layout
                 .plaintext_len
-                .div_ceil(payload_header.chunk_size)
+                .div_ceil(payload_layout.chunk_size)
                 * 16;
         IndexRunStandaloneStreamContainer {
             object_id: BackendObjectId::new(format!("objects/v02/standalone-{byte}"))
@@ -3051,7 +3098,7 @@ mod tests {
                     .expect("keyring object id"),
                 digest: [byte.wrapping_add(1); 32],
             },
-            payload_header,
+            payload_layout,
         }
     }
 
@@ -3247,19 +3294,76 @@ mod tests {
     }
 
     #[test]
-    fn zero_plaintext_standalone_stream_keeps_its_authenticated_object() {
+    fn maximum_selected_part_table_round_trips_without_raising_ordinary_record_limit() {
         let limits = IndexRunLimits::default();
         let mut run = standalone_stream_fixture();
         let container = &mut run.standalone_stream_containers[0];
-        container.payload_header.plaintext_len = 0;
-        container.stored_len = container.payload_header.header_len;
+        container.payload_layout.parts = (1..=crate::MAX_PAYLOAD_PARTS as u32)
+            .map(|part_number| crate::PayloadPart {
+                part_number,
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x63; 32]),
+                plaintext_len: 1,
+            })
+            .collect();
+        container.payload_layout.plaintext_len = crate::MAX_PAYLOAD_PARTS as u64;
+        container.stored_len = container
+            .payload_layout
+            .stored_len()
+            .expect("bounded part table");
+        let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
+            panic!("upsert");
+        };
+        upsert.content_len = crate::MAX_PAYLOAD_PARTS as u64;
+        let encoded = encode_index_run_frames(&run, &limits).expect("large part table");
+        assert!(
+            encoded
+                .frames
+                .iter()
+                .any(|frame| frame.bytes.len() > limits.max_record_bytes)
+        );
+        assert!(
+            encoded
+                .frames
+                .iter()
+                .all(|frame| frame.bytes.len() <= limits.max_frame_bytes)
+        );
+        let bytes = encode_index_run(&run, &limits).expect("bundle");
+        assert_eq!(decode_index_run(&bytes, &limits), Ok(run.clone()));
+        assert_eq!(
+            super::record_limit(super::IndexRunFrameRole::Metadata, Some(0), &limits),
+            limits.max_record_bytes
+        );
+        assert_eq!(
+            super::record_limit(super::IndexRunFrameRole::Namespace, Some(2), &limits),
+            limits.max_record_bytes
+        );
+        run.standalone_stream_containers[0]
+            .payload_layout
+            .parts
+            .push(crate::PayloadPart {
+                part_number: 10_001,
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x64; 32]),
+                plaintext_len: 1,
+            });
+        assert!(encode_index_run(&run, &limits).is_err());
+    }
+
+    #[test]
+    fn zero_plaintext_standalone_stream_is_rejected() {
+        let limits = IndexRunLimits::default();
+        let mut run = standalone_stream_fixture();
+        let container = &mut run.standalone_stream_containers[0];
+        container.payload_layout.plaintext_len = 0;
+        container.stored_len = 0;
         let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
             panic!("fixture starts with an upsert");
         };
         upsert.content_len = 0;
 
-        let encoded = encode_index_run(&run, &limits).expect("encode zero standalone stream");
-        assert_eq!(decode_index_run(&encoded, &limits), Ok(run));
+        assert_eq!(
+            encode_index_run(&run, &limits),
+            Err(IndexRunError::InvalidStandaloneStreamContainer)
+        );
     }
 
     #[test]
@@ -3576,7 +3680,7 @@ mod tests {
         let encoded = encode_index_run(&fixture(), &IndexRunLimits::default()).expect("encode run");
         assert_eq!(
             hex(&encoded),
-            "03fb017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006000000000000000000000000090202020001b601000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c23232323232323232323232323232323232323232323232323232323232323230000000300000000000002000000000000000800111111111111111111111111111111111111111111111111111111111111111109636f6e74656e742d31080d030b6e616d6573706163652d3192017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006010000000000000000000000090202023900003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901020000001e02240101444444444444444444444444444444444444444444444444444444444444444400126a7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006020000000000000000000000090202021201010e74656e616e742f64656c65746564122300001574656e616e742f736e617073686f742f6368756e6b11d209ffffffffffffffc9"
+            "039b027273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006000000000000000000000000090202020001d601000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c232323232323232323232323232323232323232323232323232323232323232300000003000000000000020000000000000008001111111111111111111111111111111111111111111111111111111111111111a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a309636f6e74656e742d31080d030b6e616d6573706163652d3192017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006010000000000000000000000090202023900003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901020000001e02240101444444444444444444444444444444444444444444444444444444444444444400126a7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006020000000000000000000000090202021201010e74656e616e742f64656c65746564122300001574656e616e742f736e617073686f742f6368756e6b11d209ffffffffffffffc9"
         );
     }
 
@@ -3827,6 +3931,7 @@ mod tests {
         );
         run.self_pack = Some(IndexRunSelfPack {
             pack_id: [0x88; 32],
+            attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
             content_key_id: KeyId::new("historical-content").expect("key id"),
             stored_len: 2_048,
             record_count: 3,
@@ -3902,7 +4007,7 @@ mod tests {
     #[test]
     fn rejects_transplanted_self_pack_facts_between_metadata_frames() {
         let limits = IndexRunLimits {
-            max_frame_bytes: 320,
+            max_frame_bytes: 384,
             ..IndexRunLimits::default()
         };
         let mut run = fixture();
@@ -3941,6 +4046,7 @@ mod tests {
         };
         run.self_pack = Some(IndexRunSelfPack {
             pack_id: [0x88; 32],
+            attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
             content_key_id: KeyId::new("historical-content").expect("key id"),
             stored_len: 1_250,
             record_count: 1,
@@ -3999,6 +4105,7 @@ mod tests {
         };
         run.self_pack = Some(IndexRunSelfPack {
             pack_id: [0x88; 32],
+            attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
             content_key_id: KeyId::new("historical-content").expect("key id"),
             stored_len: super::INDEX_PACK_MAX_STORED_BYTES + 1,
             record_count: 1,

@@ -493,7 +493,7 @@ pub(crate) struct V2StoredStandalonePayload {
     pub(crate) version_id: Option<BackendVersionId>,
     pub(crate) object_len: u64,
     pub(crate) object_digest: [u8; 32],
-    pub(crate) payload_header: crate::payload::SegmentedPayloadHeader,
+    pub(crate) payload_layout: crate::payload::SegmentedPayloadLayout,
 }
 
 pub(crate) struct V2StandalonePayloadWrite<St> {
@@ -1772,24 +1772,25 @@ where
         if cancellation.is_cancelled() {
             return Err(V2FormatError::ObjectBodyReadFailed);
         }
-        let payload_sealer = SegmentedPayloadSealer::new(&self.keyring, payload_segment_size)
-            .map_err(|_| V2FormatError::InvalidHeaderField)?;
+        let repository_context = super::service::packed::repository_context_from_refs(
+            &self.options.repository_id,
+            &self.options.keyring_envelope_ref,
+        )
+        .map_err(|_| V2FormatError::InvalidHeaderField)?;
+        let payload_sealer = SegmentedPayloadSealer::new(
+            &self.keyring,
+            payload_segment_size,
+            repository_context,
+            super::standalone::standalone_carrier_id(&object_id)?,
+            1,
+        )
+        .map_err(|_| V2FormatError::InvalidHeaderField)?;
         let mut assembler = MultipartObjectAssembler::new(multipart_part_size)?;
         let mut multipart = self
             .create_standalone_multipart_upload(&object_id, retention, legal_hold)
             .await
             .map_err(storage_to_v2)?;
         let mut object_digest = Sha256Hasher::new();
-        let payload_header = payload_sealer.header();
-        object_digest.update(&payload_header);
-        if assembler
-            .push_bytes(&mut multipart, &payload_header)
-            .await
-            .is_err()
-        {
-            abort_v2_commit_multipart(multipart, "standalone_header").await;
-            return Err(V2FormatError::StorageOperationFailed);
-        }
         if cancellation.is_cancelled() {
             abort_v2_commit_multipart(multipart, "standalone_cancelled").await;
             return Err(V2FormatError::ObjectBodyReadFailed);
@@ -1939,8 +1940,8 @@ where
             return Err(V2FormatError::StorageOperationFailed);
         }
 
-        let payload_header = payload_sealer
-            .header_reference(plaintext_seen)
+        let payload_layout = payload_sealer
+            .layout_reference(plaintext_seen)
             .map_err(|_| V2FormatError::InvalidHeaderField)?;
         let object_len = payload_sealer
             .sealed_len_for_plaintext_len(plaintext_seen)
@@ -1999,7 +2000,7 @@ where
             version_id,
             object_len,
             object_digest,
-            payload_header,
+            payload_layout,
         })
     }
 

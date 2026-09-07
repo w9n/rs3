@@ -22,7 +22,6 @@ pub const V2_PAYLOAD_PACK_SEGMENT_BYTES: usize = rs3_types::PAYLOAD_PACK_SEGMENT
 pub const V2_PAYLOAD_PACK_ID_LEN: usize = 32;
 
 const PAYLOAD_PACK_SEGMENT_AAD_DOMAIN: &[u8] = b"rs3:payload-pack-segment-aad:v3\n";
-const PAYLOAD_PACK_SEGMENT_NONCE_CONTEXT_DOMAIN: &[u8] = b"rs3:payload-pack-segment-context:v3\n";
 const AEAD_TAG_LEN: u64 = rs3_types::PAYLOAD_AEAD_TAG_LEN as u64;
 const MAX_CONTEXT_LEN: usize = 1024;
 const MAX_OBJECT_KEY_LEN: usize = 1024;
@@ -78,6 +77,7 @@ impl fmt::Debug for V2PayloadPackId {
 #[derive(Clone, PartialEq, Eq)]
 pub struct V2PayloadPackFacts {
     pack_id: V2PayloadPackId,
+    attempt_id: rs3_types::PayloadAttemptId,
     content_key_id: KeyId,
     stored_len: u32,
     record_count: u32,
@@ -99,6 +99,7 @@ impl V2PayloadPackFacts {
     /// Validates facts recovered from an authenticated encrypted index run.
     pub fn new(
         pack_id: V2PayloadPackId,
+        attempt_id: rs3_types::PayloadAttemptId,
         content_key_id: KeyId,
         stored_len: u32,
         record_count: u32,
@@ -114,6 +115,7 @@ impl V2PayloadPackFacts {
         }
         Ok(Self {
             pack_id,
+            attempt_id,
             content_key_id,
             stored_len,
             record_count,
@@ -124,6 +126,12 @@ impl V2PayloadPackFacts {
     #[must_use]
     pub const fn pack_id(&self) -> V2PayloadPackId {
         self.pack_id
+    }
+
+    /// Returns the fresh encryption attempt shared by this immutable pack.
+    #[must_use]
+    pub const fn attempt_id(&self) -> rs3_types::PayloadAttemptId {
+        self.attempt_id
     }
 
     /// Returns the historical content key needed to open this pack.
@@ -475,6 +483,7 @@ fn seal_v2_payload_pack_with_layout(
 
     let facts = V2PayloadPackFacts::new(
         pack_id,
+        rs3_crypto::random_payload_attempt_id()?,
         content_key_id,
         stored_len,
         u32::try_from(records.len()).map_err(|_| V2FormatError::PayloadPackLimitExceeded)?,
@@ -621,11 +630,11 @@ pub fn open_v2_payload_pack_record_span_with_segments(
         return Err(V2FormatError::InvalidPayloadPack);
     }
     let start_segment = u64::from(span.start_segment);
-    let segment_count = u64::from(span.segment_count);
+    let selected_count = u64::from(span.segment_count);
     let mut cursor = 0_usize;
     let mut selected_plaintext = Vec::new();
     let mut segments = Vec::with_capacity(span.segment_count as usize);
-    for relative_segment in 0..segment_count {
+    for relative_segment in 0..selected_count {
         let segment_ordinal = start_segment
             .checked_add(relative_segment)
             .ok_or(V2FormatError::InvalidPayloadPack)?;
@@ -641,22 +650,23 @@ pub fn open_v2_payload_pack_record_span_with_segments(
             .get(cursor..end)
             .ok_or(V2FormatError::TruncatedBody)?;
         let aad = segment_associated_data(
-            context.object,
             context.facts,
             context.record,
             context.plaintext_len,
             segment_ordinal,
             segment_plaintext_len,
         )?;
-        let nonce_context = segment_nonce_context(
-            context.facts.pack_id,
-            context.record.record_ordinal,
-            segment_ordinal,
-        );
-        let plaintext = keyring.open_payload_pack_segment(
+        let plaintext = keyring.open_payload_segment(
             context.facts.content_key_id(),
-            &aad,
-            &nonce_context,
+            crypto_segment_context(
+                context.object,
+                context.facts,
+                context.record,
+                segment_ordinal,
+                segment_plaintext_len,
+                segment_ordinal + 1 == segment_count(context.plaintext_len)?,
+                &aad,
+            ),
             ciphertext,
         )?;
         if u64::try_from(plaintext.len()).ok() != Some(segment_plaintext_len) {
@@ -832,16 +842,24 @@ fn seal_record_into(
             )
             .ok_or(V2FormatError::InvalidPayloadPack)?;
         let aad = segment_associated_data(
-            context,
             facts,
             record,
             plaintext_len,
             segment_ordinal,
             segment_plaintext_len,
         )?;
-        let nonce_context =
-            segment_nonce_context(facts.pack_id, record.record_ordinal, segment_ordinal);
-        let sealed = keyring.seal_payload_pack_segment(&aad, &nonce_context, plaintext_segment)?;
+        let sealed = keyring.seal_payload_segment(
+            crypto_segment_context(
+                context,
+                facts,
+                record,
+                segment_ordinal,
+                segment_plaintext_len,
+                segment_ordinal + 1 == count,
+                &aad,
+            ),
+            plaintext_segment,
+        )?;
         if sealed.key_id != *facts.content_key_id()
             || u64::try_from(sealed.ciphertext.len()).ok()
                 != segment_plaintext_len.checked_add(AEAD_TAG_LEN)
@@ -863,7 +881,6 @@ fn seal_record_into(
 }
 
 fn segment_associated_data(
-    context: PayloadPackContext<'_>,
     facts: &V2PayloadPackFacts,
     record: &V2PayloadPackRecordRef,
     plaintext_len: u64,
@@ -872,11 +889,6 @@ fn segment_associated_data(
 ) -> V2Result<Vec<u8>> {
     let mut aad = Vec::new();
     aad.extend_from_slice(PAYLOAD_PACK_SEGMENT_AAD_DOMAIN);
-    push_framed(&mut aad, context.repository_context)?;
-    push_framed(&mut aad, context.containing_object.as_str().as_bytes())?;
-    aad.extend_from_slice(&context.section_ordinal.to_be_bytes());
-    aad.extend_from_slice(facts.pack_id.as_bytes());
-    push_framed(&mut aad, facts.content_key_id.as_str().as_bytes())?;
     aad.extend_from_slice(&facts.stored_len.to_be_bytes());
     aad.extend_from_slice(&facts.record_count.to_be_bytes());
     aad.extend_from_slice(&record.record_ordinal.to_be_bytes());
@@ -897,19 +909,27 @@ fn segment_associated_data(
     Ok(aad)
 }
 
-fn segment_nonce_context(
-    pack_id: V2PayloadPackId,
-    record_ordinal: u32,
+fn crypto_segment_context<'a>(
+    object: PayloadPackContext<'a>,
+    facts: &'a V2PayloadPackFacts,
+    record: &V2PayloadPackRecordRef,
     segment_ordinal: u64,
-) -> Vec<u8> {
-    let mut context = Vec::with_capacity(
-        PAYLOAD_PACK_SEGMENT_NONCE_CONTEXT_DOMAIN.len() + V2_PAYLOAD_PACK_ID_LEN + 4 + 8,
-    );
-    context.extend_from_slice(PAYLOAD_PACK_SEGMENT_NONCE_CONTEXT_DOMAIN);
-    context.extend_from_slice(pack_id.as_bytes());
-    context.extend_from_slice(&record_ordinal.to_be_bytes());
-    context.extend_from_slice(&segment_ordinal.to_be_bytes());
-    context
+    plaintext_len: u64,
+    is_final: bool,
+    layout_context: &'a [u8],
+) -> rs3_crypto::PayloadSegmentContext<'a> {
+    rs3_crypto::PayloadSegmentContext {
+        repository_context: object.repository_context,
+        containing_object: object.containing_object,
+        section_ordinal: Some(object.section_ordinal),
+        carrier_id: facts.pack_id.as_bytes(),
+        attempt_id: facts.attempt_id,
+        part_ordinal: record.record_ordinal,
+        segment_ordinal,
+        plaintext_len,
+        is_final,
+        layout_context,
+    }
 }
 
 fn validate_public_context(
@@ -958,7 +978,7 @@ fn validate_physical_order(order: &[usize], count: usize) -> V2Result<()> {
 
 fn segment_count(plaintext_len: u64) -> V2Result<u64> {
     if plaintext_len == 0 {
-        return Ok(1);
+        return Err(V2FormatError::InvalidPayloadPack);
     }
     plaintext_len
         .checked_add(V2_PAYLOAD_PACK_SEGMENT_BYTES as u64 - 1)
@@ -999,16 +1019,6 @@ fn segment_ciphertext_offset(segment_ordinal: u64) -> V2Result<u64> {
     segment_ordinal
         .checked_mul(V2_PAYLOAD_PACK_SEGMENT_BYTES as u64 + AEAD_TAG_LEN)
         .ok_or(V2FormatError::InvalidPayloadPack)
-}
-
-fn push_framed(output: &mut Vec<u8>, value: &[u8]) -> V2Result<()> {
-    output.extend_from_slice(
-        &u64::try_from(value.len())
-            .map_err(|_| V2FormatError::PayloadPackLimitExceeded)?
-            .to_be_bytes(),
-    );
-    output.extend_from_slice(value);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1295,8 +1305,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_record_is_one_authenticated_tag() {
-        let pack = must_v2(seal_v2_payload_pack_with_layout(
+    fn empty_records_require_index_only_values() {
+        let result = seal_v2_payload_pack_with_layout(
             &keyring(),
             REPOSITORY_CONTEXT,
             &object_id("commits/opaque-commit"),
@@ -1306,9 +1316,8 @@ mod tests {
             }],
             V2PayloadPackId::from_bytes([3_u8; V2_PAYLOAD_PACK_ID_LEN]),
             &[0],
-        ));
-        assert_eq!(pack.bytes().len(), AEAD_TAG_LEN as usize);
-        assert_eq!(must_v2(open_record(&pack, 0)), Bytes::new());
+        );
+        assert!(matches!(result, Err(V2FormatError::InvalidPayloadPack)));
     }
 
     #[test]
@@ -1387,6 +1396,9 @@ mod tests {
 
         let mut bad_facts = facts.clone();
         bad_facts.pack_id = V2PayloadPackId::from_bytes([8_u8; V2_PAYLOAD_PACK_ID_LEN]);
+        assert!(open(&bad_facts, record).is_err());
+        bad_facts = facts.clone();
+        bad_facts.attempt_id = rs3_types::PayloadAttemptId::from_bytes([9; 32]);
         assert!(open(&bad_facts, record).is_err());
         bad_facts = facts.clone();
         bad_facts.content_key_id = match KeyId::new("unknown-content-key".to_owned()) {

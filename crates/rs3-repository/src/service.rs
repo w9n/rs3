@@ -4,7 +4,7 @@ use crate::error::{RepositoryError, Result};
 use crate::lru::LruCache;
 use crate::payload::{
     DEFAULT_PAYLOAD_SEGMENT_SIZE, SegmentCiphertextSpan, SegmentPlaintextSelection,
-    SegmentedPayloadHeader, open_segmented_payload_cached_segments,
+    SegmentedPayloadLayout, open_segmented_payload_cached_segments,
     open_segmented_payload_span_with_segments, segmented_plaintext_segment_len,
     segmented_plaintext_selection,
 };
@@ -122,7 +122,7 @@ impl RepositoryResources {
     pub(crate) fn open_cached_decrypted_segments(
         &self,
         identity: DecryptedSegmentIdentity<'_>,
-        header: &SegmentedPayloadHeader,
+        header: &SegmentedPayloadLayout,
         range: ByteRange,
     ) -> Result<Option<Bytes>> {
         let selection = segmented_plaintext_selection(header, range)?;
@@ -155,7 +155,7 @@ impl RepositoryResources {
         &self,
         keyring: &KeyRing,
         identity: DecryptedSegmentIdentity<'_>,
-        header: &SegmentedPayloadHeader,
+        header: &SegmentedPayloadLayout,
         range: ByteRange,
         span: SegmentCiphertextSpan,
         ciphertext: Bytes,
@@ -175,7 +175,7 @@ impl RepositoryResources {
     fn cached_decrypted_segments(
         &self,
         object_ref: &BackendObjectRef,
-        header: &SegmentedPayloadHeader,
+        header: &SegmentedPayloadLayout,
         selection: SegmentPlaintextSelection,
     ) -> Result<DecryptedSegmentLookup> {
         if selection.segment_count == 0 {
@@ -454,9 +454,7 @@ mod tests {
         DecryptedSegmentCache, DecryptedSegmentCacheInsert, DecryptedSegmentIdentity,
         RepositoryResources,
     };
-    use crate::payload::{
-        parse_segmented_payload_header, seal_streamable_payload_object, segmented_ciphertext_span,
-    };
+    use crate::payload::{seal_payload_object, segmented_ciphertext_span};
     use crate::test_support::signing_keyring;
     use bytes::Bytes;
     use rs3_storage::ByteRange;
@@ -546,10 +544,15 @@ mod tests {
         let cache_ref = BackendObjectRef::from(object_id("v2-stream-cache/exact-carrier"));
         let other_cache_ref = BackendObjectRef::from(object_id("v2-stream-cache/other-carrier"));
         let plaintext = b"payload crossing more than one encrypted segment";
-        let sealed = seal_streamable_payload_object(&keyring, &payload_id, plaintext, 16)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let header = parse_segmented_payload_header(&payload_id, &sealed)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let (sealed, header) = seal_payload_object(
+            &keyring,
+            &payload_id,
+            plaintext,
+            16,
+            b"fixture-context".to_vec(),
+            [4; 32],
+        )
+        .expect("seal fixture");
         let range = ByteRange::Slice { offset: 7, len: 29 };
         let span =
             segmented_ciphertext_span(&header, range).unwrap_or_else(|error| panic!("{error}"));

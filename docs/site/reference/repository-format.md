@@ -3,7 +3,7 @@
 The repository format is draft. This page is the design contract for
 `commits/v02`. It is not a compatibility promise. The gateway reads and writes
 bounded payload packs, encrypted index runs, signed index-root checkpoints, and
-canonical framed streamed payloads with guarded metadata-only compaction.
+ciphertext-only detached payloads with guarded metadata-only compaction.
 New bounded writes are partitioned by effective protection cohort, and exact
 full-GC planning plus guarded retention renewal are implemented. Live-provider
 restart/fault qualification and final release qualification are not complete.
@@ -138,12 +138,13 @@ batch places its non-empty values into one pack and stores only compact pack
 pointers in `INDEX_RUN`. Empty objects are index-only. Index checkpointing and
 compaction never rewrite payload bytes.
 
-Each pack has a random 256-bit identity, one content-key identifier, and records
+Each pack has a random 256-bit carrier identity, a fresh 256-bit sealing attempt,
+one content-key identifier, and records
 in randomized physical order. The pack section contains ciphertext only; its
 authenticated layout lives in the encrypted `INDEX_RUN`. A small record is
 ciphertext followed by one 16-byte AEAD tag. Its nonce is derived through a
-keyed KDF from the pack identity, record ordinal, and authenticated plaintext
-digest, so the format does not store a nonce per record. Records larger than 64
+keyed HMAC from authenticated carrier, attempt, record and segment context,
+using the same scheme as detached payloads. The format stores no nonce per record. Records larger than 64
 KiB use canonical 64 KiB independently authenticated segments for efficient
 range reads; smaller records use one segment. Both writer and reader enforce
 that rule so a writer bug cannot create pathological one-byte segments or make
@@ -154,7 +155,7 @@ uses 64 records, while the release-binary high-throughput scale lane can use
 4,096. These are
 writer policies inside the same bounded format, not different trust models.
 
-The encrypted index container table carries the shared pack identity,
+The encrypted index container table carries the shared pack and attempt identities,
 content-key ID, record count, and exact containing-object reference. For a pack
 embedded beside the run, the historical keyring-envelope object and digest come
 from that signed commit; an external container-table entry preserves them
@@ -211,13 +212,49 @@ for later guarded reclamation. Registered in-flight objects are protected from
 same-process GC; maintenance across processes still requires external quiescence.
 
 The encrypted carrier record binds the exact object key and version, stored
-length, ciphertext digest, historical keyring envelope, and segmented header.
-Compaction and checkpoints preserve those facts without copying payloads.
-Partial reads fetch the exact ciphertext segments selected by the authenticated
-header. Full reads validate the header and each bounded segment group before
-release, then withhold the final group until exact EOF and the aggregate digest
-match. Cache identities bind repository/keyring context and all carrier, header,
-and content-length facts; decryption still uses the real payload identity.
+length, ciphertext digest, historical keyring envelope, carrier ID, content key,
+segment size, total plaintext length and selected parts. Backend payload bytes
+contain only concatenated ciphertext and 16-byte tags. There is no payload header.
+
+The descriptor accepts at most 10,000 positive-length parts in strictly increasing
+original part-number order. Each part records its number, fresh 32-byte attempt ID
+and plaintext length. Every part ends on its own segment boundary, so completion
+can assemble independently sealed parts without re-encryption. This is a format
+capability; client multipart endpoints remain deferred. The current writer emits
+one part. Ordinary metadata records retain their 16 KiB cap; only a standalone
+container record can use up to 512 KiB, within the existing bounded index frame.
+
+Readers validate lengths, bounds and ordering, then derive part offsets once.
+Range translation accounts for a short final segment in each part. Compaction
+and checkpoints preserve descriptors without copying payloads. Full reads
+verify the first bounded segment group before returning a response body and
+withhold the final group until exact EOF and the aggregate digest match. Cache
+identities bind repository/keyring context and every carrier, attempt, part,
+layout and content-length fact; decryption uses the real payload identity.
+
+### Shared segment authentication
+
+All payload carriers use XChaCha20-Poly1305 with a 24-byte nonce derived as:
+
+```text
+context = carrier_id[32] || attempt_id[32] || part_or_record_u32be || segment_u64be
+nonce = HMAC-SHA256(content_secret,
+    "rs3:payload-segment-nonce:v3" || 0x00 ||
+    len_u64be(aad) || aad || len_u64be(context) || context)[0..24]
+```
+
+Canonical AAD starts with `rs3:payload-segment-aad:v3`, then length-framed
+repository/historical-keyring context, containing object key and content-key ID.
+It binds the optional section ordinal, fixed context above, segment plaintext
+length, EOF byte and length-framed carrier layout. Integers use big-endian bytes.
+A detached layout binds segment size. A pack layout additionally binds pack size,
+record count, record offset and length, and segment offsets and lengths.
+
+Writers generate a fresh attempt ID before sealing a replacement part or changed
+pack. Repeating backend transmission of already sealed bytes preserves the same
+attempt. Matching content is not an upload identity. Attempt and layout metadata
+stay encrypted; object counts, ciphertext lengths and write timing remain the
+accepted backend observations.
 
 Gateway deduplication remains deferred because it adds equality and
 shared-liveness leakage; Kopia already chunks, packs, and deduplicates its own

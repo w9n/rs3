@@ -21,12 +21,11 @@ use super::{
     generate_v2_commit_key, parse_v2_commit_object, v2_streaming_upload_working_set_bytes,
 };
 use super::{open_v2_index_run, seal_v2_index_run};
-use crate::payload::{parse_segmented_payload_header, seal_streamable_payload_object};
+use crate::payload::seal_payload_object;
 use crate::{CommitCoordinatorOptions, RepositoryError, RepositoryOptions, RepositoryPutOptions};
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_index::PayloadHeaderReference;
 use rs3_index::run::{
     IndexMutation, IndexPayloadPointer, IndexRunLimits, IndexRunStandaloneStreamContainer,
 };
@@ -248,13 +247,14 @@ async fn standalone_read_fixture(
     ));
 
     let object_id = object_id("objects/v02/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-    let stored_body = must_repo(seal_streamable_payload_object(
+    let (stored_body, header) = must_repo(seal_payload_object(
         &keyring,
         &object_id,
         &body,
         64 * 1024,
+        context.clone(),
+        must_v2(super::standalone::standalone_carrier_id(&object_id)),
     ));
-    let header = must_repo(parse_segmented_payload_header(&object_id, &stored_body));
     let metadata = store
         .put(
             &object_id,
@@ -266,15 +266,9 @@ async fn standalone_read_fixture(
         )
         .await
         .expect("write standalone payload");
-    let mut payload_header = PayloadHeaderReference {
-        chunk_size: header.chunk_size,
-        plaintext_len: header.plaintext_len,
-        key_id: header.key_id,
-        nonce_prefix: header.nonce_prefix,
-        header_len: u64::try_from(header.header_len).expect("header length"),
-    };
+    let mut payload_layout = header.reference().clone();
     if tamper_signed_header {
-        payload_header.nonce_prefix[0] ^= 0x80;
+        payload_layout.carrier_id[0] ^= 0x80;
     }
     run.standalone_stream_containers = vec![IndexRunStandaloneStreamContainer {
         object_id: object_id.clone(),
@@ -285,7 +279,7 @@ async fn standalone_read_fixture(
             object_id: options.keyring_envelope_ref.object_id.clone(),
             digest: options.keyring_envelope_ref.digest,
         },
-        payload_header,
+        payload_layout,
     }];
     for mutation in &mut run.mutations {
         let IndexMutation::Upsert(upsert) = mutation else {

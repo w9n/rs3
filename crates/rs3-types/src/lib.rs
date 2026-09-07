@@ -10,10 +10,26 @@ use thiserror::Error;
 pub const PAYLOAD_AEAD_TAG_LEN: usize = 16;
 /// Plaintext bytes per independently authenticated v02 payload-pack segment.
 pub const PAYLOAD_PACK_SEGMENT_BYTES: usize = 64 * 1024;
-/// Random prefix bytes in a segmented or streamable payload's nonce context.
-pub const PAYLOAD_NONCE_PREFIX_LEN: usize = 16;
 /// Bytes in the complete XChaCha20 nonce used for payload encryption.
 pub const PAYLOAD_NONCE_LEN: usize = 24;
+
+/// Fresh identity for one immutable payload sealing attempt.
+///
+/// Reusing an identity is permitted only when retrying already sealed bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PayloadAttemptId([u8; 32]);
+
+impl PayloadAttemptId {
+    /// Reconstructs an identity from authenticated layout metadata.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the exact bytes used by the segment nonce and associated data.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 /// Result alias for type validation.
 pub type Result<T> = std::result::Result<T, TypeError>;

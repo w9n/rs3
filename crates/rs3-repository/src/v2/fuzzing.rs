@@ -1,8 +1,8 @@
 //! Fuzz-only adapters for backend-controlled v2 parser inputs.
 
 use crate::payload::{
-    open_payload_object, parse_segmented_payload_header_with_total_len,
-    seal_streamable_payload_object, segmented_ciphertext_span, total_segmented_payload_len,
+    SegmentedPayloadLayout, open_payload_object, seal_payload_object, segmented_ciphertext_span,
+    total_segmented_payload_len,
 };
 use crate::v2::index_root::{
     decode_v2_index_root_plaintext_for_fuzzing, encode_v2_index_root_plaintext_for_fuzzing,
@@ -19,7 +19,7 @@ use crate::v2::{
 };
 use bytes::Bytes;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_index::PayloadHeaderReference;
+use rs3_index::PayloadLayout;
 use rs3_index::run::{
     IndexBlindKey, IndexMutation, IndexPayloadPointer, IndexRun, IndexRunKeyringRef,
     IndexRunLimits, IndexRunStandaloneStreamContainer, IndexTombstone, IndexUpsert,
@@ -271,6 +271,9 @@ pub fn open_v2_payload_pack(input: &[u8]) {
     }
 
     exercise_raw_payload_pack_facts(input);
+    if input.is_empty() {
+        return;
+    }
 
     let keyring = signing_keyring();
     let containing_object = object_id("commits/v02/fuzz-payload-pack");
@@ -307,40 +310,51 @@ pub fn open_v2_payload_pack(input: &[u8]) {
     });
 }
 
-/// Exercises both segmented standalone header generations and exact span arithmetic.
+/// Exercises authenticated standalone layout bounds, spans and ciphertext tampering.
 pub fn parse_segmented_payload(input: &[u8]) {
-    if input.len() > MAX_FUZZ_INPUT_LEN {
+    if input.is_empty() || input.len() > MAX_FUZZ_INPUT_LEN {
         return;
     }
-
     let object = object_id("objects/v02/fuzz-standalone");
-    let total_len = fuzz_u64(input).unwrap_or(input.len() as u64);
-    if let Ok(header) = parse_segmented_payload_header_with_total_len(&object, input, total_len) {
-        let _ = total_segmented_payload_len(&header);
-        let _ = segmented_ciphertext_span(&header, ByteRange::Full);
-    }
-
     let keyring = signing_keyring();
     let plaintext = input.get(..MAX_STRUCTURED_PAYLOAD_LEN).unwrap_or(input);
-    let chunk_size = usize::from(input.first().copied().unwrap_or(0))
-        .saturating_add(1)
-        .min(512);
-    let sealed = seal_streamable_payload_object(&keyring, &object, plaintext, chunk_size)
-        .unwrap_or_else(|error| panic!("segmented payload fixture failed to seal: {error}"));
-    let opened = open_payload_object(&keyring, &object, sealed.clone(), ByteRange::Full)
-        .unwrap_or_else(|error| panic!("sealed segmented payload failed to open: {error}"));
-    assert_eq!(opened.as_ref(), plaintext);
+    let chunk_size = usize::from(input[0]) + 1;
+    let (sealed, layout) = seal_payload_object(
+        &keyring,
+        &object,
+        plaintext,
+        chunk_size,
+        b"fuzz-context".to_vec(),
+        [4; 32],
+    )
+    .unwrap_or_else(|error| panic!("payload fixture: {error}"));
+    assert_eq!(
+        open_payload_object(&keyring, &object, &layout, sealed.clone(), ByteRange::Full)
+            .unwrap_or_else(|error| panic!("payload open: {error}"))
+            .as_ref(),
+        plaintext
+    );
     exercise_near_valid_bytes(input, &sealed, |candidate| {
-        let candidate = Bytes::copy_from_slice(candidate);
-        let _ = open_payload_object(&keyring, &object, candidate, ByteRange::Full);
+        let _ = open_payload_object(
+            &keyring,
+            &object,
+            &layout,
+            Bytes::copy_from_slice(candidate),
+            ByteRange::Full,
+        );
     });
+    let mut reference = layout.reference().clone();
+    reference.chunk_size = fuzz_u64(input).unwrap_or(0);
+    reference.plaintext_len = fuzz_u64(input.get(8..).unwrap_or(input)).unwrap_or(u64::MAX);
+    if let Ok(candidate) = SegmentedPayloadLayout::new(reference, b"fuzz-context".to_vec()) {
+        let _ = total_segmented_payload_len(&candidate);
+        let _ = segmented_ciphertext_span(&candidate, ByteRange::Full);
+    }
 }
 
 fn standalone_index_run_fixture() -> IndexRun {
-    let header = payload_header();
-    let stored_len = header.header_len
-        + header.plaintext_len
-        + header.plaintext_len.div_ceil(header.chunk_size) * 16;
+    let header = payload_layout();
+    let stored_len = header.plaintext_len + header.plaintext_len.div_ceil(header.chunk_size) * 16;
     IndexRun {
         sequence: Sequence::new(7),
         self_pack: None,
@@ -356,7 +370,7 @@ fn standalone_index_run_fixture() -> IndexRun {
                 object_id: object_id("keyrings/fuzz"),
                 digest: [0x52; 32],
             },
-            payload_header: header.clone(),
+            payload_layout: header.clone(),
         }],
         mutations: vec![
             IndexMutation::Upsert(IndexUpsert {
@@ -434,13 +448,17 @@ fn index_root_fixture() -> V2IndexRoot {
     .unwrap_or_else(|error| panic!("index-root fixture was invalid: {error}"))
 }
 
-fn payload_header() -> PayloadHeaderReference {
-    PayloadHeaderReference {
+fn payload_layout() -> PayloadLayout {
+    PayloadLayout {
         chunk_size: 512,
         plaintext_len: 1_025,
         key_id: key_id("content"),
-        nonce_prefix: [0x41; 16],
-        header_len: 73,
+        carrier_id: [0x41; 32],
+        parts: vec![rs3_index::PayloadPart {
+            part_number: 1,
+            attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x81; 32]),
+            plaintext_len: 1_025,
+        }],
     }
 }
 
@@ -452,6 +470,7 @@ fn exercise_raw_payload_pack_facts(input: &[u8]) {
     let record_count = fuzz_u32(input.get(36..).unwrap_or_default()).unwrap_or(0);
     let Ok(facts) = V2PayloadPackFacts::new(
         V2PayloadPackId::from_bytes(pack_id),
+        rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
         key_id("content"),
         stored_len,
         record_count,

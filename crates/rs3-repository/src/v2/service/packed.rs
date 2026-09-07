@@ -409,6 +409,7 @@ where
                             .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?,
                         length: location.length,
                         pack_id: pack.pack_id,
+                        attempt_id: pack.attempt_id,
                         content_key_id: pack.content_key_id.clone(),
                         keyring_envelope_object_id: self
                             .commit_store
@@ -636,6 +637,7 @@ pub(in crate::v2) fn apply_packed_index_run(
                     .ok_or_else(|| v2_repository_error(V2FormatError::SectionBounds))?,
                 length: section.length,
                 pack_id: pack.pack_id,
+                attempt_id: pack.attempt_id,
                 content_key_id: pack.content_key_id.clone(),
                 keyring_envelope_object_id: replay
                     .parsed_header
@@ -771,6 +773,7 @@ pub(in crate::v2) fn apply_packed_index_run(
 fn index_run_self_pack(layout: &V2PayloadPackLayout) -> IndexRunSelfPack {
     IndexRunSelfPack {
         pack_id: layout.facts().pack_id().into_bytes(),
+        attempt_id: layout.facts().attempt_id(),
         content_key_id: layout.facts().content_key_id().clone(),
         stored_len: u64::from(layout.facts().stored_len()),
         record_count: layout.facts().record_count(),
@@ -791,6 +794,7 @@ fn index_run_pack_container(carrier: &V2PackCarrierReference) -> IndexRunContain
         pack_section_ordinal: carrier.pack_section_ordinal,
         pack_section_len: carrier.length,
         pack_id: carrier.pack_id,
+        attempt_id: carrier.attempt_id,
         content_key_id: carrier.content_key_id.clone(),
         pack_record_count: carrier.pack_record_count,
     }
@@ -808,7 +812,7 @@ fn index_run_standalone_stream_container(
             object_id: carrier.keyring_envelope_object_id.clone(),
             digest: carrier.keyring_envelope_digest,
         },
-        payload_header: carrier.payload_header.clone(),
+        payload_layout: carrier.payload_layout.clone(),
     }
 }
 
@@ -822,6 +826,7 @@ fn pack_carrier_from_index_run(container: &IndexRunContainer) -> V2PackCarrierRe
         pack_offset: container.pack_section_offset,
         length: container.pack_section_len,
         pack_id: container.pack_id,
+        attempt_id: container.attempt_id,
         content_key_id: container.content_key_id.clone(),
         keyring_envelope_object_id: container.keyring_envelope.object_id.clone(),
         keyring_envelope_digest: container.keyring_envelope.digest,
@@ -839,7 +844,7 @@ fn standalone_stream_carrier_from_index_run(
         stored_len: container.stored_len,
         keyring_envelope_object_id: container.keyring_envelope.object_id.clone(),
         keyring_envelope_digest: container.keyring_envelope.digest,
-        payload_header: container.payload_header.clone(),
+        payload_layout: container.payload_layout.clone(),
     }
 }
 
@@ -975,7 +980,7 @@ fn verify_blind_key(
 mod tests {
     use super::intern_standalone_stream_carrier;
     use crate::state::RepositoryState;
-    use rs3_index::{PayloadHeaderReference, V2StandaloneStreamCarrierReference};
+    use rs3_index::{PayloadLayout, V2StandaloneStreamCarrierReference};
     use rs3_types::{BackendObjectId, BackendVersionId, KeyId};
     use std::sync::Arc;
 
@@ -991,12 +996,16 @@ mod tests {
             keyring_envelope_object_id: BackendObjectId::new("meta/v02/keyring")
                 .expect("keyring object id"),
             keyring_envelope_digest: [2; 32],
-            payload_header: PayloadHeaderReference {
+            payload_layout: PayloadLayout {
                 chunk_size: 1_024,
                 plaintext_len: 3_900,
                 key_id: KeyId::new("content-key").expect("content key id"),
-                nonce_prefix: [3; 16],
-                header_len: 48,
+                carrier_id: [3; 32],
+                parts: vec![rs3_index::PayloadPart {
+                    part_number: 1,
+                    attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x81; 32]),
+                    plaintext_len: 3_900,
+                }],
             },
         }
     }

@@ -3,11 +3,10 @@
 use super::{V2FormatError, v2_repository_error};
 use crate::error::{RepositoryError, Result};
 use crate::payload::{
-    SegmentedPayloadHeader, open_segmented_payload_span,
-    parse_segmented_payload_header_with_total_len, segmented_ciphertext_span,
+    SegmentedPayloadLayout, open_segmented_payload_span, segmented_ciphertext_span,
 };
 use bytes::{Bytes, BytesMut};
-use futures_util::{Stream, stream};
+use futures_util::{Stream, StreamExt, stream};
 use rs3_crypto::KeyRing;
 use rs3_crypto::Sha256Hasher;
 use rs3_storage::{BlobRead, ByteRange};
@@ -50,33 +49,24 @@ pub(super) async fn open_authenticated_payload_stream(
     reader: Box<dyn BlobRead>,
     keyring: Arc<KeyRing>,
     payload_id: BackendObjectId,
-    expected_header: SegmentedPayloadHeader,
+    expected_layout: SegmentedPayloadLayout,
     expected_section_digest: [u8; 32],
     expected_stored_len: u64,
 ) -> Result<V2AuthenticatedReadBody> {
-    if reader.exact_len() != expected_stored_len || expected_header.plaintext_len == 0 {
+    if reader.exact_len() != expected_stored_len || expected_layout.plaintext_len == 0 {
         return Err(invalid_payload(&payload_id));
     }
 
-    let mut cursor = BlobCursor::new(reader);
-    let header_len =
-        u64::try_from(expected_header.header_len).map_err(|_| invalid_payload(&payload_id))?;
-    let header_bytes = cursor.take_exact(header_len).await?;
-    let actual_header = parse_segmented_payload_header_with_total_len(
-        &payload_id,
-        &header_bytes,
-        expected_stored_len,
-    )?;
-    if actual_header != expected_header {
+    if crate::payload::total_segmented_payload_len(&expected_layout)? != expected_stored_len {
         return Err(invalid_payload(&payload_id));
     }
-
-    let chunk_size = expected_header.chunk_size;
+    let cursor = BlobCursor::new(reader);
+    let chunk_size = expected_layout.chunk_size;
     let segments_per_chunk = TARGET_PLAINTEXT_CHUNK_BYTES
         .checked_div(chunk_size)
         .unwrap_or(0)
         .max(1);
-    let total_segments = expected_header.plaintext_len.div_ceil(chunk_size);
+    let total_segments = expected_layout.segment_count();
     let grouped_plaintext_bytes = segments_per_chunk
         .checked_mul(chunk_size)
         .ok_or_else(|| invalid_payload(&payload_id))?;
@@ -90,22 +80,23 @@ pub(super) async fn open_authenticated_payload_stream(
     let working_set_bytes = grouped_ciphertext_bytes
         .checked_add(grouped_plaintext_bytes)
         .and_then(|bytes| bytes.checked_add(TARGET_PLAINTEXT_CHUNK_BYTES))
+        .and_then(|bytes| bytes.checked_add(expected_layout.retained_bytes()))
         .ok_or_else(|| invalid_payload(&payload_id))?;
 
-    let mut digest = Sha256Hasher::new();
-    digest.update(&header_bytes);
+    let digest = Sha256Hasher::new();
     let state = AuthenticatedReadState {
         cursor,
         keyring,
         payload_id,
-        header: expected_header,
+        layout: expected_layout,
         expected_section_digest,
         digest,
         next_segment: 0,
         total_segments,
-        segments_per_chunk,
+        segments_per_chunk: usize::try_from(segments_per_chunk)
+            .map_err(|_| stream_storage_error())?,
     };
-    let content_len = state.header.plaintext_len;
+    let content_len = state.layout.plaintext_len;
     let inner = stream::try_unfold(state, |mut state| async move {
         if state.next_segment == state.total_segments {
             return Ok(None);
@@ -115,27 +106,21 @@ pub(super) async fn open_authenticated_payload_stream(
             .next_segment
             .saturating_add(state.segments_per_chunk)
             .min(state.total_segments);
-        let offset = state
-            .next_segment
-            .checked_mul(state.header.chunk_size)
-            .ok_or_else(|| invalid_payload(&state.payload_id))?;
-        let end = end_segment
-            .checked_mul(state.header.chunk_size)
-            .ok_or_else(|| invalid_payload(&state.payload_id))?
-            .min(state.header.plaintext_len);
+        let offset = state.layout.plaintext_offset(state.next_segment)?;
+        let end = state.layout.plaintext_offset(end_segment)?;
         let range = ByteRange::Slice {
             offset,
             len: end
                 .checked_sub(offset)
                 .ok_or_else(|| invalid_payload(&state.payload_id))?,
         };
-        let span = segmented_ciphertext_span(&state.header, range)?;
+        let span = segmented_ciphertext_span(&state.layout, range)?;
         let ciphertext = state.cursor.take_exact(span.len).await?;
         state.digest.update(&ciphertext);
         let plaintext = open_segmented_payload_span(
             &state.keyring,
             &state.payload_id,
-            &state.header,
+            &state.layout,
             range,
             span,
             ciphertext,
@@ -153,10 +138,14 @@ pub(super) async fn open_authenticated_payload_stream(
         Ok(Some((plaintext, state)))
     });
 
+    // Authenticate the first bounded group before returning a response body.
+    // This catches a transplanted descriptor without relying on a public layout.
+    let mut inner = Box::pin(inner);
+    let first = inner.next().await.ok_or_else(stream_storage_error)??;
     Ok(V2AuthenticatedReadBody {
         content_len,
         working_set_bytes,
-        inner: Box::pin(inner),
+        inner: Box::pin(stream::once(async move { Ok(first) }).chain(inner)),
     })
 }
 
@@ -164,12 +153,12 @@ struct AuthenticatedReadState {
     cursor: BlobCursor,
     keyring: Arc<KeyRing>,
     payload_id: BackendObjectId,
-    header: SegmentedPayloadHeader,
+    layout: SegmentedPayloadLayout,
     expected_section_digest: [u8; 32],
     digest: Sha256Hasher,
-    next_segment: u64,
-    total_segments: u64,
-    segments_per_chunk: u64,
+    next_segment: usize,
+    total_segments: usize,
+    segments_per_chunk: usize,
 }
 
 struct BlobCursor {
@@ -245,7 +234,7 @@ fn stream_storage_error() -> RepositoryError {
 #[cfg(test)]
 mod tests {
     use super::open_authenticated_payload_stream;
-    use crate::payload::{parse_segmented_payload_header, seal_streamable_payload_object};
+    use crate::payload::seal_payload_object;
     use crate::test_support::{backend_object_id, signing_keyring};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -286,17 +275,22 @@ mod tests {
         let keyring = Arc::new(signing_keyring());
         let payload_id = backend_object_id("stream/final-digest");
         let plaintext = Bytes::from(vec![0x5a; 2 * 1024 * 1024 + 17]);
-        let sealed = seal_streamable_payload_object(&keyring, &payload_id, &plaintext, 64 * 1024)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let header = parse_segmented_payload_header(&payload_id, &sealed)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let (sealed, layout) = seal_payload_object(
+            &keyring,
+            &payload_id,
+            &plaintext,
+            64 * 1024,
+            b"fixture-context".to_vec(),
+            [4; 32],
+        )
+        .expect("seal fixture");
         let mut wrong_digest: [u8; 32] = Sha256Hasher::digest(&sealed);
         wrong_digest[0] ^= 0x80;
         let mut body = open_authenticated_payload_stream(
             chunked(&sealed),
             keyring,
             payload_id,
-            header,
+            layout,
             wrong_digest,
             sealed.len() as u64,
         )
@@ -325,20 +319,25 @@ mod tests {
         let keyring = Arc::new(signing_keyring());
         let payload_id = backend_object_id("stream/segment-tamper");
         let plaintext = Bytes::from(vec![0x31; 2 * 1024 * 1024 + 17]);
-        let sealed = seal_streamable_payload_object(&keyring, &payload_id, &plaintext, 64 * 1024)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let header = parse_segmented_payload_header(&payload_id, &sealed)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let (sealed, layout) = seal_payload_object(
+            &keyring,
+            &payload_id,
+            &plaintext,
+            64 * 1024,
+            b"fixture-context".to_vec(),
+            [4; 32],
+        )
+        .expect("seal fixture");
         let digest: [u8; 32] = Sha256Hasher::digest(&sealed);
         let mut corrupted = sealed.to_vec();
-        let affected = header.header_len + 1024 * 1024 + 16 * 16 + 17;
+        let affected = 1024 * 1024 + 16 * 16 + 17;
         corrupted[affected] ^= 0x80;
         let corrupted = Bytes::from(corrupted);
         let mut body = open_authenticated_payload_stream(
             chunked(&corrupted),
             keyring,
             payload_id,
-            header,
+            layout,
             digest,
             corrupted.len() as u64,
         )
@@ -357,22 +356,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_header_mismatch_fails_before_returning_a_body() {
+    async fn authenticated_layout_mismatch_fails_before_returning_plaintext() {
         let keyring = Arc::new(signing_keyring());
-        let payload_id = backend_object_id("stream/header-mismatch");
+        let payload_id = backend_object_id("stream/layout-mismatch");
         let plaintext = Bytes::from_static(b"authenticated");
-        let sealed = seal_streamable_payload_object(&keyring, &payload_id, &plaintext, 512)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let mut header = parse_segmented_payload_header(&payload_id, &sealed)
-            .unwrap_or_else(|error| panic!("{error}"));
-        header.nonce_prefix[0] ^= 0x80;
+        let (sealed, mut layout) = seal_payload_object(
+            &keyring,
+            &payload_id,
+            &plaintext,
+            512,
+            b"fixture-context".to_vec(),
+            [4; 32],
+        )
+        .expect("seal fixture");
+        let mut reference = layout.reference().clone();
+        reference.carrier_id[0] ^= 0x80;
+        layout =
+            crate::payload::SegmentedPayloadLayout::new(reference, b"fixture-context".to_vec())
+                .expect("layout");
         let digest: [u8; 32] = Sha256Hasher::digest(&sealed);
 
         let body = open_authenticated_payload_stream(
             chunked(&sealed),
             keyring,
             payload_id,
-            header,
+            layout,
             digest,
             sealed.len() as u64,
         )

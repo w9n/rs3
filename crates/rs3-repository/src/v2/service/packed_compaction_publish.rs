@@ -479,6 +479,7 @@ fn source_self_pack_container(
             .map_err(|_| v2_repository_error(V2FormatError::SectionBounds))?,
         pack_section_len: section.length,
         pack_id: pack.pack_id,
+        attempt_id: pack.attempt_id,
         content_key_id: pack.content_key_id.clone(),
         pack_record_count: pack.record_count,
     }))

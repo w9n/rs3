@@ -310,18 +310,18 @@ S3 listing and timestamps are not coordination primitives. A future
 disconnected mode would need explicit branches, authenticated merge semantics,
 and deterministic conflict policy in a different repository contract.
 
-Payload segmentation is recorded per pack record or streamed-payload header.
-Small packed values use one AEAD record; medium and large values use
-independently authenticated segments for bounded range reads. The authenticated
-index descriptor carries the physical pack layout or exact streamed section
-facts, so neither read path needs an unauthenticated directory lookup. Bounded
-commits use one single-part upload with a compact header; only genuinely
-streaming commits pay the fixed multipart header reservation.
+Payload segmentation is recorded in encrypted pack or detached-payload layouts.
+Both carriers use the same attempt-bound segment nonce scheme. Detached layouts
+retain original selected part numbers and fresh attempt IDs, allowing independent
+parts to be assembled without re-encryption. Readers derive offsets from bounded
+authenticated metadata, including each part's final short segment. Backend payload
+objects contain only ciphertext and tags. All publication commits use one bounded
+PUT; large payloads use backend multipart before their short index publication.
 
 Partial streamed reads fetch only the authenticated ciphertext segments that
 cover the requested plaintext range. The in-memory decrypted-segment cache uses
 an opaque identity derived from repository and historical keyring context plus
-the exact commit, version, body, section, payload-header, and content-length
+the exact commit, version, body, section, payload-layout, and content-length
 facts. The actual payload ID remains the AEAD identity. This prevents cache
 entries from aliasing across exact carriers without creating a backend object
 or exposing a new backend key.

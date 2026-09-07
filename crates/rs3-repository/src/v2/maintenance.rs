@@ -1126,7 +1126,7 @@ struct V2StandalonePayloadRoot {
     object_digest: [u8; 32],
     keyring_envelope_object_id: BackendObjectId,
     keyring_envelope_digest: [u8; 32],
-    payload_header: rs3_index::PayloadHeaderReference,
+    payload_layout: rs3_index::PayloadLayout,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2913,7 +2913,7 @@ fn standalone_payload_root(
         object_digest: carrier.object_digest,
         keyring_envelope_object_id: carrier.keyring_envelope_object_id.clone(),
         keyring_envelope_digest: carrier.keyring_envelope_digest,
-        payload_header: carrier.payload_header.clone(),
+        payload_layout: carrier.payload_layout.clone(),
     }
 }
 
@@ -3008,7 +3008,7 @@ mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use bytes::Bytes;
-    use rs3_index::PayloadHeaderReference;
+    use rs3_index::PayloadLayout;
     use rs3_storage::{BlobStore, MemoryBlobStore, PutOptions, read_bounded_full_at};
     use rs3_types::{BackendObjectId, BackendVersionId, KeyId};
     use std::time::Duration;
@@ -3086,12 +3086,16 @@ mod tests {
             keyring_envelope_object_id: BackendObjectId::new(format!("meta/v02/keyring-{byte}"))
                 .expect("keyring object id"),
             keyring_envelope_digest: [byte.wrapping_add(2); 32],
-            payload_header: PayloadHeaderReference {
+            payload_layout: PayloadLayout {
                 chunk_size: 1_024,
                 plaintext_len: 3_000,
                 key_id: KeyId::new(format!("content-key-{byte}")).expect("content key id"),
-                nonce_prefix: [byte.wrapping_add(3); 16],
-                header_len: 48,
+                carrier_id: [byte.wrapping_add(3); 32],
+                parts: vec![rs3_index::PayloadPart {
+                    part_number: 1,
+                    attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x81; 32]),
+                    plaintext_len: 3_000,
+                }],
             },
         }
     }
