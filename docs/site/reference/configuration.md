@@ -22,7 +22,7 @@ An explicit `--gateway-mode restore-readonly` forces maintenance off.
 | `RS3_INIT_PROFILE` | no | `production` | One-shot init posture: `local` or `production`. Production permits deliberate bootstrap; journaled S3 init may qualify provider evidence before repository publication. Other production checks apply before backend access. |
 | `RS3_INIT_JOURNAL_SECRET` | for writable Kubernetes init | unset | Declared bootstrap Secret in the anchor namespace; equivalent to `init --journal-secret`. Persists unfinished initialization under the writer Lease. Not used by serve or read-only verification. |
 | `RS3_INIT_GOVERNANCE_BYPASS_REVIEWED` | automatic governance qualification | `false` | Explicit review that the serving principal cannot bypass retention; equivalent to `init --governance-bypass-reviewed`. Requires a principal fingerprint. Existing matching evidence retains its recorded review. |
-| `RS3_RECOVERY_PUBLIC_KEY` | production bundle verification/import only | none | `ed25519:<hex-public-key>` used to verify signed v2 restore bundles during `verify-bundle` and `import-anchor`. |
+| `RS3_RECOVERY_PUBLIC_KEY` | production bundle verification/import only | none | `ed25519:<hex-public-key>` used to verify signed v03 restore bundles during `verify-bundle` and `import-anchor`. |
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
 | `RUST_LOG` | no | `info` | Tracing filter for `rs3` application targets. Dependency targets are always disabled because upstream HTTP and S3 traces can contain object paths or authentication headers. |
 
@@ -339,7 +339,7 @@ output. The production profile also rejects memory anchors,
 retention-unsupported local backends, plaintext S3-compatible backend
 endpoints, missing gateway credentials, and missing repository retention for
 mutation-capable serving. Findings include remediation hints. The opt-in
-`--probe` mode also checks backend reachability, v2 anchor readability, and
+`--probe` mode also checks backend reachability, v03 anchor readability, and
 keyring envelope readability.
 
 ## Helm Repository Keys

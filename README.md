@@ -6,7 +6,7 @@ S3-compatible backup gateway for Kubernetes operators.
 ## Status
 
 The project has a working local S3-compatible gateway path, repository
-encryption boundaries, signed v2 commit/anchor plumbing, integration harnesses,
+encryption boundaries, signed v03 commits and anchors, integration harnesses,
 Kubernetes Lease anchoring, restore-bundle workflows, production posture checks,
 and Kopia-focused performance measurement. The current release target is a
 production preview: suitable for controlled evaluation, not yet a stable
@@ -14,15 +14,13 @@ repository-format or security guarantee. New preview repositories use the
 `v3-preview` repository format; it is the only format accepted by the current
 gateway.
 
-Large known-length and chunked uploads use the same catalogued state model as
-bounded batches. Unknown-length and zero-length streamed commits use the signed
-section shape `[PAYLOAD, INDEX_RUN]`. Large known-length requests instead upload
-one opaque standalone payload carrier before publishing a short `[INDEX_RUN]`
-commit containing its encrypted exact reference. Checkpoints, recovery,
-compaction, and garbage collection retain either historical payload carrier
-without copying its ciphertext. Zero-length streamed requests remain
-authenticated stream carriers rather than being rewritten into a different wire
-shape.
+Bounded nonempty writes publish a ciphertext-only `PAYLOAD_PACK` with an
+`INDEX_RUN`. Large or unknown-length nonempty streams upload one opaque detached
+payload, verify its complete stored ciphertext, then publish a short
+`[INDEX_RUN]` commit containing the encrypted exact reference. Empty values are
+index-only. Checkpoints, recovery, compaction and garbage collection preserve
+exact payload references without copying ciphertext. Success requires accepted,
+anchored publication; an uploaded payload alone is not visible repository state.
 
 Current engineering priorities:
 
@@ -117,7 +115,7 @@ tradeoff is useful.
 - `crates/rs3-index`: append-friendly index and repository state model.
 - `crates/rs3-storage`: object-store abstraction.
 - `crates/rs3-k8s`: Kubernetes anchor integration surface.
-- `crates/rs3-repository`: repository write, read, v2 anchor contracts, commit,
+- `crates/rs3-repository`: repository write, read, anchor contracts, commit,
   and maintenance behavior.
 - `crates/rs3-server`: command-line gateway process and S3 compatibility layer.
 - `xtask`: local automation used by `just`.

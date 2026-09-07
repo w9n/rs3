@@ -168,7 +168,8 @@ make the gateway generate an undeclared salt on first normal startup; that makes
 disaster recovery dependent on a cluster Secret that may be gone.
 
 Bootstrap assumes a fresh, randomized backend prefix. The gateway probes the
-root and known v2 sub-prefixes before initializing, but provider `LIST`
+root and known repository sub-prefixes, including refused legacy generations,
+before initializing, but provider `LIST`
 semantics are still part of the storage trust boundary. Do not bootstrap over an
 old or unknown prefix; recover or import the existing repository instead.
 
@@ -198,7 +199,7 @@ A new cluster needs more than backend credentials:
 - repository ID
 - repository salt
 - wrapping-key source for the envelope
-- trusted v2 anchor position: sequence, commit key, commit object version ID
+- trusted v03 anchor position and repository format generation: sequence, commit key, commit object version ID
   when available, commit body digest, signing key ID, and format-root reference
 
 The trusted anchor position can come from a recovery bundle or audited export.
@@ -266,8 +267,8 @@ At a glance:
 | Live retained-backend v2 Velero dynamic-PVC gateway-restart restore | Passed on 2026-05-18 with `just preview-gate-v2-live` against an Object Lock bucket with repository governance retention enabled; backup and restore completed, restored bytes matched, and v2 Lease assertions passed after backup, after gateway restart, and after restore. |
 | Live retained-backend v2 Velero/Postgres restore | Passed on 2026-05-18 with `just preview-gate-v2-live` against an Object Lock bucket with repository governance retention enabled; Postgres rows were backed up and restored, and v2 Lease assertions passed after backup and after restore. |
 | Live retained-backend v2 Kopia gateway backup/restore | Passed on 2026-05-18 as part of `just preview-gate-v2-live` against an Object Lock bucket with repository governance retention enabled; restored bytes matched. |
-| Live retained-backend v03 gateway smoke | Passed on 2026-05-18 as part of `just preview-gate-v2-live` through the local gateway using `mc` and default `rclone lsf` for `PUT`, `HEAD`, `GET`, and prefix listing with governance retention. |
-| v2 Kubernetes Lease gateway smoke | Passed on 2026-05-18 as part of `just preview-gate-v2-live`; Helm deployed the default v3-preview gateway with Kubernetes Lease anchoring, the S3 smoke passed, and the harness verified v2 Lease annotations. |
+| Live retained-backend v2 gateway smoke | Passed on 2026-05-18 as part of `just preview-gate-v2-live` through the local gateway using `mc` and default `rclone lsf` for `PUT`, `HEAD`, `GET`, and prefix listing with governance retention. |
+| v2 Kubernetes Lease gateway smoke | Passed on 2026-05-18 as part of `just preview-gate-v2-live`; Helm deployed the then-default v2-preview gateway with Kubernetes Lease anchoring, the S3 smoke passed, and the harness verified v2 Lease annotations. |
 | Local v2 streamable payload checks | Passed on 2026-07-11 with focused repository and gateway tests plus `just check-s3`. These checks cover canonical framed known-length, repository-layer EOF-finalized and zero-length streams, signed payload-section validation, checkpoint/reload, metadata-only compaction, GC reachability, and retained multipart Object Lock compile coverage. The public S3 boundary requires a declared or SigV4-decoded length; unsigned HTTP chunked PUT is rejected with `411 MissingContentLength`. |
 | Local v2 Velero dynamic-PVC gateway-restart smoke | Passed on 2026-05-17 with `just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke` on a fresh kind cluster. Backup completed, the gateway deployment was restarted, restore completed, restored pod data was verified, and the cluster was deleted. |
 | Local v2 Velero/Postgres RustFS smoke | Passed on 2026-05-16 after v2 concurrent payload-section cache fills were coalesced. The gateway run completed backup and restore, wrote no backend `segments/` objects, read 29.0 MB versus 28.9 MB for the direct RustFS baseline, and used 57 backend requests versus 708 for direct RustFS. |
@@ -411,6 +412,11 @@ Preview evidence should show:
 - accepted leakage is documented in the security model
 
 ## `v03` Release Blockers
+
+V03 publication chronology remains an implementation gate: the writer signs
+local wall time and replay does not yet reject timestamps at or before the
+parent's. Do not qualify retention history until strict ordering and clock,
+restart and writer-handoff tests pass. Codec fixtures do not prove this property.
 
 The replacement repository generation must complete all of these together:
 

@@ -1,8 +1,8 @@
 # Repository Format Reference
 
-The repository format is draft. This page is the design contract for
-`commits/v03`. It is not a compatibility promise. The gateway reads and writes
-bounded payload packs, encrypted index runs, signed index-root checkpoints, and
+This reference describes the current `commits/v03` encoding and runtime bounds
+for implementers and verifiers. The format remains preview-scoped. The gateway
+reads and writes bounded payload packs, encrypted index runs, signed index-root checkpoints, and
 ciphertext-only detached payloads with guarded metadata-only compaction.
 New bounded writes are partitioned by effective protection cohort, and exact
 full-GC planning plus guarded retention renewal are implemented. Live-provider
@@ -35,8 +35,8 @@ generation 3, distinct from format-root envelope rotation generations.
 - Plaintext logical paths and Kubernetes names do not appear in backend keys,
   tags, unauthenticated metadata, signed headers, metrics, logs, or errors.
 - Privacy-sensitive metadata is encrypted and authenticated.
-- Every accepted repository transition is a signed, monotonic commit selected
-  by an external anchor.
+- Every accepted repository transition has a signed sequence and exact parent
+  selected by an external anchor.
 - S3 listing order and mutable latest-object state are never authoritative.
 - Every retained restore-critical reference includes the exact provider object
   version when the backend supplies version IDs.
@@ -48,17 +48,6 @@ generation 3, distinct from format-root envelope rotation generations.
 - Provider retention is never shortened by `rs3`.
 
 ## Format Generations
-
-The existing prototype uses keys of this form:
-
-```text
-commits/v01/<20-digit-sequence>/<32-byte-random-id-base64url>
-```
-
-That generation is removed and unsupported. It is not an input to the `v03`
-design, and initialization of a `v03` repository must fail if the chosen backend
-prefix is not demonstrably fresh. Importing or converting a `v01` repository is
-outside the product contract.
 
 The current preview runtime and catalog format use:
 
@@ -131,6 +120,11 @@ encodings, overlapping sections, arithmetic overflow, and trailing bytes
 outside the signed layout fail closed. Signed section digests, framed indices,
 compacted runs and detached payloads are intrinsic to format 3; no capability
 bits are assigned. Root catalogs accept levels zero and one.
+
+`publish_time_ms` is signed wall-clock metadata. The current writer uses its
+local clock, and replay does not yet enforce a timestamp greater than the
+parent's. Strict chronology and its clock/handoff tests remain required before
+retention-history qualification. Sequence order is independently validated.
 
 The current framed index plaintext is wire version 7. Frame, section and mutation
 ordinals, generations, content lengths, retention days, and bounded counts use
@@ -338,13 +332,27 @@ format change.
 
 Wire version 7 uses canonical length-delimited records and no compression. Each
 ciphertext frame and run has an explicit record and byte
-limit; the target maximum encrypted run object is 8 MiB. Index-frame associated
+limit; the maximum encrypted run object is 8 MiB. Index-frame associated
 data binds at least the immutable repository identity, exact historical
 keyring-envelope reference, exact containing object key, section ordinal, run
 identity, and frame ordinal. The provider version does not exist until after
 upload, so the accepted signed catalog will bind that returned exact version
 together with object length and ciphertext digest. Reordering, duplicating, or
 transplanting frames must fail authentication.
+
+Default plaintext and framing bounds are distinct:
+
+| Bound | Limit |
+| --- | ---: |
+| Encoded run plaintext | 7 MiB |
+| Plaintext projection frame | 1 MiB minus 1 KiB |
+| Ordinary record | 16 KiB |
+| Standalone container record | 512 KiB |
+| External containers | 4,096 |
+| Mutations per run | 65,536 |
+| Logical path | 1,024 bytes |
+| Physical run envelope | 8 MiB |
+| Frames per physical run | 4,096 |
 
 ## Small Signed Index Roots
 
@@ -389,6 +397,11 @@ records they mask requires a separate future guarded or offline merge with
 protected-root and GC proof. Foreground compaction is metadata-only and never
 reads, decrypts, or rewrites payload ciphertext.
 
+An index root is bounded to 8 MiB and 1,024 active runs, with aggregate
+ceilings of 16,777,216 mutations and 8 GiB of stored run bytes. Per-run limits
+remain 65,536 mutations, 4,096 frames and 8 MiB. These bounds apply before
+accepting the catalog, independently of the number of live logical objects.
+
 ## Descriptor-First Recovery
 
 Cold recovery starts only from the external anchor:
@@ -402,8 +415,8 @@ Cold recovery starts only from the external anchor:
    cumulative run set beyond the accepted state.
 5. Replay post-catalog commit runs oldest to newest, again retaining at most one
    bounded frame beyond the accepted state.
-6. Verify catalog cardinality and structural invariants, then sample exact
-   payload references as required by the recovery gate.
+6. Verify catalog cardinality and structural invariants. Payload checks belong
+   to subsequent reads and qualification tests, not index reconstruction.
 7. Re-read the external anchor before installing the recovered state. If it
    changed, discard the candidate and retry within a bounded policy.
 
@@ -487,14 +500,18 @@ Kubernetes writer fence used for anchor advancement. Commit-tail and encrypted
 tail-byte posture remains part of the release design, but is not yet an
 equivalent automatic runtime gate.
 
-Initial engineering watermarks are:
+Default replay budgets are independent of the active-run watermarks:
 
-| State | Commit tail after catalog | Encrypted tail index bytes |
-| --- | ---: | ---: |
-| Checkpoint requested | 1,000 | 32 MiB |
-| Operationally degraded | 2,000 | 48 MiB |
-| New mutations paused | 3,000 | 64 MiB |
-| Absolute verifier ceiling | 4,096 | 96 MiB |
+| Budget | Default |
+| --- | ---: |
+| Commits walked to a snapshot | 4,096 |
+| Cumulative provider-reported commit-object bytes | 1 TiB |
+| Retained encrypted index-section bytes | 64 MiB |
+| One body-verification range read | 8 MiB |
+
+These are `V2ReplayLimits` defaults. They are verifier ceilings, not automatic
+checkpoint triggers. Descriptor-first startup avoids reading unrelated payload
+bytes even though their containing object sizes count toward its object budget.
 
 For active runs, a coordinator requests compaction at 256. If no maintenance
 guard is configured, it degrades and retries at each additional 64-run boundary,
@@ -554,15 +571,9 @@ level, and compaction generation. Delayed list visibility, duplicate versions,
 and abandoned uploads are therefore availability and cleanup concerns, not
 state-selection mechanisms.
 
-The coordinator requests compaction at 256 active runs. A missing maintenance
-guard degrades and retries at subsequent 64-run boundaries below 896. A fully
-validated bounded plan that cannot reduce run count may likewise defer and
-retry below 896. Both fail closed at that pause watermark. A configured guard
-rejection, corruption, storage or anchor failure, and every other compaction
-error poisons immediately. The writer also refuses a compact mutation before it
-would create a 1,025th active run. These are distinct defenses: operational
-backpressure acts early, while the immutable format ceiling remains the final
-fail-closed bound.
+The writer also refuses a mutation that would create a 1,025th active run.
+[Automatic watermarks](#automatic-catalog-watermarks) provide earlier
+backpressure; the format ceiling remains the final bound.
 
 ## Reachability, Retention, and GC
 
@@ -603,26 +614,13 @@ format/data-key rotation, or cross-format protected-root renewal. Existing held
 graphs also fail full maintenance. New v03 legal holds are disabled until hold
 propagation and guarded release cover every restore dependency.
 
-Payload-pack cleaning is a separate space-reclamation operation, not part of
-the exact-root deletion proof. A fully dead pack
-may be deleted only after the complete exact-root mark, orphan-age floor,
-protection checks, and maintenance-fence checks pass. A mixed pack is left in
-place until its dead fraction justifies cleaning. Cleaning re-encrypts its live
-records into a new random pack, publishes higher-generation physical
-references, and retains the old exact version while any current or protected
-historical root reaches it. Mutable reference counts are not authoritative.
-
-Current writers never mix different effective `(retention mode, retain days,
-legal hold)` cohorts in one new payload pack. Client legal-hold publication is
-currently disabled, but the cohort dimension remains a defensive format
-invariant for preexisting data. Packs written before that rule, or
-otherwise conservatively over-protected, remain safe but may occupy space until
-a future cleaner rewrites their live records.
-
-If a candidate pack has live fraction `l`, cleaning must copy at least
-`l / (1 - l)` bytes for every byte it can reclaim. The cleaner therefore uses
-an explicit utilization threshold and never runs on every checkpoint. Index
-checkpointing and compaction must not copy every live payload.
+Payload-pack cleaning is not implemented. A fully dead pack can be reclaimed
+by exact-root GC once age, protection and fence checks pass. A mixed pack keeps
+its dead bytes while live or protected historical references reach it. Current
+writers partition new packs by effective protection cohort, but there is no
+promise of prompt space reclamation from partially dead packs. A future cleaner
+must publish replacement references and preserve old exact versions for every
+protected root; index compaction does not copy payloads.
 
 ## Anchors and Writer Coordination
 
@@ -676,11 +674,11 @@ artifact. Retries use the verified exact provider versions of their dependencies
 A matching unfinished journal can resume without an anchor; a completed or
 missing journal with existing backend data requires explicit recovery.
 
-Initialization is permitted only on a verified fresh prefix. Detection of
-unsupported `v01` objects, an existing anchor, an existing format root, or
-ambiguous listing state fails closed. There is no automatic import, overwrite,
-or migration behavior. The freshness inventory is paged and capped at 4,096
-pages and 2,000,000 raw provider members, including filtered version members.
+A new initialization requires a verified fresh prefix. Unsupported `v01` or
+`v02` objects, foreign existing state and ambiguous inventory fail closed. Only
+a matching unfinished bootstrap journal can resume its prepared operation;
+there is no automatic import, overwrite or migration. The freshness inventory
+is paged and capped at 4,096 pages and 2,000,000 raw provider members, including filtered version members.
 
 Wrapping-key rewrap preserves repository data keys and is not compromise
 recovery. Historical keys may be retired only after reachability and retention
@@ -688,50 +686,19 @@ prove that no protected root requires them.
 
 ## Implementation and Qualification Gates
 
-Before `commits/v03` can qualify as the repository format, implementation must
-include:
-
-- canonical encoding, crypto, corruption, and cross-object transplant vectors;
-- descriptor and frame parsers with fixed hostile-input budgets and fuzzing;
-- fresh-process 10k, 100k, and 1M committed-write recovery gates that verify
-  exact cardinality plus first, middle, and last payload bytes;
-- a 1M filesystem recovery target of at most 180 seconds and 4 GiB RSS on the
-  documented 4-vCPU, 16-GiB runner;
-- no payload reads during normal index recovery and at most 1.25x index byte
-  read amplification;
-- fresh post-recovery sentinel reads that use one exact backend range `GET` per
-  record and at most 1.04x ciphertext-byte amplification for 512 B values (528
-  B including the AEAD tag, or 1.03125x, is the format expectation);
-- enforced small-object write gates for a 64-object batch: at most 1.50x for
-  512 B values (target 1.40x), at most 1.15x for 4 KiB values, at most 1.03x
-  for 256 KiB values, and at most 320 fixed backend bytes per empty object;
-- a sequential 512 B committed-write gate of at most 3.0x plus a
-  checkpoint-and-compaction-inclusive lifetime gate of at most 1.50x;
-- amplification evidence at 32 B, 256 B, and 1,024 B logical path lengths that
-  reports payload amplification separately from fixed metadata bytes per
-  object;
-- separate adversarial raw-S3 and real Kopia/Velero tiny-source-file gates, so
-  a million 512 B S3 objects does not pretend to model a client that already
-  packs and deduplicates its repository blobs;
-- measured known-length and chunked streamed-write lanes that cover checkpoint
-  reload, post-compaction cold ranges, and exact GC reachability without
-  attributing historical pre-wire-4 results to the current format;
-- checkpoint crash, stale-fence, delayed-read, replay, deletion, and exact
-  provider-version fault tests;
-- GC tests proving exact payload reachability across overlapping runs,
-  tombstones, protected roots, and failed compactions; and
-- a retained-provider restart and writer-handoff qualification run.
-
-The local and CI recipes enforce generous elapsed-time regression ceilings on
-every runner, including a separate recovery ceiling. Time results qualify a
-release only on the pinned runner. Correctness, allocation, request, byte, and
-amplification ceilings apply everywhere.
+Frozen canonical fixtures and nine fuzz targets cover current codecs;
+[Testing](../testing.md) maps the executable coverage and its limits. Full
+qualification still requires strict publication chronology, retained-provider
+restart/fault evidence, production-cardinality maintenance and matched recovery
+and amplification results for the exact candidate. Historical v02 measurements
+do not qualify v03. See [Production Preview](../production-preview.md) and
+[Performance](../performance.md) for evidence and release gates.
 
 ## Compatibility Promise
 
 There is no stable repository-format promise yet. `commits/v01` is removed and
-unsupported without migration support. The gateway reads and writes the preview
-`commits/v03` envelope with index-run wire version 7. The current reader rejects
+unsupported, as is `commits/v02`, without migration support. The gateway reads
+and writes the preview `commits/v03` envelope with index-run wire version 7. The current reader rejects
 retired streamed-commit pointers and earlier preview layouts. Recreate evaluation
 repositories when the preview wire changes. Catalog, exact descriptors,
 framed streaming, and guarded metadata-only mixed-carrier compaction are
