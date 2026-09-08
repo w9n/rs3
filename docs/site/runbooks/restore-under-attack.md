@@ -36,13 +36,21 @@ kubectl -n <gateway-namespace> scale deployment/<gateway-deployment> --replicas=
 ```
 
 If the deployment must remain online for restore traffic, switch it to
-`restore-readonly` before exposing it to restore clients.
+`restore-readonly` before exposing it to restore clients. For a journaled
+installation, reuse the original Job's `RS3_INIT_JOURNAL_SECRET` name below.
+Disabling bootstrap stops initialization; the explicit journal reference keeps
+generated provider evidence projected. Preserve existing key/credential Secret
+references and the Lease. If evidence comes from an external ConfigMap instead,
+keep that reference and omit the journal override.
 
 ```sh
 helm upgrade <release> charts/rs3-gateway \
   --namespace <gateway-namespace> \
   --reuse-values \
-  --set-string gateway.mode=restore-readonly
+  --set-string gateway.mode=restore-readonly \
+  --set bootstrap.enabled=false \
+  --set-string bootstrap.existingJournalSecret='<original-journal-secret>' \
+  --set-string maintenance.mode=''
 ```
 
 Do not switch back to `read-write` until the trusted commit chain and anchor state
@@ -76,7 +84,9 @@ rs3 recovery-points --limit 100 --cursor '<next_cursor>' --format json
 
 Review `sequence`, `publish_time_ms`, `protected_until_ms`, and `current` in the
 response. The cursor is tied to the live anchor; restart the listing if the
-anchor advances or the cursor is rejected. Select the exact sequence in an
+anchor advances or the cursor is rejected. For a separate Helm reader, use the
+[historical reader overlay](../deploy-backup-restore.md#recover-an-earlier-gateway-state).
+With an already configured CLI environment, select the exact sequence in an
 isolated read-only gateway:
 
 ```sh
@@ -267,7 +277,10 @@ kubectl -n velero patch backupstoragelocations.velero.io/default \
 helm upgrade <release> charts/rs3-gateway \
   --namespace <gateway-namespace> \
   --reuse-values \
-  --set-string gateway.mode=restore-readonly
+  --set-string gateway.mode=restore-readonly \
+  --set bootstrap.enabled=false \
+  --set-string bootstrap.existingJournalSecret='<original-journal-secret>' \
+  --set-string maintenance.mode=''
 ```
 
 Run the restore into an isolated target where practical.

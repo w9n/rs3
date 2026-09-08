@@ -1,5 +1,8 @@
 # Getting Started
 
+For Kubernetes deployment and an ordinary client round trip, use
+[Deploy, Back Up, and Restore](deploy-backup-restore.md).
+
 This page gives the local development path. If you are evaluating whether `rs3`
 is worth a controlled trial, start with [Evaluation](evaluation.md) first.
 Production deployment guidance stays conservative until the repository format

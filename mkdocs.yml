@@ -62,6 +62,7 @@ nav:
       - Security Review: security-review.md
       - Performance: performance.md
   - Operate:
+      - Deploy, Back Up, and Restore: deploy-backup-restore.md
       - Operations: operations.md
       - Runbooks:
           - Retention And Object Lock: runbooks/retention-and-object-lock.md

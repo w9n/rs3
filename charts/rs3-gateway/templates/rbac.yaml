@@ -14,12 +14,14 @@ rules:
       - {{ include "rs3-gateway.bootstrapJournalName" . | quote }}
     verbs: ["get", "update"]
   {{- end }}
+  {{- if eq .Values.gateway.mode "read-write" }}
   - apiGroups:
       - coordination.k8s.io
     resources:
       - leases
     verbs:
       - create
+  {{- end }}
   - apiGroups:
       - coordination.k8s.io
     resources:
@@ -28,7 +30,9 @@ rules:
       - {{ .Values.anchor.name | quote }}
     verbs:
       - get
+      {{- if eq .Values.gateway.mode "read-write" }}
       - update
+      {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

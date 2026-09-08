@@ -311,6 +311,10 @@ and exact live payload references. Descriptor-first recovery verifies that
 graph and rechecks the anchor before installing state. Missing anchor plus
 missing trusted bundle is fail-closed for normal recovery.
 
+The chart-generated Role for `restore-readonly` grants only `get` on the
+selected anchor Lease. Lease creation and updates remain read-write gateway
+permissions; Helm tests verify both permission sets.
+
 ### Anchor Lease Annotation Visibility
 
 The Kubernetes Lease anchor stores its state in Lease annotations under the

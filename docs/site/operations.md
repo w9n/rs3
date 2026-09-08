@@ -1,5 +1,9 @@
 # Operations
 
+Start with [Deploy, Back Up, and Restore](deploy-backup-restore.md) for the
+one-time Helm setup and routine client workflow. This page covers operational
+settings, checks, and advanced recovery.
+
 This page describes the current operator-facing shape. Treat it as development
 documentation until the repository format and hardened anchor path are stable.
 

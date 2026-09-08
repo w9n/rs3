@@ -59,6 +59,10 @@ spec:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           args:
             - serve
+            {{- if .Values.recovery.point }}
+            - --recovery-point
+            - {{ .Values.recovery.point | quote }}
+            {{- end }}
           ports:
             - name: s3
               containerPort: {{ .Values.service.port }}
@@ -99,7 +103,7 @@ spec:
               mountPath: {{ .Values.persistence.mountPath | quote }}
             - name: tmp
               mountPath: /tmp
-            {{- if or .Values.providerConformance.existingConfigMap .Values.bootstrap.enabled }}
+            {{- if or .Values.providerConformance.existingConfigMap .Values.bootstrap.enabled .Values.bootstrap.existingJournalSecret }}
             - name: provider-conformance
               mountPath: /etc/rs3/provider-conformance
               readOnly: true
@@ -116,7 +120,7 @@ spec:
           {{- end }}
         - name: tmp
           emptyDir: {}
-        {{- if or .Values.providerConformance.existingConfigMap .Values.bootstrap.enabled }}
+        {{- if or .Values.providerConformance.existingConfigMap .Values.bootstrap.enabled .Values.bootstrap.existingJournalSecret }}
         - name: provider-conformance
           {{- if .Values.providerConformance.existingConfigMap }}
           configMap:

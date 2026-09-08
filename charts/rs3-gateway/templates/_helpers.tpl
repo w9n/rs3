@@ -55,6 +55,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- define "rs3-gateway.validateValues" -}}
+{{- if .Values.recovery.point -}}
+{{- if or (ne .Values.gateway.mode "restore-readonly") .Values.bootstrap.enabled .Values.repository.allowInit -}}
+{{- fail "recovery.point requires restore-readonly with bootstrap disabled and repository.allowInit=false" -}}
+{{- end -}}
+{{- if or (not (regexMatch "^(0|[1-9][0-9]{0,19})$" .Values.recovery.point)) (and (eq (len .Values.recovery.point) 20) (gt .Values.recovery.point "18446744073709551615")) -}}
+{{- fail "recovery.point must be a quoted decimal u64 sequence" -}}
+{{- end -}}
+{{- end -}}
 {{- if .Values.bootstrap.enabled -}}
 {{- if or (ne .Values.anchor.mode "kubernetes-lease") (ne .Values.gateway.mode "read-write") (ne .Values.gateway.writerGuard "required") -}}
 {{- fail "bootstrap requires a read-write Kubernetes gateway with required writer guard" -}}

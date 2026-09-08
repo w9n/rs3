@@ -200,7 +200,7 @@
 - name: RS3_MAINTENANCE_MAX_INVENTORY_ITEMS
   value: {{ .Values.maintenance.maxInventoryItems | quote }}
 {{- end }}
-{{- if or .Values.providerConformance.existingConfigMap (and .Values.bootstrap.enabled (not $bootstrap)) }}
+{{- if or .Values.providerConformance.existingConfigMap (and (or .Values.bootstrap.enabled .Values.bootstrap.existingJournalSecret) (not $bootstrap)) }}
 - name: RS3_PROVIDER_CONFORMANCE_REPORT_FILE
   value: /etc/rs3/provider-conformance/report.json
 {{- end }}

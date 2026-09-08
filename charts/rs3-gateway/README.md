@@ -5,6 +5,10 @@ The chart is preview-scoped: keep one read-write gateway per repository, use a
 Kubernetes Lease anchor, and provide repository identity plus key material
 deliberately.
 
+Follow [Deploy, Back Up, and Restore](../../docs/site/deploy-backup-restore.md)
+for one configuration, journaled Helm initialization, and a verified Kopia round
+trip.
+
 ## Prerequisites
 
 - A Kubernetes cluster with a namespace for the gateway.
@@ -13,31 +17,16 @@ deliberately.
 - A bearer token Secret for the admin listener health and operator-fact routes.
 - Repository ID, salt, and keyring wrapping key material.
 - Lease RBAC, either created by this chart or managed externally.
-- A ConfigMap containing current path-redacted provider-conformance JSON for a
-  production read-write deployment.
+- Journaled S3 bootstrap (`bootstrap.enabled=true`), or an existing initialized
+  repository and a ConfigMap containing current provider-conformance JSON.
 
-## Local Smoke Install
+## Local evaluation
 
-For a local `file://` backend, enable the PVC and create fixture secrets through
-values. This is not a production posture.
-
-```sh
-helm upgrade --install rs3 charts/rs3-gateway \
-  --set admin.profile=local \
-  --set persistence.enabled=true \
-  --set credentials.create=true \
-  --set-string credentials.accessKeyId=local \
-  --set-string credentials.secretAccessKey=local-secret \
-  --set admin.createToken=true \
-  --set-string admin.bearerToken=local-admin-token-12345 \
-  --set repositoryKeys.create=true \
-  --set-string repositoryKeys.saltHex=1111111111111111111111111111111111111111111111111111111111111111 \
-  --set-string repositoryKeys.wrappingKeyHex=2222222222222222222222222222222222222222222222222222222222222222 \
-  --set repository.allowInit=true
-```
-
-`repository.allowInit=true` should only be used for a new, empty repository
-prefix under operator control.
+For a disposable local filesystem smoke, use the explicit memory-anchor example
+in [Getting Started](../../docs/site/getting-started.md#run-a-local-gateway-smoke).
+Kubernetes serving refuses `repository.allowInit=true`: use the journaled S3
+bootstrap Job below for a new chart deployment. A memory anchor is not durable
+recovery authority.
 
 ## Production-Like Values
 
@@ -271,3 +260,21 @@ GitOps pruning policies. To use a predeclared dedicated Secret, set
 This opt-in flow automates provider qualification, initialization and a fresh
 payload round trip. Independent
 off-cluster recovery export and verification remain separate requirements.
+
+## Historical read-only reader
+
+Deploy a separate release with the original external key and credential Secret
+references, repository ID, backend, and exact anchor name/namespace. Set
+`gateway.mode=restore-readonly`, `bootstrap.enabled=false`,
+`repository.allowInit=false`, and leave `maintenance.mode` empty. Set
+`recovery.point` to the quoted decimal sequence returned by `recovery-points`;
+empty means the current accepted anchor. The chart rejects a historical selector
+in read-write mode and rejects values outside the unsigned 64-bit range.
+
+When initialization generated provider evidence, set
+`bootstrap.existingJournalSecret` to the original journal name even with
+bootstrap disabled. Its evidence remains projected without an init Job, journal
+writes, or replacement Secret. An explicit `providerConformance.existingConfigMap`
+continues to take precedence. Do not delete the original retained journal when
+changing modes. External key Secrets are reused without generating key material.
+See the [reader overlay](../../docs/site/deploy-backup-restore.md#recover-an-earlier-gateway-state).

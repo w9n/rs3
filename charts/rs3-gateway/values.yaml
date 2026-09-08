@@ -11,6 +11,7 @@ bootstrap:
   timeoutSeconds: 1800
   # Optional predeclared, dedicated Secret in this release namespace. Must carry
   # rs3.rs/bootstrap-journal: v1. Otherwise the chart declares its stable Secret.
+  # Also reuses its provider evidence when bootstrap is disabled for a restore reader.
   existingJournalSecret: ""
 
 # Gateway container image. Override repository/tag for published images or
@@ -235,6 +236,9 @@ repositoryKeys:
 # or serving with the live Kubernetes anchor. This is public key material and
 # may be stored in Helm values; keep the corresponding signing key offline.
 recovery:
+  # Exact accepted sequence for a restore-readonly view; empty serves the current anchor.
+  # Quote the decimal value to preserve all u64 bits through YAML/Helm.
+  point: ""
   # Optional portable bundle-import verification key.
   publicKey: ""
   # Validated recovery-policy preset. A nonzero window is always configured.

@@ -346,6 +346,22 @@ mutation-capable serving. Findings include remediation hints. The opt-in
 `--probe` mode also checks backend reachability, v03 anchor readability, and
 keyring envelope readability.
 
+## Helm Recovery Selection
+
+`recovery.point` defaults to an empty string, which serves the current accepted
+anchor. A quoted decimal unsigned 64-bit sequence selects an authenticated
+historical view through `serve --recovery-point`. The chart requires
+`gateway.mode=restore-readonly`, `bootstrap.enabled=false`, and
+`repository.allowInit=false`; leave `maintenance.mode` empty. The selected view
+still validates the live authority and protection deadline on reads.
+
+Reuse the original external key/credential Secret references and anchor settings
+for a separate reader. `bootstrap.existingJournalSecret` can project the original
+journal's `provider-conformance.json` with bootstrap disabled. It does not create
+an init Job or mutate the journal. External evidence ConfigMaps take precedence.
+[Deploy, Back Up, and Restore](../deploy-backup-restore.md) provides the complete
+configuration and reader overlay.
+
 ## Helm Repository Keys
 
 The chart always uses the encrypted keyring-envelope model. Provide the

@@ -3,6 +3,8 @@
 `rs3` is an experimental Rust workspace for a path-private, tamper-evident,
 S3-compatible backup gateway for Kubernetes operators.
 
+For the operator path, start with [Deploy, Back Up, and Restore](docs/site/deploy-backup-restore.md): configure once, let Helm initialize the repository, then use the same gateway for backups and ordinary restores.
+
 ## Status
 
 The project has a working local S3-compatible gateway path, repository

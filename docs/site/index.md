@@ -102,7 +102,7 @@ defaults as production-stable yet.
 | Platform lead | [Evaluation](evaluation.md) |
 | Release reviewer | [Production Preview](production-preview.md) |
 | Security reviewer | [Security Model](security-model.md) and [Security Review](security-review.md) |
-| Operator | [Operations](operations.md) and [Restore Under Attack](runbooks/restore-under-attack.md) |
+| Operator | [Deploy, Back Up, and Restore](deploy-backup-restore.md), then [Operations](operations.md) |
 | Contributor | [Architecture](architecture.md) and [Testing](testing.md) |
 | Performance reviewer | [Performance](performance.md) |
 

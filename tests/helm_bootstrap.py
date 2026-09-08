@@ -28,7 +28,72 @@ def env(container):
     return result
 
 
+def historical_reader_preserves_bindings(production):
+    original = list(documents(render(production)))
+    writer = one(original, "Deployment")["spec"]["template"]["spec"]
+    writer_env = env(writer["containers"][0])
+    writer_lease_rules = [rule for rule in one(original, "Role")["rules"] if "leases" in rule["resources"]]
+    assert writer_lease_rules == [
+        {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["create"]},
+        {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "resourceNames": [writer_env["RS3_ANCHOR_NAME"]["value"]], "verbs": ["get", "update"]},
+    ]
+    journal = env(one(original, "Job")["spec"]["template"]["spec"]["containers"][0])["RS3_INIT_JOURNAL_SECRET"]["value"]
+    reader = copy.deepcopy(production)
+    reader["bootstrap"] = {"enabled": False, "existingJournalSecret": journal}
+    reader["gateway"] = {"mode": "restore-readonly"}
+    reader["recovery"] = {"point": "18446744073709551615"}
+    docs = list(documents(render(reader)))
+    pod = one(docs, "Deployment")["spec"]["template"]["spec"]
+    gateway = pod["containers"][0]
+    assert gateway["args"] == ["serve", "--recovery-point", "18446744073709551615"]
+    assert "initContainers" not in pod
+    assert not any(doc["kind"] in {"Job", "Secret"} for doc in docs)
+    reader_env = env(gateway)
+    for name in (
+        "RS3_REPOSITORY_ID", "RS3_REPOSITORY_SALT_HEX", "RS3_KEYRING_WRAPPING_KEY_HEX",
+        "RS3_KEYRING_ENVELOPE_OBJECT_ID", "RS3_STATIC_ACCESS_KEY_ID",
+        "RS3_STATIC_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+        "RS3_ADMIN_BEARER_TOKEN", "RS3_ANCHOR_NAME", "RS3_ANCHOR_NAMESPACE",
+        "RS3_PROVIDER_CONFORMANCE_REPORT_FILE", "RS3_BACKEND_PREFIX",
+    ):
+        assert reader_env[name] == writer_env[name], name
+    assert reader_env["RS3_ALLOW_REPOSITORY_INIT"]["value"] == "false"
+    assert reader_env["RS3_RECLAMATION_ENABLED"]["value"] == "false"
+    assert "RS3_MAINTENANCE_MODE" not in reader_env
+    evidence = next(volume for volume in pod["volumes"] if volume["name"] == "provider-conformance")
+    assert evidence["secret"]["secretName"] == journal
+    assert evidence["secret"]["items"] == [{"key": "provider-conformance.json", "path": "report.json"}]
+    assert not any("secrets" in rule["resources"] for rule in one(docs, "Role")["rules"])
+    assert one(docs, "Role")["rules"] == [{
+        "apiGroups": ["coordination.k8s.io"], "resources": ["leases"],
+        "resourceNames": [writer_env["RS3_ANCHOR_NAME"]["value"]], "verbs": ["get"],
+    }]
+    for point in ("0", "42", "9007199254740993"):
+        reader["recovery"]["point"] = point
+        assert one(list(documents(render(reader))), "Deployment")["spec"]["template"]["spec"]["containers"][0]["args"][-1] == point
+    for point in (42, -1, "-1", "01", "1.5", "18446744073709551616", "1e3"):
+        reader["recovery"]["point"] = point
+        render(reader, succeeds=False)
+    reader["recovery"]["point"] = "42"
+    for section, field, value in (
+        ("gateway", "mode", "read-write"), ("bootstrap", "enabled", True),
+        ("repository", "allowInit", True), ("maintenance", "mode", "auto"),
+    ):
+        invalid = copy.deepcopy(reader)
+        invalid.setdefault(section, {})[field] = value
+        render(invalid, succeeds=False)
+    reader["providerConformance"] = {"existingConfigMap": "external-evidence"}
+    pod = one(list(documents(render(reader))), "Deployment")["spec"]["template"]["spec"]
+    evidence = next(volume for volume in pod["volumes"] if volume["name"] == "provider-conformance")
+    assert evidence["configMap"]["name"] == "external-evidence" and "secret" not in evidence
+
+
 def main():
+    ordinary = list(documents(render(local_values())))
+    ordinary_rules = one(ordinary, "Role")["rules"]
+    assert ordinary_rules[0]["verbs"] == ["create"]
+    assert ordinary_rules[1]["verbs"] == ["get", "update"]
+    assert all("secrets" not in rule["resources"] for rule in ordinary_rules)
     config = values()
     docs = list(documents(render(config)))
     job = one(docs, "Job")
@@ -87,12 +152,17 @@ def main():
         "image": {"digest": "sha256:" + "a" * 64},
         "backend": {"endpoint": "https://fixture.invalid"},
         "credentials": {"existingSecret": "fixture-client"},
+        "backendCredentials": {"existingSecret": "fixture-backend"},
         "repositoryKeys": {"existingSecret": "fixture-keys"},
         "admin": {"existingTokenSecret": "fixture-admin"},
         "repository": {"retention": {"mode": "compliance", "days": 30}},
     }
+    invalid_local = local_values()
+    invalid_local["recovery"] = {"point": "42"}
+    render(invalid_local, succeeds=False)
     production_docs = list(documents(render(production)))
     assert "RS3_RECOVERY_PUBLIC_KEY" not in env(one(production_docs, "Job")["spec"]["template"]["spec"]["containers"][0])
+    historical_reader_preserves_bindings(production)
     production["recovery"] = {"publicKey": "invalid"}
     render(production, succeeds=False)
     production["recovery"]["publicKey"] = "ed25519:" + "a" * 64
