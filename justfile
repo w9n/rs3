@@ -303,6 +303,97 @@ perf-commit *ARGS:
 perf-commit-parallel *ARGS:
     cargo run -p xtask --bin xtask -- perf --scenario write-committed-parallel {{ARGS}}
 
+# Enforce the four mandatory small-write ceilings and retain every raw JSONL sample.
+# Requires a clean committed revision; RS3_SCALE_GATE_RUNS defaults to three.
+perf-small-workloads EVIDENCE_DIR:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    runs="${RS3_SCALE_GATE_RUNS:-3}"
+    if ! [[ "${runs}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "RS3_SCALE_GATE_RUNS must be a positive integer" >&2
+      exit 2
+    fi
+    build_revision="$(git rev-parse --verify HEAD)"
+    verify_source() {
+      local observed_revision observed_status
+      observed_revision="$(git rev-parse --verify HEAD)"
+      observed_status="$(git status --porcelain --untracked-files=all)"
+      if [[ "${observed_revision}" != "${build_revision}" || -n "${observed_status}" ]]; then
+        echo "small-workload qualification requires the same clean committed revision, including untracked inputs" >&2
+        exit 2
+      fi
+    }
+    verify_source
+    evidence_dir="{{EVIDENCE_DIR}}"
+    mkdir -p "${evidence_dir}"
+    for artifact in build.log commands.txt binary.sha256; do
+      if [[ -e "${evidence_dir}/${artifact}" ]]; then
+        echo "refusing to overwrite existing build evidence: ${artifact}" >&2
+        exit 2
+      fi
+    done
+    build=(env "RS3_BUILD_GIT_SHA=${build_revision}" cargo build --release -p xtask --bin xtask)
+    printf '%q ' "${build[@]}" > "${evidence_dir}/commands.txt"
+    printf '\n' >> "${evidence_dir}/commands.txt"
+    verify_source
+    "${build[@]}" 2>&1 | tee "${evidence_dir}/build.log"
+    verify_source
+    sha256sum target/release/xtask > "${evidence_dir}/binary.sha256"
+    failed=0
+    for ((run = 1; run <= runs; run++)); do
+      for lane in empty-64 batch-4k-64 batch-256k-64 sequential-512-64; do
+        scenario=write-batch
+        batch=64
+        concurrency=64
+        case "${lane}" in
+          empty-64) size=0; ceiling=(--max-write-bytes-per-object 320) ;;
+          batch-4k-64) size=4096; ceiling=(--max-write-amp 1.15) ;;
+          batch-256k-64) size=262144; ceiling=(--max-write-amp 1.03) ;;
+          sequential-512-64) size=512; scenario=write-committed; batch=1; concurrency=1; ceiling=(--max-write-amp 3.0) ;;
+        esac
+        report="${evidence_dir}/${lane}-run-$(printf '%03d' "${run}").jsonl"
+        if [[ -e "${report}" ]]; then
+          echo "refusing to overwrite existing raw performance evidence: ${report}" >&2
+          exit 2
+        fi
+        command=(target/release/xtask perf
+          --scenario "${scenario}" --backend memory --objects 64 --object-size "${size}"
+          --logical-path-len 32 --commit-batch-items "${batch}"
+          --commit-max-pending-items "${batch}" --commit-batch-delay-ms 60000
+          --concurrency "${concurrency}" "${ceiling[@]}" --format jsonl)
+        printf '%q ' "${command[@]}" >> "${evidence_dir}/commands.txt"
+        printf '> %q\n' "${report}" >> "${evidence_dir}/commands.txt"
+        verify_source
+        echo "small-workload run ${run}/${runs}: ${lane}" >&2
+        if ! "${command[@]}" | tee "${report}"; then
+          failed=1
+        fi
+        if ! python3 - "${report}" "${build_revision}" "${scenario}" "${size}" "${batch}" <<'PYVERIFY'
+    import json, sys
+    path, revision, scenario, size, batch = sys.argv[1:]
+    with open(path, encoding="utf-8") as source:
+        records = [json.loads(line) for line in source if line.strip()]
+    assert len(records) == 1, "one raw measurement is required per workload/run"
+    record = records[0]
+    assert revision != "unknown" and not revision.endswith("-dirty")
+    assert record["source_revision"] == revision, "compiled revision differs from selected source"
+    assert record["scenario"] == scenario and record["backend_name"] == "memory"
+    assert record["objects"] == 64 and record["object_size"] == int(size)
+    assert record["logical_path_len"] == 32
+    assert record["commit"]["batch_items"] == int(batch)
+    assert record["backend"]["puts"] == (1 if scenario == "write-batch" else 64), "workload publication shape changed"
+    assert record["checkpoint"] is None, "small-write budgets exclude final checkpoint"
+    assert record["requested_plaintext_write_bytes"] == 64 * int(size)
+    PYVERIFY
+        then
+          failed=1
+        fi
+      done
+    done
+    verify_source
+    sha256sum --check "${evidence_dir}/binary.sha256"
+    exit "${failed}"
+
 # Run the fixed release-profile object-count scale tiers. Set
 # RS3_SCALE_GATE_RUNS to change the default three-run stability sample.
 [private]

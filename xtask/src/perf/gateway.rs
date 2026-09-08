@@ -328,6 +328,7 @@ fn enforce_gateway_report(
     peak_rss_bytes: Option<u64>,
 ) -> Result<()> {
     report.enforce_max_write_amplification(args.max_write_amp)?;
+    report.enforce_max_write_bytes_per_object(args.max_write_bytes_per_object)?;
     report.enforce_max_verification_read_amplification(args.max_verification_read_amp)?;
     report.enforce_max_total_write_io_amplification(args.max_total_write_io_amp)?;
     report.enforce_exact_multipart_counts(args.expected_multipart_parts_per_object)?;

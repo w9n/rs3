@@ -258,6 +258,27 @@ measurements that establish the relevant bounds.
 | sequential committed 512 B objects | 3.0x |
 | checkpoint-and-compaction-inclusive lifetime 512 B lane | 1.50x |
 
+`just perf-small-workloads /path/to/new-evidence-directory` enforces the
+empty, 4 KiB, 256 KiB, and sequential 512 B ceilings with the existing in-memory
+xtask workloads. It requires a clean committed revision, including no untracked
+nonignored inputs, and rechecks HEAD and status after building, before every
+sample, and after the series. It binds that revision into the release binary
+and retains its build log, SHA-256, exact commands, and unmodified JSONL samples.
+Use an evidence directory outside the checkout or under an ignored directory.
+It runs three samples per workload by default (`RS3_SCALE_GATE_RUNS`). A failed
+ceiling or changed publication shape fails the recipe; failed measurements
+remain on disk.
+
+These small-write budgets use the existing post-genesis counters: initialization
+is excluded, and no final checkpoint is added. Each batched workload writes 64
+objects with exact 32-byte paths in one commit. The sequential workload writes
+64 objects, awaiting each accepted commit before starting the next, with one
+object per commit. Empty objects use total backend bytes divided by object
+count, not a plaintext ratio; the raw byte count remains in each record. The
+checkpoint-and-compaction-inclusive lifetime gate is separate. This command
+adds enforcement; passing qualification still requires measurements from the
+selected final revision.
+
 The repository integration suite enforces the physical shape for a 64-object
 batch (one single-PUT commit, one payload pack, and one index run) and the 1.50x
 hard ceiling for a 32-byte-path lane. The release-binary scale recipes now also
