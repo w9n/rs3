@@ -1041,6 +1041,11 @@ where
             return Err(RepositoryError::AlreadyExists(key));
         }
 
+        let checksum = options
+            .checksum
+            .as_ref()
+            .map(crate::UploadChecksum::get)
+            .transpose()?;
         let sequence = pending.allocate_sequence()?;
         let material = object_material(key.as_str(), sequence);
         let manifest_id = keyring.derive_manifest_id(&material)?;
@@ -1065,6 +1070,7 @@ where
             legal_hold: options.legal_hold,
         };
         let manifest = TrustedManifest {
+            checksum,
             key: key.clone(),
             content_len: plaintext_len,
             modified_at_ms,
@@ -1168,6 +1174,7 @@ where
             .get(&entry.manifest_id)
             .cloned()
             .unwrap_or_else(|| TrustedManifest {
+                checksum: None,
                 key: key.clone(),
                 content_len: entry.content_len,
                 modified_at_ms: entry.modified_at_ms,

@@ -250,6 +250,7 @@ where
                         return Ok(None);
                     };
                     mutations.push(IndexMutation::Upsert(IndexUpsert {
+                        checksum: manifest.checksum.clone(),
                         mutation_ordinal,
                         blind_key: IndexBlindKey::try_from(&entry.blind_key)
                             .map_err(|_| v2_repository_error(V2FormatError::InvalidHeaderField))?,
@@ -749,6 +750,7 @@ pub(in crate::v2) fn apply_packed_index_run(
                 state.manifests.insert(
                     manifest_id.clone(),
                     TrustedManifest {
+                        checksum: upsert.checksum,
                         key: upsert.path,
                         content_len: upsert.content_len,
                         modified_at_ms: upsert.modified_at_ms,

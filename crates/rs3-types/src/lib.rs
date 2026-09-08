@@ -1,6 +1,9 @@
 //! Shared strongly typed identifiers and policy types.
 
 pub mod cbor;
+mod checksum;
+
+pub use checksum::{ChecksumAlgorithm, ChecksumError, ChecksumType, ObjectChecksum};
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;

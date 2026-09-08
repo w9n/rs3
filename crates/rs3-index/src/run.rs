@@ -3,7 +3,7 @@
 use crate::PayloadLayout;
 use rs3_types::{
     BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LegalHoldStatus, LogicalPath,
-    RetentionMode, RetentionPolicy, Sequence,
+    ObjectChecksum, RetentionMode, RetentionPolicy, Sequence,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -12,7 +12,7 @@ use std::fmt;
 pub const INDEX_RUN_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-run-frame-plaintext:v2\n";
 
 /// Version of the canonical index-run wire encoding.
-pub const INDEX_RUN_WIRE_VERSION: u16 = 8;
+pub const INDEX_RUN_WIRE_VERSION: u16 = 9;
 
 /// Maximum stored size of one v03 payload pack.
 pub const INDEX_PACK_MAX_STORED_BYTES: u64 = 32 * 1024 * 1024;
@@ -317,6 +317,8 @@ pub struct IndexUpsert {
     pub retention: Option<RetentionPolicy>,
     /// Effective legal-hold state, when present.
     pub legal_hold: Option<LegalHoldStatus>,
+    /// Client-declared checksum accepted for the complete object, when present.
+    pub checksum: Option<ObjectChecksum>,
 }
 
 impl fmt::Debug for IndexUpsert {
@@ -333,6 +335,7 @@ impl fmt::Debug for IndexUpsert {
             .field("modified_at_ms", &self.modified_at_ms)
             .field("retention", &self.retention)
             .field("legal_hold", &self.legal_hold)
+            .field("checksum", &self.checksum)
             .finish()
     }
 }
@@ -862,6 +865,7 @@ pub fn encode_index_run_frames(
                 record.i64(upsert.modified_at_ms)?;
                 encode_retention(&mut record, upsert.retention)?;
                 encode_legal_hold(&mut record, upsert.legal_hold)?;
+                encode_checksum(&mut record, upsert.checksum.as_ref())?;
             }
             IndexMutation::Tombstone(tombstone) => {
                 record.u8(1)?;
@@ -1987,6 +1991,7 @@ fn decode_namespace_projection(
                     modified_at_ms: record.i64()?,
                     retention: decode_retention(record)?,
                     legal_hold: decode_legal_hold(record)?,
+                    checksum: decode_checksum(record)?,
                 },
                 namespace_key_ordinal,
             ))
@@ -2096,6 +2101,7 @@ fn pair_projections(
                 modified_at_ms: namespace_modified_at_ms,
                 retention,
                 legal_hold,
+                checksum,
             },
             ListingProjection::Upsert {
                 path,
@@ -2118,6 +2124,7 @@ fn pair_projections(
                 modified_at_ms,
                 retention,
                 legal_hold,
+                checksum,
             }))
         }
         (
@@ -2232,6 +2239,7 @@ enum NamespaceProjection {
         modified_at_ms: i64,
         retention: Option<RetentionPolicy>,
         legal_hold: Option<LegalHoldStatus>,
+        checksum: Option<ObjectChecksum>,
     },
     Tombstone {
         blind_key: IndexBlindKey,
@@ -2527,6 +2535,7 @@ fn validate_completion_receipt(run: &IndexRun) -> Result<(), IndexRunError> {
         if upserts.next().is_some()
             || upsert.path != receipt.key
             || upsert.content_len != receipt.content_len
+            || upsert.checksum != receipt.checksum
         {
             return Err(IndexRunError::FrameFactsMismatch);
         }
@@ -2929,6 +2938,30 @@ fn decode_legal_hold(reader: &mut Reader<'_>) -> Result<Option<LegalHoldStatus>,
     }
 }
 
+fn encode_checksum(
+    writer: &mut Writer,
+    checksum: Option<&ObjectChecksum>,
+) -> Result<(), IndexRunError> {
+    let Some(checksum) = checksum else {
+        return writer.u8(0);
+    };
+    let encoded = checksum.encode();
+    validate_count("checksum", encoded.len(), ObjectChecksum::MAX_ENCODED_BYTES)?;
+    writer.u8(u8::try_from(encoded.len()).map_err(|_| IndexRunError::IntegerOverflow)?)?;
+    writer.bytes(&encoded)
+}
+
+fn decode_checksum(reader: &mut Reader<'_>) -> Result<Option<ObjectChecksum>, IndexRunError> {
+    let length = usize::from(reader.u8()?);
+    if length == 0 {
+        return Ok(None);
+    }
+    validate_count("checksum", length, ObjectChecksum::MAX_ENCODED_BYTES)?;
+    ObjectChecksum::decode(reader.bytes(length)?)
+        .map(Some)
+        .map_err(|_| IndexRunError::InvalidValue { field: "checksum" })
+}
+
 fn decode_blind_key(reader: &mut Reader<'_>) -> Result<IndexBlindKey, IndexRunError> {
     let mut bytes = [0_u8; 32];
     bytes.copy_from_slice(reader.bytes(32)?);
@@ -3141,8 +3174,8 @@ mod tests {
         decode_index_run_frames, encode_index_run, encode_index_run_frames,
     };
     use rs3_types::{
-        BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LegalHoldStatus, LogicalPath,
-        RetentionMode, RetentionPolicy, Sequence,
+        BackendObjectId, BackendVersionId, BlindIndexKey, ChecksumAlgorithm, ChecksumType, KeyId,
+        LegalHoldStatus, LogicalPath, ObjectChecksum, RetentionMode, RetentionPolicy, Sequence,
     };
 
     fn fixture() -> IndexRun {
@@ -3188,6 +3221,7 @@ mod tests {
                     modified_at_ms: -55,
                     retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
                     legal_hold: Some(LegalHoldStatus::On),
+                    checksum: None,
                 }),
                 IndexMutation::Tombstone(IndexTombstone {
                     mutation_ordinal: 1,
@@ -3269,9 +3303,16 @@ mod tests {
     fn completion_fixture() -> IndexRun {
         let mut run = standalone_stream_fixture();
         run.mutations.truncate(1);
-        let IndexMutation::Upsert(upsert) = &run.mutations[0] else {
+        let checksum = ObjectChecksum::new(
+            ChecksumAlgorithm::Crc32c,
+            ChecksumType::Composite { parts: 1 },
+            vec![0xa4; 4],
+        )
+        .expect("checksum");
+        let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
             panic!("upsert");
         };
+        upsert.checksum = Some(checksum.clone());
         run.completion_receipt = Some(crate::completion::CompletionReceipt {
             upload_id: rs3_types::MultipartUploadId::from_bytes([0x71; 32]),
             commit_sequence: Sequence::new(12),
@@ -3280,6 +3321,7 @@ mod tests {
             key: upsert.path.clone(),
             content_len: upsert.content_len,
             etag: "multipart-result".to_owned(),
+            checksum: Some(checksum),
         });
         run
     }
@@ -3304,6 +3346,62 @@ mod tests {
         let mut missing = run;
         missing.mutations.clear();
         assert!(encode_index_run(&missing, &limits).is_err());
+    }
+
+    #[test]
+    fn completion_receipt_checksum_must_match_bound_upsert() {
+        let limits = IndexRunLimits::default();
+        let checksum = ObjectChecksum::new(
+            ChecksumAlgorithm::Crc32c,
+            ChecksumType::Composite { parts: 1 },
+            vec![0xa1; 4],
+        )
+        .expect("checksum");
+        let mut run = completion_fixture();
+        let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
+            panic!("upsert");
+        };
+        upsert.checksum = Some(checksum.clone());
+        run.completion_receipt.as_mut().expect("receipt").checksum = Some(checksum);
+        assert!(encode_index_run(&run, &limits).is_ok());
+
+        let mut receipt_mismatch = run.clone();
+        receipt_mismatch
+            .completion_receipt
+            .as_mut()
+            .expect("receipt")
+            .checksum = None;
+        assert!(encode_index_run(&receipt_mismatch, &limits).is_err());
+
+        let mut upsert_mismatch = run;
+        let IndexMutation::Upsert(upsert) = &mut upsert_mismatch.mutations[0] else {
+            panic!("upsert");
+        };
+        upsert.checksum = None;
+        assert!(encode_index_run(&upsert_mismatch, &limits).is_err());
+    }
+
+    #[test]
+    fn checksum_namespace_codec_round_trips_and_rejects_malformed_bytes() {
+        let checksum = ObjectChecksum::new(
+            ChecksumAlgorithm::Sha256,
+            ChecksumType::FullObject,
+            vec![0xb2; 32],
+        )
+        .expect("checksum");
+        let mut encoded = super::Writer::new(64);
+        super::encode_checksum(&mut encoded, Some(&checksum)).expect("encode checksum");
+        let encoded = encoded.finish();
+        assert_eq!(
+            super::decode_checksum(&mut super::Reader::new(&encoded)),
+            Ok(Some(checksum))
+        );
+        assert_eq!(
+            super::decode_checksum(&mut super::Reader::new(&[0])),
+            Ok(None)
+        );
+        assert!(super::decode_checksum(&mut super::Reader::new(&[49])).is_err());
+        assert!(super::decode_checksum(&mut super::Reader::new(&[1, 0])).is_err());
     }
 
     #[test]
@@ -4098,7 +4196,7 @@ mod tests {
         let encoded = encode_index_run(&fixture(), &IndexRunLimits::default()).expect("encode run");
         assert_eq!(
             hex(&encoded),
-            "0395027273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0008000000000000000000090202020001d301000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c232323232323232323232323232323232323232323232323232323232323232303000000000000020000000000000008001111111111111111111111111111111111111111111111111111111111111111a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a309636f6e74656e742d31080d030b6e616d6573706163652d318c017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0008010000000000000000090202023600003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901021e0224010144444444444444444444444444444444444444444444444444444444444444440012627273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00080200000000000000000902020213000e74656e616e742f64656c657465640101121d070e736e617073686f742f6368756e6b000011d209ffffffffffffffc9"
+            "0395027273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0009000000000000000000090202020001d301000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c232323232323232323232323232323232323232323232323232323232323232303000000000000020000000000000008001111111111111111111111111111111111111111111111111111111111111111a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a309636f6e74656e742d31080d030b6e616d6573706163652d318d017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0009010000000000000000090202023700003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901021e020024010144444444444444444444444444444444444444444444444444444444444444440012627273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00090200000000000000000902020213000e74656e616e742f64656c657465640101121d070e736e617073686f742f6368756e6b000011d209ffffffffffffffc9"
         );
     }
 

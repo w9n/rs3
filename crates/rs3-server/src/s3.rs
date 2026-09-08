@@ -3,6 +3,7 @@
 mod adapter;
 mod boundary;
 mod bounded_io;
+mod checksum;
 mod mapping;
 mod recovery_tools;
 mod runtime;

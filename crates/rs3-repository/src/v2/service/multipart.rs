@@ -2,9 +2,10 @@
 
 use super::*;
 use crate::v2::{V3MultipartUpload, V3UploadedPart, V3VerifiedMultipartUpload};
+use crate::{MultipartChecksumKind, MultipartChecksumPolicy, UploadChecksum};
 use rs3_index::completion::CompletionReceipt;
 use rs3_storage::BlobRead;
-use rs3_types::MultipartUploadId;
+use rs3_types::{ChecksumType, MultipartUploadId, ObjectChecksum};
 
 /// Canonical selected client part numbers and unquoted ETags, bounded to 10,000.
 /// Request identity is independent of the logical key and plaintext equality.
@@ -12,17 +13,47 @@ use rs3_types::MultipartUploadId;
 pub struct V3MultipartSelection {
     parts: Vec<(u32, String)>,
     digest: [u8; 32],
+    declared_checksums: Vec<Option<ObjectChecksum>>,
+    expected_checksum: Option<ObjectChecksum>,
+    declared_kind: Option<MultipartChecksumKind>,
 }
 
 impl V3MultipartSelection {
     /// Rejects empty, unordered, repeated, oversized or malformed selections.
     pub fn new(parts: Vec<(u32, String)>) -> Result<Self> {
+        Self::with_checksums(
+            parts
+                .into_iter()
+                .map(|(number, etag)| (number, etag, None))
+                .collect(),
+            None,
+        )
+    }
+
+    /// Binds exact declared part and final checksum facts to accepted retries.
+    pub fn with_checksums(
+        selected: Vec<(u32, String, Option<ObjectChecksum>)>,
+        expected_checksum: Option<ObjectChecksum>,
+    ) -> Result<Self> {
+        Self::with_checksums_and_kind(selected, expected_checksum, None)
+    }
+
+    /// Also binds an explicitly declared completion type, even without a digest.
+    pub fn with_checksums_and_kind(
+        selected: Vec<(u32, String, Option<ObjectChecksum>)>,
+        expected_checksum: Option<ObjectChecksum>,
+        declared_kind: Option<MultipartChecksumKind>,
+    ) -> Result<Self> {
+        let (parts, declared_checksums): (Vec<_>, Vec<_>) = selected
+            .into_iter()
+            .map(|(number, etag, checksum)| ((number, etag), checksum))
+            .unzip();
         if parts.is_empty() || parts.len() > rs3_index::MAX_PAYLOAD_PARTS {
             return Err(invalid_completion());
         }
         let mut previous = 0;
         let mut digest = Sha256Hasher::new();
-        digest.update(b"rs3:v3-multipart-client-selection:v1\0");
+        digest.update(b"rs3:v3-multipart-client-selection:v2\0");
         digest.update((parts.len() as u64).to_be_bytes());
         for (number, etag) in &parts {
             if *number <= previous
@@ -38,9 +69,29 @@ impl V3MultipartSelection {
             digest.update((etag.len() as u16).to_be_bytes());
             digest.update(etag.as_bytes());
         }
+        for checksum in declared_checksums
+            .iter()
+            .chain(std::iter::once(&expected_checksum))
+        {
+            if let Some(checksum) = checksum {
+                let encoded = checksum.encode();
+                digest.update((encoded.len() as u64).to_be_bytes());
+                digest.update(encoded);
+            } else {
+                digest.update(0_u64.to_be_bytes());
+            }
+        }
+        digest.update([match declared_kind {
+            None => 0,
+            Some(MultipartChecksumKind::FullObject) => 1,
+            Some(MultipartChecksumKind::Composite) => 2,
+        }]);
         Ok(Self {
             parts,
             digest: digest.finalize(),
+            declared_checksums,
+            expected_checksum,
+            declared_kind,
         })
     }
 
@@ -59,6 +110,7 @@ pub struct V3ClientMultipartUpload {
     options: RepositoryPutOptions,
     protection: (Option<RetentionPolicy>, Option<LegalHoldStatus>),
     upload: V3MultipartUpload,
+    checksum_policy: Option<MultipartChecksumPolicy>,
 }
 
 impl V3ClientMultipartUpload {
@@ -72,24 +124,97 @@ impl V3ClientMultipartUpload {
         self.key == *key
     }
 
+    /// Checksum algorithm and construction fixed when this upload was created.
+    pub fn checksum_policy(&self) -> Option<MultipartChecksumPolicy> {
+        self.checksum_policy
+    }
+
     /// Streams and seals one independent part attempt.
     pub async fn upload_part(
         &self,
         number: u32,
         body: Box<dyn BlobRead>,
+        checksum: Option<UploadChecksum>,
     ) -> Result<V3UploadedPart> {
         self.upload
-            .upload_part(number, body)
+            .upload_part(number, body, checksum)
             .await
             .map_err(v2_repository_error)
     }
 
     /// Checks tokens before the caller removes this unfinished session.
     pub fn validate_selection(&self, selection: &V3MultipartSelection) -> Result<()> {
-        self.upload
+        let parts = self
+            .upload
             .select_parts(&selection.parts)
-            .map(|_| ())
-            .map_err(v2_repository_error)
+            .map_err(v2_repository_error)?;
+        self.selected_checksum(selection, &parts).map(|_| ())
+    }
+
+    fn selected_checksum(
+        &self,
+        selection: &V3MultipartSelection,
+        parts: &[V3UploadedPart],
+    ) -> Result<Option<ObjectChecksum>> {
+        let Some(policy) = self.checksum_policy else {
+            if selection.declared_kind.is_some()
+                || selection.expected_checksum.is_some()
+                || selection.declared_checksums.iter().any(Option::is_some)
+            {
+                return Err(invalid_completion());
+            }
+            return Ok(None);
+        };
+        if selection
+            .declared_kind
+            .is_some_and(|kind| kind != policy.kind())
+        {
+            return Err(invalid_completion());
+        }
+        let kind = match policy.kind() {
+            MultipartChecksumKind::FullObject => ChecksumType::FullObject,
+            MultipartChecksumKind::Composite => ChecksumType::Composite {
+                parts: parts.len() as u32,
+            },
+        };
+        let mut checksums = Vec::with_capacity(parts.len());
+        for (index, (part, declared)) in parts.iter().zip(&selection.declared_checksums).enumerate()
+        {
+            let actual = part
+                .checksum()
+                .ok_or(RepositoryError::ObjectChecksumUnavailable)?;
+            if actual.algorithm() != policy.algorithm() || actual.kind() != ChecksumType::FullObject
+            {
+                return Err(invalid_completion());
+            }
+            if policy.kind() == MultipartChecksumKind::Composite
+                && (part.part_number() != index as u32 + 1 || declared.is_none())
+            {
+                return Err(invalid_completion());
+            }
+            if let Some(declared) = declared {
+                if declared.algorithm() != policy.algorithm()
+                    || declared.kind() != ChecksumType::FullObject
+                {
+                    return Err(invalid_completion());
+                }
+                if declared != actual {
+                    return Err(RepositoryError::ObjectChecksumMismatch);
+                }
+            }
+            checksums.push((actual.digest(), part.plaintext_len()));
+        }
+        let combined = rs3_crypto::combine_part_checksums(policy.algorithm(), kind, &checksums)
+            .map_err(|_| invalid_completion())?;
+        if let Some(expected) = &selection.expected_checksum {
+            if expected.algorithm() != policy.algorithm() || expected.kind() != kind {
+                return Err(invalid_completion());
+            }
+            if expected != &combined {
+                return Err(RepositoryError::ObjectChecksumMismatch);
+            }
+        }
+        Ok(Some(combined))
     }
 
     /// Returns up to 1001 current parts after a marker for bounded pagination.
@@ -148,9 +273,13 @@ impl<S: BlobStore + Clone> V2Repository<S> {
         &self,
         key: LogicalPath,
         options: RepositoryPutOptions,
+        checksum_policy: Option<MultipartChecksumPolicy>,
     ) -> Result<V3ClientMultipartUpload> {
         self.ensure_local_state_ready()?;
         self.validate_client_object_lock(&options)?;
+        if options.checksum.is_some() {
+            return Err(invalid_completion());
+        }
         if key.as_str().len() > 1024 {
             return Err(invalid_completion());
         }
@@ -161,7 +290,7 @@ impl<S: BlobStore + Clone> V2Repository<S> {
         let protection = self.effective_put_protection(&options);
         let upload = self
             .commit_store
-            .create_client_multipart_upload(protection.0, protection.1)
+            .create_client_multipart_upload(protection.0, protection.1, checksum_policy)
             .await
             .map_err(v2_repository_error)?;
         Ok(V3ClientMultipartUpload {
@@ -170,6 +299,7 @@ impl<S: BlobStore + Clone> V2Repository<S> {
             options,
             protection,
             upload,
+            checksum_policy,
         })
     }
 
@@ -192,7 +322,7 @@ impl<S: BlobStore + Clone> V2Repository<S> {
 
     pub(in crate::v2) async fn prepare_multipart_completion(
         &self,
-        session: V3ClientMultipartUpload,
+        mut session: V3ClientMultipartUpload,
         selection: V3MultipartSelection,
     ) -> Result<PreparedMultipartCompletion> {
         if self.effective_put_protection(&session.options) != session.protection {
@@ -206,6 +336,14 @@ impl<S: BlobStore + Clone> V2Repository<S> {
                 return Err(v2_repository_error(error));
             }
         };
+        let checksum = match session.selected_checksum(&selection, &parts) {
+            Ok(checksum) => checksum,
+            Err(error) => {
+                let _ = session.abort().await;
+                return Err(error);
+            }
+        };
+        session.options.checksum = checksum.map(UploadChecksum::verified);
         let attempts_digest = V3UploadedPart::selected_attempts_digest(&parts);
         let verified = self
             .commit_store
@@ -249,6 +387,7 @@ impl<S: BlobStore + Clone> V2Repository<S> {
             (len == 0).then(Bytes::new),
         )?;
         let receipt = CompletionReceipt {
+            checksum: staged.metadata.checksum.clone(),
             upload_id: completion.id,
             commit_sequence,
             selection_digest: completion.selection_digest,

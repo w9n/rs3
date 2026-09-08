@@ -426,8 +426,11 @@ impl RuntimeRepository {
         &self,
         key: LogicalPath,
         options: RepositoryPutOptions,
+        checksum_policy: Option<rs3_repository::MultipartChecksumPolicy>,
     ) -> Result<rs3_repository::v2::V3ClientMultipartUpload, RepositoryError> {
-        self.repository.create_multipart_upload(key, options).await
+        self.repository
+            .create_multipart_upload(key, options, checksum_policy)
+            .await
     }
 
     pub(super) fn accepted_multipart_completion(

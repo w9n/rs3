@@ -52,7 +52,7 @@ async fn multipart_selected_attempts_restore_across_part_boundaries_with_one_rea
     let store = CountingBlobStore::new(MemoryBlobStore::new());
     let repo = repository(store.clone());
     let upload = repo
-        .create_client_multipart_upload(None, None)
+        .create_client_multipart_upload(None, None, None)
         .await
         .expect("create");
     let object_id = upload.object_id.clone();
@@ -62,13 +62,13 @@ async fn multipart_selected_attempts_restore_across_part_boundaries_with_one_rea
     );
     let prefix = Bytes::from(vec![7; rs3_storage::MULTIPART_MIN_PART_BYTES as usize]);
     let (first, old) = tokio::join!(
-        upload.upload_part(2, plaintext(prefix)),
-        upload.upload_part(7, plaintext(Bytes::from_static(b"tail")))
+        upload.upload_part(2, plaintext(prefix), None),
+        upload.upload_part(7, plaintext(Bytes::from_static(b"tail")), None)
     );
     let first = first.expect("first");
     let old = old.expect("old");
     let last = upload
-        .upload_part(7, plaintext(Bytes::from_static(b"tail")))
+        .upload_part(7, plaintext(Bytes::from_static(b"tail")), None)
         .await
         .expect("replacement");
     assert_ne!(
@@ -78,7 +78,7 @@ async fn multipart_selected_attempts_restore_across_part_boundaries_with_one_rea
     );
     assert_ne!(old.digest, last.digest);
     upload
-        .upload_part(5, plaintext(Bytes::from_static(b"omitted")))
+        .upload_part(5, plaintext(Bytes::from_static(b"omitted")), None)
         .await
         .expect("unused");
     store.reset_operation_counts().expect("reset");
@@ -140,12 +140,12 @@ async fn multipart_selected_attempts_restore_across_part_boundaries_with_one_rea
 async fn multipart_empty_and_stale_zero_length_selections_have_no_carrier() {
     let repo = repository(MemoryBlobStore::new());
     let upload = repo
-        .create_client_multipart_upload(None, None)
+        .create_client_multipart_upload(None, None, None)
         .await
         .expect("create");
     let id = upload.object_id.clone();
     let part = upload
-        .upload_part(10_000, plaintext(Bytes::new()))
+        .upload_part(10_000, plaintext(Bytes::new()), None)
         .await
         .expect("empty");
     let verified = repo
@@ -156,15 +156,15 @@ async fn multipart_empty_and_stale_zero_length_selections_have_no_carrier() {
     assert!(verified.stored.is_none());
     assert!(repo.store.head(&id).await.is_err());
     let upload = repo
-        .create_client_multipart_upload(None, None)
+        .create_client_multipart_upload(None, None, None)
         .await
         .expect("new");
     let empty = upload
-        .upload_part(1, plaintext(Bytes::new()))
+        .upload_part(1, plaintext(Bytes::new()), None)
         .await
         .expect("empty");
     upload
-        .upload_part(1, plaintext(Bytes::from_static(b"new")))
+        .upload_part(1, plaintext(Bytes::from_static(b"new")), None)
         .await
         .expect("replacement");
     assert!(
@@ -179,29 +179,29 @@ async fn multipart_small_nonfinal_foreign_and_corrupt_expected_parts_fail_closed
     for case in 0..4 {
         let repo = repository(MemoryBlobStore::new());
         let upload = repo
-            .create_client_multipart_upload(None, None)
+            .create_client_multipart_upload(None, None, None)
             .await
             .expect("create");
         let id = upload.object_id.clone();
         let mut part = upload
-            .upload_part(1, plaintext(Bytes::from_static(b"abc")))
+            .upload_part(1, plaintext(Bytes::from_static(b"abc")), None)
             .await
             .expect("part");
         let selected = match case {
             0 => vec![
                 part,
                 upload
-                    .upload_part(2, plaintext(Bytes::from_static(b"tail")))
+                    .upload_part(2, plaintext(Bytes::from_static(b"tail")), None)
                     .await
                     .expect("tail"),
             ],
             1 => {
                 let other = repo
-                    .create_client_multipart_upload(None, None)
+                    .create_client_multipart_upload(None, None, None)
                     .await
                     .expect("other");
                 let foreign = other
-                    .upload_part(1, plaintext(Bytes::new()))
+                    .upload_part(1, plaintext(Bytes::new()), None)
                     .await
                     .expect("foreign empty");
                 other.abort().await.expect("abort");
@@ -213,7 +213,7 @@ async fn multipart_small_nonfinal_foreign_and_corrupt_expected_parts_fail_closed
             }
             _ => {
                 upload
-                    .upload_part(1, plaintext(Bytes::from_static(b"new")))
+                    .upload_part(1, plaintext(Bytes::from_static(b"new")), None)
                     .await
                     .expect("replace");
                 vec![part]
@@ -238,7 +238,7 @@ async fn multipart_small_nonfinal_foreign_and_corrupt_expected_parts_fail_closed
 async fn multipart_plaintext_length_errors_never_accept_a_part() {
     let repo = repository(MemoryBlobStore::new());
     let upload = repo
-        .create_client_multipart_upload(None, None)
+        .create_client_multipart_upload(None, None, None)
         .await
         .expect("create");
     for declared in [0, 2, 4] {
@@ -246,18 +246,18 @@ async fn multipart_plaintext_length_errors_never_accept_a_part() {
             bytes: Bytes::from_static(b"abc"),
             declared,
         };
-        assert!(upload.upload_part(1, Box::new(read)).await.is_err());
+        assert!(upload.upload_part(1, Box::new(read), None).await.is_err());
     }
     assert!(upload.parts.read().expect("parts").is_empty());
     assert!(
         upload
-            .upload_part(0, plaintext(Bytes::new()))
+            .upload_part(0, plaintext(Bytes::new()), None)
             .await
             .is_err()
     );
     assert!(
         upload
-            .upload_part(10_001, plaintext(Bytes::new()))
+            .upload_part(10_001, plaintext(Bytes::new()), None)
             .await
             .is_err()
     );
@@ -268,7 +268,8 @@ async fn multipart_plaintext_length_errors_never_accept_a_part() {
                 Box::new(Plaintext {
                     bytes: Bytes::new(),
                     declared: rs3_storage::MULTIPART_MAX_PART_BYTES
-                })
+                }),
+                None
             )
             .await
             .is_err(),
@@ -292,12 +293,12 @@ async fn multipart_ambiguous_completion_returns_no_publication_input() {
     );
     let repo = repository(fault);
     let upload = repo
-        .create_client_multipart_upload(None, None)
+        .create_client_multipart_upload(None, None, None)
         .await
         .expect("create");
     let id = upload.object_id.clone();
     let part = upload
-        .upload_part(1, plaintext(Bytes::from_static(b"abc")))
+        .upload_part(1, plaintext(Bytes::from_static(b"abc")), None)
         .await
         .expect("part");
     assert!(
@@ -318,11 +319,11 @@ async fn multipart_retained_completion_preserves_exact_version_and_full_post_com
     repo.options.provider_profile = V2ProviderProfile::RetainedVersionObjectLock;
     let retention = RetentionPolicy::new(RetentionMode::Governance, 30);
     let upload = repo
-        .create_client_multipart_upload(Some(retention), None)
+        .create_client_multipart_upload(Some(retention), None, None)
         .await
         .expect("retained create");
     let part = upload
-        .upload_part(1, plaintext(Bytes::from_static(b"retained")))
+        .upload_part(1, plaintext(Bytes::from_static(b"retained")), None)
         .await
         .expect("part");
     let floor = required_retain_until_ms(Some(retention)).expect("horizon");
@@ -351,7 +352,7 @@ async fn multipart_retained_completion_preserves_exact_version_and_full_post_com
 async fn multipart_zero_length_final_part_does_not_enter_ciphertext_layout() {
     let repo = repository(MemoryBlobStore::new());
     let upload = repo
-        .create_client_multipart_upload(None, None)
+        .create_client_multipart_upload(None, None, None)
         .await
         .expect("create");
     let first = upload
@@ -362,11 +363,12 @@ async fn multipart_zero_length_final_part_does_not_enter_ciphertext_layout() {
                 rs3_storage::MULTIPART_MIN_PART_BYTES
                     as usize
             ])),
+            None,
         )
         .await
         .expect("first");
     let empty = upload
-        .upload_part(9, plaintext(Bytes::new()))
+        .upload_part(9, plaintext(Bytes::new()), None)
         .await
         .expect("empty final");
     let verified = repo
@@ -397,14 +399,14 @@ async fn multipart_stalled_input_does_not_accept_part_and_can_abort() {
     let mut repo = repository(MemoryBlobStore::new());
     repo.options.stream_read_stall_timeout = Duration::from_millis(5);
     let upload = repo
-        .create_client_multipart_upload(None, None)
+        .create_client_multipart_upload(None, None, None)
         .await
         .expect("create");
     let id = upload.object_id.clone();
     assert!(
         tokio::time::timeout(
             Duration::from_secs(1),
-            upload.upload_part(1, Box::new(Stalled))
+            upload.upload_part(1, Box::new(Stalled), None)
         )
         .await
         .expect("bounded stall")
@@ -413,4 +415,96 @@ async fn multipart_stalled_input_does_not_accept_part_and_can_abort() {
     assert!(upload.parts.read().expect("parts").is_empty());
     upload.abort().await.expect("abort");
     assert!(!repo.is_inflight_standalone_object(&id).expect("released"));
+}
+
+#[tokio::test]
+async fn multipart_verified_eof_checksum_is_required_before_replacing_current_attempt() {
+    use crate::MultipartChecksumKind;
+    use rs3_types::ChecksumAlgorithm;
+
+    struct VerifiedBody {
+        body: Box<dyn BlobRead>,
+        handoff: UploadChecksum,
+        value: Option<ObjectChecksum>,
+    }
+    #[async_trait]
+    impl BlobRead for VerifiedBody {
+        fn exact_len(&self) -> u64 {
+            self.body.exact_len()
+        }
+        async fn next_chunk(&mut self) -> rs3_storage::Result<Option<Bytes>> {
+            let chunk = self.body.next_chunk().await?;
+            if chunk.is_none()
+                && let Some(value) = self.value.take()
+            {
+                self.handoff.finish(value).expect("one EOF handoff");
+            }
+            Ok(chunk)
+        }
+    }
+    let checksum = |algorithm, kind| {
+        let mut hasher = rs3_crypto::ChecksumHasher::new(algorithm);
+        hasher.update(b"abc");
+        ObjectChecksum::new(algorithm, kind, hasher.finalize()).expect("checksum")
+    };
+    let repo = repository(MemoryBlobStore::new());
+    let policy =
+        MultipartChecksumPolicy::new(ChecksumAlgorithm::Crc32, MultipartChecksumKind::FullObject)
+            .expect("policy");
+    let upload = repo
+        .create_client_multipart_upload(None, None, Some(policy))
+        .await
+        .expect("upload");
+    let original_value = checksum(ChecksumAlgorithm::Crc32, ChecksumType::FullObject);
+    let handoff = UploadChecksum::pending();
+    let old = upload
+        .upload_part(
+            1,
+            Box::new(VerifiedBody {
+                body: plaintext(Bytes::from_static(b"abc")),
+                handoff: handoff.clone(),
+                value: Some(original_value.clone()),
+            }),
+            Some(handoff),
+        )
+        .await
+        .expect("verified EOF part");
+    assert_eq!(old.checksum(), Some(&original_value));
+    for invalid in [
+        None,
+        Some(UploadChecksum::pending()),
+        Some(UploadChecksum::verified(checksum(
+            ChecksumAlgorithm::Sha256,
+            ChecksumType::FullObject,
+        ))),
+        Some(UploadChecksum::verified(checksum(
+            ChecksumAlgorithm::Crc32,
+            ChecksumType::Composite { parts: 1 },
+        ))),
+    ] {
+        assert!(
+            upload
+                .upload_part(1, plaintext(Bytes::from_static(b"abc")), invalid)
+                .await
+                .is_err()
+        );
+        let listed = upload.list_parts(0, 10).expect("current");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].etag(), old.etag());
+        assert_eq!(listed[0].checksum(), Some(&original_value));
+    }
+    let new_value = checksum(ChecksumAlgorithm::Crc32, ChecksumType::FullObject);
+    let new = upload
+        .upload_part(
+            1,
+            plaintext(Bytes::from_static(b"abc")),
+            Some(UploadChecksum::verified(new_value)),
+        )
+        .await
+        .expect("replacement");
+    assert_ne!(old.etag(), new.etag());
+    assert!(upload.select_parts(&[(1, old.etag())]).is_err());
+    let selected = upload.select_parts(&[(1, new.etag())]).expect("latest");
+    assert_eq!(selected[0].checksum(), Some(&original_value));
+    upload.abort().await.expect("abort");
 }

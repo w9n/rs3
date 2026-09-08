@@ -26,6 +26,12 @@ pub enum RepositoryError {
     /// The object body stream failed before it could be fully read.
     #[error("object body stream could not be read")]
     ObjectBodyReadFailed,
+    /// A requested checksum was not resolved by the verified request reader.
+    #[error("request checksum is not available from a verified complete body")]
+    ObjectChecksumUnavailable,
+    /// A declared checksum disagrees with verified uploaded content.
+    #[error("request checksum did not match verified content")]
+    ObjectChecksumMismatch,
     /// Repository sequence allocation overflowed.
     #[error("repository sequence overflow")]
     SequenceOverflow,

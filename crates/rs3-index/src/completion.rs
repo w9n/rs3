@@ -1,7 +1,9 @@
 //! Bounded authenticated multipart completion results, independent of payload
 //! retention. Only accepted repository publication may install these records.
 
-use rs3_types::{LogicalPath, MultipartUploadId, Sequence, cbor};
+use rs3_types::{
+    ChecksumAlgorithm, ChecksumType, LogicalPath, MultipartUploadId, ObjectChecksum, Sequence, cbor,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Maximum durable results retained, newest accepted commit sequences first.
@@ -26,6 +28,8 @@ pub struct CompletionReceipt {
     pub content_len: u64,
     /// Exact client response ETag, distinct from provider ciphertext ETags.
     pub etag: String,
+    /// Accepted client checksum, when supplied with this multipart completion.
+    pub checksum: Option<ObjectChecksum>,
 }
 
 impl std::fmt::Debug for CompletionReceipt {
@@ -58,17 +62,26 @@ impl CompletionReceipt {
             || self.etag.is_empty()
             || self.etag.len() > 128
             || self.etag.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
+            || self.checksum.as_ref().is_some_and(|checksum| {
+                matches!(
+                    (checksum.algorithm(), checksum.kind()),
+                    (
+                        ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256,
+                        ChecksumType::FullObject
+                    )
+                )
+            })
         {
             return Err(CompletionReceiptError);
         }
         Ok(())
     }
 
-    /// Encodes the fixed seven-field canonical CBOR array.
+    /// Encodes the fixed eight-field canonical CBOR array.
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let mut out = Vec::new();
-        cbor::write_array_len(&mut out, 7);
+        cbor::write_array_len(&mut out, 8);
         cbor::write_bytes(&mut out, self.upload_id.as_bytes());
         cbor::write_u64(&mut out, self.commit_sequence.get());
         cbor::write_bytes(&mut out, &self.selection_digest);
@@ -76,6 +89,10 @@ impl CompletionReceipt {
         cbor::write_text(&mut out, self.key.as_str());
         cbor::write_u64(&mut out, self.content_len);
         cbor::write_text(&mut out, &self.etag);
+        match &self.checksum {
+            Some(checksum) => cbor::write_bytes(&mut out, &checksum.encode()),
+            None => cbor::write_null(&mut out),
+        }
         if out.len() > MAX_COMPLETION_RECEIPT_BYTES {
             return Err(CompletionReceiptError);
         }
@@ -93,7 +110,7 @@ impl CompletionReceipt {
 
 fn decode(input: &[u8]) -> cbor::CborResult<CompletionReceipt> {
     let mut reader = cbor::Reader::new(input);
-    if reader.read_array_len()? != 7 {
+    if reader.read_array_len()? != 8 {
         return Err(cbor::CborError::Invalid);
     }
     let upload_id = MultipartUploadId::from_bytes(
@@ -115,6 +132,15 @@ fn decode(input: &[u8]) -> cbor::CborResult<CompletionReceipt> {
         LogicalPath::new(reader.read_text_bounded(1024)?).map_err(|_| cbor::CborError::Invalid)?;
     let content_len = reader.read_u64()?;
     let etag = reader.read_text_bounded(128)?;
+    let checksum = if reader.next_is_null() {
+        reader.read_null()?;
+        None
+    } else {
+        Some(
+            ObjectChecksum::decode(&reader.read_bytes_bounded(ObjectChecksum::MAX_ENCODED_BYTES)?)
+                .map_err(|_| cbor::CborError::Invalid)?,
+        )
+    };
     if !reader.is_finished() {
         return Err(cbor::CborError::Invalid);
     }
@@ -126,6 +152,7 @@ fn decode(input: &[u8]) -> cbor::CborResult<CompletionReceipt> {
         key,
         content_len,
         etag,
+        checksum,
     };
     receipt.validate().map_err(|_| cbor::CborError::Invalid)?;
     Ok(receipt)
@@ -221,6 +248,7 @@ mod tests {
             key: LogicalPath::new("private/key").expect("key"),
             content_len: 42,
             etag: "opaque-result-2".to_owned(),
+            checksum: None,
         }
     }
 
@@ -248,6 +276,52 @@ mod tests {
         invalid.commit_sequence = Sequence::ZERO;
         assert!(invalid.encode().is_err());
         assert!(!format!("{original:?}").contains("private"));
+    }
+
+    #[test]
+    fn receipt_checksum_round_trips_and_rejects_malformed_cbor() {
+        let checksum = ObjectChecksum::new(
+            rs3_types::ChecksumAlgorithm::Crc32,
+            rs3_types::ChecksumType::FullObject,
+            vec![0xa5; 4],
+        )
+        .expect("checksum");
+        let mut original = receipt(1);
+        original.checksum = Some(checksum.clone());
+        let bytes = original.encode().expect("encode");
+        assert_eq!(CompletionReceipt::decode(&bytes), Ok(original));
+
+        let checksum_bytes = checksum.encode();
+        let checksum_offset = bytes.len() - checksum_bytes.len();
+        let mut malformed = bytes;
+        malformed[checksum_offset + 3] = 0x43;
+        assert!(CompletionReceipt::decode(&malformed).is_err());
+    }
+
+    #[test]
+    fn multipart_receipt_rejects_full_object_sha_checksums() {
+        for algorithm in [ChecksumAlgorithm::Sha1, ChecksumAlgorithm::Sha256] {
+            let mut invalid = receipt(1);
+            invalid.checksum = Some(
+                ObjectChecksum::new(
+                    algorithm,
+                    ChecksumType::FullObject,
+                    vec![0; algorithm.digest_len()],
+                )
+                .expect("checksum"),
+            );
+            assert!(invalid.encode().is_err());
+        }
+        let mut accepted = receipt(1);
+        accepted.checksum = Some(
+            ObjectChecksum::new(
+                ChecksumAlgorithm::Sha256,
+                ChecksumType::Composite { parts: 1 },
+                vec![0; ChecksumAlgorithm::Sha256.digest_len()],
+            )
+            .expect("checksum"),
+        );
+        assert!(accepted.encode().is_ok());
     }
 
     #[test]

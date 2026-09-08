@@ -1,6 +1,7 @@
 //! Cryptographic boundaries for repository privacy.
 
 mod checkpoint;
+mod checksum;
 mod constant_time;
 mod derive;
 mod envelope;
@@ -18,6 +19,7 @@ mod secret;
 pub use checkpoint::{
     CheckpointSignature, validate_recovery_public_key, verify_recovery_signature,
 };
+pub use checksum::{ChecksumHasher, combine_part_checksums};
 pub use constant_time::ct_eq;
 pub use derive::{NamespaceBlindKey, derive_blind_index_key, derive_manifest_id};
 pub use envelope::{

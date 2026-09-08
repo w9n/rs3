@@ -16,6 +16,7 @@ test-util = []
 [dependencies]
 aes-gcm-siv.workspace = true
 chacha20poly1305.workspace = true
+crc-fast.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 hmac.workspace = true

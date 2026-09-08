@@ -6,8 +6,10 @@ mod tests;
 
 use super::*;
 use crate::payload::SegmentedPayloadLayout;
+use crate::{MultipartChecksumPolicy, UploadChecksum};
 use rs3_index::{PayloadLayout, PayloadPart};
 use rs3_storage::{BlobMultipartPart, BlobMultipartSession, BlobRead};
+use rs3_types::{ChecksumType, ObjectChecksum};
 use std::sync::Mutex;
 
 const PART_SEGMENT_BYTES: usize = 64 * 1024;
@@ -20,6 +22,7 @@ pub struct V3UploadedPart {
     backend: BlobMultipartPart,
     part: PayloadPart,
     digest: [u8; 32],
+    checksum: Option<ObjectChecksum>,
 }
 
 impl V3UploadedPart {
@@ -30,6 +33,10 @@ impl V3UploadedPart {
     /// Plaintext bytes accepted for this part.
     pub fn plaintext_len(&self) -> u64 {
         self.part.plaintext_len
+    }
+    /// Verified plaintext checksum, kept independent of the opaque part token.
+    pub fn checksum(&self) -> Option<&ObjectChecksum> {
+        self.checksum.as_ref()
     }
     pub(in crate::v2) fn selected_attempts_digest(parts: &[Self]) -> [u8; 32] {
         let mut digest = Sha256Hasher::new();
@@ -64,6 +71,7 @@ pub struct V3MultipartUpload {
     retention: Option<RetentionPolicy>,
     legal_hold: Option<LegalHoldStatus>,
     stall_timeout: Duration,
+    checksum_policy: Option<MultipartChecksumPolicy>,
     parts: RwLock<std::collections::BTreeMap<u32, V3UploadedPart>>,
 }
 
@@ -89,7 +97,11 @@ impl V3MultipartUpload {
         &self,
         part_number: u32,
         read: Box<dyn BlobRead>,
+        checksum: Option<UploadChecksum>,
     ) -> V2Result<V3UploadedPart> {
+        if self.checksum_policy.is_some() != checksum.is_some() {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
         let index = part_number
             .checked_sub(1)
             .ok_or(V2FormatError::InvalidHeaderField)? as usize;
@@ -136,11 +148,29 @@ impl V3MultipartUpload {
             .map_err(|_| V2FormatError::StorageOperationFailed)?
             .take()
             .ok_or(V2FormatError::ProviderProfileFailed)?;
+        // EncryptedPartBody records its digest only after exact plaintext EOF.
+        // A trailer handoff is therefore resolved before replacing the current part.
+        let checksum = checksum
+            .map(|checksum| {
+                checksum
+                    .get()
+                    .map_err(|_| V2FormatError::InvalidHeaderField)
+            })
+            .transpose()?;
+        if checksum.as_ref().is_some_and(|checksum| {
+            checksum.kind() != ChecksumType::FullObject
+                || self
+                    .checksum_policy
+                    .is_none_or(|policy| policy.algorithm() != checksum.algorithm())
+        }) {
+            return Err(V2FormatError::InvalidHeaderField);
+        }
         let uploaded = V3UploadedPart {
             scope: Arc::clone(&self.scope),
             backend,
             part,
             digest,
+            checksum,
         };
         self.parts
             .write()
@@ -197,6 +227,7 @@ impl<S: BlobStore> V2CommitStore<S> {
         &self,
         retention: Option<RetentionPolicy>,
         legal_hold: Option<LegalHoldStatus>,
+        checksum_policy: Option<MultipartChecksumPolicy>,
     ) -> V2Result<V3MultipartUpload> {
         self.validate_write_protection_profile(retention, legal_hold)?;
         let object_id = super::super::standalone::generate_v2_standalone_object_id()?;
@@ -232,6 +263,7 @@ impl<S: BlobStore> V2CommitStore<S> {
             retention,
             legal_hold,
             stall_timeout: self.options.stream_read_stall_timeout,
+            checksum_policy,
             parts: RwLock::new(Default::default()),
         })
     }

@@ -15,6 +15,8 @@ use std::sync::Arc;
 /// Trusted manifest metadata used by the current in-memory query model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TrustedManifest {
+    /// Verified checksum, visible only through authenticated object metadata.
+    pub(crate) checksum: Option<rs3_types::ObjectChecksum>,
     /// Client-visible key inside the trusted boundary.
     pub(crate) key: LogicalPath,
     /// Client-visible content length.
@@ -175,6 +177,7 @@ impl TrustedManifest {
     /// Converts trusted manifest metadata into public repository metadata.
     pub(crate) fn into_metadata(self) -> RepositoryObjectMetadata {
         RepositoryObjectMetadata {
+            checksum: self.checksum,
             key: self.key,
             content_len: self.content_len,
             modified_at_ms: self.modified_at_ms,
@@ -186,6 +189,7 @@ impl TrustedManifest {
     /// Converts trusted manifest metadata into durable manifest metadata.
     pub(crate) fn into_durable(self) -> DurableManifest {
         DurableManifest {
+            checksum: self.checksum,
             key: self.key,
             content_len: self.content_len,
             modified_at_ms: self.modified_at_ms,

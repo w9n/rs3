@@ -935,6 +935,7 @@ mod tests {
 
     fn manifest(key: &str) -> TrustedManifest {
         TrustedManifest {
+            checksum: None,
             key: path(key),
             content_len: 1,
             modified_at_ms: 1,

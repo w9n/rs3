@@ -32,7 +32,18 @@ create-only checks, failed anchor advancement, lost anchor replies and local
 installation failure. Adapter tests also cover the five multipart routes, replacement serialization,
 parallel parts, completion freeze, duplicate completion, monotonic expiry,
 admission limits, cancellation, readonly mode and invalid selected/body facts.
-Live-provider and default-checksum qualification remain separate.
+Checksum tests cover all five algorithms, encrypted metadata and completion
+receipt persistence, and failed writes that leave the accepted value intact.
+`cargo test -p rs3-server --test checksum_trailers` sends authenticated SigV4
+chunks and trailers through the real listener, including missing and invalid
+trailer cases.
+
+Local client qualification covers 100 MiB AWS CLI 2.34.24 ordinary and multipart
+uploads with default CRC64NVME and explicit SHA256 on memory and RustFS
+backends. Velero 1.18.0 with AWS plugin 1.14.0 passes default CRC32 backup and
+restore after namespace deletion. Independent calculations check returned
+checksums and restored bytes. These fixtures leave retained-provider fault and
+recovery-history qualification as separate work.
 
 `just fuzz-smoke` exercises commit headers/objects, canonical CBOR, both
 repository-envelope purposes, recovery bundles, index runs/roots, format roots,

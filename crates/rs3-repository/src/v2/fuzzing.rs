@@ -373,6 +373,7 @@ fn standalone_index_run_fixture() -> IndexRun {
         }],
         mutations: vec![
             IndexMutation::Upsert(IndexUpsert {
+                checksum: None,
                 mutation_ordinal: 0,
                 blind_key: IndexBlindKey::from_bytes([0x31; 32]),
                 namespace_key_id: key_id("namespace"),

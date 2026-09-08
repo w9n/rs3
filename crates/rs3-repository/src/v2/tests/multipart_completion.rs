@@ -1,5 +1,7 @@
 use super::*;
 use crate::v2::{V3ClientMultipartUpload, V3MultipartSelection};
+use crate::{MultipartChecksumKind, MultipartChecksumPolicy, UploadChecksum};
+use rs3_types::{ChecksumAlgorithm, ChecksumType, ObjectChecksum};
 
 struct Fixture {
     store: MemoryBlobStore,
@@ -60,15 +62,29 @@ impl Fixture {
                         create_only,
                         ..Default::default()
                     },
+                    Some(policy(
+                        ChecksumAlgorithm::Crc64Nvme,
+                        MultipartChecksumKind::FullObject,
+                    )),
                 )
                 .await,
         );
         let part = must_repo(
             upload
-                .upload_part(3, Box::new(Body(Bytes::from_static(bytes))))
+                .upload_part(
+                    3,
+                    Box::new(Body(Bytes::from_static(bytes))),
+                    Some(UploadChecksum::verified(checksum(
+                        ChecksumAlgorithm::Crc64Nvme,
+                        bytes,
+                    ))),
+                )
                 .await,
         );
-        let selection = must_repo(V3MultipartSelection::new(vec![(3, part.etag())]));
+        let selection = must_repo(V3MultipartSelection::with_checksums(
+            vec![(3, part.etag(), part.checksum().cloned())],
+            part.checksum().cloned(),
+        ));
         (upload, selection)
     }
 
@@ -91,7 +107,7 @@ impl rs3_storage::BlobRead for Body {
         self.0.len() as u64
     }
     async fn next_chunk(&mut self) -> rs3_storage::Result<Option<Bytes>> {
-        Ok((!self.0.is_empty()).then(|| self.0.split_to(self.0.len())))
+        Ok((!self.0.is_empty()).then(|| self.0.split_to(self.0.len().min(64 * 1024))))
     }
 }
 fn key() -> LogicalPath {
@@ -189,6 +205,14 @@ async fn multipart_receipt_survives_overwrite_checkpoint_compaction_and_restart(
         let anchor = must_v2(f.anchor.read_v2().await).expect("accepted");
         assert_eq!(receipt.commit_sequence, anchor.sequence);
         assert_eq!(receipt.content_len, body.len() as u64);
+        assert_eq!(
+            receipt.checksum,
+            Some(checksum(ChecksumAlgorithm::Crc64Nvme, body))
+        );
+        assert_eq!(
+            must_repo(f.repository.head(&key())).checksum,
+            receipt.checksum
+        );
         assert_eq!(
             must_repo(f.repository.get_range(&key(), ByteRange::Full).await).as_ref(),
             body
@@ -526,4 +550,282 @@ async fn multipart_receipt_eviction_survives_automatic_compaction_and_root_repla
         must_repo(fresh.get_range(&key(), ByteRange::Full).await),
         Bytes::from_static(b"next")
     );
+}
+
+fn policy(algorithm: ChecksumAlgorithm, kind: MultipartChecksumKind) -> MultipartChecksumPolicy {
+    MultipartChecksumPolicy::new(algorithm, kind).expect("supported multipart policy")
+}
+
+fn checksum(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> ObjectChecksum {
+    let mut hasher = rs3_crypto::ChecksumHasher::new(algorithm);
+    hasher.update(bytes);
+    ObjectChecksum::new(algorithm, ChecksumType::FullObject, hasher.finalize()).expect("checksum")
+}
+
+#[tokio::test]
+async fn multipart_checksum_combination_matches_selected_bytes_and_rejects_bad_final_before_consumption()
+ {
+    for algorithm in [
+        ChecksumAlgorithm::Crc32,
+        ChecksumAlgorithm::Crc32c,
+        ChecksumAlgorithm::Crc64Nvme,
+    ] {
+        let f = Fixture::new().await;
+        let coordinator = f.coordinator();
+        let upload = must_repo(
+            f.repository
+                .create_multipart_upload(
+                    key(),
+                    RepositoryPutOptions::default(),
+                    Some(policy(algorithm, MultipartChecksumKind::FullObject)),
+                )
+                .await,
+        );
+        let prefix = Bytes::from(vec![7; rs3_storage::MULTIPART_MIN_PART_BYTES as usize]);
+        let first_checksum = checksum(algorithm, &prefix);
+        let first = must_repo(
+            upload
+                .upload_part(
+                    2,
+                    Box::new(Body(prefix.clone())),
+                    Some(UploadChecksum::verified(first_checksum)),
+                )
+                .await,
+        );
+        let last_checksum = checksum(algorithm, b"tail");
+        let last = must_repo(
+            upload
+                .upload_part(
+                    7,
+                    Box::new(Body(Bytes::from_static(b"tail"))),
+                    Some(UploadChecksum::verified(last_checksum)),
+                )
+                .await,
+        );
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(b"tail");
+        let expected = checksum(algorithm, &bytes);
+        let pairs = vec![(2, first.etag(), None), (7, last.etag(), None)];
+        let bad = must_repo(V3MultipartSelection::with_checksums(
+            pairs.clone(),
+            Some(checksum(algorithm, b"wrong")),
+        ));
+        let before = must_v2(f.anchor.read_v2().await);
+        assert!(matches!(
+            upload.validate_selection(&bad),
+            Err(RepositoryError::ObjectChecksumMismatch)
+        ));
+        assert_eq!(must_v2(f.anchor.read_v2().await), before);
+        assert!(f.repository.head(&key()).is_err());
+        let selection = must_repo(V3MultipartSelection::with_checksums(
+            pairs,
+            Some(expected.clone()),
+        ));
+        must_repo(upload.validate_selection(&selection));
+        let id = upload.id();
+        let receipt = must_repo(
+            coordinator
+                .complete_multipart_upload(upload, selection.clone())
+                .await,
+        );
+        assert_eq!(receipt.checksum, Some(expected));
+        assert!(
+            f.repository
+                .accepted_multipart_completion(&id, &key(), &bad)
+                .is_err()
+        );
+        assert_eq!(
+            must_repo(
+                f.reopen()
+                    .await
+                    .accepted_multipart_completion(&id, &key(), &selection)
+            ),
+            Some(receipt)
+        );
+    }
+}
+
+#[tokio::test]
+async fn multipart_composite_requires_exact_part_facts_and_consecutive_numbers() {
+    for algorithm in [
+        ChecksumAlgorithm::Crc32,
+        ChecksumAlgorithm::Crc32c,
+        ChecksumAlgorithm::Sha1,
+        ChecksumAlgorithm::Sha256,
+    ] {
+        let f = Fixture::new().await;
+        let coordinator = f.coordinator();
+        let upload = must_repo(
+            f.repository
+                .create_multipart_upload(
+                    key(),
+                    RepositoryPutOptions::default(),
+                    Some(policy(algorithm, MultipartChecksumKind::Composite)),
+                )
+                .await,
+        );
+        let actual = checksum(algorithm, b"abc");
+        let first = must_repo(
+            upload
+                .upload_part(
+                    1,
+                    Box::new(Body(Bytes::from_static(b"abc"))),
+                    Some(UploadChecksum::verified(actual.clone())),
+                )
+                .await,
+        );
+        let skipped = must_repo(
+            upload
+                .upload_part(
+                    3,
+                    Box::new(Body(Bytes::from_static(b"abc"))),
+                    Some(UploadChecksum::verified(actual.clone())),
+                )
+                .await,
+        );
+        let gap = must_repo(V3MultipartSelection::with_checksums(
+            vec![(3, skipped.etag(), Some(actual.clone()))],
+            None,
+        ));
+        assert!(upload.validate_selection(&gap).is_err());
+        let missing = must_repo(V3MultipartSelection::new(vec![(1, first.etag())]));
+        assert!(upload.validate_selection(&missing).is_err());
+        let wrong = must_repo(V3MultipartSelection::with_checksums(
+            vec![(1, first.etag(), Some(checksum(algorithm, b"wrong")))],
+            None,
+        ));
+        assert!(matches!(
+            upload.validate_selection(&wrong),
+            Err(RepositoryError::ObjectChecksumMismatch)
+        ));
+        let mut hasher = rs3_crypto::ChecksumHasher::new(algorithm);
+        hasher.update(actual.digest());
+        let expected = ObjectChecksum::new(
+            algorithm,
+            ChecksumType::Composite { parts: 1 },
+            hasher.finalize(),
+        )
+        .expect("composite");
+        let selection = must_repo(V3MultipartSelection::with_checksums(
+            vec![(1, first.etag(), Some(actual))],
+            Some(expected.clone()),
+        ));
+        let id = upload.id();
+        let receipt = must_repo(
+            coordinator
+                .complete_multipart_upload(upload, selection.clone())
+                .await,
+        );
+        assert_eq!(receipt.checksum, Some(expected));
+        for changed in [gap, missing, wrong] {
+            assert!(
+                f.repository
+                    .accepted_multipart_completion(&id, &key(), &changed)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            must_repo(
+                f.reopen()
+                    .await
+                    .accepted_multipart_completion(&id, &key(), &selection)
+            ),
+            Some(receipt)
+        );
+    }
+}
+
+#[tokio::test]
+async fn multipart_authoritative_checksum_failure_publishes_neither_object_nor_receipt() {
+    let f = Fixture::new().await;
+    let coordinator = f.coordinator();
+    let (upload, selection) = f.upload(b"original", false).await;
+    let id = upload.id();
+    let part = must_repo(upload.list_parts(0, 10)).remove(0);
+    let changed = must_repo(V3MultipartSelection::with_checksums(
+        vec![(3, part.etag(), part.checksum().cloned())],
+        Some(checksum(ChecksumAlgorithm::Crc64Nvme, b"wrong")),
+    ));
+    let before = must_v2(f.anchor.read_v2().await);
+    assert!(matches!(
+        coordinator.complete_multipart_upload(upload, changed).await,
+        Err(RepositoryError::ObjectChecksumMismatch)
+    ));
+    assert_eq!(must_v2(f.anchor.read_v2().await), before);
+    assert!(f.repository.head(&key()).is_err());
+    assert!(
+        must_repo(
+            f.repository
+                .accepted_multipart_completion(&id, &key(), &selection)
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn multipart_policy_rejects_unsupported_constructions() {
+    for algorithm in [ChecksumAlgorithm::Sha1, ChecksumAlgorithm::Sha256] {
+        assert!(
+            MultipartChecksumPolicy::new(algorithm, MultipartChecksumKind::FullObject).is_err()
+        );
+    }
+    assert!(
+        MultipartChecksumPolicy::new(
+            ChecksumAlgorithm::Crc64Nvme,
+            MultipartChecksumKind::Composite
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn multipart_retry_digest_binds_checksum_presence_and_explicit_kind() {
+    let f = Fixture::new().await;
+    let coordinator = f.coordinator();
+    let (upload, _) = f.upload(b"abc", false).await;
+    let part = must_repo(upload.list_parts(0, 1)).remove(0);
+    let pairs = vec![(3, part.etag(), part.checksum().cloned())];
+    let selection = must_repo(V3MultipartSelection::with_checksums_and_kind(
+        pairs.clone(),
+        part.checksum().cloned(),
+        Some(MultipartChecksumKind::FullObject),
+    ));
+    let wrong_kind = must_repo(V3MultipartSelection::with_checksums_and_kind(
+        pairs.clone(),
+        None,
+        Some(MultipartChecksumKind::Composite),
+    ));
+    assert!(upload.validate_selection(&wrong_kind).is_err());
+    let id = upload.id();
+    must_repo(
+        coordinator
+            .complete_multipart_upload(upload, selection.clone())
+            .await,
+    );
+    let changed = [
+        must_repo(V3MultipartSelection::with_checksums(
+            pairs.clone(),
+            part.checksum().cloned(),
+        )),
+        must_repo(V3MultipartSelection::with_checksums_and_kind(
+            pairs,
+            None,
+            Some(MultipartChecksumKind::FullObject),
+        )),
+        must_repo(V3MultipartSelection::with_checksums_and_kind(
+            vec![(3, part.etag(), None)],
+            part.checksum().cloned(),
+            Some(MultipartChecksumKind::FullObject),
+        )),
+        wrong_kind,
+    ];
+    let fresh = f.reopen().await;
+    for changed in changed {
+        assert_ne!(selection.digest(), changed.digest());
+        assert!(
+            fresh
+                .accepted_multipart_completion(&id, &key(), &changed)
+                .is_err()
+        );
+    }
 }

@@ -63,6 +63,20 @@ not delete payloads or promise historical recovery. Unknown upload IDs cannot
 create a new publication, and an unresolved anchor result blocks receipt lookup
 until trusted recovery.
 
+Client request checksums are compatibility integrity facts, not repository
+authentication. The gateway hashes CRC32, CRC32C, CRC64NVME, SHA1, and SHA256
+alongside encryption over the plaintext request stream, then completes
+validation before accepting repository publication. The
+optional typed checksum is stored in encrypted namespace metadata and in the
+encrypted multipart completion receipt, never as an object-store key or provider
+metadata. Full-object `HEAD` and `GET` responses expose the stored checksum and
+its construction type only when the client enables checksum mode; partial `GET`
+responses do not claim a checksum for a different byte range. Multipart
+selection digests bind the selected part checksum facts, while the aggregate
+checksum is the durable metadata fact. Independent vectors, authenticated HTTP
+trailer tests, AWS CLI CRC64NVME/SHA256 transfers and a Velero default CRC32
+backup, namespace deletion and restore cover these client paths.
+
 ## Accepted Leakage
 
 The replacement `v03` design accepts specific backend-visible leakage:
@@ -159,7 +173,10 @@ encrypted index metadata; detached objects expose no self-describing header.
 Full publication readback remains mandatory. Multipart-boundary range and tamper
 tests cover the format capability and the gateway adapter covers the client
 multipart routes. Live-provider and default-request-checksum qualification remain
-separate from those local checks.
+separate from those local checks. The default request checksum is CRC64NVME for
+ordinary PUT and multipart creation, with full-object construction; supported
+non-CRC64 multipart algorithms use composite construction unless the client
+selects a different supported type.
 
 ## Rollback Rule
 
@@ -463,10 +480,10 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
   tests remain required for retention history; signed timestamps alone are not
   a proven retention clock.
 
-- The `v03` catalog, wire-version-7 pack/stream run model, compaction, and
-  automatic watermark paths remain preview-scoped. Durable format freeze,
-  retained-provider qualification, and external cryptographic review are still
-  outstanding.
+- The `v03` catalog, wire-version-9 pack/stream run model, wire-version-5 root,
+  compaction, and automatic watermark paths remain preview-scoped. Durable
+  format freeze, retained-provider qualification, and external cryptographic
+  review are still outstanding.
 - Durable format compatibility is not promised yet.
 - The cryptographic design has not had an external review.
 - Metadata sealing uses fresh random 96-bit nonces with a standard misuse-resistant

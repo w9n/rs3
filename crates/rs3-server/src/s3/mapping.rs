@@ -613,7 +613,10 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
                 "request body length did not match Content-Length"
             )
         }
-        RepositoryError::ObjectBodyReadFailed => {
+        RepositoryError::ObjectChecksumMismatch => {
+            s3s::s3_error!(BadDigest, "checksum did not match request body")
+        }
+        RepositoryError::ObjectBodyReadFailed | RepositoryError::ObjectChecksumUnavailable => {
             s3s::s3_error!(IncompleteBody, "failed to read request body")
         }
         RepositoryError::Storage(StorageError::InvalidRange) => s3s::s3_error!(InvalidRange),

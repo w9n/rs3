@@ -14,6 +14,7 @@ s3 = ["rs3-storage/s3", "dep:rustls"]
 k8s = ["dep:rs3-k8s", "dep:rustls", "k8s-openapi/v1_35"]
 
 [dependencies]
+base64.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
@@ -50,6 +51,8 @@ tracing-subscriber.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+hmac.workspace = true
+sha2.workspace = true
 rs3-storage = { workspace = true, features = ["test-util"] }
 
 [lints]

@@ -1416,6 +1416,7 @@ mod tests {
             standalone_stream_containers: Vec::new(),
             mutations: vec![
                 IndexMutation::Upsert(IndexUpsert {
+                    checksum: None,
                     mutation_ordinal: 0,
                     blind_key: IndexBlindKey::from_bytes([0x30; 32]),
                     namespace_key_id: must(KeyId::new("namespace")),
@@ -1433,6 +1434,7 @@ mod tests {
                     legal_hold: Some(LegalHoldStatus::On),
                 }),
                 IndexMutation::Upsert(IndexUpsert {
+                    checksum: None,
                     mutation_ordinal: 1,
                     blind_key: IndexBlindKey::from_bytes([0x10; 32]),
                     namespace_key_id: must(KeyId::new("namespace")),
@@ -1458,6 +1460,7 @@ mod tests {
                     generation: Sequence::new(19),
                 }),
                 IndexMutation::Upsert(IndexUpsert {
+                    checksum: None,
                     mutation_ordinal: 3,
                     blind_key: IndexBlindKey::from_bytes([0x40; 32]),
                     namespace_key_id: must(KeyId::new("namespace")),
@@ -1512,6 +1515,7 @@ mod tests {
                 payload_layout,
             }],
             mutations: vec![IndexMutation::Upsert(IndexUpsert {
+                checksum: None,
                 mutation_ordinal: 0,
                 blind_key: IndexBlindKey::from_bytes([0x96; 32]),
                 namespace_key_id: must(KeyId::new("namespace")),

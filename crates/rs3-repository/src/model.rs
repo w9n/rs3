@@ -5,6 +5,8 @@ use rs3_types::{LegalHoldStatus, LogicalPath, RetentionPolicy};
 /// Options for a trusted repository PUT.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryPutOptions {
+    /// Optional verified checksum, resolved before trusted metadata is staged.
+    pub checksum: Option<crate::UploadChecksum>,
     /// Reject the write if the client-visible key already exists.
     pub create_only: bool,
     /// Optional retention policy to apply to backend objects.
@@ -16,6 +18,8 @@ pub struct RepositoryPutOptions {
 /// Metadata returned for a client-visible object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryObjectMetadata {
+    /// Verified plaintext checksum stored inside authenticated encryption.
+    pub checksum: Option<rs3_types::ObjectChecksum>,
     /// Client-visible key inside the trusted boundary.
     pub key: LogicalPath,
     /// Client-visible content length.

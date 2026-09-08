@@ -1,6 +1,7 @@
 //! Trusted repository workflow above storage and namespace indexes.
 
 mod checkpoint;
+mod checksum;
 mod commit_options;
 mod error;
 mod keyring_envelope;
@@ -10,6 +11,8 @@ mod namespace;
 mod payload;
 mod service;
 mod state;
+
+pub use checksum::{MultipartChecksumKind, MultipartChecksumPolicy, UploadChecksum};
 pub mod v2;
 
 #[cfg(test)]

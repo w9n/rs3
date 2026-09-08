@@ -634,6 +634,7 @@ mod tests {
         payload: IndexPayloadPointer,
     ) -> IndexMutation {
         IndexMutation::Upsert(IndexUpsert {
+            checksum: None,
             mutation_ordinal: ordinal,
             blind_key,
             namespace_key_id: key_id("namespace-key"),

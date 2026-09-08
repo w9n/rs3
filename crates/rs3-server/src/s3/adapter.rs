@@ -1,6 +1,7 @@
 //! Typed S3 service adapter backed by repository operations.
 
 use super::S3BoundaryError;
+use super::checksum::{ChecksumRequest, checksum_output, validate_body};
 use super::mapping::{
     ListPage, collect_body_reserving, content_range, etag, i64_len, legal_hold_header,
     legal_hold_output, list_page as map_list_page, list_versions_output, logical_path, max_keys,
@@ -40,6 +41,20 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
 mod multipart;
+
+fn put_object_output(metadata: &rs3_repository::RepositoryObjectMetadata) -> PutObjectOutput {
+    let checksum = checksum_output(metadata.checksum.as_ref());
+    PutObjectOutput {
+        checksum_crc32: checksum.checksum_crc32,
+        checksum_crc32c: checksum.checksum_crc32c,
+        checksum_crc64nvme: checksum.checksum_crc64nvme,
+        checksum_sha1: checksum.checksum_sha1,
+        checksum_sha256: checksum.checksum_sha256,
+        checksum_type: checksum.checksum_type,
+        e_tag: Some(etag(metadata.content_len, metadata.modified_at_ms)),
+        ..Default::default()
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct GatewayS3Service {
@@ -651,19 +666,19 @@ impl S3 for GatewayS3Service {
         &self,
         req: S3Request<s3s::dto::CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::CreateMultipartUploadOutput>> {
-        self.multipart_create(req.input).await
+        self.multipart_create(req).await
     }
     async fn upload_part(
         &self,
         req: S3Request<s3s::dto::UploadPartInput>,
     ) -> S3Result<S3Response<s3s::dto::UploadPartOutput>> {
-        self.multipart_upload_part(req.input).await
+        self.multipart_upload_part(req).await
     }
     async fn complete_multipart_upload(
         &self,
         req: S3Request<s3s::dto::CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
-        self.multipart_complete(req.input).await
+        self.multipart_complete(req).await
     }
     async fn abort_multipart_upload(
         &self,
@@ -816,7 +831,8 @@ impl S3 for GatewayS3Service {
         const OPERATION: &str = "PutObject";
         let request_id = self.next_request_id();
         let started = Instant::now();
-        let input = req.input;
+        let mut input = req.input;
+        let mut checksum_failure = None;
         let bucket = input.bucket.clone();
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
@@ -825,6 +841,14 @@ impl S3 for GatewayS3Service {
             self.check_bucket(&input.bucket)?;
             self.check_mutation_allowed()?;
             validate_put_object_request(&input, self.max_put_object_bytes)?;
+            let checksum_request =
+                ChecksumRequest::from_put(&input, &req.headers, req.trailing_headers)
+                    .map_err(|error| error.into_s3_error())?;
+            let checksum = rs3_repository::UploadChecksum::pending();
+            let (body, failure) =
+                validate_body(input.body.take(), checksum_request, checksum.clone());
+            input.body = Some(body);
+            checksum_failure = Some(failure);
 
             let retention = put_object_retention_policy(&input)?;
             let legal_hold = put_object_legal_hold_status(&input)?;
@@ -889,6 +913,7 @@ impl S3 for GatewayS3Service {
                         declared_len,
                         stream,
                         RepositoryPutOptions {
+                            checksum: Some(checksum.clone()),
                             create_only,
                             retention,
                             legal_hold,
@@ -907,13 +932,7 @@ impl S3 for GatewayS3Service {
                     usize::try_from(declared_len).unwrap_or(usize::MAX),
                 );
 
-                return Ok(S3Response::new(PutObjectOutput {
-                    e_tag: Some(etag(
-                        committed.metadata.content_len,
-                        committed.metadata.modified_at_ms,
-                    )),
-                    ..PutObjectOutput::default()
-                }));
+                return Ok(S3Response::new(put_object_output(&committed.metadata)));
             }
             if declared_len.is_none() && self.repository.supports_streaming_put() {
                 let body_collect_started = Instant::now();
@@ -980,6 +999,7 @@ impl S3 for GatewayS3Service {
                             key,
                             stream,
                             RepositoryPutOptions {
+                                checksum: Some(checksum.clone()),
                                 create_only,
                                 retention,
                                 legal_hold,
@@ -999,13 +1019,7 @@ impl S3 for GatewayS3Service {
                         usize::try_from(committed.metadata.content_len).unwrap_or(usize::MAX),
                     );
 
-                    return Ok(S3Response::new(PutObjectOutput {
-                        e_tag: Some(etag(
-                            committed.metadata.content_len,
-                            committed.metadata.modified_at_ms,
-                        )),
-                        ..PutObjectOutput::default()
-                    }));
+                    return Ok(S3Response::new(put_object_output(&committed.metadata)));
                 }
                 let body_collect_elapsed = body_collect_started.elapsed();
                 record_s3_request_body_collect_metrics(OPERATION, body_collect_elapsed);
@@ -1027,6 +1041,7 @@ impl S3 for GatewayS3Service {
                         key,
                         body,
                         RepositoryPutOptions {
+                            checksum: Some(checksum.clone()),
                             create_only,
                             retention,
                             legal_hold,
@@ -1035,13 +1050,7 @@ impl S3 for GatewayS3Service {
                     .await
                     .map_err(repository_error)?;
 
-                return Ok(S3Response::new(PutObjectOutput {
-                    e_tag: Some(etag(
-                        committed.metadata.content_len,
-                        committed.metadata.modified_at_ms,
-                    )),
-                    ..PutObjectOutput::default()
-                }));
+                return Ok(S3Response::new(put_object_output(&committed.metadata)));
             }
             let body_collect_started = Instant::now();
             let mut upload_body_reservation = self.upload_body_budget.reservation();
@@ -1080,6 +1089,7 @@ impl S3 for GatewayS3Service {
                     key,
                     body,
                     RepositoryPutOptions {
+                        checksum: Some(checksum.clone()),
                         create_only,
                         retention,
                         legal_hold,
@@ -1088,16 +1098,14 @@ impl S3 for GatewayS3Service {
                 .await
                 .map_err(repository_error)?;
 
-            Ok(S3Response::new(PutObjectOutput {
-                e_tag: Some(etag(
-                    committed.metadata.content_len,
-                    committed.metadata.modified_at_ms,
-                )),
-                ..PutObjectOutput::default()
-            }))
+            Ok(S3Response::new(put_object_output(&committed.metadata)))
         }
         .instrument(span)
         .await;
+        let result = result.map_err(|error| match &checksum_failure {
+            Some(failure) => failure.map_error(error),
+            None => error,
+        });
         self.record_request_result(
             OPERATION,
             request_id,
@@ -1126,6 +1134,11 @@ impl S3 for GatewayS3Service {
             validate_get_object_request(&input)?;
 
             let requested_range = input.range.is_some();
+            let want_checksum = input
+                .checksum_mode
+                .as_ref()
+                .is_some_and(|mode| mode.as_str() == s3s::dto::ChecksumMode::ENABLED)
+                && !requested_range;
             let key = logical_path(input.key)?;
             let resolved = self
                 .repository
@@ -1181,7 +1194,18 @@ impl S3 for GatewayS3Service {
                 "S3 response body prepared",
             );
             let content_length = i64_len(response_body_len)?;
+            let checksum = checksum_output(if want_checksum {
+                metadata.checksum.as_ref()
+            } else {
+                None
+            });
             let mut output = GetObjectOutput {
+                checksum_crc32: checksum.checksum_crc32,
+                checksum_crc32c: checksum.checksum_crc32c,
+                checksum_crc64nvme: checksum.checksum_crc64nvme,
+                checksum_sha1: checksum.checksum_sha1,
+                checksum_sha256: checksum.checksum_sha256,
+                checksum_type: checksum.checksum_type,
                 accept_ranges: Some("bytes".to_owned()),
                 body: Some(StreamingBlob::from(response_body)),
                 content_length: Some(content_length),
@@ -1236,6 +1260,11 @@ impl S3 for GatewayS3Service {
             validate_head_object_request(&input)?;
 
             let requested_range = input.range.is_some();
+            let want_checksum = input
+                .checksum_mode
+                .as_ref()
+                .is_some_and(|mode| mode.as_str() == s3s::dto::ChecksumMode::ENABLED)
+                && !requested_range;
             let key = logical_path(input.key)?;
             let metadata = self.repository.head(&key).map_err(repository_error)?;
             let content_length = match resolve_range(input.range, metadata.content_len)? {
@@ -1253,7 +1282,18 @@ impl S3 for GatewayS3Service {
             );
             let (object_lock_mode, object_lock_retain_until_date) =
                 retention_headers(metadata.retention.as_ref(), metadata.modified_at_ms)?;
+            let checksum = checksum_output(if want_checksum {
+                metadata.checksum.as_ref()
+            } else {
+                None
+            });
             Ok(S3Response::new(HeadObjectOutput {
+                checksum_crc32: checksum.checksum_crc32,
+                checksum_crc32c: checksum.checksum_crc32c,
+                checksum_crc64nvme: checksum.checksum_crc64nvme,
+                checksum_sha1: checksum.checksum_sha1,
+                checksum_sha256: checksum.checksum_sha256,
+                checksum_type: checksum.checksum_type,
                 accept_ranges: Some("bytes".to_owned()),
                 content_length: Some(i64_len(content_length)?),
                 content_type: Some("application/octet-stream".to_owned()),
@@ -1705,7 +1745,10 @@ fn record_s3_response_body_bytes(operation: &'static str, len: usize) {
 
 #[cfg(test)]
 mod tests {
+    mod checksum;
     mod multipart;
+    mod multipart_checksum;
+
     use super::{
         DownloadBodyBudget, GatewayS3Service, RequestRateLimiter, UploadBodyBudget,
         status_code_label,

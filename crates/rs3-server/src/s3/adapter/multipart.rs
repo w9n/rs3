@@ -1,5 +1,6 @@
 //! Multipart S3 routes and owned bounded upload work.
 
+mod checksum;
 mod sessions;
 use super::*;
 use rs3_repository::v2::{V3ClientMultipartUpload, V3MultipartSelection};
@@ -56,20 +57,21 @@ impl GatewayS3Service {
 
     pub(super) async fn multipart_create(
         &self,
-        input: CreateMultipartUploadInput,
+        req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let input = req.input;
         let service = self.clone();
         self.multipart_request(
             "CreateMultipartUpload",
             input.bucket.clone(),
             true,
             async move {
+                crate::s3::checksum::validate_request_headers(&req.headers)
+                    .map_err(|error| error.into_s3_error())?;
                 reject_options(&[
                     input.acl.is_some(),
                     input.bucket_key_enabled.is_some(),
                     input.cache_control.is_some(),
-                    input.checksum_algorithm.is_some(),
-                    input.checksum_type.is_some(),
                     input.content_disposition.is_some(),
                     input.content_encoding.is_some(),
                     input.content_language.is_some(),
@@ -99,6 +101,7 @@ impl GatewayS3Service {
                         .is_some_and(|v| v.as_str() != StorageClass::STANDARD),
                     input.object_lock_legal_hold_status.is_some(),
                 ])?;
+                let checksum_policy = checksum::creation_policy(&input)?;
                 let protection = PutObjectInput {
                     object_lock_mode: input.object_lock_mode,
                     object_lock_retain_until_date: input.object_lock_retain_until_date,
@@ -121,11 +124,16 @@ impl GatewayS3Service {
                             retention,
                             ..Default::default()
                         },
+                        Some(checksum_policy),
                     )
                     .await
                     .map_err(repository_error)?;
                 let id = service.multipart.insert(upload, permit).await?;
                 Ok(CreateMultipartUploadOutput {
+                    checksum_algorithm: Some(checksum_algorithm_output(
+                        checksum_policy.algorithm(),
+                    )),
+                    checksum_type: Some(checksum_kind_output(checksum_policy.kind())),
                     bucket: Some(input.bucket),
                     key: Some(input.key),
                     upload_id: Some(hex::encode(id.as_bytes())),
@@ -138,17 +146,12 @@ impl GatewayS3Service {
 
     pub(super) async fn multipart_upload_part(
         &self,
-        input: UploadPartInput,
+        req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
+        let mut input = req.input;
         let service = self.clone();
         self.multipart_request("UploadPart", input.bucket.clone(), true, async move {
             reject_options(&[
-                input.checksum_algorithm.is_some(),
-                input.checksum_crc32.is_some(),
-                input.checksum_crc32c.is_some(),
-                input.checksum_crc64nvme.is_some(),
-                input.checksum_sha1.is_some(),
-                input.checksum_sha256.is_some(),
                 input.content_md5.is_some(),
                 input.expected_bucket_owner.is_some(),
                 input.request_payer.is_some(),
@@ -178,11 +181,28 @@ impl GatewayS3Service {
                 return Err(too_large());
             }
             let id = upload_id(&input.upload_id)?;
-            let key = logical_path(input.key)?;
+            let key = logical_path(input.key.clone())?;
             let session = service.multipart.get(&id)?;
             let state = session.upload.read().await;
             session.ensure_live()?;
             let upload = matching_upload(&state, &key)?;
+            let policy = upload.checksum_policy().ok_or_else(internal)?;
+            let request = ChecksumRequest::from_upload_part(
+                &input,
+                &req.headers,
+                req.trailing_headers,
+                policy.algorithm(),
+            )
+            .map_err(|error| error.into_s3_error())?;
+            if request.algorithm() != policy.algorithm() {
+                return Err(s3s::s3_error!(
+                    BadDigest,
+                    "part checksum algorithm differs from upload"
+                ));
+            }
+            let checksum = rs3_repository::UploadChecksum::pending();
+            let (body, checksum_failure) =
+                validate_body(input.body.take(), request, checksum.clone());
             let slot = session.part_slot(number)?;
             let _part = slot.lock.lock().await;
             session.ensure_live()?;
@@ -190,23 +210,32 @@ impl GatewayS3Service {
             reservation.reserve_until("UploadPart", CLIENT_PART_WORKING_SET_BYTES)?;
             let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let body = ClientPartBody {
-                body: input.body,
+                body: Some(body),
                 len,
                 remaining: len,
                 timeout: service.stream_read_stall_timeout,
                 failed: Arc::clone(&failed),
                 terminal: false,
             };
-            let result = upload.upload_part(number, Box::new(body)).await;
+            let result = upload
+                .upload_part(number, Box::new(body), Some(checksum))
+                .await;
             if failed.load(Ordering::Acquire) {
-                return Err(s3s::s3_error!(
+                return Err(checksum_failure.map_error(s3s::s3_error!(
                     IncompleteBody,
                     "multipart body did not match its declared bounded length"
-                ));
+                )));
             }
-            let part = result.map_err(repository_error)?;
+            let part =
+                result.map_err(|error| checksum_failure.map_error(repository_error(error)))?;
             record_s3_request_body_bytes("UploadPart", usize::try_from(len).unwrap_or(usize::MAX));
+            let checksum = checksum_output(part.checksum());
             Ok(UploadPartOutput {
+                checksum_crc32: checksum.checksum_crc32,
+                checksum_crc32c: checksum.checksum_crc32c,
+                checksum_crc64nvme: checksum.checksum_crc64nvme,
+                checksum_sha1: checksum.checksum_sha1,
+                checksum_sha256: checksum.checksum_sha256,
                 e_tag: Some(ETag::Strong(part.etag())),
                 ..Default::default()
             })
@@ -216,21 +245,18 @@ impl GatewayS3Service {
 
     pub(super) async fn multipart_complete(
         &self,
-        input: CompleteMultipartUploadInput,
+        req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let input = req.input;
         let service = self.clone();
         self.multipart_request(
             "CompleteMultipartUpload",
             input.bucket.clone(),
             true,
             async move {
+                crate::s3::checksum::validate_request_headers(&req.headers)
+                    .map_err(|error| error.into_s3_error())?;
                 reject_options(&[
-                    input.checksum_crc32.is_some(),
-                    input.checksum_crc32c.is_some(),
-                    input.checksum_crc64nvme.is_some(),
-                    input.checksum_sha1.is_some(),
-                    input.checksum_sha256.is_some(),
-                    input.checksum_type.is_some(),
                     input.expected_bucket_owner.is_some(),
                     input.if_match.is_some(),
                     input.request_payer.is_some(),
@@ -238,6 +264,7 @@ impl GatewayS3Service {
                     input.sse_customer_key.is_some(),
                     input.sse_customer_key_md5.is_some(),
                 ])?;
+                let selection = selected_parts(&input)?;
                 let create_only = match input.if_none_match {
                     None => false,
                     Some(ETagCondition::Any) => true,
@@ -255,7 +282,6 @@ impl GatewayS3Service {
                     .map_err(|_| {
                         s3s::s3_error!(InvalidArgument, "invalid multipart object size")
                     })?;
-                let selection = selected_parts(input.multipart_upload)?;
                 let id = upload_id(&input.upload_id)?;
                 let key = logical_path(input.key.clone())?;
                 let accepted = || {
@@ -289,9 +315,15 @@ impl GatewayS3Service {
                 }
                 session.ensure_live()?;
                 let upload = matching_upload(&state, &key)?;
-                upload.validate_selection(&selection).map_err(|_| {
-                    s3s::s3_error!(InvalidPart, "selected part is missing or replaced")
-                })?;
+                upload
+                    .validate_selection(&selection)
+                    .map_err(|error| match error {
+                        RepositoryError::ObjectChecksumMismatch => repository_error(error),
+                        _ => s3s::s3_error!(
+                            InvalidPart,
+                            "selected part is missing, replaced or has invalid checksum facts"
+                        ),
+                    })?;
                 let len = upload.selected_size(&selection).map_err(|_| {
                     s3s::s3_error!(
                         EntityTooSmall,
@@ -388,14 +420,25 @@ impl GatewayS3Service {
             let next = parts.last().map(|part| part.part_number() as i32);
             let parts = parts
                 .into_iter()
-                .map(|part| Part {
-                    part_number: Some(part.part_number() as i32),
-                    size: Some(part.plaintext_len() as i64),
-                    e_tag: Some(ETag::Strong(part.etag())),
-                    ..Default::default()
+                .map(|part| {
+                    let checksum = checksum_output(part.checksum());
+                    Part {
+                        checksum_crc32: checksum.checksum_crc32,
+                        checksum_crc32c: checksum.checksum_crc32c,
+                        checksum_crc64nvme: checksum.checksum_crc64nvme,
+                        checksum_sha1: checksum.checksum_sha1,
+                        checksum_sha256: checksum.checksum_sha256,
+                        part_number: Some(part.part_number() as i32),
+                        size: Some(part.plaintext_len() as i64),
+                        e_tag: Some(ETag::Strong(part.etag())),
+                        ..Default::default()
+                    }
                 })
                 .collect();
+            let policy = upload.checksum_policy().ok_or_else(internal)?;
             Ok(ListPartsOutput {
+                checksum_algorithm: Some(checksum_algorithm_output(policy.algorithm())),
+                checksum_type: Some(checksum_kind_output(policy.kind())),
                 bucket: Some(input.bucket),
                 key: Some(input.key),
                 upload_id: Some(input.upload_id),
@@ -446,29 +489,29 @@ fn matching_upload<'a>(
         .filter(|upload| upload.matches_key(key))
         .ok_or_else(no_upload)
 }
-fn selected_parts(upload: Option<CompletedMultipartUpload>) -> S3Result<V3MultipartSelection> {
-    let parts = upload.and_then(|upload| upload.parts).ok_or_else(|| {
-        s3s::s3_error!(
-            InvalidRequest,
-            "multipart completion requires selected parts"
-        )
-    })?;
+fn selected_parts(input: &CompleteMultipartUploadInput) -> S3Result<V3MultipartSelection> {
+    let parts = input
+        .multipart_upload
+        .as_ref()
+        .and_then(|upload| upload.parts.as_ref())
+        .ok_or_else(|| {
+            s3s::s3_error!(
+                InvalidRequest,
+                "multipart completion requires selected parts"
+            )
+        })?;
     if parts.is_empty() || parts.len() > 10_000 {
         return Err(s3s::s3_error!(
             InvalidRequest,
             "invalid multipart selected part count"
         ));
     }
+    let expected = checksum::completion_checksum(input, parts.len())?;
+    let kind = checksum::completion_kind(input)?;
     let mut previous = 0;
     let mut selection = Vec::with_capacity(parts.len());
     for part in parts {
-        reject_options(&[
-            part.checksum_crc32.is_some(),
-            part.checksum_crc32c.is_some(),
-            part.checksum_crc64nvme.is_some(),
-            part.checksum_sha1.is_some(),
-            part.checksum_sha256.is_some(),
-        ])?;
+        let checksum = checksum::part_checksum(part)?;
         let number = part
             .part_number
             .and_then(|v| u32::try_from(v).ok())
@@ -483,11 +526,12 @@ fn selected_parts(upload: Option<CompletedMultipartUpload>) -> S3Result<V3Multip
         previous = number;
         let etag = part
             .e_tag
+            .clone()
             .and_then(ETag::into_strong)
             .ok_or_else(|| s3s::s3_error!(InvalidPart, "selected part requires its strong ETag"))?;
-        selection.push((number, etag));
+        selection.push((number, etag, checksum));
     }
-    V3MultipartSelection::new(selection)
+    V3MultipartSelection::with_checksums_and_kind(selection, expected, kind)
         .map_err(|_| s3s::s3_error!(InvalidPart, "invalid selected part ETag"))
 }
 fn completion_output(
@@ -502,7 +546,14 @@ fn completion_output(
             "multipart object size does not match accepted completion"
         ));
     }
+    let checksum = checksum_output(receipt.checksum.as_ref());
     Ok(CompleteMultipartUploadOutput {
+        checksum_crc32: checksum.checksum_crc32,
+        checksum_crc32c: checksum.checksum_crc32c,
+        checksum_crc64nvme: checksum.checksum_crc64nvme,
+        checksum_sha1: checksum.checksum_sha1,
+        checksum_sha256: checksum.checksum_sha256,
+        checksum_type: checksum.checksum_type,
         bucket: Some(bucket.to_owned()),
         key: Some(key.to_owned()),
         e_tag: Some(ETag::Strong(receipt.etag)),
@@ -571,4 +622,21 @@ impl rs3_storage::BlobRead for ClientPartBody {
             }
         }
     }
+}
+
+fn checksum_algorithm_output(algorithm: rs3_types::ChecksumAlgorithm) -> ChecksumAlgorithm {
+    use rs3_types::ChecksumAlgorithm as Algorithm;
+    ChecksumAlgorithm::from_static(match algorithm {
+        Algorithm::Crc32 => ChecksumAlgorithm::CRC32,
+        Algorithm::Crc32c => ChecksumAlgorithm::CRC32C,
+        Algorithm::Crc64Nvme => ChecksumAlgorithm::CRC64NVME,
+        Algorithm::Sha1 => ChecksumAlgorithm::SHA1,
+        Algorithm::Sha256 => ChecksumAlgorithm::SHA256,
+    })
+}
+fn checksum_kind_output(kind: rs3_repository::MultipartChecksumKind) -> ChecksumType {
+    ChecksumType::from_static(match kind {
+        rs3_repository::MultipartChecksumKind::FullObject => ChecksumType::FULL_OBJECT,
+        rs3_repository::MultipartChecksumKind::Composite => ChecksumType::COMPOSITE,
+    })
 }

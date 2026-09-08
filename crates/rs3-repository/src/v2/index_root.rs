@@ -30,7 +30,7 @@ const INDEX_ROOT_MAGIC: &[u8; 8] = b"rs3:irt\n";
 const INDEX_ROOT_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-root-plaintext:v02\n";
 const INDEX_ROOT_AAD_DOMAIN: &[u8] = b"rs3:index-root-aad:v02\n";
 const INDEX_ROOT_FORMAT_GENERATION: u16 = 2;
-const INDEX_ROOT_WIRE_VERSION: u16 = 4;
+const INDEX_ROOT_WIRE_VERSION: u16 = 5;
 const INDEX_ROOT_NONCE_LEN: usize = 12;
 const INDEX_ROOT_TAG_LEN: usize = 16;
 const INDEX_ROOT_SEAL_OVERHEAD: usize = INDEX_ROOT_NONCE_LEN + INDEX_ROOT_TAG_LEN;
@@ -1249,7 +1249,7 @@ mod tests {
     fn encrypted_root_round_trips_and_sorts_runs() {
         let keyring = keyring();
         let object = object_id("commits/v03/00000000000000000010/root");
-        let root = fixture();
+        let root = completion_fixture();
         assert_eq!(root.runs()[0].run_id, [1; 32]);
         let sealed = must(seal_v2_index_root(
             &keyring,
@@ -1285,6 +1285,14 @@ mod tests {
             key: logical_path("private/deleted"),
             content_len: 42,
             etag: "original-result".to_owned(),
+            checksum: Some(
+                rs3_types::ObjectChecksum::new(
+                    rs3_types::ChecksumAlgorithm::Crc32c,
+                    rs3_types::ChecksumType::Composite { parts: 2 },
+                    vec![0x74; 4],
+                )
+                .expect("checksum"),
+            ),
         };
         fixture().with_completion_receipts(
             rs3_index::completion::CompletionReceipts::from_snapshot(vec![receipt])
@@ -1347,7 +1355,7 @@ mod tests {
         let digest: [u8; 32] = Sha256Hasher::digest(encoded);
         assert_eq!(
             hex::encode(digest),
-            "69882ab1453c8c144fe0a63050223e78c2019239effa5d43efae1a2304850919"
+            "87b7f27868e543814383ad51110c10652d4a5b4d1d4312668ae063e3637add5b"
         );
     }
 
@@ -1386,7 +1394,7 @@ mod tests {
         let digest: [u8; 32] = Sha256Hasher::digest(encoded);
         assert_eq!(
             hex::encode(digest),
-            "1ed26e1cf318df3dc2ffb152c3cd2bb4fd714d5e1173d3962faea4a00e742b86"
+            "1c60148596d078f2bbf23d51b2babe8a6ce536f0917efe6c290cdd61d243d1d5"
         );
     }
 

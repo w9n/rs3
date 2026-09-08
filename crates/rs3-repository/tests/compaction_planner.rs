@@ -117,6 +117,7 @@ fn mutation(key: u8, generation: u64, live: bool) -> IndexMutation {
     let generation = Sequence::new(generation);
     if live {
         IndexMutation::Upsert(IndexUpsert {
+            checksum: None,
             mutation_ordinal: 0,
             blind_key,
             namespace_key_id,
