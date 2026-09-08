@@ -3538,41 +3538,49 @@ async fn v2_repository_hides_unaccepted_mutation_after_anchor_failure() {
     assert_eq!(body, Bytes::from_static(b"accepted"));
 }
 
-/// Reports a compare-and-advance failure whose update the anchor service
-/// still applies after the caller's immediate re-read: the delayed-apply
-/// shape of a timed-out Lease update that the API server commits anyway.
+/// How an in-flight update behaves once the caller performs its fencing read.
+#[derive(Clone, Copy)]
+enum DelayedApply {
+    /// The delayed update landed before the fencing write.
+    LandsBeforeFence,
+    /// The fencing write landed first, so the delayed update is refused.
+    RefusedByFence,
+    /// The fencing write itself cannot be performed.
+    FenceFails,
+}
+
+/// Reports a compare-and-advance failure whose update the anchor service may
+/// still apply later: the delayed-apply shape of a timed-out Lease update.
+/// A plain read never settles it; only the fencing read does.
 struct DelayedApplyV2Anchor {
     inner: V2MemoryAnchor,
     pending: std::sync::Mutex<Option<(Option<V2AnchorState>, V2AnchorState)>>,
     remaining_failures: AtomicUsize,
+    mode: DelayedApply,
 }
 
 impl DelayedApplyV2Anchor {
-    fn new(inner: V2MemoryAnchor) -> Self {
+    fn new(inner: V2MemoryAnchor, mode: DelayedApply) -> Self {
         Self {
             inner,
             pending: std::sync::Mutex::new(None),
             remaining_failures: AtomicUsize::new(1),
+            mode,
         }
+    }
+
+    fn take_pending(&self) -> Option<(Option<V2AnchorState>, V2AnchorState)> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 }
 
 #[async_trait::async_trait]
 impl V2CommitAnchor for DelayedApplyV2Anchor {
     async fn read_v2(&self) -> super::V2Result<Option<V2AnchorState>> {
-        // The re-read observes the parent; the delayed update lands after it.
-        let observed = self.inner.read_v2().await?;
-        let pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some((expected, next)) = pending {
-            self.inner
-                .compare_and_advance_v2(expected.as_ref(), next)
-                .await?;
-        }
-        Ok(observed)
+        self.inner.read_v2().await
     }
 
     async fn compare_and_advance_v2(
@@ -3595,15 +3603,39 @@ impl V2CommitAnchor for DelayedApplyV2Anchor {
         }
         self.inner.compare_and_advance_v2(expected, next).await
     }
+
+    async fn fence_and_read_v2(&self) -> super::V2Result<Option<V2AnchorState>> {
+        match self.mode {
+            DelayedApply::LandsBeforeFence => {
+                if let Some((expected, next)) = self.take_pending() {
+                    self.inner
+                        .compare_and_advance_v2(expected.as_ref(), next)
+                        .await?;
+                }
+                self.inner.read_v2().await
+            }
+            DelayedApply::RefusedByFence => {
+                // The fencing write bumped the resource version first: the
+                // delayed request can never apply now.
+                drop(self.take_pending());
+                self.inner.read_v2().await
+            }
+            DelayedApply::FenceFails => Err(V2FormatError::AnchorAdvanceFailed),
+        }
+    }
 }
 
-/// Reproducer for the ambiguous-CAS resolution: one re-read decides that a
-/// failed advance did not happen, so the overlay is rolled back and the client
-/// is told the write failed, yet the anchor then accepts that very commit.
-/// The local view is stale until the chain is reloaded. This pins current
-/// behavior; choosing a remedy needs this shape, not a hypothetical one.
-#[tokio::test]
-async fn v2_repository_delayed_anchor_apply_after_ambiguous_cas_leaves_local_state_stale() {
+struct AmbiguousCasFixture {
+    repository: V2Repository<MemoryBlobStore>,
+    store: MemoryBlobStore,
+    keyring: KeyRing,
+    live_anchor: V2MemoryAnchor,
+    genesis: V2AnchorState,
+    key: LogicalPath,
+    later_key: LogicalPath,
+}
+
+async fn ambiguous_cas_fixture() -> AmbiguousCasFixture {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
     let options = V2CommitStoreOptions::for_profile(
@@ -3612,66 +3644,184 @@ async fn v2_repository_delayed_anchor_apply_after_ambiguous_cas_leaves_local_sta
         sample_keyring_envelope_ref(),
         sample_format_ref(),
     );
-    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let repository = V2Repository::new(
+        store.clone(),
+        keyring.clone(),
+        RepositoryOptions::default(),
+        options,
+    );
     let live_anchor = V2MemoryAnchor::new();
-    let key =
-        LogicalPath::new("snapshots/ambiguous-cas.bin").unwrap_or_else(|error| panic!("{error}"));
-    let later_key =
-        LogicalPath::new("snapshots/after-ambiguity.bin").unwrap_or_else(|error| panic!("{error}"));
     must_repo(repository.write_genesis_snapshot(&live_anchor).await);
     let genesis = must_v2(live_anchor.read_v2().await).expect("genesis anchor");
+    AmbiguousCasFixture {
+        repository,
+        store,
+        keyring,
+        live_anchor,
+        genesis,
+        key: LogicalPath::new("snapshots/ambiguous-cas.bin")
+            .unwrap_or_else(|error| panic!("{error}")),
+        later_key: LogicalPath::new("snapshots/after-ambiguity.bin")
+            .unwrap_or_else(|error| panic!("{error}")),
+    }
+}
 
-    let ambiguous = repository
+/// The lost reply covered an accepted publication: the fencing read observes
+/// the advanced anchor, so the client learns the truth and nothing is stale.
+#[tokio::test]
+async fn ambiguous_cas_settled_by_fencing_reports_success_when_the_update_landed() {
+    let fixture = ambiguous_cas_fixture().await;
+    let accepted = must_repo(
+        fixture
+            .repository
+            .put_committed(
+                &DelayedApplyV2Anchor::new(
+                    fixture.live_anchor.clone(),
+                    DelayedApply::LandsBeforeFence,
+                ),
+                fixture.key.clone(),
+                Bytes::from_static(b"durable"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    assert_eq!(accepted.content_len, 7);
+    assert!(fixture.repository.head(&fixture.key).is_ok());
+    let live = must_v2(fixture.live_anchor.read_v2().await).expect("advanced");
+    assert_eq!(
+        live.sequence,
+        Sequence::new(fixture.genesis.sequence.get() + 1)
+    );
+    // Local state tracks the anchor: the next write publishes without reload.
+    must_repo(
+        fixture
+            .repository
+            .put_committed(
+                &fixture.live_anchor,
+                fixture.later_key.clone(),
+                Bytes::from_static(b"after"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+}
+
+/// The fencing write landed first, so the delayed request can never apply:
+/// the failure reported to the client is definitive and nothing is stale.
+#[tokio::test]
+async fn ambiguous_cas_settled_by_fencing_reports_failure_when_the_update_was_refused() {
+    let fixture = ambiguous_cas_fixture().await;
+    let refused = fixture
+        .repository
         .put_committed(
-            &DelayedApplyV2Anchor::new(live_anchor.clone()),
-            key.clone(),
-            Bytes::from_static(b"durable despite failure"),
+            &DelayedApplyV2Anchor::new(fixture.live_anchor.clone(), DelayedApply::RefusedByFence),
+            fixture.key.clone(),
+            Bytes::from_static(b"never lands"),
             RepositoryPutOptions::default(),
         )
         .await;
-
-    // The client is told the write failed and the local overlay hides it.
     assert!(matches!(
-        ambiguous,
+        refused,
         Err(crate::RepositoryError::CommitFailed { .. })
     ));
     assert!(matches!(
-        repository.head(&key),
+        fixture.repository.head(&fixture.key),
         Err(crate::RepositoryError::NotFound(_))
     ));
-    // Yet the anchor service applied the update after the resolving re-read.
-    let accepted = must_v2(live_anchor.read_v2().await).expect("advanced anchor");
-    assert_eq!(accepted.sequence, Sequence::new(genesis.sequence.get() + 1));
+    assert_eq!(
+        must_v2(fixture.live_anchor.read_v2().await).expect("anchor"),
+        fixture.genesis
+    );
+    // No stale state: the next write publishes without any reload.
+    must_repo(
+        fixture
+            .repository
+            .put_committed(
+                &fixture.live_anchor,
+                fixture.later_key.clone(),
+                Bytes::from_static(b"after"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    assert!(matches!(
+        fixture.repository.head(&fixture.key),
+        Err(crate::RepositoryError::NotFound(_))
+    ));
+}
 
-    // Every later publication from this process is refused as stale.
-    let stale = repository
+/// When even the fencing write fails, the outcome is unknown: the client is
+/// told so, and mutations stay blocked until the chain is reloaded.
+#[tokio::test]
+async fn ambiguous_cas_with_failed_fencing_reports_unknown_and_blocks_mutations() {
+    let fixture = ambiguous_cas_fixture().await;
+    let unknown = fixture
+        .repository
         .put_committed(
-            &live_anchor,
-            later_key.clone(),
-            Bytes::from_static(b"after"),
+            &DelayedApplyV2Anchor::new(fixture.live_anchor.clone(), DelayedApply::FenceFails),
+            fixture.key.clone(),
+            Bytes::from_static(b"unknown"),
             RepositoryPutOptions::default(),
         )
         .await;
     assert!(
-        matches!(&stale, Err(crate::RepositoryError::CommitFailed { reason }) if reason.contains("stale")),
-        "unexpected result: {stale:?}"
+        matches!(
+            unknown,
+            Err(crate::RepositoryError::AcceptedRecoveryRequired)
+        ),
+        "unexpected result: {unknown:?}"
     );
+    let blocked = fixture
+        .repository
+        .put_committed(
+            &fixture.live_anchor,
+            fixture.later_key.clone(),
+            Bytes::from_static(b"blocked"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(
+        matches!(
+            blocked,
+            Err(crate::RepositoryError::AcceptedRecoveryRequired)
+        ),
+        "unexpected result: {blocked:?}"
+    );
+    // The block is not lifted in place; even a reload keeps refusing writes.
     assert!(matches!(
-        repository.head(&later_key),
-        Err(crate::RepositoryError::NotFound(_))
+        fixture
+            .repository
+            .load_chain_from_anchor(&fixture.live_anchor)
+            .await,
+        Err(crate::RepositoryError::AcceptedRecoveryRequired)
     ));
-
-    // Reloading from the anchor reveals the write the client saw fail.
-    must_repo(repository.load_chain_from_anchor(&live_anchor).await);
-    assert_eq!(
-        must_repo(repository.get_range(&key, ByteRange::Full).await),
-        Bytes::from_static(b"durable despite failure")
+    // Reconciliation is a fresh instance loading the anchored truth under a
+    // new writer epoch, which is what a gateway restart does.
+    let reconciled = V2Repository::new(
+        fixture.store.clone(),
+        fixture.keyring.clone(),
+        RepositoryOptions::default(),
+        V2CommitStoreOptions::for_profile(
+            V2ProviderProfile::Dev,
+            sample_repository_id(),
+            sample_keyring_envelope_ref(),
+            sample_format_ref(),
+        ),
     );
     must_repo(
-        repository
+        reconciled
+            .load_chain_from_anchor(&fixture.live_anchor)
+            .await,
+    );
+    assert!(matches!(
+        reconciled.head(&fixture.key),
+        Err(crate::RepositoryError::NotFound(_))
+    ));
+    must_repo(
+        reconciled
             .put_committed(
-                &live_anchor,
-                later_key,
+                &fixture.live_anchor,
+                fixture.later_key.clone(),
                 Bytes::from_static(b"after"),
                 RepositoryPutOptions::default(),
             )

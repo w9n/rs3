@@ -257,6 +257,16 @@ pub trait V2CommitAnchor: Send + Sync {
         expected: Option<&V2AnchorState>,
         next: V2AnchorState,
     ) -> V2Result<V2AnchorState>;
+
+    /// Settles an advance whose reply was lost.
+    ///
+    /// Implementations with asynchronous delivery perform a fencing write
+    /// first, so an earlier in-flight update can no longer land after the
+    /// returned state was observed. Anchors that apply updates synchronously
+    /// simply read. A plain re-read never provides that guarantee.
+    async fn fence_and_read_v2(&self) -> V2Result<Option<V2AnchorState>> {
+        self.read_v2().await
+    }
 }
 
 /// In-memory v2 anchor for local tests and preview wiring.
@@ -1755,9 +1765,13 @@ where
         match advance {
             Ok(accepted) if accepted == uploaded.anchor_state => {}
             result => {
-                // A lost CAS reply may still cover an accepted publication.
-                // Resolve the exact state before any caller retries or rolls back.
-                match anchor.read_v2().await {
+                // A lost CAS reply may still cover an accepted publication, and
+                // the update may still land after any plain re-read. Settle it
+                // under a fencing write: the state that write observes is final
+                // because the earlier request can no longer apply. If even the
+                // fencing write fails, the outcome is unknown and mutations
+                // stay blocked until explicit reconciliation.
+                match anchor.fence_and_read_v2().await {
                     Ok(Some(accepted)) if accepted == uploaded.anchor_state => {}
                     Ok(Some(current)) if current == *expected_parent => {
                         return Err(result.err().unwrap_or(V2FormatError::StaleAnchor));

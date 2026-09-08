@@ -426,7 +426,12 @@ RS3_ANCHOR_FIELD_MANAGER=rs3-server
 ```
 
 If the configured anchor cannot be read or advanced, writes must fail closed.
-Do not silently fall back to a memory anchor.
+Do not silently fall back to a memory anchor. An advance whose reply is lost is
+settled by a fencing write on the Lease: once that resource-version-guarded
+update lands, the earlier request can no longer apply, so the state it observes
+decides whether the publication was accepted. If the fencing write itself
+fails, the outcome is reported as unknown and further mutations stay blocked
+until the chain is reloaded from the anchor.
 
 The read-write gateway coordinates ownership and accepted anchor state on this
 same Lease. Ownership takeover is based on an unchanged renewal counter observed

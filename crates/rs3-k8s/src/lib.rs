@@ -28,6 +28,7 @@ use lease_guard::{
 };
 
 const REPOSITORY_FORMAT_ANNOTATION: &str = "rs3.rs/repository-format-generation";
+const ANCHOR_FENCE_ANNOTATION: &str = "rs3.rs/anchor-fence";
 const V2_SEQUENCE_ANNOTATION: &str = "rs3.rs/v3-sequence";
 const V2_COMMIT_KEY_ANNOTATION: &str = "rs3.rs/v3-commit-key";
 const V2_BODY_DIGEST_ANNOTATION: &str = "rs3.rs/v3-body-digest";
@@ -122,6 +123,52 @@ impl V2CommitAnchor for KubernetesLeaseAnchor {
         )
         .await
     }
+
+    async fn fence_and_read_v2(&self) -> V2Result<Option<V2AnchorState>> {
+        fence_and_read_lease(&self.api, &self.settings, self.writer_fence.as_ref()).await
+    }
+}
+
+/// Performs a resource-version-guarded no-op update on the Lease, then returns
+/// the anchor state that update carried.
+///
+/// Every Lease update is a replace against the resource version the writer
+/// read. Once this write lands, any earlier in-flight update still carrying an
+/// older resource version is refused by the API server, so the returned state
+/// is the final answer for an advance whose reply was lost. The fencing
+/// annotation is a counter that never affects anchor decoding.
+async fn fence_and_read_lease(
+    api: &impl LeaseGuardApi,
+    settings: &LeaseSettings,
+    writer_fence: Option<&WriterFence>,
+) -> V2Result<Option<V2AnchorState>> {
+    for _attempt in 0..MAX_ADVANCE_ATTEMPTS {
+        match api.get_lease(&settings.namespace, &settings.name).await {
+            Ok(Some(mut lease)) => {
+                validate_writer_fence(&lease, writer_fence)?;
+                let annotations = lease.metadata.annotations.get_or_insert_with(BTreeMap::new);
+                let next = annotations
+                    .get(ANCHOR_FENCE_ANNOTATION)
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    .wrapping_add(1);
+                annotations.insert(ANCHOR_FENCE_ANNOTATION.to_owned(), next.to_string());
+                match api
+                    .replace_lease(&settings.namespace, &settings.name, &lease)
+                    .await
+                {
+                    Ok(lease) => return v2_anchor_state_from_lease_optional(&lease),
+                    Err(LeaseGuardError::Conflict) => continue,
+                    Err(_) => return Err(V2FormatError::AnchorAdvanceFailed),
+                }
+            }
+            // Without a Lease there is nothing an in-flight advance could
+            // have applied against, and a fenced writer never creates one.
+            Ok(None) => return Ok(None),
+            Err(_) => return Err(V2FormatError::AnchorReadFailed),
+        }
+    }
+    Err(V2FormatError::AnchorAdvanceFailed)
 }
 
 async fn compare_and_advance_lease(

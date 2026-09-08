@@ -389,3 +389,96 @@ async fn accepted_write_with_lost_response_is_not_republished_from_old_parent() 
         v2_state(2)
     );
 }
+
+#[tokio::test]
+async fn fencing_read_bumps_the_resource_version_so_earlier_updates_cannot_land() {
+    let api = FakeLeaseApi::default();
+    *api.lease.lock().await = Some(stored_lease(1, "1"));
+    // A delayed advance prepared against the version the fencing read replaces.
+    let mut delayed = stored_lease(2, "1");
+    delayed.metadata.resource_version = Some("1".to_owned());
+
+    assert_eq!(
+        fence_and_read_lease(&api, &settings(), None)
+            .await
+            .expect("fenced read"),
+        Some(v2_state(1))
+    );
+    let stored = api.lease.lock().await.clone().expect("lease");
+    assert_eq!(stored.metadata.resource_version.as_deref(), Some("2"));
+    assert_eq!(
+        stored
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(ANCHOR_FENCE_ANNOTATION))
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        *api.calls.lock().await,
+        vec![Operation::Get, Operation::Replace]
+    );
+    // The earlier request is refused: it can never land after the fence.
+    assert!(matches!(
+        api.replace_lease("fixture", "anchor", &delayed).await,
+        Err(LeaseGuardError::Conflict)
+    ));
+    assert_eq!(
+        fence_and_read_lease(&api, &settings(), None)
+            .await
+            .expect("second fenced read"),
+        Some(v2_state(1))
+    );
+    // Anchor decoding ignores the fence counter, and advances keep it.
+    assert_eq!(
+        advance(&api, Some(1), 2).await.expect("advance"),
+        v2_state(2)
+    );
+    assert_eq!(
+        fence_and_read_lease(&api, &settings(), None)
+            .await
+            .expect("fenced read after advance"),
+        Some(v2_state(2))
+    );
+}
+
+#[tokio::test]
+async fn fencing_read_never_creates_a_lease_and_requires_the_live_writer_claim() {
+    let api = FakeLeaseApi::default();
+    assert_eq!(
+        fence_and_read_lease(&api, &settings(), None)
+            .await
+            .expect("no lease"),
+        None
+    );
+    assert_eq!(*api.calls.lock().await, vec![Operation::Get]);
+
+    let (api, fence) = fenced_api().await;
+    // The Lease holds the writer claim but no anchor yet.
+    assert_eq!(
+        fence_and_read_lease(&api, &settings(), Some(&fence))
+            .await
+            .expect("fenced read under the live claim"),
+        None
+    );
+    let current = api.lease.lock().await.clone().expect("lease");
+    let mut stolen = lease_with_guard_state(
+        current,
+        &WriterFenceClaim {
+            holder_identity: "writer-b".to_owned(),
+            token: 2,
+        },
+        2,
+        Duration::from_secs(30),
+        Timestamp::now(),
+        true,
+    )
+    .expect("handoff");
+    stolen.metadata.resource_version = Some("9".to_owned());
+    *api.lease.lock().await = Some(stolen);
+    assert!(matches!(
+        fence_and_read_lease(&api, &settings(), Some(&fence)).await,
+        Err(V2FormatError::AnchorAdvanceFailed)
+    ));
+}

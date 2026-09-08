@@ -208,4 +208,8 @@ impl V2CommitAnchor for DynV2CommitAnchor {
     ) -> V2Result<V2AnchorState> {
         self.inner.compare_and_advance_v2(expected, next).await
     }
+
+    async fn fence_and_read_v2(&self) -> V2Result<Option<V2AnchorState>> {
+        self.inner.fence_and_read_v2().await
+    }
 }
