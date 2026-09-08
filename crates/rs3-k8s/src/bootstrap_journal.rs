@@ -96,6 +96,26 @@ impl KubernetesBootstrapJournal {
         self.inner.state()
     }
 
+    /// Reads declared journal state without claiming it or holding the Lease.
+    ///
+    /// Ownership annotations are validated the same way as a claim, so a
+    /// journal bound to a replaced anchor Lease is rejected rather than
+    /// reported as progress. Callers decide what the bytes mean; a completed
+    /// record never authorizes writes without a fenced claim.
+    pub async fn read_state(anchor: LeaseSettings, secret_name: String) -> Result<Option<Vec<u8>>> {
+        if anchor.namespace.is_empty() || anchor.name.is_empty() || secret_name.is_empty() {
+            return Err(BootstrapJournalError::InvalidConfig);
+        }
+        let client = Client::try_default()
+            .await
+            .map_err(|_| BootstrapJournalError::ApiUnavailable)?;
+        let api = KubernetesJournalApi {
+            leases: Api::namespaced(client.clone(), &anchor.namespace),
+            secrets: Api::namespaced(client, &anchor.namespace),
+        };
+        Journal::read_state(&api, &anchor.name, &secret_name).await
+    }
+
     /// Saves exact bytes with revision CAS, verifying ambiguous update replies.
     /// Optional derived evidence is projected as `provider-conformance.json`
     /// in the same Secret revision; `None` removes that projection. The caller
@@ -131,6 +151,50 @@ struct Journal<A> {
 }
 
 impl<A: JournalApi> Journal<A> {
+    async fn read_state(api: &A, anchor_name: &str, secret_name: &str) -> Result<Option<Vec<u8>>> {
+        let mut secret = api
+            .get_secret(secret_name)
+            .await?
+            .ok_or(BootstrapJournalError::Missing)?;
+        validate_secret(&secret, secret_name)?;
+        let annotations = secret
+            .metadata
+            .annotations
+            .as_ref()
+            .ok_or(BootstrapJournalError::InvalidState)?;
+        match (
+            annotations.get(SECRET_UID),
+            annotations.get(LEASE_UID),
+            annotations.get(EPOCH),
+        ) {
+            (None, None, None) if secret.data.as_ref().is_none_or(BTreeMap::is_empty) => {
+                return Ok(None);
+            }
+            (Some(secret_uid), Some(uid), Some(epoch)) => {
+                let token: u64 = epoch
+                    .parse()
+                    .map_err(|_| BootstrapJournalError::InvalidState)?;
+                if secret_uid != required(&secret.metadata.uid)?
+                    || token == 0
+                    || token.to_string() != *epoch
+                {
+                    return Err(BootstrapJournalError::InvalidState);
+                }
+                if let Some(lease) = api.get_lease(anchor_name).await?
+                    && required(&lease.metadata.uid)? != uid
+                {
+                    return Err(BootstrapJournalError::InvalidState);
+                }
+            }
+            _ => return Err(BootstrapJournalError::InvalidState),
+        }
+        Ok(secret
+            .data
+            .as_mut()
+            .and_then(|data| data.remove(STATE))
+            .map(|bytes| bytes.0))
+    }
+
     async fn claim(
         api: A,
         anchor: LeaseSettings,

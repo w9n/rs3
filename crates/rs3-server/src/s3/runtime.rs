@@ -825,7 +825,59 @@ pub fn v2_bootstrap_journal_is_initialized(
     }
 }
 
+/// Reads the declared bootstrap journal Secret without claiming it.
+///
+/// This lets a one-shot initializer decide whether the repository already
+/// completed initialization under this configuration before it contends for
+/// the writer Lease. A completed record never authorizes writes on its own.
+#[cfg(feature = "k8s")]
+pub async fn v2_bootstrap_journal_state(
+    config: &RuntimeConfig,
+    journal_secret: &str,
+) -> Result<Option<Vec<u8>>, S3BoundaryError> {
+    let crate::AnchorConfig::KubernetesLease {
+        namespace,
+        name,
+        field_manager,
+    } = &config.anchor
+    else {
+        return Err(repository_init(
+            "journaled initialization requires a Kubernetes anchor",
+        ));
+    };
+    rs3_k8s::KubernetesBootstrapJournal::read_state(
+        rs3_k8s::LeaseSettings {
+            namespace: namespace.clone(),
+            name: name.clone(),
+            field_manager: field_manager.clone(),
+        },
+        journal_secret.to_owned(),
+    )
+    .await
+    .map_err(repository_init)
+}
+
 impl V2PreparedRepositoryInit {
+    /// Verifies an already initialized repository without the writer Lease.
+    ///
+    /// The live anchor and its accepted chain are read exactly as a
+    /// restore-readonly gateway reads them; nothing is written and a missing
+    /// anchor fails closed toward explicit recovery.
+    pub async fn verify_initialized(self) -> Result<V2RepositoryInitReport, S3BoundaryError> {
+        let mut config = self.config;
+        config.mode = GatewayMode::RestoreReadOnly;
+        config.repository.allow_init = false;
+        let runtime = RuntimeRepository::from_preflighted_store(
+            &config,
+            self.store,
+            None,
+            None,
+            RuntimeStartup::Current,
+        )
+        .await?;
+        verified_init_report(runtime).await
+    }
+
     /// Checks repository format and backend write policy without initialization.
     pub async fn prepare(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
         if config.repository.format != RepositoryFormat::V3Preview {
@@ -1812,6 +1864,30 @@ mod tests {
         assert!(report.initialized);
         assert!(report.verified_commit_count > 0);
         assert!(!store.list_prefix("").await.expect("inventory").is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_verification_never_initializes_and_reports_missing_anchors() {
+        // An empty memory anchor over an empty store is the cluster-loss
+        // shape: verification must fail closed instead of initializing.
+        let config = runtime_config(true);
+        let prepared = super::V2PreparedRepositoryInit::prepare(&config)
+            .await
+            .expect("storage preflight");
+        let store = prepared
+            .store
+            .memory_store()
+            .expect("memory fixture")
+            .clone();
+        let error = prepared
+            .verify_initialized()
+            .await
+            .expect_err("empty repository is not verified into existence");
+        assert!(
+            error.to_string().contains("restore-readonly"),
+            "unexpected error: {error}"
+        );
+        assert!(store.list_prefix("").await.expect("no writes").is_empty());
     }
 
     #[tokio::test]

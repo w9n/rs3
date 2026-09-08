@@ -182,6 +182,76 @@ async fn journal_handoff_preserves_state_and_unrelated_metadata() {
 }
 
 #[tokio::test]
+async fn read_state_reports_progress_without_a_claim_and_rejects_replaced_leases() {
+    let (api, first) = fixture().await;
+    // A declared, never claimed journal has no progress.
+    assert_eq!(
+        Journal::read_state(&api, "anchor", "journal")
+            .await
+            .expect("empty journal"),
+        None
+    );
+    let mut journal = claim(&api, &first).await;
+    journal.save(b"initialized", None).await.expect("save");
+    let writes = api.writes.load(Ordering::SeqCst);
+
+    assert_eq!(
+        Journal::read_state(&api, "anchor", "journal")
+            .await
+            .expect("claimed journal"),
+        Some(b"initialized".to_vec())
+    );
+    // Reading never writes, and the fenced owner keeps its claim.
+    assert_eq!(api.writes.load(Ordering::SeqCst), writes);
+    journal
+        .save(b"still owned", None)
+        .await
+        .expect("owner saves");
+
+    // The read is independent of the Lease being held right now.
+    first.release_at(Timestamp::now()).await.expect("release");
+    assert_eq!(
+        Journal::read_state(&api, "anchor", "journal")
+            .await
+            .expect("released lease"),
+        Some(b"still owned".to_vec())
+    );
+    // A missing Lease still reports the recorded progress; the caller then
+    // fails on the missing anchor instead of reinitializing.
+    *api.lease.lease.lock().await = None;
+    assert_eq!(
+        Journal::read_state(&api, "anchor", "journal")
+            .await
+            .expect("missing lease"),
+        Some(b"still owned".to_vec())
+    );
+    // A recreated Lease with a different UID invalidates the journal binding.
+    let replacement = guard(api.lease.clone(), "writer-c");
+    replacement
+        .acquire_at(Timestamp::now(), Duration::ZERO)
+        .await
+        .expect("acquire replacement");
+    api.lease
+        .lease
+        .lock()
+        .await
+        .as_mut()
+        .expect("lease")
+        .metadata
+        .uid = Some("replacement-uid".to_owned());
+    assert_eq!(
+        Journal::read_state(&api, "anchor", "journal").await,
+        Err(BootstrapJournalError::InvalidState)
+    );
+    // Missing or unowned Secrets are reported, never treated as empty progress.
+    *api.secret.lock().await = None;
+    assert_eq!(
+        Journal::read_state(&api, "anchor", "journal").await,
+        Err(BootstrapJournalError::Missing)
+    );
+}
+
+#[tokio::test]
 async fn journal_revision_conflict_poison_prevents_blind_retry() {
     let (api, guard) = fixture().await;
     let mut first = claim(&api, &guard).await;

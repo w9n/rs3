@@ -112,7 +112,24 @@ fn writer_fence_is_live(_readiness: &ServeReadinessSource) -> bool {
     }
 }
 
+/// How acquisition treats a Lease that a live writer keeps renewing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LiveWriterPolicy {
+    /// Serving waits for the current writer to exit or expire.
+    Wait,
+    /// One-shot commands fail closed instead of deadlocking behind a gateway
+    /// that only exits once they finish.
+    FailFast,
+}
+
 pub(super) async fn acquire(config: &RuntimeConfig) -> Result<WriterGuardRuntime> {
+    acquire_with_policy(config, LiveWriterPolicy::Wait).await
+}
+
+pub(super) async fn acquire_with_policy(
+    config: &RuntimeConfig,
+    policy: LiveWriterPolicy,
+) -> Result<WriterGuardRuntime> {
     if !config.mode.allows_mutation() || config.writer_guard == WriterGuardConfig::Off {
         return Ok(WriterGuardRuntime::disabled());
     }
@@ -142,10 +159,23 @@ pub(super) async fn acquire(config: &RuntimeConfig) -> Result<WriterGuardRuntime
         )
         .context("failed to configure writer lease guard")?;
 
-        lease_guard
-            .acquire()
-            .await
-            .context("failed to acquire writer lease guard")?;
+        match policy {
+            LiveWriterPolicy::Wait => lease_guard
+                .acquire()
+                .await
+                .context("failed to acquire writer lease guard")?,
+            LiveWriterPolicy::FailFast => match lease_guard.acquire_unless_live_writer().await {
+                Ok(state) => state,
+                Err(LeaseGuardError::HeldByLiveWriter) => bail!(
+                    "the anchor Lease is held by a live gateway writer; initialization and fresh qualification need exclusive ownership. A completed journal is verified without the Lease, so stop the serving gateway only when this run must initialize or requalify"
+                ),
+                Err(error) => {
+                    return Err(
+                        anyhow::Error::new(error).context("failed to acquire writer lease guard")
+                    );
+                }
+            },
+        };
         let writer_fence = lease_guard
             .writer_fence()
             .context("failed to establish writer fencing token")?;
@@ -175,6 +205,7 @@ pub(super) async fn acquire(config: &RuntimeConfig) -> Result<WriterGuardRuntime
         let _ = namespace;
         let _ = name;
         let _ = field_manager;
+        let _ = policy;
         bail!("RS3_WRITER_GUARD=required needs the k8s feature");
     }
 }

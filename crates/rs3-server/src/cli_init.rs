@@ -107,13 +107,37 @@ pub(super) async fn run(
     enforce_profile(config, profile, journal_qualification)?;
     // Storage policy failures must precede even writer Lease acquisition.
     let prepared = V2PreparedRepositoryInit::prepare(config).await?;
+    #[cfg(feature = "k8s")]
+    if needs_journal && config.backend.is_s3() {
+        // A journal completed under this exact configuration is verified
+        // read-only. Contending for the Lease would deadlock behind a serving
+        // gateway whose rollout waits for this very Job.
+        let state =
+            rs3_server::v2_bootstrap_journal_state(config, journal_secret.unwrap_or_default())
+                .await?;
+        if state
+            .as_deref()
+            .map(|bytes| rs3_server::v2_bootstrap_journal_is_initialized(config, bytes))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            tracing::info!(
+                "journaled initialization already completed for this configuration; verifying without the writer Lease"
+            );
+            return Ok(prepared.verify_initialized().await?);
+        }
+    }
     let mut guard_config = config.clone();
     if config.mode.allows_mutation()
         && matches!(config.anchor, AnchorConfig::KubernetesLease { .. })
     {
         guard_config.writer_guard = WriterGuardConfig::Required;
     }
-    let guard = super::cli_writer_guard::acquire(&guard_config).await?;
+    let guard = super::cli_writer_guard::acquire_with_policy(
+        &guard_config,
+        super::cli_writer_guard::LiveWriterPolicy::FailFast,
+    )
+    .await?;
     #[cfg(feature = "k8s")]
     let result = match guard.writer_fence() {
         Some(fence) => {

@@ -53,6 +53,8 @@ pub use maintenance_offline::{
 };
 #[cfg(feature = "k8s")]
 pub use s3::offline_maintenance_runtime_from_writer_fence;
+#[cfg(feature = "k8s")]
+pub use s3::v2_bootstrap_journal_state;
 pub use s3::{
     DoctorProbeCheck, DoctorProbeReport, GatewayS3Boundary, KeyringEnvelopeInspectOptions,
     KeyringEnvelopeInspectReport, KeyringEnvelopeRewrapOptions, KeyringEnvelopeRewrapReport,

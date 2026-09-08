@@ -23,6 +23,8 @@ pub use recovery_tools::{
 };
 #[cfg(feature = "k8s")]
 pub use runtime::offline_maintenance_runtime_from_writer_fence;
+#[cfg(feature = "k8s")]
+pub use runtime::v2_bootstrap_journal_state;
 pub(crate) use runtime::v2_quick_maintenance_from_config;
 pub use runtime::{
     DoctorProbeCheck, DoctorProbeReport, RuntimeV2ProviderConformanceOptions,

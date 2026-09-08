@@ -250,6 +250,25 @@ impl<A> LeaseGuard<A>
 where
     A: LeaseGuardApi,
 {
+    /// Waits out an unchanged holder, but fails as soon as the holder proves
+    /// live by renewing during takeover observation.
+    ///
+    /// One-shot callers such as repository initialization use this so they
+    /// cannot deadlock behind a serving gateway that will not exit for them.
+    pub async fn acquire_unless_live_writer(&self) -> Result<LeaseGuardState, LeaseGuardError> {
+        loop {
+            match self
+                .acquire_at(Timestamp::now(), self.clock.elapsed())
+                .await
+            {
+                Err(LeaseGuardError::HeldByOther) => {
+                    tokio::time::sleep(ACQUIRE_POLL_INTERVAL).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// Attempts to acquire the Lease at supplied wall and monotonic times.
     ///
     /// Wall time is written for Kubernetes interoperability and diagnostics. It
@@ -538,6 +557,11 @@ impl KubernetesLeaseGuard {
                 result => return result,
             }
         }
+    }
+
+    /// Waits out an unchanged holder but fails on a live, renewing writer.
+    pub async fn acquire_unless_live_writer(&self) -> Result<LeaseGuardState, LeaseGuardError> {
+        self.inner.acquire_unless_live_writer().await
     }
 
     /// Attempts one acquisition without waiting out a held Lease.
@@ -961,6 +985,35 @@ mod tests {
                 .await,
             Err(LeaseGuardError::HeldByOther)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquire_unless_live_writer_waits_for_stale_holders_but_fails_on_renewal() {
+        let api = FakeLeaseApi::default();
+        *api.lease.lock().await = Some(held_lease("pod-b/process-1", 7, 11));
+        let guard = std::sync::Arc::new(lease_guard(api.clone(), "job/init"));
+
+        let attempt = tokio::spawn({
+            let guard = std::sync::Arc::clone(&guard);
+            async move { guard.acquire_unless_live_writer().await }
+        });
+        // Let the first sighting start the observation window, then renew.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        *api.lease.lock().await = Some(held_lease("pod-b/process-1", 7, 12));
+        assert_eq!(
+            attempt.await.expect("task"),
+            Err(LeaseGuardError::HeldByLiveWriter)
+        );
+
+        // A missing Lease is acquired immediately by the same call.
+        *api.lease.lock().await = None;
+        let state = guard
+            .acquire_unless_live_writer()
+            .await
+            .expect("free lease acquired");
+        assert_eq!(state.holder_identity, "job/init");
     }
 
     #[tokio::test]
