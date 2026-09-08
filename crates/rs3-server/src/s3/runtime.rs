@@ -1559,6 +1559,10 @@ async fn load_existing_v2_repository(
     }
 
     let keyring_reference = keyring_reference_from_v2(&format_root.active_keyring_envelope_ref);
+    reject_unbound_keyring_override(
+        keys.envelope_object_id.as_ref(),
+        &keyring_reference.object_id,
+    )?;
     let loaded_keyring = open_gateway_keyring_reference(store, keys, &keyring_reference).await?;
     Ok(LoadedV2Repository {
         keyring: loaded_keyring.keyring,
@@ -1740,6 +1744,24 @@ fn v2_keyring_root_ref(reference: &KeyringEnvelopeReference) -> V2KeyringEnvelop
     }
 }
 
+/// An anchored repository opens only the envelope its format root binds.
+///
+/// A configured override naming another object, typically a rewrapped
+/// envelope, is an activation this preview does not support. Refusing it is
+/// better than silently opening the old envelope while the operator believes
+/// the new wrapping key is in use.
+fn reject_unbound_keyring_override(
+    configured: Option<&BackendObjectId>,
+    bound: &BackendObjectId,
+) -> Result<(), S3BoundaryError> {
+    match configured {
+        Some(configured) if configured != bound => Err(repository_init(
+            "RS3_KEYRING_ENVELOPE_OBJECT_ID names a keyring envelope that the anchored format root does not bind; a rewrapped envelope stays inactive until a format update binds it and this preview provides no such activation, so unset the override or keep the bound envelope and its wrapping key",
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn keyring_reference_from_v2(reference: &V2KeyringEnvelopeRootRef) -> KeyringEnvelopeReference {
     KeyringEnvelopeReference {
         generation: reference.generation,
@@ -1864,6 +1886,17 @@ mod tests {
         assert!(report.initialized);
         assert!(report.verified_commit_count > 0);
         assert!(!store.list_prefix("").await.expect("inventory").is_empty());
+    }
+
+    #[test]
+    fn anchored_repositories_refuse_unbound_keyring_overrides() {
+        let bound = BackendObjectId::new("keyrings/bound.cbor").expect("object id");
+        let rewrapped = BackendObjectId::new("keyrings/rewrapped.cbor").expect("object id");
+        assert!(super::reject_unbound_keyring_override(None, &bound).is_ok());
+        assert!(super::reject_unbound_keyring_override(Some(&bound), &bound).is_ok());
+        let error = super::reject_unbound_keyring_override(Some(&rewrapped), &bound)
+            .expect_err("a rewrapped envelope is not activated by configuration");
+        assert!(error.to_string().contains("does not bind"));
     }
 
     #[tokio::test]

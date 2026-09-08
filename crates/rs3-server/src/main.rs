@@ -1294,6 +1294,9 @@ fn print_keyring_rewrap_report(
             } else {
                 println!("RS3_KEYRING_WRAPPING_KEY_HEX=<external-secret>");
             }
+            println!(
+                "# The rewrapped envelope is inactive until a format update binds it; anchored serving keeps the bound envelope and its wrapping key."
+            );
         }
     }
     Ok(())

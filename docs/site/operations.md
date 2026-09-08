@@ -379,7 +379,12 @@ cryptographic revocation mechanism.
 Keep the old wrapping-key source available for restore paths that still trust
 format roots or commits bound to the old envelope. A newly written rewrapped
 envelope only becomes active repository state after a later accepted format or
-keyring update binds it.
+keyring update binds it, and this preview provides no such activation: an
+anchored gateway keeps opening the envelope its format root binds with the old
+wrapping key. Pointing `RS3_KEYRING_ENVELOPE_OBJECT_ID` at the rewrapped
+object on an anchored repository is rejected at startup rather than silently
+ignored. The rewrapped envelope is a hygiene artifact for future activation
+and for unanchored recovery tooling that names it explicitly.
 When writing envelopes outside the gateway, set envelope retention deliberately
 with `RS3_REPOSITORY_RETENTION_MODE` and `RS3_REPOSITORY_RETENTION_DAYS`;
 retention protects restore metadata from deletion but does not make a leaked
