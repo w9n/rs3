@@ -15,6 +15,8 @@ use std::sync::Arc;
 /// Trusted manifest metadata used by the current in-memory query model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TrustedManifest {
+    /// Accepted plaintext ETag, kept inside trusted metadata.
+    pub(crate) etag: rs3_types::ObjectEtag,
     /// Verified checksum, visible only through authenticated object metadata.
     pub(crate) checksum: Option<rs3_types::ObjectChecksum>,
     /// Client-visible key inside the trusted boundary.
@@ -80,6 +82,7 @@ impl RepositoryState {
             self.list_entries.insert(
                 key,
                 RepositoryListEntry {
+                    etag: manifest.etag,
                     key: manifest.key,
                     content_len: manifest.content_len,
                     modified_at_ms: manifest.modified_at_ms,
@@ -148,6 +151,7 @@ impl RepositoryState {
                 continue;
             }
             let list_entry = RepositoryListEntry {
+                etag: manifest.etag,
                 key: manifest.key.clone(),
                 content_len: manifest.content_len,
                 modified_at_ms: manifest.modified_at_ms,
@@ -177,6 +181,7 @@ impl TrustedManifest {
     /// Converts trusted manifest metadata into public repository metadata.
     pub(crate) fn into_metadata(self) -> RepositoryObjectMetadata {
         RepositoryObjectMetadata {
+            etag: self.etag,
             checksum: self.checksum,
             key: self.key,
             content_len: self.content_len,
@@ -189,6 +194,7 @@ impl TrustedManifest {
     /// Converts trusted manifest metadata into durable manifest metadata.
     pub(crate) fn into_durable(self) -> DurableManifest {
         DurableManifest {
+            etag: self.etag,
             checksum: self.checksum,
             key: self.key,
             content_len: self.content_len,

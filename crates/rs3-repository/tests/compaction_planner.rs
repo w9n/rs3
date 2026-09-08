@@ -117,6 +117,7 @@ fn mutation(key: u8, generation: u64, live: bool) -> IndexMutation {
     let generation = Sequence::new(generation);
     if live {
         IndexMutation::Upsert(IndexUpsert {
+            etag: rs3_types::ObjectEtag::single(rs3_crypto::md5(b"")),
             checksum: None,
             mutation_ordinal: 0,
             blind_key,

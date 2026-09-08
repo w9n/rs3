@@ -74,8 +74,22 @@ its construction type only when the client enables checksum mode; partial `GET`
 responses do not claim a checksum for a different byte range. Multipart
 selection digests bind the selected part checksum facts, while the aggregate
 checksum is the durable metadata fact. Independent vectors, authenticated HTTP
-trailer tests, AWS CLI CRC64NVME/SHA256 transfers and a Velero default CRC32
-backup, namespace deletion and restore cover these client paths.
+trailer tests and adapter tests cover these flexible-checksum paths.
+[Testing](testing.md) records source-bound client qualification and its limits.
+
+Every accepted object also carries a mandatory trusted ETag derived from
+plaintext MD5 values in the encrypted namespace metadata. A single-object ETag
+is the complete plaintext MD5; a multipart ETag is the MD5 of the ordered raw
+selected-part MD5 digests with a `-N` count suffix. The same stored ETag is
+returned through object writes, completion, HEAD, GET, and current-object
+listings. `Content-MD5` is an optional canonical Base64 request fact checked at
+exact EOF before publication or part replacement. Part ETags are plaintext MD5
+values; internal sealing attempt IDs remain separate and hidden. These client
+compatibility facts are separate from flexible checksums, repository
+authentication, deduplication, provider metadata, and provider keys.
+The MD5 is computed once at the plaintext consumer without an extra payload
+read. Local vectors, adapter tests and authenticated HTTP tests cover these
+paths; client qualification and its limits are recorded in [Testing](testing.md).
 
 ## Accepted Leakage
 
@@ -480,7 +494,7 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
   tests remain required for retention history; signed timestamps alone are not
   a proven retention clock.
 
-- The `v03` catalog, wire-version-9 pack/stream run model, wire-version-5 root,
+- The `v03` catalog, wire-version-10 pack/stream run model, wire-version-6 root,
   compaction, and automatic watermark paths remain preview-scoped. Durable
   format freeze, retained-provider qualification, and external cryptographic
   review are still outstanding.

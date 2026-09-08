@@ -199,6 +199,56 @@ async fn signed_invalid_or_malformed_chunk_signature_is_refused() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn signed_content_md5_rejects_bad_replacements_and_keeps_the_trusted_etag() {
+    let server = TestServer::start().await;
+    let body = b"signed md5 body";
+    let digest = md5_base64(body);
+    let etag = md5_hex(body);
+    let response = server
+        .request(&signed_regular_put(
+            server.addr,
+            "content-md5-http",
+            body,
+            body.len(),
+            &digest,
+        ))
+        .await;
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(response.contains(&etag));
+
+    let response = server
+        .request(&signed_regular_put(
+            server.addr,
+            "content-md5-http",
+            b"replacement",
+            b"replacement".len(),
+            &digest,
+        ))
+        .await;
+    assert!(response.starts_with("HTTP/1.1 400"));
+    assert!(response.contains("BadDigest"));
+
+    let response = server
+        .request(&signed_regular_put(
+            server.addr,
+            "content-md5-malformed",
+            body,
+            body.len(),
+            "not-canonical-base64",
+        ))
+        .await;
+    assert!(response.starts_with("HTTP/1.1 400"));
+    assert!(response.contains("InvalidDigest"));
+
+    let response = server
+        .request(&signed_head(server.addr, "content-md5-http"))
+        .await;
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(response.contains(&etag));
+    server.shutdown().await;
+}
+
 fn signed_chunked_put(
     addr: SocketAddr,
     key: &str,
@@ -218,7 +268,7 @@ fn signed_chunked_put(
         chunked_body(payload, &checksum, trailer_mode, &timestamp, &placeholder).len();
     let host = addr.to_string();
     let headers = streaming_headers(&host, &timestamp, payload.len(), body_length);
-    let seed_signature = request_signature("PUT", &path, &headers, date);
+    let seed_signature = request_signature("PUT", &path, &headers, date, STREAMING_TRAILER);
     let mut body = chunked_body(
         payload,
         &checksum,
@@ -228,7 +278,28 @@ fn signed_chunked_put(
     );
     apply_chunk_mode(&mut body, chunk_mode);
     debug_assert_eq!(body.len(), body_length);
-    http_request("PUT", &path, headers, &body, date)
+    http_request("PUT", &path, headers, &body, date, STREAMING_TRAILER)
+}
+
+fn signed_regular_put(
+    addr: SocketAddr,
+    key: &str,
+    body: &[u8],
+    declared_len: usize,
+    content_md5: &str,
+) -> Vec<u8> {
+    let path = format!("/client-bucket/{key}");
+    let timestamp = timestamp();
+    let date = timestamp[..8].to_owned();
+    let payload_hash = hex::encode(Sha256::digest(body));
+    let headers = vec![
+        ("content-length".to_owned(), declared_len.to_string()),
+        ("content-md5".to_owned(), content_md5.to_owned()),
+        ("host".to_owned(), addr.to_string()),
+        ("x-amz-content-sha256".to_owned(), payload_hash.clone()),
+        ("x-amz-date".to_owned(), timestamp),
+    ];
+    http_request("PUT", &path, headers, body, &date, &payload_hash)
 }
 
 fn signed_head(addr: SocketAddr, key: &str) -> Vec<u8> {
@@ -244,7 +315,7 @@ fn signed_head(addr: SocketAddr, key: &str) -> Vec<u8> {
         ("x-amz-date".to_owned(), timestamp),
         ("x-amz-checksum-mode".to_owned(), "ENABLED".to_owned()),
     ];
-    http_request("HEAD", &path, headers, &[], &date)
+    http_request("HEAD", &path, headers, &[], &date, "UNSIGNED-PAYLOAD")
 }
 
 fn streaming_headers(
@@ -280,8 +351,9 @@ fn http_request(
     mut headers: Vec<(String, String)>,
     body: &[u8],
     date: &str,
+    payload_hash: &str,
 ) -> Vec<u8> {
-    let signature = request_signature(method, path, &headers, date);
+    let signature = request_signature(method, path, &headers, date, payload_hash);
     let signed_headers = signed_header_names(&headers);
     headers.push((
         "authorization".to_owned(),
@@ -303,17 +375,17 @@ fn http_request(
     request
 }
 
-fn request_signature(method: &str, path: &str, headers: &[(String, String)], date: &str) -> String {
+fn request_signature(
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    date: &str,
+    payload_hash: &str,
+) -> String {
     let canonical_headers = canonical_headers(headers);
     let signed_headers = signed_header_names(headers);
-    let canonical_request = format!(
-        "{method}\n{path}\n\n{canonical_headers}\n{signed_headers}\n{}",
-        if method == "PUT" {
-            STREAMING_TRAILER
-        } else {
-            "UNSIGNED-PAYLOAD"
-        }
-    );
+    let canonical_request =
+        format!("{method}\n{path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}",);
     let canonical_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
     let timestamp = headers
         .iter()
@@ -428,6 +500,14 @@ fn crc32(body: &[u8]) -> String {
     let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Crc32);
     hasher.update(body);
     STANDARD.encode(hasher.finalize())
+}
+
+fn md5_base64(body: &[u8]) -> String {
+    STANDARD.encode(rs3_crypto::md5(body).as_bytes())
+}
+
+fn md5_hex(body: &[u8]) -> String {
+    hex::encode(rs3_crypto::md5(body).as_bytes())
 }
 
 fn timestamp() -> String {

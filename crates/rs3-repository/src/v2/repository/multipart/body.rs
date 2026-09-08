@@ -3,6 +3,11 @@
 use super::*;
 use rs3_storage::Result as StorageResult;
 
+pub(super) struct PartDigests {
+    pub(super) ciphertext: [u8; 32],
+    pub(super) md5: rs3_types::Md5Digest,
+}
+
 pub(super) struct EncryptedPartBody {
     sealer: SegmentedPayloadSealer,
     keyring: Arc<KeyRing>,
@@ -13,7 +18,9 @@ pub(super) struct EncryptedPartBody {
     pending: Bytes,
     segment: usize,
     digest: Sha256Hasher,
-    result: Arc<Mutex<Option<[u8; 32]>>>,
+    result: Arc<Mutex<Option<PartDigests>>>,
+    md5: Option<rs3_crypto::Md5Hasher>,
+    expected_md5: Option<rs3_types::Md5Digest>,
     stall_timeout: Duration,
     terminal: bool,
 }
@@ -30,7 +37,7 @@ impl EncryptedPartBody {
         input: Box<dyn BlobRead>,
         ciphertext_len: u64,
         stall_timeout: Duration,
-        result: Arc<Mutex<Option<[u8; 32]>>>,
+        result: Arc<Mutex<Option<PartDigests>>>,
     ) -> Self {
         Self {
             remaining: input.exact_len(),
@@ -41,11 +48,18 @@ impl EncryptedPartBody {
             ciphertext_len,
             stall_timeout,
             result,
+            md5: Some(rs3_crypto::Md5Hasher::new()),
+            expected_md5: None,
             pending: Bytes::new(),
             segment: 0,
             digest: Sha256Hasher::new(),
             terminal: false,
         }
+    }
+
+    pub(super) fn with_expected_md5(mut self, expected: Option<rs3_types::Md5Digest>) -> Self {
+        self.expected_md5 = expected;
+        self
     }
 
     async fn next_input(&mut self) -> StorageResult<Option<Bytes>> {
@@ -61,8 +75,15 @@ impl EncryptedPartBody {
         Ok(())
     }
 
-    fn finish_digest(&self) -> StorageResult<()> {
-        *self.result.lock().map_err(|_| invalid_body())? = Some(self.digest.clone().finalize());
+    fn finish_digest(&mut self) -> StorageResult<()> {
+        let md5 = self.md5.take().ok_or_else(invalid_body)?.finalize();
+        *self.result.lock().map_err(|_| invalid_body())? = Some(PartDigests {
+            ciphertext: self.digest.clone().finalize(),
+            md5,
+        });
+        if self.expected_md5.is_some_and(|expected| expected != md5) {
+            return Err(invalid_body());
+        }
         Ok(())
     }
 }
@@ -103,6 +124,10 @@ impl BlobRead for EncryptedPartBody {
         if is_final {
             self.require_eof().await?;
         }
+        self.md5
+            .as_mut()
+            .ok_or_else(invalid_body)?
+            .update(&plaintext);
         let bytes = self
             .sealer
             .seal_segment(

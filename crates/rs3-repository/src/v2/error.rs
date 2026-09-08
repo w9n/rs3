@@ -25,6 +25,9 @@ pub type V2Result<T> = std::result::Result<T, V2FormatError>;
 /// Errors returned by v2 commit-format and protocol-boundary checks.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum V2FormatError {
+    /// Plaintext did not match the declared Content-MD5.
+    #[error("content MD5 did not match request body")]
+    ContentMd5Mismatch,
     /// A random commit key did not have the required shape.
     #[error("invalid v03 commit key")]
     InvalidCommitKey,
@@ -185,6 +188,7 @@ impl V2FormatError {
             | Self::ObjectTooLarge
             | Self::ObjectLengthMismatch
             | Self::ObjectBodyReadFailed
+            | Self::ContentMd5Mismatch
             | Self::MaintenanceCancelled => V2ErrorClass::RetryableClient,
             Self::ProviderProfileFailed => V2ErrorClass::ProviderConformance,
             Self::RecoveryBundleRequired => V2ErrorClass::OperatorActionRequired,

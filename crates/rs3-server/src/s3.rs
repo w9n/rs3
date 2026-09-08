@@ -4,6 +4,7 @@ mod adapter;
 mod boundary;
 mod bounded_io;
 mod checksum;
+mod content_md5;
 mod mapping;
 mod recovery_tools;
 mod runtime;

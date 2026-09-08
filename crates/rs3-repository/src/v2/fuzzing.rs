@@ -373,6 +373,7 @@ fn standalone_index_run_fixture() -> IndexRun {
         }],
         mutations: vec![
             IndexMutation::Upsert(IndexUpsert {
+                etag: rs3_types::ObjectEtag::single(rs3_crypto::md5(b"fixture")),
                 checksum: None,
                 mutation_ordinal: 0,
                 blind_key: IndexBlindKey::from_bytes([0x31; 32]),

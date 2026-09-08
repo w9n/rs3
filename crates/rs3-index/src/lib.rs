@@ -6,7 +6,7 @@ pub mod run;
 
 use rs3_types::{
     BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LegalHoldStatus, LogicalPath,
-    ManifestId, PrefixToken, RetentionPolicy, Sequence,
+    ManifestId, ObjectEtag, PrefixToken, RetentionPolicy, Sequence,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -272,6 +272,8 @@ pub struct DurableManifest {
     /// Effective legal-hold status, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legal_hold: Option<LegalHoldStatus>,
+    /// Trusted plaintext MD5 ETag for this object.
+    pub etag: ObjectEtag,
     /// Client-declared checksum accepted for the complete object, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum: Option<rs3_types::ObjectChecksum>,
@@ -483,7 +485,7 @@ mod tests {
     };
     use rs3_types::{
         BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LogicalPath, ManifestId,
-        PrefixToken, Sequence,
+        ObjectEtag, PrefixToken, Sequence,
     };
     use std::sync::Arc;
 
@@ -579,6 +581,7 @@ mod tests {
             modified_at_ms: 7,
             retention: None,
             legal_hold: None,
+            etag: ObjectEtag::single(rs3_types::Md5Digest::from_bytes([0x55; 16])),
             checksum: None,
         };
 

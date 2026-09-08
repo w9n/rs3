@@ -10,6 +10,7 @@ mod fingerprint;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
 mod keyring;
+mod md5;
 mod metadata;
 mod payload;
 mod primitives;
@@ -29,6 +30,7 @@ pub use envelope::{
 pub use error::CryptoError;
 pub use fingerprint::{Sha256Hasher, derive_public_fingerprint};
 pub use keyring::{KeyMaterial, KeyRing, MIN_REPOSITORY_SALT_LEN, RepositoryKeyContext};
+pub use md5::{Md5Hasher, md5, multipart_etag};
 pub use metadata::MetadataSeal;
 pub use payload::{PayloadSegmentContext, PayloadSegmentSeal};
 pub use random::{random_carrier_id, random_payload_attempt_id, random_physical_order_key};

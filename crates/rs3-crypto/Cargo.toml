@@ -20,6 +20,7 @@ crc-fast.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 hmac.workspace = true
+md-5.workspace = true
 ring.workspace = true
 rs3-types.workspace = true
 sha2.workspace = true

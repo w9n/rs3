@@ -935,6 +935,7 @@ mod tests {
 
     fn manifest(key: &str) -> TrustedManifest {
         TrustedManifest {
+            etag: rs3_types::ObjectEtag::single(rs3_crypto::md5(b"fixture")),
             checksum: None,
             key: path(key),
             content_len: 1,

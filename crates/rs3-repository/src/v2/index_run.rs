@@ -1416,6 +1416,7 @@ mod tests {
             standalone_stream_containers: Vec::new(),
             mutations: vec![
                 IndexMutation::Upsert(IndexUpsert {
+                    etag: rs3_types::ObjectEtag::single(rs3_crypto::md5(b"fixture")),
                     checksum: None,
                     mutation_ordinal: 0,
                     blind_key: IndexBlindKey::from_bytes([0x30; 32]),
@@ -1434,6 +1435,7 @@ mod tests {
                     legal_hold: Some(LegalHoldStatus::On),
                 }),
                 IndexMutation::Upsert(IndexUpsert {
+                    etag: rs3_types::ObjectEtag::single(rs3_crypto::md5(b"fixture")),
                     checksum: None,
                     mutation_ordinal: 1,
                     blind_key: IndexBlindKey::from_bytes([0x10; 32]),
@@ -1460,6 +1462,7 @@ mod tests {
                     generation: Sequence::new(19),
                 }),
                 IndexMutation::Upsert(IndexUpsert {
+                    etag: rs3_types::ObjectEtag::single(rs3_crypto::md5(b"fixture")),
                     checksum: None,
                     mutation_ordinal: 3,
                     blind_key: IndexBlindKey::from_bytes([0x40; 32]),
@@ -1515,6 +1518,7 @@ mod tests {
                 payload_layout,
             }],
             mutations: vec![IndexMutation::Upsert(IndexUpsert {
+                etag: rs3_types::ObjectEtag::single(rs3_crypto::md5(b"fixture")),
                 checksum: None,
                 mutation_ordinal: 0,
                 blind_key: IndexBlindKey::from_bytes([0x96; 32]),

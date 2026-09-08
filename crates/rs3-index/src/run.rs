@@ -2,8 +2,8 @@
 
 use crate::PayloadLayout;
 use rs3_types::{
-    BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LegalHoldStatus, LogicalPath,
-    ObjectChecksum, RetentionMode, RetentionPolicy, Sequence,
+    BackendObjectId, BackendVersionId, BlindIndexKey, ChecksumType, KeyId, LegalHoldStatus,
+    LogicalPath, ObjectChecksum, ObjectEtag, RetentionMode, RetentionPolicy, Sequence,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -12,7 +12,7 @@ use std::fmt;
 pub const INDEX_RUN_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-run-frame-plaintext:v2\n";
 
 /// Version of the canonical index-run wire encoding.
-pub const INDEX_RUN_WIRE_VERSION: u16 = 9;
+pub const INDEX_RUN_WIRE_VERSION: u16 = 10;
 
 /// Maximum stored size of one v03 payload pack.
 pub const INDEX_PACK_MAX_STORED_BYTES: u64 = 32 * 1024 * 1024;
@@ -317,6 +317,8 @@ pub struct IndexUpsert {
     pub retention: Option<RetentionPolicy>,
     /// Effective legal-hold state, when present.
     pub legal_hold: Option<LegalHoldStatus>,
+    /// Trusted plaintext MD5 ETag for this object.
+    pub etag: ObjectEtag,
     /// Client-declared checksum accepted for the complete object, when present.
     pub checksum: Option<ObjectChecksum>,
 }
@@ -335,6 +337,7 @@ impl fmt::Debug for IndexUpsert {
             .field("modified_at_ms", &self.modified_at_ms)
             .field("retention", &self.retention)
             .field("legal_hold", &self.legal_hold)
+            .field("etag", &"<redacted>")
             .field("checksum", &self.checksum)
             .finish()
     }
@@ -866,6 +869,7 @@ pub fn encode_index_run_frames(
                 encode_retention(&mut record, upsert.retention)?;
                 encode_legal_hold(&mut record, upsert.legal_hold)?;
                 encode_checksum(&mut record, upsert.checksum.as_ref())?;
+                record.bytes(&upsert.etag.encode())?;
             }
             IndexMutation::Tombstone(tombstone) => {
                 record.u8(1)?;
@@ -1992,6 +1996,7 @@ fn decode_namespace_projection(
                     retention: decode_retention(record)?,
                     legal_hold: decode_legal_hold(record)?,
                     checksum: decode_checksum(record)?,
+                    etag: decode_etag(record)?,
                 },
                 namespace_key_ordinal,
             ))
@@ -2102,6 +2107,7 @@ fn pair_projections(
                 retention,
                 legal_hold,
                 checksum,
+                etag,
             },
             ListingProjection::Upsert {
                 path,
@@ -2124,6 +2130,7 @@ fn pair_projections(
                 modified_at_ms,
                 retention,
                 legal_hold,
+                etag,
                 checksum,
             }))
         }
@@ -2240,6 +2247,7 @@ enum NamespaceProjection {
         retention: Option<RetentionPolicy>,
         legal_hold: Option<LegalHoldStatus>,
         checksum: Option<ObjectChecksum>,
+        etag: ObjectEtag,
     },
     Tombstone {
         blind_key: IndexBlindKey,
@@ -2535,6 +2543,7 @@ fn validate_completion_receipt(run: &IndexRun) -> Result<(), IndexRunError> {
         if upserts.next().is_some()
             || upsert.path != receipt.key
             || upsert.content_len != receipt.content_len
+            || upsert.etag != receipt.etag
             || upsert.checksum != receipt.checksum
         {
             return Err(IndexRunError::FrameFactsMismatch);
@@ -2581,6 +2590,12 @@ fn validate_mutations(run: &IndexRun, limits: &IndexRunLimits) -> Result<(), Ind
                     limits.max_path_bytes,
                 )?;
                 validate_empty_payload(upsert.payload, upsert.content_len)?;
+                if let Some(checksum) = upsert.checksum.as_ref()
+                    && let ChecksumType::Composite { parts } = checksum.kind()
+                    && upsert.etag.part_count() != Some(parts)
+                {
+                    return Err(IndexRunError::FrameFactsMismatch);
+                }
                 validate_payload_pointer(
                     upsert.payload,
                     upsert.content_len,
@@ -2962,6 +2977,11 @@ fn decode_checksum(reader: &mut Reader<'_>) -> Result<Option<ObjectChecksum>, In
         .map_err(|_| IndexRunError::InvalidValue { field: "checksum" })
 }
 
+fn decode_etag(reader: &mut Reader<'_>) -> Result<ObjectEtag, IndexRunError> {
+    ObjectEtag::decode(reader.bytes(ObjectEtag::ENCODED_BYTES)?)
+        .map_err(|_| IndexRunError::InvalidValue { field: "etag" })
+}
+
 fn decode_blind_key(reader: &mut Reader<'_>) -> Result<IndexBlindKey, IndexRunError> {
     let mut bytes = [0_u8; 32];
     bytes.copy_from_slice(reader.bytes(32)?);
@@ -3175,8 +3195,17 @@ mod tests {
     };
     use rs3_types::{
         BackendObjectId, BackendVersionId, BlindIndexKey, ChecksumAlgorithm, ChecksumType, KeyId,
-        LegalHoldStatus, LogicalPath, ObjectChecksum, RetentionMode, RetentionPolicy, Sequence,
+        LegalHoldStatus, LogicalPath, Md5Digest, ObjectChecksum, ObjectEtag, RetentionMode,
+        RetentionPolicy, Sequence,
     };
+
+    fn single_etag(byte: u8) -> ObjectEtag {
+        ObjectEtag::single(Md5Digest::from_bytes([byte; 16]))
+    }
+
+    fn multipart_etag(byte: u8, parts: u32) -> ObjectEtag {
+        ObjectEtag::multipart(Md5Digest::from_bytes([byte; 16]), parts).expect("multipart etag")
+    }
 
     fn fixture() -> IndexRun {
         IndexRun {
@@ -3221,6 +3250,7 @@ mod tests {
                     modified_at_ms: -55,
                     retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
                     legal_hold: Some(LegalHoldStatus::On),
+                    etag: single_etag(0x55),
                     checksum: None,
                 }),
                 IndexMutation::Tombstone(IndexTombstone {
@@ -3313,6 +3343,7 @@ mod tests {
             panic!("upsert");
         };
         upsert.checksum = Some(checksum.clone());
+        upsert.etag = multipart_etag(0x56, 1);
         run.completion_receipt = Some(crate::completion::CompletionReceipt {
             upload_id: rs3_types::MultipartUploadId::from_bytes([0x71; 32]),
             commit_sequence: Sequence::new(12),
@@ -3320,7 +3351,7 @@ mod tests {
             attempts_digest: [0x73; 32],
             key: upsert.path.clone(),
             content_len: upsert.content_len,
-            etag: "multipart-result".to_owned(),
+            etag: upsert.etag,
             checksum: Some(checksum),
         });
         run
@@ -3332,12 +3363,13 @@ mod tests {
         let run = completion_fixture();
         let bytes = encode_index_run(&run, &limits).expect("encode receipt run");
         assert_eq!(decode_index_run(&bytes, &limits), Ok(run.clone()));
-        for field in 0..3 {
+        for field in 0..4 {
             let mut wrong = run.clone();
             let receipt = wrong.completion_receipt.as_mut().expect("receipt");
             match field {
                 0 => receipt.key = LogicalPath::new("different/key").expect("path"),
                 1 => receipt.content_len += 1,
+                2 => receipt.etag = multipart_etag(0x57, 1),
                 _ => wrong.mutations.push(fixture().mutations[1].clone()),
             }
             assert!(encode_index_run(&wrong, &limits).is_err());
@@ -3784,7 +3816,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_pre_v6_frames() {
+    fn decoder_rejects_pre_v10_frames() {
         let limits = IndexRunLimits::default();
         let mut encoded = encode_index_run(&standalone_stream_fixture(), &limits)
             .expect("encode standalone stream run");
@@ -3793,11 +3825,11 @@ mod tests {
             .position(|window| window == INDEX_RUN_PLAINTEXT_DOMAIN)
             .expect("frame domain");
         let version_offset = domain_offset + INDEX_RUN_PLAINTEXT_DOMAIN.len();
-        encoded[version_offset..version_offset + 2].copy_from_slice(&5_u16.to_be_bytes());
+        encoded[version_offset..version_offset + 2].copy_from_slice(&9_u16.to_be_bytes());
 
         assert_eq!(
             decode_index_run(&encoded, &limits),
-            Err(IndexRunError::UnsupportedVersion(5))
+            Err(IndexRunError::UnsupportedVersion(9))
         );
     }
 
@@ -4196,7 +4228,7 @@ mod tests {
         let encoded = encode_index_run(&fixture(), &IndexRunLimits::default()).expect("encode run");
         assert_eq!(
             hex(&encoded),
-            "0395027273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0009000000000000000000090202020001d301000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c232323232323232323232323232323232323232323232323232323232323232303000000000000020000000000000008001111111111111111111111111111111111111111111111111111111111111111a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a309636f6e74656e742d31080d030b6e616d6573706163652d318d017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0009010000000000000000090202023700003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901021e020024010144444444444444444444444444444444444444444444444444444444444444440012627273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a00090200000000000000000902020213000e74656e616e742f64656c657465640101121d070e736e617073686f742f6368756e6b000011d209ffffffffffffffc9"
+            "0395027273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a000a000000000000000000090202020001d301000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c232323232323232323232323232323232323232323232323232323232323232303000000000000020000000000000008001111111111111111111111111111111111111111111111111111111111111111a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a309636f6e74656e742d31080d030b6e616d6573706163652d31a1017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a000a010000000000000000090202024b00003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901021e0200000000005555555555555555555555555555555524010144444444444444444444444444444444444444444444444444444444444444440012627273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a000a0200000000000000000902020213000e74656e616e742f64656c657465640101121d070e736e617073686f742f6368756e6b000011d209ffffffffffffffc9"
         );
     }
 

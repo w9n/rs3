@@ -488,6 +488,7 @@ impl V2CommitWrite {
 
 /// Complete authenticated facts for one independently uploaded payload object.
 pub(crate) struct V2StoredStandalonePayload {
+    pub(crate) etag: rs3_types::ObjectEtag,
     pub(crate) object_id: BackendObjectId,
     pub(crate) version_id: Option<BackendVersionId>,
     pub(crate) object_len: u64,
@@ -1654,6 +1655,7 @@ where
             return Err(V2FormatError::ObjectBodyReadFailed);
         }
 
+        let mut plaintext_md5 = rs3_crypto::Md5Hasher::new();
         let mut plaintext_seen = 0_u64;
         let mut next_segment_index = 0_usize;
         let mut segment = Vec::with_capacity(payload_segment_size);
@@ -1705,6 +1707,7 @@ where
                     V2FormatError::ObjectTooLarge
                 });
             }
+            plaintext_md5.update(&chunk);
             let mut remaining = chunk.as_ref();
             while !remaining.is_empty() {
                 let take = payload_segment_size
@@ -1854,6 +1857,7 @@ where
             )
             .await?;
         Ok(V2StoredStandalonePayload {
+            etag: rs3_types::ObjectEtag::single(plaintext_md5.finalize()),
             object_id,
             version_id,
             object_len,

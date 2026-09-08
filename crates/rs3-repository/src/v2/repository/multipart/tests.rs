@@ -62,23 +62,27 @@ async fn multipart_selected_attempts_restore_across_part_boundaries_with_one_rea
     );
     let prefix = Bytes::from(vec![7; rs3_storage::MULTIPART_MIN_PART_BYTES as usize]);
     let (first, old) = tokio::join!(
-        upload.upload_part(2, plaintext(prefix), None),
-        upload.upload_part(7, plaintext(Bytes::from_static(b"tail")), None)
+        upload.upload_part(2, plaintext(prefix), None, None),
+        upload.upload_part(7, plaintext(Bytes::from_static(b"tail")), None, None)
     );
     let first = first.expect("first");
     let old = old.expect("old");
     let last = upload
-        .upload_part(7, plaintext(Bytes::from_static(b"tail")), None)
+        .upload_part(7, plaintext(Bytes::from_static(b"tail")), None, None)
         .await
         .expect("replacement");
-    assert_ne!(
+    assert_eq!(
         old.etag(),
         last.etag(),
-        "equal plaintext is a fresh sealing attempt"
+        "equal plaintext has an equal client MD5"
+    );
+    assert_ne!(
+        old.part.attempt_id, last.part.attempt_id,
+        "sealing attempt remains fresh"
     );
     assert_ne!(old.digest, last.digest);
     upload
-        .upload_part(5, plaintext(Bytes::from_static(b"omitted")), None)
+        .upload_part(5, plaintext(Bytes::from_static(b"omitted")), None, None)
         .await
         .expect("unused");
     store.reset_operation_counts().expect("reset");
@@ -145,7 +149,7 @@ async fn multipart_empty_and_stale_zero_length_selections_have_no_carrier() {
         .expect("create");
     let id = upload.object_id.clone();
     let part = upload
-        .upload_part(10_000, plaintext(Bytes::new()), None)
+        .upload_part(10_000, plaintext(Bytes::new()), None, None)
         .await
         .expect("empty");
     let verified = repo
@@ -160,11 +164,11 @@ async fn multipart_empty_and_stale_zero_length_selections_have_no_carrier() {
         .await
         .expect("new");
     let empty = upload
-        .upload_part(1, plaintext(Bytes::new()), None)
+        .upload_part(1, plaintext(Bytes::new()), None, None)
         .await
         .expect("empty");
     upload
-        .upload_part(1, plaintext(Bytes::from_static(b"new")), None)
+        .upload_part(1, plaintext(Bytes::from_static(b"new")), None, None)
         .await
         .expect("replacement");
     assert!(
@@ -184,14 +188,14 @@ async fn multipart_small_nonfinal_foreign_and_corrupt_expected_parts_fail_closed
             .expect("create");
         let id = upload.object_id.clone();
         let mut part = upload
-            .upload_part(1, plaintext(Bytes::from_static(b"abc")), None)
+            .upload_part(1, plaintext(Bytes::from_static(b"abc")), None, None)
             .await
             .expect("part");
         let selected = match case {
             0 => vec![
                 part,
                 upload
-                    .upload_part(2, plaintext(Bytes::from_static(b"tail")), None)
+                    .upload_part(2, plaintext(Bytes::from_static(b"tail")), None, None)
                     .await
                     .expect("tail"),
             ],
@@ -201,7 +205,7 @@ async fn multipart_small_nonfinal_foreign_and_corrupt_expected_parts_fail_closed
                     .await
                     .expect("other");
                 let foreign = other
-                    .upload_part(1, plaintext(Bytes::new()), None)
+                    .upload_part(1, plaintext(Bytes::new()), None, None)
                     .await
                     .expect("foreign empty");
                 other.abort().await.expect("abort");
@@ -213,7 +217,7 @@ async fn multipart_small_nonfinal_foreign_and_corrupt_expected_parts_fail_closed
             }
             _ => {
                 upload
-                    .upload_part(1, plaintext(Bytes::from_static(b"new")), None)
+                    .upload_part(1, plaintext(Bytes::from_static(b"new")), None, None)
                     .await
                     .expect("replace");
                 vec![part]
@@ -246,18 +250,23 @@ async fn multipart_plaintext_length_errors_never_accept_a_part() {
             bytes: Bytes::from_static(b"abc"),
             declared,
         };
-        assert!(upload.upload_part(1, Box::new(read), None).await.is_err());
+        assert!(
+            upload
+                .upload_part(1, Box::new(read), None, None)
+                .await
+                .is_err()
+        );
     }
     assert!(upload.parts.read().expect("parts").is_empty());
     assert!(
         upload
-            .upload_part(0, plaintext(Bytes::new()), None)
+            .upload_part(0, plaintext(Bytes::new()), None, None)
             .await
             .is_err()
     );
     assert!(
         upload
-            .upload_part(10_001, plaintext(Bytes::new()), None)
+            .upload_part(10_001, plaintext(Bytes::new()), None, None)
             .await
             .is_err()
     );
@@ -269,6 +278,7 @@ async fn multipart_plaintext_length_errors_never_accept_a_part() {
                     bytes: Bytes::new(),
                     declared: rs3_storage::MULTIPART_MAX_PART_BYTES
                 }),
+                None,
                 None
             )
             .await
@@ -298,7 +308,7 @@ async fn multipart_ambiguous_completion_returns_no_publication_input() {
         .expect("create");
     let id = upload.object_id.clone();
     let part = upload
-        .upload_part(1, plaintext(Bytes::from_static(b"abc")), None)
+        .upload_part(1, plaintext(Bytes::from_static(b"abc")), None, None)
         .await
         .expect("part");
     assert!(
@@ -323,7 +333,7 @@ async fn multipart_retained_completion_preserves_exact_version_and_full_post_com
         .await
         .expect("retained create");
     let part = upload
-        .upload_part(1, plaintext(Bytes::from_static(b"retained")), None)
+        .upload_part(1, plaintext(Bytes::from_static(b"retained")), None, None)
         .await
         .expect("part");
     let floor = required_retain_until_ms(Some(retention)).expect("horizon");
@@ -364,17 +374,23 @@ async fn multipart_zero_length_final_part_does_not_enter_ciphertext_layout() {
                     as usize
             ])),
             None,
+            None,
         )
         .await
         .expect("first");
     let empty = upload
-        .upload_part(9, plaintext(Bytes::new()), None)
+        .upload_part(9, plaintext(Bytes::new()), None, None)
         .await
         .expect("empty final");
     let verified = repo
         .complete_client_multipart_upload(upload, vec![first, empty])
         .await
         .expect("complete");
+    assert_eq!(
+        verified.etag.part_count(),
+        Some(2),
+        "empty final part remains in client ETag count"
+    );
     let stored = verified.stored.as_ref().expect("carrier");
     assert_eq!(stored.payload_layout.parts.len(), 1);
     assert_eq!(stored.payload_layout.parts[0].part_number, 1);
@@ -406,7 +422,7 @@ async fn multipart_stalled_input_does_not_accept_part_and_can_abort() {
     assert!(
         tokio::time::timeout(
             Duration::from_secs(1),
-            upload.upload_part(1, Box::new(Stalled), None)
+            upload.upload_part(1, Box::new(Stalled), None, None)
         )
         .await
         .expect("bounded stall")
@@ -466,6 +482,7 @@ async fn multipart_verified_eof_checksum_is_required_before_replacing_current_at
                 value: Some(original_value.clone()),
             }),
             Some(handoff),
+            None,
         )
         .await
         .expect("verified EOF part");
@@ -484,7 +501,7 @@ async fn multipart_verified_eof_checksum_is_required_before_replacing_current_at
     ] {
         assert!(
             upload
-                .upload_part(1, plaintext(Bytes::from_static(b"abc")), invalid)
+                .upload_part(1, plaintext(Bytes::from_static(b"abc")), invalid, None)
                 .await
                 .is_err()
         );
@@ -499,12 +516,52 @@ async fn multipart_verified_eof_checksum_is_required_before_replacing_current_at
             1,
             plaintext(Bytes::from_static(b"abc")),
             Some(UploadChecksum::verified(new_value)),
+            None,
         )
         .await
         .expect("replacement");
-    assert_ne!(old.etag(), new.etag());
-    assert!(upload.select_parts(&[(1, old.etag())]).is_err());
+    assert_eq!(old.etag(), new.etag());
+    assert_ne!(old.part.attempt_id, new.part.attempt_id);
+    assert_eq!(
+        upload
+            .select_parts(&[(1, old.etag())])
+            .expect("current equal-MD5 selection")[0]
+            .part
+            .attempt_id,
+        new.part.attempt_id
+    );
     let selected = upload.select_parts(&[(1, new.etag())]).expect("latest");
     assert_eq!(selected[0].checksum(), Some(&original_value));
     upload.abort().await.expect("abort");
+}
+
+#[tokio::test]
+async fn multipart_content_md5_failure_preserves_prior_provider_part_and_attempt() {
+    let repo = repository(MemoryBlobStore::new());
+    let upload = repo
+        .create_client_multipart_upload(None, None, None)
+        .await
+        .expect("upload");
+    let bytes = Bytes::from(vec![5; PART_SEGMENT_BYTES + 1]);
+    let md5 = rs3_crypto::md5(&bytes);
+    let old = upload
+        .upload_part(1, plaintext(bytes), None, Some(md5))
+        .await
+        .expect("verified original");
+    let before = V3UploadedPart::selected_attempts_digest(std::slice::from_ref(&old));
+    let replacement = Bytes::from(vec![6; PART_SEGMENT_BYTES + 1]);
+    assert!(matches!(
+        upload
+            .upload_part(1, plaintext(replacement), None, Some(md5))
+            .await,
+        Err(V2FormatError::ContentMd5Mismatch)
+    ));
+    let listed = upload.list_parts(0, 1).expect("original remains");
+    assert_eq!(V3UploadedPart::selected_attempts_digest(&listed), before);
+    let verified = repo
+        .complete_client_multipart_upload(upload, listed)
+        .await
+        .expect("original provider token remains usable");
+    assert_eq!(verified.etag.part_count(), Some(1));
+    assert_eq!(verified.plaintext_len(), (PART_SEGMENT_BYTES + 1) as u64);
 }

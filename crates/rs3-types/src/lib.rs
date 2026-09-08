@@ -2,8 +2,10 @@
 
 pub mod cbor;
 mod checksum;
+mod etag;
 
 pub use checksum::{ChecksumAlgorithm, ChecksumError, ChecksumType, ObjectChecksum};
+pub use etag::{Md5Digest, ObjectEtag, ObjectEtagError};
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;

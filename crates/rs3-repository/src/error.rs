@@ -32,6 +32,9 @@ pub enum RepositoryError {
     /// A declared checksum disagrees with verified uploaded content.
     #[error("request checksum did not match verified content")]
     ObjectChecksumMismatch,
+    /// Plaintext did not match the declared Content-MD5.
+    #[error("content MD5 did not match request body")]
+    ContentMd5Mismatch,
     /// Repository sequence allocation overflowed.
     #[error("repository sequence overflow")]
     SequenceOverflow,

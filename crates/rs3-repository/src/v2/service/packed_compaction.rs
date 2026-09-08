@@ -634,6 +634,7 @@ mod tests {
         payload: IndexPayloadPointer,
     ) -> IndexMutation {
         IndexMutation::Upsert(IndexUpsert {
+            etag: rs3_types::ObjectEtag::single(rs3_crypto::md5(b"fixture")),
             checksum: None,
             mutation_ordinal: ordinal,
             blind_key,

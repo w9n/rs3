@@ -135,9 +135,10 @@ impl V3ClientMultipartUpload {
         number: u32,
         body: Box<dyn BlobRead>,
         checksum: Option<UploadChecksum>,
+        expected_md5: Option<rs3_types::Md5Digest>,
     ) -> Result<V3UploadedPart> {
         self.upload
-            .upload_part(number, body, checksum)
+            .upload_part(number, body, checksum, expected_md5)
             .await
             .map_err(v2_repository_error)
     }
@@ -277,7 +278,7 @@ impl<S: BlobStore + Clone> V2Repository<S> {
     ) -> Result<V3ClientMultipartUpload> {
         self.ensure_local_state_ready()?;
         self.validate_client_object_lock(&options)?;
-        if options.checksum.is_some() {
+        if options.checksum.is_some() || options.expected_md5.is_some() {
             return Err(invalid_completion());
         }
         if key.as_str().len() > 1024 {
@@ -385,6 +386,7 @@ impl<S: BlobStore + Clone> V2Repository<S> {
             len,
             completion.options,
             (len == 0).then(Bytes::new),
+            completion.verified.etag,
         )?;
         let receipt = CompletionReceipt {
             checksum: staged.metadata.checksum.clone(),
@@ -394,7 +396,7 @@ impl<S: BlobStore + Clone> V2Repository<S> {
             attempts_digest: completion.attempts_digest,
             key: staged.metadata.key.clone(),
             content_len: len,
-            etag: format!("rs3-{:x}-{:x}", staged.metadata.modified_at_ms, len),
+            etag: staged.metadata.etag,
         };
         let result = async {
             let mut pending = self.pending_snapshot()?;

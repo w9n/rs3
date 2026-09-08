@@ -12,18 +12,18 @@ reports, and stored metadata remain path-private.
 | `HeadBucket` | Implemented | Accepts only the configured public bucket. | Basic SDK bucket probes work. |
 | `ListBuckets` | Implemented | Returns the configured public bucket. | Basic SDK account probes work without exposing backend buckets. |
 | `GetBucketLocation` | Implemented | Returns the configured S3 region. | SDK region discovery works for the served bucket. |
-| `PutObject` | Implemented | Supports normal writes, create-only `If-None-Match: *`, qualified Object Lock retention headers, bounded buffering, and concurrent declared-length large bodies through backend multipart standalone payloads followed by fenced publication. Validates a full-object CRC32, CRC32C, CRC64NVME, SHA1, or SHA256 checksum from the request header or verified SigV4 trailer. An omitted checksum algorithm uses CRC64NVME. Per-request retention is rejected unless the repository uses the retained-version profile. Legal-hold headers, append offsets, and unsupported conditionals are rejected before repository mutation. | Kopia, Velero, and single-stream upload clients can write through the gateway within configured size and admission budgets. |
-| `CreateMultipartUpload` | Implemented | Captures the destination, qualified retention, checksum algorithm, and full-object or composite checksum type before accepting parts; starts an opaque detached carrier. An omitted algorithm uses CRC64NVME with full-object construction. Other supported algorithms default to composite construction. | Supports bounded multipart sessions with immutable checksum policy. |
-| `UploadPart` | Implemented | Streams independent parts, validates one full-object part checksum from a header or verified SigV4 trailer, serializes replacement of the same number, and requires a declared plaintext length. | Different numbers upload concurrently without a whole-part buffer. Each accepted part returns its validated checksum. |
-| `CompleteMultipartUpload` | Implemented | Validates the exact selected parts, their checksums and order, the optional final checksum, and the selected full-object or composite type; fully verifies ciphertext, then publishes the value and a durable completion receipt. Supports `If-None-Match: *` at publication. | Accepted retries return the original result and checksum without overwriting a newer value. |
+| `PutObject` | Implemented | Supports normal writes, create-only `If-None-Match: *`, qualified Object Lock retention headers, bounded buffering, and concurrent declared-length large bodies through backend multipart standalone payloads followed by fenced publication. Computes a trusted ETag derived from the plaintext MD5 and validates an optional canonical Base64 `Content-MD5` header at exact EOF before publication. Flexible CRC32, CRC32C, CRC64NVME, SHA1, or SHA256 checksums remain independently supported. Per-request retention is rejected unless the repository uses the retained-version profile. Legal-hold headers, append offsets, and unsupported conditionals are rejected before repository mutation. | Kopia, Velero, and single-stream upload clients can write through the gateway within configured size and admission budgets. |
+| `CreateMultipartUpload` | Implemented | Captures the destination, qualified retention, checksum algorithm, and full-object or composite checksum type before accepting parts; starts an opaque detached carrier. An omitted flexible-checksum algorithm uses CRC64NVME with full-object construction. Other supported algorithms default to composite construction. The final ETag uses the standard MD5-of-selected-part-MD5s form. | Supports bounded multipart sessions with immutable checksum policy. |
+| `UploadPart` | Implemented | Streams independent parts, validates an optional canonical Base64 `Content-MD5` at exact EOF before replacing a provider part, and validates one flexible checksum from a header or verified SigV4 trailer. | Different numbers upload concurrently without a whole-part buffer. Each part ETag is the plaintext MD5 hex value; internal sealing attempt IDs remain separate and hidden. |
+| `CompleteMultipartUpload` | Implemented | Validates the exact selected parts, their checksums and order, the optional final checksum, and the selected full-object or composite type; computes the standard MD5-of-selected-part-MD5s ETag, fully verifies ciphertext, then publishes the value and a durable completion receipt. Supports `If-None-Match: *` at publication. | Accepted retries return the original result, ETag and checksum without overwriting a newer value. |
 | `AbortMultipartUpload` | Implemented | Waits for active part writes and aborts unfinished provider state. | Does not delete any accepted value. |
-| `ListParts` | Implemented | Lists current original part numbers and ETags, at most 1,000 per page. | Clients can inspect and paginate unfinished uploads. |
-| `HeadObject` | Implemented | Returns metadata, ETag, length, last-modified, supported Object Lock headers, and `Content-Type: application/octet-stream`. With `ChecksumMode: ENABLED`, it also returns the stored checksum and its construction type. Range or part-number metadata probes do not return checksum fields. Accepts the current unversioned `versionId=null`; rejects historical IDs and part-number metadata probes. | Metadata-only probes work without reading payload bytes. |
-| `GetObject` | Implemented | Supports full-object and byte-range reads and returns `Content-Type: application/octet-stream`. With `ChecksumMode: ENABLED`, a full-object response returns the stored checksum and its construction type; a partial response omits checksum fields because the checksum does not cover the requested byte range. Accepts the current unversioned `versionId=null`; rejects historical IDs and part-number reads. | Restore clients can perform full and ranged reads. |
-| `ListObjects` | Implemented | Supports prefix, delimiter, marker, and bounded result pages. | Older S3 clients can list logical prefixes. |
-| `ListObjectsV2` | Implemented | Supports prefix, delimiter, continuation tokens, start-after, and bounded result pages. | Modern backup clients can list logical prefixes. |
+| `ListParts` | Implemented | Lists current original part numbers and plaintext-MD5 ETags, at most 1,000 per page. | Clients can inspect and paginate unfinished uploads. |
+| `HeadObject` | Implemented | Returns the stored ETag with metadata, length, last-modified, supported Object Lock headers, and `Content-Type: application/octet-stream`. With `ChecksumMode: ENABLED`, it also returns the stored flexible checksum and its construction type. Range or part-number metadata probes do not return checksum fields. Accepts the current unversioned `versionId=null`; rejects historical IDs and part-number metadata probes. | Metadata-only probes work without reading payload bytes. |
+| `GetObject` | Implemented | Supports full-object and byte-range reads and returns the stored ETag with `Content-Type: application/octet-stream`. With `ChecksumMode: ENABLED`, a full-object response returns the stored flexible checksum and its construction type; a partial response omits checksum fields because the checksum does not cover the requested byte range. Accepts the current unversioned `versionId=null`; rejects historical IDs and part-number reads. | Restore clients can perform full and ranged reads. |
+| `ListObjects` | Implemented | Supports prefix, delimiter, marker, and bounded result pages; each returned object carries its stored ETag. | Older S3 clients can list logical prefixes. |
+| `ListObjectsV2` | Implemented | Supports prefix, delimiter, continuation tokens, start-after, and bounded result pages; each returned object carries its stored ETag. | Modern backup clients can list logical prefixes. |
 | `GetBucketVersioning` | Implemented | Returns an empty versioning configuration, with no enabled/suspended status or MFA-delete setting. | Clients can detect the unversioned logical bucket. |
-| `ListObjectVersions` | Implemented for the current view | Each live key appears once with `VersionId=null` and `IsLatest=true`; no old values or delete markers. Supports prefix, delimiter, max keys, key markers and URL encoding. | Version-mode listings work for the current namespace. |
+| `ListObjectVersions` | Implemented for the current view | Each live key appears once with `VersionId=null`, `IsLatest=true`, and its stored ETag; no old values or delete markers. Supports prefix, delimiter, max keys, key markers and URL encoding. | Version-mode listings work for the current namespace. |
 | `DeleteObject` | Implemented | Performs a logical tombstone commit. Accepts current `versionId=null`; rejects historical IDs and conditional deletes. | Clients can delete current logical objects; retained backend versions remain protected until maintenance can remove eligible garbage. |
 | `DeleteObjects` | Implemented | Performs per-key logical tombstone commits, returns per-key `Deleted` or `Error` entries, and honors quiet mode. Historical version IDs or conditional entries return per-key errors; current `versionId=null` is accepted. | Batch-delete clients such as barman-cloud can clean up logical keys without losing per-object failure detail. |
 | `GetObjectLegalHold` | Implemented | Reads the current logical object's legal-hold status. Accepts current `versionId=null`; rejects historical IDs. | Object Lock aware clients can inspect legal hold. |
@@ -36,7 +36,7 @@ reports, and stored metadata remain path-private.
 | Restore-readonly mode | Rejects mutating operations including multipart creation, part upload, completion and abort, `PutObject`, `PutObjectLegalHold`, `DeleteObject`, and `DeleteObjects`. | Restore gateways can serve reads without accepting repository mutations. |
 | Object versions | Provider version IDs protect repository internals. The client-facing bucket remains unversioned and never exposes those IDs. | Literal `versionId=null` addresses the current logical value in supported read/delete operations; other version IDs are rejected. It is not a durable reference across overwrites. |
 | Object Lock retention | `PutObject` accepts retention headers only when startup selected and qualified the retained-version profile. An AtomicCreate or development repository cannot be upgraded by one request. Repository retention can strengthen backend commit protection; client-facing retention mutation APIs are not implemented. | Retention is configured at repository initialization or supplied on a qualified retained write, not by later client-side release or shortening. |
-| Multipart options | `Content-MD5`, nondefault content types, custom metadata, tags, ACLs and explicit SSE options are not implemented. Unsupported options return `NotImplemented`. Request checksums are supported for the five algorithms described below. | Use an omitted or `application/octet-stream` content type and an omitted or `STANDARD` storage class. `Content-MD5` and MD5 ETag behavior remain a later compatibility task. |
+| Multipart options | Nondefault content types, custom metadata including `X-Amz-Meta-Md5chksum`, tags, ACLs and explicit SSE options are not implemented. Unsupported options return `NotImplemented`. Canonical `Content-MD5` is supported on `PutObject` and `UploadPart`; flexible request checksums are supported for the five algorithms described below. | Use an omitted or `application/octet-stream` content type and an omitted or `STANDARD` storage class. |
 
 ## Request checksums
 
@@ -44,8 +44,8 @@ The gateway hashes the plaintext request stream alongside encryption and
 completes checksum validation before it accepts repository publication. It
 accepts one checksum algorithm per request. `PutObject` is always full-object.
 Multipart creation captures the algorithm and construction type before any part
-is accepted. Multipart
-part checksums always cover that part's bytes. A composite checksum hashes the
+is accepted. Multipart part checksums always cover that part's bytes. A
+composite checksum hashes the
 selected parts' raw digests; its response value appends the selected part count
 as `-N`. A completion request can supply the plain Base64 digest with explicit
 `ChecksumType: COMPOSITE`. An optional `-N` suffix must match the selected count.
@@ -70,9 +70,31 @@ metadata and are returned by the corresponding S3 responses. Multipart
 selection digests bind the selected part checksum facts; those raw part facts
 are not stored as durable standalone records. Checksums are not
 provider object keys, backend metadata, ETags, or repository authentication
-digests. Qualification covers independent vectors, authenticated HTTP trailer
-tests, AWS CLI 2.34.24 CRC64NVME and SHA256 transfers, and Velero 1.18.0 with
-AWS plugin 1.14.0 default CRC32 backup and restore.
+digests. Local vectors, authenticated HTTP trailer tests, and adapter tests
+cover the implementation. [Testing](../testing.md) records source-bound client
+qualification and its limits.
+
+## ETags and `Content-MD5`
+
+Every accepted native or S3 object has one trusted ETag derived from plaintext
+MD5 values. A single `PutObject` ETag is the MD5 of the complete plaintext. A
+multipart ETag is the MD5 of the concatenated raw MD5 digests of the selected
+parts, followed by `-N`, where `N` is the selected part count; it is not the MD5
+of the complete object. The same stored ETag is returned by `PutObject`,
+multipart completion, `HeadObject`, full or ranged `GetObject`, `ListObjects`,
+`ListObjectsV2`, and the current entry in `ListObjectVersions`.
+
+`Content-MD5` is an optional canonical Base64 request fact for `PutObject` and
+`UploadPart`. The gateway hashes once at the repository plaintext consumer and
+checks the declaration at exact EOF. A malformed, duplicate, conflicting,
+mismatched, or incomplete declaration fails before object publication or part
+replacement. Each part ETag is the plaintext MD5 of that part; internal sealing
+attempt IDs remain separate and hidden. Generic custom metadata, including
+`X-Amz-Meta-Md5chksum`, remains outside the repository contract: multipart
+requests reject it, while ordinary `PutObject` does not preserve it. ETags and
+`Content-MD5` are client compatibility facts, distinct from flexible checksums,
+repository authentication, deduplication, and provider metadata or keys. The
+MD5 is computed once at the plaintext consumer without an extra payload read.
 
 ## Explicitly Not Implemented
 
@@ -139,5 +161,5 @@ returns the original ETag, even after a later overwrite. An unknown, aborted or
 evicted ID cannot initiate a new publication. Unresolved anchor outcomes fail
 closed until trusted recovery. Ordinary `PutObject` remains a new write.
 
-Current part ETags are opaque sealing-attempt tokens and completed-object ETags
-use the existing rs3 metadata token. They are not plaintext MD5 checksums.
+Current part ETags are plaintext MD5 hex values. Completed-object ETags use the
+stored aggregate ETag described above.

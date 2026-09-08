@@ -2,7 +2,8 @@
 //! retention. Only accepted repository publication may install these records.
 
 use rs3_types::{
-    ChecksumAlgorithm, ChecksumType, LogicalPath, MultipartUploadId, ObjectChecksum, Sequence, cbor,
+    ChecksumAlgorithm, ChecksumType, LogicalPath, MultipartUploadId, ObjectChecksum, ObjectEtag,
+    Sequence, cbor,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,8 +27,8 @@ pub struct CompletionReceipt {
     pub key: LogicalPath,
     /// Accepted plaintext length.
     pub content_len: u64,
-    /// Exact client response ETag, distinct from provider ciphertext ETags.
-    pub etag: String,
+    /// Exact multipart MD5 ETag, distinct from provider ciphertext ETags.
+    pub etag: ObjectEtag,
     /// Accepted client checksum, when supplied with this multipart completion.
     pub checksum: Option<ObjectChecksum>,
 }
@@ -57,11 +58,11 @@ type Result<T> = std::result::Result<T, CompletionReceiptError>;
 impl CompletionReceipt {
     /// Validates semantic and allocation bounds independently of a wire decoder.
     pub fn validate(&self) -> Result<()> {
+        let Some(part_count) = self.etag.part_count() else {
+            return Err(CompletionReceiptError);
+        };
         if self.commit_sequence == Sequence::ZERO
             || self.key.as_str().len() > 1024
-            || self.etag.is_empty()
-            || self.etag.len() > 128
-            || self.etag.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
             || self.checksum.as_ref().is_some_and(|checksum| {
                 matches!(
                     (checksum.algorithm(), checksum.kind()),
@@ -69,7 +70,7 @@ impl CompletionReceipt {
                         ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256,
                         ChecksumType::FullObject
                     )
-                )
+                ) || matches!(checksum.kind(), ChecksumType::Composite { parts } if parts != part_count)
             })
         {
             return Err(CompletionReceiptError);
@@ -88,7 +89,7 @@ impl CompletionReceipt {
         cbor::write_bytes(&mut out, &self.attempts_digest);
         cbor::write_text(&mut out, self.key.as_str());
         cbor::write_u64(&mut out, self.content_len);
-        cbor::write_text(&mut out, &self.etag);
+        cbor::write_bytes(&mut out, &self.etag.encode());
         match &self.checksum {
             Some(checksum) => cbor::write_bytes(&mut out, &checksum.encode()),
             None => cbor::write_null(&mut out),
@@ -131,7 +132,8 @@ fn decode(input: &[u8]) -> cbor::CborResult<CompletionReceipt> {
     let key =
         LogicalPath::new(reader.read_text_bounded(1024)?).map_err(|_| cbor::CborError::Invalid)?;
     let content_len = reader.read_u64()?;
-    let etag = reader.read_text_bounded(128)?;
+    let etag = ObjectEtag::decode(&reader.read_bytes_bounded(ObjectEtag::ENCODED_BYTES)?)
+        .map_err(|_| cbor::CborError::Invalid)?;
     let checksum = if reader.next_is_null() {
         reader.read_null()?;
         None
@@ -237,6 +239,11 @@ impl CompletionReceipts {
 mod tests {
     use super::*;
 
+    fn multipart_etag(byte: u8, parts: u32) -> ObjectEtag {
+        ObjectEtag::multipart(rs3_types::Md5Digest::from_bytes([byte; 16]), parts)
+            .expect("multipart etag")
+    }
+
     fn receipt(sequence: u64) -> CompletionReceipt {
         let mut id = [0; 32];
         id[..8].copy_from_slice(&sequence.to_be_bytes());
@@ -247,7 +254,7 @@ mod tests {
             attempts_digest: [4; 32],
             key: LogicalPath::new("private/key").expect("key"),
             content_len: 42,
-            etag: "opaque-result-2".to_owned(),
+            etag: multipart_etag(0x05, 1),
             checksum: None,
         }
     }
@@ -268,9 +275,7 @@ mod tests {
         overlong.splice(35..36, [0x18, 1]);
         assert!(CompletionReceipt::decode(&overlong).is_err());
         let mut invalid = original.clone();
-        invalid.etag = "x".repeat(129);
-        assert!(invalid.encode().is_err());
-        invalid.etag = "bad\r\nheader".to_owned();
+        invalid.etag = ObjectEtag::single(rs3_types::Md5Digest::from_bytes([0; 16]));
         assert!(invalid.encode().is_err());
         invalid = original.clone();
         invalid.commit_sequence = Sequence::ZERO;
@@ -322,6 +327,15 @@ mod tests {
             .expect("checksum"),
         );
         assert!(accepted.encode().is_ok());
+        accepted.checksum = Some(
+            ObjectChecksum::new(
+                ChecksumAlgorithm::Sha256,
+                ChecksumType::Composite { parts: 2 },
+                vec![0; ChecksumAlgorithm::Sha256.digest_len()],
+            )
+            .expect("checksum"),
+        );
+        assert!(accepted.encode().is_err());
     }
 
     #[test]
@@ -345,7 +359,7 @@ mod tests {
             receipts
         );
         let mut conflict = receipt(2);
-        conflict.etag = "different-result".to_owned();
+        conflict.etag = multipart_etag(0x06, 1);
         assert!(receipts.insert(conflict).is_err());
         assert_eq!(receipts, before, "reject before mutation");
         receipts.insert(receipt(2)).expect("equal replay");

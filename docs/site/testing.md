@@ -34,16 +34,36 @@ parallel parts, completion freeze, duplicate completion, monotonic expiry,
 admission limits, cancellation, readonly mode and invalid selected/body facts.
 Checksum tests cover all five algorithms, encrypted metadata and completion
 receipt persistence, and failed writes that leave the accepted value intact.
+MD5/ETag tests cover empty, buffered, known-length, unknown-length and
+multipart paths, while `Content-MD5` tests cover canonical parsing, exact EOF
+validation, and failures that preserve the accepted object or part.
 `cargo test -p rs3-server --test checksum_trailers` sends authenticated SigV4
 chunks and trailers through the real listener, including missing and invalid
 trailer cases.
 
-Local client qualification covers 100 MiB AWS CLI 2.34.24 ordinary and multipart
-uploads with default CRC64NVME and explicit SHA256 on memory and RustFS
-backends. Velero 1.18.0 with AWS plugin 1.14.0 passes default CRC32 backup and
-restore after namespace deletion. Independent calculations check returned
-checksums and restored bytes. These fixtures leave retained-provider fault and
-recovery-history qualification as separate work.
+Local flexible-checksum qualification covered 100 MiB AWS CLI 2.34.24 ordinary
+and multipart uploads with CRC64NVME and SHA256 on memory and RustFS. Velero
+1.18.0 with AWS plugin 1.14.0 passed default CRC32 backup and restore after
+namespace deletion. Those runs preceded the MD5 ETag format update.
+
+MD5 ETag qualification uses rclone 1.75.0 and AWS CLI 2.34.24 on memory and
+RustFS. Direct rclone single PUT validates Content-MD5 and returns the expected
+MD5 ETag; `md5sum` and hash-based `check` agree, while a same-size corrupted
+local file fails hash comparison. A rejected bad-MD5 overwrite preserves the
+accepted ETag and original bytes.
+
+Direct AWS two-part uploads validate each part's Content-MD5 and return the
+independently calculated MD5-of-part-MD5s ETag. Bad-MD5 part replacements leave
+the prior part usable, and direct rclone `check --download` verifies the
+completed bytes. These runs use 100 MiB objects and verify matching ETags from
+HEAD, GET and listing responses.
+
+Direct rclone multipart creation rejects its unconditional Mtime metadata;
+ordinary PUT accepts that metadata but does not preserve it. Multipart download
+checks therefore use AWS-created objects. These results qualify byte and ETag
+behavior, not metadata preservation or all rclone upload options. Earlier
+Velero qualification preceded the MD5 format update and was not repeated for
+this change.
 
 `just fuzz-smoke` exercises commit headers/objects, canonical CBOR, both
 repository-envelope purposes, recovery bundles, index runs/roots, format roots,

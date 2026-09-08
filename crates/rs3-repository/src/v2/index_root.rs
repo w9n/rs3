@@ -30,7 +30,7 @@ const INDEX_ROOT_MAGIC: &[u8; 8] = b"rs3:irt\n";
 const INDEX_ROOT_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-root-plaintext:v02\n";
 const INDEX_ROOT_AAD_DOMAIN: &[u8] = b"rs3:index-root-aad:v02\n";
 const INDEX_ROOT_FORMAT_GENERATION: u16 = 2;
-const INDEX_ROOT_WIRE_VERSION: u16 = 5;
+const INDEX_ROOT_WIRE_VERSION: u16 = 6;
 const INDEX_ROOT_NONCE_LEN: usize = 12;
 const INDEX_ROOT_TAG_LEN: usize = 16;
 const INDEX_ROOT_SEAL_OVERHEAD: usize = INDEX_ROOT_NONCE_LEN + INDEX_ROOT_TAG_LEN;
@@ -1284,7 +1284,8 @@ mod tests {
             attempts_digest: [0x73; 32],
             key: logical_path("private/deleted"),
             content_len: 42,
-            etag: "original-result".to_owned(),
+            etag: rs3_types::ObjectEtag::multipart(rs3_types::Md5Digest::from_bytes([0x74; 16]), 2)
+                .expect("multipart etag"),
             checksum: Some(
                 rs3_types::ObjectChecksum::new(
                     rs3_types::ChecksumAlgorithm::Crc32c,
@@ -1355,7 +1356,7 @@ mod tests {
         let digest: [u8; 32] = Sha256Hasher::digest(encoded);
         assert_eq!(
             hex::encode(digest),
-            "87b7f27868e543814383ad51110c10652d4a5b4d1d4312668ae063e3637add5b"
+            "11e84416d7a30856e77b8a5e50a8b69a92c0b6d8fbb035884136720714fc8f87"
         );
     }
 
@@ -1394,7 +1395,7 @@ mod tests {
         let digest: [u8; 32] = Sha256Hasher::digest(encoded);
         assert_eq!(
             hex::encode(digest),
-            "1c60148596d078f2bbf23d51b2babe8a6ce536f0917efe6c290cdd61d243d1d5"
+            "cce5595c8ec7574e908bf78328a3e11534001b7a36e17d7d044f5196d26492d5"
         );
     }
 

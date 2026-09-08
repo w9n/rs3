@@ -78,6 +78,7 @@ impl Fixture {
                         ChecksumAlgorithm::Crc64Nvme,
                         bytes,
                     ))),
+                    None,
                 )
                 .await,
         );
@@ -205,6 +206,16 @@ async fn multipart_receipt_survives_overwrite_checkpoint_compaction_and_restart(
         let anchor = must_v2(f.anchor.read_v2().await).expect("accepted");
         assert_eq!(receipt.commit_sequence, anchor.sequence);
         assert_eq!(receipt.content_len, body.len() as u64);
+        assert_eq!(
+            receipt.etag.to_s3_string(),
+            if empty {
+                "59adb24ef3cdbe0297f05b395827453f-1"
+            } else {
+                "ea630fc1df1b4960edd2b2deaecc8582-1"
+            }
+        );
+        assert_eq!(must_repo(f.repository.head(&key())).etag, receipt.etag);
+        assert_eq!(must_repo(f.repository.list(""))[0].etag, receipt.etag);
         assert_eq!(
             receipt.checksum,
             Some(checksum(ChecksumAlgorithm::Crc64Nvme, body))
@@ -589,6 +600,7 @@ async fn multipart_checksum_combination_matches_selected_bytes_and_rejects_bad_f
                     2,
                     Box::new(Body(prefix.clone())),
                     Some(UploadChecksum::verified(first_checksum)),
+                    None,
                 )
                 .await,
         );
@@ -599,6 +611,7 @@ async fn multipart_checksum_combination_matches_selected_bytes_and_rejects_bad_f
                     7,
                     Box::new(Body(Bytes::from_static(b"tail"))),
                     Some(UploadChecksum::verified(last_checksum)),
+                    None,
                 )
                 .await,
         );
@@ -671,6 +684,7 @@ async fn multipart_composite_requires_exact_part_facts_and_consecutive_numbers()
                     1,
                     Box::new(Body(Bytes::from_static(b"abc"))),
                     Some(UploadChecksum::verified(actual.clone())),
+                    None,
                 )
                 .await,
         );
@@ -680,6 +694,7 @@ async fn multipart_composite_requires_exact_part_facts_and_consecutive_numbers()
                     3,
                     Box::new(Body(Bytes::from_static(b"abc"))),
                     Some(UploadChecksum::verified(actual.clone())),
+                    None,
                 )
                 .await,
         );
@@ -828,4 +843,149 @@ async fn multipart_retry_digest_binds_checksum_presence_and_explicit_kind() {
                 .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn native_md5_etags_cover_buffered_known_unknown_and_empty_without_optional_handoff() {
+    for mode in 0..3 {
+        for bytes in [b"abc".as_slice(), b"".as_slice()] {
+            let f = Fixture::new().await;
+            let options = RepositoryPutOptions::default();
+            let metadata = match mode {
+                0 => must_repo(
+                    f.repository
+                        .put_committed(&f.anchor, key(), Bytes::copy_from_slice(bytes), options)
+                        .await,
+                ),
+                1 => must_repo(
+                    f.repository
+                        .put_committed_streaming_known_len(
+                            &f.anchor,
+                            key(),
+                            bytes.len() as u64,
+                            futures_util::stream::iter(
+                                bytes
+                                    .chunks(1)
+                                    .map(|chunk| Ok(Bytes::copy_from_slice(chunk))),
+                            ),
+                            options,
+                            5 * 1024 * 1024,
+                        )
+                        .await,
+                ),
+                _ => must_repo(
+                    f.repository
+                        .put_committed_streaming_unknown_len(
+                            &f.anchor,
+                            key(),
+                            futures_util::stream::iter(
+                                bytes
+                                    .chunks(1)
+                                    .map(|chunk| Ok(Bytes::copy_from_slice(chunk))),
+                            ),
+                            options,
+                            5 * 1024 * 1024,
+                            10,
+                        )
+                        .await,
+                ),
+            };
+            let expected = if bytes.is_empty() {
+                "d41d8cd98f00b204e9800998ecf8427e"
+            } else {
+                "900150983cd24fb0d6963f7d28e17f72"
+            };
+            assert_eq!(metadata.etag.to_s3_string(), expected);
+            assert!(metadata.checksum.is_none());
+            assert_eq!(must_repo(f.repository.head(&key())).etag, metadata.etag);
+            assert_eq!(must_repo(f.repository.list(""))[0].etag, metadata.etag);
+            let fresh = f.reopen().await;
+            assert_eq!(must_repo(fresh.head(&key())).etag, metadata.etag);
+            assert_eq!(must_repo(fresh.list(""))[0].etag, metadata.etag);
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_content_md5_mismatch_never_replaces_accepted_value_on_any_write_path() {
+    for mode in 0..3 {
+        let f = Fixture::new().await;
+        let original = must_repo(
+            f.repository
+                .put_committed(
+                    &f.anchor,
+                    key(),
+                    Bytes::from_static(b"abc"),
+                    RepositoryPutOptions::default(),
+                )
+                .await,
+        );
+        let before = must_v2(f.anchor.read_v2().await);
+        let options = RepositoryPutOptions {
+            expected_md5: Some(original.etag.digest()),
+            ..Default::default()
+        };
+        let stream = || futures_util::stream::iter([Ok(Bytes::from_static(b"bad"))]);
+        let result = match mode {
+            0 => {
+                f.repository
+                    .put_committed(&f.anchor, key(), Bytes::from_static(b"bad"), options)
+                    .await
+            }
+            1 => {
+                f.repository
+                    .put_committed_streaming_known_len(
+                        &f.anchor,
+                        key(),
+                        3,
+                        stream(),
+                        options,
+                        5 * 1024 * 1024,
+                    )
+                    .await
+            }
+            _ => {
+                f.repository
+                    .put_committed_streaming_unknown_len(
+                        &f.anchor,
+                        key(),
+                        stream(),
+                        options,
+                        5 * 1024 * 1024,
+                        10,
+                    )
+                    .await
+            }
+        };
+        assert!(matches!(result, Err(RepositoryError::ContentMd5Mismatch)));
+        assert_eq!(must_v2(f.anchor.read_v2().await), before);
+        assert_eq!(must_repo(f.repository.head(&key())).etag, original.etag);
+        assert_eq!(
+            must_repo(f.reopen().await.get_range(&key(), ByteRange::Full).await),
+            Bytes::from_static(b"abc")
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_trusted_manifest_cannot_synthesize_object_metadata_or_etag() {
+    let f = Fixture::new().await;
+    must_repo(
+        f.repository
+            .put_committed(
+                &f.anchor,
+                key(),
+                Bytes::from_static(b"abc"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    must_repo(f.repository.clear_trusted_manifests_for_tests());
+    assert!(f.repository.head(&key()).is_err());
+    assert!(
+        f.repository
+            .get_range(&key(), ByteRange::Full)
+            .await
+            .is_err()
+    );
 }

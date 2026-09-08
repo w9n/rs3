@@ -3,6 +3,7 @@
 mod checksum;
 mod sessions;
 use super::*;
+use crate::s3::content_md5::upload_part_expected_md5;
 use rs3_repository::v2::{V3ClientMultipartUpload, V3MultipartSelection};
 use rs3_types::{LogicalPath, MultipartUploadId};
 use s3s::dto::*;
@@ -152,7 +153,6 @@ impl GatewayS3Service {
         let service = self.clone();
         self.multipart_request("UploadPart", input.bucket.clone(), true, async move {
             reject_options(&[
-                input.content_md5.is_some(),
                 input.expected_bucket_owner.is_some(),
                 input.request_payer.is_some(),
                 input.sse_customer_algorithm.is_some(),
@@ -200,6 +200,8 @@ impl GatewayS3Service {
                     "part checksum algorithm differs from upload"
                 ));
             }
+            let expected_md5 = upload_part_expected_md5(&input, &req.headers)
+                .map_err(|error| error.into_s3_error())?;
             let checksum = rs3_repository::UploadChecksum::pending();
             let (body, checksum_failure) =
                 validate_body(input.body.take(), request, checksum.clone());
@@ -218,7 +220,7 @@ impl GatewayS3Service {
                 terminal: false,
             };
             let result = upload
-                .upload_part(number, Box::new(body), Some(checksum))
+                .upload_part(number, Box::new(body), Some(checksum), expected_md5)
                 .await;
             if failed.load(Ordering::Acquire) {
                 return Err(checksum_failure.map_error(s3s::s3_error!(
@@ -556,7 +558,7 @@ fn completion_output(
         checksum_type: checksum.checksum_type,
         bucket: Some(bucket.to_owned()),
         key: Some(key.to_owned()),
-        e_tag: Some(ETag::Strong(receipt.etag)),
+        e_tag: Some(ETag::Strong(receipt.etag.to_s3_string())),
         ..Default::default()
     })
 }

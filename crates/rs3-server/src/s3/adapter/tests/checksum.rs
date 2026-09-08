@@ -1,7 +1,7 @@
 use super::*;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use s3s::dto::{ChecksumMode, Range};
+use s3s::dto::{ChecksumMode, ETag, Range};
 
 fn input(body: &'static [u8], declared: Option<i64>, digest: &str) -> PutObjectInput {
     PutObjectInput {
@@ -12,6 +12,76 @@ fn input(body: &'static [u8], declared: Option<i64>, digest: &str) -> PutObjectI
         body: Some(StreamingBlob::from(Body::from(Bytes::from_static(body)))),
         ..Default::default()
     }
+}
+
+fn md5_input(body: &'static [u8], declared: Option<i64>, digest: &str) -> PutObjectInput {
+    PutObjectInput {
+        bucket: "client-bucket".into(),
+        key: "private/content-md5".into(),
+        content_length: declared,
+        content_md5: Some(digest.into()),
+        body: Some(StreamingBlob::from(Body::from(Bytes::from_static(body)))),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn content_md5_validates_every_put_body_path_and_keeps_the_prior_etag() {
+    // Frozen MD5 values, independently generated from RFC 1321 test vectors.
+    let original = "4vxxTEcn7pOV8yTNLn8zHw==";
+    let original_etag = "e2fc714c4727ee9395f324cd2e7f331f";
+    let bad = "AAAAAAAAAAAAAAAAAAAAAA==";
+    for (threshold, declared) in [(64, Some(4)), (3, Some(4)), (64, None), (3, None)] {
+        let service = gateway_service_with_put_body_limits(64, threshold, 5 * 1024 * 1024).await;
+        let base = accepted_v2_sequence(&service).await;
+        let error = service
+            .put_object(s3_request(md5_input(b"abcd", declared, bad)))
+            .await
+            .expect_err("mismatched Content-MD5");
+        assert_eq!(error.code().as_str(), "BadDigest");
+        assert_eq!(accepted_v2_sequence(&service).await, base);
+
+        let put = service
+            .put_object(s3_request(md5_input(b"abcd", declared, original)))
+            .await
+            .expect("verified Content-MD5 PUT")
+            .output;
+        assert_eq!(put.e_tag, Some(ETag::Strong(original_etag.to_owned())));
+
+        let accepted = accepted_v2_sequence(&service).await;
+        let error = service
+            .put_object(s3_request(md5_input(b"wxyz", declared, original)))
+            .await
+            .expect_err("failed replacement");
+        assert_eq!(error.code().as_str(), "BadDigest");
+        assert_eq!(accepted_v2_sequence(&service).await, accepted);
+        let head = service
+            .head_object(s3_request(HeadObjectInput {
+                bucket: "client-bucket".into(),
+                key: "private/content-md5".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("retained object")
+            .output;
+        assert_eq!(head.e_tag, Some(ETag::Strong(original_etag.to_owned())));
+    }
+}
+
+#[tokio::test]
+async fn content_md5_does_not_publish_a_truncated_known_length_stream() {
+    let service = gateway_service_with_put_body_limits(64, 3, 5 * 1024 * 1024).await;
+    let base = accepted_v2_sequence(&service).await;
+    let error = service
+        .put_object(s3_request(md5_input(
+            b"abc",
+            Some(4),
+            "kAFQmDzST7DWlj99KOF/cg==",
+        )))
+        .await
+        .expect_err("truncated streaming body");
+    assert_eq!(error.code().as_str(), "IncompleteBody");
+    assert_eq!(accepted_v2_sequence(&service).await, base);
 }
 
 #[tokio::test]

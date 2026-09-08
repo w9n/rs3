@@ -126,7 +126,7 @@ local clock, and replay does not yet enforce a timestamp greater than the
 parent's. Strict chronology and its clock/handoff tests remain required before
 retention-history qualification. Sequence order is independently validated.
 
-The current framed index plaintext is wire version 9. Frame, section and mutation
+The current framed index plaintext is wire version 10. Frame, section and mutation
 ordinals, generations, content lengths, retention days, and bounded counts use
 canonical unsigned varints; readers reject overlong encodings. Generation and
 content length appear in both the namespace and listing projections because each
@@ -313,9 +313,10 @@ Runs contain two encrypted projections linked by mutation ordinal:
   the trusted gateway.
 
 The namespace projection stores the raw 32-byte blinded key, generation,
-compact payload pointer, trusted `HEAD` metadata, retention state, and an
-optional client checksum. The listing projection stores the encrypted logical
-path once together with generation, size, and modification time. Frame-local
+compact payload pointer, trusted `HEAD` metadata, retention state, mandatory
+trusted `ObjectEtag` derived from plaintext MD5 values, and an optional flexible
+checksum. The listing projection stores the encrypted logical path once
+together with generation, size, and modification time. Frame-local
 tables deduplicate exact pack and detached carriers, including object keys,
 provider versions, stored lengths, authenticated digests, and historical
 keyring context. A run may carry one self-pack declaration. Canonical varints
@@ -331,7 +332,7 @@ initially materialize a compact in-memory state, but the durable layout must
 also permit a future bounded local cache and range-selected frames without a
 format change.
 
-Wire version 9 uses canonical length-delimited records and no compression. Each
+Wire version 10 uses canonical length-delimited records and no compression. Each
 ciphertext frame and run has an explicit record and byte
 limit; the maximum encrypted run object is 8 MiB. Index-frame associated
 data binds at least the immutable repository identity, exact historical
@@ -341,9 +342,13 @@ upload, so the accepted signed catalog will bind that returned exact version
 together with object length and ciphertext digest. Reordering, duplicating, or
 transplanting frames must fail authentication.
 
-Wire version 9 adds one optional checksum field to each namespace upsert. A
-one-byte length prefixes at most 48 bytes of canonical `ObjectChecksum` encoding,
-`[algorithm_tag, composite_parts_or_zero, raw_digest]`; a zero length
+Wire version 9 added one optional checksum field to each namespace upsert. Wire
+version 10 adds the mandatory `ObjectEtag` field. It is exactly 20 bytes:
+big-endian u32 multipart count followed by the raw 16-byte MD5 digest. Count
+zero identifies a single-object ETag; counts one through 10,000 identify a
+multipart ETag. A one-byte length prefixes at most 48 bytes of canonical
+`ObjectChecksum` encoding, `[algorithm_tag, composite_parts_or_zero, raw_digest]`;
+a zero length
 means that no client checksum was accepted. The supported algorithms are
 CRC32, CRC32C, CRC64NVME, SHA1, and SHA256. Full-object checksums cover the
 complete plaintext object stream. Composite checksums hash the ordered raw
@@ -371,16 +376,17 @@ The repository publication API binds each accepted multipart completion to one
 receipt inside its encrypted index run. Metadata record tag 4 follows all
 container and namespace-key records and occurs at most once. It uses the
 canonical CBOR array `[upload_id, commit_sequence, selection_digest,
-attempts_digest, logical_key, content_len, response_etag, checksum]`. IDs and
-digests are 32-byte strings. The final checksum field is either null or a CBOR
+attempts_digest, logical_key, content_len, etag, checksum]`. IDs and digests
+are 32-byte strings. The `etag` field is a CBOR byte string containing the exact
+20-byte `ObjectEtag` encoding. The final checksum field is either null or a CBOR
 byte string containing the bounded canonical `ObjectChecksum` encoding
 described above. Commit sequence is the enclosing accepted commit sequence,
 independent of namespace mutation generations. The receipt binds the run's
-single upsert key, plaintext length, and checksum exactly. The run may also
+single upsert key, plaintext length, ETag, and checksum exactly. The run may also
 carry stale namespace tombstones for
 the same key and generation; they do not change the receipt binding. Each
-receipt is capped at 2,048 bytes, with a 1,024-byte key and a 128-byte printable
-ASCII ETag.
+receipt is capped at 2,048 bytes, with a 1,024-byte key and an exact 20-byte
+ETag encoding.
 
 The client-selection digest uses SHA-256 over
 `rs3:v3-multipart-client-selection:v2` followed by a zero byte, a big-endian
@@ -395,7 +401,7 @@ The selected-attempt digest uses the domain
 u64 count, then each big-endian u32 part number, 32-byte attempt ID,
 big-endian u64 plaintext length and 32-byte expected ciphertext digest.
 
-Root plaintext wire version 5 appends a big-endian u32 receipt count after the
+Root plaintext wire version 6 appends a big-endian u32 receipt count after the
 run catalog, followed by big-endian u32 lengths and canonical receipt bytes,
 sorted by upload ID. The latest 1,024 accepted completion results survive
 checkpoint, compaction and replay. A root snapshot replaces receipt state
@@ -765,9 +771,9 @@ do not qualify v03. See [Production Preview](../production-preview.md) and
 
 There is no stable repository-format promise yet. `commits/v01` is removed and
 unsupported, as is `commits/v02`, without migration support. The gateway reads
-and writes the preview `commits/v03` envelope with index-run wire version 9 and
-index-root wire version 5. The current reader rejects wire version 8 and other
-earlier preview layouts. Recreate evaluation repositories when the preview wire
+and writes the preview `commits/v03` envelope with index-run wire version 10 and
+index-root wire version 6. The current reader rejects wire versions 8 and 9 and
+other earlier preview layouts. Recreate evaluation repositories when the preview wire
 changes. Catalog, exact descriptors,
 framed streaming, and guarded metadata-only mixed-carrier compaction are
 integrated, while retained-provider restart/fault GC qualification and final

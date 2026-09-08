@@ -350,7 +350,7 @@ pub(super) fn list_page(
                 key: Some(key.to_owned()),
                 last_modified: Some(timestamp(entry.modified_at_ms)?),
                 size: Some(i64_len(entry.content_len)?),
-                e_tag: Some(etag(entry.content_len, entry.modified_at_ms)),
+                e_tag: Some(etag(&entry.etag)),
                 ..Object::default()
             })),
         );
@@ -592,8 +592,8 @@ fn timestamp_system_time(timestamp: &Timestamp) -> S3Result<SystemTime> {
         .ok_or_else(|| s3s::s3_error!(InvalidRequest, "timestamp is out of range"))
 }
 
-pub(super) fn etag(content_len: u64, modified_at_ms: i64) -> s3s::dto::ETag {
-    s3s::dto::ETag::Strong(format!("rs3-{modified_at_ms:x}-{content_len:x}"))
+pub(super) fn etag(etag: &rs3_types::ObjectEtag) -> s3s::dto::ETag {
+    s3s::dto::ETag::Strong(etag.to_s3_string())
 }
 
 pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
@@ -613,7 +613,7 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
                 "request body length did not match Content-Length"
             )
         }
-        RepositoryError::ObjectChecksumMismatch => {
+        RepositoryError::ObjectChecksumMismatch | RepositoryError::ContentMd5Mismatch => {
             s3s::s3_error!(BadDigest, "checksum did not match request body")
         }
         RepositoryError::ObjectBodyReadFailed | RepositoryError::ObjectChecksumUnavailable => {
@@ -715,12 +715,13 @@ mod tests {
     use bytes::Bytes;
     use futures_util::{StreamExt, stream};
     use rs3_repository::RepositoryListEntry;
-    use rs3_types::LogicalPath;
+    use rs3_types::{LogicalPath, Md5Digest, ObjectEtag};
     use s3s::dto::StreamingBlob;
     use std::time::Duration;
 
     fn entry(key: &str) -> RepositoryListEntry {
         RepositoryListEntry {
+            etag: ObjectEtag::single(Md5Digest::from_bytes([0; 16])),
             key: LogicalPath::new(key).unwrap_or_else(|error| panic!("{error}")),
             content_len: 1,
             modified_at_ms: 1,

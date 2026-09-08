@@ -3128,6 +3128,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hmac 0.12.1",
+ "md-5",
  "ring",
  "rs3-types",
  "sha2 0.10.9",
@@ -3246,7 +3247,9 @@ dependencies = [
 name = "rs3-types"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

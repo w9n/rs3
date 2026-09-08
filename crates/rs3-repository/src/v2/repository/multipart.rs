@@ -23,6 +23,7 @@ pub struct V3UploadedPart {
     part: PayloadPart,
     digest: [u8; 32],
     checksum: Option<ObjectChecksum>,
+    md5: rs3_types::Md5Digest,
 }
 
 impl V3UploadedPart {
@@ -51,9 +52,9 @@ impl V3UploadedPart {
         digest.finalize()
     }
 
-    /// Opaque preview part token; separate from stored ciphertext identity.
+    /// Plaintext MD5 ETag; internal attempt identity remains independently random.
     pub fn etag(&self) -> String {
-        hex::encode(self.part.attempt_id.as_bytes())
+        rs3_types::ObjectEtag::single(self.md5).to_s3_string()
     }
 }
 
@@ -78,6 +79,7 @@ pub struct V3MultipartUpload {
 /// Fully verified detached bytes awaiting logical, fenced publication.
 /// This object carries no authority to acknowledge a successful client write.
 pub struct V3VerifiedMultipartUpload {
+    pub(crate) etag: rs3_types::ObjectEtag,
     pub(crate) stored: Option<V2StoredStandalonePayload>,
     pub(crate) _inflight: V2InflightStandaloneObject,
 }
@@ -98,6 +100,7 @@ impl V3MultipartUpload {
         part_number: u32,
         read: Box<dyn BlobRead>,
         checksum: Option<UploadChecksum>,
+        expected_md5: Option<rs3_types::Md5Digest>,
     ) -> V2Result<V3UploadedPart> {
         if self.checksum_policy.is_some() != checksum.is_some() {
             return Err(V2FormatError::InvalidHeaderField);
@@ -134,20 +137,24 @@ impl V3MultipartUpload {
             ciphertext_len,
             self.stall_timeout,
             Arc::clone(&digest),
-        );
-        let backend = self
-            .backend
-            .upload_part(index, Box::new(body))
-            .await
-            .map_err(storage_to_v2)?;
+        )
+        .with_expected_md5(expected_md5);
+        let backend = self.backend.upload_part(index, Box::new(body)).await;
+        let digests = digest
+            .lock()
+            .map_err(|_| V2FormatError::StorageOperationFailed)?
+            .take();
+        if digests
+            .as_ref()
+            .is_some_and(|digests| expected_md5.is_some_and(|expected| expected != digests.md5))
+        {
+            return Err(V2FormatError::ContentMd5Mismatch);
+        }
+        let backend = backend.map_err(storage_to_v2)?;
         if backend.index() != index || backend.content_len() != ciphertext_len {
             return Err(V2FormatError::ProviderProfileFailed);
         }
-        let digest = digest
-            .lock()
-            .map_err(|_| V2FormatError::StorageOperationFailed)?
-            .take()
-            .ok_or(V2FormatError::ProviderProfileFailed)?;
+        let digests = digests.ok_or(V2FormatError::ProviderProfileFailed)?;
         // EncryptedPartBody records its digest only after exact plaintext EOF.
         // A trailer handoff is therefore resolved before replacing the current part.
         let checksum = checksum
@@ -169,7 +176,8 @@ impl V3MultipartUpload {
             scope: Arc::clone(&self.scope),
             backend,
             part,
-            digest,
+            digest: digests.ciphertext,
+            md5: digests.md5,
             checksum,
         };
         self.parts
@@ -283,9 +291,13 @@ impl<S: BlobStore> V2CommitStore<S> {
                 return Err(error);
             }
         };
+        let etag =
+            rs3_crypto::multipart_etag(&parts.iter().map(|part| part.md5).collect::<Vec<_>>())
+                .map_err(|_| V2FormatError::InvalidHeaderField)?;
         let Some(layout) = layout else {
             abort_client_upload(upload.backend).await?;
             return Ok(V3VerifiedMultipartUpload {
+                etag,
                 stored: None,
                 _inflight: upload.inflight,
             });
@@ -346,7 +358,9 @@ impl<S: BlobStore> V2CommitStore<S> {
             )
             .await?;
         Ok(V3VerifiedMultipartUpload {
+            etag,
             stored: Some(V2StoredStandalonePayload {
+                etag,
                 object_id: upload.object_id,
                 version_id,
                 object_len: expected_len,

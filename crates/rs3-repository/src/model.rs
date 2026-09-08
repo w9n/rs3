@@ -5,6 +5,8 @@ use rs3_types::{LegalHoldStatus, LogicalPath, RetentionPolicy};
 /// Options for a trusted repository PUT.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryPutOptions {
+    /// Optional client MD5 expectation, checked against repository-computed plaintext.
+    pub expected_md5: Option<rs3_types::Md5Digest>,
     /// Optional verified checksum, resolved before trusted metadata is staged.
     pub checksum: Option<crate::UploadChecksum>,
     /// Reject the write if the client-visible key already exists.
@@ -18,6 +20,8 @@ pub struct RepositoryPutOptions {
 /// Metadata returned for a client-visible object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryObjectMetadata {
+    /// Accepted plaintext ETag stored inside authenticated encryption.
+    pub etag: rs3_types::ObjectEtag,
     /// Verified plaintext checksum stored inside authenticated encryption.
     pub checksum: Option<rs3_types::ObjectChecksum>,
     /// Client-visible key inside the trusted boundary.
@@ -35,6 +39,8 @@ pub struct RepositoryObjectMetadata {
 /// Entry returned from trusted namespace listing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryListEntry {
+    /// Accepted plaintext ETag, independent of operation identity.
+    pub etag: rs3_types::ObjectEtag,
     /// Client-visible key inside the trusted boundary.
     pub key: LogicalPath,
     /// Client-visible content length.

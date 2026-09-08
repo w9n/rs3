@@ -250,6 +250,7 @@ where
                         return Ok(None);
                     };
                     mutations.push(IndexMutation::Upsert(IndexUpsert {
+                        etag: manifest.etag,
                         checksum: manifest.checksum.clone(),
                         mutation_ordinal,
                         blind_key: IndexBlindKey::try_from(&entry.blind_key)
@@ -750,6 +751,7 @@ pub(in crate::v2) fn apply_packed_index_run(
                 state.manifests.insert(
                     manifest_id.clone(),
                     TrustedManifest {
+                        etag: upsert.etag,
                         checksum: upsert.checksum,
                         key: upsert.path,
                         content_len: upsert.content_len,

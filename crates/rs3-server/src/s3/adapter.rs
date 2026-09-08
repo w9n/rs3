@@ -2,6 +2,7 @@
 
 use super::S3BoundaryError;
 use super::checksum::{ChecksumRequest, checksum_output, validate_body};
+use super::content_md5::put_expected_md5;
 use super::mapping::{
     ListPage, collect_body_reserving, content_range, etag, i64_len, legal_hold_header,
     legal_hold_output, list_page as map_list_page, list_versions_output, logical_path, max_keys,
@@ -51,7 +52,7 @@ fn put_object_output(metadata: &rs3_repository::RepositoryObjectMetadata) -> Put
         checksum_sha1: checksum.checksum_sha1,
         checksum_sha256: checksum.checksum_sha256,
         checksum_type: checksum.checksum_type,
-        e_tag: Some(etag(metadata.content_len, metadata.modified_at_ms)),
+        e_tag: Some(etag(&metadata.etag)),
         ..Default::default()
     }
 }
@@ -841,6 +842,8 @@ impl S3 for GatewayS3Service {
             self.check_bucket(&input.bucket)?;
             self.check_mutation_allowed()?;
             validate_put_object_request(&input, self.max_put_object_bytes)?;
+            let expected_md5 =
+                put_expected_md5(&input, &req.headers).map_err(|error| error.into_s3_error())?;
             let checksum_request =
                 ChecksumRequest::from_put(&input, &req.headers, req.trailing_headers)
                     .map_err(|error| error.into_s3_error())?;
@@ -913,6 +916,7 @@ impl S3 for GatewayS3Service {
                         declared_len,
                         stream,
                         RepositoryPutOptions {
+                            expected_md5,
                             checksum: Some(checksum.clone()),
                             create_only,
                             retention,
@@ -999,6 +1003,7 @@ impl S3 for GatewayS3Service {
                             key,
                             stream,
                             RepositoryPutOptions {
+                                expected_md5,
                                 checksum: Some(checksum.clone()),
                                 create_only,
                                 retention,
@@ -1041,6 +1046,7 @@ impl S3 for GatewayS3Service {
                         key,
                         body,
                         RepositoryPutOptions {
+                            expected_md5,
                             checksum: Some(checksum.clone()),
                             create_only,
                             retention,
@@ -1089,6 +1095,7 @@ impl S3 for GatewayS3Service {
                     key,
                     body,
                     RepositoryPutOptions {
+                        expected_md5,
                         checksum: Some(checksum.clone()),
                         create_only,
                         retention,
@@ -1210,7 +1217,7 @@ impl S3 for GatewayS3Service {
                 body: Some(StreamingBlob::from(response_body)),
                 content_length: Some(content_length),
                 content_type: Some("application/octet-stream".to_owned()),
-                e_tag: Some(etag(metadata.content_len, metadata.modified_at_ms)),
+                e_tag: Some(etag(&metadata.etag)),
                 last_modified: Some(timestamp(metadata.modified_at_ms)?),
                 ..GetObjectOutput::default()
             };
@@ -1297,7 +1304,7 @@ impl S3 for GatewayS3Service {
                 accept_ranges: Some("bytes".to_owned()),
                 content_length: Some(i64_len(content_length)?),
                 content_type: Some("application/octet-stream".to_owned()),
-                e_tag: Some(etag(metadata.content_len, metadata.modified_at_ms)),
+                e_tag: Some(etag(&metadata.etag)),
                 last_modified: Some(timestamp(metadata.modified_at_ms)?),
                 object_lock_mode,
                 object_lock_retain_until_date,

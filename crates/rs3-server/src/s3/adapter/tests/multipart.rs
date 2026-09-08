@@ -1,4 +1,6 @@
 use super::*;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use s3s::dto::*;
 use std::sync::Arc;
 use tokio::sync::{Barrier, Notify};
@@ -106,6 +108,54 @@ async fn multipart_stalled_body_maps_outer_timeout_and_keeps_session_retryable()
             .expect("retry completes");
         assert_eq!(accepted_v2_sequence(&service).await, 2);
     }
+}
+
+#[tokio::test]
+async fn multipart_content_md5_validates_before_replacing_a_part_and_returns_standard_etags() {
+    let service = gateway_service().await;
+    let id = create(&service).await;
+    // Frozen MD5("body") from RFC 1321-compatible tooling.
+    let part_md5 =
+        STANDARD.encode(hex::decode("841a2d689ad86bd1611447453c22c6fc").expect("vector"));
+    let mut first = part_input(&id, 1, body(Bytes::from_static(b"body")), 4);
+    first.content_md5 = Some(part_md5);
+    let part = service
+        .upload_part(s3_request(first))
+        .await
+        .expect("verified part")
+        .output
+        .e_tag
+        .expect("part ETag");
+    assert_eq!(
+        part,
+        ETag::Strong("841a2d689ad86bd1611447453c22c6fc".to_owned())
+    );
+
+    let mut replacement = part_input(&id, 1, body(Bytes::from_static(b"tail")), 4);
+    replacement.content_md5 = Some(STANDARD.encode([0_u8; 16]));
+    let error = service
+        .upload_part(s3_request(replacement))
+        .await
+        .expect_err("mismatched replacement");
+    assert_eq!(error.code().as_str(), "BadDigest");
+    let listed = service
+        .list_parts(s3_request(list_input(&id)))
+        .await
+        .expect("list retained part")
+        .output
+        .parts
+        .expect("part list");
+    assert_eq!(listed[0].e_tag, Some(part.clone()));
+
+    let complete = service
+        .complete_multipart_upload(s3_request(complete_input(&id, vec![(1, part)])))
+        .await
+        .expect("complete")
+        .output;
+    let expected = rs3_crypto::multipart_etag(&[rs3_crypto::md5(b"body")])
+        .expect("one-part aggregate")
+        .to_s3_string();
+    assert_eq!(complete.e_tag, Some(ETag::Strong(expected)));
 }
 
 #[tokio::test]

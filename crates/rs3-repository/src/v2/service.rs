@@ -720,8 +720,13 @@ where
         let _guard = self.mutation_lock.lock().await;
         let _publication_guard = self.publication_lock.write().await;
         let base_anchor = self.ensure_accepted_anchor_matches(anchor).await?;
-        let (staged, rollback) =
-            self.stage_put_metadata_sync_with_rollback(key, plaintext_len, options, None)?;
+        let (staged, rollback) = self.stage_put_metadata_sync_with_rollback(
+            key,
+            plaintext_len,
+            options,
+            None,
+            upload.stored.etag,
+        )?;
         let carrier = Arc::new(V2StandaloneStreamCarrierReference {
             object_id: upload.stored.object_id.clone(),
             version_id: upload.stored.version_id.clone(),
@@ -987,8 +992,14 @@ where
             u64::try_from(body.len()).map_err(|_| RepositoryError::CommitFailed {
                 reason: "payload length does not fit in u64".to_owned(),
             })?;
-        let (staged, checkpoint) =
-            self.stage_put_metadata_sync_with_rollback(key, plaintext_len, options, Some(body))?;
+        let etag = rs3_types::ObjectEtag::single(rs3_crypto::md5(&body));
+        let (staged, checkpoint) = self.stage_put_metadata_sync_with_rollback(
+            key,
+            plaintext_len,
+            options,
+            Some(body),
+            etag,
+        )?;
 
         Ok((staged.metadata, V2StagedPutRollback { checkpoint }))
     }
@@ -999,7 +1010,14 @@ where
         plaintext_len: u64,
         options: RepositoryPutOptions,
         pending_body: Option<Bytes>,
+        etag: rs3_types::ObjectEtag,
     ) -> Result<(StagedV2Put, PendingV2Checkpoint)> {
+        if options
+            .expected_md5
+            .is_some_and(|expected| etag.part_count().is_some() || expected != etag.digest())
+        {
+            return Err(RepositoryError::ContentMd5Mismatch);
+        }
         self.validate_client_object_lock(&options)?;
         let retention = strongest_retention_policy(
             self.repository.options.default_retention,
@@ -1070,6 +1088,7 @@ where
             legal_hold: options.legal_hold,
         };
         let manifest = TrustedManifest {
+            etag,
             checksum,
             key: key.clone(),
             content_len: plaintext_len,
@@ -1173,14 +1192,7 @@ where
             .manifests
             .get(&entry.manifest_id)
             .cloned()
-            .unwrap_or_else(|| TrustedManifest {
-                checksum: None,
-                key: key.clone(),
-                content_len: entry.content_len,
-                modified_at_ms: entry.modified_at_ms,
-                retention: entry.retention,
-                legal_hold: entry.legal_hold,
-            });
+            .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
         Ok(V2ResolvedObject {
             metadata: manifest.into_metadata(),
             entry,
@@ -1793,6 +1805,17 @@ where
         for rollback in rollbacks.into_iter().rev() {
             pending.rollback(rollback)?;
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_trusted_manifests_for_tests(&self) -> Result<()> {
+        self.accepted
+            .write()
+            .map_err(|_| RepositoryError::StatePoisoned)?
+            .repository
+            .manifests
+            .clear();
         Ok(())
     }
 
@@ -2707,6 +2730,7 @@ fn current_time_ms() -> i64 {
 
 fn v2_repository_error(error: V2FormatError) -> RepositoryError {
     match error {
+        V2FormatError::ContentMd5Mismatch => return RepositoryError::ContentMd5Mismatch,
         V2FormatError::ObjectTooLarge => return RepositoryError::ObjectTooLarge,
         V2FormatError::ObjectLengthMismatch => {
             return RepositoryError::ObjectLengthMismatch;
