@@ -17,6 +17,12 @@ pub enum RepositoryError {
     /// The client-visible object already exists and create-only mode was requested.
     #[error("object already exists")]
     AlreadyExists(LogicalPath),
+    /// A source condition did not match the accepted object.
+    #[error("object precondition failed")]
+    PreconditionFailed,
+    /// Copy options are malformed or exceed the request bound.
+    #[error("invalid copy options")]
+    InvalidCopyOptions,
     /// The object exceeds a configured size limit.
     #[error("object exceeds configured maximum size")]
     ObjectTooLarge,

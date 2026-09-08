@@ -385,7 +385,11 @@ impl<S: BlobStore + Clone> V2Repository<S> {
             completion.key,
             len,
             completion.options,
-            (len == 0).then(Bytes::new),
+            if len == 0 {
+                super::StagedPayload::Buffered(Bytes::new())
+            } else {
+                super::StagedPayload::Detached
+            },
             completion.verified.etag,
         )?;
         let receipt = CompletionReceipt {

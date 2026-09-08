@@ -599,7 +599,12 @@ pub(super) fn etag(etag: &rs3_types::ObjectEtag) -> s3s::dto::ETag {
 pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
     match error {
         RepositoryError::NotFound(_) => s3s::s3_error!(NoSuchKey),
-        RepositoryError::AlreadyExists(_) => s3s::s3_error!(PreconditionFailed),
+        RepositoryError::AlreadyExists(_) | RepositoryError::PreconditionFailed => {
+            s3s::s3_error!(PreconditionFailed)
+        }
+        RepositoryError::InvalidCopyOptions => {
+            s3s::s3_error!(InvalidRequest, "invalid CopyObject source condition")
+        }
         RepositoryError::CommitBackpressure => {
             s3s::s3_error!(ServiceUnavailable, "commit coordinator is overloaded")
         }

@@ -40,8 +40,8 @@ use rs3_repository::v2::{
     check_v2_provider_conformance, v2_format_object_id,
 };
 use rs3_repository::{
-    DeleteOutcome, RepositoryError, RepositoryListEntry, RepositoryObjectMetadata,
-    RepositoryOptions, RepositoryPutOptions,
+    DeleteOutcome, RepositoryCopyOptions, RepositoryError, RepositoryListEntry,
+    RepositoryObjectMetadata, RepositoryOptions, RepositoryPutOptions,
 };
 #[cfg(test)]
 use rs3_storage::MemoryBlobStore;
@@ -416,6 +416,20 @@ impl RuntimeRepository {
     ) -> Result<RuntimeCommittedPut, RepositoryError> {
         self.coordinator
             .put_committed(key, body, options)
+            .await
+            .map(|committed| RuntimeCommittedPut {
+                metadata: committed.metadata,
+            })
+    }
+
+    pub(super) async fn copy_committed(
+        &self,
+        source: LogicalPath,
+        destination: LogicalPath,
+        options: RepositoryCopyOptions,
+    ) -> Result<RuntimeCommittedPut, RepositoryError> {
+        self.coordinator
+            .copy_committed(source, destination, options)
             .await
             .map(|committed| RuntimeCommittedPut {
                 metadata: committed.metadata,

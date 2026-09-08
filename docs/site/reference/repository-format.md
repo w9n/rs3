@@ -287,6 +287,30 @@ shared-liveness leakage; Kopia already chunks, packs, and deduplicates its own
 repository blobs. Any future deduplicating mode needs an explicit capability
 and its own security and GC qualification.
 
+## Metadata-Only Copies
+
+A supported same-bucket `CopyObject` captures a current accepted namespace
+entry under the writer fence and creates a fresh encrypted destination manifest
+and `INDEX_RUN` upsert. The upsert preserves the source plaintext length, ETag,
+flexible checksum, effective protection, and exact authenticated payload
+reference. It creates no payload-pack record, detached payload, plaintext
+payload read, re-encryption, or carrier rewrite. A later source overwrite or
+logical delete therefore cannot alter the copied value.
+
+The copied upsert is an ordinary staged mutation: it shares admission bounds,
+compatible protection-cohort batching, signed publication, anchor advancement,
+and rollback behavior with writes. Source `If-Match`, when supplied, compares
+the trusted accepted ETag at capture rather than a provider latest object. The
+format has no client-visible historical copy reference and no metadata-replace
+variant.
+
+For retained copies, the provider's exact source carrier and restore metadata
+dependencies must cover the fresh copy timestamp before the new entry is
+acknowledged. The check can use bounded metadata `HEAD` and retention-extension
+operations, but never payload reads or a full-GC traversal. Missing exact
+versions, deadlines, or protection facts fail closed; a copy never shortens the
+source protection clock.
+
 ## Framed Index Runs
 
 `INDEX_RUN` is the append-friendly unit for namespace mutations. Runs are
@@ -662,9 +686,13 @@ explicitly protected historical anchor. For each root it includes:
 
 A live payload reference protects its exact pack commit or detached object version. It does
 not recursively protect every ancestor merely because the payload was first
-written in an old commit. GC resolves active runs by generation before deriving
-these exact payload roots. Empty foreground values have no payload dependency. Conservative over-retention is permitted when a mark
-cannot be proven complete; deletion on an incomplete or ambiguous mark is not.
+written in an old commit. A metadata-only copy adds another live encrypted
+reference to that same exact carrier; source overwrite or deletion does not
+break the copied reference, and exact-root GC retains it until no live or
+protected root requires it. GC resolves active runs by generation before
+deriving these exact payload roots. Empty foreground values have no payload
+dependency. Conservative over-retention is permitted when a mark cannot be
+proven complete; deletion on an incomplete or ambiguous mark is not.
 
 GC must finish the whole mark phase before deleting, fail closed on missing or
 malformed reachable data, treat unknown retention or legal-hold state as

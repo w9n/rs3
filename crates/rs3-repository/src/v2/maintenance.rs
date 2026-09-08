@@ -14,7 +14,7 @@ use super::{V2CommitKind, V2IndexRoot, V2IndexRootRunRef, V2SectionType, open_v2
 use crate::state::RepositoryState;
 use async_trait::async_trait;
 use bytes::Bytes;
-use rs3_index::{PayloadReference, V2StandaloneStreamCarrierReference};
+use rs3_index::{NamespaceEntry, PayloadReference, V2StandaloneStreamCarrierReference};
 use rs3_storage::{
     BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore,
     ByteRange, PutOptions, StorageError,
@@ -2719,6 +2719,223 @@ where
         })
     }
 
+    /// Protects an accepted copy reference while its caller excludes publication and GC.
+    /// At most three exact targets and nine backend operations; never reads payload bytes.
+    pub(super) async fn protect_copy_source<A, G>(
+        &self,
+        anchor: &A,
+        guard: &G,
+        base_anchor: &V2AnchorState,
+        source: &NamespaceEntry,
+        modified_at_ms: i64,
+    ) -> V2Result<()>
+    where
+        A: V2CommitAnchor,
+        G: V2MaintenanceGuard + ?Sized,
+    {
+        if source.legal_hold == Some(LegalHoldStatus::On) {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        let Some(policy) = active_retention(strongest_retention(
+            self.retention_policy(),
+            source.retention,
+        )) else {
+            return Ok(());
+        };
+        if self.provider_profile() != V2ProviderProfile::RetainedVersionObjectLock {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        let deadline = modified_at_ms
+            .checked_add(i64::from(policy.retain_days) * 86_400_000)
+            .filter(|_| modified_at_ms >= 0)
+            .ok_or(V2FormatError::ProviderProfileFailed)?;
+        let keyring = self
+            .options()
+            .maintenance_keyring_envelope_ref
+            .as_ref()
+            .ok_or(V2FormatError::ProviderProfileFailed)?;
+        if keyring.commit_ref()? != self.options().keyring_envelope_ref {
+            return Err(V2FormatError::InvalidFormatRoot);
+        }
+        let mut targets = Vec::with_capacity(3);
+        let carrier = match &source.payload_ref {
+            Some(PayloadReference::V2Pack { carrier, .. }) => Some((
+                carrier.commit_key.clone(),
+                carrier.commit_version_id.clone(),
+                carrier.commit_stored_len,
+                &carrier.content_key_id,
+            )),
+            Some(PayloadReference::V2StandaloneStream { carrier }) => Some((
+                carrier.object_id.clone(),
+                carrier.version_id.clone(),
+                carrier.stored_len,
+                &carrier.payload_layout.key_id,
+            )),
+            None if source.content_len == 0 => None,
+            _ => return Err(V2FormatError::InvalidHeaderField),
+        };
+        if let Some((object_id, version_id, stored_len, content_key_id)) = carrier {
+            // Historical envelope IDs/digests remain immutable AEAD context. Restore
+            // uses the historical content key carried by the configured current keyring.
+            if !self.keyring().descriptors().iter().any(|key| {
+                &key.id == content_key_id
+                    && key.purpose == rs3_types::KeyPurpose::Content
+                    && key.status.is_enabled_for_lookup()
+            }) {
+                return Err(V2FormatError::ProviderProfileFailed);
+            }
+            targets.push((object_id, version_id, Some(stored_len)));
+        }
+        targets.extend([
+            (
+                self.options().format_ref.object_id.clone(),
+                self.options().format_ref.version_id.clone(),
+                None,
+            ),
+            (keyring.object_id.clone(), keyring.version_id.clone(), None),
+        ]);
+        // Reject incomplete exact references before any provider operation.
+        if targets
+            .iter()
+            .any(|(_, version, length)| version.is_none() || *length == Some(0))
+        {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        for (object_id, version_id, stored_len) in targets {
+            guard.verify_v2_maintenance(Some(base_anchor)).await?;
+            if anchor.read_v2().await?.as_ref() != Some(base_anchor) {
+                return Err(V2FormatError::StaleAnchor);
+            }
+            let observed = self
+                .store()
+                .head_at(&object_id, version_id.as_ref())
+                .await
+                .map_err(|_| V2FormatError::StorageOperationFailed)?;
+            if observed.object_id != object_id
+                || observed.version_id != version_id
+                || observed.content_len == 0
+                || stored_len.is_some_and(|length| length != observed.content_len)
+            {
+                return Err(V2FormatError::ProviderProfileFailed);
+            }
+            let observed_deadline = observed
+                .retain_until_ms
+                .ok_or(V2FormatError::ProviderProfileFailed)?;
+            let observed_policy =
+                active_retention(observed.retention).ok_or(V2FormatError::ProviderProfileFailed)?;
+            let required_deadline = deadline.max(observed_deadline);
+            let mut required_policy = strongest_retention(Some(policy), Some(observed_policy))
+                .ok_or(V2FormatError::ProviderProfileFailed)?;
+            if observed_deadline >= deadline
+                && retention_satisfies(observed.retention.as_ref(), &required_policy)
+            {
+                continue;
+            }
+            // The storage API accepts relative days. Round upward to cover the fixed
+            // copy timestamp even when it is slightly ahead of this sampled clock.
+            let remaining_ms = required_deadline
+                .checked_sub(current_time_ms())
+                .ok_or(V2FormatError::ProviderProfileFailed)?
+                .max(0);
+            let days = u32::try_from(
+                remaining_ms / 86_400_000 + i64::from(remaining_ms % 86_400_000 != 0),
+            )
+            .map_err(|_| V2FormatError::ProviderProfileFailed)?;
+            required_policy.retain_days = required_policy.retain_days.max(days);
+            let target = V2RetentionTarget {
+                object_id,
+                version_id,
+                stored_len: observed.content_len,
+                required_retention: Some(required_policy),
+                required_legal_hold: observed.legal_hold,
+            };
+            self.extend_and_verify_retention_target(
+                anchor,
+                guard,
+                Some(base_anchor),
+                &target,
+                Some(required_deadline),
+            )
+            .await?;
+        }
+        guard.verify_v2_maintenance(Some(base_anchor)).await?;
+        if anchor.read_v2().await?.as_ref() != Some(base_anchor) {
+            return Err(V2FormatError::StaleAnchor);
+        }
+        Ok(())
+    }
+
+    async fn extend_and_verify_retention_target<A, G>(
+        &self,
+        anchor: &A,
+        guard: &G,
+        base_anchor: Option<&V2AnchorState>,
+        target: &V2RetentionTarget,
+        fixed_deadline: Option<i64>,
+    ) -> V2Result<()>
+    where
+        A: V2CommitAnchor,
+        G: V2MaintenanceGuard + ?Sized,
+    {
+        guard.verify_v2_maintenance(base_anchor).await?;
+        if anchor.read_v2().await? != base_anchor.cloned() {
+            return Err(V2FormatError::StaleAnchor);
+        }
+        if self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock
+            && target.version_id.is_none()
+        {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        let policy = target
+            .required_retention
+            .ok_or(V2FormatError::ProviderProfileFailed)?;
+        // Copies retain their captured promise; maintenance samples only after
+        // verifying the fence and anchor, immediately before provider extension.
+        let required_deadline = match fixed_deadline {
+            Some(deadline) => deadline,
+            None => required_retain_until_ms(policy)?,
+        };
+        self.store()
+            .extend_retention_at(&target.object_id, target.version_id.as_ref(), policy)
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed)?;
+        let exact = self
+            .store()
+            .head_at(&target.object_id, target.version_id.as_ref())
+            .await
+            .map_err(|_| V2FormatError::ProviderProfileFailed)?;
+        let object_matches = exact.object_id == target.object_id;
+        let version_matches = exact.version_id == target.version_id;
+        let length_matches = exact.content_len == target.stored_len;
+        let retention_matches = retention_satisfies(exact.retention.as_ref(), &policy);
+        let legal_hold_matches = target.required_legal_hold != Some(LegalHoldStatus::On)
+            || exact.legal_hold == Some(LegalHoldStatus::On);
+        let deadline_matches = exact
+            .retain_until_ms
+            .is_some_and(|actual| actual >= required_deadline);
+        if !(object_matches
+            && version_matches
+            && length_matches
+            && retention_matches
+            && legal_hold_matches
+            && deadline_matches)
+        {
+            tracing::error!(
+                target: "rs3_repository",
+                operation = "v2_retention_renewal_verify",
+                object_matches,
+                version_matches,
+                length_matches,
+                retention_matches,
+                legal_hold_matches,
+                deadline_matches,
+                "exact retention renewal postcondition failed",
+            );
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        Ok(())
+    }
+
     async fn apply_retention_renewal<A, G>(
         &self,
         anchor: &A,
@@ -2732,8 +2949,6 @@ where
         A: V2CommitAnchor,
         G: V2MaintenanceGuard,
     {
-        let retained_profile =
-            self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock;
         let mut renewed_count = 0_usize;
         let mut renewed_bytes = 0_u64;
 
@@ -2743,57 +2958,9 @@ where
             if cancellation.is_cancelled() {
                 return Err(V2FormatError::MaintenanceCancelled);
             }
-            let policy = target
-                .required_retention
-                .ok_or(V2FormatError::ProviderProfileFailed)?;
-            guard.verify_v2_maintenance(base_anchor).await?;
-            if anchor.read_v2().await? != base_anchor.cloned() {
-                return Err(V2FormatError::StaleAnchor);
-            }
-            if retained_profile && target.version_id.is_none() {
-                return Err(V2FormatError::ProviderProfileFailed);
-            }
             pace_maintenance_operation(op_pacing_delay).await;
-
-            let required_retain_until_ms = required_retain_until_ms(policy)?;
-            self.store()
-                .extend_retention_at(&target.object_id, target.version_id.as_ref(), policy)
-                .await
-                .map_err(|_| V2FormatError::StorageOperationFailed)?;
-            let exact = self
-                .store()
-                .head_at(&target.object_id, target.version_id.as_ref())
-                .await
-                .map_err(|_| V2FormatError::ProviderProfileFailed)?;
-            let object_matches = exact.object_id == target.object_id;
-            let version_matches = exact.version_id == target.version_id;
-            let length_matches = exact.content_len == target.stored_len;
-            let retention_matches = retention_satisfies(exact.retention.as_ref(), &policy);
-            let legal_hold_matches = target.required_legal_hold != Some(LegalHoldStatus::On)
-                || exact.legal_hold == Some(LegalHoldStatus::On);
-            let deadline_matches = exact
-                .retain_until_ms
-                .is_some_and(|actual| actual >= required_retain_until_ms);
-            if !(object_matches
-                && version_matches
-                && length_matches
-                && retention_matches
-                && legal_hold_matches
-                && deadline_matches)
-            {
-                tracing::error!(
-                    target: "rs3_repository",
-                    operation = "v2_retention_renewal_verify",
-                    object_matches,
-                    version_matches,
-                    length_matches,
-                    retention_matches,
-                    legal_hold_matches,
-                    deadline_matches,
-                    "exact retention renewal postcondition failed",
-                );
-                return Err(V2FormatError::ProviderProfileFailed);
-            }
+            self.extend_and_verify_retention_target(anchor, guard, base_anchor, &target, None)
+                .await?;
             renewed_count = renewed_count.saturating_add(1);
             renewed_bytes = renewed_bytes.saturating_add(target.stored_len);
         }

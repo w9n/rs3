@@ -65,6 +65,22 @@ behavior, not metadata preservation or all rclone upload options. Earlier
 Velero qualification preceded the MD5 format update and was not repeated for
 this change.
 
+Copy qualification uses the final `s3,k8s` release binary with rclone 1.75.0
+and AWS CLI 2.34.24. Direct rclone `moveto` passes for a 4 KiB packed object
+and an AWS-created 100 MiB multipart object on memory and RustFS. Each move
+uses `CopyObject` followed by `DeleteObject`, without payload download/upload
+fallback. ETag, SHA256 checksum/type, length and restored bytes remain exact
+after source deletion. RustFS provider traces record zero source-payload reads
+or writes during both moves; normal encrypted metadata publication still occurs.
+
+A fresh gateway process restores both copied destinations using the unchanged
+Kubernetes Lease anchor, with repository initialization disabled. This is a
+graceful process-restart check, not crash takeover or retained-provider
+qualification. Source-condition mismatch, cross-bucket copy and metadata
+`REPLACE` reject without creating destinations. COPY accepts the client's inert
+content/user metadata and default `STANDARD` storage class; these results do
+not qualify arbitrary metadata preservation or other copy extensions.
+
 `just fuzz-smoke` exercises commit headers/objects, canonical CBOR, both
 repository-envelope purposes, recovery bundles, index runs/roots, format roots,
 payload packs and detached single-part payloads. It copies raw seeds and frozen

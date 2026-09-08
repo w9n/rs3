@@ -24,8 +24,8 @@ pub use keyring_envelope::{
     KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE, keyring_envelope_object_id, store_keyring_envelope,
 };
 pub use model::{
-    DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry, RepositoryObjectMetadata,
-    RepositoryPutOptions,
+    DeleteOutcome, PhysicalDeleteOutcome, RepositoryCopyOptions, RepositoryListEntry,
+    RepositoryObjectMetadata, RepositoryPutOptions,
 };
 pub use payload::{
     DEFAULT_PAYLOAD_SEGMENT_SIZE, MAX_PAYLOAD_SEGMENT_SIZE, effective_payload_segment_size,

@@ -566,3 +566,128 @@ async fn canceled_immediate_publisher_keeps_ownership_until_resolution() {
         Bytes::from_static(b"first")
     );
 }
+
+#[tokio::test]
+async fn copy_successor_binds_accepted_source_while_overwrite_is_publishing() {
+    let f = Fixture::new().await;
+    let original = must_repo(f.repository.head(&key("shared")));
+    let first = f.pause(false).await;
+    let copy = tokio::spawn({
+        let c = Arc::clone(&f.coordinator);
+        async move {
+            c.copy_committed(
+                key("shared"),
+                key("copied"),
+                crate::RepositoryCopyOptions {
+                    source_if_match: Some(original.etag.to_s3_string()),
+                },
+            )
+            .await
+        }
+    });
+    f.staged_successor().await;
+    assert!(matches!(
+        f.repository.head(&key("copied")),
+        Err(RepositoryError::NotFound(_))
+    ));
+    f.store.commit_put_pause.release.notify_one();
+    must_repo(bounded(first).await.expect("overwriting put"));
+    let copied = must_repo(bounded(copy).await.expect("copy task"));
+    assert_eq!(copied.metadata.etag, original.etag);
+    let fresh = f.reopened(copied.anchor_state).await;
+    assert_eq!(
+        must_repo(fresh.get_range(&key("shared"), ByteRange::Full).await),
+        Bytes::from_static(b"first")
+    );
+    assert_eq!(
+        must_repo(fresh.get_range(&key("copied"), ByteRange::Full).await),
+        Bytes::from_static(b"base")
+    );
+}
+
+#[tokio::test]
+async fn copy_successor_rolls_back_with_failed_prefix_and_cancelled_waiter_remains_owned() {
+    for fail_prefix in [true, false] {
+        let f = Fixture::new().await;
+        let first = f.pause(fail_prefix).await;
+        let copy = tokio::spawn({
+            let c = Arc::clone(&f.coordinator);
+            async move {
+                c.copy_committed(key("shared"), key("copied"), Default::default())
+                    .await
+            }
+        });
+        f.staged_successor().await;
+        if !fail_prefix {
+            copy.abort();
+        }
+        f.store.commit_put_pause.release.notify_one();
+        let result = bounded(first).await.expect("prefix task");
+        if fail_prefix {
+            assert!(result.is_err());
+            assert!(bounded(copy).await.expect("copy task").is_err());
+            assert!(matches!(
+                f.repository.head(&key("copied")),
+                Err(RepositoryError::NotFound(_))
+            ));
+            assert_eq!(
+                must_repo(f.repository.pending_operation_count_for_tests()),
+                0
+            );
+        } else {
+            must_repo(result);
+            must_repo(bounded(f.coordinator.write_index_snapshot()).await);
+            assert_eq!(
+                must_repo(
+                    f.repository
+                        .get_range(&key("copied"), ByteRange::Full)
+                        .await
+                ),
+                Bytes::from_static(b"base")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn copy_waits_for_maintenance_exclusion_and_unpublished_source_becomes_exact_before_capture()
+{
+    let f = Fixture::new().await;
+    let window = must_repo(f.coordinator.begin_maintenance_window().await);
+    let copy = f
+        .coordinator
+        .copy_committed(key("shared"), key("copied"), Default::default());
+    tokio::pin!(copy);
+    assert!(futures_util::poll!(&mut copy).is_pending());
+    assert_eq!(
+        must_repo(f.repository.pending_operation_count_for_tests()),
+        0
+    );
+    drop(window);
+    must_repo(bounded(copy).await);
+    f.store.commit_put_pause.mode.store(1, Ordering::SeqCst);
+    let source = f.put("new-source", b"new accepted bytes");
+    bounded(f.store.commit_put_pause.entered.notified()).await;
+    let second_copy = tokio::spawn({
+        let c = Arc::clone(&f.coordinator);
+        async move {
+            c.copy_committed(key("new-source"), key("new-copy"), Default::default())
+                .await
+        }
+    });
+    assert!(matches!(
+        f.repository.head(&key("new-source")),
+        Err(RepositoryError::NotFound(_))
+    ));
+    f.store.commit_put_pause.release.notify_one();
+    must_repo(bounded(source).await.expect("source task"));
+    must_repo(bounded(second_copy).await.expect("copy task"));
+    assert_eq!(
+        must_repo(
+            f.repository
+                .get_range(&key("new-copy"), ByteRange::Full)
+                .await
+        ),
+        Bytes::from_static(b"new accepted bytes")
+    );
+}

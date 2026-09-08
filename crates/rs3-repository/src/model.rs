@@ -17,6 +17,37 @@ pub struct RepositoryPutOptions {
     pub legal_hold: Option<LegalHoldStatus>,
 }
 
+/// Options for copying one accepted object within a repository.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RepositoryCopyOptions {
+    /// Optional bounded, unquoted source ETag checked at accepted source capture.
+    pub source_if_match: Option<String>,
+}
+
+impl std::fmt::Debug for RepositoryCopyOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RepositoryCopyOptions")
+            .field("source_if_match_present", &self.source_if_match.is_some())
+            .finish()
+    }
+}
+
+impl RepositoryCopyOptions {
+    pub(crate) fn validate(&self) -> crate::Result<()> {
+        if self.source_if_match.as_ref().is_some_and(|value| {
+            value.is_empty()
+                || value.len() > 128
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() && byte != b'"')
+        }) {
+            return Err(crate::RepositoryError::InvalidCopyOptions);
+        }
+        Ok(())
+    }
+}
+
 /// Metadata returned for a client-visible object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryObjectMetadata {

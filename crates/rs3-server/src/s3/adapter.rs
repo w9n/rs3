@@ -18,18 +18,20 @@ use crate::{AdminReadinessSource, AdminRuntimeFactsSource, GatewayMode, RuntimeC
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, stream};
 use rs3_repository::v2::V2AuthenticatedReadBody;
-use rs3_repository::{RepositoryError, RepositoryPutOptions};
+use rs3_repository::{RepositoryCopyOptions, RepositoryError, RepositoryPutOptions};
 use rs3_storage::{ByteRange, StorageError};
 use rs3_types::{PublicBucket, RetentionMode};
 use s3s::dto::{
-    Bucket, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
-    DeletedObject, Error as DeleteObjectError, GetBucketLocationInput, GetBucketLocationOutput,
+    Bucket, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, DeleteObjectInput,
+    DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+    ETagCondition, Error as DeleteObjectError, GetBucketLocationInput, GetBucketLocationOutput,
     GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectLegalHoldInput,
     GetObjectLegalHoldOutput, GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
     HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectVersionsInput,
     ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-    ListObjectsV2Output, ObjectIdentifier, Owner, PutObjectInput, PutObjectLegalHoldInput,
-    PutObjectLegalHoldOutput, PutObjectOutput, StreamingBlob,
+    ListObjectsV2Output, MetadataDirective, ObjectIdentifier, Owner, PutObjectInput,
+    PutObjectLegalHoldInput, PutObjectLegalHoldOutput, PutObjectOutput, StorageClass,
+    StreamingBlob,
 };
 use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
 use s3s::{Body, S3, S3Request, S3Response, S3Result, StdError};
@@ -42,6 +44,156 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
 mod multipart;
+
+fn copy_object_result(
+    metadata: &rs3_repository::RepositoryObjectMetadata,
+) -> S3Result<CopyObjectResult> {
+    let checksum = checksum_output(metadata.checksum.as_ref());
+    Ok(CopyObjectResult {
+        checksum_crc32: checksum.checksum_crc32,
+        checksum_crc32c: checksum.checksum_crc32c,
+        checksum_crc64nvme: checksum.checksum_crc64nvme,
+        checksum_sha1: checksum.checksum_sha1,
+        checksum_sha256: checksum.checksum_sha256,
+        checksum_type: checksum.checksum_type,
+        e_tag: Some(etag(&metadata.etag)),
+        last_modified: Some(timestamp(metadata.modified_at_ms)?),
+    })
+}
+
+fn copy_source_if_match(input: &CopyObjectInput) -> S3Result<Option<String>> {
+    match input.copy_source_if_match.as_ref() {
+        None | Some(ETagCondition::Any) => Ok(None),
+        Some(ETagCondition::ETag(ETag::Strong(value))) => Ok(Some(value.clone())),
+        Some(ETagCondition::ETag(ETag::Weak(_))) => Err(s3s::s3_error!(
+            InvalidRequest,
+            "CopyObject source If-Match must use a strong ETag"
+        )),
+    }
+}
+
+fn validate_copy_object_headers(headers: &http::HeaderMap) -> S3Result<()> {
+    const UNSUPPORTED_RAW_HEADERS: &[&str] = &[
+        "if-match",
+        "if-none-match",
+        "x-amz-sdk-checksum-algorithm",
+        "x-amz-checksum-type",
+    ];
+
+    if UNSUPPORTED_RAW_HEADERS
+        .iter()
+        .any(|header| headers.contains_key(*header))
+    {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "CopyObject request includes an unsupported condition or checksum override"
+        ));
+    }
+    for header in ["x-amz-copy-source", "x-amz-copy-source-if-match"] {
+        if headers.get_all(header).iter().nth(1).is_some() {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "CopyObject request contains a duplicate source header"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn copy_source_and_destination(
+    input: &CopyObjectInput,
+    public_bucket: &PublicBucket,
+) -> S3Result<(rs3_types::LogicalPath, rs3_types::LogicalPath)> {
+    let CopySource::Bucket {
+        bucket,
+        key,
+        version_id,
+    } = &input.copy_source
+    else {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "CopyObject access point and ARN sources are not supported"
+        ));
+    };
+    if bucket.as_ref() != public_bucket.as_str() {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "CopyObject source must use the configured bucket"
+        ));
+    }
+    if version_id
+        .as_deref()
+        .is_some_and(|version| version != "null")
+    {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "versioned CopyObject sources are not supported"
+        ));
+    }
+
+    let source = logical_path(key.to_string())?;
+    let destination = logical_path(input.key.clone())?;
+    if source == destination {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "CopyObject source and destination must differ"
+        ));
+    }
+    Ok((source, destination))
+}
+
+fn validate_copy_object_options(input: &CopyObjectInput) -> S3Result<()> {
+    if input
+        .metadata_directive
+        .as_ref()
+        .is_some_and(|directive| directive.as_str() != MetadataDirective::COPY)
+    {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "CopyObject metadata replacement is not supported"
+        ));
+    }
+
+    if input.acl.is_some()
+        || input.bucket_key_enabled.is_some()
+        || input.checksum_algorithm.is_some()
+        || input.copy_source_if_modified_since.is_some()
+        || input.copy_source_if_none_match.is_some()
+        || input.copy_source_if_unmodified_since.is_some()
+        || input.copy_source_sse_customer_algorithm.is_some()
+        || input.copy_source_sse_customer_key.is_some()
+        || input.copy_source_sse_customer_key_md5.is_some()
+        || input.expected_bucket_owner.is_some()
+        || input.expected_source_bucket_owner.is_some()
+        || input.grant_full_control.is_some()
+        || input.grant_read.is_some()
+        || input.grant_read_acp.is_some()
+        || input.grant_write_acp.is_some()
+        || input.object_lock_legal_hold_status.is_some()
+        || input.object_lock_mode.is_some()
+        || input.object_lock_retain_until_date.is_some()
+        || input.request_payer.is_some()
+        || input.sse_customer_algorithm.is_some()
+        || input.sse_customer_key.is_some()
+        || input.sse_customer_key_md5.is_some()
+        || input.ssekms_encryption_context.is_some()
+        || input.ssekms_key_id.is_some()
+        || input.server_side_encryption.is_some()
+        || input
+            .storage_class
+            .as_ref()
+            .is_some_and(|storage_class| storage_class.as_str() != StorageClass::STANDARD)
+        || input.tagging.is_some()
+        || input.tagging_directive.is_some()
+        || input.website_redirect_location.is_some()
+    {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "CopyObject metadata, policy, encryption, or tagging overrides are not supported"
+        ));
+    }
+    Ok(())
+}
 
 fn put_object_output(metadata: &rs3_repository::RepositoryObjectMetadata) -> PutObjectOutput {
     let checksum = checksum_output(metadata.checksum.as_ref());
@@ -810,6 +962,52 @@ impl S3 for GatewayS3Service {
             self.check_bucket(&input.bucket)?;
             Ok(S3Response::new(GetBucketLocationOutput {
                 location_constraint: None,
+            }))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
+    }
+
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        const OPERATION: &str = "CopyObject";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
+
+        let result = async {
+            let _admission = self.admit_request(OPERATION)?;
+            self.check_bucket(&input.bucket)?;
+            self.check_mutation_allowed()?;
+            validate_copy_object_headers(&req.headers)?;
+            validate_copy_object_options(&input)?;
+            let (source, destination) = copy_source_and_destination(&input, &self.public_bucket)?;
+            let source_if_match = copy_source_if_match(&input)?;
+            let committed = self
+                .repository
+                .copy_committed(
+                    source,
+                    destination,
+                    RepositoryCopyOptions { source_if_match },
+                )
+                .await
+                .map_err(repository_error)?;
+            Ok(S3Response::new(CopyObjectOutput {
+                copy_object_result: Some(copy_object_result(&committed.metadata)?),
+                ..CopyObjectOutput::default()
             }))
         }
         .instrument(span)
@@ -1769,11 +1967,13 @@ mod tests {
     use rs3_storage::BlobStore;
     use rs3_types::RetentionMode;
     use s3s::dto::{
-        Delete, DeleteObjectInput, DeleteObjectsInput, GetBucketLocationInput, GetObjectInput,
+        ChecksumAlgorithm, CompleteMultipartUploadInput, CompletedMultipartUpload, CompletedPart,
+        CopyObjectInput, CopySource, CreateMultipartUploadInput, Delete, DeleteObjectInput,
+        DeleteObjectsInput, ETag, ETagCondition, GetBucketLocationInput, GetObjectInput,
         GetObjectLegalHoldInput, HeadBucketInput, HeadObjectInput, ListBucketsInput,
-        ListObjectsInput, ListObjectsV2Input, ObjectIdentifier, ObjectLockLegalHold,
-        ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectInput, PutObjectLegalHoldInput,
-        StreamingBlob, Timestamp,
+        ListObjectsInput, ListObjectsV2Input, MetadataDirective, ObjectIdentifier,
+        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectInput,
+        PutObjectLegalHoldInput, StorageClass, StreamingBlob, Timestamp, UploadPartInput,
     };
     use s3s::{Body, S3, S3Request, S3Response};
     use std::time::{Duration, SystemTime};
@@ -1893,6 +2093,21 @@ mod tests {
         }
     }
 
+    fn copy_input(source: &str, destination: &str) -> CopyObjectInput {
+        let mut builder = CopyObjectInput::builder();
+        builder
+            .set_bucket("client-bucket".to_owned())
+            .set_key(destination.to_owned())
+            .set_copy_source(CopySource::Bucket {
+                bucket: "client-bucket".into(),
+                key: source.into(),
+                version_id: None,
+            });
+        builder
+            .build()
+            .unwrap_or_else(|error| panic!("copy fixture: {error}"))
+    }
+
     fn delete_objects_input(
         objects: Vec<ObjectIdentifier>,
         quiet: Option<bool>,
@@ -1997,6 +2212,346 @@ mod tests {
             }))
             .await
             .expect("fixture put");
+    }
+
+    #[tokio::test]
+    async fn copy_object_preserves_trusted_facts_for_packed_and_empty_sources() {
+        let service = gateway_service().await;
+        let source = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/copy-source.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"copy bytes",
+                )))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect("source put")
+            .output;
+
+        let mut request = s3_request(copy_input(
+            "snapshots/copy-source.bin",
+            "snapshots/copy-destination.bin",
+        ));
+        request.input.copy_source =
+            CopySource::parse("client-bucket/snapshots/copy-source.bin?versionId=null")
+                .unwrap_or_else(|error| panic!("copy source fixture: {error}"));
+        request.input.metadata = Some(std::collections::HashMap::from([(
+            "mtime".to_owned(),
+            "inert-under-copy".to_owned(),
+        )]));
+        request.input.metadata_directive =
+            Some(MetadataDirective::from_static(MetadataDirective::COPY));
+        request.input.cache_control = Some("no-store".to_owned());
+        request.input.content_disposition = Some("attachment".to_owned());
+        request.input.content_encoding = Some("identity".to_owned());
+        request.input.content_language = Some("en".to_owned());
+        request.input.content_type = Some("application/octet-stream".to_owned());
+        request.input.expires = Some(Timestamp::from(SystemTime::UNIX_EPOCH));
+        request.input.storage_class = Some(StorageClass::from_static(StorageClass::STANDARD));
+        let copied = service
+            .copy_object(request)
+            .await
+            .expect("copy")
+            .output
+            .copy_object_result
+            .expect("copy result");
+        assert_eq!(copied.e_tag, source.e_tag);
+        assert_eq!(copied.checksum_crc64nvme, source.checksum_crc64nvme);
+        assert!(copied.last_modified.is_some());
+        assert_eq!(
+            response_body(
+                service
+                    .get_object(s3_request(GetObjectInput {
+                        bucket: "client-bucket".to_owned(),
+                        key: "snapshots/copy-destination.bin".to_owned(),
+                        ..GetObjectInput::default()
+                    }))
+                    .await
+                    .expect("copied object"),
+            )
+            .await,
+            Bytes::from_static(b"copy bytes")
+        );
+
+        service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/copy-source.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"replacement",
+                )))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect("source replacement");
+        assert_eq!(
+            response_body(
+                service
+                    .get_object(s3_request(GetObjectInput {
+                        bucket: "client-bucket".to_owned(),
+                        key: "snapshots/copy-destination.bin".to_owned(),
+                        ..GetObjectInput::default()
+                    }))
+                    .await
+                    .expect("copied object remains exact source"),
+            )
+            .await,
+            Bytes::from_static(b"copy bytes")
+        );
+
+        let empty = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/empty-source.bin".to_owned(),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect("empty source put")
+            .output;
+        let mut empty_request = s3_request(copy_input(
+            "snapshots/empty-source.bin",
+            "snapshots/empty-destination.bin",
+        ));
+        empty_request.input.content_type = Some("text/plain".to_owned());
+        let empty_copy = service
+            .copy_object(empty_request)
+            .await
+            .expect("empty copy")
+            .output
+            .copy_object_result
+            .expect("empty copy result");
+        assert_eq!(empty_copy.e_tag, empty.e_tag);
+        let head = service
+            .head_object(s3_request(HeadObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/empty-destination.bin".to_owned(),
+                ..HeadObjectInput::default()
+            }))
+            .await
+            .expect("empty copied head");
+        assert_eq!(head.output.content_length, Some(0));
+    }
+
+    #[tokio::test]
+    async fn copy_object_preserves_multipart_source_etag_and_bytes() {
+        let service = gateway_service().await;
+        let created = service
+            .create_multipart_upload(s3_request(CreateMultipartUploadInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/multipart-copy-source.bin".to_owned(),
+                ..CreateMultipartUploadInput::default()
+            }))
+            .await
+            .expect("create multipart source")
+            .output;
+        let upload_id = created.upload_id.expect("upload id");
+        let part = service
+            .upload_part(s3_request(UploadPartInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/multipart-copy-source.bin".to_owned(),
+                upload_id: upload_id.clone(),
+                part_number: 1,
+                content_length: Some(16),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"multipart source",
+                )))),
+                ..UploadPartInput::default()
+            }))
+            .await
+            .expect("multipart source part")
+            .output;
+        let source = service
+            .complete_multipart_upload(s3_request(CompleteMultipartUploadInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/multipart-copy-source.bin".to_owned(),
+                upload_id,
+                multipart_upload: Some(CompletedMultipartUpload {
+                    parts: Some(vec![CompletedPart {
+                        part_number: Some(1),
+                        e_tag: part.e_tag,
+                        ..CompletedPart::default()
+                    }]),
+                }),
+                ..CompleteMultipartUploadInput::default()
+            }))
+            .await
+            .expect("complete multipart source")
+            .output;
+        let copied = service
+            .copy_object(s3_request(copy_input(
+                "snapshots/multipart-copy-source.bin",
+                "snapshots/multipart-copy-destination.bin",
+            )))
+            .await
+            .expect("multipart copy")
+            .output
+            .copy_object_result
+            .expect("multipart copy result");
+        assert_eq!(copied.e_tag, source.e_tag);
+        assert_eq!(
+            response_body(
+                service
+                    .get_object(s3_request(GetObjectInput {
+                        bucket: "client-bucket".to_owned(),
+                        key: "snapshots/multipart-copy-destination.bin".to_owned(),
+                        ..GetObjectInput::default()
+                    }))
+                    .await
+                    .expect("copied multipart source"),
+            )
+            .await,
+            Bytes::from_static(b"multipart source")
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_object_enforces_source_conditions_and_rejects_unsupported_options() {
+        let service = gateway_service().await;
+        let source = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/conditional-copy-source.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"source",
+                )))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect("source put")
+            .output;
+        let source_etag = source.e_tag.expect("source ETag");
+        let mut matched = copy_input(
+            "snapshots/conditional-copy-source.bin",
+            "snapshots/conditional-copy-destination.bin",
+        );
+        matched.copy_source_if_match = Some(ETagCondition::ETag(source_etag));
+        assert!(service.copy_object(s3_request(matched)).await.is_ok());
+
+        for (destination, condition) in [
+            (
+                "snapshots/conditional-copy-mismatch.bin",
+                ETagCondition::ETag(ETag::Strong("0".repeat(32))),
+            ),
+            (
+                "snapshots/conditional-copy-literal-star.bin",
+                ETagCondition::ETag(ETag::Strong("*".to_owned())),
+            ),
+        ] {
+            let mut input = copy_input("snapshots/conditional-copy-source.bin", destination);
+            input.copy_source_if_match = Some(condition);
+            let error = service
+                .copy_object(s3_request(input))
+                .await
+                .expect_err("source condition must fail");
+            assert_eq!(*error.code(), s3s::S3ErrorCode::PreconditionFailed);
+        }
+
+        let sequence = accepted_v2_sequence(&service).await;
+        let mut malformed = copy_input(
+            "snapshots/conditional-copy-source.bin",
+            "snapshots/conditional-copy-malformed.bin",
+        );
+        malformed.copy_source_if_match = Some(ETagCondition::ETag(ETag::Strong(String::new())));
+        let error = service
+            .copy_object(s3_request(malformed))
+            .await
+            .expect_err("empty source ETag is malformed");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidRequest);
+
+        let mut replace = copy_input(
+            "snapshots/conditional-copy-source.bin",
+            "snapshots/rejected-metadata.bin",
+        );
+        replace.metadata_directive =
+            Some(MetadataDirective::from_static(MetadataDirective::REPLACE));
+        let error = service
+            .copy_object(s3_request(replace))
+            .await
+            .expect_err("metadata replace is not supported");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
+
+        let mut checksum = copy_input(
+            "snapshots/conditional-copy-source.bin",
+            "snapshots/rejected-checksum.bin",
+        );
+        checksum.checksum_algorithm =
+            Some(ChecksumAlgorithm::from_static(ChecksumAlgorithm::SHA256));
+        let error = service
+            .copy_object(s3_request(checksum))
+            .await
+            .expect_err("checksum override is not supported");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
+
+        let mut storage_class = copy_input(
+            "snapshots/conditional-copy-source.bin",
+            "snapshots/rejected-storage-class.bin",
+        );
+        storage_class.storage_class = Some(StorageClass::from_static(StorageClass::GLACIER));
+        let error = service
+            .copy_object(s3_request(storage_class))
+            .await
+            .expect_err("nondefault storage class is an override");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
+
+        for header in ["if-match", "if-none-match"] {
+            let mut conditional = s3_request(copy_input(
+                "snapshots/conditional-copy-source.bin",
+                "snapshots/rejected-destination-condition.bin",
+            ));
+            conditional
+                .headers
+                .insert(header, http::HeaderValue::from_static("*"));
+            let error = service
+                .copy_object(conditional)
+                .await
+                .expect_err("destination condition is not in the pinned DTO");
+            assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidRequest);
+        }
+
+        let mut historical = copy_input(
+            "snapshots/conditional-copy-source.bin",
+            "snapshots/rejected-historical.bin",
+        );
+        historical.copy_source = CopySource::Bucket {
+            bucket: "client-bucket".into(),
+            key: "snapshots/conditional-copy-source.bin".into(),
+            version_id: Some("historical".into()),
+        };
+        let error = service
+            .copy_object(s3_request(historical))
+            .await
+            .expect_err("historical source is unsupported");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
+        assert_eq!(accepted_v2_sequence(&service).await, sequence);
+    }
+
+    #[tokio::test]
+    async fn copy_object_rejects_restore_readonly_mode() {
+        let mut service = gateway_service().await;
+        service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/readonly-copy-source.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"source",
+                )))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect("source put");
+        let sequence = accepted_v2_sequence(&service).await;
+        service.mode = GatewayMode::RestoreReadOnly;
+        let error = service
+            .copy_object(s3_request(copy_input(
+                "snapshots/readonly-copy-source.bin",
+                "snapshots/readonly-copy-destination.bin",
+            )))
+            .await
+            .expect_err("restore-readonly mode rejects copy");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::AccessDenied);
+        assert_eq!(accepted_v2_sequence(&service).await, sequence);
     }
 
     #[tokio::test]

@@ -10,7 +10,9 @@ use super::service::{
 use super::{V2FormatError, V2FullGcApplyOptions, V2MaintenanceCancellation, V2MaintenanceGuard};
 use crate::CommitCoordinatorOptions;
 use crate::error::{RepositoryError, Result};
-use crate::model::{DeleteOutcome, RepositoryObjectMetadata, RepositoryPutOptions};
+use crate::model::{
+    DeleteOutcome, RepositoryCopyOptions, RepositoryObjectMetadata, RepositoryPutOptions,
+};
 use bytes::Bytes;
 use futures_util::Stream;
 use rs3_storage::BlobStore;
@@ -105,6 +107,19 @@ struct PendingBatch {
 struct V2ProtectionCohort {
     retention: Option<RetentionPolicy>,
     legal_hold: Option<LegalHoldStatus>,
+}
+
+enum CoordinatedWrite {
+    Put {
+        key: LogicalPath,
+        body: Bytes,
+        options: RepositoryPutOptions,
+    },
+    Copy {
+        source: LogicalPath,
+        destination: LogicalPath,
+        options: RepositoryCopyOptions,
+    },
 }
 
 struct CommitWaiter {
@@ -381,20 +396,76 @@ where
         options: RepositoryPutOptions,
     ) -> Result<V2CommittedPut> {
         self.repository.validate_client_object_lock(&options)?;
-        let (retention, legal_hold) = self.repository.effective_put_protection(&options);
-        let protection = V2ProtectionCohort {
-            retention,
-            legal_hold,
-        };
+        self.enqueue_write(CoordinatedWrite::Put { key, body, options })
+            .await
+    }
+
+    /// Copies the exact accepted source reference without reading payload bytes.
+    /// Source conditions are checked at capture; success waits for anchored publication.
+    pub async fn copy_committed(
+        &self,
+        source: LogicalPath,
+        destination: LogicalPath,
+        options: RepositoryCopyOptions,
+    ) -> Result<V2CommittedPut> {
+        options.validate()?;
+        self.enqueue_write(CoordinatedWrite::Copy {
+            source,
+            destination,
+            options,
+        })
+        .await
+    }
+
+    async fn enqueue_write(&self, write: CoordinatedWrite) -> Result<V2CommittedPut> {
         let (metadata, rx, publish_generation, should_publish_now) = {
             let stage_lock_started = Instant::now();
-            let _stage = loop {
+            let mut compaction_checked = false;
+            let (_stage, copy_source, protection) = loop {
                 // Register before checking capacity, so publication cannot signal
                 // between releasing staging and starting the wait.
                 let changed = self.capacity_changed.notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
-                let mut stage = self.stage_lock.lock().await;
+                let stage = self.stage_lock.lock().await;
+                let copy_source = match &write {
+                    CoordinatedWrite::Copy {
+                        source, options, ..
+                    } => match self.repository.capture_copy_source(source, options) {
+                        Ok(source) => Some(source),
+                        Err(RepositoryError::NotFound(_))
+                            if {
+                                let batch = self.batch.lock().await;
+                                batch.publishing || !batch.waiters.is_empty()
+                            } =>
+                        {
+                            drop(stage);
+                            let _publisher = self.publisher.lock().await;
+                            let _stage = self.stage_lock.lock().await;
+                            self.publish_locked_batch().await?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    },
+                    CoordinatedWrite::Put { .. } => None,
+                };
+                let (retention, legal_hold) = match (&write, &copy_source) {
+                    (CoordinatedWrite::Put { options, .. }, _) => {
+                        self.repository.effective_put_protection(options)
+                    }
+                    (_, Some(source)) => {
+                        (source.metadata().retention, source.metadata().legal_hold)
+                    }
+                    _ => return Err(commit_failed("copy source capture missing")),
+                };
+                let protection = V2ProtectionCohort {
+                    retention,
+                    legal_hold,
+                };
+                let retained_copy = copy_source.is_some()
+                    && (retention.is_some_and(|policy| {
+                        policy.mode != rs3_types::RetentionMode::None && policy.retain_days > 0
+                    }) || legal_hold == Some(LegalHoldStatus::On));
                 let (wait_for_capacity, needs_barrier) = {
                     let batch = self.batch.lock().await;
                     let occupied = batch.publishing || !batch.waiters.is_empty();
@@ -406,7 +477,9 @@ where
                     (
                         wait_for_capacity,
                         (occupied && batch.protection != Some(protection))
-                            || index_compaction_due(self.repository.active_index_run_count()?),
+                            || (retained_copy && batch.publishing)
+                            || (!compaction_checked
+                                && index_compaction_due(self.repository.active_index_run_count()?)),
                     )
                 };
                 if wait_for_capacity {
@@ -417,11 +490,13 @@ where
                 if needs_barrier {
                     drop(stage);
                     let _publisher = self.publisher.lock().await;
-                    stage = self.stage_lock.lock().await;
+                    let _stage = self.stage_lock.lock().await;
                     self.publish_locked_batch().await?;
                     self.prepare_index_catalog_for_growth_locked().await?;
+                    compaction_checked = true;
+                    continue;
                 }
-                break stage;
+                break (stage, copy_source, protection);
             };
             record_v2_commit_put_phase_duration("stage_lock_wait", stage_lock_started.elapsed());
             let should_start_timer = {
@@ -455,7 +530,23 @@ where
             };
 
             let stage_write_started = Instant::now();
-            let staged = self.repository.stage_put(key, body, options).await;
+            let staged = match write {
+                CoordinatedWrite::Put { key, body, options } => {
+                    self.repository.stage_put(key, body, options).await
+                }
+                CoordinatedWrite::Copy { destination, .. } => {
+                    let source =
+                        copy_source.ok_or_else(|| commit_failed("copy source capture missing"))?;
+                    self.repository
+                        .stage_copy_coordinated(
+                            V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref()),
+                            source,
+                            destination,
+                            self.maintenance_guard.as_deref(),
+                        )
+                        .await
+                }
+            };
             record_v2_commit_put_phase_duration("stage_write", stage_write_started.elapsed());
             let (metadata, rollback) = staged?;
             let (tx, rx) = oneshot::channel();

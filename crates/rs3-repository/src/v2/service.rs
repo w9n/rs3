@@ -19,8 +19,8 @@ use crate::checkpoint::seal_manifest_record;
 use crate::error::{RepositoryError, Result};
 use crate::lru::LruCache;
 use crate::model::{
-    DeleteOutcome, PhysicalDeleteOutcome, RepositoryListEntry, RepositoryObjectMetadata,
-    RepositoryPutOptions,
+    DeleteOutcome, PhysicalDeleteOutcome, RepositoryCopyOptions, RepositoryListEntry,
+    RepositoryObjectMetadata, RepositoryPutOptions,
 };
 use crate::namespace::first_namespace_entry;
 use crate::payload::{
@@ -189,6 +189,15 @@ impl V2ResolvedObject {
     pub fn metadata(&self) -> &RepositoryObjectMetadata {
         &self.metadata
     }
+}
+
+enum StagedPayload<'a> {
+    Buffered(Bytes),
+    Detached,
+    Copy {
+        source: &'a V2ResolvedObject,
+        modified_at_ms: i64,
+    },
 }
 
 struct StreamLength {
@@ -724,7 +733,7 @@ where
             key,
             plaintext_len,
             options,
-            None,
+            StagedPayload::Detached,
             upload.stored.etag,
         )?;
         let carrier = Arc::new(V2StandaloneStreamCarrierReference {
@@ -969,6 +978,90 @@ where
             .await
     }
 
+    /// Captures only accepted immutable references while coordinator staging excludes GC.
+    pub(super) fn capture_copy_source(
+        &self,
+        key: &LogicalPath,
+        options: &RepositoryCopyOptions,
+    ) -> Result<V2ResolvedObject> {
+        self.ensure_local_state_ready()?;
+        options.validate()?;
+        let mut source = self.resolve_object(key)?;
+        if options
+            .source_if_match
+            .as_ref()
+            .is_some_and(|expected| expected != &source.metadata.etag.to_s3_string())
+        {
+            return Err(RepositoryError::PreconditionFailed);
+        }
+        if source.entry.content_len != 0
+            && !matches!(
+                source.entry.payload_ref,
+                Some(PayloadReference::V2Pack { .. } | PayloadReference::V2StandaloneStream { .. })
+            )
+        {
+            return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
+        }
+        let (retention, legal_hold) = self.effective_put_protection(&RepositoryPutOptions {
+            retention: source.metadata.retention,
+            legal_hold: source.metadata.legal_hold,
+            ..RepositoryPutOptions::default()
+        });
+        source.metadata.retention = retention;
+        source.metadata.legal_hold = legal_hold;
+        source.entry.retention = retention;
+        source.entry.legal_hold = legal_hold;
+        Ok(source)
+    }
+
+    /// Stages an inherited reference under the coordinator's capture-to-stage exclusion.
+    /// Retained callers have drained the active publisher before protection awaits.
+    pub(super) async fn stage_copy_coordinated<A: V2CommitAnchor>(
+        &self,
+        mutation: V2CoordinatedMutation<'_, A>,
+        source: V2ResolvedObject,
+        destination: LogicalPath,
+        guard: Option<&dyn super::V2MaintenanceGuard>,
+    ) -> Result<(RepositoryObjectMetadata, V2StagedPutRollback)> {
+        self.validate_coordinator_lease(mutation.lease)?;
+        let modified_at_ms = current_time_ms();
+        let needs_protection = source
+            .metadata
+            .retention
+            .is_some_and(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
+            || source.metadata.legal_hold == Some(LegalHoldStatus::On);
+        if needs_protection {
+            let guard = guard
+                .ok_or_else(|| v2_repository_error(V2FormatError::MaintenanceAccessRequired))?;
+            let base = self.ensure_accepted_anchor_matches(mutation.anchor).await?;
+            self.commit_store
+                .protect_copy_source(mutation.anchor, guard, &base, &source.entry, modified_at_ms)
+                .await
+                .map_err(v2_repository_error)?;
+        }
+        let options = RepositoryPutOptions {
+            checksum: source
+                .metadata
+                .checksum
+                .clone()
+                .map(crate::UploadChecksum::verified),
+            retention: source.metadata.retention,
+            legal_hold: source.metadata.legal_hold,
+            ..RepositoryPutOptions::default()
+        };
+        let (staged, checkpoint) = self.stage_put_metadata_sync_with_rollback(
+            destination,
+            source.metadata.content_len,
+            options,
+            StagedPayload::Copy {
+                source: &source,
+                modified_at_ms,
+            },
+            source.metadata.etag,
+        )?;
+        Ok((staged.metadata, V2StagedPutRollback { checkpoint }))
+    }
+
     /// Stages an object write without publishing the covering v2 commit.
     ///
     /// This is used by the v2 commit coordinator. Callers must publish the
@@ -997,7 +1090,7 @@ where
             key,
             plaintext_len,
             options,
-            Some(body),
+            StagedPayload::Buffered(body),
             etag,
         )?;
 
@@ -1009,7 +1102,7 @@ where
         key: LogicalPath,
         plaintext_len: u64,
         options: RepositoryPutOptions,
-        pending_body: Option<Bytes>,
+        payload: StagedPayload<'_>,
         etag: rs3_types::ObjectEtag,
     ) -> Result<(StagedV2Put, PendingV2Checkpoint)> {
         if options
@@ -1073,13 +1166,24 @@ where
             .collect::<Vec<_>>();
 
         let pending_object_id = BackendObjectId::new(format!("v2-pending/{}", sequence.get()))?;
-        let modified_at_ms = current_time_ms();
+        let modified_at_ms = match &payload {
+            StagedPayload::Copy { modified_at_ms, .. } => *modified_at_ms,
+            _ => current_time_ms(),
+        };
+        let (object_id, object_version_id, payload_ref) = match &payload {
+            StagedPayload::Copy { source, .. } => (
+                source.entry.object_id.clone(),
+                source.entry.object_version_id.clone(),
+                source.entry.payload_ref.clone(),
+            ),
+            _ => (pending_object_id, None, Some(PayloadReference::Pending)),
+        };
         let entry = NamespaceEntry {
             namespace_key_id: primary_blind_key.key_id,
             blind_key: primary_blind_key.blind_key,
-            object_id: pending_object_id,
-            object_version_id: None,
-            payload_ref: Some(PayloadReference::Pending),
+            object_id,
+            object_version_id,
+            payload_ref,
             manifest_id: manifest_id.clone(),
             content_len: plaintext_len,
             modified_at_ms,
@@ -1112,10 +1216,13 @@ where
             prefix_tokens: Vec::new(),
             sealed_manifest: Box::new(sealed_manifest),
         });
-        let payload = pending_body.map(|body| PendingV2Payload {
-            manifest_id: manifest_id.clone(),
-            body,
-        });
+        let payload = match payload {
+            StagedPayload::Buffered(body) => Some(PendingV2Payload {
+                manifest_id: manifest_id.clone(),
+                body,
+            }),
+            StagedPayload::Detached | StagedPayload::Copy { .. } => None,
+        };
         let rollback = pending.append_operation(
             deltas,
             Some((manifest_id.clone(), manifest.clone())),
