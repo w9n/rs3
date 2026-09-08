@@ -256,10 +256,20 @@ At a glance:
 - local performance and compatibility smokes remain release evidence, not a
   provider certification
 
+Current v03 performance is reported in [Performance](performance.md#current-results-september-8-2026):
+the September 8 comparison includes three-sample throughput, Kopia backup/restore,
+scale, RSS, and byte accounting. All 120 Kopia content checks pass, but sequential
+512 B amplification and large-PostgreSQL Kopia elapsed time fail their budgets.
+The measurements are shared-host evidence with unrestricted Docker providers,
+not dedicated-runner or external-provider qualification.
+
+The older table below retains historical qualification evidence for its named
+revisions; it does not establish current candidate performance.
+
 | Evidence | Result |
 | --- | --- |
-| Clean host-local fresh-process scale | Revision `f4d05b0` passed the complete 10k, 100k, and 1M three-sample filesystem gate plus the path-length matrix on 2026-07-13. The 1M writers completed in 59.589-60.105 s at 955,781,120-956,370,944 B RSS and 1.268284240x writes. Fresh readers recovered in 5.324-5.482 s at 1,009,922,048-1,010,692,096 B RSS, listed exactly one million objects and 245 runs, and used one exact `GET` at 1.03125x per sentinel. This is clean host-local correctness and resource evidence, not pinned-runner timing, HTTP gateway, or provider qualification. |
-| Candidate-bound Kopia matrix | Revision `7d87f90` passed all five separately bounded three-pair profiles on 2026-07-13 with source-bound summaries, workload consistency, and every expanded regression budget. Backend reads were 1.01-1.04x and writes were approximately 1.00x. Total elapsed was 0.29-1.62x and average gateway HWM RSS was 150.08-633.88 MiB, within the 1.75x and 1.25 GiB gates. This is local RustFS evidence, not a live-provider claim. |
+| Historical host-local fresh-process scale | Revision `f4d05b0` passed the complete 10k, 100k, and 1M three-sample filesystem gate plus the path-length matrix on 2026-07-13. The 1M writers completed in 59.589-60.105 s at 955,781,120-956,370,944 B RSS and 1.268284240x writes. Fresh readers recovered in 5.324-5.482 s at 1,009,922,048-1,010,692,096 B RSS, listed exactly one million objects and 245 runs, and used one exact `GET` at 1.03125x per sentinel. This is clean host-local correctness and resource evidence, not pinned-runner timing, HTTP gateway, or provider qualification. |
+| Historical candidate-bound Kopia matrix | Revision `7d87f90` passed all five separately bounded three-pair profiles on 2026-07-13 with source-bound summaries, workload consistency, and every expanded regression budget. Backend reads were 1.01-1.04x and writes were approximately 1.00x. Total elapsed was 0.29-1.62x and average gateway HWM RSS was 150.08-633.88 MiB, within the 1.75x and 1.25 GiB gates. This is local RustFS evidence, not a live-provider claim. |
 | Historical standalone S3 and gateway baseline | Revision `f4d05b0` passed the equal-work `just perf-standalone-gate` against disposable RustFS on 2026-07-13. Release-gateway throughput at concurrency 1/2/4/8 was 98.50/190.33/281.76/401.28 MiB/s, or 4.07x scaling. Every point stayed at 1.000270x writes, 1.000246x verification reads, and 2.000515x total verified I/O. Peak RSS was 223,387,648/397,221,888/631,521,280/1,006,772,224 B. |
 | Historical bounded full-restore HTTP baseline | Revision `765229e` passed three release-gateway runs of three complete 256 MiB restores. Average read latency was 581.727-664.972 ms, plaintext throughput was 373.240-428.565 MiB/s, gateway peak RSS was 564,342,784-564,801,536 B including the in-process ciphertext backend and preceding upload, and every restore used one backend GET at 1.000244420x read amplification. The final candidate must rerun this lane. |
 | Historical local Kubernetes release gate | Revision `e16c418` passed the standalone gate, direct Kopia, fresh-kind Velero/Kopia dynamic-PVC gateway-restart restore, and Velero/Postgres restore on 2026-07-12. This remains behavior evidence, but its Kubernetes summaries predate source-bound nested-image reporting and cannot qualify a later candidate. |
