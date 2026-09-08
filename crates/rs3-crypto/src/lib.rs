@@ -33,5 +33,7 @@ pub use keyring::{KeyMaterial, KeyRing, MIN_REPOSITORY_SALT_LEN, RepositoryKeyCo
 pub use md5::{Md5Hasher, md5, multipart_etag};
 pub use metadata::MetadataSeal;
 pub use payload::{PayloadSegmentContext, PayloadSegmentSeal};
-pub use random::{random_carrier_id, random_payload_attempt_id, random_physical_order_key};
+pub use random::{
+    random_carrier_id, random_payload_attempt_id, random_physical_order_key, random_repository_salt,
+};
 pub use secret::SecretBytes;

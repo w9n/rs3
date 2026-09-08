@@ -101,8 +101,12 @@ impl Probe for FixtureProbe<'_> {
     }
 }
 
+fn fixture_config() -> RuntimeConfig {
+    crate::s3::test_support::runtime_config(true)
+}
+
 fn open(journal: &mut MemoryJournal) -> OnboardingJournal<'_, MemoryJournal> {
-    OnboardingJournal::open(journal, "context".to_owned()).expect("open")
+    OnboardingJournal::open(journal, &fixture_config()).expect("open")
 }
 
 #[tokio::test]
@@ -239,7 +243,10 @@ async fn changed_implementation_requalifies_without_replacing_bootstrap_or_reset
         Some(b"unfinished exact genesis".as_slice())
     );
     assert!(second.prefixes.lock().expect("prefixes")[0].ends_with("/2"));
-    assert!(OnboardingJournal::open(&mut backing, "other context".to_owned()).is_err());
+    let mut other = fixture_config();
+    other.repository_keys.repository_id =
+        rs3_types::RepositoryId::new("other-repository").expect("repository id");
+    assert!(OnboardingJournal::open(&mut backing, &other).is_err());
 }
 
 #[tokio::test]
@@ -333,12 +340,12 @@ fn malformed_context_scope_budget_and_retired_journals_are_rejected() {
         malformed[field] = value;
         backing.bytes = Some(serde_json::to_vec(&malformed).expect("malformed"));
         assert!(
-            OnboardingJournal::open(&mut backing, "context".to_owned()).is_err(),
+            OnboardingJournal::open(&mut backing, &fixture_config()).is_err(),
             "{field}"
         );
     }
     backing.bytes = Some(vec![b' '; MAX_BOOTSTRAP_JOURNAL_BYTES + 1]);
-    assert!(OnboardingJournal::open(&mut backing, "context".to_owned()).is_err());
+    assert!(OnboardingJournal::open(&mut backing, &fixture_config()).is_err());
 }
 
 #[tokio::test]
@@ -351,30 +358,74 @@ async fn qualification_wrapper_drives_the_real_bootstrap_engine_and_reuses_accep
     let probe = FixtureProbe::default();
     let guard = Guard::default();
     let first = {
-        let mut journal =
-            OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-                .expect("journal");
+        let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
         journal
             .qualify(&probe, &guard, None)
             .await
             .expect("qualify");
-        bootstrap::initialize(&config, &store, &anchor, &guard, &mut journal)
+        bootstrap::initialize(&config, &store, &anchor, &guard, &mut journal, None)
             .await
             .expect("bootstrap")
     };
     assert!(first.initialized);
     let saves = backing.saves;
-    let mut journal =
-        OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-            .expect("reopen");
+    let mut journal = OnboardingJournal::open(&mut backing, &config).expect("reopen");
     journal.qualify(&probe, &guard, None).await.expect("reuse");
-    let second = bootstrap::initialize(&config, &store, &anchor, &guard, &mut journal)
+    let second = bootstrap::initialize(&config, &store, &anchor, &guard, &mut journal, None)
         .await
         .expect("verify accepted");
     assert_eq!(first.anchor, second.anchor);
     assert!(!second.initialized);
     assert_eq!(probe.prefixes.lock().expect("prefixes").len(), 1);
     assert_eq!(backing.saves, saves);
+}
+
+#[tokio::test]
+async fn onboarding_generates_and_journals_the_salt_when_none_is_configured() {
+    let mut config = crate::s3::test_support::runtime_config(true);
+    config.repository_keys.repository_salt_hex = None;
+    let store = RuntimeStore::new(rs3_storage::MemoryBlobStore::new());
+    let anchor = RuntimeV2Anchor::new(rs3_repository::v2::V2MemoryAnchor::new());
+    let mut backing = MemoryJournal::default();
+    let probe = FixtureProbe::default();
+    let guard = Guard::default();
+    let (first, salt) = {
+        let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
+        let salt = journal.salt.clone();
+        assert_eq!(
+            journal.record.repository_salt_hex.as_deref(),
+            Some(hex::encode(&salt).as_str())
+        );
+        journal
+            .qualify(&probe, &guard, None)
+            .await
+            .expect("qualify");
+        let report = bootstrap::initialize(&config, &store, &anchor, &guard, &mut journal, None)
+            .await
+            .expect("bootstrap");
+        (report, salt)
+    };
+    assert!(first.initialized);
+    assert_eq!(salt.len(), rs3_crypto::MIN_REPOSITORY_SALT_LEN);
+
+    // Reopening resolves the same salt and verifies without new probes.
+    let mut journal = OnboardingJournal::open(&mut backing, &config).expect("reopen");
+    assert_eq!(journal.salt, salt);
+    journal.qualify(&probe, &guard, None).await.expect("reuse");
+    let second = bootstrap::initialize(&config, &store, &anchor, &guard, &mut journal, None)
+        .await
+        .expect("verify accepted");
+    assert_eq!(first.anchor, second.anchor);
+    assert!(!second.initialized);
+    assert_eq!(probe.prefixes.lock().expect("prefixes").len(), 1);
+
+    // Pinning the recorded salt works; pinning another value is rejected.
+    let mut pinned = config.clone();
+    pinned.repository_keys.repository_salt_hex = Some(hex::encode(&salt));
+    assert!(OnboardingJournal::open(&mut backing, &pinned).is_ok());
+    let mut wrong = config.clone();
+    wrong.repository_keys.repository_salt_hex = Some("7f".repeat(32));
+    assert!(OnboardingJournal::open(&mut backing, &wrong).is_err());
 }
 
 #[tokio::test]
@@ -410,9 +461,7 @@ async fn projected_readiness_requires_matching_evidence_and_completed_bootstrap(
     let guard = Guard::default();
     let anchor = RuntimeV2Anchor::new(rs3_repository::v2::V2MemoryAnchor::new());
     {
-        let mut journal =
-            OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-                .expect("journal");
+        let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
         journal
             .qualify(
                 &ProviderProbe {
@@ -431,11 +480,9 @@ async fn projected_readiness_requires_matching_evidence_and_completed_bootstrap(
             .expect("not initialized")
     );
     {
-        let mut journal =
-            OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-                .expect("journal");
+        let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
         let mut report =
-            bootstrap::initialize(&config, store.handle(), &anchor, &guard, &mut journal)
+            bootstrap::initialize(&config, store.handle(), &anchor, &guard, &mut journal, None)
                 .await
                 .expect("initialize");
         assert!(

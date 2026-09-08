@@ -17,7 +17,6 @@ credentials practical.
 Before serving restore traffic, identify or recover:
 
 - repository ID
-- public repository salt
 - wrapping-key source for the keyring envelope
 - accepted v2 anchor sequence, commit key, commit object version ID when
   available, commit body digest, signing key ID, and format-root reference
@@ -147,7 +146,6 @@ RS3_BACKEND_ENDPOINT=s3 \
 RS3_BACKEND_BUCKET=<bucket> \
 RS3_BACKEND_PREFIX=<repository-prefix> \
 RS3_REPOSITORY_ID=<repository-id> \
-RS3_REPOSITORY_SALT_HEX=<repository-salt-hex> \
 RS3_RECOVERY_PUBLIC_KEY=ed25519:<recovery-public-key-hex> \
 cargo run -p rs3-server --features s3,k8s -- verify-bundle \
   --bundle-file rs3-restore-bundle.cbor \
@@ -156,8 +154,9 @@ cargo run -p rs3-server --features s3,k8s -- verify-bundle \
 ```
 
 If a fresh cluster is missing the Kubernetes Lease, import the trusted v2 anchor
-after configuring the same repository ID, salt, wrapping-key source, backend,
-and retention settings.
+after configuring the same repository ID, wrapping-key source, backend, and
+retention settings. The public salt is recovered from the format root the
+bundle's anchor binds and checked against the bundle's salt digest.
 
 ```sh
 cargo run -p rs3-server --features s3,k8s -- import-anchor \
@@ -185,7 +184,7 @@ that bundle; it does not expose historical S3 object versions or select arbitrar
 Before starting:
 
 - Preserve a trusted, signed bundle from before the unwanted writes, with the
-  matching repository ID, salt, wrapping key and recovery public key.
+  matching repository ID, wrapping key and recovery public key.
 - Verify that every referenced commit, index, payload, format root and keyring
   version is still readable and protected through the expected restore duration.
   The configured retention duration alone does not prove this.

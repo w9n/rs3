@@ -28,7 +28,9 @@ identifiers, not content hashes or path derivations.
 The keyring is encrypted under an external high-entropy wrapping key. Kubernetes
 Secret custody is the initial deployment model; the wrapping-key source stays
 outside the object store. A human passphrase is not a suitable raw wrapping key.
-The public repository salt is required restore context, not another secret.
+The public repository salt is authenticated envelope context, not another
+secret and not a key-derivation input: envelopes carry it publicly, bind it
+into their associated data, and a verified envelope supplies it on opening.
 Domain-separated HMAC derivations use explicit framing for variable-length
 inputs. New derivations require distinct domains inside `rs3-crypto`.
 

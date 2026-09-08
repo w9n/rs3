@@ -125,8 +125,9 @@ pub(super) mod test_support {
             repository_keys: RepositoryKeysConfig {
                 repository_id: RepositoryId::new("test-repository")
                     .unwrap_or_else(|error| panic!("{error}")),
-                repository_salt_hex:
+                repository_salt_hex: Some(
                     "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
+                ),
                 envelope_object_id: None,
                 wrapping_key_id: "wrap-v1".to_owned(),
                 wrapping_key_hex: SecretString::from(

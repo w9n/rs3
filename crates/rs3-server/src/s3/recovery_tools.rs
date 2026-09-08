@@ -163,15 +163,22 @@ where
         config.recovery.public_key.as_deref(),
     )?;
 
-    let context = repository_key_context(&config.repository_keys)?;
-    let format_root = open_format_root(
+    let (format_root, context) = open_format_root(
         &store,
-        &context,
+        &config.repository_keys,
         &config.repository_keys.wrapping_key_id,
         &options.wrapping_key,
         &bundle.anchor.format_ref,
     )
     .await?;
+    if bundle
+        .repository_salt_digest
+        .is_some_and(|digest| digest != rs3_crypto::Sha256Hasher::digest(context.salt()))
+    {
+        return Err(repository_init(
+            "restore bundle salt digest does not match the format root its anchor binds",
+        ));
+    }
     if format_root.repository_id != repository_id
         || format_root.provider_profile != expected_profile
         || format_root.retention != config.repository_retention
@@ -244,7 +251,7 @@ where
 
     Ok(KeyringEnvelopeInspectReport {
         repository_id: keys.repository_id.clone(),
-        repository_salt_hex: keys.repository_salt_hex.clone(),
+        repository_salt_hex: hex::encode(&opened.envelope.repository_salt),
         envelope_object_id: opened.object_id,
         envelope_digest: opened.envelope.digest().map_err(repository_init)?,
         generation: opened.envelope.generation,
@@ -296,7 +303,8 @@ where
         )));
     }
 
-    let context = repository_key_context(keys)?;
+    let context = repository_key_context_for_envelope(keys, &opened.envelope)?;
+    let repository_salt_hex = hex::encode(&opened.envelope.repository_salt);
     let rewrapped = opened
         .envelope
         .rewrap(
@@ -321,7 +329,7 @@ where
 
     Ok(KeyringEnvelopeRewrapReport {
         repository_id: keys.repository_id.clone(),
-        repository_salt_hex: keys.repository_salt_hex.clone(),
+        repository_salt_hex,
         envelope_object_id: reference.object_id,
         envelope_digest: reference.digest,
         generation: reference.generation,
@@ -391,11 +399,11 @@ fn verification_report(
 
 async fn open_format_root<S>(
     store: &S,
-    context: &RepositoryKeyContext,
+    keys: &RepositoryKeyContextConfig,
     wrapping_key_id: &str,
     wrapping_key: &SecretBytes,
     reference: &V2FormatRef,
-) -> Result<V2FormatRoot, S3BoundaryError>
+) -> Result<(V2FormatRoot, RepositoryKeyContext), S3BoundaryError>
 where
     S: BlobStore,
 {
@@ -416,10 +424,16 @@ where
             "v2 format root object does not match the bundle reference",
         ));
     }
+    // The bundle reference digest ties this envelope to the trusted anchor,
+    // so its public salt is recovered context rather than backend discovery.
+    let context = repository_key_context_for_envelope(keys, &envelope)?;
     let plaintext = envelope
-        .open_format(context, wrapping_key_id, wrapping_key)
+        .open_format(&context, wrapping_key_id, wrapping_key)
         .map_err(repository_init)?;
-    V2FormatRoot::from_plaintext_bytes(&plaintext).map_err(repository_init)
+    Ok((
+        V2FormatRoot::from_plaintext_bytes(&plaintext).map_err(repository_init)?,
+        context,
+    ))
 }
 
 async fn open_v2_keyring_envelope<S>(
@@ -483,12 +497,14 @@ where
     if object_id.as_str().ends_with(".json") {
         return Err(repository_init("retired keyring object format"));
     }
-    let context = repository_key_context(keys)?;
     let body =
         read_bounded_object_at(store, &object_id, None, MAX_KEYRING_ENVELOPE_OBJECT_BYTES).await?;
     let envelope =
         RepositoryEnvelope::from_object_bytes(&body, rs3_crypto::EnvelopePurpose::Keyring)
             .map_err(repository_init)?;
+    // Without an anchor, the wrapping key is what authenticates this envelope
+    // and its public salt; opening below enforces that binding.
+    let context = repository_key_context_for_envelope(keys, &envelope)?;
     let keyring = envelope
         .open_keyring(&context, wrapping_key_id, wrapping_key)
         .map_err(repository_init)?;
@@ -500,15 +516,26 @@ where
     })
 }
 
-fn repository_key_context(
+/// Builds the envelope context from an envelope's public salt, insisting that
+/// an operator-pinned salt agrees with it.
+fn repository_key_context_for_envelope(
     keys: &RepositoryKeyContextConfig,
+    envelope: &RepositoryEnvelope,
 ) -> Result<RepositoryKeyContext, S3BoundaryError> {
-    let salt = hex::decode(&keys.repository_salt_hex).map_err(|error| {
-        repository_init(format!(
-            "RS3_REPOSITORY_SALT_HEX must be hex-encoded repository salt: {error}",
-        ))
-    })?;
-    RepositoryKeyContext::new(keys.repository_id.clone(), salt).map_err(repository_init)
+    if let Some(configured) = keys.repository_salt_hex.as_deref() {
+        let configured = hex::decode(configured).map_err(|error| {
+            repository_init(format!(
+                "RS3_REPOSITORY_SALT_HEX must be hex-encoded repository salt: {error}",
+            ))
+        })?;
+        if configured != envelope.repository_salt {
+            return Err(repository_init(
+                "RS3_REPOSITORY_SALT_HEX does not match the public salt bound into the repository envelope; unset it to recover the salt from the verified envelope, or supply the recorded value",
+            ));
+        }
+    }
+    RepositoryKeyContext::new(keys.repository_id.clone(), envelope.repository_salt.clone())
+        .map_err(repository_init)
 }
 
 #[cfg(test)]
@@ -646,6 +673,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keyring_inspect_recovers_the_envelope_salt_and_rejects_a_pinned_mismatch() {
+        let store = MemoryBlobStore::new();
+        let context = crypto_context();
+        let wrapping_key = secret(OLD_WRAP_HEX);
+        let keyring = KeyRing::generate_random().unwrap_or_else(|error| panic!("{error}"));
+        let envelope = keyring
+            .seal_keyring_envelope(&context, "wrap-v1", &wrapping_key, 1)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let reference = store_keyring_envelope(&store, &envelope, None, None)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut keys = key_context();
+        keys.repository_salt_hex = None;
+        let inspect = inspect_keyring_envelope_with_store(
+            store.clone(),
+            &keys,
+            KeyringEnvelopeInspectOptions {
+                envelope_object_id: Some(reference.object_id.clone()),
+                wrapping_key: wrapping_key.clone(),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(inspect.repository_salt_hex, SALT_HEX);
+
+        keys.repository_salt_hex = Some("33".repeat(32));
+        let error = inspect_keyring_envelope_with_store(
+            store,
+            &keys,
+            KeyringEnvelopeInspectOptions {
+                envelope_object_id: Some(reference.object_id),
+                wrapping_key,
+            },
+        )
+        .await
+        .expect_err("pinned salt must match the envelope");
+        assert!(error.to_string().contains("does not match the public salt"));
+    }
+
+    #[tokio::test]
+    async fn verify_bundle_checks_the_salt_digest_against_the_anchored_format_root() {
+        let (store, mut bundle, wrapping_key) = verification_fixture(V2ProviderProfile::Dev).await;
+        let salt = hex::decode(SALT_HEX).unwrap_or_else(|error| panic!("{error}"));
+        bundle.repository_salt_digest = Some(rs3_crypto::Sha256Hasher::digest(&salt));
+        let mut config = tool_config();
+        config.repository_keys.repository_salt_hex = None;
+        let report = verify_v2_recovery_bundle_with_store(
+            store.clone(),
+            &config,
+            bundle.clone(),
+            V2RecoveryBundleVerificationOptions {
+                min_sequence: Sequence::new(1),
+                wrapping_key: wrapping_key.clone(),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(report.verified_commit_count, 1);
+
+        bundle.repository_salt_digest = Some([9; 32]);
+        let error = verify_v2_recovery_bundle_with_store(
+            store,
+            &config,
+            bundle,
+            V2RecoveryBundleVerificationOptions {
+                min_sequence: Sequence::new(1),
+                wrapping_key,
+            },
+        )
+        .await
+        .expect_err("a foreign salt digest is rejected");
+        assert!(error.to_string().contains("salt digest"));
+    }
+
+    #[tokio::test]
     async fn verify_bundle_rejects_anchor_below_external_floor() {
         let (store, bundle, wrapping_key) = verification_fixture(V2ProviderProfile::Dev).await;
         let error = verify_v2_recovery_bundle_with_store(
@@ -728,7 +830,7 @@ mod tests {
     fn key_context() -> RepositoryKeyContextConfig {
         RepositoryKeyContextConfig {
             repository_id: repository_id(),
-            repository_salt_hex: SALT_HEX.to_owned(),
+            repository_salt_hex: Some(SALT_HEX.to_owned()),
             envelope_object_id: None,
             wrapping_key_id: "wrap-v1".to_owned(),
         }

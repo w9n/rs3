@@ -161,7 +161,9 @@ reference.
 ## Keys And Bootstrap
 
 The gateway uses an encrypted keyring envelope. Operators provide a stable
-repository ID, a stable public salt, and a wrapping-key source. For an anchored
+repository ID and a wrapping-key source; the public salt is generated at
+initialization, journaled, and recovered from the verified envelope on every
+later start, so it needs no separate custody. For an anchored
 repository, startup reads the accepted v2 anchor, verifies the signed commit
 chain and format root, and opens the keyring envelope bound through that format
 root. It does not trust S3 listing order or a mutable "latest" object to choose
@@ -190,9 +192,10 @@ Operational rules:
   password KDF before setting `RS3_KEYRING_WRAPPING_KEY_HEX`.
 - Keep wrapping keys, KMS access, HSM access, or Vault tokens outside the object
   store and outside broad cluster write credentials.
-- Provide a stable salt once per repository and keep it with trusted repository
-  configuration and recovery material.
-- Treat salts as public restore metadata, not as second passwords.
+- Leave `RS3_REPOSITORY_SALT_HEX` unset unless you must pin a known salt; a
+  pinned value that disagrees with the envelope fails startup rather than
+  silently switching context.
+- Treat salts as public envelope metadata, not as second passwords.
 - Keep historical keys available for at least the maximum retention window.
 - Do not destroy a key while any retained commit can reference data that
   requires it.
@@ -201,14 +204,14 @@ For a first empty repository, configure the repository context and wrapping key:
 
 ```sh
 RS3_REPOSITORY_ID=prod-backups
-RS3_REPOSITORY_SALT_HEX=<stable-public-salt-hex>
 RS3_KEYRING_WRAPPING_KEY_ID=wrap-2026-05 # optional; defaults to wrap-v1
 RS3_KEYRING_WRAPPING_KEY_HEX=<wrapping-key-hex>
 ```
 
 In Helm, set `repositoryKeys.create=true` or provide
-`repositoryKeys.existingSecret`. The required Secret keys are `salt-hex` and
-`wrapping-key-hex`; `wrapping-key-id` is optional and defaults to `wrap-v1`;
+`repositoryKeys.existingSecret`. The required Secret key is
+`wrapping-key-hex`; `salt-hex` optionally pins the public salt;
+`wrapping-key-id` is optional and defaults to `wrap-v1`;
 `envelope-object-id` is an optional override. Helm values stay declarative; the
 gateway writes the encrypted envelope object, not mutated chart state.
 
@@ -351,8 +354,8 @@ cargo run -p rs3-server -- keyring inspect \
 
 This opens the envelope and prints public key descriptors only. It does not
 print repository data keys or wrapping-key material. The command uses the
-normal `RS3_BACKEND_*`, `RS3_REPOSITORY_ID`, and `RS3_REPOSITORY_SALT_HEX`
-configuration.
+normal `RS3_BACKEND_*` and `RS3_REPOSITORY_ID` configuration and reports the
+public salt it recovered from the envelope.
 
 Rewrap the keyring envelope with a new wrapping key without rewriting backup
 data:
@@ -565,9 +568,10 @@ are rendered only when both `metrics.enabled` and `alerts.enabled` are true.
 Treat the restore bundle as public but integrity-sensitive recovery metadata.
 It should live outside the object-store account and outside the cluster whose
 Lease it may need to recreate. Backend credentials alone are not enough for
-disaster recovery; the bundle, repository ID, public salt, wrapping-key source,
-and selected retention context must agree before a new cluster imports an
-anchor. The operational procedure is [Restore Under Attack](runbooks/restore-under-attack.md).
+disaster recovery; the bundle, repository ID, wrapping-key source, and
+selected retention context must agree before a new cluster imports an anchor,
+and the signed bundle's salt digest must match the format root the anchor
+binds. The operational procedure is [Restore Under Attack](runbooks/restore-under-attack.md).
 
 ## Metrics
 
@@ -664,7 +668,6 @@ general retained-provider qualification.
     being protected:
 
     - repository ID
-    - public repository salt
     - wrapping-key source for the keyring envelope
     - trusted v2 anchor position: sequence, commit key, commit object version ID
       when available, commit body digest, signing key ID, and format-root
@@ -702,8 +705,9 @@ Run only one `read-write` gateway for a repository. Multiple independent
 writers cannot safely coordinate repository state without a stronger shared
 write protocol. Scaled restore readers should use `restore-readonly`.
 
-Disaster recovery into a new cluster requires the repository ID, public salt,
-wrapping-key source, and a trusted v2 anchor position from outside S3. Backend
+Disaster recovery into a new cluster requires the repository ID,
+wrapping-key source, and a trusted v2 anchor position from outside S3; the
+public salt is recovered from the format root that position binds. Backend
 objects alone are not a latest-state oracle because the backend can hide newer
 valid commits and replay older valid commits.
 
@@ -744,7 +748,6 @@ RS3_BACKEND_ENDPOINT=s3 \
 RS3_BACKEND_BUCKET=<bucket> \
 RS3_BACKEND_PREFIX=<repository-prefix> \
 RS3_REPOSITORY_ID=<repository-id> \
-RS3_REPOSITORY_SALT_HEX=<repository-salt-hex> \
 RS3_RECOVERY_PUBLIC_KEY=ed25519:<recovery-public-key-hex> \
 cargo run -p rs3-server -- verify-bundle \
   --bundle-file rs3-restore-bundle.cbor \
@@ -752,8 +755,9 @@ cargo run -p rs3-server -- verify-bundle \
   --wrapping-key-hex-file <wrapping-key-hex-file>
 ```
 
-The verifier opens the encrypted format root and keyring envelope, checks `RS3_RECOVERY_PUBLIC_KEY`, then
-verifies the anchor-selected signed commit chain to the nearest snapshot
+The verifier opens the encrypted format root and keyring envelope, checks
+`RS3_RECOVERY_PUBLIC_KEY` and the bundle's salt digest against the format root,
+then verifies the anchor-selected signed commit chain to the nearest snapshot
 without mutating storage or the external anchor.
 
 The bundle is a weak-subjectivity checkpoint, not a permanent snapshot pin.
@@ -764,7 +768,7 @@ provider retention window covering its referenced versions can expire. Keep at l
 until its replacement has been exported, signed, and verified.
 
 On a new cluster with a missing anchor, import the trusted v2 anchor from that
-bundle after configuring the same repository ID, salt, wrapping-key source,
+bundle after configuring the same repository ID, wrapping-key source,
 backend, and retention settings:
 
 ```sh

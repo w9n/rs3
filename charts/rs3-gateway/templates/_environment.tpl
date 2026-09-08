@@ -114,6 +114,7 @@
     secretKeyRef:
       name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
       key: salt-hex
+      optional: true
 - name: RS3_KEYRING_ENVELOPE_OBJECT_ID
   valueFrom:
     secretKeyRef:

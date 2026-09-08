@@ -1780,8 +1780,9 @@ mod tests {
             recovery: RecoveryConfig::default(),
             repository_keys: RepositoryKeysConfig {
                 repository_id,
-                repository_salt_hex:
+                repository_salt_hex: Some(
                     "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
+                ),
                 envelope_object_id: Some(
                     BackendObjectId::new("keyrings/00000000000000000001-digest.cbor")
                         .unwrap_or_else(|error| panic!("{error}")),

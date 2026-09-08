@@ -104,7 +104,7 @@ fn open_gateway_keyring(
     if object_id.as_str().ends_with(".json") {
         return Err(repository_init("retired keyring object format"));
     }
-    let context = repository_key_context(keys)?;
+    let context = repository_key_context_for_envelope(keys, &envelope)?;
     let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
     let keyring = envelope
         .open_keyring(&context, &keys.wrapping_key_id, &wrapping_key)
@@ -118,6 +118,7 @@ fn open_gateway_keyring(
     Ok(LoadedGatewayKeyring {
         keyring,
         envelope_reference: Some(reference),
+        repository_salt: envelope.repository_salt,
     })
 }
 
@@ -175,7 +176,8 @@ async fn bootstrap_missing_keyring_envelope(
         ));
     }
 
-    let (keyring, envelope) = prepare_gateway_keyring(keys)?;
+    let salt = configured_or_generated_repository_salt(keys)?;
+    let (keyring, envelope) = prepare_gateway_keyring(keys, &salt)?;
     let reference = if let Some(object_id) = configured_object_id {
         store_configured_keyring_envelope(store, &object_id, &envelope, retention).await?
     } else {
@@ -193,13 +195,15 @@ async fn bootstrap_missing_keyring_envelope(
     Ok(LoadedGatewayKeyring {
         keyring,
         envelope_reference: Some(reference),
+        repository_salt: salt,
     })
 }
 
 pub(super) fn prepare_gateway_keyring(
     keys: &RepositoryKeysConfig,
+    salt: &[u8],
 ) -> Result<(KeyRing, RepositoryEnvelope), S3BoundaryError> {
-    let context = repository_key_context(keys)?;
+    let context = repository_key_context_for_salt(keys, salt)?;
     let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
     let keyring = KeyRing::generate_random().map_err(repository_init)?;
     let envelope = keyring
@@ -305,13 +309,57 @@ async fn repository_has_anchor_bound_objects(
 pub(super) struct LoadedGatewayKeyring {
     pub(super) keyring: KeyRing,
     pub(super) envelope_reference: Option<KeyringEnvelopeReference>,
+    /// Public salt bound into the opened or sealed envelope.
+    pub(super) repository_salt: Vec<u8>,
 }
 
-pub(super) fn repository_key_context(
+/// Decodes the optional operator-pinned public salt.
+pub(super) fn configured_repository_salt(
     keys: &RepositoryKeysConfig,
+) -> Result<Option<Vec<u8>>, S3BoundaryError> {
+    keys.repository_salt_hex
+        .as_deref()
+        .map(repository_salt)
+        .transpose()
+}
+
+/// Builds the envelope context from a verified envelope's public salt.
+///
+/// A configured salt must match the envelope; otherwise the salt is recovered
+/// from the envelope, whose authenticity the caller has already tied to the
+/// anchor, the format root, or the wrapping key before opening it.
+pub(super) fn repository_key_context_for_envelope(
+    keys: &RepositoryKeysConfig,
+    envelope: &RepositoryEnvelope,
 ) -> Result<RepositoryKeyContext, S3BoundaryError> {
-    let salt = repository_salt(&keys.repository_salt_hex)?;
-    RepositoryKeyContext::new(keys.repository_id.clone(), salt).map_err(repository_init)
+    if let Some(configured) = configured_repository_salt(keys)?
+        && configured != envelope.repository_salt
+    {
+        return Err(repository_init(format!(
+            "{REPOSITORY_SALT_HEX_ENV} does not match the public salt bound into the repository envelope; unset it to recover the salt from the verified envelope, or supply the recorded value"
+        )));
+    }
+    repository_key_context_for_salt(keys, &envelope.repository_salt)
+}
+
+/// Builds the envelope context for a known salt, used when sealing.
+pub(super) fn repository_key_context_for_salt(
+    keys: &RepositoryKeysConfig,
+    salt: &[u8],
+) -> Result<RepositoryKeyContext, S3BoundaryError> {
+    RepositoryKeyContext::new(keys.repository_id.clone(), salt.to_vec()).map_err(repository_init)
+}
+
+/// Returns the configured salt, or generates one for a new repository.
+pub(super) fn configured_or_generated_repository_salt(
+    keys: &RepositoryKeysConfig,
+) -> Result<Vec<u8>, S3BoundaryError> {
+    match configured_repository_salt(keys)? {
+        Some(salt) => Ok(salt),
+        None => rs3_crypto::random_repository_salt()
+            .map(|salt| salt.to_vec())
+            .map_err(repository_init),
+    }
 }
 
 pub(super) fn secret_hex(

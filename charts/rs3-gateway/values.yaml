@@ -227,6 +227,9 @@ repository:
 repositoryKeys:
   create: false
   existingSecret: ""
+  # Optional. Leave empty: initialization generates the public salt, journals
+  # it, and every later start recovers it from the verified envelope. Set it
+  # only to pin a known value; a mismatch with the envelope fails startup.
   saltHex: ""
   envelopeObjectId: ""
   wrappingKeyId: wrap-v1

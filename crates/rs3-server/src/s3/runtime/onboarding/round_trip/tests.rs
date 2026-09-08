@@ -9,10 +9,8 @@ async fn bootstrap_fixture(
     anchor: &RuntimeV2Anchor,
     backing: &mut MemoryJournal,
 ) -> V2RepositoryInitReport {
-    let mut journal =
-        OnboardingJournal::open(backing, bootstrap::context(config).expect("context"))
-            .expect("journal");
-    bootstrap::initialize(config, store, anchor, &Guard::default(), &mut journal)
+    let mut journal = OnboardingJournal::open(backing, config).expect("journal");
+    bootstrap::initialize(config, store, anchor, &Guard::default(), &mut journal, None)
         .await
         .expect("bootstrap")
 }
@@ -33,11 +31,8 @@ async fn every_restore_journal_boundary_resumes_without_duplicate_publication() 
                 let genesis = report.anchor.clone();
                 backing.fail = Some((backing.saves + at, after));
                 {
-                    let mut journal = OnboardingJournal::open(
-                        &mut backing,
-                        bootstrap::context(&config).expect("context"),
-                    )
-                    .expect("journal");
+                    let mut journal =
+                        OnboardingJournal::open(&mut backing, &config).expect("journal");
                     assert!(
                         verify(
                             &config,
@@ -55,11 +50,7 @@ async fn every_restore_journal_boundary_resumes_without_duplicate_publication() 
                 backing.fail = None;
                 // Real retry reloads accepted state before any new publication.
                 report = bootstrap_fixture(&config, &store, &anchor, &mut backing).await;
-                let mut journal = OnboardingJournal::open(
-                    &mut backing,
-                    bootstrap::context(&config).expect("context"),
-                )
-                .expect("journal");
+                let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
                 verify(
                     &config,
                     &store,
@@ -128,9 +119,7 @@ async fn rejected_puts_exhaust_the_durable_budget_and_writer_loss_prevents_io() 
                 FaultAction::return_error("fixture write denied"),
             ))
             .expect("fault");
-        let mut journal =
-            OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-                .expect("journal");
+        let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
         assert!(
             verify(
                 &config,
@@ -148,9 +137,7 @@ async fn rejected_puts_exhaust_the_durable_budget_and_writer_loss_prevents_io() 
         );
     }
     let puts = storage.operation_counts().expect("counts").put;
-    let mut journal =
-        OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-            .expect("journal");
+    let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
     assert!(
         verify(
             &config,
@@ -189,9 +176,7 @@ async fn unexpected_fixture_bytes_are_not_overwritten_or_deleted() {
     let key;
     let body;
     {
-        let mut journal =
-            OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-                .expect("journal");
+        let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
         (key, body) = fixture(&journal.record.probe_root).expect("fixture");
         assert!(
             verify(
@@ -219,9 +204,7 @@ async fn unexpected_fixture_bytes_are_not_overwritten_or_deleted() {
         .await
         .expect("different same-length bytes");
     let before = storage.operation_counts().expect("counts").put;
-    let mut journal =
-        OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-            .expect("journal");
+    let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
     assert!(
         verify(
             &config,
@@ -302,11 +285,7 @@ async fn lost_publication_replies_reconcile_before_another_write() {
             fail_read: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         {
-            let mut journal = OnboardingJournal::open(
-                &mut backing,
-                bootstrap::context(&config).expect("context"),
-            )
-            .expect("journal");
+            let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
             assert!(
                 verify(
                     &config,
@@ -321,9 +300,7 @@ async fn lost_publication_replies_reconcile_before_another_write() {
             );
         }
         report = bootstrap_fixture(&config, &store, &anchor, &mut backing).await;
-        let mut journal =
-            OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-                .expect("journal");
+        let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
         verify(
             &config,
             &store,
@@ -360,9 +337,7 @@ async fn corrupt_ciphertext_blocks_restore_even_when_authenticated_metadata_open
     backing.fail = Some((backing.saves + 3, false));
     let key;
     {
-        let mut journal =
-            OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-                .expect("journal");
+        let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
         key = fixture(&journal.record.probe_root).expect("fixture").0;
         assert!(
             verify(
@@ -418,9 +393,7 @@ async fn corrupt_ciphertext_blocks_restore_even_when_authenticated_metadata_open
         .expect("authenticated metadata opens");
     reader.head(&key).expect("HEAD still succeeds");
     let before = storage.operation_counts().expect("counts").put;
-    let mut journal =
-        OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-            .expect("journal");
+    let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
     assert!(
         verify(
             &config,
@@ -457,9 +430,7 @@ async fn failed_tombstone_publications_exhaust_the_delete_budget_without_readine
     let mut report = bootstrap_fixture(&config, &store, &anchor, &mut backing).await;
     backing.fail = Some((backing.saves + 3, true));
     {
-        let mut journal =
-            OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-                .expect("journal");
+        let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
         assert!(
             verify(
                 &config,
@@ -482,9 +453,7 @@ async fn failed_tombstone_publications_exhaust_the_delete_budget_without_readine
                 FaultAction::return_error("tombstone denied"),
             ))
             .expect("fault");
-        let mut journal =
-            OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-                .expect("journal");
+        let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
         assert!(
             verify(
                 &config,
@@ -502,9 +471,7 @@ async fn failed_tombstone_publications_exhaust_the_delete_budget_without_readine
         );
     }
     let puts = storage.operation_counts().expect("counts").put;
-    let mut journal =
-        OnboardingJournal::open(&mut backing, bootstrap::context(&config).expect("context"))
-            .expect("journal");
+    let mut journal = OnboardingJournal::open(&mut backing, &config).expect("journal");
     assert!(
         verify(
             &config,

@@ -2,7 +2,10 @@
 
 use super::*;
 use crate::admin::provider_conformance_target_fingerprint;
-use crate::s3::runtime_keyring::{open_gateway_keyring_object, prepare_gateway_keyring};
+use crate::s3::runtime_keyring::{
+    configured_or_generated_repository_salt, configured_repository_salt,
+    open_gateway_keyring_object, prepare_gateway_keyring,
+};
 use rs3_crypto::derive_public_fingerprint;
 use rs3_k8s::{KubernetesBootstrapJournal, MAX_BOOTSTRAP_JOURNAL_BYTES};
 use rs3_repository::v2::V2FormatError;
@@ -39,6 +42,11 @@ impl Journal for KubernetesBootstrapJournal {
 struct Record {
     schema: String,
     context: String,
+    /// Public salt this initialization sealed its envelopes under. Absent only
+    /// in journals written before salts were generated, which always ran with
+    /// a configured salt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository_salt_hex: Option<String>,
     phase: Phase,
 }
 
@@ -85,9 +93,8 @@ fn invalid() -> S3BoundaryError {
     repository_init("bootstrap journal does not match the configured unfinished initialization")
 }
 
-pub(super) fn context(config: &RuntimeConfig) -> Result<String, S3BoundaryError> {
+pub(super) fn context(config: &RuntimeConfig, salt: &[u8]) -> Result<String, S3BoundaryError> {
     let keys = &config.repository_keys;
-    let salt = hex::decode(&keys.repository_salt_hex).map_err(|_| invalid())?;
     let identity = serde_json::to_vec(&(
         &keys.repository_id,
         salt,
@@ -107,28 +114,62 @@ pub(super) fn context(config: &RuntimeConfig) -> Result<String, S3BoundaryError>
     ))
 }
 
-fn decode(bytes: &[u8], expected: &str) -> Result<Record, S3BoundaryError> {
+/// Resolves the salt a journal was written under.
+///
+/// A configured or externally fixed salt must agree with the recorded one.
+/// Journals written before salts were recorded always ran with a configured
+/// salt, so they resolve to the configured value alone.
+pub(super) fn resolve_recorded_salt(
+    config: &RuntimeConfig,
+    fixed_salt: Option<&[u8]>,
+    recorded_hex: Option<&str>,
+) -> Result<Vec<u8>, S3BoundaryError> {
+    let fixed = match fixed_salt {
+        Some(salt) => Some(salt.to_vec()),
+        None => configured_repository_salt(&config.repository_keys)?,
+    };
+    let recorded = recorded_hex
+        .map(|hex| hex::decode(hex).map_err(|_| invalid()))
+        .transpose()?;
+    match (fixed, recorded) {
+        (Some(fixed), Some(recorded)) if fixed != recorded => Err(invalid()),
+        (Some(fixed), _) => Ok(fixed),
+        (None, Some(recorded)) => Ok(recorded),
+        (None, None) => Err(invalid()),
+    }
+}
+
+fn decode(
+    bytes: &[u8],
+    config: &RuntimeConfig,
+    fixed_salt: Option<&[u8]>,
+) -> Result<(Record, Vec<u8>), S3BoundaryError> {
     if bytes.len() > MAX_BOOTSTRAP_JOURNAL_BYTES {
         return Err(invalid());
     }
     let record: Record = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    let salt = resolve_recorded_salt(config, fixed_salt, record.repository_salt_hex.as_deref())?;
     let remaining = match &record.phase {
         Phase::Keyring { artifact } | Phase::Format { artifact, .. } => artifact.remaining,
         Phase::Genesis { remaining, .. } => *remaining,
         Phase::Initialized { .. } => 0,
     };
-    if record.schema != SCHEMA || record.context != expected || remaining > WRITE_ATTEMPTS {
+    if record.schema != SCHEMA
+        || record.context != context(config, &salt)?
+        || remaining > WRITE_ATTEMPTS
+    {
         return Err(invalid());
     }
-    Ok(record)
+    Ok((record, salt))
 }
 
 pub(super) fn is_initialized(
     config: &RuntimeConfig,
+    fixed_salt: Option<&[u8]>,
     bytes: &[u8],
 ) -> Result<bool, S3BoundaryError> {
     Ok(matches!(
-        decode(bytes, &context(config)?)?.phase,
+        decode(bytes, config, fixed_salt)?.0.phase,
         Phase::Initialized { .. }
     ))
 }
@@ -147,6 +188,8 @@ struct Bootstrap<'a, J> {
     anchor: &'a RuntimeV2Anchor,
     guard: &'a dyn V2MaintenanceGuard,
     journal: &'a mut J,
+    /// Salt fixed by an enclosing journal; otherwise configured or generated.
+    fixed_salt: Option<Vec<u8>>,
 }
 
 impl<J: Journal> Bootstrap<'_, J> {
@@ -174,7 +217,7 @@ impl<J: Journal> Bootstrap<'_, J> {
     async fn verify_accepted(
         &self,
         initialized: bool,
-    ) -> Result<V2RepositoryInitReport, S3BoundaryError> {
+    ) -> Result<(V2RepositoryInitReport, Vec<u8>), S3BoundaryError> {
         let anchor = self
             .anchor
             .read_v2()
@@ -192,27 +235,37 @@ impl<J: Journal> Bootstrap<'_, J> {
             self.config,
         )
         .await?;
+        if self
+            .fixed_salt
+            .as_ref()
+            .is_some_and(|fixed| *fixed != loaded.repository_salt)
+        {
+            return Err(invalid());
+        }
+        let repository_salt = loaded.repository_salt.clone();
         let options = bootstrap_commit_options(self.config, &loaded)?;
         let commits = V2CommitStore::new(self.store.clone(), loaded.keyring, options);
         let chain = commits
             .load_replay_chain_from_state(&anchor)
             .await
             .map_err(repository_init)?;
-        Ok(V2RepositoryInitReport {
-            anchor,
-            initialized,
-            verified_commit_count: chain.commits_newest_first.len(),
-            probe_attempts: 0,
-            payload_restore_verified: false,
-            probe_observation: None,
-        })
+        Ok((
+            V2RepositoryInitReport {
+                anchor,
+                initialized,
+                verified_commit_count: chain.commits_newest_first.len(),
+                probe_attempts: 0,
+                payload_restore_verified: false,
+                probe_observation: None,
+            },
+            repository_salt,
+        ))
     }
 
     async fn run(&mut self) -> Result<V2RepositoryInitReport, S3BoundaryError> {
         self.check_guard().await?;
-        let expected = context(self.config)?;
-        let mut record = match self.journal.state()? {
-            Some(bytes) => decode(bytes, &expected)?,
+        let (mut record, salt) = match self.journal.state()? {
+            Some(bytes) => decode(bytes, self.config, self.fixed_salt.as_deref())?,
             None => {
                 if self
                     .anchor
@@ -221,12 +274,13 @@ impl<J: Journal> Bootstrap<'_, J> {
                     .map_err(repository_init)?
                     .is_some()
                 {
-                    let report = self.verify_accepted(false).await?;
+                    let (report, salt) = self.verify_accepted(false).await?;
                     save(
                         self.journal,
                         &Record {
                             schema: SCHEMA.to_owned(),
-                            context: expected,
+                            context: context(self.config, &salt)?,
+                            repository_salt_hex: Some(hex::encode(&salt)),
                             phase: Phase::Initialized {
                                 accepted: report.anchor.clone(),
                             },
@@ -242,26 +296,34 @@ impl<J: Journal> Bootstrap<'_, J> {
                     None,
                 )
                 .await?;
-                let (_, envelope) = prepare_gateway_keyring(&self.config.repository_keys)?;
+                // The salt is decided once here and journaled with the first
+                // artifact, so every retry seals under the same context.
+                let salt = match self.fixed_salt.clone() {
+                    Some(salt) => salt,
+                    None => configured_or_generated_repository_salt(&self.config.repository_keys)?,
+                };
+                let (_, envelope) = prepare_gateway_keyring(&self.config.repository_keys, &salt)?;
                 let artifact = Artifact::new(
                     self.keyring_id(&envelope)?,
                     envelope.to_object_bytes().map_err(repository_init)?,
                 );
                 let record = Record {
                     schema: SCHEMA.to_owned(),
-                    context: expected,
+                    context: context(self.config, &salt)?,
+                    repository_salt_hex: Some(hex::encode(&salt)),
                     phase: Phase::Keyring { artifact },
                 };
                 save(self.journal, &record).await?;
-                record
+                (record, salt)
             }
         };
         loop {
             self.check_guard().await?;
             if let Phase::Initialized { accepted } = &record.phase {
-                let report = self.verify_accepted(false).await?;
+                let (report, verified_salt) = self.verify_accepted(false).await?;
                 if report.anchor.sequence < accepted.sequence
                     || (report.anchor.sequence == accepted.sequence && report.anchor != *accepted)
+                    || verified_salt != salt
                 {
                     return Err(invalid());
                 }
@@ -276,7 +338,9 @@ impl<J: Journal> Bootstrap<'_, J> {
                         rs3_crypto::EnvelopePurpose::Keyring,
                     )
                     .map_err(repository_init)?;
-                    if artifact.object_id != self.keyring_id(&envelope)? {
+                    if artifact.object_id != self.keyring_id(&envelope)?
+                        || envelope.repository_salt != salt
+                    {
                         return Err(invalid());
                     }
                     // Decrypt before any PUT: a changed wrapping key must fail here.
@@ -309,7 +373,7 @@ impl<J: Journal> Bootstrap<'_, J> {
                         v2_provider_profile(&self.config.backend, self.config.repository.retention),
                         self.config.repository.retention,
                     );
-                    let envelope = prepare_format_root(&self.config.repository_keys, &root)?;
+                    let envelope = prepare_format_root(&self.config.repository_keys, &root, &salt)?;
                     record.phase = Phase::Format {
                         keyring,
                         artifact: Artifact::new(
@@ -342,12 +406,17 @@ impl<J: Journal> Bootstrap<'_, J> {
                         object_id: artifact.object_id.clone(),
                         version_id: None,
                     };
-                    let root = open_format_root_body(
+                    let opened = open_format_root_body(
                         &self.config.repository_keys,
                         &format,
                         &artifact.body,
                     )?;
-                    let loaded = self.load_dependencies(&keyring, &root, &format).await?;
+                    if opened.repository_salt != salt {
+                        return Err(invalid());
+                    }
+                    let loaded = self
+                        .load_dependencies(&keyring, &opened.root, &format, &salt)
+                        .await?;
                     self.protect_dependency(&keyring.object_id, keyring.version_id.as_ref())
                         .await?;
                     format.version_id = self
@@ -378,9 +447,14 @@ impl<J: Journal> Bootstrap<'_, J> {
                     intent,
                     remaining,
                 } => {
-                    let root =
+                    let opened =
                         open_format_root(self.store, &self.config.repository_keys, &format).await?;
-                    let loaded = self.load_dependencies(&keyring, &root, &format).await?;
+                    if opened.repository_salt != salt {
+                        return Err(invalid());
+                    }
+                    let loaded = self
+                        .load_dependencies(&keyring, &opened.root, &format, &salt)
+                        .await?;
                     let options = bootstrap_commit_options(self.config, &loaded)?;
                     let commits = V2CommitStore::new(self.store.clone(), loaded.keyring, options);
                     let prepared = commits
@@ -423,7 +497,7 @@ impl<J: Journal> Bootstrap<'_, J> {
                         }
                         Err(error) => return Err(repository_init(error)),
                     }
-                    let report = self.verify_accepted(true).await?;
+                    let (report, _) = self.verify_accepted(true).await?;
                     record.phase = Phase::Initialized {
                         accepted: report.anchor.clone(),
                     };
@@ -464,6 +538,7 @@ impl<J: Journal> Bootstrap<'_, J> {
         keyring: &V2KeyringEnvelopeRootRef,
         root: &V2FormatRoot,
         format: &V2FormatRef,
+        salt: &[u8],
     ) -> Result<LoadedV2Repository, S3BoundaryError> {
         if root.active_keyring_envelope_ref != *keyring
             || root.repository_id != self.config.repository_keys.repository_id
@@ -484,6 +559,7 @@ impl<J: Journal> Bootstrap<'_, J> {
             .primary_key_id(KeyPurpose::CheckpointSigning)
             .map_err(repository_init)?
             != root.signing_key_id
+            || loaded.repository_salt != salt
         {
             return Err(invalid());
         }
@@ -492,6 +568,7 @@ impl<J: Journal> Bootstrap<'_, J> {
             keyring_ref: keyring.clone(),
             format_ref: format.clone(),
             anchor_present: false,
+            repository_salt: loaded.repository_salt,
         })
     }
 
@@ -638,6 +715,7 @@ pub(super) async fn initialize(
     anchor: &RuntimeV2Anchor,
     guard: &dyn V2MaintenanceGuard,
     journal: &mut impl Journal,
+    fixed_salt: Option<Vec<u8>>,
 ) -> Result<V2RepositoryInitReport, S3BoundaryError> {
     Bootstrap {
         config,
@@ -645,6 +723,7 @@ pub(super) async fn initialize(
         anchor,
         guard,
         journal,
+        fixed_salt,
     }
     .run()
     .await

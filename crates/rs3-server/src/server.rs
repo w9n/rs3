@@ -322,8 +322,9 @@ mod tests {
             repository_keys: RepositoryKeysConfig {
                 repository_id: RepositoryId::new("test-repository")
                     .unwrap_or_else(|error| panic!("{error}")),
-                repository_salt_hex:
+                repository_salt_hex: Some(
                     "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
+                ),
                 envelope_object_id: Some(
                     BackendObjectId::new("keyrings/test-envelope.cbor")
                         .unwrap_or_else(|error| panic!("{error}")),

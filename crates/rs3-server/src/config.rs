@@ -148,8 +148,10 @@ pub struct RepositoryToolConfig {
 pub struct RepositoryKeyContextConfig {
     /// Stable repository derivation context.
     pub repository_id: RepositoryId,
-    /// Stable public salt used with the repository ID when opening envelopes.
-    pub repository_salt_hex: String,
+    /// Optional operator-pinned public salt. When unset, initialization
+    /// generates one and every later opener recovers it from the verified
+    /// envelope; when set, it must equal the envelope's salt.
+    pub repository_salt_hex: Option<String>,
     /// Optional bootstrap or recovery override for an encrypted keyring envelope object.
     pub envelope_object_id: Option<BackendObjectId>,
     /// Operator-visible wrapping key identifier.
@@ -531,8 +533,8 @@ impl RepositoryFormat {
 pub struct RepositoryKeysConfig {
     /// Stable repository derivation context.
     pub repository_id: RepositoryId,
-    /// Stable public salt used with the repository ID when opening the envelope.
-    pub repository_salt_hex: String,
+    /// Optional operator-pinned public salt; see [`RepositoryKeyContextConfig`].
+    pub repository_salt_hex: Option<String>,
     /// Optional bootstrap or recovery override for the encrypted keyring envelope.
     pub envelope_object_id: Option<BackendObjectId>,
     /// Operator-visible wrapping key identifier.
@@ -546,7 +548,13 @@ impl fmt::Debug for RepositoryKeysConfig {
         formatter
             .debug_struct("RepositoryKeysConfig")
             .field("repository_id", &"<configured>")
-            .field("repository_salt_hex", &"<configured>")
+            .field(
+                "repository_salt_hex",
+                &self
+                    .repository_salt_hex
+                    .as_ref()
+                    .map_or("<recovered-from-envelope>", |_| "<configured>"),
+            )
             .field("envelope_object_id", &"<configured>")
             .field("wrapping_key_id", &"<configured>")
             .field("wrapping_key_hex", &REDACTED_SECRET_VALUE)
@@ -1545,8 +1553,8 @@ fn validate_runtime_writer_guard(
 }
 
 fn validate_runtime_repository_keys(errors: &mut Vec<ConfigError>, keys: &RepositoryKeysConfig) {
-    if let Err(error) =
-        validate_repository_salt_hex(REPOSITORY_SALT_HEX_ENV, &keys.repository_salt_hex)
+    if let Some(salt_hex) = keys.repository_salt_hex.as_deref()
+        && let Err(error) = validate_repository_salt_hex(REPOSITORY_SALT_HEX_ENV, salt_hex)
     {
         errors.push(error);
     }
@@ -2121,7 +2129,7 @@ fn parse_repository_key_context_config(
         .unwrap_or(None);
     let repository_salt_hex = collect_config_error(
         &mut errors,
-        required_repository_salt_hex(source, REPOSITORY_SALT_HEX_ENV),
+        optional_repository_salt_hex(source, REPOSITORY_SALT_HEX_ENV),
     );
     let envelope_object_id = match optional_value(source, KEYRING_ENVELOPE_OBJECT_ID_ENV) {
         Some(value) => collect_config_error(
@@ -2164,13 +2172,15 @@ fn parse_backend_object_id(
     })
 }
 
-fn required_repository_salt_hex(
+fn optional_repository_salt_hex(
     source: &impl ConfigSource,
     key: &'static str,
-) -> Result<String, ConfigError> {
-    let value = required_value(source, key)?;
+) -> Result<Option<String>, ConfigError> {
+    let Some(value) = optional_value(source, key) else {
+        return Ok(None);
+    };
     validate_repository_salt_hex(key, &value)?;
-    Ok(value)
+    Ok(Some(value))
 }
 
 fn required_secret_hex(
@@ -2465,7 +2475,7 @@ mod tests {
         RepositoryKeysConfig {
             repository_id: rs3_types::RepositoryId::new("test-repository")
                 .unwrap_or_else(|error| panic!("{error}")),
-            repository_salt_hex: REPOSITORY_SALT_HEX.to_owned(),
+            repository_salt_hex: Some(REPOSITORY_SALT_HEX.to_owned()),
             envelope_object_id: None,
             wrapping_key_id: super::DEFAULT_KEYRING_WRAPPING_KEY_ID.to_owned(),
             wrapping_key_hex: SecretString::from(WRAPPING_KEY_HEX),
@@ -2602,7 +2612,7 @@ mod tests {
             RepositoryKeyContextConfig {
                 repository_id: rs3_types::RepositoryId::new("test-repository")
                     .unwrap_or_else(|error| panic!("{error}")),
-                repository_salt_hex: REPOSITORY_SALT_HEX.to_owned(),
+                repository_salt_hex: Some(REPOSITORY_SALT_HEX.to_owned()),
                 envelope_object_id: Some(
                     rs3_types::BackendObjectId::new("keyrings/bootstrap-envelope.cbor")
                         .unwrap_or_else(|error| panic!("{error}")),
@@ -2623,7 +2633,6 @@ mod tests {
                 "RS3_BACKEND_ENDPOINT",
                 "RS3_BACKEND_BUCKET",
                 super::REPOSITORY_ID_ENV,
-                super::REPOSITORY_SALT_HEX_ENV,
             ]
         );
     }
@@ -3431,14 +3440,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_repository_salt() {
+    fn accepts_a_missing_repository_salt_for_envelope_recovery() {
         let source = minimal_source().without(super::REPOSITORY_SALT_HEX_ENV);
 
-        let config = RuntimeConfig::from_source(&source);
+        let config = RuntimeConfig::from_source(&source).expect("salt is optional");
 
-        assert!(
-            matches!(config, Err(ConfigError::Missing { key }) if key == super::REPOSITORY_SALT_HEX_ENV)
-        );
+        assert_eq!(config.repository_keys.repository_salt_hex, None);
+        assert!(format!("{:?}", config.repository_keys).contains("<recovered-from-envelope>"));
     }
 
     #[test]

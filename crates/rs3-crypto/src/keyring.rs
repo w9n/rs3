@@ -10,7 +10,7 @@ use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, RepositoryId};
 use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
-/// Minimum public repository salt length accepted by the production KDF path.
+/// Minimum public repository salt length accepted in envelope context.
 pub const MIN_REPOSITORY_SALT_LEN: usize = 32;
 
 /// Secret-bearing keyring entry.
@@ -32,7 +32,11 @@ impl KeyMaterial {
     }
 }
 
-/// Stable public context that binds derived keys to one repository.
+/// Stable public context bound into repository envelope associated data.
+///
+/// Neither field enters key derivation: data keys are independently random
+/// and envelope keys derive from the wrapping key alone. The salt is public
+/// envelope metadata that a verified envelope carries for its own opening.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryKeyContext {
     repository_id: RepositoryId,
@@ -54,12 +58,12 @@ impl RepositoryKeyContext {
         })
     }
 
-    /// Returns the public repository identifier bound into derived keys.
+    /// Returns the public repository identifier bound into envelopes.
     pub fn repository_id(&self) -> &RepositoryId {
         &self.repository_id
     }
 
-    /// Returns the public repository salt bound into derived keys.
+    /// Returns the public repository salt bound into envelopes.
     pub fn salt(&self) -> &[u8] {
         &self.salt
     }

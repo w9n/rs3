@@ -68,6 +68,7 @@ async fn run(
         anchor,
         guard,
         journal,
+        fixed_salt: None,
     }
     .run()
     .await
@@ -129,6 +130,106 @@ async fn every_journal_boundary_resumes_without_replacing_published_artifacts() 
                 assert_eq!(storage.operation_counts().expect("counts").put, 3);
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn generated_salt_is_journaled_once_and_shared_by_every_resume() {
+    for save_at in 1..=7 {
+        for after in [false, true] {
+            let mut config = config(false);
+            config.repository_keys.repository_salt_hex = None;
+            let storage = CountingBlobStore::new(MemoryBlobStore::new());
+            let store = RuntimeStore::new(storage.clone());
+            let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+            let mut journal = MemoryJournal {
+                fail: Some((save_at, after)),
+                ..Default::default()
+            };
+            let guard = Guard::default();
+            assert!(
+                run(&config, &store, &anchor, &mut journal, &guard)
+                    .await
+                    .is_err(),
+                "save {save_at} after={after}"
+            );
+            // A failure before the first save leaves nothing recorded, and the
+            // resume simply decides a salt then; any later boundary must reuse
+            // the journaled one.
+            let recorded = journal
+                .bytes
+                .as_deref()
+                .map(|bytes| decode(bytes, &config, None).expect("recorded salt").1);
+            journal.fail = None;
+            let report = run(&config, &store, &anchor, &mut journal, &guard)
+                .await
+                .expect("resume without a configured salt");
+            assert_eq!(report.verified_commit_count, 1);
+            let (_, salt) =
+                decode(journal.bytes.as_deref().expect("journal"), &config, None).expect("record");
+            assert_eq!(salt.len(), rs3_crypto::MIN_REPOSITORY_SALT_LEN);
+            if let Some(recorded) = recorded {
+                assert_eq!(salt, recorded, "resume reuses the journaled salt");
+            }
+            assert_eq!(storage.operation_counts().expect("counts").put, 3);
+
+            // The recorded salt is the one the envelopes carry: pinning it
+            // verifies, pinning another value fails closed without writes.
+            let mut pinned = config.clone();
+            pinned.repository_keys.repository_salt_hex = Some(hex::encode(&salt));
+            let again = run(&pinned, &store, &anchor, &mut journal, &guard)
+                .await
+                .expect("pinned matching salt");
+            assert!(!again.initialized);
+            let mut wrong = config.clone();
+            wrong.repository_keys.repository_salt_hex = Some("7f".repeat(32));
+            assert!(
+                run(&wrong, &store, &anchor, &mut journal, &guard)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(storage.operation_counts().expect("counts").put, 3);
+        }
+    }
+}
+
+#[tokio::test]
+async fn tampered_journal_salt_fails_closed_before_any_write() {
+    for save_at in 1..=5 {
+        let mut config = config(false);
+        config.repository_keys.repository_salt_hex = None;
+        let storage = CountingBlobStore::new(MemoryBlobStore::new());
+        let store = RuntimeStore::new(storage.clone());
+        let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+        let mut journal = MemoryJournal {
+            fail: Some((save_at, true)),
+            ..Default::default()
+        };
+        let guard = Guard::default();
+        assert!(
+            run(&config, &store, &anchor, &mut journal, &guard)
+                .await
+                .is_err()
+        );
+        let puts = storage.operation_counts().expect("counts").put;
+        // A journal writer swaps the salt and forges a matching context, the
+        // strongest tampering the fingerprint alone cannot detect.
+        let (mut record, _) =
+            decode(journal.bytes.as_deref().expect("journal"), &config, None).expect("record");
+        let forged = vec![0x5a; rs3_crypto::MIN_REPOSITORY_SALT_LEN];
+        record.repository_salt_hex = Some(hex::encode(&forged));
+        record.context = context(&config, &forged).expect("forged context");
+        journal.fail = None;
+        save(&mut journal, &record).await.expect("tampered journal");
+        let error = run(&config, &store, &anchor, &mut journal, &guard)
+            .await
+            .expect_err("save {save_at}: envelopes sealed under the real salt reject the forgery");
+        assert!(!error.to_string().is_empty());
+        assert_eq!(
+            storage.operation_counts().expect("counts").put,
+            puts,
+            "save {save_at}: no write after a tampered salt"
+        );
     }
 }
 
@@ -217,7 +318,7 @@ async fn exhausted_artifact_budgets_allow_reconciliation_but_never_new_puts() {
                 .is_err()
         );
         let intent = journal.bytes.clone().expect("persisted intent");
-        let mut record = decode(&intent, &context(&config).expect("context")).expect("record");
+        let (mut record, _) = decode(&intent, &config, None).expect("record");
         match &mut record.phase {
             Phase::Keyring { artifact } | Phase::Format { artifact, .. } => artifact.remaining = 0,
             Phase::Genesis { remaining, .. } => *remaining = 0,
@@ -257,7 +358,7 @@ async fn exhausted_artifact_budgets_allow_reconciliation_but_never_new_puts() {
                 intent,
                 ..
             } => {
-                let root = open_format_root(&store, &config.repository_keys, format)
+                let opened = open_format_root(&store, &config.repository_keys, format)
                     .await
                     .expect("format");
                 let engine = Bootstrap {
@@ -266,9 +367,10 @@ async fn exhausted_artifact_budgets_allow_reconciliation_but_never_new_puts() {
                     anchor: &anchor,
                     guard: &guard,
                     journal: &mut journal,
+                    fixed_salt: None,
                 };
                 let loaded = engine
-                    .load_dependencies(keyring, &root, format)
+                    .load_dependencies(keyring, &opened.root, format, &opened.repository_salt)
                     .await
                     .expect("dependencies");
                 let options = bootstrap_commit_options(&config, &loaded).expect("options");
@@ -326,7 +428,7 @@ async fn missing_anchor_or_journal_requires_recovery_and_changed_context_never_w
                 changed.repository_keys.wrapping_key_hex =
                     secrecy::SecretString::from("77".repeat(32))
             }
-            4 => changed.repository_keys.repository_salt_hex = "33".repeat(32),
+            4 => changed.repository_keys.repository_salt_hex = Some("33".repeat(32)),
             5 => changed.provider_conformance.principal_fingerprint = Some("ab".repeat(32)),
             6 => {
                 changed.repository.retention =
@@ -368,25 +470,53 @@ async fn missing_anchor_or_journal_requires_recovery_and_changed_context_never_w
 
 #[test]
 fn journal_decode_rejects_oversize_unknown_schema_fields_and_budget() {
+    let config = config(false);
+    let salt = configured_repository_salt(&config.repository_keys)
+        .expect("salt")
+        .expect("configured salt");
     let record = Record {
         schema: SCHEMA.to_owned(),
-        context: "context".to_owned(),
+        context: context(&config, &salt).expect("context"),
+        repository_salt_hex: Some(hex::encode(&salt)),
         phase: Phase::Keyring {
             artifact: Artifact::new(BackendObjectId::new("opaque").expect("id"), vec![1]),
         },
     };
+    let bytes = serde_json::to_vec(&record).expect("bytes");
+    assert_eq!(decode(&bytes, &config, None).expect("record").1, salt);
     let value = serde_json::to_value(&record).expect("JSON");
-    for field in ["schema", "context", "extra"] {
+    for field in ["schema", "context", "repository_salt_hex", "extra"] {
         let mut changed = value.clone();
         changed[field] = serde_json::json!("wrong");
-        assert!(decode(&serde_json::to_vec(&changed).expect("bytes"), "context").is_err());
+        assert!(
+            decode(&serde_json::to_vec(&changed).expect("bytes"), &config, None).is_err(),
+            "{field}"
+        );
     }
+    // Journals written before salts were recorded resolve to the configured
+    // salt; without any salt the journal cannot be interpreted.
+    let mut legacy = value.clone();
+    legacy
+        .as_object_mut()
+        .expect("object")
+        .remove("repository_salt_hex");
+    let legacy = serde_json::to_vec(&legacy).expect("bytes");
+    assert_eq!(decode(&legacy, &config, None).expect("legacy").1, salt);
+    let mut unconfigured = config.clone();
+    unconfigured.repository_keys.repository_salt_hex = None;
+    assert!(decode(&legacy, &unconfigured, None).is_err());
+    assert_eq!(
+        decode(&bytes, &unconfigured, None).expect("recorded").1,
+        salt
+    );
+    // An enclosing journal's fixed salt must agree with the recorded one.
+    assert!(decode(&bytes, &unconfigured, Some(&[7; 32])).is_err());
     let mut record = record;
     if let Phase::Keyring { artifact } = &mut record.phase {
         artifact.remaining = WRITE_ATTEMPTS + 1;
     }
-    assert!(decode(&serde_json::to_vec(&record).expect("bytes"), "context").is_err());
-    assert!(decode(&vec![b' '; MAX_BOOTSTRAP_JOURNAL_BYTES + 1], "context").is_err());
+    assert!(decode(&serde_json::to_vec(&record).expect("bytes"), &config, None).is_err());
+    assert!(decode(&vec![b' '; MAX_BOOTSTRAP_JOURNAL_BYTES + 1], &config, None).is_err());
 }
 
 #[tokio::test]
@@ -464,11 +594,8 @@ async fn corrupted_planned_artifacts_fail_before_dependent_writes() {
                 .await
                 .is_err()
         );
-        let mut record = decode(
-            journal.bytes.as_deref().expect("intent"),
-            &context(&config).expect("context"),
-        )
-        .expect("record");
+        let (mut record, _) =
+            decode(journal.bytes.as_deref().expect("intent"), &config, None).expect("record");
         match &mut record.phase {
             Phase::Keyring { artifact } | Phase::Format { artifact, .. } => {
                 let last = artifact.body.last_mut().expect("body");

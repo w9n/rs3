@@ -26,9 +26,9 @@ Prepare these inputs before installing:
 | `rs3-backend` | `access-key-id`, `secret-access-key` | Provider credentials used by the gateway. |
 | `rs3-client` | `access-key-id`, `secret-access-key` | Separate S3 credentials accepted from backup clients. |
 | `rs3-admin` | `bearer-token` | Admin health and status authentication; at least 16 bytes. |
-| `rs3-keys` | `salt-hex`, `wrapping-key-hex` | Stable public salt and high-entropy wrapping key, each 32 bytes encoded as 64 hex characters. Optional `wrapping-key-id` defaults to `wrap-v1`. |
+| `rs3-keys` | `wrapping-key-hex` | High-entropy wrapping key, 32 bytes encoded as 64 hex characters. Optional `wrapping-key-id` defaults to `wrap-v1`. Optional `salt-hex` pins the public salt; omit it and initialization generates and journals the salt. |
 
-Generate the salt and wrapping key once using your secret-management process.
+Generate the wrapping key once using your secret-management process.
 Keep the key Secret, repository configuration, and trusted recovery material
 outside the cluster being protected. Provider credentials alone cannot restore
 an rs3 repository. Kopia also needs its own repository password.
@@ -112,10 +112,9 @@ read-only and never takes the writer Lease, so it does not disturb the serving
 gateway. Implementation or policy changes may require fresh qualification,
 which does take the Lease: while the previous gateway pod still holds it, the
 Job attempt fails fast and retries after the `Recreate` rollout stops that pod.
-The journal allows three complete qualification runs in total; see
-[Bootstrap operations](operations.md#keys-and-bootstrap) before the third.
-[Bootstrap operations](operations.md#keys-and-bootstrap) explains retry limits
-and protected probe objects that may remain after qualification.
+The journal allows three complete qualification runs in total.
+[Bootstrap operations](operations.md#keys-and-bootstrap) explains that limit
+and the protected probe objects that may remain after qualification.
 
 ## 3. Connect Kopia and make a backup
 

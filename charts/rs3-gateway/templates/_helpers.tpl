@@ -395,8 +395,8 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and .Values.credentials.create (not .Values.credentials.secretAccessKey) -}}
 {{- fail "credentials.secretAccessKey is required when credentials.create=true" -}}
 {{- end -}}
-{{- if and .Values.repositoryKeys.create (not .Values.repositoryKeys.saltHex) -}}
-{{- fail "repositoryKeys.saltHex is required when repositoryKeys.create=true" -}}
+{{- if and .Values.repositoryKeys.saltHex (not (regexMatch "^[0-9a-fA-F]{64,}$" .Values.repositoryKeys.saltHex)) -}}
+{{- fail "repositoryKeys.saltHex must be at least 32 bytes of hex when set; leave it empty to let initialization generate and journal the salt" -}}
 {{- end -}}
 {{- if and .Values.repositoryKeys.create (not .Values.repositoryKeys.wrappingKeyHex) -}}
 {{- fail "repositoryKeys.wrappingKeyHex is required when repositoryKeys.create=true" -}}

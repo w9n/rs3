@@ -7,6 +7,7 @@ use crate::admin::{
     provider_conformance_summary_from_bytes, provider_conformance_target_fingerprint,
     read_provider_conformance_evidence, selected_provider_profile,
 };
+use crate::s3::runtime_keyring::configured_or_generated_repository_salt;
 use rs3_k8s::MAX_BOOTSTRAP_JOURNAL_BYTES;
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,10 @@ mod round_trip;
 struct Record {
     schema: String,
     context: String,
+    /// Public salt fixed for the whole onboarding, journaled before any
+    /// artifact exists so retries and the nested bootstrap share it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository_salt_hex: Option<String>,
     probe_root: String,
     attempts: u8,
     evidence: Option<String>,
@@ -30,11 +35,14 @@ struct Record {
 }
 
 impl Record {
-    fn decode(bytes: &[u8], context: &str) -> Result<Self, S3BoundaryError> {
+    fn decode(bytes: &[u8], config: &RuntimeConfig) -> Result<(Self, Vec<u8>), S3BoundaryError> {
         if bytes.len() > MAX_BOOTSTRAP_JOURNAL_BYTES {
             return Err(invalid());
         }
         let record: Self = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        let salt =
+            bootstrap::resolve_recorded_salt(config, None, record.repository_salt_hex.as_deref())?;
+        let context = bootstrap::context(config, &salt)?;
         let root_valid = record
             .probe_root
             .strip_prefix("rs3-probes/")
@@ -55,7 +63,7 @@ impl Record {
         {
             return Err(invalid());
         }
-        Ok(record)
+        Ok((record, salt))
     }
 }
 
@@ -63,7 +71,7 @@ pub(super) fn is_initialized(
     config: &RuntimeConfig,
     bytes: &[u8],
 ) -> Result<bool, S3BoundaryError> {
-    let record = Record::decode(bytes, &bootstrap::context(config)?)?;
+    let (record, salt) = Record::decode(bytes, config)?;
     if !record
         .round_trip
         .as_ref()
@@ -81,7 +89,7 @@ pub(super) fn is_initialized(
     record
         .bootstrap
         .as_deref()
-        .map(|bytes| bootstrap::is_initialized(config, bytes.as_bytes()))
+        .map(|bytes| bootstrap::is_initialized(config, Some(&salt), bytes.as_bytes()))
         .transpose()
         .map(|completed| completed.unwrap_or(false))
 }
@@ -182,27 +190,35 @@ fn require_probe_review(
 struct OnboardingJournal<'a, J> {
     journal: &'a mut J,
     record: Record,
+    /// Salt every envelope of this onboarding is sealed and opened under.
+    salt: Vec<u8>,
     usable: bool,
 }
 
 impl<'a, J: Journal> OnboardingJournal<'a, J> {
-    fn open(journal: &'a mut J, context: String) -> Result<Self, S3BoundaryError> {
-        let record: Record = match journal.state()? {
-            Some(bytes) => Record::decode(bytes, &context)?,
-            None => Record {
-                schema: SCHEMA.to_owned(),
-                context: context.clone(),
-                probe_root: default_v2_provider_probe_prefix()?,
-                attempts: 0,
-                evidence: None,
-                bootstrap: None,
-                probe_observation: None,
-                round_trip: None,
-            },
+    fn open(journal: &'a mut J, config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
+        let (record, salt) = match journal.state()? {
+            Some(bytes) => Record::decode(bytes, config)?,
+            None => {
+                let salt = configured_or_generated_repository_salt(&config.repository_keys)?;
+                let record = Record {
+                    schema: SCHEMA.to_owned(),
+                    context: bootstrap::context(config, &salt)?,
+                    repository_salt_hex: Some(hex::encode(&salt)),
+                    probe_root: default_v2_provider_probe_prefix()?,
+                    attempts: 0,
+                    evidence: None,
+                    bootstrap: None,
+                    probe_observation: None,
+                    round_trip: None,
+                };
+                (record, salt)
+            }
         };
         Ok(Self {
             journal,
             record,
+            salt,
             usable: true,
         })
     }
@@ -331,7 +347,8 @@ pub(super) async fn initialize(
     journal: &mut impl Journal,
     governance_bypass_reviewed: bool,
 ) -> Result<V2RepositoryInitReport, S3BoundaryError> {
-    let mut journal = OnboardingJournal::open(journal, bootstrap::context(config)?)?;
+    let mut journal = OnboardingJournal::open(journal, config)?;
+    let salt = journal.salt.clone();
     guard
         .verify_v2_maintenance(None)
         .await
@@ -372,8 +389,15 @@ pub(super) async fn initialize(
             external,
         )
         .await?;
-    let mut report =
-        bootstrap::initialize(config, store.handle(), anchor, guard, &mut journal).await?;
+    let mut report = bootstrap::initialize(
+        config,
+        store.handle(),
+        anchor,
+        guard,
+        &mut journal,
+        Some(salt),
+    )
+    .await?;
     round_trip::verify(
         config,
         store.handle(),

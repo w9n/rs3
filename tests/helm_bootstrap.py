@@ -130,6 +130,18 @@ def main():
     # repeated command after a failed Job creates a new Job.
     assert "-init-r1-" in job["metadata"]["name"] and len(job["metadata"]["name"]) <= 63
     assert job["spec"]["backoffLimit"] == 3
+    # The public salt is optional: initialization generates and journals it,
+    # so the Secret omits the key and the env reference tolerates its absence.
+    assert init_env["RS3_REPOSITORY_SALT_HEX"]["valueFrom"]["secretKeyRef"]["optional"] is True
+    unsalted = copy.deepcopy(config)
+    unsalted["repositoryKeys"]["saltHex"] = ""
+    unsalted_docs = list(documents(render(unsalted)))
+    keys = next(doc for doc in unsalted_docs if doc["kind"] == "Secret" and "wrapping-key-hex" in doc.get("data", {}))
+    assert "salt-hex" not in keys["data"]
+    assert "RS3_REPOSITORY_SALT_HEX" in env(one(unsalted_docs, "Job")["spec"]["template"]["spec"]["containers"][0])
+    malformed = copy.deepcopy(config)
+    malformed["repositoryKeys"]["saltHex"] = "abc"
+    render(malformed, succeeds=False)
     changed = copy.deepcopy(config)
     changed["image"] = {"tag": "next-build"}
     assert one(list(documents(render(changed))), "Job")["metadata"]["name"] != job["metadata"]["name"]

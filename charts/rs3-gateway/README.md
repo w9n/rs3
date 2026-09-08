@@ -15,7 +15,8 @@ trip.
 - An object-store backend or a local `file://` backend for development.
 - Static S3 credentials for backup clients.
 - A bearer token Secret for the admin listener health and operator-fact routes.
-- Repository ID, salt, and keyring wrapping key material.
+- Repository ID and keyring wrapping key material. The public salt is
+  generated at initialization unless `repositoryKeys.saltHex` pins it.
 - Lease RBAC, either created by this chart or managed externally.
 - Journaled S3 bootstrap (`bootstrap.enabled=true`), or an existing initialized
   repository and a ConfigMap containing current provider-conformance JSON.
@@ -127,9 +128,11 @@ Expected Secret keys are:
 | `backendCredentials.existingSecret` | `access-key-id`, `secret-access-key` |
 | `credentials.existingSecret` | `access-key-id`, `secret-access-key` |
 | `admin.existingTokenSecret` | `bearer-token`; optional `mutation-bearer-token` for maintenance `POST` routes |
-| `repositoryKeys.existingSecret` | `salt-hex`, `envelope-object-id`, `wrapping-key-id`, `wrapping-key-hex` |
+| `repositoryKeys.existingSecret` | `wrapping-key-hex`; optional `salt-hex`, `envelope-object-id`, `wrapping-key-id` |
 
 `envelope-object-id` may be omitted to use the default envelope object.
+`salt-hex` may be omitted: initialization generates the public salt, journals
+it, and the gateway recovers it from the verified envelope on every start.
 
 Kubernetes onboarding and normal serving do not require `recovery.publicKey`.
 They use the declared repository-key Secret and live Lease, and bootstrap

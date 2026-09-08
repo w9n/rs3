@@ -10,8 +10,9 @@ use super::runtime_builders::build_v2_anchor_with_writer_fence;
 use super::runtime_builders::{StoreBuild, build_store, build_v2_anchor, coordinator_options};
 use super::runtime_handles::{RuntimeStore, RuntimeV2Anchor};
 use super::runtime_keyring::{
-    open_gateway_keyring_reference, repository_key_context, retained_version_id,
-    retained_version_required, secret_hex, unanchored_gateway_keyring,
+    open_gateway_keyring_reference, repository_key_context_for_envelope,
+    repository_key_context_for_salt, retained_version_id, retained_version_required, secret_hex,
+    unanchored_gateway_keyring,
 };
 use crate::admin::{
     AdminReadiness, AdminReadinessSource, AdminRepositoryRuntimeFacts, AdminRuntimeFacts,
@@ -245,6 +246,14 @@ struct LoadedV2Repository {
     keyring_ref: V2KeyringEnvelopeRootRef,
     format_ref: V2FormatRef,
     anchor_present: bool,
+    /// Public salt bound into the format root and keyring envelope.
+    repository_salt: Vec<u8>,
+}
+
+/// A decrypted format root together with the public salt its envelope carried.
+struct OpenedFormatRoot {
+    root: V2FormatRoot,
+    repository_salt: Vec<u8>,
 }
 
 fn bootstrap_commit_options(
@@ -970,6 +979,7 @@ impl V2PreparedRepositoryInit {
             anchor.handle(),
             &writer_fence,
             &mut journal,
+            None,
         )
         .await
     }
@@ -1218,6 +1228,7 @@ pub async fn export_v2_recovery_bundle_from_config(
     .await?;
     let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
     let maintenance_keyring_ref = loaded.keyring_ref.clone();
+    let repository_salt_digest = rs3_crypto::Sha256Hasher::digest(&loaded.repository_salt);
     let commit_options = V2CommitStoreOptions::for_profile(
         provider_profile,
         config.repository_keys.repository_id.clone(),
@@ -1234,6 +1245,9 @@ pub async fn export_v2_recovery_bundle_from_config(
 
     let mut bundle = V2RecoveryBundle::from_anchor(anchor_state.clone(), anchor_state.sequence);
     bundle.repository_id = Some(config.repository_keys.repository_id.clone());
+    // The signed bundle cross-checks the salt of the anchored format root, so
+    // an unconfigured opener still detects a bundle from another lineage.
+    bundle.repository_salt_digest = Some(repository_salt_digest);
     Ok(bundle)
 }
 
@@ -1277,6 +1291,7 @@ pub async fn import_v2_anchor_from_config(
         config,
     )
     .await?;
+    reject_bundle_salt_mismatch(bundle.repository_salt_digest, &loaded.repository_salt)?;
     let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
     let maintenance_keyring_ref = loaded.keyring_ref.clone();
     let commit_options = V2CommitStoreOptions::for_profile(
@@ -1522,8 +1537,14 @@ async fn bootstrap_v2_repository(
         provider_profile,
         config.repository.retention,
     );
-    let format_ref =
-        store_format_root(store, keys, &format_root, config.repository.retention).await?;
+    let format_ref = store_format_root(
+        store,
+        keys,
+        &format_root,
+        config.repository.retention,
+        &loaded_keyring.repository_salt,
+    )
+    .await?;
 
     tracing::info!(
         target: "rs3_repository",
@@ -1537,6 +1558,7 @@ async fn bootstrap_v2_repository(
         keyring_ref,
         format_ref,
         anchor_present: false,
+        repository_salt: loaded_keyring.repository_salt,
     })
 }
 
@@ -1546,7 +1568,10 @@ async fn load_existing_v2_repository(
     anchor_state: &V2AnchorState,
     config: &RuntimeConfig,
 ) -> Result<LoadedV2Repository, S3BoundaryError> {
-    let format_root = open_format_root(store, keys, &anchor_state.format_ref).await?;
+    let OpenedFormatRoot {
+        root: format_root,
+        repository_salt,
+    } = open_format_root(store, keys, &anchor_state.format_ref).await?;
     if format_root.repository_id != keys.repository_id
         || format_root.provider_profile
             != v2_provider_profile(&config.backend, config.repository.retention)
@@ -1564,11 +1589,13 @@ async fn load_existing_v2_repository(
         &keyring_reference.object_id,
     )?;
     let loaded_keyring = open_gateway_keyring_reference(store, keys, &keyring_reference).await?;
+    reject_salt_disagreement(&repository_salt, &loaded_keyring.repository_salt)?;
     Ok(LoadedV2Repository {
         keyring: loaded_keyring.keyring,
         keyring_ref: format_root.active_keyring_envelope_ref,
         format_ref: anchor_state.format_ref.clone(),
         anchor_present: true,
+        repository_salt,
     })
 }
 
@@ -1577,8 +1604,9 @@ async fn store_format_root(
     keys: &RepositoryKeysConfig,
     root: &V2FormatRoot,
     retention: Option<RetentionPolicy>,
+    repository_salt: &[u8],
 ) -> Result<V2FormatRef, S3BoundaryError> {
-    let envelope = prepare_format_root(keys, root)?;
+    let envelope = prepare_format_root(keys, root, repository_salt)?;
     let digest = envelope.digest().map_err(repository_init)?;
     let object_id = v2_format_object_id(envelope.generation, &digest).map_err(repository_init)?;
     let body = Bytes::from(envelope.to_object_bytes().map_err(repository_init)?);
@@ -1597,8 +1625,9 @@ async fn store_format_root(
 fn prepare_format_root(
     keys: &RepositoryKeysConfig,
     root: &V2FormatRoot,
+    repository_salt: &[u8],
 ) -> Result<RepositoryEnvelope, S3BoundaryError> {
-    let context = repository_key_context(keys)?;
+    let context = repository_key_context_for_salt(keys, repository_salt)?;
     let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
     let plaintext = root.to_plaintext_bytes().map_err(repository_init)?;
     let envelope = RepositoryEnvelope::seal_format(
@@ -1656,7 +1685,7 @@ async fn open_format_root(
     store: &RuntimeStore,
     keys: &RepositoryKeysConfig,
     reference: &V2FormatRef,
-) -> Result<V2FormatRoot, S3BoundaryError> {
+) -> Result<OpenedFormatRoot, S3BoundaryError> {
     let body = read_bounded_object_at(
         store,
         &reference.object_id,
@@ -1671,7 +1700,7 @@ fn open_format_root_body(
     keys: &RepositoryKeysConfig,
     reference: &V2FormatRef,
     body: &[u8],
-) -> Result<V2FormatRoot, S3BoundaryError> {
+) -> Result<OpenedFormatRoot, S3BoundaryError> {
     let envelope = RepositoryEnvelope::from_object_bytes(body, rs3_crypto::EnvelopePurpose::Format)
         .map_err(repository_init)?;
     if envelope.generation != reference.generation
@@ -1681,12 +1710,43 @@ fn open_format_root_body(
             "v2 format root object does not match the anchor-bound reference",
         ));
     }
-    let context = repository_key_context(keys)?;
+    // The reference digest above ties this envelope to the anchor, so its
+    // public salt is trusted context rather than backend discovery.
+    let context = repository_key_context_for_envelope(keys, &envelope)?;
     let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
     let plaintext = envelope
         .open_format(&context, &keys.wrapping_key_id, &wrapping_key)
         .map_err(repository_init)?;
-    V2FormatRoot::from_plaintext_bytes(&plaintext).map_err(repository_init)
+    Ok(OpenedFormatRoot {
+        root: V2FormatRoot::from_plaintext_bytes(&plaintext).map_err(repository_init)?,
+        repository_salt: envelope.repository_salt,
+    })
+}
+
+/// The format root and the keyring envelope it binds must carry one salt.
+fn reject_salt_disagreement(
+    format_salt: &[u8],
+    keyring_salt: &[u8],
+) -> Result<(), S3BoundaryError> {
+    if format_salt != keyring_salt {
+        return Err(repository_init(
+            "v2 format root and its bound keyring envelope disagree on the public repository salt",
+        ));
+    }
+    Ok(())
+}
+
+/// A signed bundle carrying a salt digest must describe the anchored lineage.
+fn reject_bundle_salt_mismatch(
+    digest: Option<[u8; 32]>,
+    repository_salt: &[u8],
+) -> Result<(), S3BoundaryError> {
+    if digest.is_some_and(|digest| digest != rs3_crypto::Sha256Hasher::digest(repository_salt)) {
+        return Err(repository_init(
+            "trusted v2 restore bundle salt digest does not match the anchored format root",
+        ));
+    }
+    Ok(())
 }
 
 async fn reject_v2_bootstrap_with_foreign_objects<S>(
@@ -2409,8 +2469,9 @@ mod tests {
         let expected_object_id = object_id.clone();
         let keys = RepositoryKeysConfig {
             repository_id,
-            repository_salt_hex: "0202020202020202020202020202020202020202020202020202020202020202"
-                .to_owned(),
+            repository_salt_hex: Some(
+                "0202020202020202020202020202020202020202020202020202020202020202".to_owned(),
+            ),
             envelope_object_id: Some(object_id),
             wrapping_key_id: "wrap-v1".to_owned(),
             wrapping_key_hex: SecretString::from(
@@ -2439,6 +2500,42 @@ mod tests {
                 .map(|reference| reference.object_id.clone()),
             Some(expected_object_id)
         );
+        assert_eq!(opened.repository_salt, vec![2; 32]);
+
+        // Without a configured salt the verified envelope supplies it.
+        let mut recovering = keys.clone();
+        recovering.repository_salt_hex = None;
+        let recovered = unanchored_gateway_keyring(&store, &recovering, None, true)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(recovered.repository_salt, vec![2; 32]);
+        assert_eq!(recovered.keyring.descriptors(), keyring.descriptors());
+
+        // A configured salt that disagrees with the envelope is an explicit
+        // error, never a silent fallback to the envelope's value.
+        let mut mismatched = keys.clone();
+        mismatched.repository_salt_hex = Some("03".repeat(32));
+        let error = match unanchored_gateway_keyring(&store, &mismatched, None, true).await {
+            Ok(_) => panic!("configured salt must match the envelope"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("does not match the public salt"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn bundle_salt_digest_must_match_the_anchored_salt_when_present() {
+        let salt = vec![5; 32];
+        let digest = rs3_crypto::Sha256Hasher::digest(&salt);
+        assert!(super::reject_bundle_salt_mismatch(None, &salt).is_ok());
+        assert!(super::reject_bundle_salt_mismatch(Some(digest), &salt).is_ok());
+        let error =
+            super::reject_bundle_salt_mismatch(Some([9; 32]), &salt).expect_err("foreign lineage");
+        assert!(error.to_string().contains("salt digest"));
+        assert!(super::reject_salt_disagreement(&salt, &salt).is_ok());
+        assert!(super::reject_salt_disagreement(&salt, &[6; 32]).is_err());
     }
 
     #[tokio::test]
@@ -2453,8 +2550,14 @@ mod tests {
         };
 
         let repository_id = config.repository_keys.repository_id.clone();
-        let repository_salt = hex::decode(&config.repository_keys.repository_salt_hex)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let repository_salt = hex::decode(
+            config
+                .repository_keys
+                .repository_salt_hex
+                .as_deref()
+                .expect("fixture salt"),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
         let context = RepositoryKeyContext::new(repository_id, repository_salt)
             .unwrap_or_else(|error| panic!("{error}"));
         let keyring = KeyRing::generate_random().unwrap_or_else(|error| panic!("{error}"));
