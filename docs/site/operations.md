@@ -763,7 +763,9 @@ cargo run -p rs3-server -- verify-bundle \
 The verifier opens the encrypted format root and keyring envelope, checks
 `RS3_RECOVERY_PUBLIC_KEY` and the bundle's salt digest against the format root,
 then verifies the anchor-selected signed commit chain to the nearest snapshot
-without mutating storage or the external anchor.
+without mutating storage or the external anchor. The salt digest is part of
+the bundle contract: a bundle exported without it is refused, so re-export
+bundles that predate this release.
 
 The bundle is a weak-subjectivity checkpoint, not a permanent snapshot pin.
 The automatic recovery registry protects accepted points and maintenance renews

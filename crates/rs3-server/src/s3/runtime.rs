@@ -1736,17 +1736,22 @@ fn reject_salt_disagreement(
     Ok(())
 }
 
-/// A signed bundle carrying a salt digest must describe the anchored lineage.
+/// A trusted bundle must carry the salt digest of the lineage it describes.
 fn reject_bundle_salt_mismatch(
     digest: Option<[u8; 32]>,
     repository_salt: &[u8],
 ) -> Result<(), S3BoundaryError> {
-    if digest.is_some_and(|digest| digest != rs3_crypto::Sha256Hasher::digest(repository_salt)) {
-        return Err(repository_init(
-            "trusted v2 restore bundle salt digest does not match the anchored format root",
-        ));
+    match digest {
+        None => Err(repository_init(
+            "trusted v2 restore bundle lacks the repository salt digest; export it again with this release",
+        )),
+        Some(digest) if digest != rs3_crypto::Sha256Hasher::digest(repository_salt) => {
+            Err(repository_init(
+                "trusted v2 restore bundle salt digest does not match the anchored format root",
+            ))
+        }
+        Some(_) => Ok(()),
     }
-    Ok(())
 }
 
 async fn reject_v2_bootstrap_with_foreign_objects<S>(
@@ -2529,7 +2534,13 @@ mod tests {
     fn bundle_salt_digest_must_match_the_anchored_salt_when_present() {
         let salt = vec![5; 32];
         let digest = rs3_crypto::Sha256Hasher::digest(&salt);
-        assert!(super::reject_bundle_salt_mismatch(None, &salt).is_ok());
+        let missing = super::reject_bundle_salt_mismatch(None, &salt)
+            .expect_err("the digest is part of the bundle contract");
+        assert!(
+            missing
+                .to_string()
+                .contains("lacks the repository salt digest")
+        );
         assert!(super::reject_bundle_salt_mismatch(Some(digest), &salt).is_ok());
         let error =
             super::reject_bundle_salt_mismatch(Some([9; 32]), &salt).expect_err("foreign lineage");

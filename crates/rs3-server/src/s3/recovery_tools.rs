@@ -171,13 +171,18 @@ where
         &bundle.anchor.format_ref,
     )
     .await?;
-    if bundle
-        .repository_salt_digest
-        .is_some_and(|digest| digest != rs3_crypto::Sha256Hasher::digest(context.salt()))
-    {
-        return Err(repository_init(
-            "restore bundle salt digest does not match the format root its anchor binds",
-        ));
+    match bundle.repository_salt_digest {
+        None => {
+            return Err(repository_init(
+                "restore bundle lacks the repository salt digest; export it again with this release",
+            ));
+        }
+        Some(digest) if digest != rs3_crypto::Sha256Hasher::digest(context.salt()) => {
+            return Err(repository_init(
+                "restore bundle salt digest does not match the format root its anchor binds",
+            ));
+        }
+        Some(_) => {}
     }
     if format_root.repository_id != repository_id
         || format_root.provider_profile != expected_profile
@@ -647,6 +652,9 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         let mut bundle = V2RecoveryBundle::from_anchor(genesis.anchor_state, Sequence::new(1));
         bundle.repository_id = Some(repository_id);
+        bundle.repository_salt_digest = Some(rs3_crypto::Sha256Hasher::digest(
+            hex::decode(SALT_HEX).unwrap_or_else(|error| panic!("{error}")),
+        ));
         bundle.exported_at_ms = 42;
 
         (store, bundle, wrapping_key)
@@ -715,8 +723,6 @@ mod tests {
     #[tokio::test]
     async fn verify_bundle_checks_the_salt_digest_against_the_anchored_format_root() {
         let (store, mut bundle, wrapping_key) = verification_fixture(V2ProviderProfile::Dev).await;
-        let salt = hex::decode(SALT_HEX).unwrap_or_else(|error| panic!("{error}"));
-        bundle.repository_salt_digest = Some(rs3_crypto::Sha256Hasher::digest(&salt));
         let mut config = tool_config();
         config.repository_keys.repository_salt_hex = None;
         let report = verify_v2_recovery_bundle_with_store(
@@ -732,19 +738,31 @@ mod tests {
         .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(report.verified_commit_count, 1);
 
+        let verify = |bundle| {
+            verify_v2_recovery_bundle_with_store(
+                store.clone(),
+                &config,
+                bundle,
+                V2RecoveryBundleVerificationOptions {
+                    min_sequence: Sequence::new(1),
+                    wrapping_key: wrapping_key.clone(),
+                },
+            )
+        };
         bundle.repository_salt_digest = Some([9; 32]);
-        let error = verify_v2_recovery_bundle_with_store(
-            store,
-            &config,
-            bundle,
-            V2RecoveryBundleVerificationOptions {
-                min_sequence: Sequence::new(1),
-                wrapping_key,
-            },
-        )
-        .await
-        .expect_err("a foreign salt digest is rejected");
+        let error = verify(bundle.clone())
+            .await
+            .expect_err("a foreign salt digest is rejected");
         assert!(error.to_string().contains("salt digest"));
+        bundle.repository_salt_digest = None;
+        let error = verify(bundle)
+            .await
+            .expect_err("the digest is part of the bundle contract");
+        assert!(
+            error
+                .to_string()
+                .contains("lacks the repository salt digest")
+        );
     }
 
     #[tokio::test]
