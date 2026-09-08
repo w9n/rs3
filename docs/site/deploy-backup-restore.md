@@ -100,12 +100,20 @@ kubectl -n backup logs job/<init-job-name>
 ```
 
 Correct the reported configuration or provider issue and repeat the same Helm
-command. Keep the journal Secret and Lease. Do not reset the journal, change the
-repository salt, or enable serving-time initialization to retry. A completed
-journal with a missing anchor requires the recovery procedure below.
+command. Each release revision runs its own Job, so the repeat reruns
+initialization from the journaled progress. Keep the journal Secret and Lease.
+Do not reset the journal, change the repository salt, or enable serving-time
+initialization to retry. A completed journal with a missing anchor requires the
+recovery procedure below.
 
-Keep `bootstrap.enabled=true` for ordinary upgrades. Existing journaled progress
-is reused; implementation or policy changes may require fresh qualification.
+Keep `bootstrap.enabled=true` for ordinary upgrades. A Job that finds the
+journal completed under the current configuration verifies the repository
+read-only and never takes the writer Lease, so it does not disturb the serving
+gateway. Implementation or policy changes may require fresh qualification,
+which does take the Lease: while the previous gateway pod still holds it, the
+Job attempt fails fast and retries after the `Recreate` rollout stops that pod.
+The journal allows three complete qualification runs in total; see
+[Bootstrap operations](operations.md#keys-and-bootstrap) before the third.
 [Bootstrap operations](operations.md#keys-and-bootstrap) explains retry limits
 and protected probe objects that may remain after qualification.
 

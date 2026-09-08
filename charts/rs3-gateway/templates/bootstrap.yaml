@@ -15,7 +15,10 @@ type: Opaque
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ printf "%s-init-%s" (include "rs3-gateway.fullname" . | trunc 40 | trimSuffix "-") (.Values | toJson | sha256sum | trunc 12) }}
+  {{- /* Every release revision gets its own Job, so repeating the Helm command
+       after an exhausted or failed Job reruns initialization. Helm prunes the
+       previous revision's Job; the journal Secret keeps the durable record. */}}
+  name: {{ printf "%s-init-r%d-%s" (include "rs3-gateway.fullname" . | trunc 32 | trimSuffix "-") (int .Release.Revision) (.Values | toJson | sha256sum | trunc 12) }}
   labels:
     {{- include "rs3-gateway.labels" . | nindent 4 }}
 spec:

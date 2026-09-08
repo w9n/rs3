@@ -241,10 +241,16 @@ current evidence before the gateway starts. Evidence projects
 from the journal Secret automatically; `providerConformance.existingConfigMap`
 continues to select externally managed evidence and is never overwritten.
 
-Repeated installs preserve the journal and completed Job. Configuration changes
-create a new Job, which reuses matching qualification and verifies the existing
-repository. The journal permits at most three complete probe runs across retries
-and upgrades. An ambiguous run consumes a reservation; exhaustion requires
+Every Helm revision creates a new Job and prunes the previous one; the journal
+Secret is the durable record. A Job that finds the journal completed under the
+current configuration verifies the live anchor and chain read-only, without the
+writer Lease, so ordinary upgrades and repeated installs do not contend with a
+serving gateway. Only initialization and fresh qualification take the Lease.
+While the previous gateway pod still holds it, that Job attempt fails fast
+instead of waiting; the required `Recreate` strategy stops the old pod and a
+retry acquires the Lease. After an exhausted or failed Job, correct the cause
+and repeat the same Helm command. The journal permits at most three complete
+probe runs across retries and upgrades. An ambiguous run consumes a reservation; exhaustion requires
 reviewed matching external evidence. Retained probe versions, including legal
 holds, can remain outside the repository prefix.
 The init Job's JSON report and journal retain timestamped aggregate observations

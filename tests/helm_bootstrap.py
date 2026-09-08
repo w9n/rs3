@@ -126,6 +126,10 @@ def main():
     assert service_selector["app.kubernetes.io/component"] == "gateway"
     assert job["spec"]["template"]["metadata"]["labels"]["app.kubernetes.io/component"] != "gateway"
     assert one(list(documents(render(config))), "Job")["metadata"]["name"] == job["metadata"]["name"]
+    # helm template renders revision 1; live upgrades change the revision so a
+    # repeated command after a failed Job creates a new Job.
+    assert "-init-r1-" in job["metadata"]["name"] and len(job["metadata"]["name"]) <= 63
+    assert job["spec"]["backoffLimit"] == 3
     changed = copy.deepcopy(config)
     changed["image"] = {"tag": "next-build"}
     assert one(list(documents(render(changed))), "Job")["metadata"]["name"] != job["metadata"]["name"]
