@@ -22,6 +22,9 @@ pub(crate) const REPOSITORY_ID: &str = "rs3-integration-repository";
 pub(crate) const REPOSITORY_SALT_HEX: &str =
     "2222222222222222222222222222222222222222222222222222222222222222";
 pub(crate) const SECRET_ACCESS_KEY: &str = "rs3-fixture-secret-key";
+// This caps diagnostic text attached to the original Helm error. Command::output
+// still buffers a command result before this display truncation is applied.
+const MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES: usize = 16 * 1024;
 
 pub(crate) struct GatewayChartValues<'a> {
     pub(crate) release_name: &'a str,
@@ -54,6 +57,7 @@ pub(crate) struct GatewayChartValues<'a> {
 
 pub(crate) fn helm_install_gateway(
     helm_bin: &str,
+    kubectl_bin: &str,
     kubeconfig_path: &Path,
     values: &GatewayChartValues<'_>,
 ) -> Result<()> {
@@ -179,7 +183,135 @@ pub(crate) fn helm_install_gateway(
             &format!("persistence.enabled={}", values.persistence_enabled),
         ],
     )
-    .context("failed to install gateway Helm chart")
+    .map_err(|error| {
+        error.context(format!(
+            "failed to install gateway Helm chart; namespace diagnostics before cleanup:\n{}",
+            collect_namespace_failure_diagnostics(kubectl_bin, kubeconfig_path, values)
+        ))
+    })
+}
+
+fn collect_namespace_failure_diagnostics(
+    kubectl_bin: &str,
+    kubeconfig_path: &Path,
+    values: &GatewayChartValues<'_>,
+) -> String {
+    let kubeconfig = kubeconfig_path.to_string_lossy();
+    let selector = format!("app.kubernetes.io/instance={}", values.release_name);
+    let mut redactions = vec![
+        ADMIN_BEARER_TOKEN,
+        ACCESS_KEY_ID,
+        SECRET_ACCESS_KEY,
+        values.backend_endpoint,
+        values.backend_prefix,
+        values.repository_salt_hex,
+        values.keyring_wrapping_key_hex,
+        kubeconfig.as_ref(),
+    ];
+    if let Some(access_key_id) = values.backend_access_key_id {
+        redactions.push(access_key_id);
+    }
+    if let Some(secret_access_key) = values.backend_secret_access_key {
+        redactions.push(secret_access_key);
+    }
+
+    [
+        capture_namespace_command(
+            "gateway pod readiness",
+            kubectl_bin,
+            &[
+                "--kubeconfig",
+                kubeconfig.as_ref(),
+                "--request-timeout=10s",
+                "--namespace",
+                values.namespace,
+                "get",
+                "pods",
+                "--selector",
+                selector.as_str(),
+                "--output",
+                "wide",
+            ],
+            &redactions,
+        ),
+        capture_namespace_command(
+            "namespace events",
+            kubectl_bin,
+            &[
+                "--kubeconfig",
+                kubeconfig.as_ref(),
+                "--request-timeout=10s",
+                "--namespace",
+                values.namespace,
+                "get",
+                "events",
+                "--sort-by=.lastTimestamp",
+            ],
+            &redactions,
+        ),
+        capture_namespace_command(
+            "gateway container logs",
+            kubectl_bin,
+            &[
+                "--kubeconfig",
+                kubeconfig.as_ref(),
+                "--request-timeout=10s",
+                "--namespace",
+                values.namespace,
+                "logs",
+                "--selector",
+                selector.as_str(),
+                "--all-containers=true",
+                "--prefix=true",
+                "--tail=80",
+                "--max-log-requests=3",
+                "--pod-running-timeout=10s",
+            ],
+            &redactions,
+        ),
+    ]
+    .join("\n\n")
+}
+
+fn capture_namespace_command(
+    label: &str,
+    kubectl_bin: &str,
+    args: &[&str],
+    redactions: &[&str],
+) -> String {
+    match Command::new(kubectl_bin).args(args).output() {
+        Ok(output) => format!(
+            "{label} ({}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            truncated_redacted_diagnostic(&output.stdout, redactions),
+            truncated_redacted_diagnostic(&output.stderr, redactions),
+        ),
+        Err(error) => format!(
+            "{label}: failed to start kubectl: {}",
+            truncated_redacted_text(error.to_string(), redactions)
+        ),
+    }
+}
+
+fn truncated_redacted_diagnostic(bytes: &[u8], redactions: &[&str]) -> String {
+    truncated_redacted_text(String::from_utf8_lossy(bytes).into_owned(), redactions)
+}
+
+fn truncated_redacted_text(mut text: String, redactions: &[&str]) -> String {
+    for value in redactions {
+        if !value.is_empty() {
+            text = text.replace(value, "[REDACTED]");
+        }
+    }
+    if text.len() <= MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES {
+        return text;
+    }
+
+    let mut tail_start = text.len() - MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES;
+    while !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("[... {tail_start} bytes omitted]\n{}", &text[tail_start..])
 }
 
 pub(crate) fn helm_set_gateway_mode(
@@ -503,6 +635,11 @@ impl KindCluster {
         &self.name
     }
 
+    /// Docker network shared by kind control-plane and worker containers.
+    pub(crate) const fn docker_network(&self) -> &'static str {
+        "kind"
+    }
+
     /// Load a locally available image into the cluster.
     ///
     /// `kind load docker-image` exports a manifest list and imports it with
@@ -667,4 +804,26 @@ pub(crate) fn run_command_capture(program: &str, args: &[&str]) -> Result<String
     }
 
     String::from_utf8(output.stdout).context("command stdout was not valid UTF-8")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES, truncated_redacted_text};
+
+    #[test]
+    fn namespace_diagnostics_redact_before_truncation() {
+        let secret = "fixture-secret";
+        let output = format!(
+            "{}{}",
+            "x".repeat(MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES),
+            secret
+        );
+
+        let diagnostic = truncated_redacted_text(output, &[secret]);
+
+        assert!(diagnostic.starts_with("[... "));
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert!(!diagnostic.contains(secret));
+        assert!(diagnostic.len() <= MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES + 64);
+    }
 }

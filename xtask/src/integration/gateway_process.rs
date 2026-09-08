@@ -99,6 +99,15 @@ impl RunningGateway {
         Self::start_inner(backend, backend_prefix, None, options).await
     }
 
+    pub(crate) async fn start_for_backend_with_log_capture_options(
+        backend: &GatewayBackend,
+        backend_prefix: String,
+        rust_log: &str,
+        options: GatewayProcessOptions,
+    ) -> Result<Self> {
+        Self::start_inner(backend, backend_prefix, Some(rust_log), options).await
+    }
+
     pub(crate) async fn start_with_log_capture_options(
         backend: &RunningS3Container,
         backend_prefix: String,
@@ -106,7 +115,13 @@ impl RunningGateway {
         options: GatewayProcessOptions,
     ) -> Result<Self> {
         let backend = GatewayBackend::from_container(backend);
-        Self::start_inner(&backend, backend_prefix, Some(rust_log), options).await
+        Self::start_for_backend_with_log_capture_options(
+            &backend,
+            backend_prefix,
+            rust_log,
+            options,
+        )
+        .await
     }
 
     async fn start_inner(

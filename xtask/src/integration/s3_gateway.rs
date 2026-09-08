@@ -124,6 +124,7 @@ pub(crate) fn run_s3_gateway(args: S3GatewayArgs) -> Result<()> {
                 args.region,
                 s3_container::S3ContainerOptions {
                     object_lock: args.retention_mode.is_some(),
+                    network: None,
                 },
             )?;
             runtime.block_on(async {
@@ -214,9 +215,10 @@ async fn run_gateway_contract_for_backend(
     process_options: GatewayProcessOptions,
     tooling_smoke: bool,
 ) -> Result<()> {
-    let mut gateway = RunningGateway::start_for_backend_with_options(
+    let mut gateway = RunningGateway::start_for_backend_with_log_capture_options(
         backend,
         backend_prefix.clone(),
+        "info",
         process_options,
     )
     .await?;
@@ -224,7 +226,7 @@ async fn run_gateway_contract_for_backend(
     let result: Result<()> = async {
         assert_gateway_contract(&client).await?;
         if tooling_smoke {
-            assert_operator_tooling_smoke(&gateway, backend).await?;
+            assert_operator_tooling_smoke(&gateway.endpoint_url()).await?;
         }
         assert_backend_keys_path_private(backend, &backend_prefix).await?;
         Ok(())
@@ -491,10 +493,7 @@ async fn assert_backend_keys_path_private(
 }
 
 #[cfg(feature = "containers")]
-async fn assert_operator_tooling_smoke(
-    gateway: &RunningGateway,
-    backend: &GatewayBackend,
-) -> Result<()> {
+pub(super) async fn assert_operator_tooling_smoke(endpoint: &str) -> Result<()> {
     let fixture_root = unique_temp_path("tooling-smoke");
     fs::create_dir_all(&fixture_root).context("failed to create tooling smoke directory")?;
     let _cleanup = ToolingSmokeCleanup(fixture_root.clone());
@@ -517,7 +516,6 @@ async fn assert_operator_tooling_smoke(
     fs::write(&aws_credentials_path, b"")
         .context("failed to write empty AWS tooling smoke credentials")?;
 
-    let endpoint = gateway.endpoint_url();
     require_tool("aws", &["--version"], Some("aws-cli/2"))?;
     require_tool("rclone", &["version"], Some("rclone v"))?;
     require_tool("mc", &["--version"], Some("mc version"))?;
@@ -541,7 +539,7 @@ async fn assert_operator_tooling_smoke(
                     "alias",
                     "set",
                     "gw",
-                    endpoint.as_str(),
+                    endpoint,
                     ACCESS_KEY_ID,
                     SECRET_ACCESS_KEY,
                     "--api",
@@ -584,7 +582,7 @@ async fn assert_operator_tooling_smoke(
             aws_remote.as_str(),
             "--no-progress",
             "--endpoint-url",
-            endpoint.as_str(),
+            endpoint,
         ]);
         run_status(&mut aws_upload, "aws cli multipart-sized upload")?;
         let aws_download = fixture_root.join("aws-download.bin");
@@ -599,7 +597,7 @@ async fn assert_operator_tooling_smoke(
             aws_download_str,
             "--no-progress",
             "--endpoint-url",
-            endpoint.as_str(),
+            endpoint,
         ]);
         run_status(&mut aws_get, "aws cli download")?;
         assert_files_equal(&source_path, &aws_download, "aws cli")?;
@@ -615,7 +613,7 @@ async fn assert_operator_tooling_smoke(
                 "--checksum-mode",
                 "ENABLED",
                 "--endpoint-url",
-                endpoint.as_str(),
+                endpoint,
                 "--output",
                 "json",
             ]),
@@ -630,7 +628,7 @@ async fn assert_operator_tooling_smoke(
                 .env("RCLONE_CONFIG_GW_PROVIDER", "Other")
                 .env("RCLONE_CONFIG_GW_ACCESS_KEY_ID", ACCESS_KEY_ID)
                 .env("RCLONE_CONFIG_GW_SECRET_ACCESS_KEY", SECRET_ACCESS_KEY)
-                .env("RCLONE_CONFIG_GW_ENDPOINT", &endpoint)
+                .env("RCLONE_CONFIG_GW_ENDPOINT", endpoint)
                 .env("RCLONE_CONFIG_GW_REGION", "us-east-1")
                 .env("RCLONE_CONFIG_GW_NO_CHECK_BUCKET", "true")
                 .env("RCLONE_CONFIG_GW_NO_SYSTEM_METADATA", "true")
@@ -751,7 +749,7 @@ async fn assert_operator_tooling_smoke(
                 "--checksum-mode",
                 "ENABLED",
                 "--endpoint-url",
-                endpoint.as_str(),
+                endpoint,
                 "--output",
                 "json",
             ]),
@@ -802,7 +800,7 @@ async fn assert_operator_tooling_smoke(
 
         Ok(())
     })();
-    let cleanup = cleanup_gateway_prefix(gateway, backend, &smoke_prefix)
+    let cleanup = cleanup_gateway_prefix(endpoint, &smoke_prefix)
         .await
         .context("failed to clean tooling smoke objects");
     smoke_result?;
@@ -1023,12 +1021,8 @@ fn assert_multipart_etag(etag: &str, label: &'static str) -> Result<()> {
 }
 
 #[cfg(feature = "containers")]
-async fn cleanup_gateway_prefix(
-    gateway: &RunningGateway,
-    backend: &GatewayBackend,
-    prefix: &str,
-) -> Result<()> {
-    let client = gateway.client_for_backend(backend);
+async fn cleanup_gateway_prefix(endpoint: &str, prefix: &str) -> Result<()> {
+    let client = s3_container::s3_client(endpoint, "us-east-1", ACCESS_KEY_ID, SECRET_ACCESS_KEY);
     for _ in 0..1024 {
         let page = client
             .list_objects_v2()

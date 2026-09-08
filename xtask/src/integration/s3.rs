@@ -139,6 +139,7 @@ fn run_container_s3(args: S3LocalArgs) -> Result<()> {
         args.region,
         s3_container::S3ContainerOptions {
             object_lock: args.object_lock,
+            network: None,
         },
     )?;
 

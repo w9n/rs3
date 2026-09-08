@@ -213,10 +213,11 @@ integration-s3-gateway *ARGS:
     cargo build -p rs3-server --bin rs3-server --features s3
     cargo run -p xtask --bin xtask --features containers -- integration s3-gateway {{ARGS}}
 
-# Qualify retained-version storage and gateway behavior against disposable local providers.
+# Qualify retained-version storage and guarded gateway behavior against disposable local providers.
+# Governance bypass IAM remains separately qualified; this fixture uses compliance Object Lock.
 preview-gate-v2-retained-local:
     just integration-s3-container --qualification-profile retained-version --object-lock --retention-days 1 --gc-rehearsal
-    just integration-s3-gateway --retention-mode governance --retention-days 1 --tooling-smoke
+    just integration-k8s-gateway --retention-mode compliance --retention-days 30 --tooling-smoke
 
 # Run the v2 live S3 gateway integration harness.
 integration-s3-gateway-v2-live *ARGS:

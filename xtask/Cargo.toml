@@ -20,7 +20,7 @@ containers = [
   "dep:testcontainers",
 ]
 k8s = [
-  "s3",
+  "containers",
   "dep:aws-sdk-s3",
   "dep:k8s-openapi",
   "dep:rs3-k8s",

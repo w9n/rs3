@@ -1,7 +1,26 @@
 //! Kubernetes gateway integration harness.
 
+use super::S3ContainerProvider;
 use anyhow::Result;
-use clap::Args;
+#[cfg(any(feature = "k8s", test))]
+use anyhow::bail;
+use clap::{Args, ValueEnum};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum K8sGatewayRetentionMode {
+    Compliance,
+    Governance,
+}
+
+#[cfg(feature = "k8s")]
+impl K8sGatewayRetentionMode {
+    const fn as_env(self) -> &'static str {
+        match self {
+            Self::Compliance => "compliance",
+            Self::Governance => "governance",
+        }
+    }
+}
 
 #[derive(Debug, Args)]
 pub(crate) struct K8sGatewayArgs {
@@ -20,6 +39,18 @@ pub(crate) struct K8sGatewayArgs {
     /// Gateway image tag to build, load, and deploy.
     #[arg(long, default_value = "rs3-server:ci")]
     image: String,
+    /// Container provider used as the journaled S3 backend.
+    #[arg(long, value_enum, default_value_t = S3ContainerProvider::Rustfs)]
+    container_provider: S3ContainerProvider,
+    /// Repository retention mode for journaled backend objects.
+    #[arg(long, value_enum)]
+    retention_mode: Option<K8sGatewayRetentionMode>,
+    /// Repository retention duration in days.
+    #[arg(long)]
+    retention_days: Option<u32>,
+    /// Exercise AWS CLI, rclone, mc, and restic through the guarded gateway.
+    #[arg(long, default_value_t = false)]
+    tooling_smoke: bool,
     /// Force a fixed payload segment size. Omit to use adaptive per-object sizing.
     #[arg(long)]
     payload_segment_size: Option<usize>,
@@ -41,7 +72,7 @@ pub(crate) struct K8sGatewayArgs {
     /// Do not load the gateway image into kind.
     #[arg(long)]
     skip_image_load: bool,
-    /// Keep the kind cluster after the run for manual inspection.
+    /// Keep the kind cluster after the run for manual inspection; the temporary S3 backend is removed.
     #[arg(long)]
     keep_cluster: bool,
     /// Readiness timeout in seconds.
@@ -58,12 +89,27 @@ pub(crate) fn run_k8s_gateway(_args: K8sGatewayArgs) -> Result<()> {
 
 #[cfg(feature = "k8s")]
 pub(crate) fn run_k8s_gateway(args: K8sGatewayArgs) -> Result<()> {
+    validate_k8s_gateway_args(&args)?;
     imp::run(args)
+}
+
+#[cfg(any(feature = "k8s", test))]
+fn validate_k8s_gateway_args(args: &K8sGatewayArgs) -> Result<()> {
+    match (args.retention_mode, args.retention_days) {
+        (Some(K8sGatewayRetentionMode::Governance), _) => bail!(
+            "the guarded Kubernetes fixture does not assert governance-bypass IAM review; use --retention-mode compliance or a separately qualified governance provider"
+        ),
+        (Some(_), Some(days)) if days > 0 => Ok(()),
+        (Some(_), None) => bail!("--retention-days is required when --retention-mode is set"),
+        (None, Some(_)) => bail!("--retention-mode is required when --retention-days is set"),
+        (Some(_), Some(_)) => bail!("--retention-days must be greater than zero"),
+        (None, None) => Ok(()),
+    }
 }
 
 #[cfg(feature = "k8s")]
 mod imp {
-    use super::K8sGatewayArgs;
+    use super::{K8sGatewayArgs, K8sGatewayRetentionMode};
     use crate::integration::k8s_support::{
         ACCESS_KEY_ID, DEFAULT_PUBLIC_BUCKET, GATEWAY_PORT, GatewayChartValues, K8sWorkspace,
         KEYRING_ENVELOPE_OBJECT_ID, KEYRING_WRAPPING_KEY_HEX, KEYRING_WRAPPING_KEY_ID, KindCluster,
@@ -71,6 +117,7 @@ mod imp {
         build_source_revision, default_cluster_name, helm_fullname, helm_install_gateway,
         helm_lint_gateway, require_command, run_command, split_image_ref,
     };
+    use crate::integration::{s3_container, s3_gateway};
     use anyhow::{Context, Result, bail};
     use aws_sdk_s3::{
         Client,
@@ -133,10 +180,21 @@ mod imp {
             cluster.load_image(&args.image)?;
         }
 
+        let backend = s3_container::start_s3_container_with_options(
+            args.container_provider,
+            None,
+            None,
+            s3_container::S3ContainerOptions {
+                object_lock: args.retention_mode.is_some(),
+                network: Some(cluster.docker_network()),
+            },
+        )?;
+        let backend_endpoint = backend.network_endpoint_url()?.to_owned();
         let (image_repository, image_tag) = split_image_ref(&args.image);
         let anchor_mode = "kubernetes-lease";
         helm_install_gateway(
             &args.helm_bin,
+            &args.kubectl_bin,
             cluster.kubeconfig_path(),
             &GatewayChartValues {
                 release_name: &args.release_name,
@@ -145,19 +203,19 @@ mod imp {
                 image_tag: &image_tag,
                 gateway_mode: "read-write",
                 public_bucket: DEFAULT_PUBLIC_BUCKET,
-                backend_endpoint: "file:///data",
-                backend_bucket: "backend",
+                backend_endpoint: &backend_endpoint,
+                backend_bucket: &backend.bucket,
                 backend_prefix: "repository",
-                backend_region: "us-east-1",
-                backend_access_key_id: None,
-                backend_secret_access_key: None,
+                backend_region: &backend.region,
+                backend_access_key_id: Some(&backend.access_key_id),
+                backend_secret_access_key: Some(&backend.secret_access_key),
                 anchor_mode,
                 anchor_name: "checkpoint",
                 log_format: "plain",
                 rust_log: "info",
                 payload_segment_size: args.payload_segment_size,
-                retention_mode: None,
-                retention_days: None,
+                retention_mode: args.retention_mode.map(K8sGatewayRetentionMode::as_env),
+                retention_days: args.retention_days,
                 repository_id: REPOSITORY_ID,
                 repository_salt_hex: REPOSITORY_SALT_HEX,
                 keyring_envelope_object_id: KEYRING_ENVELOPE_OBJECT_ID,
@@ -185,8 +243,15 @@ mod imp {
                     args.wait_secs,
                 )
                 .await?;
-                let smoke =
-                    run_s3_smoke(port_forward.endpoint_url(), args.payload_segment_size).await;
+                let endpoint = port_forward.endpoint_url();
+                let smoke = async {
+                    run_s3_smoke(endpoint.clone(), args.payload_segment_size).await?;
+                    if args.tooling_smoke {
+                        s3_gateway::assert_operator_tooling_smoke(&endpoint).await?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
                 let shutdown = port_forward.shutdown();
 
                 smoke?;
@@ -203,6 +268,7 @@ mod imp {
                 Ok(())
             });
 
+        drop(backend);
         if result.is_ok() {
             cluster.delete()?;
         }
@@ -342,5 +408,53 @@ mod imp {
             .timeout_config(timeout_config)
             .build();
         Client::from_conf(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{K8sGatewayArgs, K8sGatewayRetentionMode, validate_k8s_gateway_args};
+    use crate::integration::S3ContainerProvider;
+
+    fn args(
+        retention_mode: Option<K8sGatewayRetentionMode>,
+        retention_days: Option<u32>,
+    ) -> K8sGatewayArgs {
+        K8sGatewayArgs {
+            cluster_name: None,
+            reuse_kind_cluster: false,
+            namespace: "rs3-ci".to_owned(),
+            release_name: "rs3".to_owned(),
+            image: "rs3-server:ci".to_owned(),
+            container_provider: S3ContainerProvider::Rustfs,
+            retention_mode,
+            retention_days,
+            tooling_smoke: false,
+            payload_segment_size: None,
+            kind_bin: "kind".to_owned(),
+            docker_bin: "docker".to_owned(),
+            helm_bin: "helm".to_owned(),
+            kubectl_bin: "kubectl".to_owned(),
+            skip_image_build: false,
+            skip_image_load: false,
+            keep_cluster: false,
+            wait_secs: 180,
+        }
+    }
+
+    #[test]
+    fn retention_mode_requires_a_positive_duration() {
+        for (mode, days) in [
+            (Some(K8sGatewayRetentionMode::Compliance), None),
+            (None, Some(1)),
+            (Some(K8sGatewayRetentionMode::Compliance), Some(0)),
+            (Some(K8sGatewayRetentionMode::Governance), Some(1)),
+        ] {
+            assert!(validate_k8s_gateway_args(&args(mode, days)).is_err());
+        }
+        assert!(
+            validate_k8s_gateway_args(&args(Some(K8sGatewayRetentionMode::Compliance), Some(1),))
+                .is_ok()
+        );
     }
 }

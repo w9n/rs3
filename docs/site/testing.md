@@ -62,17 +62,29 @@ The earlier MD5 qualification used AWS-created multipart objects because
 multipart creation then rejected rclone's Mtime metadata. Ordinary PUT and
 multipart creation now both accept user metadata without preserving it.
 These results qualify byte and ETag behavior, not metadata preservation or all
-rclone upload options. Earlier Velero qualification preceded the MD5 format
-update and was not repeated for this change.
+rclone upload options. At revision `453c2ff`, the
+[corrected nightly run](https://github.com/w9n/rs3/actions/runs/34226674202)
+passed both the gateway-restart dynamic-PVC and PostgreSQL backup/restore Velero
+smokes. This is lane-scoped evidence and does not establish an overall nightly
+pass.
 
 `just integration-s3-gateway --tooling-smoke` requires AWS CLI v2, rclone, mc
-and restic. It uses deterministic incompressible data above 8 MiB, verifies
+and restic. The repository's `nix develop` shell supplies these clients. It
+uses deterministic incompressible data above 8 MiB, verifies
 uploaded and restored bytes, and checks exact length and multipart ETags for
 AWS and rclone uploads. AWS uses an isolated configuration with an explicit
 8 MiB multipart threshold; rclone uses explicit settings that disable system
 metadata and its custom MD5 metadata. Restic initializes, backs up and restores
 a repository. A missing tool or failed required upload fails the lane. Generic
 user-metadata preservation is outside this preview compatibility contract.
+
+When a gateway exits during startup, the qualification harness attaches the
+final 80 captured log lines to that startup failure. When a Helm gateway
+installation fails, it attaches a capped failure excerpt containing selected-pod
+readiness, namespace events and selected-container logs before deleting the
+disposable kind cluster. The Helm excerpt redacts fixture credentials and
+configured backend paths; these diagnostics aid failure triage and do not
+change readiness timeouts or qualify a provider.
 
 The four-client lane passes against a disposable local RustFS backend with AWS
 CLI 2.34.24, rclone 1.75.0, mc RELEASE.2025-08-13 and restic 0.19.1. Both
@@ -244,49 +256,33 @@ meaningful when the retention and exact-version checks run:
 just integration-s3-local --qualification-profile retained-version --object-lock
 ```
 
-For the consolidated v2 live preview gate, export provider credentials and use
-the positional gate command. The gate creates fresh sub-prefixes for the lanes
-it runs:
+For retained gateway qualification, use the guarded Kubernetes fixture:
 
 ```sh
-export AWS_ACCESS_KEY_ID=<access-key-id>
-export AWS_SECRET_ACCESS_KEY=<secret-access-key>
-export AWS_REGION=<region>
-export RS3_GOVERNANCE_BYPASS_REVIEWED=true
-just preview-gate-v2-live <bucket> <endpoint> <region>
+just preview-gate-v2-retained-local
 ```
 
-`RS3_GOVERNANCE_BYPASS_REVIEWED=true` is an operator assertion that normal
-gateway credentials cannot bypass governance retention after IAM or bucket
-policy review. The gate writes provider-conformance JSON under
-`.local/integration/`.
+This runs direct Object Lock/exact-version checks, then a 30-day COMPLIANCE
+repository with journaled initialization, a Kubernetes Lease, and AWS CLI,
+rclone, mc and restic round trips. It uses disposable local providers. It does
+not qualify an external provider or demonstrate an elapsed retention window.
 
-For governance mode, also review IAM or bucket policy so normal gateway
-credentials cannot bypass governance retention. The live retained-version test
-does not grant or use bypass headers, so it is not a substitute for that
-credential review.
+The legacy `preview-gate-v2-live`, `integration-s3-gateway-v2-live` and
+`integration-kopia-gateway-v2-live` recipes still include retained local
+memory-anchor launchers. Those launchers cannot meet the current recovery
+maintenance-guard requirement and are not current end-to-end qualification
+commands. For an external backend, qualify the provider and exercise backup
+and restore through a journaled Kubernetes deployment as described in
+[Production Preview](production-preview.md). External-provider qualification
+remains a separate requirement.
 
-After a provider passes qualification, run a real Kopia backup/restore through
-the gateway against the same backend. Use a fresh backend prefix for each live
-run, and enable repository retention when validating an Object Lock bucket:
+For governance mode, review IAM or bucket policy so normal gateway credentials
+cannot bypass governance retention. `RS3_GOVERNANCE_BYPASS_REVIEWED=true` records
+that operator assertion; the live Object Lock probe does not establish it.
 
-```sh
-RS3_REPOSITORY_RETENTION_MODE=governance \
-RS3_REPOSITORY_RETENTION_DAYS=1 \
-just integration-kopia-gateway --mode provided --backend-prefix <fresh-prefix>
-```
-
-For the Kubernetes path, run the Velero dynamic PVC gateway-restart lane against
-the same provider. This creates a disposable kind cluster, runs a Velero/Kopia
-backup, deletes the namespace, restarts the stateless gateway, restores the
-namespace, verifies that the replacement gateway container did not enter a
-startup restart loop, and verifies the restored file bytes:
-
-```sh
-RS3_REPOSITORY_RETENTION_MODE=governance \
-RS3_REPOSITORY_RETENTION_DAYS=1 \
-just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-prefix <fresh-prefix>
-```
+`integration k8s-gateway --keep-cluster` retains the kind cluster for log and
+resource inspection. Its disposable S3 backend is still removed, so the kept
+gateway is not usable for further requests.
 
 ## Privacy Tests
 

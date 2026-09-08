@@ -595,6 +595,7 @@ mod imp {
                     let (image_repository, image_tag) = split_image_ref(&args.image);
                     helm_install_gateway(
                         &args.helm_bin,
+                        &args.kubectl_bin,
                         kubeconfig_path,
                         &GatewayChartValues {
                             release_name: &args.release_name,

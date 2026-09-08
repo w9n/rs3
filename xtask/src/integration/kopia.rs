@@ -246,6 +246,7 @@ pub(crate) fn run_kopia_gateway(args: KopiaGatewayArgs) -> Result<()> {
                 args.region,
                 s3_container::S3ContainerOptions {
                     object_lock: args.retention_mode.is_some(),
+                    network: None,
                 },
             )?;
             let backend = GatewayBackend::from_container(&running);
