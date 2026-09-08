@@ -337,6 +337,14 @@ pinned-runner procedure actually enforces that condition.
 
 ## Current Release Matrix
 
+The standalone and Kopia qualification recipes build their gateway and any
+measurement proxy before starting bounded readiness checks. Build time is not
+gateway startup time. Direct `xtask` invocations and the ad hoc
+`just perf-s3-gateway` wrapper must prebuild the selected gateway profile and
+features, and measured Kopia needs the proxy's default development profile.
+The nightly recipe continues independent lanes after a failure and returns a
+failing status if any lane fails, preserving all available qualification evidence.
+
 On 2026-07-13, clean revision `7d87f90` passed five separately bounded
 `perf-kopia-profile-candidate` runs. Each row is the average of three
 alternating direct/gateway pairs using a release gateway and the adaptive

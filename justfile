@@ -130,16 +130,20 @@ preview-gate-release:
 
 # Expensive local v2 gate for scheduled CI or release-candidate hardening.
 preview-gate-v2-nightly:
-    just check-s3
-    just fuzz-smoke
-    just fault-injection-sweep
-    just perf-standalone-gate
-    just integration-s3-gateway --tooling-smoke
-    just preview-gate-v2-retained-local
-    just integration-kopia-gateway
-    just integration-k8s-gateway --wait-secs 240
-    just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image
-    just integration-velero-kopia-postgres-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image
+    #!/usr/bin/env bash
+    set -euo pipefail
+    qualification_status=0
+    just check-s3 || qualification_status=1
+    just fuzz-smoke || qualification_status=1
+    just fault-injection-sweep || qualification_status=1
+    just perf-standalone-gate || qualification_status=1
+    just integration-s3-gateway --tooling-smoke || qualification_status=1
+    just preview-gate-v2-retained-local || qualification_status=1
+    just integration-kopia-gateway || qualification_status=1
+    just integration-k8s-gateway --wait-secs 240 || qualification_status=1
+    just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image || qualification_status=1
+    just integration-velero-kopia-postgres-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image || qualification_status=1
+    exit "${qualification_status}"
 
 # Live retained-backend v2 gate. Credentials are read from the normal AWS/S3 env.
 preview-gate-v2-live BACKEND_BUCKET ENDPOINT_URL REGION:
@@ -206,6 +210,7 @@ integration-s3-container *ARGS:
 
 # Run the S3 gateway integration harness.
 integration-s3-gateway *ARGS:
+    cargo build -p rs3-server --bin rs3-server --features s3
     cargo run -p xtask --bin xtask --features containers -- integration s3-gateway {{ARGS}}
 
 # Qualify retained-version storage and gateway behavior against disposable local providers.
@@ -215,14 +220,17 @@ preview-gate-v2-retained-local:
 
 # Run the v2 live S3 gateway integration harness.
 integration-s3-gateway-v2-live *ARGS:
+    cargo build -p rs3-server --bin rs3-server --features s3
     cargo run -p xtask --bin xtask --features containers -- integration s3-gateway --mode provided --retention-mode governance --retention-days 1 --tooling-smoke {{ARGS}}
 
 # Run the Kopia gateway integration harness.
 integration-kopia-gateway *ARGS:
+    cargo build -p rs3-server --bin rs3-server --features s3
     cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway {{ARGS}}
 
 # Run the v2 live Kopia gateway integration harness.
 integration-kopia-gateway-v2-live *ARGS:
+    cargo build -p rs3-server --bin rs3-server --features s3
     cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway --mode provided --retention-mode governance --retention-days 1 {{ARGS}}
 
 # Run the Kubernetes gateway integration harness.
@@ -586,7 +594,10 @@ perf-kopia-profile-candidate PROFILE:
     if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then
       build_revision="${build_revision}-dirty"
     fi
-    RS3_BUILD_GIT_SHA="${build_revision}" cargo build -p xtask --bin xtask --features containers
+    export RS3_BUILD_GIT_SHA="${build_revision}"
+    cargo build -p xtask --bin xtask --features containers
+    cargo build --release -p rs3-server --bin rs3-server --features s3
+    cargo build -p xtask --bin rs3-integration-storage-proxy
     target/debug/xtask integration kopia-measured-matrix \
       --runs 3 \
       --profile-set single \
@@ -616,6 +627,8 @@ perf-standalone-gate:
       build_revision="${build_revision}-dirty"
     fi
     RS3_BUILD_GIT_SHA="${build_revision}" cargo build --release -p xtask --bin xtask --features containers
+    # Keep cold compilation outside the gateway's bounded readiness wait.
+    RS3_BUILD_GIT_SHA="${build_revision}" cargo build --release -p rs3-server --features s3
     objects=8
     object_size=67108865
     baseline_throughput=""
