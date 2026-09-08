@@ -3538,6 +3538,147 @@ async fn v2_repository_hides_unaccepted_mutation_after_anchor_failure() {
     assert_eq!(body, Bytes::from_static(b"accepted"));
 }
 
+/// Reports a compare-and-advance failure whose update the anchor service
+/// still applies after the caller's immediate re-read: the delayed-apply
+/// shape of a timed-out Lease update that the API server commits anyway.
+struct DelayedApplyV2Anchor {
+    inner: V2MemoryAnchor,
+    pending: std::sync::Mutex<Option<(Option<V2AnchorState>, V2AnchorState)>>,
+    remaining_failures: AtomicUsize,
+}
+
+impl DelayedApplyV2Anchor {
+    fn new(inner: V2MemoryAnchor) -> Self {
+        Self {
+            inner,
+            pending: std::sync::Mutex::new(None),
+            remaining_failures: AtomicUsize::new(1),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl V2CommitAnchor for DelayedApplyV2Anchor {
+    async fn read_v2(&self) -> super::V2Result<Option<V2AnchorState>> {
+        // The re-read observes the parent; the delayed update lands after it.
+        let observed = self.inner.read_v2().await?;
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some((expected, next)) = pending {
+            self.inner
+                .compare_and_advance_v2(expected.as_ref(), next)
+                .await?;
+        }
+        Ok(observed)
+    }
+
+    async fn compare_and_advance_v2(
+        &self,
+        expected: Option<&V2AnchorState>,
+        next: V2AnchorState,
+    ) -> super::V2Result<V2AnchorState> {
+        if self
+            .remaining_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            *self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((expected.cloned(), next));
+            return Err(V2FormatError::AnchorAdvanceFailed);
+        }
+        self.inner.compare_and_advance_v2(expected, next).await
+    }
+}
+
+/// Reproducer for the ambiguous-CAS resolution: one re-read decides that a
+/// failed advance did not happen, so the overlay is rolled back and the client
+/// is told the write failed, yet the anchor then accepts that very commit.
+/// The local view is stale until the chain is reloaded. This pins current
+/// behavior; choosing a remedy needs this shape, not a hypothetical one.
+#[tokio::test]
+async fn v2_repository_delayed_anchor_apply_after_ambiguous_cas_leaves_local_state_stale() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = V2Repository::new(store, keyring, RepositoryOptions::default(), options);
+    let live_anchor = V2MemoryAnchor::new();
+    let key =
+        LogicalPath::new("snapshots/ambiguous-cas.bin").unwrap_or_else(|error| panic!("{error}"));
+    let later_key =
+        LogicalPath::new("snapshots/after-ambiguity.bin").unwrap_or_else(|error| panic!("{error}"));
+    must_repo(repository.write_genesis_snapshot(&live_anchor).await);
+    let genesis = must_v2(live_anchor.read_v2().await).expect("genesis anchor");
+
+    let ambiguous = repository
+        .put_committed(
+            &DelayedApplyV2Anchor::new(live_anchor.clone()),
+            key.clone(),
+            Bytes::from_static(b"durable despite failure"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+
+    // The client is told the write failed and the local overlay hides it.
+    assert!(matches!(
+        ambiguous,
+        Err(crate::RepositoryError::CommitFailed { .. })
+    ));
+    assert!(matches!(
+        repository.head(&key),
+        Err(crate::RepositoryError::NotFound(_))
+    ));
+    // Yet the anchor service applied the update after the resolving re-read.
+    let accepted = must_v2(live_anchor.read_v2().await).expect("advanced anchor");
+    assert_eq!(accepted.sequence, Sequence::new(genesis.sequence.get() + 1));
+
+    // Every later publication from this process is refused as stale.
+    let stale = repository
+        .put_committed(
+            &live_anchor,
+            later_key.clone(),
+            Bytes::from_static(b"after"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(
+        matches!(&stale, Err(crate::RepositoryError::CommitFailed { reason }) if reason.contains("stale")),
+        "unexpected result: {stale:?}"
+    );
+    assert!(matches!(
+        repository.head(&later_key),
+        Err(crate::RepositoryError::NotFound(_))
+    ));
+
+    // Reloading from the anchor reveals the write the client saw fail.
+    must_repo(repository.load_chain_from_anchor(&live_anchor).await);
+    assert_eq!(
+        must_repo(repository.get_range(&key, ByteRange::Full).await),
+        Bytes::from_static(b"durable despite failure")
+    );
+    must_repo(
+        repository
+            .put_committed(
+                &live_anchor,
+                later_key,
+                Bytes::from_static(b"after"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+}
+
 #[tokio::test]
 async fn v2_repository_does_not_expose_staged_put_before_anchor_acceptance() {
     let store = MemoryBlobStore::new();
