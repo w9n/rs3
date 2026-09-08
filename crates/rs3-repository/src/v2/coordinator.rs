@@ -101,6 +101,8 @@ struct PendingBatch {
     generation: u64,
     failed: Option<String>,
     protection: Option<V2ProtectionCohort>,
+    #[cfg(test)]
+    force_cohort_mismatch_for_tests: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,6 +393,12 @@ where
         self.batch.lock().await.waiters.len()
     }
 
+    /// Makes the next enqueue take the defensive cohort-mismatch branch.
+    #[cfg(test)]
+    pub(crate) async fn force_cohort_mismatch_for_tests(&self) {
+        self.batch.lock().await.force_cohort_mismatch_for_tests = true;
+    }
+
     fn clone_for_owned_task(&self) -> Self {
         Self {
             repository: Arc::clone(&self.repository),
@@ -583,9 +591,17 @@ where
             let (metadata, rollback) = staged?;
             let (tx, rx) = oneshot::channel();
             let mut batch = self.batch.lock().await;
-            if batch.waiters.is_empty() && !batch.publishing {
+            #[cfg(test)]
+            let forced_mismatch = std::mem::take(&mut batch.force_cohort_mismatch_for_tests);
+            #[cfg(not(test))]
+            let forced_mismatch = false;
+            if !forced_mismatch && batch.waiters.is_empty() && !batch.publishing {
                 batch.protection = Some(protection);
-            } else if batch.protection != Some(protection) {
+            } else if forced_mismatch || batch.protection != Some(protection) {
+                drop(batch);
+                // The staged overlay entry must not outlive a rejected enqueue,
+                // or the next batch publishes a write whose client saw failure.
+                self.repository.rollback_staged_puts(vec![rollback])?;
                 return Err(commit_failed(
                     "v2 commit batch contains incompatible protection cohorts",
                 ));

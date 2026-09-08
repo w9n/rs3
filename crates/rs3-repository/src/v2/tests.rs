@@ -5251,6 +5251,75 @@ async fn v2_commit_coordinator_separates_incompatible_protection_cohorts() {
 }
 
 #[tokio::test]
+async fn v2_commit_coordinator_rolls_back_write_rejected_by_cohort_check() {
+    let store = MemoryBlobStore::new();
+    let keyring = must_crypto(KeyRing::generate_random());
+    let options = V2CommitStoreOptions::for_profile(
+        V2ProviderProfile::Dev,
+        sample_repository_id(),
+        sample_keyring_envelope_ref(),
+        sample_format_ref(),
+    );
+    let repository = Arc::new(V2Repository::new(
+        store.clone(),
+        keyring,
+        RepositoryOptions::default(),
+        options,
+    ));
+    let anchor = V2MemoryAnchor::new();
+    must_repo(repository.write_genesis_snapshot(&anchor).await);
+    let coordinator = Arc::new(must_repo(V2CommitCoordinator::with_options(
+        Arc::clone(&repository),
+        anchor.clone(),
+        CommitCoordinatorOptions::new(4, Duration::from_millis(10)),
+    )));
+    let rejected_key =
+        LogicalPath::new("cohorts/rejected.bin").unwrap_or_else(|error| panic!("{error}"));
+    let accepted_key =
+        LogicalPath::new("cohorts/accepted.bin").unwrap_or_else(|error| panic!("{error}"));
+
+    coordinator.force_cohort_mismatch_for_tests().await;
+    let rejected = coordinator
+        .put_committed(
+            rejected_key.clone(),
+            Bytes::from_static(b"rejected"),
+            RepositoryPutOptions::default(),
+        )
+        .await;
+    assert!(matches!(
+        rejected,
+        Err(crate::RepositoryError::CommitFailed { ref reason })
+            if reason.contains("incompatible protection cohorts")
+    ));
+    // The rejected write must leave no staged overlay entry behind.
+    assert_eq!(must_repo(repository.pending_operation_count_for_tests()), 0);
+    assert_eq!(coordinator.pending_item_count_for_tests().await, 0);
+
+    must_repo(
+        coordinator
+            .put_committed(
+                accepted_key.clone(),
+                Bytes::from_static(b"accepted"),
+                RepositoryPutOptions::default(),
+            )
+            .await,
+    );
+    assert!(repository.head(&accepted_key).is_ok());
+    assert!(matches!(
+        repository.head(&rejected_key),
+        Err(crate::RepositoryError::NotFound(_))
+    ));
+    let chain = must_v2(
+        repository
+            .commit_store()
+            .load_chain_from_anchor(&anchor)
+            .await,
+    )
+    .expect("v2 chain should exist");
+    assert_eq!(chain.commits_newest_first.len(), 2);
+}
+
+#[tokio::test]
 async fn v2_direct_staging_rejects_mixed_protection_cohorts() {
     let store = MemoryBlobStore::new();
     let keyring = must_crypto(KeyRing::generate_random());
