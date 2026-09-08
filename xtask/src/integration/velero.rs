@@ -623,7 +623,7 @@ mod imp {
                             retention_mode: args.repository_retention_mode.as_deref(),
                             retention_days: args.repository_retention_days,
                             repository_id: REPOSITORY_ID,
-                            repository_salt_hex: REPOSITORY_SALT_HEX,
+                            repository_salt_hex: Some(REPOSITORY_SALT_HEX),
                             keyring_envelope_object_id: KEYRING_ENVELOPE_OBJECT_ID,
                             keyring_wrapping_key_id: KEYRING_WRAPPING_KEY_ID,
                             keyring_wrapping_key_hex: KEYRING_WRAPPING_KEY_HEX,

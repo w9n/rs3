@@ -78,6 +78,14 @@ pub(crate) struct K8sGatewayArgs {
     /// Readiness timeout in seconds.
     #[arg(long, default_value_t = 180)]
     wait_secs: u64,
+    /// Omit the pinned salt so initialization generates and journals it.
+    #[arg(long, default_value_t = false)]
+    generated_salt: bool,
+    /// After the smoke: restart the gateway, repeat the same Helm command
+    /// against the live writer, then upgrade to a rebuilt image that needs
+    /// requalification, verifying the repository after each step.
+    #[arg(long, default_value_t = false)]
+    lifecycle_checks: bool,
 }
 
 #[cfg(not(feature = "k8s"))]
@@ -114,8 +122,9 @@ mod imp {
         ACCESS_KEY_ID, DEFAULT_PUBLIC_BUCKET, GATEWAY_PORT, GatewayChartValues, K8sWorkspace,
         KEYRING_ENVELOPE_OBJECT_ID, KEYRING_WRAPPING_KEY_HEX, KEYRING_WRAPPING_KEY_ID, KindCluster,
         PortForward, REPOSITORY_ID, REPOSITORY_SALT_HEX, SECRET_ACCESS_KEY, assert_v2_lease_anchor,
-        build_source_revision, default_cluster_name, helm_fullname, helm_install_gateway,
-        helm_lint_gateway, require_command, run_command, split_image_ref,
+        bootstrap_journal_attempts, build_source_revision, default_cluster_name, helm_fullname,
+        helm_install_gateway, helm_lint_gateway, kubectl_rollout_restart, require_command,
+        run_command, split_image_ref, wait_for_bootstrap_jobs,
     };
     use crate::integration::{s3_container, s3_gateway};
     use anyhow::{Context, Result, bail};
@@ -191,40 +200,17 @@ mod imp {
         )?;
         let backend_endpoint = backend.network_endpoint_url()?.to_owned();
         let (image_repository, image_tag) = split_image_ref(&args.image);
-        let anchor_mode = "kubernetes-lease";
+        let deployment = Deployment {
+            args: &args,
+            image_repository: &image_repository,
+            backend_endpoint: &backend_endpoint,
+            backend: &backend,
+        };
         helm_install_gateway(
             &args.helm_bin,
             &args.kubectl_bin,
             cluster.kubeconfig_path(),
-            &GatewayChartValues {
-                release_name: &args.release_name,
-                namespace: &args.namespace,
-                image_repository: &image_repository,
-                image_tag: &image_tag,
-                gateway_mode: "read-write",
-                public_bucket: DEFAULT_PUBLIC_BUCKET,
-                backend_endpoint: &backend_endpoint,
-                backend_bucket: &backend.bucket,
-                backend_prefix: "repository",
-                backend_region: &backend.region,
-                backend_access_key_id: Some(&backend.access_key_id),
-                backend_secret_access_key: Some(&backend.secret_access_key),
-                anchor_mode,
-                anchor_name: "checkpoint",
-                log_format: "plain",
-                rust_log: "info",
-                payload_segment_size: args.payload_segment_size,
-                retention_mode: args.retention_mode.map(K8sGatewayRetentionMode::as_env),
-                retention_days: args.retention_days,
-                repository_id: REPOSITORY_ID,
-                repository_salt_hex: REPOSITORY_SALT_HEX,
-                keyring_envelope_object_id: KEYRING_ENVELOPE_OBJECT_ID,
-                keyring_wrapping_key_id: KEYRING_WRAPPING_KEY_ID,
-                keyring_wrapping_key_hex: KEYRING_WRAPPING_KEY_HEX,
-                persistence_enabled: false,
-                wait_secs: args.wait_secs,
-                governance_review: None,
-            },
+            &deployment.chart_values(&image_tag),
         )?;
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -267,6 +253,12 @@ mod imp {
                     "checkpoint",
                 )?;
                 Ok(())
+            })
+            .and_then(|_| {
+                if !args.lifecycle_checks {
+                    return Ok(());
+                }
+                lifecycle_checks(&deployment, &runtime, &cluster, &service_name)
             });
 
         drop(backend);
@@ -275,6 +267,226 @@ mod imp {
         }
 
         result
+    }
+
+    /// Everything one Helm install of the candidate needs, so later lifecycle
+    /// steps render exactly the same values apart from the image tag.
+    struct Deployment<'a> {
+        args: &'a K8sGatewayArgs,
+        image_repository: &'a str,
+        backend_endpoint: &'a str,
+        backend: &'a s3_container::RunningS3Container,
+    }
+
+    impl<'a> Deployment<'a> {
+        fn chart_values(&self, image_tag: &'a str) -> GatewayChartValues<'a> {
+            let args = self.args;
+            GatewayChartValues {
+                release_name: &args.release_name,
+                namespace: &args.namespace,
+                image_repository: self.image_repository,
+                image_tag,
+                gateway_mode: "read-write",
+                public_bucket: DEFAULT_PUBLIC_BUCKET,
+                backend_endpoint: self.backend_endpoint,
+                backend_bucket: &self.backend.bucket,
+                backend_prefix: "repository",
+                backend_region: &self.backend.region,
+                backend_access_key_id: Some(&self.backend.access_key_id),
+                backend_secret_access_key: Some(&self.backend.secret_access_key),
+                anchor_mode: "kubernetes-lease",
+                anchor_name: "checkpoint",
+                log_format: "plain",
+                rust_log: "info",
+                payload_segment_size: args.payload_segment_size,
+                retention_mode: args.retention_mode.map(K8sGatewayRetentionMode::as_env),
+                retention_days: args.retention_days,
+                repository_id: REPOSITORY_ID,
+                repository_salt_hex: (!args.generated_salt).then_some(REPOSITORY_SALT_HEX),
+                keyring_envelope_object_id: KEYRING_ENVELOPE_OBJECT_ID,
+                keyring_wrapping_key_id: KEYRING_WRAPPING_KEY_ID,
+                keyring_wrapping_key_hex: KEYRING_WRAPPING_KEY_HEX,
+                persistence_enabled: false,
+                wait_secs: args.wait_secs,
+                governance_review: None,
+            }
+        }
+    }
+
+    /// Exercises the deployment transitions the operator guide describes.
+    ///
+    /// The object written by the first smoke must stay readable across a
+    /// gateway restart (state and salt recovered from the anchor and its
+    /// envelopes), a repeated same-values Helm command against the serving
+    /// writer (a new Job verifies read-only, no new qualification), and an
+    /// image-only upgrade whose changed binary needs fresh qualification
+    /// under the Lease after the Recreate rollout.
+    fn lifecycle_checks(
+        deployment: &Deployment<'_>,
+        runtime: &tokio::runtime::Runtime,
+        cluster: &KindCluster,
+        service_name: &str,
+    ) -> Result<()> {
+        let args = deployment.args;
+        let read_back = |label: &str| -> Result<()> {
+            runtime.block_on(async {
+                let mut port_forward = PortForward::start(
+                    &args.kubectl_bin,
+                    cluster.kubeconfig_path(),
+                    &args.namespace,
+                    service_name,
+                    GATEWAY_PORT,
+                    args.wait_secs,
+                )
+                .await?;
+                let endpoint = port_forward.endpoint_url();
+                let checked = async {
+                    assert_smoke_object_readable(endpoint.clone(), args.payload_segment_size)
+                        .await
+                        .with_context(|| format!("{label}: earlier object unreadable"))?;
+                    run_s3_smoke(endpoint, args.payload_segment_size).await
+                }
+                .await;
+                let shutdown = port_forward.shutdown();
+                checked?;
+                shutdown
+            })
+        };
+        let attempts = || {
+            bootstrap_journal_attempts(
+                &args.kubectl_bin,
+                cluster.kubeconfig_path(),
+                &args.namespace,
+                &args.release_name,
+            )
+        };
+        let (image_repository, image_tag) = split_image_ref(&args.image);
+        let deployment_name = helm_fullname(&args.release_name);
+        let baseline_attempts = attempts()?;
+        if baseline_attempts != 1 {
+            bail!(
+                "expected exactly one qualification run after install, found {baseline_attempts}"
+            );
+        }
+
+        println!("lifecycle: restarting the gateway");
+        kubectl_rollout_restart(
+            &args.kubectl_bin,
+            cluster.kubeconfig_path(),
+            &args.namespace,
+            &deployment_name,
+            args.wait_secs,
+        )?;
+        read_back("after restart")?;
+
+        println!("lifecycle: repeating the same Helm command against the live writer");
+        helm_install_gateway(
+            &args.helm_bin,
+            &args.kubectl_bin,
+            cluster.kubeconfig_path(),
+            &deployment.chart_values(&image_tag),
+        )?;
+        wait_for_bootstrap_jobs(
+            &args.kubectl_bin,
+            cluster.kubeconfig_path(),
+            &args.namespace,
+            args.wait_secs,
+        )?;
+        let after_repeat = attempts()?;
+        if after_repeat != baseline_attempts {
+            bail!(
+                "a same-values repeat must verify without qualification, but attempts went {baseline_attempts} -> {after_repeat}"
+            );
+        }
+        read_back("after same-values repeat")?;
+
+        println!("lifecycle: upgrading to a rebuilt image that needs requalification");
+        let requalify_tag = format!("{image_tag}-requalify");
+        let requalify_image = format!("{image_repository}:{requalify_tag}");
+        // The binary must stay bound to a valid revision: evidence from an
+        // unbound build is never accepted, so the rebuilt image carries a
+        // distinct but well-formed revision instead of a suffix.
+        let revision_arg = format!(
+            "REVISION={}",
+            requalification_revision(build_source_revision())
+        );
+        run_command(
+            &args.docker_bin,
+            &[
+                "build",
+                "--build-arg",
+                revision_arg.as_str(),
+                "-t",
+                requalify_image.as_str(),
+                ".",
+            ],
+        )
+        .context("failed to build the requalification image")?;
+        cluster.load_image(&requalify_image)?;
+        helm_install_gateway(
+            &args.helm_bin,
+            &args.kubectl_bin,
+            cluster.kubeconfig_path(),
+            &deployment.chart_values(&requalify_tag),
+        )?;
+        wait_for_bootstrap_jobs(
+            &args.kubectl_bin,
+            cluster.kubeconfig_path(),
+            &args.namespace,
+            args.wait_secs,
+        )?;
+        let after_requalify = attempts()?;
+        if after_requalify != baseline_attempts + 1 {
+            bail!(
+                "an image-only upgrade must requalify once, but attempts went {baseline_attempts} -> {after_requalify}"
+            );
+        }
+        read_back("after image-only requalification")?;
+        assert_v2_lease_anchor(
+            &args.kubectl_bin,
+            cluster.kubeconfig_path(),
+            &args.namespace,
+            "checkpoint",
+        )
+    }
+
+    /// Derives a distinct, well-formed revision for the requalification
+    /// image by flipping the last digit of the candidate's hash.
+    pub(super) fn requalification_revision(candidate: &str) -> String {
+        let hash = candidate.strip_suffix("-dirty").unwrap_or(candidate);
+        let mut flipped = hash.to_owned();
+        match flipped.pop() {
+            Some('0') => flipped.push('1'),
+            Some(_) => flipped.push('0'),
+            None => {}
+        }
+        flipped
+    }
+
+    async fn assert_smoke_object_readable(
+        endpoint_url: String,
+        payload_segment_size: Option<usize>,
+    ) -> Result<()> {
+        let payload_segment_size =
+            payload_segment_size.unwrap_or(rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE);
+        let expected = deterministic_body(payload_segment_size * 2 + 123);
+        let get = s3_client(&endpoint_url)
+            .get_object()
+            .bucket(DEFAULT_PUBLIC_BUCKET)
+            .key("smoke/object.txt")
+            .send()
+            .await
+            .context("earlier smoke object GetObject failed")?;
+        let actual = get
+            .body
+            .collect()
+            .await
+            .context("failed to collect earlier smoke object body")?
+            .into_bytes();
+        if actual.as_ref() != expected.as_slice() {
+            bail!("earlier smoke object body changed across the lifecycle step");
+        }
+        Ok(())
     }
 
     async fn run_s3_smoke(endpoint_url: String, payload_segment_size: Option<usize>) -> Result<()> {
@@ -415,6 +627,22 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::{K8sGatewayArgs, K8sGatewayRetentionMode, validate_k8s_gateway_args};
+
+    #[cfg(feature = "k8s")]
+    #[test]
+    fn requalification_revision_stays_well_formed_and_distinct() {
+        let candidate = "a".repeat(39) + "0";
+        let derived = super::imp::requalification_revision(&candidate);
+        assert_eq!(derived, "a".repeat(39) + "1");
+        assert_eq!(
+            super::imp::requalification_revision(&(candidate.clone() + "-dirty")),
+            "a".repeat(39) + "1"
+        );
+        assert_eq!(
+            super::imp::requalification_revision(&("b".repeat(40))),
+            "b".repeat(39) + "0"
+        );
+    }
     use crate::integration::S3ContainerProvider;
 
     fn args(
@@ -437,6 +665,8 @@ mod tests {
             helm_bin: "helm".to_owned(),
             kubectl_bin: "kubectl".to_owned(),
             skip_image_build: false,
+            generated_salt: false,
+            lifecycle_checks: false,
             skip_image_load: false,
             keep_cluster: false,
             wait_secs: 180,

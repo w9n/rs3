@@ -47,7 +47,8 @@ pub(crate) struct GatewayChartValues<'a> {
     pub(crate) retention_mode: Option<&'a str>,
     pub(crate) retention_days: Option<u32>,
     pub(crate) repository_id: &'a str,
-    pub(crate) repository_salt_hex: &'a str,
+    /// Pinned public salt, or `None` to let initialization generate one.
+    pub(crate) repository_salt_hex: Option<&'a str>,
     pub(crate) keyring_envelope_object_id: &'a str,
     pub(crate) keyring_wrapping_key_id: &'a str,
     pub(crate) keyring_wrapping_key_hex: &'a str,
@@ -230,7 +231,10 @@ pub(crate) fn helm_install_gateway(
             "--set",
             "repositoryKeys.create=true",
             "--set-string",
-            &helm_set_string("repositoryKeys.saltHex", values.repository_salt_hex),
+            &helm_set_string(
+                "repositoryKeys.saltHex",
+                values.repository_salt_hex.unwrap_or_default(),
+            ),
             "--set-string",
             &helm_set_string(
                 "repositoryKeys.envelopeObjectId",
@@ -280,7 +284,7 @@ fn collect_namespace_failure_diagnostics(
         SECRET_ACCESS_KEY,
         values.backend_endpoint,
         values.backend_prefix,
-        values.repository_salt_hex,
+        values.repository_salt_hex.unwrap_or_default(),
         values.keyring_wrapping_key_hex,
         kubeconfig.as_ref(),
     ];
@@ -530,6 +534,104 @@ fn required_u64_annotation(
 
 fn helm_set_string(key: &str, value: &str) -> String {
     format!("{key}={}", value.replace('\\', "\\\\").replace(',', "\\,"))
+}
+
+/// Restarts the gateway Deployment and waits for the rollout to finish.
+pub(crate) fn kubectl_rollout_restart(
+    kubectl_bin: &str,
+    kubeconfig_path: &Path,
+    namespace: &str,
+    deployment: &str,
+    wait_secs: u64,
+) -> Result<()> {
+    let kubeconfig = path_str(kubeconfig_path)?;
+    let target = format!("deployment/{deployment}");
+    run_command(
+        kubectl_bin,
+        &[
+            "--kubeconfig",
+            kubeconfig,
+            "-n",
+            namespace,
+            "rollout",
+            "restart",
+            &target,
+        ],
+    )?;
+    let timeout = format!("--timeout={wait_secs}s");
+    run_command(
+        kubectl_bin,
+        &[
+            "--kubeconfig",
+            kubeconfig,
+            "-n",
+            namespace,
+            "rollout",
+            "status",
+            &target,
+            &timeout,
+        ],
+    )
+}
+
+/// Waits until every bootstrap Job in the namespace has completed.
+pub(crate) fn wait_for_bootstrap_jobs(
+    kubectl_bin: &str,
+    kubeconfig_path: &Path,
+    namespace: &str,
+    wait_secs: u64,
+) -> Result<()> {
+    let kubeconfig = path_str(kubeconfig_path)?;
+    let timeout = format!("--timeout={wait_secs}s");
+    run_command(
+        kubectl_bin,
+        &[
+            "--kubeconfig",
+            kubeconfig,
+            "-n",
+            namespace,
+            "wait",
+            "--for=condition=complete",
+            "job",
+            "--all",
+            &timeout,
+        ],
+    )
+    .context("bootstrap Job did not complete")
+}
+
+/// Reads the onboarding journal's durable probe reservation count.
+pub(crate) fn bootstrap_journal_attempts(
+    kubectl_bin: &str,
+    kubeconfig_path: &Path,
+    namespace: &str,
+    release_name: &str,
+) -> Result<u64> {
+    let kubeconfig = path_str(kubeconfig_path)?;
+    let mut journal = helm_fullname(release_name);
+    journal.truncate(53);
+    let journal = format!("{}-bootstrap", journal.trim_end_matches('-'));
+    let state = run_command_capture(
+        kubectl_bin,
+        &[
+            "--kubeconfig",
+            kubeconfig,
+            "-n",
+            namespace,
+            "get",
+            "secret",
+            &journal,
+            "-o",
+            "go-template={{index .data \"state\" | base64decode}}",
+        ],
+    )
+    .with_context(|| format!("failed to read bootstrap journal `{journal}`"))?;
+    let record: serde_json::Value =
+        serde_json::from_str(state.trim()).context("bootstrap journal state was not JSON")?;
+    record
+        .get("attempts")
+        .and_then(serde_json::Value::as_u64)
+        .context("bootstrap journal state has no attempts count")
 }
 
 pub(crate) fn helm_fullname(release_name: &str) -> String {

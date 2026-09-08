@@ -274,6 +274,11 @@ integration-velero-kopia-postgres-smoke *ARGS:
 integration-velero-kopia-postgres-v2-live *ARGS:
     RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke --backend-mode provided --repository-retention-mode governance --repository-retention-days 15 {{ARGS}}
 
+# Candidate-only lifecycle qualification: generated salt, restart, same-values
+# Helm repeat against the live writer, and image-only requalification.
+integration-k8s-gateway-lifecycle *ARGS:
+    RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration k8s-gateway --generated-salt --lifecycle-checks --wait-secs 300 {{ARGS}}
+
 # Lint both the local fixture and fail-closed production value profiles.
 helm-lint:
     helm lint charts/rs3-gateway \
