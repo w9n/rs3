@@ -58,7 +58,12 @@ impl<S: BlobStore> V2CommitStore<S> {
         reachability.recovery_clock_uncertainty_ms = Some(accepted.policy.clock_uncertainty_ms());
         let current_floor = (self.provider_profile()
             == V2ProviderProfile::RetainedVersionObjectLock)
-            .then(|| accepted.policy.coverage_until_ms(self.publication_now_ms()))
+            .then(|| {
+                accepted
+                    .policy
+                    .coverage_until_ms(self.publication_now_ms())
+                    .and_then(super::super::recovery::policy::ceil_physical_deadline_ms)
+            })
             .transpose()?;
         reachability.current_recovery_floor_ms = current_floor;
         let snapshot = &accepted.snapshot;

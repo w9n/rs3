@@ -4,6 +4,7 @@ mod multipart_completion;
 mod prepared_genesis;
 mod publication_overlap;
 mod publication_time;
+mod recovery_acceptance;
 mod recovery_coverage;
 mod recovery_protection;
 mod recovery_publication;
@@ -7895,6 +7896,9 @@ async fn retained_v2_full_gc_renews_exact_live_versions_before_deleting() {
         .await
         .unwrap_or_else(|error| panic!("put orphan: {error}"));
 
+    let minimum_deadline = must_v2(super::recovery::policy::ceil_physical_deadline_ms(
+        repository.publication_now_ms() + 86_400_000,
+    ));
     let apply = must_v2(
         repository
             .apply_full_gc(
@@ -7929,8 +7933,14 @@ async fn retained_v2_full_gc_renews_exact_live_versions_before_deleting() {
         .head(&child.commit_key.object_id)
         .await
         .unwrap_or_else(|error| panic!("head latest version: {error}"));
-    assert_eq!(anchored.retention, Some(retention));
-    assert!(anchored.retain_until_ms.is_some());
+    let physical = anchored.retention.expect("verified physical protection");
+    assert_eq!(physical.mode, retention.mode);
+    assert!(physical.retain_days >= retention.retain_days);
+    assert!(
+        anchored
+            .retain_until_ms
+            .is_some_and(|deadline| deadline >= minimum_deadline)
+    );
     assert_eq!(latest.retention, None);
 }
 

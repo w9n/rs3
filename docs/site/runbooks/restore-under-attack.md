@@ -92,9 +92,12 @@ operations, and does not change the live anchor. Point the restore client at
 the isolated S3 endpoint and copy recovered data to an isolated destination;
 copying data back to production is a separately reviewed normal write. This
 preview implementation does not expose S3 `versionId` history or select an
-arbitrary time. Retained-provider restart, fault, and outage qualification is
-still pending; if the live authority is unavailable, use the trusted-bundle
-path below.
+arbitrary time. A local retained RustFS Object Lock and Kubernetes Lease exercise
+passed graceful read-only and writer restarts, historical AWS CLI/rclone copyout
+and range reads, and actual compaction after 256 writes. Deterministic
+controlled-time tests cover expiry, renewal, guard faults, and eligible
+exact-version GC. This does not qualify a 30-day provider outage or all retained
+providers; if the live authority is unavailable, use the trusted-bundle path below.
 
 ### Fall back to a trusted restore bundle
 

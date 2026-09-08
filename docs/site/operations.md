@@ -630,8 +630,12 @@ logical namespace for restore. Copy recovered data to an isolated destination;
 copying it back is a separately reviewed normal write. This preview workflow
 does not rewind the live anchor or expose S3 `versionId` history. Use the
 [incident runbook](runbooks/restore-under-attack.md) for the trusted-bundle
-fallback when live authority is unavailable. Retained-provider restart, fault,
-and outage qualification remains pending.
+fallback when live authority is unavailable. A local retained RustFS Object Lock
+and Kubernetes Lease exercise passed graceful read-only and writer restarts,
+historical AWS CLI/rclone copyout and range reads, and actual compaction after 256
+writes. Deterministic controlled-time tests cover expiry, renewal, guard faults,
+and eligible exact-version GC. This does not establish a 30-day outage bound or
+general retained-provider qualification.
 
 !!! note "DR survival kit"
     Keep this material outside the object-store account and outside the namespace

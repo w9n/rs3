@@ -116,6 +116,22 @@ fn checked_deadline(base_ms: i64, offset_ms: i64) -> V2Result<i64> {
         .ok_or(V2FormatError::InvalidPublicationTime)
 }
 
+/// Rounds an absolute provider deadline upward to its UTC-day bucket.
+///
+/// Our storage adapter accepts retention as a relative whole-day policy.
+/// Planning with this canonical physical floor keeps a quiescent preview and
+/// apply stable during one bucket, while never shortening the exact protection
+/// required by the logical policy.
+pub(crate) fn ceil_physical_deadline_ms(required_until_ms: i64) -> V2Result<i64> {
+    if required_until_ms < 0 {
+        return Err(V2FormatError::InvalidPublicationTime);
+    }
+    let remainder = required_until_ms % DAY_MS;
+    required_until_ms
+        .checked_add((DAY_MS - remainder) % DAY_MS)
+        .ok_or(V2FormatError::InvalidPublicationTime)
+}
+
 /// Translates an absolute minimum into the provider's relative-day primitive.
 /// The caller must still verify the exact returned deadline after the write or
 /// extension; this calculation cannot establish backend protection by itself.
@@ -189,6 +205,21 @@ mod tests {
         assert_eq!(policy.expiry_cutoff_ms(10_000), Ok(0));
         assert_eq!(
             policy.expiry_cutoff_ms(-1),
+            Err(V2FormatError::InvalidPublicationTime)
+        );
+    }
+
+    #[test]
+    fn physical_deadlines_round_up_without_weakening_the_logical_floor() {
+        assert_eq!(ceil_physical_deadline_ms(0), Ok(0));
+        assert_eq!(ceil_physical_deadline_ms(DAY_MS), Ok(DAY_MS));
+        assert_eq!(ceil_physical_deadline_ms(DAY_MS + 1), Ok(2 * DAY_MS));
+        assert_eq!(
+            ceil_physical_deadline_ms(i64::MAX),
+            Err(V2FormatError::InvalidPublicationTime)
+        );
+        assert_eq!(
+            ceil_physical_deadline_ms(-1),
             Err(V2FormatError::InvalidPublicationTime)
         );
     }

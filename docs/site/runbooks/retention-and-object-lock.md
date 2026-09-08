@@ -30,6 +30,19 @@ provider's `RS3_REPOSITORY_RETENTION_DAYS` is a physical protection floor for
 backend versions, not a historical selector. It must exceed the automatic
 maintenance interval plus its renewal safety horizon, and a provider may impose
 a longer floor. Neither setting shortens an already accepted deadline.
+Maintenance rounds generated physical coverage targets up to a UTC-day boundary
+so an unchanged dry run can be applied without millisecond-by-millisecond
+changes to its digest. Crossing that coverage boundary requires a new dry run.
+The generated target can be almost one day later than the exact requirement;
+the adapter then rounds its relative retention period to whole days. Logical
+recovery deadlines remain exact.
+
+A local retained RustFS Object Lock and Kubernetes Lease exercise passed graceful
+read-only and writer restarts, historical AWS CLI/rclone copyout and range reads,
+and actual compaction after 256 writes. Its dry run followed by an apply with
+reclamation disabled made no provider deletes. Deterministic controlled-time tests
+cover expiry, renewal, guard faults, and eligible exact-version GC. This is not a
+30-day provider-outage exercise or general retained-provider qualification.
 
 Use `compliance` where the provider supports it. Use `governance` only when
 privileged bypass is intentional. Normal gateway credentials should not carry
@@ -168,8 +181,10 @@ authenticated registry must agree. Preserve trusted bundles and verify their
 complete graphs for recovery when that authority is unavailable. The gateway
 does not expose arbitrary historical-root registration, in-place format or
 data-key rotation, or an S3 historical-version API.
-The registry and operator selection path are preview implementation; retained-
-provider restart, fault, and outage qualification remains pending.
+The registry and operator selection path are preview implementation. A local
+retained RustFS Object Lock and Kubernetes Lease exercise covers graceful restart
+and selected historical reads; provider-fault and 30-day outage qualification
+remain pending.
 Repository-level maintenance rejects foreign-format protected roots before any
 storage read, and v03 rejects client legal holds. Treat those as unsupported
 capabilities. Do not bypass the rejection by omitting a root or mutating Object

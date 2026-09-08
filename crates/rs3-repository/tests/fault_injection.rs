@@ -435,10 +435,10 @@ async fn ambiguous_retention_renewal_aborts_before_any_orphan_delete() {
         .head_at(&genesis.commit_key.object_id, genesis.version_id.as_ref())
         .await
         .expect("ambiguous renewal may safely have strengthened exact retention");
-    assert_eq!(
-        exact.retention,
-        Some(RetentionPolicy::new(RetentionMode::Compliance, 1))
-    );
+    let physical = exact.retention.expect("exact version remains protected");
+    assert_eq!(physical.mode, RetentionMode::Compliance);
+    assert!(physical.retain_days >= 1);
+    assert!(exact.retain_until_ms.is_some());
 }
 
 #[tokio::test]

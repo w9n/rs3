@@ -35,7 +35,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(not(test))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default lead time for extending provider retention on live objects.
 pub const DEFAULT_RETENTION_RENEWAL_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -1379,6 +1381,19 @@ impl<S> V2CommitStore<S>
 where
     S: BlobStore,
 {
+    // Tests share the commit-store instance clock with provider/publication
+    // fixtures. Production keeps the existing maintenance wall-clock source.
+    fn maintenance_now_ms(&self) -> i64 {
+        #[cfg(test)]
+        {
+            self.publication_now_ms()
+        }
+        #[cfg(not(test))]
+        {
+            current_time_ms()
+        }
+    }
+
     pub(crate) fn open_index_root_without_replay(
         &self,
         containing_commit: &V2ReplayCommit,
@@ -1598,7 +1613,7 @@ where
         let mut list_request_count = 0_u64;
         let mut inventory_item_count = 0_u64;
         let mut head_count = reachability.graph_head_count;
-        let now_ms = current_time_ms();
+        let now_ms = self.maintenance_now_ms();
         for (prefix, object_class) in [
             ("commits/v03/", V2OrphanObjectClass::Commit),
             ("objects/v03/", V2OrphanObjectClass::Object),
@@ -1818,7 +1833,7 @@ where
             cancellation,
             op_pacing_delay,
         } = bounds;
-        let now_ms = current_time_ms();
+        let now_ms = self.maintenance_now_ms();
         let min_age_ms = options.min_age.as_millis();
         let mut gc = V2OrphanGcReport {
             scanned_count: report.candidates.len(),
@@ -2364,7 +2379,7 @@ where
         let verified_commit_count = chain
             .map(|chain| chain.commits_newest_first.len())
             .unwrap_or_default();
-        let now_ms = current_time_ms();
+        let now_ms = self.maintenance_now_ms();
         let last_anchored_commit_age_ms = chain
             .and_then(|chain| chain.commits_newest_first.first())
             .and_then(|commit| {
@@ -2994,12 +3009,12 @@ where
         let required_deadline = match target.required_deadline {
             Some(deadline) if deadline >= 0 => deadline,
             Some(_) => return Err(V2FormatError::ProviderProfileFailed),
-            None => required_retain_until_ms(requested_policy)?,
+            None => required_retain_until_ms(requested_policy, self.maintenance_now_ms())?,
         };
         let policy = super::recovery::policy::physical_retention_for_deadline(
             Some(requested_policy),
             target.required_deadline,
-            current_time_ms(),
+            self.maintenance_now_ms(),
         )?
         .ok_or(V2FormatError::ProviderProfileFailed)?;
         self.store()
@@ -3087,8 +3102,8 @@ where
     ) -> V2Result<V2RetentionRenewalPlan> {
         let retained_profile =
             self.provider_profile() == V2ProviderProfile::RetainedVersionObjectLock;
-        let renew_before_ms =
-            current_time_ms().saturating_add(duration_millis_i64_saturating(horizon));
+        let now_ms = self.maintenance_now_ms();
+        let renew_before_ms = now_ms.saturating_add(duration_millis_i64_saturating(horizon));
         let mut plan = V2RetentionRenewalPlan::default();
 
         for target in targets {
@@ -3168,7 +3183,7 @@ where
                 plan.extend_count = plan.extend_count.saturating_add(1);
                 plan.head_count = plan.head_count.saturating_add(1);
                 let (required_deadline, required_legal_hold) =
-                    planned_renewal_requirements(target, &metadata, policy)?;
+                    planned_renewal_requirements(target, &metadata, policy, now_ms)?;
                 plan.targets.push(V2RetentionTarget {
                     object_id: metadata.object_id,
                     version_id: metadata.version_id,
@@ -3227,6 +3242,7 @@ fn validate_standalone_payload_root(root: &V2StandalonePayloadRoot) -> V2Result<
     validate_v2_standalone_object(&root.object_id, root.stored_len)
 }
 
+#[cfg(not(test))]
 fn current_time_ms() -> i64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3265,10 +3281,11 @@ fn planned_renewal_requirements(
     target: &V2RetentionTarget,
     metadata: &BlobMetadata,
     policy: RetentionPolicy,
+    now_ms: i64,
 ) -> V2Result<(i64, Option<LegalHoldStatus>)> {
     let required_deadline = target
         .required_deadline
-        .unwrap_or(required_retain_until_ms(policy)?);
+        .unwrap_or(planned_retain_until_ms_at(policy, now_ms)?);
     let required_deadline = metadata
         .retain_until_ms
         .map_or(required_deadline, |observed| {
@@ -3312,14 +3329,18 @@ fn duration_millis_i64_saturating(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
-fn required_retain_until_ms(policy: RetentionPolicy) -> V2Result<i64> {
-    current_time_ms()
+fn required_retain_until_ms(policy: RetentionPolicy, now_ms: i64) -> V2Result<i64> {
+    now_ms
         .checked_add(
             i64::from(policy.retain_days)
                 .checked_mul(86_400_000)
                 .ok_or(V2FormatError::ProviderProfileFailed)?,
         )
         .ok_or(V2FormatError::ProviderProfileFailed)
+}
+
+fn planned_retain_until_ms_at(policy: RetentionPolicy, now_ms: i64) -> V2Result<i64> {
+    super::recovery::policy::ceil_physical_deadline_ms(required_retain_until_ms(policy, now_ms)?)
 }
 
 fn commit_section_bytes(commit: &V2ReplayCommit, index: usize) -> V2Result<&[u8]> {
@@ -3533,6 +3554,19 @@ mod tests {
     }
 
     #[test]
+    fn canonical_physical_floor_changes_plan_digest_at_the_next_bucket() {
+        const DAY: i64 = 86_400_000;
+        let mut within_bucket = digest_plan(["objects/v03/a", "objects/v03/b"]);
+        within_bucket.verified_current_recovery_floor_ms = Some(3 * DAY);
+        let mut next_bucket = within_bucket.clone();
+        next_bucket.verified_current_recovery_floor_ms = Some(4 * DAY);
+        assert_ne!(
+            full_gc_plan_digest(&within_bucket, &digest_options()),
+            full_gc_plan_digest(&next_bucket, &digest_options())
+        );
+    }
+
+    #[test]
     fn standalone_roots_mark_exact_live_and_protected_versions() {
         let root = standalone_root(0x31);
         validate_standalone_payload_root(&root).expect("valid standalone root");
@@ -3638,8 +3672,8 @@ mod tests {
             legal_hold: Some(LegalHoldStatus::On),
         };
 
-        let (deadline, hold) =
-            planned_renewal_requirements(&target, &metadata, policy).expect("planned requirements");
+        let (deadline, hold) = planned_renewal_requirements(&target, &metadata, policy, 0)
+            .expect("planned requirements");
         assert_eq!(deadline, 3_000);
         assert_eq!(hold, Some(LegalHoldStatus::On));
 
@@ -3655,6 +3689,7 @@ mod tests {
                 ..metadata
             },
             policy,
+            0,
         )
         .expect("moving deadline");
         assert!(
