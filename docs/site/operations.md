@@ -473,6 +473,14 @@ floor, and accepted deadlines are never shortened. Retained read-write serving
 requires `RS3_MAINTENANCE_MODE=auto`; set `RS3_RECLAMATION_ENABLED=false` to
 keep renewal active while disabling physical orphan deletion.
 
+The recovery registry holds at most about 4.2 million live points, roughly
+1.62 accepted commits per second sustained across a thirty-day window. A
+gateway that reaches that ceiling refuses every write with a recovery-history
+capacity error rather than shortening any promise; writes resume as the oldest
+history pages expire. Batching small writes keeps sustained publication rates
+far below the ceiling; see the
+[repository format reference](reference/repository-format.md) for the bounds.
+
 ## Full Maintenance
 
 The read-write gateway runs the v2 full-maintenance supervisor in process. It

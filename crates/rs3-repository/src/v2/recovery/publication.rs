@@ -164,6 +164,9 @@ impl CapturedRecoveryPublication {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v2::recovery::history::{
+        MAX_RECOVERY_PAGE_RECORDS, RecoveryPageClaims, RecoveryPageLocation,
+    };
     use crate::v2::{V2AnchorState, V2CommitKey, V2FormatRef};
     use rs3_types::{BackendObjectId, BackendVersionId, KeyId, Sequence};
 
@@ -252,6 +255,128 @@ mod tests {
         assert_eq!(replayed.tail.len(), 1);
         assert_eq!(replayed.tail[0].anchor.sequence, Sequence::new(2));
         assert!(replayed.tail[0].protected_until_ms > 160_000);
+    }
+
+    /// A registry at the storage ceiling: 1,024 exact pages of 4,096 points
+    /// followed by a full live tail, with consistent sequence ordering.
+    fn full_registry(tail_deadline: i64, page_deadline: i64) -> AcceptedRecoveryState {
+        let policy = RecoveryPolicy::PRESET;
+        let paged = (MAX_RECOVERY_PAGES * MAX_RECOVERY_PAGE_RECORDS) as u64;
+        let tail = (0..MAX_RECOVERY_TAIL_RECORDS as u64)
+            .map(|ordinal| RecoveryPoint {
+                anchor: anchor(paged + ordinal + 1),
+                publish_time_ms: 1_000 + ordinal as i64,
+                protected_until_ms: tail_deadline,
+                policy_id: policy.identity(),
+            })
+            .collect();
+        let pages = (0..MAX_RECOVERY_PAGES as u64)
+            .map(|page_index| {
+                let first = page_index * MAX_RECOVERY_PAGE_RECORDS as u64 + 1;
+                let last = (page_index + 1) * MAX_RECOVERY_PAGE_RECORDS as u64;
+                RecoveryPageRef {
+                    location: RecoveryPageLocation::Exact {
+                        anchor: anchor(last + 1),
+                        section_ordinal: 0,
+                        page_index: 0,
+                    },
+                    claims: RecoveryPageClaims {
+                        record_count: MAX_RECOVERY_PAGE_RECORDS as u32,
+                        first_sequence: Sequence::new(first),
+                        last_sequence: Sequence::new(last),
+                        minimum_deadline_ms: page_deadline,
+                        maximum_deadline_ms: page_deadline,
+                    },
+                }
+            })
+            .collect();
+        AcceptedRecoveryState {
+            policy,
+            snapshot: Arc::new(RecoverySnapshot {
+                pages,
+                tail,
+                expire_before_ms: 0,
+            }),
+        }
+    }
+
+    /// The storage ceiling is 4,096 live tail points plus 1,024 live pages of
+    /// 4,096 points, about 4.2 million points. At the thirty-day preset that
+    /// is roughly 1.62 accepted commits per second sustained for the window.
+    #[test]
+    fn full_history_fails_closed_until_pages_expire_and_drops_no_live_point() {
+        let page_deadline = 10_000_000;
+        let tail_deadline = 20_000_000;
+        let previous = full_registry(tail_deadline, page_deadline);
+        let parent =
+            (MAX_RECOVERY_PAGES * MAX_RECOVERY_PAGE_RECORDS + MAX_RECOVERY_TAIL_RECORDS) as u64 + 1;
+        let plan = V2PublicationPlan {
+            sampled_now_ms: 5_000_000,
+            parent: anchor(parent),
+            parent_publish_time_ms: 4_999_000,
+            publish_time_ms: 5_000_000,
+        };
+
+        // Every page and every tail point is still live: the publication is
+        // refused and the accepted registry is left exactly as it was.
+        let refused = CapturedRecoveryPublication::new(
+            plan.clone(),
+            previous.clone(),
+            RecoveryPolicy::PRESET,
+            true,
+        );
+        assert!(matches!(
+            refused,
+            Err(V2FormatError::RecoveryHistoryCapacity)
+        ));
+        assert_eq!(previous.snapshot.pages.len(), MAX_RECOVERY_PAGES);
+        assert_eq!(previous.snapshot.tail.len(), MAX_RECOVERY_TAIL_RECORDS);
+
+        // One live page short of the ceiling still publishes; the roll keeps
+        // every live tail point in the new page.
+        let mut almost_full = previous.clone();
+        Arc::make_mut(&mut almost_full.snapshot).pages.pop();
+        let capture = CapturedRecoveryPublication::new(
+            plan.clone(),
+            almost_full,
+            RecoveryPolicy::PRESET,
+            true,
+        )
+        .expect("one free page slot");
+        assert_eq!(capture.section.delta.roll_tail, Some(0));
+        assert_eq!(
+            capture.section.local_pages[0].points.len(),
+            MAX_RECOVERY_TAIL_RECORDS
+        );
+        let snapshot = capture.section.snapshot.expect("root snapshot");
+        assert_eq!(snapshot.pages.len(), MAX_RECOVERY_PAGES);
+        assert_eq!(snapshot.tail.len(), 1);
+
+        // Once trusted time passes the pages' deadline plus clock uncertainty,
+        // the same publication succeeds: expired pages are released, the still
+        // protected tail rolls into one page, and nothing live is dropped.
+        let later = V2PublicationPlan {
+            sampled_now_ms: page_deadline + 60_001,
+            parent: anchor(parent),
+            parent_publish_time_ms: page_deadline + 60_000,
+            publish_time_ms: page_deadline + 60_001,
+        };
+        let capture =
+            CapturedRecoveryPublication::new(later, previous, RecoveryPolicy::PRESET, true)
+                .expect("expired pages free capacity");
+        assert_eq!(
+            capture.section.delta.expire_before_ms,
+            Some(page_deadline + 1)
+        );
+        assert_eq!(capture.section.delta.roll_tail, Some(0));
+        assert_eq!(
+            capture.section.local_pages[0].points.len(),
+            MAX_RECOVERY_TAIL_RECORDS
+        );
+        let snapshot = capture.section.snapshot.expect("root snapshot");
+        assert_eq!(snapshot.pages.len(), 1);
+        assert_eq!(snapshot.tail.len(), 1);
+        assert!(snapshot.tail[0].protected_until_ms > page_deadline + 60_001);
     }
 
     #[test]

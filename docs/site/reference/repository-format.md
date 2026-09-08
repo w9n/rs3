@@ -190,10 +190,16 @@ carry authenticated sequence and deadline claims plus the exact commit,
 provider-version, section, and page location needed to read that page. Recovery
 loads one exact page at a time and never treats an old page's embedded registry
 as new authority. If a page contains both expired and live points, its release
-is delayed conservatively to the page's maximum deadline. These storage bounds
-do not establish an effective history capacity: replay, graph, inventory, and
-provider byte budgets can impose a lower limit, and v03 has no qualified
-four-million-point capacity claim.
+is delayed conservatively to the page's maximum deadline. When the tail holds
+4,096 live points and 1,024 live pages remain, publication fails closed with a
+recovery-history capacity error: no promise is shortened and no live point is
+dropped, and every write path shares that refusal until the oldest page's
+maximum deadline passes the expiry cutoff. The storage ceiling is therefore
+about 4.2 million points, which at the thirty-day preset is roughly 1.62
+accepted commits per second sustained for the whole window. These storage
+bounds do not establish an effective history capacity: replay, graph,
+inventory, and provider byte budgets can impose a lower limit, and v03 has no
+qualified four-million-point capacity claim.
 
 For the retained-version Object Lock profile, a successor is not acknowledged
 until the exact restore dependency graph is covered through the required
