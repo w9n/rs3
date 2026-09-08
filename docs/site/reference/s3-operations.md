@@ -38,7 +38,7 @@ reports, and stored metadata remain path-private.
 | Object versions | Provider version IDs protect repository internals. The client-facing bucket remains unversioned and never exposes those IDs. | Literal `versionId=null` addresses the current logical value in supported read/delete operations; other version IDs are rejected. It is not a durable reference across overwrites. |
 | Object Lock retention | `PutObject` accepts retention headers only when startup selected and qualified the retained-version profile. An AtomicCreate or development repository cannot be upgraded by one request. `CopyObject` inherits the accepted source protection and verifies exact required dependencies before publication; it does not accept a replacement policy. Repository retention can strengthen backend commit protection; client-facing retention mutation APIs are not implemented. | Retention is configured at repository initialization or supplied on a qualified retained write, not by later client-side release or shortening. |
 | CopyObject scope | The source and destination must be distinct current keys in the configured bucket. The source may use a strong `x-amz-copy-source-if-match`; omitted or `COPY` metadata directives preserve trusted metadata and ignore supplied user metadata and ordinary content headers. An omitted or `STANDARD` storage class is supported. | Cross-bucket, access-point or ARN, historical, and source date or weak-ETag conditions are rejected. Destination `If-Match` and `If-None-Match`, metadata `REPLACE`, checksum changes, Object Lock, encryption, ACL, tag, nondefault storage-class, and policy overrides are not implemented. |
-| Multipart options | Nondefault content types, custom metadata including `X-Amz-Meta-Md5chksum`, tags, ACLs and explicit SSE options are not implemented. Unsupported options return `NotImplemented`. Canonical `Content-MD5` is supported on `PutObject` and `UploadPart`; flexible request checksums are supported for the five algorithms described below. | Use an omitted or `application/octet-stream` content type and an omitted or `STANDARD` storage class. |
+| Multipart options | Nondefault content types, tags, ACLs and explicit SSE options are not implemented. Custom user metadata, including `X-Amz-Meta-Md5chksum`, is accepted but discarded, matching ordinary PUT. Unsupported options return `NotImplemented`. Canonical `Content-MD5` is supported on `PutObject` and `UploadPart`; flexible request checksums are supported for the five algorithms described below. | Use an omitted or `application/octet-stream` content type and an omitted or `STANDARD` storage class. |
 
 ## Request checksums
 
@@ -92,8 +92,8 @@ checks the declaration at exact EOF. A malformed, duplicate, conflicting,
 mismatched, or incomplete declaration fails before object publication or part
 replacement. Each part ETag is the plaintext MD5 of that part; internal sealing
 attempt IDs remain separate and hidden. Generic custom metadata, including
-`X-Amz-Meta-Md5chksum`, remains outside the repository contract: multipart
-requests reject it, while ordinary `PutObject` does not preserve it. ETags and
+`X-Amz-Meta-Md5chksum`, remains outside the repository contract: ordinary PUT
+and multipart creation accept it but do not persist or return it. ETags and
 `Content-MD5` are client compatibility facts, distinct from flexible checksums,
 repository authentication, deduplication, and provider metadata or keys. The
 MD5 is computed once at the plaintext consumer without an extra payload read.

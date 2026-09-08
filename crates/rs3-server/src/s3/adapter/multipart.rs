@@ -82,7 +82,7 @@ impl GatewayS3Service {
                     input.grant_read.is_some(),
                     input.grant_read_acp.is_some(),
                     input.grant_write_acp.is_some(),
-                    input.metadata.as_ref().is_some_and(|v| !v.is_empty()),
+                    // Custom metadata is accepted but intentionally not retained in the v03 preview.
                     input.request_payer.is_some(),
                     input.sse_customer_algorithm.is_some(),
                     input.sse_customer_key.is_some(),

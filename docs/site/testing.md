@@ -58,12 +58,28 @@ the prior part usable, and direct rclone `check --download` verifies the
 completed bytes. These runs use 100 MiB objects and verify matching ETags from
 HEAD, GET and listing responses.
 
-Direct rclone multipart creation rejects its unconditional Mtime metadata;
-ordinary PUT accepts that metadata but does not preserve it. Multipart download
-checks therefore use AWS-created objects. These results qualify byte and ETag
-behavior, not metadata preservation or all rclone upload options. Earlier
-Velero qualification preceded the MD5 format update and was not repeated for
-this change.
+The earlier MD5 qualification used AWS-created multipart objects because
+multipart creation then rejected rclone's Mtime metadata. Ordinary PUT and
+multipart creation now both accept user metadata without preserving it.
+These results qualify byte and ETag behavior, not metadata preservation or all
+rclone upload options. Earlier Velero qualification preceded the MD5 format
+update and was not repeated for this change.
+
+`just integration-s3-gateway --tooling-smoke` requires AWS CLI v2, rclone, mc
+and restic. It uses deterministic incompressible data above 8 MiB, verifies
+uploaded and restored bytes, and checks exact length and multipart ETags for
+AWS and rclone uploads. AWS uses an isolated configuration with an explicit
+8 MiB multipart threshold; rclone uses explicit settings that disable system
+metadata and its custom MD5 metadata. Restic initializes, backs up and restores
+a repository. A missing tool or failed required upload fails the lane. Generic
+user-metadata preservation is outside this preview compatibility contract.
+
+The four-client lane passes against a disposable local RustFS backend with AWS
+CLI 2.34.24, rclone 1.75.0, mc RELEASE.2025-08-13 and restic 0.19.1. Both
+AWS and rclone return independently verified two-part ETags for the 9 MiB-plus-
+one-byte fixture. mc uses ordinary PUT at that size; restic backup and restore
+pass without a claim about its internal multipart layout. This lane uses an
+in-memory rollback anchor and does not qualify process restart or retention.
 
 Copy qualification uses the final `s3,k8s` release binary with rclone 1.75.0
 and AWS CLI 2.34.24. Direct rclone `moveto` passes for a 4 KiB packed object

@@ -341,6 +341,62 @@ async fn multipart_invalid_selection_keeps_session_and_empty_completion_is_index
 }
 
 #[tokio::test]
+async fn multipart_accepts_but_does_not_persist_custom_metadata() {
+    let service = gateway_service().await;
+    let created = service
+        .create_multipart_upload(s3_request(CreateMultipartUploadInput {
+            bucket: "client-bucket".into(),
+            key: KEY.into(),
+            metadata: Some(std::collections::HashMap::from([(
+                "arbitrary-client-metadata".to_owned(),
+                "accepted-but-not-retained".to_owned(),
+            )])),
+            ..Default::default()
+        }))
+        .await
+        .expect("metadata-bearing create")
+        .output;
+    let id = created.upload_id.expect("upload id");
+    let bytes = Bytes::from_static(b"multipart metadata");
+    let part_etag = part(&service, &id, 1, bytes.clone()).await;
+    let completed = service
+        .complete_multipart_upload(s3_request(complete_input(&id, vec![(1, part_etag)])))
+        .await
+        .expect("metadata-bearing completion")
+        .output;
+    let expected_etag = ETag::Strong(
+        rs3_crypto::multipart_etag(&[rs3_crypto::md5(bytes.as_ref())])
+            .expect("one-part aggregate")
+            .to_s3_string(),
+    );
+    assert_eq!(completed.e_tag, Some(expected_etag));
+    assert_eq!(
+        response_body(
+            service
+                .get_object(s3_request(GetObjectInput {
+                    bucket: "client-bucket".into(),
+                    key: KEY.into(),
+                    ..Default::default()
+                }))
+                .await
+                .expect("completed object"),
+        )
+        .await,
+        bytes
+    );
+    let head = service
+        .head_object(s3_request(HeadObjectInput {
+            bucket: "client-bucket".into(),
+            key: KEY.into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("head")
+        .output;
+    assert!(head.metadata.is_none());
+}
+
+#[tokio::test]
 async fn multipart_rejects_wrong_identity_readonly_and_invalid_body() {
     let mut service = gateway_service().await;
     let id = create(&service).await;
