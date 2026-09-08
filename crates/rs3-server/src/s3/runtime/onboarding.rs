@@ -7,7 +7,9 @@ use crate::admin::{
     provider_conformance_summary_from_bytes, provider_conformance_target_fingerprint,
     read_provider_conformance_evidence, selected_provider_profile,
 };
-use crate::s3::runtime_keyring::configured_or_generated_repository_salt;
+use crate::s3::runtime_keyring::{
+    configured_or_generated_repository_salt, configured_repository_salt,
+};
 use rs3_k8s::MAX_BOOTSTRAP_JOURNAL_BYTES;
 use serde::{Deserialize, Serialize};
 
@@ -196,11 +198,32 @@ struct OnboardingJournal<'a, J> {
 }
 
 impl<'a, J: Journal> OnboardingJournal<'a, J> {
-    fn open(journal: &'a mut J, config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
+    /// Opens or creates the onboarding record.
+    ///
+    /// `existing_salt` is the salt recovered from an already anchored
+    /// repository. A fresh journal over such a repository must adopt it: only
+    /// a repository that does not exist yet gets a generated salt.
+    fn open(
+        journal: &'a mut J,
+        config: &RuntimeConfig,
+        existing_salt: Option<Vec<u8>>,
+    ) -> Result<Self, S3BoundaryError> {
         let (record, salt) = match journal.state()? {
             Some(bytes) => Record::decode(bytes, config)?,
             None => {
-                let salt = configured_or_generated_repository_salt(&config.repository_keys)?;
+                let configured = configured_repository_salt(&config.repository_keys)?;
+                let salt = match (configured, existing_salt) {
+                    (Some(configured), Some(existing)) if configured != existing => {
+                        return Err(repository_init(
+                            "RS3_REPOSITORY_SALT_HEX does not match the salt of the anchored repository this journal would onboard",
+                        ));
+                    }
+                    (Some(configured), _) => configured,
+                    (None, Some(existing)) => existing,
+                    (None, None) => {
+                        configured_or_generated_repository_salt(&config.repository_keys)?
+                    }
+                };
                 let record = Record {
                     schema: SCHEMA.to_owned(),
                     context: bootstrap::context(config, &salt)?,
@@ -339,6 +362,32 @@ impl<J: Journal> Journal for OnboardingJournal<'_, J> {
     }
 }
 
+/// Recovers the salt of an already anchored repository for a journal that
+/// has not recorded anything yet.
+///
+/// A fresh journal over an intact anchor must adopt that salt from the
+/// authenticated format root: generating one would seal nothing the existing
+/// envelopes accept and leave every retry stuck. Only a repository that does
+/// not exist yet gets a generated salt.
+async fn existing_repository_salt(
+    config: &RuntimeConfig,
+    store: &RuntimeStore,
+    anchor: &RuntimeV2Anchor,
+    journal: &impl Journal,
+) -> Result<Option<Vec<u8>>, S3BoundaryError> {
+    if journal.state()?.is_some() {
+        return Ok(None);
+    }
+    let Some(anchor_state) = anchor.read_v2().await.map_err(repository_init)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        load_existing_v2_repository(store, &config.repository_keys, &anchor_state, config)
+            .await?
+            .repository_salt,
+    ))
+}
+
 pub(super) async fn initialize(
     config: &RuntimeConfig,
     store: &StoreBuild,
@@ -347,7 +396,8 @@ pub(super) async fn initialize(
     journal: &mut impl Journal,
     governance_bypass_reviewed: bool,
 ) -> Result<V2RepositoryInitReport, S3BoundaryError> {
-    let mut journal = OnboardingJournal::open(journal, config)?;
+    let existing_salt = existing_repository_salt(config, store.handle(), anchor, journal).await?;
+    let mut journal = OnboardingJournal::open(journal, config, existing_salt)?;
     let salt = journal.salt.clone();
     guard
         .verify_v2_maintenance(None)
