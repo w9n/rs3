@@ -875,6 +875,17 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         ));
     }
 
+    // Serving and initialization deliberately do not require an offline
+    // recovery signer. Cluster-loss import does, so report that readiness
+    // separately and without blocking the production posture.
+    if config.recovery.public_key.is_none() {
+        findings.push(AdminFinding::warning(
+            "recovery.cluster-loss-readiness",
+            "cluster-loss anchor import requires RS3_RECOVERY_PUBLIC_KEY and a signed restore bundle; serving and initialization do not",
+            "configure RS3_RECOVERY_PUBLIC_KEY with the trusted offline signing key and keep a signed export-restore-bundle artifact off-cluster before relying on import-anchor after cluster loss",
+        ));
+    }
+
     if config.repository.allow_init {
         findings.push(AdminFinding::error(
             "repository.init-enabled",
@@ -1627,6 +1638,21 @@ mod tests {
             findings
                 .iter()
                 .all(|finding| !finding.remediation.is_empty())
+        );
+        // Cluster-loss readiness is reported, never enforced at startup.
+        let readiness = findings
+            .iter()
+            .find(|finding| finding.code == "recovery.cluster-loss-readiness")
+            .expect("missing recovery key is reported");
+        assert!(!readiness.is_blocking());
+        assert!(readiness.message.contains("RS3_RECOVERY_PUBLIC_KEY"));
+        config.recovery.public_key = Some(
+            "ed25519:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+        );
+        assert!(
+            !doctor_findings(&config, AdminReportProfile::Production)
+                .iter()
+                .any(|finding| finding.code == "recovery.cluster-loss-readiness")
         );
     }
 

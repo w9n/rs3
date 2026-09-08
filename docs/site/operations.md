@@ -31,7 +31,12 @@ cargo run -p rs3-server -- doctor --profile production --probe
 The production profile rejects memory anchors, retention-unsupported local
 backends, plaintext S3-compatible backend endpoints, missing gateway
 credentials, and missing repository retention for mutation-capable serving.
-Every finding includes a remediation hint. Probe mode additionally checks
+Every finding includes a remediation hint. Serving and initialization do not
+require an offline recovery signer, so a missing `RS3_RECOVERY_PUBLIC_KEY` is
+reported as the non-blocking `recovery.cluster-loss-readiness` warning:
+signed bundle import after cluster loss needs that key and a signed
+off-cluster bundle, and the warning says so before the outage rather than
+during it. Probe mode additionally checks
 backend reachability, v2 anchor readability (including Kubernetes Lease access
 when configured), and keyring envelope readability without printing backend
 object names or configured Kubernetes object names.
