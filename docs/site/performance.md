@@ -245,7 +245,9 @@ and authenticated index material, not payload copying.
 Cold sentinel reads used one exact range `GET` per record at 1.00390625x for
 4 KiB records and 1.000244140625x for 256 KiB records.
 
-Qualification must enforce, not merely report, these initial ceilings:
+Qualification must meet these initial ceilings. Not every recipe currently
+enforces every ceiling, so qualification claims must cite the individual
+measurements that establish the relevant bounds.
 
 | Workload | Required backend write bound |
 | --- | ---: |

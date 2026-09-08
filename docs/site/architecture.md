@@ -373,9 +373,9 @@ a second controller, CronJob, or repository writer. The supervisor depends on
 the provider-neutral commit-anchor and maintenance-guard traits; Kubernetes
 supplies those contracts with the same fenced Lease used by normal writes.
 
-Automatic mode evaluates bounded retention-deadline and reclaimable-orphan
-facts, adds deterministic jitter, and applies cooldown or failure backoff only
-when doing so cannot cross the renewal safety boundary. Manual mode performs no
+Automatic mode evaluates bounded retention-deadline, authenticated recovery-expiry,
+and reclaimable-orphan facts, adds bounded random jitter, and applies cooldown or
+failure backoff only when doing so cannot cross the renewal safety boundary. Manual mode performs no
 background inventory scans and accepts explicit operator runs. Restore-readonly
 mode forces the supervisor off. A missing guard parks the state machine rather
 than retrying or mutating without exclusion.

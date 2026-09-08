@@ -112,7 +112,7 @@ mc ls rs3-local/backup/smoke/
 Local S3-compatible checks are opt-in:
 
 ```sh
-just integration-s3-local --mode container
+just integration-s3-container
 just integration-s3-gateway
 ```
 

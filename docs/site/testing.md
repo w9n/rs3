@@ -114,7 +114,7 @@ retained-provider and complete recovery qualification.
 | --- | --- | --- |
 | Default | `just check` | Format, clippy, workspace tests. |
 | Preview local gate | `just preview-gate-local` | Default checks, S3-feature checks, and dependency policy checks. |
-| Storage S3 | `just integration-s3-local --mode container` | Storage contract against a disposable S3-compatible provider. |
+| Storage S3 | `just integration-s3-container` | Storage contract against a disposable S3-compatible provider; `just integration-s3-local --mode provided` runs it against an existing endpoint. |
 | Gateway S3 | `just integration-s3-gateway` | Gateway S3 operations through the repository path. |
 | Local v2 nightly gate | `just preview-gate-v2-nightly` | Scheduled or release-candidate gate: S3 feature checks plus v2 S3 tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes against disposable local backends. |
 | Live v2 preview gate | `just preview-gate-v2-live <bucket> <endpoint> <region>` | Consolidated retained-backend gate. Generates fresh sub-prefixes and runs v2 provider conformance, Gateway S3, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes. |

@@ -166,9 +166,10 @@ The preview bootstrap path is declarative:
 4. Deploy the gateway with Kubernetes Lease anchoring.
 
 The salt is not secret, but it is required restore metadata. Put it in trusted
-GitOps or a recovery bundle with the repository ID and anchor position. Do not
-make the gateway generate an undeclared salt on first normal startup; that makes
-disaster recovery dependent on a cluster Secret that may be gone.
+GitOps or a recovery bundle with the repository ID and anchor position, not
+only in the cluster Secret the gateway reads it from. The gateway never
+generates a salt, so keep that independent copy available if the gateway Secret
+is lost.
 
 Bootstrap assumes a fresh, randomized backend prefix. The gateway probes the
 root and known repository sub-prefixes, including refused legacy generations,
