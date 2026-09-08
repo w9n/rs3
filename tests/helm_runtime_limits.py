@@ -85,6 +85,10 @@ def main() -> None:
     assert defaults["RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS"] == "120"
     assert defaults["RS3_BACKEND_OPERATION_TIMEOUT_SECS"] == "300"
     assert defaults["RS3_BACKEND_STALLED_STREAM_GRACE_SECS"] == "30"
+    assert defaults["RS3_RECOVERY_WINDOW_DAYS"] == "30"
+    assert defaults["RS3_RECOVERY_RENEWAL_MARGIN_SECONDS"] == "86400"
+    assert defaults["RS3_RECOVERY_CLOCK_UNCERTAINTY_MS"] == "60000"
+    assert defaults["RS3_RECLAMATION_ENABLED"] == "true"
 
     custom = local_values()
     custom["hardening"] = {
@@ -98,6 +102,12 @@ def main() -> None:
         "maxConcurrentRequests": 32,
         "requestRateLimitPerSecond": 128,
     }
+    custom["recovery"] = {
+        "windowDays": 45,
+        "renewalMarginSeconds": 90_000,
+        "clockUncertaintyMs": 1_000,
+    }
+    custom["maintenance"] = {"reclamationEnabled": False}
     custom["backend"] = {
         "endpoint": "file:///data",
         "bucket": "backend",
@@ -119,6 +129,31 @@ def main() -> None:
     assert configured["RS3_MAX_CONCURRENT_REQUESTS"] == "32"
     assert configured["RS3_BACKEND_CONNECT_TIMEOUT_SECS"] == "3"
     assert configured["RS3_BACKEND_OPERATION_TIMEOUT_SECS"] == "40"
+    assert configured["RS3_RECOVERY_WINDOW_DAYS"] == "45"
+    assert configured["RS3_RECOVERY_RENEWAL_MARGIN_SECONDS"] == "90000"
+    assert configured["RS3_RECOVERY_CLOCK_UNCERTAINTY_MS"] == "1000"
+    assert configured["RS3_RECLAMATION_ENABLED"] == "false"
+
+    readonly = local_values()
+    readonly["gateway"] = {"mode": "restore-readonly", "writerGuard": "off"}
+    readonly_env = deployment_env(render(readonly))
+    assert readonly_env["RS3_RECLAMATION_ENABLED"] == "false"
+
+    zero_recovery_window = copy.deepcopy(custom)
+    zero_recovery_window["recovery"]["windowDays"] = 0
+    render(zero_recovery_window, succeeds=False)
+
+    zero_recovery_uncertainty = copy.deepcopy(custom)
+    zero_recovery_uncertainty["recovery"]["clockUncertaintyMs"] = 0
+    render(zero_recovery_uncertainty, succeeds=False)
+
+    insufficient_recovery_margin = copy.deepcopy(custom)
+    insufficient_recovery_margin["recovery"] = {
+        "windowDays": 30,
+        "renewalMarginSeconds": 60,
+        "clockUncertaintyMs": 60_000,
+    }
+    render(insufficient_recovery_margin, succeeds=False)
 
     buffered_above_max = copy.deepcopy(custom)
     buffered_above_max["hardening"]["bufferedPutObjectBytes"] = 104_857_601

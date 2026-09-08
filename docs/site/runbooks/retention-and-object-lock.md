@@ -23,6 +23,14 @@ RS3_REPOSITORY_RETENTION_MODE=compliance
 RS3_REPOSITORY_RETENTION_DAYS=30
 ```
 
+The recovery policy is a separate logical history setting. Its default
+`RS3_RECOVERY_WINDOW_DAYS=30` keeps each accepted predecessor selectable for a
+30-day recovery window; it is applied to newly published history. The
+provider's `RS3_REPOSITORY_RETENTION_DAYS` is a physical protection floor for
+backend versions, not a historical selector. It must exceed the automatic
+maintenance interval plus its renewal safety horizon, and a provider may impose
+a longer floor. Neither setting shortens an already accepted deadline.
+
 Use `compliance` where the provider supports it. Use `governance` only when
 privileged bypass is intentional. Normal gateway credentials should not carry
 governance bypass permission.
@@ -150,12 +158,18 @@ deserialization and rejects returned member counts above the requested
 `MaxKeys`; protocol-invalid providers therefore cannot turn a bounded page into
 an unbounded allocation.
 
-The gateway does not expose historical-root registration or in-place format or
-data-key rotation. Automatic maintenance protects the current anchor graph. It does not maintain
-an automatic history of every acknowledged state for a configured recovery
-window. A retained object alone is insufficient historical recovery authority;
-preserve trusted bundles and verify their complete graphs before relying on
-[isolated incident recovery](restore-under-attack.md).
+For retained Object Lock repositories, every accepted successor records its
+exact predecessor, policy, and
+protection deadline in the encrypted authenticated recovery registry. The
+current point is implicit, and the operator can list and select registered
+points with the [recovery-point workflow](restore-under-attack.md). A retained
+object alone is still insufficient recovery authority: the live anchor and
+authenticated registry must agree. Preserve trusted bundles and verify their
+complete graphs for recovery when that authority is unavailable. The gateway
+does not expose arbitrary historical-root registration, in-place format or
+data-key rotation, or an S3 historical-version API.
+The registry and operator selection path are preview implementation; retained-
+provider restart, fault, and outage qualification remains pending.
 Repository-level maintenance rejects foreign-format protected roots before any
 storage read, and v03 rejects client legal holds. Treat those as unsupported
 capabilities. Do not bypass the rejection by omitting a root or mutating Object
@@ -163,12 +177,14 @@ Lock metadata outside the documented provider qualification workflow.
 
 The read-write gateway now runs guarded renewal and orphan reclamation as a
 background service when `RS3_MAINTENANCE_MODE=auto`, which is the default.
-`manual` requires an operator trigger and `off` disables renewal, so treat both
-as an explicit operational exception when retention is enabled. The supervisor
-parks rather than running without an enforced maintenance guard. While parked,
-it performs neither renewal nor reclamation: locks can expire and garbage can
-accumulate. Alert on parked or failed maintenance and on approaching retention
-deadlines; a running gateway is not evidence that renewal succeeded.
+Retained read-write repositories require `auto`; `manual` requires an operator
+trigger and `off` disables the supervisor, so neither is a retained-writer
+posture. Set `RS3_RECLAMATION_ENABLED=false` when physical orphan deletion must
+stay disabled: renewal still runs in `auto`, while eligible garbage is retained.
+The supervisor parks rather than running without an enforced maintenance guard.
+While parked, it performs neither renewal nor reclamation: locks can expire and
+garbage can accumulate. Alert on parked or failed maintenance and on approaching
+retention deadlines; a running gateway is not evidence that renewal succeeded.
 
 Size every Object Lock window strictly longer than:
 
@@ -211,9 +227,10 @@ ceiling or a promise to delete on a specific day.
 
 Client expiry alone does not shrink backing storage. Data must become
 unreachable, any required compaction must succeed, all protection must permit
-deletion, and a guarded maintenance pass must finish within its budgets.
-Protecting selected historical roots can keep additional objects reachable;
-the current automatic supervisor does not register those roots for you.
+deletion, and a guarded maintenance pass must finish within its budgets. The
+automatic recovery registry protects its accepted points; a bundle-imported or
+operator-supplied external root still requires the explicit protected-root
+workflow.
 
 ## Cluster Takeover
 

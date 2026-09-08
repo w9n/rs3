@@ -155,6 +155,18 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- if not (gt (int64 .Values.recovery.windowDays) 0) -}}
+{{- fail "recovery.windowDays must be greater than zero" -}}
+{{- end -}}
+{{- if not (gt (int64 .Values.recovery.renewalMarginSeconds) 0) -}}
+{{- fail "recovery.renewalMarginSeconds must be greater than zero" -}}
+{{- end -}}
+{{- if not (gt (int64 .Values.recovery.clockUncertaintyMs) 0) -}}
+{{- fail "recovery.clockUncertaintyMs must be greater than zero" -}}
+{{- end -}}
+{{- if le (mul (int64 .Values.recovery.renewalMarginSeconds) 1000) (int64 .Values.recovery.clockUncertaintyMs) -}}
+{{- fail "recovery.renewalMarginSeconds must exceed recovery.clockUncertaintyMs after milliseconds conversion" -}}
+{{- end -}}
 {{- if not .Values.repository.id -}}
 {{- fail "repository.id is required; use a stable value for keyring envelope binding" -}}
 {{- end -}}
@@ -324,6 +336,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- fail "repository.retention.days must be greater than zero when repository.retention.mode is set" -}}
 {{- end -}}
 {{- $maintenanceMode := .Values.maintenance.mode | default "auto" -}}
+{{- if and .Values.repository.retention.mode (eq .Values.gateway.mode "read-write") (ne $maintenanceMode "auto") -}}
+{{- fail "retained read-write repositories require maintenance.mode=auto for protection renewal; set maintenance.reclamationEnabled=false to disable physical deletion" -}}
+{{- end -}}
 {{- $maintenanceHorizon := int64 (.Values.maintenance.renewalHorizonSeconds | default 604800) -}}
 {{- $maintenanceMaxInterval := int64 (.Values.maintenance.maxIntervalSeconds | default 604800) -}}
 {{- $retentionSeconds := mul (int64 .Values.repository.retention.days) 86400 -}}

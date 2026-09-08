@@ -275,7 +275,7 @@ async fn exhausted_artifact_budgets_allow_reconciliation_but_never_new_puts() {
                 let commits = V2CommitStore::new(store.clone(), loaded.keyring, options);
                 let prepared = commits.open_prepared_genesis(intent).expect("intent");
                 commits
-                    .publish_prepared_genesis(&anchor, &prepared, true)
+                    .publish_prepared_genesis_with_guard(&anchor, &prepared, true, &guard)
                     .await
                     .expect("delayed publication");
             }

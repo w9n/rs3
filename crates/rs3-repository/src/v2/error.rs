@@ -64,6 +64,18 @@ pub enum V2FormatError {
     /// A header field had an invalid type, length, or value.
     #[error("invalid v03 commit header field")]
     InvalidHeaderField,
+    /// Signed ancestry or the bounded publication clock is invalid.
+    #[error("invalid v03 publication time")]
+    InvalidPublicationTime,
+    /// Authenticated recovery history is missing, malformed or inconsistent.
+    #[error("invalid v03 recovery history")]
+    InvalidRecoveryHistory,
+    /// Recovery history cannot grow without violating fixed resource bounds.
+    #[error("v03 recovery history capacity exceeded")]
+    RecoveryHistoryCapacity,
+    /// Recovery policy is invalid or would silently discard accepted promises.
+    #[error("invalid v03 recovery policy")]
+    InvalidRecoveryPolicy,
     /// The header algorithm identifiers do not exactly match v03.
     #[error("invalid v03 commit algorithm identifiers")]
     InvalidAlgorithms,
@@ -197,7 +209,9 @@ impl V2FormatError {
             | Self::MaintenanceBudgetExceeded
             | Self::MaintenancePlanChanged
             | Self::OrphanGcMinAgeTooLow
-            | Self::ReplayBudgetExceeded => V2ErrorClass::OperatorActionRequired,
+            | Self::ReplayBudgetExceeded
+            | Self::RecoveryHistoryCapacity
+            | Self::InvalidRecoveryPolicy => V2ErrorClass::OperatorActionRequired,
             Self::InvalidCommitKey
             | Self::TruncatedHeader
             | Self::TruncatedBody
@@ -210,6 +224,8 @@ impl V2FormatError {
             | Self::NonCanonicalCbor
             | Self::MissingHeaderField
             | Self::InvalidHeaderField
+            | Self::InvalidPublicationTime
+            | Self::InvalidRecoveryHistory
             | Self::InvalidAlgorithms
             | Self::SelfKeyMismatch
             | Self::SignatureVerification

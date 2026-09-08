@@ -344,7 +344,7 @@ impl<S: BlobStore> V2CommitStore<S> {
             &parts,
         )
         .await?;
-        let version_id = self
+        let verified = self
             .verify_commit_protection_postconditions(
                 &upload.object_id,
                 &metadata,
@@ -362,7 +362,7 @@ impl<S: BlobStore> V2CommitStore<S> {
             stored: Some(V2StoredStandalonePayload {
                 etag,
                 object_id: upload.object_id,
-                version_id,
+                version_id: verified.version_id,
                 object_len: expected_len,
                 object_digest: digest,
                 payload_layout: layout,

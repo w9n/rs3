@@ -409,6 +409,7 @@ where
     }
 
     let apply_options = V2FullGcApplyOptions {
+        reclamation_enabled: true,
         dry_run: dry_run_options,
         orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(std::time::Duration::ZERO),
         retained_provider_conformance_passed: true,

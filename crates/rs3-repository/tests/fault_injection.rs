@@ -163,6 +163,7 @@ async fn gc_stale_list_preserves_live_payload_refs_and_protected_roots() {
                     Duration::ZERO,
                 ),
                 retained_provider_conformance_passed: false,
+                reclamation_enabled: true,
             },
         )
         .await
@@ -424,6 +425,7 @@ async fn ambiguous_retention_renewal_aborts_before_any_orphan_delete() {
                 },
                 orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                 retained_provider_conformance_passed: true,
+                reclamation_enabled: true,
             },
         )
         .await;
@@ -1386,6 +1388,7 @@ mod sustained_churn {
                     },
                     orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance_passed: false,
+                    reclamation_enabled: true,
                 },
             )
             .await

@@ -18,6 +18,7 @@ mod maintenance;
 mod payload_cache;
 mod payload_pack;
 mod provider;
+mod recovery;
 mod repository;
 mod service;
 mod standalone;
@@ -78,6 +79,7 @@ pub use provider::{
     V2ProviderConformanceReport, V2ProviderProfile, check_v2_provider_conformance,
     required_v2_provider_check_names,
 };
+pub use recovery::policy::RecoveryPolicy;
 pub use repository::{
     DEFAULT_V2_REPLAY_MAX_COMMITS, DEFAULT_V2_REPLAY_MAX_RETAINED_BYTES,
     DEFAULT_V2_REPLAY_MAX_TOTAL_COMMIT_BYTES, DEFAULT_V2_REPLAY_READ_CHUNK_BYTES,
@@ -88,8 +90,9 @@ pub use repository::{
     v2_streaming_upload_working_set_bytes,
 };
 pub use service::{
-    V2AuthenticatedReadBody, V2FullMaintenanceReport, V2Repository, V2ResolvedObject,
-    V3ClientMultipartUpload, V3MultipartSelection,
+    V2AuthenticatedReadBody, V2FullMaintenanceReport, V2RecoveryCursor, V2RecoveryPointInfo,
+    V2RecoveryPointPage, V2RecoveryView, V2Repository, V2ResolvedObject, V3ClientMultipartUpload,
+    V3MultipartSelection,
 };
 
 mod recovery_bundle;

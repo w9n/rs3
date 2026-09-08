@@ -23,6 +23,10 @@ An explicit `--gateway-mode restore-readonly` forces maintenance off.
 | `RS3_INIT_JOURNAL_SECRET` | for writable Kubernetes init | unset | Declared bootstrap Secret in the anchor namespace; equivalent to `init --journal-secret`. Persists unfinished initialization under the writer Lease. Not used by serve or read-only verification. |
 | `RS3_INIT_GOVERNANCE_BYPASS_REVIEWED` | automatic governance qualification | `false` | Explicit review that the serving principal cannot bypass retention; equivalent to `init --governance-bypass-reviewed`. Requires a principal fingerprint. Existing matching evidence retains its recorded review. |
 | `RS3_RECOVERY_PUBLIC_KEY` | production bundle verification/import only | none | `ed25519:<hex-public-key>` used to verify signed v03 restore bundles during `verify-bundle` and `import-anchor`. |
+| `RS3_RECOVERY_WINDOW_DAYS` | recovery policy | `30` | Positive validated recovery-window preset in whole days, applied to newly initialized and published recovery history on retained Object Lock repositories. Unretained development and atomic-create repositories do not enable automatic history. Zero does not disable recovery history; configuration alone does not establish provider-protection evidence. |
+| `RS3_RECOVERY_RENEWAL_MARGIN_SECONDS` | recovery policy | `86400` | Validated policy renewal margin in seconds; it must exceed clock uncertainty after conversion to milliseconds. |
+| `RS3_RECOVERY_CLOCK_UNCERTAINTY_MS` | recovery policy | `60000` | Positive validated maximum clock-uncertainty allowance in milliseconds. |
+| `RS3_RECLAMATION_ENABLED` | maintenance | `true` | Disables physical orphan reclamation while retaining protection renewal; restore-readonly configuration forces the value to `false`. |
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
 | `RUST_LOG` | no | `info` | Tracing filter for `rs3` application targets. Dependency targets are always disabled because upstream HTTP and S3 traces can contain object paths or authentication headers. |
 
@@ -74,7 +78,7 @@ controller or CronJob.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `RS3_MAINTENANCE_MODE` | no | `auto` | `auto` enables scheduled full maintenance, `manual` accepts operator-triggered runs only, and `off` disables the supervisor. Must be unset for `restore-readonly`, which forces maintenance off. |
+| `RS3_MAINTENANCE_MODE` | no | `auto` | `auto` enables scheduled full maintenance, `manual` accepts operator-triggered runs only, and `off` disables the supervisor. Retained read-write repositories require `auto` so protection renewal cannot be disabled; set `RS3_RECLAMATION_ENABLED=false` to keep renewal while disabling physical deletion. Must be unset for `restore-readonly`, which forces maintenance off. |
 | `RS3_MAINTENANCE_RENEWAL_HORIZON_SECONDS` | no | `604800` | Lead time before the nearest retention deadline at which an automatic run becomes due. |
 | `RS3_MAINTENANCE_ORPHAN_PRESSURE_BYTES` | no | `1073741824` | Reclaimable orphan-byte threshold for an automatic run. |
 | `RS3_MAINTENANCE_ORPHAN_PRESSURE_COUNT` | no | `512` | Orphan-candidate count threshold for an automatic run. |

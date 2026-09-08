@@ -482,6 +482,16 @@ pub struct AdminMaintenanceSupervisorSummary {
     pub paused: bool,
     /// Nearest provider retain-until deadline observed by planning.
     pub nearest_retain_until_ms: Option<i64>,
+    /// Next authenticated recovery-history expiry checkpoint opportunity.
+    pub recovery_expiry_due_ms: Option<i64>,
+    /// Accepted current and historical recovery points that remain recoverable.
+    pub recovery_recoverable_point_count: u64,
+    /// Oldest signed publish time among accepted recoverable points.
+    pub recovery_oldest_recoverable_publish_time_ms: Option<i64>,
+    /// Deduplicated exact bytes retained solely for authenticated recovery history.
+    pub recovery_historical_exact_bytes: u64,
+    /// Authenticated clock uncertainty used when scheduling recovery renewal.
+    pub recovery_clock_uncertainty_ms: Option<u32>,
     /// Next scheduled trigger time in milliseconds since the Unix epoch.
     pub next_trigger_at_ms: Option<i64>,
     /// Reason associated with the next scheduled trigger.
@@ -515,6 +525,12 @@ impl From<&MaintenanceStatusSnapshot> for AdminMaintenanceSupervisorSummary {
             parked_reason: snapshot.parked_reason,
             paused: snapshot.paused,
             nearest_retain_until_ms: snapshot.nearest_retain_until_ms,
+            recovery_expiry_due_ms: snapshot.recovery_expiry_due_ms,
+            recovery_recoverable_point_count: snapshot.recovery_recoverable_point_count,
+            recovery_oldest_recoverable_publish_time_ms: snapshot
+                .recovery_oldest_recoverable_publish_time_ms,
+            recovery_historical_exact_bytes: snapshot.recovery_historical_exact_bytes,
+            recovery_clock_uncertainty_ms: snapshot.recovery_clock_uncertainty_ms,
             next_trigger_at_ms: snapshot.next_trigger_at_ms,
             next_trigger_reason: snapshot.next_trigger_reason,
             consecutive_failures: snapshot.consecutive_failures,
@@ -556,6 +572,16 @@ pub struct AdminV2MaintenanceSummary {
     pub retention_renewal_blocked_count: usize,
     /// Live commit bytes whose renewal could not be planned from available metadata.
     pub retention_renewal_blocked_bytes: u64,
+    /// Next authenticated recovery-history expiry checkpoint opportunity.
+    pub recovery_expiry_due_ms: Option<i64>,
+    /// Accepted current and historical recovery points that remain recoverable.
+    pub recovery_recoverable_point_count: u64,
+    /// Oldest signed publish time among accepted recoverable points.
+    pub recovery_oldest_recoverable_publish_time_ms: Option<i64>,
+    /// Deduplicated exact bytes retained solely for authenticated recovery history.
+    pub recovery_historical_exact_bytes: u64,
+    /// Authenticated clock uncertainty used when scheduling recovery renewal.
+    pub recovery_clock_uncertainty_ms: Option<u32>,
 }
 
 /// Accepted v2 anchor summary.
@@ -1257,6 +1283,12 @@ async fn maintenance_summary(config: &RuntimeConfig) -> AdminMaintenanceSummary 
                 retention_renewal_bytes: report.retention_renewal_bytes,
                 retention_renewal_blocked_count: report.retention_renewal_blocked_count,
                 retention_renewal_blocked_bytes: report.retention_renewal_blocked_bytes,
+                recovery_expiry_due_ms: report.recovery_expiry_due_ms,
+                recovery_recoverable_point_count: report.recovery_recoverable_point_count,
+                recovery_oldest_recoverable_publish_time_ms: report
+                    .recovery_oldest_recoverable_publish_time_ms,
+                recovery_historical_exact_bytes: report.recovery_historical_exact_bytes,
+                recovery_clock_uncertainty_ms: report.recovery_clock_uncertainty_ms,
             }),
             supervisor: None,
         },
@@ -1741,6 +1773,11 @@ mod tests {
                 parked_reason: Some("maintenance-guard-missing"),
                 paused: false,
                 nearest_retain_until_ms: None,
+                recovery_expiry_due_ms: Some(9_000),
+                recovery_recoverable_point_count: 3,
+                recovery_oldest_recoverable_publish_time_ms: Some(1_000),
+                recovery_historical_exact_bytes: 4_096,
+                recovery_clock_uncertainty_ms: Some(250),
                 next_trigger_at_ms: None,
                 next_trigger_reason: None,
                 consecutive_failures: 0,
@@ -1769,6 +1806,14 @@ mod tests {
             .unwrap_or_else(|| panic!("supervisor facts should be attached"));
         assert_eq!(supervisor.state, "parked");
         assert_eq!(supervisor.parked_reason, Some("maintenance-guard-missing"));
+        assert_eq!(supervisor.recovery_expiry_due_ms, Some(9_000));
+        assert_eq!(supervisor.recovery_recoverable_point_count, 3);
+        assert_eq!(
+            supervisor.recovery_oldest_recoverable_publish_time_ms,
+            Some(1_000)
+        );
+        assert_eq!(supervisor.recovery_historical_exact_bytes, 4_096);
+        assert_eq!(supervisor.recovery_clock_uncertainty_ms, Some(250));
         let json =
             serde_json::to_string(&report.maintenance).unwrap_or_else(|error| panic!("{error}"));
         assert!(!json.contains("client-private-bucket"));

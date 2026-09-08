@@ -3,6 +3,12 @@ mod copy_retention;
 mod multipart_completion;
 mod prepared_genesis;
 mod publication_overlap;
+mod publication_time;
+mod recovery_coverage;
+mod recovery_protection;
+mod recovery_publication;
+mod recovery_reachability;
+mod recovery_view;
 mod standalone_verification;
 
 use standalone_verification::{ObservedReadback, ReadbackFault, ReadbackProbe};
@@ -1825,16 +1831,20 @@ fn maximum_section_batch_fits_bounded_header() {
     let keyring = signing_keyring();
     let (commit_key, mut header, _) = sample_header();
     header.kind = V2CommitKind::Delta;
-    header.section_index = [V2SectionType::PayloadPack, V2SectionType::IndexRun]
-        .into_iter()
-        .map(|section_type| V2SectionDescriptor {
-            section_type,
-            offset: 0,
-            length: 0,
-            flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-            digest: digest_v2_section(&[]),
-        })
-        .collect();
+    header.section_index = [
+        V2SectionType::PayloadPack,
+        V2SectionType::IndexRun,
+        V2SectionType::Recovery,
+    ]
+    .into_iter()
+    .map(|section_type| V2SectionDescriptor {
+        section_type,
+        offset: 0,
+        length: 0,
+        flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
+        digest: digest_v2_section(&[]),
+    })
+    .collect();
     header.body_digest = digest_v2_section(&[]);
     header = must_v2(header.sign_with_keyring(&keyring));
     let body = must_v2(header.encode_object(&[]));
@@ -1844,7 +1854,7 @@ fn maximum_section_batch_fits_bounded_header() {
         body,
         &keyring,
     ));
-    assert_eq!(parsed.parsed_header.header.section_index.len(), 2);
+    assert_eq!(parsed.parsed_header.header.section_index.len(), 3);
     header
         .section_index
         .insert(0, header.section_index[0].clone());
@@ -4405,6 +4415,7 @@ async fn v2_full_gc_zero_age_skips_registered_inflight_standalone_object() {
                     dry_run: V2FullGcDryRunOptions::default(),
                     orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance_passed: false,
+                    reclamation_enabled: true,
                 },
             )
             .await,
@@ -4562,6 +4573,7 @@ async fn v2_writer_standalone_survives_compaction_checkpoint_and_full_gc() {
                     orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO)
                         .with_same_sequence_deletion(true),
                     retained_provider_conformance_passed: false,
+                    reclamation_enabled: true,
                 },
             )
             .await,
@@ -5276,7 +5288,7 @@ async fn v2_direct_staging_rejects_mixed_protection_cohorts() {
             .await,
         Err(RepositoryError::CommitFailed { .. })
     ));
-    must_repo(repository.publish_pending_index_delta(&anchor).await);
+    must_repo(repository.publish_pending_index_delta(&anchor, None).await);
     assert!(matches!(
         repository.head(&strong_key),
         Err(RepositoryError::NotFound(_))
@@ -5320,7 +5332,7 @@ async fn v2_direct_staging_normalizes_the_global_protection_floor() {
             )
             .await,
     );
-    must_repo(repository.publish_pending_index_delta(&anchor).await);
+    must_repo(repository.publish_pending_index_delta(&anchor, None).await);
 
     assert_eq!(
         must_repo(repository.accepted_pack_carrier_counts_for_tests()),
@@ -7503,6 +7515,7 @@ async fn v2_full_gc_apply_requires_maintenance_guard() {
                 dry_run: V2FullGcDryRunOptions::default(),
                 orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                 retained_provider_conformance_passed: false,
+                reclamation_enabled: true,
             },
         )
         .await;
@@ -7530,6 +7543,7 @@ async fn v2_prepared_full_gc_apply_does_not_replan_before_mutation() {
         dry_run: V2FullGcDryRunOptions::default(),
         orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
         retained_provider_conformance_passed: false,
+        reclamation_enabled: true,
     };
     let prepared = must_v2(
         repository
@@ -7600,6 +7614,7 @@ async fn v2_full_gc_apply_deletes_only_fully_dead_orphans_after_dry_run() {
                     dry_run: V2FullGcDryRunOptions::default(),
                     orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance_passed: false,
+                    reclamation_enabled: true,
                 },
             )
             .await,
@@ -7657,6 +7672,7 @@ async fn v2_full_gc_apply_returns_partial_report_on_mid_pass_guard_abort() {
                     dry_run: V2FullGcDryRunOptions::default(),
                     orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance_passed: false,
+                    reclamation_enabled: true,
                 },
             )
             .await,
@@ -7760,6 +7776,7 @@ async fn v2_full_gc_apply_preserves_supplied_historical_roots() {
                     },
                     orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance_passed: false,
+                    reclamation_enabled: true,
                 },
             )
             .await,
@@ -7795,6 +7812,7 @@ async fn retained_v2_full_gc_apply_requires_provider_conformance() {
                 dry_run: V2FullGcDryRunOptions::default(),
                 orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                 retained_provider_conformance_passed: false,
+                reclamation_enabled: true,
             },
         )
         .await;
@@ -7834,6 +7852,7 @@ async fn retained_v2_full_gc_apply_deletes_unprotected_exact_version_after_confo
                     dry_run: V2FullGcDryRunOptions::default(),
                     orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance_passed: true,
+                    reclamation_enabled: true,
                 },
             )
             .await,
@@ -7892,6 +7911,7 @@ async fn retained_v2_full_gc_renews_exact_live_versions_before_deleting() {
                     },
                     orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance_passed: true,
+                    reclamation_enabled: true,
                 },
             )
             .await,
@@ -7977,6 +7997,7 @@ async fn retained_v2_full_gc_renews_format_and_keyring_roots() {
                     },
                     orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance_passed: true,
+                    reclamation_enabled: true,
                 },
             )
             .await,
@@ -8026,7 +8047,7 @@ async fn v2_repository_full_gc_dry_run_reports_mixed_commit_payload_bytes() {
             )
             .await,
     );
-    must_repo(repository.publish_pending_index_delta(&anchor).await);
+    must_repo(repository.publish_pending_index_delta(&anchor, None).await);
     must_repo(repository.delete_committed(&anchor, deleted_key).await);
 
     store
@@ -9178,6 +9199,7 @@ async fn v2_maintenance_window_full_gc_guard_loss_fails_closed_and_rerun_complet
         dry_run: V2FullGcDryRunOptions::default(),
         orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
         retained_provider_conformance_passed: false,
+        reclamation_enabled: true,
     };
 
     let aborted = must_repo(
@@ -9266,6 +9288,7 @@ async fn v2_maintenance_window_full_gc_cancellation_stops_at_mutation_boundary()
         dry_run: V2FullGcDryRunOptions::default(),
         orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
         retained_provider_conformance_passed: false,
+        reclamation_enabled: true,
     };
 
     let cancelled = must_repo(
@@ -9348,6 +9371,7 @@ async fn v2_maintenance_window_and_watermark_compaction_do_not_deadlock() {
                         dry_run: V2FullGcDryRunOptions::default(),
                         orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                         retained_provider_conformance_passed: false,
+                        reclamation_enabled: true,
                     },
                     &cancellation,
                 )

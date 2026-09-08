@@ -11,22 +11,29 @@ use rs3_server::{
 use std::net::SocketAddr;
 use tokio::sync::watch;
 
+pub(super) struct ServeSelection {
+    pub gateway_mode: Option<GatewayModeArg>,
+    pub recovery_point: Option<u64>,
+}
+
 pub(super) async fn run(
     bind: Option<SocketAddr>,
     metrics_bind: Option<SocketAddr>,
-    gateway_mode: Option<GatewayModeArg>,
+    selection: ServeSelection,
     admin_bind: Option<SocketAddr>,
     admin_bearer_token: Option<String>,
     admin_mutation_bearer_token: Option<String>,
     admin_profile: DoctorProfile,
 ) -> Result<()> {
-    let mut config = RuntimeConfig::from_env_with_mode_override(gateway_mode.map(Into::into))?;
+    let mut config =
+        RuntimeConfig::from_env_with_mode_override(selection.gateway_mode.map(Into::into))?;
     if let Some(bind) = bind {
         config.bind = bind;
     }
     if let Some(metrics_bind) = metrics_bind {
         config.metrics.bind = Some(metrics_bind);
     }
+    validate_recovery_selection(config.mode, selection.recovery_point)?;
     config.validate()?;
     let admin_config = admin_http_config(
         admin_bind,
@@ -38,7 +45,7 @@ pub(super) async fn run(
     install_metrics(config.metrics.bind)?;
     log_runtime_config(&config);
     let writer_guard = acquire(&config).await?;
-    let server = match bind_gateway(config.clone(), &writer_guard).await {
+    let server = match bind_gateway(config.clone(), &writer_guard, selection.recovery_point).await {
         Ok(server) => server,
         Err(error) => {
             if let Err(release_error) = writer_guard.release().await {
@@ -235,7 +242,13 @@ impl rs3_server::AdminRuntimeFactsSource for MaintenanceAwareFactsSource {
 async fn bind_gateway(
     config: RuntimeConfig,
     _writer_guard: &WriterGuardRuntime,
+    recovery_point: Option<u64>,
 ) -> Result<GatewayServer> {
+    if let Some(sequence) = recovery_point {
+        return GatewayServer::bind_with_recovery_point(config, rs3_types::Sequence::new(sequence))
+            .await
+            .map_err(anyhow::Error::from);
+    }
     #[cfg(feature = "k8s")]
     if let Some(writer_fence) = _writer_guard.writer_fence() {
         return GatewayServer::bind_with_writer_fence(config, writer_fence)
@@ -322,5 +335,25 @@ fn install_metrics(bind: Option<SocketAddr>) -> Result<()> {
 async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         tracing::warn!(%error, "failed to install Ctrl+C shutdown handler");
+    }
+}
+
+fn validate_recovery_selection(mode: rs3_server::GatewayMode, point: Option<u64>) -> Result<()> {
+    if point.is_some() && mode != rs3_server::GatewayMode::RestoreReadOnly {
+        anyhow::bail!("--recovery-point requires restore-readonly gateway mode");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod recovery_selection_tests {
+    use super::*;
+    #[test]
+    fn historical_selector_requires_readonly_mode() {
+        assert!(validate_recovery_selection(rs3_server::GatewayMode::ReadWrite, Some(1)).is_err());
+        assert!(
+            validate_recovery_selection(rs3_server::GatewayMode::RestoreReadOnly, Some(1)).is_ok()
+        );
+        assert!(validate_recovery_selection(rs3_server::GatewayMode::ReadWrite, None).is_ok());
     }
 }

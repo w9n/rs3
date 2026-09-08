@@ -39,6 +39,8 @@ pub struct OfflineMaintenanceRequest {
     pub orphan_gc: V2OrphanGcOptions,
     /// Whether retained-version provider conformance evidence passed.
     pub retained_provider_conformance_passed: bool,
+    /// Whether applying the reviewed plan may reclaim unreachable versions.
+    pub reclamation_enabled: bool,
 }
 
 /// Result of one offline break-glass maintenance invocation.
@@ -174,6 +176,7 @@ async fn run_fenced(
         dry_run: request.dry_run.clone(),
         orphan_gc: request.orphan_gc,
         retained_provider_conformance_passed: request.retained_provider_conformance_passed,
+        reclamation_enabled: request.reclamation_enabled,
     };
     match &request.command {
         OfflineMaintenanceCommand::DryRun => {
@@ -517,6 +520,7 @@ mod tests {
             dry_run: V2FullGcDryRunOptions::default(),
             orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
             retained_provider_conformance_passed: true,
+            reclamation_enabled: true,
         }
     }
 
@@ -564,6 +568,38 @@ mod tests {
         .await;
         assert!(matches!(stale, Err(OfflineMaintenanceError::StalePlan)));
         assert_eq!(environment.releases.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn offline_apply_keeps_orphans_when_reclamation_is_disabled() {
+        let (environment, runtime) = memory_environment_with_orphan().await;
+        let mut dry_run_request = request(OfflineMaintenanceCommand::DryRun);
+        dry_run_request.reclamation_enabled = false;
+        let dry_run = run_offline_maintenance(&environment, dry_run_request)
+            .await
+            .expect("offline dry run should plan against the memory backend");
+
+        let mut apply_request = request(OfflineMaintenanceCommand::Apply {
+            plan_digest: dry_run.plan_digest,
+        });
+        apply_request.reclamation_enabled = false;
+        let applied = run_offline_maintenance(&environment, apply_request)
+            .await
+            .expect("offline apply should accept a non-reclaiming plan");
+        let apply = applied.apply.expect("apply report");
+        assert_eq!(apply.orphan_gc.deleted_count, 0);
+
+        let orphans = runtime
+            .repository
+            .commit_store()
+            .report_orphans(&runtime.anchor)
+            .await
+            .expect("post-apply orphan report");
+        assert_eq!(
+            orphans.candidates.len(),
+            1,
+            "orphan must remain unreclaimed"
+        );
     }
 
     #[tokio::test]

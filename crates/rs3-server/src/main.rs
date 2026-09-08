@@ -2,6 +2,7 @@
 
 mod cli_init;
 mod cli_offline;
+mod cli_recovery;
 mod cli_serve;
 mod cli_writer_guard;
 
@@ -77,6 +78,9 @@ enum Commands {
         metrics_bind: Option<SocketAddr>,
         #[arg(long, value_enum)]
         gateway_mode: Option<GatewayModeArg>,
+        /// Exact authenticated commit sequence to serve in restore-readonly mode.
+        #[arg(long)]
+        recovery_point: Option<u64>,
         #[arg(long, env = "RS3_ADMIN_BIND")]
         admin_bind: Option<SocketAddr>,
         #[arg(long, env = "RS3_ADMIN_BEARER_TOKEN", hide_env_values = true)]
@@ -85,6 +89,15 @@ enum Commands {
         admin_mutation_bearer_token: Option<String>,
         #[arg(long, env = "RS3_ADMIN_PROFILE", value_enum, default_value_t = DoctorProfile::Production)]
         admin_profile: DoctorProfile,
+    },
+    /// List authenticated historical restore points without changing the live anchor.
+    RecoveryPoints {
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=256))]
+        limit: u16,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
+        format: RecoveryReportFormat,
     },
     /// Validate runtime configuration against a local or production posture.
     Doctor {
@@ -400,6 +413,7 @@ async fn main() -> Result<()> {
             bind,
             metrics_bind,
             gateway_mode,
+            recovery_point,
             admin_bind,
             admin_bearer_token,
             admin_mutation_bearer_token,
@@ -408,13 +422,23 @@ async fn main() -> Result<()> {
             cli_serve::run(
                 bind,
                 metrics_bind,
-                gateway_mode,
+                cli_serve::ServeSelection {
+                    gateway_mode,
+                    recovery_point,
+                },
                 admin_bind,
                 admin_bearer_token,
                 admin_mutation_bearer_token,
                 admin_profile,
             )
             .await?;
+        }
+        Commands::RecoveryPoints {
+            limit,
+            cursor,
+            format,
+        } => {
+            cli_recovery::run(usize::from(limit), cursor.as_deref(), format).await?;
         }
         Commands::Doctor { profile, probe } => {
             let config = RuntimeConfig::from_env()?;
@@ -1865,6 +1889,11 @@ mod tests {
                 retention_renewal_blocked_count: 0,
                 retention_renewal_blocked_bytes: 0,
                 nearest_retain_until_ms: None,
+                recovery_expiry_due_ms: None,
+                recovery_recoverable_point_count: 0,
+                recovery_oldest_recoverable_publish_time_ms: None,
+                recovery_historical_exact_bytes: 0,
+                recovery_clock_uncertainty_ms: None,
             })
         }
 

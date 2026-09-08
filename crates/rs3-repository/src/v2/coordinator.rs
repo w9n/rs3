@@ -334,23 +334,54 @@ where
 
     /// Runs budgeted v2 full maintenance inside a drained exclusion window.
     ///
-    /// The window from [`Self::begin_maintenance_window`] is held for the
-    /// whole run, so client writes wait on the staging lock and resume
-    /// unchanged afterwards. Inside the window the repository service runs the
-    /// budgeted dry run and the destructive apply with the engine's existing
-    /// invariants: renewal strictly before deletion and a maintenance-guard
-    /// plus anchor recheck before every mutation. The cancellation signal is
-    /// honored at mutation boundaries only.
+    /// Automatic runs may first publish a recovery-expiry checkpoint when an
+    /// authenticated history record has actually expired. The full-GC plan is
+    /// then prepared from that accepted anchor. A digest-bound operator apply
+    /// deliberately skips this automatic transition so it can only apply the
+    /// exact plan the operator reviewed.
     pub async fn run_full_maintenance(
         &self,
         options: V2FullGcApplyOptions,
         cancellation: &V2MaintenanceCancellation,
     ) -> Result<V2FullMaintenanceReport> {
+        self.run_full_maintenance_expected(options, None, cancellation, &|| {})
+            .await
+    }
+
+    /// Runs full maintenance with an optional operator-reviewed plan digest.
+    ///
+    /// See [`Self::run_full_maintenance`] for the recovery-expiry behavior.
+    /// Supplying `expected_plan_digest` prevents an automatic checkpoint from
+    /// changing the reviewed plan before its stale-plan comparison.
+    pub async fn run_full_maintenance_expected(
+        &self,
+        options: V2FullGcApplyOptions,
+        expected_plan_digest: Option<&str>,
+        cancellation: &V2MaintenanceCancellation,
+        on_applying: &(dyn Fn() + Send + Sync),
+    ) -> Result<V2FullMaintenanceReport> {
         let window = self.begin_maintenance_window().await?;
-        let report = self
-            .repository
-            .apply_full_gc_quiesced(self.anchor.as_ref(), window.guard(), options, cancellation)
-            .await;
+        let report = async {
+            if expected_plan_digest.is_none() {
+                self.repository
+                    .maybe_publish_recovery_expiry_checkpoint_coordinated(
+                        V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref())
+                            .with_guard(Some(window.guard())),
+                    )
+                    .await?;
+            }
+            on_applying();
+            self.repository
+                .apply_full_gc_quiesced_expected(
+                    self.anchor.as_ref(),
+                    window.guard(),
+                    options,
+                    expected_plan_digest,
+                    cancellation,
+                )
+                .await
+        }
+        .await;
         drop(window);
         report
     }
@@ -385,6 +416,7 @@ where
             batch: Arc::clone(&self.batch),
             status: Arc::clone(&self.status),
             lease: Arc::clone(&self.lease),
+            maintenance_guard: self.maintenance_guard.clone(),
         }
     }
 
@@ -659,7 +691,8 @@ where
             let metadata = owned
                 .repository
                 .publish_standalone_streaming_known_len_coordinated(
-                    V2CoordinatedMutation::new(&owned.lease, owned.anchor.as_ref()),
+                    V2CoordinatedMutation::new(&owned.lease, owned.anchor.as_ref())
+                        .with_guard(owned.maintenance_guard.as_deref()),
                     key,
                     plaintext_len,
                     upload,
@@ -704,7 +737,8 @@ where
             owned
                 .repository
                 .publish_multipart_completion(
-                    V2CoordinatedMutation::new(&owned.lease, owned.anchor.as_ref()),
+                    V2CoordinatedMutation::new(&owned.lease, owned.anchor.as_ref())
+                        .with_guard(owned.maintenance_guard.as_deref()),
                     prepared,
                 )
                 .await
@@ -733,7 +767,8 @@ where
         let metadata = self
             .repository
             .put_committed_streaming_unknown_len_coordinated(
-                V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref()),
+                V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref())
+                    .with_guard(self.maintenance_guard.as_deref()),
                 key,
                 stream,
                 options,
@@ -761,7 +796,8 @@ where
         self.prepare_index_catalog_for_growth_locked().await?;
         self.repository
             .delete_committed_coordinated(
-                V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref()),
+                V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref())
+                    .with_guard(self.maintenance_guard.as_deref()),
                 key,
             )
             .await
@@ -775,7 +811,8 @@ where
     ) -> Result<RepositoryObjectMetadata> {
         self.repository
             .set_legal_hold_committed_coordinated(
-                V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref()),
+                V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref())
+                    .with_guard(self.maintenance_guard.as_deref()),
                 key,
                 status,
             )
@@ -796,10 +833,10 @@ where
                 .ok_or_else(|| commit_failed("v2 anchor is missing after index compaction"));
         }
         self.repository
-            .write_index_snapshot_coordinated(V2CoordinatedMutation::new(
-                &self.lease,
-                self.anchor.as_ref(),
-            ))
+            .write_index_snapshot_coordinated(
+                V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref())
+                    .with_guard(self.maintenance_guard.as_deref()),
+            )
             .await
             .map(|stored| stored.anchor_state)
     }
@@ -810,10 +847,10 @@ where
         let _stage = self.stage_lock.lock().await;
         self.publish_locked_batch().await?;
         self.repository
-            .load_chain_from_anchor_coordinated(V2CoordinatedMutation::new(
-                &self.lease,
-                self.anchor.as_ref(),
-            ))
+            .load_chain_from_anchor_coordinated(
+                V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref())
+                    .with_guard(self.maintenance_guard.as_deref()),
+            )
             .await
     }
 
@@ -839,7 +876,7 @@ where
         let started = Instant::now();
         let published = self
             .repository
-            .publish_pending_index_delta(self.anchor.as_ref())
+            .publish_pending_index_delta(self.anchor.as_ref(), self.maintenance_guard.as_deref())
             .await;
         let result = finish_v2_waiters(
             &self.repository,
@@ -895,7 +932,8 @@ where
             match self
                 .repository
                 .compact_packed_index_runs_coordinated(
-                    V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref()),
+                    V2CoordinatedMutation::new(&self.lease, self.anchor.as_ref())
+                        .with_guard(Some(guard)),
                     guard,
                 )
                 .await
@@ -957,6 +995,7 @@ struct PublicationContext<S, A> {
     batch: Arc<Mutex<PendingBatch>>,
     status: Arc<CoordinatorStatus>,
     lease: Arc<V2CoordinatorLease>,
+    maintenance_guard: Option<Arc<dyn V2MaintenanceGuard>>,
 }
 
 fn spawn_delayed_v2_publish<S, A>(
@@ -989,6 +1028,7 @@ async fn publish_pending_v2_batch<S, A>(
         batch,
         status,
         lease: _lease,
+        maintenance_guard,
     } = context;
     let _publisher = publisher.lock().await;
     let stage = stage_lock.lock().await;
@@ -1014,7 +1054,11 @@ async fn publish_pending_v2_batch<S, A>(
     let published = match publication {
         Ok(publication) => {
             repository
-                .publish_frozen_pending_index_delta(anchor.as_ref(), publication)
+                .publish_frozen_pending_index_delta(
+                    anchor.as_ref(),
+                    publication,
+                    maintenance_guard.as_deref(),
+                )
                 .await
         }
         Err(error) => Err(error),

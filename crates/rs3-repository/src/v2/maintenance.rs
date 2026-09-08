@@ -1,5 +1,11 @@
 //! v2 maintenance planning and conservative apply paths.
 
+mod recovery;
+
+pub(in crate::v2) mod introduced;
+
+pub(in crate::v2) mod coverage;
+
 use super::commit::{V2_SECTION_FLAG_MUST_UNDERSTAND, V2CommitKey};
 use super::error::{V2FormatError, V2Result};
 use super::provider::V2ProviderProfile;
@@ -516,6 +522,17 @@ pub struct V2MaintenanceReport {
     /// Earliest provider retain-until deadline observed across live renewal
     /// targets, in milliseconds since the Unix epoch.
     pub nearest_retain_until_ms: Option<i64>,
+    /// Earliest authenticated recovery-history expiry time that can advance
+    /// the accepted cutoff, including the policy clock-uncertainty floor.
+    pub recovery_expiry_due_ms: Option<i64>,
+    /// Accepted current and historical recovery points that remain recoverable.
+    pub recovery_recoverable_point_count: u64,
+    /// Oldest signed publish time among accepted recoverable points.
+    pub recovery_oldest_recoverable_publish_time_ms: Option<i64>,
+    /// Deduplicated exact bytes retained solely for authenticated recovery history.
+    pub recovery_historical_exact_bytes: u64,
+    /// Authenticated clock uncertainty used when scheduling recovery renewal.
+    pub recovery_clock_uncertainty_ms: Option<u32>,
 }
 
 /// Operator-accepted budgets for v2 full-maintenance dry runs and apply plans.
@@ -544,6 +561,11 @@ pub struct V2MaintenanceBudgets {
     ///
     /// Filtered members such as S3 delete markers count against this ceiling.
     pub max_inventory_item_count: u64,
+    /// Accounted graph metadata ceiling for authenticated history traversal.
+    /// Independent of the startup replay chain's commit and retained-byte limits.
+    pub max_history_metadata_bytes: u64,
+    /// Maximum encrypted sections awaiting historical dependency decoding.
+    pub max_history_pending_bytes: u64,
     /// Optional autovacuum-style delay inserted before each budgeted planning
     /// operation and before each destructive maintenance mutation.
     ///
@@ -570,6 +592,8 @@ impl Default for V2MaintenanceBudgets {
             max_retention_extend_count: None,
             max_inventory_page_count: DEFAULT_MAX_INVENTORY_PAGES,
             max_inventory_item_count: DEFAULT_MAX_INVENTORY_ITEMS,
+            max_history_metadata_bytes: 256 * 1024 * 1024,
+            max_history_pending_bytes: 64 * 1024 * 1024,
             op_pacing_delay: None,
         }
     }
@@ -797,6 +821,10 @@ pub struct V2FullGcApplyOptions {
     pub orphan_gc: V2OrphanGcOptions,
     /// Whether retained-version provider conformance has passed for this run.
     pub retained_provider_conformance_passed: bool,
+    /// Whether this run may physically reclaim fully dead orphan objects.
+    ///
+    /// Retention renewal remains active when reclamation is disabled.
+    pub reclamation_enabled: bool,
 }
 
 /// Result of destructive v2 full-maintenance apply.
@@ -831,12 +859,18 @@ struct V2RetentionTarget {
     stored_len: u64,
     required_retention: Option<RetentionPolicy>,
     required_legal_hold: Option<LegalHoldStatus>,
+    /// Immutable provider-retention floor for this exact object version.
+    required_deadline: Option<i64>,
+    /// Dependency of the current accepted namespace, not history alone.
+    current_recovery_dependency: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct V2FullGcPlan {
     report: V2FullGcDryRunReport,
     base_anchor: Option<V2AnchorState>,
+    recovery_expire_before_ms: Option<i64>,
+    verified_current_recovery_floor_ms: Option<i64>,
     retention_renewal: V2RetentionRenewalPlan,
     orphans: V2OrphanReport,
     current_chain: Option<V2ReplayChain>,
@@ -957,6 +991,8 @@ fn encode_plan_anchor(anchor: &V2AnchorState) -> Vec<u8> {
 }
 
 fn encode_plan_budgets(encoded: &mut Vec<u8>, budgets: V2MaintenanceBudgets) {
+    encoded.extend_from_slice(&budgets.max_history_metadata_bytes.to_be_bytes());
+    encoded.extend_from_slice(&budgets.max_history_pending_bytes.to_be_bytes());
     push_plan_option_u64(encoded, budgets.max_request_count);
     push_plan_option_u64(encoded, budgets.max_version_list_count);
     push_plan_option_u64(encoded, budgets.max_head_count);
@@ -987,6 +1023,7 @@ fn encode_plan_options(options: &V2FullGcApplyOptions) -> Vec<u8> {
     push_plan_duration(&mut encoded, options.orphan_gc.min_age);
     push_plan_bool(&mut encoded, options.orphan_gc.delete_same_sequence);
     push_plan_bool(&mut encoded, options.retained_provider_conformance_passed);
+    push_plan_bool(&mut encoded, options.reclamation_enabled);
     encoded
 }
 
@@ -1054,6 +1091,7 @@ fn encode_plan_renewal(target: &V2RetentionTarget) -> Vec<u8> {
     encoded.extend_from_slice(&target.stored_len.to_be_bytes());
     push_plan_retention(&mut encoded, target.required_retention);
     push_plan_legal_hold(&mut encoded, target.required_legal_hold);
+    push_plan_option_i64(&mut encoded, target.required_deadline);
     encoded
 }
 
@@ -1074,6 +1112,14 @@ fn full_gc_plan_digest(plan: &V2FullGcPlan, options: &V2FullGcApplyOptions) -> S
     let mut base_anchor = vec![u8::from(plan.base_anchor.is_some())];
     if let Some(anchor) = plan.base_anchor.as_ref() {
         push_plan_bytes(&mut base_anchor, &encode_plan_anchor(anchor));
+    }
+    base_anchor.push(u8::from(plan.recovery_expire_before_ms.is_some()));
+    if let Some(cutoff) = plan.recovery_expire_before_ms {
+        base_anchor.extend_from_slice(&cutoff.to_be_bytes());
+    }
+    base_anchor.push(u8::from(plan.verified_current_recovery_floor_ms.is_some()));
+    if let Some(floor) = plan.verified_current_recovery_floor_ms {
+        base_anchor.extend_from_slice(&floor.to_be_bytes());
     }
     let orphans = encode_plan_group(
         b"orphans",
@@ -1145,6 +1191,17 @@ struct V2ReachabilityState {
     anchor_state: Option<V2AnchorState>,
     current_chain: Option<V2ReplayChain>,
     current_state: Option<RepositoryState>,
+    recovery_expire_before_ms: Option<i64>,
+    current_recovery_floor_ms: Option<i64>,
+    recovery_next_expiry_ms: Option<i64>,
+    recovery_expiry_due_ms: Option<i64>,
+    recovery_recoverable_point_count: u64,
+    recovery_oldest_recoverable_publish_time_ms: Option<i64>,
+    recovery_historical_exact_bytes: u64,
+    recovery_clock_uncertainty_ms: Option<u32>,
+    history_metadata_bytes: u64,
+    history_pending_bytes: u64,
+    verified_commits: BTreeMap<(BackendObjectId, Option<BackendVersionId>), Arc<V2ReplayCommit>>,
     reachable: BTreeSet<BackendObjectId>,
     reachable_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
     renewal_targets: BTreeMap<(BackendObjectId, Option<BackendVersionId>), V2RetentionTarget>,
@@ -1172,18 +1229,33 @@ impl V2ReachabilityState {
         retention: Option<RetentionPolicy>,
         legal_hold: Option<LegalHoldStatus>,
     ) -> V2Result<()> {
-        self.chain_get_count = self
-            .chain_get_count
-            .saturating_add(usize_to_u64(chain.commits_newest_first.len()));
         for commit in &chain.commits_newest_first {
-            self.chain_read_bytes = self.chain_read_bytes.saturating_add(commit.object_len);
-            self.chain_retained_bytes = commit
-                .retained_sections
-                .iter()
-                .flatten()
-                .fold(self.chain_retained_bytes, |total, section| {
-                    total.saturating_add(usize_to_u64(section.len()))
-                });
+            let key = (
+                commit.parsed_header.header.self_ref.commit_key.clone(),
+                commit.version_id.clone(),
+            );
+            let newly_verified = !self.verified_commits.contains_key(&key);
+            if let Some(previous) = self.verified_commits.get(&key) {
+                if previous.parsed_header != commit.parsed_header
+                    || previous.version_id != commit.version_id
+                    || previous.object_len != commit.object_len
+                {
+                    return Err(V2FormatError::InvalidHeaderField);
+                }
+            } else {
+                self.verified_commits.insert(key, Arc::new(commit.clone()));
+            }
+            if newly_verified {
+                self.chain_get_count = self.chain_get_count.saturating_add(1);
+                self.chain_read_bytes = self.chain_read_bytes.saturating_add(commit.object_len);
+                self.chain_retained_bytes = commit
+                    .retained_sections
+                    .iter()
+                    .flatten()
+                    .fold(self.chain_retained_bytes, |total, section| {
+                        total.saturating_add(usize_to_u64(section.len()))
+                    });
+            }
             let object_id = commit.parsed_header.header.self_ref.commit_key.clone();
             let version_key = (object_id.clone(), commit.version_id.clone());
             self.reachable.insert(object_id.clone());
@@ -1195,6 +1267,7 @@ impl V2ReachabilityState {
                 commit.object_len,
                 retention,
                 legal_hold,
+                None,
             )?;
             if protected {
                 self.protected_versions.insert(version_key);
@@ -1230,6 +1303,7 @@ impl V2ReachabilityState {
             root.stored_len,
             retention,
             legal_hold,
+            None,
         )?;
         if protected {
             self.protected_versions.insert(version_key);
@@ -1244,6 +1318,7 @@ impl V2ReachabilityState {
         stored_len: u64,
         retention: Option<RetentionPolicy>,
         legal_hold: Option<LegalHoldStatus>,
+        required_deadline: Option<i64>,
     ) -> V2Result<()> {
         let key = (object_id.clone(), version_id.clone());
         if let Some(target) = self.renewal_targets.get_mut(&key) {
@@ -1251,6 +1326,7 @@ impl V2ReachabilityState {
                 return Err(V2FormatError::ProviderProfileFailed);
             }
             target.required_retention = strongest_retention(target.required_retention, retention);
+            target.required_deadline = target.required_deadline.max(required_deadline);
             if legal_hold == Some(LegalHoldStatus::On) {
                 target.required_legal_hold = Some(LegalHoldStatus::On);
             }
@@ -1264,9 +1340,19 @@ impl V2ReachabilityState {
                 stored_len,
                 required_retention: retention,
                 required_legal_hold: legal_hold,
+                required_deadline,
+                current_recovery_dependency: false,
             },
         );
         Ok(())
+    }
+
+    /// Marks targets reached from the accepted current namespace before
+    /// historical recovery traversal contributes any historical-only targets.
+    fn mark_current_recovery_dependencies(&mut self) {
+        for target in self.renewal_targets.values_mut() {
+            target.current_recovery_dependency = true;
+        }
     }
 
     fn include_required_protection(
@@ -1839,6 +1925,7 @@ where
                 .await?;
             reachability.current_chain = Some(chain);
             reachability.current_state = Some(current_state);
+            reachability.mark_current_recovery_dependencies();
         }
 
         for protected_root in protected_roots {
@@ -1849,6 +1936,9 @@ where
             self.include_live_payload_roots(&mut reachability, &chain, true, budgets)
                 .await?;
         }
+
+        self.include_recovery_history(&mut reachability, budgets)
+            .await?;
 
         if include_restore_metadata {
             self.include_restore_metadata_roots(&mut reachability, budgets)
@@ -1869,6 +1959,11 @@ where
             .fold(self.retention_policy(), |retention, target| {
                 strongest_retention(retention, target.required_retention)
             });
+        let required_deadline = reachability
+            .renewal_targets
+            .values()
+            .filter_map(|target| target.required_deadline)
+            .max();
         let has_legal_hold = reachability
             .renewal_targets
             .values()
@@ -1923,6 +2018,7 @@ where
                 exact.content_len,
                 Some(retention),
                 None,
+                required_deadline,
             )?;
         }
         Ok(())
@@ -2161,9 +2257,7 @@ where
         let mut previous_published_at_ms = None;
         for commit in chain.commits_newest_first.iter().rev() {
             let published_at_ms = commit.parsed_header.header.publish_time_ms;
-            if previous_published_at_ms.is_some_and(|previous| published_at_ms < previous) {
-                return Err(V2FormatError::StaleAnchor);
-            }
+            super::recovery::validate_parent_time(previous_published_at_ms, published_at_ms)?;
             previous_published_at_ms = Some(published_at_ms);
             referenced_run_commits.extend(
                 self.apply_commit_sections_to_namespace_state(&mut state, commit, limits)
@@ -2182,7 +2276,7 @@ where
         let mut referenced_run_commits = Vec::new();
         for (index, section) in commit.parsed_header.header.section_index.iter().enumerate() {
             match section.section_type {
-                V2SectionType::PayloadPack => {}
+                V2SectionType::PayloadPack | V2SectionType::Recovery => {}
                 V2SectionType::IndexRun => {
                     let section_bytes = commit_section_bytes(commit, index)?;
                     apply_packed_index_run(
@@ -2350,6 +2444,12 @@ where
             retention_renewal_blocked_count: retention_renewal.blocked_count,
             retention_renewal_blocked_bytes: retention_renewal.blocked_bytes,
             nearest_retain_until_ms: retention_renewal.nearest_retain_until_ms,
+            recovery_expiry_due_ms: reachability.recovery_expiry_due_ms,
+            recovery_recoverable_point_count: reachability.recovery_recoverable_point_count,
+            recovery_oldest_recoverable_publish_time_ms: reachability
+                .recovery_oldest_recoverable_publish_time_ms,
+            recovery_historical_exact_bytes: reachability.recovery_historical_exact_bytes,
+            recovery_clock_uncertainty_ms: reachability.recovery_clock_uncertainty_ms,
         })
     }
 
@@ -2569,6 +2669,8 @@ where
         Ok(V2FullGcPlan {
             report,
             base_anchor: reachability.anchor_state,
+            recovery_expire_before_ms: reachability.recovery_expire_before_ms,
+            verified_current_recovery_floor_ms: reachability.current_recovery_floor_ms,
             retention_renewal,
             orphans,
             current_chain: reachability.current_chain,
@@ -2667,6 +2769,7 @@ where
 
         let V2FullGcPlan {
             report: dry_run,
+            verified_current_recovery_floor_ms,
             retention_renewal,
             orphans,
             ..
@@ -2696,8 +2799,18 @@ where
             )
             .await?;
 
-        let gc = self
-            .delete_expired_orphan_candidates(
+        if let (Some(base_anchor), Some(verified_current_floor_ms)) =
+            (base_anchor.as_ref(), verified_current_recovery_floor_ms)
+        {
+            guard.verify_v2_maintenance(Some(base_anchor)).await?;
+            if anchor.read_v2().await?.as_ref() != Some(base_anchor) {
+                return Err(V2FormatError::StaleAnchor);
+            }
+            self.cache_verified_recovery_coverage(base_anchor, verified_current_floor_ms);
+        }
+
+        let gc = if options.reclamation_enabled {
+            self.delete_expired_orphan_candidates(
                 anchor,
                 guard,
                 base_anchor.as_ref(),
@@ -2709,7 +2822,10 @@ where
                     op_pacing_delay,
                 },
             )
-            .await?;
+            .await?
+        } else {
+            V2OrphanGcReport::default()
+        };
 
         Ok(V2FullGcApplyReport {
             dry_run,
@@ -2824,39 +2940,24 @@ where
             let observed_policy =
                 active_retention(observed.retention).ok_or(V2FormatError::ProviderProfileFailed)?;
             let required_deadline = deadline.max(observed_deadline);
-            let mut required_policy = strongest_retention(Some(policy), Some(observed_policy))
+            let required_policy = strongest_retention(Some(policy), Some(observed_policy))
                 .ok_or(V2FormatError::ProviderProfileFailed)?;
             if observed_deadline >= deadline
                 && retention_satisfies(observed.retention.as_ref(), &required_policy)
             {
                 continue;
             }
-            // The storage API accepts relative days. Round upward to cover the fixed
-            // copy timestamp even when it is slightly ahead of this sampled clock.
-            let remaining_ms = required_deadline
-                .checked_sub(current_time_ms())
-                .ok_or(V2FormatError::ProviderProfileFailed)?
-                .max(0);
-            let days = u32::try_from(
-                remaining_ms / 86_400_000 + i64::from(remaining_ms % 86_400_000 != 0),
-            )
-            .map_err(|_| V2FormatError::ProviderProfileFailed)?;
-            required_policy.retain_days = required_policy.retain_days.max(days);
             let target = V2RetentionTarget {
                 object_id,
                 version_id,
                 stored_len: observed.content_len,
                 required_retention: Some(required_policy),
                 required_legal_hold: observed.legal_hold,
+                required_deadline: Some(required_deadline),
+                current_recovery_dependency: false,
             };
-            self.extend_and_verify_retention_target(
-                anchor,
-                guard,
-                Some(base_anchor),
-                &target,
-                Some(required_deadline),
-            )
-            .await?;
+            self.extend_and_verify_retention_target(anchor, guard, Some(base_anchor), &target)
+                .await?;
         }
         guard.verify_v2_maintenance(Some(base_anchor)).await?;
         if anchor.read_v2().await?.as_ref() != Some(base_anchor) {
@@ -2871,8 +2972,7 @@ where
         guard: &G,
         base_anchor: Option<&V2AnchorState>,
         target: &V2RetentionTarget,
-        fixed_deadline: Option<i64>,
-    ) -> V2Result<()>
+    ) -> V2Result<i64>
     where
         A: V2CommitAnchor,
         G: V2MaintenanceGuard + ?Sized,
@@ -2886,15 +2986,22 @@ where
         {
             return Err(V2FormatError::ProviderProfileFailed);
         }
-        let policy = target
+        let requested_policy = target
             .required_retention
             .ok_or(V2FormatError::ProviderProfileFailed)?;
-        // Copies retain their captured promise; maintenance samples only after
-        // verifying the fence and anchor, immediately before provider extension.
-        let required_deadline = match fixed_deadline {
-            Some(deadline) => deadline,
-            None => required_retain_until_ms(policy)?,
+        // Absolute recovery floors are translated only after the fence and
+        // anchor are verified, immediately before the provider mutation.
+        let required_deadline = match target.required_deadline {
+            Some(deadline) if deadline >= 0 => deadline,
+            Some(_) => return Err(V2FormatError::ProviderProfileFailed),
+            None => required_retain_until_ms(requested_policy)?,
         };
+        let policy = super::recovery::policy::physical_retention_for_deadline(
+            Some(requested_policy),
+            target.required_deadline,
+            current_time_ms(),
+        )?
+        .ok_or(V2FormatError::ProviderProfileFailed)?;
         self.store()
             .extend_retention_at(&target.object_id, target.version_id.as_ref(), policy)
             .await
@@ -2933,7 +3040,9 @@ where
             );
             return Err(V2FormatError::ProviderProfileFailed);
         }
-        Ok(())
+        exact
+            .retain_until_ms
+            .ok_or(V2FormatError::ProviderProfileFailed)
     }
 
     async fn apply_retention_renewal<A, G>(
@@ -2959,7 +3068,7 @@ where
                 return Err(V2FormatError::MaintenanceCancelled);
             }
             pace_maintenance_operation(op_pacing_delay).await;
-            self.extend_and_verify_retention_target(anchor, guard, base_anchor, &target, None)
+            self.extend_and_verify_retention_target(anchor, guard, base_anchor, &target)
                 .await?;
             renewed_count = renewed_count.saturating_add(1);
             renewed_bytes = renewed_bytes.saturating_add(target.stored_len);
@@ -2983,12 +3092,21 @@ where
         let mut plan = V2RetentionRenewalPlan::default();
 
         for target in targets {
-            let policy = active_retention(strongest_retention(
+            let requested_policy = active_retention(strongest_retention(
                 self.retention_policy(),
                 target.required_retention,
             ));
             let requires_hold = target.required_legal_hold == Some(LegalHoldStatus::On);
-            if policy.is_none() && !requires_hold {
+            if target
+                .required_deadline
+                .is_some_and(|deadline| deadline < 0)
+                || target.required_deadline.is_some() && requested_policy.is_none()
+            {
+                plan.blocked_count = plan.blocked_count.saturating_add(1);
+                plan.blocked_bytes = plan.blocked_bytes.saturating_add(target.stored_len);
+                continue;
+            }
+            if requested_policy.is_none() && !requires_hold {
                 continue;
             }
             let object_id = &target.object_id;
@@ -3021,6 +3139,13 @@ where
                 continue;
             }
 
+            let policy = requested_policy.and_then(|requested| {
+                active_retention(strongest_retention(
+                    Some(requested),
+                    active_retention(metadata.retention),
+                ))
+            });
+
             if policy.is_some()
                 && let Some(retain_until_ms) = metadata.retain_until_ms
             {
@@ -3031,18 +3156,27 @@ where
             }
 
             if let Some(policy) = policy
-                && retention_renewal_needed(&metadata, policy, renew_before_ms)
+                && (retention_renewal_needed(&metadata, policy, renew_before_ms)
+                    || target.required_deadline.is_some_and(|deadline| {
+                        metadata
+                            .retain_until_ms
+                            .is_none_or(|retain_until_ms| retain_until_ms < deadline)
+                    }))
             {
                 plan.commit_count = plan.commit_count.saturating_add(1);
                 plan.bytes = plan.bytes.saturating_add(metadata.content_len);
                 plan.extend_count = plan.extend_count.saturating_add(1);
                 plan.head_count = plan.head_count.saturating_add(1);
+                let (required_deadline, required_legal_hold) =
+                    planned_renewal_requirements(target, &metadata, policy)?;
                 plan.targets.push(V2RetentionTarget {
                     object_id: metadata.object_id,
                     version_id: metadata.version_id,
                     stored_len: metadata.content_len,
                     required_retention: Some(policy),
-                    required_legal_hold: target.required_legal_hold,
+                    required_legal_hold,
+                    required_deadline: Some(required_deadline),
+                    current_recovery_dependency: target.current_recovery_dependency,
                 });
             }
         }
@@ -3122,6 +3256,34 @@ fn ensure_next_budgeted_operation(limit: Option<u64>, used: u64) -> V2Result<()>
     Ok(())
 }
 
+/// Carries observed exact protections into an extension target.
+///
+/// A mutable provider operation must never weaken a longer observed deadline
+/// or an active legal hold. Targets without an existing absolute floor retain
+/// their moving relative renewal deadline.
+fn planned_renewal_requirements(
+    target: &V2RetentionTarget,
+    metadata: &BlobMetadata,
+    policy: RetentionPolicy,
+) -> V2Result<(i64, Option<LegalHoldStatus>)> {
+    let required_deadline = target
+        .required_deadline
+        .unwrap_or(required_retain_until_ms(policy)?);
+    let required_deadline = metadata
+        .retain_until_ms
+        .map_or(required_deadline, |observed| {
+            observed.max(required_deadline)
+        });
+    let required_legal_hold = if target.required_legal_hold == Some(LegalHoldStatus::On)
+        || metadata.legal_hold == Some(LegalHoldStatus::On)
+    {
+        Some(LegalHoldStatus::On)
+    } else {
+        None
+    };
+    Ok((required_deadline, required_legal_hold))
+}
+
 fn retention_renewal_needed(
     metadata: &BlobMetadata,
     requested: RetentionPolicy,
@@ -3174,15 +3336,17 @@ mod tests {
         V2FormatError, V2FullGcApplyOptions, V2FullGcDryRunOptions, V2FullGcDryRunReport,
         V2FullGcPlan, V2MaintenanceBudgetedStore, V2MaintenanceBudgets, V2MaintenancePlanCost,
         V2OrphanCandidate, V2OrphanGcOptions, V2OrphanObjectClass, V2OrphanReport,
-        V2ReachabilityState, V2RetentionRenewalPlan, V2StandalonePayloadRoot, full_gc_plan_digest,
-        validate_standalone_payload_root,
+        V2ReachabilityState, V2RetentionRenewalPlan, V2RetentionTarget, V2StandalonePayloadRoot,
+        full_gc_plan_digest, planned_renewal_requirements, validate_standalone_payload_root,
     };
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use bytes::Bytes;
     use rs3_index::PayloadLayout;
-    use rs3_storage::{BlobStore, MemoryBlobStore, PutOptions, read_bounded_full_at};
-    use rs3_types::{BackendObjectId, BackendVersionId, KeyId};
+    use rs3_storage::{BlobMetadata, BlobStore, MemoryBlobStore, PutOptions, read_bounded_full_at};
+    use rs3_types::{
+        BackendObjectId, BackendVersionId, KeyId, LegalHoldStatus, RetentionMode, RetentionPolicy,
+    };
     use std::time::Duration;
 
     #[tokio::test]
@@ -3321,6 +3485,8 @@ mod tests {
                 exact_version_apply_ready: true,
             },
             base_anchor: None,
+            recovery_expire_before_ms: None,
+            verified_current_recovery_floor_ms: None,
             retention_renewal: V2RetentionRenewalPlan::default(),
             orphans: V2OrphanReport {
                 reachable_commit_count: 0,
@@ -3337,6 +3503,7 @@ mod tests {
             dry_run: V2FullGcDryRunOptions::default(),
             orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
             retained_provider_conformance_passed: true,
+            reclamation_enabled: true,
         }
     }
 
@@ -3355,6 +3522,13 @@ mod tests {
         assert_eq!(
             full_gc_plan_digest(&first, &digest_options()),
             full_gc_plan_digest(&reordered, &digest_options())
+        );
+
+        let mut reclamation_disabled = digest_options();
+        reclamation_disabled.reclamation_enabled = false;
+        assert_ne!(
+            full_gc_plan_digest(&first, &digest_options()),
+            full_gc_plan_digest(&first, &reclamation_disabled)
         );
     }
 
@@ -3425,7 +3599,7 @@ mod tests {
             let object_id = BackendObjectId::new(format!("objects/v03/{ordinal:020}"))
                 .expect("bounded object ID");
             reachability
-                .include_renewal_target(object_id, None, ordinal + 1, None, None)
+                .include_renewal_target(object_id, None, ordinal + 1, None, None, None)
                 .expect("unique target");
         }
         assert_eq!(reachability.renewal_targets.len(), 4_096);
@@ -3433,8 +3607,94 @@ mod tests {
         let object_id =
             BackendObjectId::new("objects/v03/00000000000000000000").expect("bounded object ID");
         assert_eq!(
-            reachability.include_renewal_target(object_id, None, 2, None, None),
+            reachability.include_renewal_target(object_id, None, 2, None, None, None),
             Err(V2FormatError::ProviderProfileFailed)
         );
+    }
+
+    #[test]
+    fn planned_renewal_preserves_observed_deadline_and_legal_hold() {
+        let object_id =
+            BackendObjectId::new("objects/v03/renewal-observed").expect("bounded object id");
+        let version_id = Some(BackendVersionId::new("version-observed").expect("version id"));
+        let policy = RetentionPolicy::new(RetentionMode::Compliance, 1);
+        let target = V2RetentionTarget {
+            object_id: object_id.clone(),
+            version_id: version_id.clone(),
+            stored_len: 32,
+            required_retention: Some(policy),
+            required_legal_hold: None,
+            required_deadline: Some(2_000),
+            current_recovery_dependency: false,
+        };
+        let metadata = BlobMetadata {
+            object_id,
+            content_len: 32,
+            modified_at_ms: None,
+            etag: None,
+            version_id,
+            retention: Some(RetentionPolicy::new(RetentionMode::Governance, 30)),
+            retain_until_ms: Some(3_000),
+            legal_hold: Some(LegalHoldStatus::On),
+        };
+
+        let (deadline, hold) =
+            planned_renewal_requirements(&target, &metadata, policy).expect("planned requirements");
+        assert_eq!(deadline, 3_000);
+        assert_eq!(hold, Some(LegalHoldStatus::On));
+
+        let no_fixed_floor = V2RetentionTarget {
+            required_deadline: None,
+            ..target
+        };
+        let (moving_deadline, _) = planned_renewal_requirements(
+            &no_fixed_floor,
+            &BlobMetadata {
+                retain_until_ms: Some(0),
+                legal_hold: None,
+                ..metadata
+            },
+            policy,
+        )
+        .expect("moving deadline");
+        assert!(
+            moving_deadline > 0,
+            "relative renewal must advance a missing floor"
+        );
+    }
+
+    #[test]
+    fn renewal_targets_merge_strongest_fixed_deadline_per_exact_version() {
+        let object_id =
+            BackendObjectId::new("objects/v03/renewal-target").expect("bounded object ID");
+        let version_id = Some(BackendVersionId::new("version-a").expect("version ID"));
+        let mut reachability = V2ReachabilityState::default();
+
+        reachability
+            .include_renewal_target(
+                object_id.clone(),
+                version_id.clone(),
+                32,
+                None,
+                None,
+                Some(1_000),
+            )
+            .expect("first target");
+        reachability
+            .include_renewal_target(
+                object_id.clone(),
+                version_id.clone(),
+                32,
+                None,
+                None,
+                Some(2_000),
+            )
+            .expect("stronger target");
+
+        let target = reachability
+            .renewal_targets
+            .get(&(object_id, version_id))
+            .expect("merged exact target");
+        assert_eq!(target.required_deadline, Some(2_000));
     }
 }

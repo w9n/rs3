@@ -31,12 +31,13 @@ use rs3_types::{
     RetentionPolicy, Sequence,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_RANDOM_KEY_ATTEMPTS: usize = 3;
+const VERIFIED_PUBLICATION_TIME_CACHE_ENTRIES: usize = 4;
 
 #[derive(Debug)]
 pub(super) struct StreamReadStalled;
@@ -314,6 +315,10 @@ impl V2CommitAnchor for V2MemoryAnchor {
 pub struct V2CommitStoreOptions {
     /// Immutable repository identity bound into framed-section AEAD contexts.
     pub repository_id: RepositoryId,
+    /// Authenticated recovery promises. None is explicit native/artifact mode without history claims.
+    pub recovery_policy: Option<super::RecoveryPolicy>,
+    /// Shared graph and provider-operation limits for publication protection.
+    pub recovery_maintenance_budgets: super::V2MaintenanceBudgets,
     /// Provider profile selected for post-write checks.
     pub provider_profile: V2ProviderProfile,
     /// Maximum idle time allowed while reading streamed payload chunks.
@@ -342,6 +347,8 @@ impl V2CommitStoreOptions {
     ) -> Self {
         Self {
             repository_id,
+            recovery_policy: None,
+            recovery_maintenance_budgets: super::V2MaintenanceBudgets::default(),
             provider_profile: profile,
             stream_read_stall_timeout: DEFAULT_V2_STREAM_READ_STALL_TIMEOUT,
             retention: match profile {
@@ -357,6 +364,21 @@ impl V2CommitStoreOptions {
             maintenance_keyring_envelope_ref: None,
             replay_limits: V2ReplayLimits::default(),
         }
+    }
+
+    /// Enables authenticated recovery-point history for repository publications.
+    pub const fn with_recovery_policy(mut self, policy: Option<super::RecoveryPolicy>) -> Self {
+        self.recovery_policy = policy;
+        self
+    }
+
+    /// Shares operator maintenance limits with foreground recovery verification.
+    pub const fn with_recovery_maintenance_budgets(
+        mut self,
+        budgets: super::V2MaintenanceBudgets,
+    ) -> Self {
+        self.recovery_maintenance_budgets = budgets;
+        self
     }
 
     /// Uses a specific idle timeout for streamed request-body reads.
@@ -450,6 +472,8 @@ pub struct V2CommitWrite {
     pub retention: Option<RetentionPolicy>,
     /// Legal hold required by objects represented in this commit.
     pub legal_hold: Option<LegalHoldStatus>,
+    /// Absolute physical protection floor, separate from logical object policy.
+    pub required_retain_until_ms: Option<i64>,
 }
 
 impl V2CommitWrite {
@@ -460,6 +484,7 @@ impl V2CommitWrite {
             sections,
             retention: None,
             legal_hold: None,
+            required_retain_until_ms: None,
         }
     }
 
@@ -470,6 +495,7 @@ impl V2CommitWrite {
             sections,
             retention: None,
             legal_hold: None,
+            required_retain_until_ms: None,
         }
     }
 
@@ -482,6 +508,12 @@ impl V2CommitWrite {
     /// Requests this legal hold for the physical commit object.
     pub const fn with_legal_hold(mut self, legal_hold: Option<LegalHoldStatus>) -> Self {
         self.legal_hold = legal_hold;
+        self
+    }
+
+    /// Requires exact backend protection through this absolute deadline.
+    pub const fn with_required_retain_until_ms(mut self, deadline: Option<i64>) -> Self {
+        self.required_retain_until_ms = deadline;
         self
     }
 }
@@ -522,11 +554,12 @@ impl V2WritePostconditions {
         expected_object_len: u64,
         required_retention: Option<RetentionPolicy>,
         required_legal_hold: Option<LegalHoldStatus>,
+        required_retain_until_ms: Option<i64>,
     ) -> Self {
         Self {
             expected_object_len,
             required_retention,
-            required_retain_until_ms: None,
+            required_retain_until_ms,
             required_legal_hold,
             expected_stored_digest: None,
         }
@@ -549,9 +582,22 @@ impl V2WritePostconditions {
     }
 }
 
+/// One immutable parent/time choice shared by coverage, metadata encoding and retry.
+#[derive(Clone, Debug)]
+pub(super) struct V2PublicationPlan {
+    pub(super) sampled_now_ms: i64,
+    pub(super) parent: V2AnchorState,
+    pub(super) parent_publish_time_ms: i64,
+    pub(super) publish_time_ms: i64,
+}
+
 /// Result of a v2 commit write accepted by the anchor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V2StoredCommit {
+    /// Actual protection observed on the exact version during verification.
+    pub(crate) verified_retain_until_ms: Option<i64>,
+    /// Verified signed publication time, strictly after the accepted parent.
+    pub publish_time_ms: i64,
     /// Accepted anchor state.
     pub anchor_state: V2AnchorState,
     /// Full commit key that was written.
@@ -728,6 +774,11 @@ pub struct V2CommitStore<S> {
     keyring: KeyRing,
     options: V2CommitStoreOptions,
     inflight_standalone_objects: Arc<RwLock<BTreeSet<BackendObjectId>>>,
+    verified_publication_times: Arc<RwLock<VecDeque<(V2AnchorState, i64, bool)>>>,
+    pub(in crate::v2) recovery_coverage:
+        Arc<RwLock<Option<super::maintenance::coverage::RecoveryCoverage>>>,
+    #[cfg(test)]
+    publication_time_override: Arc<std::sync::atomic::AtomicI64>,
 }
 
 pub(crate) struct V2InflightStandaloneObject {
@@ -788,7 +839,99 @@ where
             keyring,
             options,
             inflight_standalone_objects: Arc::new(RwLock::new(BTreeSet::new())),
+            verified_publication_times: Arc::new(RwLock::new(VecDeque::new())),
+            recovery_coverage: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            publication_time_override: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
         }
+    }
+
+    pub(super) fn publication_now_ms(&self) -> i64 {
+        #[cfg(test)]
+        {
+            let sample = self.publication_time_override.load(Ordering::Acquire);
+            if sample != i64::MIN {
+                return sample;
+            }
+        }
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
+            Err(_) => -1,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_publication_time_for_tests(&self, sample: i64) {
+        self.publication_time_override
+            .store(sample, Ordering::Release);
+    }
+
+    fn remember_verified_publication_time(
+        &self,
+        anchor: &V2AnchorState,
+        time: i64,
+        has_recovery: bool,
+    ) -> V2Result<()> {
+        super::recovery::validate_parent_time(None, time)?;
+        let mut cache = self
+            .verified_publication_times
+            .write()
+            .map_err(|_| V2FormatError::StorageOperationFailed)?;
+        if let Some(index) = cache
+            .iter()
+            .position(|(candidate, _, _)| candidate == anchor)
+        {
+            cache.remove(index);
+        }
+        cache.push_back((anchor.clone(), time, has_recovery));
+        while cache.len() > VERIFIED_PUBLICATION_TIME_CACHE_ENTRIES {
+            cache.pop_front();
+        }
+        Ok(())
+    }
+
+    /// Exact signed header facts are cached, never provider timestamps. This
+    /// bounded cache also retains the reused base of unrelated compaction siblings.
+    pub(super) async fn verified_parent_publish_time(
+        &self,
+        anchor: &V2AnchorState,
+    ) -> V2Result<i64> {
+        Ok(self.verified_parent_header_facts(anchor).await?.0)
+    }
+
+    async fn verified_parent_header_facts(&self, anchor: &V2AnchorState) -> V2Result<(i64, bool)> {
+        {
+            let mut cache = self
+                .verified_publication_times
+                .write()
+                .map_err(|_| V2FormatError::StorageOperationFailed)?;
+            if let Some(index) = cache
+                .iter()
+                .position(|(candidate, _, _)| candidate == anchor)
+                && let Some(entry) = cache.remove(index)
+            {
+                let facts = (entry.1, entry.2);
+                cache.push_back(entry);
+                return Ok(facts);
+            }
+        }
+        let parsed = self
+            .read_commit_header_at(&anchor.commit_key, anchor.version_id.as_ref())
+            .await?;
+        let header = &parsed.header;
+        if header.self_ref.sequence != anchor.sequence
+            || header.body_digest != anchor.body_digest
+            || header.signing_key_id != anchor.signing_key_id
+        {
+            return Err(V2FormatError::StaleAnchor);
+        }
+        let time = header.publish_time_ms;
+        let has_recovery = header
+            .section_index
+            .iter()
+            .any(|section| section.section_type == V2SectionType::Recovery);
+        self.remember_verified_publication_time(anchor, time, has_recovery)?;
+        Ok((time, has_recovery))
     }
 
     pub(crate) fn claim_inflight_standalone_object(
@@ -834,6 +977,10 @@ where
             keyring: self.keyring.clone(),
             options: self.options.clone(),
             inflight_standalone_objects: Arc::clone(&self.inflight_standalone_objects),
+            verified_publication_times: Arc::clone(&self.verified_publication_times),
+            recovery_coverage: Arc::clone(&self.recovery_coverage),
+            #[cfg(test)]
+            publication_time_override: Arc::clone(&self.publication_time_override),
         }
     }
 
@@ -887,7 +1034,8 @@ where
         self.publish_prepared_genesis(anchor, &prepared, true).await
     }
 
-    /// Writes and anchors a child commit from the current anchor.
+    /// Writes and anchors a native artifact child without recovery history.
+    /// History-enabled repositories must publish through the repository service.
     pub async fn write_child_commit<A>(
         &self,
         anchor: &A,
@@ -896,38 +1044,122 @@ where
     where
         A: V2CommitAnchor,
     {
+        if self.options.recovery_policy.is_some() {
+            return Err(V2FormatError::InvalidRecoveryHistory);
+        }
         let current = anchor.read_v2().await?;
         let Some(current) = current else {
             return Err(V2FormatError::MissingAnchor);
         };
+        if self.verified_parent_header_facts(&current).await?.1 {
+            return Err(V2FormatError::InvalidRecoveryHistory);
+        }
         let next_sequence = current
             .sequence
             .checked_next()
             .ok_or(V2FormatError::InvalidHeaderField)?;
+        if write
+            .sections
+            .iter()
+            .any(|section| section.section_type == V2SectionType::Recovery)
+        {
+            return Err(V2FormatError::InvalidRecoveryHistory);
+        }
         self.write_commit_with_expected_anchor(anchor, Some(current), next_sequence, write)
             .await
     }
 
-    /// Writes and anchors a child commit whose sections depend on the generated commit key.
+    /// Writes a native artifact child whose sections depend on its generated key.
+    /// History-enabled repositories must publish through the repository service.
     pub async fn write_child_commit_with<A, F>(
         &self,
         anchor: &A,
+        mut build: F,
+    ) -> V2Result<V2StoredCommit>
+    where
+        A: V2CommitAnchor,
+        F: FnMut(&V2CommitKey) -> V2Result<V2CommitWrite>,
+    {
+        if self.options.recovery_policy.is_some() {
+            return Err(V2FormatError::InvalidRecoveryHistory);
+        }
+        let current = anchor.read_v2().await?;
+        let Some(current) = current else {
+            return Err(V2FormatError::MissingAnchor);
+        };
+        if self.verified_parent_header_facts(&current).await?.1 {
+            return Err(V2FormatError::InvalidRecoveryHistory);
+        }
+        let next_sequence = current
+            .sequence
+            .checked_next()
+            .ok_or(V2FormatError::InvalidHeaderField)?;
+        self.write_commit_with_expected_anchor_builder(
+            anchor,
+            Some(current),
+            next_sequence,
+            None,
+            |key| {
+                let write = build(key)?;
+                if write
+                    .sections
+                    .iter()
+                    .any(|section| section.section_type == V2SectionType::Recovery)
+                {
+                    return Err(V2FormatError::InvalidRecoveryHistory);
+                }
+                Ok(write)
+            },
+        )
+        .await
+    }
+
+    /// Captures time before asynchronous recovery protection and section encoding.
+    pub(super) async fn prepare_child_publication(
+        &self,
+        parent: &V2AnchorState,
+    ) -> V2Result<V2PublicationPlan> {
+        let parent_publish_time_ms = self.verified_parent_publish_time(parent).await?;
+        let sampled_now_ms = self.publication_now_ms();
+        let publish_time_ms =
+            super::recovery::choose_publish_time(sampled_now_ms, Some(parent_publish_time_ms))?;
+        Ok(V2PublicationPlan {
+            sampled_now_ms,
+            parent: parent.clone(),
+            parent_publish_time_ms,
+            publish_time_ms,
+        })
+    }
+
+    /// Publishes with the exact time already used to prepare authenticated history.
+    pub(super) async fn write_prepared_child_commit_with<A, F>(
+        &self,
+        anchor: &A,
+        plan: &V2PublicationPlan,
         build: F,
     ) -> V2Result<V2StoredCommit>
     where
         A: V2CommitAnchor,
         F: FnMut(&V2CommitKey) -> V2Result<V2CommitWrite>,
     {
-        let current = anchor.read_v2().await?;
-        let Some(current) = current else {
-            return Err(V2FormatError::MissingAnchor);
-        };
-        let next_sequence = current
+        if anchor.read_v2().await?.as_ref() != Some(&plan.parent)
+            || self.verified_parent_publish_time(&plan.parent).await? != plan.parent_publish_time_ms
+        {
+            return Err(V2FormatError::StaleAnchor);
+        }
+        let sequence = plan
+            .parent
             .sequence
             .checked_next()
             .ok_or(V2FormatError::InvalidHeaderField)?;
-        self.write_commit_with_expected_anchor_builder(anchor, Some(current), next_sequence, build)
-            .await
+        self.write_commit_with_expected_anchor_builder(
+            anchor,
+            Some(plan.parent.clone()),
+            sequence,
+            Some(plan.publish_time_ms),
+            build,
+        )
+        .await
     }
 
     /// Reads and verifies the commit currently selected by the anchor.
@@ -1014,6 +1246,7 @@ where
         let mut seen = BTreeSet::new();
         let mut total_commit_bytes = 0_u64;
         let mut retained_bytes = 0_u64;
+        let mut child_publish_time = None;
 
         loop {
             if commits.len() >= limits.max_commits {
@@ -1047,6 +1280,13 @@ where
                 return Err(V2FormatError::BodyDigestMismatch);
             }
             validate_v2_commit_object_len(&parsed_header, metadata.content_len)?;
+            if let Some(child_time) = child_publish_time {
+                super::recovery::validate_parent_time(
+                    Some(parsed_header.header.publish_time_ms),
+                    child_time,
+                )?;
+            }
+            child_publish_time = Some(parsed_header.header.publish_time_ms);
 
             let retained_sections = self
                 .verify_replay_sections(
@@ -1066,6 +1306,9 @@ where
                 retained_sections,
             });
             if is_root {
+                // The trusted exact root cuts replay; its predecessor may have
+                // been reclaimed. Check that edge at publication/adoption, not
+                // by requiring old payload carriers during checkpoint restart.
                 break;
             }
             let Some(parent) = parent else {
@@ -1077,6 +1320,19 @@ where
             next_sequence = Some(parent.sequence);
         }
 
+        let head = commits.first().ok_or(V2FormatError::MissingAnchor)?;
+        if head.parsed_header.header.signing_key_id != anchor_state.signing_key_id {
+            return Err(V2FormatError::StaleAnchor);
+        }
+        self.remember_verified_publication_time(
+            anchor_state,
+            head.parsed_header.header.publish_time_ms,
+            head.parsed_header
+                .header
+                .section_index
+                .iter()
+                .any(|section| section.section_type == V2SectionType::Recovery),
+        )?;
         Ok(V2ReplayChain {
             commits_newest_first: commits,
         })
@@ -1097,10 +1353,15 @@ where
         for (index, section) in parsed_header.header.section_index.iter().enumerate() {
             let retain = matches!(
                 section.section_type,
-                V2SectionType::IndexRun | V2SectionType::IndexRoot
+                V2SectionType::IndexRun | V2SectionType::IndexRoot | V2SectionType::Recovery
             );
             if !retain {
                 continue;
+            }
+            if section.section_type == V2SectionType::Recovery
+                && section.length > super::recovery::section::MAX_RECOVERY_SECTION_BYTES as u64
+            {
+                return Err(V2FormatError::RecoveryHistoryCapacity);
             }
             *retained_bytes = retained_bytes
                 .checked_add(section.length)
@@ -1293,7 +1554,9 @@ where
             bytes.extend_from_slice(&remaining);
             Bytes::from(bytes)
         };
-        parse_v2_commit_header(object_id, &header_bytes, &self.keyring)
+        let parsed = parse_v2_commit_header(object_id, &header_bytes, &self.keyring)?;
+        super::recovery::validate_parent_time(None, parsed.header.publish_time_ms)?;
+        Ok(parsed)
     }
 
     /// Reads commit bytes from a key and version without requiring a full object read.
@@ -1344,7 +1607,38 @@ where
         let Some(current) = anchor.read_v2().await? else {
             return Err(V2FormatError::MissingAnchor);
         };
+        // History publication needs the private captured predecessor and exact
+        // graph-coverage proof. Generic ambiguous artifact adoption cannot supply it.
+        if self.options.recovery_policy.is_some() {
+            return Err(V2FormatError::InvalidRecoveryHistory);
+        }
+        let accepted_header = self
+            .read_commit_header_at(&current.commit_key, current.version_id.as_ref())
+            .await?;
+        if accepted_header.header.body_digest != current.body_digest
+            || accepted_header.header.self_ref.sequence != current.sequence
+            || accepted_header.header.signing_key_id != current.signing_key_id
+        {
+            return Err(V2FormatError::StaleAnchor);
+        }
+        if accepted_header
+            .header
+            .section_index
+            .iter()
+            .any(|section| section.section_type == V2SectionType::Recovery)
+        {
+            return Err(V2FormatError::InvalidRecoveryHistory);
+        }
         let parsed = self.read_replay_commit_at(object_id, version_id).await?;
+        if parsed
+            .parsed_header
+            .header
+            .section_index
+            .iter()
+            .any(|section| section.section_type == V2SectionType::Recovery)
+        {
+            return Err(V2FormatError::InvalidRecoveryHistory);
+        }
         self.verify_full_commit_sections(object_id, version_id, &parsed.parsed_header)
             .await?;
         let header = &parsed.parsed_header.header;
@@ -1362,7 +1656,14 @@ where
             return Err(V2FormatError::StaleAnchor);
         }
 
-        self.verify_existing_commit_postconditions(object_id, version_id)
+        let parent_time = self.verified_parent_publish_time(&current).await?;
+        super::recovery::validate_parent_time(Some(parent_time), header.publish_time_ms)?;
+        super::recovery::validate_publication_time(
+            self.publication_now_ms(),
+            header.publish_time_ms,
+        )?;
+        let verified_retain_until_ms = self
+            .verify_existing_commit_postconditions(object_id, version_id)
             .await?;
         let commit_key = V2CommitKey::parse(object_id)?;
         let version_id = version_id.cloned();
@@ -1377,11 +1678,13 @@ where
             signing_key_id: header.signing_key_id.clone(),
             format_ref: current.format_ref.clone(),
         };
+        self.remember_verified_publication_time(&anchor_state, header.publish_time_ms, false)?;
         anchor
             .compare_and_advance_v2(Some(&current), anchor_state.clone())
             .await?;
-
         Ok(V2StoredCommit {
+            verified_retain_until_ms,
+            publish_time_ms: header.publish_time_ms,
             anchor_state,
             commit_key,
             version_id,
@@ -1402,6 +1705,7 @@ where
         anchor: &A,
         expected_parent: &V2AnchorState,
         uploaded: &V2StoredCommit,
+        history_uncertainty_ms: Option<u32>,
     ) -> V2Result<V2StoredCommit>
     where
         A: V2CommitAnchor,
@@ -1418,11 +1722,33 @@ where
         {
             return Err(V2FormatError::StaleAnchor);
         }
-        self.verify_existing_commit_postconditions(
-            &uploaded.commit_key.object_id,
-            uploaded.version_id.as_ref(),
-        )
-        .await?;
+        let parent_time = self.verified_parent_publish_time(expected_parent).await?;
+        super::recovery::validate_parent_time(Some(parent_time), uploaded.publish_time_ms)?;
+        super::recovery::validate_publication_time(
+            self.publication_now_ms(),
+            uploaded.publish_time_ms,
+        )?;
+        let verified_retain_until_ms = self
+            .verify_existing_commit_postconditions(
+                &uploaded.commit_key.object_id,
+                uploaded.version_id.as_ref(),
+            )
+            .await?;
+        if self
+            .verified_parent_header_facts(&uploaded.anchor_state)
+            .await?
+            .0
+            != uploaded.publish_time_ms
+        {
+            return Err(V2FormatError::StaleAnchor);
+        }
+        if let Some(uncertainty) = history_uncertainty_ms {
+            super::recovery::validate_history_publication_freshness(
+                self.publication_now_ms(),
+                uploaded.publish_time_ms,
+                uncertainty,
+            )?;
+        }
         let advance = anchor
             .compare_and_advance_v2(Some(expected_parent), uploaded.anchor_state.clone())
             .await;
@@ -1440,7 +1766,9 @@ where
                 }
             }
         }
-        Ok(uploaded.clone())
+        let mut accepted = uploaded.clone();
+        accepted.verified_retain_until_ms = verified_retain_until_ms;
+        Ok(accepted)
     }
 
     /// Verifies a recovery bundle and recreates a missing anchor from it.
@@ -1479,7 +1807,7 @@ where
     where
         A: V2CommitAnchor,
     {
-        self.write_commit_with_expected_anchor_builder(anchor, expected, sequence, |_| {
+        self.write_commit_with_expected_anchor_builder(anchor, expected, sequence, None, |_| {
             Ok(write.clone())
         })
         .await
@@ -1490,6 +1818,7 @@ where
         anchor: &A,
         expected: Option<V2AnchorState>,
         sequence: Sequence,
+        selected_time: Option<i64>,
         mut build: F,
     ) -> V2Result<V2StoredCommit>
     where
@@ -1503,12 +1832,27 @@ where
             version_id: state.version_id.clone(),
         });
 
+        let parent_time = match expected.as_ref() {
+            Some(anchor) => Some(self.verified_parent_publish_time(anchor).await?),
+            None => None,
+        };
+        let publish_time_ms = match selected_time {
+            Some(chosen) => {
+                super::recovery::validate_parent_time(parent_time, chosen)?;
+                super::recovery::validate_publication_time(self.publication_now_ms(), chosen)?;
+                chosen
+            }
+            None => super::recovery::choose_publish_time(self.publication_now_ms(), parent_time)?,
+        };
         let mut last_collision = false;
         for _ in 0..MAX_RANDOM_KEY_ATTEMPTS {
             let commit_key = generate_v2_commit_key(sequence)?;
             let write = build(&commit_key)?;
-            let commit_retention =
-                strongest_retention_policy(self.options.retention, write.retention);
+            let commit_retention = super::recovery::policy::physical_retention_for_deadline(
+                strongest_retention_policy(self.options.retention, write.retention),
+                write.required_retain_until_ms,
+                self.publication_now_ms(),
+            )?;
             let commit_legal_hold = strongest_legal_hold(self.options.legal_hold, write.legal_hold);
             self.validate_write_protection_profile(commit_retention, commit_legal_hold)?;
             let (section_index, section_region) = build_section_region(&write.sections)?;
@@ -1519,6 +1863,7 @@ where
                 &write,
                 section_index.clone(),
                 body_digest,
+                publish_time_ms,
             )?;
             let object_body = header.encode_object(&section_region)?;
             let object_len =
@@ -1545,13 +1890,19 @@ where
                 }
                 Err(_) => return Err(V2FormatError::StorageOperationFailed),
             };
-            let version_id = self
+            let verified = self
                 .verify_commit_postconditions(
                     &commit_key.object_id,
                     &metadata,
-                    V2WritePostconditions::commit(object_len, commit_retention, commit_legal_hold),
+                    V2WritePostconditions::commit(
+                        object_len,
+                        commit_retention,
+                        commit_legal_hold,
+                        write.required_retain_until_ms,
+                    ),
                 )
                 .await?;
+            let version_id = verified.version_id.clone();
             let anchor_state = V2AnchorState {
                 sequence,
                 commit_key: commit_key.object_id.clone(),
@@ -1560,10 +1911,21 @@ where
                 signing_key_id: header.signing_key_id,
                 format_ref: self.options.format_ref.clone(),
             };
+            // Cache verified header facts before CAS; cache failure must not turn
+            // an accepted publication into an apparently unaccepted write failure.
+            self.remember_verified_publication_time(
+                &anchor_state,
+                publish_time_ms,
+                section_index
+                    .iter()
+                    .any(|section| section.section_type == V2SectionType::Recovery),
+            )?;
             anchor
                 .compare_and_advance_v2(expected.as_ref(), anchor_state.clone())
                 .await?;
             return Ok(V2StoredCommit {
+                verified_retain_until_ms: verified.retain_until_ms,
+                publish_time_ms,
                 anchor_state,
                 commit_key,
                 version_id,
@@ -1586,6 +1948,7 @@ where
         write: &V2CommitWrite,
         section_index: Vec<V2SectionDescriptor>,
         body_digest: [u8; 32],
+        publish_time_ms: i64,
     ) -> V2Result<V2CommitHeader> {
         let header = V2CommitHeader {
             self_ref: V2CommitSelfRef {
@@ -1593,7 +1956,7 @@ where
                 commit_key: commit_key.object_id.clone(),
             },
             parent,
-            publish_time_ms: current_time_ms(),
+            publish_time_ms,
             kind: write.kind,
             algorithms: Default::default(),
             keyring_envelope_ref: self.options.keyring_envelope_ref.clone(),
@@ -1843,7 +2206,7 @@ where
                 .map_err(storage_to_v2)?;
         }
         let object_digest: [u8; 32] = object_digest.finalize();
-        let version_id = self
+        let verified = self
             .verify_commit_postconditions(
                 &object_id,
                 &metadata,
@@ -1859,7 +2222,7 @@ where
         Ok(V2StoredStandalonePayload {
             etag: rs3_types::ObjectEtag::single(plaintext_md5.finalize()),
             object_id,
-            version_id,
+            version_id: verified.version_id,
             object_len,
             object_digest,
             payload_layout,
@@ -1927,14 +2290,15 @@ where
         object_id: &BackendObjectId,
         metadata: &BlobMetadata,
         postconditions: V2WritePostconditions,
-    ) -> V2Result<Option<BackendVersionId>> {
-        let version_id = self
+    ) -> V2Result<BlobMetadata> {
+        let exact = self
             .verify_commit_protection_postconditions(object_id, metadata, postconditions)
             .await?;
+        let version_id = exact.version_id.as_ref();
         if let Some(expected_digest) = postconditions.expected_stored_digest {
             self.verify_exact_stored_object_digest(
                 object_id,
-                version_id.as_ref(),
+                version_id,
                 postconditions.expected_object_len,
                 expected_digest,
             )
@@ -1944,7 +2308,7 @@ where
                 .store
                 .get_range_at(
                     object_id,
-                    version_id.as_ref(),
+                    version_id,
                     ByteRange::Slice { offset: 0, len: 1 },
                 )
                 .await
@@ -1953,7 +2317,7 @@ where
                 return Err(V2FormatError::ProviderProfileFailed);
             }
         }
-        Ok(version_id)
+        Ok(exact)
     }
 
     async fn verify_commit_protection_postconditions(
@@ -1961,7 +2325,7 @@ where
         object_id: &BackendObjectId,
         metadata: &BlobMetadata,
         postconditions: V2WritePostconditions,
-    ) -> V2Result<Option<BackendVersionId>> {
+    ) -> V2Result<BlobMetadata> {
         if metadata.content_len != postconditions.expected_object_len
             || postconditions.expected_object_len == 0
         {
@@ -1985,16 +2349,16 @@ where
             return Err(V2FormatError::ProviderProfileFailed);
         }
         match self.options.provider_profile {
-            V2ProviderProfile::Dev | V2ProviderProfile::AtomicCreate => Ok(exact.version_id),
+            V2ProviderProfile::Dev | V2ProviderProfile::AtomicCreate => Ok(exact),
             V2ProviderProfile::RetainedVersionObjectLock => {
                 if postconditions.required_retention.is_none()
                     && postconditions.required_legal_hold != Some(LegalHoldStatus::On)
                 {
                     return Err(V2FormatError::ProviderProfileFailed);
                 }
-                let Some(version_id) = exact.version_id.clone() else {
+                if exact.version_id.is_none() {
                     return Err(V2FormatError::ProviderProfileFailed);
-                };
+                }
                 if let Some(retention) = postconditions.required_retention
                     && !retention_satisfies(exact.retention.as_ref(), &retention)
                 {
@@ -2005,7 +2369,7 @@ where
                 {
                     return Err(V2FormatError::ProviderProfileFailed);
                 }
-                Ok(Some(version_id))
+                Ok(exact)
             }
         }
     }
@@ -2056,9 +2420,9 @@ where
         &self,
         object_id: &BackendObjectId,
         version_id: Option<&BackendVersionId>,
-    ) -> V2Result<()> {
+    ) -> V2Result<Option<i64>> {
         match self.options.provider_profile {
-            V2ProviderProfile::Dev | V2ProviderProfile::AtomicCreate => Ok(()),
+            V2ProviderProfile::Dev | V2ProviderProfile::AtomicCreate => Ok(None),
             V2ProviderProfile::RetainedVersionObjectLock => {
                 if self.options.retention.is_none()
                     && self.options.legal_hold != Some(LegalHoldStatus::On)
@@ -2073,6 +2437,12 @@ where
                     .head_at(object_id, Some(version_id))
                     .await
                     .map_err(|_| V2FormatError::ProviderProfileFailed)?;
+                if metadata.object_id != *object_id
+                    || metadata.version_id.as_ref() != Some(version_id)
+                    || metadata.content_len == 0
+                {
+                    return Err(V2FormatError::ProviderProfileFailed);
+                }
                 if let Some(retention) = self.options.retention
                     && !retention_satisfies(metadata.retention.as_ref(), &retention)
                 {
@@ -2086,7 +2456,7 @@ where
                     )
                     .await
                     .map_err(|_| V2FormatError::ProviderProfileFailed)?;
-                Ok(())
+                Ok(metadata.retain_until_ms)
             }
         }
     }

@@ -53,6 +53,7 @@ pub(super) async fn run(args: MaintenanceOfflineArgs) -> Result<()> {
         },
         orphan_gc: default_maintenance_orphan_gc_options(),
         retained_provider_conformance_passed: provider_conformance_evidence_passed(&config),
+        reclamation_enabled: config.maintenance.reclamation_enabled,
     };
 
     let outcome = match &config.anchor {

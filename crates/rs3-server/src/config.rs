@@ -2,7 +2,7 @@
 
 use crate::identity::StaticCredentials;
 use rs3_crypto::{MIN_REPOSITORY_SALT_LEN, SecretBytes, ct_eq, validate_recovery_public_key};
-use rs3_repository::v2::{DEFAULT_RETENTION_RENEWAL_HORIZON, V2MaintenanceBudgets};
+use rs3_repository::v2::{DEFAULT_RETENTION_RENEWAL_HORIZON, RecoveryPolicy, V2MaintenanceBudgets};
 use rs3_repository::{DEFAULT_PAYLOAD_SEGMENT_SIZE, v2::DEFAULT_V2_STREAM_READ_STALL_TIMEOUT};
 use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
@@ -51,6 +51,9 @@ const PROVIDER_CONFORMANCE_REPORT_FILE_ENV: &str = "RS3_PROVIDER_CONFORMANCE_REP
 const PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV: &str = "RS3_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS";
 const PROVIDER_PRINCIPAL_FINGERPRINT_ENV: &str = "RS3_PROVIDER_PRINCIPAL_FINGERPRINT";
 pub(crate) const RECOVERY_PUBLIC_KEY_ENV: &str = "RS3_RECOVERY_PUBLIC_KEY";
+const RECOVERY_WINDOW_DAYS_ENV: &str = "RS3_RECOVERY_WINDOW_DAYS";
+const RECOVERY_RENEWAL_MARGIN_SECONDS_ENV: &str = "RS3_RECOVERY_RENEWAL_MARGIN_SECONDS";
+const RECOVERY_CLOCK_UNCERTAINTY_MS_ENV: &str = "RS3_RECOVERY_CLOCK_UNCERTAINTY_MS";
 
 pub(crate) const REPOSITORY_SALT_HEX_ENV: &str = "RS3_REPOSITORY_SALT_HEX";
 pub(crate) const KEYRING_ENVELOPE_OBJECT_ID_ENV: &str = "RS3_KEYRING_ENVELOPE_OBJECT_ID";
@@ -60,6 +63,7 @@ const REPOSITORY_ID_ENV: &str = "RS3_REPOSITORY_ID";
 const ALLOW_MEMORY_ANCHOR_ENV: &str = "RS3_ALLOW_MEMORY_ANCHOR";
 const WRITER_GUARD_ENV: &str = "RS3_WRITER_GUARD";
 const MAINTENANCE_MODE_ENV: &str = "RS3_MAINTENANCE_MODE";
+const RECLAMATION_ENABLED_ENV: &str = "RS3_RECLAMATION_ENABLED";
 const MAINTENANCE_RENEWAL_HORIZON_SECONDS_ENV: &str = "RS3_MAINTENANCE_RENEWAL_HORIZON_SECONDS";
 const MAINTENANCE_ORPHAN_PRESSURE_BYTES_ENV: &str = "RS3_MAINTENANCE_ORPHAN_PRESSURE_BYTES";
 const MAINTENANCE_ORPHAN_PRESSURE_COUNT_ENV: &str = "RS3_MAINTENANCE_ORPHAN_PRESSURE_COUNT";
@@ -401,6 +405,10 @@ impl MaintenanceMode {
 pub struct MaintenanceConfig {
     /// Supervisor posture. Forced off for restore-readonly gateways.
     pub mode: MaintenanceMode,
+    /// Whether completed maintenance plans may delete unreachable backend versions.
+    ///
+    /// Disabling reclamation does not disable protection renewal.
+    pub reclamation_enabled: bool,
     /// Lead time before the nearest provider retain-until deadline.
     pub renewal_horizon: Duration,
     /// Orphan bytes at which a full-maintenance run becomes due.
@@ -426,6 +434,7 @@ impl Default for MaintenanceConfig {
         let budget_defaults = V2MaintenanceBudgets::default();
         Self {
             mode: MaintenanceMode::Auto,
+            reclamation_enabled: true,
             renewal_horizon: DEFAULT_RETENTION_RENEWAL_HORIZON,
             orphan_pressure_bytes: DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_BYTES,
             orphan_pressure_count: DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_COUNT,
@@ -446,6 +455,7 @@ impl MaintenanceConfig {
     pub fn forced_off() -> Self {
         Self {
             mode: MaintenanceMode::Off,
+            reclamation_enabled: false,
             ..Self::default()
         }
     }
@@ -473,10 +483,21 @@ pub struct ProviderConformanceConfig {
 }
 
 /// Disaster-recovery trust settings.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryConfig {
     /// Operator-controlled public key used to verify recovery bundle signatures.
     pub public_key: Option<String>,
+    /// Validated recovery-history promise policy.
+    pub policy: RecoveryPolicy,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            public_key: None,
+            policy: RecoveryPolicy::PRESET,
+        }
+    }
 }
 
 impl Default for ProviderConformanceConfig {
@@ -628,7 +649,7 @@ impl RuntimeConfig {
         validate_runtime_hardening(&mut errors, &self.hardening);
         validate_runtime_batching(&mut errors, &self.batching);
         validate_runtime_repository(&mut errors, &self.repository);
-        validate_runtime_maintenance(&mut errors, self.mode, &self.maintenance);
+        validate_runtime_maintenance(&mut errors, self.mode, &self.repository, &self.maintenance);
         validate_runtime_provider_conformance(&mut errors, &self.provider_conformance);
         validate_runtime_writer_guard(&mut errors, &self.anchor, self.writer_guard);
         validate_runtime_repository_keys(&mut errors, &self.repository_keys);
@@ -1345,6 +1366,7 @@ fn validate_runtime_repository(errors: &mut Vec<ConfigError>, repository: &Repos
 fn validate_runtime_maintenance(
     errors: &mut Vec<ConfigError>,
     mode: GatewayMode,
+    repository: &RepositoryConfig,
     maintenance: &MaintenanceConfig,
 ) {
     if mode == GatewayMode::RestoreReadOnly && maintenance.mode != MaintenanceMode::Off {
@@ -1353,6 +1375,17 @@ fn validate_runtime_maintenance(
             MAINTENANCE_MODE_ENV,
             maintenance.mode.as_str(),
             "restore-readonly gateways require maintenance to be off",
+        );
+    }
+    if mode == GatewayMode::ReadWrite
+        && repository.retention.is_some()
+        && maintenance.mode != MaintenanceMode::Auto
+    {
+        push_runtime_invalid(
+            errors,
+            MAINTENANCE_MODE_ENV,
+            maintenance.mode.as_str(),
+            "retained repositories require auto maintenance for protection renewal; set RS3_RECLAMATION_ENABLED=false to disable physical deletion",
         );
     }
     for (key, value) in [
@@ -1806,6 +1839,14 @@ fn parse_maintenance_config(
 
     let mut errors = Vec::new();
     let defaults = MaintenanceConfig::default();
+    let reclamation_enabled = collect_config_error(
+        &mut errors,
+        parse_bool(
+            RECLAMATION_ENABLED_ENV,
+            source.value(RECLAMATION_ENABLED_ENV),
+            defaults.reclamation_enabled,
+        ),
+    );
     let renewal_horizon = collect_config_error(
         &mut errors,
         parse_positive_u64(
@@ -1898,6 +1939,7 @@ fn parse_maintenance_config(
 
     Ok(MaintenanceConfig {
         mode: maintenance_mode,
+        reclamation_enabled: require_collected_config(reclamation_enabled)?,
         renewal_horizon: require_collected_config(renewal_horizon)?,
         orphan_pressure_bytes: require_collected_config(orphan_pressure_bytes)?,
         orphan_pressure_count: require_collected_config(orphan_pressure_count)?,
@@ -1959,7 +2001,40 @@ fn parse_recovery_config(source: &impl ConfigSource) -> Result<RecoveryConfig, C
             Ok(value)
         })
         .transpose()?;
-    Ok(RecoveryConfig { public_key })
+    let defaults = RecoveryPolicy::PRESET;
+    let window_days = parse_positive_u32_with_default(
+        RECOVERY_WINDOW_DAYS_ENV,
+        source.value(RECOVERY_WINDOW_DAYS_ENV),
+        defaults.window_days(),
+    )?;
+    let renewal_margin_seconds = parse_positive_u32_with_default(
+        RECOVERY_RENEWAL_MARGIN_SECONDS_ENV,
+        source.value(RECOVERY_RENEWAL_MARGIN_SECONDS_ENV),
+        defaults.renewal_margin_seconds(),
+    )?;
+    let clock_uncertainty_ms = parse_positive_u32_with_default(
+        RECOVERY_CLOCK_UNCERTAINTY_MS_ENV,
+        source.value(RECOVERY_CLOCK_UNCERTAINTY_MS_ENV),
+        defaults.clock_uncertainty_ms(),
+    )?;
+    let policy = RecoveryPolicy::new(window_days, renewal_margin_seconds, clock_uncertainty_ms)
+        .map_err(|error| ConfigError::Invalid {
+            key: RECOVERY_RENEWAL_MARGIN_SECONDS_ENV,
+            value: renewal_margin_seconds.to_string(),
+            reason: error.to_string(),
+        })?;
+    Ok(RecoveryConfig { public_key, policy })
+}
+
+fn parse_positive_u32_with_default(
+    key: &'static str,
+    value: Option<String>,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    match value {
+        Some(value) => parse_positive_u32(key, Some(value), String::new()),
+        None => Ok(default),
+    }
 }
 
 fn parse_repository_format(source: &impl ConfigSource) -> Result<RepositoryFormat, ConfigError> {
@@ -2947,6 +3022,7 @@ mod tests {
         };
         assert_eq!(maintenance, MaintenanceConfig::default());
         assert_eq!(maintenance.mode, super::MaintenanceMode::Auto);
+        assert!(maintenance.reclamation_enabled);
         assert_eq!(
             maintenance.renewal_horizon,
             Duration::from_secs(7 * 24 * 60 * 60)
@@ -3035,6 +3111,7 @@ mod tests {
     fn parses_maintenance_overrides() {
         let source = minimal_source()
             .with(super::MAINTENANCE_MODE_ENV, "manual")
+            .with(super::RECLAMATION_ENABLED_ENV, "false")
             .with(super::MAINTENANCE_RENEWAL_HORIZON_SECONDS_ENV, "86400")
             .with(super::MAINTENANCE_ORPHAN_PRESSURE_BYTES_ENV, "1048576")
             .with(super::MAINTENANCE_ORPHAN_PRESSURE_COUNT_ENV, "9")
@@ -3055,6 +3132,7 @@ mod tests {
             Err(error) => panic!("{error}"),
         };
         assert_eq!(maintenance.mode, super::MaintenanceMode::Manual);
+        assert!(!maintenance.reclamation_enabled);
         assert_eq!(maintenance.renewal_horizon, Duration::from_secs(86_400));
         assert_eq!(maintenance.orphan_pressure_bytes, 1_048_576);
         assert_eq!(maintenance.orphan_pressure_count, 9);
@@ -3074,14 +3152,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_maintenance_mode() {
-        let source = minimal_source().with(super::MAINTENANCE_MODE_ENV, "always");
-
-        let config = RuntimeConfig::from_source(&source);
-
-        assert!(
-            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::MAINTENANCE_MODE_ENV)
-        );
+    fn rejects_invalid_maintenance_mode_or_reclamation_switch() {
+        for (key, value) in [
+            (super::MAINTENANCE_MODE_ENV, "always"),
+            (super::RECLAMATION_ENABLED_ENV, "sometimes"),
+        ] {
+            let config = RuntimeConfig::from_source(&minimal_source().with(key, value));
+            assert!(
+                matches!(config, Err(ConfigError::Invalid { key: invalid_key, .. }) if invalid_key == key)
+            );
+        }
     }
 
     #[test]
@@ -3122,8 +3202,27 @@ mod tests {
     }
 
     #[test]
+    fn retained_read_write_rejects_manual_or_off_maintenance() {
+        for value in ["manual", "off"] {
+            let source = minimal_source()
+                .with(super::REPOSITORY_RETENTION_MODE_ENV, "governance")
+                .with(super::REPOSITORY_RETENTION_DAYS_ENV, "30")
+                .with(super::MAINTENANCE_MODE_ENV, value);
+
+            let config = RuntimeConfig::from_source(&source);
+
+            assert!(
+                matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::MAINTENANCE_MODE_ENV),
+                "expected retained RS3_MAINTENANCE_MODE={value} rejection"
+            );
+        }
+    }
+
+    #[test]
     fn forces_maintenance_off_for_restore_readonly() {
-        let source = minimal_source().with("RS3_GATEWAY_MODE", "restore-readonly");
+        let source = minimal_source()
+            .with("RS3_GATEWAY_MODE", "restore-readonly")
+            .with(super::RECLAMATION_ENABLED_ENV, "true");
 
         let config = RuntimeConfig::from_source(&source);
 
@@ -3132,6 +3231,7 @@ mod tests {
             Err(error) => panic!("{error}"),
         };
         assert_eq!(maintenance.mode, super::MaintenanceMode::Off);
+        assert!(!maintenance.reclamation_enabled);
     }
 
     #[test]
@@ -3189,6 +3289,44 @@ mod tests {
 
         assert!(config_error_keys(&error).contains(&super::PROVIDER_PRINCIPAL_FINGERPRINT_ENV));
         assert!(!error.to_string().contains("tenant-a"));
+    }
+
+    #[test]
+    fn parses_recovery_policy_overrides() {
+        let source = minimal_source()
+            .with(super::RECOVERY_WINDOW_DAYS_ENV, "45")
+            .with(super::RECOVERY_RENEWAL_MARGIN_SECONDS_ENV, "90000")
+            .with(super::RECOVERY_CLOCK_UNCERTAINTY_MS_ENV, "1000");
+
+        let config = RuntimeConfig::from_source(&source).expect("valid recovery policy");
+        assert_eq!(config.recovery.policy.window_days(), 45);
+        assert_eq!(config.recovery.policy.renewal_margin_seconds(), 90_000);
+        assert_eq!(config.recovery.policy.clock_uncertainty_ms(), 1_000);
+    }
+
+    #[test]
+    fn rejects_invalid_recovery_policy_values() {
+        for (key, value) in [
+            (super::RECOVERY_WINDOW_DAYS_ENV, "0"),
+            (super::RECOVERY_RENEWAL_MARGIN_SECONDS_ENV, "0"),
+            (super::RECOVERY_CLOCK_UNCERTAINTY_MS_ENV, "0"),
+            (super::RECOVERY_WINDOW_DAYS_ENV, "4294967296"),
+        ] {
+            let config = RuntimeConfig::from_source(&minimal_source().with(key, value));
+            assert!(
+                matches!(config, Err(ConfigError::Invalid { key: invalid_key, .. }) if invalid_key == key),
+                "expected recovery policy rejection for {key}={value}"
+            );
+        }
+        let config = RuntimeConfig::from_source(
+            &minimal_source()
+                .with(super::RECOVERY_RENEWAL_MARGIN_SECONDS_ENV, "60")
+                .with(super::RECOVERY_CLOCK_UNCERTAINTY_MS_ENV, "60000"),
+        );
+        assert!(matches!(
+            config,
+            Err(ConfigError::Invalid { key, .. }) if key == super::RECOVERY_RENEWAL_MARGIN_SECONDS_ENV
+        ));
     }
 
     #[test]

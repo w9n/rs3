@@ -1520,6 +1520,11 @@ mod tests {
                 retention_renewal_blocked_count: 0,
                 retention_renewal_blocked_bytes: 0,
                 nearest_retain_until_ms: None,
+                recovery_expiry_due_ms: None,
+                recovery_recoverable_point_count: 0,
+                recovery_oldest_recoverable_publish_time_ms: None,
+                recovery_historical_exact_bytes: 0,
+                recovery_clock_uncertainty_ms: None,
             }
         }
 

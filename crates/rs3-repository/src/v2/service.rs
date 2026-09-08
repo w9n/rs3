@@ -1,5 +1,6 @@
 //! v2 repository operations over the existing trusted namespace service.
 
+use super::V2MaintenanceGuard;
 use super::commit::{V2_SECTION_FLAG_COMPRESSED, V2_SECTION_FLAG_MUST_UNDERSTAND};
 use super::error::V2FormatError;
 use super::repository::{
@@ -55,7 +56,14 @@ pub(super) mod packed;
 mod packed_compaction;
 mod packed_compaction_publish;
 mod read_stream;
+mod recovery;
+mod recovery_view;
+pub use recovery_view::{
+    V2RecoveryCursor, V2RecoveryPointInfo, V2RecoveryPointPage, V2RecoveryView,
+};
 mod staging;
+
+use super::recovery::publication::AcceptedRecoveryState;
 
 use super::standalone::{generate_v2_standalone_object_id, validate_v2_standalone_object};
 pub use compaction::V2FullMaintenanceReport;
@@ -99,11 +107,21 @@ pub(super) struct V2CoordinatorLease {
 pub(super) struct V2CoordinatedMutation<'a, A> {
     lease: &'a V2CoordinatorLease,
     anchor: &'a A,
+    guard: Option<&'a dyn V2MaintenanceGuard>,
 }
 
 impl<'a, A> V2CoordinatedMutation<'a, A> {
+    pub(super) fn with_guard(mut self, guard: Option<&'a dyn V2MaintenanceGuard>) -> Self {
+        self.guard = guard;
+        self
+    }
+
     pub(super) fn new(lease: &'a V2CoordinatorLease, anchor: &'a A) -> Self {
-        Self { lease, anchor }
+        Self {
+            lease,
+            anchor,
+            guard: None,
+        }
     }
 }
 
@@ -125,6 +143,7 @@ impl Drop for V2DirectMutationLease {
 
 #[derive(Default)]
 struct V2AcceptedState {
+    recovery: Option<AcceptedRecoveryState>,
     repository: RepositoryState,
     runs: Vec<V2IndexRootRunRef>,
     anchor: Option<super::repository::V2AnchorState>,
@@ -136,6 +155,7 @@ pub(crate) struct V2PendingPublication {
 }
 
 struct PendingV2Install {
+    recovery: Option<AcceptedRecoveryState>,
     completion_receipts: Option<(Sequence, rs3_index::completion::CompletionReceipts)>,
     sequence: Sequence,
     mutations: Vec<PendingV2InstallMutation>,
@@ -200,9 +220,10 @@ enum StagedPayload<'a> {
     },
 }
 
-struct StreamLength {
+struct StreamUploadLimits {
     expected: Option<u64>,
     maximum: u64,
+    multipart_part_size: usize,
 }
 
 impl<S> V2Repository<S>
@@ -293,15 +314,39 @@ where
     where
         A: V2CommitAnchor,
     {
+        self.write_genesis_snapshot_with_guard(anchor, None).await
+    }
+
+    /// Initializes recovery protection under the caller's existing writer fence.
+    pub async fn write_genesis_snapshot_with_guard<A>(
+        &self,
+        anchor: &A,
+        guard: Option<&dyn V2MaintenanceGuard>,
+    ) -> Result<V2StoredCommit>
+    where
+        A: V2CommitAnchor,
+    {
         let _mutation_lease = self.claim_direct_mutation()?;
         let _publication_guard = self.publication_lock.write().await;
-        let stored = self
-            .commit_store
-            .write_genesis_snapshot(anchor)
-            .await
-            .map_err(v2_repository_error)?;
+        let stored = match guard {
+            Some(guard) => {
+                self.commit_store
+                    .write_genesis_snapshot_with_guard(anchor, guard)
+                    .await
+            }
+            None => self.commit_store.write_genesis_snapshot(anchor).await,
+        }
+        .map_err(v2_repository_error)?;
         match self.accepted.write() {
-            Ok(mut accepted) => accepted.anchor = Some(stored.anchor_state.clone()),
+            Ok(mut accepted) => {
+                accepted.anchor = Some(stored.anchor_state.clone());
+                accepted.recovery = self.commit_store.options().recovery_policy.map(|policy| {
+                    AcceptedRecoveryState {
+                        policy,
+                        snapshot: Arc::new(Default::default()),
+                    }
+                });
+            }
             Err(error) => {
                 self.mark_local_recovery_required();
                 tracing::error!(
@@ -322,7 +367,7 @@ where
         A: V2CommitAnchor,
     {
         let _mutation_lease = self.claim_direct_mutation()?;
-        self.write_index_snapshot_inner(anchor).await
+        self.write_index_snapshot_inner(anchor, None).await
     }
 
     pub(super) async fn write_index_snapshot_coordinated<A>(
@@ -333,15 +378,47 @@ where
         A: V2CommitAnchor,
     {
         self.validate_coordinator_lease(mutation.lease)?;
-        self.write_index_snapshot_inner(mutation.anchor).await
+        self.write_index_snapshot_inner(mutation.anchor, mutation.guard)
+            .await
     }
 
-    async fn write_index_snapshot_inner<A>(&self, anchor: &A) -> Result<V2StoredCommit>
+    async fn write_index_snapshot_inner<A>(
+        &self,
+        anchor: &A,
+        guard: Option<&dyn V2MaintenanceGuard>,
+    ) -> Result<V2StoredCommit>
+    where
+        A: V2CommitAnchor,
+    {
+        self.write_index_snapshot_if_needed(anchor, guard, false)
+            .await?
+            .ok_or_else(|| v2_repository_error(V2FormatError::InvalidRecoveryHistory))
+    }
+
+    pub(super) async fn maybe_publish_recovery_expiry_checkpoint_coordinated<A>(
+        &self,
+        mutation: V2CoordinatedMutation<'_, A>,
+    ) -> Result<Option<V2StoredCommit>>
+    where
+        A: V2CommitAnchor,
+    {
+        self.validate_coordinator_lease(mutation.lease)?;
+        self.write_index_snapshot_if_needed(mutation.anchor, mutation.guard, true)
+            .await
+    }
+
+    async fn write_index_snapshot_if_needed<A>(
+        &self,
+        anchor: &A,
+        guard: Option<&dyn V2MaintenanceGuard>,
+        only_expiry: bool,
+    ) -> Result<Option<V2StoredCommit>>
     where
         A: V2CommitAnchor,
     {
         let _guard = self.mutation_lock.lock().await;
-        self.publish_pending_index_delta(anchor).await?;
+        self.publish_pending_index_delta(anchor, guard).await?;
+        let _publication_guard = self.publication_lock.write().await;
         let base_anchor = anchor
             .read_v2()
             .await
@@ -356,6 +433,24 @@ where
             != Some(&base_anchor)
         {
             return Err(v2_repository_error(V2FormatError::StaleAnchor));
+        }
+        if only_expiry {
+            let accepted = self
+                .accepted
+                .read()
+                .map_err(|_| RepositoryError::StatePoisoned)?;
+            let Some(history) = &accepted.recovery else {
+                return Ok(None);
+            };
+            let Some(policy) = self.commit_store.options().recovery_policy else {
+                return Err(v2_repository_error(V2FormatError::InvalidRecoveryPolicy));
+            };
+            if !history
+                .expiry_checkpoint_due(self.commit_store.publication_now_ms(), policy)
+                .map_err(v2_repository_error)?
+            {
+                return Ok(None);
+            }
         }
         let (covered_generation, expected_live_object_count, expected_runs, receipts) = {
             let accepted = self
@@ -379,6 +474,9 @@ where
         )
         .map_err(v2_repository_error)?
         .with_completion_receipts(receipts);
+        let mut prepared = self
+            .prepare_service_publication(anchor, &base_anchor, true, guard)
+            .await?;
         let temporary_anchor = V2MemoryAnchor::with_state(base_anchor.clone());
         let keyring = self.repository.keyring()?;
         let context = packed::repository_context_from_refs(
@@ -387,7 +485,7 @@ where
         )?;
         let uploaded = self
             .commit_store
-            .write_child_commit_with(&temporary_anchor, |commit_key| {
+            .write_prepared_child_commit_with(&temporary_anchor, &prepared.plan, |commit_key| {
                 let sealed = seal_v2_index_root(
                     keyring.as_ref(),
                     &context,
@@ -395,11 +493,15 @@ where
                     0,
                     &root,
                 )?;
-                Ok(V2CommitWrite::snapshot(vec![V2CommitSection::new(
-                    V2SectionType::IndexRoot,
-                    V2_SECTION_FLAG_MUST_UNDERSTAND,
-                    sealed.bytes().clone(),
-                )]))
+                self.append_recovery_section(
+                    V2CommitWrite::snapshot(vec![V2CommitSection::new(
+                        V2SectionType::IndexRoot,
+                        V2_SECTION_FLAG_MUST_UNDERSTAND,
+                        sealed.bytes().clone(),
+                    )]),
+                    commit_key,
+                    &prepared,
+                )
             })
             .await
             .map_err(v2_repository_error)?;
@@ -415,20 +517,28 @@ where
             .await
             .map_err(v2_repository_error)?;
         self.verify_exact_index_root(&candidate_chain, &root)?;
-        if anchor.read_v2().await.map_err(v2_repository_error)? != Some(base_anchor) {
+        let recovery = self
+            .verify_recovery_publication(anchor, guard, &mut prepared, &uploaded, &[], &[])
+            .await?;
+        if anchor.read_v2().await.map_err(v2_repository_error)? != Some(base_anchor.clone()) {
             return Err(v2_repository_error(V2FormatError::StaleAnchor));
         }
+        self.validate_recovery_publication_freshness(&prepared)?;
         let adopted = self
             .commit_store
-            .adopt_unanchored_child(
+            .adopt_verified_unanchored_child(
                 anchor,
-                &uploaded.commit_key.object_id,
-                uploaded.version_id.as_ref(),
+                &base_anchor,
+                &uploaded,
+                prepared.history_uncertainty_ms(),
             )
             .await
             .map_err(v2_repository_error)?;
         match self.accepted.write() {
-            Ok(mut accepted) => accepted.anchor = Some(adopted.anchor_state.clone()),
+            Ok(mut accepted) => {
+                accepted.anchor = Some(adopted.anchor_state.clone());
+                accepted.recovery = recovery;
+            }
             Err(error) => {
                 self.mark_local_recovery_required();
                 tracing::error!(
@@ -440,7 +550,8 @@ where
                 return Err(RepositoryError::AcceptedRecoveryRequired);
             }
         }
-        Ok(adopted)
+        self.advance_service_recovery_coverage(&prepared, &adopted.anchor_state);
+        Ok(Some(adopted))
     }
 
     fn verify_exact_index_root(&self, chain: &V2ReplayChain, expected: &V2IndexRoot) -> Result<()> {
@@ -511,6 +622,10 @@ where
             .load_replay_chain_from_state(&anchor_state)
             .await
             .map_err(v2_repository_error)?;
+        let recovery = self
+            .commit_store
+            .replay_recovery_history(&chain)
+            .map_err(v2_repository_error)?;
         let (rebuilt, accepted_runs) = self.replay_bounded_chain_to_state_and_runs(&chain).await?;
         if anchor.read_v2().await.map_err(v2_repository_error)? != Some(anchor_state.clone()) {
             return Err(v2_repository_error(V2FormatError::StaleAnchor));
@@ -520,6 +635,7 @@ where
             .accepted
             .write()
             .map_err(|_| RepositoryError::StatePoisoned)? = V2AcceptedState {
+            recovery,
             repository: rebuilt,
             runs: accepted_runs,
             anchor: Some(anchor_state),
@@ -540,9 +656,8 @@ where
         let mut previous_published_at_ms = None;
         for commit in chain.commits_newest_first.iter().rev() {
             let published_at_ms = commit.parsed_header.header.publish_time_ms;
-            if previous_published_at_ms.is_some_and(|previous| published_at_ms < previous) {
-                return Err(v2_repository_error(V2FormatError::StaleAnchor));
-            }
+            super::recovery::validate_parent_time(previous_published_at_ms, published_at_ms)
+                .map_err(v2_repository_error)?;
             previous_published_at_ms = Some(published_at_ms);
             accepted_runs.extend(
                 self.apply_replay_commit_sections(&mut rebuilt, commit)
@@ -577,12 +692,29 @@ where
     where
         A: V2CommitAnchor,
     {
+        self.put_committed_with_guard(anchor, key, body, options, None)
+            .await
+    }
+
+    /// Publishes a direct write using the caller's existing writer exclusion.
+    /// Retained recovery history requires this guard through coverage and publication.
+    pub async fn put_committed_with_guard<A>(
+        &self,
+        anchor: &A,
+        key: LogicalPath,
+        body: Bytes,
+        options: RepositoryPutOptions,
+        guard: Option<&dyn V2MaintenanceGuard>,
+    ) -> Result<RepositoryObjectMetadata>
+    where
+        A: V2CommitAnchor,
+    {
         let _mutation_lease = self.claim_direct_mutation()?;
         let _guard = self.mutation_lock.lock().await;
         let _publication_guard = self.publication_lock.write().await;
         self.ensure_accepted_anchor_matches(anchor).await?;
         let (metadata, rollback) = self.stage_put_unlocked(key, body, options)?;
-        if let Err(error) = self.publish_pending_index_delta_locked(anchor).await {
+        if let Err(error) = self.publish_pending_index_delta_locked(anchor, guard).await {
             self.rollback_staged_puts(vec![rollback])?;
             return Err(error);
         }
@@ -608,13 +740,14 @@ where
         self.put_committed_streaming_detached(
             anchor,
             key,
-            StreamLength {
+            StreamUploadLimits {
                 expected: Some(plaintext_len),
                 maximum: plaintext_len,
+                multipart_part_size,
             },
             stream,
             options,
-            multipart_part_size,
+            None,
         )
         .await
     }
@@ -711,8 +844,15 @@ where
         A: V2CommitAnchor,
     {
         self.validate_coordinator_lease(mutation.lease)?;
-        self.publish_standalone_streaming(mutation.anchor, key, plaintext_len, upload, options)
-            .await
+        self.publish_standalone_streaming(
+            mutation.anchor,
+            key,
+            plaintext_len,
+            upload,
+            options,
+            mutation.guard,
+        )
+        .await
     }
 
     async fn publish_standalone_streaming<A>(
@@ -722,6 +862,7 @@ where
         plaintext_len: u64,
         upload: V2StandalonePayloadUpload,
         options: RepositoryPutOptions,
+        guard: Option<&dyn V2MaintenanceGuard>,
     ) -> Result<RepositoryObjectMetadata>
     where
         A: V2CommitAnchor,
@@ -751,7 +892,7 @@ where
             payload_layout: upload.stored.payload_layout.reference().clone(),
         });
         let result = self
-            .publish_staged_standalone_locked(anchor, &base_anchor, &staged, carrier)
+            .publish_staged_standalone_locked(anchor, &base_anchor, &staged, carrier, guard)
             .await;
         match result {
             Ok(()) => Ok(staged.metadata),
@@ -771,6 +912,7 @@ where
         base_anchor: &super::repository::V2AnchorState,
         staged: &StagedV2Put,
         carrier: Arc<V2StandaloneStreamCarrierReference>,
+        guard: Option<&dyn V2MaintenanceGuard>,
     ) -> Result<()>
     where
         A: V2CommitAnchor,
@@ -802,19 +944,26 @@ where
         if !resolved {
             return Err(v2_repository_error(V2FormatError::InvalidHeaderField));
         }
+        let mut prepared = self
+            .prepare_service_publication(anchor, base_anchor, false, guard)
+            .await?;
         let temporary_anchor = V2MemoryAnchor::with_state(base_anchor.clone());
         let mut accepted_run = None;
         let uploaded = self
             .commit_store
-            .write_child_commit_with(&temporary_anchor, |commit_key| {
+            .write_prepared_child_commit_with(&temporary_anchor, &prepared.plan, |commit_key| {
                 let packed = self
                     .pending_packed_sections_for_commit(commit_key, &pending)
                     .map_err(|_| V2FormatError::InvalidHeaderField)?
                     .ok_or(V2FormatError::InvalidHeaderField)?;
                 accepted_run = Some(packed.run);
-                Ok(V2CommitWrite::delta(packed.sections)
-                    .with_retention(packed.retention)
-                    .with_legal_hold(packed.legal_hold))
+                self.append_recovery_section(
+                    V2CommitWrite::delta(packed.sections)
+                        .with_retention(packed.retention)
+                        .with_legal_hold(packed.legal_hold),
+                    commit_key,
+                    &prepared,
+                )
             })
             .await
             .map_err(v2_repository_error)?;
@@ -822,14 +971,30 @@ where
             .map(|run| self.accepted_run_ref(run, &uploaded))
             .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
         self.validate_accepted_run_append(&accepted_run)?;
-        let install =
+        let mut install =
             self.prepare_pending_install(&pending, staged.sequence, Some(accepted_run))?;
+        install.recovery = self
+            .verify_recovery_publication(
+                anchor,
+                guard,
+                &mut prepared,
+                &uploaded,
+                &Self::pending_recovery_entries(&pending),
+                &[],
+            )
+            .await?;
+        self.validate_recovery_publication_freshness(&prepared)?;
         let adopted = self
             .commit_store
-            .adopt_verified_unanchored_child(anchor, base_anchor, &uploaded)
+            .adopt_verified_unanchored_child(
+                anchor,
+                base_anchor,
+                &uploaded,
+                prepared.history_uncertainty_ms(),
+            )
             .await
             .map_err(|error| self.publication_error(error))?;
-        if let Err(error) = self.install_pending_commit(install, adopted.anchor_state) {
+        if let Err(error) = self.install_pending_commit(install, adopted.anchor_state.clone()) {
             self.mark_local_recovery_required();
             tracing::error!(
                 target: "rs3_repository",
@@ -839,6 +1004,7 @@ where
             );
             return Err(RepositoryError::AcceptedRecoveryRequired);
         }
+        self.advance_service_recovery_coverage(&prepared, &adopted.anchor_state);
         Ok(())
     }
 
@@ -857,13 +1023,17 @@ where
         St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
         let _mutation_lease = self.claim_direct_mutation()?;
-        self.put_committed_streaming_unknown_len_inner(
+        self.put_committed_streaming_detached(
             anchor,
             key,
+            StreamUploadLimits {
+                expected: None,
+                maximum: max_plaintext_len,
+                multipart_part_size,
+            },
             stream,
             options,
-            multipart_part_size,
-            max_plaintext_len,
+            None,
         )
         .await
     }
@@ -882,40 +1052,17 @@ where
         St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
         self.validate_coordinator_lease(mutation.lease)?;
-        self.put_committed_streaming_unknown_len_inner(
+        self.put_committed_streaming_detached(
             mutation.anchor,
             key,
-            stream,
-            options,
-            multipart_part_size,
-            max_plaintext_len,
-        )
-        .await
-    }
-
-    async fn put_committed_streaming_unknown_len_inner<A, St>(
-        &self,
-        anchor: &A,
-        key: LogicalPath,
-        stream: St,
-        options: RepositoryPutOptions,
-        multipart_part_size: usize,
-        max_plaintext_len: u64,
-    ) -> Result<RepositoryObjectMetadata>
-    where
-        A: V2CommitAnchor,
-        St: Stream<Item = Result<Bytes>> + Unpin + Send,
-    {
-        self.put_committed_streaming_detached(
-            anchor,
-            key,
-            StreamLength {
+            StreamUploadLimits {
                 expected: None,
                 maximum: max_plaintext_len,
+                multipart_part_size,
             },
             stream,
             options,
-            multipart_part_size,
+            mutation.guard,
         )
         .await
     }
@@ -924,19 +1071,20 @@ where
         &self,
         anchor: &A,
         key: LogicalPath,
-        length: StreamLength,
+        limits: StreamUploadLimits,
         mut stream: St,
         options: RepositoryPutOptions,
-        multipart_part_size: usize,
+        guard: Option<&dyn V2MaintenanceGuard>,
     ) -> Result<RepositoryObjectMetadata>
     where
         A: V2CommitAnchor,
         St: Stream<Item = Result<Bytes>> + Unpin + Send,
     {
-        let StreamLength {
+        let StreamUploadLimits {
             expected: expected_plaintext_len,
             maximum: max_plaintext_len,
-        } = length;
+            multipart_part_size,
+        } = limits;
         self.validate_client_object_lock(&options)?;
         self.ensure_put_create_allowed(&key, &options)?;
         let first = super::repository::next_nonempty_stream_chunk(
@@ -953,7 +1101,7 @@ where
             let _publication_guard = self.publication_lock.write().await;
             self.ensure_accepted_anchor_matches(anchor).await?;
             let (metadata, rollback) = self.stage_put_unlocked(key, Bytes::new(), options)?;
-            if let Err(error) = self.publish_pending_index_delta_locked(anchor).await {
+            if let Err(error) = self.publish_pending_index_delta_locked(anchor, guard).await {
                 self.rollback_staged_puts(vec![rollback])?;
                 return Err(error);
             }
@@ -974,7 +1122,7 @@ where
             )
             .await?;
         let plaintext_len = upload.stored.payload_layout.plaintext_len;
-        self.publish_standalone_streaming(anchor, key, plaintext_len, upload, options)
+        self.publish_standalone_streaming(anchor, key, plaintext_len, upload, options, guard)
             .await
     }
 
@@ -1791,8 +1939,21 @@ where
     where
         A: V2CommitAnchor,
     {
+        self.delete_committed_with_guard(anchor, key, None).await
+    }
+
+    /// Publishes a direct tombstone using the caller's existing writer exclusion.
+    pub async fn delete_committed_with_guard<A>(
+        &self,
+        anchor: &A,
+        key: LogicalPath,
+        guard: Option<&dyn V2MaintenanceGuard>,
+    ) -> Result<DeleteOutcome>
+    where
+        A: V2CommitAnchor,
+    {
         let _mutation_lease = self.claim_direct_mutation()?;
-        self.delete_committed_inner(anchor, key).await
+        self.delete_committed_inner(anchor, key, guard).await
     }
 
     pub(super) async fn delete_committed_coordinated<A>(
@@ -1804,10 +1965,16 @@ where
         A: V2CommitAnchor,
     {
         self.validate_coordinator_lease(mutation.lease)?;
-        self.delete_committed_inner(mutation.anchor, key).await
+        self.delete_committed_inner(mutation.anchor, key, mutation.guard)
+            .await
     }
 
-    async fn delete_committed_inner<A>(&self, anchor: &A, key: LogicalPath) -> Result<DeleteOutcome>
+    async fn delete_committed_inner<A>(
+        &self,
+        anchor: &A,
+        key: LogicalPath,
+        guard: Option<&dyn V2MaintenanceGuard>,
+    ) -> Result<DeleteOutcome>
     where
         A: V2CommitAnchor,
     {
@@ -1815,7 +1982,7 @@ where
         let _publication_guard = self.publication_lock.write().await;
         self.ensure_accepted_anchor_matches(anchor).await?;
         let rollback = self.stage_delete(&key)?;
-        if let Err(error) = self.publish_pending_index_delta_locked(anchor).await {
+        if let Err(error) = self.publish_pending_index_delta_locked(anchor, guard).await {
             self.rollback_state_mutations(vec![rollback])?;
             return Err(error);
         }
@@ -2002,34 +2169,37 @@ where
         &self,
         anchor: &A,
         publication: V2PendingPublication,
+        guard: Option<&dyn V2MaintenanceGuard>,
     ) -> Result<Option<V2StoredCommit>>
     where
         A: V2CommitAnchor,
     {
         let _publication_guard = self.publication_lock.write().await;
-        self.publish_pending_snapshot(anchor, publication.snapshot)
+        self.publish_pending_snapshot(anchor, publication.snapshot, guard)
             .await
     }
 
     pub(crate) async fn publish_pending_index_delta<A>(
         &self,
         anchor: &A,
+        guard: Option<&dyn V2MaintenanceGuard>,
     ) -> Result<Option<V2StoredCommit>>
     where
         A: V2CommitAnchor,
     {
         let _publication_guard = self.publication_lock.write().await;
-        self.publish_pending_index_delta_locked(anchor).await
+        self.publish_pending_index_delta_locked(anchor, guard).await
     }
 
     async fn publish_pending_index_delta_locked<A>(
         &self,
         anchor: &A,
+        guard: Option<&dyn V2MaintenanceGuard>,
     ) -> Result<Option<V2StoredCommit>>
     where
         A: V2CommitAnchor,
     {
-        self.publish_pending_snapshot(anchor, self.pending_snapshot()?)
+        self.publish_pending_snapshot(anchor, self.pending_snapshot()?, guard)
             .await
     }
 
@@ -2037,6 +2207,7 @@ where
         &self,
         anchor: &A,
         mut pending: PendingV2Snapshot,
+        guard: Option<&dyn V2MaintenanceGuard>,
     ) -> Result<Option<V2StoredCommit>>
     where
         A: V2CommitAnchor,
@@ -2045,21 +2216,28 @@ where
             return Ok(None);
         };
         let base_anchor = self.ensure_accepted_anchor_matches(anchor).await?;
+        let mut prepared = self
+            .prepare_service_publication(anchor, &base_anchor, false, guard)
+            .await?;
         let mut accepted_pack_locations = None;
         let mut accepted_run = None;
         let temporary_anchor = V2MemoryAnchor::with_state(base_anchor.clone());
         let uploaded = self
             .commit_store
-            .write_child_commit_with(&temporary_anchor, |commit_key| {
+            .write_prepared_child_commit_with(&temporary_anchor, &prepared.plan, |commit_key| {
                 let packed = self
                     .pending_packed_sections_for_commit(commit_key, &pending)
                     .map_err(|_| V2FormatError::InvalidHeaderField)?
                     .ok_or(V2FormatError::ObjectTooLarge)?;
                 accepted_pack_locations = Some(packed.locations);
                 accepted_run = Some(packed.run);
-                Ok(V2CommitWrite::delta(packed.sections)
-                    .with_retention(packed.retention)
-                    .with_legal_hold(packed.legal_hold))
+                self.append_recovery_section(
+                    V2CommitWrite::delta(packed.sections)
+                        .with_retention(packed.retention)
+                        .with_legal_hold(packed.legal_hold),
+                    commit_key,
+                    &prepared,
+                )
             })
             .await
             .map_err(v2_repository_error)?;
@@ -2084,10 +2262,26 @@ where
             .as_ref()
             .ok_or_else(|| v2_repository_error(V2FormatError::InvalidHeaderField))?;
         self.resolve_pending_pack_refs(&mut pending, &uploaded, locations)?;
-        let install = self.prepare_pending_install(&pending, sequence, accepted_run)?;
+        let mut install = self.prepare_pending_install(&pending, sequence, accepted_run)?;
+        install.recovery = self
+            .verify_recovery_publication(
+                anchor,
+                guard,
+                &mut prepared,
+                &uploaded,
+                &Self::pending_recovery_entries(&pending),
+                &[],
+            )
+            .await?;
+        self.validate_recovery_publication_freshness(&prepared)?;
         let stored = self
             .commit_store
-            .adopt_verified_unanchored_child(anchor, &base_anchor, &uploaded)
+            .adopt_verified_unanchored_child(
+                anchor,
+                &base_anchor,
+                &uploaded,
+                prepared.history_uncertainty_ms(),
+            )
             .await
             .map_err(|error| self.publication_error(error))?;
         if let Err(error) = self.install_pending_commit(install, stored.anchor_state.clone()) {
@@ -2100,6 +2294,7 @@ where
             );
             return Err(RepositoryError::AcceptedRecoveryRequired);
         }
+        self.advance_service_recovery_coverage(&prepared, &stored.anchor_state);
         Ok(Some(stored))
     }
 
@@ -2244,6 +2439,7 @@ where
             .map_err(|_| RepositoryError::StatePoisoned)?
             .validate_snapshot(pending)?;
         Ok(PendingV2Install {
+            recovery: None,
             completion_receipts,
             sequence,
             mutations,
@@ -2301,6 +2497,7 @@ where
         if let Some(run) = install.run {
             accepted.runs.push(run);
         }
+        accepted.recovery = install.recovery;
         accepted.anchor = Some(anchor);
         Ok(())
     }
@@ -2448,7 +2645,7 @@ where
                 return Err(v2_repository_error(V2FormatError::UnsupportedSection));
             }
             match section.section_type {
-                V2SectionType::PayloadPack => {}
+                V2SectionType::PayloadPack | V2SectionType::Recovery => {}
                 V2SectionType::IndexRun => {
                     let section_bytes = replay_section_bytes(commit, index)?;
                     let keyring = self.repository.keyring()?;

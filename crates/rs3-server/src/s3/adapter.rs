@@ -234,6 +234,15 @@ impl GatewayS3Service {
         Self::from_repository(config, repository).await
     }
 
+    pub(super) async fn from_config_with_recovery_point(
+        config: &RuntimeConfig,
+        sequence: rs3_types::Sequence,
+    ) -> Result<Self, S3BoundaryError> {
+        let repository =
+            RuntimeRepository::from_config_with_recovery_point(config, sequence).await?;
+        Self::from_repository(config, repository).await
+    }
+
     #[cfg(feature = "k8s")]
     pub(super) async fn from_config_with_writer_fence(
         config: &RuntimeConfig,
@@ -415,7 +424,7 @@ impl GatewayS3Service {
         self.delete_committed_key(object.key).await
     }
 
-    fn admit_request(&self, operation: &'static str) -> S3Result<OwnedSemaphorePermit> {
+    async fn admit_request(&self, operation: &'static str) -> S3Result<OwnedSemaphorePermit> {
         let permit = match self.request_slots.clone().try_acquire_owned() {
             Ok(permit) => Ok(permit),
             Err(_error) => {
@@ -434,6 +443,11 @@ impl GatewayS3Service {
                 "gateway request rate limit exceeded"
             ));
         }
+
+        self.repository
+            .check_recovery_authority()
+            .await
+            .map_err(repository_error)?;
 
         Ok(permit)
     }
@@ -858,7 +872,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             Ok(S3Response::new(HeadBucketOutput::default()))
         }
@@ -887,7 +901,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             if input.expected_bucket_owner.is_some() {
                 return Err(s3s::s3_error!(
@@ -920,7 +934,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, None);
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             Ok(S3Response::new(ListBucketsOutput {
                 buckets: Some(vec![Bucket {
                     name: Some(self.public_bucket.as_str().to_owned()),
@@ -958,7 +972,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             Ok(S3Response::new(GetBucketLocationOutput {
                 location_constraint: None,
@@ -989,7 +1003,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             self.check_mutation_allowed()?;
             validate_copy_object_headers(&req.headers)?;
@@ -1036,7 +1050,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             self.check_mutation_allowed()?;
             validate_put_object_request(&input, self.max_put_object_bytes)?;
@@ -1334,7 +1348,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             validate_get_object_request(&input)?;
 
@@ -1460,7 +1474,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             validate_head_object_request(&input)?;
 
@@ -1535,7 +1549,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             validate_get_object_legal_hold_request(&input)?;
 
@@ -1570,7 +1584,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             self.check_mutation_allowed()?;
             let _ = put_object_legal_hold_request_status(&input)?;
@@ -1604,7 +1618,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             validate_list_versions_request(&input)?;
             let prefix = input.prefix.clone().unwrap_or_default();
@@ -1642,7 +1656,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
 
             let prefix = input.prefix.unwrap_or_default();
@@ -1702,7 +1716,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
 
             let prefix = input.prefix.unwrap_or_default();
@@ -1767,7 +1781,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             self.check_mutation_allowed()?;
             validate_delete_object_request(&input)?;
@@ -1804,7 +1818,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             self.check_mutation_allowed()?;
             validate_delete_objects_request(&input)?;
@@ -1955,8 +1969,8 @@ mod tests {
     mod multipart_checksum;
 
     use super::{
-        DownloadBodyBudget, GatewayS3Service, RequestRateLimiter, UploadBodyBudget,
-        status_code_label,
+        DownloadBodyBudget, GatewayS3Service, RequestRateLimiter, RuntimeRepository,
+        UploadBodyBudget, status_code_label,
     };
     use crate::GatewayMode;
     use crate::config::configured_streaming_upload_working_set_bytes;
@@ -1976,6 +1990,7 @@ mod tests {
         PutObjectLegalHoldInput, StorageClass, StreamingBlob, Timestamp, UploadPartInput,
     };
     use s3s::{Body, S3, S3Request, S3Response};
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     async fn gateway_service() -> GatewayS3Service {
@@ -1992,7 +2007,13 @@ mod tests {
             RetentionMode::Governance,
             1,
         ));
-        GatewayS3Service::from_config(&config)
+        let repository = RuntimeRepository::from_config_with_maintenance_guard(
+            &config,
+            Arc::new(rs3_repository::v2::UnenforcedQuiescedMaintenanceGuard),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+        GatewayS3Service::from_repository(&config, repository)
             .await
             .unwrap_or_else(|error| panic!("{error}"))
     }
@@ -3764,10 +3785,12 @@ mod tests {
             });
         let _permit = service
             .admit_request("TestOperation")
+            .await
             .unwrap_or_else(|error| panic!("{error}"));
 
         let error = service
             .admit_request("TestOperation")
+            .await
             .expect_err("second admission should be rejected");
 
         assert_eq!(error.code().as_str(), "SlowDown");

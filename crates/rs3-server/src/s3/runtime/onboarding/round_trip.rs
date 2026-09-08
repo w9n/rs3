@@ -154,7 +154,7 @@ pub(super) async fn verify<J: Journal>(
                 .await
                 .map_err(|_| failed())?;
             repository
-                .put_committed(
+                .put_committed_with_guard(
                     anchor,
                     key.clone(),
                     body.clone(),
@@ -162,6 +162,7 @@ pub(super) async fn verify<J: Journal>(
                         create_only: true,
                         ..Default::default()
                     },
+                    Some(guard),
                 )
                 .await
                 .map_err(|_| failed())?;
@@ -204,7 +205,7 @@ pub(super) async fn verify<J: Journal>(
                 .await
                 .map_err(|_| failed())?;
             repository
-                .delete_committed(anchor, key.clone())
+                .delete_committed_with_guard(anchor, key.clone(), Some(guard))
                 .await
                 .map_err(|_| failed())?;
         } else if accepted.sequence <= verified.sequence {

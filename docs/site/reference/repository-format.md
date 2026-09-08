@@ -110,9 +110,10 @@ index root. Exact stored lengths are checked against postconditions and signed
 section coverage. Signature input is the complete prelude and canonical header
 with the signature field zeroed. There is no separate header digest.
 
-The complete header span is limited to 8 KiB and a reader accepts at most two
-sections. Delta commits contain `[INDEX_RUN]` or `[PAYLOAD_PACK, INDEX_RUN]`;
-root commits contain exactly `[INDEX_ROOT]`. Every section must carry the
+The complete header span is limited to 8 KiB and a reader accepts at most three
+sections. Delta commits contain `[INDEX_RUN]`, `[PAYLOAD_PACK, INDEX_RUN]`, or
+one of those layouts with a trailing `[RECOVERY]`; root commits contain
+`[INDEX_ROOT]` with an optional `[RECOVERY]`. Every section must carry the
 must-understand flag, with no compression. Every commit uses a single PUT;
 there is no upload-mode field or padded header. Retired section codes
 `0x0001` through `0x0004`, nonzero reserved bytes or capabilities, noncanonical
@@ -121,10 +122,13 @@ outside the signed layout fail closed. Signed section digests, framed indices,
 compacted runs and detached payloads are intrinsic to format 3; no capability
 bits are assigned. Root catalogs accept levels zero and one.
 
-`publish_time_ms` is signed wall-clock metadata. The current writer uses its
-local clock, and replay does not yet enforce a timestamp greater than the
-parent's. Strict chronology and its clock/handoff tests remain required before
-retention-history qualification. Sequence order is independently validated.
+`publish_time_ms` is signed wall-clock metadata. Each accepted child must have a
+strictly later publication time than its exact parent. The writer chooses that
+time from one sampled clock value with a bounded lead for millisecond
+tie-breaking, and exact retries reuse the prepared value. Recovery expiry uses
+the separately sampled current time and its declared uncertainty; a signed
+publication timestamp alone never authorizes expiry. Sequence order is
+independently validated.
 
 The current framed index plaintext is wire version 10. Frame, section and mutation
 ordinals, generations, content lengths, retention days, and bounded counts use
@@ -152,6 +156,62 @@ reader can authenticate an index range without downloading unrelated payload
 sections. Payload ciphertext is authenticated when the referenced object is
 read. The whole-object digest remains an identity and maintenance check, not a
 reason to read every payload during startup.
+
+## Authenticated Recovery History
+
+When the recovery policy is enabled, accepted v03 commits carry an encrypted
+`Recovery` section with wire code `0x0008`. The section is authenticated by the
+containing signed section descriptor and sealed with the metadata key under the
+same repository and exact-object context as other encrypted metadata. A root
+commit may pair it with `INDEX_ROOT`; a child commit may pair it with `INDEX_RUN`
+and an optional payload pack.
+
+Each accepted successor registers the exact predecessor anchor in this section.
+The registered point stores the predecessor publication time, the fixed
+supersession deadline, and the policy identity that produced that deadline.
+The accepted current anchor is implicit and is not duplicated as a historical
+record. A point enters history only when its successor is accepted through the
+external anchor. The server preset is a 30-day window with a one-day renewal
+margin; these values and the clock uncertainty are bounded configuration. A
+reduction changes the policy for new points; it cannot shorten an already
+accepted point's deadline.
+
+Expiry is an authenticated state transition. The writer derives a conservative
+cutoff from a sampled current clock minus the configured uncertainty, then
+publishes that cutoff in a later accepted recovery section under the normal
+writer fence and anchor protocol. Parent chronology uses signed commit times;
+expiry does not use provider timestamps or the commit timestamp as a substitute
+for current time.
+
+The encrypted registry uses a bounded tail and exact page references. The
+encoded recovery section is capped at 8 MiB, the active tail at 4,096 points,
+the registry at 1,024 pages, and each page at 4,096 points. Page references
+carry authenticated sequence and deadline claims plus the exact commit,
+provider-version, section, and page location needed to read that page. Recovery
+loads one exact page at a time and never treats an old page's embedded registry
+as new authority. If a page contains both expired and live points, its release
+is delayed conservatively to the page's maximum deadline. These storage bounds
+do not establish an effective history capacity: replay, graph, inventory, and
+provider byte budgets can impose a lower limit, and v03 has no qualified
+four-million-point capacity claim.
+
+For the retained-version Object Lock profile, a successor is not acknowledged
+until the exact restore dependency graph is covered through the required
+supersession promise. Renewal reserves an additional margin that subsequent
+writes may reuse. The writer renews and post-verifies exact
+provider versions, rechecks the writer fence and unchanged parent, and only then
+performs the anchor CAS. Missing version IDs, insufficient protection, an
+ambiguous provider result, a budget exhaustion, or a fence change fails closed.
+Non-retained profiles do not provide this provider-history guarantee and remain
+subject to their selected provider conformance contract.
+
+Each S3 endpoint exposes one unversioned namespace: the live namespace by
+default, or the selected historical namespace in a readonly recovery gateway.
+Historical `versionId` reads, version listings, delete-marker APIs, and client
+registration of arbitrary historical roots are unsupported. Recovery points are
+selected through the separate authenticated operator recovery interface and
+opened in an isolated read-only namespace; selection never rewinds or advances
+the live anchor.
 
 ## Value-Separated Payload Packs
 
@@ -674,8 +734,9 @@ backpressure; the format ceiling remains the final bound.
 
 ## Reachability, Retention, and GC
 
-The authoritative reachability graph starts from the current anchor and every
-explicitly protected historical anchor. For each root it includes:
+The authoritative reachability graph starts from the current anchor, every
+unexpired point in the accepted encrypted recovery registry, and any explicitly
+supplied same-format protected root. For each root it includes:
 
 - the exact catalog and post-catalog commit versions;
 - the exact active index-run versions;
@@ -710,10 +771,11 @@ or exhaustion of either ceiling aborts before mutation.
 
 Protected historical anchors must bind the active exact format-root reference.
 Supplying a root from another format generation fails before object-store
-reads. The gateway does not expose historical-root registration, in-place
-format/data-key rotation, or cross-format protected-root renewal. Existing held
-graphs also fail full maintenance. New v03 legal holds are disabled until hold
-propagation and guarded release cover every restore dependency.
+reads. The gateway does not expose client registration of arbitrary historical
+roots, in-place format/data-key rotation, or cross-format protected-root
+renewal. Existing held graphs also fail full maintenance. New v03 legal holds
+are disabled until hold propagation and guarded release cover every restore
+dependency.
 
 Payload-pack cleaning is not implemented. A fully dead pack can be reclaimed
 by exact-root GC once age, protection and fence checks pass. A mixed pack keeps

@@ -64,8 +64,8 @@ pub use s3::{
     export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
     init_v2_repository_from_config, inspect_keyring_envelope_from_tool_config,
     inspect_keyring_envelope_with_store, offline_maintenance_runtime_from_config,
-    rewrap_keyring_envelope_from_tool_config, rewrap_keyring_envelope_with_store,
-    v2_bootstrap_journal_is_initialized, verify_v2_recovery_bundle_from_tool_config,
-    verify_v2_recovery_bundle_with_store,
+    recovery_points_from_config, rewrap_keyring_envelope_from_tool_config,
+    rewrap_keyring_envelope_with_store, v2_bootstrap_journal_is_initialized,
+    verify_v2_recovery_bundle_from_tool_config, verify_v2_recovery_bundle_with_store,
 };
 pub use server::{GatewayServer, GatewayServerError};

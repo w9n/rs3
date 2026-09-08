@@ -106,9 +106,12 @@ and last persisted provider-conformance evidence. `GET /admin/status` adds
 restore-trust and maintenance verification and may touch repository state. For
 v2 repositories, status includes verified commit-chain counts, orphan counts,
 and commit-retention renewal counts using the built-in seven-day renewal
-horizon. Full-maintenance dry runs can also include explicit protected
-historical roots; those roots block orphan deletion until the operator
-deliberately discards them from the maintenance plan.
+horizon. For retained Object Lock repositories, accepted predecessors are
+registered automatically in the encrypted
+recovery history and are included in maintenance protection. Full-maintenance
+dry runs can also include explicit externally supplied historical roots; those
+roots block orphan deletion until the operator deliberately discards them from
+the maintenance plan.
 Neither report exposes a path browser, configured bucket names, backend
 prefixes, repository IDs, client-visible object paths, or secret material. Treat
 these reports as preview fact models, not as stable workflow APIs.
@@ -453,6 +456,14 @@ Provider retention is capability-gated. A backend that cannot extend retention
 must return an unsupported operation rather than pretending the object is
 protected.
 
+Recovery history has a separate logical window. `RS3_RECOVERY_WINDOW_DAYS=30`
+is the default for newly published points; `RS3_REPOSITORY_RETENTION_DAYS` is
+the physical provider-protection floor and must cover the automatic maintenance
+interval plus its renewal safety horizon. The provider may impose a longer
+floor, and accepted deadlines are never shortened. Retained read-write serving
+requires `RS3_MAINTENANCE_MODE=auto`; set `RS3_RECLAMATION_ENABLED=false` to
+keep renewal active while disabling physical orphan deletion.
+
 ## Full Maintenance
 
 The read-write gateway runs the v2 full-maintenance supervisor in process. It
@@ -600,6 +611,28 @@ verified commit chain and external anchor over any mode that repairs state
 automatically. If break-glass restore is added, it should require explicit
 operator input and leave an audit trail.
 
+When the live anchor and authenticated recovery registry are available, list
+and select an exact recovery point without changing the production namespace:
+
+```sh
+rs3 recovery-points --limit 100 --format json
+rs3 recovery-points --limit 100 --cursor '<next_cursor>' --format json
+
+rs3 serve \
+  --gateway-mode restore-readonly \
+  --recovery-point <sequence> \
+  --bind 127.0.0.1:9081
+```
+
+The cursor is bound to the live anchor. The selected view rechecks the anchor
+and protection deadline, rejects writes and deletes, and serves the selected
+logical namespace for restore. Copy recovered data to an isolated destination;
+copying it back is a separately reviewed normal write. This preview workflow
+does not rewind the live anchor or expose S3 `versionId` history. Use the
+[incident runbook](runbooks/restore-under-attack.md) for the trusted-bundle
+fallback when live authority is unavailable. Retained-provider restart, fault,
+and outage qualification remains pending.
+
 !!! note "DR survival kit"
     Keep this material outside the object-store account and outside the namespace
     being protected:
@@ -698,10 +731,10 @@ verifies the anchor-selected signed commit chain to the nearest snapshot
 without mutating storage or the external anchor.
 
 The bundle is a weak-subjectivity checkpoint, not a permanent snapshot pin.
-Automatic maintenance protects the current anchor graph and does not register
-older exported roots. Refresh the preserved bundle after maintenance or major
-repository changes, and before the provider retention window covering its
-referenced versions can expire. Keep at least one previously verified bundle
+The automatic recovery registry protects accepted points and maintenance renews
+their referenced graph; it does not register older exported roots. Refresh the
+preserved bundle after maintenance or major repository changes, and before the
+provider retention window covering its referenced versions can expire. Keep at least one previously verified bundle
 until its replacement has been exported, signed, and verified.
 
 On a new cluster with a missing anchor, import the trusted v2 anchor from that

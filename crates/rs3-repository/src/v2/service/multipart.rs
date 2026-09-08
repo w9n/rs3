@@ -386,9 +386,9 @@ impl<S: BlobStore + Clone> V2Repository<S> {
             len,
             completion.options,
             if len == 0 {
-                super::StagedPayload::Buffered(Bytes::new())
+                StagedPayload::Buffered(Bytes::new())
             } else {
-                super::StagedPayload::Detached
+                StagedPayload::Detached
             },
             completion.verified.etag,
         )?;
@@ -436,7 +436,7 @@ impl<S: BlobStore + Clone> V2Repository<S> {
                 }
             }
             pending.completion_receipt = Some(receipt.clone());
-            self.publish_pending_snapshot(mutation.anchor, pending)
+            self.publish_pending_snapshot(mutation.anchor, pending, mutation.guard)
                 .await?
                 .ok_or_else(invalid_completion)?;
             Ok(receipt)

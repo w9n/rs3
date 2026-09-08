@@ -136,6 +136,12 @@
 - name: RS3_RECOVERY_PUBLIC_KEY
   value: {{ .Values.recovery.publicKey | quote }}
 {{- end }}
+- name: RS3_RECOVERY_WINDOW_DAYS
+  value: {{ .Values.recovery.windowDays | quote }}
+- name: RS3_RECOVERY_RENEWAL_MARGIN_SECONDS
+  value: {{ .Values.recovery.renewalMarginSeconds | quote }}
+- name: RS3_RECOVERY_CLOCK_UNCERTAINTY_MS
+  value: {{ .Values.recovery.clockUncertaintyMs | quote }}
 - name: RS3_ANCHOR_MODE
   value: {{ .Values.anchor.mode | quote }}
 - name: RS3_WRITER_GUARD
@@ -152,6 +158,8 @@
 - name: RS3_ANCHOR_FIELD_MANAGER
   value: {{ .Values.anchor.fieldManager | quote }}
 {{- end }}
+- name: RS3_RECLAMATION_ENABLED
+  value: {{ ternary false .Values.maintenance.reclamationEnabled (eq .Values.gateway.mode "restore-readonly") | quote }}
 {{- if .Values.maintenance.mode }}
 - name: RS3_MAINTENANCE_MODE
   value: {{ .Values.maintenance.mode | quote }}

@@ -66,14 +66,43 @@ where
         )
         .map_err(|_| V2FormatError::InvalidHeaderField)?;
         let sealed = seal_v2_index_root(&self.keyring, &context, &commit_key.object_id, 0, &root)?;
-        let write = V2CommitWrite::snapshot(vec![V2CommitSection::new(
+        let mut write = V2CommitWrite::snapshot(vec![V2CommitSection::new(
             V2SectionType::IndexRoot,
             V2_SECTION_FLAG_MUST_UNDERSTAND,
             sealed.bytes().clone(),
         )]);
+        if let Some(policy) = self.options.recovery_policy {
+            let recovery = crate::v2::recovery::history::RecoverySection {
+                current_policy: policy,
+                delta: Default::default(),
+                snapshot: Some(Default::default()),
+                local_pages: Vec::new(),
+            };
+            let bytes = crate::v2::recovery::section::seal(
+                &self.keyring,
+                &context,
+                &commit_key.object_id,
+                1,
+                &recovery.encode()?,
+            )?;
+            write.sections.push(V2CommitSection::new(
+                V2SectionType::Recovery,
+                V2_SECTION_FLAG_MUST_UNDERSTAND,
+                bytes,
+            ));
+        }
         let (section_index, section_region) = build_section_region(&write.sections)?;
         let body_digest = body_digest_for_v2_sections(&section_index, &section_region)?;
-        let header = self.build_header(&commit_key, None, &write, section_index, body_digest)?;
+        let publish_time_ms =
+            super::super::recovery::choose_publish_time(self.publication_now_ms(), None)?;
+        let header = self.build_header(
+            &commit_key,
+            None,
+            &write,
+            section_index,
+            body_digest,
+            publish_time_ms,
+        )?;
         Ok(V2PreparedGenesis {
             record: GenesisRecord {
                 schema: JOURNAL_SCHEMA.to_owned(),
@@ -126,7 +155,12 @@ where
             || header.self_ref.sequence != Sequence::new(1)
             || header.kind != V2CommitKind::Root
             || header.keyring_envelope_ref != record.keyring_envelope_ref
-            || header.section_index.len() != 1
+            || header.section_index.len()
+                != if self.options.recovery_policy.is_some() {
+                    2
+                } else {
+                    1
+                }
             || header.section_index[0].section_type != V2SectionType::IndexRoot
         {
             return Err(V2FormatError::InvalidHeaderField);
@@ -141,7 +175,10 @@ where
             &context,
             &record.object_id,
             0,
-            &record.body[parsed.parsed_header.sections_start..],
+            &record.body[parsed.parsed_header.sections_start
+                ..parsed.parsed_header.sections_start
+                    + usize::try_from(header.section_index[0].length)
+                        .map_err(|_| V2FormatError::SectionBounds)?],
         )?;
         let expected = V2IndexRoot::new(
             Sequence::new(0),
@@ -150,6 +187,42 @@ where
             self.options.keyring_envelope_ref.clone(),
             Vec::new(),
         )?;
+        if let Some(policy) = self.options.recovery_policy {
+            let descriptor = &header.section_index[1];
+            if descriptor.section_type != V2SectionType::Recovery {
+                return Err(V2FormatError::InvalidRecoveryHistory);
+            }
+            let start = parsed
+                .parsed_header
+                .sections_start
+                .checked_add(
+                    usize::try_from(descriptor.offset).map_err(|_| V2FormatError::SectionBounds)?,
+                )
+                .ok_or(V2FormatError::SectionBounds)?;
+            let length =
+                usize::try_from(descriptor.length).map_err(|_| V2FormatError::SectionBounds)?;
+            let stored = record
+                .body
+                .get(
+                    start
+                        ..start
+                            .checked_add(length)
+                            .ok_or(V2FormatError::SectionBounds)?,
+                )
+                .ok_or(V2FormatError::SectionBounds)?;
+            let plaintext = crate::v2::recovery::section::open(
+                &self.keyring,
+                &context,
+                &record.object_id,
+                1,
+                stored,
+            )?;
+            let recovery = crate::v2::recovery::history::RecoverySection::decode(&plaintext)?;
+            recovery.validate_for_commit(None, header.publish_time_ms, true, 0)?;
+            if recovery.current_policy != policy {
+                return Err(V2FormatError::InvalidRecoveryPolicy);
+            }
+        }
         if root != expected {
             return Err(V2FormatError::InvalidHeaderField);
         }
@@ -175,8 +248,49 @@ where
     where
         A: V2CommitAnchor,
     {
+        self.publish_prepared_genesis_inner(anchor, prepared, allow_upload, None)
+            .await
+    }
+
+    /// Publishes retained recovery genesis under the caller's real writer fence.
+    pub async fn publish_prepared_genesis_with_guard<A: V2CommitAnchor>(
+        &self,
+        anchor: &A,
+        prepared: &V2PreparedGenesis,
+        allow_upload: bool,
+        guard: &dyn crate::v2::V2MaintenanceGuard,
+    ) -> V2Result<V2StoredCommit> {
+        self.publish_prepared_genesis_inner(anchor, prepared, allow_upload, Some(guard))
+            .await
+    }
+
+    /// Creates retained recovery genesis under the caller's real writer fence.
+    pub async fn write_genesis_snapshot_with_guard<A: V2CommitAnchor>(
+        &self,
+        anchor: &A,
+        guard: &dyn crate::v2::V2MaintenanceGuard,
+    ) -> V2Result<V2StoredCommit> {
+        if anchor.read_v2().await?.is_some() {
+            return Err(V2FormatError::StaleAnchor);
+        }
+        let prepared = self.prepare_genesis_snapshot()?;
+        self.publish_prepared_genesis_with_guard(anchor, &prepared, true, guard)
+            .await
+    }
+
+    async fn publish_prepared_genesis_inner<A: V2CommitAnchor>(
+        &self,
+        anchor: &A,
+        prepared: &V2PreparedGenesis,
+        allow_upload: bool,
+        guard: Option<&dyn crate::v2::V2MaintenanceGuard>,
+    ) -> V2Result<V2StoredCommit> {
         let parsed = self.validate_prepared_genesis(prepared)?;
         let header = &parsed.parsed_header.header;
+        super::super::recovery::validate_publication_time(
+            self.publication_now_ms(),
+            header.publish_time_ms,
+        )?;
         let record = &prepared.record;
         let current = anchor.read_v2().await?;
         if let Some(current) = current.as_ref()
@@ -188,14 +302,37 @@ where
         {
             return Err(V2FormatError::StaleAnchor);
         }
+        let needs_recovery_protection = current.is_none()
+            && record.provider_profile == V2ProviderProfile::RetainedVersionObjectLock
+            && self.options.recovery_policy.is_some();
+        if needs_recovery_protection {
+            guard
+                .ok_or(V2FormatError::ProviderProfileFailed)?
+                .verify_v2_maintenance(None)
+                .await?;
+        }
         // Once accepted, the external anchor selects the exact version. Before
         // acceptance, only the journal's one preselected random identity is read.
         let version = current.as_ref().and_then(|state| state.version_id.as_ref());
-        let required_deadline = if current.is_none() {
+        let mut required_deadline = if current.is_none() {
             required_retain_until_ms(record.retention)
         } else {
             None
         };
+        if current.is_none()
+            && record.provider_profile == V2ProviderProfile::RetainedVersionObjectLock
+            && let Some(policy) = self.options.recovery_policy
+        {
+            let recovery_deadline = policy.coverage_until_ms(self.publication_now_ms())?;
+            required_deadline = Some(required_deadline.map_or(recovery_deadline, |existing| {
+                existing.max(recovery_deadline)
+            }));
+        }
+        let physical_retention = crate::v2::recovery::policy::physical_retention_for_deadline(
+            record.retention,
+            required_deadline,
+            self.publication_now_ms(),
+        )?;
         let metadata = match self.store.head_at(&record.object_id, version).await {
             Ok(metadata) => metadata,
             Err(StorageError::NotFound(_)) if current.is_none() => {
@@ -206,7 +343,7 @@ where
                     .put_commit_object(
                         &record.object_id,
                         Bytes::copy_from_slice(&record.body),
-                        record.retention,
+                        physical_retention,
                         record.legal_hold,
                     )
                     .await
@@ -224,7 +361,29 @@ where
         if current.is_some() && metadata.version_id.as_ref() != version {
             return Err(V2FormatError::ProviderProfileFailed);
         }
-        if required_deadline.is_some_and(|required| {
+        let object_len =
+            u64::try_from(record.body.len()).map_err(|_| V2FormatError::InvalidHeaderField)?;
+        if needs_recovery_protection {
+            let candidate = V2AnchorState {
+                sequence: Sequence::new(1),
+                commit_key: record.object_id.clone(),
+                body_digest: header.body_digest,
+                version_id: metadata.version_id.clone(),
+                signing_key_id: header.signing_key_id.clone(),
+                format_ref: record.format_ref.clone(),
+            };
+            // Repair protection under the real guard before verifying the
+            // complete candidate. This preserves stronger observed mode/hold
+            // and never gives an unverified candidate anchor authority.
+            self.protect_recovery_genesis(
+                anchor,
+                guard.ok_or(V2FormatError::ProviderProfileFailed)?,
+                &candidate,
+                object_len,
+                required_deadline.ok_or(V2FormatError::ProviderProfileFailed)?,
+            )
+            .await?;
+        } else if required_deadline.is_some_and(|required| {
             metadata
                 .retain_until_ms
                 .is_none_or(|actual| actual < required)
@@ -239,16 +398,17 @@ where
                 .extend_retention_at(
                     &record.object_id,
                     metadata.version_id.as_ref(),
-                    record
-                        .retention
-                        .ok_or(V2FormatError::ProviderProfileFailed)?,
+                    crate::v2::recovery::policy::physical_retention_for_deadline(
+                        record.retention,
+                        required_deadline,
+                        self.publication_now_ms(),
+                    )?
+                    .ok_or(V2FormatError::ProviderProfileFailed)?,
                 )
                 .await
                 .map_err(|_| V2FormatError::StorageOperationFailed)?;
         }
-        let object_len =
-            u64::try_from(record.body.len()).map_err(|_| V2FormatError::InvalidHeaderField)?;
-        let version_id = self
+        let verified = self
             .verify_commit_postconditions(
                 &record.object_id,
                 &metadata,
@@ -261,6 +421,7 @@ where
                 ),
             )
             .await?;
+        let version_id = verified.version_id.clone();
         let next = V2AnchorState {
             sequence: Sequence::new(1),
             commit_key: record.object_id.clone(),
@@ -269,6 +430,23 @@ where
             signing_key_id: header.signing_key_id.clone(),
             format_ref: record.format_ref.clone(),
         };
+        if needs_recovery_protection {
+            guard
+                .ok_or(V2FormatError::ProviderProfileFailed)?
+                .verify_v2_maintenance(None)
+                .await?;
+            if anchor.read_v2().await?.is_some() {
+                return Err(V2FormatError::StaleAnchor);
+            }
+        }
+        self.remember_verified_publication_time(
+            &next,
+            header.publish_time_ms,
+            header
+                .section_index
+                .iter()
+                .any(|section| section.section_type == V2SectionType::Recovery),
+        )?;
         if current.as_ref() != Some(&next) {
             let result = anchor.compare_and_advance_v2(None, next.clone()).await;
             // Never repeat CAS after an ambiguous result until the accepted
@@ -278,6 +456,8 @@ where
             }
         }
         Ok(V2StoredCommit {
+            verified_retain_until_ms: verified.retain_until_ms,
+            publish_time_ms: header.publish_time_ms,
             anchor_state: next,
             commit_key: V2CommitKey::parse(&record.object_id)?,
             version_id,

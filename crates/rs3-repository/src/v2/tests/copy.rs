@@ -171,6 +171,7 @@ async fn copy_preserves_all_carrier_shapes_without_payload_io_through_delete_com
                         dry_run: V2FullGcDryRunOptions::default(),
                         orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                         retained_provider_conformance_passed: false,
+                        reclamation_enabled: true,
                     },
                 )
                 .await,

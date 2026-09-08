@@ -44,6 +44,16 @@ impl GatewayServer {
         Self::bind_with_boundary(config, boundary).await
     }
 
+    /// Binds a readonly gateway to an authenticated historical commit.
+    pub async fn bind_with_recovery_point(
+        config: RuntimeConfig,
+        sequence: rs3_types::Sequence,
+    ) -> Result<Self, GatewayServerError> {
+        let boundary =
+            GatewayS3Boundary::build_with_recovery_point(config.clone(), sequence).await?;
+        Self::bind_with_boundary(config, boundary).await
+    }
+
     /// Binds a gateway whose Kubernetes anchor updates are fenced by the
     /// supplied live writer epoch.
     #[cfg(feature = "k8s")]

@@ -331,3 +331,84 @@ async fn prepared_genesis_repeat_uses_accepted_version_after_latest_is_replaced(
     );
     assert_eq!(store.operation_counts().expect("counts").put, before);
 }
+
+#[tokio::test]
+async fn prepared_recovery_genesis_retry_checks_guard_before_repair_and_preserves_observed_protection()
+ {
+    let store = MemoryBlobStore::new();
+    let policy = crate::v2::RecoveryPolicy::PRESET;
+    let options = commit_store_options_with_maintenance_roots(
+        &store,
+        V2ProviderProfile::RetainedVersionObjectLock,
+        Some(RetentionPolicy::new(RetentionMode::Governance, 1)),
+    )
+    .await
+    .with_recovery_policy(Some(policy));
+    let writer = V2CommitStore::new(store.clone(), signing_keyring(), options);
+    let prepared = must_v2(writer.prepare_genesis_snapshot());
+    let journal: serde_json::Value =
+        serde_json::from_slice(&must_v2(prepared.to_journal_bytes())).expect("trusted journal");
+    let id = object_id(journal["object_id"].as_str().expect("opaque candidate key"));
+    let body: Vec<u8> = serde_json::from_value(journal["body"].clone()).expect("candidate bytes");
+    // Model an unfinished bootstrap retry whose immutable candidate already
+    // has a stronger mode and hold, but not the full recovery window yet.
+    let prior = store
+        .put(
+            &id,
+            Bytes::from(body),
+            PutOptions {
+                retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 1)),
+                legal_hold: Some(LegalHoldStatus::On),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .expect("pre-existing exact candidate");
+    let anchor = V2MemoryAnchor::new();
+    let before = store.operation_counts().expect("counts");
+    assert_eq!(
+        writer
+            .publish_prepared_genesis_with_guard(
+                &anchor,
+                &prepared,
+                false,
+                &FailsAfterMaintenanceGuard::new(1),
+            )
+            .await,
+        Err(V2FormatError::MaintenanceAccessRequired)
+    );
+    let failed = store.operation_counts().expect("counts");
+    assert_eq!(failed.put, before.put);
+    assert_eq!(failed.extend_retention, before.extend_retention);
+    assert_eq!(must_v2(anchor.read_v2().await), None);
+
+    let minimum_floor = must_v2(policy.coverage_until_ms(writer.publication_now_ms()));
+    let accepted = must_v2(
+        writer
+            .publish_prepared_genesis_with_guard(
+                &anchor,
+                &prepared,
+                false,
+                &UnenforcedQuiescedMaintenanceGuard,
+            )
+            .await,
+    );
+    let exact = store
+        .head_at(&id, prior.version_id.as_ref())
+        .await
+        .expect("accepted exact candidate");
+    assert_eq!(accepted.version_id, prior.version_id);
+    assert_eq!(store.operation_counts().expect("counts").put, before.put);
+    assert_eq!(
+        exact.retention.map(|retention| retention.mode),
+        Some(RetentionMode::Compliance)
+    );
+    assert_eq!(exact.legal_hold, Some(LegalHoldStatus::On));
+    assert!(
+        exact
+            .retain_until_ms
+            .is_some_and(|floor| floor >= minimum_floor)
+    );
+    assert_eq!(accepted.verified_retain_until_ms, exact.retain_until_ms);
+    assert_eq!(must_v2(anchor.read_v2().await), Some(accepted.anchor_state));
+}

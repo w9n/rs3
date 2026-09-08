@@ -62,7 +62,41 @@ kubectl -n velero get backups,restores,podvolumebackups,podvolumerestores -o yam
 Preserve object-store audit logs outside the affected account when available.
 Do not include plaintext paths or Kubernetes secrets in shared artifacts.
 
-## 3. Prefer a Trusted Restore Bundle
+## 3. Select a recovery point
+
+### Use the authenticated live registry
+
+When the current anchor and recovery registry are available, list the bounded
+set of authenticated points before reaching for a bundle:
+
+```sh
+rs3 recovery-points --limit 100 --format json
+rs3 recovery-points --limit 100 --cursor '<next_cursor>' --format json
+```
+
+Review `sequence`, `publish_time_ms`, `protected_until_ms`, and `current` in the
+response. The cursor is tied to the live anchor; restart the listing if the
+anchor advances or the cursor is rejected. Select the exact sequence in an
+isolated read-only gateway:
+
+```sh
+rs3 serve \
+  --gateway-mode restore-readonly \
+  --recovery-point <sequence> \
+  --bind 127.0.0.1:9081
+```
+
+The selected view rechecks the live anchor and protection deadline before
+serving reads. It rejects writes, deletes, multipart mutation, and copy
+operations, and does not change the live anchor. Point the restore client at
+the isolated S3 endpoint and copy recovered data to an isolated destination;
+copying data back to production is a separately reviewed normal write. This
+preview implementation does not expose S3 `versionId` history or select an
+arbitrary time. Retained-provider restart, fault, and outage qualification is
+still pending; if the live authority is unavailable, use the trusted-bundle
+path below.
+
+### Fall back to a trusted restore bundle
 
 From a healthy cluster or regular operations job, export a trusted bundle and
 store it outside the object-store account.

@@ -57,6 +57,9 @@ mod bootstrap;
 #[cfg(feature = "k8s")]
 mod onboarding;
 
+mod recovery_view;
+pub use recovery_view::recovery_points_from_config;
+
 const V2_FORMAT_ENVELOPE_CONTENT_TYPE: &str = "application/vnd.rs3.format-envelope+cbor";
 
 /// Result of importing a trusted v2 anchor bundle.
@@ -206,6 +209,7 @@ pub struct RuntimeV2ProviderConformanceOptions {
 pub(super) struct RuntimeRepository {
     store: RuntimeStore,
     repository: Arc<V2Repository<RuntimeStore>>,
+    recovery_view: Option<Arc<rs3_repository::v2::V2RecoveryView<RuntimeStore>>>,
     coordinator: Arc<V2CommitCoordinator<RuntimeStore, RuntimeV2Anchor>>,
     anchor: RuntimeV2Anchor,
     initialized: bool,
@@ -247,20 +251,34 @@ fn bootstrap_commit_options(
     config: &RuntimeConfig,
     loaded: &LoadedV2Repository,
 ) -> Result<V2CommitStoreOptions, S3BoundaryError> {
+    let provider_profile = v2_provider_profile(&config.backend, config.repository.retention);
+    // Recovery history records exact protected object versions. Only the
+    // retained profile establishes that provider contract at the gateway
+    // boundary; Dev and AtomicCreate retain their native publication path.
+    let recovery_policy = (provider_profile == V2ProviderProfile::RetainedVersionObjectLock)
+        .then_some(config.recovery.policy);
     Ok(V2CommitStoreOptions::for_profile(
-        v2_provider_profile(&config.backend, config.repository.retention),
+        provider_profile,
         config.repository_keys.repository_id.clone(),
         loaded.keyring_ref.commit_ref().map_err(repository_init)?,
         loaded.format_ref.clone(),
     )
     .with_maintenance_keyring_envelope_ref(loaded.keyring_ref.clone())
+    .with_recovery_policy(recovery_policy)
+    .with_recovery_maintenance_budgets(config.maintenance.budgets())
     .with_retention(config.repository.retention)
     .with_stream_read_stall_timeout(config.hardening.stream_read_stall_timeout))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeStartup {
+    Current,
+    HistoryOnly,
+}
+
 impl RuntimeRepository {
     pub(super) async fn from_config(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
-        Self::from_config_inner(config, None, None).await
+        Self::from_config_inner(config, None, None, RuntimeStartup::Current).await
     }
 
     #[cfg(feature = "k8s")]
@@ -269,14 +287,26 @@ impl RuntimeRepository {
         writer_fence: WriterFence,
     ) -> Result<Self, S3BoundaryError> {
         let maintenance_guard: Arc<dyn V2MaintenanceGuard> = Arc::new(writer_fence.clone());
-        Self::from_config_inner(config, Some(writer_fence), Some(maintenance_guard)).await
+        Self::from_config_inner(
+            config,
+            Some(writer_fence),
+            Some(maintenance_guard),
+            RuntimeStartup::Current,
+        )
+        .await
     }
 
     pub(super) async fn from_config_with_maintenance_guard(
         config: &RuntimeConfig,
         maintenance_guard: Arc<dyn V2MaintenanceGuard>,
     ) -> Result<Self, S3BoundaryError> {
-        Self::from_config_inner(config, None, Some(maintenance_guard)).await
+        Self::from_config_inner(
+            config,
+            None,
+            Some(maintenance_guard),
+            RuntimeStartup::Current,
+        )
+        .await
     }
 
     async fn from_config_inner(
@@ -284,6 +314,7 @@ impl RuntimeRepository {
         #[cfg(feature = "k8s")] writer_fence: Option<WriterFence>,
         #[cfg(not(feature = "k8s"))] _writer_fence: Option<()>,
         maintenance_guard: Option<Arc<dyn V2MaintenanceGuard>>,
+        startup: RuntimeStartup,
     ) -> Result<Self, S3BoundaryError> {
         let store = build_store(&config.backend).await?;
         store
@@ -291,7 +322,7 @@ impl RuntimeRepository {
             .await?;
         #[cfg(not(feature = "k8s"))]
         let writer_fence = _writer_fence;
-        Self::from_preflighted_store(config, store, writer_fence, maintenance_guard).await
+        Self::from_preflighted_store(config, store, writer_fence, maintenance_guard, startup).await
     }
 
     async fn from_preflighted_store(
@@ -300,7 +331,14 @@ impl RuntimeRepository {
         #[cfg(feature = "k8s")] writer_fence: Option<WriterFence>,
         #[cfg(not(feature = "k8s"))] _writer_fence: Option<()>,
         maintenance_guard: Option<Arc<dyn V2MaintenanceGuard>>,
+        startup: RuntimeStartup,
     ) -> Result<Self, S3BoundaryError> {
+        if startup == RuntimeStartup::HistoryOnly && config.mode != GatewayMode::RestoreReadOnly {
+            return Err(repository_init(
+                "history startup requires restore-readonly mode",
+            ));
+        }
+
         #[cfg(feature = "k8s")]
         if config.mode.allows_mutation()
             && config.repository.allow_init
@@ -347,13 +385,20 @@ impl RuntimeRepository {
         ));
 
         if loaded.anchor_present {
-            repository
-                .load_chain_from_anchor(&anchor_handle)
-                .await
-                .map_err(repository_init)?;
+            if startup == RuntimeStartup::Current {
+                repository
+                    .load_chain_from_anchor(&anchor_handle)
+                    .await
+                    .map_err(repository_init)?;
+            }
         } else {
+            if startup == RuntimeStartup::HistoryOnly {
+                return Err(repository_init(
+                    "history startup requires a current accepted anchor",
+                ));
+            }
             repository
-                .write_genesis_snapshot(&anchor_handle)
+                .write_genesis_snapshot_with_guard(&anchor_handle, maintenance_guard.as_deref())
                 .await
                 .map_err(repository_init)?;
         }
@@ -377,6 +422,7 @@ impl RuntimeRepository {
         Ok(Self {
             store: store_handle,
             repository,
+            recovery_view: None,
             coordinator,
             anchor: anchor_handle,
             initialized,
@@ -392,6 +438,12 @@ impl RuntimeRepository {
         &self,
         _mode: GatewayMode,
     ) -> Result<(), S3BoundaryError> {
+        if self.recovery_view.is_some() {
+            return self
+                .check_recovery_authority()
+                .await
+                .map_err(repository_init);
+        }
         let Some(anchor_state) = self.anchor.read_v2().await.map_err(repository_init)? else {
             return Err(repository_init("v3-preview repository anchor is missing"));
         };
@@ -528,16 +580,21 @@ impl RuntimeRepository {
         &self,
         key: &LogicalPath,
     ) -> Result<RepositoryObjectMetadata, RepositoryError> {
-        self.repository.head(key)
+        match &self.recovery_view {
+            Some(view) => view.head(key),
+            None => self.repository.head(key),
+        }
     }
 
     pub(super) fn resolve_object(
         &self,
         key: &LogicalPath,
     ) -> Result<RuntimeResolvedObject, RepositoryError> {
-        self.repository
-            .resolve_object(key)
-            .map(|inner| RuntimeResolvedObject { inner })
+        match &self.recovery_view {
+            Some(view) => view.resolve_object(key),
+            None => self.repository.resolve_object(key),
+        }
+        .map(|inner| RuntimeResolvedObject { inner })
     }
 
     #[cfg(test)]
@@ -546,7 +603,8 @@ impl RuntimeRepository {
         key: &LogicalPath,
         range: ByteRange,
     ) -> Result<Bytes, RepositoryError> {
-        self.repository.get_range(key, range).await
+        let resolved = self.resolve_object(key)?;
+        self.get_resolved_range(&resolved, range).await
     }
 
     pub(super) async fn get_resolved_range(
@@ -554,18 +612,28 @@ impl RuntimeRepository {
         resolved: &RuntimeResolvedObject,
         range: ByteRange,
     ) -> Result<Bytes, RepositoryError> {
-        self.repository
-            .get_resolved_range(&resolved.inner, range)
-            .await
+        match &self.recovery_view {
+            Some(view) => view.get_resolved_range(&resolved.inner, range).await,
+            None => {
+                self.repository
+                    .get_resolved_range(&resolved.inner, range)
+                    .await
+            }
+        }
     }
 
     pub(super) async fn get_resolved_full_stream(
         &self,
         resolved: &RuntimeResolvedObject,
     ) -> Result<Option<V2AuthenticatedReadBody>, RepositoryError> {
-        self.repository
-            .get_resolved_full_stream(&resolved.inner)
-            .await
+        match &self.recovery_view {
+            Some(view) => view.get_resolved_full_stream(&resolved.inner).await,
+            None => {
+                self.repository
+                    .get_resolved_full_stream(&resolved.inner)
+                    .await
+            }
+        }
     }
 
     pub(super) fn list_page(
@@ -574,7 +642,10 @@ impl RuntimeRepository {
         start_after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RepositoryListEntry>, RepositoryError> {
-        self.repository.list_page(prefix, start_after, limit)
+        match &self.recovery_view {
+            Some(view) => view.list_page(prefix, start_after, limit),
+            None => self.repository.list_page(prefix, start_after, limit),
+        }
     }
 
     pub(super) async fn delete_committed(
@@ -666,20 +737,11 @@ impl MaintenanceRuntime for RuntimeRepository {
         on_phase: &(dyn Fn(MaintenanceRunPhase) + Send + Sync),
     ) -> Result<V2FullMaintenanceReport, RepositoryError> {
         on_phase(MaintenanceRunPhase::Quiescing);
-        let window = self.coordinator.begin_maintenance_window().await?;
-        on_phase(MaintenanceRunPhase::Applying);
-        let report = self
-            .repository
-            .apply_full_gc_quiesced_expected(
-                &self.anchor,
-                window.guard(),
-                options,
-                expected_plan_digest,
-                cancellation,
-            )
-            .await;
-        drop(window);
-        report
+        self.coordinator
+            .run_full_maintenance_expected(options, expected_plan_digest, cancellation, &|| {
+                on_phase(MaintenanceRunPhase::Applying)
+            })
+            .await
     }
 }
 
@@ -702,6 +764,9 @@ impl AdminRuntimeFactsSource for RuntimeRepositoryAdminFacts {
 #[async_trait::async_trait]
 impl AdminReadinessSource for RuntimeRepositoryAdminFacts {
     async fn check_readiness(&self) -> AdminReadiness {
+        if self.repository.check_recovery_authority().await.is_err() {
+            return AdminReadiness::unavailable("recovery.point-unavailable");
+        }
         if self.repository.coordinator.status().poisoned {
             return AdminReadiness::unavailable("repository.coordinator-poisoned");
         }
@@ -788,8 +853,14 @@ impl V2PreparedRepositoryInit {
                 "Kubernetes repository initialization requires an acquired writer fence",
             ));
         }
-        let runtime =
-            RuntimeRepository::from_preflighted_store(&self.config, self.store, None, None).await?;
+        let runtime = RuntimeRepository::from_preflighted_store(
+            &self.config,
+            self.store,
+            None,
+            None,
+            RuntimeStartup::Current,
+        )
+        .await?;
         verified_init_report(runtime).await
     }
 
@@ -1770,11 +1841,16 @@ mod tests {
             .memory_store()
             .expect("memory fixture")
             .clone();
-        let error =
-            RuntimeRepository::from_preflighted_store(&prepared.config, prepared.store, None, None)
-                .await
-                .err()
-                .expect("common runtime cannot bypass journaled bootstrap");
+        let error = RuntimeRepository::from_preflighted_store(
+            &prepared.config,
+            prepared.store,
+            None,
+            None,
+            super::RuntimeStartup::Current,
+        )
+        .await
+        .err()
+        .expect("common runtime cannot bypass journaled bootstrap");
         #[cfg(feature = "k8s")]
         assert!(error.to_string().contains("journaled init"));
         #[cfg(not(feature = "k8s"))]
@@ -1853,6 +1929,7 @@ mod tests {
                 Duration::ZERO,
             ),
             retained_provider_conformance_passed: true,
+            reclamation_enabled: true,
         };
         let preview = runtime
             .preview_full_gc_plan(options.clone())
@@ -2146,9 +2223,12 @@ mod tests {
     async fn runtime_repository_default_retention_applies_to_writes() {
         let mut config = runtime_config(true);
         config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 30));
-        let runtime = RuntimeRepository::from_config(&config)
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
+        let runtime = RuntimeRepository::from_config_with_maintenance_guard(
+            &config,
+            Arc::new(rs3_repository::v2::UnenforcedQuiescedMaintenanceGuard),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
 
         let put = runtime
             .put_committed(
@@ -2157,8 +2237,12 @@ mod tests {
                 Bytes::from_static(b"body"),
                 RepositoryPutOptions::default(),
             )
-            .await;
-        assert!(put.is_ok());
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            put.metadata.retention,
+            Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
+        );
 
         let accepted = runtime
             .memory_v2_anchor()
@@ -2173,10 +2257,11 @@ mod tests {
             .head_at(&accepted.commit_key, accepted.version_id.as_ref())
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(
-            commit.retention,
-            Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
-        );
+        let retention = commit
+            .retention
+            .unwrap_or_else(|| panic!("missing backend retention"));
+        assert_eq!(retention.mode, RetentionMode::Compliance);
+        assert!(retention.retain_days >= 30);
     }
 
     #[tokio::test]

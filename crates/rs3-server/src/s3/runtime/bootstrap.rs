@@ -391,7 +391,12 @@ impl<J: Journal> Bootstrap<'_, J> {
                     self.protect_dependency(&format.object_id, format.version_id.as_ref())
                         .await?;
                     let result = commits
-                        .publish_prepared_genesis(self.anchor, &prepared, false)
+                        .publish_prepared_genesis_with_guard(
+                            self.anchor,
+                            &prepared,
+                            false,
+                            self.guard,
+                        )
                         .await;
                     match result {
                         Ok(_) => {}
@@ -407,7 +412,12 @@ impl<J: Journal> Bootstrap<'_, J> {
                             save(self.journal, &record).await?;
                             self.check_guard().await?;
                             commits
-                                .publish_prepared_genesis(self.anchor, &prepared, true)
+                                .publish_prepared_genesis_with_guard(
+                                    self.anchor,
+                                    &prepared,
+                                    true,
+                                    self.guard,
+                                )
                                 .await
                                 .map_err(repository_init)?;
                         }

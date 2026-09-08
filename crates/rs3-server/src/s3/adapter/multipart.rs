@@ -24,7 +24,7 @@ impl GatewayS3Service {
         mutation: bool,
         work: impl std::future::Future<Output = S3Result<T>> + Send + 'static,
     ) -> S3Result<S3Response<T>> {
-        let permit = self.admit_request(operation)?;
+        let permit = self.admit_request(operation).await?;
         self.check_bucket(&bucket)?;
         if mutation {
             self.check_mutation_allowed()?;

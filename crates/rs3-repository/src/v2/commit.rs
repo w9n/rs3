@@ -23,7 +23,7 @@ pub const V2_HEADER_META_LEN: usize = 40;
 /// Maximum complete v2 commit header span.
 pub const V2_MAX_HEADER_SIZE: usize = 8192;
 /// Maximum number of physical sections in one v03 commit.
-pub const V2_MAX_COMMIT_SECTIONS: usize = 2;
+pub const V2_MAX_COMMIT_SECTIONS: usize = 3;
 /// Magic bytes at the start of every v2 commit object.
 pub const V2_COMMIT_MAGIC: &[u8; 8] = b"rs3:cmt\n";
 /// v03 commit format version.
@@ -77,6 +77,8 @@ pub enum V2SectionType {
     IndexRoot,
     /// Immutable encrypted value container referenced by an index run.
     PayloadPack,
+    /// Encrypted accepted recovery history transition and optional checkpoint catalog.
+    Recovery,
     /// Unknown section type preserved for validation decisions.
     Unknown(u16),
 }
@@ -88,6 +90,7 @@ impl V2SectionType {
             Self::IndexRun => 0x0005,
             Self::IndexRoot => 0x0006,
             Self::PayloadPack => 0x0007,
+            Self::Recovery => 0x0008,
             Self::Unknown(value) => value,
         }
     }
@@ -97,6 +100,7 @@ impl V2SectionType {
             0x0005 => Self::IndexRun,
             0x0006 => Self::IndexRoot,
             0x0007 => Self::PayloadPack,
+            0x0008 => Self::Recovery,
             other => Self::Unknown(other),
         }
     }
@@ -1029,13 +1033,22 @@ pub(crate) fn validate_commit_section_semantics(header: &V2CommitHeader) -> V2Re
         .map(|section| section.section_type)
         .collect::<Vec<_>>();
     let valid = match header.kind {
-        V2CommitKind::Root => types.as_slice() == [V2SectionType::IndexRoot],
+        V2CommitKind::Root => matches!(
+            types.as_slice(),
+            [V2SectionType::IndexRoot] | [V2SectionType::IndexRoot, V2SectionType::Recovery]
+        ),
         V2CommitKind::Delta => {
             header.parent.is_some()
                 && matches!(
                     types.as_slice(),
                     [V2SectionType::IndexRun]
                         | [V2SectionType::PayloadPack, V2SectionType::IndexRun]
+                        | [V2SectionType::IndexRun, V2SectionType::Recovery]
+                        | [
+                            V2SectionType::PayloadPack,
+                            V2SectionType::IndexRun,
+                            V2SectionType::Recovery
+                        ]
                 )
         }
     };

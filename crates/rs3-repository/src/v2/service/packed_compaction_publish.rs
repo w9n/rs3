@@ -211,10 +211,15 @@ where
         let mut compacted_refs = Vec::with_capacity(output_runs.len());
         for run in output_runs {
             let temporary_anchor = V2MemoryAnchor::with_state(base_anchor.clone());
+            let sibling_plan = self
+                .commit_store
+                .prepare_child_publication(&base_anchor)
+                .await
+                .map_err(v2_repository_error)?;
             let mut sealed_facts = None;
             let uploaded = self
                 .commit_store
-                .write_child_commit_with(&temporary_anchor, |commit_key| {
+                .write_prepared_child_commit_with(&temporary_anchor, &sibling_plan, |commit_key| {
                     let sealed = seal_v2_index_run(
                         keyring.as_ref(),
                         &context,
@@ -314,6 +319,7 @@ where
             });
         }
 
+        let introduced_runs = compacted_refs.clone();
         let mut candidate_refs = retained_refs;
         candidate_refs.extend(compacted_refs);
         let root = V2IndexRoot::new(
@@ -332,10 +338,13 @@ where
                 .completion_receipts
                 .clone(),
         );
+        let mut prepared = self
+            .prepare_service_publication(anchor, &base_anchor, true, Some(guard))
+            .await?;
         let root_anchor = V2MemoryAnchor::with_state(base_anchor.clone());
         let uploaded_root = self
             .commit_store
-            .write_child_commit_with(&root_anchor, |commit_key| {
+            .write_prepared_child_commit_with(&root_anchor, &prepared.plan, |commit_key| {
                 let sealed = seal_v2_index_root(
                     keyring.as_ref(),
                     &context,
@@ -350,7 +359,7 @@ where
                 )])
                 .with_retention(protection.0);
                 write = write.with_legal_hold(protection.1);
-                Ok(write)
+                self.append_recovery_section(write, commit_key, &prepared)
             })
             .await
             .map_err(v2_repository_error)?;
@@ -366,6 +375,16 @@ where
             .await
             .map_err(v2_repository_error)?;
         self.verify_exact_index_root(&candidate_chain, &root)?;
+        let recovery = self
+            .verify_recovery_publication(
+                anchor,
+                Some(guard),
+                &mut prepared,
+                &uploaded_root,
+                &[],
+                &introduced_runs,
+            )
+            .await?;
         if root_anchor.read_v2().await.map_err(v2_repository_error)? != Some(candidate_anchor) {
             return Err(v2_repository_error(V2FormatError::StaleAnchor));
         }
@@ -388,17 +407,20 @@ where
         if anchor.read_v2().await.map_err(v2_repository_error)? != Some(base_anchor.clone()) {
             return Err(v2_repository_error(V2FormatError::StaleAnchor));
         }
+        self.validate_recovery_publication_freshness(&prepared)?;
         let adopted = self
             .commit_store
-            .adopt_unanchored_child(
+            .adopt_verified_unanchored_child(
                 anchor,
-                &uploaded_root.commit_key.object_id,
-                uploaded_root.version_id.as_ref(),
+                &base_anchor,
+                &uploaded_root,
+                prepared.history_uncertainty_ms(),
             )
             .await
             .map_err(v2_repository_error)?;
         match self.accepted.write() {
             Ok(mut accepted) => {
+                accepted.recovery = recovery;
                 accepted.runs = candidate_refs;
                 accepted.anchor = Some(adopted.anchor_state.clone());
             }
@@ -413,6 +435,7 @@ where
                 return Err(RepositoryError::AcceptedRecoveryRequired);
             }
         }
+        self.advance_service_recovery_coverage(&prepared, &adopted.anchor_state);
         Ok(adopted)
     }
 

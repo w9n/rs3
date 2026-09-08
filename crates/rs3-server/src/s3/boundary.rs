@@ -39,7 +39,15 @@ impl GatewayS3Boundary {
     /// Returns [`S3BoundaryError::MissingStaticCredentials`] when no static
     /// credentials are configured for the process.
     pub async fn build(config: RuntimeConfig) -> Result<Self, S3BoundaryError> {
-        Self::build_inner(config, None).await
+        Self::build_inner(config, None, None).await
+    }
+
+    /// Builds a readonly gateway at one authenticated historical commit.
+    pub async fn build_with_recovery_point(
+        config: RuntimeConfig,
+        sequence: rs3_types::Sequence,
+    ) -> Result<Self, S3BoundaryError> {
+        Self::build_inner(config, None, Some(sequence)).await
     }
 
     #[cfg(feature = "k8s")]
@@ -47,13 +55,14 @@ impl GatewayS3Boundary {
         config: RuntimeConfig,
         writer_fence: rs3_k8s::WriterFence,
     ) -> Result<Self, S3BoundaryError> {
-        Self::build_inner(config, Some(writer_fence)).await
+        Self::build_inner(config, Some(writer_fence), None).await
     }
 
     async fn build_inner(
         config: RuntimeConfig,
         #[cfg(feature = "k8s")] writer_fence: Option<rs3_k8s::WriterFence>,
         #[cfg(not(feature = "k8s"))] _writer_fence: Option<()>,
+        recovery_point: Option<rs3_types::Sequence>,
     ) -> Result<Self, S3BoundaryError> {
         config
             .validate()
@@ -65,15 +74,20 @@ impl GatewayS3Boundary {
             .clone()
             .ok_or(S3BoundaryError::MissingStaticCredentials)?;
 
-        #[cfg(feature = "k8s")]
-        let adapter = match writer_fence {
-            Some(writer_fence) => {
-                GatewayS3Service::from_config_with_writer_fence(&config, writer_fence).await?
-            }
-            None => GatewayS3Service::from_config(&config).await?,
+        let adapter = if let Some(sequence) = recovery_point {
+            GatewayS3Service::from_config_with_recovery_point(&config, sequence).await?
+        } else {
+            #[cfg(feature = "k8s")]
+            let adapter = match writer_fence {
+                Some(writer_fence) => {
+                    GatewayS3Service::from_config_with_writer_fence(&config, writer_fence).await?
+                }
+                None => GatewayS3Service::from_config(&config).await?,
+            };
+            #[cfg(not(feature = "k8s"))]
+            let adapter = GatewayS3Service::from_config(&config).await?;
+            adapter
         };
-        #[cfg(not(feature = "k8s"))]
-        let adapter = GatewayS3Service::from_config(&config).await?;
         let admin_runtime_facts = adapter.admin_runtime_facts_source();
         let admin_readiness = adapter.admin_readiness_source();
         let maintenance_runtime = adapter.maintenance_runtime();
