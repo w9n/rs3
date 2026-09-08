@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+const MAX_GATEWAY_PROMETHEUS_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+
 pub(crate) async fn scrape_prometheus_metrics(authority: &str) -> Result<String> {
     let started = Instant::now();
     loop {
@@ -33,10 +35,18 @@ async fn scrape_prometheus_metrics_once(authority: &str) -> Result<String> {
         .await
         .context("failed to write metrics scrape request")?;
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .context("failed to read metrics scrape response")?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        stream
+            .take(MAX_GATEWAY_PROMETHEUS_RESPONSE_BYTES + 1)
+            .read_to_end(&mut response),
+    )
+    .await
+    .context("timed out reading metrics scrape response")?
+    .context("failed to read metrics scrape response")?;
+    if response.len() > MAX_GATEWAY_PROMETHEUS_RESPONSE_BYTES as usize {
+        bail!("metrics scrape response exceeded the bounded capture size");
+    }
     let response = String::from_utf8(response).context("metrics scrape response was not UTF-8")?;
     let (head, body) = response
         .split_once("\r\n\r\n")
@@ -646,7 +656,66 @@ fn duration_summary_json(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_prometheus_sample, prometheus_metrics_delta_json};
+    use super::{
+        MAX_GATEWAY_PROMETHEUS_RESPONSE_BYTES, parse_prometheus_sample,
+        prometheus_metrics_delta_json, scrape_prometheus_metrics_once,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn response_server(response: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener should bind");
+        let authority = listener
+            .local_addr()
+            .expect("loopback listener should have an address")
+            .to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("client should connect");
+            // Drain the request before closing so unread bytes cannot cause a
+            // TCP reset instead of the response the test intends to exercise.
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 4096, "bounded scrape request");
+                request.push(stream.read_u8().await.expect("request byte"));
+            }
+            let _ = stream.write_all(&response).await;
+        });
+        authority
+    }
+
+    #[tokio::test]
+    async fn accepts_a_bounded_prometheus_scrape() {
+        let body = "# HELP rs3_test_total test\nrs3_test_total 1\n";
+        let endpoint = response_server(
+            format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}").into_bytes(),
+        )
+        .await;
+
+        let scraped = scrape_prometheus_metrics_once(&endpoint)
+            .await
+            .expect("bounded metrics response should be accepted");
+
+        assert_eq!(scraped, body);
+        let sample = scraped.lines().nth(1).expect("sample line");
+        assert!(parse_prometheus_sample(sample).is_some());
+    }
+
+    #[tokio::test]
+    async fn rejects_an_oversized_prometheus_scrape() {
+        let body = "x".repeat(MAX_GATEWAY_PROMETHEUS_RESPONSE_BYTES as usize + 1);
+        let endpoint = response_server(
+            format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}").into_bytes(),
+        )
+        .await;
+
+        let error = scrape_prometheus_metrics_once(&endpoint)
+            .await
+            .expect_err("oversized metrics response should be rejected");
+
+        assert!(error.to_string().contains("bounded capture size"));
+    }
 
     #[test]
     fn parses_escaped_prometheus_labels() {

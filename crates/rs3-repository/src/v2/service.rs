@@ -478,7 +478,7 @@ where
             .prepare_service_publication(anchor, &base_anchor, true, guard)
             .await?;
         let temporary_anchor = V2MemoryAnchor::with_state(base_anchor.clone());
-        let keyring = self.repository.keyring()?;
+        let keyring = self.repository.keyring();
         let context = packed::repository_context_from_refs(
             &self.commit_store.options().repository_id,
             &self.commit_store.options().keyring_envelope_ref,
@@ -1265,7 +1265,7 @@ where
             options.retention,
         );
         let requested_protection = self.effective_stored_protection(retention, options.legal_hold);
-        let keyring = self.repository.keyring()?;
+        let keyring = self.repository.keyring();
         let primary_blind_key = keyring.derive_primary_blind_index_key(&key)?;
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(&key)?;
         let accepted = self
@@ -1404,7 +1404,7 @@ where
         if !options.create_only {
             return Ok(());
         }
-        let keyring = self.repository.keyring()?;
+        let keyring = self.repository.keyring();
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
         let accepted = self
             .accepted
@@ -1433,7 +1433,7 @@ where
 
     /// Resolves trusted metadata and the accepted namespace entry once.
     pub fn resolve_object(&self, key: &LogicalPath) -> Result<V2ResolvedObject> {
-        let keyring = self.repository.keyring()?;
+        let keyring = self.repository.keyring();
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
         let state = self
             .accepted
@@ -1466,7 +1466,7 @@ where
         resolved: &V2ResolvedObject,
         range: ByteRange,
     ) -> Result<Bytes> {
-        let keyring = self.repository.keyring()?;
+        let keyring = self.repository.keyring();
         let entry = resolved.entry.clone();
         let content_len = entry.content_len;
         if content_len == 0 {
@@ -1564,7 +1564,7 @@ where
         let reader = self.open_stream_payload(&payload).await?;
         let body = read_stream::open_authenticated_payload_stream(
             reader,
-            self.repository.keyring()?,
+            self.repository.keyring(),
             payload.payload_id().clone(),
             header,
             payload.stored_digest(),
@@ -2020,7 +2020,7 @@ where
     }
 
     fn stage_delete(&self, key: &LogicalPath) -> Result<PendingV2Checkpoint> {
-        let keyring = self.repository.keyring()?;
+        let keyring = self.repository.keyring();
         let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
         let accepted = self
             .accepted
@@ -2648,7 +2648,7 @@ where
                 V2SectionType::PayloadPack | V2SectionType::Recovery => {}
                 V2SectionType::IndexRun => {
                     let section_bytes = replay_section_bytes(commit, index)?;
-                    let keyring = self.repository.keyring()?;
+                    let keyring = self.repository.keyring();
                     accepted_runs.push(packed::apply_packed_index_run(
                         keyring.as_ref(),
                         &self.commit_store.options().repository_id,

@@ -5401,15 +5401,29 @@ async fn v2_commit_coordinator_rolls_back_batch_after_anchor_failure() {
 
     let later_key =
         LogicalPath::new("snapshots/v2-later.bin").unwrap_or_else(|error| panic!("{error}"));
-    let later = must_repo(
-        coordinator
-            .put_committed(
-                later_key.clone(),
-                Bytes::from_static(b"later"),
-                RepositoryPutOptions::default(),
-            )
-            .await,
-    );
+    let later_key_for_task = later_key.clone();
+    let later = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move {
+            coordinator
+                .put_committed(
+                    later_key_for_task,
+                    Bytes::from_static(b"later"),
+                    RepositoryPutOptions::default(),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while coordinator.pending_item_count_for_tests().await != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("later put should enqueue into the pending batch");
+    // This drains the batch without publishing an additional snapshot commit.
+    must_repo(coordinator.reload_from_anchor().await);
+    let later = must_repo(later.await.unwrap_or_else(|error| panic!("{error}")));
     let accepted = must_v2(anchor.read_v2().await).expect("v2 later anchor should be accepted");
 
     assert!(matches!(

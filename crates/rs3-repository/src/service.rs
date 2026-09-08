@@ -21,7 +21,7 @@ pub const DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Keyring, read cache and options shared by current repository operations.
 pub(crate) struct RepositoryResources {
-    pub(crate) keyring: RwLock<Arc<KeyRing>>,
+    pub(crate) keyring: Arc<KeyRing>,
     pub(crate) options: RepositoryOptions,
     decrypted_segments: RwLock<DecryptedSegmentCache>,
 }
@@ -61,7 +61,7 @@ impl RepositoryResources {
     /// Creates shared repository resources with an explicit keyring and options.
     pub(crate) fn new(keyring: KeyRing, options: RepositoryOptions) -> Self {
         Self {
-            keyring: RwLock::new(Arc::new(keyring)),
+            keyring: Arc::new(keyring),
             options,
             decrypted_segments: RwLock::new(DecryptedSegmentCache::with_max_bytes(
                 options.decrypted_segment_cache_max_bytes,
@@ -264,11 +264,8 @@ impl RepositoryResources {
     }
 
     /// Returns the active keyring.
-    pub(crate) fn keyring(&self) -> Result<Arc<KeyRing>> {
-        self.keyring
-            .read()
-            .map_err(|_| RepositoryError::StatePoisoned)
-            .map(|keyring| Arc::clone(&*keyring))
+    pub(crate) fn keyring(&self) -> Arc<KeyRing> {
+        Arc::clone(&self.keyring)
     }
 }
 

@@ -82,7 +82,7 @@ where
         {
             return Err(v2_repository_error(V2FormatError::InvalidIndexRun));
         }
-        let keyring = self.repository.keyring()?;
+        let keyring = self.repository.keyring();
         let accepted = self
             .accepted
             .read()

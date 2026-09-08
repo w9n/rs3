@@ -167,7 +167,7 @@ where
             ));
         }
 
-        let keyring = self.repository.keyring()?;
+        let keyring = self.repository.keyring();
         let sources = self
             .load_compaction_sources(keyring.as_ref(), &source_refs)
             .await?;
