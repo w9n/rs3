@@ -53,6 +53,62 @@ pub(crate) struct GatewayChartValues<'a> {
     pub(crate) keyring_wrapping_key_hex: &'a str,
     pub(crate) persistence_enabled: bool,
     pub(crate) wait_secs: u64,
+    /// Operator-asserted governance review inputs. The harness never
+    /// fabricates them; governance bootstrap without them fails before Helm.
+    pub(crate) governance_review: Option<&'a GovernanceReview>,
+}
+
+/// Reviewed governance-bypass inputs supplied by the operator environment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GovernanceReview {
+    pub(crate) principal_fingerprint: String,
+}
+
+pub(crate) const GOVERNANCE_BYPASS_REVIEWED_ENV: &str = "RS3_GOVERNANCE_BYPASS_REVIEWED";
+pub(crate) const PROVIDER_PRINCIPAL_FINGERPRINT_ENV: &str = "RS3_PROVIDER_PRINCIPAL_FINGERPRINT";
+
+/// Reads governance review inputs from the environment when the requested
+/// retention mode needs them. Non-governance modes never read them.
+pub(crate) fn governance_review_from_env(
+    retention_mode: Option<&str>,
+) -> Result<Option<GovernanceReview>> {
+    governance_review_from_values(
+        retention_mode,
+        std::env::var(GOVERNANCE_BYPASS_REVIEWED_ENV)
+            .ok()
+            .as_deref(),
+        std::env::var(PROVIDER_PRINCIPAL_FINGERPRINT_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn governance_review_from_values(
+    retention_mode: Option<&str>,
+    reviewed: Option<&str>,
+    fingerprint: Option<&str>,
+) -> Result<Option<GovernanceReview>> {
+    if retention_mode != Some("governance") {
+        return Ok(None);
+    }
+    if reviewed != Some("true") {
+        bail!(
+            "governance retention on a provided backend requires {GOVERNANCE_BYPASS_REVIEWED_ENV}=true after reviewing that gateway credentials cannot bypass governance retention; the harness does not assert this review"
+        );
+    }
+    let fingerprint = fingerprint.unwrap_or_default();
+    if fingerprint.len() != 64
+        || !fingerprint
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!(
+            "governance retention requires {PROVIDER_PRINCIPAL_FINGERPRINT_ENV} set to the lowercase SHA-256 fingerprint of the reviewed credential principal"
+        );
+    }
+    Ok(Some(GovernanceReview {
+        principal_fingerprint: fingerprint.to_owned(),
+    }))
 }
 
 pub(crate) fn helm_install_gateway(
@@ -74,6 +130,19 @@ pub(crate) fn helm_install_gateway(
             || values.backend_endpoint.starts_with("http://")
             || values.backend_endpoint.starts_with("https://"));
     let allow_init = !bootstrap && values.gateway_mode != "restore-readonly";
+    if bootstrap
+        && values.retention_mode == Some("governance")
+        && values.governance_review.is_none()
+    {
+        bail!(
+            "automatic governance bootstrap requires reviewed operator inputs; set {GOVERNANCE_BYPASS_REVIEWED_ENV}=true and {PROVIDER_PRINCIPAL_FINGERPRINT_ENV}"
+        );
+    }
+    let governance_bypass_reviewed = values.governance_review.is_some();
+    let principal_fingerprint = values
+        .governance_review
+        .map(|review| review.principal_fingerprint.as_str())
+        .unwrap_or_default();
     run_command(
         helm_bin,
         &[
@@ -181,6 +250,13 @@ pub(crate) fn helm_install_gateway(
             &format!("anchor.allowMemory={}", values.anchor_mode == "memory"),
             "--set",
             &format!("persistence.enabled={}", values.persistence_enabled),
+            "--set",
+            &format!("bootstrap.governanceBypassReviewed={governance_bypass_reviewed}"),
+            "--set-string",
+            &helm_set_string(
+                "providerConformance.principalFingerprint",
+                principal_fingerprint,
+            ),
         ],
     )
     .map_err(|error| {
@@ -808,7 +884,59 @@ pub(crate) fn run_command_capture(program: &str, args: &[&str]) -> Result<String
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES, truncated_redacted_text};
+    use super::{
+        GovernanceReview, MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES, governance_review_from_values,
+        truncated_redacted_text,
+    };
+
+    #[test]
+    fn governance_review_requires_explicit_operator_inputs() {
+        let fingerprint = "a".repeat(64);
+        assert_eq!(
+            governance_review_from_values(Some("compliance"), None, None).expect("unused"),
+            None
+        );
+        assert_eq!(
+            governance_review_from_values(None, Some("true"), Some(&fingerprint)).expect("unused"),
+            None
+        );
+        let missing = governance_review_from_values(Some("governance"), None, Some(&fingerprint))
+            .expect_err("review flag required");
+        assert!(
+            missing
+                .to_string()
+                .contains("RS3_GOVERNANCE_BYPASS_REVIEWED=true")
+        );
+        let wrong =
+            governance_review_from_values(Some("governance"), Some("yes"), Some(&fingerprint))
+                .expect_err("only the literal true counts as review");
+        assert!(
+            wrong
+                .to_string()
+                .contains("RS3_GOVERNANCE_BYPASS_REVIEWED=true")
+        );
+        for bad in [
+            "",
+            "ABCDEF",
+            &"a".repeat(63),
+            &format!("{}G", "a".repeat(63)),
+        ] {
+            let error = governance_review_from_values(Some("governance"), Some("true"), Some(bad))
+                .expect_err("fingerprint must be 64 lowercase hex characters");
+            assert!(
+                error
+                    .to_string()
+                    .contains("RS3_PROVIDER_PRINCIPAL_FINGERPRINT")
+            );
+        }
+        assert_eq!(
+            governance_review_from_values(Some("governance"), Some("true"), Some(&fingerprint))
+                .expect("complete review"),
+            Some(GovernanceReview {
+                principal_fingerprint: fingerprint,
+            })
+        );
+    }
 
     #[test]
     fn namespace_diagnostics_redact_before_truncation() {

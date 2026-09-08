@@ -305,9 +305,10 @@ mod imp {
     use crate::integration::k8s_support::{
         GatewayChartValues, K8sWorkspace, KEYRING_ENVELOPE_OBJECT_ID, KEYRING_WRAPPING_KEY_HEX,
         KEYRING_WRAPPING_KEY_ID, KindCluster, REPOSITORY_ID, REPOSITORY_SALT_HEX,
-        assert_v2_lease_anchor, build_source_revision, default_cluster_name, helm_fullname,
-        helm_install_gateway, helm_lint_gateway, helm_set_gateway_mode, now_millis, path_str,
-        require_command, run_command, run_command_capture, split_image_ref,
+        assert_v2_lease_anchor, build_source_revision, default_cluster_name,
+        governance_review_from_env, helm_fullname, helm_install_gateway, helm_lint_gateway,
+        helm_set_gateway_mode, now_millis, path_str, require_command, run_command,
+        run_command_capture, split_image_ref,
     };
     use anyhow::{Context, Result, bail};
     use artifacts::{ArtifactCollector, gateway_backend_counts};
@@ -464,6 +465,10 @@ mod imp {
             bail!("direct RustFS scenarios require --backend-mode cluster-rustfs");
         }
         let backend = backend_target(&args)?;
+        // Governance review inputs are operator assertions. Resolve them before
+        // any cluster work so a missing review fails immediately and clearly.
+        let governance_review =
+            governance_review_from_env(args.repository_retention_mode.as_deref())?;
         require_command(&args.kind_bin, &["version"])?;
         require_command(&args.kubectl_bin, &["version", "--client"])?;
         require_command(&args.helm_bin, &["version", "--short"])?;
@@ -624,6 +629,7 @@ mod imp {
                             keyring_wrapping_key_hex: KEYRING_WRAPPING_KEY_HEX,
                             persistence_enabled: false,
                             wait_secs: args.wait_secs,
+                            governance_review: governance_review.as_ref(),
                         },
                     )
                 })?;

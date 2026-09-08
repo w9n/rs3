@@ -223,6 +223,7 @@ mod imp {
                 keyring_wrapping_key_hex: KEYRING_WRAPPING_KEY_HEX,
                 persistence_enabled: false,
                 wait_secs: args.wait_secs,
+                governance_review: None,
             },
         )?;
 
