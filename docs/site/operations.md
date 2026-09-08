@@ -242,8 +242,11 @@ deployment; the example above uses the local development defaults.
 
 Init writes the initial keyring, format root, genesis commit, and anchor, then
 reloads the accepted chain and releases the Lease before exiting. Cancellation
-stops renewal and lets the Lease expire. If another gateway owns the Lease,
-init waits without writing repository objects until ownership is available.
+stops renewal and lets the Lease expire. A journal already completed under the
+current configuration is verified read-only without the Lease. When init must
+initialize or requalify, it waits out only an unchanged stale holder; a live
+gateway that keeps renewing makes init fail fast rather than wait, because a
+rollout that waits for this init would otherwise deadlock.
 Keep `repository.allowInit=false` for
 normal serving. Kubernetes runtime construction also refuses initialization
 permission; use the journaled init command before starting the gateway.
@@ -317,9 +320,12 @@ The chart declares a normal initialization Job plus a read-only deployment
 init container, sharing the serving image, backend credentials and service
 account. No manual report transfer is required. The startup wait reads projected
 journal state and the configured evidence file before starting the gateway;
-the gateway then verifies the live anchor normally. Repeated installs reuse
-the completed Job and journal. A changed configuration creates a new Job;
-qualification is reused only when its bound implementation and policy match.
+the gateway then verifies the live anchor normally. Every Helm revision runs
+a new Job and reuses the journal; a Job that finds the journal completed under
+the current configuration verifies read-only without the Lease. Qualification
+is reused only when its bound implementation and policy match; otherwise the
+Job requalifies under the Lease after the `Recreate` rollout stops the previous
+gateway pod.
 This orchestrates initialization, provider evidence and the bootstrap payload
 round trip. Independently verified
 off-cluster recovery export is still a separate requirement.
