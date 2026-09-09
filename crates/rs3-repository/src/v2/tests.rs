@@ -1107,6 +1107,14 @@ struct CommitPutPause {
     release: Notify,
 }
 
+#[derive(Clone, Copy, Default)]
+enum CommitHeadIdentityFault {
+    #[default]
+    None,
+    WrongObject,
+    WrongVersion,
+}
+
 #[derive(Clone)]
 struct SlowCommitGetStore {
     commit_put_pause: Arc<CommitPutPause>,
@@ -1119,6 +1127,7 @@ struct SlowCommitGetStore {
     corrupt_ranged_commit_gets_for: Arc<Mutex<Option<BackendObjectId>>>,
     corrupt_standalone_reads: Arc<std::sync::atomic::AtomicBool>,
     readback_probe: Arc<ReadbackProbe>,
+    commit_head_identity_fault: Arc<Mutex<CommitHeadIdentityFault>>,
     standalone_gets: Arc<AtomicUsize>,
     standalone_puts: Arc<AtomicUsize>,
 }
@@ -1136,6 +1145,7 @@ impl SlowCommitGetStore {
             corrupt_ranged_commit_gets_for: Arc::new(Mutex::new(None)),
             corrupt_standalone_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             readback_probe: Arc::new(ReadbackProbe::default()),
+            commit_head_identity_fault: Arc::new(Mutex::new(CommitHeadIdentityFault::None)),
             standalone_gets: Arc::new(AtomicUsize::new(0)),
             standalone_puts: Arc::new(AtomicUsize::new(0)),
         }
@@ -1377,6 +1387,23 @@ impl BlobStore for SlowCommitGetStore {
         version_id: Option<&BackendVersionId>,
     ) -> rs3_storage::Result<BlobMetadata> {
         let mut metadata = self.inner.head_at(object_id, version_id).await?;
+        if object_id.as_str().starts_with("commits/v03/") {
+            match *self
+                .commit_head_identity_fault
+                .lock()
+                .expect("HEAD fault lock")
+            {
+                CommitHeadIdentityFault::None => {}
+                CommitHeadIdentityFault::WrongObject => {
+                    metadata.object_id =
+                        BackendObjectId::new("commits/v03/wrong-object").expect("fixture object");
+                }
+                CommitHeadIdentityFault::WrongVersion => {
+                    metadata.version_id =
+                        Some(BackendVersionId::new("wrong-version").expect("fixture version"));
+                }
+            }
+        }
         if object_id.as_str().starts_with("objects/v03/")
             && self.readback_probe.fault() == ReadbackFault::WrongVersion
         {

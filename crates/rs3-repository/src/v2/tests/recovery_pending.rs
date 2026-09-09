@@ -148,3 +148,59 @@ async fn recovery_pending_history_skips_old_registry_bytes_and_releases_section_
         Bytes::from(vec![11; 512])
     );
 }
+
+#[tokio::test]
+async fn recovery_replay_rejects_mismatched_exact_head_before_reading_sections() {
+    let store = SlowCommitGetStore::new(MemoryBlobStore::new(), Duration::ZERO);
+    let writer = V2CommitStore::new(
+        store.clone(),
+        signing_keyring(),
+        V2CommitStoreOptions::for_profile(
+            V2ProviderProfile::Dev,
+            sample_repository_id(),
+            sample_keyring_envelope_ref(),
+            sample_format_ref(),
+        ),
+    );
+    let anchor = V2MemoryAnchor::new();
+    let stored = must_v2(writer.write_genesis_snapshot(&anchor).await);
+    let expected = must_v2(
+        writer
+            .read_replay_commit_at(&stored.anchor_state.commit_key, stored.version_id.as_ref())
+            .await,
+    );
+    assert!(expected.retained_sections.iter().any(Option::is_some));
+    for fault in [
+        CommitHeadIdentityFault::WrongObject,
+        CommitHeadIdentityFault::WrongVersion,
+    ] {
+        *store
+            .commit_head_identity_fault
+            .lock()
+            .expect("HEAD fault lock") = fault;
+        let before = store.ranged_commit_get_count();
+        assert_eq!(
+            writer
+                .read_replay_commit_at(&stored.anchor_state.commit_key, stored.version_id.as_ref())
+                .await,
+            Err(V2FormatError::ProviderProfileFailed)
+        );
+        assert_eq!(
+            store.ranged_commit_get_count(),
+            before,
+            "reject HEAD identity before fetching signed headers or section bodies"
+        );
+    }
+    *store
+        .commit_head_identity_fault
+        .lock()
+        .expect("HEAD fault lock") = CommitHeadIdentityFault::None;
+    assert_eq!(
+        must_v2(
+            writer
+                .read_replay_commit_at(&stored.anchor_state.commit_key, stored.version_id.as_ref())
+                .await
+        ),
+        expected
+    );
+}

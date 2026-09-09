@@ -1628,41 +1628,19 @@ where
         object_id: &BackendObjectId,
         version_id: Option<&BackendVersionId>,
     ) -> V2Result<V2ReplayCommit> {
-        let limits = self.options.replay_limits;
-        if limits.max_commits == 0
-            || limits.max_total_commit_bytes == 0
-            || limits.max_retained_bytes == 0
-            || limits.read_chunk_bytes == 0
-        {
-            return Err(V2FormatError::ReplayBudgetExceeded);
-        }
-        let metadata = self
-            .store
-            .head_at(object_id, version_id)
-            .await
-            .map_err(|_| V2FormatError::StorageOperationFailed)?;
-        if metadata.content_len > limits.max_total_commit_bytes {
-            return Err(V2FormatError::ReplayBudgetExceeded);
-        }
-        let parsed_header = self.read_commit_header_at(object_id, version_id).await?;
-        validate_v2_commit_object_len(&parsed_header, metadata.content_len)?;
+        let mut commit = self.read_commit_facts_at(object_id, version_id).await?;
         let mut retained_bytes = 0_u64;
-        let retained_sections = self
+        commit.retained_sections = self
             .verify_replay_sections(
                 object_id,
                 version_id,
-                &parsed_header,
+                &commit.parsed_header,
                 &mut retained_bytes,
-                limits,
+                self.options.replay_limits,
                 u64::MAX,
             )
             .await?;
-        Ok(V2ReplayCommit {
-            parsed_header,
-            version_id: version_id.cloned(),
-            object_len: metadata.content_len,
-            retained_sections,
-        })
+        Ok(commit)
     }
 
     /// Reads and verifies only the signed commit header at a key and version.
