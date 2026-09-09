@@ -86,16 +86,7 @@ impl V2ReachabilityState {
         // Charge before growing either tree. The fixed allowances include
         // B-tree node slack; dynamic carrier/key strings are charged twice.
         let bytes = if new_pack {
-            512 + usize_to_u64(std::mem::size_of::<V2PackCarrierReference>())
-                + 2 * usize_to_u64(
-                    carrier.commit_key.as_str().len()
-                        + carrier
-                            .commit_version_id
-                            .as_ref()
-                            .map_or(0, |id| id.as_str().len())
-                        + carrier.content_key_id.as_str().len()
-                        + carrier.keyring_envelope_object_id.as_str().len(),
-                )
+            pack_fact_bytes(carrier)
         } else {
             128
         };
@@ -111,6 +102,19 @@ impl V2ReachabilityState {
             .insert(span);
         Ok(())
     }
+}
+
+pub(super) fn pack_fact_bytes(carrier: &V2PackCarrierReference) -> u64 {
+    512 + usize_to_u64(std::mem::size_of::<V2PackCarrierReference>())
+        + 2 * usize_to_u64(
+            carrier.commit_key.as_str().len()
+                + carrier
+                    .commit_version_id
+                    .as_ref()
+                    .map_or(0, |id| id.as_str().len())
+                + carrier.content_key_id.as_str().len()
+                + carrier.keyring_envelope_object_id.as_str().len(),
+        )
 }
 
 impl PackedUsage {

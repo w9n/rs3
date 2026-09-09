@@ -787,6 +787,8 @@ pub struct V2CommitStore<S> {
     verified_publication_times: Arc<RwLock<VecDeque<(V2AnchorState, i64, bool)>>>,
     pub(in crate::v2) recovery_coverage:
         Arc<RwLock<Option<super::maintenance::coverage::RecoveryCoverage>>>,
+    pub(in crate::v2) recovery_capacity:
+        Arc<RwLock<Option<super::maintenance::capacity::RecoveryCapacity>>>,
     #[cfg(test)]
     publication_time_override: Arc<std::sync::atomic::AtomicI64>,
 }
@@ -851,6 +853,7 @@ where
             inflight_standalone_objects: Arc::new(RwLock::new(BTreeSet::new())),
             verified_publication_times: Arc::new(RwLock::new(VecDeque::new())),
             recovery_coverage: Arc::new(RwLock::new(None)),
+            recovery_capacity: Arc::new(RwLock::new(None)),
             #[cfg(test)]
             publication_time_override: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
         }
@@ -989,6 +992,7 @@ where
             inflight_standalone_objects: Arc::clone(&self.inflight_standalone_objects),
             verified_publication_times: Arc::clone(&self.verified_publication_times),
             recovery_coverage: Arc::clone(&self.recovery_coverage),
+            recovery_capacity: Arc::clone(&self.recovery_capacity),
             #[cfg(test)]
             publication_time_override: Arc::clone(&self.publication_time_override),
         }

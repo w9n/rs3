@@ -1,6 +1,7 @@
 //! Accepted recovery transition preparation and pre-CAS readback.
 
 use super::*;
+use crate::v2::maintenance::capacity::RecoveryCapacity;
 use crate::v2::maintenance::coverage::RecoveryCoverage;
 use crate::v2::maintenance::introduced::RecoveryIntroduced;
 use crate::v2::recovery::publication::CapturedRecoveryPublication;
@@ -11,6 +12,7 @@ pub(super) struct PreparedServicePublication {
     pub recovery: Option<CapturedRecoveryPublication>,
     coverage: Option<RecoveryCoverage>,
     introduced_floor: Option<i64>,
+    capacity: Option<RecoveryCapacity>,
 }
 
 impl PreparedServicePublication {
@@ -100,6 +102,7 @@ impl<S: BlobStore + Clone> V2Repository<S> {
             recovery,
             coverage,
             introduced_floor: None,
+            capacity: None,
         })
     }
 
@@ -143,6 +146,10 @@ impl<S: BlobStore + Clone> V2Repository<S> {
         prepared: &PreparedServicePublication,
         accepted: &V2AnchorState,
     ) {
+        if let Some(capacity) = &prepared.capacity {
+            self.commit_store
+                .install_recovery_capacity(capacity, accepted);
+        }
         if let (Some(base), Some(introduced)) = (&prepared.coverage, prepared.introduced_floor) {
             self.commit_store
                 .advance_recovery_coverage(base, accepted, introduced);
@@ -243,6 +250,35 @@ impl<S: BlobStore + Clone> V2Repository<S> {
                     .await
                     .map_err(v2_repository_error)?,
             );
+        }
+        if prepared.coverage.is_some() {
+            prepared.capacity = Some(
+                self.commit_store
+                    .verify_recovery_capacity(
+                        &capture.publication.parent,
+                        uploaded,
+                        &authenticated.header,
+                        entries,
+                        new_runs,
+                    )
+                    .await
+                    .map_err(v2_repository_error)?,
+            );
+            let guard =
+                guard.ok_or_else(|| v2_repository_error(V2FormatError::ProviderProfileFailed))?;
+            guard
+                .verify_v2_maintenance(Some(&capture.publication.parent))
+                .await
+                .map_err(v2_repository_error)?;
+            if anchor
+                .read_v2()
+                .await
+                .map_err(v2_repository_error)?
+                .as_ref()
+                != Some(&capture.publication.parent)
+            {
+                return Err(v2_repository_error(V2FormatError::StaleAnchor));
+            }
         }
         Ok(Some(AcceptedRecoveryState {
             policy: section.current_policy,

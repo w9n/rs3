@@ -91,6 +91,16 @@ The MD5 is computed once at the plaintext consumer without an extra payload
 read. Local vectors, adapter tests and authenticated HTTP tests cover these
 paths; client qualification and its limits are recorded in [Testing](testing.md).
 
+Retained publication's capacity cache binds conservative metadata and exact-target
+bounds to an exact accepted anchor and budget configuration. It is separate from
+retention coverage and cannot select repository state. Candidate fallback walks
+are read-only; the writer rechecks the real parent and fence before CAS and caches
+capacity only after accepted-state installation. Cache loss adds verification
+reads rather than permission to exceed the metadata limit. Extra metadata range
+reads near a capacity boundary are visible to the backend, without plaintext
+path labels. The [admission limits](reference/repository-format.md#recovery-metadata-admission)
+do not certify pending-section, inventory, replay or optional I/O budgets.
+
 ## Accepted Leakage
 
 The replacement `v03` design accepts specific backend-visible leakage:

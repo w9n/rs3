@@ -217,6 +217,14 @@ compaction error poisons the coordinator immediately instead of allowing writes
 to run past an uncertain maintenance failure. Already accepted reads remain
 available.
 
+Retained writers also track conservative recovery metadata and exact-target
+capacity separately from cached retention coverage. Ordinary publications add
+bounded costs; a cold cache or exhausted estimate requires an exact candidate
+graph check before acceptance. Foreground admission leaves a small margin for
+an expiry root. The [metadata admission contract](reference/repository-format.md#recovery-metadata-admission)
+describes the shared limits and the separate pending-section, replay and inventory
+constraints. This check does not raise the qualified operating capacity.
+
 The state-flow view below separates the normal write path from the restore read
 path. Bounded nonempty writes pack encrypted values with an index run; large
 uploads store detached ciphertext referenced by a short index-run commit.

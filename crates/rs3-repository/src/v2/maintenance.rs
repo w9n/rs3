@@ -1,5 +1,6 @@
 //! v2 maintenance planning and conservative apply paths.
 
+pub(in crate::v2) mod capacity;
 mod packed_usage;
 mod recovery;
 
@@ -1930,7 +1931,28 @@ where
     where
         A: V2CommitAnchor,
     {
-        let anchor_state = anchor.read_v2().await?;
+        self.load_reachability_from_state(
+            anchor.read_v2().await?,
+            protected_roots,
+            budgets,
+            include_restore_metadata,
+            collect_packed_usage,
+            false,
+        )
+        .await
+    }
+
+    // A candidate is an exact read-only graph root, never latest-state authority.
+    // Publication callers must separately fence and recheck the real parent.
+    async fn load_reachability_from_state(
+        &self,
+        anchor_state: Option<V2AnchorState>,
+        protected_roots: &[V2AnchorState],
+        budgets: V2MaintenanceBudgets,
+        include_restore_metadata: bool,
+        collect_packed_usage: bool,
+        include_current_history: bool,
+    ) -> V2Result<V2ReachabilityState> {
         if anchor_state
             .as_ref()
             .is_some_and(|state| state.format_ref != self.options().format_ref)
@@ -1966,7 +1988,7 @@ where
                 .await?;
         }
 
-        self.include_recovery_history(&mut reachability, budgets)
+        self.include_recovery_history(&mut reachability, budgets, include_current_history)
             .await?;
 
         if include_restore_metadata {

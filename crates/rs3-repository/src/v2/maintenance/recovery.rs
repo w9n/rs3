@@ -33,6 +33,7 @@ impl<S: BlobStore> V2CommitStore<S> {
         &self,
         reachability: &mut V2ReachabilityState,
         budgets: V2MaintenanceBudgets,
+        include_current_history: bool,
     ) -> V2Result<()> {
         let Some(chain) = reachability.current_chain.as_ref() else {
             return Ok(());
@@ -133,6 +134,31 @@ impl<S: BlobStore> V2CommitStore<S> {
             .transpose()?;
         blocks.sort_unstable_by(|left, right| right.0.cmp(&left.0));
         let mut walk = HistoryWalk::default();
+        if include_current_history {
+            // Capacity includes the current point's eventual historical walk,
+            // including obsolete records still present in its immutable runs.
+            // This dry traversal grants no retention or deletion authority.
+            let current = chain
+                .commits_newest_first
+                .first()
+                .ok_or(V2FormatError::InvalidRecoveryHistory)?;
+            let point = RecoveryPoint {
+                anchor: reachability
+                    .anchor_state
+                    .clone()
+                    .ok_or(V2FormatError::MissingAnchor)?,
+                publish_time_ms: current.parsed_header.header.publish_time_ms,
+                protected_until_ms: blocks
+                    .iter()
+                    .map(|block| block.0)
+                    .chain(current_floor)
+                    .max()
+                    .unwrap_or(cutoff),
+                policy_id: accepted.policy.identity(),
+            };
+            self.walk_recovery_point(reachability, &mut walk, point, budgets)
+                .await?;
+        }
         for (deadline, block) in blocks {
             match block {
                 HistoryBlock::Tail(points) => {
@@ -469,8 +495,7 @@ impl<S: BlobStore> V2CommitStore<S> {
         }
         charge_history_metadata(
             state,
-            usize_to_u64(std::mem::size_of::<V2IndexRootRunRef>())
-                .saturating_add(2 * usize_to_u64(commit.parsed_header.header_len)),
+            run_fact_bytes(usize_to_u64(commit.parsed_header.header_len)),
             budgets,
         )?;
         walk.runs.insert(key, actual);
@@ -522,11 +547,7 @@ impl<S: BlobStore> V2CommitStore<S> {
                         }
                         charge_history_metadata(
                             state,
-                            target_fact_bytes(&key)
-                                .saturating_add(usize_to_u64(std::mem::size_of::<
-                                    V2StandalonePayloadRoot,
-                                >()))
-                                .saturating_add(1024),
+                            target_fact_bytes(&key).saturating_add(standalone_fact_bytes()),
                             budgets,
                         )?;
                         let metadata = self
@@ -588,7 +609,7 @@ fn retained_bytes(commit: &V2ReplayCommit) -> u64 {
         })
 }
 
-fn target_fact_bytes(key: &ExactVersion) -> u64 {
+pub(super) fn target_fact_bytes(key: &ExactVersion) -> u64 {
     // Account repeated exact keys in reachability, target and visited maps,
     // including tree nodes. This is an input-size bound, not an allocator meter.
     1024_u64
@@ -599,8 +620,20 @@ fn target_fact_bytes(key: &ExactVersion) -> u64 {
 }
 
 fn commit_fact_bytes(commit: &V2ReplayCommit) -> u64 {
-    usize_to_u64(std::mem::size_of::<V2ReplayCommit>())
-        .saturating_add(2 * usize_to_u64(commit.parsed_header.header_len))
+    commit_header_fact_bytes(usize_to_u64(commit.parsed_header.header_len))
+}
+
+pub(super) fn commit_header_fact_bytes(header_len: u64) -> u64 {
+    usize_to_u64(std::mem::size_of::<V2ReplayCommit>()).saturating_add(header_len.saturating_mul(2))
+}
+
+pub(super) fn run_fact_bytes(header_len: u64) -> u64 {
+    usize_to_u64(std::mem::size_of::<V2IndexRootRunRef>())
+        .saturating_add(header_len.saturating_mul(2))
+}
+
+pub(super) fn standalone_fact_bytes() -> u64 {
+    usize_to_u64(std::mem::size_of::<V2StandalonePayloadRoot>()).saturating_add(1024)
 }
 
 pub(super) fn charge_history_metadata(

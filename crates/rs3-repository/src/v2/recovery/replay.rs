@@ -14,6 +14,7 @@ pub(in crate::v2) struct AuthenticatedRecoverySection {
     pub ordinal: u32,
     pub kind: V2CommitKind,
     pub section: RecoverySection,
+    pub header: crate::v2::commit::V2ParsedCommitHeader,
 }
 
 impl<S: BlobStore> V2CommitStore<S> {
@@ -109,6 +110,7 @@ impl<S: BlobStore> V2CommitStore<S> {
             ordinal,
             kind,
             section,
+            header: commit.parsed_header,
         })
     }
 

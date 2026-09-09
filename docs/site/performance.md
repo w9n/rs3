@@ -64,8 +64,8 @@ A separate 55,000-overwrite diagnostic isolates the **256 MiB graph-metadata
 budget**: the default walk fails, while changing only that budget to 512 MiB
 allows the same graph to finish with 272.98 MiB accounted. A fresh writer using
 the default budget refuses its next publication before any backend PUT or anchor
-advance. Cached coverage can therefore permit growth that a later maintenance
-pass or restarted writer cannot handle under the default budget. The diagnostic
+advance. In that measured revision, cached coverage permitted growth that a later
+maintenance pass or restarted writer could not handle under the default budget. The diagnostic
 does not qualify a larger production configuration or change any runtime limit.
 
 | Measurement at 10,000 writes | Overwrite | Append |
@@ -92,7 +92,7 @@ counts. The append workload also retains more metadata from index compaction.
 Growth counters include automatic compaction and verification, and exclude the
 final deletion, forced checkpoint, and diagnostic maintenance scans.
 
-Submitted plaintext totals 4.88 MiB in each workload. The overwrite workload
+At 10,000 writes, submitted plaintext totals 4.88 MiB in each workload. The overwrite workload
 ends with no live values; append retains 9,999. Most stored bytes before expiry
 are commit, index, and recovery metadata. All payload ciphertext remains
 referenced through history at that point. Quick reporting, full GC planning,
@@ -105,8 +105,8 @@ These runs reclaim objects only after crossing observed physical lock deadlines,
 with another renewal keeping current dependencies protected in the meantime.
 They do not establish the earliest possible reclamation time.
 
-The production implementation is based on `0eb5064`; the harness only changes
-tests. These are single release-build runs using a controlled in-memory provider
+These measurements use production code at `0eb5064` and a test-only harness.
+They predate the admission repair described below. These are single release-build runs using a controlled in-memory provider
 and simulated time, without the HTTP gateway or Kubernetes. A reopen constructs
 a new repository instance in the same process. RSS includes the provider,
 driver, and allocator state and excludes swapped-out pages. The shared host was
@@ -132,11 +132,32 @@ runs end with a `HISTORY_SCALE` record whose phase is `complete`. Phase records
 include cumulative counters so setup and verification traffic remain visible.
 Failures retain the last completed phase and fail the test; increasing the
 requested count does not increase production budgets.
-For the budget-isolation diagnostic, set `RS3_HISTORY_SCALE_WRITES=55000` and
-`RS3_HISTORY_SCALE_DIAGNOSE=1` with `overwrite`. It also tries one read-only graph
-walk with a 512 MiB metadata budget and checks fresh-writer refusal under the
-default. The test still exits unsuccessfully to preserve the default-budget
-failure, even when those diagnostic checks succeed.
+The recorded budget-isolation diagnostic used `RS3_HISTORY_SCALE_WRITES=55000`
+and `RS3_HISTORY_SCALE_DIAGNOSE=1` with `overwrite`. On the measured revision it
+also tried one read-only graph walk with a 512 MiB metadata budget and checked
+fresh-writer refusal under the default. It exited unsuccessfully to preserve
+the default-budget failure. With current admission checks, growth can refuse
+before reaching that diagnostic phase.
+
+### Admission repair after the experiment
+
+Retained writers now check conservative graph metadata and exact-target capacity
+before accepting a candidate, including when retention coverage is cached.
+The [admission contract](reference/repository-format.md#recovery-metadata-admission)
+uses the same hard limits as maintenance, with a small foreground reserve for an
+expiry root. Ordinary successors update a constant-size certificate without
+rereading the old graph. A cold cache or an exhausted estimate requires an exact
+candidate graph walk, which adds metadata read traffic near the boundary.
+
+Reduced-budget controlled-provider regressions cover warm growth refusal,
+restart, current and historical reads, same-budget renewal, expiry, and eventual
+GC. Root and compaction refusals preserve the accepted anchor. The existing
+bounded-successor I/O regression remains in place. These checks establish the
+metadata admission behavior, not a new production capacity or network benchmark.
+The pending-section, inventory, replay and optional I/O limits remain independent;
+there is no general guarantee that every maintenance operation will fit.
+The source-bound tables above remain historical measurements. Existing hard limits, the wire format, retention promises, and the stored-payload
+layout are unchanged.
 
 ## Large uploads
 

@@ -255,7 +255,7 @@ At a glance:
 - local performance and compatibility smokes remain release evidence, not a
   provider certification
 
-Current v03 performance is reported in [Performance](performance.md#current-results-september-8-2026):
+Current v03 performance is reported in [Performance](performance.md#backend-comparison-september-8-2026):
 the September 8 comparison includes three-sample throughput, Kopia backup/restore,
 scale, RSS, and byte accounting. All 120 Kopia content checks pass, but sequential
 512 B amplification and large-PostgreSQL Kopia elapsed time fail their budgets.

@@ -219,6 +219,36 @@ selected through the separate authenticated operator recovery interface and
 opened in an isolated read-only namespace; selection never rewinds or advances
 the live anchor.
 
+### Recovery metadata admission
+
+Retained-profile publication checks graph metadata capacity separately from
+physical retention coverage. Its in-memory capacity certificate binds the exact
+accepted anchor and maintenance budgets. It conservatively includes the current
+point's eventual historical traversal, packed-reference accounting, and exact
+restore-envelope targets. Ordinary successors add bounded commit, run and payload
+reference costs without rereading the old graph. Cache loss or exhaustion of the
+conservative estimate triggers a read-only walk of the exact candidate before
+the real anchor CAS. Only acceptance and local installation update the cache.
+
+The shared defaults remain 256 MiB of accounted graph metadata and 2,000,000
+exact targets. Foreground delta admission leaves 128 KiB and one target for a
+metadata-only expiry root. Root publications may use that margin but must fit the
+hard limits; repeated nonreducing roots can consume it. Expiry can release
+capacity through candidate verification without shortening an accepted promise.
+A refusal leaves the accepted namespace and anchor unchanged. Already uploaded
+candidate objects remain unanchored and subject to guarded orphan GC.
+
+This admission check covers metadata bytes and reachable-target count. It does
+not certify the separate 64 MiB pending-section limit, startup replay limits,
+provider inventory, or optional per-pass I/O budgets. Traversal still enforces
+those limits independently. Capacity verification may read obsolete records
+still present in current immutable runs because a future historical traversal
+would read them too; missing exact dependencies fail closed. This is a read-only
+capacity check, not additional retention or deletion authority. Existing
+oversized repositories are not repaired by this check, and larger configurations
+still require end-to-end qualification.
+
+
 ## Value-Separated Payload Packs
 
 `PAYLOAD_PACK` is an immutable value container, not an index level. A normal

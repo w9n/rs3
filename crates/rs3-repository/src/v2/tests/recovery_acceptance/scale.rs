@@ -5,6 +5,8 @@ use rs3_storage::BlobOperationCounts;
 use serde_json::json;
 use std::time::Instant;
 
+mod capacity;
+
 type ScaleStore = CountingBlobStore<ControlledDeadlineStore>;
 
 struct Scale {
@@ -18,6 +20,10 @@ struct Scale {
 
 impl Scale {
     async fn new(mode: &'static str) -> Self {
+        Self::with_budgets(mode, V2MaintenanceBudgets::default()).await
+    }
+
+    async fn with_budgets(mode: &'static str, budgets: V2MaintenanceBudgets) -> Self {
         let start = i64::try_from(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -33,7 +39,8 @@ impl Scale {
             Some(RetentionPolicy::new(RetentionMode::Compliance, 1)),
         )
         .await
-        .with_recovery_policy(Some(RecoveryPolicy::PRESET));
+        .with_recovery_policy(Some(RecoveryPolicy::PRESET))
+        .with_recovery_maintenance_budgets(budgets);
         let repository = Arc::new(V2Repository::new(
             store.clone(),
             must_crypto(KeyRing::generate_random()),
