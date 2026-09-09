@@ -87,6 +87,12 @@ maintenance:
   # (defaults: 4096 pages; 2000000 items)
   maxInventoryPages: null
   maxInventoryItems: null
+  # Authenticated recovery-history byte caps. Leave unset for the server
+  # defaults (256 MiB metadata; 64 MiB pending sections). Raise the metadata
+  # cap only with a reviewed capacity plan; 1073741824 bytes selects an explicit 1 GiB metadata cap.
+  maxHistoryMetadataBytes: null
+  # At least 24 MiB. Larger replay chains and read scratch can require more.
+  maxHistoryPendingBytes: null
 
 # Persisted output from `rs3 check-v2-provider --format json`. Retained
 # automatic maintenance fails closed without current evidence for the selected

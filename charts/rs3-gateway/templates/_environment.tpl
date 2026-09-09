@@ -201,6 +201,14 @@
 - name: RS3_MAINTENANCE_MAX_INVENTORY_ITEMS
   value: {{ .Values.maintenance.maxInventoryItems | quote }}
 {{- end }}
+{{- if .Values.maintenance.maxHistoryMetadataBytes }}
+- name: RS3_MAINTENANCE_MAX_HISTORY_METADATA_BYTES
+  value: {{ printf "%d" (int64 .Values.maintenance.maxHistoryMetadataBytes) | quote }}
+{{- end }}
+{{- if .Values.maintenance.maxHistoryPendingBytes }}
+- name: RS3_MAINTENANCE_MAX_HISTORY_PENDING_BYTES
+  value: {{ printf "%d" (int64 .Values.maintenance.maxHistoryPendingBytes) | quote }}
+{{- end }}
 {{- if or .Values.providerConformance.existingConfigMap (and (or .Values.bootstrap.enabled .Values.bootstrap.existingJournalSecret) (not $bootstrap)) }}
 - name: RS3_PROVIDER_CONFORMANCE_REPORT_FILE
   value: /etc/rs3/provider-conformance/report.json

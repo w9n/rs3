@@ -1176,7 +1176,6 @@ pub(crate) async fn v2_quick_maintenance_from_config(
             "v3-preview maintenance requires an accepted anchor",
         ));
     };
-    let provider_profile = v2_provider_profile(&config.backend, config.repository.retention);
     let loaded = load_existing_v2_repository(
         store.handle(),
         &config.repository_keys,
@@ -1184,19 +1183,17 @@ pub(crate) async fn v2_quick_maintenance_from_config(
         config,
     )
     .await?;
-    let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
-    let maintenance_keyring_ref = loaded.keyring_ref.clone();
-    let commit_options = V2CommitStoreOptions::for_profile(
-        provider_profile,
-        config.repository_keys.repository_id.clone(),
-        commit_ref,
-        loaded.format_ref,
-    )
-    .with_maintenance_keyring_envelope_ref(maintenance_keyring_ref)
-    .with_retention(config.repository.retention);
+    let commit_options = bootstrap_commit_options(config, &loaded)?;
     let commit_store = V2CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
     commit_store
-        .quick_maintenance(&anchor_handle)
+        .quick_maintenance_with_options(
+            &anchor_handle,
+            V2QuickMaintenanceOptions {
+                budgets: config.maintenance.budgets(),
+                retention_renewal_horizon: config.maintenance.renewal_horizon,
+                ..V2QuickMaintenanceOptions::default()
+            },
+        )
         .await
         .map_err(repository_init)
 }

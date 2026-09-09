@@ -74,11 +74,18 @@ const MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV: &str = "RS3_MAINTENANCE_MIN_COOLDOWN
 const MAINTENANCE_PACING_DELAY_MS_ENV: &str = "RS3_MAINTENANCE_PACING_DELAY_MS";
 const MAINTENANCE_MAX_INVENTORY_PAGES_ENV: &str = "RS3_MAINTENANCE_MAX_INVENTORY_PAGES";
 const MAINTENANCE_MAX_INVENTORY_ITEMS_ENV: &str = "RS3_MAINTENANCE_MAX_INVENTORY_ITEMS";
+const MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV: &str =
+    "RS3_MAINTENANCE_MAX_HISTORY_METADATA_BYTES";
+const MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV: &str = "RS3_MAINTENANCE_MAX_HISTORY_PENDING_BYTES";
 const DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_COUNT: u64 = 512;
 const DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS: u64 = 48 * 60 * 60;
 const DEFAULT_MAINTENANCE_MAX_INTERVAL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_MAINTENANCE_MIN_COOLDOWN_SECONDS: u64 = 60 * 60;
+const MIN_MAINTENANCE_HISTORY_METADATA_BYTES: u64 = 1024 * 1024;
+const MAX_MAINTENANCE_HISTORY_METADATA_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MIN_MAINTENANCE_HISTORY_PENDING_BYTES: u64 = 24 * 1024 * 1024;
+const MAX_MAINTENANCE_HISTORY_PENDING_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Complete runtime configuration for the gateway process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -429,6 +436,10 @@ pub struct MaintenanceConfig {
     pub max_inventory_pages: u64,
     /// Maximum raw provider members consumed while building maintenance inventory.
     pub max_inventory_items: u64,
+    /// Maximum authenticated recovery-history metadata bytes accounted by one plan.
+    pub max_history_metadata_bytes: u64,
+    /// Maximum encoded section buffers and read scratch during history traversal.
+    pub max_history_pending_bytes: u64,
 }
 
 impl Default for MaintenanceConfig {
@@ -448,6 +459,8 @@ impl Default for MaintenanceConfig {
             pacing_delay: None,
             max_inventory_pages: budget_defaults.max_inventory_page_count,
             max_inventory_items: budget_defaults.max_inventory_item_count,
+            max_history_metadata_bytes: budget_defaults.max_history_metadata_bytes,
+            max_history_pending_bytes: budget_defaults.max_history_pending_bytes,
         }
     }
 }
@@ -467,6 +480,8 @@ impl MaintenanceConfig {
         V2MaintenanceBudgets {
             max_inventory_page_count: self.max_inventory_pages,
             max_inventory_item_count: self.max_inventory_items,
+            max_history_metadata_bytes: self.max_history_metadata_bytes,
+            max_history_pending_bytes: self.max_history_pending_bytes,
             op_pacing_delay: self.pacing_delay,
             ..V2MaintenanceBudgets::default()
         }
@@ -1931,6 +1946,26 @@ fn parse_maintenance_config(
             defaults.max_inventory_items,
         ),
     );
+    let max_history_metadata_bytes = collect_config_error(
+        &mut errors,
+        parse_bounded_u64(
+            MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV,
+            source.value(MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV),
+            defaults.max_history_metadata_bytes,
+            MIN_MAINTENANCE_HISTORY_METADATA_BYTES,
+            MAX_MAINTENANCE_HISTORY_METADATA_BYTES,
+        ),
+    );
+    let max_history_pending_bytes = collect_config_error(
+        &mut errors,
+        parse_bounded_u64(
+            MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV,
+            source.value(MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV),
+            defaults.max_history_pending_bytes,
+            MIN_MAINTENANCE_HISTORY_PENDING_BYTES,
+            MAX_MAINTENANCE_HISTORY_PENDING_BYTES,
+        ),
+    );
     if let (Some(min_cooldown), Some(max_interval)) = (min_cooldown, max_interval)
         && min_cooldown > max_interval
     {
@@ -1957,6 +1992,8 @@ fn parse_maintenance_config(
         pacing_delay: require_collected_config(pacing_delay)?,
         max_inventory_pages: require_collected_config(max_inventory_pages)?,
         max_inventory_items: require_collected_config(max_inventory_items)?,
+        max_history_metadata_bytes: require_collected_config(max_history_metadata_bytes)?,
+        max_history_pending_bytes: require_collected_config(max_history_pending_bytes)?,
     })
 }
 
@@ -2386,6 +2423,26 @@ fn parse_positive_u64(
             key,
             value: "0".to_owned(),
             reason: "expected value greater than zero".to_owned(),
+        });
+    }
+
+    Ok(parsed)
+}
+
+fn parse_bounded_u64(
+    key: &'static str,
+    value: Option<String>,
+    default: u64,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, ConfigError> {
+    let reported_value = value.clone().unwrap_or_else(|| default.to_string());
+    let parsed = parse_u64(key, value, default)?;
+    if !(minimum..=maximum).contains(&parsed) {
+        return Err(ConfigError::Invalid {
+            key,
+            value: reported_value,
+            reason: format!("expected whole bytes from {minimum} through {maximum}"),
         });
     }
 
@@ -3048,6 +3105,8 @@ mod tests {
         );
         assert_eq!(maintenance.min_cooldown, Duration::from_secs(60 * 60));
         assert_eq!(maintenance.pacing_delay, None);
+        assert_eq!(maintenance.max_history_metadata_bytes, 256 * 1024 * 1024);
+        assert_eq!(maintenance.max_history_pending_bytes, 64 * 1024 * 1024);
         let budgets = maintenance.budgets();
         assert_eq!(budgets.op_pacing_delay, None);
         assert_eq!(
@@ -3058,6 +3117,8 @@ mod tests {
             budgets.max_inventory_item_count,
             rs3_repository::v2::V2MaintenanceBudgets::default().max_inventory_item_count
         );
+        assert_eq!(budgets.max_history_metadata_bytes, 256 * 1024 * 1024);
+        assert_eq!(budgets.max_history_pending_bytes, 64 * 1024 * 1024);
     }
 
     #[test]
@@ -3132,7 +3193,12 @@ mod tests {
             .with(super::MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV, "600")
             .with(super::MAINTENANCE_PACING_DELAY_MS_ENV, "25")
             .with(super::MAINTENANCE_MAX_INVENTORY_PAGES_ENV, "128")
-            .with(super::MAINTENANCE_MAX_INVENTORY_ITEMS_ENV, "4096");
+            .with(super::MAINTENANCE_MAX_INVENTORY_ITEMS_ENV, "4096")
+            .with(
+                super::MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV,
+                "1073741824",
+            )
+            .with(super::MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV, "25165824");
 
         let config = RuntimeConfig::from_source(&source);
 
@@ -3154,10 +3220,14 @@ mod tests {
         assert_eq!(maintenance.pacing_delay, Some(Duration::from_millis(25)));
         assert_eq!(maintenance.max_inventory_pages, 128);
         assert_eq!(maintenance.max_inventory_items, 4_096);
+        assert_eq!(maintenance.max_history_metadata_bytes, 1_073_741_824);
+        assert_eq!(maintenance.max_history_pending_bytes, 25_165_824);
         let budgets = maintenance.budgets();
         assert_eq!(budgets.op_pacing_delay, Some(Duration::from_millis(25)));
         assert_eq!(budgets.max_inventory_page_count, 128);
         assert_eq!(budgets.max_inventory_item_count, 4_096);
+        assert_eq!(budgets.max_history_metadata_bytes, 1_073_741_824);
+        assert_eq!(budgets.max_history_pending_bytes, 25_165_824);
     }
 
     #[test]
@@ -3185,6 +3255,8 @@ mod tests {
             super::MAINTENANCE_PACING_DELAY_MS_ENV,
             super::MAINTENANCE_MAX_INVENTORY_PAGES_ENV,
             super::MAINTENANCE_MAX_INVENTORY_ITEMS_ENV,
+            super::MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV,
+            super::MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV,
         ] {
             let source = minimal_source().with(key, "0");
 
@@ -3193,6 +3265,50 @@ mod tests {
             assert!(
                 matches!(config, Err(ConfigError::Invalid { key: invalid_key, .. }) if invalid_key == key),
                 "expected zero rejection for {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_maintenance_history_budgets() {
+        let bounds = RuntimeConfig::from_source(
+            &minimal_source()
+                .with(
+                    super::MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV,
+                    "8589934592",
+                )
+                .with(
+                    super::MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV,
+                    "1073741824",
+                ),
+        )
+        .expect("maximum history budgets must be accepted");
+        assert_eq!(
+            bounds.maintenance.max_history_metadata_bytes,
+            8 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            bounds.maintenance.max_history_pending_bytes,
+            1024 * 1024 * 1024
+        );
+
+        for (key, value) in [
+            (super::MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV, "1048575"),
+            (
+                super::MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV,
+                "8589934593",
+            ),
+            (super::MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV, "25165823"),
+            (
+                super::MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV,
+                "1073741825",
+            ),
+        ] {
+            let config = RuntimeConfig::from_source(&minimal_source().with(key, value));
+
+            assert!(
+                matches!(config, Err(ConfigError::Invalid { key: invalid_key, .. }) if invalid_key == key),
+                "expected {key}={value} rejection"
             );
         }
     }

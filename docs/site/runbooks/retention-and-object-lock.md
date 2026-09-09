@@ -159,6 +159,13 @@ exposes these ceilings as `RS3_MAINTENANCE_MAX_INVENTORY_PAGES` and
 `RS3_MAINTENANCE_MAX_INVENTORY_ITEMS`. Require an explicit, reviewed increase
 for larger repositories.
 
+Authenticated recovery history has separate byte caps shared by foreground
+publication verification and maintenance planning: 256 MiB metadata and 64 MiB
+pending sections by default. Configure
+`RS3_MAINTENANCE_MAX_HISTORY_METADATA_BYTES=1073741824` to select a 1 GiB
+metadata cap explicitly. The server rejects metadata caps below
+1 MiB or above 8 GiB, and pending-section caps below 24 MiB or above 1 GiB.
+
 Full-GC planning wraps its store in a read-only ledger. Every logical provider
 `HEAD`, bounded range `GET`, and LIST page is charged before it is forwarded,
 including commit replay, referenced catalog runs, protected roots, and renewal

@@ -167,6 +167,11 @@ not provide that capability.
   read-write default; `manual` disables background triggers, and `off` disables
   the supervisor. Inventory ceilings and pacing are configured under the
   `maintenance` values block. Do not deploy a second maintenance writer.
+- The `maintenance.maxHistoryMetadataBytes` and
+  `maintenance.maxHistoryPendingBytes` values bound authenticated recovery
+  history in both publication verification and maintenance. Leave them unset
+  for the 256 MiB and 64 MiB server defaults. For example,
+  `maxHistoryMetadataBytes: 1073741824` explicitly selects a 1 GiB metadata cap.
 - Lease fencing coordinates writers that share one Kubernetes apiserver and
   anchor Lease. Disconnected read-write gateways that only share or synchronize
   S3 storage remain unsupported: an eventually consistent or malicious backend

@@ -88,6 +88,14 @@ controller or CronJob.
 | `RS3_MAINTENANCE_PACING_DELAY_MS` | no | unset | Optional positive delay between backend maintenance operations. |
 | `RS3_MAINTENANCE_MAX_INVENTORY_PAGES` | no | `4096` | Maximum provider inventory pages consumed by one plan. |
 | `RS3_MAINTENANCE_MAX_INVENTORY_ITEMS` | no | `2000000` | Maximum raw provider members consumed by one plan, including filtered members such as delete markers. |
+| `RS3_MAINTENANCE_MAX_HISTORY_METADATA_BYTES` | no | `268435456` | Maximum authenticated recovery-history metadata bytes accounted by one plan. Whole bytes from `1048576` through `8589934592`. |
+| `RS3_MAINTENANCE_MAX_HISTORY_PENDING_BYTES` | no | `67108864` | Maximum encoded section buffers and read scratch during recovery-history traversal. Whole bytes from `25165824` through `1073741824`; a replay chain may need more than the minimum. |
+
+These history caps apply to foreground publication verification and maintenance
+planning through the same bounded-budget mapping. They do not grow with the
+repository. For example,
+`RS3_MAINTENANCE_MAX_HISTORY_METADATA_BYTES=1073741824` selects a 1 GiB metadata
+cap without changing the server or chart default.
 
 For automatic retained serving, the production doctor requires the provider
 retention window to exceed the maximum maintenance interval plus the renewal

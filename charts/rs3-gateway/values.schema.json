@@ -71,7 +71,9 @@
         "minCooldownSeconds",
         "pacingDelayMs",
         "maxInventoryPages",
-        "maxInventoryItems"
+        "maxInventoryItems",
+        "maxHistoryMetadataBytes",
+        "maxHistoryPendingBytes"
       ],
       "properties": {
         "mode": { "type": "string", "enum": ["", "auto", "manual", "off"] },
@@ -84,7 +86,17 @@
         "minCooldownSeconds": { "type": ["integer", "null"], "minimum": 1 },
         "pacingDelayMs": { "type": ["integer", "null"], "minimum": 1 },
         "maxInventoryPages": { "type": ["integer", "null"], "minimum": 1 },
-        "maxInventoryItems": { "type": ["integer", "null"], "minimum": 1 }
+        "maxInventoryItems": { "type": ["integer", "null"], "minimum": 1 },
+        "maxHistoryMetadataBytes": {
+          "type": ["integer", "null"],
+          "minimum": 1048576,
+          "maximum": 8589934592
+        },
+        "maxHistoryPendingBytes": {
+          "type": ["integer", "null"],
+          "minimum": 25165824,
+          "maximum": 1073741824
+        }
       }
     },
     "recovery": {

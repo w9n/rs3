@@ -89,6 +89,8 @@ def main() -> None:
     assert defaults["RS3_RECOVERY_RENEWAL_MARGIN_SECONDS"] == "86400"
     assert defaults["RS3_RECOVERY_CLOCK_UNCERTAINTY_MS"] == "60000"
     assert defaults["RS3_RECLAMATION_ENABLED"] == "true"
+    assert "RS3_MAINTENANCE_MAX_HISTORY_METADATA_BYTES" not in defaults
+    assert "RS3_MAINTENANCE_MAX_HISTORY_PENDING_BYTES" not in defaults
 
     custom = local_values()
     custom["hardening"] = {
@@ -107,7 +109,11 @@ def main() -> None:
         "renewalMarginSeconds": 90_000,
         "clockUncertaintyMs": 1_000,
     }
-    custom["maintenance"] = {"reclamationEnabled": False}
+    custom["maintenance"] = {
+        "reclamationEnabled": False,
+        "maxHistoryMetadataBytes": 1_073_741_824,
+        "maxHistoryPendingBytes": 25_165_824,
+    }
     custom["backend"] = {
         "endpoint": "file:///data",
         "bucket": "backend",
@@ -133,6 +139,8 @@ def main() -> None:
     assert configured["RS3_RECOVERY_RENEWAL_MARGIN_SECONDS"] == "90000"
     assert configured["RS3_RECOVERY_CLOCK_UNCERTAINTY_MS"] == "1000"
     assert configured["RS3_RECLAMATION_ENABLED"] == "false"
+    assert configured["RS3_MAINTENANCE_MAX_HISTORY_METADATA_BYTES"] == "1073741824"
+    assert configured["RS3_MAINTENANCE_MAX_HISTORY_PENDING_BYTES"] == "25165824"
 
     readonly = local_values()
     readonly["gateway"] = {"mode": "restore-readonly", "writerGuard": "off"}
@@ -154,6 +162,22 @@ def main() -> None:
         "clockUncertaintyMs": 60_000,
     }
     render(insufficient_recovery_margin, succeeds=False)
+
+    metadata_below_minimum = copy.deepcopy(custom)
+    metadata_below_minimum["maintenance"]["maxHistoryMetadataBytes"] = 1_048_575
+    render(metadata_below_minimum, succeeds=False)
+
+    metadata_above_maximum = copy.deepcopy(custom)
+    metadata_above_maximum["maintenance"]["maxHistoryMetadataBytes"] = 8_589_934_593
+    render(metadata_above_maximum, succeeds=False)
+
+    pending_below_minimum = copy.deepcopy(custom)
+    pending_below_minimum["maintenance"]["maxHistoryPendingBytes"] = 25_165_823
+    render(pending_below_minimum, succeeds=False)
+
+    pending_above_maximum = copy.deepcopy(custom)
+    pending_above_maximum["maintenance"]["maxHistoryPendingBytes"] = 1_073_741_825
+    render(pending_above_maximum, succeeds=False)
 
     buffered_above_max = copy.deepcopy(custom)
     buffered_above_max["hardening"]["bufferedPutObjectBytes"] = 104_857_601
