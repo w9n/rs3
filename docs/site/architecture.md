@@ -62,12 +62,6 @@ syncs; it does not provide versioning or Object Lock. Construction is synchronou
 A canceled filesystem read or listing must be reopened, because reusing its
 cursor fails rather than silently skipping work completed by a detached worker.
 
-Compaction can combine up to 256 small source runs while keeping its 16 MiB
-encoded-source and 131,072-mutation bounds. The wider window amortizes root
-publication across more runs. Catalog estimates still select a cheaper subset
-when rewriting large older shards would cost more. Recovery page capacity,
-retention promises, reader limits and the wire format are unchanged.
-
 ## Repository State
 
 !!! warning "Format implementation status"
@@ -153,7 +147,9 @@ and discards upserts proven obsolete by the accepted blinded-key namespace.
 Winning tombstones remain to mask older values. This prevents overwritten or
 deleted versions from filling the catalog indefinitely, including when full
 older shards precede later churn. Runs outside the selected window retain their exact
-references. The output contains fewer bounded level-1 generation-range shards;
+references. Combining more small runs amortizes root publication. The encoded
+source budget does not bound total process memory: decoded records and per-run
+structures also occupy memory. The output contains fewer bounded level-1 generation-range shards;
 an entirely obsolete window needs no replacement run. Level is a storage tier,
 never a compaction epoch. The format accepts only levels 0 and 1.
 
