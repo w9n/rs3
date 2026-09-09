@@ -108,7 +108,7 @@ pub struct V3IndexRunFrameDescriptor {
 impl fmt::Debug for V3IndexRunFrameDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V2IndexRunFrameDescriptor")
+            .debug_struct("V3IndexRunFrameDescriptor")
             .field("ordinal", &self.ordinal)
             .field("role", &self.role)
             .field("role_ordinal", &self.role_ordinal)
@@ -226,7 +226,7 @@ impl V3IndexRunHeaderProbe {
 impl fmt::Debug for V3VerifiedIndexRunDirectory {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V2VerifiedIndexRunDirectory")
+            .debug_struct("V3VerifiedIndexRunDirectory")
             .field("run_id", &self.header.run_id)
             .field("sequence", &self.sequence)
             .field("mutation_count", &self.mutation_count)

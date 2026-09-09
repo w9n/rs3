@@ -118,7 +118,7 @@ pub struct V3IndexRootRunRef {
 impl fmt::Debug for V3IndexRootRunRef {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V2IndexRootRunRef")
+            .debug_struct("V3IndexRootRunRef")
             .field("run_id", &self.run_id)
             .field("run_sequence", &self.run_sequence)
             .field("minimum_generation", &self.minimum_generation)
@@ -192,7 +192,7 @@ pub struct V3IndexRoot {
 impl fmt::Debug for V3IndexRoot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V2IndexRoot")
+            .debug_struct("V3IndexRoot")
             .field("covered_generation", &self.covered_generation)
             .field(
                 "expected_live_object_count",

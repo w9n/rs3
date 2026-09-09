@@ -37,7 +37,7 @@ pub struct V3PayloadPackRecordInput {
 impl fmt::Debug for V3PayloadPackRecordInput {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V2PayloadPackRecordInput")
+            .debug_struct("V3PayloadPackRecordInput")
             .field("plaintext_len", &self.plaintext.len())
             .finish()
     }
@@ -69,7 +69,7 @@ impl V3PayloadPackId {
 
 impl fmt::Debug for V3PayloadPackId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("V2PayloadPackId(<redacted>)")
+        formatter.write_str("V3PayloadPackId(<redacted>)")
     }
 }
 
@@ -86,7 +86,7 @@ pub struct V3PayloadPackFacts {
 impl fmt::Debug for V3PayloadPackFacts {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V2PayloadPackFacts")
+            .debug_struct("V3PayloadPackFacts")
             .field("pack_id", &self.pack_id)
             .field("content_key_id", &self.content_key_id)
             .field("stored_len", &self.stored_len)
@@ -163,7 +163,7 @@ pub struct V3PayloadPackRecordRef {
 impl fmt::Debug for V3PayloadPackRecordRef {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V2PayloadPackRecordRef")
+            .debug_struct("V3PayloadPackRecordRef")
             .field("record_ordinal", &self.record_ordinal)
             .field("physical_offset", &self.physical_offset)
             .finish()
@@ -203,7 +203,7 @@ pub struct V3PayloadPackRecord {
 impl fmt::Debug for V3PayloadPackRecord {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V2PayloadPackRecord")
+            .debug_struct("V3PayloadPackRecord")
             .field("reference", &self.reference)
             .field("plaintext_len", &self.plaintext_len)
             .finish()
@@ -250,7 +250,7 @@ pub struct V3PayloadPackLayout {
 impl fmt::Debug for V3PayloadPackLayout {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V2PayloadPackLayout")
+            .debug_struct("V3PayloadPackLayout")
             .field("facts", &self.facts)
             .field("records", &self.records)
             .finish()
@@ -304,7 +304,7 @@ pub struct V3SealedPayloadPack {
 impl fmt::Debug for V3SealedPayloadPack {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V2SealedPayloadPack")
+            .debug_struct("V3SealedPayloadPack")
             .field("layout", &self.layout)
             .field("stored_len", &self.bytes.len())
             .finish()
@@ -377,7 +377,7 @@ pub struct V3PayloadPackRecordContext<'a> {
 impl fmt::Debug for V3PayloadPackRecordContext<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V2PayloadPackRecordContext")
+            .debug_struct("V3PayloadPackRecordContext")
             .field("section_ordinal", &self.object.section_ordinal)
             .field("facts", self.facts)
             .field("record", self.record)

@@ -155,10 +155,10 @@ not provide that capability.
   read-write deployments.
 - Production read-write rendering requires `bootstrap.enabled=true` or
   `providerConformance.existingConfigMap`. For external evidence, generate its `reportKey` with `rs3
-  check-v2-provider --format json` against the selected retained backend and
+  check-provider --format json` against the selected retained backend and
   refresh it before `providerConformance.maxAgeSeconds` expires. The production
   doctor and maintenance engine fail closed on missing, stale, failed, or
-  profile-mismatched evidence. The v2 report also requires the complete check
+  profile-mismatched evidence. The provider report also requires the complete check
   manifest and a target fingerprint matching the configured endpoint, bucket,
   prefix, and `providerConformance.principalFingerprint`. Governance retention
   requires that fingerprint so rotating to a differently privileged principal

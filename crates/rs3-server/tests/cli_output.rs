@@ -7,7 +7,7 @@ const PROVIDER_CHECK_LOG_MESSAGE: &str = "v2 provider check configuration valida
 
 #[test]
 fn json_reports_are_not_polluted_by_plain_tracing_logs() {
-    let output = run_provider_report(&["check-v2-provider", "--format", "json"]);
+    let output = run_provider_report(&["check-provider", "--format", "json"]);
     assert_provider_report_stdout(&output.stdout);
     assert!(!output.stdout.contains(PROVIDER_CHECK_LOG_MESSAGE));
     assert!(output.stderr.contains(PROVIDER_CHECK_LOG_MESSAGE));
@@ -15,13 +15,8 @@ fn json_reports_are_not_polluted_by_plain_tracing_logs() {
 
 #[test]
 fn json_reports_are_not_polluted_by_json_tracing_logs() {
-    let output = run_provider_report(&[
-        "--log-format",
-        "json",
-        "check-v2-provider",
-        "--format",
-        "json",
-    ]);
+    let output =
+        run_provider_report(&["--log-format", "json", "check-provider", "--format", "json"]);
     assert_provider_report_stdout(&output.stdout);
     assert!(!output.stdout.contains(PROVIDER_CHECK_LOG_MESSAGE));
     assert!(output.stderr.contains(PROVIDER_CHECK_LOG_MESSAGE));
@@ -105,7 +100,7 @@ fn reports_distinguish_executable_bytes_with_the_same_source_revision() {
         .expect("open copy")
         .write_all(&[0])
         .expect("append fixture byte");
-    let args = ["check-v2-provider", "--format", "json"];
+    let args = ["check-provider", "--format", "json"];
     let first: Value =
         serde_json::from_str(&run_provider_report(&args).stdout).expect("first report");
     let second: Value = serde_json::from_str(&run_provider_report_binary(&copied, &args).stdout)

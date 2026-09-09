@@ -57,7 +57,7 @@ pub struct V3MaintenanceWindow {
 impl std::fmt::Debug for V3MaintenanceWindow {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("V2MaintenanceWindow")
+            .debug_struct("V3MaintenanceWindow")
             .field(
                 "base_sequence",
                 &self.base_anchor.as_ref().map(|anchor| anchor.sequence),

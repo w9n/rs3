@@ -121,15 +121,15 @@ preview-gate-local:
     just deny
     just deny-s3
 
-# Expensive v2 production-preview integration gate for release candidates.
+# Expensive v3 production-preview integration gate for release candidates.
 preview-gate-release:
     just perf-standalone-gate
     just integration-kopia-gateway
     just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image
     just integration-velero-kopia-postgres-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image
 
-# Expensive local v2 gate for scheduled CI or release-candidate hardening.
-preview-gate-v2-nightly:
+# Expensive local v3 gate for scheduled CI or release-candidate hardening.
+preview-gate-v3-nightly:
     #!/usr/bin/env bash
     set -euo pipefail
     qualification_status=0
@@ -138,31 +138,31 @@ preview-gate-v2-nightly:
     just fault-injection-sweep || qualification_status=1
     just perf-standalone-gate || qualification_status=1
     just integration-s3-gateway --tooling-smoke || qualification_status=1
-    just preview-gate-v2-retained-local || qualification_status=1
+    just preview-gate-v3-retained-local || qualification_status=1
     just integration-kopia-gateway || qualification_status=1
     just integration-k8s-gateway --wait-secs 240 || qualification_status=1
     just integration-velero-kopia-dynamic-pvc-gateway-restart-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image || qualification_status=1
     just integration-velero-kopia-postgres-smoke --pull-velero-images --pull-openebs-images --pull-postgres-image --pull-rustfs-image || qualification_status=1
     exit "${qualification_status}"
 
-# Live retained-backend v2 gate. Credentials are read from the normal AWS/S3 env.
-preview-gate-v2-live BACKEND_BUCKET ENDPOINT_URL REGION:
+# Live retained-backend v3 gate. Credentials are read from the normal AWS/S3 env.
+preview-gate-v3-live BACKEND_BUCKET ENDPOINT_URL REGION:
     #!/usr/bin/env bash
     set -euo pipefail
     timestamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
     base="${RS3_LIVE_BACKEND_PREFIX_BASE:-rs3-live/${timestamp}}"
     mkdir -p .local/integration
     printf '%s\n' "${base}" > ".local/integration/${timestamp}.txt"
-    echo "v2 live gate using a fresh backend prefix; exact value is in the local artifact directory"
-    just check-v2-provider-v2-live "{{BACKEND_BUCKET}}" "{{ENDPOINT_URL}}" "{{REGION}}" "${base}/a" > ".local/integration/${timestamp}.json"
-    just integration-s3-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/b"
-    just integration-kopia-gateway-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/c"
+    echo "v3 live gate using a fresh backend prefix; exact value is in the local artifact directory"
+    just check-provider-live "{{BACKEND_BUCKET}}" "{{ENDPOINT_URL}}" "{{REGION}}" "${base}/a" > ".local/integration/${timestamp}.json"
+    just integration-s3-gateway-v3-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/b"
+    just integration-kopia-gateway-v3-live --backend-bucket "{{BACKEND_BUCKET}}" --endpoint-url "{{ENDPOINT_URL}}" --region "{{REGION}}" --backend-prefix "${base}/c"
     just integration-k8s-gateway --wait-secs 240
-    just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/d" --pull-velero-images --pull-openebs-images --pull-postgres-image
-    just integration-velero-kopia-postgres-v2-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/e" --pull-velero-images --pull-openebs-images --pull-postgres-image
+    just integration-velero-kopia-dynamic-pvc-gateway-restart-v3-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/d" --pull-velero-images --pull-openebs-images --pull-postgres-image
+    just integration-velero-kopia-postgres-v3-live --backend-bucket "{{BACKEND_BUCKET}}" --backend-endpoint-url "{{ENDPOINT_URL}}" --backend-region "{{REGION}}" --backend-prefix "${base}/e" --pull-velero-images --pull-openebs-images --pull-postgres-image
 
-# Check a live v2 backend for retained-version and object-lock behavior.
-check-v2-provider-v2-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
+# Check a live v3 backend for retained-version and object-lock behavior.
+check-provider-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
     #!/usr/bin/env bash
     set -euo pipefail
     : "${RS3_GOVERNANCE_BYPASS_REVIEWED:?set RS3_GOVERNANCE_BYPASS_REVIEWED=true after reviewing that gateway credentials cannot bypass governance retention}"
@@ -185,16 +185,16 @@ check-v2-provider-v2-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
     RS3_REPOSITORY_ID=rs3-provider-conformance \
     RS3_REPOSITORY_SALT_HEX=2222222222222222222222222222222222222222222222222222222222222222 \
     RS3_KEYRING_WRAPPING_KEY_HEX=3333333333333333333333333333333333333333333333333333333333333333 \
-      cargo run -p rs3-server --features s3 -- check-v2-provider \
+      cargo run -p rs3-server --features s3 -- check-provider \
         --legal-hold \
         --governance-bypass-reviewed \
         --format json
 
-# Rehearse v2 garbage collection against a live backend through the enforced
-# Kubernetes writer fence. Set RS3_V2_REHEARSAL_LEASE_NAMESPACE (and optionally
-# RS3_V2_REHEARSAL_LEASE_NAME) to name the dedicated rehearsal Lease.
-v2-gc-rehearsal-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
-    cargo run -p xtask --bin xtask --features k8s -- v2 gc-rehearsal --backend s3 --s3-bucket "{{BACKEND_BUCKET}}" --s3-prefix "{{BACKEND_PREFIX}}" --s3-endpoint-url "{{ENDPOINT_URL}}" --s3-region "{{REGION}}" --retained-provider-conformance-passed --format json
+# Rehearse v3 garbage collection against a live backend through the enforced
+# Kubernetes writer fence. Set RS3_REHEARSAL_LEASE_NAMESPACE (and optionally
+# RS3_REHEARSAL_LEASE_NAME) to name the dedicated rehearsal Lease.
+repository-gc-rehearsal-live BACKEND_BUCKET ENDPOINT_URL REGION BACKEND_PREFIX:
+    cargo run -p xtask --bin xtask --features k8s -- repository gc-rehearsal --backend s3 --s3-bucket "{{BACKEND_BUCKET}}" --s3-prefix "{{BACKEND_PREFIX}}" --s3-endpoint-url "{{ENDPOINT_URL}}" --s3-region "{{REGION}}" --retained-provider-conformance-passed --format json
 
 # Run live S3 storage contract tests against configured credentials.
 integration-s3:
@@ -215,12 +215,12 @@ integration-s3-gateway *ARGS:
 
 # Qualify retained-version storage and guarded gateway behavior against disposable local providers.
 # Governance bypass IAM remains separately qualified; this fixture uses compliance Object Lock.
-preview-gate-v2-retained-local:
+preview-gate-v3-retained-local:
     just integration-s3-container --qualification-profile retained-version --object-lock --retention-days 1 --gc-rehearsal
     just integration-k8s-gateway --retention-mode compliance --retention-days 30 --tooling-smoke
 
-# Run the v2 live S3 gateway integration harness.
-integration-s3-gateway-v2-live *ARGS:
+# Run the v3 live S3 gateway integration harness.
+integration-s3-gateway-v3-live *ARGS:
     cargo build -p rs3-server --bin rs3-server --features s3
     cargo run -p xtask --bin xtask --features containers -- integration s3-gateway --mode provided --retention-mode governance --retention-days 1 --tooling-smoke {{ARGS}}
 
@@ -229,8 +229,8 @@ integration-kopia-gateway *ARGS:
     cargo build -p rs3-server --bin rs3-server --features s3
     cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway {{ARGS}}
 
-# Run the v2 live Kopia gateway integration harness.
-integration-kopia-gateway-v2-live *ARGS:
+# Run the v3 live Kopia gateway integration harness.
+integration-kopia-gateway-v3-live *ARGS:
     cargo build -p rs3-server --bin rs3-server --features s3
     cargo run -p xtask --bin xtask --features containers -- integration kopia-gateway --mode provided --retention-mode governance --retention-days 1 {{ARGS}}
 
@@ -254,11 +254,11 @@ integration-velero-kopia-dynamic-pvc-smoke *ARGS:
 integration-velero-kopia-dynamic-pvc-gateway-restart-smoke *ARGS:
     RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke {{ARGS}}
 
-# Run the v2 live dynamic-PVC gateway-restart smoke test. Governance retention
+# Run the v3 live dynamic-PVC gateway-restart smoke test. Governance retention
 # on a provided backend needs operator review inputs: RS3_GOVERNANCE_BYPASS_REVIEWED=true
-# and RS3_PROVIDER_PRINCIPAL_FINGERPRINT (see check-v2-provider-v2-live). The chart
+# and RS3_PROVIDER_PRINCIPAL_FINGERPRINT (see check-provider-live). The chart
 # requires retention above the renewal horizon plus maintenance interval (14 days).
-integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live *ARGS:
+integration-velero-kopia-dynamic-pvc-gateway-restart-v3-live *ARGS:
     RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-dynamic-pvc-gateway-restart-smoke --backend-mode provided --repository-retention-mode governance --repository-retention-days 15 {{ARGS}}
 
 # Run the Velero Kopia restore-readonly dynamic-PVC smoke test.
@@ -269,9 +269,9 @@ integration-velero-kopia-dynamic-pvc-restore-readonly-smoke *ARGS:
 integration-velero-kopia-postgres-smoke *ARGS:
     RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke {{ARGS}}
 
-# Run the v2 live Velero Kopia Postgres smoke test. Needs the same governance
-# review inputs and retention floor as the gateway-restart v2-live recipe.
-integration-velero-kopia-postgres-v2-live *ARGS:
+# Run the v3 live Velero Kopia Postgres smoke test. Needs the same governance
+# review inputs and retention floor as the gateway-restart v3-live recipe.
+integration-velero-kopia-postgres-v3-live *ARGS:
     RS3_BUILD_GIT_SHA="$(just --quiet _candidate-revision)" cargo run -p xtask --bin xtask --features k8s -- integration velero-kopia-postgres-smoke --backend-mode provided --repository-retention-mode governance --repository-retention-days 15 {{ARGS}}
 
 # Candidate-only lifecycle qualification: generated salt, restart, same-values

@@ -2,7 +2,7 @@
 
 mod integration;
 mod perf;
-mod v2;
+mod repository;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -24,7 +24,7 @@ struct Cli {
 enum Commands {
     Integration(Box<integration::IntegrationArgs>),
     Perf(Box<perf::PerfArgs>),
-    V2(Box<v2::V2Args>),
+    Repository(Box<repository::RepositoryArgs>),
 }
 
 fn main() -> Result<()> {
@@ -38,11 +38,11 @@ fn main() -> Result<()> {
         Some(Commands::Perf(args)) => {
             perf::run(*args)?;
         }
-        Some(Commands::V2(args)) => {
-            v2::run(*args)?;
+        Some(Commands::Repository(args)) => {
+            repository::run(*args)?;
         }
         None => {
-            println!("usage: cargo xtask <integration|perf|v2>");
+            println!("usage: cargo xtask <integration|perf|repository>");
         }
     }
 

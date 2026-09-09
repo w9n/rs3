@@ -977,7 +977,7 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
         findings.push(AdminFinding::error(
             "maintenance.provider-conformance",
             "retained maintenance requires current provider-conformance evidence for the selected profile",
-            "run rs3 check-v2-provider --format json against the retained backend, store the report outside that backend, and configure RS3_PROVIDER_CONFORMANCE_REPORT_FILE",
+            "run rs3 check-provider --format json against the retained backend, store the report outside that backend, and configure RS3_PROVIDER_CONFORMANCE_REPORT_FILE",
         ));
     }
 

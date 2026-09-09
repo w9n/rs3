@@ -162,7 +162,7 @@ enum Commands {
         timeout_seconds: u64,
     },
     /// Probe v3 object-store behavior required by the repository format.
-    CheckV2Provider {
+    CheckProvider {
         /// Synthetic backing prefix, disjoint from the repository prefix on S3.
         #[arg(long)]
         probe_prefix: Option<String>,
@@ -525,7 +525,7 @@ async fn main() -> Result<()> {
             cli_init::wait_for_journal(&config, &journal_file, timeout_seconds).await?;
         }
 
-        Commands::CheckV2Provider {
+        Commands::CheckProvider {
             probe_prefix,
             legal_hold,
             governance_bypass_reviewed,
@@ -1732,6 +1732,16 @@ mod tests {
     use serde::Serialize;
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn provider_check_uses_current_unversioned_command() {
+        use clap::Parser;
+
+        let cli = super::Cli::try_parse_from(["rs3", "check-provider", "--format", "json"])
+            .expect("parse provider check");
+        assert!(matches!(cli.command, super::Commands::CheckProvider { .. }));
+        assert!(super::Cli::try_parse_from(["rs3", "check-v2-provider"]).is_err());
+    }
 
     fn runtime_config() -> RuntimeConfig {
         let bind = match "127.0.0.1:9080".parse() {

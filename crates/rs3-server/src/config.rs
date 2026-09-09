@@ -491,7 +491,7 @@ impl MaintenanceConfig {
 /// Provider-conformance evidence settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderConformanceConfig {
-    /// Optional JSON report emitted by `rs3 check-v3-provider`.
+    /// Optional JSON report emitted by `rs3 check-provider`.
     pub report_file: Option<PathBuf>,
     /// Maximum accepted report age before status marks the evidence stale.
     pub max_age: Duration,
@@ -2695,7 +2695,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_legacy_repository_format_v3_preview() {
+    fn accepts_current_repository_format_v3_preview() {
         let source = minimal_source().with(super::REPOSITORY_FORMAT_ENV, "v3-preview");
 
         let config = RuntimeConfig::from_source(&source);

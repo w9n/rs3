@@ -94,7 +94,7 @@ maintenance:
   # At least 24 MiB. Larger replay chains and read scratch can require more.
   maxHistoryPendingBytes: null
 
-# Persisted output from `rs3 check-v2-provider --format json`. Retained
+# Persisted output from `rs3 check-provider --format json`. Retained
 # automatic maintenance fails closed without current evidence for the selected
 # provider profile. bootstrap.enabled can generate and project evidence through
 # its declared Secret; an existing ConfigMap remains externally owned and read-only.

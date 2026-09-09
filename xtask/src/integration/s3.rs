@@ -176,7 +176,7 @@ fn run_container_gc_rehearsal(
     let retention_days = retention_days.to_string();
     let mut command = Command::new(executable);
     command.args([
-        "v2",
+        "repository",
         "gc-rehearsal",
         "--backend",
         "s3",

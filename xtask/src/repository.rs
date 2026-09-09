@@ -31,27 +31,27 @@ use rs3_types::KeyPurpose;
 #[cfg(feature = "s3")]
 use rs3_types::{RepositoryId, RetentionMode, RetentionPolicy, Sequence};
 
-/// v2 repository automation.
+/// Repository automation.
 #[derive(Args)]
-pub(crate) struct V2Args {
+pub(crate) struct RepositoryArgs {
     #[command(subcommand)]
-    command: V2Command,
+    command: RepositoryCommand,
 }
 
 #[derive(Subcommand)]
-enum V2Command {
-    /// Rehearse retained-profile v2 orphan GC against a fresh backend prefix.
-    GcRehearsal(Box<V2GcRehearsalArgs>),
+enum RepositoryCommand {
+    /// Rehearse retained-profile orphan GC against a fresh backend prefix.
+    GcRehearsal(Box<GcRehearsalArgs>),
 }
 
 #[derive(Args)]
-struct V2GcRehearsalArgs {
+struct GcRehearsalArgs {
     /// Backend object-store target.
     #[command(flatten)]
-    backend: V2BackendArgs,
+    backend: BackendArgs,
     /// Retention mode used for the protected rehearsal orphan.
-    #[arg(long, value_enum, default_value_t = V2RetentionModeArg::Governance)]
-    retention_mode: V2RetentionModeArg,
+    #[arg(long, value_enum, default_value_t = RetentionModeArg::Governance)]
+    retention_mode: RetentionModeArg,
     /// Retention duration for protected rehearsal objects.
     #[arg(long, default_value_t = 1)]
     retention_days: u32,
@@ -68,20 +68,20 @@ struct V2GcRehearsalArgs {
     /// Kubernetes namespace of the rehearsal writer-fence Lease.
     ///
     /// Required for the enforced (default) rehearsal path.
-    #[arg(long, env = "RS3_V2_REHEARSAL_LEASE_NAMESPACE")]
+    #[arg(long, env = "RS3_REHEARSAL_LEASE_NAMESPACE")]
     lease_namespace: Option<String>,
     /// Kubernetes Lease name fencing this rehearsal.
     ///
     /// Use a dedicated rehearsal Lease, never the gateway writer lease.
     #[arg(
         long,
-        env = "RS3_V2_REHEARSAL_LEASE_NAME",
+        env = "RS3_REHEARSAL_LEASE_NAME",
         default_value = "rs3-v2-gc-rehearsal"
     )]
     lease_name: String,
     /// Output format.
-    #[arg(long, value_enum, default_value_t = V2ReportFormat::Json)]
-    format: V2ReportFormat,
+    #[arg(long, value_enum, default_value_t = ReportFormat::Json)]
+    format: ReportFormat,
 }
 
 /// Maintenance-guard selection for the destructive rehearsal apply.
@@ -107,14 +107,14 @@ impl RehearsalGuardMode {
 
 /// Resolves the rehearsal guard mode, failing closed without explicit opt-in.
 #[cfg(feature = "s3")]
-fn rehearsal_guard_mode(args: &V2GcRehearsalArgs) -> Result<RehearsalGuardMode> {
+fn rehearsal_guard_mode(args: &GcRehearsalArgs) -> Result<RehearsalGuardMode> {
     if args.unenforced_guard {
         return Ok(RehearsalGuardMode::Unenforced);
     }
     #[cfg(feature = "k8s")]
     {
         let namespace = args.lease_namespace.clone().context(
-            "enforced GC rehearsal needs --lease-namespace (RS3_V2_REHEARSAL_LEASE_NAMESPACE); \
+            "enforced GC rehearsal needs --lease-namespace (RS3_REHEARSAL_LEASE_NAMESPACE); \
              pass --unenforced-guard only for isolated rehearsals",
         )?;
         Ok(RehearsalGuardMode::KubernetesWriterFence {
@@ -130,44 +130,48 @@ fn rehearsal_guard_mode(args: &V2GcRehearsalArgs) -> Result<RehearsalGuardMode> 
 }
 
 #[derive(Clone, Debug, Args)]
-struct V2BackendArgs {
+struct BackendArgs {
     /// Backend implementation used by retained GC rehearsal.
-    #[arg(long, value_enum, default_value_t = V2Backend::S3)]
-    backend: V2Backend,
+    #[arg(long, value_enum, default_value_t = Backend::S3)]
+    backend: Backend,
     /// S3 bucket used with `--backend s3`.
     #[cfg(feature = "s3")]
-    #[arg(long, env = "RS3_V2_S3_BUCKET")]
+    #[arg(long, env = "RS3_REHEARSAL_S3_BUCKET")]
     s3_bucket: Option<String>,
     /// S3 key prefix used with `--backend s3`.
     #[cfg(feature = "s3")]
-    #[arg(long, env = "RS3_V2_S3_PREFIX")]
+    #[arg(long, env = "RS3_REHEARSAL_S3_PREFIX")]
     s3_prefix: Option<String>,
     /// Custom S3 endpoint URL used with `--backend s3`.
     #[cfg(feature = "s3")]
-    #[arg(long, env = "RS3_V2_S3_ENDPOINT_URL")]
+    #[arg(long, env = "RS3_REHEARSAL_S3_ENDPOINT_URL")]
     s3_endpoint_url: Option<String>,
     /// AWS region override used with `--backend s3`.
     #[cfg(feature = "s3")]
-    #[arg(long, env = "RS3_V2_S3_REGION")]
+    #[arg(long, env = "RS3_REHEARSAL_S3_REGION")]
     s3_region: Option<String>,
     /// Allow plain HTTP for local S3-compatible endpoints used with `--backend s3`.
     #[cfg(feature = "s3")]
-    #[arg(long, env = "RS3_V2_S3_ALLOW_HTTP", default_value_t = false)]
+    #[arg(long, env = "RS3_REHEARSAL_S3_ALLOW_HTTP", default_value_t = false)]
     s3_allow_http: bool,
     /// Use virtual-hosted bucket addressing instead of path-style addressing.
     #[cfg(feature = "s3")]
-    #[arg(long, env = "RS3_V2_S3_VIRTUAL_HOSTED_STYLE", default_value_t = false)]
+    #[arg(
+        long,
+        env = "RS3_REHEARSAL_S3_VIRTUAL_HOSTED_STYLE",
+        default_value_t = false
+    )]
     s3_virtual_hosted_style: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum V2Backend {
+enum Backend {
     /// S3-compatible backend using the default environment/config chain.
     S3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum V2ReportFormat {
+enum ReportFormat {
     /// JSON object.
     Json,
     /// Human-readable key-value lines.
@@ -175,24 +179,24 @@ enum V2ReportFormat {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum V2RetentionModeArg {
+enum RetentionModeArg {
     /// Governance retention.
     Governance,
     /// Compliance retention.
     Compliance,
 }
 
-pub(crate) fn run(args: V2Args) -> Result<()> {
+pub(crate) fn run(args: RepositoryArgs) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("failed to build v2 automation runtime")?;
+        .context("failed to build repository automation runtime")?;
     runtime.block_on(run_async(args))
 }
 
-async fn run_async(args: V2Args) -> Result<()> {
+async fn run_async(args: RepositoryArgs) -> Result<()> {
     match args.command {
-        V2Command::GcRehearsal(args) => {
+        RepositoryCommand::GcRehearsal(args) => {
             let format = args.format;
             let report = gc_rehearsal(*args).await?;
             print_gc_rehearsal_report(&report, format)?;
@@ -201,7 +205,7 @@ async fn run_async(args: V2Args) -> Result<()> {
     Ok(())
 }
 
-async fn gc_rehearsal(args: V2GcRehearsalArgs) -> Result<serde_json::Value> {
+async fn gc_rehearsal(args: GcRehearsalArgs) -> Result<serde_json::Value> {
     if !args.retained_provider_conformance_passed {
         bail!("--retained-provider-conformance-passed is required for retained GC rehearsal");
     }
@@ -210,9 +214,9 @@ async fn gc_rehearsal(args: V2GcRehearsalArgs) -> Result<serde_json::Value> {
     }
     match args.backend.backend {
         #[cfg(not(feature = "s3"))]
-        V2Backend::S3 => bail!("retained GC rehearsal requires the s3 feature"),
+        Backend::S3 => bail!("retained GC rehearsal requires the s3 feature"),
         #[cfg(feature = "s3")]
-        V2Backend::S3 => {
+        Backend::S3 => {
             let guard_mode = rehearsal_guard_mode(&args)?;
             let mut random = [0_u8; 12];
             getrandom::fill(&mut random)
@@ -239,7 +243,7 @@ async fn gc_rehearsal(args: V2GcRehearsalArgs) -> Result<serde_json::Value> {
 #[cfg(feature = "s3")]
 async fn gc_rehearsal_with_store<S>(
     store: S,
-    args: V2GcRehearsalArgs,
+    args: GcRehearsalArgs,
     guard_mode: RehearsalGuardMode,
 ) -> Result<serde_json::Value>
 where
@@ -638,19 +642,19 @@ async fn renew_rehearsal_fence(lease_guard: std::sync::Arc<rs3_k8s::KubernetesLe
 }
 
 #[cfg(feature = "s3")]
-fn retention_mode(mode: V2RetentionModeArg) -> RetentionMode {
+fn retention_mode(mode: RetentionModeArg) -> RetentionMode {
     match mode {
-        V2RetentionModeArg::Governance => RetentionMode::Governance,
-        V2RetentionModeArg::Compliance => RetentionMode::Compliance,
+        RetentionModeArg::Governance => RetentionMode::Governance,
+        RetentionModeArg::Compliance => RetentionMode::Compliance,
     }
 }
 
-fn print_gc_rehearsal_report(report: &serde_json::Value, format: V2ReportFormat) -> Result<()> {
+fn print_gc_rehearsal_report(report: &serde_json::Value, format: ReportFormat) -> Result<()> {
     match format {
-        V2ReportFormat::Json => {
+        ReportFormat::Json => {
             println!("{}", serde_json::to_string_pretty(report)?);
         }
-        V2ReportFormat::Text => {
+        ReportFormat::Text => {
             println!("schema={}", report["schema"].as_str().unwrap_or_default());
             println!("passed={}", report["passed"].as_bool().unwrap_or(false));
             println!(
@@ -734,17 +738,17 @@ where
             ByteRange::Full,
         )
         .await
-        .context("failed to read v2 format root envelope")?;
+        .context("failed to read v03 format root envelope")?;
     let envelope =
         RepositoryEnvelope::from_object_bytes(body.as_ref(), rs3_crypto::EnvelopePurpose::Format)
-            .context("failed to decode v2 format root envelope")?;
+            .context("failed to decode v03 format root envelope")?;
     if envelope.generation != reference.generation || envelope.digest()? != reference.digest {
-        bail!("v2 format root object does not match the bundle reference");
+        bail!("v03 format root object does not match the bundle reference");
     }
     let plaintext = envelope
         .open_format(context, wrapping_key_id, wrapping_key)
-        .context("failed to open v2 format root envelope")?;
-    V3FormatRoot::from_plaintext_bytes(&plaintext).context("failed to decode v2 format root")
+        .context("failed to open v03 format root envelope")?;
+    V3FormatRoot::from_plaintext_bytes(&plaintext).context("failed to decode v03 format root")
 }
 
 #[cfg(feature = "s3")]
@@ -765,24 +769,24 @@ where
             ByteRange::Full,
         )
         .await
-        .context("failed to read v2 keyring envelope")?;
+        .context("failed to read repository keyring envelope")?;
     let envelope =
         RepositoryEnvelope::from_object_bytes(body.as_ref(), rs3_crypto::EnvelopePurpose::Keyring)
             .context("failed to decode keyring envelope")?;
     if envelope.generation != reference.generation || envelope.digest()? != reference.digest {
-        bail!("v2 keyring envelope does not match the format-root reference");
+        bail!("repository keyring envelope does not match the format-root reference");
     }
     envelope
         .open_keyring(context, wrapping_key_id, wrapping_key)
-        .context("failed to open v2 keyring envelope")
+        .context("failed to open repository keyring envelope")
 }
 
 #[cfg(feature = "s3")]
-async fn s3_store(args: &V2BackendArgs) -> Result<S3BlobStore> {
+async fn s3_store(args: &BackendArgs) -> Result<S3BlobStore> {
     let bucket = args
         .s3_bucket
         .clone()
-        .context("--s3-bucket or RS3_V2_S3_BUCKET is required with --backend s3")?;
+        .context("--s3-bucket or RS3_REHEARSAL_S3_BUCKET is required with --backend s3")?;
     let config = S3BlobStoreConfig::new(bucket)
         .context("failed to create S3 backend config")?
         .with_prefix(args.s3_prefix.clone())
@@ -806,16 +810,16 @@ fn retention_mode_name(mode: RetentionMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    fn parse_gc_rehearsal_args(arguments: &[&str]) -> super::V2GcRehearsalArgs {
+    fn parse_gc_rehearsal_args(arguments: &[&str]) -> super::GcRehearsalArgs {
         use clap::Parser;
-        let mut full = vec!["xtask", "v2", "gc-rehearsal"];
+        let mut full = vec!["xtask", "repository", "gc-rehearsal"];
         full.extend_from_slice(arguments);
         let cli = crate::Cli::try_parse_from(full)
             .unwrap_or_else(|error| panic!("parse gc-rehearsal arguments: {error}"));
-        let Some(crate::Commands::V2(args)) = cli.command else {
-            panic!("expected v2 command");
+        let Some(crate::Commands::Repository(args)) = cli.command else {
+            panic!("expected repository command");
         };
-        let super::V2Command::GcRehearsal(args) = args.command;
+        let super::RepositoryCommand::GcRehearsal(args) = args.command;
         *args
     }
 

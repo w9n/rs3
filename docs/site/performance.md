@@ -12,7 +12,8 @@ to every sample, revision binding and method detail.
 At `be30107`, compaction can select 256 small source runs instead of 128 while
 keeping the 16 MiB encoded-source and 131,072-mutation limits. The wire format,
 recovery promise, publication verification and reader limits do not change.
-Three alternating pairs passed for each workload.
+Three alternating pairs passed for each workload. Stored growth subtracts each
+initial inventory; retained setup objects still occupy storage.
 
 | Median metric | 512 B serial overwrites, baseline → candidate | 64 Kopia snapshots, baseline → candidate |
 | --- | ---: | ---: |
@@ -22,7 +23,8 @@ Three alternating pairs passed for each workload.
 | Backend HTTP requests | 14,610 → 14,669 | 12,965 → 13,286 |
 
 For tiny serial writes, stored growth falls **17.45%**, uploaded body data
-17.46%, and downloaded body data 19.83%; requests rise 0.40%. For Kopia,
+17.46%, and downloaded body data 19.83%; requests rise 0.40%. Storage
+amplification falls from **7.669x to 6.330x** submitted plaintext. For Kopia,
 stored and uploaded bytes fall 0.019%, downloads 0.36% at the paired median,
 and requests rise 2.48%. These serial writes cannot share a publication batch.
 The [bounded-compaction report](reports/bounded-compaction-cost-2026-09-09.md)
