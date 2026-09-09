@@ -16,7 +16,7 @@ posture and status.
   <a class="rv-lightbox" href="../assets/architecture-overview.png" aria-label="Enlarge rs3 architecture overview diagram" aria-haspopup="dialog" data-rv-title="Architecture overview">
     <picture>
       <source srcset="../assets/architecture-overview.webp" type="image/webp">
-      <img class="rv-diagram" src="../assets/architecture-overview.png" width="1672" height="941" loading="lazy" decoding="async" alt="Architecture overview showing S3 backup clients, the trusted rs3 gateway process, an opaque object store, an external Kubernetes Lease anchor, and the read-only console path.">
+      <img class="rv-diagram" src="../assets/architecture-overview.png" width="1605" height="980" loading="lazy" decoding="async" alt="v03 architecture: S3 clients use the trusted rs3 gateway, which stores encrypted packed or detached payloads in the object store and verifies or advances a separate Kubernetes Lease anchor. An optional read-only console accesses redacted admin status.">
     </picture>
   </a>
 </figure>
@@ -218,9 +218,11 @@ to run past an uncertain maintenance failure. Already accepted reads remain
 available.
 
 The state-flow view below separates the normal write path from the restore read
-path. A normal write blinds the namespace lookup, encrypts payload segments,
-stages payload plus an index run, publishes a signed commit, advances the
-external anchor, and only then acknowledges the client write. A restore read
+path. Bounded nonempty writes pack encrypted values with an index run; large
+uploads store detached ciphertext referenced by a short index-run commit.
+Empty values are index-only. Publication verifies stored ciphertext, accepts
+the signed commit through the external anchor, and only then acknowledges the
+client write. A restore read
 starts from trusted anchor state, verifies the signed catalog and runs, finds
 the exact encrypted payload reference, range-reads the retained version when
 required, verifies AEAD segments, and returns restored bytes.
@@ -229,7 +231,7 @@ required, verifies AEAD segments, and returns restored bytes.
   <a class="rv-lightbox" href="../assets/architecture-state-flow.png" aria-label="Enlarge rs3 write and restore state flow diagram" aria-haspopup="dialog" data-rv-title="Write and restore flow">
     <picture>
       <source srcset="../assets/architecture-state-flow.webp" type="image/webp">
-      <img class="rv-diagram" src="../assets/architecture-state-flow.png" width="1692" height="930" loading="lazy" decoding="async" alt="Write and restore flow showing committed writes through signed v03 commits and anchored restore reads through verified commit state.">
+      <img class="rv-diagram" src="../assets/architecture-state-flow.png" width="1605" height="980" loading="lazy" decoding="async" alt="Writes use packed values or detached payloads, verify stored ciphertext and advance the Lease before returning success. Restores start from a trusted anchor or retained point, verify the catalog and runs, resolve exact payload references and authenticate segments. Unresolved publication outcomes block mutations.">
     </picture>
   </a>
 </figure>
@@ -303,9 +305,11 @@ owner. A commit coordinator holds an RAII lease that is also retained by every
 delayed publisher task; direct mutation and maintenance entry points fail while
 that lease exists. This prevents a cancelled request or a second local API path
 from publishing and clearing another batch's speculative overlay. All semantic
-installation checks occur before anchor CAS. A lost CAS reply is reconciled by
-reading the exact anchor. A matching accepted child completes normally; an
-unchanged parent permits failure rollback. If the outcome cannot be resolved,
+installation checks occur before anchor CAS. A lost CAS reply is settled by a
+resource-version-guarded fencing update on the Lease. Once that update succeeds,
+the earlier request cannot land afterward: a matching accepted child completes
+normally, while an unchanged parent permits failure rollback. If the fencing
+update fails or the outcome cannot be resolved,
 or local installation fails after acceptance, callers receive a recovery-required
 error and new mutations stop until restart from the trusted anchor.
 
