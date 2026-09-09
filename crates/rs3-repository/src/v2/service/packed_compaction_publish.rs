@@ -1,5 +1,9 @@
 //! Guarded publication of metadata-only packed index-run compaction.
 
+mod selection;
+
+use selection::cost_aware_compaction_plan;
+
 use super::packed::{
     V2PackedIndexRunReplay, apply_packed_index_run, index_run_bounds, repository_context_from_refs,
 };
@@ -159,8 +163,7 @@ where
             .map(|run| (run.mutation_count, run.location.section_len))
             .collect::<Vec<_>>();
         let window = compaction_window(&sizes).map_err(v2_repository_error)?;
-        let source_refs = ordered_refs.drain(window).collect::<Vec<_>>();
-        let retained_refs = ordered_refs;
+        let source_refs = &ordered_refs[window.clone()];
         if source_refs.len() < 2 {
             return Err(v2_repository_error(
                 V2FormatError::MaintenanceBudgetExceeded,
@@ -169,26 +172,29 @@ where
 
         let keyring = self.repository.keyring();
         let sources = self
-            .load_compaction_sources(keyring.as_ref(), &source_refs)
+            .load_compaction_sources(keyring.as_ref(), source_refs)
             .await?;
         let plan = {
             let accepted = self
                 .accepted
                 .read()
                 .map_err(|_| RepositoryError::StatePoisoned)?;
-            plan_packed_run_compaction(
+            cost_aware_compaction_plan(
                 sources,
+                &sizes[window.clone()],
                 &IndexRunLimits::default(),
-                Some(&accepted.repository.namespace),
+                &accepted.repository.namespace,
             )
         };
-        let output_runs = match plan {
-            Ok(runs) => runs,
+        let (selected, output_runs) = match plan {
+            Ok(plan) => plan,
             Err(V2FormatError::MaintenanceBudgetExceeded) => {
                 return Err(RepositoryError::MaintenanceNotBeneficial);
             }
             Err(error) => return Err(v2_repository_error(error)),
         };
+        drop(ordered_refs.drain(window.start + selected.start..window.start + selected.end));
+        let retained_refs = ordered_refs;
         // Level is a storage tier, not a compaction epoch. Both foreground and
         // older compacted runs share this bounded contiguous generation window;
         // every output stays level one. Other exact run references are unchanged.

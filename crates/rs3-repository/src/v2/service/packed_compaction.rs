@@ -18,6 +18,7 @@ use std::sync::Arc;
 /// Each exact container is required precisely when its corresponding self
 /// carrier is present. It converts a commit-relative pointer into durable
 /// exact-object facts before source-run boundaries disappear during compaction.
+#[derive(Clone)]
 pub(super) struct PackedCompactionSourceRun {
     pub(super) run: IndexRun,
     pub(super) self_pack_container: Option<IndexRunContainer>,
@@ -55,11 +56,15 @@ impl ResolvedMutation {
 /// held under the caller's publication lock and bound to its accepted anchor.
 /// It permits pruning obsolete upserts, including an empty replacement set;
 /// winning tombstones and all source validation remain mandatory.
-pub(super) fn plan_packed_run_compaction(
-    sources: Vec<PackedCompactionSourceRun>,
+pub(super) fn plan_packed_run_compaction<I>(
+    sources: I,
     limits: &IndexRunLimits,
     current_namespace: Option<&rs3_index::NamespaceIndex>,
-) -> V2Result<Vec<IndexRun>> {
+) -> V2Result<Vec<IndexRun>>
+where
+    I: IntoIterator<Item = PackedCompactionSourceRun>,
+    I::IntoIter: ExactSizeIterator,
+{
     plan_packed_run_compaction_counted(
         sources,
         limits,
@@ -88,17 +93,22 @@ impl EncodeAttemptCounter {
     }
 }
 
-fn plan_packed_run_compaction_counted(
-    sources: Vec<PackedCompactionSourceRun>,
+fn plan_packed_run_compaction_counted<I>(
+    sources: I,
     limits: &IndexRunLimits,
     encode_attempts: &EncodeAttemptCounter,
     current_namespace: Option<&rs3_index::NamespaceIndex>,
-) -> V2Result<Vec<IndexRun>> {
-    if sources.is_empty() {
+) -> V2Result<Vec<IndexRun>>
+where
+    I: IntoIterator<Item = PackedCompactionSourceRun>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let sources = sources.into_iter();
+    let source_count = sources.len();
+    if source_count == 0 {
         return Err(V2FormatError::InvalidIndexRun);
     }
 
-    let source_count = sources.len();
     let mut winners = BTreeMap::<IndexBlindKey, ResolvedMutation>::new();
     let mut standalone_carriers = BTreeMap::<
         (
