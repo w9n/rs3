@@ -1,29 +1,28 @@
 //! Command-line entry point for the rs3 gateway.
 
+mod cli_init;
+mod cli_offline;
+mod cli_recovery;
+mod cli_serve;
+mod cli_writer_guard;
+
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use metrics_exporter_prometheus::PrometheusBuilder;
 use rs3_crypto::SecretBytes;
-use rs3_repository::v2::{
-    UnenforcedQuiescedMaintenanceGuard, V2AnchorState, V2FullGcDryRunOptions, V2FullGcDryRunReport,
-    V2ProviderCheckStatus, V2ProviderConformanceReport, V2ProviderProfile, V2RecoveryBundle,
+use rs3_repository::v3::{
+    V3AnchorState, V3ProviderCheckStatus, V3ProviderConformanceReport, V3ProviderProfile,
+    V3RecoveryBundle,
 };
 use rs3_server::{
-    AdminBearerToken, AdminHttpAuth, AdminHttpConfig, AdminHttpServer, AdminReadiness,
-    AdminReadinessSource, AdminReportProfile, AnchorConfig, GatewayMode, GatewayServer,
-    MaintenanceConfig, MaintenanceMode, OfflineMaintenanceEnvironment, OfflineMaintenanceError,
-    OfflineMaintenanceFence, OfflineMaintenanceOutcome, OfflineMaintenanceRequest,
-    PROVIDER_CONFORMANCE_SCHEMA, RepositoryToolConfig, RuntimeConfig,
-    RuntimeV2ProviderConformanceOptions, V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions,
-    V2AnchorImportReport, V2ProviderCheckConfig, V2RecoveryBundleVerificationOptions,
-    V2RecoveryBundleVerificationReport, V2RepositoryInitReport, WriterGuardConfig, backend_kind,
-    check_v2_provider_conformance_from_provider_config, default_maintenance_orphan_gc_options,
-    doctor_findings, doctor_probe_from_config, export_v2_recovery_bundle_from_config,
-    import_v2_anchor_from_config, init_v2_repository_from_config,
-    inspect_keyring_envelope_from_tool_config, offline_maintenance_runtime_from_config,
-    provider_conformance_evidence_passed, provider_conformance_target_fingerprint,
-    rewrap_keyring_envelope_from_tool_config, run_offline_maintenance, runtime_config_profile,
-    verify_v2_recovery_bundle_from_tool_config, write_v2_index_snapshot_from_config,
+    AdminReportProfile, AnchorConfig, GatewayMode, PROVIDER_CONFORMANCE_SCHEMA,
+    RepositoryToolConfig, RuntimeConfig, RuntimeV3ProviderConformanceOptions,
+    V3_RESTORE_BUNDLE_SCHEMA, V3AnchorImportOptions, V3AnchorImportReport, V3ProviderCheckConfig,
+    V3RecoveryBundleVerificationOptions, V3RecoveryBundleVerificationReport,
+    V3RepositoryInitReport, backend_kind, check_v3_provider_conformance_from_provider_config,
+    doctor_findings, doctor_probe_from_config, export_v3_recovery_bundle_from_config,
+    import_v3_anchor_from_config, inspect_keyring_envelope_from_tool_config,
+    provider_conformance_target_fingerprint, rewrap_keyring_envelope_from_tool_config,
+    runtime_config_profile, verify_v3_recovery_bundle_from_tool_config,
 };
 use rs3_server::{
     KeyringEnvelopeInspectOptions, KeyringEnvelopeInspectReport, KeyringEnvelopeRewrapOptions,
@@ -31,20 +30,16 @@ use rs3_server::{
 };
 use rs3_types::{BackendObjectId, KeyDescriptor, KeyPurpose, KeyStatus, RetentionMode, Sequence};
 use secrecy::{ExposeSecret, SecretString};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "s3", feature = "k8s"))]
 use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
 use tracing_subscriber::filter::{EnvFilter, FilterExt, filter_fn};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use zeroize::Zeroizing;
-
-#[cfg(feature = "k8s")]
-use rs3_k8s::{KubernetesLeaseGuard, LeaseGuardError, LeaseSettings, WriterFence};
 
 #[cfg(any(feature = "s3", feature = "k8s"))]
 static RUSTLS_PROVIDER: Once = Once::new();
@@ -83,6 +78,9 @@ enum Commands {
         metrics_bind: Option<SocketAddr>,
         #[arg(long, value_enum)]
         gateway_mode: Option<GatewayModeArg>,
+        /// Exact authenticated commit sequence to serve in restore-readonly mode.
+        #[arg(long)]
+        recovery_point: Option<u64>,
         #[arg(long, env = "RS3_ADMIN_BIND")]
         admin_bind: Option<SocketAddr>,
         #[arg(long, env = "RS3_ADMIN_BEARER_TOKEN", hide_env_values = true)]
@@ -92,6 +90,15 @@ enum Commands {
         #[arg(long, env = "RS3_ADMIN_PROFILE", value_enum, default_value_t = DoctorProfile::Production)]
         admin_profile: DoctorProfile,
     },
+    /// List authenticated historical restore points without changing the live anchor.
+    RecoveryPoints {
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=256))]
+        limit: u16,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
+        format: RecoveryReportFormat,
+    },
     /// Validate runtime configuration against a local or production posture.
     Doctor {
         #[arg(long, env = "RS3_DOCTOR_PROFILE", value_enum, default_value_t = DoctorProfile::Local)]
@@ -100,27 +107,63 @@ enum Commands {
         #[arg(long)]
         probe: bool,
     },
-    /// Export a signed restore bundle for offline recovery.
+    /// Export a canonical CBOR restore bundle for offline signing and recovery.
     ExportRestoreBundle {
+        /// Destination for the canonical CBOR recovery artifact (must not exist).
+        #[arg(long)]
+        output: std::path::PathBuf,
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
-    /// Verify a trusted v2 restore bundle without writing an anchor.
+    /// Verify and attach an externally produced signature to a CBOR bundle, offline.
+    AttachBundleSignature {
+        /// Existing unsigned CBOR artifact; use `-` for stdin.
+        #[arg(long)]
+        bundle_file: String,
+        /// Ed25519 signature as 128 hexadecimal characters.
+        #[arg(long)]
+        signature_hex: String,
+        /// Independent recovery public key, in ed25519:<hex> form.
+        #[arg(long)]
+        public_key: String,
+        /// Destination for the signed CBOR artifact (must not exist).
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Verify a trusted v3 restore bundle without writing an anchor.
     VerifyBundle(Box<VerifyBundleArgs>),
     /// Inspect or rewrap encrypted repository keyring envelopes.
     Keyring(Box<KeyringArgs>),
-    /// Initialize a missing v2 repository, verify it, then exit.
+    /// Initialize a missing v3 repository, verify it, then exit.
     Init {
+        /// Production checks permit deliberate bootstrap with journaled provider qualification.
+        #[arg(long, env = "RS3_INIT_PROFILE", value_enum, default_value_t = DoctorProfile::Production)]
+        profile: DoctorProfile,
+        /// Declared bootstrap journal Secret in the anchor namespace.
+        #[arg(long, env = "RS3_INIT_JOURNAL_SECRET")]
+        journal_secret: Option<String>,
+        /// Reviewed that the serving principal cannot bypass governance retention.
+        #[arg(
+            long,
+            env = "RS3_INIT_GOVERNANCE_BYPASS_REVIEWED",
+            default_value_t = false
+        )]
+        governance_bypass_reviewed: bool,
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
-    /// Write a v2 index snapshot and report the accepted anchor state.
-    WriteIndexSnapshot {
-        #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
-        format: RecoveryReportFormat,
+    /// Wait read-only for projected S3 initialization and matching evidence.
+    WaitForInit {
+        /// Read-only projected journal state from the declared bootstrap Secret.
+        #[arg(long)]
+        journal_file: PathBuf,
+        /// Maximum time to wait for initialization and current qualification.
+        #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
     },
-    /// Probe v2 object-store behavior required by the repository format.
-    CheckV2Provider {
+    /// Probe v3 object-store behavior required by the repository format.
+    CheckProvider {
+        /// Synthetic backing prefix, disjoint from the repository prefix on S3.
         #[arg(long)]
         probe_prefix: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -130,8 +173,8 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
-    /// Import a trusted v2 anchor after operator recovery review.
-    ImportV2Anchor(Box<ImportV2AnchorArgs>),
+    /// Import a trusted v3 anchor after operator recovery review.
+    ImportAnchor(Box<ImportAnchorArgs>),
     /// Operate the in-gateway maintenance supervisor over the admin API.
     Maintenance(Box<MaintenanceArgs>),
     /// Break-glass maintenance for when the gateway cannot run.
@@ -224,8 +267,8 @@ enum MaintenanceOutputFormat {
 }
 
 #[derive(Debug, Args)]
-struct ImportV2AnchorArgs {
-    /// JSON bundle from `export-restore-bundle`; use `-` for stdin.
+struct ImportAnchorArgs {
+    /// CBOR artifact from `export-restore-bundle --output`; use `-` for stdin.
     #[arg(long)]
     bundle_file: String,
     /// External weak-subjectivity floor accepted by the operator.
@@ -241,7 +284,7 @@ struct ImportV2AnchorArgs {
 
 #[derive(Debug, Args)]
 struct VerifyBundleArgs {
-    /// JSON bundle from `export-restore-bundle`; use `-` for stdin.
+    /// CBOR artifact from `export-restore-bundle --output`; use `-` for stdin.
     #[arg(long)]
     bundle_file: String,
     /// External weak-subjectivity floor accepted by the operator.
@@ -370,105 +413,54 @@ async fn main() -> Result<()> {
             bind,
             metrics_bind,
             gateway_mode,
+            recovery_point,
             admin_bind,
             admin_bearer_token,
             admin_mutation_bearer_token,
             admin_profile,
         } => {
-            let mut config = RuntimeConfig::from_env()?;
-            if let Some(bind) = bind {
-                config.bind = bind;
-            }
-            if let Some(metrics_bind) = metrics_bind {
-                config.metrics.bind = Some(metrics_bind);
-            }
-            if let Some(gateway_mode) = gateway_mode {
-                apply_gateway_mode_override(&mut config, gateway_mode);
-            }
-            config.validate()?;
-            let admin_config = admin_http_config(
+            cli_serve::run(
+                bind,
+                metrics_bind,
+                cli_serve::ServeSelection {
+                    gateway_mode,
+                    recovery_point,
+                },
                 admin_bind,
                 admin_bearer_token,
                 admin_mutation_bearer_token,
                 admin_profile,
-            )?;
-            enforce_serve_profile(&config, admin_profile, admin_config.is_some())?;
-            install_metrics(config.metrics.bind)?;
-            log_runtime_config(&config);
-            let writer_guard = start_writer_guard(&config).await?;
-            let server = match bind_gateway(config.clone(), &writer_guard).await {
-                Ok(server) => server,
-                Err(error) => {
-                    if let Err(release_error) = writer_guard.release().await {
-                        return Err(anyhow::anyhow!(
-                            "failed to bind gateway listener: {error}; writer fence release also failed: {release_error}"
-                        ));
-                    }
-                    return Err(error);
-                }
-            };
-            tracing::info!(bind = %server.local_addr(), "gateway S3 listener started");
-            let mut maintenance_supervisor = start_maintenance_supervisor(&config, &server);
-            let run_result = match admin_config {
-                Some(admin_config) => {
-                    let admin_runtime_facts = maintenance_aware_facts_source(
-                        server.admin_runtime_facts_source(),
-                        maintenance_supervisor.as_ref(),
-                    );
-                    let admin_readiness =
-                        writer_guard.readiness_source(server.admin_readiness_source());
-                    let admin_server = AdminHttpServer::bind_with_runtime_sources(
-                        config,
-                        admin_config,
-                        admin_runtime_facts,
-                        admin_readiness,
-                    )
-                    .await;
-                    let mut admin_server = match admin_server {
-                        Ok(admin_server) => admin_server,
-                        Err(error) => {
-                            if let Some(supervisor) = maintenance_supervisor.take() {
-                                supervisor.shutdown().await;
-                            }
-                            if let Err(release_error) = writer_guard.release().await {
-                                return Err(anyhow::anyhow!(
-                                    "failed to bind admin listener: {error}; writer fence release also failed: {release_error}"
-                                ));
-                            }
-                            return Err(error.into());
-                        }
-                    };
-                    if let Some(supervisor) = maintenance_supervisor.as_ref() {
-                        admin_server = admin_server.with_maintenance_control(supervisor.control());
-                    }
-                    tracing::info!(
-                        bind = %admin_server.local_addr(),
-                        "gateway admin listener started",
-                    );
-                    run_gateway_and_admin(server, admin_server, writer_guard.shutdown()).await
-                }
-                None => server
-                    .run_until_shutdown(shutdown_signal_or_writer_guard(writer_guard.shutdown()))
-                    .await
-                    .map_err(anyhow::Error::from),
-            };
-            if let Some(maintenance_supervisor) = maintenance_supervisor {
-                maintenance_supervisor.shutdown().await;
-            }
-            let release_result = writer_guard.release().await;
-            run_result?;
-            release_result?;
+            )
+            .await?;
+        }
+        Commands::RecoveryPoints {
+            limit,
+            cursor,
+            format,
+        } => {
+            cli_recovery::run(usize::from(limit), cursor.as_deref(), format).await?;
         }
         Commands::Doctor { profile, probe } => {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
             run_doctor(&config, profile, probe).await?;
         }
-        Commands::ExportRestoreBundle { format } => {
+        Commands::ExportRestoreBundle { output, format } => {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
-            let bundle = export_v2_recovery_bundle_from_config(&config).await?;
-            print_v2_restore_bundle(&bundle, format)?;
+            let bundle = export_v3_recovery_bundle_from_config(&config).await?;
+            write_restore_bundle(&output, &bundle)?;
+            print_v3_restore_bundle(&bundle, format)?;
+        }
+        Commands::AttachBundleSignature {
+            bundle_file,
+            signature_hex,
+            public_key,
+            output,
+        } => {
+            let mut bundle = read_v3_recovery_bundle(&bundle_file)?;
+            attach_bundle_signature(&mut bundle, &signature_hex, &public_key)?;
+            write_restore_bundle(&output, &bundle)?;
         }
         Commands::VerifyBundle(args) => {
             let VerifyBundleArgs {
@@ -487,50 +479,63 @@ async fn main() -> Result<()> {
                     .clone_from(wrapping_key_id);
             }
             log_repository_tool_config(&config);
-            let bundle = read_v2_recovery_bundle_json(&bundle_file)?;
+            let bundle = read_v3_recovery_bundle(&bundle_file)?;
             let wrapping_key = required_wrapping_key_input(
                 wrapping_key_hex,
                 wrapping_key_hex_file.as_deref(),
                 "--wrapping-key-hex",
                 "--wrapping-key-hex-file",
             )?;
-            let report = verify_v2_recovery_bundle_from_tool_config(
+            let report = verify_v3_recovery_bundle_from_tool_config(
                 &config,
                 bundle,
-                V2RecoveryBundleVerificationOptions {
+                V3RecoveryBundleVerificationOptions {
                     min_sequence: Sequence::new(min_sequence),
                     wrapping_key,
                 },
             )
             .await?;
-            print_v2_recovery_bundle_verification_report(&report, format)?;
+            print_v3_recovery_bundle_verification_report(&report, format)?;
         }
         Commands::Keyring(args) => {
             run_keyring_command(*args).await?;
         }
-        Commands::Init { format } => {
+        Commands::Init {
+            profile,
+            journal_secret,
+            governance_bypass_reviewed,
+            format,
+        } => {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
-            let report = init_v2_repository_from_config(&config).await?;
-            print_v2_repository_init_report(&report, format)?;
+            let report = cli_init::run(
+                &config,
+                profile,
+                journal_secret.as_deref(),
+                governance_bypass_reviewed,
+            )
+            .await?;
+            print_v3_repository_init_report(&report, format)?;
         }
-        Commands::WriteIndexSnapshot { format } => {
+        Commands::WaitForInit {
+            journal_file,
+            timeout_seconds,
+        } => {
             let config = RuntimeConfig::from_env()?;
-            log_runtime_config(&config);
-            let anchor = write_v2_index_snapshot_from_config(&config).await?;
-            print_v2_anchor_state("rs3.v2-index-snapshot.v1", &anchor, format)?;
+            cli_init::wait_for_journal(&config, &journal_file, timeout_seconds).await?;
         }
-        Commands::CheckV2Provider {
+
+        Commands::CheckProvider {
             probe_prefix,
             legal_hold,
             governance_bypass_reviewed,
             format,
         } => {
-            let config = V2ProviderCheckConfig::from_env()?;
-            log_v2_provider_check_config(&config);
-            let report = check_v2_provider_conformance_from_provider_config(
+            let config = V3ProviderCheckConfig::from_env()?;
+            log_v3_provider_check_config(&config);
+            let report = check_v3_provider_conformance_from_provider_config(
                 &config,
-                RuntimeV2ProviderConformanceOptions {
+                RuntimeV3ProviderConformanceOptions {
                     probe_prefix,
                     legal_hold,
                     governance_bypass_reviewed,
@@ -538,25 +543,24 @@ async fn main() -> Result<()> {
             )
             .await?;
             let passed = report.passed();
-            let target_fingerprint = provider_conformance_target_fingerprint(&config);
-            print_v2_provider_conformance_report(&report, &target_fingerprint, format)?;
+            print_v3_provider_conformance_report(&report, &config, format)?;
             if !passed {
-                anyhow::bail!("v2 provider conformance failed");
+                anyhow::bail!("v03 provider conformance failed");
             }
         }
-        Commands::ImportV2Anchor(args) => {
+        Commands::ImportAnchor(args) => {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
             let format = args.format;
             let (bundle, options) = recovery_bundle_from_import_args(&config, *args)?;
-            let report = import_v2_anchor_from_config(&config, bundle, options).await?;
-            print_v2_anchor_import_report(&report, format)?;
+            let report = import_v3_anchor_from_config(&config, bundle, options).await?;
+            print_v3_anchor_import_report(&report, format)?;
         }
         Commands::Maintenance(args) => {
             run_maintenance_command(*args).await?;
         }
         Commands::MaintenanceOffline(args) => {
-            run_maintenance_offline_command(*args).await?;
+            cli_offline::run(*args).await?;
         }
     }
 
@@ -784,311 +788,6 @@ fn print_maintenance_text(command: &MaintenanceCommand, value: &serde_json::Valu
     }
 }
 
-/// Poll interval while the offline fence observes a held Lease.
-#[cfg(feature = "k8s")]
-const OFFLINE_FENCE_ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
-/// Upper bound on the offline fence takeover observation loop.
-#[cfg(feature = "k8s")]
-const OFFLINE_FENCE_ACQUIRE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(4 * WRITER_LEASE_DURATION.as_secs());
-
-/// Runs one break-glass offline maintenance subcommand.
-async fn run_maintenance_offline_command(args: MaintenanceOfflineArgs) -> Result<()> {
-    let config = RuntimeConfig::from_env()?;
-    log_runtime_config(&config);
-    if !config.mode.allows_mutation() {
-        bail!("offline maintenance requires a mutation-capable gateway mode");
-    }
-
-    let command = match &args.command {
-        MaintenanceOfflineCommand::DryRun => rs3_server::OfflineMaintenanceCommand::DryRun,
-        MaintenanceOfflineCommand::Apply { plan_digest } => {
-            rs3_server::OfflineMaintenanceCommand::Apply {
-                plan_digest: plan_digest.clone(),
-            }
-        }
-    };
-    let request = OfflineMaintenanceRequest {
-        command,
-        dry_run: V2FullGcDryRunOptions {
-            budgets: config.maintenance.budgets(),
-            retention_renewal_horizon: config.maintenance.renewal_horizon,
-            protected_roots: Vec::new(),
-        },
-        orphan_gc: default_maintenance_orphan_gc_options(),
-        retained_provider_conformance_passed: provider_conformance_evidence_passed(&config),
-    };
-
-    let outcome = match &config.anchor {
-        AnchorConfig::Memory => {
-            // The memory anchor cannot host a real writer fence; RS3_ALLOW_MEMORY_ANCHOR
-            // already gated this configuration at parse time.
-            tracing::warn!(
-                "offline maintenance on the memory anchor uses the unenforced honor-system \
-                 guard; development use only",
-            );
-            let environment = MemoryOfflineMaintenanceEnvironment {
-                config: config.clone(),
-            };
-            run_offline_maintenance(&environment, request).await?
-        }
-        AnchorConfig::KubernetesLease {
-            namespace,
-            name,
-            field_manager,
-        } => {
-            #[cfg(feature = "k8s")]
-            {
-                let hostname = std::env::var("HOSTNAME").context(
-                    "offline maintenance needs HOSTNAME to identify this operator process",
-                )?;
-                // Same holder-identity pattern as the gateway writer guard,
-                // with a marker suffix so operators can tell a break-glass
-                // holder apart in the Lease.
-                let holder_identity = format!("{hostname}/{}/offline-maintenance", random_hex(16)?);
-                let lease_guard = KubernetesLeaseGuard::new(
-                    LeaseSettings {
-                        namespace: namespace.clone(),
-                        name: name.clone(),
-                        field_manager: field_manager.clone(),
-                    },
-                    holder_identity,
-                    WRITER_LEASE_DURATION,
-                )
-                .context("failed to configure offline writer lease guard")?;
-                let environment = KubernetesOfflineMaintenanceEnvironment {
-                    config: config.clone(),
-                    lease_guard: std::sync::Arc::new(lease_guard),
-                };
-                run_offline_maintenance(&environment, request).await?
-            }
-            #[cfg(not(feature = "k8s"))]
-            {
-                let _ = (namespace, name, field_manager);
-                bail!("offline maintenance on a kubernetes-lease anchor requires the k8s feature");
-            }
-        }
-    };
-
-    print_offline_maintenance_outcome(&outcome, args.format)
-}
-
-/// Offline environment for the development memory anchor.
-struct MemoryOfflineMaintenanceEnvironment {
-    config: RuntimeConfig,
-}
-
-/// No-op fence used with the memory anchor; there is nothing to release.
-struct MemoryOfflineFence;
-
-#[async_trait::async_trait]
-impl OfflineMaintenanceFence for MemoryOfflineFence {
-    async fn release(&self) -> Result<(), OfflineMaintenanceError> {
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl OfflineMaintenanceEnvironment for MemoryOfflineMaintenanceEnvironment {
-    async fn acquire_fence(
-        &self,
-    ) -> Result<Box<dyn OfflineMaintenanceFence>, OfflineMaintenanceError> {
-        Ok(Box::new(MemoryOfflineFence))
-    }
-
-    async fn open_runtime(
-        &self,
-    ) -> Result<std::sync::Arc<dyn rs3_server::MaintenanceRuntime>, OfflineMaintenanceError> {
-        offline_maintenance_runtime_from_config(
-            &self.config,
-            std::sync::Arc::new(UnenforcedQuiescedMaintenanceGuard),
-        )
-        .await
-        .map_err(|error| OfflineMaintenanceError::OpenFailed {
-            reason: error.to_string(),
-        })
-    }
-}
-
-/// Offline environment fenced through the Kubernetes anchor Lease.
-#[cfg(feature = "k8s")]
-struct KubernetesOfflineMaintenanceEnvironment {
-    config: RuntimeConfig,
-    lease_guard: std::sync::Arc<KubernetesLeaseGuard>,
-}
-
-#[cfg(feature = "k8s")]
-struct KubernetesOfflineFence {
-    lease_guard: std::sync::Arc<KubernetesLeaseGuard>,
-    renew_task: tokio::task::JoinHandle<()>,
-}
-
-#[cfg(feature = "k8s")]
-#[async_trait::async_trait]
-impl OfflineMaintenanceFence for KubernetesOfflineFence {
-    async fn release(&self) -> Result<(), OfflineMaintenanceError> {
-        self.renew_task.abort();
-        self.lease_guard
-            .release()
-            .await
-            .map_err(|error| OfflineMaintenanceError::ReleaseFailed {
-                reason: error.to_string(),
-            })
-    }
-}
-
-#[cfg(feature = "k8s")]
-#[async_trait::async_trait]
-impl OfflineMaintenanceEnvironment for KubernetesOfflineMaintenanceEnvironment {
-    async fn acquire_fence(
-        &self,
-    ) -> Result<Box<dyn OfflineMaintenanceFence>, OfflineMaintenanceError> {
-        let deadline = std::time::Instant::now() + OFFLINE_FENCE_ACQUIRE_TIMEOUT;
-        loop {
-            match self.lease_guard.try_acquire().await {
-                Ok(_state) => break,
-                Err(LeaseGuardError::HeldByOther) => {
-                    // An unchanged holder is still under monotonic takeover
-                    // observation; keep watching for the full lease duration.
-                    if std::time::Instant::now() >= deadline {
-                        return Err(OfflineMaintenanceError::FenceUnavailable {
-                            reason: "writer fence takeover observation did not resolve in time"
-                                .to_owned(),
-                        });
-                    }
-                    tokio::time::sleep(OFFLINE_FENCE_ACQUIRE_POLL).await;
-                }
-                Err(error @ LeaseGuardError::HeldByLiveWriter) => {
-                    return Err(OfflineMaintenanceError::LiveWriterPresent {
-                        reason: error.to_string(),
-                    });
-                }
-                Err(error) => {
-                    return Err(OfflineMaintenanceError::FenceUnavailable {
-                        reason: error.to_string(),
-                    });
-                }
-            }
-        }
-        tracing::info!("offline maintenance writer fence acquired");
-        let renew_task = tokio::spawn(renew_offline_writer_fence(std::sync::Arc::clone(
-            &self.lease_guard,
-        )));
-        Ok(Box::new(KubernetesOfflineFence {
-            lease_guard: std::sync::Arc::clone(&self.lease_guard),
-            renew_task,
-        }))
-    }
-
-    async fn open_runtime(
-        &self,
-    ) -> Result<std::sync::Arc<dyn rs3_server::MaintenanceRuntime>, OfflineMaintenanceError> {
-        let writer_fence = self.lease_guard.writer_fence().map_err(|error| {
-            OfflineMaintenanceError::OpenFailed {
-                reason: error.to_string(),
-            }
-        })?;
-        rs3_server::offline_maintenance_runtime_from_writer_fence(&self.config, writer_fence)
-            .await
-            .map_err(|error| OfflineMaintenanceError::OpenFailed {
-                reason: error.to_string(),
-            })
-    }
-}
-
-/// Renews the offline writer fence until release or loss of ownership.
-///
-/// On loss of ownership the local fence goes dead and the engine's
-/// per-mutation guard and anchor rechecks fail closed at the next boundary.
-#[cfg(feature = "k8s")]
-async fn renew_offline_writer_fence(lease_guard: std::sync::Arc<KubernetesLeaseGuard>) {
-    loop {
-        tokio::time::sleep(WRITER_LEASE_RENEW_INTERVAL).await;
-        if let Err(error) = lease_guard.renew().await {
-            tracing::warn!(%error, "offline maintenance writer fence renewal failed");
-            if matches!(
-                error,
-                LeaseGuardError::HeldByOther
-                    | LeaseGuardError::HeldByLiveWriter
-                    | LeaseGuardError::LostLease
-            ) {
-                break;
-            }
-        }
-    }
-}
-
-/// Prints one offline maintenance outcome in the selected format.
-fn print_offline_maintenance_outcome(
-    outcome: &OfflineMaintenanceOutcome,
-    format: MaintenanceOutputFormat,
-) -> Result<()> {
-    match format {
-        MaintenanceOutputFormat::Json => {
-            let apply = outcome.apply.as_ref().map(|apply| {
-                serde_json::json!({
-                    "retention_renewed_object_count": apply.retention_renewed_object_count,
-                    "retention_renewed_bytes": apply.retention_renewed_bytes,
-                    "deleted_object_count": apply.orphan_gc.deleted_count,
-                    "protected_object_count": apply.orphan_gc.protected_count,
-                    "failed_delete_count": apply.orphan_gc.failed_delete_count,
-                })
-            });
-            let report = serde_json::json!({
-                "schema": "rs3.maintenance-offline.v1",
-                "command": if outcome.apply.is_some() { "apply" } else { "dry-run" },
-                "plan_digest": outcome.plan_digest,
-                "report": offline_dry_run_report_json(&outcome.dry_run),
-                "apply": apply,
-            });
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        MaintenanceOutputFormat::Text => {
-            println!("plan digest: {}", outcome.plan_digest);
-            println!("fits budgets: {}", outcome.dry_run.fits_budgets);
-            println!(
-                "reclaimable dead bytes: {}",
-                outcome.dry_run.dead_bytes_reclaimable
-            );
-            println!(
-                "renewal targets: {} objects / {} bytes",
-                outcome.dry_run.retention_renewal_commit_count,
-                outcome.dry_run.retention_renewal_bytes
-            );
-            if let Some(apply) = outcome.apply.as_ref() {
-                println!(
-                    "renewed: {} objects / {} bytes",
-                    apply.retention_renewed_object_count, apply.retention_renewed_bytes
-                );
-                println!("deleted orphans: {}", apply.orphan_gc.deleted_count);
-                println!("protected orphans: {}", apply.orphan_gc.protected_count);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Path-redacted JSON view of one dry-run report, matching the admin schema.
-fn offline_dry_run_report_json(report: &V2FullGcDryRunReport) -> serde_json::Value {
-    serde_json::json!({
-        "base_sequence": report.base_sequence.map(|sequence| sequence.get()),
-        "chain_live_commit_count": report.chain_live_commit_count,
-        "candidate_commit_count": report.candidate_commit_count,
-        "fully_dead_commit_count": report.fully_dead_commit_count,
-        "mixed_commit_count": report.mixed_commit_count,
-        "dead_bytes_reclaimable": report.dead_bytes_reclaimable,
-        "retention_blocked_bytes": report.retention_blocked_bytes,
-        "legal_hold_blocked_bytes": report.legal_hold_blocked_bytes,
-        "unknown_protection_blocked_bytes": report.unknown_protection_blocked_bytes,
-        "retention_renewal_commit_count": report.retention_renewal_commit_count,
-        "retention_renewal_bytes": report.retention_renewal_bytes,
-        "retention_renewal_blocked_count": report.retention_renewal_blocked_count,
-        "retention_renewal_blocked_bytes": report.retention_renewal_blocked_bytes,
-        "fits_budgets": report.fits_budgets,
-        "exact_version_apply_ready": report.exact_version_apply_ready,
-    })
-}
-
 async fn run_keyring_command(args: KeyringArgs) -> Result<()> {
     match args.command {
         KeyringCommand::Inspect(args) => {
@@ -1181,54 +880,82 @@ async fn run_keyring_command(args: KeyringArgs) -> Result<()> {
 
 fn recovery_bundle_from_import_args(
     config: &RuntimeConfig,
-    args: ImportV2AnchorArgs,
-) -> Result<(V2RecoveryBundle, V2AnchorImportOptions)> {
-    let options = V2AnchorImportOptions {
+    args: ImportAnchorArgs,
+) -> Result<(V3RecoveryBundle, V3AnchorImportOptions)> {
+    let options = V3AnchorImportOptions {
         min_sequence: Sequence::new(args.min_sequence),
         force_rollback: args.force_rollback,
     };
-    let bundle = read_restore_bundle_json(&args.bundle_file, config)?;
+    let bundle = parse_restore_bundle(&read_bundle_bytes(&args.bundle_file)?, config)?;
     Ok((bundle, options))
 }
 
-fn read_restore_bundle_json(path: &str, config: &RuntimeConfig) -> Result<V2RecoveryBundle> {
-    let mut input = String::new();
-    if path == "-" {
-        std::io::stdin()
-            .read_to_string(&mut input)
-            .context("failed to read restore bundle from stdin")?;
+fn read_bundle_bytes(path: &str) -> Result<Vec<u8>> {
+    let source: Box<dyn Read> = if path == "-" {
+        Box::new(std::io::stdin())
     } else {
-        input = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read restore bundle {path}"))?;
-    }
-    parse_restore_bundle_json(&input, config)
+        Box::new(std::fs::File::open(path).context("failed to open restore bundle")?)
+    };
+    read_bounded_bundle(source)
 }
 
-fn read_v2_recovery_bundle_json(path: &str) -> Result<V2RecoveryBundle> {
-    let mut input = String::new();
-    if path == "-" {
-        std::io::stdin()
-            .read_to_string(&mut input)
-            .context("failed to read restore bundle from stdin")?;
-    } else {
-        input = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read restore bundle {path}"))?;
+fn read_bounded_bundle(source: impl Read) -> Result<Vec<u8>> {
+    let maximum = rs3_repository::v3::MAX_RECOVERY_BUNDLE_BYTES;
+    let mut input = Vec::new();
+    source
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut input)
+        .context("failed to read restore bundle")?;
+    if input.len() > maximum {
+        bail!("restore bundle exceeds size limit");
     }
-    serde_json::from_str(&input).context("failed to parse v2 restore bundle JSON")
+    Ok(input)
 }
 
-fn parse_restore_bundle_json(input: &str, config: &RuntimeConfig) -> Result<V2RecoveryBundle> {
-    let mut bundle: V2RecoveryBundle =
-        serde_json::from_str(input).context("failed to parse v2 restore bundle JSON")?;
-    if let Some(repository_id) = bundle.repository_id.as_ref()
-        && repository_id != &config.repository_keys.repository_id
-    {
+fn read_v3_recovery_bundle(path: &str) -> Result<V3RecoveryBundle> {
+    V3RecoveryBundle::from_object_bytes(&read_bundle_bytes(path)?)
+        .context("failed to parse restore bundle CBOR")
+}
+
+fn parse_restore_bundle(input: &[u8], config: &RuntimeConfig) -> Result<V3RecoveryBundle> {
+    let bundle = V3RecoveryBundle::from_object_bytes(input)
+        .context("failed to parse restore bundle CBOR")?;
+    if bundle.repository_id.as_ref() != Some(&config.repository_keys.repository_id) {
         bail!("restore bundle repository ID does not match configured repository ID");
     }
-    if bundle.repository_id.is_none() {
-        bundle.repository_id = Some(config.repository_keys.repository_id.clone());
-    }
     Ok(bundle)
+}
+
+fn write_restore_bundle(path: &std::path::Path, bundle: &V3RecoveryBundle) -> Result<()> {
+    let bytes = bundle.to_object_bytes()?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .context("failed to create restore bundle; destination must not exist")?;
+    file.write_all(&bytes)
+        .context("failed to write restore bundle")?;
+    file.sync_all().context("failed to sync restore bundle")?;
+    Ok(())
+}
+
+fn attach_bundle_signature(
+    bundle: &mut V3RecoveryBundle,
+    signature_hex: &str,
+    public_key: &str,
+) -> Result<()> {
+    if signature_hex.len() != 128 {
+        bail!("recovery signature must contain 128 hexadecimal characters");
+    }
+    let signature = hex::decode(signature_hex).context("invalid recovery signature encoding")?;
+    rs3_crypto::verify_recovery_signature(
+        public_key,
+        &bundle.offline_signature_payload()?,
+        &signature,
+    )
+    .context("recovery signature verification failed")?;
+    bundle.offline_signature = Some(signature);
+    Ok(())
 }
 
 fn optional_backend_object_id(
@@ -1330,8 +1057,8 @@ fn install_rustls_provider() {
 #[cfg(not(any(feature = "s3", feature = "k8s")))]
 fn install_rustls_provider() {}
 
-fn print_v2_anchor_import_report(
-    report: &V2AnchorImportReport,
+fn print_v3_anchor_import_report(
+    report: &V3AnchorImportReport,
     format: RecoveryReportFormat,
 ) -> Result<()> {
     match format {
@@ -1348,38 +1075,50 @@ fn print_v2_anchor_import_report(
             println!("schema=rs3.v2-anchor-import.v1");
             println!("applied={}", report.applied);
             println!("verified_commit_count={}", report.verified_commit_count);
-            print_v2_anchor_text(&report.anchor);
+            print_v3_anchor_text(&report.anchor);
         }
     }
     Ok(())
 }
 
-fn print_v2_repository_init_report(
-    report: &V2RepositoryInitReport,
+fn print_v3_repository_init_report(
+    report: &V3RepositoryInitReport,
     format: RecoveryReportFormat,
 ) -> Result<()> {
     match format {
         RecoveryReportFormat::Json => {
             let report_json = serde_json::json!({
-                "schema": "rs3.v2-init.v1",
+                "schema": "rs3.v2-init.v2",
                 "initialized": report.initialized,
                 "verified_commit_count": report.verified_commit_count,
                 "anchor": serde_json::to_value(&report.anchor)?,
+                "probe_attempts": report.probe_attempts,
+                "payload_restore_verified": report.payload_restore_verified,
+                "probe_observation": report.probe_observation,
             });
             println!("{}", serde_json::to_string_pretty(&report_json)?);
         }
         RecoveryReportFormat::Text => {
-            println!("schema=rs3.v2-init.v1");
+            println!("schema=rs3.v2-init.v2");
             println!("initialized={}", report.initialized);
             println!("verified_commit_count={}", report.verified_commit_count);
-            print_v2_anchor_text(&report.anchor);
+            println!("probe_attempts={}", report.probe_attempts);
+            println!(
+                "payload_restore_verified={}",
+                report.payload_restore_verified
+            );
+            println!(
+                "probe_observation={}",
+                serde_json::to_string(&report.probe_observation)?
+            );
+            print_v3_anchor_text(&report.anchor);
         }
     }
     Ok(())
 }
 
-fn print_v2_recovery_bundle_verification_report(
-    report: &V2RecoveryBundleVerificationReport,
+fn print_v3_recovery_bundle_verification_report(
+    report: &V3RecoveryBundleVerificationReport,
     format: RecoveryReportFormat,
 ) -> Result<()> {
     match format {
@@ -1427,7 +1166,7 @@ fn print_v2_recovery_bundle_verification_report(
             println!("schema=rs3.v2-verify-bundle.v1");
             println!("verified=true");
             println!("repository_id={}", report.repository_id.as_str());
-            print_v2_anchor_text(&report.anchor);
+            print_v3_anchor_text(&report.anchor);
             println!(
                 "weak_subjectivity_floor_sequence={}",
                 report.weak_subjectivity_floor_sequence.get()
@@ -1497,11 +1236,10 @@ fn print_keyring_inspect_report(
             println!("wrapping_key_id={}", report.wrapping_key_id);
             for key in &report.keys {
                 println!(
-                    "key id={} purpose={} status={} algorithm={}",
+                    "key id={} purpose={} status={}",
                     key.id.as_str(),
                     key_purpose_name(key.purpose),
-                    key_status_name(key.status),
-                    key.algorithm
+                    key_status_name(key.status)
                 );
             }
         }
@@ -1556,43 +1294,35 @@ fn print_keyring_rewrap_report(
             } else {
                 println!("RS3_KEYRING_WRAPPING_KEY_HEX=<external-secret>");
             }
+            println!(
+                "# The rewrapped envelope is inactive until a format update binds it; anchored serving keeps the bound envelope and its wrapping key."
+            );
         }
     }
     Ok(())
 }
 
-fn print_v2_provider_conformance_report(
-    report: &V2ProviderConformanceReport,
-    target_fingerprint: &str,
+fn print_v3_provider_conformance_report(
+    report: &V3ProviderConformanceReport,
+    config: &V3ProviderCheckConfig,
     format: RecoveryReportFormat,
 ) -> Result<()> {
+    let target_fingerprint = provider_conformance_target_fingerprint(config);
     match format {
         RecoveryReportFormat::Json => {
-            let checks = report
-                .checks
-                .iter()
-                .map(|check| {
-                    serde_json::json!({
-                        "name": check.name,
-                        "status": provider_check_status_name(check.status),
-                        "reason": check.reason,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let report_json = serde_json::json!({
-                "schema": PROVIDER_CONFORMANCE_SCHEMA,
-                "source_revision": build_source_revision(),
-                "target_fingerprint": target_fingerprint,
-                "generated_at_ms": current_time_ms().unwrap_or(0),
-                "profile": provider_profile_name(report.profile),
-                "passed": report.passed(),
-                "checks": checks,
-            });
-            println!("{}", serde_json::to_string_pretty(&report_json)?);
+            println!(
+                "{}",
+                rs3_server::encode_provider_conformance_evidence(config, report)?
+            );
         }
         RecoveryReportFormat::Text => {
             println!("schema={PROVIDER_CONFORMANCE_SCHEMA}");
             println!("source_revision={}", build_source_revision());
+            println!(
+                "implementation_fingerprint={}",
+                rs3_server::provider_conformance_implementation_fingerprint()
+                    .unwrap_or("unavailable")
+            );
             println!("target_fingerprint={target_fingerprint}");
             println!("generated_at_ms={}", current_time_ms().unwrap_or(0));
             println!("profile={}", provider_profile_name(report.profile));
@@ -1621,17 +1351,17 @@ fn build_source_revision() -> &'static str {
     option_env!("RS3_BUILD_GIT_SHA").unwrap_or("unknown")
 }
 
-fn print_v2_restore_bundle(bundle: &V2RecoveryBundle, format: RecoveryReportFormat) -> Result<()> {
+fn print_v3_restore_bundle(bundle: &V3RecoveryBundle, format: RecoveryReportFormat) -> Result<()> {
     match format {
         RecoveryReportFormat::Json => {
             println!("{}", serde_json::to_string_pretty(bundle)?);
         }
         RecoveryReportFormat::Text => {
-            println!("schema={V2_RESTORE_BUNDLE_SCHEMA}");
+            println!("schema={V3_RESTORE_BUNDLE_SCHEMA}");
             if let Some(repository_id) = bundle.repository_id.as_ref() {
                 println!("repository_id={}", repository_id.as_str());
             }
-            print_v2_anchor_text(&bundle.anchor);
+            print_v3_anchor_text(&bundle.anchor);
             println!(
                 "weak_subjectivity_floor_sequence={}",
                 bundle.weak_subjectivity_floor_sequence.get()
@@ -1649,28 +1379,7 @@ fn print_v2_restore_bundle(bundle: &V2RecoveryBundle, format: RecoveryReportForm
     Ok(())
 }
 
-fn print_v2_anchor_state(
-    schema: &'static str,
-    anchor: &V2AnchorState,
-    format: RecoveryReportFormat,
-) -> Result<()> {
-    match format {
-        RecoveryReportFormat::Json => {
-            let report = serde_json::json!({
-                "schema": schema,
-                "anchor": serde_json::to_value(anchor)?,
-            });
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        RecoveryReportFormat::Text => {
-            println!("schema={schema}");
-            print_v2_anchor_text(anchor);
-        }
-    }
-    Ok(())
-}
-
-fn print_v2_anchor_text(anchor: &V2AnchorState) {
+fn print_v3_anchor_text(anchor: &V3AnchorState) {
     println!("anchor_sequence={}", anchor.sequence.get());
     println!("anchor_commit_key={}", anchor.commit_key.as_str());
     println!("anchor_body_digest={}", hex::encode(anchor.body_digest));
@@ -1720,13 +1429,9 @@ fn key_descriptor_json(descriptor: &KeyDescriptor) -> serde_json::Value {
     serde_json::json!({
         "id": descriptor.id.as_str(),
         "purpose": key_purpose_name(descriptor.purpose),
-        "algorithm": descriptor.algorithm.as_str(),
         "status": key_status_name(descriptor.status),
         "created_at_ms": descriptor.created_at_ms,
-        "not_before_ms": descriptor.not_before_ms,
-        "not_after_ms": descriptor.not_after_ms,
         "public_key": descriptor.public_key.as_deref(),
-        "external_kms_uri": descriptor.external_kms_uri.as_deref(),
     })
 }
 
@@ -1803,438 +1508,12 @@ async fn run_doctor(config: &RuntimeConfig, profile: DoctorProfile, probe: bool)
     )
 }
 
-fn enforce_serve_profile(
-    config: &RuntimeConfig,
-    profile: DoctorProfile,
-    admin_listener_configured: bool,
-) -> Result<()> {
-    if profile == DoctorProfile::Local {
-        tracing::warn!(
-            "local serve profile bypasses production posture enforcement; do not expose this listener",
-        );
-        return Ok(());
-    }
-
-    if !admin_listener_configured {
-        anyhow::bail!(
-            "production serve profile requires RS3_ADMIN_BIND and RS3_ADMIN_BEARER_TOKEN for readiness and operator status",
-        );
-    }
-
-    let findings = doctor_findings(config, AdminReportProfile::Production);
-    for finding in findings.iter().filter(|finding| !finding.is_blocking()) {
-        tracing::warn!(
-            code = finding.code,
-            message = finding.message,
-            remediation = finding.remediation,
-            "production serve posture warning",
-        );
-    }
-    let findings = findings
-        .into_iter()
-        .filter(|finding| finding.is_blocking())
-        .collect::<Vec<_>>();
-    if findings.is_empty() {
-        return Ok(());
-    }
-
-    let codes = findings
-        .iter()
-        .map(|finding| finding.code)
-        .collect::<Vec<_>>()
-        .join(",");
-    anyhow::bail!(
-        "production serve posture failed ({codes}); run `rs3-server doctor --profile production` for remediation",
-    )
-}
-
-fn admin_http_config(
-    bind: Option<SocketAddr>,
-    bearer_token: Option<String>,
-    mutation_bearer_token: Option<String>,
-    profile: DoctorProfile,
-) -> Result<Option<AdminHttpConfig>> {
-    let Some(bind) = bind else {
-        return Ok(None);
-    };
-    let Some(bearer_token) = bearer_token else {
-        anyhow::bail!("RS3_ADMIN_BEARER_TOKEN is required when RS3_ADMIN_BIND is set");
-    };
-    let token = AdminBearerToken::new(bearer_token)?;
-    // Without a distinct mutation token, the admin listener stays read-only
-    // and POST maintenance routes are disabled.
-    let auth = match mutation_bearer_token {
-        Some(mutation_bearer_token) => {
-            let mutation = AdminBearerToken::new(mutation_bearer_token)?;
-            AdminHttpAuth::bearer_with_mutation(token, mutation)?
-        }
-        None => AdminHttpAuth::bearer(token),
-    };
-    Ok(Some(AdminHttpConfig::new(bind, auth, profile.into())))
-}
-
-struct WriterGuardRuntime {
-    shutdown: Option<watch::Receiver<bool>>,
-    held: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    required: bool,
-    #[cfg(feature = "k8s")]
-    writer_fence: Option<WriterFence>,
-    #[cfg(feature = "k8s")]
-    lease_guard: Option<std::sync::Arc<KubernetesLeaseGuard>>,
-    renew_task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl WriterGuardRuntime {
-    fn disabled() -> Self {
-        Self {
-            shutdown: None,
-            held: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            required: false,
-            #[cfg(feature = "k8s")]
-            writer_fence: None,
-            #[cfg(feature = "k8s")]
-            lease_guard: None,
-            renew_task: None,
-        }
-    }
-
-    fn shutdown(&self) -> Option<watch::Receiver<bool>> {
-        self.shutdown.clone()
-    }
-
-    fn readiness_source(
-        &self,
-        repository: std::sync::Arc<dyn AdminReadinessSource>,
-    ) -> std::sync::Arc<dyn AdminReadinessSource> {
-        std::sync::Arc::new(ServeReadinessSource {
-            repository,
-            writer_guard_held: std::sync::Arc::clone(&self.held),
-            writer_guard_required: self.required,
-            #[cfg(feature = "k8s")]
-            writer_fence: self.writer_fence.clone(),
-        })
-    }
-
-    async fn release(&self) -> Result<()> {
-        if let Some(renew_task) = self.renew_task.as_ref() {
-            renew_task.abort();
-        }
-        #[cfg(feature = "k8s")]
-        if let Some(lease_guard) = self.lease_guard.as_ref() {
-            lease_guard
-                .release()
-                .await
-                .context("failed to release writer fence during orderly shutdown")?;
-        }
-        Ok(())
-    }
-}
-
-/// Starts the in-gateway maintenance supervisor for mutation-capable modes.
-///
-/// Restore-readonly gateways force maintenance off at configuration time, and
-/// `RS3_MAINTENANCE_MODE=off` keeps the supervisor from starting at all.
-fn start_maintenance_supervisor(
-    config: &RuntimeConfig,
-    server: &GatewayServer,
-) -> Option<rs3_server::MaintenanceSupervisorHandle> {
-    if !config.mode.allows_mutation() || config.maintenance.mode == MaintenanceMode::Off {
-        return None;
-    }
-    let conformance_config = config.clone();
-    let supervisor_config = rs3_server::MaintenanceSupervisorConfig::from_runtime(
-        config.maintenance,
-        config.repository.retention.is_some(),
-        std::sync::Arc::new(move || {
-            rs3_server::provider_conformance_evidence_passed(&conformance_config)
-        }),
-    );
-    let handle = rs3_server::MaintenanceSupervisor::start(
-        supervisor_config,
-        server.maintenance_runtime(),
-        std::sync::Arc::new(rs3_server::SystemMaintenanceClock),
-    );
-    tracing::info!(
-        maintenance_mode = config.maintenance.mode.as_str(),
-        "maintenance supervisor started",
-    );
-    Some(handle)
-}
-
-/// Wraps the gateway facts source so admin reports include supervisor status.
-fn maintenance_aware_facts_source(
-    inner: std::sync::Arc<dyn rs3_server::AdminRuntimeFactsSource>,
-    supervisor: Option<&rs3_server::MaintenanceSupervisorHandle>,
-) -> std::sync::Arc<dyn rs3_server::AdminRuntimeFactsSource> {
-    let Some(supervisor) = supervisor else {
-        return inner;
-    };
-    std::sync::Arc::new(MaintenanceAwareFactsSource {
-        inner,
-        status: supervisor.status(),
-    })
-}
-
-struct MaintenanceAwareFactsSource {
-    inner: std::sync::Arc<dyn rs3_server::AdminRuntimeFactsSource>,
-    status: rs3_server::MaintenanceStatusHandle,
-}
-
-impl rs3_server::AdminRuntimeFactsSource for MaintenanceAwareFactsSource {
-    fn snapshot(&self) -> rs3_server::AdminRuntimeFacts {
-        let mut facts = self.inner.snapshot();
-        facts.maintenance_supervisor = Some(rs3_server::AdminMaintenanceSupervisorSummary::from(
-            &self.status.snapshot(),
-        ));
-        facts
-    }
-}
-
-async fn bind_gateway(
-    config: RuntimeConfig,
-    _writer_guard: &WriterGuardRuntime,
-) -> Result<GatewayServer> {
-    #[cfg(feature = "k8s")]
-    if let Some(writer_fence) = _writer_guard.writer_fence.clone() {
-        return GatewayServer::bind_with_writer_fence(config, writer_fence)
-            .await
-            .map_err(anyhow::Error::from);
-    }
-    GatewayServer::bind(config)
-        .await
-        .map_err(anyhow::Error::from)
-}
-
-struct ServeReadinessSource {
-    repository: std::sync::Arc<dyn AdminReadinessSource>,
-    writer_guard_held: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    writer_guard_required: bool,
-    #[cfg(feature = "k8s")]
-    writer_fence: Option<WriterFence>,
-}
-
-#[async_trait::async_trait]
-impl AdminReadinessSource for ServeReadinessSource {
-    async fn check_readiness(&self) -> AdminReadiness {
-        if self.writer_guard_required
-            && (!self
-                .writer_guard_held
-                .load(std::sync::atomic::Ordering::Acquire)
-                || !writer_fence_is_live(self))
-        {
-            return AdminReadiness::unavailable("writer-guard.not-held");
-        }
-        self.repository.check_readiness().await
-    }
-}
-
-fn writer_fence_is_live(_readiness: &ServeReadinessSource) -> bool {
-    #[cfg(feature = "k8s")]
-    {
-        _readiness
-            .writer_fence
-            .as_ref()
-            .is_some_and(WriterFence::is_live)
-    }
-    #[cfg(not(feature = "k8s"))]
-    {
-        true
-    }
-}
-
-async fn start_writer_guard(config: &RuntimeConfig) -> Result<WriterGuardRuntime> {
-    if !config.mode.allows_mutation() || config.writer_guard == WriterGuardConfig::Off {
-        return Ok(WriterGuardRuntime::disabled());
-    }
-
-    let AnchorConfig::KubernetesLease {
-        namespace,
-        name,
-        field_manager,
-    } = &config.anchor
-    else {
-        bail!("RS3_WRITER_GUARD=required needs RS3_ANCHOR_MODE=kubernetes-lease");
-    };
-
-    #[cfg(feature = "k8s")]
-    {
-        let hostname = std::env::var("HOSTNAME")
-            .context("RS3_WRITER_GUARD=required needs HOSTNAME to identify this writer pod")?;
-        let holder_identity = format!("{hostname}/{}", random_hex(16)?);
-        let lease_guard = KubernetesLeaseGuard::new(
-            LeaseSettings {
-                namespace: namespace.clone(),
-                name: name.clone(),
-                field_manager: field_manager.clone(),
-            },
-            holder_identity,
-            WRITER_LEASE_DURATION,
-        )
-        .context("failed to configure writer lease guard")?;
-
-        lease_guard
-            .acquire()
-            .await
-            .context("failed to acquire writer lease guard")?;
-        let writer_fence = lease_guard
-            .writer_fence()
-            .context("failed to establish writer fencing token")?;
-        tracing::info!("writer lease guard acquired");
-
-        let lease_guard = std::sync::Arc::new(lease_guard);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let renew_task = tokio::spawn(renew_writer_guard(
-            std::sync::Arc::clone(&lease_guard),
-            shutdown_tx,
-            std::sync::Arc::clone(&held),
-        ));
-
-        Ok(WriterGuardRuntime {
-            shutdown: Some(shutdown_rx),
-            held,
-            required: true,
-            writer_fence: Some(writer_fence),
-            lease_guard: Some(lease_guard),
-            renew_task: Some(renew_task),
-        })
-    }
-
-    #[cfg(not(feature = "k8s"))]
-    {
-        let _ = namespace;
-        let _ = name;
-        let _ = field_manager;
-        bail!("RS3_WRITER_GUARD=required needs the k8s feature");
-    }
-}
-
-#[cfg(feature = "k8s")]
-async fn renew_writer_guard(
-    lease_guard: std::sync::Arc<KubernetesLeaseGuard>,
-    shutdown_tx: watch::Sender<bool>,
-    held: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    let mut last_success = std::time::Instant::now();
-    loop {
-        tokio::time::sleep(WRITER_LEASE_RENEW_INTERVAL).await;
-        match lease_guard.renew().await {
-            Ok(_) => {
-                last_success = std::time::Instant::now();
-            }
-            Err(error) => {
-                let elapsed = last_success.elapsed();
-                tracing::warn!(
-                    %error,
-                    elapsed_ms = elapsed.as_millis(),
-                    "writer lease renewal failed",
-                );
-                if matches!(
-                    error,
-                    LeaseGuardError::HeldByOther | LeaseGuardError::LostLease
-                ) {
-                    held.store(false, std::sync::atomic::Ordering::Release);
-                    tracing::error!(
-                        "writer lease is held by another live identity; initiating graceful shutdown",
-                    );
-                    let _ = shutdown_tx.send(true);
-                    break;
-                }
-                if elapsed >= WRITER_LEASE_DURATION {
-                    held.store(false, std::sync::atomic::Ordering::Release);
-                    tracing::error!(
-                        "writer lease renewal failed past the lease duration; initiating graceful shutdown",
-                    );
-                    let _ = shutdown_tx.send(true);
-                    break;
-                }
-            }
-        }
-    }
-}
-
-async fn run_gateway_and_admin(
-    gateway: GatewayServer,
-    admin: AdminHttpServer,
-    writer_guard_shutdown: Option<watch::Receiver<bool>>,
-) -> Result<()> {
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let gateway_shutdown = shutdown_rx.clone();
-    let admin_shutdown = shutdown_rx;
-
-    if let Some(writer_guard_shutdown) = writer_guard_shutdown {
-        let writer_guard_shutdown_tx = shutdown_tx.clone();
-        tokio::spawn(async move {
-            wait_for_shutdown(writer_guard_shutdown).await;
-            let _ = writer_guard_shutdown_tx.send(true);
-        });
-    }
-
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        let _ = shutdown_tx.send(true);
-    });
-
-    let gateway_task = async move {
-        gateway
-            .run_until_shutdown(wait_for_shutdown(gateway_shutdown))
-            .await
-            .map_err(anyhow::Error::from)
-    };
-    let admin_task = async move {
-        admin
-            .run_until_shutdown(wait_for_shutdown(admin_shutdown))
-            .await
-            .map_err(anyhow::Error::from)
-    };
-
-    tokio::try_join!(gateway_task, admin_task)?;
-    Ok(())
-}
-
-async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
-    if *shutdown.borrow() {
-        return;
-    }
-    while shutdown.changed().await.is_ok() {
-        if *shutdown.borrow() {
-            break;
-        }
-    }
-}
-
-async fn shutdown_signal_or_writer_guard(writer_guard_shutdown: Option<watch::Receiver<bool>>) {
-    let Some(writer_guard_shutdown) = writer_guard_shutdown else {
-        shutdown_signal().await;
-        return;
-    };
-    tokio::select! {
-        _ = shutdown_signal() => {}
-        _ = wait_for_shutdown(writer_guard_shutdown) => {}
-    }
-}
-
 impl From<GatewayModeArg> for GatewayMode {
     fn from(value: GatewayModeArg) -> Self {
         match value {
             GatewayModeArg::ReadWrite => Self::ReadWrite,
             GatewayModeArg::RestoreReadonly => Self::RestoreReadOnly,
         }
-    }
-}
-
-fn apply_gateway_mode_override(config: &mut RuntimeConfig, mode: GatewayModeArg) {
-    let previous_mode = config.mode;
-    let mode = mode.into();
-    config.mode = mode;
-    match (previous_mode, mode) {
-        (_, GatewayMode::RestoreReadOnly) => {
-            config.maintenance = MaintenanceConfig::forced_off();
-        }
-        (GatewayMode::RestoreReadOnly, GatewayMode::ReadWrite) => {
-            config.maintenance = MaintenanceConfig::default();
-        }
-        (GatewayMode::ReadWrite, GatewayMode::ReadWrite) => {}
     }
 }
 
@@ -2247,11 +1526,11 @@ impl From<DoctorProfile> for AdminReportProfile {
     }
 }
 
-fn provider_profile_name(profile: V2ProviderProfile) -> &'static str {
+fn provider_profile_name(profile: V3ProviderProfile) -> &'static str {
     match profile {
-        V2ProviderProfile::Dev => "dev",
-        V2ProviderProfile::AtomicCreate => "atomic-create",
-        V2ProviderProfile::RetainedVersionObjectLock => "retained-version-object-lock",
+        V3ProviderProfile::Dev => "dev",
+        V3ProviderProfile::AtomicCreate => "atomic-create",
+        V3ProviderProfile::RetainedVersionObjectLock => "retained-version-object-lock",
     }
 }
 
@@ -2263,10 +1542,10 @@ fn retention_mode_name(mode: RetentionMode) -> &'static str {
     }
 }
 
-fn provider_check_status_name(status: V2ProviderCheckStatus) -> &'static str {
+fn provider_check_status_name(status: V3ProviderCheckStatus) -> &'static str {
     match status {
-        V2ProviderCheckStatus::Passed => "passed",
-        V2ProviderCheckStatus::Failed => "failed",
+        V3ProviderCheckStatus::Passed => "passed",
+        V3ProviderCheckStatus::Failed => "failed",
     }
 }
 
@@ -2288,23 +1567,6 @@ impl DoctorProfile {
             Self::Local => "local",
             Self::Production => "production",
         }
-    }
-}
-
-fn install_metrics(bind: Option<SocketAddr>) -> Result<()> {
-    let Some(bind) = bind else {
-        return Ok(());
-    };
-    PrometheusBuilder::new()
-        .with_http_listener(bind)
-        .install()?;
-    tracing::info!(bind = %bind, "gateway metrics listener started");
-    Ok(())
-}
-
-async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::warn!(%error, "failed to install Ctrl+C shutdown handler");
     }
 }
 
@@ -2352,7 +1614,7 @@ fn log_runtime_config(config: &RuntimeConfig) {
     );
 }
 
-fn log_v2_provider_check_config(config: &V2ProviderCheckConfig) {
+fn log_v3_provider_check_config(config: &V3ProviderCheckConfig) {
     let backend_kind = backend_kind(&config.backend.endpoint);
     let repository_retention_mode = config
         .repository_retention
@@ -2373,7 +1635,7 @@ fn log_v2_provider_check_config(config: &V2ProviderCheckConfig) {
         backend_kind,
         repository_retention_mode,
         repository_retention_days,
-        "v2 provider check configuration validated",
+        "v03 provider check configuration validated",
     );
 }
 
@@ -2451,11 +1713,11 @@ fn is_path_safe_tracing_target(target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::cli_serve::enforce_serve_profile;
     use super::{
-        DoctorProfile, GatewayModeArg, ImportV2AnchorArgs, MaintenanceArgs, MaintenanceCommand,
-        MaintenanceOutputFormat, PROVIDER_CONFORMANCE_SCHEMA, RecoveryReportFormat,
-        apply_gateway_mode_override, backend_kind, doctor_findings, enforce_serve_profile,
-        is_path_safe_tracing_target, parse_admin_origin, parse_restore_bundle_json,
+        DoctorProfile, ImportAnchorArgs, MaintenanceArgs, MaintenanceCommand,
+        MaintenanceOutputFormat, PROVIDER_CONFORMANCE_SCHEMA, RecoveryReportFormat, backend_kind,
+        doctor_findings, is_path_safe_tracing_target, parse_admin_origin, parse_restore_bundle,
         provider_conformance_target_fingerprint, recovery_bundle_from_import_args,
         run_maintenance_command, runtime_config_profile,
     };
@@ -2463,13 +1725,23 @@ mod tests {
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MaintenanceConfig,
         MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig,
         RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
-        V2ProviderCheckConfig, WriterGuardConfig,
+        V3ProviderCheckConfig, WriterGuardConfig,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
     use serde::Serialize;
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn provider_check_uses_current_unversioned_command() {
+        use clap::Parser;
+
+        let cli = super::Cli::try_parse_from(["rs3", "check-provider", "--format", "json"])
+            .expect("parse provider check");
+        assert!(matches!(cli.command, super::Commands::CheckProvider { .. }));
+        assert!(super::Cli::try_parse_from(["rs3", "check-v2-provider"]).is_err());
+    }
 
     fn runtime_config() -> RuntimeConfig {
         let bind = match "127.0.0.1:9080".parse() {
@@ -2505,7 +1777,7 @@ mod tests {
                 max_pending_items: 64,
             },
             repository: RepositoryConfig {
-                format: RepositoryFormat::V2Preview,
+                format: RepositoryFormat::V3Preview,
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:
@@ -2518,10 +1790,11 @@ mod tests {
             recovery: RecoveryConfig::default(),
             repository_keys: RepositoryKeysConfig {
                 repository_id,
-                repository_salt_hex:
+                repository_salt_hex: Some(
                     "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
+                ),
                 envelope_object_id: Some(
-                    BackendObjectId::new("keyrings/00000000000000000001-digest.json")
+                    BackendObjectId::new("keyrings/00000000000000000001-digest.cbor")
                         .unwrap_or_else(|error| panic!("{error}")),
                 ),
                 wrapping_key_id: "wrap-v1".to_owned(),
@@ -2537,7 +1810,9 @@ mod tests {
     struct TestProviderEvidence {
         schema: &'static str,
         source_revision: &'static str,
+        implementation_fingerprint: &'static str,
         target_fingerprint: String,
+        retention: Option<RetentionPolicy>,
         generated_at_ms: Option<i64>,
         profile: &'static str,
         passed: bool,
@@ -2563,13 +1838,13 @@ mod tests {
     }
 
     struct CliMockMaintenanceRuntime {
-        dry_run: rs3_repository::v2::V2FullGcDryRunReport,
+        dry_run: rs3_repository::v3::V3FullGcDryRunReport,
     }
 
     impl CliMockMaintenanceRuntime {
         fn new() -> Self {
             Self {
-                dry_run: rs3_repository::v2::V2FullGcDryRunReport {
+                dry_run: rs3_repository::v3::V3FullGcDryRunReport {
                     base_sequence: None,
                     chain_live_commit_count: 1,
                     protected_root_count: 0,
@@ -2587,7 +1862,7 @@ mod tests {
                     retention_renewal_bytes: 0,
                     retention_renewal_blocked_count: 0,
                     retention_renewal_blocked_bytes: 0,
-                    planned_cost: rs3_repository::v2::V2MaintenancePlanCost::default(),
+                    planned_cost: rs3_repository::v3::V3MaintenancePlanCost::default(),
                     fits_budgets: true,
                     exact_version_apply_ready: true,
                 },
@@ -2610,9 +1885,9 @@ mod tests {
 
         async fn quick_maintenance_report(
             &self,
-        ) -> Result<rs3_repository::v2::V2MaintenanceReport, rs3_repository::RepositoryError>
+        ) -> Result<rs3_repository::v3::V3MaintenanceReport, rs3_repository::RepositoryError>
         {
-            Ok(rs3_repository::v2::V2MaintenanceReport {
+            Ok(rs3_repository::v3::V3MaintenanceReport {
                 anchor_present: true,
                 verified_commit_count: 1,
                 last_anchored_commit_age_ms: Some(0),
@@ -2622,29 +1897,36 @@ mod tests {
                 oldest_orphan_age_ms: None,
                 reclaimable_orphan_candidate_count: 0,
                 reclaimable_orphan_candidate_bytes: 0,
+                packed_payload_stored_bytes: 0,
+                packed_payload_referenced_bytes: 0,
                 oldest_reclaimable_orphan_age_ms: None,
                 retention_renewal_commit_count: 0,
                 retention_renewal_bytes: 0,
                 retention_renewal_blocked_count: 0,
                 retention_renewal_blocked_bytes: 0,
                 nearest_retain_until_ms: None,
+                recovery_expiry_due_ms: None,
+                recovery_recoverable_point_count: 0,
+                recovery_oldest_recoverable_publish_time_ms: None,
+                recovery_historical_exact_bytes: 0,
+                recovery_clock_uncertainty_ms: None,
             })
         }
 
         async fn full_gc_dry_run(
             &self,
-            _options: rs3_repository::v2::V2FullGcDryRunOptions,
-        ) -> Result<rs3_repository::v2::V2FullGcDryRunReport, rs3_repository::RepositoryError>
+            _options: rs3_repository::v3::V3FullGcDryRunOptions,
+        ) -> Result<rs3_repository::v3::V3FullGcDryRunReport, rs3_repository::RepositoryError>
         {
             Ok(self.dry_run.clone())
         }
 
         async fn preview_full_gc_plan(
             &self,
-            _options: rs3_repository::v2::V2FullGcApplyOptions,
-        ) -> Result<rs3_repository::v2::V2FullGcPlanPreview, rs3_repository::RepositoryError>
+            _options: rs3_repository::v3::V3FullGcApplyOptions,
+        ) -> Result<rs3_repository::v3::V3FullGcPlanPreview, rs3_repository::RepositoryError>
         {
-            Ok(rs3_repository::v2::V2FullGcPlanPreview {
+            Ok(rs3_repository::v3::V3FullGcPlanPreview {
                 report: self.dry_run.clone(),
                 plan_digest: self.plan_digest(),
             })
@@ -2652,11 +1934,11 @@ mod tests {
 
         async fn run_full_maintenance(
             &self,
-            _options: rs3_repository::v2::V2FullGcApplyOptions,
+            _options: rs3_repository::v3::V3FullGcApplyOptions,
             expected_plan_digest: Option<&str>,
-            _cancellation: &rs3_repository::v2::V2MaintenanceCancellation,
+            _cancellation: &rs3_repository::v3::V3MaintenanceCancellation,
             on_phase: &(dyn Fn(rs3_server::MaintenanceRunPhase) + Send + Sync),
-        ) -> Result<rs3_repository::v2::V2FullMaintenanceReport, rs3_repository::RepositoryError>
+        ) -> Result<rs3_repository::v3::V3FullMaintenanceReport, rs3_repository::RepositoryError>
         {
             on_phase(rs3_server::MaintenanceRunPhase::Quiescing);
             if let Some(expected) = expected_plan_digest
@@ -2667,13 +1949,13 @@ mod tests {
                 });
             }
             on_phase(rs3_server::MaintenanceRunPhase::Applying);
-            Ok(rs3_repository::v2::V2FullMaintenanceReport {
+            Ok(rs3_repository::v3::V3FullMaintenanceReport {
                 dry_run: self.dry_run.clone(),
-                apply: rs3_repository::v2::V2FullGcApplyReport {
+                apply: rs3_repository::v3::V3FullGcApplyReport {
                     dry_run: self.dry_run.clone(),
                     retention_renewed_object_count: 0,
                     retention_renewed_bytes: 0,
-                    orphan_gc: rs3_repository::v2::V2OrphanGcReport::default(),
+                    orphan_gc: rs3_repository::v3::V3OrphanGcReport::default(),
                 },
             })
         }
@@ -2702,7 +1984,7 @@ mod tests {
                     ..rs3_server::MaintenanceConfig::default()
                 },
                 retention_configured: false,
-                orphan_gc: rs3_repository::v2::V2OrphanGcOptions::new_for_test_rehearsal(
+                orphan_gc: rs3_repository::v3::V3OrphanGcOptions::new_for_test_rehearsal(
                     Duration::ZERO,
                 ),
                 retained_provider_conformance: std::sync::Arc::new(|| true),
@@ -2905,30 +2187,6 @@ mod tests {
     }
 
     #[test]
-    fn restore_readonly_cli_override_forces_maintenance_off() {
-        let mut config = runtime_config();
-
-        apply_gateway_mode_override(&mut config, GatewayModeArg::RestoreReadonly);
-
-        assert_eq!(config.mode, GatewayMode::RestoreReadOnly);
-        assert_eq!(config.maintenance.mode, rs3_server::MaintenanceMode::Off);
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn read_write_cli_override_restores_the_default_maintenance_posture() {
-        let mut config = runtime_config();
-        config.mode = GatewayMode::RestoreReadOnly;
-        config.maintenance = MaintenanceConfig::forced_off();
-
-        apply_gateway_mode_override(&mut config, GatewayModeArg::ReadWrite);
-
-        assert_eq!(config.mode, GatewayMode::ReadWrite);
-        assert_eq!(config.maintenance, MaintenanceConfig::default());
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
     fn local_doctor_allows_local_development_config() {
         let findings = doctor_findings(&runtime_config(), DoctorProfile::Local.into());
 
@@ -2946,7 +2204,7 @@ mod tests {
         assert!(codes.contains(&"anchor.memory"));
         assert!(codes.contains(&"retention.missing"));
         assert!(codes.contains(&"auth.credentials-missing"));
-        assert!(codes.contains(&"recovery.public-key"));
+        assert!(!codes.contains(&"recovery.public-key"));
         assert!(codes.contains(&"repository.init-enabled"));
         assert!(codes.contains(&"writer-guard.required"));
     }
@@ -3000,9 +2258,9 @@ mod tests {
             std::process::id()
         ));
         let target_fingerprint =
-            provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(&config));
-        let checks = rs3_repository::v2::required_v2_provider_check_names(
-            rs3_repository::v2::V2ProviderProfile::RetainedVersionObjectLock,
+            provider_conformance_target_fingerprint(&V3ProviderCheckConfig::from(&config));
+        let checks = rs3_repository::v3::required_v3_provider_check_names(
+            rs3_repository::v3::V3ProviderProfile::RetainedVersionObjectLock,
         )
         .into_iter()
         .map(|name| TestProviderCheck {
@@ -3014,7 +2272,11 @@ mod tests {
         let evidence = TestProviderEvidence {
             schema: PROVIDER_CONFORMANCE_SCHEMA,
             source_revision: super::build_source_revision(),
+            implementation_fingerprint:
+                rs3_server::provider_conformance_implementation_fingerprint()
+                    .expect("executable fingerprint"),
             target_fingerprint,
+            retention: config.repository.retention,
             generated_at_ms: super::current_time_ms(),
             profile: "retained-version-object-lock",
             passed: true,
@@ -3031,7 +2293,92 @@ mod tests {
 
         assert!(findings.is_empty());
         assert!(enforce_serve_profile(&config, DoctorProfile::Production, true).is_ok());
+        config.repository.allow_init = true;
+        assert!(
+            super::cli_init::enforce_profile(&config, DoctorProfile::Production, false).is_ok()
+        );
+        assert!(
+            config.repository.allow_init,
+            "init validation preserves the config"
+        );
+        let serve_error = enforce_serve_profile(&config, DoctorProfile::Production, true)
+            .expect_err("serving must still reject bootstrap permission");
+        assert!(serve_error.to_string().contains("repository.init-enabled"));
+
+        config.repository.retention = None;
+        let error = super::cli_init::enforce_profile(&config, DoctorProfile::Production, false)
+            .expect_err("production init still requires retention");
+        assert!(error.to_string().contains("retention.missing"));
+        config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 30));
         fs::remove_file(provider_report).unwrap_or_else(|error| panic!("{error}"));
+        let error = super::cli_init::enforce_profile(&config, DoctorProfile::Production, false)
+            .expect_err("production init still requires qualified evidence");
+        assert!(
+            error
+                .to_string()
+                .contains("maintenance.provider-conformance")
+        );
+        config.provider_conformance.report_file = None;
+        assert!(super::cli_init::enforce_profile(&config, DoctorProfile::Production, true).is_ok());
+        config.static_credentials = None;
+        let error = super::cli_init::enforce_profile(&config, DoctorProfile::Production, true)
+            .expect_err("qualification does not exempt other production requirements");
+        assert!(error.to_string().contains("auth.credentials-missing"));
+    }
+
+    #[tokio::test]
+    async fn production_init_rejects_posture_before_backend_access() {
+        let config = runtime_config();
+        let error = super::cli_init::run(&config, DoctorProfile::Production, None, false)
+            .await
+            .expect_err("invalid production configuration must fail preflight")
+            .to_string();
+        assert!(error.contains("anchor.memory"));
+        assert!(error.contains("retention.missing"));
+        assert!(!error.contains("repository.init-enabled"));
+        assert!(!error.contains("tenant"));
+        assert!(super::cli_init::enforce_profile(&config, DoctorProfile::Local, false).is_ok());
+    }
+
+    #[test]
+    fn init_parses_explicit_posture_profiles() {
+        use clap::Parser;
+
+        for (name, expected) in [
+            ("local", DoctorProfile::Local),
+            ("production", DoctorProfile::Production),
+        ] {
+            let cli = super::Cli::try_parse_from(["rs3", "init", "--profile", name])
+                .expect("init profile parses");
+            assert!(
+                matches!(cli.command, super::Commands::Init { profile, .. } if profile == expected)
+            );
+        }
+        assert!(super::Cli::try_parse_from(["rs3", "init", "--profile", "unknown"]).is_err());
+        let cli = super::Cli::try_parse_from(["rs3", "init", "--journal-secret", "bootstrap"])
+            .expect("journal option parses");
+        assert!(
+            matches!(cli.command, super::Commands::Init { journal_secret, .. } if journal_secret.as_deref() == Some("bootstrap"))
+        );
+    }
+
+    #[tokio::test]
+    async fn init_rejects_missing_or_inapplicable_journal_before_io() {
+        let mut config = runtime_config();
+        config.anchor = AnchorConfig::KubernetesLease {
+            namespace: "fixture".to_owned(),
+            name: "fixture".to_owned(),
+            field_manager: "fixture".to_owned(),
+        };
+        let error = super::cli_init::run(&config, DoctorProfile::Local, None, false)
+            .await
+            .expect_err("missing declared journal");
+        assert!(error.to_string().contains("requires --journal-secret"));
+        config.mode = rs3_server::GatewayMode::RestoreReadOnly;
+        let error = super::cli_init::run(&config, DoctorProfile::Local, Some("bootstrap"), false)
+            .await
+            .expect_err("readonly must not claim a journal");
+        assert!(error.to_string().contains("applies only"));
     }
 
     #[test]
@@ -3055,45 +2402,113 @@ mod tests {
         assert!(enforce_serve_profile(&runtime_config(), DoctorProfile::Local, false).is_ok());
     }
 
+    fn sample_restore_bundle(repository_id: &str) -> rs3_repository::v3::V3RecoveryBundle {
+        let anchor = rs3_repository::v3::V3AnchorState {
+            sequence: rs3_types::Sequence::new(7),
+            commit_key: BackendObjectId::new(
+                "commits/v03/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            )
+            .expect("commit key"),
+            body_digest: [0x11; 32],
+            version_id: Some(rs3_types::BackendVersionId::new("version-a").expect("version")),
+            signing_key_id: rs3_types::KeyId::new("checkpoint-v1").expect("key"),
+            format_ref: rs3_repository::v3::V3FormatRef {
+                generation: 1,
+                digest: "22".repeat(32),
+                object_id: BackendObjectId::new("format/00000000000000000001/abc")
+                    .expect("format key"),
+                version_id: Some(
+                    rs3_types::BackendVersionId::new("format-version-a").expect("version"),
+                ),
+            },
+        };
+        let mut bundle =
+            rs3_repository::v3::V3RecoveryBundle::from_anchor(anchor, rs3_types::Sequence::new(7));
+        bundle.repository_id = Some(RepositoryId::new(repository_id).expect("repo ID"));
+        bundle.repository_salt_digest = Some([0x33; 32]);
+        bundle.exported_at_ms = 42;
+        bundle
+    }
+
+    #[test]
+    fn portable_bundle_files_preserve_signatures_and_refuse_overwrite() {
+        let mut bundle = sample_restore_bundle("tenant-repository");
+        let signer = rs3_crypto::KeyRing::generate_random().expect("signer");
+        let public_key = signer
+            .descriptors()
+            .into_iter()
+            .find(|key| key.purpose == rs3_types::KeyPurpose::CheckpointSigning)
+            .and_then(|key| key.public_key)
+            .expect("public key");
+        let signature = signer
+            .sign_checkpoint_payload(&bundle.offline_signature_payload().expect("payload"))
+            .expect("signature")
+            .signature;
+        super::attach_bundle_signature(&mut bundle, &hex::encode(&signature), &public_key)
+            .expect("attach");
+        let before = bundle.clone();
+        assert!(
+            super::attach_bundle_signature(&mut bundle, &"00".repeat(64), &public_key).is_err()
+        );
+        assert_eq!(
+            bundle, before,
+            "failed attachment preserves existing signature"
+        );
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rs3-signed-bundle-{}-{unique}.cbor",
+            std::process::id()
+        ));
+        super::write_restore_bundle(&path, &bundle).expect("write");
+        let read = super::read_v3_recovery_bundle(path.to_str().expect("path")).expect("read");
+        assert_eq!(read, bundle);
+        read.verify_offline_signature(&public_key).expect("verify");
+        assert!(super::write_restore_bundle(&path, &bundle).is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("bytes"),
+            bundle.to_object_bytes().expect("encode")
+        );
+        std::fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn bundle_input_is_bounded_and_import_requires_repository_identity() {
+        let maximum = rs3_repository::v3::MAX_RECOVERY_BUNDLE_BYTES;
+        assert!(super::read_bounded_bundle(std::io::repeat(0)).is_err());
+        assert_eq!(
+            super::read_bounded_bundle(&vec![0; maximum][..])
+                .expect("at bound")
+                .len(),
+            maximum
+        );
+        let mut bundle = sample_restore_bundle("tenant-repository");
+        bundle.repository_id = None;
+        assert!(
+            parse_restore_bundle(&bundle.to_object_bytes().expect("bytes"), &runtime_config())
+                .is_err()
+        );
+        assert!(parse_restore_bundle(b"{}", &runtime_config()).is_err());
+    }
+
     #[test]
     fn import_bundle_parser_accepts_export_restore_bundle_shape() {
         let config = runtime_config();
-        let input = serde_json::json!({
-            "schema": "rs3.restore-bundle.v2-preview.v1",
-            "repository": {
-                "id": "tenant-repository",
-                "salt_digest": "33".repeat(32)
-            },
-            "anchor": {
-                "sequence": 7,
-                "commit_key": "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "body_digest": "11".repeat(32),
-                "version_id": "version-a",
-                "signing_key_id": "checkpoint-v1",
-                "format": {
-                    "generation": 1,
-                    "digest": "22".repeat(32),
-                    "object_id": "format/00000000000000000001/abc",
-                    "version_id": "format-version-a"
-                }
-            },
-            "weak_subjectivity_floor_sequence": 7,
-            "format_digest": "22".repeat(32),
-            "format_generation": 1,
-            "exported_at_ms": 42,
-            "offline_signature": null
-        })
-        .to_string();
+        let input = sample_restore_bundle("tenant-repository")
+            .to_object_bytes()
+            .expect("bundle bytes");
 
         let bundle =
-            parse_restore_bundle_json(&input, &config).unwrap_or_else(|error| panic!("{error}"));
+            parse_restore_bundle(&input, &config).unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(bundle.anchor.sequence.get(), 7);
         assert_eq!(
             bundle.repository_id.as_ref().map(RepositoryId::as_str),
             Some("tenant-repository")
         );
-        assert_eq!(bundle.format_generation, Some(1));
+        assert_eq!(bundle.anchor.format_ref.generation, 1);
         assert_eq!(
             bundle.anchor.version_id.as_ref().map(|id| id.as_str()),
             Some("version-a")
@@ -3104,31 +2519,11 @@ mod tests {
     #[test]
     fn import_bundle_parser_rejects_wrong_repository() {
         let config = runtime_config();
-        let input = serde_json::json!({
-            "schema": "rs3.restore-bundle.v2-preview.v1",
-            "repository": {
-                "id": "other-repository"
-            },
-            "anchor": {
-                "sequence": 7,
-                "commit_key": "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "body_digest": "11".repeat(32),
-                "signing_key_id": "checkpoint-v1",
-                "format": {
-                    "generation": 1,
-                    "digest": "22".repeat(32),
-                    "object_id": "format/00000000000000000001/abc"
-                }
-            },
-            "weak_subjectivity_floor_sequence": 7,
-            "format_digest": "22".repeat(32),
-            "format_generation": 1,
-            "exported_at_ms": 42,
-            "offline_signature": null
-        })
-        .to_string();
+        let input = sample_restore_bundle("other-repository")
+            .to_object_bytes()
+            .expect("bundle bytes");
 
-        let error = match parse_restore_bundle_json(&input, &config) {
+        let error = match parse_restore_bundle(&input, &config) {
             Ok(_) => panic!("wrong-repository restore bundle should be rejected"),
             Err(error) => error,
         };
@@ -3137,41 +2532,21 @@ mod tests {
     }
 
     #[test]
-    fn import_v2_anchor_reads_bundle_file_and_preserves_operator_options() {
+    fn import_v3_anchor_reads_bundle_file_and_preserves_operator_options() {
         let config = runtime_config();
-        let input = serde_json::json!({
-            "schema": "rs3.restore-bundle.v2-preview.v1",
-            "repository": {
-                "id": "tenant-repository"
-            },
-            "anchor": {
-                "sequence": 7,
-                "commit_key": "commits/v02/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "body_digest": "11".repeat(32),
-                "signing_key_id": "checkpoint-v1",
-                "format": {
-                    "generation": 1,
-                    "digest": "22".repeat(32),
-                    "object_id": "format/00000000000000000001/abc"
-                }
-            },
-            "weak_subjectivity_floor_sequence": 7,
-            "format_digest": "22".repeat(32),
-            "format_generation": 1,
-            "exported_at_ms": 42,
-            "offline_signature": null
-        })
-        .to_string();
+        let input = sample_restore_bundle("tenant-repository")
+            .to_object_bytes()
+            .expect("bundle bytes");
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_else(|error| panic!("{error}"))
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "rs3-import-v2-anchor-test-{}-{unique}.json",
+            "rs3-import-anchor-test-{}-{unique}.cbor",
             std::process::id()
         ));
         std::fs::write(&path, input).unwrap_or_else(|error| panic!("{error}"));
-        let args = ImportV2AnchorArgs {
+        let args = ImportAnchorArgs {
             bundle_file: path.to_string_lossy().into_owned(),
             min_sequence: 5,
             force_rollback: true,

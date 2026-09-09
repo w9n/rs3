@@ -1,0 +1,733 @@
+//! Resumable initialization from trusted external intent, never backend discovery.
+
+use super::*;
+use crate::admin::provider_conformance_target_fingerprint;
+use crate::s3::runtime_keyring::{
+    configured_or_generated_repository_salt, configured_repository_salt,
+    open_gateway_keyring_object, prepare_gateway_keyring,
+};
+use rs3_crypto::derive_public_fingerprint;
+use rs3_k8s::{KubernetesBootstrapJournal, MAX_BOOTSTRAP_JOURNAL_BYTES};
+use rs3_repository::v3::V3FormatError;
+use rs3_repository::{KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE, keyring_envelope_object_id};
+use rs3_storage::retention_satisfies;
+use rs3_types::BackendVersionId;
+use serde::{Deserialize, Serialize};
+
+const SCHEMA: &str = "rs3.bootstrap.v1";
+const WRITE_ATTEMPTS: u8 = 3;
+
+// Private seam for crash tests; Kubernetes is the sole durable implementation.
+#[async_trait::async_trait]
+pub(super) trait Journal: Send {
+    fn state(&self) -> Result<Option<&[u8]>, S3BoundaryError>;
+    async fn save(&mut self, bytes: &[u8], evidence: Option<&str>) -> Result<(), S3BoundaryError>;
+}
+
+#[async_trait::async_trait]
+impl Journal for KubernetesBootstrapJournal {
+    fn state(&self) -> Result<Option<&[u8]>, S3BoundaryError> {
+        self.state().map_err(repository_init)
+    }
+
+    async fn save(&mut self, bytes: &[u8], evidence: Option<&str>) -> Result<(), S3BoundaryError> {
+        self.save(bytes, evidence.map(str::as_bytes))
+            .await
+            .map_err(repository_init)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Record {
+    schema: String,
+    context: String,
+    /// Public salt this initialization sealed its envelopes under. Absent only
+    /// in journals written before salts were generated, which always ran with
+    /// a configured salt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository_salt_hex: Option<String>,
+    phase: Phase,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "phase", deny_unknown_fields)]
+enum Phase {
+    Keyring {
+        artifact: Artifact,
+    },
+    Format {
+        keyring: V3KeyringEnvelopeRootRef,
+        artifact: Artifact,
+    },
+    Genesis {
+        keyring: V3KeyringEnvelopeRootRef,
+        format: V3FormatRef,
+        intent: Vec<u8>,
+        remaining: u8,
+    },
+    Initialized {
+        accepted: V3AnchorState,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Artifact {
+    object_id: BackendObjectId,
+    body: Vec<u8>,
+    remaining: u8,
+}
+
+impl Artifact {
+    fn new(object_id: BackendObjectId, body: Vec<u8>) -> Self {
+        Self {
+            object_id,
+            body,
+            remaining: WRITE_ATTEMPTS,
+        }
+    }
+}
+
+fn invalid() -> S3BoundaryError {
+    repository_init("bootstrap journal does not match the configured unfinished initialization")
+}
+
+pub(super) fn context(config: &RuntimeConfig, salt: &[u8]) -> Result<String, S3BoundaryError> {
+    let keys = &config.repository_keys;
+    let identity = serde_json::to_vec(&(
+        &keys.repository_id,
+        salt,
+        &keys.wrapping_key_id,
+        &keys.envelope_object_id,
+        v3_provider_profile(&config.backend, config.repository.retention),
+        config.repository.retention,
+    ))
+    .map_err(|_| invalid())?;
+    Ok(derive_public_fingerprint(
+        b"rs3.bootstrap.context.v1",
+        &[
+            provider_conformance_target_fingerprint(&V3ProviderCheckConfig::from(config))
+                .as_bytes(),
+            &identity,
+        ],
+    ))
+}
+
+/// Resolves the salt a journal was written under.
+///
+/// A configured or externally fixed salt must agree with the recorded one.
+/// Journals written before salts were recorded always ran with a configured
+/// salt, so they resolve to the configured value alone.
+pub(super) fn resolve_recorded_salt(
+    config: &RuntimeConfig,
+    fixed_salt: Option<&[u8]>,
+    recorded_hex: Option<&str>,
+) -> Result<Vec<u8>, S3BoundaryError> {
+    let fixed = match fixed_salt {
+        Some(salt) => Some(salt.to_vec()),
+        None => configured_repository_salt(&config.repository_keys)?,
+    };
+    let recorded = recorded_hex
+        .map(|hex| hex::decode(hex).map_err(|_| invalid()))
+        .transpose()?;
+    match (fixed, recorded) {
+        (Some(fixed), Some(recorded)) if fixed != recorded => Err(invalid()),
+        (Some(fixed), _) => Ok(fixed),
+        (None, Some(recorded)) => Ok(recorded),
+        (None, None) => Err(invalid()),
+    }
+}
+
+fn decode(
+    bytes: &[u8],
+    config: &RuntimeConfig,
+    fixed_salt: Option<&[u8]>,
+) -> Result<(Record, Vec<u8>), S3BoundaryError> {
+    if bytes.len() > MAX_BOOTSTRAP_JOURNAL_BYTES {
+        return Err(invalid());
+    }
+    let record: Record = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    let salt = resolve_recorded_salt(config, fixed_salt, record.repository_salt_hex.as_deref())?;
+    let remaining = match &record.phase {
+        Phase::Keyring { artifact } | Phase::Format { artifact, .. } => artifact.remaining,
+        Phase::Genesis { remaining, .. } => *remaining,
+        Phase::Initialized { .. } => 0,
+    };
+    if record.schema != SCHEMA
+        || record.context != context(config, &salt)?
+        || remaining > WRITE_ATTEMPTS
+    {
+        return Err(invalid());
+    }
+    Ok((record, salt))
+}
+
+pub(super) fn is_initialized(
+    config: &RuntimeConfig,
+    fixed_salt: Option<&[u8]>,
+    bytes: &[u8],
+) -> Result<bool, S3BoundaryError> {
+    Ok(matches!(
+        decode(bytes, config, fixed_salt)?.0.phase,
+        Phase::Initialized { .. }
+    ))
+}
+
+async fn save(journal: &mut impl Journal, record: &Record) -> Result<(), S3BoundaryError> {
+    let bytes = serde_json::to_vec(record).map_err(|_| invalid())?;
+    if bytes.len() > MAX_BOOTSTRAP_JOURNAL_BYTES {
+        return Err(invalid());
+    }
+    journal.save(&bytes, None).await
+}
+
+struct Bootstrap<'a, J> {
+    config: &'a RuntimeConfig,
+    store: &'a RuntimeStore,
+    anchor: &'a RuntimeV3Anchor,
+    guard: &'a dyn V3MaintenanceGuard,
+    journal: &'a mut J,
+    /// Salt fixed by an enclosing journal; otherwise configured or generated.
+    fixed_salt: Option<Vec<u8>>,
+}
+
+impl<J: Journal> Bootstrap<'_, J> {
+    async fn check_guard(&self) -> Result<(), S3BoundaryError> {
+        self.guard
+            .verify_v3_maintenance(None)
+            .await
+            .map_err(repository_init)
+    }
+
+    async fn require_unaccepted(&self) -> Result<(), S3BoundaryError> {
+        self.check_guard().await?;
+        if self
+            .anchor
+            .read_v3()
+            .await
+            .map_err(repository_init)?
+            .is_some()
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    async fn verify_accepted(
+        &self,
+        initialized: bool,
+    ) -> Result<(V3RepositoryInitReport, Vec<u8>), S3BoundaryError> {
+        let anchor = self
+            .anchor
+            .read_v3()
+            .await
+            .map_err(repository_init)?
+            .ok_or_else(|| {
+                repository_init(
+                    "completed bootstrap requires explicit recovery of its missing anchor",
+                )
+            })?;
+        let loaded = load_existing_v3_repository(
+            self.store,
+            &self.config.repository_keys,
+            &anchor,
+            self.config,
+        )
+        .await?;
+        if self
+            .fixed_salt
+            .as_ref()
+            .is_some_and(|fixed| *fixed != loaded.repository_salt)
+        {
+            return Err(invalid());
+        }
+        let repository_salt = loaded.repository_salt.clone();
+        let options = bootstrap_commit_options(self.config, &loaded)?;
+        let commits = V3CommitStore::new(self.store.clone(), loaded.keyring, options);
+        let chain = commits
+            .load_replay_chain_from_state(&anchor)
+            .await
+            .map_err(repository_init)?;
+        Ok((
+            V3RepositoryInitReport {
+                anchor,
+                initialized,
+                verified_commit_count: chain.commits_newest_first.len(),
+                probe_attempts: 0,
+                payload_restore_verified: false,
+                probe_observation: None,
+            },
+            repository_salt,
+        ))
+    }
+
+    async fn run(&mut self) -> Result<V3RepositoryInitReport, S3BoundaryError> {
+        self.check_guard().await?;
+        let (mut record, salt) = match self.journal.state()? {
+            Some(bytes) => decode(bytes, self.config, self.fixed_salt.as_deref())?,
+            None => {
+                if self
+                    .anchor
+                    .read_v3()
+                    .await
+                    .map_err(repository_init)?
+                    .is_some()
+                {
+                    let (report, salt) = self.verify_accepted(false).await?;
+                    save(
+                        self.journal,
+                        &Record {
+                            schema: SCHEMA.to_owned(),
+                            context: context(self.config, &salt)?,
+                            repository_salt_hex: Some(hex::encode(&salt)),
+                            phase: Phase::Initialized {
+                                accepted: report.anchor.clone(),
+                            },
+                        },
+                    )
+                    .await?;
+                    return Ok(report);
+                }
+                self.require_init_permission()?;
+                reject_v3_bootstrap_with_foreign_objects(
+                    self.store,
+                    v3_provider_profile(&self.config.backend, self.config.repository.retention),
+                    None,
+                )
+                .await?;
+                // The salt is decided once here and journaled with the first
+                // artifact, so every retry seals under the same context.
+                let salt = match self.fixed_salt.clone() {
+                    Some(salt) => salt,
+                    None => configured_or_generated_repository_salt(&self.config.repository_keys)?,
+                };
+                let (_, envelope) = prepare_gateway_keyring(&self.config.repository_keys, &salt)?;
+                let artifact = Artifact::new(
+                    self.keyring_id(&envelope)?,
+                    envelope.to_object_bytes().map_err(repository_init)?,
+                );
+                let record = Record {
+                    schema: SCHEMA.to_owned(),
+                    context: context(self.config, &salt)?,
+                    repository_salt_hex: Some(hex::encode(&salt)),
+                    phase: Phase::Keyring { artifact },
+                };
+                save(self.journal, &record).await?;
+                (record, salt)
+            }
+        };
+        loop {
+            self.check_guard().await?;
+            if let Phase::Initialized { accepted } = &record.phase {
+                let (report, verified_salt) = self.verify_accepted(false).await?;
+                if report.anchor.sequence < accepted.sequence
+                    || (report.anchor.sequence == accepted.sequence && report.anchor != *accepted)
+                    || verified_salt != salt
+                {
+                    return Err(invalid());
+                }
+                return Ok(report);
+            }
+            self.require_init_permission()?;
+            match record.phase.clone() {
+                Phase::Keyring { artifact } => {
+                    self.require_unaccepted().await?;
+                    let envelope = RepositoryEnvelope::from_object_bytes(
+                        &artifact.body,
+                        rs3_crypto::EnvelopePurpose::Keyring,
+                    )
+                    .map_err(repository_init)?;
+                    if artifact.object_id != self.keyring_id(&envelope)?
+                        || envelope.repository_salt != salt
+                    {
+                        return Err(invalid());
+                    }
+                    // Decrypt before any PUT: a changed wrapping key must fail here.
+                    let loaded = open_gateway_keyring_object(
+                        &self.config.repository_keys,
+                        artifact.object_id.clone(),
+                        None,
+                        Bytes::copy_from_slice(&artifact.body),
+                    )?;
+                    let version_id = self
+                        .publish_artifact(
+                            &mut record,
+                            &artifact,
+                            KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE,
+                        )
+                        .await?;
+                    let keyring = V3KeyringEnvelopeRootRef {
+                        generation: envelope.generation,
+                        digest: envelope.digest().map_err(repository_init)?,
+                        object_id: artifact.object_id,
+                        version_id,
+                    };
+                    let root = V3FormatRoot::new(
+                        self.config.repository_keys.repository_id.clone(),
+                        keyring.clone(),
+                        loaded
+                            .keyring
+                            .primary_key_id(KeyPurpose::CheckpointSigning)
+                            .map_err(repository_init)?,
+                        v3_provider_profile(&self.config.backend, self.config.repository.retention),
+                        self.config.repository.retention,
+                    );
+                    let envelope = prepare_format_root(&self.config.repository_keys, &root, &salt)?;
+                    record.phase = Phase::Format {
+                        keyring,
+                        artifact: Artifact::new(
+                            v3_format_object_id(
+                                envelope.generation,
+                                &envelope.digest().map_err(repository_init)?,
+                            )
+                            .map_err(repository_init)?,
+                            envelope.to_object_bytes().map_err(repository_init)?,
+                        ),
+                    };
+                }
+                Phase::Format { keyring, artifact } => {
+                    self.require_unaccepted().await?;
+                    let envelope = RepositoryEnvelope::from_object_bytes(
+                        &artifact.body,
+                        rs3_crypto::EnvelopePurpose::Format,
+                    )
+                    .map_err(repository_init)?;
+                    let digest = envelope.digest().map_err(repository_init)?;
+                    if artifact.object_id
+                        != v3_format_object_id(envelope.generation, &digest)
+                            .map_err(repository_init)?
+                    {
+                        return Err(invalid());
+                    }
+                    let mut format = V3FormatRef {
+                        generation: envelope.generation,
+                        digest,
+                        object_id: artifact.object_id.clone(),
+                        version_id: None,
+                    };
+                    let opened = open_format_root_body(
+                        &self.config.repository_keys,
+                        &format,
+                        &artifact.body,
+                    )?;
+                    if opened.repository_salt != salt {
+                        return Err(invalid());
+                    }
+                    let loaded = self
+                        .load_dependencies(&keyring, &opened.root, &format, &salt)
+                        .await?;
+                    self.protect_dependency(&keyring.object_id, keyring.version_id.as_ref())
+                        .await?;
+                    format.version_id = self
+                        .publish_artifact(&mut record, &artifact, V3_FORMAT_ENVELOPE_CONTENT_TYPE)
+                        .await?;
+                    let loaded = LoadedV3Repository {
+                        format_ref: format.clone(),
+                        ..loaded
+                    };
+                    let options = bootstrap_commit_options(self.config, &loaded)?;
+                    let commits = V3CommitStore::new(self.store.clone(), loaded.keyring, options);
+                    let intent = commits
+                        .prepare_genesis_snapshot()
+                        .map_err(repository_init)?
+                        .to_journal_bytes()
+                        .map_err(repository_init)?
+                        .to_vec();
+                    record.phase = Phase::Genesis {
+                        keyring,
+                        format,
+                        intent,
+                        remaining: WRITE_ATTEMPTS,
+                    };
+                }
+                Phase::Genesis {
+                    keyring,
+                    format,
+                    intent,
+                    remaining,
+                } => {
+                    let opened =
+                        open_format_root(self.store, &self.config.repository_keys, &format).await?;
+                    if opened.repository_salt != salt {
+                        return Err(invalid());
+                    }
+                    let loaded = self
+                        .load_dependencies(&keyring, &opened.root, &format, &salt)
+                        .await?;
+                    let options = bootstrap_commit_options(self.config, &loaded)?;
+                    let commits = V3CommitStore::new(self.store.clone(), loaded.keyring, options);
+                    let prepared = commits
+                        .open_prepared_genesis(&intent)
+                        .map_err(repository_init)?;
+                    self.protect_dependency(&keyring.object_id, keyring.version_id.as_ref())
+                        .await?;
+                    self.protect_dependency(&format.object_id, format.version_id.as_ref())
+                        .await?;
+                    let result = commits
+                        .publish_prepared_genesis_with_guard(
+                            self.anchor,
+                            &prepared,
+                            false,
+                            self.guard,
+                        )
+                        .await;
+                    match result {
+                        Ok(_) => {}
+                        Err(V3FormatError::BootstrapUploadRequired) => {
+                            if remaining == 0 {
+                                return Err(repository_init(
+                                    "bootstrap upload budget exhausted; reconcile or recover explicitly",
+                                ));
+                            }
+                            if let Phase::Genesis { remaining, .. } = &mut record.phase {
+                                *remaining -= 1;
+                            }
+                            save(self.journal, &record).await?;
+                            self.check_guard().await?;
+                            commits
+                                .publish_prepared_genesis_with_guard(
+                                    self.anchor,
+                                    &prepared,
+                                    true,
+                                    self.guard,
+                                )
+                                .await
+                                .map_err(repository_init)?;
+                        }
+                        Err(error) => return Err(repository_init(error)),
+                    }
+                    let (report, _) = self.verify_accepted(true).await?;
+                    record.phase = Phase::Initialized {
+                        accepted: report.anchor.clone(),
+                    };
+                    save(self.journal, &record).await?;
+                    return Ok(report);
+                }
+                Phase::Initialized { .. } => return Err(invalid()),
+            }
+            save(self.journal, &record).await?;
+        }
+    }
+
+    fn require_init_permission(&self) -> Result<(), S3BoundaryError> {
+        if !self.config.mode.allows_mutation() || !self.config.repository.allow_init {
+            return Err(repository_init(
+                "unfinished bootstrap requires explicit initialization permission",
+            ));
+        }
+        Ok(())
+    }
+
+    fn keyring_id(
+        &self,
+        envelope: &RepositoryEnvelope,
+    ) -> Result<BackendObjectId, S3BoundaryError> {
+        match &self.config.repository_keys.envelope_object_id {
+            Some(id) => Ok(id.clone()),
+            None => keyring_envelope_object_id(
+                envelope.generation,
+                &envelope.digest().map_err(repository_init)?,
+            )
+            .map_err(repository_init),
+        }
+    }
+
+    async fn load_dependencies(
+        &self,
+        keyring: &V3KeyringEnvelopeRootRef,
+        root: &V3FormatRoot,
+        format: &V3FormatRef,
+        salt: &[u8],
+    ) -> Result<LoadedV3Repository, S3BoundaryError> {
+        if root.active_keyring_envelope_ref != *keyring
+            || root.repository_id != self.config.repository_keys.repository_id
+            || root.provider_profile
+                != v3_provider_profile(&self.config.backend, self.config.repository.retention)
+            || root.retention != self.config.repository.retention
+        {
+            return Err(invalid());
+        }
+        let loaded = open_gateway_keyring_reference(
+            self.store,
+            &self.config.repository_keys,
+            &keyring_reference_from_v3(keyring),
+        )
+        .await?;
+        if loaded
+            .keyring
+            .primary_key_id(KeyPurpose::CheckpointSigning)
+            .map_err(repository_init)?
+            != root.signing_key_id
+            || loaded.repository_salt != salt
+        {
+            return Err(invalid());
+        }
+        Ok(LoadedV3Repository {
+            keyring: loaded.keyring,
+            keyring_ref: keyring.clone(),
+            format_ref: format.clone(),
+            anchor_present: false,
+            repository_salt: loaded.repository_salt,
+        })
+    }
+
+    async fn publish_artifact(
+        &mut self,
+        record: &mut Record,
+        artifact: &Artifact,
+        content_type: &'static str,
+    ) -> Result<Option<BackendVersionId>, S3BoundaryError> {
+        let metadata = match self.store.head(&artifact.object_id).await {
+            Ok(metadata) => metadata,
+            Err(StorageError::NotFound(_)) => {
+                if artifact.remaining == 0 {
+                    return Err(repository_init(
+                        "bootstrap upload budget exhausted; reconcile or recover explicitly",
+                    ));
+                }
+                match &mut record.phase {
+                    Phase::Keyring { artifact } | Phase::Format { artifact, .. } => {
+                        artifact.remaining -= 1
+                    }
+                    _ => return Err(invalid()),
+                }
+                save(self.journal, record).await?;
+                self.require_unaccepted().await?;
+                match self
+                    .store
+                    .put(
+                        &artifact.object_id,
+                        Bytes::copy_from_slice(&artifact.body),
+                        PutOptions {
+                            retention: self.config.repository.retention,
+                            legal_hold: None,
+                            content_type: Some(content_type.to_owned()),
+                            do_not_recreate: !retained_version_required(
+                                self.config.repository.retention,
+                                None,
+                            ),
+                        },
+                    )
+                    .await
+                {
+                    Ok(metadata) => metadata,
+                    Err(_) => self
+                        .store
+                        .head(&artifact.object_id)
+                        .await
+                        .map_err(repository_init)?,
+                }
+            }
+            Err(error) => return Err(repository_init(error)),
+        };
+        if metadata.object_id != artifact.object_id
+            || metadata.content_len != artifact.body.len() as u64
+        {
+            return Err(invalid());
+        }
+        let version = retained_version_id(
+            &artifact.object_id,
+            &metadata,
+            self.config.repository.retention,
+            None,
+        )
+        .map_err(repository_init)?;
+        let body = read_bounded_object_at(
+            self.store,
+            &artifact.object_id,
+            version.as_ref(),
+            MAX_BOOTSTRAP_JOURNAL_BYTES as u64,
+        )
+        .await?;
+        if body.as_ref() != artifact.body {
+            return Err(invalid());
+        }
+        self.protect_dependency(&artifact.object_id, version.as_ref())
+            .await?;
+        Ok(version)
+    }
+
+    async fn protect_dependency(
+        &self,
+        id: &BackendObjectId,
+        version: Option<&BackendVersionId>,
+    ) -> Result<(), S3BoundaryError> {
+        let retention = self
+            .config
+            .repository
+            .retention
+            .filter(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0);
+        let deadline = retention
+            .map(|policy| {
+                current_time_ms()
+                    .checked_add(i64::from(policy.retain_days) * 86_400_000)
+                    .ok_or_else(invalid)
+            })
+            .transpose()?;
+        let mut metadata = self
+            .store
+            .head_at(id, version)
+            .await
+            .map_err(repository_init)?;
+        if metadata.object_id != *id
+            || metadata.version_id.as_ref() != version
+            || (retention.is_some() && version.is_none())
+        {
+            return Err(invalid());
+        }
+        if let Some(policy) = retention {
+            if deadline.is_some_and(|required| {
+                metadata
+                    .retain_until_ms
+                    .is_none_or(|actual| actual < required)
+            }) {
+                self.check_guard().await?;
+                self.store
+                    .extend_retention_at(id, version, policy)
+                    .await
+                    .map_err(repository_init)?;
+                metadata = self
+                    .store
+                    .head_at(id, version)
+                    .await
+                    .map_err(repository_init)?;
+            }
+            if metadata.object_id != *id
+                || metadata.version_id.as_ref() != version
+                || !retention_satisfies(metadata.retention.as_ref(), &policy)
+                || deadline.is_some_and(|required| {
+                    metadata
+                        .retain_until_ms
+                        .is_none_or(|actual| actual < required)
+                })
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) async fn initialize(
+    config: &RuntimeConfig,
+    store: &RuntimeStore,
+    anchor: &RuntimeV3Anchor,
+    guard: &dyn V3MaintenanceGuard,
+    journal: &mut impl Journal,
+    fixed_salt: Option<Vec<u8>>,
+) -> Result<V3RepositoryInitReport, S3BoundaryError> {
+    Bootstrap {
+        config,
+        store,
+        anchor,
+        guard,
+        journal,
+        fixed_salt,
+    }
+    .run()
+    .await
+}
+
+#[cfg(test)]
+mod tests;

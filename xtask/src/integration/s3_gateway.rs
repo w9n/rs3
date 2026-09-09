@@ -15,13 +15,19 @@ use anyhow::Result;
 use aws_sdk_s3::{Client, primitives::ByteStream};
 use clap::{Args, ValueEnum};
 #[cfg(feature = "containers")]
+use rs3_crypto::Sha256Hasher;
+#[cfg(feature = "containers")]
+use serde_json::Value;
+#[cfg(feature = "containers")]
 use std::env;
 #[cfg(feature = "containers")]
 use std::fs;
 #[cfg(feature = "containers")]
-use std::path::PathBuf;
+use std::io::{Read, Write};
 #[cfg(feature = "containers")]
-use std::process::Command;
+use std::path::{Path, PathBuf};
+#[cfg(feature = "containers")]
+use std::process::{Command, Output};
 #[cfg(feature = "containers")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,6 +41,8 @@ const GATEWAY_LIST_KEYS: &[&str] = &[
     "snapshots/paginated/b.bin",
     "snapshots/paginated/c.bin",
 ];
+#[cfg(feature = "containers")]
+const TOOLING_FIXTURE_SIZE: usize = 9 * 1024 * 1024 + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum S3GatewayMode {
@@ -86,7 +94,7 @@ pub(crate) struct S3GatewayArgs {
     /// Repository retention duration in days.
     #[arg(long, env = "RS3_REPOSITORY_RETENTION_DAYS")]
     retention_days: Option<u32>,
-    /// Also exercise common operator tools (`mc` and default `rclone lsf`).
+    /// Also exercise mc and rclone current/unversioned listing and reads.
     #[arg(long, default_value_t = false)]
     tooling_smoke: bool,
 }
@@ -116,6 +124,7 @@ pub(crate) fn run_s3_gateway(args: S3GatewayArgs) -> Result<()> {
                 args.region,
                 s3_container::S3ContainerOptions {
                     object_lock: args.retention_mode.is_some(),
+                    network: None,
                 },
             )?;
             runtime.block_on(async {
@@ -206,9 +215,10 @@ async fn run_gateway_contract_for_backend(
     process_options: GatewayProcessOptions,
     tooling_smoke: bool,
 ) -> Result<()> {
-    let mut gateway = RunningGateway::start_for_backend_with_options(
+    let mut gateway = RunningGateway::start_for_backend_with_log_capture_options(
         backend,
         backend_prefix.clone(),
+        "info",
         process_options,
     )
     .await?;
@@ -216,7 +226,7 @@ async fn run_gateway_contract_for_backend(
     let result: Result<()> = async {
         assert_gateway_contract(&client).await?;
         if tooling_smoke {
-            assert_operator_tooling_smoke(&gateway).await?;
+            assert_operator_tooling_smoke(&gateway.endpoint_url()).await?;
         }
         assert_backend_keys_path_private(backend, &backend_prefix).await?;
         Ok(())
@@ -483,82 +493,571 @@ async fn assert_backend_keys_path_private(
 }
 
 #[cfg(feature = "containers")]
-async fn assert_operator_tooling_smoke(gateway: &RunningGateway) -> Result<()> {
-    let body = b"rs3 gateway operator tooling smoke\n";
-    let body_path = unique_temp_path("body.txt");
-    let mc_config_dir = unique_temp_path("mc");
+pub(super) async fn assert_operator_tooling_smoke(endpoint: &str) -> Result<()> {
+    let fixture_root = unique_temp_path("tooling-smoke");
+    fs::create_dir_all(&fixture_root).context("failed to create tooling smoke directory")?;
+    let _cleanup = ToolingSmokeCleanup(fixture_root.clone());
+    let source_dir = fixture_root.join("source");
+    fs::create_dir_all(&source_dir).context("failed to create tooling smoke source directory")?;
+    let source_path = source_dir.join("large.bin");
+    write_tooling_fixture(&source_path)?;
+    let source = source_path
+        .to_str()
+        .context("tooling smoke source path was not valid UTF-8")?;
+    let mc_config_dir = fixture_root.join("mc");
     fs::create_dir_all(&mc_config_dir).context("failed to create temporary mc config directory")?;
-    fs::write(&body_path, body).context("failed to write operator tooling smoke body")?;
+    let aws_config_path = fixture_root.join("aws-config");
+    fs::write(
+        &aws_config_path,
+        "[default]\nregion = us-east-1\ns3 =\n    multipart_threshold = 8MB\n    multipart_chunksize = 8MB\n    max_concurrent_requests = 2\n",
+    )
+    .context("failed to write AWS tooling smoke config")?;
+    let aws_credentials_path = fixture_root.join("empty-credentials");
+    fs::write(&aws_credentials_path, b"")
+        .context("failed to write empty AWS tooling smoke credentials")?;
 
-    let endpoint = gateway.endpoint_url();
-    run_status(
-        Command::new("mc")
-            .env("MC_CONFIG_DIR", &mc_config_dir)
-            .args([
-                "alias",
-                "set",
-                "gw",
-                endpoint.as_str(),
-                ACCESS_KEY_ID,
-                SECRET_ACCESS_KEY,
-                "--api",
-                "S3v4",
-            ]),
-        "mc alias set",
-    )?;
-    run_status(
-        Command::new("mc")
-            .env("MC_CONFIG_DIR", &mc_config_dir)
-            .arg("cp")
-            .arg(&body_path)
-            .arg(format!("gw/{PUBLIC_BUCKET}/smoke/path-private.txt"))
-            .arg("--json"),
-        "mc cp",
-    )?;
-    run_status(
-        Command::new("mc")
-            .env("MC_CONFIG_DIR", &mc_config_dir)
-            .args([
-                "stat",
-                &format!("gw/{PUBLIC_BUCKET}/smoke/path-private.txt"),
-                "--json",
-            ]),
-        "mc stat",
-    )?;
-    let mc_cat = run_output(
-        Command::new("mc")
-            .env("MC_CONFIG_DIR", &mc_config_dir)
-            .args(["cat", &format!("gw/{PUBLIC_BUCKET}/smoke/path-private.txt")]),
-        "mc cat",
-    )?;
-    if mc_cat.as_slice() != body {
-        anyhow::bail!("mc cat returned a different body than mc cp wrote");
-    }
+    require_tool("aws", &["--version"], Some("aws-cli/2"))?;
+    require_tool("rclone", &["version"], Some("rclone v"))?;
+    require_tool("mc", &["--version"], Some("mc version"))?;
+    require_tool("restic", &["version"], Some("restic"))?;
+    eprintln!(
+        "tooling capability scope: custom metadata is accepted but not persisted for ordinary PUT and multipart uploads; this smoke does not claim metadata preservation"
+    );
 
-    let rclone_list = run_output(
-        Command::new("rclone")
-            .env("RCLONE_CONFIG_GW_TYPE", "s3")
-            .env("RCLONE_CONFIG_GW_PROVIDER", "Other")
-            .env("RCLONE_CONFIG_GW_ACCESS_KEY_ID", ACCESS_KEY_ID)
-            .env("RCLONE_CONFIG_GW_SECRET_ACCESS_KEY", SECRET_ACCESS_KEY)
-            .env("RCLONE_CONFIG_GW_ENDPOINT", endpoint)
-            .env("RCLONE_CONFIG_GW_REGION", "us-east-1")
-            .env("RCLONE_CONFIG_GW_NO_CHECK_BUCKET", "true")
-            .args([
+    let smoke_prefix = format!("tooling/rs3-{}/{}/", std::process::id(), unique_millis());
+    let aws_remote = format!("s3://{PUBLIC_BUCKET}/{smoke_prefix}aws/large.bin");
+    let mc_remote = format!("gw/{PUBLIC_BUCKET}/{smoke_prefix}mc/large.bin");
+    let rclone_remote = format!("gw:{PUBLIC_BUCKET}/{smoke_prefix}rclone/large.bin");
+    let rclone_check_remote = format!("gw:{PUBLIC_BUCKET}/{smoke_prefix}aws");
+    let restic_repository = format!("s3:{endpoint}/{PUBLIC_BUCKET}/{smoke_prefix}restic");
+
+    let smoke_result: Result<()> = (|| {
+        run_status(
+            Command::new("mc")
+                .env("MC_CONFIG_DIR", &mc_config_dir)
+                .args([
+                    "alias",
+                    "set",
+                    "gw",
+                    endpoint,
+                    ACCESS_KEY_ID,
+                    SECRET_ACCESS_KEY,
+                    "--api",
+                    "S3v4",
+                ]),
+            "mc alias set",
+        )?;
+        run_status(
+            Command::new("mc")
+                .env("MC_CONFIG_DIR", &mc_config_dir)
+                .args(["cp", source, mc_remote.as_str(), "--json"]),
+            "mc multipart-sized upload",
+        )?;
+        run_status(
+            Command::new("mc")
+                .env("MC_CONFIG_DIR", &mc_config_dir)
+                .args(["stat", mc_remote.as_str(), "--json"]),
+            "mc stat",
+        )?;
+        let mc_download = fixture_root.join("mc-download.bin");
+        run_status(
+            Command::new("mc")
+                .env("MC_CONFIG_DIR", &mc_config_dir)
+                .args([
+                    "cp",
+                    mc_remote.as_str(),
+                    mc_download
+                        .to_str()
+                        .context("mc download path was not valid UTF-8")?,
+                ]),
+            "mc download",
+        )?;
+        assert_files_equal(&source_path, &mc_download, "mc")?;
+
+        let mut aws_upload = configured_aws_command(&aws_config_path, &aws_credentials_path);
+        aws_upload.args([
+            "s3",
+            "cp",
+            source,
+            aws_remote.as_str(),
+            "--no-progress",
+            "--endpoint-url",
+            endpoint,
+        ]);
+        run_status(&mut aws_upload, "aws cli multipart-sized upload")?;
+        let aws_download = fixture_root.join("aws-download.bin");
+        let aws_download_str = aws_download
+            .to_str()
+            .context("AWS download path was not valid UTF-8")?;
+        let mut aws_get = configured_aws_command(&aws_config_path, &aws_credentials_path);
+        aws_get.args([
+            "s3",
+            "cp",
+            aws_remote.as_str(),
+            aws_download_str,
+            "--no-progress",
+            "--endpoint-url",
+            endpoint,
+        ]);
+        run_status(&mut aws_get, "aws cli download")?;
+        assert_files_equal(&source_path, &aws_download, "aws cli")?;
+        let mut aws_head = configured_aws_command(&aws_config_path, &aws_credentials_path);
+        let aws_head_output = run_output(
+            aws_head.args([
+                "s3api",
+                "head-object",
+                "--bucket",
+                PUBLIC_BUCKET,
+                "--key",
+                &format!("{smoke_prefix}aws/large.bin"),
+                "--checksum-mode",
+                "ENABLED",
+                "--endpoint-url",
+                endpoint,
+                "--output",
+                "json",
+            ]),
+            "aws cli head-object",
+        )?;
+        assert_aws_multipart_head(&aws_head_output, "aws")?;
+
+        let rclone_command = || {
+            let mut command = Command::new("rclone");
+            command
+                .env("RCLONE_CONFIG_GW_TYPE", "s3")
+                .env("RCLONE_CONFIG_GW_PROVIDER", "Other")
+                .env("RCLONE_CONFIG_GW_ACCESS_KEY_ID", ACCESS_KEY_ID)
+                .env("RCLONE_CONFIG_GW_SECRET_ACCESS_KEY", SECRET_ACCESS_KEY)
+                .env("RCLONE_CONFIG_GW_ENDPOINT", endpoint)
+                .env("RCLONE_CONFIG_GW_REGION", "us-east-1")
+                .env("RCLONE_CONFIG_GW_NO_CHECK_BUCKET", "true")
+                .env("RCLONE_CONFIG_GW_NO_SYSTEM_METADATA", "true")
+                .env("RCLONE_CONFIG_GW_DISABLE_CHECKSUM", "true")
+                .env("RCLONE_CONFIG_GW_USE_MULTIPART_ETAG", "true");
+            command
+        };
+        let rclone_mc_remote = format!("gw:{PUBLIC_BUCKET}/{smoke_prefix}mc/large.bin");
+        let rclone_mc_download = fixture_root.join("rclone-mc-download.bin");
+        run_status(
+            rclone_command().args([
+                "copyto",
+                rclone_mc_remote.as_str(),
+                rclone_mc_download
+                    .to_str()
+                    .context("rclone download path was not valid UTF-8")?,
+            ]),
+            "rclone read of mc object",
+        )?;
+        assert_files_equal(&source_path, &rclone_mc_download, "rclone")?;
+        let rclone_listing = run_output(
+            rclone_command().args([
                 "lsf",
-                &format!("gw:{PUBLIC_BUCKET}/smoke"),
-                "--s3-no-check-bucket",
+                format!("gw:{PUBLIC_BUCKET}/{smoke_prefix}mc").as_str(),
             ]),
-        "rclone lsf",
-    )?;
-    let rclone_list = String::from_utf8(rclone_list).context("rclone lsf output was not UTF-8")?;
-    if !rclone_list.lines().any(|line| line == "path-private.txt") {
-        anyhow::bail!("rclone lsf did not list the object written by mc");
-    }
+            "rclone list",
+        )?;
+        if !String::from_utf8_lossy(&rclone_listing)
+            .lines()
+            .any(|line| line.trim() == "large.bin")
+        {
+            anyhow::bail!("rclone list did not expose the mc-uploaded fixture");
+        }
+        let rclone_versions = run_output(
+            rclone_command().args([
+                "lsf",
+                format!("gw:{PUBLIC_BUCKET}/{smoke_prefix}mc").as_str(),
+                "--s3-versions",
+                "--s3-list-chunk",
+                "1",
+            ]),
+            "rclone version list",
+        )?;
+        if !String::from_utf8_lossy(&rclone_versions)
+            .lines()
+            .any(|line| line.trim_end().ends_with("large.bin"))
+        {
+            anyhow::bail!("rclone version list did not expose the current fixture");
+        }
+        let rclone_version_dirs = run_output(
+            rclone_command().args([
+                "lsd",
+                format!("gw:{PUBLIC_BUCKET}").as_str(),
+                "--s3-versions",
+            ]),
+            "rclone version directory list",
+        )?;
+        if !String::from_utf8_lossy(&rclone_version_dirs)
+            .lines()
+            .any(|line| line.split_whitespace().last() == Some("tooling"))
+        {
+            anyhow::bail!("rclone version directory list did not expose the tooling prefix");
+        }
+        let rclone_version_body = run_output(
+            rclone_command().args(["cat", rclone_mc_remote.as_str(), "--s3-versions"]),
+            "rclone version-mode read",
+        )?;
+        if rclone_version_body.as_slice()
+            != fs::read(&source_path)
+                .context("failed to read fixture")?
+                .as_slice()
+        {
+            anyhow::bail!("rclone version-mode read returned different bytes");
+        }
+        eprintln!(
+            "tooling capability scope: rclone uses --s3-no-system-metadata, --s3-disable-checksum and --s3-use-multipart-etag; default-client metadata preservation is not asserted"
+        );
+        let mut rclone_upload = rclone_command();
+        run_status(
+            rclone_upload.args([
+                "copyto",
+                source,
+                rclone_remote.as_str(),
+                "--s3-upload-cutoff",
+                "8Mi",
+                "--s3-chunk-size",
+                "8Mi",
+                "--s3-upload-concurrency",
+                "2",
+                "--retries",
+                "1",
+                "--low-level-retries",
+                "1",
+            ]),
+            "rclone multipart-sized upload",
+        )?;
+        let rclone_download = fixture_root.join("rclone-download.bin");
+        run_status(
+            rclone_command().args([
+                "copyto",
+                rclone_remote.as_str(),
+                rclone_download
+                    .to_str()
+                    .context("rclone download path was not valid UTF-8")?,
+            ]),
+            "rclone download",
+        )?;
+        assert_files_equal(&source_path, &rclone_download, "rclone")?;
+        let mut rclone_head = configured_aws_command(&aws_config_path, &aws_credentials_path);
+        let rclone_head_output = run_output(
+            rclone_head.args([
+                "s3api",
+                "head-object",
+                "--bucket",
+                PUBLIC_BUCKET,
+                "--key",
+                &format!("{smoke_prefix}rclone/large.bin"),
+                "--checksum-mode",
+                "ENABLED",
+                "--endpoint-url",
+                endpoint,
+                "--output",
+                "json",
+            ]),
+            "AWS head-object for rclone upload",
+        )?;
+        assert_aws_multipart_head(&rclone_head_output, "rclone")?;
+        run_status(
+            rclone_command().args([
+                "check",
+                "--download",
+                "--one-way",
+                source_dir
+                    .to_str()
+                    .context("rclone source directory was not valid UTF-8")?,
+                rclone_check_remote.as_str(),
+            ]),
+            "rclone multipart download verification",
+        )?;
 
-    let _ = fs::remove_file(body_path);
-    let _ = fs::remove_dir_all(mc_config_dir);
+        let restic_cache = fixture_root.join("restic-cache");
+        let mut restic_init = configured_restic_command(&restic_repository, &restic_cache);
+        restic_init.arg("init");
+        run_status(&mut restic_init, "restic init")?;
+        let mut restic_backup = configured_restic_command(&restic_repository, &restic_cache);
+        restic_backup
+            .current_dir(&fixture_root)
+            .args(["backup", "source"]);
+        run_status(&mut restic_backup, "restic backup")?;
+        let restic_restore = fixture_root.join("restic-restore");
+        fs::create_dir_all(&restic_restore).context("failed to create restic restore directory")?;
+        let mut restic_restore_command =
+            configured_restic_command(&restic_repository, &restic_cache);
+        restic_restore_command.args([
+            "restore",
+            "latest",
+            "--target",
+            restic_restore
+                .to_str()
+                .context("restic restore path was not valid UTF-8")?,
+        ]);
+        run_status(&mut restic_restore_command, "restic restore")?;
+        let mut restored = Vec::new();
+        find_named_files(&restic_restore, "large.bin", &mut restored)?;
+        if restored.len() != 1 {
+            anyhow::bail!("restic restore did not produce exactly one large fixture");
+        }
+        assert_files_equal(&source_path, &restored[0], "restic")?;
+
+        Ok(())
+    })();
+    let cleanup = cleanup_gateway_prefix(endpoint, &smoke_prefix)
+        .await
+        .context("failed to clean tooling smoke objects");
+    smoke_result?;
+    cleanup?;
     Ok(())
+}
+
+#[cfg(feature = "containers")]
+struct ToolingSmokeCleanup(PathBuf);
+
+#[cfg(feature = "containers")]
+impl Drop for ToolingSmokeCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(feature = "containers")]
+fn write_tooling_fixture(path: &Path) -> Result<()> {
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let mut file = fs::File::create(path).context("failed to create tooling smoke fixture")?;
+    let mut chunk = [0_u8; CHUNK_SIZE];
+    let mut written = 0usize;
+    let mut block_index = 0u64;
+    while written < TOOLING_FIXTURE_SIZE {
+        let length = (TOOLING_FIXTURE_SIZE - written).min(CHUNK_SIZE);
+        for block in chunk[..length].chunks_mut(32) {
+            let mut input = [0_u8; 16];
+            input[..8].copy_from_slice(b"rs3-t17!");
+            input[8..].copy_from_slice(&block_index.to_be_bytes());
+            let digest = Sha256Hasher::digest(input);
+            block.copy_from_slice(&digest[..block.len()]);
+            block_index += 1;
+        }
+        file.write_all(&chunk[..length])
+            .context("failed to write tooling smoke fixture")?;
+        written += length;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "containers")]
+fn assert_files_equal(expected: &Path, actual: &Path, client: &'static str) -> Result<()> {
+    const BUFFER_SIZE: usize = 128 * 1024;
+    let mut expected_file = fs::File::open(expected)
+        .with_context(|| format!("{client} verification could not open expected file"))?;
+    let mut actual_file = fs::File::open(actual)
+        .with_context(|| format!("{client} verification could not open downloaded file"))?;
+    let mut expected_buffer = [0_u8; BUFFER_SIZE];
+    let mut actual_buffer = [0_u8; BUFFER_SIZE];
+    loop {
+        let expected_read = expected_file
+            .read(&mut expected_buffer)
+            .with_context(|| format!("{client} verification could not read expected file"))?;
+        let actual_read = actual_file
+            .read(&mut actual_buffer)
+            .with_context(|| format!("{client} verification could not read downloaded file"))?;
+        if expected_read != actual_read
+            || expected_buffer[..expected_read] != actual_buffer[..actual_read]
+        {
+            anyhow::bail!("{client} downloaded bytes differ from the fixture");
+        }
+        if expected_read == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "containers")]
+fn find_named_files(root: &Path, name: &str, found: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(root).with_context(|| {
+        format!(
+            "failed to read tooling smoke restore directory {}",
+            root.display()
+        )
+    })? {
+        let entry = entry.context("failed to inspect tooling smoke restore entry")?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .context("failed to inspect tooling smoke restore entry type")?;
+        if file_type.is_dir() {
+            find_named_files(&path, name, found)?;
+        } else if file_type.is_file()
+            && path.file_name().and_then(|value| value.to_str()) == Some(name)
+        {
+            found.push(path);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "containers")]
+fn require_tool(program: &'static str, args: &[&str], marker: Option<&str>) -> Result<()> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("tooling smoke requires {program} on PATH"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "tooling smoke preflight {program} exited with {}",
+            output.status
+        );
+    }
+    let detail = command_output_detail(&output);
+    if let Some(marker) = marker
+        && !detail.contains(marker)
+    {
+        anyhow::bail!("tooling smoke preflight {program} did not report {marker}: {detail}");
+    }
+    eprintln!("tooling version {program}: {}", detail.replace('\n', " "));
+    Ok(())
+}
+
+#[cfg(feature = "containers")]
+fn configured_aws_command(config_path: &Path, credentials_path: &Path) -> Command {
+    let mut command = Command::new("aws");
+    command
+        .env("AWS_CONFIG_FILE", config_path)
+        .env("AWS_SHARED_CREDENTIALS_FILE", credentials_path)
+        .env("AWS_ACCESS_KEY_ID", ACCESS_KEY_ID)
+        .env("AWS_SECRET_ACCESS_KEY", SECRET_ACCESS_KEY)
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("AWS_PAGER", "")
+        .env_remove("AWS_REQUEST_CHECKSUM_CALCULATION")
+        .env_remove("AWS_RESPONSE_CHECKSUM_VALIDATION")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_WEB_IDENTITY_TOKEN_FILE")
+        .env_remove("AWS_ROLE_ARN")
+        .env_remove("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+        .env_remove("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+        .env_remove("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE");
+    command
+}
+
+#[cfg(feature = "containers")]
+fn configured_restic_command(repository: &str, cache_dir: &Path) -> Command {
+    let mut command = Command::new("restic");
+    command
+        .env("RESTIC_REPOSITORY", repository)
+        .env("RESTIC_PASSWORD", "rs3-tooling-smoke-password")
+        .env("AWS_ACCESS_KEY_ID", ACCESS_KEY_ID)
+        .env("AWS_SECRET_ACCESS_KEY", SECRET_ACCESS_KEY)
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("RESTIC_CACHE_DIR", cache_dir)
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_WEB_IDENTITY_TOKEN_FILE")
+        .env_remove("AWS_ROLE_ARN")
+        .env_remove("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+        .env_remove("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+        .env_remove("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE");
+    command
+}
+
+#[cfg(feature = "containers")]
+fn command_output_detail(output: &Output) -> String {
+    let mut detail = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        if !detail.is_empty() {
+            detail.push('\n');
+        }
+        detail.push_str(&stderr);
+    }
+    let detail = detail.trim();
+    let truncated: String = detail.chars().take(4000).collect();
+    if truncated.len() == detail.len() {
+        truncated
+    } else {
+        format!("{truncated}...")
+    }
+}
+
+#[cfg(feature = "containers")]
+fn assert_aws_multipart_head(output: &[u8], client: &'static str) -> Result<()> {
+    let value: Value = serde_json::from_slice(output).context("AWS HeadObject JSON was invalid")?;
+    let length = value
+        .get("ContentLength")
+        .and_then(Value::as_u64)
+        .context("AWS HeadObject did not return ContentLength")?;
+    if length != TOOLING_FIXTURE_SIZE as u64 {
+        anyhow::bail!(
+            "AWS HeadObject returned ContentLength {length}, expected {TOOLING_FIXTURE_SIZE}"
+        );
+    }
+    let etag = value
+        .get("ETag")
+        .and_then(Value::as_str)
+        .context("AWS HeadObject did not return ETag")?;
+    assert_multipart_etag(etag, "AWS HeadObject")?;
+    eprintln!(
+        "tooling multipart verified: {}",
+        serde_json::json!({"client": client, "content_length": length, "etag": etag})
+    );
+    Ok(())
+}
+
+#[cfg(feature = "containers")]
+fn assert_multipart_etag(etag: &str, label: &'static str) -> Result<()> {
+    let etag = etag.trim_matches('"');
+    let (digest, count) = etag
+        .rsplit_once('-')
+        .context("multipart ETag did not include a part-count suffix")?;
+    if count != "2"
+        || digest.len() != 32
+        || !digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        anyhow::bail!("{label} did not return the expected two-part ETag");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "containers")]
+async fn cleanup_gateway_prefix(endpoint: &str, prefix: &str) -> Result<()> {
+    let client = s3_container::s3_client(endpoint, "us-east-1", ACCESS_KEY_ID, SECRET_ACCESS_KEY);
+    for _ in 0..1024 {
+        let page = client
+            .list_objects_v2()
+            .bucket(PUBLIC_BUCKET)
+            .prefix(prefix)
+            .send()
+            .await
+            .context("failed to list tooling smoke objects for cleanup")?;
+        let keys = page
+            .contents()
+            .iter()
+            .filter_map(|object| object.key())
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        for key in keys {
+            client
+                .delete_object()
+                .bucket(PUBLIC_BUCKET)
+                .key(key)
+                .send()
+                .await
+                .context("failed to delete tooling smoke object during cleanup")?;
+        }
+    }
+    anyhow::bail!("tooling smoke cleanup did not drain its prefix")
+}
+
+#[cfg(feature = "containers")]
+fn unique_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
 }
 
 #[cfg(feature = "containers")]

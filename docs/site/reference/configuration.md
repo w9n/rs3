@@ -3,6 +3,11 @@
 The gateway reads runtime configuration from environment variables. Command-line
 flags may override selected listener and gateway-mode settings.
 
+`serve --gateway-mode read-write` selects the mode before maintenance settings
+are parsed, preserving configured intervals, budgets and auto/manual/off policy.
+Invalid settings become configuration errors when maintenance is activated.
+An explicit `--gateway-mode restore-readonly` forces maintenance off.
+
 ## Server
 
 | Variable | Required | Default | Description |
@@ -14,23 +19,33 @@ flags may override selected listener and gateway-mode settings.
 | `RS3_ADMIN_BEARER_TOKEN` | with admin listener | none | Read bearer token for admin `GET` routes. Must be at least 16 bytes and separate from backup-client S3 credentials. |
 | `RS3_ADMIN_MUTATION_BEARER_TOKEN` | no | none | Distinct bearer token for maintenance mutation routes. Must be at least 16 bytes and differ from the read token. When absent, all maintenance `POST` routes are disabled. |
 | `RS3_ADMIN_PROFILE` | no | `production` | Admin status profile: `local` or `production`. |
-| `RS3_RECOVERY_PUBLIC_KEY` | production recovery | none | `ed25519:<hex-public-key>` used to verify signed v2 restore bundles during `verify-bundle` and `import-v2-anchor`. |
+| `RS3_INIT_PROFILE` | no | `production` | One-shot init posture: `local` or `production`. Production permits deliberate bootstrap; journaled S3 init may qualify provider evidence before repository publication. Other production checks apply before backend access. |
+| `RS3_INIT_JOURNAL_SECRET` | for writable Kubernetes init | unset | Declared bootstrap Secret in the anchor namespace; equivalent to `init --journal-secret`. Persists unfinished initialization under the writer Lease. Not used by serve or read-only verification. |
+| `RS3_INIT_GOVERNANCE_BYPASS_REVIEWED` | automatic governance qualification | `false` | Explicit review that the serving principal cannot bypass retention; equivalent to `init --governance-bypass-reviewed`. Requires a principal fingerprint. Existing matching evidence retains its recorded review. |
+| `RS3_RECOVERY_PUBLIC_KEY` | production bundle verification/import only | none | `ed25519:<hex-public-key>` used to verify signed v03 restore bundles during `verify-bundle` and `import-anchor`. |
+| `RS3_RECOVERY_WINDOW_DAYS` | recovery policy | `30` | Positive validated recovery-window preset in whole days, applied to newly initialized and published recovery history on retained Object Lock repositories. Unretained development and atomic-create repositories do not enable automatic history. Zero does not disable recovery history; configuration alone does not establish provider-protection evidence. |
+| `RS3_RECOVERY_RENEWAL_MARGIN_SECONDS` | recovery policy | `86400` | Validated policy renewal margin in seconds; it must exceed clock uncertainty after conversion to milliseconds. |
+| `RS3_RECOVERY_CLOCK_UNCERTAINTY_MS` | recovery policy | `60000` | Positive validated maximum clock-uncertainty allowance in milliseconds. |
+| `RS3_RECLAMATION_ENABLED` | maintenance | `true` | Disables physical orphan reclamation while retaining protection renewal; restore-readonly configuration forces the value to `false`. |
 | `RS3_LOG_FORMAT` | no | `plain` | `plain` or `json`. |
 | `RUST_LOG` | no | `info` | Tracing filter for `rs3` application targets. Dependency targets are always disabled because upstream HTTP and S3 traces can contain object paths or authentication headers. |
 
-`init`, `export-restore-bundle`, `import-v2-anchor`, and
-`write-index-snapshot` use the same repository, backend, anchor, and keyring
+`init`, `export-restore-bundle`, and `import-anchor` use the same repository, backend, anchor, and keyring
 settings as `serve`.
 `verify-bundle` and `keyring inspect`/`keyring rewrap` use the same repository
 and backend settings, but take wrapping-key material from their own flags or
 environment. The exported bundle contains public but integrity-sensitive
 restore metadata; keep wrapping-key material in the configured secret source.
-Prefer `import-v2-anchor --bundle-file <json>` over manually transcribing anchor fields
-from the exported bundle. Production recovery requires an external
+Prefer `import-anchor --bundle-file <bundle.cbor>` over manually transcribing anchor fields
+from the exported bundle. Normal Kubernetes initialization and serving do not require a recovery signing
+key. Portable production bundle import requires an external
 `--min-sequence` floor and `RS3_RECOVERY_PUBLIC_KEY`. `export-restore-bundle`
-prints `offline_signature_payload_hex`; sign those canonical bytes offline with
-the matching Ed25519 recovery key and store the hex signature in
-`offline_signature` before import. `import-v2-anchor` also refuses when stored
+writes a CBOR artifact to its required `--output` path and prints an inspection
+report containing `offline_signature_payload_hex`. Sign those canonical bytes
+offline with the matching Ed25519 recovery key. Use `attach-bundle-signature`
+to verify and attach that signature to a new CBOR artifact before import; this
+command needs no backend, Kubernetes, or private signing-key access. JSON reports
+cannot be imported. `import-anchor` also refuses when stored
 commit keys contain a sequence higher than the imported anchor; `--force-rollback`
 is an explicit rollback override for that condition.
 Machine-readable command output is written to stdout; tracing logs are written
@@ -63,7 +78,7 @@ controller or CronJob.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `RS3_MAINTENANCE_MODE` | no | `auto` | `auto` enables scheduled full maintenance, `manual` accepts operator-triggered runs only, and `off` disables the supervisor. Must be unset for `restore-readonly`, which forces maintenance off. |
+| `RS3_MAINTENANCE_MODE` | no | `auto` | `auto` enables scheduled full maintenance, `manual` accepts operator-triggered runs only, and `off` disables the supervisor. Retained read-write repositories require `auto` so protection renewal cannot be disabled; set `RS3_RECLAMATION_ENABLED=false` to keep renewal while disabling physical deletion. Must be unset for `restore-readonly`, which forces maintenance off. |
 | `RS3_MAINTENANCE_RENEWAL_HORIZON_SECONDS` | no | `604800` | Lead time before the nearest retention deadline at which an automatic run becomes due. |
 | `RS3_MAINTENANCE_ORPHAN_PRESSURE_BYTES` | no | `1073741824` | Reclaimable orphan-byte threshold for an automatic run. |
 | `RS3_MAINTENANCE_ORPHAN_PRESSURE_COUNT` | no | `512` | Orphan-candidate count threshold for an automatic run. |
@@ -73,6 +88,14 @@ controller or CronJob.
 | `RS3_MAINTENANCE_PACING_DELAY_MS` | no | unset | Optional positive delay between backend maintenance operations. |
 | `RS3_MAINTENANCE_MAX_INVENTORY_PAGES` | no | `4096` | Maximum provider inventory pages consumed by one plan. |
 | `RS3_MAINTENANCE_MAX_INVENTORY_ITEMS` | no | `2000000` | Maximum raw provider members consumed by one plan, including filtered members such as delete markers. |
+| `RS3_MAINTENANCE_MAX_HISTORY_METADATA_BYTES` | no | `268435456` | Maximum authenticated recovery-history metadata bytes accounted by one plan. Whole bytes from `1048576` through `8589934592`. |
+| `RS3_MAINTENANCE_MAX_HISTORY_PENDING_BYTES` | no | `67108864` | Maximum encoded section buffers and read scratch during recovery-history traversal. Whole bytes from `25165824` through `1073741824`; a replay chain may need more than the minimum. |
+
+These history caps apply to foreground publication verification and maintenance
+planning through the same bounded-budget mapping. They do not grow with the
+repository. For example,
+`RS3_MAINTENANCE_MAX_HISTORY_METADATA_BYTES=1073741824` selects a 1 GiB metadata
+cap without changing the server or chart default.
 
 For automatic retained serving, the production doctor requires the provider
 retention window to exceed the maximum maintenance interval plus the renewal
@@ -129,10 +152,10 @@ cluster resources.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `RS3_MAX_PUT_OBJECT_BYTES` | no | `5368709120` | Maximum accepted single `PutObject` body. Requests with larger declared bodies fail before a repository commit is staged. Must not exceed 10,000 times `RS3_BACKEND_MULTIPART_PART_BYTES`, with an absolute maximum of `53687091200000` bytes. |
+| `RS3_MAX_PUT_OBJECT_BYTES` | no | `5368709120` | Maximum accepted `PutObject` body and final `CompleteMultipartUpload` logical object length. Requests above it fail before a repository commit is staged. Must not exceed 10,000 times `RS3_BACKEND_MULTIPART_PART_BYTES`, with an absolute maximum of `53687091200000` bytes. |
 | `RS3_BUFFERED_PUT_OBJECT_BYTES` | no | `67108864` | Largest `PutObject` body collected as one buffered write. Larger known-length bodies use backend multipart streaming. Must not exceed `RS3_MAX_PUT_OBJECT_BYTES`. |
 | `RS3_BACKEND_MULTIPART_PART_BYTES` | no | `16777216` | Backend multipart part size for large `PutObject` writes. S3-compatible backends require between `5242880` bytes (5 MiB) and `5368709120` bytes (5 GiB), inclusive. |
-| `RS3_STREAM_READ_STALL_TIMEOUT_SECS` | no | `30` | Maximum idle time between non-empty body bytes while the gateway reads any `PutObject` request body, including buffered bodies, the unknown-length buffered prefix, and multipart streaming. Empty transport frames do not renew the deadline. Stalled streams fail as incomplete request bodies. |
+| `RS3_STREAM_READ_STALL_TIMEOUT_SECS` | no | `30` | Maximum idle time between non-empty body bytes while the gateway reads any `PutObject` request body, including buffered bodies, the unknown-length buffered prefix, multipart streaming and client `UploadPart` bodies. Empty transport frames do not renew the deadline. Stalled streams fail as incomplete request bodies. |
 | `RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES` | no | `536870912` | Admission budget for request body bytes held by in-flight upload operations. Buffered uploads reserve their full collected body; streaming uploads reserve a working set derived from multipart parts and the effective payload segment size, not a hard RSS cap for every HTTP chunk. Excess uploads fail with S3 `SlowDown`. |
 | `RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES` | no | `536870912` | Admission budget for response memory held by in-flight downloads. Buffered pack and range responses reserve their resolved length. Full streamed-carrier responses reserve a conservative bounded working set derived from the authenticated segment size, while their total response may be larger. Reservations remain until the body is consumed or dropped; excess downloads fail with S3 `SlowDown`. |
 | `RS3_MAX_CONCURRENT_CONNECTIONS` | no | `1024` | Maximum simultaneously open S3 listener connections. Values above the runtime semaphore capacity are rejected during configuration. |
@@ -173,7 +196,7 @@ values without exposing the endpoint, bucket, or prefix.
 
 ## Provider Conformance Evidence
 
-Run `rs3 check-v2-provider --format json` against the selected backend/profile
+Run `rs3 check-provider --format json` against the selected backend/profile
 and preserve the JSON report outside the backend. Mount that report into the
 gateway and configure the path below so admin reports can show last-known
 provider evidence without running live probes from status.
@@ -181,20 +204,39 @@ The check command loads only backend and repository-retention settings; it does
 not require repository identity, anchor, keyring, public bucket, or gateway
 credential variables.
 
-The current `rs3.v2-provider-conformance.v4` report binds its
-`source_revision` to the exact running gateway build and a path-safe
-`target_fingerprint` to the endpoint, bucket, prefix, and optional
-credential-principal fingerprint. Its separate profile field binds the
-required provider semantics. Production evidence must contain the complete
-versioned check manifest with no omissions, duplicates, or unknown entries.
-Missing, stale, unreasonably future-dated, failed, profile-mismatched, or
-source- or target-mismatched evidence fails the production doctor and retained
-maintenance. This is an operational evidence boundary, not a cryptographic
-attestation against an operator who can replace both configuration and report.
+For S3, configure a nonempty repository prefix. Probes use a random
+`rs3-probes/<opaque-id>` prefix in the same bucket; `--probe-prefix` overrides
+that backing prefix. Repository and probe prefixes must be disjoint canonical
+paths: nonempty slash-separated components containing only ASCII letters,
+digits, hyphens, underscores or periods, with no `.` or `..` component.
+The probe handle shares the configured SDK credential provider and disables
+SDK retries for every probe operation. Both namespaces undergo Lifecycle
+inspection; separately review any prefix-specific IAM or bucket policies.
+The standalone command is not resumable. Each invocation can leave retained
+versions, including indefinitely held legal-hold probes, outside the repository
+namespace. Preserve and manage these synthetic objects separately.
+
+The current `rs3.v2-provider-conformance.v5` report binds
+`implementation_fingerprint` to the SHA-256 of the executing Linux binary,
+including uncommitted build changes. It reads `/proc/self/exe` once per process
+with bounded memory; unavailable executable identity fails qualification closed.
+Use the same executable for qualification and serving. `source_revision` also
+records and checks the embedded Git revision; it is not sufficient by itself.
+
+The path-safe `target_fingerprint` binds the endpoint, bucket, prefix, optional
+credential-principal fingerprint, repository format and exact requested retention
+mode/days. The report also records the retention policy explicitly. Its profile
+selects the required provider semantics. Reports are capped at 64 KiB and must
+contain the complete versioned check manifest without omissions, duplicates or
+unknown fields. Missing, stale, future-dated, failed or context-mismatched evidence
+fails the production doctor and retained maintenance. Retired report schemas
+are rejected; regenerate evidence instead of converting an old report. This is
+an operational evidence boundary, not host attestation or protection against an
+operator who can replace both configuration and report.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `RS3_PROVIDER_CONFORMANCE_REPORT_FILE` | no | unset | Local path to a JSON report emitted by `rs3 check-v2-provider --format json`. The path itself is not reported. |
+| `RS3_PROVIDER_CONFORMANCE_REPORT_FILE` | no | unset | Local path to a JSON report emitted by `rs3 check-provider --format json`. The path itself is not reported. |
 | `RS3_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS` | no | `604800` | Maximum report age before admin reports mark provider evidence `stale`. |
 | `RS3_PROVIDER_PRINCIPAL_FINGERPRINT` | governance retention | unset | Lowercase 64-character SHA-256 fingerprint of the exact IAM or service-account principal whose governance-bypass permissions were reviewed. The raw principal is not emitted; changing this value invalidates prior evidence. |
 
@@ -219,8 +261,8 @@ outside the chart. If `serviceAccount.create=false`, set `serviceAccount.name`.
 | --- | --- | --- | --- |
 | `RS3_ALLOW_REPOSITORY_INIT` | no | `false` | Allows first-run initialization when the configured anchor is missing. Set only for deliberate new-repository bootstrap on a fresh prefix, preferably with `rs3 init`; leave unset for existing repositories and use anchor import for recovery. |
 | `RS3_REPOSITORY_ID` | yes | none | Stable repository context. Keep it with trusted restore metadata. |
-| `RS3_REPOSITORY_SALT_HEX` | yes | none | Stable operator-provided 32-byte public salt, hex-encoded. Generate once per repository and keep with trusted public restore metadata. |
-| `RS3_KEYRING_ENVELOPE_OBJECT_ID` | no | unset | Bootstrap or recovery override for a specific encrypted keyring envelope object. Existing anchored repositories use the envelope reference bound through the v2 format root. |
+| `RS3_REPOSITORY_SALT_HEX` | no | generated | Optional pinned public salt, at least 32 bytes hex-encoded. When unset, initialization generates the salt, journals it, and every later start, tool, and historical reader recovers it from the verified format root or keyring envelope. When set, it must equal the envelope's salt; a mismatch fails closed. |
+| `RS3_KEYRING_ENVELOPE_OBJECT_ID` | no | unset | Bootstrap or recovery override for a specific encrypted keyring envelope object. Existing anchored repositories use the envelope reference bound through the v03 format root and refuse an override that names a different object, such as a rewrapped envelope. |
 | `RS3_KEYRING_WRAPPING_KEY_ID` | no | `wrap-v1` | Operator-visible wrapping key identifier expected by the envelope. |
 | `RS3_KEYRING_WRAPPING_KEY_HEX` | yes | none | Hex-encoded high-entropy wrapping key used to open or initialize the envelope. KMS/HSM/Vault integration should replace this for hardened deployments. |
 
@@ -229,7 +271,7 @@ commit chain and format root, and opens the format-bound envelope. It does not
 list S3 and guess a latest envelope.
 
 The gateway no longer exposes a repository-format selector. Legacy
-`RS3_REPOSITORY_FORMAT=v2-preview` is accepted for migration friendliness; any
+`RS3_REPOSITORY_FORMAT=v3-preview` is accepted for migration friendliness; any
 other value is rejected.
 
 For a first empty repository, startup creates a random purpose-specific keyring
@@ -239,7 +281,7 @@ under the default counted `keyrings/` object name. If
 bootstrap override. A missing anchor with committed repository objects is a
 recovery error, not an invitation to pick backend state.
 
-Before creating the v2 format root, startup performs a defensive repository
+Before creating the v03 format root, startup performs a defensive repository
 inventory and rejects foreign objects. Retained-version object-lock profiles
 inventory object versions as well as current objects so data hidden behind
 provider versioning still blocks bootstrap. This LIST is a preflight guard, not
@@ -258,13 +300,14 @@ Minimal first-run settings:
 ```sh
 RS3_REPOSITORY_ID=<id>
 RS3_ALLOW_REPOSITORY_INIT=true
-RS3_REPOSITORY_SALT_HEX=<salt-hex>
 RS3_KEYRING_WRAPPING_KEY_HEX=<wrapping-key-hex>
 ```
 
-For production-like deployments, set `RS3_REPOSITORY_SALT_HEX` explicitly and
-keep the same value with trusted restore metadata. The salt is public, but a new
-cluster needs it to open the same repository context.
+The public salt is envelope context, not key material: the format root and
+keyring envelope carry it and bind it into their authentication, so a new
+cluster recovers it from the envelope the trusted anchor names. `rs3 keyring
+inspect` prints the recovered value. Set `RS3_REPOSITORY_SALT_HEX` only to pin
+a known salt; the gateway then refuses an envelope carrying any other value.
 
 ## Gateway Mode
 
@@ -290,7 +333,7 @@ where practical, and backend credentials that cannot write.
 | `RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES` | no | `268435456` | Maximum plaintext bytes retained in the process-local decrypted segment LRU cache. Set to `0` to disable the cache. |
 | `RS3_COMMIT_MAX_BATCH_ITEMS` | no | `64` | Maximum staged writes covered by one commit batch. |
 | `RS3_COMMIT_MAX_BATCH_DELAY_MS` | no | `25` | Maximum delay before publishing a partial commit batch. |
-| `RS3_COMMIT_MAX_PENDING_ITEMS` | no | batch item limit | Maximum writes waiting for commit before backpressure. |
+| `RS3_COMMIT_MAX_PENDING_ITEMS` | no | batch item limit | Maximum staged writes across the publishing prefix and its successor. Full publishing capacity waits without staging more writes; an unfilled batch at this limit applies backpressure. |
 | `RS3_REPOSITORY_RETENTION_MODE` | no | unset | `governance` or `compliance` when repository retention is enabled. |
 | `RS3_REPOSITORY_RETENTION_DAYS` | with retention mode | unset | Positive retention duration in days. |
 
@@ -309,8 +352,24 @@ output. The production profile also rejects memory anchors,
 retention-unsupported local backends, plaintext S3-compatible backend
 endpoints, missing gateway credentials, and missing repository retention for
 mutation-capable serving. Findings include remediation hints. The opt-in
-`--probe` mode also checks backend reachability, v2 anchor readability, and
+`--probe` mode also checks backend reachability, v03 anchor readability, and
 keyring envelope readability.
+
+## Helm Recovery Selection
+
+`recovery.point` defaults to an empty string, which serves the current accepted
+anchor. A quoted decimal unsigned 64-bit sequence selects an authenticated
+historical view through `serve --recovery-point`. The chart requires
+`gateway.mode=restore-readonly`, `bootstrap.enabled=false`, and
+`repository.allowInit=false`; leave `maintenance.mode` empty. The selected view
+still validates the live authority and protection deadline on reads.
+
+Reuse the original external key/credential Secret references and anchor settings
+for a separate reader. `bootstrap.existingJournalSecret` can project the original
+journal's `provider-conformance.json` with bootstrap disabled. It does not create
+an init Job or mutate the journal. External evidence ConfigMaps take precedence.
+[Deploy, Back Up, and Restore](../deploy-backup-restore.md) provides the complete
+configuration and reader overlay.
 
 ## Helm Repository Keys
 
@@ -327,12 +386,12 @@ fenced writer epoch on the anchor Lease before accepting traffic.
 
 | Secret key | Meaning |
 | --- | --- |
-| `salt-hex` | Stable public repository salt. |
+| `salt-hex` | Optional pinned public repository salt; omit to let initialization generate and journal it. |
 | `envelope-object-id` | Optional bootstrap or recovery override for the encrypted keyring envelope. |
 | `wrapping-key-id` | Optional operator-visible wrapping key identifier; defaults to `wrap-v1` when absent. |
 | `wrapping-key-hex` | High-entropy wrapping key material for the preview. |
 
-Helm should consume the configured repository ID, salt, and unwrap settings from
+Helm should consume the configured repository ID and unwrap settings from
 values or an existing Secret. The gateway writes the encrypted envelope object
 on first empty-repository startup; chart state does not need to mutate after
 that first run.

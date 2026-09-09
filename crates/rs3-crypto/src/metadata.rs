@@ -1,8 +1,8 @@
 //! Metadata payload sealing helpers.
 //!
 //! Metadata uses the `aes-gcm-siv` crate's AES-256-GCM-SIV AEAD. The nonce is
-//! deterministically derived from secret key material, associated data, and
-//! plaintext so retrying the same manifest/index write is stable. GCM-SIV keeps
+//! sampled from the operating system for every seal. Exact publication retries
+//! reuse already sealed bytes. GCM-SIV keeps
 //! the metadata boundary on a standard misuse-resistant AEAD construction.
 
 use crate::keyring::KeyRing;
@@ -20,7 +20,7 @@ const METADATA_TAG_LEN: usize = 16;
 pub struct MetadataSeal {
     /// Metadata key ID.
     pub key_id: KeyId,
-    /// Deterministic nonce for this sealed payload.
+    /// Fresh random 96-bit nonce for this sealed payload.
     pub nonce: Vec<u8>,
     /// Sealed payload bytes.
     pub ciphertext: Vec<u8>,
@@ -36,7 +36,8 @@ impl KeyRing {
         plaintext: &[u8],
     ) -> Result<MetadataSeal, CryptoError> {
         let key = self.primary_key(KeyPurpose::Metadata)?;
-        let nonce = metadata_nonce(&key.secret, associated_data, plaintext)?;
+        let mut nonce = vec![0; METADATA_NONCE_LEN];
+        getrandom::fill(&mut nonce).map_err(|_| CryptoError::RandomnessUnavailable)?;
         let (ciphertext, tag) =
             encrypt_metadata_with_key(&key.secret, associated_data, &nonce, plaintext)?;
 
@@ -60,17 +61,6 @@ impl KeyRing {
         let key = self.enabled_key_by_id(key_id, KeyPurpose::Metadata)?;
         decrypt_metadata_with_key(&key.secret, associated_data, nonce, ciphertext, tag)
     }
-}
-
-fn metadata_nonce(
-    secret: &SecretBytes,
-    associated_data: &[u8],
-    plaintext: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
-    let material = nonce_material(associated_data, plaintext);
-    let mut nonce = derive_hmac(secret, b"rs3:metadata-aead-nonce:v1", &material)?;
-    nonce.truncate(METADATA_NONCE_LEN);
-    Ok(nonce.to_vec())
 }
 
 fn encrypt_metadata_with_key(
@@ -119,19 +109,6 @@ fn metadata_cipher(secret: &SecretBytes) -> Result<Aes256GcmSiv, CryptoError> {
     Aes256GcmSiv::new_from_slice(&key).map_err(|_| CryptoError::AeadOperationFailed)
 }
 
-fn nonce_material(associated_data: &[u8], plaintext: &[u8]) -> Vec<u8> {
-    framed_pair(associated_data, plaintext)
-}
-
-fn framed_pair(left: &[u8], right: &[u8]) -> Vec<u8> {
-    let mut material = Vec::with_capacity(16 + left.len() + right.len());
-    material.extend_from_slice(&(left.len() as u64).to_be_bytes());
-    material.extend_from_slice(left);
-    material.extend_from_slice(&(right.len() as u64).to_be_bytes());
-    material.extend_from_slice(right);
-    material
-}
-
 #[cfg(test)]
 mod tests {
     use super::MetadataSeal;
@@ -157,13 +134,9 @@ mod tests {
             KeyDescriptor {
                 id: key_id(value),
                 purpose: KeyPurpose::Metadata,
-                algorithm: "aes-256-gcm-siv-hmac-sha256-nonce-v1".to_string(),
                 status,
                 created_at_ms: 0,
-                not_before_ms: None,
-                not_after_ms: None,
                 public_key: None,
-                external_kms_uri: None,
             },
             secret(secret_byte),
         )
@@ -174,13 +147,9 @@ mod tests {
             KeyDescriptor {
                 id: key_id("namespace"),
                 purpose: KeyPurpose::Namespace,
-                algorithm: "hmac-sha256".to_string(),
                 status: KeyStatus::Primary,
                 created_at_ms: 0,
-                not_before_ms: None,
-                not_after_ms: None,
                 public_key: None,
-                external_kms_uri: None,
             },
             secret(1),
         )
@@ -220,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn sealed_metadata_is_deterministic_for_retry_stability() {
+    fn repeated_metadata_seals_use_fresh_nonces_and_both_open() {
         let keyring = keyring();
 
         let first = match keyring.seal_metadata_payload(b"manifest-a", b"client/path") {
@@ -232,7 +201,22 @@ mod tests {
             Err(error) => panic!("{error}"),
         };
 
-        assert_eq!(first, second);
+        assert_ne!(first.nonce, second.nonce);
+        assert_ne!(first.ciphertext, second.ciphertext);
+        for sealed in [&first, &second] {
+            assert_eq!(
+                keyring
+                    .open_metadata_payload(
+                        &sealed.key_id,
+                        b"manifest-a",
+                        &sealed.nonce,
+                        &sealed.ciphertext,
+                        &sealed.tag
+                    )
+                    .expect("open"),
+                b"client/path"
+            );
+        }
         assert_eq!(first.nonce.len(), 12);
         assert_eq!(first.tag.len(), 16);
     }

@@ -1,6 +1,7 @@
 //! Local filesystem `BlobStore` implementation.
 
 use crate::read::{BLOB_READ_CHUNK_BYTES, BlobReadSource, exact_blob_read};
+use crate::retention::retention_is_active;
 use crate::{
     BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobRead, BlobStore, ByteRange, PutOptions,
     Result, StorageError, object_kind, prefix_kind, record_blob_delete,
@@ -9,11 +10,12 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionMode, RetentionPolicy};
+use rs3_types::{BackendObjectId, LegalHoldStatus, RetentionPolicy};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Filesystem-backed `BlobStore` for local durable development and tests.
@@ -35,6 +37,7 @@ impl FilesystemBlobStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(provider_error)?;
+        sync_directory_ancestors(&root, None).map_err(provider_error)?;
         Ok(Self { root })
     }
 
@@ -85,21 +88,22 @@ impl BlobStore for FilesystemBlobStore {
         }
 
         let path = self.object_path(object_id)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(provider_error)?;
-        }
-
-        let write = if options.do_not_recreate {
-            write_new_file(&path, &body).map_err(|error| {
+        let write_id = object_id.clone();
+        let root = self.root.clone();
+        let write = blocking_io(move || {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(provider_error)?;
+            }
+            write_file(&path, &body, options.do_not_recreate).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    StorageError::AlreadyExists(object_id.clone())
+                    StorageError::AlreadyExists(write_id)
                 } else {
                     provider_error(error)
                 }
-            })
-        } else {
-            write_replace_file(&path, &body).map_err(provider_error)
-        };
+            })?;
+            sync_directory_ancestors(parent_directory(&path)?, Some(&root)).map_err(provider_error)
+        })
+        .await;
 
         if let Err(error) = write {
             let result = match error {
@@ -120,7 +124,7 @@ impl BlobStore for FilesystemBlobStore {
         let kind = object_kind(object_id);
         let path = self.object_path(object_id)?;
 
-        let body = match read_file_range(&path, range) {
+        let body = match blocking_io(move || read_file_range(&path, range)).await {
             Ok(body) => body,
             Err(StorageError::NotFound(_)) => {
                 record_blob_get(kind, range, 0, "not_found", started.elapsed());
@@ -155,7 +159,7 @@ impl BlobStore for FilesystemBlobStore {
         let started = Instant::now();
         let kind = object_kind(object_id).to_owned();
         let path = self.object_path(object_id)?;
-        let (source, exact_len) = match open_file_range(&path, range) {
+        let (source, exact_len) = match blocking_io(move || open_file_range(&path, range)).await {
             Ok(opened) => opened,
             Err(StorageError::NotFound(_)) => {
                 record_blob_get(&kind, range, 0, "not_found", started.elapsed());
@@ -196,7 +200,7 @@ impl BlobStore for FilesystemBlobStore {
         let started = Instant::now();
         let kind = object_kind(object_id);
         let path = self.object_path(object_id)?;
-        let metadata = match fs::metadata(&path) {
+        let metadata = match blocking_io(move || Ok(fs::metadata(&path))).await? {
             Ok(metadata) if metadata.is_file() => metadata,
             Ok(_) => {
                 record_blob_head(kind, "not_found", started.elapsed());
@@ -219,20 +223,20 @@ impl BlobStore for FilesystemBlobStore {
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<BlobMetadata>> {
         let started = Instant::now();
         let kind = prefix_kind(prefix);
-        let prefix_path = if prefix.is_empty() {
-            self.root.clone()
-        } else {
-            self.root.join(safe_relative_path(prefix)?)
-        };
+        let prefix_path = prefix_search_root(&self.root, prefix)?;
 
-        if !prefix_path.exists() {
-            record_blob_list(kind, 0, "ok", started.elapsed());
-            return Ok(Vec::new());
-        }
-
-        let mut entries = Vec::new();
-        collect_files(&self.root, &prefix_path, prefix, &mut entries)?;
-        entries.sort_by(|left, right| left.object_id.cmp(&right.object_id));
+        let root = self.root.clone();
+        let prefix = prefix.to_owned();
+        let entries = blocking_io(move || {
+            if !prefix_path.is_dir() {
+                return Ok(Vec::new());
+            }
+            let mut entries = Vec::new();
+            collect_files(&root, &prefix_path, &prefix, &mut entries)?;
+            entries.sort_by(|left, right| left.object_id.cmp(&right.object_id));
+            Ok(entries)
+        })
+        .await?;
 
         record_blob_list(kind, entries.len(), "ok", started.elapsed());
         Ok(entries)
@@ -246,17 +250,15 @@ impl BlobStore for FilesystemBlobStore {
         if mode == BlobListMode::Versions {
             return Err(StorageError::VersionUnsupported);
         }
-        let prefix_path = if prefix.is_empty() {
-            self.root.clone()
-        } else {
-            self.root.join(safe_relative_path(prefix)?)
-        };
+        let prefix_path = prefix_search_root(&self.root, prefix)?;
         Ok(Box::new(FilesystemBlobList {
-            root: self.root.clone(),
-            prefix: prefix.to_owned(),
-            pending_root: Some(prefix_path),
-            directories: Vec::new(),
-            complete: false,
+            cursor: Some(FilesystemListCursor {
+                root: self.root.clone(),
+                prefix: prefix.to_owned(),
+                pending_root: Some(prefix_path),
+                directories: Vec::new(),
+                complete: false,
+            }),
         }))
     }
 
@@ -264,7 +266,17 @@ impl BlobStore for FilesystemBlobStore {
         let started = Instant::now();
         let kind = object_kind(object_id);
         let path = self.object_path(object_id)?;
-        match fs::remove_file(&path) {
+        let root = self.root.clone();
+        match blocking_io(move || {
+            Ok(fs::remove_file(&path).and_then(|()| {
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("object path has no parent"))?;
+                sync_directory_ancestors(parent, Some(&root))
+            }))
+        })
+        .await?
+        {
             Ok(()) => {
                 record_blob_delete(kind, "ok", started.elapsed());
                 Ok(())
@@ -288,7 +300,7 @@ impl BlobStore for FilesystemBlobStore {
         let started = Instant::now();
         let kind = object_kind(object_id);
         let path = self.object_path(object_id)?;
-        if !path.is_file() {
+        if !blocking_io(move || Ok(path.is_file())).await? {
             record_blob_extend_retention(kind, "not_found", started.elapsed());
             return Err(StorageError::NotFound(object_id.clone()));
         }
@@ -305,7 +317,7 @@ impl BlobStore for FilesystemBlobStore {
         let started = Instant::now();
         let kind = object_kind(object_id);
         let path = self.object_path(object_id)?;
-        if !path.is_file() {
+        if !blocking_io(move || Ok(path.is_file())).await? {
             record_blob_set_legal_hold(kind, "not_found", started.elapsed());
             return Err(StorageError::NotFound(object_id.clone()));
         }
@@ -328,6 +340,10 @@ impl BlobStore for FilesystemBlobStore {
 }
 
 struct FilesystemBlobList {
+    cursor: Option<FilesystemListCursor>,
+}
+
+struct FilesystemListCursor {
     root: PathBuf,
     prefix: String,
     pending_root: Option<PathBuf>,
@@ -338,6 +354,12 @@ struct FilesystemBlobList {
 #[async_trait]
 impl BlobList for FilesystemBlobList {
     async fn next_page(&mut self, max_items: NonZeroUsize) -> Result<BlobListPage> {
+        blocking_cursor(&mut self.cursor, move |cursor| cursor.next_page(max_items)).await
+    }
+}
+
+impl FilesystemListCursor {
+    fn next_page(&mut self, max_items: NonZeroUsize) -> Result<BlobListPage> {
         if self.complete {
             return Ok(BlobListPage {
                 entries: Vec::new(),
@@ -349,6 +371,7 @@ impl BlobList for FilesystemBlobList {
         let started = Instant::now();
         let kind = prefix_kind(&self.prefix);
         let mut entries = Vec::with_capacity(max_items.get().min(1_024));
+        let mut consumed_items = 0;
         if let Some(root) = self.pending_root.take() {
             match fs::metadata(&root) {
                 Ok(metadata) if metadata.is_dir() => {
@@ -356,6 +379,7 @@ impl BlobList for FilesystemBlobList {
                         .push(fs::read_dir(root).map_err(provider_error)?);
                 }
                 Ok(metadata) if metadata.is_file() => {
+                    consumed_items += 1;
                     let object_id = object_id_from_path(&self.root, &root)?;
                     if object_id.as_str().starts_with(&self.prefix) {
                         entries.push(blob_metadata(object_id, metadata));
@@ -370,7 +394,7 @@ impl BlobList for FilesystemBlobList {
             }
         }
 
-        while entries.len() < max_items.get() && !self.complete {
+        while consumed_items < max_items.get() && !self.complete {
             let Some(directory) = self.directories.last_mut() else {
                 self.complete = true;
                 break;
@@ -380,6 +404,10 @@ impl BlobList for FilesystemBlobList {
                 continue;
             };
             let entry = entry.map_err(provider_error)?;
+            consumed_items += 1;
+            if is_temporary_name(&entry.file_name()) {
+                continue;
+            }
             let file_type = entry.file_type().map_err(provider_error)?;
             if file_type.is_dir() {
                 self.directories
@@ -396,7 +424,6 @@ impl BlobList for FilesystemBlobList {
         }
 
         record_blob_list(kind, entries.len(), "ok", started.elapsed());
-        let consumed_items = entries.len();
         Ok(BlobListPage {
             entries,
             consumed_items,
@@ -406,6 +433,10 @@ impl BlobList for FilesystemBlobList {
 }
 
 struct FileReadSource {
+    cursor: Option<FileReadCursor>,
+}
+
+struct FileReadCursor {
     file: File,
     range_remaining: Option<u64>,
 }
@@ -413,6 +444,12 @@ struct FileReadSource {
 #[async_trait]
 impl BlobReadSource for FileReadSource {
     async fn next_source_chunk(&mut self) -> Result<Option<Bytes>> {
+        blocking_cursor(&mut self.cursor, FileReadCursor::next_chunk).await
+    }
+}
+
+impl FileReadCursor {
+    fn next_chunk(&mut self) -> Result<Option<Bytes>> {
         if self.range_remaining == Some(0) {
             return Ok(None);
         }
@@ -491,25 +528,75 @@ impl Drop for ObservedFilesystemRead {
     }
 }
 
-fn write_new_file(path: &Path, body: &[u8]) -> std::io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(body)?;
-    file.sync_all()
+/// Runs filesystem syscalls off the async runtime's request workers.
+async fn blocking_io<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|_| StorageError::Provider("filesystem worker failed".to_owned()))?
 }
 
-fn write_replace_file(path: &Path, body: &[u8]) -> std::io::Result<()> {
+/// A canceled operation consumes its cursor. Reuse fails instead of silently
+/// skipping bytes or inventory entries that a detached worker already consumed.
+async fn blocking_cursor<T: Send + 'static, O: Send + 'static>(
+    cursor: &mut Option<T>,
+    operation: impl FnOnce(&mut T) -> Result<O> + Send + 'static,
+) -> Result<O> {
+    let mut owned = cursor.take().ok_or_else(|| {
+        StorageError::Provider("filesystem cursor is no longer available".to_owned())
+    })?;
+    let (returned, result) = blocking_io(move || {
+        let result = operation(&mut owned);
+        Ok((owned, result))
+    })
+    .await?;
+    *cursor = Some(returned);
+    result
+}
+
+fn parent_directory(path: &Path) -> Result<&Path> {
+    path.parent()
+        .ok_or_else(|| StorageError::Provider("object path has no parent".to_owned()))
+}
+
+fn sync_directory_ancestors(path: &Path, stop: Option<&Path>) -> std::io::Result<()> {
+    for directory in path.ancestors() {
+        // The empty parent of a relative path denotes the current directory.
+        let directory = if directory.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            directory
+        };
+        File::open(directory)?.sync_all()?;
+        if Some(directory) == stop {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn write_file(path: &Path, body: &[u8], create_only: bool) -> std::io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("object path has no parent"))?;
     let temp_path = parent.join(temp_file_name());
+    // Only clean up a temporary file whose exclusive creation succeeded.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)?;
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
         file.write_all(body)?;
         file.sync_all()?;
-        fs::rename(&temp_path, path)
+        if create_only {
+            // Linking a fully written inode publishes atomically and refuses to
+            // replace a concurrently published object.
+            fs::hard_link(&temp_path, path)?;
+            fs::remove_file(&temp_path)
+        } else {
+            fs::rename(&temp_path, path)
+        }
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
@@ -554,11 +641,27 @@ fn open_file_range(path: &Path, range: ByteRange) -> Result<(FileReadSource, u64
     file.seek(SeekFrom::Start(offset)).map_err(provider_error)?;
     Ok((
         FileReadSource {
-            file,
-            range_remaining,
+            cursor: Some(FileReadCursor {
+                file,
+                range_remaining,
+            }),
         },
         exact_len,
     ))
+}
+
+fn prefix_search_root(root: &Path, prefix: &str) -> Result<PathBuf> {
+    // A string prefix may end in the middle of a filename or directory name.
+    // Start at its last complete directory component and filter actual keys.
+    safe_relative_path(prefix)?;
+    match prefix.rfind('/') {
+        Some(index) => Ok(root.join(safe_relative_path(&prefix[..index])?)),
+        None => Ok(root.to_path_buf()),
+    }
+}
+
+fn is_temporary_name(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with(".rs3-tmp-")
 }
 
 fn collect_files(
@@ -569,6 +672,9 @@ fn collect_files(
 ) -> Result<()> {
     for entry in fs::read_dir(directory).map_err(provider_error)? {
         let entry = entry.map_err(provider_error)?;
+        if is_temporary_name(&entry.file_name()) {
+            continue;
+        }
         let path = entry.path();
         let file_type = entry.file_type().map_err(provider_error)?;
         if file_type.is_dir() {
@@ -636,20 +742,18 @@ fn safe_relative_path(value: &str) -> Result<PathBuf> {
 }
 
 fn temp_file_name() -> String {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_nanos();
-    format!(".rs3-tmp-{}-{nanos}", std::process::id())
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    format!(".rs3-tmp-{}-{nanos}-{id}", std::process::id())
 }
 
 fn system_time_millis(time: SystemTime) -> Option<i64> {
     let millis = time.duration_since(UNIX_EPOCH).ok()?.as_millis();
     i64::try_from(millis).ok()
-}
-
-fn retention_is_active(policy: &RetentionPolicy) -> bool {
-    policy.mode != RetentionMode::None && policy.retain_days > 0
 }
 
 fn map_read_error(path: &Path, error: std::io::Error) -> StorageError {
@@ -708,6 +812,103 @@ mod tests {
 
     fn object_id(value: &str) -> BackendObjectId {
         BackendObjectId::new(value).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_filesystem_worker_does_not_block_runtime_or_skip_cursor_state() {
+        let mut cursor = Some(0);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        {
+            let operation = super::blocking_cursor(&mut cursor, move |value| {
+                let _ = started_tx.send(());
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("worker release");
+                *value += 1;
+                let _ = finished_tx.send(());
+                Ok(())
+            });
+            tokio::pin!(operation);
+            tokio::select! {
+                started = started_rx => started.expect("worker started without blocking runtime"),
+                result = &mut operation => panic!("worker completed before release: {result:?}"),
+            }
+            // Drop the pending operation, as a disconnected request would.
+        }
+        release_tx.send(()).expect("release detached worker");
+        finished_rx.await.expect("detached worker finished");
+        assert!(
+            super::blocking_cursor(&mut cursor, |_| Ok(()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_only_publishes_one_complete_inode() {
+        let dir = TestDir::new();
+        let store = FilesystemBlobStore::new(dir.path()).expect("store");
+        let id = object_id("nested/objects/create-only");
+        let first = Bytes::from(vec![0x11; 2 * 1024 * 1024]);
+        let second = Bytes::from(vec![0x22; 2 * 1024 * 1024]);
+        let options = PutOptions {
+            do_not_recreate: true,
+            ..PutOptions::default()
+        };
+        let (left, right) = tokio::join!(
+            store.put(&id, first.clone(), options.clone()),
+            store.put(&id, second.clone(), options),
+        );
+        let expected = match (left, right) {
+            (Ok(_), Err(StorageError::AlreadyExists(_))) => first,
+            (Err(StorageError::AlreadyExists(_)), Ok(_)) => second,
+            other => panic!("expected exactly one create-only winner: {other:?}"),
+        };
+        assert_eq!(
+            store
+                .get_range(&id, ByteRange::Full)
+                .await
+                .expect("read winner"),
+            expected
+        );
+        let names = std::fs::read_dir(dir.path().join("nested/objects"))
+            .expect("directory")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![std::ffi::OsString::from("create-only")]);
+    }
+
+    #[tokio::test]
+    async fn replacement_preserves_an_already_open_read() {
+        let dir = TestDir::new();
+        let store = FilesystemBlobStore::new(dir.path()).expect("store");
+        let id = object_id("objects/replaced");
+        let original = Bytes::from(vec![0x31; super::BLOB_READ_CHUNK_BYTES + 13]);
+        store
+            .put(&id, original.clone(), PutOptions::default())
+            .await
+            .expect("initial put");
+        let read = store
+            .open_range_at(&id, None, ByteRange::Full)
+            .await
+            .expect("open old inode");
+        store
+            .put(&id, Bytes::from_static(b"new"), PutOptions::default())
+            .await
+            .expect("replace");
+        let actual = crate::collect_bounded_blob_read(read, original.len() as u64)
+            .await
+            .expect("read original inode");
+        assert_eq!(actual, original);
+        assert_eq!(
+            store
+                .get_range(&id, ByteRange::Full)
+                .await
+                .expect("read current"),
+            Bytes::from_static(b"new")
+        );
     }
 
     #[tokio::test]

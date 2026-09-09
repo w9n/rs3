@@ -1,37 +1,27 @@
 //! Repository service implementation.
 
-use crate::checkpoint::seal_manifest_record;
 use crate::error::{RepositoryError, Result};
 use crate::lru::LruCache;
-use crate::model::RepositoryObjectMetadata;
-use crate::namespace::{first_namespace_entry, prefix_tokens_for_key};
 use crate::payload::{
     DEFAULT_PAYLOAD_SEGMENT_SIZE, SegmentCiphertextSpan, SegmentPlaintextSelection,
-    SegmentedPayloadHeader, open_segmented_payload_cached_segments,
+    SegmentedPayloadLayout, open_segmented_payload_cached_segments,
     open_segmented_payload_span_with_segments, segmented_plaintext_segment_len,
     segmented_plaintext_selection,
 };
-use crate::state::{RepositoryState, TrustedManifest, next_sequence, object_material};
 use bytes::Bytes;
-use rs3_crypto::{KeyRing, NamespaceBlindKey};
-use rs3_index::{IndexDelta, KeyringEnvelopeReference};
-use rs3_storage::{BlobStore, ByteRange, StorageError};
+use rs3_crypto::KeyRing;
+use rs3_storage::{ByteRange, StorageError, active_retention};
 use rs3_types::{
-    BackendObjectId, BackendObjectRef, BackendVersionId, LegalHoldStatus, LogicalPath,
-    RetentionMode, RetentionPolicy,
+    BackendObjectId, BackendObjectRef, BackendVersionId, LegalHoldStatus, RetentionPolicy,
 };
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, RwLock};
 
 /// Default maximum plaintext bytes retained in the decrypted segment LRU cache.
 pub const DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Trusted repository service.
-pub struct Repository<S> {
-    pub(crate) store: S,
-    pub(crate) keyring: RwLock<Arc<KeyRing>>,
-    pub(crate) keyring_envelope: RwLock<Option<KeyringEnvelopeReference>>,
-    pub(crate) state: RwLock<RepositoryState>,
+/// Keyring, read cache and options shared by current repository operations.
+pub(crate) struct RepositoryResources {
+    pub(crate) keyring: Arc<KeyRing>,
     pub(crate) options: RepositoryOptions,
     decrypted_segments: RwLock<DecryptedSegmentCache>,
 }
@@ -67,41 +57,16 @@ impl Default for RepositoryOptions {
     }
 }
 
-impl<S> Repository<S>
-where
-    S: BlobStore,
-{
-    /// Creates a trusted repository service with an explicit keyring.
-    pub fn with_keyring(store: S, keyring: KeyRing) -> Self {
-        Self::with_keyring_and_options(store, keyring, RepositoryOptions::default())
-    }
-
-    /// Creates a trusted repository service with an explicit keyring and options.
-    pub fn with_keyring_and_options(
-        store: S,
-        keyring: KeyRing,
-        options: RepositoryOptions,
-    ) -> Self {
+impl RepositoryResources {
+    /// Creates shared repository resources with an explicit keyring and options.
+    pub(crate) fn new(keyring: KeyRing, options: RepositoryOptions) -> Self {
         Self {
-            store,
-            keyring: RwLock::new(Arc::new(keyring)),
-            keyring_envelope: RwLock::new(None),
-            state: RwLock::new(RepositoryState::default()),
+            keyring: Arc::new(keyring),
             options,
             decrypted_segments: RwLock::new(DecryptedSegmentCache::with_max_bytes(
                 options.decrypted_segment_cache_max_bytes,
             )),
         }
-    }
-
-    /// Replaces the active keyring after a validated data-key update.
-    pub fn replace_keyring(&self, keyring: KeyRing) -> Result<()> {
-        let mut active = self
-            .keyring
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)?;
-        *active = Arc::new(keyring);
-        Ok(())
     }
 
     pub(crate) fn cached_decrypted_segment_span(
@@ -157,7 +122,7 @@ where
     pub(crate) fn open_cached_decrypted_segments(
         &self,
         identity: DecryptedSegmentIdentity<'_>,
-        header: &SegmentedPayloadHeader,
+        header: &SegmentedPayloadLayout,
         range: ByteRange,
     ) -> Result<Option<Bytes>> {
         let selection = segmented_plaintext_selection(header, range)?;
@@ -190,7 +155,7 @@ where
         &self,
         keyring: &KeyRing,
         identity: DecryptedSegmentIdentity<'_>,
-        header: &SegmentedPayloadHeader,
+        header: &SegmentedPayloadLayout,
         range: ByteRange,
         span: SegmentCiphertextSpan,
         ciphertext: Bytes,
@@ -210,7 +175,7 @@ where
     fn cached_decrypted_segments(
         &self,
         object_ref: &BackendObjectRef,
-        header: &SegmentedPayloadHeader,
+        header: &SegmentedPayloadLayout,
         selection: SegmentPlaintextSelection,
     ) -> Result<DecryptedSegmentLookup> {
         if selection.segment_count == 0 {
@@ -298,123 +263,9 @@ where
         Ok(())
     }
 
-    /// Applies legal hold for a client-visible object and its backend payload.
-    pub async fn set_legal_hold(
-        &self,
-        key: &LogicalPath,
-        status: LegalHoldStatus,
-    ) -> Result<RepositoryObjectMetadata> {
-        let keyring = self.keyring()?;
-        let lookup_blind_keys = keyring.derive_blind_index_keys_for_lookup(key)?;
-        let object_ref = self.object_ref_for_candidates(key, &lookup_blind_keys)?;
-        self.store
-            .set_legal_hold_at(
-                &object_ref.object_id,
-                object_ref.version_id.as_ref(),
-                status,
-            )
-            .await?;
-        let backend = self
-            .store
-            .head_at(&object_ref.object_id, object_ref.version_id.as_ref())
-            .await?;
-
-        let mut state = self.write_state()?;
-        let entry = first_namespace_entry(&state.namespace, &lookup_blind_keys)
-            .ok_or_else(|| RepositoryError::NotFound(key.clone()))?
-            .clone();
-        let content_len = state
-            .manifests
-            .get(&entry.manifest_id)
-            .map(|manifest| manifest.content_len)
-            .unwrap_or(entry.content_len);
-        let retention = state
-            .manifests
-            .get(&entry.manifest_id)
-            .map(|manifest| manifest.retention)
-            .unwrap_or(entry.retention);
-        let sequence = next_sequence(&mut state)?;
-        let material = object_material(key.as_str(), sequence);
-        let manifest_id = keyring.derive_manifest_id(&material)?;
-        let mut updated = entry;
-        updated.manifest_id = manifest_id.clone();
-        updated.generation = sequence;
-        updated.retention = retention;
-        updated.legal_hold = backend.legal_hold.or(Some(status));
-        updated.object_version_id = backend.version_id.or(updated.object_version_id);
-        let prefix_tokens =
-            prefix_tokens_for_key(&keyring, &updated.namespace_key_id, key.as_str())?;
-        let manifest = TrustedManifest {
-            key: key.clone(),
-            content_len,
-            modified_at_ms: modified_at_ms_or_now(backend.modified_at_ms, sequence),
-            retention,
-            legal_hold: updated.legal_hold,
-        };
-        let sealed_manifest = seal_manifest_record(&keyring, &manifest_id, &manifest)?;
-        state.pending_index_deltas.push(IndexDelta::Upsert {
-            entry: Box::new(updated.clone()),
-            prefix_tokens: prefix_tokens.clone(),
-            sealed_manifest: Box::new(sealed_manifest),
-        });
-        state.manifests.insert(manifest_id, manifest.clone());
-        state.upsert_namespace_entry(updated.clone(), prefix_tokens);
-
-        Ok(manifest.into_metadata())
-    }
-
-    fn object_ref_for_candidates(
-        &self,
-        key: &LogicalPath,
-        lookup_blind_keys: &[NamespaceBlindKey],
-    ) -> Result<BackendObjectRef> {
-        let state = self.read_state()?;
-        first_namespace_entry(&state.namespace, lookup_blind_keys)
-            .map(|entry| BackendObjectRef {
-                object_id: entry.object_id.clone(),
-                version_id: entry.object_version_id.clone(),
-            })
-            .ok_or_else(|| RepositoryError::NotFound(key.clone()))
-    }
-
     /// Returns the active keyring.
-    pub(crate) fn keyring(&self) -> Result<Arc<KeyRing>> {
-        self.keyring
-            .read()
-            .map_err(|_| RepositoryError::StatePoisoned)
-            .map(|keyring| Arc::clone(&*keyring))
-    }
-
-    /// Replaces the keyring envelope reference recorded in future checkpoints.
-    ///
-    /// Runtime constructors use this after opening an externally stored
-    /// encrypted keyring envelope so checkpoint records bind the active
-    /// wrapping-key source without requiring production server code to create
-    /// key material.
-    pub fn set_keyring_envelope_reference(
-        &self,
-        reference: Option<KeyringEnvelopeReference>,
-    ) -> Result<()> {
-        let mut active = self
-            .keyring_envelope
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)?;
-        *active = reference;
-        Ok(())
-    }
-
-    /// Reads repository state.
-    pub(crate) fn read_state(&self) -> Result<RwLockReadGuard<'_, RepositoryState>> {
-        self.state
-            .read()
-            .map_err(|_| RepositoryError::StatePoisoned)
-    }
-
-    /// Writes repository state.
-    pub(crate) fn write_state(&self) -> Result<RwLockWriteGuard<'_, RepositoryState>> {
-        self.state
-            .write()
-            .map_err(|_| RepositoryError::StatePoisoned)
+    pub(crate) fn keyring(&self) -> Arc<KeyRing> {
+        Arc::clone(&self.keyring)
     }
 }
 
@@ -575,24 +426,6 @@ fn record_decrypted_segment_cache_many(result: &'static str, events: u64, bytes:
     .increment(bytes);
 }
 
-fn modified_at_ms_or_now(modified_at_ms: Option<i64>, sequence: rs3_types::Sequence) -> i64 {
-    modified_at_ms.unwrap_or_else(|| current_time_ms().unwrap_or(sequence.get() as i64))
-}
-
-pub(crate) fn strongest_retention_policy(
-    left: Option<RetentionPolicy>,
-    right: Option<RetentionPolicy>,
-) -> Option<RetentionPolicy> {
-    match (active_retention(left), active_retention(right)) {
-        (Some(left), Some(right)) => Some(RetentionPolicy::new(
-            stronger_retention_mode(left.mode, right.mode),
-            left.retain_days.max(right.retain_days),
-        )),
-        (Some(policy), None) | (None, Some(policy)) => Some(policy),
-        (None, None) => None,
-    }
-}
-
 pub(crate) fn require_version_for_retained_write(
     object_id: &BackendObjectId,
     metadata: &rs3_storage::BlobMetadata,
@@ -612,41 +445,16 @@ pub(crate) fn version_binding_required(
     active_retention(retention).is_some() || legal_hold == Some(LegalHoldStatus::On)
 }
 
-fn active_retention(policy: Option<RetentionPolicy>) -> Option<RetentionPolicy> {
-    policy.filter(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
-}
-
-fn stronger_retention_mode(left: RetentionMode, right: RetentionMode) -> RetentionMode {
-    match (left, right) {
-        (RetentionMode::Compliance, _) | (_, RetentionMode::Compliance) => {
-            RetentionMode::Compliance
-        }
-        (RetentionMode::Governance, _) | (_, RetentionMode::Governance) => {
-            RetentionMode::Governance
-        }
-        (RetentionMode::None, RetentionMode::None) => RetentionMode::None,
-    }
-}
-
-fn current_time_ms() -> Option<i64> {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_millis();
-    i64::try_from(millis).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        DecryptedSegmentCache, DecryptedSegmentCacheInsert, DecryptedSegmentIdentity, Repository,
+        DecryptedSegmentCache, DecryptedSegmentCacheInsert, DecryptedSegmentIdentity,
+        RepositoryResources,
     };
-    use crate::payload::{
-        parse_segmented_payload_header, seal_streamable_payload_object, segmented_ciphertext_span,
-    };
+    use crate::payload::{seal_payload_object, segmented_ciphertext_span};
     use crate::test_support::signing_keyring;
     use bytes::Bytes;
-    use rs3_storage::{ByteRange, MemoryBlobStore};
+    use rs3_storage::ByteRange;
     use rs3_types::{BackendObjectId, BackendObjectRef};
 
     fn object_id(value: &str) -> BackendObjectId {
@@ -727,15 +535,21 @@ mod tests {
     #[test]
     fn decrypted_segment_cache_identity_is_separate_from_payload_auth_identity() {
         let keyring = signing_keyring();
-        let repository = Repository::with_keyring(MemoryBlobStore::new(), keyring.clone());
+        let repository =
+            RepositoryResources::new(keyring.clone(), super::RepositoryOptions::default());
         let payload_id = object_id("v2-payload/authenticated-payload");
         let cache_ref = BackendObjectRef::from(object_id("v2-stream-cache/exact-carrier"));
         let other_cache_ref = BackendObjectRef::from(object_id("v2-stream-cache/other-carrier"));
         let plaintext = b"payload crossing more than one encrypted segment";
-        let sealed = seal_streamable_payload_object(&keyring, &payload_id, plaintext, 16)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let header = parse_segmented_payload_header(&payload_id, &sealed)
-            .unwrap_or_else(|error| panic!("{error}"));
+        let (sealed, header) = seal_payload_object(
+            &keyring,
+            &payload_id,
+            plaintext,
+            16,
+            b"fixture-context".to_vec(),
+            [4; 32],
+        )
+        .expect("seal fixture");
         let range = ByteRange::Slice { offset: 7, len: 29 };
         let span =
             segmented_ciphertext_span(&header, range).unwrap_or_else(|error| panic!("{error}"));

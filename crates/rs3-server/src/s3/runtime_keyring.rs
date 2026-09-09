@@ -7,7 +7,8 @@ use crate::RepositoryKeysConfig;
 use crate::config::{KEYRING_WRAPPING_KEY_HEX_ENV, REPOSITORY_SALT_HEX_ENV};
 use bytes::Bytes;
 use rs3_crypto::{
-    KeyRing, KeyringEnvelope, MAX_KEYRING_ENVELOPE_OBJECT_BYTES, RepositoryKeyContext, SecretBytes,
+    KeyRing, MAX_KEYRING_ENVELOPE_OBJECT_BYTES, RepositoryEnvelope, RepositoryKeyContext,
+    SecretBytes,
 };
 use rs3_index::KeyringEnvelopeReference;
 use rs3_repository::{KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE, store_keyring_envelope};
@@ -48,7 +49,7 @@ pub(super) async fn unanchored_gateway_keyring(
 
     if repository_has_anchor_bound_objects(store).await? {
         return Err(repository_init(
-            "v2 commit anchor is missing but repository objects already exist; run explicit anchor recovery instead of choosing backend state",
+            "v03 commit anchor is missing but repository objects already exist; run explicit anchor recovery instead of choosing backend state",
         ));
     }
 
@@ -70,7 +71,7 @@ pub(super) async fn unanchored_gateway_keyring(
         keyrings.extend(page.entries);
         if keyrings.len() > 1 {
             return Err(repository_init(
-                "v2 commit anchor is missing and multiple unanchored keyring envelopes exist; provide an explicit envelope override or recover the anchor",
+                "v03 commit anchor is missing and multiple unanchored keyring envelopes exist; provide an explicit envelope override or recover the anchor",
             ));
         }
     }
@@ -98,12 +99,15 @@ fn open_gateway_keyring(
     keys: &RepositoryKeysConfig,
     object_id: BackendObjectId,
     version_id: Option<rs3_types::BackendVersionId>,
-    envelope: KeyringEnvelope,
+    envelope: RepositoryEnvelope,
 ) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
-    let context = repository_key_context(keys)?;
+    if object_id.as_str().ends_with(".json") {
+        return Err(repository_init("retired keyring object format"));
+    }
+    let context = repository_key_context_for_envelope(keys, &envelope)?;
     let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
     let keyring = envelope
-        .open(&context, &keys.wrapping_key_id, &wrapping_key)
+        .open_keyring(&context, &keys.wrapping_key_id, &wrapping_key)
         .map_err(repository_init)?;
     let reference = KeyringEnvelopeReference {
         generation: envelope.generation,
@@ -114,16 +118,19 @@ fn open_gateway_keyring(
     Ok(LoadedGatewayKeyring {
         keyring,
         envelope_reference: Some(reference),
+        repository_salt: envelope.repository_salt,
     })
 }
 
-fn open_gateway_keyring_object(
+pub(super) fn open_gateway_keyring_object(
     keys: &RepositoryKeysConfig,
     object_id: BackendObjectId,
     version_id: Option<rs3_types::BackendVersionId>,
     body: Bytes,
 ) -> Result<LoadedGatewayKeyring, S3BoundaryError> {
-    let envelope = KeyringEnvelope::from_object_bytes(&body).map_err(repository_init)?;
+    let envelope =
+        RepositoryEnvelope::from_object_bytes(&body, rs3_crypto::EnvelopePurpose::Keyring)
+            .map_err(repository_init)?;
     open_gateway_keyring(keys, object_id, version_id, envelope)
 }
 
@@ -139,7 +146,9 @@ pub(super) async fn open_gateway_keyring_reference(
         MAX_KEYRING_ENVELOPE_OBJECT_BYTES,
     )
     .await?;
-    let envelope = KeyringEnvelope::from_object_bytes(&body).map_err(repository_init)?;
+    let envelope =
+        RepositoryEnvelope::from_object_bytes(&body, rs3_crypto::EnvelopePurpose::Keyring)
+            .map_err(repository_init)?;
     let digest = envelope.digest().map_err(repository_init)?;
     if envelope.generation != reference.generation || digest != reference.digest {
         return Err(repository_init(format!(
@@ -167,12 +176,8 @@ async fn bootstrap_missing_keyring_envelope(
         ));
     }
 
-    let context = repository_key_context(keys)?;
-    let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
-    let keyring = KeyRing::generate_random().map_err(repository_init)?;
-    let envelope = keyring
-        .seal_keyring_envelope(&context, &keys.wrapping_key_id, &wrapping_key, 1)
-        .map_err(repository_init)?;
+    let salt = configured_or_generated_repository_salt(keys)?;
+    let (keyring, envelope) = prepare_gateway_keyring(keys, &salt)?;
     let reference = if let Some(object_id) = configured_object_id {
         store_configured_keyring_envelope(store, &object_id, &envelope, retention).await?
     } else {
@@ -190,13 +195,27 @@ async fn bootstrap_missing_keyring_envelope(
     Ok(LoadedGatewayKeyring {
         keyring,
         envelope_reference: Some(reference),
+        repository_salt: salt,
     })
+}
+
+pub(super) fn prepare_gateway_keyring(
+    keys: &RepositoryKeysConfig,
+    salt: &[u8],
+) -> Result<(KeyRing, RepositoryEnvelope), S3BoundaryError> {
+    let context = repository_key_context_for_salt(keys, salt)?;
+    let wrapping_key = secret_hex(KEYRING_WRAPPING_KEY_HEX_ENV, &keys.wrapping_key_hex)?;
+    let keyring = KeyRing::generate_random().map_err(repository_init)?;
+    let envelope = keyring
+        .seal_keyring_envelope(&context, &keys.wrapping_key_id, &wrapping_key, 1)
+        .map_err(repository_init)?;
+    Ok((keyring, envelope))
 }
 
 async fn store_configured_keyring_envelope(
     store: &RuntimeStore,
     object_id: &BackendObjectId,
-    envelope: &KeyringEnvelope,
+    envelope: &RepositoryEnvelope,
     retention: Option<RetentionPolicy>,
 ) -> Result<KeyringEnvelopeReference, S3BoundaryError> {
     let digest = envelope.digest().map_err(repository_init)?;
@@ -290,13 +309,57 @@ async fn repository_has_anchor_bound_objects(
 pub(super) struct LoadedGatewayKeyring {
     pub(super) keyring: KeyRing,
     pub(super) envelope_reference: Option<KeyringEnvelopeReference>,
+    /// Public salt bound into the opened or sealed envelope.
+    pub(super) repository_salt: Vec<u8>,
 }
 
-pub(super) fn repository_key_context(
+/// Decodes the optional operator-pinned public salt.
+pub(super) fn configured_repository_salt(
     keys: &RepositoryKeysConfig,
+) -> Result<Option<Vec<u8>>, S3BoundaryError> {
+    keys.repository_salt_hex
+        .as_deref()
+        .map(repository_salt)
+        .transpose()
+}
+
+/// Builds the envelope context from a verified envelope's public salt.
+///
+/// A configured salt must match the envelope; otherwise the salt is recovered
+/// from the envelope, whose authenticity the caller has already tied to the
+/// anchor, the format root, or the wrapping key before opening it.
+pub(super) fn repository_key_context_for_envelope(
+    keys: &RepositoryKeysConfig,
+    envelope: &RepositoryEnvelope,
 ) -> Result<RepositoryKeyContext, S3BoundaryError> {
-    let salt = repository_salt(&keys.repository_salt_hex)?;
-    RepositoryKeyContext::new(keys.repository_id.clone(), salt).map_err(repository_init)
+    if let Some(configured) = configured_repository_salt(keys)?
+        && configured != envelope.repository_salt
+    {
+        return Err(repository_init(format!(
+            "{REPOSITORY_SALT_HEX_ENV} does not match the public salt bound into the repository envelope; unset it to recover the salt from the verified envelope, or supply the recorded value"
+        )));
+    }
+    repository_key_context_for_salt(keys, &envelope.repository_salt)
+}
+
+/// Builds the envelope context for a known salt, used when sealing.
+pub(super) fn repository_key_context_for_salt(
+    keys: &RepositoryKeysConfig,
+    salt: &[u8],
+) -> Result<RepositoryKeyContext, S3BoundaryError> {
+    RepositoryKeyContext::new(keys.repository_id.clone(), salt.to_vec()).map_err(repository_init)
+}
+
+/// Returns the configured salt, or generates one for a new repository.
+pub(super) fn configured_or_generated_repository_salt(
+    keys: &RepositoryKeysConfig,
+) -> Result<Vec<u8>, S3BoundaryError> {
+    match configured_repository_salt(keys)? {
+        Some(salt) => Ok(salt),
+        None => rs3_crypto::random_repository_salt()
+            .map(|salt| salt.to_vec())
+            .map_err(repository_init),
+    }
 }
 
 pub(super) fn secret_hex(

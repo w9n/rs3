@@ -64,7 +64,7 @@ pub(super) fn install_velero(
     target: &VeleroS3Target,
 ) -> Result<()> {
     let backup_location_config = format!(
-        "region=us-east-1,s3ForcePathStyle=true,s3Url={},checksumAlgorithm=",
+        "region=us-east-1,s3ForcePathStyle=true,s3Url={}",
         target.endpoint_url
     );
 

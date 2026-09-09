@@ -49,9 +49,71 @@ Do not expose these outside encrypted and authenticated payloads:
 This applies to object keys, tags, unauthenticated metadata, logs, metrics
 labels, traces, commit headers, and error messages.
 
+Buffered publication keeps its frozen prefix and staged successor within the
+same admission and overlay bounds. It does not expose unaccepted namespace state
+or upload a successor carrier before its parent is resolved. A lost anchor-CAS
+reply requires exact-state reconciliation; an unresolved outcome stops further
+mutations. Backend-visible classes and identifiers are unchanged, while request
+cadence and batch sizes may change when staging overlaps upload.
+
+Multipart completion receipts keep upload identity, destination and selected-part
+facts inside encrypted runs and root catalogs. They add bounded metadata bytes
+and can therefore affect observed index sizes. Their count-based eviction does
+not delete payloads or promise historical recovery. Unknown upload IDs cannot
+create a new publication, and an unresolved anchor result blocks receipt lookup
+until trusted recovery.
+
+Client request checksums are compatibility integrity facts, not repository
+authentication. The gateway hashes CRC32, CRC32C, CRC64NVME, SHA1, and SHA256
+alongside encryption over the plaintext request stream, then completes
+validation before accepting repository publication. The
+optional typed checksum is stored in encrypted namespace metadata and in the
+encrypted multipart completion receipt, never as an object-store key or provider
+metadata. Full-object `HEAD` and `GET` responses expose the stored checksum and
+its construction type only when the client enables checksum mode; partial `GET`
+responses do not claim a checksum for a different byte range. Multipart
+selection digests bind the selected part checksum facts, while the aggregate
+checksum is the durable metadata fact. Independent vectors, authenticated HTTP
+trailer tests and adapter tests cover these flexible-checksum paths.
+[Testing](testing.md) records source-bound client qualification and its limits.
+
+Every accepted object also carries a mandatory trusted ETag derived from
+plaintext MD5 values in the encrypted namespace metadata. A single-object ETag
+is the complete plaintext MD5; a multipart ETag is the MD5 of the ordered raw
+selected-part MD5 digests with a `-N` count suffix. The same stored ETag is
+returned through object writes, completion, HEAD, GET, and current-object
+listings. `Content-MD5` is an optional canonical Base64 request fact checked at
+exact EOF before publication or part replacement. Part ETags are plaintext MD5
+values; internal sealing attempt IDs remain separate and hidden. These client
+compatibility facts are separate from flexible checksums, repository
+authentication, deduplication, provider metadata, and provider keys.
+The MD5 is computed once at the plaintext consumer without an extra payload
+read. Local vectors, adapter tests and authenticated HTTP tests cover these
+paths; client qualification and its limits are recorded in [Testing](testing.md).
+
+Retained publication's capacity cache binds conservative metadata, encoded-section
+and exact-target bounds to an exact accepted anchor and budget configuration. It is separate from
+retention coverage and cannot select repository state. Candidate fallback walks
+are read-only; the writer rechecks the real parent and fence before CAS and caches
+capacity only after accepted-state installation. Cache loss adds verification
+reads rather than permission to exceed the metadata limit. Extra metadata range
+reads near a capacity boundary are visible to the backend, without plaintext
+path labels. The [admission limits](reference/repository-format.md#recovery-metadata-admission)
+include encoded pending buffers, but do not certify whole-process RAM, provider
+inventory, startup replay or optional I/O budgets. Historical traversal caches
+signed header facts and fetches only referenced index or recovery sections. It
+continues to verify exact versions, descriptor digests and encrypted contexts;
+an unused old recovery registry never becomes authority. Selective range reads
+and compaction scheduling change the backend-visible request and object-size
+patterns without exposing plaintext paths.
+
+A wider bounded metadata-compaction window can reduce checkpoint frequency and
+change metadata object sizes. It creates no new backend identifier or plaintext
+field; existing object-size and write-cadence leakage still applies.
+
 ## Accepted Leakage
 
-The replacement `v02` design accepts specific backend-visible leakage:
+The replacement `v03` design accepts specific backend-visible leakage:
 
 | Leakage | Why It Exists | Current Mitigation |
 | --- | --- | --- |
@@ -60,23 +122,31 @@ The replacement `v02` design accepts specific backend-visible leakage:
 | Coarse write and restore timing | The provider sees requests arrive. | Avoid path labels in telemetry; future batching/jitter where useful. |
 | Retention mode | Provider retention APIs expose mode and retain-until behavior. | Treat retention mode as policy metadata, not tenant identity. |
 | Source network metadata | The provider sees the gateway's network identity. | Deploy through controlled egress where required. |
-| Broad object class | `format/`, `keyrings/`, `commits/v02/`, and `objects/v02/` support lifecycle and operations. | Keep class names generic and path-free; compacted sibling carriers and cleaned-pack keys do not reveal tenant, path, or workload. |
+| Broad object class | `format/`, `keyrings/`, `commits/v03/`, and `objects/v03/` support lifecycle and operations. | Keep class names generic and path-free; compacted sibling carriers and cleaned-pack keys do not reveal tenant, path, or workload. |
 | Commit sequence and run inventory | Sequence-bounded commit keys and immutable run objects expose commit and compaction activity. | Batch commits, use random object IDs, keep catalog counts, levels, and bounds encrypted. |
 | Compaction cadence | The provider sees sibling delta-carrier and root writes, plus later cleanup. | Compact at bounded active-run watermarks and consider optional jitter; never include paths in scheduling telemetry. |
 | Payload-pack shape and access | A commit exposes aggregate pack size, and exact range reads reveal ciphertext span and access patterns. | Batch by bounded protection cohort, randomize record order, keep record descriptors inside encrypted authenticated index runs, and consider optional padding only with measured budgets. |
-| Streamed-payload shape and access | An embedded `[PAYLOAD, INDEX_RUN]` commit or a standalone `objects/v02/` payload followed by `[INDEX_RUN]` reveals that one streamed carrier was written, its ciphertext length, write cadence, publication delay, and later range-access spans. Concurrent standalone uploads also expose aggregate concurrency through timing and request volume. A zero-length stream still has an authenticated payload header and is distinguishable by size from larger streams. | Keep path and payload identity inside authenticated ciphertext, use opaque random commit and object keys, fetch only authenticated segments, and treat padding or traffic shaping as future measured modes. |
-| Deterministic metadata equality | Stable metadata sealing can produce identical sealed bytes for identical metadata under identical associated data. | Bind framed ciphertext to a unique run and frame context; complete equality analysis before format freeze. |
+| Streamed-payload shape and access | A standalone `objects/v03/` payload followed by `[INDEX_RUN]` reveals ciphertext size, write cadence, publication delay, concurrency, and range-access spans. Empty values are index-only. | Encrypt carrier references, use random opaque object keys, and authenticate segments before release. |
+| Recovery-history shape and access | Accepted recovery sections expose opaque commit and section counts, encrypted section sizes, publication cadence, and retained-provider renewal activity. Registry points, paths, logical deadlines, and policy identities remain encrypted. The backend sees Object Lock modes and physical retain-until dates, which can reveal the approximate protection window. | Keep recovery history in the encrypted `0x0008` section, use exact opaque references, and document finite page, graph, provider-retention, and outage bounds. |
+| Copy cadence and shared carrier liveness | A same-bucket copy creates a new metadata publication without a new payload carrier. Under retained protection, the provider can observe exact-version metadata checks or extensions that keep opaque source dependencies live for the copied timestamp. | Source and destination paths, plaintext, ETag, and checksum remain encrypted repository metadata. The gateway uses only accepted exact references and does not expose provider-visible logical identifiers. |
+| Exact retry equality | Reusing prepared ciphertext for a publication retry reveals that the same opaque bytes were sent again. | Fresh random metadata nonces prevent intentional equality across independent seals; retain unique authenticated run/frame context. |
 
 Optional mitigations include padding, pack-size normalization, commit batching,
 compaction jitter, and stricter telemetry redaction.
 
+Maintenance metrics and admin reports expose aggregate packed-payload stored,
+referenced and unreferenced ciphertext bytes. These reveal aggregate utilization
+to telemetry readers, with no path, tenant, object ID or version labels. Accounting
+unions current and conservatively protected references, and does not download payloads
+or add backend requests. The totals are observations, never deletion authority.
+
 The removed prototype used `format/`, `keyrings/`, and
-`commits/v01/<sequence>/<random-id>`. The runtime now uses `commits/v02` with
+`commits/v01/<sequence>/<random-id>`. The runtime now uses `commits/v03` with
 compact payload-pack, index-run, and index-root sections. No production
 repository used `v01`, and no migration or dual reader is planned.
 
 !!! warning "Security implementation status"
-    The gateway reads and writes the preview `v02` commit envelope with
+    The gateway reads and writes the preview `v03` commit envelope with
     signed per-section digests. Bounded normal writes use encrypted payload
     packs and framed index runs; recovery replays index runs without reading
     payload bytes. The encrypted run carries each payload record's authenticated
@@ -88,17 +158,25 @@ repository used `v01`, and no migration or dual reader is planned.
     writes signed `INDEX_ROOT` catalogs of exact embedded run sections.
     Publication reads back and opens the exact signed candidate root and every
     new compacted run before anchor adoption, and maintenance derives exact run
-    and live-payload reachability from the same verified catalog. Known-length,
-    unknown-length, and zero-length streaming writes use the canonical
-    `[PAYLOAD, INDEX_RUN]` shape and enter the same catalog. Guarded metadata-only
-    packed/streamed-run compaction and automatic active-run watermarks are
+    and live-payload reachability from the same verified catalog. Nonempty large
+    streams use detached payloads and short index-only publication commits;
+    empty values are index-only. Metadata compaction and active-run watermarks are
     implemented. New bounded writes are partitioned by effective protection
     cohort, and guarded full GC renews exact restore dependencies from one
-    bounded plan before deleting exact orphans. Production claims remain blocked
-    on retained-provider restart/fault qualification, pinned-runner filesystem
-    qualification, live-provider reruns, and external cryptographic review.
+    bounded plan before deleting exact orphans. Local retained RustFS Object Lock
+    and Kubernetes Lease coverage includes graceful read-only and writer restart,
+    historical copyout and range reads,
+    and compaction after 256 writes. Production claims remain blocked on
+    pinned-runner filesystem qualification, a 30-day provider-outage exercise,
+    broader provider qualification, and external cryptographic review.
 
 ## Control Map
+
+Keyring loading rejects supplied signing public keys that disagree with their
+secret material, including inactive keys. Temporary random secrets, derived
+signing seeds and format-envelope plaintext buffers use zeroization on drop.
+Opened format plaintext retains that protection while held by the caller;
+this does not erase copies a caller creates separately.
 
 | Requirement | Mechanism | Current Evidence |
 | --- | --- | --- |
@@ -107,31 +185,45 @@ repository used `v01`, and no migration or dual reader is planned.
 | Metadata bytes are not plaintext in durable index state | AES-256-GCM-SIV sealed metadata records. | Crypto metadata tests and repository path-invariant tests. |
 | Payload objects cannot be moved silently | Associated data binds ciphertext to backend object context. | Payload tamper and object-context tests. |
 | Repository key reuse is compartmentalized | Random purpose keys are generated into an encrypted keyring envelope and bound to the repository ID, public salt, and wrapping-key identity. | Crypto keyring/envelope tests. |
-| Envelope swaps are detectable | The v2 format root and signed commits bind the active keyring envelope generation, object ID, and digest. | v2 format-root and key-envelope tests. |
-| Unsupported format transitions fail closed | The runtime exposes no v02 format or data-key rotation operation. Destructive maintenance rejects a protected root from a different exact format generation before storage reads. | Repository key-rotation read tests and cross-format protected-root rejection tests. A future rotation capability requires a separately reviewed migration design. |
-| Writes are not acknowledged before commit acceptance | Commit coordinator waits for a covering signed commit and anchor advance. | v2 coordinator and commit tests. |
-| Storage rollback is not trusted as latest state | Ed25519 commit verification, Kubernetes Lease anchor, and retained exact-version commit reads. | v2 anchor, replay, recovery import, and orphan-report tests. |
-| v2 writes are not acknowledged before signed commit acceptance | The v2 commit coordinator batches staged writes into a signed commit and advances the external v2 anchor before returning success. | v2 coordinator batching, rollback, and snapshot tests. |
+| Envelope swaps are detectable | The v03 format root binds the full keyring envelope reference; signed commits bind its historical object ID and digest. | v03 format-root and key-envelope tests. |
+| Unsupported format transitions fail closed | The runtime exposes no v03 format or data-key rotation operation. Destructive maintenance rejects a protected root from a different exact format generation before storage reads. | Repository key-rotation read tests and cross-format protected-root rejection tests. A future rotation capability requires a separately reviewed migration design. |
+| Storage rollback is not trusted as latest state | Ed25519 commit verification, Kubernetes Lease anchor, and retained exact-version commit reads. | v3 anchor, replay, recovery import, and orphan-report tests. |
+| v03 writes are not acknowledged before signed commit acceptance | The v03 commit coordinator batches staged writes into a signed commit and advances the external v03 anchor before returning success. | v3 coordinator batching, rollback, and snapshot tests. |
 | One process cannot publish another local batch's speculative overlay | Each repository instance grants one atomic RAII mutation lease. Delayed publisher tasks retain the coordinator lease; direct mutation and compaction APIs are rejected until it is released. A post-CAS local installation failure returns an explicit recovery-required error and blocks new mutations. | Duplicate-coordinator, cancelled delayed-publisher, direct-bypass, compaction-bypass, and accepted-but-recovery-required tests. |
-| v2 replay does not read payload ciphertext | Signed per-section digests and an encrypted `INDEX_ROOT` let readers verify exact run sections and replay the post-root tail without reading payload sections. Fixed commit, catalog, object-byte, and retained-index budgets fail closed. | v2 bounded replay, root codec, root-plus-tail, payload-independent request-count, malformed-length, and range-tamper tests. |
+| v03 replay does not read payload ciphertext | Signed per-section digests and an encrypted `INDEX_ROOT` let readers verify exact run sections and replay the post-root tail without reading payload sections. Fixed commit, catalog, object-byte, and retained-index budgets fail closed. | v3 bounded replay, root codec, root-plus-tail, payload-independent request-count, malformed-length, and range-tamper tests. |
 | Hostile backend metadata cannot force unbounded startup allocation or inventory | Format and keyring envelopes are length-checked at 1 MiB and 16 MiB before allocation and must reach exact EOF. Bootstrap, import, doctor, and unanchored-recovery listings use bounded provider pages under fixed page and raw-member totals; partial or over-budget inventory fails closed. | Storage exact-stream and bounded-collector tests, envelope decoder ceilings, bounded-list tests, and startup/recovery call-site coverage. |
 | Create-only writes are not silently downgraded | Atomic-create providers must honor `PutObject` with `If-None-Match: *`; non-atomic `HEAD` before `PUT` is not treated as production create-only. | Storage contract tests and opt-in live S3 tests. |
-| Retained restore reads do not trust mutable latest objects | Retained-version providers must return version IDs for restore-critical writes; anchors bind commit versions and restore reads exact versions. | Memory version-addressed storage tests, v2 retained commit tests, and opt-in live S3 Object Lock tests. |
+| Retained restore reads do not trust mutable latest objects | Retained-version providers must return version IDs for restore-critical writes; anchors bind commit versions and restore reads exact versions. | Memory version-addressed storage tests, v3 retained commit tests, and opt-in live S3 Object Lock tests. |
 | Single-writer read-write serving is guarded in Kubernetes deployments | `RS3_WRITER_GUARD=required` acquires a unique process identity and monotonic fencing token on the anchor Lease before serving. Every anchor advance verifies that live fence in the same resource-version CAS. | Lease skew, handoff, stale-writer, runtime startup guard, and configuration tests. |
 | Incident restore does not advance repository state | `restore-readonly` mode requires an accepted anchor and rejects supported mutations. | Gateway mode config, startup, and S3 adapter tests. |
+| Recovery history cannot silently change accepted authority | Each accepted successor registers its exact predecessor in the encrypted `Recovery` section. The external anchor still selects the current head, while recovery replay validates the section against its signed parent, strict publication chronology, and fixed predecessor deadline. | Recovery-section codec, publication, replay, expiry, stale-anchor, and recovery-view tests. Controlled-time tests cover expiry, renewal, guard faults, and eligible exact-version GC. A local retained RustFS Object Lock/Kubernetes Lease fixture covers graceful restart, historical AWS CLI/rclone copyout and range reads, and compaction after 256 writes. It is not a 30-day outage or general-provider qualification. |
 | Retention is never shortened | Retention extension contract rejects shortening. | Storage and repository immutability tests. |
 | Operator reporting does not become a path oracle | Core admin reports are path-redacted and do not include path browsing fields. | Admin status redaction tests. |
-| v02 index frames cannot be transplanted or reordered | Frame AEAD binds immutable repository identity, the historical keyring-envelope reference, exact object key, section ordinal, run identity, and complete frame descriptor. The signed catalog binds exact embedded commit version, length, body digest, layout, level, and compaction generation. Compacted carriers must be direct siblings of their root with the exact parent and sequence relation. | Framed-run and root codecs, guarded sibling publication, exact candidate read-back, exact catalog recovery, bounded replay, and corruption tests. Retained-provider restart and fault qualification remain. |
-| v02 payload-pack records cannot be transplanted or downgraded | Record AEAD binds immutable repository identity, historical keyring context, exact object key, pack, section, record, segment, layout, length, and final-segment facts. Encrypted `INDEX_RUN` descriptors bind the pack identity, content-key ID, historical envelope object and digest, ordinal, offset, and length. The accepted signed reference binds the returned exact version, length, and commit-body digest. | The bounded ciphertext-only pack codec, canonical segmentation, production pack-identity freshness, segment reorder/transplant rejection, publication, direct cold range-read, replay, corruption tests, and new-write protection-cohort partitioning are implemented. Mixed-pack cleaning remains a capacity optimization and needs qualification before operators rely on prompt space reclamation. |
-| v02 streamed payloads cannot be detached from their exact carrier | A self-stream run record binds the payload identity, signed section ordinal, and authenticated segmented header. Replay and compaction materialize an exact external carrier with commit key/version, stored length/body digest, historical keyring envelope, section start/ordinal/offset/length/digest, payload identity, and header. Section ranges beyond the exact stored object fail closed. | Canonical known/unknown/zero-length write, replay, checkpoint, exact-carrier tamper, compaction, GC, and range-read tests. Retained-provider fault qualification remains. |
-| v02 standalone payloads cannot become visible partially or under weaker protection | A fresh random object is segmented-AEAD sealed outside the publication lock. After completion, the writer computes a required horizon, renews only the exact returned version, and requires the provider's result to meet at least that deadline, so upload duration cannot consume the requested interval. That version must match object identity, stored length, absolute retention deadline, exact EOF, and the writer's complete ciphertext digest before an encrypted carrier reference can enter a signed run and fenced anchor transition. Unanchored objects have no namespace authority. Client legal hold is rejected until dependency-wide hold and release exist. | Concurrent 1/2/4/8 overlap with serialized publication, stalled-upload isolation, pre-completion abort, ambiguous-completion orphan, digest mismatch, delayed-body post-completion retention, missing-version pre-mutation rejection, exact protection, create-only race, anchor failure/reclaim, zero-age in-flight GC, compaction, checkpoint, fresh reload, full-read, and range-read tests pass. Retained-provider restart and fault qualification remain. |
-| Full streamed restores do not require object-sized trusted memory | One exact provider stream is length-bounded. The authenticated header is checked before the response, each bounded segment group is AEAD-verified before release, and exact EOF plus the signed aggregate digest are checked before the final plaintext group. Segment size is hard-limited to 64 MiB. | Repository tests cover bounded multi-chunk reads, one backend `GET`, header rejection, and final-group withholding on aggregate mismatch; the S3 adapter restores an object larger than its download-memory reservation. Retained-provider and fresh-process gateway performance qualification remain. |
-| Decrypted streamed-payload cache entries cannot alias across authenticated carriers | The in-memory cache key hashes repository/keyring context and every exact commit, section, payload-header, and content-length fact. Decryption continues to use the real payload ID as AEAD associated data, not the synthetic cache key. | Cache-field binding, cache/AEAD identity separation, and section-bound tests. The derived key is process-local and creates no backend object or additional backend-visible identifier. |
+| v03 index frames cannot be transplanted or reordered | Frame AEAD binds immutable repository identity, the historical keyring-envelope reference, exact object key, section ordinal, run identity, and complete frame descriptor. The signed catalog binds exact embedded commit version, length, body digest, layout, level, and compaction generation. Compacted carriers must be direct siblings of their root with the exact parent and sequence relation. | Framed-run and root codecs, guarded sibling publication, exact candidate read-back, exact catalog recovery, bounded replay, and corruption tests. Local retained RustFS/Kubernetes Lease restart after compaction passes; provider-fault and 30-day outage qualification remain open. |
+| v03 payload-pack records cannot be transplanted or downgraded | Record AEAD binds immutable repository identity, historical keyring context, exact object key, pack, section, record, segment, layout, length, and final-segment facts. Encrypted `INDEX_RUN` descriptors bind the pack identity, content-key ID, historical envelope object and digest, ordinal, offset, and length. The accepted signed reference binds the returned exact version, length, and commit-body digest. | The bounded ciphertext-only pack codec, canonical segmentation, production pack-identity freshness, segment reorder/transplant rejection, publication, direct cold range-read, replay, corruption tests, and new-write protection-cohort partitioning are implemented. Mixed-pack cleaning remains a capacity optimization and needs qualification before operators rely on prompt space reclamation. |
+| Streamed payloads remain bound to their exact object | Encrypted run records bind exact object key/version, length/digest, historical keyring envelope, and authenticated segment layout. Retired embedded stream pointers fail closed. | Known/unknown-length upload, checkpoint, exact-version tamper, compaction, GC, and restore tests. |
+| v03 standalone payloads cannot become visible partially or under weaker protection | A fresh random object is segmented-AEAD sealed outside the publication lock. After completion, the writer computes a required horizon, renews only the exact returned version, and requires the provider's result to meet at least that deadline, so upload duration cannot consume the requested interval. That version must match object identity, stored length, absolute retention deadline, exact EOF, and the writer's complete ciphertext digest before an encrypted carrier reference can enter a signed run and fenced anchor transition. Unanchored objects have no namespace authority. Client legal hold is rejected until dependency-wide hold and release exist. | Concurrent 1/2/4/8 overlap with serialized publication, stalled-upload isolation, pre-completion abort, ambiguous-completion orphan, digest mismatch, delayed-body post-completion retention, missing-version pre-mutation rejection, exact protection, create-only race, anchor failure/reclaim, zero-age in-flight GC, compaction, checkpoint, fresh reload, full-read, and range-read tests pass. Local retained RustFS/Kubernetes Lease restart passes; provider-fault and 30-day outage qualification remain open. |
+| CopyObject cannot create a forgeable or pending payload reference | The coordinator captures only an accepted source under the same fencing and staging exclusion used for publication. It preserves its exact payload reference, trusted ETag and checksum in a fresh encrypted destination record; a source `If-Match` is checked at capture. The copy itself reads, encrypts, and writes no payload bytes. | Repository coordinator and S3 adapter coverage exercise packed, detached, multipart, empty, overwrite, source-condition, restart, compaction, GC, and retained-protection paths. Direct rclone copy/delete and graceful RustFS gateway restart checks pass; exact scope is recorded in [Testing](testing.md). |
+| Full streamed restores do not require object-sized trusted memory | One exact provider stream is length-bounded. The authenticated index layout is checked before the response, each bounded segment group is AEAD-verified before release, and exact EOF plus the signed aggregate digest are checked before the final plaintext group. Segment size is hard-limited to 64 MiB. | Repository tests cover bounded multi-chunk reads, one backend `GET`, invalid-layout rejection, and final-group withholding on aggregate mismatch; the S3 adapter restores an object larger than its download-memory reservation. Retained-provider and fresh-process gateway performance qualification remain. |
+| Decrypted streamed-payload cache entries cannot alias across authenticated carriers | The in-memory cache key hashes repository/keyring context and every exact object, version, digest, payload-layout, and content-length fact. Decryption continues to use the real payload ID as AEAD associated data, not the synthetic cache key. | Cache-field binding, cache/AEAD identity separation, and exact-object tests. The derived key is process-local and creates no backend object or additional backend-visible identifier. |
 | Cold packed reads do not fetch unrelated records or metadata | Recovery materializes authenticated direct record descriptors from encrypted runs. A fresh post-recovery read uses one exact backend range `GET`; a 512 B record fetches 528 B including its AEAD tag, for 1.03125x ciphertext-byte amplification. | Direct cold-read request-count and exact-range repository test; the scale harness enforces configurable request and byte-amplification ceilings during sentinel reads. |
-| v02 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery verifies exact bounded run sections sequentially from a signed catalog under count and byte ceilings. Runtime publication keeps one accepted state plus a hard-bounded 4,096-mutation overlay; compaction uses per-run scratch state and shared identifiers rather than a cumulative replay scratch or candidate namespace. The accepted state omits the legacy prefix-token projection, structurally shares ordered path keys and exact authenticated carrier facts, and interns namespace-key IDs inside authenticated frames. | Clean revision `f4d05b0` passed three fresh-process ext4 1M runs at 955,781,120-956,370,944 B writer RSS, 1,009,922,048-1,010,692,096 B reader RSS, 5.324-5.482 s recovery, 245 runs, and 1.268284240x writes. Every run listed exactly one million objects and used one exact `GET` at 1.03125x for each cold sentinel. This qualifies host-local correctness and resource ceilings; the exact final candidate on the pinned runner remains. |
-| v02 checkpoint failure cannot anchor unrecoverable state | A coordinator requests metadata-only compaction at 256 active runs. A missing guard or a fully validated nonreducing bounded plan may defer below 896 and retry at later 64-run boundaries; both fail closed at 896. Configured-guard, corruption, storage, anchor, and other compaction errors poison immediately. The hard 1,024-run verifier ceiling remains. | Automatic success, missing-guard and nonreducing-plan retry and pause, configured-guard failure, hard-ceiling, and exact recovered-run-count tests. Three wire-v6 1M release runs stayed below the trigger at 245 active runs; the earlier 1,024-record lane crossed six compaction windows and recovered 233. Adversarial restart and retained-provider qualification remain. |
-| v02 compaction cannot publish a partial or payload-rewriting merge | At most the oldest 128 foreground level-0 runs are merged newest-wins including tombstones; newer level-0 and existing level-1 shards remain exact-referenced; self-pack and self-stream references become exact historical external references; equal-generation groups are indivisible; candidate carriers and root are direct siblings read back and opened exactly before one fenced CAS. Level denotes tier, not epoch, and the preview decoder rejects levels above 1. | Pure planner, bounded-window selection, historical-envelope, mixed pack/stream no-payload-write, exact candidate read-back, guard-loss, publication-lineage, recovery, invalid-tier, and automatic-watermark tests. Bottom-tier tombstone reclamation remains future guarded or offline work. |
-| v02 GC retains every live payload without retaining unrelated payload ancestry | Effective run records mark exact payload-pack and streamed-carrier versions; catalog-named runs, the replay chain, format root, and keyring envelope are marked before exact-version sweep. The strongest represented finite retention is propagated across required restore dependencies. One read-only store-boundary ledger meters every planning HEAD, bounded range GET, and LIST page before forwarding; the verified current chain and namespace state are reused instead of replayed twice. Bounded inventory and one immutable plan renew and post-verify exact versions before guarded deletion. Existing graphs that require legal hold and foreign-format protected roots fail closed. | Implemented for the current anchor graph and repository-level same-format protected-root inputs, including actual-operation budget parity, zero-budget non-forwarding, invalid page rejection, and ambiguous renewal failure. The gateway does not expose historical-root registration, legal holds, or format rotation. S3 list XML is capped before deserialization and returned member counts are checked against requested `MaxKeys`. Retained-provider restart/fault qualification remains unavailable. |
+| v03 recovery does not retain cumulative attacker-sized deltas | Descriptor-first recovery verifies exact bounded run sections sequentially from a signed catalog under count and byte ceilings. Runtime publication keeps one accepted state plus a hard-bounded 4,096-mutation overlay; compaction uses per-run scratch state and shared identifiers rather than a cumulative replay scratch or candidate namespace. The accepted state omits the legacy prefix-token projection, structurally shares ordered path keys and exact authenticated carrier facts, and interns namespace-key IDs inside authenticated frames. | Historical v02 revision `f4d05b0` passed three fresh-process ext4 1M runs at 955,781,120-956,370,944 B writer RSS, 1,009,922,048-1,010,692,096 B reader RSS, 5.324-5.482 s recovery, 245 runs, and 1.268284240x writes. Every run listed exactly one million objects and used one exact `GET` at 1.03125x for each cold sentinel. This is pre-v03 evidence; qualification of the exact v03 candidate on the pinned runner remains. |
+| v03 checkpoint failure cannot anchor unrecoverable state | A coordinator requests metadata-only compaction at 256 active runs. A missing guard or a fully validated nonreducing bounded plan may defer below 896 and retry at later 64-run boundaries; both fail closed at 896. Configured-guard, corruption, storage, anchor, and other compaction errors poison immediately. The hard 1,024-run verifier ceiling remains. | Automatic success, missing-guard and nonreducing-plan retry and pause, configured-guard failure, hard-ceiling, and exact recovered-run-count tests. Three wire-v6 1M release runs stayed below the trigger at 245 active runs; the earlier 1,024-record lane crossed six compaction windows and recovered 233. Adversarial restart and broader retained-provider qualification remain. |
+| v03 compaction cannot publish a partial or payload-rewriting merge | At most 256 active runs across levels 0 and 1 are fully validated and merged newest-wins; the accepted blinded-key namespace proves obsolete upserts, winning tombstones remain, and runs outside the window retain exact references; self-pack references become exact historical external references; equal-generation groups are indivisible; candidate carriers and root are direct siblings read back and opened exactly before one fenced CAS. Level denotes tier, not epoch, and the preview decoder rejects levels above 1. | Pure planner, full older-shard pruning, sustained fixed-key churn, protected-root GC, bounded-window selection, historical-envelope, mixed pack/stream no-payload-write, exact candidate read-back, guard-loss, publication-lineage, recovery, invalid-tier, and automatic-watermark tests. Bottom-tier tombstone reclamation remains future guarded or offline work. |
+| v03 GC retains every live payload without retaining unrelated payload ancestry | Effective run records mark exact payload-pack and streamed-carrier versions; the current anchor and every unexpired point in the accepted recovery registry, plus any explicit same-format protected roots, are marked before exact-version sweep. The strongest represented finite retention is propagated across required restore dependencies. One read-only store-boundary ledger meters every planning HEAD, bounded range GET, and LIST page before forwarding; the verified current chain and namespace state are reused instead of replayed twice. Bounded inventory and one immutable plan renew and post-verify exact versions before guarded deletion. Existing graphs that require legal hold and foreign-format protected roots fail closed. | Implemented for the current anchor graph, authenticated recovery history, and repository-level same-format protected-root inputs, including actual-operation budget parity, zero-budget non-forwarding, invalid page rejection, and ambiguous renewal failure. The gateway does not expose client registration of arbitrary historical roots, legal holds, or format rotation. S3 list XML is capped before deserialization and returned member counts are checked against requested `MaxKeys`. Controlled-time tests cover expiry, renewal, guard faults, and eligible exact-version GC; a local retained RustFS/Kubernetes Lease fixture applies a reclamation-disabled plan with no provider deletes and preserves protected reads across restart. Provider-fault and 30-day outage qualification remain open. |
+
+Payload packs and detached objects share an attempt-bound segment AEAD scheme.
+Fresh attempts separate replacement uploads even when carrier, part number and
+content key match. Repository/keyring, object, section, carrier, attempt, part,
+segment length and EOF are authenticated. Layout and attempt identities live in
+encrypted index metadata; detached objects expose no self-describing header.
+Full publication readback remains mandatory. Multipart-boundary range and tamper
+tests cover the format capability and the gateway adapter covers the client
+multipart routes. Live-provider and default-request-checksum qualification remain
+separate from those local checks. The default request checksum is CRC64NVME for
+ordinary PUT and multipart creation, with full-object construction; supported
+non-CRC64 multipart algorithms use composite construction unless the client
+selects a different supported type.
 
 ## Rollback Rule
 
@@ -154,6 +246,76 @@ versions are useful history, not latest-state authority. A missing, older, or
 newer-looking backend commit is not a reason to trust storage; it is a reason to
 stop and recover from an explicitly trusted anchor bundle.
 
+Genesis publication verifies the full exact stored object before anchor CAS.
+Prepared genesis retries reuse the same signed bytes and reconcile ambiguous
+acceptance against that candidate. They cannot replace a different accepted
+anchor. Bootstrap intent must come from trusted unfinished-bootstrap state,
+never backend discovery; an old intent is not authorization to recreate an
+anchor lost after completed onboarding. Kubernetes CLI resumption uses that
+trusted intent and introduces no new backend-visible object class.
+
+Prepared publication can reconcile without an upload allowance. A missing
+unaccepted object requires a new, durably reserved attempt; absence alone is
+not permission to consume another retained version. Protected S3 PUTs use one
+SDK attempt even when the client enables retries. Read operations retain their
+configured retry policy. This lets a durable caller bound physical upload
+attempts across ambiguous responses and restarts.
+
+The Kubernetes bootstrap-journal primitive stores bounded progress in a
+dedicated, explicitly declared Secret. It binds ownership to the Secret and
+anchor Lease UIDs plus the writer epoch, checks the live Lease claim, and uses
+resource-version CAS for updates. Conflicts and cancelled updates invalidate
+the local handle. The primitive keeps process names out of its annotations and
+shares the cluster trust domain. Writable Kubernetes init requires this journal
+and persists artifact bytes and bounded upload reservations before backend PUTs.
+Context binding covers the configured backend target and principal fingerprint,
+repository identity, salt, wrapping-key ID and retention policy. Opening the
+planned artifacts also checks the actual wrapping key. This binds the declared
+principal fingerprint; it does not discover or independently attest the effective
+cloud identity. A completed journal cannot recreate a lost anchor. Independent
+off-cluster recovery is a separate deployment capability, not an onboarding
+prerequisite. The initial custody path uses declared Kubernetes Secrets and
+the live Lease; no offline recovery signer is required to initialize or serve.
+Losing that cluster can lose the keys and accepted-state authority. Portable
+signed bundle import remains an explicit recovery operation and does not allow
+a completed bootstrap journal to recreate an absent anchor.
+
+Anchor decoding requires repository format generation 3. Old or mixed Kubernetes
+anchor annotations fail closed; they are never treated as absent authority.
+
+Portable bundle signatures cover every unsigned canonical CBOR field, including
+the repository salt digest, complete anchor and format reference, recovery floor,
+and export time. Import requires the configured repository identity and retains
+the independent signature and operator-floor checks. JSON inspection reports
+are not accepted as recovery artifacts. The encoding changes no leakage:
+repository identity, opaque object references, sequences and export cadence are
+public; paths and key material remain absent. Format and keyring envelope
+purposes are authenticated under separate derived keys, and plaintext is
+zeroized after use.
+
+Provider evidence is projected in the same Secret revision as journal state.
+Reserving a new qualification attempt removes the prior projection. The chart's
+read-only startup wait requires matching completed state and current evidence;
+it neither acquires a writer Lease nor treats that journal as a replacement for
+live anchor verification. Bootstrap and serving use the same service account
+and backend credential references. Secret access is scoped to the declared
+journal; externally supplied evidence ConfigMaps are never updated by init.
+
+Journaled S3 bootstrap verifies a synthetic payload through authenticated
+repository publication and fresh recovery, then tombstones it before the startup
+wait passes. Bounded, persisted write reservations survive ambiguous replies;
+recovery of the accepted anchor precedes retries. Only its opaque fixture key
+enters encrypted repository metadata. Its encrypted payload and tombstone remain
+subject to retention and normal graph reclamation. This checks the gateway's
+initial restore path, not off-cluster recovery authority or future durability.
+
+Probe-leftover observations read only the reserved synthetic namespace, using
+bounded version listings and exact-version HEADs. They expose aggregate counts,
+lengths, retention deadlines, legal-hold counts and bounded warning codes, never
+listed object/version identifiers or provider error bodies. Reused observations
+retain their timestamp. Missing or delayed versions and unfinished multipart
+sessions can remain unobserved; neither counts nor deadlines authorize deletion.
+
 For read-write Kubernetes deployments, the writer guard records ownership on
 the anchor Lease itself before serving and renews it while the process runs.
 Each process identity is random-suffixed, every ownership transfer increments a
@@ -168,17 +330,21 @@ maintenance can run while no writer is active. Unfenced maintenance refuses to
 advance a Lease with an active writer epoch. This guard is runtime coordination,
 not a replacement for signed commits or the external anchor.
 
-For `v02`, the external anchor names the accepted commit key, body digest,
+For `v03`, the external anchor names the accepted commit key, body digest,
 provider version ID when required, signing key ID, and format-root reference.
 The named commit authenticates the small index catalog, exact active run set,
 and exact live payload references. Descriptor-first recovery verifies that
 graph and rechecks the anchor before installing state. Missing anchor plus
 missing trusted bundle is fail-closed for normal recovery.
 
+The chart-generated Role for `restore-readonly` grants only `get` on the
+selected anchor Lease. Lease creation and updates remain read-write gateway
+permissions; Helm tests verify both permission sets.
+
 ### Anchor Lease Annotation Visibility
 
 The Kubernetes Lease anchor stores its state in Lease annotations under the
-`rs3.rs/v2-*` prefix: the accepted sequence, commit object key, commit body
+`rs3.rs/v3-*` prefix with `rs3.rs/repository-format-generation=3`: the accepted sequence, commit object key, commit body
 digest, provider version ID, signing key ID, and format-root reference. Any
 subject with `get` or `list` on that Lease can read these annotations. That
 reveals the current anchor position, the backend commit object keys and digests,
@@ -193,7 +359,59 @@ S3 is not a writer lock. A conditional create can arbitrate one object key but
 cannot fence a stale gateway or establish an order between divergent repository
 roots. Read-write failover is supported only under one Kubernetes Lease
 coordination domain. Disconnected S3-only writers are rejected; safely adding
-them would require authenticated branches and merge semantics outside `v02`.
+them would require authenticated branches and merge semantics outside `v03`.
+
+Client version probes expose only the authenticated current namespace. Their
+`null` version label identifies the current value and can change on overwrite;
+it does not expose backend version IDs, retained commit history or a stable
+historical reference. These probes add no backend key class or plaintext
+metadata. Historical version requests remain unsupported.
+
+### Authenticated Recovery History
+
+The gateway enables automatic history for retained Object Lock repositories.
+Unretained development and atomic-create repositories support ordinary reads
+and writes without this protected history. With a configured v03 recovery
+policy, each accepted successor records its
+exact predecessor in an encrypted `Recovery` section with wire code `0x0008`.
+The current accepted anchor is implicit. A predecessor becomes a selectable
+recovery point only after the successor is accepted by the external anchor.
+Each point retains the policy identity and supersession deadline that applied at
+that acceptance. A later policy reduction governs new points and cannot shorten
+an existing point's promise.
+
+The signed publication time is checked strictly against the exact parent and is
+chosen from one sampled wall-clock value with a bounded lead. Expiry uses a
+separate sampled current time minus declared clock uncertainty and must be
+published as an accepted history transition. Provider timestamps and mutable
+latest-object state cannot expire a point.
+
+The encrypted registry has a bounded tail and exact page references. Pages are
+read one at a time under the existing recovery and graph budgets. If a page is
+partly expired, the gateway retains it conservatively through the page's latest
+deadline instead of releasing individual records. These structural limits do
+not establish an effective four-million-point capacity. Replay, graph,
+inventory, encoded-byte, provider-retention, and outage budgets can reduce the
+usable history window. The local retained RustFS/Kubernetes Lease fixture covers
+restart and selected historical reads, but provider-fault and 30-day outage
+qualification remain incomplete.
+
+For the retained-version Object Lock profile, the exact restore dependency graph
+must be covered before the successor's anchor CAS. The gateway renews and
+post-verifies exact provider versions, then rechecks the writer fence and
+unchanged parent before publication. Missing protection, an ambiguous result,
+budget exhaustion, or a fence change fails closed. This guarantee is finite and
+depends on the selected provider retaining exact versions for the configured
+window and renewal margin.
+
+The operator recovery interface can list bounded authenticated points with
+`rs3 recovery-points --limit N [--cursor TOKEN]` and open one with
+`rs3 serve --gateway-mode restore-readonly --recovery-point SEQUENCE`. It
+rechecks the live anchor and selected deadline before reads, and cannot publish,
+browse backend versions, or rewind the live namespace. The S3 data plane remains
+a current unversioned view: historical `versionId` reads, version listings,
+delete-marker APIs, and arbitrary client historical-root registration are
+unsupported.
 
 ## Object Lock Rule
 
@@ -217,9 +435,12 @@ restore follow mutable latest state.
 For retained multipart writes, `rs3` verifies finite Object Lock retention on
 the completed provider version before accepting the write. Providers that do
 not carry retention from multipart creation must support applying and verifying
-it on the returned exact version immediately after completion. Missing version
-IDs or failed protection verification fail closed. Client legal-hold requests
-are rejected until restore-dependency propagation and guarded release ship.
+it on the returned exact version immediately after completion. A retained
+`CopyObject` inherits the source effective protection and verifies that the
+exact source carrier and required restore metadata cover the new fixed copy
+timestamp before acknowledgement. Missing versions, deadlines, or failed
+protection verification fail closed. Client legal-hold requests are rejected
+until restore-dependency propagation and guarded release ship.
 
 A retained-version provider may accept a second same-key write instead of
 rejecting `If-None-Match: *`. That is acceptable only for retained/Object Lock
@@ -228,12 +449,19 @@ anchor-bound versions remain exactly readable. The object key is then not the
 uniqueness authority; the signed commit, external anchor, object digest, and
 provider version ID are.
 
-In both the removed prototype and current preview `v02`, commit keys include a
+In both the removed prototype and current preview `v03`, commit keys include a
 random component. For retained-version
 providers that do not support atomic create, the writer performs a preflight
 `HEAD` and binds the accepted object version into the anchor. A same-sequence
 or orphaned retained commit is reported and skipped by automatic GC until
 retention, legal-hold, and age checks allow safe cleanup.
+
+A provider delete marker hides the current object without erasing its older
+versions. The in-memory versioned backend models this behavior as well. Anchored
+reads and readiness checks use the accepted exact version, so a current delete
+marker alone does not make that version unavailable. Exact-version deletion
+remains subject to retention and legal-hold checks. These are backend storage
+semantics; client logical deletion publishes a repository tombstone.
 
 Non-retained development backends may omit version IDs. In that mode `rs3` can
 still authenticate object bytes and detect tampering of the bytes it reads, but
@@ -270,14 +498,23 @@ single-writer compatibility probes, but it is not atomic and does not protect
 against a provider that races requests, serves stale state, or ignores
 conditional headers.
 
-`rs3 check-v2-provider` currently runs the selected prototype profile probes against the
+`rs3 check-provider` currently runs the selected prototype profile probes against the
 configured backend, including multipart upload behavior used by large
 streaming writes. Full probe reads are collected under exact expected-length
 ceilings, and current/version inventories use paged listings with page and raw
-provider-member budgets. Governance-retention deployments require an explicit
+provider-member budgets. S3 probes use a disjoint synthetic namespace in the
+same bucket and the same SDK credential provider, with one SDK attempt per
+operation. Their object counts, sizes, timing and probe names are observable;
+they contain no client data or client paths.
+
+Retained qualification requires `protected-delete-provider-probe`: exact-version
+DELETE checks reach the provider without governance-bypass headers. A local
+adapter refusal alone cannot satisfy this requirement. An unprotected-delete
+control is also required. An access denial does not establish its IAM versus
+Object Lock cause or prove equivalent prefix-specific policies. Governance-retention deployments require an explicit
 operator review that gateway credentials cannot bypass retention. It must be
 extended to cover exact compacted sibling-carrier versions before it qualifies
-`v02`.
+`v03`.
 
 ## Operator Reporting Rule
 
@@ -338,15 +575,21 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
 
 ## Current Open Risks
 
-- The `v02` catalog, wire-version-6 pack/stream run model, compaction, and
-  automatic watermark paths remain preview-scoped. Durable format freeze,
-  retained-provider qualification, and external cryptographic review are still
-  outstanding.
+- Signed publication timestamps now enforce strict parent-relative chronology
+  with a bounded lead over the sampled clock. Expiry still uses a separately
+  sampled current time plus declared uncertainty and an accepted history
+  transition; signed timestamps alone are not a current-time oracle.
+
+- The `v03` catalog, wire-version-10 pack/stream run model, wire-version-6 root,
+  compaction, and automatic watermark paths remain preview-scoped. Durable
+  format freeze, retained-provider qualification, and external cryptographic
+  review are still outstanding.
 - Durable format compatibility is not promised yet.
 - The cryptographic design has not had an external review.
-- Metadata sealing uses a standard misuse-resistant AEAD, but deterministic
-  sealing leaks equality for identical metadata under identical associated data.
-- The v02 runtime omits the legacy durable prefix-token projection. Encrypted
+- Metadata sealing uses fresh random 96-bit nonces with a standard misuse-resistant
+  AEAD. Exact retry bytes remain linkable. Aggregate key-use and rotation limits
+  still need production qualification.
+- The v03 runtime omits the legacy durable prefix-token projection. Encrypted
   index shape, object counts, ciphertext sizes, and operation timing remain
   observable as documented in the leakage table.
 - Gateway-level deduplication is not part of the baseline format. A future mode
@@ -356,25 +599,36 @@ ciphertext cannot be made confidential again by envelope rewrap alone.
 - Foreground known-length standalone payload uploads are implemented with
   random object identities, segmented AEAD, exact-version postconditions, a
   complete ciphertext verification read, fenced reference publication,
-  process-local in-flight GC roots, and opaque-orphan reporting. Retained-
-  provider restart/handoff and destructive cross-process maintenance still need
-  release-candidate qualification.
+  process-local in-flight GC roots, and opaque-orphan reporting. Local retained
+  RustFS/Kubernetes Lease restart coverage passes, but destructive cross-process
+  maintenance, provider faults, and a 30-day outage still need release-candidate
+  qualification.
 - New writes isolate payload packs by effective retention cohort. The physical
   cohort type also preserves a legal-hold dimension for defensive parsing of
-  historical state, but v02 client hold publication is disabled. Historical or
+  historical state, but v03 client hold publication is disabled. Historical or
   otherwise over-protected mixed packs remain safe but may retain dead bytes
   until a future cleaner passes retained-version, protected-root, and crash
   qualification.
 - Packed-run catalog compaction and automatic pre-ceiling backpressure pass the
   in-memory and local fresh-process filesystem 1M lanes, but not pinned-runner
-  timing, retained-provider restart, or the full adversarial crash and
-  delayed-visibility matrix. Exact
+  timing, provider-fault or 30-day outage qualification, or the full adversarial
+  crash and delayed-visibility matrix. Exact
   mixed-pack cleaning remains incomplete. Level-1 tombstones are
   retained to mask older shards; safe bottom-tier tombstone reclamation remains
   future guarded or offline work. The hard 1,024-run stop is implemented and
   fails closed.
+- Older-run compaction uses only the accepted namespace and exact authenticated
+  source runs. It adds no plaintext backend keys or metadata. Counts, sizes,
+  maintenance cadence and retained historical object volume remain observable.
+  Pruning current-view obsolete upserts does not remove dependencies from a
+  protected historical root; GC marks those exact roots independently.
 - Retained backend history depends on provider retention or Object Lock to
   resist deletion by a storage administrator.
+- Authenticated recovery history is preview-scoped. Its page and section caps
+  are structural bounds, not an effective capacity claim; graph and provider
+  budgets can reduce the usable point count. Local retained RustFS/Kubernetes Lease
+  restart coverage passes; provider-fault and outage-limit qualification remain
+  incomplete.
 - Key retirement remains retention-aware and must not remove material still
   required by locked historical commits.
 
@@ -393,3 +647,20 @@ reviewers should ask:
 - Which runbook explains recovery when the object store or anchor service is
   hostile?
 - Does the change preserve fail-closed anchor behavior?
+
+
+Provider qualification evidence is bound to the executing Linux binary digest,
+source revision, backend target, declared principal fingerprint, repository
+format and exact requested retention policy. The executable digest distinguishes
+different dirty builds with the same Git revision. The gateway reads bounded
+schema-v5 evidence and rejects mismatched or retired reports. These bindings
+prevent accidental reuse across changes; they do not attest the host, cloud
+principal or future provider behavior. The qualification process and serving
+process must use the same executable.
+
+Index listing frames use byte-prefix compression within each encrypted frame.
+The backend sees the resulting aggregate ciphertext lengths, which depend on
+path lengths and shared-prefix structure. It does not receive the plaintext
+prefixes or record boundaries. Decoders reset at each frame and bound both
+encoded records and reconstructed paths before allocating memory. This encoding
+does not remove full paths from the trusted in-memory namespace.

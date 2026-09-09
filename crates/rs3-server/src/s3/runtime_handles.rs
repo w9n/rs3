@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use rs3_repository::v2::{V2AnchorState, V2CommitAnchor, V2Result};
+use rs3_repository::v3::{V3AnchorState, V3CommitAnchor, V3Result};
 use rs3_storage::{
     BlobList, BlobListMode, BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore, ByteRange,
     PutOptions,
@@ -7,7 +7,7 @@ use rs3_storage::{
 use std::sync::Arc;
 
 pub(super) type RuntimeStore = DynBlobStore;
-pub(super) type RuntimeV2Anchor = DynV2CommitAnchor;
+pub(super) type RuntimeV3Anchor = DynV3CommitAnchor;
 
 #[derive(Clone)]
 pub(super) struct DynBlobStore {
@@ -33,6 +33,10 @@ impl BlobStore for DynBlobStore {
         self.inner.put(object_id, body, options).await
     }
 
+    fn supports_provider_delete_probe(&self) -> bool {
+        self.inner.supports_provider_delete_probe()
+    }
+
     fn supports_multipart_upload(&self) -> bool {
         self.inner.supports_multipart_upload()
     }
@@ -43,6 +47,16 @@ impl BlobStore for DynBlobStore {
         options: PutOptions,
     ) -> rs3_storage::Result<Box<dyn BlobMultipartUpload>> {
         self.inner.create_multipart_upload(object_id, options).await
+    }
+
+    async fn create_multipart_session(
+        &self,
+        object_id: &rs3_types::BackendObjectId,
+        options: PutOptions,
+    ) -> rs3_storage::Result<Box<dyn rs3_storage::BlobMultipartSession>> {
+        self.inner
+            .create_multipart_session(object_id, options)
+            .await
     }
 
     async fn get_range(
@@ -169,12 +183,12 @@ impl BlobStore for DynBlobStore {
 }
 
 #[derive(Clone)]
-pub(super) struct DynV2CommitAnchor {
-    inner: Arc<dyn V2CommitAnchor>,
+pub(super) struct DynV3CommitAnchor {
+    inner: Arc<dyn V3CommitAnchor>,
 }
 
-impl DynV2CommitAnchor {
-    pub(super) fn new(anchor: impl V2CommitAnchor + 'static) -> Self {
+impl DynV3CommitAnchor {
+    pub(super) fn new(anchor: impl V3CommitAnchor + 'static) -> Self {
         Self {
             inner: Arc::new(anchor),
         }
@@ -182,16 +196,20 @@ impl DynV2CommitAnchor {
 }
 
 #[async_trait::async_trait]
-impl V2CommitAnchor for DynV2CommitAnchor {
-    async fn read_v2(&self) -> V2Result<Option<V2AnchorState>> {
-        self.inner.read_v2().await
+impl V3CommitAnchor for DynV3CommitAnchor {
+    async fn read_v3(&self) -> V3Result<Option<V3AnchorState>> {
+        self.inner.read_v3().await
     }
 
-    async fn compare_and_advance_v2(
+    async fn compare_and_advance_v3(
         &self,
-        expected: Option<&V2AnchorState>,
-        next: V2AnchorState,
-    ) -> V2Result<V2AnchorState> {
-        self.inner.compare_and_advance_v2(expected, next).await
+        expected: Option<&V3AnchorState>,
+        next: V3AnchorState,
+    ) -> V3Result<V3AnchorState> {
+        self.inner.compare_and_advance_v3(expected, next).await
+    }
+
+    async fn fence_and_read_v3(&self) -> V3Result<Option<V3AnchorState>> {
+        self.inner.fence_and_read_v3().await
     }
 }

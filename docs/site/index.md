@@ -55,12 +55,12 @@ accepted repository state directly to an object-store backend.
 
 `rs3` is being prepared for a production preview. The repository contains a
 working local gateway path, Kopia and Velero integration harnesses, repository
-encryption boundaries, Kubernetes Lease anchoring, signed v2 commit publishing,
+encryption boundaries, Kubernetes Lease anchoring, signed v03 commit publishing,
 restore-bundle workflows, retention-aware storage contracts, metrics, tracing,
 and performance measurement against a straight proxy baseline.
 
 `commits/v01` has been removed and is unsupported; it had no production
-repositories. The runtime now reads and writes bounded `commits/v02` payload
+repositories. The runtime now reads and writes bounded `commits/v03` payload
 packs, encrypted index runs, and signed index-root checkpoints. Packed reads
 resolve authenticated record descriptors from the encrypted index and fetch
 the exact payload ciphertext range without first reading pack metadata.
@@ -102,7 +102,7 @@ defaults as production-stable yet.
 | Platform lead | [Evaluation](evaluation.md) |
 | Release reviewer | [Production Preview](production-preview.md) |
 | Security reviewer | [Security Model](security-model.md) and [Security Review](security-review.md) |
-| Operator | [Operations](operations.md) and [Restore Under Attack](runbooks/restore-under-attack.md) |
+| Operator | [Deploy, Back Up, and Restore](deploy-backup-restore.md), then [Operations](operations.md) |
 | Contributor | [Architecture](architecture.md) and [Testing](testing.md) |
 | Performance reviewer | [Performance](performance.md) |
 

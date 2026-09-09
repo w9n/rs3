@@ -1,8 +1,15 @@
 # Console Reference
 
+!!! warning "Experimental, separate component"
+    `rs3-console` is experimental operator tooling outside the production-preview
+    gateway deployment contract. The gateway image and `rs3-gateway` Helm chart
+    do not include or deploy it. Run it as a separate process for local or
+    controlled inspection.
+
 `rs3-console` is a read-only browser console for one gateway. It exists to make
 the path-redacted admin facts easier to inspect without turning the gateway into a
-management system.
+management system. Its routes and report shape are preview tooling, not stable
+workflow APIs.
 
 ## Data Flow
 
@@ -33,7 +40,7 @@ The console may display:
 
 - gateway mode
 - restore trust state and reason code
-- v2 anchor sequence, commit digest, format generation, and version-binding state
+- v3 anchor sequence, commit digest, format generation, and version-binding state
 - backend kind and retention capability
 - anchor kind and external-anchor posture
 - repository retention posture

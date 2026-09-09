@@ -8,7 +8,8 @@ use rs3_types::{LegalHoldStatus, LogicalPath, RetentionMode, RetentionPolicy};
 use s3s::S3Result;
 use s3s::dto::{
     CommonPrefix, DeleteObjectInput, DeleteObjectsInput, GetObjectInput, GetObjectLegalHoldInput,
-    HeadObjectInput, Object, ObjectIdentifier, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+    HeadObjectInput, ListObjectVersionsInput, ListObjectVersionsOutput, Object, ObjectIdentifier,
+    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectVersion, ObjectVersionStorageClass,
     PutObjectInput, PutObjectLegalHoldInput, StreamingBlob, Timestamp,
 };
 use std::collections::BTreeMap;
@@ -183,7 +184,12 @@ fn put_object_retention_policy_at(
 }
 
 pub(super) fn validate_get_object_request(input: &GetObjectInput) -> S3Result<()> {
-    if input.part_number.is_some() || input.version_id.is_some() {
+    if input.part_number.is_some()
+        || input
+            .version_id
+            .as_deref()
+            .is_some_and(|version| version != "null")
+    {
         return Err(s3s::s3_error!(
             NotImplemented,
             "part numbers and object versions are not supported"
@@ -193,7 +199,12 @@ pub(super) fn validate_get_object_request(input: &GetObjectInput) -> S3Result<()
 }
 
 pub(super) fn validate_head_object_request(input: &HeadObjectInput) -> S3Result<()> {
-    if input.part_number.is_some() || input.version_id.is_some() {
+    if input.part_number.is_some()
+        || input
+            .version_id
+            .as_deref()
+            .is_some_and(|version| version != "null")
+    {
         return Err(s3s::s3_error!(
             NotImplemented,
             "part numbers and object versions are not supported"
@@ -203,7 +214,10 @@ pub(super) fn validate_head_object_request(input: &HeadObjectInput) -> S3Result<
 }
 
 pub(super) fn validate_delete_object_request(input: &DeleteObjectInput) -> S3Result<()> {
-    if input.version_id.is_some()
+    if input
+        .version_id
+        .as_deref()
+        .is_some_and(|version| version != "null")
         || input.if_match.is_some()
         || input.if_match_last_modified_time.is_some()
         || input.if_match_size.is_some()
@@ -233,7 +247,10 @@ pub(super) fn validate_delete_objects_request(input: &DeleteObjectsInput) -> S3R
 }
 
 pub(super) fn validate_delete_objects_entry(input: &ObjectIdentifier) -> S3Result<()> {
-    if input.version_id.is_some()
+    if input
+        .version_id
+        .as_deref()
+        .is_some_and(|version| version != "null")
         || input.e_tag.is_some()
         || input.last_modified_time.is_some()
         || input.size.is_some()
@@ -249,7 +266,11 @@ pub(super) fn validate_delete_objects_entry(input: &ObjectIdentifier) -> S3Resul
 pub(super) fn validate_get_object_legal_hold_request(
     input: &GetObjectLegalHoldInput,
 ) -> S3Result<()> {
-    if input.version_id.is_some() {
+    if input
+        .version_id
+        .as_deref()
+        .is_some_and(|version| version != "null")
+    {
         return Err(s3s::s3_error!(
             NotImplemented,
             "versioned GetObjectLegalHold is not supported"
@@ -329,7 +350,7 @@ pub(super) fn list_page(
                 key: Some(key.to_owned()),
                 last_modified: Some(timestamp(entry.modified_at_ms)?),
                 size: Some(i64_len(entry.content_len)?),
-                e_tag: Some(etag(entry.content_len, entry.modified_at_ms)),
+                e_tag: Some(etag(&entry.etag)),
                 ..Object::default()
             })),
         );
@@ -361,6 +382,108 @@ pub(super) fn list_page(
         key_count,
         next_continuation_token,
     })
+}
+
+pub(super) fn validate_list_versions_request(input: &ListObjectVersionsInput) -> S3Result<()> {
+    if input
+        .version_id_marker
+        .as_deref()
+        .is_some_and(|version| version != "null")
+    {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "historical version markers are not supported"
+        ));
+    }
+    if input.version_id_marker.is_some() && input.key_marker.as_deref().is_none_or(str::is_empty) {
+        return Err(s3s::s3_error!(
+            InvalidArgument,
+            "version-id-marker requires key-marker"
+        ));
+    }
+    if input
+        .encoding_type
+        .as_ref()
+        .is_some_and(|encoding| encoding.as_str() != "url")
+    {
+        return Err(s3s::s3_error!(InvalidArgument, "encoding-type must be url"));
+    }
+    if input.expected_bucket_owner.is_some()
+        || input.request_payer.is_some()
+        || input.optional_object_attributes.is_some()
+    {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "owner, payer and optional attributes are not supported"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn list_versions_output(
+    input: ListObjectVersionsInput,
+    page: ListPage,
+    max_keys: usize,
+) -> ListObjectVersionsOutput {
+    const KEY_ENCODING: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    let url_encoded = input.encoding_type.is_some();
+    let encode = |value: Option<String>| {
+        value.map(|value| {
+            if url_encoded {
+                percent_encoding::utf8_percent_encode(&value, KEY_ENCODING).to_string()
+            } else {
+                value
+            }
+        })
+    };
+    let next_version_id_marker = page.next_continuation_token.as_ref().and_then(|key| {
+        page.contents
+            .last()
+            .filter(|object| object.key.as_ref() == Some(key))
+            .map(|_| "null".to_owned())
+    });
+    let versions: Vec<_> = page
+        .contents
+        .into_iter()
+        .map(|object| ObjectVersion {
+            key: encode(object.key),
+            version_id: Some("null".to_owned()),
+            is_latest: Some(true),
+            e_tag: object.e_tag,
+            last_modified: object.last_modified,
+            size: object.size,
+            storage_class: Some(ObjectVersionStorageClass::from_static(
+                ObjectVersionStorageClass::STANDARD,
+            )),
+            ..ObjectVersion::default()
+        })
+        .collect();
+    let common_prefixes: Vec<_> = page
+        .common_prefixes
+        .into_iter()
+        .map(|prefix| CommonPrefix {
+            prefix: encode(prefix.prefix),
+        })
+        .collect();
+    ListObjectVersionsOutput {
+        name: Some(input.bucket),
+        prefix: encode(Some(input.prefix.unwrap_or_default())),
+        delimiter: encode(input.delimiter),
+        key_marker: encode(input.key_marker),
+        version_id_marker: input.version_id_marker,
+        max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
+        is_truncated: Some(page.next_continuation_token.is_some()),
+        next_key_marker: encode(page.next_continuation_token),
+        next_version_id_marker,
+        versions: (!versions.is_empty()).then_some(versions),
+        common_prefixes: (!common_prefixes.is_empty()).then_some(common_prefixes),
+        encoding_type: input.encoding_type,
+        ..ListObjectVersionsOutput::default()
+    }
 }
 
 pub(super) fn max_keys(value: Option<i32>) -> S3Result<usize> {
@@ -469,14 +592,19 @@ fn timestamp_system_time(timestamp: &Timestamp) -> S3Result<SystemTime> {
         .ok_or_else(|| s3s::s3_error!(InvalidRequest, "timestamp is out of range"))
 }
 
-pub(super) fn etag(content_len: u64, modified_at_ms: i64) -> s3s::dto::ETag {
-    s3s::dto::ETag::Strong(format!("rs3-{modified_at_ms:x}-{content_len:x}"))
+pub(super) fn etag(etag: &rs3_types::ObjectEtag) -> s3s::dto::ETag {
+    s3s::dto::ETag::Strong(etag.to_s3_string())
 }
 
 pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
     match error {
         RepositoryError::NotFound(_) => s3s::s3_error!(NoSuchKey),
-        RepositoryError::AlreadyExists(_) => s3s::s3_error!(PreconditionFailed),
+        RepositoryError::AlreadyExists(_) | RepositoryError::PreconditionFailed => {
+            s3s::s3_error!(PreconditionFailed)
+        }
+        RepositoryError::InvalidCopyOptions => {
+            s3s::s3_error!(InvalidRequest, "invalid CopyObject source condition")
+        }
         RepositoryError::CommitBackpressure => {
             s3s::s3_error!(ServiceUnavailable, "commit coordinator is overloaded")
         }
@@ -490,13 +618,12 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
                 "request body length did not match Content-Length"
             )
         }
-        RepositoryError::ObjectBodyReadFailed => {
+        RepositoryError::ObjectChecksumMismatch | RepositoryError::ContentMd5Mismatch => {
+            s3s::s3_error!(BadDigest, "checksum did not match request body")
+        }
+        RepositoryError::ObjectBodyReadFailed | RepositoryError::ObjectChecksumUnavailable => {
             s3s::s3_error!(IncompleteBody, "failed to read request body")
         }
-        RepositoryError::UnsupportedRepositoryFormat { .. } => s3s::s3_error!(
-            NotImplemented,
-            "repository format is not supported by this operation"
-        ),
         RepositoryError::Storage(StorageError::InvalidRange) => s3s::s3_error!(InvalidRange),
         RepositoryError::Storage(StorageError::LegalHoldBlocked) => {
             s3s::s3_error!(AccessDenied, "object legal hold blocked the operation")
@@ -568,9 +695,6 @@ pub(super) fn repository_error(error: RepositoryError) -> s3s::S3Error {
         RepositoryError::KeyringEnvelopeObjectConflict { .. } => {
             repository_operation_failed("KeyringEnvelopeObjectConflict")
         }
-        RepositoryError::IndexDeltaObjectConflict { .. } => {
-            repository_operation_failed("IndexDeltaObjectConflict")
-        }
         RepositoryError::InvalidObjectFormat { .. } => {
             repository_operation_failed("InvalidObjectFormat")
         }
@@ -596,12 +720,13 @@ mod tests {
     use bytes::Bytes;
     use futures_util::{StreamExt, stream};
     use rs3_repository::RepositoryListEntry;
-    use rs3_types::LogicalPath;
+    use rs3_types::{LogicalPath, Md5Digest, ObjectEtag};
     use s3s::dto::StreamingBlob;
     use std::time::Duration;
 
     fn entry(key: &str) -> RepositoryListEntry {
         RepositoryListEntry {
+            etag: ObjectEtag::single(Md5Digest::from_bytes([0; 16])),
             key: LogicalPath::new(key).unwrap_or_else(|error| panic!("{error}")),
             content_len: 1,
             modified_at_ms: 1,

@@ -31,8 +31,10 @@ const MINIO_IMAGE: &str = "minio/minio";
 const MINIO_TAG: &str = "latest";
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct S3ContainerOptions {
+pub(crate) struct S3ContainerOptions<'a> {
     pub(crate) object_lock: bool,
+    /// Optional Docker network through which a kind node can reach this backend.
+    pub(crate) network: Option<&'a str>,
 }
 
 pub(crate) struct RunningS3Container {
@@ -42,7 +44,19 @@ pub(crate) struct RunningS3Container {
     pub(crate) region: String,
     pub(crate) access_key_id: String,
     pub(crate) secret_access_key: String,
+    #[cfg(feature = "k8s")]
+    network_endpoint_url: Option<String>,
     _container: Container<GenericImage>,
+}
+
+#[cfg(feature = "k8s")]
+impl RunningS3Container {
+    /// Returns the endpoint visible from containers on the configured Docker network.
+    pub(crate) fn network_endpoint_url(&self) -> Result<&str> {
+        self.network_endpoint_url
+            .as_deref()
+            .context("S3 container was not started on a Docker network")
+    }
 }
 
 pub(crate) fn start_s3_container(
@@ -57,7 +71,7 @@ pub(crate) fn start_s3_container_with_options(
     provider: S3ContainerProvider,
     bucket: Option<String>,
     region: Option<String>,
-    options: S3ContainerOptions,
+    options: S3ContainerOptions<'_>,
 ) -> Result<RunningS3Container> {
     match provider {
         S3ContainerProvider::Rustfs => start_rustfs_container(bucket, region, options),
@@ -111,9 +125,9 @@ pub(crate) fn s3_client_with_timeout(
 fn start_rustfs_container(
     bucket: Option<String>,
     region: Option<String>,
-    options: S3ContainerOptions,
+    options: S3ContainerOptions<'_>,
 ) -> Result<RunningS3Container> {
-    let container = GenericImage::new(RUSTFS_IMAGE, RUSTFS_TAG)
+    let mut image = GenericImage::new(RUSTFS_IMAGE, RUSTFS_TAG)
         .with_exposed_port(RUSTFS_API_PORT.tcp())
         .with_wait_for(WaitFor::http(
             HttpWaitStrategy::new("/health")
@@ -129,7 +143,11 @@ fn start_rustfs_container(
             "/data",
         ])
         .with_env_var("RUSTFS_ACCESS_KEY", RUSTFS_ACCESS_KEY_ID)
-        .with_env_var("RUSTFS_SECRET_KEY", RUSTFS_SECRET_ACCESS_KEY)
+        .with_env_var("RUSTFS_SECRET_KEY", RUSTFS_SECRET_ACCESS_KEY);
+    if let Some(network) = options.network {
+        image = image.with_network(network);
+    }
+    let container = image
         .start()
         .context("failed to start RustFS test container")?;
     let host = container
@@ -139,6 +157,16 @@ fn start_rustfs_container(
         .get_host_port_ipv4(RUSTFS_API_PORT)
         .context("failed to resolve RustFS API port")?;
     let endpoint_url = format!("http://{host}:{api_port}");
+    #[cfg(feature = "k8s")]
+    let network_endpoint_url = options
+        .network
+        .map(|_| {
+            let address = container
+                .get_bridge_ip_address()
+                .context("failed to resolve RustFS container bridge address")?;
+            Ok::<_, anyhow::Error>(format!("http://{address}:{RUSTFS_API_PORT}"))
+        })
+        .transpose()?;
     let bucket = bucket.unwrap_or_else(|| default_container_bucket(S3ContainerProvider::Rustfs));
     let region = region.unwrap_or_else(|| RUSTFS_REGION.to_owned());
 
@@ -159,6 +187,8 @@ fn start_rustfs_container(
         region,
         access_key_id: RUSTFS_ACCESS_KEY_ID.to_owned(),
         secret_access_key: RUSTFS_SECRET_ACCESS_KEY.to_owned(),
+        #[cfg(feature = "k8s")]
+        network_endpoint_url,
         _container: container,
     })
 }
@@ -166,9 +196,9 @@ fn start_rustfs_container(
 fn start_minio_container(
     bucket: Option<String>,
     region: Option<String>,
-    options: S3ContainerOptions,
+    options: S3ContainerOptions<'_>,
 ) -> Result<RunningS3Container> {
-    let container = GenericImage::new(MINIO_IMAGE, MINIO_TAG)
+    let mut image = GenericImage::new(MINIO_IMAGE, MINIO_TAG)
         .with_exposed_port(MINIO_API_PORT.tcp())
         .with_wait_for(WaitFor::http(
             HttpWaitStrategy::new("/minio/health/ready")
@@ -178,7 +208,11 @@ fn start_minio_container(
         ))
         .with_cmd(["server", "/data", "--address", ":9000"])
         .with_env_var("MINIO_ROOT_USER", MINIO_ACCESS_KEY_ID)
-        .with_env_var("MINIO_ROOT_PASSWORD", MINIO_SECRET_ACCESS_KEY)
+        .with_env_var("MINIO_ROOT_PASSWORD", MINIO_SECRET_ACCESS_KEY);
+    if let Some(network) = options.network {
+        image = image.with_network(network);
+    }
+    let container = image
         .start()
         .context("failed to start MinIO test container")?;
     let host = container
@@ -188,6 +222,16 @@ fn start_minio_container(
         .get_host_port_ipv4(MINIO_API_PORT)
         .context("failed to resolve MinIO API port")?;
     let endpoint_url = format!("http://{host}:{api_port}");
+    #[cfg(feature = "k8s")]
+    let network_endpoint_url = options
+        .network
+        .map(|_| {
+            let address = container
+                .get_bridge_ip_address()
+                .context("failed to resolve MinIO container bridge address")?;
+            Ok::<_, anyhow::Error>(format!("http://{address}:{MINIO_API_PORT}"))
+        })
+        .transpose()?;
     let bucket = bucket.unwrap_or_else(|| default_container_bucket(S3ContainerProvider::Minio));
     let region = region.unwrap_or_else(|| MINIO_REGION.to_owned());
 
@@ -208,6 +252,8 @@ fn start_minio_container(
         region,
         access_key_id: MINIO_ACCESS_KEY_ID.to_owned(),
         secret_access_key: MINIO_SECRET_ACCESS_KEY.to_owned(),
+        #[cfg(feature = "k8s")]
+        network_endpoint_url,
         _container: container,
     })
 }
@@ -230,7 +276,7 @@ fn create_bucket(
     access_key_id: &str,
     secret_access_key: &str,
     bucket: &str,
-    options: S3ContainerOptions,
+    options: S3ContainerOptions<'_>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -252,7 +298,7 @@ async fn create_bucket_async(
     access_key_id: &str,
     secret_access_key: &str,
     bucket: &str,
-    options: S3ContainerOptions,
+    options: S3ContainerOptions<'_>,
 ) -> Result<()> {
     let client = s3_client(endpoint_url, region, access_key_id, secret_access_key);
     let started = Instant::now();
@@ -275,7 +321,7 @@ async fn create_bucket_async(
 async fn try_create_bucket(
     client: &Client,
     bucket: &str,
-    options: S3ContainerOptions,
+    options: S3ContainerOptions<'_>,
 ) -> Result<()> {
     let mut request = client.create_bucket().bucket(bucket);
     if options.object_lock {

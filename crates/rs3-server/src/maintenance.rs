@@ -1,6 +1,6 @@
 //! In-gateway maintenance supervisor.
 //!
-//! Runs v2 full maintenance (retention renewal plus orphan GC) automatically
+//! Runs v3 full maintenance (retention renewal plus orphan GC) automatically
 //! inside the read-write gateway with autovacuum-style behavior: threshold and
 //! deadline triggers, jitter, cooldown, exponential backoff, and single-flight
 //! execution. The supervisor depends only on the repository runtime surface;
@@ -9,11 +9,11 @@
 use crate::config::{MaintenanceConfig, MaintenanceMode};
 use async_trait::async_trait;
 use rs3_repository::RepositoryError;
-use rs3_repository::v2::{
-    V2FullGcApplyOptions, V2FullGcDryRunOptions, V2FullGcDryRunReport, V2FullGcPlanPreview,
-    V2MaintenanceCancellation, V2MaintenanceReport, V2OrphanGcOptions, V2QuickMaintenanceOptions,
+use rs3_repository::v3::{
+    V3FullGcApplyOptions, V3FullGcDryRunOptions, V3FullGcDryRunReport, V3FullGcPlanPreview,
+    V3MaintenanceCancellation, V3MaintenanceReport, V3OrphanGcOptions, V3QuickMaintenanceOptions,
 };
-use rs3_repository::v2::{V2FullGcApplyReport, V2FullMaintenanceReport};
+use rs3_repository::v3::{V3FullGcApplyReport, V3FullMaintenanceReport};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
@@ -28,7 +28,7 @@ const MAX_RENEWAL_JITTER: Duration = Duration::from_secs(60 * 60);
 /// Minimum provider-observed orphan age before automatic deletion.
 ///
 /// Conservative floor against eventually consistent listings; break-glass and
-/// test paths can supply their own [`V2OrphanGcOptions`].
+/// test paths can supply their own [`V3OrphanGcOptions`].
 const DEFAULT_AUTO_ORPHAN_GC_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 const OUTCOME_OK: &str = "ok";
@@ -87,7 +87,7 @@ pub enum MaintenanceRunPhase {
 
 /// Repository-facing surface the supervisor schedules maintenance through.
 ///
-/// Implementations depend only on the v2 repository handle and coordinator;
+/// Implementations depend only on the v3 repository handle and coordinator;
 /// no Kubernetes types appear on this boundary.
 #[async_trait]
 pub trait MaintenanceRuntime: Send + Sync {
@@ -95,27 +95,27 @@ pub trait MaintenanceRuntime: Send + Sync {
     fn maintenance_guard_configured(&self) -> bool;
 
     /// Runs the read-only quick maintenance report used for trigger inputs.
-    async fn quick_maintenance_report(&self) -> Result<V2MaintenanceReport, RepositoryError>;
+    async fn quick_maintenance_report(&self) -> Result<V3MaintenanceReport, RepositoryError>;
 
     /// Runs the quick report under explicit supervisor limits.
     async fn quick_maintenance_report_with_options(
         &self,
-        _options: V2QuickMaintenanceOptions,
-    ) -> Result<V2MaintenanceReport, RepositoryError> {
+        _options: V3QuickMaintenanceOptions,
+    ) -> Result<V3MaintenanceReport, RepositoryError> {
         self.quick_maintenance_report().await
     }
 
     /// Runs the budgeted read-only full-GC dry run without a maintenance window.
     async fn full_gc_dry_run(
         &self,
-        options: V2FullGcDryRunOptions,
-    ) -> Result<V2FullGcDryRunReport, RepositoryError>;
+        options: V3FullGcDryRunOptions,
+    ) -> Result<V3FullGcDryRunReport, RepositoryError>;
 
     /// Previews an exact repository-owned apply plan and digest.
     async fn preview_full_gc_plan(
         &self,
-        _options: V2FullGcApplyOptions,
-    ) -> Result<V2FullGcPlanPreview, RepositoryError> {
+        _options: V3FullGcApplyOptions,
+    ) -> Result<V3FullGcPlanPreview, RepositoryError> {
         Err(RepositoryError::CommitFailed {
             reason: "exact maintenance plan previews are unavailable".to_owned(),
         })
@@ -129,11 +129,11 @@ pub trait MaintenanceRuntime: Send + Sync {
     /// exact-plan digest does not match the supplied value.
     async fn run_full_maintenance(
         &self,
-        options: V2FullGcApplyOptions,
+        options: V3FullGcApplyOptions,
         expected_plan_digest: Option<&str>,
-        cancellation: &V2MaintenanceCancellation,
+        cancellation: &V3MaintenanceCancellation,
         on_phase: &(dyn Fn(MaintenanceRunPhase) + Send + Sync),
-    ) -> Result<V2FullMaintenanceReport, RepositoryError>;
+    ) -> Result<V3FullMaintenanceReport, RepositoryError>;
 }
 
 /// Supervisor state machine position.
@@ -183,6 +183,8 @@ pub enum MaintenanceTriggerReason {
     RenewalDeadline,
     /// Orphan bytes, count, or age crossed a pressure threshold.
     OrphanPressure,
+    /// An authenticated recovery-history record reached its expiry checkpoint.
+    RecoveryExpiry,
     /// The maximum interval since the last run elapsed.
     MaxInterval,
     /// An operator or admin API requested a run.
@@ -195,6 +197,7 @@ impl MaintenanceTriggerReason {
         match self {
             Self::RenewalDeadline => "renewal-deadline",
             Self::OrphanPressure => "orphan-pressure",
+            Self::RecoveryExpiry => "recovery-expiry",
             Self::MaxInterval => "max-interval",
             Self::Manual => "manual",
         }
@@ -323,6 +326,16 @@ pub struct MaintenanceStatusSnapshot {
     pub last_success_at_ms: Option<i64>,
     /// Nearest provider retain-until deadline observed by planning.
     pub nearest_retain_until_ms: Option<i64>,
+    /// Next authenticated recovery-history expiry checkpoint opportunity.
+    pub recovery_expiry_due_ms: Option<i64>,
+    /// Accepted current and historical recovery points that remain recoverable.
+    pub recovery_recoverable_point_count: u64,
+    /// Oldest signed publish time among accepted recoverable points.
+    pub recovery_oldest_recoverable_publish_time_ms: Option<i64>,
+    /// Deduplicated exact bytes retained solely for authenticated recovery history.
+    pub recovery_historical_exact_bytes: u64,
+    /// Authenticated clock uncertainty used when scheduling recovery renewal.
+    pub recovery_clock_uncertainty_ms: Option<u32>,
     /// Summary of the most recent run attempt.
     pub last_run: Option<MaintenanceRunSummary>,
     /// Bounded history of recent maintenance operations, newest first.
@@ -341,6 +354,11 @@ impl MaintenanceStatusSnapshot {
             consecutive_failures: 0,
             last_success_at_ms: None,
             nearest_retain_until_ms: None,
+            recovery_expiry_due_ms: None,
+            recovery_recoverable_point_count: 0,
+            recovery_oldest_recoverable_publish_time_ms: None,
+            recovery_historical_exact_bytes: 0,
+            recovery_clock_uncertainty_ms: None,
             last_run: None,
             operations: Vec::new(),
         }
@@ -545,7 +563,7 @@ pub struct MaintenanceDryRunOutcome {
     /// Deterministic digest identifying the produced plan.
     pub plan_digest: String,
     /// The budgeted read-only dry-run report.
-    pub report: V2FullGcDryRunReport,
+    pub report: V3FullGcDryRunReport,
 }
 
 /// Operator control surface for the running maintenance supervisor.
@@ -559,10 +577,10 @@ pub struct MaintenanceControlHandle {
     trigger: MaintenanceTriggerHandle,
     runtime: Arc<dyn MaintenanceRuntime>,
     clock: Arc<dyn MaintenanceClock>,
-    active_cancellation: Arc<RwLock<Option<Arc<V2MaintenanceCancellation>>>>,
+    active_cancellation: Arc<RwLock<Option<Arc<V3MaintenanceCancellation>>>>,
     dry_run_lock: Arc<tokio::sync::Mutex<()>>,
     maintenance: MaintenanceConfig,
-    orphan_gc: V2OrphanGcOptions,
+    orphan_gc: V3OrphanGcOptions,
     retained_provider_conformance: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
@@ -664,20 +682,21 @@ impl MaintenanceControlHandle {
         record.started_at_ms = Some(submitted_at_ms);
         self.status.record_operation(record);
 
-        let options = V2FullGcApplyOptions {
-            dry_run: V2FullGcDryRunOptions {
+        let options = V3FullGcApplyOptions {
+            dry_run: V3FullGcDryRunOptions {
                 budgets: self.maintenance.budgets(),
                 retention_renewal_horizon: self.maintenance.renewal_horizon,
                 protected_roots: Vec::new(),
             },
             orphan_gc: self.orphan_gc,
             retained_provider_conformance_passed: (self.retained_provider_conformance)(),
+            reclamation_enabled: self.maintenance.reclamation_enabled,
         };
         let result = self.runtime.preview_full_gc_plan(options).await;
         let finished_at_ms = self.clock.now_ms();
         match result {
             Ok(preview) => {
-                let V2FullGcPlanPreview {
+                let V3FullGcPlanPreview {
                     report,
                     plan_digest,
                 } = preview;
@@ -777,7 +796,7 @@ pub struct MaintenanceSupervisorConfig {
     /// Whether repository retention is configured on this gateway.
     pub retention_configured: bool,
     /// Orphan deletion policy applied by supervised runs.
-    pub orphan_gc: V2OrphanGcOptions,
+    pub orphan_gc: V3OrphanGcOptions,
     /// Returns current retained-provider conformance evidence state.
     ///
     /// Re-evaluated before every destructive run so refreshed evidence files
@@ -805,16 +824,16 @@ impl MaintenanceSupervisorConfig {
 ///
 /// Shared by the in-gateway supervisor and the offline break-glass command so
 /// both apply the same eventually-consistent-listing age floor.
-pub fn default_maintenance_orphan_gc_options() -> V2OrphanGcOptions {
+pub fn default_maintenance_orphan_gc_options() -> V3OrphanGcOptions {
     default_auto_orphan_gc_options()
 }
 
-fn default_auto_orphan_gc_options() -> V2OrphanGcOptions {
+fn default_auto_orphan_gc_options() -> V3OrphanGcOptions {
     // The production constructor fails closed below its one-hour floor; the
     // default supervisor floor is far above it, so this cannot fail. Fall
     // back to the floor itself if the invariant ever changes.
-    V2OrphanGcOptions::new(DEFAULT_AUTO_ORPHAN_GC_MIN_AGE)
-        .unwrap_or_else(|_| V2OrphanGcOptions::new_for_test_rehearsal(Duration::from_secs(60 * 60)))
+    V3OrphanGcOptions::new(DEFAULT_AUTO_ORPHAN_GC_MIN_AGE)
+        .unwrap_or_else(|_| V3OrphanGcOptions::new_for_test_rehearsal(Duration::from_secs(60 * 60)))
 }
 
 /// Running supervisor handle with status, trigger, and shutdown control.
@@ -822,7 +841,7 @@ pub struct MaintenanceSupervisorHandle {
     status: MaintenanceStatusHandle,
     trigger: MaintenanceTriggerHandle,
     shutdown: watch::Sender<bool>,
-    active_cancellation: Arc<RwLock<Option<Arc<V2MaintenanceCancellation>>>>,
+    active_cancellation: Arc<RwLock<Option<Arc<V3MaintenanceCancellation>>>>,
     control: MaintenanceControlHandle,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -907,7 +926,7 @@ impl MaintenanceSupervisor {
         ));
         let trigger = MaintenanceTriggerHandle::new();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let active_cancellation: Arc<RwLock<Option<Arc<V2MaintenanceCancellation>>>> =
+        let active_cancellation: Arc<RwLock<Option<Arc<V3MaintenanceCancellation>>>> =
             Arc::new(RwLock::new(None));
         let jitter =
             sample_renewal_jitter(renewal_jitter_ceiling(config.maintenance.renewal_horizon));
@@ -983,7 +1002,7 @@ struct SupervisorTask {
     status: MaintenanceStatusHandle,
     trigger: MaintenanceTriggerHandle,
     shutdown: watch::Receiver<bool>,
-    active_cancellation: Arc<RwLock<Option<Arc<V2MaintenanceCancellation>>>>,
+    active_cancellation: Arc<RwLock<Option<Arc<V3MaintenanceCancellation>>>>,
     renewal_jitter: Duration,
     consecutive_failures: u32,
     last_finished_at_ms: Option<i64>,
@@ -1032,8 +1051,21 @@ impl SupervisorTask {
                 Ok(report) => {
                     record_report_gauges(&report, self.clock.now_ms());
                     let nearest_retain_until_ms = report.nearest_retain_until_ms;
+                    let recovery_expiry_due_ms = report.recovery_expiry_due_ms;
+                    let recovery_recoverable_point_count = report.recovery_recoverable_point_count;
+                    let recovery_oldest_recoverable_publish_time_ms =
+                        report.recovery_oldest_recoverable_publish_time_ms;
+                    let recovery_historical_exact_bytes = report.recovery_historical_exact_bytes;
+                    let recovery_clock_uncertainty_ms = report.recovery_clock_uncertainty_ms;
                     self.status.update(|snapshot| {
                         snapshot.nearest_retain_until_ms = nearest_retain_until_ms;
+                        snapshot.recovery_expiry_due_ms = recovery_expiry_due_ms;
+                        snapshot.recovery_recoverable_point_count =
+                            recovery_recoverable_point_count;
+                        snapshot.recovery_oldest_recoverable_publish_time_ms =
+                            recovery_oldest_recoverable_publish_time_ms;
+                        snapshot.recovery_historical_exact_bytes = recovery_historical_exact_bytes;
+                        snapshot.recovery_clock_uncertainty_ms = recovery_clock_uncertainty_ms;
                     });
                     report
                 }
@@ -1172,8 +1204,8 @@ impl SupervisorTask {
         self.shutdown_requested()
     }
 
-    fn quick_report_options(&self) -> V2QuickMaintenanceOptions {
-        V2QuickMaintenanceOptions {
+    fn quick_report_options(&self) -> V3QuickMaintenanceOptions {
+        V3QuickMaintenanceOptions {
             budgets: self.config.maintenance.budgets(),
             retention_renewal_horizon: self.config.maintenance.renewal_horizon,
             orphan_gc: self.config.orphan_gc,
@@ -1182,7 +1214,7 @@ impl SupervisorTask {
 
     fn plan_next_trigger(
         &self,
-        report: Option<&V2MaintenanceReport>,
+        report: Option<&V3MaintenanceReport>,
         now_ms: i64,
     ) -> Option<PlannedTrigger> {
         let mut candidates: Vec<PlannedTrigger> = Vec::new();
@@ -1212,6 +1244,15 @@ impl SupervisorTask {
                     due_at_ms: latest_safe_at_ms.saturating_sub(jitter_ms),
                     latest_safe_at_ms: Some(latest_safe_at_ms),
                     reason: MaintenanceTriggerReason::RenewalDeadline,
+                });
+            }
+            if let Some(recovery_expiry_due_ms) =
+                report.and_then(|report| report.recovery_expiry_due_ms)
+            {
+                automatic.push(PlannedTrigger {
+                    due_at_ms: recovery_expiry_due_ms,
+                    latest_safe_at_ms: None,
+                    reason: MaintenanceTriggerReason::RecoveryExpiry,
                 });
             }
             if report.is_some_and(|report| self.orphan_pressure_due(report)) {
@@ -1263,7 +1304,7 @@ impl SupervisorTask {
         })
     }
 
-    fn orphan_pressure_due(&self, report: &V2MaintenanceReport) -> bool {
+    fn orphan_pressure_due(&self, report: &V3MaintenanceReport) -> bool {
         let maintenance = &self.config.maintenance;
         let count = u64::try_from(report.reclaimable_orphan_candidate_count).unwrap_or(u64::MAX);
         if report.reclaimable_orphan_candidate_bytes >= maintenance.orphan_pressure_bytes {
@@ -1329,17 +1370,18 @@ impl SupervisorTask {
         };
         operation.started_at_ms = Some(started_at_ms);
         self.status.record_operation(operation.clone());
-        let cancellation = Arc::new(V2MaintenanceCancellation::new());
+        let cancellation = Arc::new(V3MaintenanceCancellation::new());
         self.set_active_cancellation(Some(Arc::clone(&cancellation)));
 
-        let options = V2FullGcApplyOptions {
-            dry_run: V2FullGcDryRunOptions {
+        let options = V3FullGcApplyOptions {
+            dry_run: V3FullGcDryRunOptions {
                 budgets: self.config.maintenance.budgets(),
                 retention_renewal_horizon: self.config.maintenance.renewal_horizon,
                 protected_roots: Vec::new(),
             },
             orphan_gc: self.config.orphan_gc,
             retained_provider_conformance_passed: (self.config.retained_provider_conformance)(),
+            reclamation_enabled: self.config.maintenance.reclamation_enabled,
         };
 
         self.status.set_state(MaintenanceSupervisorState::Quiescing);
@@ -1443,14 +1485,14 @@ impl SupervisorTask {
         started_at_ms: i64,
         duration_ms_elapsed: u64,
         finished_at_ms: i64,
-        report: &V2FullMaintenanceReport,
+        report: &V3FullMaintenanceReport,
     ) -> (MaintenanceRunSummary, MaintenanceSupervisorState) {
         let apply = &report.apply;
         let aborted = apply.orphan_gc.aborted.as_ref();
         let cancelled = aborted.is_some_and(|error| {
             matches!(
                 error,
-                rs3_repository::v2::V2FormatError::MaintenanceCancelled
+                rs3_repository::v3::V3FormatError::MaintenanceCancelled
             )
         });
         let (outcome, next_state, failure_reason) = if cancelled {
@@ -1562,7 +1604,7 @@ impl SupervisorTask {
         });
     }
 
-    fn set_active_cancellation(&self, cancellation: Option<Arc<V2MaintenanceCancellation>>) {
+    fn set_active_cancellation(&self, cancellation: Option<Arc<V3MaintenanceCancellation>>) {
         let mut slot = match self.active_cancellation.write() {
             Ok(slot) => slot,
             Err(poisoned) => poisoned.into_inner(),
@@ -1571,11 +1613,22 @@ impl SupervisorTask {
     }
 }
 
-fn reclaimable_bytes(apply: &V2FullGcApplyReport) -> u64 {
+fn reclaimable_bytes(apply: &V3FullGcApplyReport) -> u64 {
     apply.dry_run.dead_bytes_reclaimable
 }
 
-fn record_report_gauges(report: &V2MaintenanceReport, now_ms: i64) {
+fn record_report_gauges(report: &V3MaintenanceReport, now_ms: i64) {
+    metrics::gauge!("rs3_maintenance_packed_payload_stored_bytes")
+        .set(report.packed_payload_stored_bytes as f64);
+    metrics::gauge!("rs3_maintenance_packed_payload_referenced_bytes")
+        .set(report.packed_payload_referenced_bytes as f64);
+    metrics::gauge!("rs3_maintenance_packed_payload_unreferenced_bytes").set(
+        report
+            .packed_payload_stored_bytes
+            .saturating_sub(report.packed_payload_referenced_bytes) as f64,
+    );
+    metrics::gauge!("rs3_maintenance_packed_payload_observed_timestamp_seconds")
+        .set(now_ms as f64 / 1000.0);
     metrics::gauge!("rs3_maintenance_orphan_candidate_bytes")
         .set(report.reclaimable_orphan_candidate_bytes as f64);
     metrics::gauge!("rs3_maintenance_orphan_candidate_count")
@@ -1588,6 +1641,16 @@ fn record_report_gauges(report: &V2MaintenanceReport, now_ms: i64) {
 }
 
 fn initialize_supervisor_metrics() {
+    // No complete observation exists yet. An unknown inventory must not look
+    // like a measured empty repository; failures preserve the last observation.
+    for name in [
+        "rs3_maintenance_packed_payload_stored_bytes",
+        "rs3_maintenance_packed_payload_referenced_bytes",
+        "rs3_maintenance_packed_payload_unreferenced_bytes",
+        "rs3_maintenance_packed_payload_observed_timestamp_seconds",
+    ] {
+        metrics::gauge!(name).set(f64::NAN);
+    }
     for outcome in [
         OUTCOME_OK,
         OUTCOME_FAILED,
@@ -1635,10 +1698,10 @@ mod tests {
     use crate::config::{MaintenanceConfig, MaintenanceMode};
     use async_trait::async_trait;
     use rs3_repository::RepositoryError;
-    use rs3_repository::v2::{
-        V2FullGcApplyOptions, V2FullGcApplyReport, V2FullGcDryRunOptions, V2FullGcDryRunReport,
-        V2FullGcPlanPreview, V2FullMaintenanceReport, V2MaintenanceCancellation,
-        V2MaintenancePlanCost, V2MaintenanceReport, V2OrphanGcOptions, V2OrphanGcReport,
+    use rs3_repository::v3::{
+        V3FullGcApplyOptions, V3FullGcApplyReport, V3FullGcDryRunOptions, V3FullGcDryRunReport,
+        V3FullGcPlanPreview, V3FullMaintenanceReport, V3MaintenanceCancellation,
+        V3MaintenancePlanCost, V3MaintenanceReport, V3OrphanGcOptions, V3OrphanGcReport,
     };
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1647,6 +1710,58 @@ mod tests {
     use tokio::sync::watch;
 
     const START_MS: i64 = 1_750_000_000_000;
+
+    #[test]
+    fn packed_payload_metrics_distinguish_unknown_from_zero_and_track_observation_time() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let sample = |metric: &str| -> f64 {
+            let rendered = handle.render();
+            let prefix = format!("{metric} ");
+            rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .expect("unlabelled sample is exposed")
+                .parse()
+                .expect("numeric metric sample")
+        };
+        metrics::with_local_recorder(&recorder, || {
+            super::initialize_supervisor_metrics();
+            assert!(sample("rs3_maintenance_packed_payload_unreferenced_bytes").is_nan());
+            assert!(sample("rs3_maintenance_packed_payload_observed_timestamp_seconds").is_nan());
+
+            let mut report = quick_report();
+            report.packed_payload_stored_bytes = 160;
+            report.packed_payload_referenced_bytes = 96;
+            super::record_report_gauges(&report, START_MS);
+            assert_eq!(sample("rs3_maintenance_packed_payload_stored_bytes"), 160.0);
+            assert_eq!(
+                sample("rs3_maintenance_packed_payload_referenced_bytes"),
+                96.0
+            );
+            assert_eq!(
+                sample("rs3_maintenance_packed_payload_unreferenced_bytes"),
+                64.0
+            );
+            assert_eq!(
+                sample("rs3_maintenance_packed_payload_observed_timestamp_seconds"),
+                START_MS as f64 / 1000.0
+            );
+
+            // A later complete observation can report genuinely zero unused
+            // bytes; startup's unknown sample must not be confused with this.
+            report.packed_payload_referenced_bytes = 160;
+            super::record_report_gauges(&report, START_MS + 1000);
+            assert_eq!(
+                sample("rs3_maintenance_packed_payload_unreferenced_bytes"),
+                0.0
+            );
+            assert_eq!(
+                sample("rs3_maintenance_packed_payload_observed_timestamp_seconds"),
+                START_MS as f64 / 1000.0 + 1.0
+            );
+        });
+    }
 
     struct SimulatedClock {
         now: watch::Sender<i64>,
@@ -1686,8 +1801,8 @@ mod tests {
         }
     }
 
-    fn quick_report() -> V2MaintenanceReport {
-        V2MaintenanceReport {
+    fn quick_report() -> V3MaintenanceReport {
+        V3MaintenanceReport {
             anchor_present: true,
             verified_commit_count: 1,
             last_anchored_commit_age_ms: Some(0),
@@ -1703,11 +1818,18 @@ mod tests {
             retention_renewal_blocked_count: 0,
             retention_renewal_blocked_bytes: 0,
             nearest_retain_until_ms: None,
+            recovery_expiry_due_ms: None,
+            recovery_recoverable_point_count: 0,
+            recovery_oldest_recoverable_publish_time_ms: None,
+            recovery_historical_exact_bytes: 0,
+            packed_payload_stored_bytes: 0,
+            packed_payload_referenced_bytes: 0,
+            recovery_clock_uncertainty_ms: None,
         }
     }
 
-    fn dry_run_report() -> V2FullGcDryRunReport {
-        V2FullGcDryRunReport {
+    fn dry_run_report() -> V3FullGcDryRunReport {
+        V3FullGcDryRunReport {
             base_sequence: None,
             chain_live_commit_count: 1,
             protected_root_count: 0,
@@ -1725,29 +1847,29 @@ mod tests {
             retention_renewal_bytes: 32,
             retention_renewal_blocked_count: 0,
             retention_renewal_blocked_bytes: 0,
-            planned_cost: V2MaintenancePlanCost::default(),
+            planned_cost: V3MaintenancePlanCost::default(),
             fits_budgets: true,
             exact_version_apply_ready: true,
         }
     }
 
-    fn full_report() -> V2FullMaintenanceReport {
-        V2FullMaintenanceReport {
+    fn full_report() -> V3FullMaintenanceReport {
+        V3FullMaintenanceReport {
             dry_run: dry_run_report(),
-            apply: V2FullGcApplyReport {
+            apply: V3FullGcApplyReport {
                 dry_run: dry_run_report(),
                 retention_renewed_object_count: 1,
                 retention_renewed_bytes: 32,
-                orphan_gc: V2OrphanGcReport {
+                orphan_gc: V3OrphanGcReport {
                     scanned_count: 1,
                     deleted_count: 1,
-                    ..V2OrphanGcReport::default()
+                    ..V3OrphanGcReport::default()
                 },
             },
         }
     }
 
-    fn mock_plan_digest(report: &V2FullGcDryRunReport) -> String {
+    fn mock_plan_digest(report: &V3FullGcDryRunReport) -> String {
         rs3_crypto::derive_public_fingerprint(
             b"rs3.maintenance.mock-plan.v1",
             &[
@@ -1762,9 +1884,11 @@ mod tests {
     struct MockRuntime {
         guard_configured: bool,
         clock: Arc<SimulatedClock>,
-        report: StdMutex<V2MaintenanceReport>,
-        dry_run: StdMutex<V2FullGcDryRunReport>,
-        queued_results: StdMutex<VecDeque<Result<V2FullMaintenanceReport, RepositoryError>>>,
+        report: StdMutex<V3MaintenanceReport>,
+        dry_run: StdMutex<V3FullGcDryRunReport>,
+        preview_options: StdMutex<Vec<V3FullGcApplyOptions>>,
+        run_options: StdMutex<Vec<V3FullGcApplyOptions>>,
+        queued_results: StdMutex<VecDeque<Result<V3FullMaintenanceReport, RepositoryError>>>,
         always_fail: bool,
         hold_gate: Option<Arc<tokio::sync::Semaphore>>,
         wait_for_cancellation: bool,
@@ -1782,6 +1906,8 @@ mod tests {
                 clock,
                 report: StdMutex::new(quick_report()),
                 dry_run: StdMutex::new(dry_run_report()),
+                preview_options: StdMutex::new(Vec::new()),
+                run_options: StdMutex::new(Vec::new()),
                 queued_results: StdMutex::new(VecDeque::new()),
                 always_fail: false,
                 hold_gate: None,
@@ -1794,11 +1920,11 @@ mod tests {
             }
         }
 
-        fn set_report(&self, report: V2MaintenanceReport) {
+        fn set_report(&self, report: V3MaintenanceReport) {
             *self.report.lock().expect("mock report lock") = report;
         }
 
-        fn set_dry_run_report(&self, report: V2FullGcDryRunReport) {
+        fn set_dry_run_report(&self, report: V3FullGcDryRunReport) {
             *self.dry_run.lock().expect("mock dry-run lock") = report;
         }
 
@@ -1812,6 +1938,22 @@ mod tests {
                 .expect("mock run lock")
                 .clone()
         }
+
+        fn last_preview_options(&self) -> Option<V3FullGcApplyOptions> {
+            self.preview_options
+                .lock()
+                .expect("mock preview options lock")
+                .last()
+                .cloned()
+        }
+
+        fn last_run_options(&self) -> Option<V3FullGcApplyOptions> {
+            self.run_options
+                .lock()
+                .expect("mock run options lock")
+                .last()
+                .cloned()
+        }
     }
 
     #[async_trait]
@@ -1820,7 +1962,7 @@ mod tests {
             self.guard_configured
         }
 
-        async fn quick_maintenance_report(&self) -> Result<V2MaintenanceReport, RepositoryError> {
+        async fn quick_maintenance_report(&self) -> Result<V3MaintenanceReport, RepositoryError> {
             self.quick_report_count.fetch_add(1, Ordering::SeqCst);
             if self.fail_quick_report.load(Ordering::SeqCst) {
                 return Err(RepositoryError::CommitFailed {
@@ -1832,17 +1974,21 @@ mod tests {
 
         async fn full_gc_dry_run(
             &self,
-            _options: V2FullGcDryRunOptions,
-        ) -> Result<V2FullGcDryRunReport, RepositoryError> {
+            _options: V3FullGcDryRunOptions,
+        ) -> Result<V3FullGcDryRunReport, RepositoryError> {
             Ok(self.dry_run.lock().expect("mock dry-run lock").clone())
         }
 
         async fn preview_full_gc_plan(
             &self,
-            _options: V2FullGcApplyOptions,
-        ) -> Result<V2FullGcPlanPreview, RepositoryError> {
+            options: V3FullGcApplyOptions,
+        ) -> Result<V3FullGcPlanPreview, RepositoryError> {
+            self.preview_options
+                .lock()
+                .expect("mock preview options lock")
+                .push(options);
             let report = self.dry_run.lock().expect("mock dry-run lock").clone();
-            Ok(V2FullGcPlanPreview {
+            Ok(V3FullGcPlanPreview {
                 plan_digest: mock_plan_digest(&report),
                 report,
             })
@@ -1850,11 +1996,15 @@ mod tests {
 
         async fn run_full_maintenance(
             &self,
-            _options: V2FullGcApplyOptions,
+            options: V3FullGcApplyOptions,
             expected_plan_digest: Option<&str>,
-            cancellation: &V2MaintenanceCancellation,
+            cancellation: &V3MaintenanceCancellation,
             on_phase: &(dyn Fn(MaintenanceRunPhase) + Send + Sync),
-        ) -> Result<V2FullMaintenanceReport, RepositoryError> {
+        ) -> Result<V3FullMaintenanceReport, RepositoryError> {
+            self.run_options
+                .lock()
+                .expect("mock run options lock")
+                .push(options);
             self.run_started_at_ms
                 .lock()
                 .expect("mock run lock")
@@ -1882,13 +2032,13 @@ mod tests {
                 }
                 self.concurrent.fetch_sub(1, Ordering::SeqCst);
                 return Err(RepositoryError::CommitFailed {
-                    reason: "v2 maintenance run was cancelled".to_owned(),
+                    reason: "v03 maintenance run was cancelled".to_owned(),
                 });
             }
             self.concurrent.fetch_sub(1, Ordering::SeqCst);
             if self.always_fail {
                 return Err(RepositoryError::CommitFailed {
-                    reason: "v2 maintenance run failed for test".to_owned(),
+                    reason: "v03 maintenance run failed for test".to_owned(),
                 });
             }
             self.queued_results
@@ -1903,7 +2053,7 @@ mod tests {
         MaintenanceSupervisorConfig {
             maintenance,
             retention_configured: true,
-            orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+            orphan_gc: V3OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
             retained_provider_conformance: Arc::new(|| true),
         }
     }
@@ -1979,6 +2129,42 @@ mod tests {
             "due {due} outside jitter window"
         );
         assert_eq!(runtime.run_count(), 0, "far deadline must not run yet");
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn recovery_expiry_trigger_uses_authenticated_due_time_without_jitter() {
+        let clock = Arc::new(SimulatedClock::new(START_MS));
+        let due = START_MS + 10 * 24 * 60 * 60 * 1000;
+        let mut report = quick_report();
+        report.recovery_expiry_due_ms = Some(due);
+        report.recovery_recoverable_point_count = 3;
+        report.recovery_oldest_recoverable_publish_time_ms = Some(1_000);
+        report.recovery_historical_exact_bytes = 4_096;
+        report.recovery_clock_uncertainty_ms = Some(250);
+        let runtime = Arc::new(MockRuntime::new(Arc::clone(&clock)));
+        runtime.set_report(report);
+        let mut maintenance = test_maintenance_config();
+        maintenance.max_interval = Duration::from_secs(30 * 24 * 60 * 60);
+        let handle = start(
+            supervisor_config(maintenance),
+            Arc::clone(&runtime),
+            Arc::clone(&clock),
+        );
+
+        wait_until(|| snapshot_of(&handle).next_trigger_reason == Some("recovery-expiry")).await;
+
+        let snapshot = snapshot_of(&handle);
+        assert_eq!(snapshot.next_trigger_at_ms, Some(due));
+        assert_eq!(snapshot.recovery_expiry_due_ms, Some(due));
+        assert_eq!(snapshot.recovery_recoverable_point_count, 3);
+        assert_eq!(
+            snapshot.recovery_oldest_recoverable_publish_time_ms,
+            Some(1_000)
+        );
+        assert_eq!(snapshot.recovery_historical_exact_bytes, 4_096);
+        assert_eq!(snapshot.recovery_clock_uncertainty_ms, Some(250));
+        assert_eq!(runtime.run_count(), 0, "future expiry must not run yet");
         handle.shutdown().await;
     }
 
@@ -2390,6 +2576,7 @@ mod tests {
         let runtime = Arc::new(MockRuntime::new(Arc::clone(&clock)));
         let mut maintenance = test_maintenance_config();
         maintenance.mode = MaintenanceMode::Manual;
+        maintenance.reclamation_enabled = false;
         let handle = start(
             supervisor_config(maintenance),
             Arc::clone(&runtime),
@@ -2417,6 +2604,18 @@ mod tests {
         assert_eq!(record.deleted_object_count, 1);
         assert!(record.finished_at_ms.is_some());
         assert_eq!(runtime.run_count(), 1);
+        assert!(
+            !runtime
+                .last_preview_options()
+                .expect("dry run options")
+                .reclamation_enabled
+        );
+        assert!(
+            !runtime
+                .last_run_options()
+                .expect("apply options")
+                .reclamation_enabled
+        );
 
         let snapshot = snapshot_of(&handle);
         assert!(
@@ -2614,12 +2813,12 @@ mod integration_tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use rs3_crypto::KeyRing;
-    use rs3_repository::v2::{
-        UnenforcedQuiescedMaintenanceGuard, V2AnchorState, V2CommitAnchor, V2CommitCoordinator,
-        V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite, V2FormatError,
-        V2FormatRef, V2FullGcApplyOptions, V2FullMaintenanceReport, V2KeyringEnvelopeRef,
-        V2KeyringEnvelopeRootRef, V2MaintenanceCancellation, V2MaintenanceReport, V2MemoryAnchor,
-        V2OrphanGcOptions, V2ProviderProfile, V2Repository, V2Result, V2SectionType,
+    use rs3_repository::v3::{
+        UnenforcedQuiescedMaintenanceGuard, V3AnchorState, V3CommitAnchor, V3CommitCoordinator,
+        V3CommitSection, V3CommitStore, V3CommitStoreOptions, V3CommitWrite, V3FormatError,
+        V3FormatRef, V3FullGcApplyOptions, V3FullMaintenanceReport, V3KeyringEnvelopeRef,
+        V3KeyringEnvelopeRootRef, V3MaintenanceCancellation, V3MaintenanceReport, V3MemoryAnchor,
+        V3OrphanGcOptions, V3ProviderProfile, V3Repository, V3Result, V3SectionType,
     };
     use rs3_repository::{
         CommitCoordinatorOptions, RepositoryError, RepositoryOptions, RepositoryPutOptions,
@@ -2630,28 +2829,28 @@ mod integration_tests {
     use std::time::Duration;
 
     struct FailingAdvanceAnchor {
-        inner: V2MemoryAnchor,
+        inner: V3MemoryAnchor,
     }
 
     #[async_trait]
-    impl V2CommitAnchor for FailingAdvanceAnchor {
-        async fn read_v2(&self) -> V2Result<Option<V2AnchorState>> {
-            self.inner.read_v2().await
+    impl V3CommitAnchor for FailingAdvanceAnchor {
+        async fn read_v3(&self) -> V3Result<Option<V3AnchorState>> {
+            self.inner.read_v3().await
         }
 
-        async fn compare_and_advance_v2(
+        async fn compare_and_advance_v3(
             &self,
-            _expected: Option<&V2AnchorState>,
-            _next: V2AnchorState,
-        ) -> V2Result<V2AnchorState> {
-            Err(V2FormatError::AnchorAdvanceFailed)
+            _expected: Option<&V3AnchorState>,
+            _next: V3AnchorState,
+        ) -> V3Result<V3AnchorState> {
+            Err(V3FormatError::AnchorAdvanceFailed)
         }
     }
 
     struct LocalMaintenanceRuntime {
-        repository: Arc<V2Repository<MemoryBlobStore>>,
-        anchor: V2MemoryAnchor,
-        coordinator: Arc<V2CommitCoordinator<MemoryBlobStore, V2MemoryAnchor>>,
+        repository: Arc<V3Repository<MemoryBlobStore>>,
+        anchor: V3MemoryAnchor,
+        coordinator: Arc<V3CommitCoordinator<MemoryBlobStore, V3MemoryAnchor>>,
     }
 
     #[async_trait]
@@ -2660,7 +2859,7 @@ mod integration_tests {
             self.coordinator.has_maintenance_guard()
         }
 
-        async fn quick_maintenance_report(&self) -> Result<V2MaintenanceReport, RepositoryError> {
+        async fn quick_maintenance_report(&self) -> Result<V3MaintenanceReport, RepositoryError> {
             self.repository
                 .commit_store()
                 .quick_maintenance(&self.anchor)
@@ -2672,15 +2871,15 @@ mod integration_tests {
 
         async fn full_gc_dry_run(
             &self,
-            options: rs3_repository::v2::V2FullGcDryRunOptions,
-        ) -> Result<rs3_repository::v2::V2FullGcDryRunReport, RepositoryError> {
+            options: rs3_repository::v3::V3FullGcDryRunOptions,
+        ) -> Result<rs3_repository::v3::V3FullGcDryRunReport, RepositoryError> {
             self.repository.full_gc_dry_run(&self.anchor, options).await
         }
 
         async fn preview_full_gc_plan(
             &self,
-            options: V2FullGcApplyOptions,
-        ) -> Result<rs3_repository::v2::V2FullGcPlanPreview, RepositoryError> {
+            options: V3FullGcApplyOptions,
+        ) -> Result<rs3_repository::v3::V3FullGcPlanPreview, RepositoryError> {
             self.repository
                 .preview_full_gc_plan(&self.anchor, options)
                 .await
@@ -2688,11 +2887,11 @@ mod integration_tests {
 
         async fn run_full_maintenance(
             &self,
-            options: V2FullGcApplyOptions,
+            options: V3FullGcApplyOptions,
             expected_plan_digest: Option<&str>,
-            cancellation: &V2MaintenanceCancellation,
+            cancellation: &V3MaintenanceCancellation,
             on_phase: &(dyn Fn(MaintenanceRunPhase) + Send + Sync),
-        ) -> Result<V2FullMaintenanceReport, RepositoryError> {
+        ) -> Result<V3FullMaintenanceReport, RepositoryError> {
             on_phase(MaintenanceRunPhase::Quiescing);
             let window = self.coordinator.begin_maintenance_window().await?;
             on_phase(MaintenanceRunPhase::Applying);
@@ -2717,10 +2916,10 @@ mod integration_tests {
 
     async fn commit_store_options(
         store: &MemoryBlobStore,
-        profile: V2ProviderProfile,
+        profile: V3ProviderProfile,
         retention: Option<RetentionPolicy>,
-    ) -> V2CommitStoreOptions {
-        let keyring_ref = V2KeyringEnvelopeRef {
+    ) -> V3CommitStoreOptions {
+        let keyring_ref = V3KeyringEnvelopeRef {
             object_id: object_id("keyrings/00000000000000000001-bootstrap"),
             digest: [6_u8; 32],
         };
@@ -2735,7 +2934,7 @@ mod integration_tests {
             )
             .await
             .expect("keyring root put should succeed");
-        let mut format_ref = V2FormatRef {
+        let mut format_ref = V3FormatRef {
             generation: 1,
             digest: hex::encode([7_u8; 32]),
             object_id: object_id(&format!("format/{:020}-{}", 1_u64, hex::encode([7_u8; 32]))),
@@ -2753,13 +2952,13 @@ mod integration_tests {
             .await
             .expect("format root put should succeed");
         format_ref.version_id = format_metadata.version_id.clone();
-        let keyring_root = V2KeyringEnvelopeRootRef {
+        let keyring_root = V3KeyringEnvelopeRootRef {
             generation: 1,
             digest: hex::encode(keyring_ref.digest),
             object_id: keyring_ref.object_id.clone(),
             version_id: keyring_metadata.version_id,
         };
-        V2CommitStoreOptions::for_profile(
+        V3CommitStoreOptions::for_profile(
             profile,
             RepositoryId::new("supervisor-test-repository").expect("repository ID"),
             keyring_ref,
@@ -2776,11 +2975,11 @@ mod integration_tests {
         let retention = Some(RetentionPolicy::new(RetentionMode::Governance, 30));
         let options = commit_store_options(
             &store,
-            V2ProviderProfile::RetainedVersionObjectLock,
+            V3ProviderProfile::RetainedVersionObjectLock,
             retention,
         )
         .await;
-        let repository = Arc::new(V2Repository::new(
+        let repository = Arc::new(V3Repository::new(
             store.clone(),
             keyring.clone(),
             RepositoryOptions {
@@ -2789,7 +2988,7 @@ mod integration_tests {
             },
             options,
         ));
-        let anchor = V2MemoryAnchor::new();
+        let anchor = V3MemoryAnchor::new();
         repository
             .write_genesis_snapshot(&anchor)
             .await
@@ -2806,32 +3005,32 @@ mod integration_tests {
 
         // An unretained commit whose anchor advance failed is a deletable
         // orphan; live commits above keep provider retention.
-        let orphan_writer = V2CommitStore::new(
+        let orphan_writer = V3CommitStore::new(
             store.clone(),
             keyring.clone(),
-            commit_store_options(&store, V2ProviderProfile::Dev, None).await,
+            commit_store_options(&store, V3ProviderProfile::Dev, None).await,
         );
         let forked = anchor
-            .read_v2()
+            .read_v3()
             .await
             .expect("anchor read")
             .expect("anchor state");
         let failed = orphan_writer
             .write_child_commit(
                 &FailingAdvanceAnchor {
-                    inner: V2MemoryAnchor::with_state(forked),
+                    inner: V3MemoryAnchor::with_state(forked),
                 },
-                V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
+                V3CommitWrite::delta(vec![V3CommitSection::new(
+                    V3SectionType::IndexRun,
+                    rs3_repository::v3::V3_SECTION_FLAG_MUST_UNDERSTAND,
                     Bytes::from_static(b"supervisor-orphan"),
                 )]),
             )
             .await;
-        assert!(matches!(failed, Err(V2FormatError::AnchorAdvanceFailed)));
+        assert!(matches!(failed, Err(V3FormatError::AnchorAdvanceFailed)));
 
         let coordinator = Arc::new(
-            V2CommitCoordinator::with_options(
+            V3CommitCoordinator::with_options(
                 Arc::clone(&repository),
                 anchor.clone(),
                 CommitCoordinatorOptions::new(1, Duration::ZERO),
@@ -2860,7 +3059,7 @@ mod integration_tests {
             MaintenanceSupervisorConfig {
                 maintenance,
                 retention_configured: true,
-                orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+                orphan_gc: V3OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                 retained_provider_conformance: Arc::new(|| true),
             },
             runtime,
@@ -2925,14 +3124,14 @@ mod integration_tests {
     async fn control_dry_run_then_apply_reclaims_orphans_on_memory_backend() {
         let store = MemoryBlobStore::new();
         let keyring = KeyRing::generate_random().expect("test keyring");
-        let options = commit_store_options(&store, V2ProviderProfile::Dev, None).await;
-        let repository = Arc::new(V2Repository::new(
+        let options = commit_store_options(&store, V3ProviderProfile::Dev, None).await;
+        let repository = Arc::new(V3Repository::new(
             store.clone(),
             keyring.clone(),
             RepositoryOptions::default(),
             options,
         ));
-        let anchor = V2MemoryAnchor::new();
+        let anchor = V3MemoryAnchor::new();
         repository
             .write_genesis_snapshot(&anchor)
             .await
@@ -2947,32 +3146,32 @@ mod integration_tests {
             .await
             .expect("live put");
 
-        let orphan_writer = V2CommitStore::new(
+        let orphan_writer = V3CommitStore::new(
             store.clone(),
             keyring.clone(),
-            commit_store_options(&store, V2ProviderProfile::Dev, None).await,
+            commit_store_options(&store, V3ProviderProfile::Dev, None).await,
         );
         let forked = anchor
-            .read_v2()
+            .read_v3()
             .await
             .expect("anchor read")
             .expect("anchor state");
         let failed = orphan_writer
             .write_child_commit(
                 &FailingAdvanceAnchor {
-                    inner: V2MemoryAnchor::with_state(forked),
+                    inner: V3MemoryAnchor::with_state(forked),
                 },
-                V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexDelta,
-                    0,
+                V3CommitWrite::delta(vec![V3CommitSection::new(
+                    V3SectionType::IndexRun,
+                    rs3_repository::v3::V3_SECTION_FLAG_MUST_UNDERSTAND,
                     Bytes::from_static(b"control-orphan"),
                 )]),
             )
             .await;
-        assert!(matches!(failed, Err(V2FormatError::AnchorAdvanceFailed)));
+        assert!(matches!(failed, Err(V3FormatError::AnchorAdvanceFailed)));
 
         let coordinator = Arc::new(
-            V2CommitCoordinator::with_options(
+            V3CommitCoordinator::with_options(
                 Arc::clone(&repository),
                 anchor.clone(),
                 CommitCoordinatorOptions::new(1, Duration::ZERO),
@@ -2994,7 +3193,7 @@ mod integration_tests {
             MaintenanceSupervisorConfig {
                 maintenance,
                 retention_configured: false,
-                orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+                orphan_gc: V3OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                 retained_provider_conformance: Arc::new(|| true),
             },
             runtime,

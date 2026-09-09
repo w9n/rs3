@@ -1,13 +1,14 @@
-use super::runtime_handles::{RuntimeStore, RuntimeV2Anchor};
+use super::runtime_handles::{RuntimeStore, RuntimeV3Anchor};
 use super::{S3BoundaryError, repository_init};
-use crate::{AnchorConfig, BackendConfig, BatchConfig};
+use crate::{AnchorConfig, BackendConfig, BatchConfig, GatewayMode};
 #[cfg(feature = "k8s")]
 use rs3_k8s::{KubernetesLeaseAnchor, LeaseSettings, WriterFence};
 use rs3_repository::CommitCoordinatorOptions;
-use rs3_repository::v2::V2MemoryAnchor;
+use rs3_repository::v3::V3MemoryAnchor;
 use rs3_storage::{FilesystemBlobStore, MemoryBlobStore};
 #[cfg(feature = "s3")]
 use rs3_storage::{S3BlobStore, S3BlobStoreConfig, S3ClientTimeoutConfig};
+use rs3_types::RetentionPolicy;
 use std::path::{Component, Path, PathBuf};
 
 pub(super) struct StoreBuild {
@@ -18,10 +19,10 @@ pub(super) struct StoreBuild {
     memory_store: Option<MemoryBlobStore>,
 }
 
-pub(super) struct V2AnchorBuild {
-    handle: RuntimeV2Anchor,
+pub(super) struct V3AnchorBuild {
+    handle: RuntimeV3Anchor,
     #[cfg(test)]
-    memory_anchor: Option<V2MemoryAnchor>,
+    memory_anchor: Option<V3MemoryAnchor>,
 }
 
 impl StoreBuild {
@@ -33,9 +34,43 @@ impl StoreBuild {
         self.handle
     }
 
-    #[cfg(feature = "s3")]
-    pub(super) fn s3_store(&self) -> Option<&S3BlobStore> {
-        self.s3_store.as_ref()
+    /// Check write protection before keyring, format, genesis or anchor writes.
+    pub(super) async fn validate_write_policy(
+        &self,
+        mode: GatewayMode,
+        retention: Option<RetentionPolicy>,
+    ) -> Result<(), S3BoundaryError> {
+        if mode == GatewayMode::RestoreReadOnly {
+            return Ok(());
+        }
+        #[cfg(feature = "s3")]
+        if let Some(store) = self.s3_store.as_ref() {
+            store
+                .validate_repository_write_policy(retention.as_ref())
+                .await
+                .map_err(repository_init)?;
+        }
+        let _ = retention;
+        Ok(())
+    }
+
+    /// Isolate S3 probes while retaining this store's effective SDK credentials.
+    pub(super) async fn provider_probe_store(
+        &self,
+        prefix: String,
+        retention: Option<RetentionPolicy>,
+    ) -> Result<RuntimeStore, S3BoundaryError> {
+        #[cfg(feature = "s3")]
+        if let Some(store) = self.s3_store.as_ref() {
+            let probe = store.for_provider_probe(prefix).map_err(repository_init)?;
+            probe
+                .validate_repository_write_policy(retention.as_ref())
+                .await
+                .map_err(repository_init)?;
+            return Ok(RuntimeStore::new(probe));
+        }
+        let _ = (prefix, retention);
+        Ok(self.handle.clone())
     }
 
     #[cfg(test)]
@@ -44,13 +79,13 @@ impl StoreBuild {
     }
 }
 
-impl V2AnchorBuild {
-    pub(super) fn handle(&self) -> &RuntimeV2Anchor {
+impl V3AnchorBuild {
+    pub(super) fn handle(&self) -> &RuntimeV3Anchor {
         &self.handle
     }
 
     #[cfg(test)]
-    pub(super) fn memory_anchor(&self) -> Option<&V2MemoryAnchor> {
+    pub(super) fn memory_anchor(&self) -> Option<&V3MemoryAnchor> {
         self.memory_anchor.as_ref()
     }
 }
@@ -92,25 +127,25 @@ pub(super) async fn build_store(config: &BackendConfig) -> Result<StoreBuild, S3
 }
 
 #[cfg(feature = "k8s")]
-pub(super) fn build_v2_anchor(config: &AnchorConfig) -> Result<V2AnchorBuild, S3BoundaryError> {
-    build_v2_anchor_with_writer_fence(config, None)
+pub(super) fn build_v3_anchor(config: &AnchorConfig) -> Result<V3AnchorBuild, S3BoundaryError> {
+    build_v3_anchor_with_writer_fence(config, None)
 }
 
 #[cfg(not(feature = "k8s"))]
-pub(super) fn build_v2_anchor(config: &AnchorConfig) -> Result<V2AnchorBuild, S3BoundaryError> {
-    build_v2_anchor_inner(config)
+pub(super) fn build_v3_anchor(config: &AnchorConfig) -> Result<V3AnchorBuild, S3BoundaryError> {
+    build_v3_anchor_inner(config)
 }
 
 #[cfg(feature = "k8s")]
-pub(super) fn build_v2_anchor_with_writer_fence(
+pub(super) fn build_v3_anchor_with_writer_fence(
     config: &AnchorConfig,
     writer_fence: Option<WriterFence>,
-) -> Result<V2AnchorBuild, S3BoundaryError> {
+) -> Result<V3AnchorBuild, S3BoundaryError> {
     match config {
         AnchorConfig::Memory => {
-            let anchor = V2MemoryAnchor::new();
-            Ok(V2AnchorBuild {
-                handle: RuntimeV2Anchor::new(anchor.clone()),
+            let anchor = V3MemoryAnchor::new();
+            Ok(V3AnchorBuild {
+                handle: RuntimeV3Anchor::new(anchor.clone()),
                 #[cfg(test)]
                 memory_anchor: Some(anchor),
             })
@@ -131,8 +166,8 @@ pub(super) fn build_v2_anchor_with_writer_fence(
                     Some(writer_fence) => KubernetesLeaseAnchor::new_fenced(settings, writer_fence),
                     None => KubernetesLeaseAnchor::new(settings),
                 };
-                Ok(V2AnchorBuild {
-                    handle: RuntimeV2Anchor::new(anchor),
+                Ok(V3AnchorBuild {
+                    handle: RuntimeV3Anchor::new(anchor),
                     #[cfg(test)]
                     memory_anchor: None,
                 })
@@ -147,12 +182,12 @@ pub(super) fn build_v2_anchor_with_writer_fence(
 }
 
 #[cfg(not(feature = "k8s"))]
-fn build_v2_anchor_inner(config: &AnchorConfig) -> Result<V2AnchorBuild, S3BoundaryError> {
+fn build_v3_anchor_inner(config: &AnchorConfig) -> Result<V3AnchorBuild, S3BoundaryError> {
     match config {
         AnchorConfig::Memory => {
-            let anchor = V2MemoryAnchor::new();
-            Ok(V2AnchorBuild {
-                handle: RuntimeV2Anchor::new(anchor.clone()),
+            let anchor = V3MemoryAnchor::new();
+            Ok(V3AnchorBuild {
+                handle: RuntimeV3Anchor::new(anchor.clone()),
                 #[cfg(test)]
                 memory_anchor: Some(anchor),
             })

@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 pub(crate) const PUBLIC_BUCKET: &str = "client-bucket";
 pub(crate) const ACCESS_KEY_ID: &str = "rs3-fixture-access-key";
 pub(crate) const SECRET_ACCESS_KEY: &str = "rs3-fixture-secret-key";
-const KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.json";
+const KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.cbor";
 const KEYRING_WRAPPING_KEY_HEX: &str =
     "3333333333333333333333333333333333333333333333333333333333333333";
 const KEYRING_WRAPPING_KEY_ID: &str = "wrap-integration";
@@ -99,6 +99,15 @@ impl RunningGateway {
         Self::start_inner(backend, backend_prefix, None, options).await
     }
 
+    pub(crate) async fn start_for_backend_with_log_capture_options(
+        backend: &GatewayBackend,
+        backend_prefix: String,
+        rust_log: &str,
+        options: GatewayProcessOptions,
+    ) -> Result<Self> {
+        Self::start_inner(backend, backend_prefix, Some(rust_log), options).await
+    }
+
     pub(crate) async fn start_with_log_capture_options(
         backend: &RunningS3Container,
         backend_prefix: String,
@@ -106,7 +115,13 @@ impl RunningGateway {
         options: GatewayProcessOptions,
     ) -> Result<Self> {
         let backend = GatewayBackend::from_container(backend);
-        Self::start_inner(&backend, backend_prefix, Some(rust_log), options).await
+        Self::start_for_backend_with_log_capture_options(
+            &backend,
+            backend_prefix,
+            rust_log,
+            options,
+        )
+        .await
     }
 
     async fn start_inner(

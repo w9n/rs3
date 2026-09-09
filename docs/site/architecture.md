@@ -16,7 +16,7 @@ posture and status.
   <a class="rv-lightbox" href="../assets/architecture-overview.png" aria-label="Enlarge rs3 architecture overview diagram" aria-haspopup="dialog" data-rv-title="Architecture overview">
     <picture>
       <source srcset="../assets/architecture-overview.webp" type="image/webp">
-      <img class="rv-diagram" src="../assets/architecture-overview.png" width="1672" height="941" loading="lazy" decoding="async" alt="Architecture overview showing S3 backup clients, the trusted rs3 gateway process, an opaque object store, an external Kubernetes Lease anchor, and the read-only console path.">
+      <img class="rv-diagram" src="../assets/architecture-overview.png" width="1605" height="980" loading="lazy" decoding="async" alt="v03 architecture: S3 clients use the trusted rs3 gateway, which stores encrypted packed or detached payloads in the object store and verifies or advances a separate Kubernetes Lease anchor. An optional read-only console accesses redacted admin status.">
     </picture>
   </a>
 </figure>
@@ -44,6 +44,23 @@ state.
 
 Cryptographic operations stay behind `rs3-crypto`; higher-level crates should
 not add ad hoc hashing, MAC, encryption, or key derivation logic.
+Repository streaming hashes, random carrier identities and payload nonce
+construction use that boundary. Shared payload layout constants in
+`rs3-types` keep index validation and payload writers aligned.
+
+The repository API entrypoint is `rs3_repository::v3::V3Repository`.
+Tools can store keyring envelopes through
+`rs3_repository::store_keyring_envelope`, passing retention and legal-hold
+policy explicitly. The keyring, cache and runtime options shared by repository
+operations are private implementation resources.
+
+The local filesystem backend runs asynchronous read, write and inventory I/O
+on blocking workers. It publishes synced temporary files by rename or an
+exclusive hard link, then syncs directory entries before acknowledging writes
+and deletions. This requires a filesystem that supports hard links and directory
+syncs; it does not provide versioning or Object Lock. Construction is synchronous.
+A canceled filesystem read or listing must be reopened, because reusing its
+cursor fails rather than silently skipping work completed by a detached worker.
 
 ## Repository State
 
@@ -57,10 +74,9 @@ not add ad hoc hashing, MAC, encryption, or key derivation logic.
     new compacted run before anchor adoption. They also drive exact maintenance
     reachability. Guarded metadata-only compaction and automatic active-run
     watermarks are implemented for packed and streamed payload carriers.
-    Unknown-length and zero-length streaming writes publish the canonical
-    `[PAYLOAD, INDEX_RUN]` shape. Large known-length requests publish an opaque
-    standalone payload carrier plus a short `[INDEX_RUN]` commit containing its
-    encrypted exact reference. Both participate in the same catalog, compaction,
+    Nonempty large streams publish an opaque standalone payload carrier plus a
+    short `[INDEX_RUN]` commit containing its encrypted exact reference. Empty
+    streams are index-only. Both participate in the same catalog, compaction,
     and GC graph. New bounded writes are partitioned by effective protection
     cohort, and guarded full GC renews exact restore dependencies before orphan
     deletion. Retained-provider restart/fault qualification and pinned-runner
@@ -71,10 +87,8 @@ Normal writes are append-friendly and value-separated:
 
 1. Put every non-empty bounded value in the batch into one encrypted payload
    pack and stage one compact framed binary index run. Empty bounded values are
-   index-only. An unknown-length or zero-length streamed request instead writes
-   one encrypted `PAYLOAD` followed by its `INDEX_RUN`; large known-length
-   requests use the standalone carrier flow described below.
-2. Publish a signed `v02` commit under a random path-private key.
+   index-only. Nonempty large streams use the detached carrier flow below.
+2. Publish a signed `v03` commit under a random path-private key.
 3. Advance the external commit anchor.
 4. Acknowledge the client write only after the covering commit is accepted.
 
@@ -94,20 +108,8 @@ This lets a cold read issue one exact range `GET` instead of fetching a pack
 directory first. Retention mode, expiry horizon, and legal-hold requirement
 define protection cohorts because the backend protects the containing object.
 
-A streamed value is also immutable and value-separated. Unknown-length streams
-keep ciphertext in the `PAYLOAD` section of the same commit as the foreground
-run. While that run
-is embedded, a self-stream pointer carries the authenticated payload identity,
-section ordinal, and segmented-payload header. Before compaction removes the
-source-run boundary, the pointer is normalized to an exact external carrier:
-commit key and provider version, stored object length and body digest,
-historical keyring-envelope reference, section start, ordinal, offset, length,
-and digest, plus the payload identity and header. Compaction and checkpoints
-therefore move metadata references only. They do not read or rewrite streamed
-payload ciphertext.
-
-For a known-length large request, the preview instead uploads one encrypted
-segmented `objects/v02/` carrier outside the publication lock. It verifies the
+For a nonempty large stream, the preview uploads one encrypted
+segmented `objects/v03/` carrier outside the publication lock. It verifies the
 completed exact version, length, post-completion retention horizon, EOF, and full ciphertext
 digest before a short fenced commit publishes the encrypted reference. This
 allows distinct large uploads to overlap while keeping repository ordering at
@@ -117,7 +119,7 @@ races, or anchor failure can leave an invisible opaque orphan, which guarded
 maintenance reports and later reclaims. Same-process GC excludes registered
 in-flight carriers even with a zero minimum age.
 
-The v02 preview does not publish new legal holds. It rejects client hold
+The v03 preview does not publish new legal holds. It rejects client hold
 requests until every catalog, chain, format, and keyring dependency can be held
 and later released through one guarded lifecycle. The storage conformance layer
 still tests provider legal-hold mechanics independently. This is an explicit
@@ -128,40 +130,56 @@ The gateway does not deduplicate payloads. Deduplication would add equality
 leakage and shared-liveness policy; Kopia already performs chunking and
 deduplication for the primary client workload.
 
-`v02` replaces monolithic index snapshots with an encrypted LSM-style index.
+`v03` replaces monolithic index snapshots with an encrypted LSM-style index.
 Recent immutable foreground runs are level 0. Each compaction selects at most
-the oldest 128 level-0 runs, merges that bounded window newest-wins, retains
-tombstones, and emits fewer bounded level-1 generation-range shards. Newer
-level-0 runs and existing level-1 shards remain exact-referenced and are not
-rewritten. Level is a storage tier, never a compaction epoch. The preview
-format accepts only level 0 and level 1, rejecting higher values until a future
-capability explicitly defines another tier. Equal-generation mutations remain
-indivisible so a root cannot
-publish half of one logical generation. Pointers to packs or streams embedded
-beside a source run are normalized to exact external historical commit,
-section, and keyring-envelope references before source boundaries are
-discarded. A retained
-level-1 tombstone masks older records in earlier level-1 shards. Reclaiming
-those bottom-tier tombstones and the records they mask remains future guarded
-or offline maintenance. A small signed `INDEX_ROOT` catalog names the complete
-active run set. It does not serialize every live path, and compaction never
-reads or rewrites payload ciphertext.
+256 active runs, including older level-1 shards, as one contiguous
+generation window with at most 131,072 mutations and 16 MiB of stored run
+sections. That read window favors more source runs, then lower mutation/byte
+cost and older windows. Signed catalog sizes rank the complete window and one
+cheaper contiguous subset before fetching either. The compactor reads the better
+estimate first, fetching only signed headers and selected run sections. It tries
+the other candidate only when actual sharding or nonreduction makes that useful,
+reusing fetched sources. Across both plans the original bounds still apply. A
+large older shard can remain unchanged when merging newer runs gives better byte
+cost per catalog entry removed. Every fetched source is fully authenticated;
+corruption fails the operation. After validating selected sources, it selects newest mutations
+and discards upserts proven obsolete by the accepted blinded-key namespace.
+Winning tombstones remain to mask older values. This prevents overwritten or
+deleted versions from filling the catalog indefinitely, including when full
+older shards precede later churn. Runs outside the selected window retain their exact
+references. Combining more small runs amortizes root publication. The encoded
+source budget does not bound total process memory: decoded records and per-run
+structures also occupy memory. The output contains fewer bounded level-1 generation-range shards;
+an entirely obsolete window needs no replacement run. Level is a storage tier,
+never a compaction epoch. The format accepts only levels 0 and 1.
+
+Equal-generation mutations remain indivisible. Source-relative payload pointers
+become exact external historical object, section and keyring-envelope references
+before source boundaries disappear. A small signed `INDEX_ROOT` catalog names
+the complete active run set and preserves accepted completion receipts. One
+fenced anchor CAS publishes the candidate after exact read-back. Compaction
+never reads or rewrites payload ciphertext or deletes source objects. Protected
+historical roots continue to reach their original exact versions through GC;
+compaction does not change history retention policy. Tombstone reclamation
+remains future guarded work.
 
 Runs contain two specialized encrypted binary projections linked by mutation
 ordinal. The blinded namespace projection answers `HEAD` and `GET`; the
 path-sorted listing projection answers prefix listings. Frame-local container
 tables share exact object references. Values never live in an index frame, so
 LSM compaction is metadata-only and cold recovery does not read user data. Run
-wire version 6 includes canonical self-stream and exact external-stream
-carriers, an authenticated namespace-key table, and larger bounded small-object
+wire version 10 includes exact detached-payload references, encrypted client checksums and plaintext MD5 ETags,
+an authenticated namespace-key table, and larger bounded small-object
 packs. It uses canonical bounded varints for generation and content length in
 both projections.
 
 The runtime keeps one accepted compact state plus a hard-bounded 4,096-mutation
-overlay. An exclusive publication barrier freezes that overlay from pre-CAS
-validation through accepted-state installation. Publication failure discards
-the overlay instead of rolling back a second full state copy. This preserves
-commit atomicity without doubling steady-state namespace memory.
+overlay. Publication freezes a prefix while the next bounded batch can stage
+behind it. Both share the pending-item limit. Accepting a commit installs only
+its frozen prefix; a failed publication rejects that prefix and its dependent
+staged successor. Sequence allocations are not reused. Reads continue to resolve
+against accepted state. Only one carrier publication and anchor transition run
+at a time; maintenance drains both batches before entering its exclusion window.
 
 The bounded compaction path follows the same memory invariant. It does not clone
 the full accepted state before planning, verifies each source run with
@@ -190,6 +208,12 @@ keyring discovery admits at most two raw members. A provider that cannot page
 within the requested bound, returns an oversized page, or exceeds the
 applicable budget causes the control path to fail closed.
 
+Format roots and keyrings share a canonical CBOR envelope implemented in
+`rs3-crypto`, using bounded CBOR primitives from `rs3-types`. An authenticated
+purpose and separate derived AEAD key distinguish the two uses. Portable
+recovery artifacts use a bounded canonical CBOR schema in `rs3-repository`;
+the CLI keeps JSON inspection reports separate from importable artifact bytes.
+
 Automatic maintenance starts requesting packed-run compaction at 256 active
 runs. With no configured guard it degrades and retries at each additional
 64-run boundary, then pauses new mutations at 896. The immutable format ceiling
@@ -201,10 +225,23 @@ compaction error poisons the coordinator immediately instead of allowing writes
 to run past an uncertain maintenance failure. Already accepted reads remain
 available.
 
+Retained writers also track conservative recovery metadata, encoded pending
+sections and exact-target capacity separately from cached retention coverage. Ordinary publications add
+bounded costs; a cold cache or exhausted estimate requires an exact candidate
+graph check before acceptance. Foreground admission leaves a small margin for
+an expiry root. The [metadata admission contract](reference/repository-format.md#recovery-metadata-admission)
+describes the shared limits and the separate replay and inventory constraints.
+Maintenance caches signed commit headers and decodes required historical
+sections one at a time, releasing their encoded bytes before following
+dependencies. Current replay buffers are released after namespace and accepted
+recovery-registry reconstruction. This check does not raise the qualified operating capacity.
+
 The state-flow view below separates the normal write path from the restore read
-path. A normal write blinds the namespace lookup, encrypts payload segments,
-stages payload plus an index run, publishes a signed commit, advances the
-external anchor, and only then acknowledges the client write. A restore read
+path. Bounded nonempty writes pack encrypted values with an index run; large
+uploads store detached ciphertext referenced by a short index-run commit.
+Empty values are index-only. Publication verifies stored ciphertext, accepts
+the signed commit through the external anchor, and only then acknowledges the
+client write. A restore read
 starts from trusted anchor state, verifies the signed catalog and runs, finds
 the exact encrypted payload reference, range-reads the retained version when
 required, verifies AEAD segments, and returns restored bytes.
@@ -213,7 +250,7 @@ required, verifies AEAD segments, and returns restored bytes.
   <a class="rv-lightbox" href="../assets/architecture-state-flow.png" aria-label="Enlarge rs3 write and restore state flow diagram" aria-haspopup="dialog" data-rv-title="Write and restore flow">
     <picture>
       <source srcset="../assets/architecture-state-flow.webp" type="image/webp">
-      <img class="rv-diagram" src="../assets/architecture-state-flow.png" width="1692" height="930" loading="lazy" decoding="async" alt="Write and restore flow showing committed writes through signed v2 commits and anchored restore reads through verified commit state.">
+      <img class="rv-diagram" src="../assets/architecture-state-flow.png" width="1605" height="980" loading="lazy" decoding="async" alt="Writes use packed values or detached payloads, verify stored ciphertext and advance the Lease before returning success. Restores start from a trusted anchor or retained point, verify the catalog and runs, resolve exact payload references and authenticate segments. Unresolved publication outcomes block mutations.">
     </picture>
   </a>
 </figure>
@@ -228,10 +265,10 @@ Logical lookup uses secret-derived namespace tokens inside the trusted gateway.
 Directory listing is answered from repository index state, not by exposing
 client paths as backend object keys.
 
-In `v02`, encrypted runs carry a blinded lookup projection and a plaintext-path
+In `v03`, encrypted runs carry a blinded lookup projection and a plaintext-path
 listing projection inside authenticated ciphertext. Run keys, public metadata,
 and signed headers expose neither paths nor plaintext projection bounds. The
-v02 runtime does not persist the legacy durable prefix-token representation.
+v03 runtime does not persist the legacy durable prefix-token representation.
 
 ## Rollback Resistance
 
@@ -248,7 +285,7 @@ from latest-state authority:
 Provider retention and Object Lock are useful for preventing deletion of object
 versions. They do not replace commit signatures or external anchors.
 
-For `v02`, the external anchor stores the accepted commit key, body digest,
+For `v03`, the external anchor stores the accepted commit key, body digest,
 provider version ID when needed, signing key ID, and active format-root
 reference. Recovery derives the exact catalog, run, and payload graph from that
 root. Anchor import from a trusted bundle verifies the graph before recreating
@@ -259,9 +296,7 @@ catalogs name index runs only; effective highest-generation records name exact
 payload-pack or streamed-payload carriers. Maintenance marks the exact catalog
 and run versions plus the exact payload-containing object versions selected by
 live records. A payload reference does not keep its commit's entire ancestry
-reachable. This rule also protects a zero-length streamed carrier even though a
-client read can return an empty body without fetching payload bytes. GC
-completes a fail-closed mark before any deletion and rechecks both the
+reachable. Empty foreground values have no payload dependency. GC completes a fail-closed mark before any deletion and rechecks both the
 maintenance fence and anchor before deleting an exact version.
 
 Payload-pack cleaning is separate from index compaction. It rewrites live
@@ -289,9 +324,13 @@ owner. A commit coordinator holds an RAII lease that is also retained by every
 delayed publisher task; direct mutation and maintenance entry points fail while
 that lease exists. This prevents a cancelled request or a second local API path
 from publishing and clearing another batch's speculative overlay. All semantic
-installation checks occur before anchor CAS. If the anchor advances but local
-lock installation fails, callers receive an explicit recovery-required error,
-new mutations stop, and the process must restart from the accepted anchor.
+installation checks occur before anchor CAS. A lost CAS reply is settled by a
+resource-version-guarded fencing update on the Lease. Once that update succeeds,
+the earlier request cannot land afterward: a matching accepted child completes
+normally, while an unchanged parent permits failure rollback. If the fencing
+update fails or the outcome cannot be resolved,
+or local installation fails after acceptance, callers receive a recovery-required
+error and new mutations stop until restart from the trusted anchor.
 
 The single owner does not serialize large request bodies. Distinct declared-
 length standalone uploads run concurrently, then queue for the short stage,
@@ -306,18 +345,18 @@ S3 listing and timestamps are not coordination primitives. A future
 disconnected mode would need explicit branches, authenticated merge semantics,
 and deterministic conflict policy in a different repository contract.
 
-Payload segmentation is recorded per pack record or streamed-payload header.
-Small packed values use one AEAD record; medium and large values use
-independently authenticated segments for bounded range reads. The authenticated
-index descriptor carries the physical pack layout or exact streamed section
-facts, so neither read path needs an unauthenticated directory lookup. Bounded
-commits use one single-part upload with a compact header; only genuinely
-streaming commits pay the fixed multipart header reservation.
+Payload segmentation is recorded in encrypted pack or detached-payload layouts.
+Both carriers use the same attempt-bound segment nonce scheme. Detached layouts
+retain original selected part numbers and fresh attempt IDs, allowing independent
+parts to be assembled without re-encryption. Readers derive offsets from bounded
+authenticated metadata, including each part's final short segment. Backend payload
+objects contain only ciphertext and tags. All publication commits use one bounded
+PUT; large payloads use backend multipart before their short index publication.
 
 Partial streamed reads fetch only the authenticated ciphertext segments that
 cover the requested plaintext range. The in-memory decrypted-segment cache uses
 an opaque identity derived from repository and historical keyring context plus
-the exact commit, version, body, section, payload-header, and content-length
+the exact commit, version, body, section, payload-layout, and content-length
 facts. The actual payload ID remains the AEAD identity. This prevents cache
 entries from aliasing across exact carriers without creating a backend object
 or exposing a new backend key.
@@ -330,6 +369,7 @@ The first gateway surface focuses on the operations backup clients need:
 - `GET Object`, including ranges
 - `HEAD Object`
 - `ListObjectsV2`
+- unversioned `GetBucketVersioning` and current-only `ListObjectVersions`
 - `DELETE Object`
 - native conditional create behavior (`PutObject` with `If-None-Match: *`)
 - retention and legal-hold plumbing where the backend supports it
@@ -356,9 +396,9 @@ a second controller, CronJob, or repository writer. The supervisor depends on
 the provider-neutral commit-anchor and maintenance-guard traits; Kubernetes
 supplies those contracts with the same fenced Lease used by normal writes.
 
-Automatic mode evaluates bounded retention-deadline and reclaimable-orphan
-facts, adds deterministic jitter, and applies cooldown or failure backoff only
-when doing so cannot cross the renewal safety boundary. Manual mode performs no
+Automatic mode evaluates bounded retention-deadline, authenticated recovery-expiry,
+and reclaimable-orphan facts, adds bounded random jitter, and applies cooldown or
+failure backoff only when doing so cannot cross the renewal safety boundary. Manual mode performs no
 background inventory scans and accepts explicit operator runs. Restore-readonly
 mode forces the supervisor off. A missing guard parks the state machine rather
 than retrying or mutating without exclusion.

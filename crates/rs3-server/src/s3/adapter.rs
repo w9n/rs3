@@ -1,32 +1,37 @@
 //! Typed S3 service adapter backed by repository operations.
 
 use super::S3BoundaryError;
+use super::checksum::{ChecksumRequest, checksum_output, validate_body};
+use super::content_md5::put_expected_md5;
 use super::mapping::{
     ListPage, collect_body_reserving, content_range, etag, i64_len, legal_hold_header,
-    legal_hold_output, list_page as map_list_page, logical_path, max_keys, next_body_chunk,
-    put_object_legal_hold_request_status, put_object_legal_hold_status,
+    legal_hold_output, list_page as map_list_page, list_versions_output, logical_path, max_keys,
+    next_body_chunk, put_object_legal_hold_request_status, put_object_legal_hold_status,
     put_object_retention_policy, repository_error, resolve_range, retention_headers, timestamp,
     validate_delete_object_request, validate_delete_objects_entry, validate_delete_objects_request,
     validate_get_object_legal_hold_request, validate_get_object_request,
-    validate_head_object_request, validate_put_object_request,
+    validate_head_object_request, validate_list_versions_request, validate_put_object_request,
 };
 use super::runtime::RuntimeRepository;
 use crate::config::configured_streaming_upload_working_set_bytes;
 use crate::{AdminReadinessSource, AdminRuntimeFactsSource, GatewayMode, RuntimeConfig};
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, stream};
-use rs3_repository::v2::V2AuthenticatedReadBody;
-use rs3_repository::{RepositoryError, RepositoryPutOptions};
+use rs3_repository::v3::V3AuthenticatedReadBody;
+use rs3_repository::{RepositoryCopyOptions, RepositoryError, RepositoryPutOptions};
 use rs3_storage::{ByteRange, StorageError};
 use rs3_types::{PublicBucket, RetentionMode};
 use s3s::dto::{
-    Bucket, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput,
-    DeletedObject, Error as DeleteObjectError, GetBucketLocationInput, GetBucketLocationOutput,
-    GetObjectInput, GetObjectLegalHoldInput, GetObjectLegalHoldOutput, GetObjectOutput,
-    HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListBucketsInput,
-    ListBucketsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-    ListObjectsV2Output, ObjectIdentifier, Owner, PutObjectInput, PutObjectLegalHoldInput,
-    PutObjectLegalHoldOutput, PutObjectOutput, StreamingBlob,
+    Bucket, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, DeleteObjectInput,
+    DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject, ETag,
+    ETagCondition, Error as DeleteObjectError, GetBucketLocationInput, GetBucketLocationOutput,
+    GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectLegalHoldInput,
+    GetObjectLegalHoldOutput, GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
+    HeadObjectOutput, ListBucketsInput, ListBucketsOutput, ListObjectVersionsInput,
+    ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+    ListObjectsV2Output, MetadataDirective, ObjectIdentifier, Owner, PutObjectInput,
+    PutObjectLegalHoldInput, PutObjectLegalHoldOutput, PutObjectOutput, StorageClass,
+    StreamingBlob,
 };
 use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
 use s3s::{Body, S3, S3Request, S3Response, S3Result, StdError};
@@ -38,8 +43,175 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
+mod multipart;
+
+fn copy_object_result(
+    metadata: &rs3_repository::RepositoryObjectMetadata,
+) -> S3Result<CopyObjectResult> {
+    let checksum = checksum_output(metadata.checksum.as_ref());
+    Ok(CopyObjectResult {
+        checksum_crc32: checksum.checksum_crc32,
+        checksum_crc32c: checksum.checksum_crc32c,
+        checksum_crc64nvme: checksum.checksum_crc64nvme,
+        checksum_sha1: checksum.checksum_sha1,
+        checksum_sha256: checksum.checksum_sha256,
+        checksum_type: checksum.checksum_type,
+        e_tag: Some(etag(&metadata.etag)),
+        last_modified: Some(timestamp(metadata.modified_at_ms)?),
+    })
+}
+
+fn copy_source_if_match(input: &CopyObjectInput) -> S3Result<Option<String>> {
+    match input.copy_source_if_match.as_ref() {
+        None | Some(ETagCondition::Any) => Ok(None),
+        Some(ETagCondition::ETag(ETag::Strong(value))) => Ok(Some(value.clone())),
+        Some(ETagCondition::ETag(ETag::Weak(_))) => Err(s3s::s3_error!(
+            InvalidRequest,
+            "CopyObject source If-Match must use a strong ETag"
+        )),
+    }
+}
+
+fn validate_copy_object_headers(headers: &http::HeaderMap) -> S3Result<()> {
+    const UNSUPPORTED_RAW_HEADERS: &[&str] = &[
+        "if-match",
+        "if-none-match",
+        "x-amz-sdk-checksum-algorithm",
+        "x-amz-checksum-type",
+    ];
+
+    if UNSUPPORTED_RAW_HEADERS
+        .iter()
+        .any(|header| headers.contains_key(*header))
+    {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "CopyObject request includes an unsupported condition or checksum override"
+        ));
+    }
+    for header in ["x-amz-copy-source", "x-amz-copy-source-if-match"] {
+        if headers.get_all(header).iter().nth(1).is_some() {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "CopyObject request contains a duplicate source header"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn copy_source_and_destination(
+    input: &CopyObjectInput,
+    public_bucket: &PublicBucket,
+) -> S3Result<(rs3_types::LogicalPath, rs3_types::LogicalPath)> {
+    let CopySource::Bucket {
+        bucket,
+        key,
+        version_id,
+    } = &input.copy_source
+    else {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "CopyObject access point and ARN sources are not supported"
+        ));
+    };
+    if bucket.as_ref() != public_bucket.as_str() {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "CopyObject source must use the configured bucket"
+        ));
+    }
+    if version_id
+        .as_deref()
+        .is_some_and(|version| version != "null")
+    {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "versioned CopyObject sources are not supported"
+        ));
+    }
+
+    let source = logical_path(key.to_string())?;
+    let destination = logical_path(input.key.clone())?;
+    if source == destination {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "CopyObject source and destination must differ"
+        ));
+    }
+    Ok((source, destination))
+}
+
+fn validate_copy_object_options(input: &CopyObjectInput) -> S3Result<()> {
+    if input
+        .metadata_directive
+        .as_ref()
+        .is_some_and(|directive| directive.as_str() != MetadataDirective::COPY)
+    {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "CopyObject metadata replacement is not supported"
+        ));
+    }
+
+    if input.acl.is_some()
+        || input.bucket_key_enabled.is_some()
+        || input.checksum_algorithm.is_some()
+        || input.copy_source_if_modified_since.is_some()
+        || input.copy_source_if_none_match.is_some()
+        || input.copy_source_if_unmodified_since.is_some()
+        || input.copy_source_sse_customer_algorithm.is_some()
+        || input.copy_source_sse_customer_key.is_some()
+        || input.copy_source_sse_customer_key_md5.is_some()
+        || input.expected_bucket_owner.is_some()
+        || input.expected_source_bucket_owner.is_some()
+        || input.grant_full_control.is_some()
+        || input.grant_read.is_some()
+        || input.grant_read_acp.is_some()
+        || input.grant_write_acp.is_some()
+        || input.object_lock_legal_hold_status.is_some()
+        || input.object_lock_mode.is_some()
+        || input.object_lock_retain_until_date.is_some()
+        || input.request_payer.is_some()
+        || input.sse_customer_algorithm.is_some()
+        || input.sse_customer_key.is_some()
+        || input.sse_customer_key_md5.is_some()
+        || input.ssekms_encryption_context.is_some()
+        || input.ssekms_key_id.is_some()
+        || input.server_side_encryption.is_some()
+        || input
+            .storage_class
+            .as_ref()
+            .is_some_and(|storage_class| storage_class.as_str() != StorageClass::STANDARD)
+        || input.tagging.is_some()
+        || input.tagging_directive.is_some()
+        || input.website_redirect_location.is_some()
+    {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "CopyObject metadata, policy, encryption, or tagging overrides are not supported"
+        ));
+    }
+    Ok(())
+}
+
+fn put_object_output(metadata: &rs3_repository::RepositoryObjectMetadata) -> PutObjectOutput {
+    let checksum = checksum_output(metadata.checksum.as_ref());
+    PutObjectOutput {
+        checksum_crc32: checksum.checksum_crc32,
+        checksum_crc32c: checksum.checksum_crc32c,
+        checksum_crc64nvme: checksum.checksum_crc64nvme,
+        checksum_sha1: checksum.checksum_sha1,
+        checksum_sha256: checksum.checksum_sha256,
+        checksum_type: checksum.checksum_type,
+        e_tag: Some(etag(&metadata.etag)),
+        ..Default::default()
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct GatewayS3Service {
+    multipart: multipart::MultipartSessions,
     mode: GatewayMode,
     public_bucket: PublicBucket,
     repository: RuntimeRepository,
@@ -62,6 +234,15 @@ impl GatewayS3Service {
         Self::from_repository(config, repository).await
     }
 
+    pub(super) async fn from_config_with_recovery_point(
+        config: &RuntimeConfig,
+        sequence: rs3_types::Sequence,
+    ) -> Result<Self, S3BoundaryError> {
+        let repository =
+            RuntimeRepository::from_config_with_recovery_point(config, sequence).await?;
+        Self::from_repository(config, repository).await
+    }
+
     #[cfg(feature = "k8s")]
     pub(super) async fn from_config_with_writer_fence(
         config: &RuntimeConfig,
@@ -76,12 +257,10 @@ impl GatewayS3Service {
         config: &RuntimeConfig,
         repository: RuntimeRepository,
     ) -> Result<Self, S3BoundaryError> {
-        repository
-            .validate_backend_retention(config.repository.retention)
-            .await?;
         repository.load_accepted_anchor(config.mode).await?;
 
         Ok(Self {
+            multipart: multipart::MultipartSessions::new(),
             mode: config.mode,
             public_bucket: config.public_bucket.clone(),
             repository,
@@ -245,7 +424,7 @@ impl GatewayS3Service {
         self.delete_committed_key(object.key).await
     }
 
-    fn admit_request(&self, operation: &'static str) -> S3Result<OwnedSemaphorePermit> {
+    async fn admit_request(&self, operation: &'static str) -> S3Result<OwnedSemaphorePermit> {
         let permit = match self.request_slots.clone().try_acquire_owned() {
             Ok(permit) => Ok(permit),
             Err(_error) => {
@@ -264,6 +443,11 @@ impl GatewayS3Service {
                 "gateway request rate limit exceeded"
             ));
         }
+
+        self.repository
+            .check_recovery_authority()
+            .await
+            .map_err(repository_error)?;
 
         Ok(permit)
     }
@@ -534,7 +718,7 @@ fn reserved_download_body(body: Bytes, reservation: DownloadBodyReservation) -> 
 }
 
 struct ReservedAuthenticatedDownloadBody {
-    body: Mutex<V2AuthenticatedReadBody>,
+    body: Mutex<V3AuthenticatedReadBody>,
     remaining: Option<usize>,
     operation: &'static str,
     _reservation: DownloadBodyReservation,
@@ -584,7 +768,7 @@ impl ByteStream for ReservedAuthenticatedDownloadBody {
 }
 
 fn reserved_authenticated_download_body(
-    body: V2AuthenticatedReadBody,
+    body: V3AuthenticatedReadBody,
     reservation: DownloadBodyReservation,
     operation: &'static str,
 ) -> Body {
@@ -645,6 +829,37 @@ impl RequestRateLimiter {
 
 #[async_trait::async_trait]
 impl S3 for GatewayS3Service {
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<s3s::dto::CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<s3s::dto::CreateMultipartUploadOutput>> {
+        self.multipart_create(req).await
+    }
+    async fn upload_part(
+        &self,
+        req: S3Request<s3s::dto::UploadPartInput>,
+    ) -> S3Result<S3Response<s3s::dto::UploadPartOutput>> {
+        self.multipart_upload_part(req).await
+    }
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<s3s::dto::CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
+        self.multipart_complete(req).await
+    }
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<s3s::dto::AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<s3s::dto::AbortMultipartUploadOutput>> {
+        self.multipart_abort(req.input).await
+    }
+    async fn list_parts(
+        &self,
+        req: S3Request<s3s::dto::ListPartsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListPartsOutput>> {
+        self.multipart_list(req.input).await
+    }
+
     async fn head_bucket(
         &self,
         req: S3Request<HeadBucketInput>,
@@ -657,9 +872,44 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             Ok(S3Response::new(HeadBucketOutput::default()))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
+    }
+
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        const OPERATION: &str = "GetBucketVersioning";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
+
+        let result = async {
+            let _admission = self.admit_request(OPERATION).await?;
+            self.check_bucket(&input.bucket)?;
+            if input.expected_bucket_owner.is_some() {
+                return Err(s3s::s3_error!(
+                    NotImplemented,
+                    "expected owner is not supported"
+                ));
+            }
+            Ok(S3Response::new(GetBucketVersioningOutput::default()))
         }
         .instrument(span)
         .await;
@@ -684,7 +934,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, None);
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             Ok(S3Response::new(ListBucketsOutput {
                 buckets: Some(vec![Bucket {
                     name: Some(self.public_bucket.as_str().to_owned()),
@@ -722,10 +972,56 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             Ok(S3Response::new(GetBucketLocationOutput {
                 location_constraint: None,
+            }))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
+    }
+
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        const OPERATION: &str = "CopyObject";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
+
+        let result = async {
+            let _admission = self.admit_request(OPERATION).await?;
+            self.check_bucket(&input.bucket)?;
+            self.check_mutation_allowed()?;
+            validate_copy_object_headers(&req.headers)?;
+            validate_copy_object_options(&input)?;
+            let (source, destination) = copy_source_and_destination(&input, &self.public_bucket)?;
+            let source_if_match = copy_source_if_match(&input)?;
+            let committed = self
+                .repository
+                .copy_committed(
+                    source,
+                    destination,
+                    RepositoryCopyOptions { source_if_match },
+                )
+                .await
+                .map_err(repository_error)?;
+            Ok(S3Response::new(CopyObjectOutput {
+                copy_object_result: Some(copy_object_result(&committed.metadata)?),
+                ..CopyObjectOutput::default()
             }))
         }
         .instrument(span)
@@ -748,15 +1044,26 @@ impl S3 for GatewayS3Service {
         const OPERATION: &str = "PutObject";
         let request_id = self.next_request_id();
         let started = Instant::now();
-        let input = req.input;
+        let mut input = req.input;
+        let mut checksum_failure = None;
         let bucket = input.bucket.clone();
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             self.check_mutation_allowed()?;
             validate_put_object_request(&input, self.max_put_object_bytes)?;
+            let expected_md5 =
+                put_expected_md5(&input, &req.headers).map_err(|error| error.into_s3_error())?;
+            let checksum_request =
+                ChecksumRequest::from_put(&input, &req.headers, req.trailing_headers)
+                    .map_err(|error| error.into_s3_error())?;
+            let checksum = rs3_repository::UploadChecksum::pending();
+            let (body, failure) =
+                validate_body(input.body.take(), checksum_request, checksum.clone());
+            input.body = Some(body);
+            checksum_failure = Some(failure);
 
             let retention = put_object_retention_policy(&input)?;
             let legal_hold = put_object_legal_hold_status(&input)?;
@@ -768,7 +1075,7 @@ impl S3 for GatewayS3Service {
             if legal_hold.is_some() {
                 return Err(s3s::s3_error!(
                     NotImplemented,
-                    "v02 legal hold publication is not supported"
+                    "v03 legal hold publication is not supported"
                 ));
             }
             let key = logical_path(input.key)?;
@@ -821,6 +1128,8 @@ impl S3 for GatewayS3Service {
                         declared_len,
                         stream,
                         RepositoryPutOptions {
+                            expected_md5,
+                            checksum: Some(checksum.clone()),
                             create_only,
                             retention,
                             legal_hold,
@@ -839,13 +1148,7 @@ impl S3 for GatewayS3Service {
                     usize::try_from(declared_len).unwrap_or(usize::MAX),
                 );
 
-                return Ok(S3Response::new(PutObjectOutput {
-                    e_tag: Some(etag(
-                        committed.metadata.content_len,
-                        committed.metadata.modified_at_ms,
-                    )),
-                    ..PutObjectOutput::default()
-                }));
+                return Ok(S3Response::new(put_object_output(&committed.metadata)));
             }
             if declared_len.is_none() && self.repository.supports_streaming_put() {
                 let body_collect_started = Instant::now();
@@ -912,6 +1215,8 @@ impl S3 for GatewayS3Service {
                             key,
                             stream,
                             RepositoryPutOptions {
+                                expected_md5,
+                                checksum: Some(checksum.clone()),
                                 create_only,
                                 retention,
                                 legal_hold,
@@ -931,13 +1236,7 @@ impl S3 for GatewayS3Service {
                         usize::try_from(committed.metadata.content_len).unwrap_or(usize::MAX),
                     );
 
-                    return Ok(S3Response::new(PutObjectOutput {
-                        e_tag: Some(etag(
-                            committed.metadata.content_len,
-                            committed.metadata.modified_at_ms,
-                        )),
-                        ..PutObjectOutput::default()
-                    }));
+                    return Ok(S3Response::new(put_object_output(&committed.metadata)));
                 }
                 let body_collect_elapsed = body_collect_started.elapsed();
                 record_s3_request_body_collect_metrics(OPERATION, body_collect_elapsed);
@@ -959,6 +1258,8 @@ impl S3 for GatewayS3Service {
                         key,
                         body,
                         RepositoryPutOptions {
+                            expected_md5,
+                            checksum: Some(checksum.clone()),
                             create_only,
                             retention,
                             legal_hold,
@@ -967,13 +1268,7 @@ impl S3 for GatewayS3Service {
                     .await
                     .map_err(repository_error)?;
 
-                return Ok(S3Response::new(PutObjectOutput {
-                    e_tag: Some(etag(
-                        committed.metadata.content_len,
-                        committed.metadata.modified_at_ms,
-                    )),
-                    ..PutObjectOutput::default()
-                }));
+                return Ok(S3Response::new(put_object_output(&committed.metadata)));
             }
             let body_collect_started = Instant::now();
             let mut upload_body_reservation = self.upload_body_budget.reservation();
@@ -1012,6 +1307,8 @@ impl S3 for GatewayS3Service {
                     key,
                     body,
                     RepositoryPutOptions {
+                        expected_md5,
+                        checksum: Some(checksum.clone()),
                         create_only,
                         retention,
                         legal_hold,
@@ -1020,16 +1317,14 @@ impl S3 for GatewayS3Service {
                 .await
                 .map_err(repository_error)?;
 
-            Ok(S3Response::new(PutObjectOutput {
-                e_tag: Some(etag(
-                    committed.metadata.content_len,
-                    committed.metadata.modified_at_ms,
-                )),
-                ..PutObjectOutput::default()
-            }))
+            Ok(S3Response::new(put_object_output(&committed.metadata)))
         }
         .instrument(span)
         .await;
+        let result = result.map_err(|error| match &checksum_failure {
+            Some(failure) => failure.map_error(error),
+            None => error,
+        });
         self.record_request_result(
             OPERATION,
             request_id,
@@ -1053,11 +1348,16 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             validate_get_object_request(&input)?;
 
             let requested_range = input.range.is_some();
+            let want_checksum = input
+                .checksum_mode
+                .as_ref()
+                .is_some_and(|mode| mode.as_str() == s3s::dto::ChecksumMode::ENABLED)
+                && !requested_range;
             let key = logical_path(input.key)?;
             let resolved = self
                 .repository
@@ -1113,12 +1413,23 @@ impl S3 for GatewayS3Service {
                 "S3 response body prepared",
             );
             let content_length = i64_len(response_body_len)?;
+            let checksum = checksum_output(if want_checksum {
+                metadata.checksum.as_ref()
+            } else {
+                None
+            });
             let mut output = GetObjectOutput {
+                checksum_crc32: checksum.checksum_crc32,
+                checksum_crc32c: checksum.checksum_crc32c,
+                checksum_crc64nvme: checksum.checksum_crc64nvme,
+                checksum_sha1: checksum.checksum_sha1,
+                checksum_sha256: checksum.checksum_sha256,
+                checksum_type: checksum.checksum_type,
                 accept_ranges: Some("bytes".to_owned()),
                 body: Some(StreamingBlob::from(response_body)),
                 content_length: Some(content_length),
                 content_type: Some("application/octet-stream".to_owned()),
-                e_tag: Some(etag(metadata.content_len, metadata.modified_at_ms)),
+                e_tag: Some(etag(&metadata.etag)),
                 last_modified: Some(timestamp(metadata.modified_at_ms)?),
                 ..GetObjectOutput::default()
             };
@@ -1163,11 +1474,16 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             validate_head_object_request(&input)?;
 
             let requested_range = input.range.is_some();
+            let want_checksum = input
+                .checksum_mode
+                .as_ref()
+                .is_some_and(|mode| mode.as_str() == s3s::dto::ChecksumMode::ENABLED)
+                && !requested_range;
             let key = logical_path(input.key)?;
             let metadata = self.repository.head(&key).map_err(repository_error)?;
             let content_length = match resolve_range(input.range, metadata.content_len)? {
@@ -1185,11 +1501,22 @@ impl S3 for GatewayS3Service {
             );
             let (object_lock_mode, object_lock_retain_until_date) =
                 retention_headers(metadata.retention.as_ref(), metadata.modified_at_ms)?;
+            let checksum = checksum_output(if want_checksum {
+                metadata.checksum.as_ref()
+            } else {
+                None
+            });
             Ok(S3Response::new(HeadObjectOutput {
+                checksum_crc32: checksum.checksum_crc32,
+                checksum_crc32c: checksum.checksum_crc32c,
+                checksum_crc64nvme: checksum.checksum_crc64nvme,
+                checksum_sha1: checksum.checksum_sha1,
+                checksum_sha256: checksum.checksum_sha256,
+                checksum_type: checksum.checksum_type,
                 accept_ranges: Some("bytes".to_owned()),
                 content_length: Some(i64_len(content_length)?),
                 content_type: Some("application/octet-stream".to_owned()),
-                e_tag: Some(etag(metadata.content_len, metadata.modified_at_ms)),
+                e_tag: Some(etag(&metadata.etag)),
                 last_modified: Some(timestamp(metadata.modified_at_ms)?),
                 object_lock_mode,
                 object_lock_retain_until_date,
@@ -1222,7 +1549,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             validate_get_object_legal_hold_request(&input)?;
 
@@ -1257,14 +1584,52 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             self.check_mutation_allowed()?;
             let _ = put_object_legal_hold_request_status(&input)?;
             Err(s3s::s3_error!(
                 NotImplemented,
-                "v02 legal hold publication is not supported"
+                "v03 legal hold publication is not supported"
             ))
+        }
+        .instrument(span)
+        .await;
+        self.record_request_result(
+            OPERATION,
+            request_id,
+            Some(&bucket),
+            started.elapsed(),
+            &result,
+            http::StatusCode::OK,
+        );
+        result
+    }
+
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        const OPERATION: &str = "ListObjectVersions";
+        let request_id = self.next_request_id();
+        let started = Instant::now();
+        let input = req.input;
+        let bucket = input.bucket.clone();
+        let span = self.request_span(OPERATION, request_id, Some(&bucket));
+
+        let result = async {
+            let _admission = self.admit_request(OPERATION).await?;
+            self.check_bucket(&input.bucket)?;
+            validate_list_versions_request(&input)?;
+            let prefix = input.prefix.clone().unwrap_or_default();
+            let max_keys = max_keys(input.max_keys)?;
+            let page = self.list_page(
+                &prefix,
+                input.delimiter.as_deref(),
+                input.key_marker.as_deref(),
+                max_keys,
+            )?;
+            Ok(S3Response::new(list_versions_output(input, page, max_keys)))
         }
         .instrument(span)
         .await;
@@ -1291,7 +1656,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
 
             let prefix = input.prefix.unwrap_or_default();
@@ -1351,7 +1716,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
 
             let prefix = input.prefix.unwrap_or_default();
@@ -1416,7 +1781,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             self.check_mutation_allowed()?;
             validate_delete_object_request(&input)?;
@@ -1453,7 +1818,7 @@ impl S3 for GatewayS3Service {
         let span = self.request_span(OPERATION, request_id, Some(&bucket));
 
         let result = async {
-            let _admission = self.admit_request(OPERATION)?;
+            let _admission = self.admit_request(OPERATION).await?;
             self.check_bucket(&input.bucket)?;
             self.check_mutation_allowed()?;
             validate_delete_objects_request(&input)?;
@@ -1599,26 +1964,33 @@ fn record_s3_response_body_bytes(operation: &'static str, len: usize) {
 
 #[cfg(test)]
 mod tests {
+    mod checksum;
+    mod multipart;
+    mod multipart_checksum;
+
     use super::{
-        DownloadBodyBudget, GatewayS3Service, RequestRateLimiter, UploadBodyBudget,
-        status_code_label,
+        DownloadBodyBudget, GatewayS3Service, RequestRateLimiter, RuntimeRepository,
+        UploadBodyBudget, status_code_label,
     };
     use crate::GatewayMode;
     use crate::config::configured_streaming_upload_working_set_bytes;
     use crate::s3::mapping::collect_body;
     use crate::s3::test_support::runtime_config;
     use bytes::Bytes;
-    use rs3_repository::v2::V2CommitAnchor;
+    use rs3_repository::v3::V3CommitAnchor;
     use rs3_storage::BlobStore;
     use rs3_types::RetentionMode;
     use s3s::dto::{
-        Delete, DeleteObjectInput, DeleteObjectsInput, GetBucketLocationInput, GetObjectInput,
+        ChecksumAlgorithm, CompleteMultipartUploadInput, CompletedMultipartUpload, CompletedPart,
+        CopyObjectInput, CopySource, CreateMultipartUploadInput, Delete, DeleteObjectInput,
+        DeleteObjectsInput, ETag, ETagCondition, GetBucketLocationInput, GetObjectInput,
         GetObjectLegalHoldInput, HeadBucketInput, HeadObjectInput, ListBucketsInput,
-        ListObjectsInput, ListObjectsV2Input, ObjectIdentifier, ObjectLockLegalHold,
-        ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectInput, PutObjectLegalHoldInput,
-        StreamingBlob, Timestamp,
+        ListObjectsInput, ListObjectsV2Input, MetadataDirective, ObjectIdentifier,
+        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectInput,
+        PutObjectLegalHoldInput, StorageClass, StreamingBlob, Timestamp, UploadPartInput,
     };
     use s3s::{Body, S3, S3Request, S3Response};
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     async fn gateway_service() -> GatewayS3Service {
@@ -1635,7 +2007,13 @@ mod tests {
             RetentionMode::Governance,
             1,
         ));
-        GatewayS3Service::from_config(&config)
+        let repository = RuntimeRepository::from_config_with_maintenance_guard(
+            &config,
+            Arc::new(rs3_repository::v3::UnenforcedQuiescedMaintenanceGuard),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+        GatewayS3Service::from_repository(&config, repository)
             .await
             .unwrap_or_else(|error| panic!("{error}"))
     }
@@ -1736,6 +2114,21 @@ mod tests {
         }
     }
 
+    fn copy_input(source: &str, destination: &str) -> CopyObjectInput {
+        let mut builder = CopyObjectInput::builder();
+        builder
+            .set_bucket("client-bucket".to_owned())
+            .set_key(destination.to_owned())
+            .set_copy_source(CopySource::Bucket {
+                bucket: "client-bucket".into(),
+                key: source.into(),
+                version_id: None,
+            });
+        builder
+            .build()
+            .unwrap_or_else(|error| panic!("copy fixture: {error}"))
+    }
+
     fn delete_objects_input(
         objects: Vec<ObjectIdentifier>,
         quiet: Option<bool>,
@@ -1768,28 +2161,28 @@ mod tests {
         })
     }
 
-    async fn accepted_v2_sequence(service: &GatewayS3Service) -> u64 {
+    async fn accepted_v3_sequence(service: &GatewayS3Service) -> u64 {
         service
             .repository
-            .memory_v2_anchor()
-            .unwrap_or_else(|| panic!("missing v2 memory anchor"))
-            .read_v2()
+            .memory_v3_anchor()
+            .unwrap_or_else(|| panic!("missing v03 memory anchor"))
+            .read_v3()
             .await
             .unwrap_or_else(|error| panic!("{error}"))
-            .unwrap_or_else(|| panic!("missing v2 anchor state"))
+            .unwrap_or_else(|| panic!("missing v03 anchor state"))
             .sequence
             .get()
     }
 
-    async fn accepted_v2_commit_metadata(service: &GatewayS3Service) -> rs3_storage::BlobMetadata {
+    async fn accepted_v3_commit_metadata(service: &GatewayS3Service) -> rs3_storage::BlobMetadata {
         let accepted = service
             .repository
-            .memory_v2_anchor()
-            .unwrap_or_else(|| panic!("missing v2 memory anchor"))
-            .read_v2()
+            .memory_v3_anchor()
+            .unwrap_or_else(|| panic!("missing v03 memory anchor"))
+            .read_v3()
             .await
             .unwrap_or_else(|error| panic!("{error}"))
-            .unwrap_or_else(|| panic!("missing v2 anchor state"));
+            .unwrap_or_else(|| panic!("missing v03 anchor state"));
         service
             .repository
             .memory_store()
@@ -1821,6 +2214,628 @@ mod tests {
         assert_eq!(service.bucket_scope(None), "none");
         assert_eq!(service.bucket_scope(Some("client-bucket")), "configured");
         assert_eq!(service.bucket_scope(Some("tenant-a")), "other");
+    }
+
+    fn version_list_input() -> s3s::dto::ListObjectVersionsInput {
+        s3s::dto::ListObjectVersionsInput {
+            bucket: "client-bucket".to_owned(),
+            ..s3s::dto::ListObjectVersionsInput::default()
+        }
+    }
+
+    async fn put_version_fixture(service: &GatewayS3Service, key: &str, body: &'static [u8]) {
+        service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: key.to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(body)))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect("fixture put");
+    }
+
+    #[tokio::test]
+    async fn copy_object_preserves_trusted_facts_for_packed_and_empty_sources() {
+        let service = gateway_service().await;
+        let source = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/copy-source.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"copy bytes",
+                )))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect("source put")
+            .output;
+
+        let mut request = s3_request(copy_input(
+            "snapshots/copy-source.bin",
+            "snapshots/copy-destination.bin",
+        ));
+        request.input.copy_source =
+            CopySource::parse("client-bucket/snapshots/copy-source.bin?versionId=null")
+                .unwrap_or_else(|error| panic!("copy source fixture: {error}"));
+        request.input.metadata = Some(std::collections::HashMap::from([(
+            "mtime".to_owned(),
+            "inert-under-copy".to_owned(),
+        )]));
+        request.input.metadata_directive =
+            Some(MetadataDirective::from_static(MetadataDirective::COPY));
+        request.input.cache_control = Some("no-store".to_owned());
+        request.input.content_disposition = Some("attachment".to_owned());
+        request.input.content_encoding = Some("identity".to_owned());
+        request.input.content_language = Some("en".to_owned());
+        request.input.content_type = Some("application/octet-stream".to_owned());
+        request.input.expires = Some(Timestamp::from(SystemTime::UNIX_EPOCH));
+        request.input.storage_class = Some(StorageClass::from_static(StorageClass::STANDARD));
+        let copied = service
+            .copy_object(request)
+            .await
+            .expect("copy")
+            .output
+            .copy_object_result
+            .expect("copy result");
+        assert_eq!(copied.e_tag, source.e_tag);
+        assert_eq!(copied.checksum_crc64nvme, source.checksum_crc64nvme);
+        assert!(copied.last_modified.is_some());
+        assert_eq!(
+            response_body(
+                service
+                    .get_object(s3_request(GetObjectInput {
+                        bucket: "client-bucket".to_owned(),
+                        key: "snapshots/copy-destination.bin".to_owned(),
+                        ..GetObjectInput::default()
+                    }))
+                    .await
+                    .expect("copied object"),
+            )
+            .await,
+            Bytes::from_static(b"copy bytes")
+        );
+
+        service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/copy-source.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"replacement",
+                )))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect("source replacement");
+        assert_eq!(
+            response_body(
+                service
+                    .get_object(s3_request(GetObjectInput {
+                        bucket: "client-bucket".to_owned(),
+                        key: "snapshots/copy-destination.bin".to_owned(),
+                        ..GetObjectInput::default()
+                    }))
+                    .await
+                    .expect("copied object remains exact source"),
+            )
+            .await,
+            Bytes::from_static(b"copy bytes")
+        );
+
+        let empty = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/empty-source.bin".to_owned(),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect("empty source put")
+            .output;
+        let mut empty_request = s3_request(copy_input(
+            "snapshots/empty-source.bin",
+            "snapshots/empty-destination.bin",
+        ));
+        empty_request.input.content_type = Some("text/plain".to_owned());
+        let empty_copy = service
+            .copy_object(empty_request)
+            .await
+            .expect("empty copy")
+            .output
+            .copy_object_result
+            .expect("empty copy result");
+        assert_eq!(empty_copy.e_tag, empty.e_tag);
+        let head = service
+            .head_object(s3_request(HeadObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/empty-destination.bin".to_owned(),
+                ..HeadObjectInput::default()
+            }))
+            .await
+            .expect("empty copied head");
+        assert_eq!(head.output.content_length, Some(0));
+    }
+
+    #[tokio::test]
+    async fn copy_object_preserves_multipart_source_etag_and_bytes() {
+        let service = gateway_service().await;
+        let created = service
+            .create_multipart_upload(s3_request(CreateMultipartUploadInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/multipart-copy-source.bin".to_owned(),
+                ..CreateMultipartUploadInput::default()
+            }))
+            .await
+            .expect("create multipart source")
+            .output;
+        let upload_id = created.upload_id.expect("upload id");
+        let part = service
+            .upload_part(s3_request(UploadPartInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/multipart-copy-source.bin".to_owned(),
+                upload_id: upload_id.clone(),
+                part_number: 1,
+                content_length: Some(16),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"multipart source",
+                )))),
+                ..UploadPartInput::default()
+            }))
+            .await
+            .expect("multipart source part")
+            .output;
+        let source = service
+            .complete_multipart_upload(s3_request(CompleteMultipartUploadInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/multipart-copy-source.bin".to_owned(),
+                upload_id,
+                multipart_upload: Some(CompletedMultipartUpload {
+                    parts: Some(vec![CompletedPart {
+                        part_number: Some(1),
+                        e_tag: part.e_tag,
+                        ..CompletedPart::default()
+                    }]),
+                }),
+                ..CompleteMultipartUploadInput::default()
+            }))
+            .await
+            .expect("complete multipart source")
+            .output;
+        let copied = service
+            .copy_object(s3_request(copy_input(
+                "snapshots/multipart-copy-source.bin",
+                "snapshots/multipart-copy-destination.bin",
+            )))
+            .await
+            .expect("multipart copy")
+            .output
+            .copy_object_result
+            .expect("multipart copy result");
+        assert_eq!(copied.e_tag, source.e_tag);
+        assert_eq!(
+            response_body(
+                service
+                    .get_object(s3_request(GetObjectInput {
+                        bucket: "client-bucket".to_owned(),
+                        key: "snapshots/multipart-copy-destination.bin".to_owned(),
+                        ..GetObjectInput::default()
+                    }))
+                    .await
+                    .expect("copied multipart source"),
+            )
+            .await,
+            Bytes::from_static(b"multipart source")
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_object_enforces_source_conditions_and_rejects_unsupported_options() {
+        let service = gateway_service().await;
+        let source = service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/conditional-copy-source.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"source",
+                )))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect("source put")
+            .output;
+        let source_etag = source.e_tag.expect("source ETag");
+        let mut matched = copy_input(
+            "snapshots/conditional-copy-source.bin",
+            "snapshots/conditional-copy-destination.bin",
+        );
+        matched.copy_source_if_match = Some(ETagCondition::ETag(source_etag));
+        assert!(service.copy_object(s3_request(matched)).await.is_ok());
+
+        for (destination, condition) in [
+            (
+                "snapshots/conditional-copy-mismatch.bin",
+                ETagCondition::ETag(ETag::Strong("0".repeat(32))),
+            ),
+            (
+                "snapshots/conditional-copy-literal-star.bin",
+                ETagCondition::ETag(ETag::Strong("*".to_owned())),
+            ),
+        ] {
+            let mut input = copy_input("snapshots/conditional-copy-source.bin", destination);
+            input.copy_source_if_match = Some(condition);
+            let error = service
+                .copy_object(s3_request(input))
+                .await
+                .expect_err("source condition must fail");
+            assert_eq!(*error.code(), s3s::S3ErrorCode::PreconditionFailed);
+        }
+
+        let sequence = accepted_v3_sequence(&service).await;
+        let mut malformed = copy_input(
+            "snapshots/conditional-copy-source.bin",
+            "snapshots/conditional-copy-malformed.bin",
+        );
+        malformed.copy_source_if_match = Some(ETagCondition::ETag(ETag::Strong(String::new())));
+        let error = service
+            .copy_object(s3_request(malformed))
+            .await
+            .expect_err("empty source ETag is malformed");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidRequest);
+
+        let mut replace = copy_input(
+            "snapshots/conditional-copy-source.bin",
+            "snapshots/rejected-metadata.bin",
+        );
+        replace.metadata_directive =
+            Some(MetadataDirective::from_static(MetadataDirective::REPLACE));
+        let error = service
+            .copy_object(s3_request(replace))
+            .await
+            .expect_err("metadata replace is not supported");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
+
+        let mut checksum = copy_input(
+            "snapshots/conditional-copy-source.bin",
+            "snapshots/rejected-checksum.bin",
+        );
+        checksum.checksum_algorithm =
+            Some(ChecksumAlgorithm::from_static(ChecksumAlgorithm::SHA256));
+        let error = service
+            .copy_object(s3_request(checksum))
+            .await
+            .expect_err("checksum override is not supported");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
+
+        let mut storage_class = copy_input(
+            "snapshots/conditional-copy-source.bin",
+            "snapshots/rejected-storage-class.bin",
+        );
+        storage_class.storage_class = Some(StorageClass::from_static(StorageClass::GLACIER));
+        let error = service
+            .copy_object(s3_request(storage_class))
+            .await
+            .expect_err("nondefault storage class is an override");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
+
+        for header in ["if-match", "if-none-match"] {
+            let mut conditional = s3_request(copy_input(
+                "snapshots/conditional-copy-source.bin",
+                "snapshots/rejected-destination-condition.bin",
+            ));
+            conditional
+                .headers
+                .insert(header, http::HeaderValue::from_static("*"));
+            let error = service
+                .copy_object(conditional)
+                .await
+                .expect_err("destination condition is not in the pinned DTO");
+            assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidRequest);
+        }
+
+        let mut historical = copy_input(
+            "snapshots/conditional-copy-source.bin",
+            "snapshots/rejected-historical.bin",
+        );
+        historical.copy_source = CopySource::Bucket {
+            bucket: "client-bucket".into(),
+            key: "snapshots/conditional-copy-source.bin".into(),
+            version_id: Some("historical".into()),
+        };
+        let error = service
+            .copy_object(s3_request(historical))
+            .await
+            .expect_err("historical source is unsupported");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
+        assert_eq!(accepted_v3_sequence(&service).await, sequence);
+    }
+
+    #[tokio::test]
+    async fn copy_object_rejects_restore_readonly_mode() {
+        let mut service = gateway_service().await;
+        service
+            .put_object(s3_request(PutObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "snapshots/readonly-copy-source.bin".to_owned(),
+                body: Some(StreamingBlob::from(Body::from(Bytes::from_static(
+                    b"source",
+                )))),
+                ..PutObjectInput::default()
+            }))
+            .await
+            .expect("source put");
+        let sequence = accepted_v3_sequence(&service).await;
+        service.mode = GatewayMode::RestoreReadOnly;
+        let error = service
+            .copy_object(s3_request(copy_input(
+                "snapshots/readonly-copy-source.bin",
+                "snapshots/readonly-copy-destination.bin",
+            )))
+            .await
+            .expect_err("restore-readonly mode rejects copy");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::AccessDenied);
+        assert_eq!(accepted_v3_sequence(&service).await, sequence);
+    }
+
+    #[tokio::test]
+    async fn versioning_probes_are_unversioned_readonly_and_bucket_scoped() {
+        let mut service = gateway_service().await;
+        service.mode = crate::GatewayMode::RestoreReadOnly;
+        let input = s3s::dto::GetBucketVersioningInput {
+            bucket: "client-bucket".to_owned(),
+            ..s3s::dto::GetBucketVersioningInput::default()
+        };
+        let response = service
+            .get_bucket_versioning(s3_request(input.clone()))
+            .await
+            .expect("probe");
+        assert!(response.output.status.is_none());
+        assert!(response.output.mfa_delete.is_none());
+        let empty = service
+            .list_object_versions(s3_request(version_list_input()))
+            .await
+            .expect("readonly list");
+        assert!(empty.output.versions.is_none());
+        assert!(empty.output.delete_markers.is_none());
+        assert_eq!(empty.output.is_truncated, Some(false));
+        let mut foreign = input;
+        foreign.bucket = "private-other".to_owned();
+        let error = service
+            .get_bucket_versioning(s3_request(foreign))
+            .await
+            .expect_err("foreign bucket");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::AccessDenied);
+        let mut foreign = version_list_input();
+        foreign.bucket = "private-other".to_owned();
+        let error = service
+            .list_object_versions(s3_request(foreign))
+            .await
+            .expect_err("foreign list");
+        assert_eq!(*error.code(), s3s::S3ErrorCode::AccessDenied);
+        assert!(!error.to_string().contains("private-other"));
+    }
+
+    #[tokio::test]
+    async fn version_listing_exposes_only_current_values_and_null_is_readable() {
+        let service = gateway_service().await;
+        put_version_fixture(&service, "current", b"old").await;
+        put_version_fixture(&service, "current", b"replacement").await;
+        put_version_fixture(&service, "deleted", b"hidden").await;
+        service
+            .delete_object(s3_request(DeleteObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "deleted".to_owned(),
+                ..DeleteObjectInput::default()
+            }))
+            .await
+            .expect("logical delete");
+        let listed = service
+            .list_object_versions(s3_request(version_list_input()))
+            .await
+            .expect("versions")
+            .output;
+        assert!(listed.delete_markers.is_none());
+        let versions = listed.versions.expect("one current version");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].key.as_deref(), Some("current"));
+        assert_eq!(versions[0].version_id.as_deref(), Some("null"));
+        assert_eq!(versions[0].is_latest, Some(true));
+        assert_eq!(versions[0].size, Some(11));
+        let head = service
+            .head_object(s3_request(HeadObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "current".to_owned(),
+                version_id: Some("null".to_owned()),
+                ..HeadObjectInput::default()
+            }))
+            .await
+            .expect("null current head");
+        assert_eq!(versions[0].e_tag, head.output.e_tag);
+        let get = service
+            .get_object(s3_request(GetObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "current".to_owned(),
+                version_id: Some("null".to_owned()),
+                ..GetObjectInput::default()
+            }))
+            .await
+            .expect("null current get");
+        assert_eq!(response_body(get).await, Bytes::from_static(b"replacement"));
+        service
+            .get_object_legal_hold(s3_request(GetObjectLegalHoldInput {
+                bucket: "client-bucket".to_owned(),
+                key: "current".to_owned(),
+                version_id: Some("null".to_owned()),
+                ..GetObjectLegalHoldInput::default()
+            }))
+            .await
+            .expect("null current hold metadata");
+        put_version_fixture(&service, "batch-current", b"batch").await;
+        let mut identifier = delete_object_identifier("batch-current");
+        identifier.version_id = Some("null".to_owned());
+        let batch = service
+            .delete_objects(s3_request(delete_objects_input(vec![identifier], None)))
+            .await
+            .expect("null batch delete");
+        assert!(batch.output.errors.is_none());
+        for version in ["historical-version", ""] {
+            let error = service
+                .get_object(s3_request(GetObjectInput {
+                    bucket: "client-bucket".to_owned(),
+                    key: "current".to_owned(),
+                    version_id: Some(version.to_owned()),
+                    ..GetObjectInput::default()
+                }))
+                .await
+                .expect_err("historical read refused");
+            assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
+            assert!(
+                service
+                    .head_object(s3_request(HeadObjectInput {
+                        bucket: "client-bucket".to_owned(),
+                        key: "current".to_owned(),
+                        version_id: Some(version.to_owned()),
+                        ..HeadObjectInput::default()
+                    }))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                service
+                    .delete_object(s3_request(DeleteObjectInput {
+                        bucket: "client-bucket".to_owned(),
+                        key: "current".to_owned(),
+                        version_id: Some(version.to_owned()),
+                        ..DeleteObjectInput::default()
+                    }))
+                    .await
+                    .is_err()
+            );
+        }
+        service
+            .delete_object(s3_request(DeleteObjectInput {
+                bucket: "client-bucket".to_owned(),
+                key: "current".to_owned(),
+                version_id: Some("null".to_owned()),
+                ..DeleteObjectInput::default()
+            }))
+            .await
+            .expect("null logical delete");
+        let listed = service
+            .list_object_versions(s3_request(version_list_input()))
+            .await
+            .expect("after delete")
+            .output;
+        assert!(listed.versions.is_none());
+        assert!(listed.delete_markers.is_none());
+    }
+
+    #[tokio::test]
+    async fn version_listing_paginates_encoded_objects_and_common_prefixes() {
+        let service = gateway_service().await;
+        for key in ["p/a/one", "p/a/two", "p/b", "p/c/one", "p/d"] {
+            put_version_fixture(&service, key, b"x").await;
+        }
+        let mut input = version_list_input();
+        input.prefix = Some("p/".to_owned());
+        input.delimiter = Some("/".to_owned());
+        input.max_keys = Some(1);
+        input.encoding_type = Some(s3s::dto::EncodingType::from_static("url"));
+        for (index, expected) in ["p%2Fa%2F", "p%2Fb", "p%2Fc%2F", "p%2Fd"]
+            .into_iter()
+            .enumerate()
+        {
+            let output = service
+                .list_object_versions(s3_request(input.clone()))
+                .await
+                .expect("version page")
+                .output;
+            assert_eq!(output.prefix.as_deref(), Some("p%2F"));
+            assert_eq!(output.delimiter.as_deref(), Some("%2F"));
+            assert_eq!(output.max_keys, Some(1));
+            let actual = output
+                .versions
+                .as_ref()
+                .and_then(|versions| versions.first())
+                .and_then(|version| version.key.as_deref())
+                .or_else(|| {
+                    output
+                        .common_prefixes
+                        .as_ref()
+                        .and_then(|prefixes| prefixes.first())
+                        .and_then(|prefix| prefix.prefix.as_deref())
+                });
+            assert_eq!(actual, Some(expected));
+            assert_eq!(output.is_truncated, Some(index < 3));
+            if index < 3 {
+                assert_eq!(output.next_key_marker.as_deref(), Some(expected));
+                assert_eq!(
+                    output.next_version_id_marker.as_deref(),
+                    (index == 1).then_some("null")
+                );
+                input.key_marker = output.next_key_marker.map(|key| {
+                    percent_encoding::percent_decode_str(&key)
+                        .decode_utf8()
+                        .expect("UTF-8 key")
+                        .into_owned()
+                });
+                input.version_id_marker = output.next_version_id_marker;
+            } else {
+                assert!(output.next_key_marker.is_none());
+                assert!(output.next_version_id_marker.is_none());
+            }
+        }
+        put_version_fixture(&service, "space /%猫&.bin", b"special").await;
+        let mut input = version_list_input();
+        input.prefix = Some("space ".to_owned());
+        input.encoding_type = Some(s3s::dto::EncodingType::from_static("url"));
+        let output = service
+            .list_object_versions(s3_request(input))
+            .await
+            .expect("encoded special key")
+            .output;
+        assert_eq!(
+            output.versions.expect("version")[0].key.as_deref(),
+            Some("space%20%2F%25%E7%8C%AB%26.bin")
+        );
+    }
+
+    #[tokio::test]
+    async fn version_listing_rejects_unknown_markers_options_and_invalid_limits() {
+        let service = gateway_service().await;
+        put_version_fixture(&service, "current", b"x").await;
+        let mut cases = Vec::new();
+        let mut input = version_list_input();
+        input.version_id_marker = Some("old".to_owned());
+        input.key_marker = Some("current".to_owned());
+        cases.push(input);
+        let mut input = version_list_input();
+        input.version_id_marker = Some("null".to_owned());
+        cases.push(input);
+        let mut input = version_list_input();
+        input.encoding_type = Some(s3s::dto::EncodingType::from_static("unknown"));
+        cases.push(input);
+        let mut input = version_list_input();
+        input.expected_bucket_owner = Some("unknown".to_owned());
+        cases.push(input);
+        let mut input = version_list_input();
+        input.max_keys = Some(-1);
+        cases.push(input);
+        for input in cases {
+            assert!(
+                service
+                    .list_object_versions(s3_request(input))
+                    .await
+                    .is_err()
+            );
+        }
+        let mut input = version_list_input();
+        input.max_keys = Some(0);
+        let output = service
+            .list_object_versions(s3_request(input))
+            .await
+            .expect("zero limit")
+            .output;
+        assert!(output.versions.is_none());
+        assert_eq!(output.is_truncated, Some(false));
     }
 
     #[tokio::test]
@@ -1905,13 +2920,13 @@ mod tests {
             .await;
         assert!(put.is_ok());
 
-        assert_eq!(accepted_v2_sequence(&service).await, 2);
+        assert_eq!(accepted_v3_sequence(&service).await, 2);
 
         let backend_objects = service
             .repository
             .memory_store()
             .unwrap_or_else(|| panic!("missing memory store"))
-            .list_prefix("commits/v02/")
+            .list_prefix("commits/v03/")
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(backend_objects.len(), 2);
@@ -1996,7 +3011,7 @@ mod tests {
         let delete = delete.unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(delete.output.delete_marker, Some(false));
 
-        assert_eq!(accepted_v2_sequence(&service).await, 3);
+        assert_eq!(accepted_v3_sequence(&service).await, 3);
 
         let missing = service
             .head_object(s3_request(HeadObjectInput {
@@ -2210,7 +3225,7 @@ mod tests {
             .expect_err("oversized PutObject should be rejected");
 
         assert_eq!(error.code().as_str(), "EntityTooLarge");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -2267,7 +3282,7 @@ mod tests {
             .expect_err("short streaming PutObject body should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -2288,7 +3303,7 @@ mod tests {
             .expect_err("long streaming PutObject body should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -2311,7 +3326,7 @@ mod tests {
             .expect_err("streaming PutObject read error should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2333,7 +3348,7 @@ mod tests {
             .expect_err("stalled streaming PutObject body should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2355,7 +3370,7 @@ mod tests {
             .expect_err("stalled buffered PutObject body should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2376,7 +3391,7 @@ mod tests {
             .expect_err("stalled unknown-length PutObject body should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -2501,7 +3516,7 @@ mod tests {
         assert_eq!(counts.multipart_create, 0);
         assert_eq!(counts.multipart_put, 0);
         assert_eq!(service.upload_body_budget.in_flight_bytes(), 0);
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -2523,7 +3538,7 @@ mod tests {
             .expect_err("unknown-length streaming PutObject read error should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -2542,7 +3557,7 @@ mod tests {
             .expect_err("oversized declared PutObject length should be rejected");
 
         assert_eq!(error.code().as_str(), "EntityTooLarge");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[test]
@@ -2611,7 +3626,7 @@ mod tests {
             .expect_err("PutObject above in-flight body budget should be rejected");
 
         assert_eq!(error.code().as_str(), "SlowDown");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -2756,7 +3771,7 @@ mod tests {
             .expect_err("streamed PutObject above in-flight body budget should be rejected");
 
         assert_eq!(error.code().as_str(), "SlowDown");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -2770,10 +3785,12 @@ mod tests {
             });
         let _permit = service
             .admit_request("TestOperation")
+            .await
             .unwrap_or_else(|error| panic!("{error}"));
 
         let error = service
             .admit_request("TestOperation")
+            .await
             .expect_err("second admission should be rejected");
 
         assert_eq!(error.code().as_str(), "SlowDown");
@@ -2895,7 +3912,7 @@ mod tests {
             .expect_err("restore-readonly mode should reject DeleteObjects");
         assert_eq!(*delete_objects.code(), s3s::S3ErrorCode::AccessDenied);
 
-        assert_eq!(accepted_v2_sequence(&service).await, 2);
+        assert_eq!(accepted_v3_sequence(&service).await, 2);
     }
 
     #[tokio::test]
@@ -2917,7 +3934,7 @@ mod tests {
             .await;
         assert!(put.is_ok());
 
-        let commit = accepted_v2_commit_metadata(&service).await;
+        let commit = accepted_v3_commit_metadata(&service).await;
         let retention = commit
             .retention
             .as_ref()
@@ -2963,7 +3980,7 @@ mod tests {
             .expect_err("unqualified retention should be rejected");
 
         assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]

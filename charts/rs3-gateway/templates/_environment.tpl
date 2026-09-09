@@ -1,0 +1,237 @@
+{{- define "rs3-gateway.environment" -}}
+{{- $bootstrap := .bootstrap -}}
+{{- with .root -}}
+- name: RS3_BIND
+  value: "0.0.0.0:{{ .Values.service.port }}"
+{{- if .Values.metrics.enabled }}
+- name: RS3_METRICS_BIND
+  value: "0.0.0.0:{{ .Values.metrics.port }}"
+{{- end }}
+{{- if .Values.admin.enabled }}
+- name: RS3_ADMIN_BIND
+  value: "0.0.0.0:{{ .Values.admin.port }}"
+- name: RS3_ADMIN_BEARER_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "rs3-gateway.adminTokenSecretName" . }}
+      key: bearer-token
+# Optional: POST maintenance mutations stay disabled when the admin
+# Secret has no mutation-bearer-token key.
+- name: RS3_ADMIN_MUTATION_BEARER_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "rs3-gateway.adminTokenSecretName" . }}
+      key: mutation-bearer-token
+      optional: true
+{{- end }}
+- name: RS3_GATEWAY_MODE
+  value: {{ .Values.gateway.mode | quote }}
+- name: RS3_MAX_PUT_OBJECT_BYTES
+  value: {{ printf "%d" (int64 .Values.hardening.maxPutObjectBytes) | quote }}
+- name: RS3_BUFFERED_PUT_OBJECT_BYTES
+  value: {{ printf "%d" (int64 .Values.hardening.bufferedPutObjectBytes) | quote }}
+- name: RS3_BACKEND_MULTIPART_PART_BYTES
+  value: {{ printf "%d" (int64 .Values.hardening.backendMultipartPartBytes) | quote }}
+- name: RS3_STREAM_READ_STALL_TIMEOUT_SECS
+  value: {{ .Values.hardening.streamReadStallTimeoutSeconds | quote }}
+- name: RS3_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES
+  value: {{ printf "%d" (int64 .Values.hardening.maxInFlightUploadBodyBytes) | quote }}
+- name: RS3_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES
+  value: {{ printf "%d" (int64 .Values.hardening.maxInFlightDownloadBodyBytes) | quote }}
+- name: RS3_MAX_CONCURRENT_CONNECTIONS
+  value: {{ .Values.hardening.maxConcurrentConnections | quote }}
+- name: RS3_MAX_CONCURRENT_REQUESTS
+  value: {{ .Values.hardening.maxConcurrentRequests | quote }}
+- name: RS3_REQUEST_RATE_LIMIT_PER_SECOND
+  value: {{ .Values.hardening.requestRateLimitPerSecond | quote }}
+- name: RS3_PUBLIC_BUCKET
+  value: {{ .Values.publicBucket | quote }}
+- name: RS3_BACKEND_ENDPOINT
+  value: {{ .Values.backend.endpoint | quote }}
+- name: RS3_BACKEND_BUCKET
+  value: {{ .Values.backend.bucket | quote }}
+- name: RS3_BACKEND_PREFIX
+  value: {{ .Values.backend.prefix | quote }}
+- name: RS3_BACKEND_CONNECT_TIMEOUT_SECS
+  value: {{ .Values.backend.timeouts.connectSeconds | quote }}
+- name: RS3_BACKEND_READ_TIMEOUT_SECS
+  value: {{ .Values.backend.timeouts.readSeconds | quote }}
+- name: RS3_BACKEND_OPERATION_ATTEMPT_TIMEOUT_SECS
+  value: {{ .Values.backend.timeouts.operationAttemptSeconds | quote }}
+- name: RS3_BACKEND_OPERATION_TIMEOUT_SECS
+  value: {{ .Values.backend.timeouts.operationSeconds | quote }}
+- name: RS3_BACKEND_STALLED_STREAM_GRACE_SECS
+  value: {{ .Values.backend.timeouts.stalledStreamGraceSeconds | quote }}
+- name: AWS_DEFAULT_REGION
+  value: {{ .Values.backend.region | quote }}
+- name: AWS_EC2_METADATA_DISABLED
+  value: "true"
+{{- if or .Values.backendCredentials.create .Values.backendCredentials.existingSecret }}
+- name: AWS_ACCESS_KEY_ID
+  valueFrom:
+    secretKeyRef:
+      name: {{ default (printf "%s-backend" (include "rs3-gateway.fullname" .)) .Values.backendCredentials.existingSecret }}
+      key: access-key-id
+- name: AWS_SECRET_ACCESS_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ default (printf "%s-backend" (include "rs3-gateway.fullname" .)) .Values.backendCredentials.existingSecret }}
+      key: secret-access-key
+{{- end }}
+- name: RS3_STATIC_ACCESS_KEY_ID
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "rs3-gateway.secretName" . }}
+      key: access-key-id
+- name: RS3_STATIC_SECRET_ACCESS_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "rs3-gateway.secretName" . }}
+      key: secret-access-key
+- name: RS3_COMMIT_MAX_BATCH_ITEMS
+  value: {{ .Values.commit.maxBatchItems | quote }}
+- name: RS3_COMMIT_MAX_BATCH_DELAY_MS
+  value: {{ .Values.commit.maxBatchDelayMs | quote }}
+- name: RS3_COMMIT_MAX_PENDING_ITEMS
+  value: {{ .Values.commit.maxPendingItems | quote }}
+- name: RS3_REPOSITORY_ID
+  value: {{ .Values.repository.id | quote }}
+- name: RS3_ALLOW_REPOSITORY_INIT
+  value: {{ ternary true .Values.repository.allowInit $bootstrap | quote }}
+{{- if ne .Values.repository.payloadSegmentSizeBytes nil }}
+- name: RS3_PAYLOAD_SEGMENT_SIZE_BYTES
+  value: {{ printf "%d" (int64 .Values.repository.payloadSegmentSizeBytes) | quote }}
+{{- end }}
+{{- if .Values.repository.retention.mode }}
+- name: RS3_REPOSITORY_RETENTION_MODE
+  value: {{ .Values.repository.retention.mode | quote }}
+- name: RS3_REPOSITORY_RETENTION_DAYS
+  value: {{ .Values.repository.retention.days | quote }}
+{{- end }}
+{{- if or .Values.repositoryKeys.create .Values.repositoryKeys.existingSecret }}
+- name: RS3_REPOSITORY_SALT_HEX
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
+      key: salt-hex
+      optional: true
+- name: RS3_KEYRING_ENVELOPE_OBJECT_ID
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
+      key: envelope-object-id
+      optional: true
+- name: RS3_KEYRING_WRAPPING_KEY_ID
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
+      key: wrapping-key-id
+      optional: true
+- name: RS3_KEYRING_WRAPPING_KEY_HEX
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "rs3-gateway.repositoryKeySecretName" . }}
+      key: wrapping-key-hex
+{{- end }}
+{{- if .Values.recovery.publicKey }}
+- name: RS3_RECOVERY_PUBLIC_KEY
+  value: {{ .Values.recovery.publicKey | quote }}
+{{- end }}
+- name: RS3_RECOVERY_WINDOW_DAYS
+  value: {{ .Values.recovery.windowDays | quote }}
+- name: RS3_RECOVERY_RENEWAL_MARGIN_SECONDS
+  value: {{ .Values.recovery.renewalMarginSeconds | quote }}
+- name: RS3_RECOVERY_CLOCK_UNCERTAINTY_MS
+  value: {{ .Values.recovery.clockUncertaintyMs | quote }}
+- name: RS3_ANCHOR_MODE
+  value: {{ .Values.anchor.mode | quote }}
+- name: RS3_WRITER_GUARD
+  value: {{ .Values.gateway.writerGuard | quote }}
+{{- if and (eq .Values.anchor.mode "memory") .Values.anchor.allowMemory }}
+- name: RS3_ALLOW_MEMORY_ANCHOR
+  value: "true"
+{{- end }}
+{{- if eq .Values.anchor.mode "kubernetes-lease" }}
+- name: RS3_ANCHOR_NAMESPACE
+  value: {{ include "rs3-gateway.anchorNamespace" . | quote }}
+- name: RS3_ANCHOR_NAME
+  value: {{ .Values.anchor.name | quote }}
+- name: RS3_ANCHOR_FIELD_MANAGER
+  value: {{ .Values.anchor.fieldManager | quote }}
+{{- end }}
+- name: RS3_RECLAMATION_ENABLED
+  value: {{ ternary false .Values.maintenance.reclamationEnabled (eq .Values.gateway.mode "restore-readonly") | quote }}
+{{- if .Values.maintenance.mode }}
+- name: RS3_MAINTENANCE_MODE
+  value: {{ .Values.maintenance.mode | quote }}
+{{- end }}
+{{- if .Values.maintenance.renewalHorizonSeconds }}
+- name: RS3_MAINTENANCE_RENEWAL_HORIZON_SECONDS
+  value: {{ .Values.maintenance.renewalHorizonSeconds | quote }}
+{{- end }}
+{{- if .Values.maintenance.orphanPressureBytes }}
+- name: RS3_MAINTENANCE_ORPHAN_PRESSURE_BYTES
+  value: {{ printf "%d" (int64 .Values.maintenance.orphanPressureBytes) | quote }}
+{{- end }}
+{{- if .Values.maintenance.orphanPressureCount }}
+- name: RS3_MAINTENANCE_ORPHAN_PRESSURE_COUNT
+  value: {{ .Values.maintenance.orphanPressureCount | quote }}
+{{- end }}
+{{- if .Values.maintenance.orphanPressureMaxAgeSeconds }}
+- name: RS3_MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS
+  value: {{ .Values.maintenance.orphanPressureMaxAgeSeconds | quote }}
+{{- end }}
+{{- if .Values.maintenance.maxIntervalSeconds }}
+- name: RS3_MAINTENANCE_MAX_INTERVAL_SECONDS
+  value: {{ .Values.maintenance.maxIntervalSeconds | quote }}
+{{- end }}
+{{- if .Values.maintenance.minCooldownSeconds }}
+- name: RS3_MAINTENANCE_MIN_COOLDOWN_SECONDS
+  value: {{ .Values.maintenance.minCooldownSeconds | quote }}
+{{- end }}
+{{- if .Values.maintenance.pacingDelayMs }}
+- name: RS3_MAINTENANCE_PACING_DELAY_MS
+  value: {{ .Values.maintenance.pacingDelayMs | quote }}
+{{- end }}
+{{- if .Values.maintenance.maxInventoryPages }}
+- name: RS3_MAINTENANCE_MAX_INVENTORY_PAGES
+  value: {{ .Values.maintenance.maxInventoryPages | quote }}
+{{- end }}
+{{- if .Values.maintenance.maxInventoryItems }}
+- name: RS3_MAINTENANCE_MAX_INVENTORY_ITEMS
+  value: {{ .Values.maintenance.maxInventoryItems | quote }}
+{{- end }}
+{{- if .Values.maintenance.maxHistoryMetadataBytes }}
+- name: RS3_MAINTENANCE_MAX_HISTORY_METADATA_BYTES
+  value: {{ printf "%d" (int64 .Values.maintenance.maxHistoryMetadataBytes) | quote }}
+{{- end }}
+{{- if .Values.maintenance.maxHistoryPendingBytes }}
+- name: RS3_MAINTENANCE_MAX_HISTORY_PENDING_BYTES
+  value: {{ printf "%d" (int64 .Values.maintenance.maxHistoryPendingBytes) | quote }}
+{{- end }}
+{{- if or .Values.providerConformance.existingConfigMap (and (or .Values.bootstrap.enabled .Values.bootstrap.existingJournalSecret) (not $bootstrap)) }}
+- name: RS3_PROVIDER_CONFORMANCE_REPORT_FILE
+  value: /etc/rs3/provider-conformance/report.json
+{{- end }}
+- name: RS3_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS
+  value: {{ .Values.providerConformance.maxAgeSeconds | quote }}
+{{- if .Values.providerConformance.principalFingerprint }}
+- name: RS3_PROVIDER_PRINCIPAL_FINGERPRINT
+  value: {{ .Values.providerConformance.principalFingerprint | quote }}
+{{- end }}
+- name: RS3_LOG_FORMAT
+  value: {{ .Values.logging.format | quote }}
+- name: RS3_ADMIN_PROFILE
+  value: {{ .Values.admin.profile | quote }}
+- name: RUST_LOG
+  value: {{ .Values.logging.rustLog | quote }}
+{{- if $bootstrap }}
+- name: RS3_INIT_JOURNAL_SECRET
+  value: {{ include "rs3-gateway.bootstrapJournalName" . | quote }}
+- name: RS3_INIT_PROFILE
+  value: {{ .Values.admin.profile | quote }}
+- name: RS3_INIT_GOVERNANCE_BYPASS_REVIEWED
+  value: {{ .Values.bootstrap.governanceBypassReviewed | quote }}
+{{- end }}
+{{- end -}}
+{{- end -}}

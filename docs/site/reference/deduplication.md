@@ -1,6 +1,6 @@
 # Deduplication Design Note
 
-Deduplication is not part of the baseline `v02` repository format. This note
+Deduplication is not part of the baseline `v03` repository format. This note
 records the researched extension boundary so storage savings do not quietly
 weaken path privacy, confidentiality, retention, or restore correctness.
 

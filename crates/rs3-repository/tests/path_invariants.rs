@@ -3,9 +3,9 @@
 use bytes::Bytes;
 use proptest::prelude::*;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_repository::v2::{
-    UnenforcedQuiescedMaintenanceGuard, V2CommitStoreOptions, V2FormatRef, V2KeyringEnvelopeRef,
-    V2MemoryAnchor, V2ProviderProfile, V2Repository,
+use rs3_repository::v3::{
+    UnenforcedQuiescedMaintenanceGuard, V3CommitStoreOptions, V3FormatRef, V3KeyringEnvelopeRef,
+    V3MemoryAnchor, V3ProviderProfile, V3Repository,
 };
 use rs3_repository::{RepositoryOptions, RepositoryPutOptions};
 use rs3_storage::{BlobStore, ByteRange, MemoryBlobStore};
@@ -35,18 +35,18 @@ proptest! {
 
 async fn check_committed_path(path: String) -> Result<(), String> {
     let store = MemoryBlobStore::new();
-    let repository = V2Repository::new(
+    let repository = V3Repository::new(
         store.clone(),
         signing_keyring(),
         RepositoryOptions::default(),
-        V2CommitStoreOptions::for_profile(
-            V2ProviderProfile::Dev,
+        V3CommitStoreOptions::for_profile(
+            V3ProviderProfile::Dev,
             sample_repository_id()?,
             sample_keyring_envelope_ref()?,
             sample_format_ref()?,
         ),
     );
-    let anchor = V2MemoryAnchor::new();
+    let anchor = V3MemoryAnchor::new();
     let client_path = logical_path(path.clone())?;
 
     repository
@@ -128,15 +128,15 @@ fn logical_path(value: String) -> Result<LogicalPath, String> {
     LogicalPath::new(value).map_err(|error| error.to_string())
 }
 
-fn sample_keyring_envelope_ref() -> Result<V2KeyringEnvelopeRef, String> {
-    Ok(V2KeyringEnvelopeRef {
+fn sample_keyring_envelope_ref() -> Result<V3KeyringEnvelopeRef, String> {
+    Ok(V3KeyringEnvelopeRef {
         object_id: object_id("keyrings/00000000000000000001-bootstrap")?,
         digest: [6_u8; 32],
     })
 }
 
-fn sample_format_ref() -> Result<V2FormatRef, String> {
-    Ok(V2FormatRef {
+fn sample_format_ref() -> Result<V3FormatRef, String> {
+    Ok(V3FormatRef {
         generation: 1,
         digest: hex::encode([7_u8; 32]),
         object_id: object_id(&format!("format/{:020}-{}", 1_u64, hex::encode([7_u8; 32])))?,
@@ -152,32 +152,13 @@ fn object_id(value: &str) -> Result<BackendObjectId, String> {
 
 fn signing_keyring() -> KeyRing {
     keyring(vec![
-        key_material(
-            "namespace",
-            KeyPurpose::Namespace,
-            KeyStatus::Primary,
-            "hmac-sha256",
-            1,
-        ),
-        key_material(
-            "metadata",
-            KeyPurpose::Metadata,
-            KeyStatus::Primary,
-            "aes-256-gcm-siv-hmac-sha256-nonce-v1",
-            2,
-        ),
-        key_material(
-            "content",
-            KeyPurpose::Content,
-            KeyStatus::Primary,
-            "xchacha20poly1305",
-            4,
-        ),
+        key_material("namespace", KeyPurpose::Namespace, KeyStatus::Primary, 1),
+        key_material("metadata", KeyPurpose::Metadata, KeyStatus::Primary, 2),
+        key_material("content", KeyPurpose::Content, KeyStatus::Primary, 4),
         key_material(
             "signing",
             KeyPurpose::CheckpointSigning,
             KeyStatus::Primary,
-            "ed25519",
             3,
         ),
     ])
@@ -194,20 +175,15 @@ fn key_material(
     value: &str,
     purpose: KeyPurpose,
     status: KeyStatus,
-    algorithm: &str,
     secret_byte: u8,
 ) -> KeyMaterial {
     KeyMaterial::new(
         KeyDescriptor {
             id: key_id(value),
             purpose,
-            algorithm: algorithm.to_owned(),
             status,
             created_at_ms: 0,
-            not_before_ms: None,
-            not_after_ms: None,
             public_key: None,
-            external_kms_uri: None,
         },
         secret(secret_byte),
     )

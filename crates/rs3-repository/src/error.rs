@@ -17,12 +17,12 @@ pub enum RepositoryError {
     /// The client-visible object already exists and create-only mode was requested.
     #[error("object already exists")]
     AlreadyExists(LogicalPath),
-    /// The selected repository format cannot serve this operation yet.
-    #[error("repository format is not supported by this operation: {format}")]
-    UnsupportedRepositoryFormat {
-        /// Repository format spelling.
-        format: &'static str,
-    },
+    /// A source condition did not match the accepted object.
+    #[error("object precondition failed")]
+    PreconditionFailed,
+    /// Copy options are malformed or exceed the request bound.
+    #[error("invalid copy options")]
+    InvalidCopyOptions,
     /// The object exceeds a configured size limit.
     #[error("object exceeds configured maximum size")]
     ObjectTooLarge,
@@ -32,6 +32,15 @@ pub enum RepositoryError {
     /// The object body stream failed before it could be fully read.
     #[error("object body stream could not be read")]
     ObjectBodyReadFailed,
+    /// A requested checksum was not resolved by the verified request reader.
+    #[error("request checksum is not available from a verified complete body")]
+    ObjectChecksumUnavailable,
+    /// A declared checksum disagrees with verified uploaded content.
+    #[error("request checksum did not match verified content")]
+    ObjectChecksumMismatch,
+    /// Plaintext did not match the declared Content-MD5.
+    #[error("content MD5 did not match request body")]
+    ContentMd5Mismatch,
     /// Repository sequence allocation overflowed.
     #[error("repository sequence overflow")]
     SequenceOverflow,
@@ -56,8 +65,8 @@ pub enum RepositoryError {
         /// Failure reason.
         reason: String,
     },
-    /// The external anchor accepted a mutation, but local state installation failed.
-    #[error("repository mutation was accepted but local recovery is required")]
+    /// Publication was accepted or its outcome is unknown; local recovery is required.
+    #[error("repository publication requires local recovery before further mutations")]
     AcceptedRecoveryRequired,
     /// A validated maintenance candidate would not reduce repository metadata.
     #[error("repository maintenance candidate is not reducing")]
@@ -68,12 +77,6 @@ pub enum RepositoryError {
     /// A stored keyring envelope object has different content than expected.
     #[error("keyring envelope object conflicts with expected content: {object_id}")]
     KeyringEnvelopeObjectConflict {
-        /// Conflicting backend object ID.
-        object_id: BackendObjectId,
-    },
-    /// A stored index delta object has different content than expected.
-    #[error("index delta object conflicts with expected content: {object_id}")]
-    IndexDeltaObjectConflict {
         /// Conflicting backend object ID.
         object_id: BackendObjectId,
     },

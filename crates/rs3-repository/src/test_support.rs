@@ -19,63 +19,34 @@ fn key_material(
     value: &str,
     purpose: KeyPurpose,
     status: KeyStatus,
-    algorithm: &str,
     secret_byte: u8,
 ) -> KeyMaterial {
     KeyMaterial::new(
         KeyDescriptor {
             id: key_id(value),
             purpose,
-            algorithm: algorithm.to_string(),
             status,
             created_at_ms: 0,
-            not_before_ms: None,
-            not_after_ms: None,
             public_key: None,
-            external_kms_uri: None,
         },
         secret_with_byte(secret_byte),
     )
 }
 
 fn namespace_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMaterial {
-    key_material(
-        value,
-        KeyPurpose::Namespace,
-        status,
-        "hmac-sha256",
-        secret_byte,
-    )
+    key_material(value, KeyPurpose::Namespace, status, secret_byte)
 }
 
 fn checkpoint_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMaterial {
-    key_material(
-        value,
-        KeyPurpose::CheckpointSigning,
-        status,
-        "ed25519",
-        secret_byte,
-    )
+    key_material(value, KeyPurpose::CheckpointSigning, status, secret_byte)
 }
 
 fn content_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMaterial {
-    key_material(
-        value,
-        KeyPurpose::Content,
-        status,
-        "xchacha20poly1305",
-        secret_byte,
-    )
+    key_material(value, KeyPurpose::Content, status, secret_byte)
 }
 
 fn metadata_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMaterial {
-    key_material(
-        value,
-        KeyPurpose::Metadata,
-        status,
-        "aes-256-gcm-siv-hmac-sha256-nonce-v1",
-        secret_byte,
-    )
+    key_material(value, KeyPurpose::Metadata, status, secret_byte)
 }
 
 fn keyring(mut keys: Vec<KeyMaterial>) -> KeyRing {

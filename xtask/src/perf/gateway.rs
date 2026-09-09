@@ -23,7 +23,7 @@ use tokio::net::TcpStream;
 const GATEWAY_PUBLIC_BUCKET: &str = "client-bucket";
 const GATEWAY_ACCESS_KEY_ID: &str = "rs3-fixture-access-key";
 const GATEWAY_SECRET_ACCESS_KEY: &str = "rs3-fixture-secret-key";
-const GATEWAY_KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.json";
+const GATEWAY_KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.cbor";
 const GATEWAY_KEYRING_WRAPPING_KEY_HEX: &str =
     "3333333333333333333333333333333333333333333333333333333333333333";
 const GATEWAY_KEYRING_WRAPPING_KEY_ID: &str = "wrap-integration";
@@ -52,7 +52,7 @@ pub(super) fn run_s3_gateway_container_perf(args: &PerfArgs) -> Result<()> {
             .s3_prefix
             .clone()
             .unwrap_or_else(default_gateway_prefix);
-        let standalone_prefix = format!("{}/objects/v02/", backend_prefix.trim_end_matches('/'));
+        let standalone_prefix = format!("{}/objects/v03/", backend_prefix.trim_end_matches('/'));
         let backend_client = s3_container::s3_client_with_timeout(
             &target.endpoint_url,
             &target.region,
@@ -328,6 +328,7 @@ fn enforce_gateway_report(
     peak_rss_bytes: Option<u64>,
 ) -> Result<()> {
     report.enforce_max_write_amplification(args.max_write_amp)?;
+    report.enforce_max_write_bytes_per_object(args.max_write_bytes_per_object)?;
     report.enforce_max_verification_read_amplification(args.max_verification_read_amp)?;
     report.enforce_max_total_write_io_amplification(args.max_total_write_io_amp)?;
     report.enforce_exact_multipart_counts(args.expected_multipart_parts_per_object)?;
@@ -395,6 +396,7 @@ async fn gateway_full_read(
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }
@@ -468,6 +470,7 @@ async fn gateway_range_read(
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }
@@ -501,6 +504,7 @@ fn gateway_write_report(
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }

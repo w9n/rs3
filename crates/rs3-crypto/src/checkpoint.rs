@@ -5,11 +5,11 @@ use crate::SecretBytes;
 use crate::keyring::KeyRing;
 use crate::primitives::derive_hmac;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
-use rs3_types::{BackendObjectId, CheckpointId, KeyId, KeyPurpose};
-use sha2::{Digest, Sha256};
+use rs3_types::{KeyId, KeyPurpose};
+use zeroize::Zeroizing;
 
 const CHECKPOINT_PUBLIC_KEY_HEX_LEN: usize = 64;
-const CHECKPOINT_PUBLIC_KEY_PREFIX: &str = "ed25519:";
+pub(crate) const CHECKPOINT_PUBLIC_KEY_PREFIX: &str = "ed25519:";
 
 /// Checkpoint signature and the key that produced it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,12 +88,16 @@ pub(crate) fn derive_checkpoint_public_key_descriptor(
 }
 
 fn checkpoint_signing_key(secret: &SecretBytes) -> Result<Ed25519KeyPair, CryptoError> {
-    let seed = derive_hmac(secret, b"rs3:checkpoint-ed25519-seed:v1", b"ed25519")?;
+    let seed = Zeroizing::new(derive_hmac(
+        secret,
+        b"rs3:checkpoint-ed25519-seed:v1",
+        b"ed25519",
+    )?);
     Ed25519KeyPair::from_seed_unchecked(&seed)
         .map_err(|_| CryptoError::CheckpointSigningKeyRejected)
 }
 
-fn checkpoint_public_key_bytes(public_key: &str) -> Result<Vec<u8>, CryptoError> {
+pub(crate) fn checkpoint_public_key_bytes(public_key: &str) -> Result<Vec<u8>, CryptoError> {
     prefixed_ed25519_public_key_bytes(public_key)
         .map_err(|_| CryptoError::CheckpointPublicKeyMalformed)
 }
@@ -103,7 +107,7 @@ fn recovery_public_key_bytes(public_key: &str) -> Result<Vec<u8>, CryptoError> {
         .map_err(|_| CryptoError::RecoveryPublicKeyMalformed)
 }
 
-fn prefixed_ed25519_public_key_bytes(public_key: &str) -> Result<Vec<u8>, ()> {
+pub(crate) fn prefixed_ed25519_public_key_bytes(public_key: &str) -> Result<Vec<u8>, ()> {
     let Some(hex_key) = public_key.strip_prefix(CHECKPOINT_PUBLIC_KEY_PREFIX) else {
         return Err(());
     };
@@ -113,45 +117,9 @@ fn prefixed_ed25519_public_key_bytes(public_key: &str) -> Result<Vec<u8>, ()> {
     hex::decode(hex_key).map_err(|_| ())
 }
 
-/// Derives a stable checkpoint identifier from signed checkpoint bytes.
-pub fn derive_checkpoint_id(
-    canonical_payload: &[u8],
-    signature: &[u8],
-) -> Result<CheckpointId, CryptoError> {
-    let mut digest = Sha256::new();
-    digest.update(b"rs3:checkpoint-id:v1");
-    digest.update([0]);
-    digest.update(canonical_payload);
-    digest.update([0]);
-    digest.update(signature);
-    CheckpointId::new(hex::encode(digest.finalize())).map_err(CryptoError::from)
-}
-
-/// Derives a stable digest for canonical checkpoint payload bytes.
-pub fn derive_checkpoint_payload_digest(canonical_payload: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"rs3:checkpoint-payload-digest:v1");
-    digest.update([0]);
-    digest.update(canonical_payload);
-    hex::encode(digest.finalize())
-}
-
-/// Derives an opaque backend object ID for an encoded index delta object.
-pub fn derive_index_delta_object_id(delta_object: &[u8]) -> Result<BackendObjectId, CryptoError> {
-    let mut digest = Sha256::new();
-    digest.update(b"rs3:index-delta-object-id:v1");
-    digest.update([0]);
-    digest.update(delta_object);
-    BackendObjectId::new(format!("index/{}", hex::encode(digest.finalize())))
-        .map_err(CryptoError::from)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        derive_checkpoint_id, derive_checkpoint_payload_digest, derive_index_delta_object_id,
-        validate_recovery_public_key, verify_recovery_signature,
-    };
+    use super::{validate_recovery_public_key, verify_recovery_signature};
     use crate::{KeyMaterial, KeyRing, SecretBytes};
     use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus};
 
@@ -170,43 +138,26 @@ mod tests {
     }
 
     fn namespace_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMaterial {
-        key_material(
-            value,
-            KeyPurpose::Namespace,
-            status,
-            "hmac-sha256",
-            secret_byte,
-        )
+        key_material(value, KeyPurpose::Namespace, status, secret_byte)
     }
 
     fn checkpoint_key(value: &str, status: KeyStatus, secret_byte: u8) -> KeyMaterial {
-        key_material(
-            value,
-            KeyPurpose::CheckpointSigning,
-            status,
-            "ed25519",
-            secret_byte,
-        )
+        key_material(value, KeyPurpose::CheckpointSigning, status, secret_byte)
     }
 
     fn key_material(
         value: &str,
         purpose: KeyPurpose,
         status: KeyStatus,
-        algorithm: &str,
         secret_byte: u8,
     ) -> KeyMaterial {
         KeyMaterial::new(
             KeyDescriptor {
                 id: key_id(value),
                 purpose,
-                algorithm: algorithm.to_string(),
                 status,
                 created_at_ms: 0,
-                not_before_ms: None,
-                not_after_ms: None,
                 public_key: None,
-                external_kms_uri: None,
             },
             secret(secret_byte),
         )
@@ -296,110 +247,6 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_signature_verification_rejects_wrong_public_key_metadata() {
-        let signer = match KeyRing::new(vec![
-            namespace_key("namespace", KeyStatus::Primary, 1),
-            key_material(
-                "signing",
-                KeyPurpose::CheckpointSigning,
-                KeyStatus::Primary,
-                "ed25519",
-                2,
-            ),
-        ]) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
-        let verifier = match KeyRing::new(vec![
-            namespace_key("namespace", KeyStatus::Primary, 1),
-            KeyMaterial::new(
-                KeyDescriptor {
-                    id: key_id("signing"),
-                    purpose: KeyPurpose::CheckpointSigning,
-                    algorithm: "ed25519".to_owned(),
-                    status: KeyStatus::Primary,
-                    created_at_ms: 0,
-                    not_before_ms: None,
-                    not_after_ms: None,
-                    public_key: Some(
-                        "ed25519:0000000000000000000000000000000000000000000000000000000000000000"
-                            .to_owned(),
-                    ),
-                    external_kms_uri: None,
-                },
-                secret(2),
-            ),
-        ]) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
-
-        let signature = match signer.sign_checkpoint_payload(b"canonical checkpoint") {
-            Ok(signature) => signature,
-            Err(error) => panic!("{error}"),
-        };
-        let verified = verifier.verify_checkpoint_payload(
-            &signature.key_id,
-            b"canonical checkpoint",
-            &signature.signature,
-        );
-
-        assert!(verified.is_err());
-    }
-
-    #[test]
-    fn checkpoint_signature_verification_rejects_malformed_public_key_metadata() {
-        let signer = match KeyRing::new(vec![
-            namespace_key("namespace", KeyStatus::Primary, 1),
-            key_material(
-                "signing",
-                KeyPurpose::CheckpointSigning,
-                KeyStatus::Primary,
-                "ed25519",
-                2,
-            ),
-        ]) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
-        let verifier = match KeyRing::new(vec![
-            namespace_key("namespace", KeyStatus::Primary, 1),
-            KeyMaterial::new(
-                KeyDescriptor {
-                    id: key_id("signing"),
-                    purpose: KeyPurpose::CheckpointSigning,
-                    algorithm: "ed25519".to_owned(),
-                    status: KeyStatus::Primary,
-                    created_at_ms: 0,
-                    not_before_ms: None,
-                    not_after_ms: None,
-                    public_key: Some("ed25519:not-hex".to_owned()),
-                    external_kms_uri: None,
-                },
-                secret(2),
-            ),
-        ]) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
-
-        let signature = match signer.sign_checkpoint_payload(b"canonical checkpoint") {
-            Ok(signature) => signature,
-            Err(error) => panic!("{error}"),
-        };
-        let verified = verifier.verify_checkpoint_payload(
-            &signature.key_id,
-            b"canonical checkpoint",
-            &signature.signature,
-        );
-
-        assert!(matches!(
-            verified,
-            Err(crate::CryptoError::CheckpointPublicKeyMalformed)
-        ));
-    }
-
-    #[test]
     fn disabled_checkpoint_signing_key_cannot_verify() {
         let signer = match KeyRing::new(vec![
             namespace_key("namespace", KeyStatus::Primary, 1),
@@ -428,33 +275,5 @@ mod tests {
         );
 
         assert!(verified.is_err());
-    }
-
-    #[test]
-    fn checkpoint_id_changes_with_signature() {
-        let first = derive_checkpoint_id(b"canonical checkpoint", b"signature-a");
-        let second = derive_checkpoint_id(b"canonical checkpoint", b"signature-b");
-
-        assert!(first.is_ok());
-        assert!(second.is_ok());
-        assert_ne!(first.ok(), second.ok());
-    }
-
-    #[test]
-    fn checkpoint_payload_digest_ignores_signature() {
-        let first = derive_checkpoint_payload_digest(b"canonical checkpoint");
-        let second = derive_checkpoint_payload_digest(b"canonical checkpoint");
-
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn index_delta_object_id_uses_index_prefix() {
-        let object_id = derive_index_delta_object_id(b"delta bytes");
-
-        assert!(matches!(
-            object_id,
-            Ok(object_id) if object_id.as_str().starts_with("index/")
-        ));
     }
 }

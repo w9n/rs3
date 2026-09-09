@@ -15,7 +15,7 @@ with a trusted exporter and emit the derived admin metrics named in
 
 ## Example Rules
 
-This example assumes backups should advance the accepted v2 chain at least
+This example assumes backups should advance the accepted v3 chain at least
 once per hour. `Rs3AcceptedCheckpointStale` therefore fires after the newest
 accepted checkpoint is more than two hours old.
 
@@ -31,7 +31,7 @@ groups:
         annotations:
           summary: rs3 accepted checkpoint is stale
           description: >-
-            The accepted v2 chain head is older than 2x the expected backup
+            The accepted v3 chain head is older than 2x the expected backup
             cadence. Check client backup jobs, commit publishing, and anchor
             availability before trusting newer unanchored backend objects.
 
@@ -55,7 +55,7 @@ groups:
         annotations:
           summary: rs3 commit publish failures detected
           description: >-
-            One or more coordinated v2 write batches failed before acceptance.
+            One or more coordinated v3 write batches failed before acceptance.
             Inspect path-redacted repository logs and backend health; clients
             may see write failures until publishing recovers.
 

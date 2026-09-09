@@ -1,27 +1,42 @@
 # Repository Format Reference
 
-The repository format is draft. This page is the design contract for
-`commits/v02`. It is not a compatibility promise. The gateway reads and writes
-bounded payload packs, encrypted index runs, signed index-root checkpoints, and
-canonical framed streamed payloads with guarded metadata-only compaction.
+This reference describes the current `commits/v03` encoding and runtime bounds
+for implementers and verifiers. The format remains preview-scoped. The gateway
+reads and writes bounded payload packs, encrypted index runs, signed index-root checkpoints, and
+ciphertext-only detached payloads with guarded metadata-only compaction.
 New bounded writes are partitioned by effective protection cohort, and exact
 full-GC planning plus guarded retention renewal are implemented. Live-provider
 restart/fault qualification and final release qualification are not complete.
 
 !!! warning "Implementation status"
-    `commits/v01` has been removed and is unsupported. No production repository
-    depends on it, so `rs3` will not add a migration path or a dual reader. The
-    current `v02` envelope authenticates every stored section with a signed
+    `commits/v01` and `commits/v02` have been removed and are unsupported. No production repository
+    depends on them, so `rs3` will not add a migration path or a dual reader. The
+    current `v03` envelope authenticates every stored section with a signed
     digest. Bounded normal writes use ciphertext-only `PAYLOAD_PACK` sections,
     authenticated `INDEX_RUN` record descriptors, and signed `INDEX_ROOT`
     checkpoints; recovery rebuilds namespace state without reading payload
-    ciphertext. Unknown-length and zero-length streams use
-    `[PAYLOAD, INDEX_RUN]`; large known-length writes use a standalone
-    `objects/v02` payload plus `[INDEX_RUN]`. Exact stream carriers survive
+    ciphertext. Nonempty large streams use a standalone `objects/v03` payload
+    plus `[INDEX_RUN]`; empty streams are index-only. Exact carriers survive
     checkpoints, metadata-only compaction, and GC marking. Guarded compaction,
     automatic active-run watermarks, and new-write protection cohorts are
     implemented. Live retained-provider and final recovery qualification remain.
     Until those gates pass, the runtime is evaluation-only.
+
+A v03 gateway refuses v02 commit/object prefixes, version-2 commit and format
+roots, and JSON keyring artifacts. Bootstrap requires a fresh prefix. Old
+Kubernetes anchor annotations fail closed instead of appearing to be a missing
+anchor. Evaluation repositories must be recreated; no migration or dual reader
+is provided. Current anchor records explicitly carry repository format
+generation 3, distinct from format-root envelope rotation generations.
+
+## Independent version labels
+
+`commits/v03` and `objects/v03` name the preview wire format. The current Rust
+repository API is `rs3_repository::v3`, while current operator recipes use
+`repository` or `v3` names. These labels are independent of retained protocol
+names such as S3 `ListObjectsV2`, serialized report schemas, metric labels,
+cryptographic domain strings, and framing-generation bytes. Those retained
+labels do not enable a v2 reader or compatibility mode.
 
 ## Invariants
 
@@ -29,8 +44,8 @@ restart/fault qualification and final release qualification are not complete.
 - Plaintext logical paths and Kubernetes names do not appear in backend keys,
   tags, unauthenticated metadata, signed headers, metrics, logs, or errors.
 - Privacy-sensitive metadata is encrypted and authenticated.
-- Every accepted repository transition is a signed, monotonic commit selected
-  by an external anchor.
+- Every accepted repository transition has a signed sequence and exact parent
+  selected by an external anchor.
 - S3 listing order and mutable latest-object state are never authoritative.
 - Every retained restore-critical reference includes the exact provider object
   version when the backend supplies version IDs.
@@ -43,31 +58,19 @@ restart/fault qualification and final release qualification are not complete.
 
 ## Format Generations
 
-The existing prototype uses keys of this form:
-
-```text
-commits/v01/<20-digit-sequence>/<32-byte-random-id-base64url>
-```
-
-That generation is removed and unsupported. It is not an input to the `v02`
-design, and initialization of a `v02` repository must fail if the chosen backend
-prefix is not demonstrably fresh. Importing or converting a `v01` repository is
-outside the product contract.
-
 The current preview runtime and catalog format use:
 
 ```text
-commits/v02/<20-digit-sequence>/<32-byte-random-id-base64url>
-objects/v02/<32-byte-random-id-base64url>
+commits/v03/<20-digit-sequence>/<32-byte-random-id-base64url>
+objects/v03/<32-byte-random-id-base64url>
 ```
 
 The sequence component bounds commit discovery and operational analysis. The
 random component prevents paths, namespace equality, and content identity from
 appearing in keys. The current compactor stores index shards in sibling
-`commits/v02/` delta carriers so the existing signed commit and exact-version
-machinery authenticates them. `objects/v02/` stores independently sealed
-known-length streamed payloads and remains the namespace for possible payload
-packs created by later cleaning.
+`commits/v03/` delta carriers so the existing signed commit and exact-version
+machinery authenticates them. `objects/v03/` stores independently sealed
+streamed payloads with known or unknown lengths.
 Reserved keys do not distinguish object type, index level, tenant, path, or
 workload.
 
@@ -82,14 +85,13 @@ These class names, object counts, ciphertext sizes, provider version IDs, and
 write/compaction timing are accepted leakage. Plaintext catalog bounds, run
 levels, logical object counts, paths, and payload identities remain encrypted.
 
-Bounded writes publish `[PAYLOAD_PACK, INDEX_RUN]`; all-delete or all-empty
-bounded batches may publish `[INDEX_RUN]`. Unknown-length streams publish
-exactly `[PAYLOAD, INDEX_RUN]`, including zero-length streams. Known-length
-large streams first seal one random `objects/v02/` payload, then publish an
-`[INDEX_RUN]` commit that exact-references it. Signed `INDEX_ROOT`
-checkpoints replace the parent-chain replay boundary with an exact catalog of
-accepted run sections. All current v02 repositories remain evaluation data and
-may need recreation.
+Bounded nonempty writes publish `[PAYLOAD_PACK, INDEX_RUN]`; all-delete or
+all-empty batches publish `[INDEX_RUN]`. Large streams first seal one random
+`objects/v03/` payload and then publish an `[INDEX_RUN]` commit with its encrypted
+exact reference. Empty streams are index-only. Signed `[INDEX_ROOT]` checkpoints
+replace the replay boundary with an exact catalog of accepted runs. Genesis is
+an authenticated empty index root. Recreate evaluation repositories when the
+preview wire changes.
 
 ## Signed Commits
 
@@ -97,59 +99,175 @@ The accepted head is the external anchor's exact commit key, body digest,
 provider version ID when required, signing key ID, and format-root reference.
 A newest-looking key returned by `LIST` has no authority.
 
-A `v02` commit has a bounded fixed prefix followed by a canonical signed header
-and encrypted sections. The signed header covers:
+A `v03` commit starts with the eight-byte magic `rs3:cmt\n`, followed by
+32 fixed-field bytes and a canonical CBOR signed header. The complete fixed
+prelude is 40 bytes:
 
-- the format generation and required reader capabilities;
-- the commit sequence and exact self key;
-- the exact parent commit reference;
-- the active format-root and keyring-envelope references;
-- each section's type, ordinal, offset, encrypted length, and digest;
-- the complete commit-object length and body digest; and
-- the signing-key identifier and Ed25519 signature.
+| Object offset | Field | Required value |
+| --- | --- | --- |
+| 8..12 | Format version, u32 big-endian | 3 |
+| 12..16 | Minimum reader, u32 big-endian | 3 |
+| 16..20 | CBOR header length, u32 big-endian | Exact canonical length |
+| 20..28 | Capability word, u64 big-endian | 0 |
+| 28..40 | Reserved bytes | All zero |
 
-The complete header span is limited to 8 KiB and a reader accepts at most 65
-sections so the preview envelope remains bounded. The completed normal writer
-emits `[INDEX_RUN]`, `[PAYLOAD_PACK, INDEX_RUN]`, or `[PAYLOAD, INDEX_RUN]`; an
-`[INDEX_RUN]` may carry an encrypted exact reference to one separately sealed
-standalone payload. A catalog checkpoint contains exactly one `INDEX_ROOT`.
-Multipart commits reserve
-the fixed header span only when the body is genuinely streamed. Bounded commits
-use one `PutObject` and the canonical encoded header length, without 8 KiB
-padding.
-Readers reject non-canonical encodings, unknown required capabilities,
-out-of-order or overlapping sections, arithmetic overflow, duplicate ordinals,
-lengths outside the object, and trailing data not covered by the signed layout.
+The signed header records the commit sequence and self key, exact parent
+reference, publish time, kind, algorithm identifiers, keyring-envelope
+reference, ordered section descriptors and digests, body digest, signing-key
+ID, and Ed25519 signature. The format-root reference belongs to the anchor and
+index root. Exact stored lengths are checked against postconditions and signed
+section coverage. Signature input is the complete prelude and canonical header
+with the signature field zeroed. There is no separate header digest.
 
-Capability bit `0x01` requires signed per-section digests. Bit `0x02` identifies
-framed index sections. Bit `0x04` requires compacted-run root semantics,
-including authenticated run level and compaction generation. This preview
-capability accepts only tier 0 and tier 1; higher level values fail closed until
-a future capability defines their semantics. The fixed header
-advertises `0x01` for transitional delta/snapshot commits, `0x03` for framed
-pack, stream, or index-run carriers, and `0x07` for `INDEX_ROOT` commits; the
-signed section shape must agree with those bits. Readers support these shapes
-during the preview transition and fail closed on unknown required capabilities.
+The complete header span is limited to 8 KiB and a reader accepts at most three
+sections. Delta commits contain `[INDEX_RUN]`, `[PAYLOAD_PACK, INDEX_RUN]`, or
+one of those layouts with a trailing `[RECOVERY]`; root commits contain
+`[INDEX_ROOT]` with an optional `[RECOVERY]`. Every section must carry the
+must-understand flag, with no compression. Every commit uses a single PUT;
+there is no upload-mode field or padded header. Retired section codes
+`0x0001` through `0x0004`, nonzero reserved bytes or capabilities, noncanonical
+encodings, overlapping sections, arithmetic overflow, and trailing bytes
+outside the signed layout fail closed. Signed section digests, framed indices,
+compacted runs and detached payloads are intrinsic to format 3; no capability
+bits are assigned. Root catalogs accept levels zero and one.
 
-Normal commits contain one encrypted `INDEX_RUN` and exactly the carrier
-permitted by their canonical shape. An all-delete or all-empty bounded batch
-needs no payload pack, while a zero-length streamed request deliberately keeps
-its authenticated `PAYLOAD` carrier. A catalog checkpoint commit contains an
-encrypted `INDEX_ROOT`. A checkpoint may
-also cover a final bounded mutation batch, but the catalog must describe the
-exact resulting state.
+`publish_time_ms` is signed wall-clock metadata. Each accepted child must have a
+strictly later publication time than its exact parent. The writer chooses that
+time from one sampled clock value with a bounded lead for millisecond
+tie-breaking, and exact retries reuse the prepared value. Recovery expiry uses
+the separately sampled current time and its declared uncertainty; a signed
+publication timestamp alone never authorizes expiry. Sequence order is
+independently validated.
 
-The current framed index plaintext is wire version 6. Mutation ordinals,
-generations, content lengths, and bounded counts use canonical varints; readers
-reject overlong encodings. Generation and content length appear in both the
-namespace and listing projections because each projection must be independently
-validated before the two records are paired.
+The current framed index plaintext is wire version 10. Frame, section and mutation
+ordinals, generations, content lengths, retention days, and bounded counts use
+canonical unsigned varints; readers reject overlong encodings. Generation and
+content length appear in both the namespace and listing projections because each
+projection must be independently validated before the two records are paired.
+
+Listing records start with a shared-prefix byte count, suffix byte count and
+suffix bytes, followed by the mutation ordinal, kind and listing facts. The
+prefix is the longest byte prefix shared with the preceding path in that frame.
+The first record always has prefix zero and carries its full path. Identical
+paths at distinct ordinals use the full predecessor length and an empty suffix.
+Frames reset the prefix context and can be decoded independently. Prefixes may
+split a UTF-8 code point, but the complete reconstructed path must be valid UTF-8
+and satisfy the path-byte limit. Readers reject nonmaximal or out-of-bounds
+prefixes and oversized reconstructed paths before allocating path storage.
+Namespace projections retain their full 32-byte blinded keys.
+
+Frame ciphertext lengths reflect compressed metadata, including aggregate path
+lengths and shared-prefix structure. Front coding reduces stored and transferred
+index bytes; recovery still holds complete logical paths in trusted memory.
 
 Signed per-section descriptors are required for descriptor-first recovery. A
 reader can authenticate an index range without downloading unrelated payload
 sections. Payload ciphertext is authenticated when the referenced object is
 read. The whole-object digest remains an identity and maintenance check, not a
 reason to read every payload during startup.
+
+## Authenticated Recovery History
+
+When the recovery policy is enabled, accepted v03 commits carry an encrypted
+`Recovery` section with wire code `0x0008`. The section is authenticated by the
+containing signed section descriptor and sealed with the metadata key under the
+same repository and exact-object context as other encrypted metadata. A root
+commit may pair it with `INDEX_ROOT`; a child commit may pair it with `INDEX_RUN`
+and an optional payload pack.
+
+Each accepted successor registers the exact predecessor anchor in this section.
+The registered point stores the predecessor publication time, the fixed
+supersession deadline, and the policy identity that produced that deadline.
+The accepted current anchor is implicit and is not duplicated as a historical
+record. A point enters history only when its successor is accepted through the
+external anchor. The server preset is a 30-day window with a one-day renewal
+margin; these values and the clock uncertainty are bounded configuration. A
+reduction changes the policy for new points; it cannot shorten an already
+accepted point's deadline.
+
+Expiry is an authenticated state transition. The writer derives a conservative
+cutoff from a sampled current clock minus the configured uncertainty, then
+publishes that cutoff in a later accepted recovery section under the normal
+writer fence and anchor protocol. Parent chronology uses signed commit times;
+expiry does not use provider timestamps or the commit timestamp as a substitute
+for current time.
+
+The encrypted registry uses a bounded tail and exact page references. The
+encoded recovery section is capped at 8 MiB, the active tail at 4,096 points,
+the registry at 1,024 pages, and each page at 4,096 points. Page references
+carry authenticated sequence and deadline claims plus the exact commit,
+provider-version, section, and page location needed to read that page. Recovery
+loads one exact page at a time and never treats an old page's embedded registry
+as new authority. If a page contains both expired and live points, its release
+is delayed conservatively to the page's maximum deadline. When the tail holds
+4,096 live points and 1,024 live pages remain, publication fails closed with a
+recovery-history capacity error: no promise is shortened and no live point is
+dropped, and every write path shares that refusal until the oldest page's
+maximum deadline passes the expiry cutoff. The storage ceiling is therefore
+about 4.2 million points, which at the thirty-day preset is roughly 1.62
+accepted commits per second sustained for the whole window. These storage
+bounds do not establish an effective history capacity: replay, graph,
+inventory, and provider byte budgets can impose a lower limit, and v03 has no
+qualified four-million-point capacity claim.
+
+For the retained-version Object Lock profile, a successor is not acknowledged
+until the exact restore dependency graph is covered through the required
+supersession promise. Renewal reserves an additional margin that subsequent
+writes may reuse. The writer renews and post-verifies exact
+provider versions, rechecks the writer fence and unchanged parent, and only then
+performs the anchor CAS. Missing version IDs, insufficient protection, an
+ambiguous provider result, a budget exhaustion, or a fence change fails closed.
+Non-retained profiles do not provide this provider-history guarantee and remain
+subject to their selected provider conformance contract.
+
+Each S3 endpoint exposes one unversioned namespace: the live namespace by
+default, or the selected historical namespace in a readonly recovery gateway.
+Historical `versionId` reads, version listings, delete-marker APIs, and client
+registration of arbitrary historical roots are unsupported. Recovery points are
+selected through the separate authenticated operator recovery interface and
+opened in an isolated read-only namespace; selection never rewinds or advances
+the live anchor.
+
+### Recovery metadata admission
+
+Retained-profile publication checks graph metadata capacity separately from
+physical retention coverage. Its in-memory capacity certificate binds the exact
+accepted anchor and maintenance budgets. It conservatively includes the current
+point's eventual historical traversal, packed-reference accounting, and exact
+restore-envelope targets. Ordinary successors add bounded commit, run and payload
+reference costs without rereading the old graph. Cache loss or exhaustion of the
+conservative estimate triggers a read-only walk of the exact candidate before
+the real anchor CAS. Only acceptance and local installation update the cache.
+
+The shared defaults remain 256 MiB of accounted graph metadata and 2,000,000
+exact targets. Foreground delta admission leaves 128 KiB and one target for a
+metadata-only expiry root. Root publications may use that margin but must fit the
+hard limits; repeated nonreducing roots can consume it. Expiry can release
+capacity through candidate verification without shortening an accepted promise.
+A refusal leaves the accepted namespace and anchor unchanged. Already uploaded
+candidate objects remain unanchored and subject to guarded orphan GC.
+
+Admission also bounds encoded pending sections. Maintenance retains the current
+replay chain while decoding its namespace and accepted recovery registry, with
+one bounded catalog-run buffer. It then releases those encoded sections and
+traverses history using cached signed headers and one required section at a time.
+Payload carriers need only their exact identity, length and signed header;
+unreferenced historical Recovery sections are not downloaded. Referenced index
+and recovery sections still undergo exact-length, digest and authenticated
+context verification. Read-chunk scratch is included in the encoded-buffer bound.
+
+The shared pending-section default is 64 MiB. The capacity certificate tracks
+current replay size, the largest catalog run and historical section requirements;
+a root resets the replay-chain component. These are conservative encoded-buffer
+bounds, not an allocator or whole-process RAM limit. Decoded namespace and
+per-section decoder state have separate limits. Startup replay limits, provider
+inventory and optional per-pass I/O budgets remain independently enforced.
+Capacity verification may read obsolete records still present in current immutable runs because a future historical traversal
+would read them too; missing exact dependencies fail closed. This is a read-only
+capacity check, not additional retention or deletion authority. Existing
+oversized repositories are not repaired by this check, and larger configurations
+still require end-to-end qualification.
+
 
 ## Value-Separated Payload Packs
 
@@ -158,12 +276,13 @@ batch places its non-empty values into one pack and stores only compact pack
 pointers in `INDEX_RUN`. Empty objects are index-only. Index checkpointing and
 compaction never rewrite payload bytes.
 
-Each pack has a random 256-bit identity, one content-key identifier, and records
+Each pack has a random 256-bit carrier identity, a fresh 256-bit sealing attempt,
+one content-key identifier, and records
 in randomized physical order. The pack section contains ciphertext only; its
 authenticated layout lives in the encrypted `INDEX_RUN`. A small record is
 ciphertext followed by one 16-byte AEAD tag. Its nonce is derived through a
-keyed KDF from the pack identity, record ordinal, and authenticated plaintext
-digest, so the format does not store a nonce per record. Records larger than 64
+keyed HMAC from authenticated carrier, attempt, record and segment context,
+using the same scheme as detached payloads. The format stores no nonce per record. Records larger than 64
 KiB use canonical 64 KiB independently authenticated segments for efficient
 range reads; smaller records use one segment. Both writer and reader enforce
 that rule so a writer bug cannot create pathological one-byte segments or make
@@ -174,7 +293,7 @@ uses 64 records, while the release-binary high-throughput scale lane can use
 4,096. These are
 writer policies inside the same bounded format, not different trust models.
 
-The encrypted index container table carries the shared pack identity,
+The encrypted index container table carries the shared pack and attempt identities,
 content-key ID, record count, and exact containing-object reference. For a pack
 embedded beside the run, the historical keyring-envelope object and digest come
 from that signed commit; an external container-table entry preserves them
@@ -204,9 +323,9 @@ therefore use one protection cohort, or be partitioned by retention mode,
 retain-until horizon, and legal-hold requirement. Reusing or repacking a value
 must never weaken the strongest logical protection that reaches it.
 The format retains the hold dimension for fail-closed parsing of historical
-state, but the v02 gateway currently rejects new client legal holds.
+state, but the v03 gateway currently rejects new client legal holds.
 
-Padding is not part of the first `v02` contract. Content-defined chunking,
+Padding is not part of the first `v03` contract. Content-defined chunking,
 gateway-level deduplication, and compression are also outside the baseline
 format until their equality leakage, liveness, range-read, and amplification
 costs have explicit security modes and qualification evidence. Kopia already
@@ -214,93 +333,106 @@ performs its own chunking and packing, so duplicating that work in the gateway
 is not a baseline optimization. The researched extension boundary is recorded
 in [Deduplication](deduplication.md).
 
-## Streamed Payload Carriers
+## Detached Payload Carriers
 
-A known-length or chunked unknown-length upload that exceeds the bounded pack
-path is one multipart-padded commit with exactly two required sections:
+Large streams upload encrypted segmented ciphertext under a fresh random
+`objects/v03/` key before publication. Known-length and unknown-length bodies
+use the same writer. Empty streams publish only metadata. The S3 listener still
+requires a length from `Content-Length` or valid SigV4 streaming metadata;
+unsigned HTTP chunked `PutObject` receives `411 MissingContentLength`.
+
+The writer verifies the completed exact object version, length, post-completion
+retention deadline, exact EOF, and full ciphertext digest. Readback requires the
+bounded full-object provider interface with an expected-length ceiling checked
+before consuming the body. Verification holds one chunk of at most 1 MiB plus
+digest state, and refuses providers without that interface. There is no sampling
+or buffered-read fallback. A short fenced
+`[INDEX_RUN]` commit then publishes the encrypted reference. Payload storage
+alone does not make a value visible. A stalled, truncated, oversized, or failed
+body does not publish a value. A failed publication can leave an opaque orphan
+for later guarded reclamation. Registered in-flight objects are protected from
+same-process GC; maintenance across processes still requires external quiescence.
+
+The encrypted carrier record binds the exact object key and version, stored
+length, ciphertext digest, historical keyring envelope, carrier ID, content key,
+segment size, total plaintext length and selected parts. Backend payload bytes
+contain only concatenated ciphertext and 16-byte tags. There is no payload header.
+
+The descriptor accepts at most 10,000 positive-length parts in strictly increasing
+original part-number order. Each part records its number, fresh 32-byte attempt ID
+and plaintext length. Every part ends on its own segment boundary, so completion
+can assemble independently sealed parts without re-encryption. Client multipart
+writes use this layout; ordinary single-stream writes emit one part. Ordinary
+metadata records retain their 16 KiB cap; only a standalone
+container record can use up to 512 KiB, within the existing bounded index frame.
+
+Readers validate lengths, bounds and ordering, then derive part offsets once.
+Range translation accounts for a short final segment in each part. Compaction
+and checkpoints preserve descriptors without copying payloads. Full reads
+verify the first bounded segment group before returning a response body and
+withhold the final group until exact EOF and the aggregate digest match. Cache
+identities bind repository/keyring context and every carrier, attempt, part,
+layout and content-length fact; decryption uses the real payload identity.
+
+### Shared segment authentication
+
+All payload carriers use XChaCha20-Poly1305 with a 24-byte nonce derived as:
 
 ```text
-0  PAYLOAD
-1  INDEX_RUN
+context = carrier_id[32] || attempt_id[32] || part_or_record_u32be || segment_u64be
+nonce = HMAC-SHA256(content_secret,
+    "rs3:payload-segment-nonce:v3" || 0x00 ||
+    len_u64be(aad) || aad || len_u64be(context) || context)[0..24]
 ```
 
-The writer encrypts authenticated payload segments as the request body arrives,
-then finalizes and seals the covering run at EOF. It advances the anchor only
-after the complete commit version, object length, retention posture, and signed
-layout have been verified. A stalled or truncated request fails before
-publication.
+Canonical AAD starts with `rs3:payload-segment-aad:v3`, then length-framed
+repository/historical-keyring context, containing object key and content-key ID.
+It binds the optional section ordinal, fixed context above, segment plaintext
+length, EOF byte and length-framed carrier layout. Integers use big-endian bytes.
+A detached layout binds segment size. A pack layout additionally binds pack size,
+record count, record offset and length, and segment offsets and lengths.
 
-This is a repository-layer format capability. The current S3 listener supplies
-the length from `Content-Length` or valid SigV4 streaming metadata and rejects
-unsigned HTTP chunked `PutObject` without a length as `411 MissingContentLength`.
-The EOF-finalized path remains directly tested but is not currently a public
-unknown-length S3 operation.
-
-The embedded run uses a self-stream pointer. Its shared facts are the signed
-payload-section ordinal, opaque payload identity, and authenticated segmented
-header. The containing signed commit supplies the exact section offset, length,
-and digest. The run codec permits a zero-plaintext stream to keep this carrier:
-the payload section still contains an authenticated header, its run remains
-catalogued, and GC must retain the exact commit. This is distinct from an empty
-bounded value, which is index-only.
-
-Replay materializes a self-stream pointer into an exact commit reference.
-Compaction performs the same normalization before discarding the source-run
-boundary. An external stream carrier records:
-
-- exact commit key and provider version;
-- complete stored commit length and signed body digest;
-- historical keyring-envelope object and digest;
-- section-region start plus payload ordinal, offset, length, and digest; and
-- opaque payload identity and authenticated segmented-payload header.
-
-These facts are encrypted inside the run. The decoder rejects missing, unused,
-duplicate, out-of-order, mismatched-length, or out-of-object carriers. A
-compacted run has no self carrier: both embedded packs and streams become exact
-external references. Checkpointing and compaction therefore write index
-metadata only and never read, decrypt, or copy the streamed payload.
-
-A partial read derives the minimal complete ciphertext-segment span from the
-authenticated header and section facts, bounds it against the exact stored
-commit length, and issues an exact-version range `GET` when the provider supplies
-versions. A full streamed-carrier read opens one exact provider stream, validates
-the authenticated header before returning a response, authenticates bounded
-segment groups before releasing them, and verifies exact EOF plus the aggregate
-signed section digest before releasing the final group. A failure may leave the
-client with an authentic prefix but never forged plaintext or a falsely complete
-object. Decrypted range segments are cached under a process-local opaque digest
-of repository/keyring context,
-commit key/version/body/stored length, section ordinal/digest/start/offset/length,
-payload identity/header, and content length. The actual payload identity remains
-the AEAD associated-data identity. The synthetic cache identity is never written
-to the backend and adds no backend-visible name, although the provider still
-observes range offsets, lengths, timing, and cache misses.
-
-Known-length large payloads use a foreground standalone carrier. The gateway
-uploads encrypted segmented ciphertext under a fresh random `objects/v02/` key
-without holding the publication lock, renews the exact completed version's
-effective retention horizon from a post-completion clock capture, and verifies
-exact object identity, version, length, retention deadline, legal
-hold, exact EOF, and a complete ciphertext digest before publication. A short
-fenced publication then commits only the encrypted exact reference. Until that
-anchor transition succeeds the object is an invisible orphan. Process-local
-in-flight roots protect it from same-process GC; destructive maintenance across
-processes still requires the documented external quiescence guard. An
-ambiguous multipart completion or failed anchor transition can leave an opaque
-orphan for later report and guarded reclamation.
+Writers generate a fresh attempt ID before sealing a replacement part or changed
+pack. Repeating backend transmission of already sealed bytes preserves the same
+attempt. Matching content is not an upload identity. Attempt and layout metadata
+stay encrypted; object counts, ciphertext lengths and write timing remain the
+accepted backend observations.
 
 Gateway deduplication remains deferred because it adds equality and
 shared-liveness leakage; Kopia already chunks, packs, and deduplicates its own
 repository blobs. Any future deduplicating mode needs an explicit capability
 and its own security and GC qualification.
 
+## Metadata-Only Copies
+
+A supported same-bucket `CopyObject` captures a current accepted namespace
+entry under the writer fence and creates a fresh encrypted destination manifest
+and `INDEX_RUN` upsert. The upsert preserves the source plaintext length, ETag,
+flexible checksum, effective protection, and exact authenticated payload
+reference. It creates no payload-pack record, detached payload, plaintext
+payload read, re-encryption, or carrier rewrite. A later source overwrite or
+logical delete therefore cannot alter the copied value.
+
+The copied upsert is an ordinary staged mutation: it shares admission bounds,
+compatible protection-cohort batching, signed publication, anchor advancement,
+and rollback behavior with writes. Source `If-Match`, when supplied, compares
+the trusted accepted ETag at capture rather than a provider latest object. The
+format has no client-visible historical copy reference and no metadata-replace
+variant.
+
+For retained copies, the provider's exact source carrier and restore metadata
+dependencies must cover the fresh copy timestamp before the new entry is
+acknowledged. The check can use bounded metadata `HEAD` and retention-extension
+operations, but never payload reads or a full-GC traversal. Missing exact
+versions, deadlines, or protection facts fail closed; a copy never shortens the
+source protection clock.
+
 ## Framed Index Runs
 
 `INDEX_RUN` is the append-friendly unit for namespace mutations. Runs are
 immutable, sorted, encrypted, and divided into independently authenticated
-bounded frames. A normal commit embeds one recent run. Compaction may write a
-run as an exact-version `objects/v02/` object and later make it reachable from
-an accepted catalog.
+bounded frames. A normal commit embeds one recent run. Compaction writes metadata-only sibling commits and makes their exact run
+sections reachable from an accepted catalog.
 
 Each mutation carries a monotonic logical generation and is one of:
 
@@ -321,33 +453,110 @@ Runs contain two encrypted projections linked by mutation ordinal:
   the trusted gateway.
 
 The namespace projection stores the raw 32-byte blinded key, generation,
-compact payload pointer, trusted `HEAD` metadata, and retention state. The
-listing projection stores the encrypted logical path once together with
-generation, size, and modification time. Wire version 4 frame-local container
-tables separately dedupe exact pack and stream carriers, including commit keys,
-provider versions, stored lengths, signed digests, historical keyring context,
-and carrier-specific section facts. One run may carry either a self pack or a
-self stream, never both. Canonical varints and fixed-width binary fields replace
+compact payload pointer, trusted `HEAD` metadata, retention state, mandatory
+trusted `ObjectEtag` derived from plaintext MD5 values, and an optional flexible
+checksum. The listing projection stores the encrypted logical path once
+together with generation, size, and modification time. Frame-local
+tables deduplicate exact pack and detached carriers, including object keys,
+provider versions, stored lengths, authenticated digests, and historical
+keyring context. A run may carry one self-pack declaration. Canonical varints
+and fixed-width binary fields replace
 JSON, hex,
 decimal byte arrays, durable prefix tokens, nested sealed manifests, and
 repeated per-record identifiers. Projection record counts and mutation-ordinal
 pairing are authenticated and validated.
 
 Logical paths and projection bounds exist only in authenticated ciphertext.
-`v02` does not persist prefix-token objects or path-shaped keys. A reader may
+`v03` does not persist prefix-token objects or path-shaped keys. A reader may
 initially materialize a compact in-memory state, but the durable layout must
 also permit a future bounded local cache and range-selected frames without a
 format change.
 
-Wire version 4 uses canonical length-delimited records and no compression. Each
+Wire version 10 uses canonical length-delimited records and no compression. Each
 ciphertext frame and run has an explicit record and byte
-limit; the target maximum encrypted run object is 8 MiB. Index-frame associated
+limit; the maximum encrypted run object is 8 MiB. Index-frame associated
 data binds at least the immutable repository identity, exact historical
 keyring-envelope reference, exact containing object key, section ordinal, run
 identity, and frame ordinal. The provider version does not exist until after
 upload, so the accepted signed catalog will bind that returned exact version
 together with object length and ciphertext digest. Reordering, duplicating, or
 transplanting frames must fail authentication.
+
+Wire version 9 added one optional checksum field to each namespace upsert. Wire
+version 10 adds the mandatory `ObjectEtag` field. It is exactly 20 bytes:
+big-endian u32 multipart count followed by the raw 16-byte MD5 digest. Count
+zero identifies a single-object ETag; counts one through 10,000 identify a
+multipart ETag. A one-byte length prefixes at most 48 bytes of canonical
+`ObjectChecksum` encoding, `[algorithm_tag, composite_parts_or_zero, raw_digest]`;
+a zero length
+means that no client checksum was accepted. The supported algorithms are
+CRC32, CRC32C, CRC64NVME, SHA1, and SHA256. Full-object checksums cover the
+complete plaintext object stream. Composite checksums hash the ordered raw
+part digests and carry the exact part count. This field is encrypted and
+authenticated with the namespace metadata. It is never an object-store key,
+provider metadata value, or repository authentication digest.
+
+Default plaintext and framing bounds are distinct:
+
+| Bound | Limit |
+| --- | ---: |
+| Encoded run plaintext | 7 MiB |
+| Plaintext projection frame | 1 MiB minus 1 KiB |
+| Ordinary record | 16 KiB |
+| Standalone container record | 512 KiB |
+| External containers | 4,096 |
+| Mutations per run | 65,536 |
+| Logical path | 1,024 bytes |
+| Physical run envelope | 8 MiB |
+| Frames per physical run | 4,096 |
+
+## Multipart Completion Receipts
+
+The repository publication API binds each accepted multipart completion to one
+receipt inside its encrypted index run. Metadata record tag 4 follows all
+container and namespace-key records and occurs at most once. It uses the
+canonical CBOR array `[upload_id, commit_sequence, selection_digest,
+attempts_digest, logical_key, content_len, etag, checksum]`. IDs and digests
+are 32-byte strings. The `etag` field is a CBOR byte string containing the exact
+20-byte `ObjectEtag` encoding. The final checksum field is either null or a CBOR
+byte string containing the bounded canonical `ObjectChecksum` encoding
+described above. Commit sequence is the enclosing accepted commit sequence,
+independent of namespace mutation generations. The receipt binds the run's
+single upsert key, plaintext length, ETag, and checksum exactly. The run may also
+carry stale namespace tombstones for
+the same key and generation; they do not change the receipt binding. Each
+receipt is capped at 2,048 bytes, with a 1,024-byte key and an exact 20-byte
+ETag encoding.
+
+The client-selection digest uses SHA-256 over
+`rs3:v3-multipart-client-selection:v2` followed by a zero byte, a big-endian
+u64 part count, then each big-endian u32 part number, big-endian u16 unquoted
+ETag length and exact ETag bytes. It then includes, for each selected part and
+the optional final checksum, a big-endian u64 length plus its canonical checksum
+bytes, or a zero length when absent, followed by one byte for the declared
+construction kind (`0` none, `1` full-object, `2` composite).
+
+The selected-attempt digest uses the domain
+`rs3:v3-multipart-selected-attempts:v1` followed by a zero byte and big-endian
+u64 count, then each big-endian u32 part number, 32-byte attempt ID,
+big-endian u64 plaintext length and 32-byte expected ciphertext digest.
+
+Root plaintext wire version 6 appends a big-endian u32 receipt count after the
+run catalog, followed by big-endian u32 lengths and canonical receipt bytes,
+sorted by upload ID. The latest 1,024 accepted completion results survive
+checkpoint, compaction and replay. A root snapshot replaces receipt state
+reconstructed from its named runs, so old runs cannot resurrect evicted results.
+Post-root accepted deltas update that bounded set. Root receipts must precede
+the root's commit sequence. Compacted runs carry no completion record.
+
+Receipt eviction is count-based and has no payload-retention meaning. Lookup
+requires the original upload ID, logical destination and exact selected-part
+digest; it can return the original result after a later overwrite without
+publishing again. An unknown or evicted ID never authorizes a new write.
+Receipt preparation precedes the anchor CAS, and installation accompanies the
+accepted namespace change. Unresolved anchor outcomes require recovery before
+receipt lookup or another write. The client-facing multipart routes use these primitives; see
+[Supported S3 operations](s3-operations.md) for current option and session limits.
 
 ## Small Signed Index Roots
 
@@ -365,32 +574,54 @@ namespace. It records:
 - required reader capabilities and absolute resource ceilings.
 
 Recent runs may be sections of exact accepted commit versions. Current
-compacted runs are sealed sections in exact sibling `commits/v02/` delta-carrier
+compacted runs are sealed sections in exact sibling `commits/v03/` delta-carrier
 versions. The catalog authenticates the complete active run set, so backend
 listing visibility and ordering are not part of recovery.
 
 `INDEX_ROOT` names index runs, not every payload carrier. Effective highest-
 generation namespace records are the authoritative pack and stream reachability
-map. Foreground runs are level 0. The current run compactor selects at
-most the oldest 128 level-0 runs, chooses the newest mutation for each blinded
-key in that bounded window, and retains a winning tombstone just like a winning
-upsert. Newer level-0 runs and every existing level-1 shard remain
-exact-referenced and unchanged. Level is a storage tier, never a compaction
-epoch; every foreground compaction emits level 1 instead of incrementing a
-level counter. The decoder accepts only levels 0 and 1. Supporting another tier
-requires an explicit future capability and hostile-input review. Different
-mutations for the same key and generation are
-corruption. Source-relative self-pack and self-stream pointers are normalized to
-exact external historical commit, version, section, payload, and
-keyring-envelope facts before source-run boundaries disappear. The result is
-split into the fewest bounded
-generation-range shards the canonical run codec accepts. Every equal-generation
-group stays indivisible, even when that means rejecting an oversized generation
-instead of partially publishing it. A level-1 tombstone continues to mask older
-values in preserved level-1 shards. Reclaiming bottom-tier tombstones and
-records they mask requires a separate future guarded or offline merge with
-protected-root and GC proof. Foreground compaction is metadata-only and never
-reads, decrypts, or rewrites payload ciphertext.
+map. Foreground runs are level 0. The compactor selects at most 128
+active runs, regardless of level, as a contiguous generation window, capped at
+131,072 source mutations and 16 MiB of stored index-run sections. Catalog facts
+select a read window with the most runs; ties prefer fewer mutations, fewer
+stored bytes, then the oldest window. Both maximum-size runs fit these ceilings.
+The compactor validates every fetched source and plans at most two contiguous choices:
+the complete window and one subset ranked by stored-byte cost. Actual output
+sharding determines catalog reduction before a plan wins. The comparison uses
+`(source bytes + 8 MiB) / removed catalog entries`; the fixed term is a scheduling
+weight that amortizes root publication, not measured traffic. Ties retain the
+complete-window plan when both are evaluated. Both choices share one bounded
+read envelope; fallback reuses fetched sources. Catalog estimates choose which
+one to fetch first. This lets
+127 small new runs beat 128 inputs that include a large older shard, avoiding
+repeatedly rewriting that shard. The compactor selects the newest mutation for
+each blinded key.
+The already accepted namespace proves an upsert obsolete when that blinded key
+is absent or has a newer generation. Those upserts are omitted; winning
+tombstones remain. A namespace generation behind a source or inconsistent
+same-generation namespace-key identity fails closed. Different mutations for
+the same blinded key and generation fail before pruning, even if obsolete.
+
+Runs outside the window remain exact-referenced and unchanged. Output is level
+1, never an incrementing compaction epoch. The decoder accepts only levels 0
+and 1. Source-relative self-pack pointers become exact historical commit,
+version, section, payload and keyring-envelope facts. All other winning mutation
+metadata is preserved. The output uses the fewest generation-range shards
+accepted by the canonical run codec, preserving each equal-generation group.
+A fully obsolete window emits no replacement carrier; otherwise output must
+contain fewer runs than the source window. The root preserves the accepted
+coverage generation, logical object count and completion receipts.
+
+Compaction is metadata-only: it never reads, decrypts or rewrites payload
+ciphertext. It does not delete replaced runs or payloads. Protected historical
+roots still name their original exact dependencies, and guarded GC marks those
+roots independently. Winning tombstone reclamation remains future guarded
+work; this merge changes neither the wire encoding nor history retention policy.
+
+An index root is bounded to 8 MiB and 1,024 active runs, with aggregate
+ceilings of 16,777,216 mutations and 8 GiB of stored run bytes. Per-run limits
+remain 65,536 mutations, 4,096 frames and 8 MiB. These bounds apply before
+accepting the catalog, independently of the number of live logical objects.
 
 ## Descriptor-First Recovery
 
@@ -405,8 +636,8 @@ Cold recovery starts only from the external anchor:
    cumulative run set beyond the accepted state.
 5. Replay post-catalog commit runs oldest to newest, again retaining at most one
    bounded frame beyond the accepted state.
-6. Verify catalog cardinality and structural invariants, then sample exact
-   payload references as required by the recovery gate.
+6. Verify catalog cardinality and structural invariants. Payload checks belong
+   to subsequent reads and qualification tests, not index reconstruction.
 7. Re-read the external anchor before installing the recovered state. If it
    changed, discard the candidate and retry within a bounded policy.
 
@@ -422,17 +653,65 @@ EOF is required. Bootstrap and recovery inventories use provider-private pages
 under fixed total page and raw-member ceilings; a partial or over-budget
 inventory is never interpreted as empty.
 
+Both encrypted envelopes use one version-3 canonical CBOR map. Integer keys
+0 through 8 encode, in order: version, purpose, generation, repository ID,
+public salt, wrapping-key ID, nonce, ciphertext, and authentication tag.
+Purpose is 0 for keyrings and 1 for format roots. AEAD associated data is the
+seven-field map containing keys 0 through 6. The nonce is 12 random bytes;
+the detached AES-256-GCM-SIV tag is 16 bytes. Each purpose derives a separate
+AEAD key from the wrapping key. SHA-256 covers the exact complete canonical
+envelope bytes, including the public fields. Keyring objects end in `.cbor`.
+
+Keyring plaintext is `[3, keys]`, with keys sorted by purpose and key ID. Each
+key is `[id, purpose, status, created_at_ms, public_key_or_null, secret_bytes]`.
+Purpose tags are namespace 0, content 1, metadata 2, and signing 3. Status tags
+are primary 0, enabled 1, disabled 2, and retired 3. Signing public keys are raw
+32-byte Ed25519 values. Secret serialization and decrypted plaintext use
+zeroizing buffers. Limits are 4,096 keys, 255 bytes per key ID, and 4,096 bytes
+per secret. Algorithm, validity-window, and external-KMS descriptor fields are
+absent.
+
+The encrypted format-root plaintext is a six-element canonical array:
+`[format_version, repository_id, keyring_ref, signing_key_id, provider_profile, retention]`.
+An envelope reference is `[generation, digest_bytes_32, object_id, version_or_null]`.
+Provider profiles are development 0, atomic-create 1, and retained-version
+Object Lock 2. Retention is null or `[mode, retain_days]`, with modes none 0,
+governance 1, and compliance 2. Days are an unsigned 32-bit duration. The unused
+snapshot-cadence fields have been removed. The outer commit and format-root
+version are 3. Envelope generations still count key or format-root rotations.
+
+Portable recovery bundles use the version-3 array
+`[3, repository_id_or_null, salt_digest_or_null, anchor, floor, exported_at_ms, signature_or_null]`.
+The anchor is `[3, sequence, commit_key, body_digest_bytes_32, version_or_null, signing_key_id, format_ref]`.
+The first field is the repository format generation, independent of the format
+envelope reference generation.
+The format reference occurs once. The optional signature is exactly 64 bytes.
+The signature payload is the canonical two-element array containing
+`rs3:v3-recovery-bundle-offline-signature:v1` and the six-element unsigned
+bundle, omitting the signature slot. Signing requires a repository ID. Thus
+the signature binds the salt digest, recovery floor and export time as well
+as every accepted-anchor field.
+
+Bundle readers cap input at 16 KiB. Envelope and bundle text fields are capped
+at 1,024 bytes, with the narrower key-ID limit above; envelope salts are 32 to
+4,096 bytes. All these codecs reject indefinite lengths, nonminimal integers,
+unexpected fields or order, and trailing bytes. JSON remains an operator
+report format; retired JSON envelopes and recovery artifacts are not accepted.
+
 The runtime keeps one accepted compact state plus a hard-bounded
-4,096-mutation overlay. Unaccepted writes never mutate accepted state. An
-exclusive publication barrier freezes the overlay from commit snapshot through
-the anchor CAS and local install. Successful anchor publication applies the
-validated overlay once; failed publication discards it. Startup must not clone
-a second complete repository state. One atomic RAII mutation lease owns this
-overlay per service instance; delayed publishers retain the lease, and direct
-mutation or maintenance APIs cannot bypass an active coordinator. Semantic
-installation checks complete before CAS. If local lock installation alone
-fails after CAS, the caller receives a recovery-required result and all further
-mutations fail until restart from the accepted anchor.
+4,096-mutation overlay. Unaccepted writes never mutate accepted state. Publication
+freezes a prefix and permits bounded successor staging within the same total
+pending-item limit. Accepting the prefix preserves the successor and its
+allocation high-water mark. A failed prefix rejects dependent staged successors.
+Startup does not clone a second complete repository state. One atomic RAII
+mutation lease owns the overlay; timed and immediate owned publishers retain it.
+Direct mutations and maintenance cannot bypass an active coordinator.
+
+Semantic installation checks complete before CAS. A lost CAS reply is reconciled
+against the exact child and parent anchors before a successor can publish. An
+unresolved outcome or a post-CAS local installation failure requires local
+recovery and prevents further mutations until restart from the trusted anchor.
+These runtime changes do not alter the repository wire format.
 
 ## Automatic Catalog Watermarks
 
@@ -442,14 +721,18 @@ Kubernetes writer fence used for anchor advancement. Commit-tail and encrypted
 tail-byte posture remains part of the release design, but is not yet an
 equivalent automatic runtime gate.
 
-Initial engineering watermarks are:
+Default replay budgets are independent of the active-run watermarks:
 
-| State | Commit tail after catalog | Encrypted tail index bytes |
-| --- | ---: | ---: |
-| Checkpoint requested | 1,000 | 32 MiB |
-| Operationally degraded | 2,000 | 48 MiB |
-| New mutations paused | 3,000 | 64 MiB |
-| Absolute verifier ceiling | 4,096 | 96 MiB |
+| Budget | Default |
+| --- | ---: |
+| Commits walked to a snapshot | 4,096 |
+| Cumulative provider-reported commit-object bytes | 1 TiB |
+| Retained encrypted index-section bytes | 64 MiB |
+| One body-verification range read | 8 MiB |
+
+These are `V3ReplayLimits` defaults. They are verifier ceilings, not automatic
+checkpoint triggers. Descriptor-first startup avoids reading unrelated payload
+bytes even though their containing object sizes count toward its object budget.
 
 For active runs, a coordinator requests compaction at 256. If no maintenance
 guard is configured, it degrades and retries at each additional 64-run boundary,
@@ -478,15 +761,21 @@ Compaction and catalog publication use this order:
 
 1. Capture the accepted anchor and live Kubernetes `WriterFence` with no
    pending mutations.
-2. Select and verify at most the oldest 128 level-0 runs, then merge that
-   bounded foreground window newest-wins while retaining tombstones and
-   normalizing self-pack and self-stream references. Preserve newer level-0 and
-   every existing level-1 reference unchanged.
+2. Rank a bounded full window and one contiguous subset from authenticated
+   catalog sizes. Fetch the better estimate first; try the alternative only if
+   actual sharding or nonreduction warrants it, reusing fetched sources. At most
+   256 unique runs, 16 MiB of stored run sections and 131,072 mutations are
+   considered. Verify every fetched source using its signed header and exact run
+   section; unrelated payload and recovery sections need no download. Corruption
+   is fatal, while unfetched references remain unchanged.
+   Merge the chosen window newest-wins, prune upserts proven obsolete by
+   the accepted blinded-key namespace, retain winning tombstones and normalize
+   self-pack references. Preserve every run outside the window unchanged.
 3. Shard the result on generation boundaries and write each metadata-only run
    in an unanchored delta-carrier commit that is a direct child of the captured
    base.
 4. Write an unanchored signed `INDEX_ROOT`, also a direct child of that base,
-   that exact-references every new sibling carrier plus the preserved level-1
+   that exact-references every new sibling carrier plus the preserved run
    inventory. New shards have level 1 and a compaction generation equal to the
    sibling commit sequence.
 5. Read back the exact candidate root and every new sibling carrier, verify
@@ -509,20 +798,15 @@ level, and compaction generation. Delayed list visibility, duplicate versions,
 and abandoned uploads are therefore availability and cleanup concerns, not
 state-selection mechanisms.
 
-The coordinator requests compaction at 256 active runs. A missing maintenance
-guard degrades and retries at subsequent 64-run boundaries below 896. A fully
-validated bounded plan that cannot reduce run count may likewise defer and
-retry below 896. Both fail closed at that pause watermark. A configured guard
-rejection, corruption, storage or anchor failure, and every other compaction
-error poisons immediately. The writer also refuses a compact mutation before it
-would create a 1,025th active run. These are distinct defenses: operational
-backpressure acts early, while the immutable format ceiling remains the final
-fail-closed bound.
+The writer also refuses a mutation that would create a 1,025th active run.
+[Automatic watermarks](#automatic-catalog-watermarks) provide earlier
+backpressure; the format ceiling remains the final bound.
 
 ## Reachability, Retention, and GC
 
-The authoritative reachability graph starts from the current anchor and every
-explicitly protected historical anchor. For each root it includes:
+The authoritative reachability graph starts from the current anchor, every
+unexpired point in the accepted encrypted recovery registry, and any explicitly
+supplied same-format protected root. For each root it includes:
 
 - the exact catalog and post-catalog commit versions;
 - the exact active index-run versions;
@@ -531,13 +815,15 @@ explicitly protected historical anchor. For each root it includes:
 - the active format root and keyring envelopes; and
 - keys needed to authenticate or decrypt those objects.
 
-A live payload reference protects its exact containing commit version. It does
+A live payload reference protects its exact pack commit or detached object version. It does
 not recursively protect every ancestor merely because the payload was first
-written in an old commit. GC resolves active runs by generation before deriving
-these exact payload roots. This includes streamed carriers normalized by
-compaction and zero-length streamed carriers whose payload section need not be
-read to answer the client. Conservative over-retention is permitted when a mark
-cannot be proven complete; deletion on an incomplete or ambiguous mark is not.
+written in an old commit. A metadata-only copy adds another live encrypted
+reference to that same exact carrier; source overwrite or deletion does not
+break the copied reference, and exact-root GC retains it until no live or
+protected root requires it. GC resolves active runs by generation before
+deriving these exact payload roots. Empty foreground values have no payload
+dependency. Conservative over-retention is permitted when a mark cannot be
+proven complete; deletion on an incomplete or ambiguous mark is not.
 
 GC must finish the whole mark phase before deleting, fail closed on missing or
 malformed reachable data, treat unknown retention or legal-hold state as
@@ -555,31 +841,19 @@ or exhaustion of either ceiling aborts before mutation.
 
 Protected historical anchors must bind the active exact format-root reference.
 Supplying a root from another format generation fails before object-store
-reads. The gateway does not expose historical-root registration, in-place
-format/data-key rotation, or cross-format protected-root renewal. Existing held
-graphs also fail full maintenance. New v02 legal holds are disabled until hold
-propagation and guarded release cover every restore dependency.
+reads. The gateway does not expose client registration of arbitrary historical
+roots, in-place format/data-key rotation, or cross-format protected-root
+renewal. Existing held graphs also fail full maintenance. New v03 legal holds
+are disabled until hold propagation and guarded release cover every restore
+dependency.
 
-Payload-pack cleaning is a separate space-reclamation operation, not part of
-the exact-root deletion proof. A fully dead pack
-may be deleted only after the complete exact-root mark, orphan-age floor,
-protection checks, and maintenance-fence checks pass. A mixed pack is left in
-place until its dead fraction justifies cleaning. Cleaning re-encrypts its live
-records into a new random pack, publishes higher-generation physical
-references, and retains the old exact version while any current or protected
-historical root reaches it. Mutable reference counts are not authoritative.
-
-Current writers never mix different effective `(retention mode, retain days,
-legal hold)` cohorts in one new payload pack. Client legal-hold publication is
-currently disabled, but the cohort dimension remains a defensive format
-invariant for preexisting data. Packs written before that rule, or
-otherwise conservatively over-protected, remain safe but may occupy space until
-a future cleaner rewrites their live records.
-
-If a candidate pack has live fraction `l`, cleaning must copy at least
-`l / (1 - l)` bytes for every byte it can reclaim. The cleaner therefore uses
-an explicit utilization threshold and never runs on every checkpoint. Index
-checkpointing and compaction must not copy every live payload.
+Payload-pack cleaning is not implemented. A fully dead pack can be reclaimed
+by exact-root GC once age, protection and fence checks pass. A mixed pack keeps
+its dead bytes while live or protected historical references reach it. Current
+writers partition new packs by effective protection cohort, but there is no
+promise of prompt space reclamation from partially dead packs. A future cleaner
+must publish replacement references and preserve old exact versions for every
+protected root; index compaction does not copy payloads.
 
 ## Anchors and Writer Coordination
 
@@ -596,7 +870,7 @@ repository-wide state, fence a stale writer, or safely merge two encrypted
 namespace histories. Object-store listing and timestamps cannot fill that gap.
 A future disconnected multi-writer mode would require explicit branches,
 authenticated merge semantics, deterministic conflict policy, and a different
-repository contract. `v02` has no such mode.
+repository contract. `v03` has no such mode.
 
 Anchors fail closed. If an anchor cannot be read, renewed, advanced, or matched
 to the verified graph, the gateway must not accept newer-looking repository
@@ -612,16 +886,32 @@ protected root requires them.
 
 Initialization creates random purpose-specific keys, seals them in a keyring
 envelope under an external high-entropy wrapping-key source, writes an encrypted
-`v02` format root, and publishes a genesis catalog commit. The format root binds
+`v03` format root, and publishes a genesis catalog commit. The format root binds
 the exact envelope generation, key, provider version, and digest. In retained
 mode, every restore-critical initialization write must return a provider version
 ID.
 
-Initialization is permitted only on a verified fresh prefix. Detection of
-unsupported `v01` objects, an existing anchor, an existing format root, or
-ambiguous listing state fails closed. There is no automatic import, overwrite,
-or migration behavior. The freshness inventory is paged and capped at 4,096
-pages and 2,000,000 raw provider members, including filtered version members.
+Genesis preparation produces exact signed bytes before publication. Publication
+reads back the complete stored object and reconciles an ambiguous anchor reply
+against that exact candidate. A repeated prepared operation reads an already
+accepted provider version and refuses a different or newer anchor. Its bounded
+journal representation belongs in trusted bootstrap storage; it is not authority
+to recreate a lost anchor after completed initialization. The prepared publisher
+requires an explicit upload allowance to create a missing object; without one,
+it can verify and anchor an existing exact candidate. Durable retry callers must
+reserve that allowance before publication. Protected S3 PUTs disable SDK retries
+so a lost reply returns to the publication caller before another version is
+created. Kubernetes init persists keyring, format and genesis intent in its
+declared bootstrap Secret before their writes, with three upload allowances per
+artifact. Retries use the verified exact provider versions of their dependencies.
+A matching unfinished journal can resume without an anchor; a completed or
+missing journal with existing backend data requires explicit recovery.
+
+A new initialization requires a verified fresh prefix. Unsupported `v01` or
+`v02` objects, foreign existing state and ambiguous inventory fail closed. Only
+a matching unfinished bootstrap journal can resume its prepared operation;
+there is no automatic import, overwrite or migration. The freshness inventory
+is paged and capped at 4,096 pages and 2,000,000 raw provider members, including filtered version members.
 
 Wrapping-key rewrap preserves repository data keys and is not compromise
 recovery. Historical keys may be retired only after reachability and retention
@@ -629,55 +919,22 @@ prove that no protected root requires them.
 
 ## Implementation and Qualification Gates
 
-Before `commits/v02` can qualify as the repository format, implementation must
-include:
-
-- canonical encoding, crypto, corruption, and cross-object transplant vectors;
-- descriptor and frame parsers with fixed hostile-input budgets and fuzzing;
-- fresh-process 10k, 100k, and 1M committed-write recovery gates that verify
-  exact cardinality plus first, middle, and last payload bytes;
-- a 1M filesystem recovery target of at most 180 seconds and 4 GiB RSS on the
-  documented 4-vCPU, 16-GiB runner;
-- no payload reads during normal index recovery and at most 1.25x index byte
-  read amplification;
-- fresh post-recovery sentinel reads that use one exact backend range `GET` per
-  record and at most 1.04x ciphertext-byte amplification for 512 B values (528
-  B including the AEAD tag, or 1.03125x, is the format expectation);
-- enforced small-object write gates for a 64-object batch: at most 1.50x for
-  512 B values (target 1.40x), at most 1.15x for 4 KiB values, at most 1.03x
-  for 256 KiB values, and at most 320 fixed backend bytes per empty object;
-- a sequential 512 B committed-write gate of at most 3.0x plus a
-  checkpoint-and-compaction-inclusive lifetime gate of at most 1.50x;
-- amplification evidence at 32 B, 256 B, and 1,024 B logical path lengths that
-  reports payload amplification separately from fixed metadata bytes per
-  object;
-- separate adversarial raw-S3 and real Kopia/Velero tiny-source-file gates, so
-  a million 512 B S3 objects does not pretend to model a client that already
-  packs and deduplicates its repository blobs;
-- measured known-length and chunked streamed-write lanes that cover checkpoint
-  reload, post-compaction cold ranges, and exact GC reachability without
-  attributing historical pre-wire-4 results to the current format;
-- checkpoint crash, stale-fence, delayed-read, replay, deletion, and exact
-  provider-version fault tests;
-- GC tests proving exact payload reachability across overlapping runs,
-  tombstones, protected roots, and failed compactions; and
-- a retained-provider restart and writer-handoff qualification run.
-
-The local and CI recipes enforce generous elapsed-time regression ceilings on
-every runner, including a separate recovery ceiling. Time results qualify a
-release only on the pinned runner. Correctness, allocation, request, byte, and
-amplification ceilings apply everywhere.
+Frozen canonical fixtures and nine fuzz targets cover current codecs;
+[Testing](../testing.md) maps the executable coverage and its limits. Full
+qualification still requires broader retained-provider restart/fault evidence,
+production-cardinality maintenance and matched recovery
+and amplification results for the exact candidate. Historical v02 measurements
+do not qualify v03. See [Production Preview](../production-preview.md) and
+[Performance](../performance.md) for evidence and release gates.
 
 ## Compatibility Promise
 
 There is no stable repository-format promise yet. `commits/v01` is removed and
-unsupported without migration support. The gateway reads and writes the preview
-`commits/v02` envelope with index-run wire version 6. Version 4 introduced exact
-self/external streamed carriers, version 5 interns namespace-key identifiers,
-and version 6 raises the authenticated bounded pack capacity for high-throughput
-small-object batches. The current reader does not promise to open earlier
-preview run wires. Recreate evaluation
-repositories when the preview wire changes. Catalog, exact descriptors,
+unsupported, as is `commits/v02`, without migration support. The gateway reads
+and writes the preview `commits/v03` envelope with index-run wire version 10 and
+index-root wire version 6. The current reader rejects wire versions 8 and 9 and
+other earlier preview layouts. Recreate evaluation repositories when the preview wire
+changes. Catalog, exact descriptors,
 framed streaming, and guarded metadata-only mixed-carrier compaction are
 integrated, while retained-provider restart/fault GC qualification and final
 bounded-recovery qualification remain incomplete. Wire details freeze only

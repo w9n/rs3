@@ -10,10 +10,10 @@ use bytes::Bytes;
 use clap::{Args, ValueEnum};
 use futures_util::stream;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_repository::v2::{
-    UnenforcedQuiescedMaintenanceGuard, V2AnchorState, V2CommitAnchor, V2CommitCoordinator,
-    V2CommitStoreOptions, V2FormatRef, V2KeyringEnvelopeRef, V2MemoryAnchor, V2ProviderProfile,
-    V2Repository,
+use rs3_repository::v3::{
+    UnenforcedQuiescedMaintenanceGuard, V3AnchorState, V3CommitAnchor, V3CommitCoordinator,
+    V3CommitStoreOptions, V3FormatRef, V3KeyringEnvelopeRef, V3MemoryAnchor, V3ProviderProfile,
+    V3Repository,
 };
 use rs3_repository::{
     CommitCoordinatorOptions, DEFAULT_PAYLOAD_SEGMENT_SIZE, RepositoryOptions, RepositoryPutOptions,
@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
-pub(super) const PERF_REPOSITORY_FORMAT: &str = "v2-preview";
+pub(super) const PERF_REPOSITORY_FORMAT: &str = "v3-preview";
 const FRESH_PROCESS_HANDOFF_SCHEMA: &str = "rs3.perf-fresh-process-handoff.v2";
 const FRESH_PROCESS_REPORT_SCHEMA: &str = "rs3.perf-fresh-process-report.v2";
 const PERF_BODY_PATTERN_VERSION: u32 = 1;
@@ -85,6 +85,9 @@ pub(crate) struct PerfArgs {
     /// Fail a write scenario when backend bytes exceed this plaintext ratio.
     #[arg(long)]
     max_write_amp: Option<f64>,
+    /// Fail a write scenario above this many backend bytes per object, including empty objects.
+    #[arg(long)]
+    max_write_bytes_per_object: Option<u64>,
     /// Fail a write scenario when verification reads exceed this plaintext ratio.
     #[arg(long)]
     max_verification_read_amp: Option<f64>,
@@ -370,6 +373,22 @@ pub(crate) fn run(args: PerfArgs) -> Result<()> {
     {
         anyhow::bail!("--max-write-amp must be finite and greater than zero");
     }
+    if let Some(limit) = args.max_write_bytes_per_object {
+        if limit == 0 || args.objects == 0 {
+            anyhow::bail!(
+                "--max-write-bytes-per-object requires a positive limit and object count"
+            );
+        }
+        if !matches!(
+            args.scenario,
+            PerfScenario::WriteBatch
+                | PerfScenario::WriteCommitted
+                | PerfScenario::WriteCommittedParallel
+                | PerfScenario::WriteStandaloneParallel
+        ) {
+            anyhow::bail!("--max-write-bytes-per-object requires one write scenario");
+        }
+    }
     if args
         .max_verification_read_amp
         .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
@@ -492,7 +511,7 @@ struct FreshProcessHandoff {
     object_size: usize,
     logical_path_len: usize,
     body_pattern_version: u32,
-    anchor: V2AnchorState,
+    anchor: V3AnchorState,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -558,7 +577,7 @@ struct FreshProcessAggregateReport {
 }
 
 impl FreshProcessHandoff {
-    fn new(args: &PerfArgs, backend_dir: PathBuf, anchor: V2AnchorState) -> Self {
+    fn new(args: &PerfArgs, backend_dir: PathBuf, anchor: V3AnchorState) -> Self {
         Self {
             schema: FRESH_PROCESS_HANDOFF_SCHEMA.to_owned(),
             source_revision: option_env!("RS3_BUILD_GIT_SHA")
@@ -746,6 +765,9 @@ fn append_fresh_child_args(
     if let Some(limit) = args.max_write_amp {
         command.args(["--max-write-amp", &limit.to_string()]);
     }
+    if let Some(limit) = args.max_write_bytes_per_object {
+        command.args(["--max-write-bytes-per-object", &limit.to_string()]);
+    }
     if let Some(limit) = args.max_elapsed_seconds {
         command.args(["--max-elapsed-seconds", &limit.to_string()]);
     }
@@ -836,6 +858,10 @@ async fn run_async(args: PerfArgs) -> Result<()> {
         record_gate_failure(
             &mut gate_failures,
             report.enforce_max_write_amplification(args.max_write_amp),
+        );
+        record_gate_failure(
+            &mut gate_failures,
+            report.enforce_max_write_bytes_per_object(args.max_write_bytes_per_object),
         );
         record_gate_failure(
             &mut gate_failures,
@@ -981,6 +1007,9 @@ fn add_perf_args(
     if let Some(max_write_amp) = args.max_write_amp {
         command.args(["--max-write-amp", &max_write_amp.to_string()]);
     }
+    if let Some(limit) = args.max_write_bytes_per_object {
+        command.args(["--max-write-bytes-per-object", &limit.to_string()]);
+    }
     if let Some(limit) = args.max_verification_read_amp {
         command.args(["--max-verification-read-amp", &limit.to_string()]);
     }
@@ -1058,7 +1087,7 @@ where
     let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
     let batch_items = args.objects.max(1);
     let coordinator = Arc::new(
-        V2CommitCoordinator::with_options(
+        V3CommitCoordinator::with_options(
             repo,
             anchor,
             CommitCoordinatorOptions::new(
@@ -1125,6 +1154,7 @@ where
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }
@@ -1156,7 +1186,7 @@ where
     S: BlobStore + Clone + 'static,
 {
     let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
-    let coordinator = V2CommitCoordinator::with_options(repo, anchor, commit_options(args))?
+    let coordinator = V3CommitCoordinator::with_options(repo, anchor, commit_options(args))?
         .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard);
     store
         .reset_operation_counts()
@@ -1202,6 +1232,7 @@ where
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }
@@ -1271,13 +1302,14 @@ where
 
 struct ParallelWriteMeasurement<S> {
     store: CountingBlobStore<S>,
-    anchor: V2MemoryAnchor,
+    anchor: V3MemoryAnchor,
     body: Bytes,
     parallelism: usize,
     latencies: Vec<Duration>,
     elapsed: Duration,
     counts: BlobOperationCounts,
     checkpoint: Option<CheckpointMeasurement>,
+    observed_compactions: usize,
 }
 
 async fn perform_parallel_writes<S>(
@@ -1290,7 +1322,7 @@ where
     let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
     let verification_anchor = anchor.clone();
     let coordinator = Arc::new(
-        V2CommitCoordinator::with_options(repo, anchor, commit_options(args))?
+        V3CommitCoordinator::with_options(Arc::clone(&repo), anchor, commit_options(args))?
             .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard),
     );
     store
@@ -1302,6 +1334,8 @@ where
     let mut latencies = Vec::with_capacity(args.objects);
     let started = Instant::now();
     let mut checkpoint = None;
+    let mut previous_runs = repo.active_index_run_count()?;
+    let mut observed_compactions = 0;
 
     let mut next = 0;
     while next < args.objects {
@@ -1342,6 +1376,12 @@ where
                 .context("committed write task did not complete")??;
             latencies.push(latency);
         }
+        // A strict decrease between completed waves proves an accepted compaction.
+        // This is a lower bound for arbitrary concurrency; the batch-16 scale lane
+        // publishes one foreground run per wave and observes every pass.
+        let active_runs = repo.active_index_run_count()?;
+        observed_compactions += usize::from(active_runs < previous_runs);
+        previous_runs = active_runs;
         next = end;
         if let Some(requested_after_objects) =
             checkpoint_due(args.checkpoint_after_objects, checkpoint.is_some(), next)
@@ -1373,6 +1413,7 @@ where
         elapsed,
         counts,
         checkpoint,
+        observed_compactions,
     })
 }
 
@@ -1405,6 +1446,7 @@ fn parallel_write_report<S>(
         elapsed: written.elapsed,
         counts: written.counts,
         checkpoint: written.checkpoint,
+        observed_compactions: Some(written.observed_compactions),
         reload_verification,
     })
 }
@@ -1420,7 +1462,7 @@ async fn run_fresh_writer_phase(args: &PerfArgs) -> Result<()> {
     let written = perform_parallel_writes(args, store).await?;
     let anchor = written
         .anchor
-        .read_v2()
+        .read_v3()
         .await
         .context("failed to read writer anchor for fresh-process handoff")?
         .context("fresh-process writer produced no accepted anchor")?;
@@ -1468,6 +1510,10 @@ async fn run_fresh_writer_phase(args: &PerfArgs) -> Result<()> {
     );
     record_gate_failure(
         &mut failures,
+        report.enforce_max_write_bytes_per_object(args.max_write_bytes_per_object),
+    );
+    record_gate_failure(
+        &mut failures,
         report.enforce_resource_limits(args.max_elapsed_seconds, None, peak_rss_bytes),
     );
     record_gate_failure(
@@ -1491,7 +1537,7 @@ async fn run_fresh_reader_phase(args: &PerfArgs) -> Result<()> {
         FilesystemBlobStore::new(backend_dir)
             .context("failed to open fresh-process filesystem backend")?,
     );
-    let anchor = V2MemoryAnchor::with_state(handoff.anchor);
+    let anchor = V3MemoryAnchor::with_state(handoff.anchor);
     let verification = verify_parallel_reload(args, store, &anchor, &body(args.object_size), None)
         .await
         .context("fresh reader process verification failed")?;
@@ -1659,7 +1705,7 @@ where
 async fn verify_parallel_reload<S>(
     args: &PerfArgs,
     store: CountingBlobStore<S>,
-    anchor: &V2MemoryAnchor,
+    anchor: &V3MemoryAnchor,
     expected_body: &Bytes,
     checkpoint: Option<CheckpointMeasurement>,
 ) -> Result<ReloadVerification>
@@ -1825,6 +1871,7 @@ where
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }
@@ -1912,6 +1959,7 @@ where
         elapsed,
         counts,
         checkpoint: None,
+        observed_compactions: None,
         reload_verification: None,
     })
 }
@@ -1936,6 +1984,7 @@ struct PerfReport {
     elapsed: Duration,
     counts: BlobOperationCounts,
     checkpoint: Option<CheckpointMeasurement>,
+    observed_compactions: Option<usize>,
     reload_verification: Option<ReloadVerification>,
 }
 
@@ -2083,6 +2132,27 @@ impl OperationLatencyStats {
 }
 
 impl PerfReport {
+    fn enforce_max_write_bytes_per_object(&self, limit: Option<u64>) -> Result<()> {
+        let Some(limit) = limit else {
+            return Ok(());
+        };
+        if self.objects == 0 {
+            anyhow::bail!("fixed write-byte limit requires at least one object");
+        }
+        let maximum = (self.objects as u128) * u128::from(limit);
+        if u128::from(self.counts.bytes_written) > maximum {
+            anyhow::bail!(
+                "{} wrote {} backend bytes for {} objects, exceeding {} bytes/object ({} bytes total)",
+                self.scenario,
+                self.counts.bytes_written,
+                self.objects,
+                limit,
+                maximum,
+            );
+        }
+        Ok(())
+    }
+
     fn enforce_max_write_amplification(&self, limit: Option<f64>) -> Result<()> {
         let Some(limit) = limit else {
             return Ok(());
@@ -2434,6 +2504,7 @@ impl PerfReport {
                 "bytes_uploaded_attempted": self.counts.bytes_uploaded_attempted,
                 "bytes_committed": self.counts.bytes_written,
                 "bytes_written": self.counts.bytes_written,
+                "write_bytes_per_object": ratio_optional(self.counts.bytes_written, self.objects as u64),
                 "bytes_read": self.counts.bytes_read,
             },
             "requested_plaintext_bytes": requested_plaintext_bytes,
@@ -2455,6 +2526,7 @@ impl PerfReport {
                 self.counts.bytes_read,
                 self.requested_plaintext_read_bytes as u64,
             ),
+            "observed_compactions": self.observed_compactions,
             "checkpoint": self.checkpoint.map(CheckpointMeasurement::report),
             "reload_verification": self.reload_verification.as_ref().map(ReloadVerification::report),
         })
@@ -2489,12 +2561,12 @@ fn memory_store() -> CountingBlobStore<MemoryBlobStore> {
 async fn v2_repository_with_store<S>(
     args: &PerfArgs,
     store: CountingBlobStore<S>,
-) -> Result<(Arc<V2Repository<CountingBlobStore<S>>>, V2MemoryAnchor)>
+) -> Result<(Arc<V3Repository<CountingBlobStore<S>>>, V3MemoryAnchor)>
 where
     S: BlobStore + Clone,
 {
     let repository = v2_repository(args, store)?;
-    let anchor = V2MemoryAnchor::new();
+    let anchor = V3MemoryAnchor::new();
     repository
         .write_genesis_snapshot(&anchor)
         .await
@@ -2505,14 +2577,14 @@ where
 fn v2_repository<S>(
     args: &PerfArgs,
     store: CountingBlobStore<S>,
-) -> Result<Arc<V2Repository<CountingBlobStore<S>>>>
+) -> Result<Arc<V3Repository<CountingBlobStore<S>>>>
 where
     S: BlobStore + Clone,
 {
     if args.payload_segment_size == Some(0) {
         anyhow::bail!("--payload-segment-size must be greater than zero");
     }
-    Ok(Arc::new(V2Repository::new(
+    Ok(Arc::new(V3Repository::new(
         store,
         keyring()?,
         RepositoryOptions {
@@ -2522,8 +2594,8 @@ where
                 rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
             default_retention: None,
         },
-        V2CommitStoreOptions::for_profile(
-            V2ProviderProfile::Dev,
+        V3CommitStoreOptions::for_profile(
+            V3ProviderProfile::Dev,
             perf_repository_id()?,
             perf_keyring_envelope_ref()?,
             perf_format_ref()?,
@@ -2646,16 +2718,16 @@ fn perf_repository_id() -> Result<RepositoryId> {
     RepositoryId::new("rs3-xtask-perf").map_err(Into::into)
 }
 
-fn perf_keyring_envelope_ref() -> Result<V2KeyringEnvelopeRef> {
-    Ok(V2KeyringEnvelopeRef {
+fn perf_keyring_envelope_ref() -> Result<V3KeyringEnvelopeRef> {
+    Ok(V3KeyringEnvelopeRef {
         object_id: BackendObjectId::new("keyrings/perf-bootstrap")
             .context("invalid perf keyring envelope object id")?,
         digest: [6_u8; 32],
     })
 }
 
-fn perf_format_ref() -> Result<V2FormatRef> {
-    Ok(V2FormatRef {
+fn perf_format_ref() -> Result<V3FormatRef> {
+    Ok(V3FormatRef {
         generation: 1,
         digest: hex::encode([7_u8; 32]),
         object_id: BackendObjectId::new(format!(
@@ -2695,34 +2767,15 @@ fn concurrency(args: &PerfArgs) -> usize {
 
 fn keyring() -> Result<KeyRing> {
     KeyRing::new(vec![
-        key_material(
-            "namespace",
-            KeyPurpose::Namespace,
-            KeyStatus::Primary,
-            "hmac-sha256",
-            1,
-        )?,
-        key_material(
-            "metadata",
-            KeyPurpose::Metadata,
-            KeyStatus::Primary,
-            "aes-256-gcm-siv-hmac-sha256-nonce-v1",
-            2,
-        )?,
+        key_material("namespace", KeyPurpose::Namespace, KeyStatus::Primary, 1)?,
+        key_material("metadata", KeyPurpose::Metadata, KeyStatus::Primary, 2)?,
         key_material(
             "signing",
             KeyPurpose::CheckpointSigning,
             KeyStatus::Primary,
-            "ed25519",
             3,
         )?,
-        key_material(
-            "content",
-            KeyPurpose::Content,
-            KeyStatus::Primary,
-            "xchacha20poly1305",
-            4,
-        )?,
+        key_material("content", KeyPurpose::Content, KeyStatus::Primary, 4)?,
     ])
     .map_err(Into::into)
 }
@@ -2731,20 +2784,15 @@ fn key_material(
     value: &str,
     purpose: KeyPurpose,
     status: KeyStatus,
-    algorithm: &str,
     secret_byte: u8,
 ) -> Result<KeyMaterial> {
     Ok(KeyMaterial::new(
         KeyDescriptor {
             id: KeyId::new(value.to_owned())?,
             purpose,
-            algorithm: algorithm.to_owned(),
             status,
             created_at_ms: 0,
-            not_before_ms: None,
-            not_after_ms: None,
             public_key: None,
-            external_kms_uri: None,
         },
         SecretBytes::new(vec![secret_byte; SecretBytes::MIN_LEN])?,
     ))
@@ -3003,11 +3051,163 @@ mod tests {
     };
     use crate::{Cli, Commands};
     use clap::Parser;
-    use rs3_repository::v2::V2AnchorState;
+    use rs3_repository::v3::V3AnchorState;
     use rs3_storage::BlobOperationCounts;
     use rs3_types::{BackendObjectId, KeyId, Sequence};
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn small_workload_shapes_use_post_genesis_counters() {
+        for (scenario, size, expected_puts) in [
+            ("write-batch", 0, 1),
+            ("write-batch", 4096, 1),
+            ("write-batch", 262144, 1),
+            ("write-committed", 512, 64),
+        ] {
+            let cli = Cli::try_parse_from([
+                "xtask",
+                "perf",
+                "--scenario",
+                scenario,
+                "--objects",
+                "64",
+                "--object-size",
+                &size.to_string(),
+                "--logical-path-len",
+                "32",
+                "--commit-batch-items",
+                if expected_puts == 1 { "64" } else { "1" },
+                "--commit-batch-delay-ms",
+                "60000",
+                "--concurrency",
+                if expected_puts == 1 { "64" } else { "1" },
+            ])
+            .expect("parse mandatory small workload");
+            let Some(Commands::Perf(args)) = cli.command else {
+                panic!("perf command");
+            };
+            let store = super::memory_store();
+            let report = if scenario == "write-batch" {
+                super::write_batch_with_store(&args, store.clone()).await
+            } else {
+                super::write_committed_with_store(&args, store.clone()).await
+            }
+            .expect("execute mandatory small workload");
+            assert_eq!(
+                report.counts.put, expected_puts,
+                "one batch or one commit per awaited write; genesis excluded"
+            );
+            // Publication shape is a deterministic harness contract. The
+            // release recipe separately enforces the qualification ceilings
+            // and retains measurements even when a ceiling is not met.
+            assert_eq!(report.requested_plaintext_write_bytes, 64 * size);
+            assert!(report.json_value(None)["checkpoint"].is_null());
+            assert_eq!(
+                report.counts.bytes_written,
+                store.operation_counts().expect("counts").bytes_written
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_byte_gates_reject_one_byte_over_and_preserve_raw_empty_measurement() {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "perf",
+            "--scenario",
+            "write-batch",
+            "--objects",
+            "64",
+            "--object-size",
+            "0",
+            "--logical-path-len",
+            "32",
+            "--max-write-bytes-per-object",
+            "320",
+            "--commit-batch-delay-ms",
+            "60000",
+        ])
+        .expect("parse empty-byte gate");
+        let Some(Commands::Perf(args)) = cli.command else {
+            panic!("perf command");
+        };
+        assert_eq!(args.max_write_bytes_per_object, Some(320));
+        let mut report = super::write_batch_with_store(&args, super::memory_store())
+            .await
+            .expect("empty batch");
+        assert_eq!(report.requested_plaintext_write_bytes, 0);
+        assert!(report.counts.bytes_written > 0);
+        let raw = report.json_value(None);
+        assert_eq!(raw["backend"]["bytes_written"], report.counts.bytes_written);
+        assert!(
+            raw["write_amp"].is_null(),
+            "empty payload has no plaintext ratio"
+        );
+        assert_eq!(
+            raw["source_revision"],
+            option_env!("RS3_BUILD_GIT_SHA").unwrap_or("unknown")
+        );
+        report.counts.bytes_written = 64 * 320;
+        report
+            .enforce_max_write_bytes_per_object(Some(320))
+            .expect("inclusive integer boundary");
+        report.counts.bytes_written += 1;
+        assert!(
+            report
+                .enforce_max_write_bytes_per_object(Some(320))
+                .is_err()
+        );
+        report.objects = 0;
+        assert!(
+            report
+                .enforce_max_write_bytes_per_object(Some(320))
+                .is_err()
+        );
+        // Exact integer floors of the three ratio budgets. One extra byte must
+        // fail, even when the ratio is only slightly above its decimal ceiling.
+        for (plaintext, limit, maximum) in [
+            (64 * 4096, 1.15, 301_465),
+            (64 * 262_144, 1.03, 17_280_532),
+            (64 * 512, 3.0, 98_304),
+        ] {
+            report.requested_plaintext_write_bytes = plaintext;
+            report.counts.bytes_written = maximum;
+            report
+                .enforce_max_write_amplification(Some(limit))
+                .expect("integer floor is within ratio budget");
+            report.counts.bytes_written += 1;
+            assert!(report.enforce_max_write_amplification(Some(limit)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn final_checkpoint_does_not_count_as_automatic_compaction() {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "perf",
+            "--scenario",
+            "write-committed-parallel",
+            "--objects",
+            "8",
+            "--commit-batch-items",
+            "2",
+            "--concurrency",
+            "2",
+            "--verify-reload",
+            "--checkpoint-after-objects",
+            "8",
+        ])
+        .expect("parse small scale workload");
+        let Some(Commands::Perf(args)) = cli.command else {
+            panic!("expected perf command");
+        };
+        let written = super::perform_parallel_writes(&args, super::memory_store())
+            .await
+            .expect("write and checkpoint below the compaction watermark");
+        assert!(written.checkpoint.is_some());
+        assert_eq!(written.observed_compactions, 0);
+    }
 
     fn fresh_process_args() -> PerfArgs {
         let cli = Cli::try_parse_from([
@@ -3075,9 +3275,9 @@ mod tests {
     fn fresh_process_handoff_binds_the_requested_repository_facts() {
         let args = fresh_process_args();
         let backend_dir = PathBuf::from("/tmp/rs3-perf-test-backend");
-        let anchor = V2AnchorState {
+        let anchor = V3AnchorState {
             sequence: Sequence::new(9),
-            commit_key: BackendObjectId::new("commits/v02/test")
+            commit_key: BackendObjectId::new("commits/v03/test")
                 .unwrap_or_else(|error| panic!("commit key: {error}")),
             body_digest: [3; 32],
             version_id: None,

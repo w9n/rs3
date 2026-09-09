@@ -8,9 +8,17 @@ repository.workspace = true
 authors.workspace = true
 description = "Shared strongly typed identifiers and policy types for rs3"
 
+[features]
+default = []
+fuzzing = []
+
 [dependencies]
+hex.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

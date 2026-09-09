@@ -51,6 +51,13 @@ pub(crate) struct VeleroKopiaSmokeArgs {
     /// Force a fixed payload segment size. Omit to use adaptive per-object sizing.
     #[arg(long)]
     payload_segment_size: Option<usize>,
+    /// Bytes of deterministic incompressible ConfigMap data included in the backup.
+    ///
+    /// This is opt-in because ordinary smoke proofs are intentionally small. A value
+    /// above the Velero AWS plugin's 5 MiB multipart crossover qualifies its client
+    /// multipart path when paired with the gateway metrics assertion.
+    #[arg(long, default_value_t = 0)]
+    velero_backup_fixture_bytes: usize,
     /// Workload image used for the volume restore check. Defaults to the gateway image.
     #[arg(long)]
     workload_image: Option<String>,
@@ -298,9 +305,10 @@ mod imp {
     use crate::integration::k8s_support::{
         GatewayChartValues, K8sWorkspace, KEYRING_ENVELOPE_OBJECT_ID, KEYRING_WRAPPING_KEY_HEX,
         KEYRING_WRAPPING_KEY_ID, KindCluster, REPOSITORY_ID, REPOSITORY_SALT_HEX,
-        assert_v2_lease_anchor, build_source_revision, default_cluster_name, helm_fullname,
-        helm_install_gateway, helm_lint_gateway, helm_set_gateway_mode, now_millis, path_str,
-        require_command, run_command, run_command_capture, split_image_ref,
+        assert_v2_lease_anchor, build_source_revision, default_cluster_name,
+        governance_review_from_env, helm_fullname, helm_install_gateway, helm_lint_gateway,
+        helm_set_gateway_mode, now_millis, path_str, require_command, run_command,
+        run_command_capture, split_image_ref,
     };
     use anyhow::{Context, Result, bail};
     use artifacts::{ArtifactCollector, gateway_backend_counts};
@@ -321,9 +329,10 @@ mod imp {
         set_backup_storage_location_access_mode, velero_s3_target, write_velero_credentials,
     };
     use workload::{
-        apply_workload, assert_workload_proof, delete_workload_namespace, delete_workload_pod,
-        prepare_local_pv_path, remove_workload_proof, wait_for_restored_proof,
-        wait_for_workload_available, write_workload_proof,
+        apply_backup_fixture, apply_workload, assert_backup_fixture, assert_workload_proof,
+        delete_workload_namespace, delete_workload_pod, prepare_local_pv_path,
+        remove_workload_proof, wait_for_restored_proof, wait_for_workload_available,
+        write_workload_proof,
     };
 
     const VELERO_BUCKET: &str = "velero";
@@ -456,6 +465,10 @@ mod imp {
             bail!("direct RustFS scenarios require --backend-mode cluster-rustfs");
         }
         let backend = backend_target(&args)?;
+        // Governance review inputs are operator assertions. Resolve them before
+        // any cluster work so a missing review fails immediately and clearly.
+        let governance_review =
+            governance_review_from_env(args.repository_retention_mode.as_deref())?;
         require_command(&args.kind_bin, &["version"])?;
         require_command(&args.kubectl_bin, &["version", "--client"])?;
         require_command(&args.helm_bin, &["version", "--short"])?;
@@ -587,6 +600,7 @@ mod imp {
                     let (image_repository, image_tag) = split_image_ref(&args.image);
                     helm_install_gateway(
                         &args.helm_bin,
+                        &args.kubectl_bin,
                         kubeconfig_path,
                         &GatewayChartValues {
                             release_name: &args.release_name,
@@ -609,15 +623,21 @@ mod imp {
                             retention_mode: args.repository_retention_mode.as_deref(),
                             retention_days: args.repository_retention_days,
                             repository_id: REPOSITORY_ID,
-                            repository_salt_hex: REPOSITORY_SALT_HEX,
+                            repository_salt_hex: Some(REPOSITORY_SALT_HEX),
                             keyring_envelope_object_id: KEYRING_ENVELOPE_OBJECT_ID,
                             keyring_wrapping_key_id: KEYRING_WRAPPING_KEY_ID,
                             keyring_wrapping_key_hex: KEYRING_WRAPPING_KEY_HEX,
                             persistence_enabled: false,
                             wait_secs: args.wait_secs,
+                            governance_review: governance_review.as_ref(),
                         },
                     )
                 })?;
+                if args.velero_backup_fixture_bytes > 0 {
+                    run_phase(&mut state, "enable-gateway-metrics", || {
+                        enable_gateway_metrics(&args, kubeconfig_path)
+                    })?;
+                }
             }
 
             if matches!(scenario.volume, WorkloadVolume::DynamicPvc) {
@@ -634,12 +654,25 @@ mod imp {
             run_phase(&mut state, "apply-workload", || {
                 apply_workload(&args, kubeconfig_path, workspace, scenario)
             })?;
+            let backup_fixture = run_phase(&mut state, "apply-backup-fixture", || {
+                apply_backup_fixture(&args, kubeconfig_path, workspace)
+            })?;
             run_phase(&mut state, "write-workload-proof", || {
                 write_workload_proof(&args, kubeconfig_path, scenario.workload)
             })?;
             run_phase(&mut state, "verify-workload-proof", || {
                 assert_workload_proof(&args, kubeconfig_path, scenario.workload)
             })?;
+            let multipart_before =
+                if backup_fixture.is_enabled() && scenario.storage_path.uses_gateway() {
+                    Some(artifacts.capture_gateway_multipart_snapshot(
+                        &args,
+                        kubeconfig_path,
+                        "before-backup",
+                    )?)
+                } else {
+                    None
+                };
 
             let backup_name = format!("rs3-smoke-{}", now_millis());
             let restore_name = format!("rs3-restore-{}", now_millis());
@@ -661,6 +694,11 @@ mod imp {
                 artifacts.collect_checkpoint(&args, kubeconfig_path, &state, "after-backup")
             {
                 eprintln!("failed to collect after-backup checkpoint artifacts: {error:#}");
+            }
+            if let Some(before) = multipart_before.as_ref() {
+                run_phase(&mut state, "assert-client-multipart", || {
+                    artifacts.assert_gateway_multipart_qualification(&args, kubeconfig_path, before)
+                })?;
             }
             if scenario.storage_path.uses_gateway() {
                 let anchor_name = state.anchor_name.clone();
@@ -744,6 +782,9 @@ mod imp {
             run_phase(&mut state, "verify-restored-workload", || {
                 wait_for_workload_available(&args, kubeconfig_path)?;
                 wait_for_restored_proof(&args, kubeconfig_path, scenario.workload)
+            })?;
+            run_phase(&mut state, "verify-restored-backup-fixture", || {
+                assert_backup_fixture(&args, kubeconfig_path, &backup_fixture)
             })?;
             if let Err(error) =
                 artifacts.collect_checkpoint(&args, kubeconfig_path, &state, "after-restore")
@@ -971,6 +1012,30 @@ mod imp {
         .context("failed to restart gateway deployment")?;
         wait_for_gateway_rollout(args, kubeconfig_path)?;
         assert_gateway_containers_never_restarted(args, kubeconfig_path)
+    }
+
+    fn enable_gateway_metrics(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
+        let kubeconfig = path_str(kubeconfig_path)?;
+        let timeout = format!("{}s", args.wait_secs);
+        run_command(
+            &args.helm_bin,
+            &[
+                "--kubeconfig",
+                kubeconfig,
+                "upgrade",
+                &args.release_name,
+                "charts/rs3-gateway",
+                "--namespace",
+                &args.gateway_namespace,
+                "--reuse-values",
+                "--wait",
+                "--timeout",
+                &timeout,
+                "--set",
+                "metrics.enabled=true",
+            ],
+        )
+        .context("failed to enable gateway metrics for multipart qualification")
     }
 
     fn wait_for_gateway_rollout(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<()> {
