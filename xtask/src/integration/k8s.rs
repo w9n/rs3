@@ -403,9 +403,9 @@ mod imp {
         println!("lifecycle: upgrading to a rebuilt image that needs requalification");
         let requalify_tag = format!("{image_tag}-requalify");
         let requalify_image = format!("{image_repository}:{requalify_tag}");
-        // The binary must stay bound to a valid revision: evidence from an
-        // unbound build is never accepted, so the rebuilt image carries a
-        // distinct but well-formed revision instead of a suffix.
+        // A synthetic revision makes the rebuilt fixture invalidate earlier
+        // evidence. It passes the build's syntax check but does not identify
+        // another source commit; never use this image as release provenance.
         let revision_arg = format!(
             "REVISION={}",
             requalification_revision(build_source_revision())
@@ -450,8 +450,8 @@ mod imp {
         )
     }
 
-    /// Derives a distinct, well-formed revision for the requalification
-    /// image by flipping the last digit of the candidate's hash.
+    /// Derives a synthetic revision for the requalification test fixture by
+    /// flipping the candidate hash's last digit. It is not source provenance.
     pub(super) fn requalification_revision(candidate: &str) -> String {
         let hash = candidate.strip_suffix("-dirty").unwrap_or(candidate);
         let mut flipped = hash.to_owned();
