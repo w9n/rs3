@@ -3,5 +3,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    rs3_repository::v2::fuzzing::decode_v03_index_run(data);
+    rs3_repository::v3::fuzzing::decode_v03_index_run(data);
 });

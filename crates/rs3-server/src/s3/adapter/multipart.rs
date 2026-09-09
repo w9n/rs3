@@ -4,7 +4,7 @@ mod checksum;
 mod sessions;
 use super::*;
 use crate::s3::content_md5::upload_part_expected_md5;
-use rs3_repository::v2::{V3ClientMultipartUpload, V3MultipartSelection};
+use rs3_repository::v3::{V3ClientMultipartUpload, V3MultipartSelection};
 use rs3_types::{LogicalPath, MultipartUploadId};
 use s3s::dto::*;
 pub(super) use sessions::MultipartSessions;

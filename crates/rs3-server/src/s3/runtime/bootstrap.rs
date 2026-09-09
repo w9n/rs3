@@ -8,7 +8,7 @@ use crate::s3::runtime_keyring::{
 };
 use rs3_crypto::derive_public_fingerprint;
 use rs3_k8s::{KubernetesBootstrapJournal, MAX_BOOTSTRAP_JOURNAL_BYTES};
-use rs3_repository::v2::V2FormatError;
+use rs3_repository::v3::V3FormatError;
 use rs3_repository::{KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE, keyring_envelope_object_id};
 use rs3_storage::retention_satisfies;
 use rs3_types::BackendVersionId;
@@ -57,17 +57,17 @@ enum Phase {
         artifact: Artifact,
     },
     Format {
-        keyring: V2KeyringEnvelopeRootRef,
+        keyring: V3KeyringEnvelopeRootRef,
         artifact: Artifact,
     },
     Genesis {
-        keyring: V2KeyringEnvelopeRootRef,
-        format: V2FormatRef,
+        keyring: V3KeyringEnvelopeRootRef,
+        format: V3FormatRef,
         intent: Vec<u8>,
         remaining: u8,
     },
     Initialized {
-        accepted: V2AnchorState,
+        accepted: V3AnchorState,
     },
 }
 
@@ -100,14 +100,14 @@ pub(super) fn context(config: &RuntimeConfig, salt: &[u8]) -> Result<String, S3B
         salt,
         &keys.wrapping_key_id,
         &keys.envelope_object_id,
-        v2_provider_profile(&config.backend, config.repository.retention),
+        v3_provider_profile(&config.backend, config.repository.retention),
         config.repository.retention,
     ))
     .map_err(|_| invalid())?;
     Ok(derive_public_fingerprint(
         b"rs3.bootstrap.context.v1",
         &[
-            provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(config))
+            provider_conformance_target_fingerprint(&V3ProviderCheckConfig::from(config))
                 .as_bytes(),
             &identity,
         ],
@@ -185,8 +185,8 @@ async fn save(journal: &mut impl Journal, record: &Record) -> Result<(), S3Bound
 struct Bootstrap<'a, J> {
     config: &'a RuntimeConfig,
     store: &'a RuntimeStore,
-    anchor: &'a RuntimeV2Anchor,
-    guard: &'a dyn V2MaintenanceGuard,
+    anchor: &'a RuntimeV3Anchor,
+    guard: &'a dyn V3MaintenanceGuard,
     journal: &'a mut J,
     /// Salt fixed by an enclosing journal; otherwise configured or generated.
     fixed_salt: Option<Vec<u8>>,
@@ -195,7 +195,7 @@ struct Bootstrap<'a, J> {
 impl<J: Journal> Bootstrap<'_, J> {
     async fn check_guard(&self) -> Result<(), S3BoundaryError> {
         self.guard
-            .verify_v2_maintenance(None)
+            .verify_v3_maintenance(None)
             .await
             .map_err(repository_init)
     }
@@ -204,7 +204,7 @@ impl<J: Journal> Bootstrap<'_, J> {
         self.check_guard().await?;
         if self
             .anchor
-            .read_v2()
+            .read_v3()
             .await
             .map_err(repository_init)?
             .is_some()
@@ -217,10 +217,10 @@ impl<J: Journal> Bootstrap<'_, J> {
     async fn verify_accepted(
         &self,
         initialized: bool,
-    ) -> Result<(V2RepositoryInitReport, Vec<u8>), S3BoundaryError> {
+    ) -> Result<(V3RepositoryInitReport, Vec<u8>), S3BoundaryError> {
         let anchor = self
             .anchor
-            .read_v2()
+            .read_v3()
             .await
             .map_err(repository_init)?
             .ok_or_else(|| {
@@ -228,7 +228,7 @@ impl<J: Journal> Bootstrap<'_, J> {
                     "completed bootstrap requires explicit recovery of its missing anchor",
                 )
             })?;
-        let loaded = load_existing_v2_repository(
+        let loaded = load_existing_v3_repository(
             self.store,
             &self.config.repository_keys,
             &anchor,
@@ -244,13 +244,13 @@ impl<J: Journal> Bootstrap<'_, J> {
         }
         let repository_salt = loaded.repository_salt.clone();
         let options = bootstrap_commit_options(self.config, &loaded)?;
-        let commits = V2CommitStore::new(self.store.clone(), loaded.keyring, options);
+        let commits = V3CommitStore::new(self.store.clone(), loaded.keyring, options);
         let chain = commits
             .load_replay_chain_from_state(&anchor)
             .await
             .map_err(repository_init)?;
         Ok((
-            V2RepositoryInitReport {
+            V3RepositoryInitReport {
                 anchor,
                 initialized,
                 verified_commit_count: chain.commits_newest_first.len(),
@@ -262,14 +262,14 @@ impl<J: Journal> Bootstrap<'_, J> {
         ))
     }
 
-    async fn run(&mut self) -> Result<V2RepositoryInitReport, S3BoundaryError> {
+    async fn run(&mut self) -> Result<V3RepositoryInitReport, S3BoundaryError> {
         self.check_guard().await?;
         let (mut record, salt) = match self.journal.state()? {
             Some(bytes) => decode(bytes, self.config, self.fixed_salt.as_deref())?,
             None => {
                 if self
                     .anchor
-                    .read_v2()
+                    .read_v3()
                     .await
                     .map_err(repository_init)?
                     .is_some()
@@ -290,9 +290,9 @@ impl<J: Journal> Bootstrap<'_, J> {
                     return Ok(report);
                 }
                 self.require_init_permission()?;
-                reject_v2_bootstrap_with_foreign_objects(
+                reject_v3_bootstrap_with_foreign_objects(
                     self.store,
-                    v2_provider_profile(&self.config.backend, self.config.repository.retention),
+                    v3_provider_profile(&self.config.backend, self.config.repository.retention),
                     None,
                 )
                 .await?;
@@ -357,27 +357,27 @@ impl<J: Journal> Bootstrap<'_, J> {
                             KEYRING_ENVELOPE_OBJECT_CONTENT_TYPE,
                         )
                         .await?;
-                    let keyring = V2KeyringEnvelopeRootRef {
+                    let keyring = V3KeyringEnvelopeRootRef {
                         generation: envelope.generation,
                         digest: envelope.digest().map_err(repository_init)?,
                         object_id: artifact.object_id,
                         version_id,
                     };
-                    let root = V2FormatRoot::new(
+                    let root = V3FormatRoot::new(
                         self.config.repository_keys.repository_id.clone(),
                         keyring.clone(),
                         loaded
                             .keyring
                             .primary_key_id(KeyPurpose::CheckpointSigning)
                             .map_err(repository_init)?,
-                        v2_provider_profile(&self.config.backend, self.config.repository.retention),
+                        v3_provider_profile(&self.config.backend, self.config.repository.retention),
                         self.config.repository.retention,
                     );
                     let envelope = prepare_format_root(&self.config.repository_keys, &root, &salt)?;
                     record.phase = Phase::Format {
                         keyring,
                         artifact: Artifact::new(
-                            v2_format_object_id(
+                            v3_format_object_id(
                                 envelope.generation,
                                 &envelope.digest().map_err(repository_init)?,
                             )
@@ -395,12 +395,12 @@ impl<J: Journal> Bootstrap<'_, J> {
                     .map_err(repository_init)?;
                     let digest = envelope.digest().map_err(repository_init)?;
                     if artifact.object_id
-                        != v2_format_object_id(envelope.generation, &digest)
+                        != v3_format_object_id(envelope.generation, &digest)
                             .map_err(repository_init)?
                     {
                         return Err(invalid());
                     }
-                    let mut format = V2FormatRef {
+                    let mut format = V3FormatRef {
                         generation: envelope.generation,
                         digest,
                         object_id: artifact.object_id.clone(),
@@ -420,14 +420,14 @@ impl<J: Journal> Bootstrap<'_, J> {
                     self.protect_dependency(&keyring.object_id, keyring.version_id.as_ref())
                         .await?;
                     format.version_id = self
-                        .publish_artifact(&mut record, &artifact, V2_FORMAT_ENVELOPE_CONTENT_TYPE)
+                        .publish_artifact(&mut record, &artifact, V3_FORMAT_ENVELOPE_CONTENT_TYPE)
                         .await?;
-                    let loaded = LoadedV2Repository {
+                    let loaded = LoadedV3Repository {
                         format_ref: format.clone(),
                         ..loaded
                     };
                     let options = bootstrap_commit_options(self.config, &loaded)?;
-                    let commits = V2CommitStore::new(self.store.clone(), loaded.keyring, options);
+                    let commits = V3CommitStore::new(self.store.clone(), loaded.keyring, options);
                     let intent = commits
                         .prepare_genesis_snapshot()
                         .map_err(repository_init)?
@@ -456,7 +456,7 @@ impl<J: Journal> Bootstrap<'_, J> {
                         .load_dependencies(&keyring, &opened.root, &format, &salt)
                         .await?;
                     let options = bootstrap_commit_options(self.config, &loaded)?;
-                    let commits = V2CommitStore::new(self.store.clone(), loaded.keyring, options);
+                    let commits = V3CommitStore::new(self.store.clone(), loaded.keyring, options);
                     let prepared = commits
                         .open_prepared_genesis(&intent)
                         .map_err(repository_init)?;
@@ -474,7 +474,7 @@ impl<J: Journal> Bootstrap<'_, J> {
                         .await;
                     match result {
                         Ok(_) => {}
-                        Err(V2FormatError::BootstrapUploadRequired) => {
+                        Err(V3FormatError::BootstrapUploadRequired) => {
                             if remaining == 0 {
                                 return Err(repository_init(
                                     "bootstrap upload budget exhausted; reconcile or recover explicitly",
@@ -535,15 +535,15 @@ impl<J: Journal> Bootstrap<'_, J> {
 
     async fn load_dependencies(
         &self,
-        keyring: &V2KeyringEnvelopeRootRef,
-        root: &V2FormatRoot,
-        format: &V2FormatRef,
+        keyring: &V3KeyringEnvelopeRootRef,
+        root: &V3FormatRoot,
+        format: &V3FormatRef,
         salt: &[u8],
-    ) -> Result<LoadedV2Repository, S3BoundaryError> {
+    ) -> Result<LoadedV3Repository, S3BoundaryError> {
         if root.active_keyring_envelope_ref != *keyring
             || root.repository_id != self.config.repository_keys.repository_id
             || root.provider_profile
-                != v2_provider_profile(&self.config.backend, self.config.repository.retention)
+                != v3_provider_profile(&self.config.backend, self.config.repository.retention)
             || root.retention != self.config.repository.retention
         {
             return Err(invalid());
@@ -551,7 +551,7 @@ impl<J: Journal> Bootstrap<'_, J> {
         let loaded = open_gateway_keyring_reference(
             self.store,
             &self.config.repository_keys,
-            &keyring_reference_from_v2(keyring),
+            &keyring_reference_from_v3(keyring),
         )
         .await?;
         if loaded
@@ -563,7 +563,7 @@ impl<J: Journal> Bootstrap<'_, J> {
         {
             return Err(invalid());
         }
-        Ok(LoadedV2Repository {
+        Ok(LoadedV3Repository {
             keyring: loaded.keyring,
             keyring_ref: keyring.clone(),
             format_ref: format.clone(),
@@ -712,11 +712,11 @@ impl<J: Journal> Bootstrap<'_, J> {
 pub(super) async fn initialize(
     config: &RuntimeConfig,
     store: &RuntimeStore,
-    anchor: &RuntimeV2Anchor,
-    guard: &dyn V2MaintenanceGuard,
+    anchor: &RuntimeV3Anchor,
+    guard: &dyn V3MaintenanceGuard,
     journal: &mut impl Journal,
     fixed_salt: Option<Vec<u8>>,
-) -> Result<V2RepositoryInitReport, S3BoundaryError> {
+) -> Result<V3RepositoryInitReport, S3BoundaryError> {
     Bootstrap {
         config,
         store,

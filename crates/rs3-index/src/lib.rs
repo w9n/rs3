@@ -38,7 +38,8 @@ pub struct ObjectPointer {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PayloadReference {
     /// Compact payload-pack record in the current commit carrying this index run.
-    V2PackSelf {
+    #[serde(rename = "V2PackSelf")]
+    V3PackSelf {
         /// Commit section ordinal containing the payload pack.
         pack_section_ordinal: u32,
         /// Random pack identity bound into every record AEAD operation.
@@ -59,27 +60,29 @@ pub enum PayloadReference {
         record_offset: u32,
     },
     /// Compact payload-pack record in an accepted exact commit object.
-    V2Pack {
+    #[serde(rename = "V2Pack")]
+    V3Pack {
         /// Exact carrier facts shared by every record in the same payload pack.
         #[serde(flatten)]
-        carrier: Arc<V2PackCarrierReference>,
+        carrier: Arc<V3PackCarrierReference>,
         /// Record-specific facts inside the shared payload pack.
         #[serde(flatten)]
-        record: V2PackRecordReference,
+        record: V3PackRecordReference,
     },
     /// Staged value awaiting an authenticated carrier reference; never persisted.
     Pending,
     /// Streamed payload bytes stored in one exact standalone object.
-    V2StandaloneStream {
+    #[serde(rename = "V2StandaloneStream")]
+    V3StandaloneStream {
         /// Exact carrier facts shared by every reference to this streamed payload.
         #[serde(flatten)]
-        carrier: Arc<V2StandaloneStreamCarrierReference>,
+        carrier: Arc<V3StandaloneStreamCarrierReference>,
     },
 }
 
 /// Exact accepted commit and section facts shared by records in one payload pack.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct V2PackCarrierReference {
+pub struct V3PackCarrierReference {
     /// Commit object key containing the payload-pack section.
     pub commit_key: BackendObjectId,
     /// Provider version identifier for exact-version reads, when available.
@@ -111,7 +114,7 @@ pub struct V2PackCarrierReference {
 
 /// Record-specific authenticated facts inside an accepted payload pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct V2PackRecordReference {
+pub struct V3PackRecordReference {
     /// Logical record ordinal in the pack directory.
     pub record_ordinal: u32,
     /// Absolute ciphertext offset from the start of the payload-pack section.
@@ -120,7 +123,7 @@ pub struct V2PackRecordReference {
 
 /// Exact accepted standalone object facts for a streamed payload.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct V2StandaloneStreamCarrierReference {
+pub struct V3StandaloneStreamCarrierReference {
     /// Standalone backend object containing the encrypted payload.
     pub object_id: BackendObjectId,
     /// Provider version identifier for exact-version reads, when available.
@@ -325,7 +328,7 @@ pub struct NamespaceEntry {
     /// Provider version identifier for exact restore reads, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_version_id: Option<BackendVersionId>,
-    /// Commit-backed payload location for v2 repositories.
+    /// Commit-backed payload location for v3 repositories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_ref: Option<PayloadReference>,
     /// Sealed metadata record containing client-visible metadata.
@@ -480,7 +483,7 @@ impl NamespaceIndex {
 mod tests {
     use super::{
         IndexDelta, MANIFEST_PLAINTEXT_DOMAIN, NamespaceEntry, NamespaceIndex, PayloadReference,
-        V2PackCarrierReference, V2PackRecordReference, V2StandaloneStreamCarrierReference,
+        V3PackCarrierReference, V3PackRecordReference, V3StandaloneStreamCarrierReference,
         manifest_plaintext_bytes,
     };
     use rs3_types::{
@@ -595,8 +598,8 @@ mod tests {
 
     #[test]
     fn payload_pack_references_round_trip_direct_read_facts() {
-        let accepted = PayloadReference::V2Pack {
-            carrier: Arc::new(V2PackCarrierReference {
+        let accepted = PayloadReference::V3Pack {
+            carrier: Arc::new(V3PackCarrierReference {
                 commit_key: object_id("commits/opaque"),
                 commit_version_id: Some(BackendVersionId::new("version-1").expect("version id")),
                 body_digest: [0x33; 32],
@@ -611,13 +614,13 @@ mod tests {
                 keyring_envelope_digest: [0x45; 32],
                 pack_record_count: 11,
             }),
-            record: V2PackRecordReference {
+            record: V3PackRecordReference {
                 record_ordinal: 5,
                 record_offset: 12_288,
             },
         };
         let references = [
-            PayloadReference::V2PackSelf {
+            PayloadReference::V3PackSelf {
                 pack_section_ordinal: 2,
                 pack_id: [0x11; 32],
                 attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
@@ -641,7 +644,7 @@ mod tests {
 
     #[test]
     fn shared_payload_pack_reference_round_trips() {
-        let carrier = Arc::new(V2PackCarrierReference {
+        let carrier = Arc::new(V3PackCarrierReference {
             commit_key: object_id("commits/opaque"),
             commit_version_id: Some(BackendVersionId::new("version-1").expect("version id")),
             body_digest: [0x33; 32],
@@ -656,11 +659,11 @@ mod tests {
             keyring_envelope_digest: [0x45; 32],
             pack_record_count: 11,
         });
-        let record = V2PackRecordReference {
+        let record = V3PackRecordReference {
             record_ordinal: 5,
             record_offset: 12_288,
         };
-        let shared = PayloadReference::V2Pack {
+        let shared = PayloadReference::V3Pack {
             carrier: Arc::clone(&carrier),
             record,
         };
@@ -673,8 +676,8 @@ mod tests {
 
     #[test]
     fn standalone_stream_reference_round_trips_its_distinct_typed_shape() {
-        let reference = PayloadReference::V2StandaloneStream {
-            carrier: Arc::new(V2StandaloneStreamCarrierReference {
+        let reference = PayloadReference::V3StandaloneStream {
+            carrier: Arc::new(V3StandaloneStreamCarrierReference {
                 object_id: object_id("objects/v03/standalone-stream"),
                 version_id: Some(BackendVersionId::new("version-3").expect("version id")),
                 object_digest: [0x71; 32],

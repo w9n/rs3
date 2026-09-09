@@ -2,11 +2,11 @@
 
 use bytes::Bytes;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_repository::v2::{
-    V2_HEADER_META_LEN, V2_SECTION_FLAG_MUST_UNDERSTAND, V2Algorithms, V2CommitHeader, V2CommitKey,
-    V2CommitKind, V2CommitParentRef, V2CommitSelfRef, V2ErrorClass, V2FormatError,
-    V2KeyringEnvelopeRef, V2SectionDescriptor, V2SectionType, body_digest_for_v2_sections,
-    digest_v2_section, parse_v2_commit_object,
+use rs3_repository::v3::{
+    V3_HEADER_META_LEN, V3_SECTION_FLAG_MUST_UNDERSTAND, V3Algorithms, V3CommitHeader, V3CommitKey,
+    V3CommitKind, V3CommitParentRef, V3CommitSelfRef, V3ErrorClass, V3FormatError,
+    V3KeyringEnvelopeRef, V3SectionDescriptor, V3SectionType, body_digest_for_v3_sections,
+    digest_v3_section, parse_v3_commit_object,
 };
 use rs3_types::{
     BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, Sequence,
@@ -14,43 +14,43 @@ use rs3_types::{
 
 struct CommitVectorFixture {
     keyring: KeyRing,
-    commit_key: V2CommitKey,
-    header: V2CommitHeader,
+    commit_key: V3CommitKey,
+    header: V3CommitHeader,
     section_region: Bytes,
 }
 
 impl CommitVectorFixture {
     fn new() -> Self {
         let keyring = signing_keyring();
-        let commit_key = must_v2(V2CommitKey::from_parts(Sequence::new(42), [0x42; 32]));
-        let parent_key = must_v2(V2CommitKey::from_parts(Sequence::new(41), [0x41; 32]));
+        let commit_key = must_v3(V3CommitKey::from_parts(Sequence::new(42), [0x42; 32]));
+        let parent_key = must_v3(V3CommitKey::from_parts(Sequence::new(41), [0x41; 32]));
         let section_region = Bytes::from_static(b"v03-vector-section-bytes");
-        let section_index = vec![V2SectionDescriptor {
-            section_type: V2SectionType::IndexRoot,
+        let section_index = vec![V3SectionDescriptor {
+            section_type: V3SectionType::IndexRoot,
             offset: 0,
             length: section_region.len() as u64,
-            flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-            digest: digest_v2_section(&section_region),
+            flags: V3_SECTION_FLAG_MUST_UNDERSTAND,
+            digest: digest_v3_section(&section_region),
         }];
-        let body_digest = must_v2(body_digest_for_v2_sections(
+        let body_digest = must_v3(body_digest_for_v3_sections(
             &section_index,
             section_region.as_ref(),
         ));
-        let header = V2CommitHeader {
-            self_ref: V2CommitSelfRef {
+        let header = V3CommitHeader {
+            self_ref: V3CommitSelfRef {
                 sequence: commit_key.sequence,
                 commit_key: commit_key.object_id.clone(),
             },
-            parent: Some(V2CommitParentRef {
+            parent: Some(V3CommitParentRef {
                 sequence: parent_key.sequence,
                 commit_key: parent_key.object_id,
                 body_digest: [0x41; 32],
                 version_id: Some(must_type(BackendVersionId::new("vector-parent-version"))),
             }),
             publish_time_ms: 1_765_000_123_456,
-            kind: V2CommitKind::Root,
-            algorithms: V2Algorithms::v03(),
-            keyring_envelope_ref: V2KeyringEnvelopeRef {
+            kind: V3CommitKind::Root,
+            algorithms: V3Algorithms::v03(),
+            keyring_envelope_ref: V3KeyringEnvelopeRef {
                 object_id: object_id("keyrings/00000000000000000042-vector"),
                 digest: [0x24; 32],
             },
@@ -59,7 +59,7 @@ impl CommitVectorFixture {
             signature: [0_u8; 64],
             signing_key_id: key_id("signing"),
         };
-        let header = must_v2(header.sign_with_keyring(&keyring));
+        let header = must_v3(header.sign_with_keyring(&keyring));
 
         Self {
             keyring,
@@ -70,7 +70,7 @@ impl CommitVectorFixture {
     }
 
     fn encode(&self) -> Bytes {
-        must_v2(self.header.encode_object(self.section_region.as_ref()))
+        must_v3(self.header.encode_object(self.section_region.as_ref()))
     }
 }
 
@@ -79,7 +79,7 @@ fn vector_valid_single_put() {
     let fixture = CommitVectorFixture::new();
     let body = fixture.encode();
 
-    let parsed = must_v2(parse_v2_commit_object(
+    let parsed = must_v3(parse_v3_commit_object(
         &fixture.commit_key.object_id,
         body,
         &fixture.keyring,
@@ -87,7 +87,7 @@ fn vector_valid_single_put() {
 
     assert_eq!(
         parsed.parsed_header.sections_start,
-        V2_HEADER_META_LEN + parsed.parsed_header.header_len
+        V3_HEADER_META_LEN + parsed.parsed_header.header_len
     );
 }
 
@@ -97,12 +97,12 @@ fn vector_rejects_nonzero_capability() {
     let mut body = fixture.encode().to_vec();
     body[24] = 1;
     assert!(matches!(
-        parse_v2_commit_object(
+        parse_v3_commit_object(
             &fixture.commit_key.object_id,
             Bytes::from(body),
             &fixture.keyring
         ),
-        Err(V2FormatError::UnsupportedCapabilities)
+        Err(V3FormatError::UnsupportedCapabilities)
     ));
 }
 
@@ -120,13 +120,13 @@ fn vector_invalid_cases_have_expected_classes() {
     ];
 
     for case in cases {
-        let error = parse_v2_commit_object(&case.object_id, case.body, &case.keyring);
+        let error = parse_v3_commit_object(&case.object_id, case.body, &case.keyring);
         let error = match error {
             Ok(_) => panic!("invalid vector passed: {}", case.name),
             Err(error) => error,
         };
         assert_eq!(error, case.expected_error, "{}", case.name);
-        assert_eq!(error.class(), V2ErrorClass::FailClosedSecurity);
+        assert_eq!(error.class(), V3ErrorClass::FailClosedSecurity);
     }
 }
 
@@ -135,19 +135,19 @@ struct InvalidVectorCase {
     keyring: KeyRing,
     object_id: BackendObjectId,
     body: Bytes,
-    expected_error: V2FormatError,
+    expected_error: V3FormatError,
 }
 
 fn invalid_case_wrong_object_key() -> InvalidVectorCase {
     let fixture = CommitVectorFixture::new();
-    let wrong_key = must_v2(V2CommitKey::from_parts(Sequence::new(42), [0x11; 32]));
+    let wrong_key = must_v3(V3CommitKey::from_parts(Sequence::new(42), [0x11; 32]));
     let body = fixture.encode();
     InvalidVectorCase {
         name: "wrong-object-key",
         keyring: fixture.keyring,
         object_id: wrong_key.object_id,
         body,
-        expected_error: V2FormatError::SelfKeyMismatch,
+        expected_error: V3FormatError::SelfKeyMismatch,
     }
 }
 
@@ -160,7 +160,7 @@ fn invalid_case_old_format_version() -> InvalidVectorCase {
         keyring: fixture.keyring,
         object_id: fixture.commit_key.object_id,
         body: Bytes::from(body),
-        expected_error: V2FormatError::UnsupportedFormatVersion,
+        expected_error: V3FormatError::UnsupportedFormatVersion,
     }
 }
 
@@ -173,7 +173,7 @@ fn invalid_case_bad_signature() -> InvalidVectorCase {
         keyring: fixture.keyring,
         object_id: fixture.commit_key.object_id,
         body,
-        expected_error: V2FormatError::SignatureVerification,
+        expected_error: V3FormatError::SignatureVerification,
     }
 }
 
@@ -187,21 +187,21 @@ fn invalid_case_bad_body_digest() -> InvalidVectorCase {
         keyring: fixture.keyring,
         object_id: fixture.commit_key.object_id,
         body: Bytes::from(body),
-        expected_error: V2FormatError::SectionDigestMismatch,
+        expected_error: V3FormatError::SectionDigestMismatch,
     }
 }
 
 fn invalid_case_bad_algorithm() -> InvalidVectorCase {
     let mut fixture = CommitVectorFixture::new();
     fixture.header.algorithms.digest = "SHA-512".to_owned();
-    fixture.header = must_v2(fixture.header.sign_with_keyring(&fixture.keyring));
+    fixture.header = must_v3(fixture.header.sign_with_keyring(&fixture.keyring));
     let body = fixture.encode();
     InvalidVectorCase {
         name: "bad-algorithm",
         keyring: fixture.keyring,
         object_id: fixture.commit_key.object_id,
         body,
-        expected_error: V2FormatError::InvalidAlgorithms,
+        expected_error: V3FormatError::InvalidAlgorithms,
     }
 }
 
@@ -214,7 +214,7 @@ fn invalid_case_unsupported_capability() -> InvalidVectorCase {
         keyring: fixture.keyring,
         object_id: fixture.commit_key.object_id,
         body: Bytes::from(body),
-        expected_error: V2FormatError::UnsupportedCapabilities,
+        expected_error: V3FormatError::UnsupportedCapabilities,
     }
 }
 
@@ -227,7 +227,7 @@ fn invalid_case_old_reader_version() -> InvalidVectorCase {
         keyring: fixture.keyring,
         object_id: fixture.commit_key.object_id,
         body: Bytes::from(body),
-        expected_error: V2FormatError::UnsupportedReaderVersion,
+        expected_error: V3FormatError::UnsupportedReaderVersion,
     }
 }
 
@@ -240,7 +240,7 @@ fn invalid_case_reserved_fixed_header() -> InvalidVectorCase {
         keyring: fixture.keyring,
         object_id: fixture.commit_key.object_id,
         body: Bytes::from(body),
-        expected_error: V2FormatError::NonzeroReserved,
+        expected_error: V3FormatError::NonzeroReserved,
     }
 }
 
@@ -281,7 +281,7 @@ fn object_id(value: &str) -> BackendObjectId {
     must_type(BackendObjectId::new(value))
 }
 
-fn must_v2<T>(result: rs3_repository::v2::V2Result<T>) -> T {
+fn must_v3<T>(result: rs3_repository::v3::V3Result<T>) -> T {
     match result {
         Ok(value) => value,
         Err(error) => panic!("{error}"),
@@ -306,32 +306,32 @@ impl CommitVectorFixture {
     fn shape(shape: u8) -> Self {
         let mut fixture = Self::new();
         let bytes = fixture.section_region.as_ref();
-        let descriptor = |section_type, offset: usize, length: usize| V2SectionDescriptor {
+        let descriptor = |section_type, offset: usize, length: usize| V3SectionDescriptor {
             section_type,
             offset: offset as u64,
             length: length as u64,
-            flags: V2_SECTION_FLAG_MUST_UNDERSTAND,
-            digest: digest_v2_section(&bytes[offset..offset + length]),
+            flags: V3_SECTION_FLAG_MUST_UNDERSTAND,
+            digest: digest_v3_section(&bytes[offset..offset + length]),
         };
         fixture.header.kind = if shape == 0 {
-            V2CommitKind::Root
+            V3CommitKind::Root
         } else {
-            V2CommitKind::Delta
+            V3CommitKind::Delta
         };
         fixture.header.section_index = match shape {
-            0 => vec![descriptor(V2SectionType::IndexRoot, 0, bytes.len())],
-            1 => vec![descriptor(V2SectionType::IndexRun, 0, bytes.len())],
+            0 => vec![descriptor(V3SectionType::IndexRoot, 0, bytes.len())],
+            1 => vec![descriptor(V3SectionType::IndexRun, 0, bytes.len())],
             2 => vec![
-                descriptor(V2SectionType::PayloadPack, 0, 8),
-                descriptor(V2SectionType::IndexRun, 8, bytes.len() - 8),
+                descriptor(V3SectionType::PayloadPack, 0, 8),
+                descriptor(V3SectionType::IndexRun, 8, bytes.len() - 8),
             ],
             _ => panic!("unknown fixture shape"),
         };
-        fixture.header.body_digest = must_v2(body_digest_for_v2_sections(
+        fixture.header.body_digest = must_v3(body_digest_for_v3_sections(
             &fixture.header.section_index,
             bytes,
         ));
-        fixture.header = must_v2(fixture.header.sign_with_keyring(&fixture.keyring));
+        fixture.header = must_v3(fixture.header.sign_with_keyring(&fixture.keyring));
         fixture
     }
 }
@@ -358,14 +358,14 @@ fn frozen_commit_shapes_verify_and_reject_every_truncation() {
     for (shape, expected) in vectors.into_iter().enumerate() {
         let fixture = CommitVectorFixture::shape(shape as u8);
         assert_eq!(fixture.encode().as_ref(), expected);
-        must_v2(parse_v2_commit_object(
+        must_v3(parse_v3_commit_object(
             &fixture.commit_key.object_id,
             Bytes::copy_from_slice(expected),
             &fixture.keyring,
         ));
         for length in 0..expected.len() {
             assert!(
-                parse_v2_commit_object(
+                parse_v3_commit_object(
                     &fixture.commit_key.object_id,
                     Bytes::copy_from_slice(&expected[..length]),
                     &fixture.keyring
@@ -377,7 +377,7 @@ fn frozen_commit_shapes_verify_and_reject_every_truncation() {
         let mut trailing = expected.to_vec();
         trailing.push(0);
         assert!(
-            parse_v2_commit_object(
+            parse_v3_commit_object(
                 &fixture.commit_key.object_id,
                 Bytes::from(trailing),
                 &fixture.keyring

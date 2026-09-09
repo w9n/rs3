@@ -134,7 +134,7 @@ async fn retained_bootstrap_checks_policy_before_repository_io() {
         for init in [false, true] {
             let provider = Provider::new(responses.clone()).await;
             let result = if init {
-                super::V2PreparedRepositoryInit::prepare(&provider.config())
+                super::V3PreparedRepositoryInit::prepare(&provider.config())
                     .await
                     .map(|_| ())
             } else {

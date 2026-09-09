@@ -32,7 +32,7 @@ struct Record {
     attempts: u8,
     evidence: Option<String>,
     bootstrap: Option<String>,
-    probe_observation: Option<V2ProbeObservation>,
+    probe_observation: Option<V3ProbeObservation>,
     round_trip: Option<round_trip::State>,
 }
 
@@ -107,7 +107,7 @@ trait Probe: Sync {
     fn accepts(&self, evidence: &str) -> bool;
     fn ready(&self) -> Result<(), S3BoundaryError>;
     async fn run(&self, prefix: String) -> Result<String, S3BoundaryError>;
-    async fn observe(&self, root: String, attempts: u8) -> V2ProbeObservation;
+    async fn observe(&self, root: String, attempts: u8) -> V3ProbeObservation;
 }
 
 struct ProviderProbe<'a> {
@@ -127,10 +127,10 @@ impl Probe for ProviderProbe<'_> {
     }
 
     async fn run(&self, prefix: String) -> Result<String, S3BoundaryError> {
-        let config = V2ProviderCheckConfig::from(self.config);
-        let report = check_v2_provider_conformance_with_store(
+        let config = V3ProviderCheckConfig::from(self.config);
+        let report = check_v3_provider_conformance_with_store(
             &config,
-            RuntimeV2ProviderConformanceOptions {
+            RuntimeV3ProviderConformanceOptions {
                 probe_prefix: Some(prefix),
                 legal_hold: true,
                 governance_bypass_reviewed: self.governance_bypass_reviewed,
@@ -141,7 +141,7 @@ impl Probe for ProviderProbe<'_> {
         encode_provider_conformance_evidence(&config, &report)
     }
 
-    async fn observe(&self, root: String, attempts: u8) -> V2ProbeObservation {
+    async fn observe(&self, root: String, attempts: u8) -> V3ProbeObservation {
         match self
             .store
             .provider_probe_store(root, self.config.repository.retention)
@@ -154,7 +154,7 @@ impl Probe for ProviderProbe<'_> {
 }
 
 fn matching_evidence(runtime: &RuntimeConfig, evidence: &str) -> bool {
-    let config = V2ProviderCheckConfig::from(runtime);
+    let config = V3ProviderCheckConfig::from(runtime);
     provider_conformance_summary_from_bytes(
         &runtime.provider_conformance,
         selected_provider_profile(runtime),
@@ -228,7 +228,7 @@ impl<'a, J: Journal> OnboardingJournal<'a, J> {
                     schema: SCHEMA.to_owned(),
                     context: bootstrap::context(config, &salt)?,
                     repository_salt_hex: Some(hex::encode(&salt)),
-                    probe_root: default_v2_provider_probe_prefix()?,
+                    probe_root: default_v3_provider_probe_prefix()?,
                     attempts: 0,
                     evidence: None,
                     bootstrap: None,
@@ -271,12 +271,12 @@ impl<'a, J: Journal> OnboardingJournal<'a, J> {
     async fn qualify(
         &mut self,
         probe: &impl Probe,
-        guard: &dyn V2MaintenanceGuard,
+        guard: &dyn V3MaintenanceGuard,
         external: Option<String>,
     ) -> Result<(), S3BoundaryError> {
         self.state()?;
         guard
-            .verify_v2_maintenance(None)
+            .verify_v3_maintenance(None)
             .await
             .map_err(repository_init)?;
         if let Some(evidence) = external {
@@ -309,13 +309,13 @@ impl<'a, J: Journal> OnboardingJournal<'a, J> {
         self.record.evidence = None;
         self.persist().await?;
         guard
-            .verify_v2_maintenance(None)
+            .verify_v3_maintenance(None)
             .await
             .map_err(repository_init)?;
         let prefix = format!("{}/{}", self.record.probe_root, self.record.attempts);
         let outcome = probe.run(prefix).await;
         guard
-            .verify_v2_maintenance(None)
+            .verify_v3_maintenance(None)
             .await
             .map_err(repository_init)?;
         self.record.probe_observation = Some(
@@ -324,7 +324,7 @@ impl<'a, J: Journal> OnboardingJournal<'a, J> {
                 .await,
         );
         guard
-            .verify_v2_maintenance(None)
+            .verify_v3_maintenance(None)
             .await
             .map_err(repository_init)?;
         let passed = outcome
@@ -372,17 +372,17 @@ impl<J: Journal> Journal for OnboardingJournal<'_, J> {
 async fn existing_repository_salt(
     config: &RuntimeConfig,
     store: &RuntimeStore,
-    anchor: &RuntimeV2Anchor,
+    anchor: &RuntimeV3Anchor,
     journal: &impl Journal,
 ) -> Result<Option<Vec<u8>>, S3BoundaryError> {
     if journal.state()?.is_some() {
         return Ok(None);
     }
-    let Some(anchor_state) = anchor.read_v2().await.map_err(repository_init)? else {
+    let Some(anchor_state) = anchor.read_v3().await.map_err(repository_init)? else {
         return Ok(None);
     };
     Ok(Some(
-        load_existing_v2_repository(store, &config.repository_keys, &anchor_state, config)
+        load_existing_v3_repository(store, &config.repository_keys, &anchor_state, config)
             .await?
             .repository_salt,
     ))
@@ -391,25 +391,25 @@ async fn existing_repository_salt(
 pub(super) async fn initialize(
     config: &RuntimeConfig,
     store: &StoreBuild,
-    anchor: &RuntimeV2Anchor,
-    guard: &dyn V2MaintenanceGuard,
+    anchor: &RuntimeV3Anchor,
+    guard: &dyn V3MaintenanceGuard,
     journal: &mut impl Journal,
     governance_bypass_reviewed: bool,
-) -> Result<V2RepositoryInitReport, S3BoundaryError> {
+) -> Result<V3RepositoryInitReport, S3BoundaryError> {
     let existing_salt = existing_repository_salt(config, store.handle(), anchor, journal).await?;
     let mut journal = OnboardingJournal::open(journal, config, existing_salt)?;
     let salt = journal.salt.clone();
     guard
-        .verify_v2_maintenance(None)
+        .verify_v3_maintenance(None)
         .await
         .map_err(repository_init)?;
-    if journal.state()?.is_none() && anchor.read_v2().await.map_err(repository_init)?.is_none() {
+    if journal.state()?.is_none() && anchor.read_v3().await.map_err(repository_init)?.is_none() {
         if !config.repository.allow_init {
             return Err(repository_init("repository initialization is disabled"));
         }
-        reject_v2_bootstrap_with_foreign_objects(
+        reject_v3_bootstrap_with_foreign_objects(
             store.handle(),
-            v2_provider_profile(&config.backend, config.repository.retention),
+            v3_provider_profile(&config.backend, config.repository.retention),
             None,
         )
         .await?;

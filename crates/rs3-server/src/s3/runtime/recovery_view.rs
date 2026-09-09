@@ -1,7 +1,7 @@
 //! Readonly selection uses the real current anchor as independent authority.
 
 use super::*;
-use rs3_repository::v2::{V2RecoveryCursor, V2RecoveryPointPage};
+use rs3_repository::v3::{V3RecoveryCursor, V3RecoveryPointPage};
 
 impl RuntimeRepository {
     pub(in crate::s3) async fn from_config_with_recovery_point(
@@ -37,8 +37,8 @@ impl RuntimeRepository {
 pub async fn recovery_points_from_config(
     config: &RuntimeConfig,
     limit: usize,
-    cursor: Option<&V2RecoveryCursor>,
-) -> Result<V2RecoveryPointPage, S3BoundaryError> {
+    cursor: Option<&V3RecoveryCursor>,
+) -> Result<V3RecoveryPointPage, S3BoundaryError> {
     if config.mode != GatewayMode::RestoreReadOnly {
         return Err(repository_init(
             "recovery point listing requires restore-readonly mode",
@@ -67,7 +67,7 @@ mod tests {
         ));
         let mut runtime = RuntimeRepository::from_config_with_maintenance_guard(
             &config,
-            Arc::new(rs3_repository::v2::UnenforcedQuiescedMaintenanceGuard),
+            Arc::new(rs3_repository::v3::UnenforcedQuiescedMaintenanceGuard),
         )
         .await
         .expect("runtime");
@@ -82,7 +82,7 @@ mod tests {
             .expect("old put");
         let selected = runtime
             .anchor
-            .read_v2()
+            .read_v3()
             .await
             .expect("anchor")
             .expect("present");
@@ -94,7 +94,7 @@ mod tests {
             )
             .await
             .expect("replacement");
-        let current = runtime.anchor.read_v2().await.expect("current anchor");
+        let current = runtime.anchor.read_v3().await.expect("current anchor");
         runtime.recovery_view = Some(Arc::new(
             runtime
                 .repository
@@ -115,7 +115,7 @@ mod tests {
         );
         assert_eq!(runtime.head(&key).expect("selected head").content_len, 3);
         assert_eq!(
-            runtime.anchor.read_v2().await.expect("unchanged anchor"),
+            runtime.anchor.read_v3().await.expect("unchanged anchor"),
             current
         );
         assert!(

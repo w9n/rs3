@@ -1,6 +1,6 @@
 use super::*;
 use crate::s3::test_support::runtime_config;
-use rs3_repository::v2::{V2MemoryAnchor, V2Result};
+use rs3_repository::v3::{V3MemoryAnchor, V3Result};
 use rs3_storage::{
     CountingBlobStore, FaultAction, FaultInjectingBlobStore, FaultMatcher, FaultOperationKind,
     FaultRule, MemoryBlobStore,
@@ -45,12 +45,12 @@ impl Default for Guard {
     }
 }
 #[async_trait::async_trait]
-impl V2MaintenanceGuard for Guard {
-    async fn verify_v2_maintenance(&self, _: Option<&V2AnchorState>) -> V2Result<()> {
+impl V3MaintenanceGuard for Guard {
+    async fn verify_v3_maintenance(&self, _: Option<&V3AnchorState>) -> V3Result<()> {
         if self.0.load(Ordering::SeqCst) {
             Ok(())
         } else {
-            Err(V2FormatError::MaintenanceAccessRequired)
+            Err(V3FormatError::MaintenanceAccessRequired)
         }
     }
 }
@@ -58,10 +58,10 @@ impl V2MaintenanceGuard for Guard {
 async fn run(
     config: &RuntimeConfig,
     store: &RuntimeStore,
-    anchor: &RuntimeV2Anchor,
+    anchor: &RuntimeV3Anchor,
     journal: &mut MemoryJournal,
     guard: &Guard,
-) -> Result<V2RepositoryInitReport, S3BoundaryError> {
+) -> Result<V3RepositoryInitReport, S3BoundaryError> {
     Bootstrap {
         config,
         store,
@@ -89,7 +89,7 @@ async fn every_journal_boundary_resumes_without_replacing_published_artifacts() 
                 let config = config(retained);
                 let storage = CountingBlobStore::new(MemoryBlobStore::new());
                 let store = RuntimeStore::new(storage.clone());
-                let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+                let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
                 let mut journal = MemoryJournal {
                     fail: Some((save_at, after)),
                     ..Default::default()
@@ -141,7 +141,7 @@ async fn generated_salt_is_journaled_once_and_shared_by_every_resume() {
             config.repository_keys.repository_salt_hex = None;
             let storage = CountingBlobStore::new(MemoryBlobStore::new());
             let store = RuntimeStore::new(storage.clone());
-            let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+            let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
             let mut journal = MemoryJournal {
                 fail: Some((save_at, after)),
                 ..Default::default()
@@ -200,7 +200,7 @@ async fn tampered_journal_salt_fails_closed_before_any_write() {
         config.repository_keys.repository_salt_hex = None;
         let storage = CountingBlobStore::new(MemoryBlobStore::new());
         let store = RuntimeStore::new(storage.clone());
-        let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+        let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
         let mut journal = MemoryJournal {
             fail: Some((save_at, true)),
             ..Default::default()
@@ -251,7 +251,7 @@ async fn each_artifact_put_reconciles_lost_reply_or_resumes_failed_attempt() {
                 )],
             );
             let store = RuntimeStore::new(fault);
-            let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+            let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
             let mut journal = MemoryJournal::default();
             let guard = Guard::default();
             let first = run(&config, &store, &anchor, &mut journal, &guard).await;
@@ -278,7 +278,7 @@ async fn lost_writer_guard_after_reservation_prevents_the_dependent_put() {
         let config = config(false);
         let storage = CountingBlobStore::new(MemoryBlobStore::new());
         let store = RuntimeStore::new(storage.clone());
-        let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+        let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
         let guard = Guard::default();
         let mut journal = MemoryJournal {
             lose_guard: Some((save_at, Arc::clone(&guard.0))),
@@ -290,7 +290,7 @@ async fn lost_writer_guard_after_reservation_prevents_the_dependent_put() {
                 .is_err()
         );
         assert_eq!(storage.operation_counts().expect("counts").put, written);
-        assert!(anchor.read_v2().await.expect("anchor").is_none());
+        assert!(anchor.read_v3().await.expect("anchor").is_none());
         guard.0.store(true, Ordering::SeqCst);
         journal.lose_guard = None;
         run(&config, &store, &anchor, &mut journal, &guard)
@@ -306,7 +306,7 @@ async fn exhausted_artifact_budgets_allow_reconciliation_but_never_new_puts() {
         let config = config(true);
         let storage = CountingBlobStore::new(MemoryBlobStore::new());
         let store = RuntimeStore::new(storage.clone());
-        let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+        let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
         let guard = Guard::default();
         let mut journal = MemoryJournal {
             fail: Some((save_at, true)),
@@ -374,7 +374,7 @@ async fn exhausted_artifact_budgets_allow_reconciliation_but_never_new_puts() {
                     .await
                     .expect("dependencies");
                 let options = bootstrap_commit_options(&config, &loaded).expect("options");
-                let commits = V2CommitStore::new(store.clone(), loaded.keyring, options);
+                let commits = V3CommitStore::new(store.clone(), loaded.keyring, options);
                 let prepared = commits.open_prepared_genesis(intent).expect("intent");
                 commits
                     .publish_prepared_genesis_with_guard(&anchor, &prepared, true, &guard)
@@ -402,7 +402,7 @@ async fn missing_anchor_or_journal_requires_recovery_and_changed_context_never_w
     let config = config(false);
     let storage = CountingBlobStore::new(MemoryBlobStore::new());
     let store = RuntimeStore::new(storage.clone());
-    let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+    let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
     let guard = Guard::default();
     let mut journal = MemoryJournal {
         fail: Some((2, false)),
@@ -447,7 +447,7 @@ async fn missing_anchor_or_journal_requires_recovery_and_changed_context_never_w
     let report = run(&config, &store, &anchor, &mut journal, &guard)
         .await
         .expect("initialize");
-    let missing = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+    let missing = RuntimeV3Anchor::new(V3MemoryAnchor::new());
     assert!(
         run(&config, &store, &missing, &mut journal, &guard)
             .await
@@ -525,7 +525,7 @@ async fn failed_put_attempts_exhaust_the_persisted_budget_across_restarts() {
         let config = config(true);
         let memory = MemoryBlobStore::new();
         let store = RuntimeStore::new(memory.clone());
-        let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+        let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
         let guard = Guard::default();
         // Stop before the first reservation is persisted for this stage.
         let mut journal = MemoryJournal {
@@ -573,7 +573,7 @@ async fn failed_put_attempts_exhaust_the_persisted_budget_across_restarts() {
             attempts.operation_counts().expect("counts").put,
             u64::from(WRITE_ATTEMPTS)
         );
-        assert!(anchor.read_v2().await.expect("anchor").is_none());
+        assert!(anchor.read_v3().await.expect("anchor").is_none());
     }
 }
 
@@ -583,7 +583,7 @@ async fn corrupted_planned_artifacts_fail_before_dependent_writes() {
         let config = config(false);
         let storage = CountingBlobStore::new(MemoryBlobStore::new());
         let store = RuntimeStore::new(storage.clone());
-        let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+        let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
         let guard = Guard::default();
         let mut journal = MemoryJournal {
             fail: Some((save_at, false)),
@@ -619,30 +619,30 @@ async fn corrupted_planned_artifacts_fail_before_dependent_writes() {
         );
         let after = storage.operation_counts().expect("counts");
         assert_eq!(after.put, before.put);
-        assert!(anchor.read_v2().await.expect("anchor").is_none());
+        assert!(anchor.read_v3().await.expect("anchor").is_none());
     }
 }
 
 struct LostReply {
-    inner: V2MemoryAnchor,
+    inner: V3MemoryAnchor,
     next_read_fails: AtomicBool,
 }
 #[async_trait::async_trait]
-impl V2CommitAnchor for LostReply {
-    async fn read_v2(&self) -> V2Result<Option<V2AnchorState>> {
+impl V3CommitAnchor for LostReply {
+    async fn read_v3(&self) -> V3Result<Option<V3AnchorState>> {
         if self.next_read_fails.swap(false, Ordering::SeqCst) {
-            return Err(V2FormatError::AnchorReadFailed);
+            return Err(V3FormatError::AnchorReadFailed);
         }
-        self.inner.read_v2().await
+        self.inner.read_v3().await
     }
-    async fn compare_and_advance_v2(
+    async fn compare_and_advance_v3(
         &self,
-        expected: Option<&V2AnchorState>,
-        next: V2AnchorState,
-    ) -> V2Result<V2AnchorState> {
-        self.inner.compare_and_advance_v2(expected, next).await?;
+        expected: Option<&V3AnchorState>,
+        next: V3AnchorState,
+    ) -> V3Result<V3AnchorState> {
+        self.inner.compare_and_advance_v3(expected, next).await?;
         self.next_read_fails.store(true, Ordering::SeqCst);
-        Err(V2FormatError::AnchorAdvanceFailed)
+        Err(V3FormatError::AnchorAdvanceFailed)
     }
 }
 
@@ -651,8 +651,8 @@ async fn journal_resumes_after_lost_anchor_reply_and_failed_reconciliation() {
     let config = config(true);
     let storage = CountingBlobStore::new(MemoryBlobStore::new());
     let store = RuntimeStore::new(storage.clone());
-    let inner = V2MemoryAnchor::new();
-    let anchor = RuntimeV2Anchor::new(LostReply {
+    let inner = V3MemoryAnchor::new();
+    let anchor = RuntimeV3Anchor::new(LostReply {
         inner: inner.clone(),
         next_read_fails: AtomicBool::new(false),
     });
@@ -664,7 +664,7 @@ async fn journal_resumes_after_lost_anchor_reply_and_failed_reconciliation() {
             .is_err()
     );
     let accepted = inner
-        .read_v2()
+        .read_v3()
         .await
         .expect("actual accepted state")
         .expect("genesis");

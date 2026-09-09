@@ -1,14 +1,14 @@
 use super::super::tests::{Guard, MemoryJournal};
 use super::*;
-use rs3_repository::v2::V2MemoryAnchor;
+use rs3_repository::v3::V3MemoryAnchor;
 use rs3_storage::{CountingBlobStore, MemoryBlobStore};
 
 async fn bootstrap_fixture(
     config: &RuntimeConfig,
     store: &RuntimeStore,
-    anchor: &RuntimeV2Anchor,
+    anchor: &RuntimeV3Anchor,
     backing: &mut MemoryJournal,
-) -> V2RepositoryInitReport {
+) -> V3RepositoryInitReport {
     let mut journal = OnboardingJournal::open(backing, config, None).expect("journal");
     let handoff = journal.salt.clone();
     bootstrap::initialize(
@@ -33,7 +33,7 @@ async fn every_restore_journal_boundary_resumes_without_duplicate_publication() 
                     retained.then_some(RetentionPolicy::new(RetentionMode::Compliance, 1));
                 let storage = CountingBlobStore::new(MemoryBlobStore::new());
                 let store = RuntimeStore::new(storage.clone());
-                let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+                let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
                 let mut backing = MemoryJournal::default();
                 let mut report = bootstrap_fixture(&config, &store, &anchor, &mut backing).await;
                 let genesis = report.anchor.clone();
@@ -117,7 +117,7 @@ async fn rejected_puts_exhaust_the_durable_budget_and_writer_loss_prevents_io() 
     let faults = FaultInjectingBlobStore::new(MemoryBlobStore::new(), vec![]);
     let storage = CountingBlobStore::new(faults.clone());
     let store = RuntimeStore::new(storage.clone());
-    let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+    let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
     let mut backing = MemoryJournal::default();
     let mut report = bootstrap_fixture(&config, &store, &anchor, &mut backing).await;
     let baseline = report.anchor.clone();
@@ -160,7 +160,7 @@ async fn rejected_puts_exhaust_the_durable_budget_and_writer_loss_prevents_io() 
         .is_err()
     );
     assert_eq!(storage.operation_counts().expect("counts").put, puts);
-    assert_eq!(anchor.read_v2().await.expect("anchor"), Some(baseline));
+    assert_eq!(anchor.read_v3().await.expect("anchor"), Some(baseline));
     let guard = Guard::default();
     guard.0.store(false, Ordering::SeqCst);
     let counts = storage.operation_counts().expect("counts");
@@ -177,7 +177,7 @@ async fn unexpected_fixture_bytes_are_not_overwritten_or_deleted() {
     let config = crate::s3::test_support::runtime_config(true);
     let storage = CountingBlobStore::new(MemoryBlobStore::new());
     let store = RuntimeStore::new(storage.clone());
-    let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+    let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
     let mut backing = MemoryJournal::default();
     let mut report = bootstrap_fixture(&config, &store, &anchor, &mut backing).await;
     // Stop after publication/readback, before recording verification.
@@ -245,32 +245,32 @@ async fn unexpected_fixture_bytes_are_not_overwritten_or_deleted() {
 
 #[derive(Clone)]
 struct LostReply {
-    inner: V2MemoryAnchor,
+    inner: V3MemoryAnchor,
     fail_at: Sequence,
     fail_read: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait::async_trait]
-impl V2CommitAnchor for LostReply {
-    async fn read_v2(&self) -> rs3_repository::v2::V2Result<Option<V2AnchorState>> {
+impl V3CommitAnchor for LostReply {
+    async fn read_v3(&self) -> rs3_repository::v3::V3Result<Option<V3AnchorState>> {
         if self
             .fail_read
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(rs3_repository::v2::V2FormatError::AnchorReadFailed);
+            return Err(rs3_repository::v3::V3FormatError::AnchorReadFailed);
         }
-        self.inner.read_v2().await
+        self.inner.read_v3().await
     }
-    async fn compare_and_advance_v2(
+    async fn compare_and_advance_v3(
         &self,
-        expected: Option<&V2AnchorState>,
-        next: V2AnchorState,
-    ) -> rs3_repository::v2::V2Result<V2AnchorState> {
-        let accepted = self.inner.compare_and_advance_v2(expected, next).await?;
+        expected: Option<&V3AnchorState>,
+        next: V3AnchorState,
+    ) -> rs3_repository::v3::V3Result<V3AnchorState> {
+        let accepted = self.inner.compare_and_advance_v3(expected, next).await?;
         if accepted.sequence == self.fail_at {
             self.fail_read
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            Err(rs3_repository::v2::V2FormatError::AnchorAdvanceFailed)
+            Err(rs3_repository::v3::V3FormatError::AnchorAdvanceFailed)
         } else {
             Ok(accepted)
         }
@@ -283,12 +283,12 @@ async fn lost_publication_replies_reconcile_before_another_write() {
         let config = crate::s3::test_support::runtime_config(true);
         let storage = CountingBlobStore::new(MemoryBlobStore::new());
         let store = RuntimeStore::new(storage.clone());
-        let inner = V2MemoryAnchor::new();
-        let mut anchor = RuntimeV2Anchor::new(inner.clone());
+        let inner = V3MemoryAnchor::new();
+        let mut anchor = RuntimeV3Anchor::new(inner.clone());
         let mut backing = MemoryJournal::default();
         let mut report = bootstrap_fixture(&config, &store, &anchor, &mut backing).await;
         let genesis = report.anchor.clone();
-        anchor = RuntimeV2Anchor::new(LostReply {
+        anchor = RuntimeV3Anchor::new(LostReply {
             inner,
             fail_at: Sequence::new(genesis.sequence.get() + delta),
             fail_read: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -334,14 +334,14 @@ async fn lost_publication_replies_reconcile_before_another_write() {
 
 #[tokio::test]
 async fn corrupt_ciphertext_blocks_restore_even_when_authenticated_metadata_opens() {
-    use rs3_repository::v2::{V2SectionType, parse_v2_commit_header};
+    use rs3_repository::v3::{V3SectionType, parse_v3_commit_header};
     let config = crate::s3::test_support::runtime_config(true);
     let directory = super::super::super::tests::TestDir::new();
     let storage = CountingBlobStore::new(
         rs3_storage::FilesystemBlobStore::new(directory.path()).expect("filesystem store"),
     );
     let store = RuntimeStore::new(storage.clone());
-    let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+    let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
     let mut backing = MemoryJournal::default();
     let mut report = bootstrap_fixture(&config, &store, &anchor, &mut backing).await;
     backing.fail = Some((backing.saves + 3, false));
@@ -364,11 +364,11 @@ async fn corrupt_ciphertext_blocks_restore_even_when_authenticated_metadata_open
     }
     backing.fail = None;
     let accepted = anchor
-        .read_v2()
+        .read_v3()
         .await
         .expect("anchor")
         .expect("accepted PUT");
-    let loaded = load_existing_v2_repository(&store, &config.repository_keys, &accepted, &config)
+    let loaded = load_existing_v3_repository(&store, &config.repository_keys, &accepted, &config)
         .await
         .expect("keys");
     let mut bytes = storage
@@ -377,12 +377,12 @@ async fn corrupt_ciphertext_blocks_restore_even_when_authenticated_metadata_open
         .expect("commit")
         .to_vec();
     let parsed =
-        parse_v2_commit_header(&accepted.commit_key, &bytes, &loaded.keyring).expect("header");
+        parse_v3_commit_header(&accepted.commit_key, &bytes, &loaded.keyring).expect("header");
     let payload = parsed
         .header
         .section_index
         .iter()
-        .find(|section| section.section_type == V2SectionType::PayloadPack)
+        .find(|section| section.section_type == V3SectionType::PayloadPack)
         .expect("payload section");
     let last = parsed.sections_start
         + usize::try_from(payload.offset + payload.length).expect("payload end")
@@ -435,7 +435,7 @@ async fn failed_tombstone_publications_exhaust_the_delete_budget_without_readine
     let faults = FaultInjectingBlobStore::new(MemoryBlobStore::new(), vec![]);
     let storage = CountingBlobStore::new(faults.clone());
     let store = RuntimeStore::new(storage.clone());
-    let anchor = RuntimeV2Anchor::new(V2MemoryAnchor::new());
+    let anchor = RuntimeV3Anchor::new(V3MemoryAnchor::new());
     let mut backing = MemoryJournal::default();
     let mut report = bootstrap_fixture(&config, &store, &anchor, &mut backing).await;
     backing.fail = Some((backing.saves + 3, true));
@@ -455,7 +455,7 @@ async fn failed_tombstone_publications_exhaust_the_delete_budget_without_readine
         );
     }
     backing.fail = None;
-    let accepted = anchor.read_v2().await.expect("accepted PUT");
+    let accepted = anchor.read_v3().await.expect("accepted PUT");
     for remaining in (0..3).rev() {
         faults
             .push_rule(FaultRule::new(
@@ -496,7 +496,7 @@ async fn failed_tombstone_publications_exhaust_the_delete_budget_without_readine
     );
     assert_eq!(storage.operation_counts().expect("counts").put, puts);
     assert_eq!(
-        anchor.read_v2().await.expect("unchanged accepted state"),
+        anchor.read_v3().await.expect("unchanged accepted state"),
         accepted
     );
     assert!(

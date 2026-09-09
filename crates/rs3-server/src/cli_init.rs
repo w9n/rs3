@@ -3,7 +3,7 @@
 use super::DoctorProfile;
 use anyhow::{Result, bail};
 use rs3_server::{
-    AnchorConfig, RuntimeConfig, V2PreparedRepositoryInit, V2RepositoryInitReport,
+    AnchorConfig, RuntimeConfig, V3PreparedRepositoryInit, V3RepositoryInitReport,
     WriterGuardConfig, doctor_findings,
 };
 
@@ -33,7 +33,7 @@ pub(super) async fn wait_for_journal(
                     .map_err(|_| {
                         anyhow::anyhow!("projected initialization journal cannot be read")
                     })?;
-                if rs3_server::v2_bootstrap_journal_is_initialized(config, &bytes)?
+                if rs3_server::v3_bootstrap_journal_is_initialized(config, &bytes)?
                     && rs3_server::provider_conformance_evidence_passed(config)
                 {
                     return Ok(());
@@ -90,7 +90,7 @@ pub(super) async fn run(
     profile: DoctorProfile,
     journal_secret: Option<&str>,
     governance_bypass_reviewed: bool,
-) -> Result<V2RepositoryInitReport> {
+) -> Result<V3RepositoryInitReport> {
     let needs_journal = config.mode.allows_mutation()
         && matches!(config.anchor, AnchorConfig::KubernetesLease { .. });
     if needs_journal && journal_secret.is_none_or(str::is_empty) {
@@ -106,18 +106,18 @@ pub(super) async fn run(
         && config.provider_conformance.report_file.is_none();
     enforce_profile(config, profile, journal_qualification)?;
     // Storage policy failures must precede even writer Lease acquisition.
-    let prepared = V2PreparedRepositoryInit::prepare(config).await?;
+    let prepared = V3PreparedRepositoryInit::prepare(config).await?;
     #[cfg(feature = "k8s")]
     if needs_journal && config.backend.is_s3() {
         // A journal completed under this exact configuration is verified
         // read-only. Contending for the Lease would deadlock behind a serving
         // gateway whose rollout waits for this very Job.
         let state =
-            rs3_server::v2_bootstrap_journal_state(config, journal_secret.unwrap_or_default())
+            rs3_server::v3_bootstrap_journal_state(config, journal_secret.unwrap_or_default())
                 .await?;
         if state
             .as_deref()
-            .map(|bytes| rs3_server::v2_bootstrap_journal_is_initialized(config, bytes))
+            .map(|bytes| rs3_server::v3_bootstrap_journal_is_initialized(config, bytes))
             .transpose()?
             .unwrap_or(false)
         {

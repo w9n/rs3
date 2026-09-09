@@ -9,16 +9,16 @@ use rs3_crypto::{KeyRing, RepositoryEnvelope, RepositoryKeyContext, SecretBytes}
 #[cfg(feature = "s3")]
 use rs3_repository::store_keyring_envelope;
 #[cfg(feature = "s3")]
-use rs3_repository::v2::v2_format_object_id;
+use rs3_repository::v3::v3_format_object_id;
 #[cfg(feature = "s3")]
-use rs3_repository::v2::{
-    UnenforcedQuiescedMaintenanceGuard, V2FullGcApplyOptions, V2FullGcDryRunOptions,
-    V2MaintenanceBudgets, V2OrphanGcOptions, generate_v2_commit_key,
+use rs3_repository::v3::{
+    UnenforcedQuiescedMaintenanceGuard, V3FullGcApplyOptions, V3FullGcDryRunOptions,
+    V3MaintenanceBudgets, V3OrphanGcOptions, generate_v3_commit_key,
 };
 #[cfg(feature = "s3")]
-use rs3_repository::v2::{
-    V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot, V2KeyringEnvelopeRootRef,
-    V2ProviderProfile,
+use rs3_repository::v3::{
+    V3CommitStore, V3CommitStoreOptions, V3FormatRef, V3FormatRoot, V3KeyringEnvelopeRootRef,
+    V3ProviderProfile,
 };
 #[cfg(feature = "s3")]
 use rs3_storage::PutOptions;
@@ -275,7 +275,7 @@ where
         store_keyring_envelope(&store, &keyring_envelope, Some(retention), None)
             .await
             .context("failed to store rehearsal keyring envelope")?;
-    let keyring_root = V2KeyringEnvelopeRootRef {
+    let keyring_root = V3KeyringEnvelopeRootRef {
         generation: keyring_reference.generation,
         digest: keyring_reference.digest,
         object_id: keyring_reference.object_id,
@@ -284,11 +284,11 @@ where
     let signing_key_id = keyring
         .primary_key_id(KeyPurpose::CheckpointSigning)
         .context("rehearsal keyring has no signing key")?;
-    let format_root = V2FormatRoot::new(
+    let format_root = V3FormatRoot::new(
         repository_id.clone(),
         keyring_root.clone(),
         signing_key_id,
-        V2ProviderProfile::RetainedVersionObjectLock,
+        V3ProviderProfile::RetainedVersionObjectLock,
         Some(retention),
     );
     let format_plaintext = format_root
@@ -305,7 +305,7 @@ where
     let format_digest = format_envelope
         .digest()
         .context("failed to digest rehearsal format root")?;
-    let format_object_id = v2_format_object_id(format_envelope.generation, &format_digest)
+    let format_object_id = v3_format_object_id(format_envelope.generation, &format_digest)
         .context("failed to build rehearsal format-root object ID")?;
     let format_metadata = store
         .put(
@@ -322,7 +322,7 @@ where
         )
         .await
         .context("failed to store rehearsal format root")?;
-    let format_ref = V2FormatRef {
+    let format_ref = V3FormatRef {
         generation: format_envelope.generation,
         digest: format_digest,
         object_id: format_object_id,
@@ -331,25 +331,25 @@ where
     let keyring_ref = keyring_root
         .commit_ref()
         .context("failed to create rehearsal commit keyring reference")?;
-    let commit_options = V2CommitStoreOptions::for_profile(
-        V2ProviderProfile::RetainedVersionObjectLock,
+    let commit_options = V3CommitStoreOptions::for_profile(
+        V3ProviderProfile::RetainedVersionObjectLock,
         repository_id,
         keyring_ref,
         format_ref.clone(),
     )
     .with_maintenance_keyring_envelope_ref(keyring_root.clone())
     .with_retention(Some(retention));
-    let repository = V2CommitStore::new(store.clone(), keyring, commit_options.clone());
-    let anchor = rs3_repository::v2::V2MemoryAnchor::new();
+    let repository = V3CommitStore::new(store.clone(), keyring, commit_options.clone());
+    let anchor = rs3_repository::v3::V3MemoryAnchor::new();
 
     let genesis = repository
         .write_genesis_snapshot(&anchor)
         .await
         .context("failed to write retained rehearsal genesis")?;
-    let unprotected_key = generate_v2_commit_key(Sequence::new(99))
+    let unprotected_key = generate_v3_commit_key(Sequence::new(99))
         .context("failed to generate unprotected orphan key")?
         .object_id;
-    let protected_key = generate_v2_commit_key(Sequence::new(100))
+    let protected_key = generate_v3_commit_key(Sequence::new(100))
         .context("failed to generate protected orphan key")?
         .object_id;
 
@@ -373,16 +373,16 @@ where
         .await
         .context("failed to write retained exact-version orphan")?;
 
-    let dry_run_options = V2FullGcDryRunOptions {
-        budgets: V2MaintenanceBudgets {
+    let dry_run_options = V3FullGcDryRunOptions {
+        budgets: V3MaintenanceBudgets {
             max_delete_count: Some(1),
             max_retention_extend_count: Some(3),
-            ..V2MaintenanceBudgets::default()
+            ..V3MaintenanceBudgets::default()
         },
         retention_renewal_horizon: std::time::Duration::from_secs(
             u64::from(args.retention_days.saturating_add(1)) * 24 * 60 * 60,
         ),
-        ..V2FullGcDryRunOptions::default()
+        ..V3FullGcDryRunOptions::default()
     };
     let before = repository
         .full_gc_dry_run(&anchor, dry_run_options.clone())
@@ -408,10 +408,10 @@ where
         );
     }
 
-    let apply_options = V2FullGcApplyOptions {
+    let apply_options = V3FullGcApplyOptions {
         reclamation_enabled: true,
         dry_run: dry_run_options,
-        orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(std::time::Duration::ZERO),
+        orphan_gc: V3OrphanGcOptions::new_for_test_rehearsal(std::time::Duration::ZERO),
         retained_provider_conformance_passed: true,
     };
     let apply = match &guard_mode {
@@ -449,7 +449,7 @@ where
     }
 
     let after = repository
-        .full_gc_dry_run(&anchor, V2FullGcDryRunOptions::default())
+        .full_gc_dry_run(&anchor, V3FullGcDryRunOptions::default())
         .await
         .context("failed to dry-run after retained GC rehearsal apply")?;
     if after.fully_dead_commit_count != 0 || after.retention_blocked_bytes == 0 {
@@ -477,7 +477,7 @@ where
     )
     .await
     .context("failed to reopen renewed keyring envelope")?;
-    let fresh_repository = V2CommitStore::new(store.clone(), reopened_keyring, commit_options);
+    let fresh_repository = V3CommitStore::new(store.clone(), reopened_keyring, commit_options);
     let verified = fresh_repository
         .load_replay_chain_from_anchor(&anchor)
         .await
@@ -552,15 +552,15 @@ const REHEARSAL_FENCE_ACQUIRE_POLL: std::time::Duration = std::time::Duration::f
 /// path.
 #[cfg(feature = "k8s")]
 async fn apply_with_kubernetes_writer_fence<S, A>(
-    repository: &V2CommitStore<S>,
+    repository: &V3CommitStore<S>,
     anchor: &A,
-    options: rs3_repository::v2::V2FullGcApplyOptions,
+    options: rs3_repository::v3::V3FullGcApplyOptions,
     namespace: &str,
     name: &str,
-) -> Result<rs3_repository::v2::V2FullGcApplyReport>
+) -> Result<rs3_repository::v3::V3FullGcApplyReport>
 where
     S: BlobStore + Clone,
-    A: rs3_repository::v2::V2CommitAnchor,
+    A: rs3_repository::v3::V3CommitAnchor,
 {
     let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "xtask".to_owned());
     let mut random = [0_u8; 16];
@@ -722,8 +722,8 @@ async fn open_format_root<S>(
     context: &RepositoryKeyContext,
     wrapping_key_id: &str,
     wrapping_key: &SecretBytes,
-    reference: &V2FormatRef,
-) -> Result<V2FormatRoot>
+    reference: &V3FormatRef,
+) -> Result<V3FormatRoot>
 where
     S: BlobStore,
 {
@@ -744,7 +744,7 @@ where
     let plaintext = envelope
         .open_format(context, wrapping_key_id, wrapping_key)
         .context("failed to open v2 format root envelope")?;
-    V2FormatRoot::from_plaintext_bytes(&plaintext).context("failed to decode v2 format root")
+    V3FormatRoot::from_plaintext_bytes(&plaintext).context("failed to decode v2 format root")
 }
 
 #[cfg(feature = "s3")]
@@ -753,7 +753,7 @@ async fn open_keyring_envelope<S>(
     context: &RepositoryKeyContext,
     wrapping_key_id: &str,
     wrapping_key: &SecretBytes,
-    reference: &V2KeyringEnvelopeRootRef,
+    reference: &V3KeyringEnvelopeRootRef,
 ) -> Result<KeyRing>
 where
     S: BlobStore,

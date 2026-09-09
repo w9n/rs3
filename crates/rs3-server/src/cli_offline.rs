@@ -10,8 +10,8 @@ use anyhow::Context;
 use anyhow::{Result, bail};
 #[cfg(feature = "k8s")]
 use rs3_k8s::{KubernetesLeaseGuard, LeaseGuardError, LeaseSettings};
-use rs3_repository::v2::{
-    UnenforcedQuiescedMaintenanceGuard, V2FullGcDryRunOptions, V2FullGcDryRunReport,
+use rs3_repository::v3::{
+    UnenforcedQuiescedMaintenanceGuard, V3FullGcDryRunOptions, V3FullGcDryRunReport,
 };
 use rs3_server::{
     AnchorConfig, OfflineMaintenanceEnvironment, OfflineMaintenanceError, OfflineMaintenanceFence,
@@ -46,7 +46,7 @@ pub(super) async fn run(args: MaintenanceOfflineArgs) -> Result<()> {
     };
     let request = OfflineMaintenanceRequest {
         command,
-        dry_run: V2FullGcDryRunOptions {
+        dry_run: V3FullGcDryRunOptions {
             budgets: config.maintenance.budgets(),
             retention_renewal_horizon: config.maintenance.renewal_horizon,
             protected_roots: Vec::new(),
@@ -306,7 +306,7 @@ fn print_offline_maintenance_outcome(
 }
 
 /// Path-redacted JSON view of one dry-run report, matching the admin schema.
-fn offline_dry_run_report_json(report: &V2FullGcDryRunReport) -> serde_json::Value {
+fn offline_dry_run_report_json(report: &V3FullGcDryRunReport) -> serde_json::Value {
     serde_json::json!({
         "base_sequence": report.base_sequence.map(|sequence| sequence.get()),
         "chain_live_commit_count": report.chain_live_commit_count,

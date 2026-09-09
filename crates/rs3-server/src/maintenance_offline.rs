@@ -9,9 +9,9 @@
 use crate::maintenance::{MAINTENANCE_PLAN_STALE_REASON, MaintenanceRuntime};
 use async_trait::async_trait;
 use rs3_repository::RepositoryError;
-use rs3_repository::v2::{
-    V2FullGcApplyOptions, V2FullGcApplyReport, V2FullGcDryRunOptions, V2FullGcDryRunReport,
-    V2MaintenanceCancellation, V2OrphanGcOptions,
+use rs3_repository::v3::{
+    V3FullGcApplyOptions, V3FullGcApplyReport, V3FullGcDryRunOptions, V3FullGcDryRunReport,
+    V3MaintenanceCancellation, V3OrphanGcOptions,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -34,9 +34,9 @@ pub struct OfflineMaintenanceRequest {
     /// Operation to perform once the fence is held.
     pub command: OfflineMaintenanceCommand,
     /// Budgeted dry-run options shared by planning and the apply preflight.
-    pub dry_run: V2FullGcDryRunOptions,
+    pub dry_run: V3FullGcDryRunOptions,
     /// Conservative orphan deletion policy for apply.
-    pub orphan_gc: V2OrphanGcOptions,
+    pub orphan_gc: V3OrphanGcOptions,
     /// Whether retained-version provider conformance evidence passed.
     pub retained_provider_conformance_passed: bool,
     /// Whether applying the reviewed plan may reclaim unreachable versions.
@@ -49,9 +49,9 @@ pub struct OfflineMaintenanceOutcome {
     /// Deterministic digest identifying the produced or applied plan.
     pub plan_digest: String,
     /// Budgeted read-only dry-run report backing this outcome.
-    pub dry_run: V2FullGcDryRunReport,
+    pub dry_run: V3FullGcDryRunReport,
     /// Destructive apply report, present for apply invocations only.
-    pub apply: Option<V2FullGcApplyReport>,
+    pub apply: Option<V3FullGcApplyReport>,
 }
 
 /// Errors from the offline break-glass maintenance path.
@@ -172,7 +172,7 @@ async fn run_fenced(
     request: &OfflineMaintenanceRequest,
 ) -> Result<OfflineMaintenanceOutcome, OfflineMaintenanceError> {
     let runtime = environment.open_runtime().await?;
-    let apply_options = V2FullGcApplyOptions {
+    let apply_options = V3FullGcApplyOptions {
         dry_run: request.dry_run.clone(),
         orphan_gc: request.orphan_gc,
         retained_provider_conformance_passed: request.retained_provider_conformance_passed,
@@ -194,7 +194,7 @@ async fn run_fenced(
             // The engine re-plans inside the exclusion window, fails closed on
             // digest drift, renews retention strictly before deletion, and
             // rechecks the guard and anchor before every mutation.
-            let cancellation = V2MaintenanceCancellation::new();
+            let cancellation = V3MaintenanceCancellation::new();
             let report = runtime
                 .run_full_maintenance(
                     apply_options,
@@ -247,13 +247,13 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use rs3_crypto::KeyRing;
-    use rs3_repository::v2::{
-        UnenforcedQuiescedMaintenanceGuard, V2AnchorState, V2CommitAnchor, V2CommitCoordinator,
-        V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite, V2FormatError,
-        V2FormatRef, V2FullGcApplyOptions, V2FullGcDryRunOptions, V2FullGcPlanPreview,
-        V2FullMaintenanceReport, V2KeyringEnvelopeRef, V2KeyringEnvelopeRootRef,
-        V2MaintenanceCancellation, V2MaintenanceReport, V2MemoryAnchor, V2OrphanGcOptions,
-        V2ProviderProfile, V2Repository, V2Result, V2SectionType,
+    use rs3_repository::v3::{
+        UnenforcedQuiescedMaintenanceGuard, V3AnchorState, V3CommitAnchor, V3CommitCoordinator,
+        V3CommitSection, V3CommitStore, V3CommitStoreOptions, V3CommitWrite, V3FormatError,
+        V3FormatRef, V3FullGcApplyOptions, V3FullGcDryRunOptions, V3FullGcPlanPreview,
+        V3FullMaintenanceReport, V3KeyringEnvelopeRef, V3KeyringEnvelopeRootRef,
+        V3MaintenanceCancellation, V3MaintenanceReport, V3MemoryAnchor, V3OrphanGcOptions,
+        V3ProviderProfile, V3Repository, V3Result, V3SectionType,
     };
     use rs3_repository::{
         CommitCoordinatorOptions, RepositoryError, RepositoryOptions, RepositoryPutOptions,
@@ -313,28 +313,28 @@ mod tests {
     }
 
     struct FailingAdvanceAnchor {
-        inner: V2MemoryAnchor,
+        inner: V3MemoryAnchor,
     }
 
     #[async_trait]
-    impl V2CommitAnchor for FailingAdvanceAnchor {
-        async fn read_v2(&self) -> V2Result<Option<V2AnchorState>> {
-            self.inner.read_v2().await
+    impl V3CommitAnchor for FailingAdvanceAnchor {
+        async fn read_v3(&self) -> V3Result<Option<V3AnchorState>> {
+            self.inner.read_v3().await
         }
 
-        async fn compare_and_advance_v2(
+        async fn compare_and_advance_v3(
             &self,
-            _expected: Option<&V2AnchorState>,
-            _next: V2AnchorState,
-        ) -> V2Result<V2AnchorState> {
-            Err(V2FormatError::AnchorAdvanceFailed)
+            _expected: Option<&V3AnchorState>,
+            _next: V3AnchorState,
+        ) -> V3Result<V3AnchorState> {
+            Err(V3FormatError::AnchorAdvanceFailed)
         }
     }
 
     struct MemoryOfflineRuntime {
-        repository: Arc<V2Repository<MemoryBlobStore>>,
-        anchor: V2MemoryAnchor,
-        coordinator: Arc<V2CommitCoordinator<MemoryBlobStore, V2MemoryAnchor>>,
+        repository: Arc<V3Repository<MemoryBlobStore>>,
+        anchor: V3MemoryAnchor,
+        coordinator: Arc<V3CommitCoordinator<MemoryBlobStore, V3MemoryAnchor>>,
     }
 
     #[async_trait]
@@ -343,7 +343,7 @@ mod tests {
             self.coordinator.has_maintenance_guard()
         }
 
-        async fn quick_maintenance_report(&self) -> Result<V2MaintenanceReport, RepositoryError> {
+        async fn quick_maintenance_report(&self) -> Result<V3MaintenanceReport, RepositoryError> {
             self.repository
                 .commit_store()
                 .quick_maintenance(&self.anchor)
@@ -355,15 +355,15 @@ mod tests {
 
         async fn full_gc_dry_run(
             &self,
-            options: V2FullGcDryRunOptions,
-        ) -> Result<rs3_repository::v2::V2FullGcDryRunReport, RepositoryError> {
+            options: V3FullGcDryRunOptions,
+        ) -> Result<rs3_repository::v3::V3FullGcDryRunReport, RepositoryError> {
             self.repository.full_gc_dry_run(&self.anchor, options).await
         }
 
         async fn preview_full_gc_plan(
             &self,
-            options: V2FullGcApplyOptions,
-        ) -> Result<V2FullGcPlanPreview, RepositoryError> {
+            options: V3FullGcApplyOptions,
+        ) -> Result<V3FullGcPlanPreview, RepositoryError> {
             self.repository
                 .preview_full_gc_plan(&self.anchor, options)
                 .await
@@ -371,11 +371,11 @@ mod tests {
 
         async fn run_full_maintenance(
             &self,
-            options: V2FullGcApplyOptions,
+            options: V3FullGcApplyOptions,
             expected_plan_digest: Option<&str>,
-            cancellation: &V2MaintenanceCancellation,
+            cancellation: &V3MaintenanceCancellation,
             on_phase: &(dyn Fn(MaintenanceRunPhase) + Send + Sync),
-        ) -> Result<V2FullMaintenanceReport, RepositoryError> {
+        ) -> Result<V3FullMaintenanceReport, RepositoryError> {
             on_phase(MaintenanceRunPhase::Quiescing);
             let window = self.coordinator.begin_maintenance_window().await?;
             on_phase(MaintenanceRunPhase::Applying);
@@ -398,8 +398,8 @@ mod tests {
         BackendObjectId::new(value).expect("test object ID should be valid")
     }
 
-    async fn commit_store_options(store: &MemoryBlobStore) -> V2CommitStoreOptions {
-        let keyring_ref = V2KeyringEnvelopeRef {
+    async fn commit_store_options(store: &MemoryBlobStore) -> V3CommitStoreOptions {
+        let keyring_ref = V3KeyringEnvelopeRef {
             object_id: object_id("keyrings/00000000000000000001-bootstrap"),
             digest: [6_u8; 32],
         };
@@ -411,7 +411,7 @@ mod tests {
             )
             .await
             .expect("keyring root put should succeed");
-        let mut format_ref = V2FormatRef {
+        let mut format_ref = V3FormatRef {
             generation: 1,
             digest: hex::encode([7_u8; 32]),
             object_id: object_id(&format!("format/{:020}-{}", 1_u64, hex::encode([7_u8; 32]))),
@@ -426,14 +426,14 @@ mod tests {
             .await
             .expect("format root put should succeed");
         format_ref.version_id = format_metadata.version_id.clone();
-        let keyring_root = V2KeyringEnvelopeRootRef {
+        let keyring_root = V3KeyringEnvelopeRootRef {
             generation: 1,
             digest: hex::encode(keyring_ref.digest),
             object_id: keyring_ref.object_id.clone(),
             version_id: keyring_metadata.version_id,
         };
-        V2CommitStoreOptions::for_profile(
-            V2ProviderProfile::Dev,
+        V3CommitStoreOptions::for_profile(
+            V3ProviderProfile::Dev,
             RepositoryId::new("offline-test-repository").expect("repository ID"),
             keyring_ref,
             format_ref,
@@ -446,13 +446,13 @@ mod tests {
         let store = MemoryBlobStore::new();
         let keyring = KeyRing::generate_random().expect("test keyring");
         let options = commit_store_options(&store).await;
-        let repository = Arc::new(V2Repository::new(
+        let repository = Arc::new(V3Repository::new(
             store.clone(),
             keyring.clone(),
             RepositoryOptions::default(),
             options,
         ));
-        let anchor = V2MemoryAnchor::new();
+        let anchor = V3MemoryAnchor::new();
         repository
             .write_genesis_snapshot(&anchor)
             .await
@@ -467,32 +467,32 @@ mod tests {
             .await
             .expect("live put");
 
-        let orphan_writer = V2CommitStore::new(
+        let orphan_writer = V3CommitStore::new(
             store.clone(),
             keyring.clone(),
             commit_store_options(&store).await,
         );
         let forked = anchor
-            .read_v2()
+            .read_v3()
             .await
             .expect("anchor read")
             .expect("anchor state");
         let failed = orphan_writer
             .write_child_commit(
                 &FailingAdvanceAnchor {
-                    inner: V2MemoryAnchor::with_state(forked),
+                    inner: V3MemoryAnchor::with_state(forked),
                 },
-                V2CommitWrite::delta(vec![V2CommitSection::new(
-                    V2SectionType::IndexRun,
-                    rs3_repository::v2::V2_SECTION_FLAG_MUST_UNDERSTAND,
+                V3CommitWrite::delta(vec![V3CommitSection::new(
+                    V3SectionType::IndexRun,
+                    rs3_repository::v3::V3_SECTION_FLAG_MUST_UNDERSTAND,
                     Bytes::from_static(b"offline-orphan"),
                 )]),
             )
             .await;
-        assert!(matches!(failed, Err(V2FormatError::AnchorAdvanceFailed)));
+        assert!(matches!(failed, Err(V3FormatError::AnchorAdvanceFailed)));
 
         let coordinator = Arc::new(
-            V2CommitCoordinator::with_options(
+            V3CommitCoordinator::with_options(
                 Arc::clone(&repository),
                 anchor.clone(),
                 CommitCoordinatorOptions::new(1, Duration::ZERO),
@@ -517,8 +517,8 @@ mod tests {
     fn request(command: OfflineMaintenanceCommand) -> OfflineMaintenanceRequest {
         OfflineMaintenanceRequest {
             command,
-            dry_run: V2FullGcDryRunOptions::default(),
-            orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+            dry_run: V3FullGcDryRunOptions::default(),
+            orphan_gc: V3OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
             retained_provider_conformance_passed: true,
             reclamation_enabled: true,
         }

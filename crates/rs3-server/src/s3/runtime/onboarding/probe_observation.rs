@@ -10,8 +10,8 @@ const MAX_PAGES: usize = 4;
 const MAX_RAW_MEMBERS: usize = 128;
 const MAX_HEADS: usize = 32;
 
-pub(super) fn unavailable(attempts: u8, warning: &str) -> V2ProbeObservation {
-    V2ProbeObservation {
+pub(super) fn unavailable(attempts: u8, warning: &str) -> V3ProbeObservation {
+    V3ProbeObservation {
         attempts_covered: attempts,
         observed_at_ms: current_time_ms(),
         listing_exhausted: false,
@@ -50,7 +50,7 @@ fn in_scope(id: &str, attempts: u8) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-pub(super) async fn observe(store: &impl BlobStore, attempts: u8) -> V2ProbeObservation {
+pub(super) async fn observe(store: &impl BlobStore, attempts: u8) -> V3ProbeObservation {
     let mut report = unavailable(attempts, "list-unavailable");
     let Ok(mut listing) = store.open_bounded_list("", BlobListMode::Versions).await else {
         return report;

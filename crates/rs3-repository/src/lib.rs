@@ -13,7 +13,7 @@ mod service;
 mod state;
 
 pub use checksum::{MultipartChecksumKind, MultipartChecksumPolicy, UploadChecksum};
-pub mod v2;
+pub mod v3;
 
 #[cfg(test)]
 mod test_support;

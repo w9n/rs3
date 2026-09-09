@@ -15,25 +15,25 @@ mod runtime_keyring;
 pub use boundary::{GatewayS3Boundary, S3Hardening};
 pub use recovery_tools::{
     KeyringEnvelopeInspectOptions, KeyringEnvelopeInspectReport, KeyringEnvelopeRewrapOptions,
-    KeyringEnvelopeRewrapReport, V2RecoveryBundleVerificationOptions,
-    V2RecoveryBundleVerificationReport, inspect_keyring_envelope_from_tool_config,
+    KeyringEnvelopeRewrapReport, V3RecoveryBundleVerificationOptions,
+    V3RecoveryBundleVerificationReport, inspect_keyring_envelope_from_tool_config,
     inspect_keyring_envelope_with_store, rewrap_keyring_envelope_from_tool_config,
-    rewrap_keyring_envelope_with_store, verify_v2_recovery_bundle_from_tool_config,
-    verify_v2_recovery_bundle_with_store,
+    rewrap_keyring_envelope_with_store, verify_v3_recovery_bundle_from_tool_config,
+    verify_v3_recovery_bundle_with_store,
 };
 #[cfg(feature = "k8s")]
 pub use runtime::offline_maintenance_runtime_from_writer_fence;
 #[cfg(feature = "k8s")]
-pub use runtime::v2_bootstrap_journal_state;
-pub(crate) use runtime::v2_quick_maintenance_from_config;
+pub use runtime::v3_bootstrap_journal_state;
+pub(crate) use runtime::v3_quick_maintenance_from_config;
 pub use runtime::{
-    DoctorProbeCheck, DoctorProbeReport, RuntimeV2ProviderConformanceOptions,
-    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport,
-    V2PreparedRepositoryInit, V2ProbeObservation, V2RepositoryInitReport,
-    check_v2_provider_conformance_from_config, check_v2_provider_conformance_from_provider_config,
-    doctor_probe_from_config, export_v2_recovery_bundle_from_config, import_v2_anchor_from_config,
-    init_v2_repository_from_config, offline_maintenance_runtime_from_config,
-    recovery_points_from_config, v2_bootstrap_journal_is_initialized,
+    DoctorProbeCheck, DoctorProbeReport, RuntimeV3ProviderConformanceOptions,
+    V3_RESTORE_BUNDLE_SCHEMA, V3AnchorImportOptions, V3AnchorImportReport,
+    V3PreparedRepositoryInit, V3ProbeObservation, V3RepositoryInitReport,
+    check_v3_provider_conformance_from_config, check_v3_provider_conformance_from_provider_config,
+    doctor_probe_from_config, export_v3_recovery_bundle_from_config, import_v3_anchor_from_config,
+    init_v3_repository_from_config, offline_maintenance_runtime_from_config,
+    recovery_points_from_config, v3_bootstrap_journal_is_initialized,
 };
 use thiserror::Error;
 
@@ -49,7 +49,7 @@ pub enum S3BoundaryError {
     /// Static credentials are required before exposing the S3 service.
     #[error("static credentials are required to build the S3 boundary")]
     MissingStaticCredentials,
-    /// The configured v2 commit anchor is unavailable in this build.
+    /// The configured v3 commit anchor is unavailable in this build.
     #[error("configured v03 commit anchor mode is unavailable in this build")]
     UnsupportedAnchorMode,
     /// The configured backend object store is unavailable in this build.

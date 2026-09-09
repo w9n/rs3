@@ -112,7 +112,7 @@ async fn multipart_default_crc64_is_computed_and_echoed_through_completion_and_h
     assert_eq!(parts.len(), 1);
     assert_eq!(parts[0].checksum_crc64nvme.as_deref(), Some(CRC64));
     assert_eq!(parts[0].e_tag, Some(etag.clone()));
-    assert_eq!(accepted_v2_sequence(&service).await, 1);
+    assert_eq!(accepted_v3_sequence(&service).await, 1);
     // Full CRC permits omitted per-part declarations and computes the final value.
     let completed = service
         .complete_multipart_upload(s3_request(complete_input(&id, etag)))
@@ -127,7 +127,7 @@ async fn multipart_default_crc64_is_computed_and_echoed_through_completion_and_h
     let metadata = head(&service).await;
     assert_eq!(metadata.content_length, Some(9));
     assert_eq!(metadata.checksum_crc64nvme.as_deref(), Some(CRC64));
-    assert_eq!(accepted_v2_sequence(&service).await, 2);
+    assert_eq!(accepted_v3_sequence(&service).await, 2);
 }
 
 #[tokio::test]
@@ -151,7 +151,7 @@ async fn multipart_bad_digest_replacement_preserves_prior_part_and_its_checksum(
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].e_tag, original.e_tag);
     assert_eq!(listed[0].checksum_crc64nvme.as_deref(), Some(CRC64));
-    assert_eq!(accepted_v2_sequence(&service).await, 1);
+    assert_eq!(accepted_v3_sequence(&service).await, 1);
     service
         .complete_multipart_upload(s3_request(complete_input(
             &id,
@@ -245,7 +245,7 @@ async fn multipart_sha256_composite_validates_parts_and_final_before_consuming_u
         .await
         .expect_err("bad final digest");
     assert_eq!(error.code().as_str(), "BadDigest");
-    assert_eq!(accepted_v2_sequence(&service).await, 1);
+    assert_eq!(accepted_v3_sequence(&service).await, 1);
     assert_eq!(
         list(&service, &id).await.parts.expect("parts")[0].e_tag,
         Some(etag)
@@ -268,7 +268,7 @@ async fn multipart_sha256_composite_validates_parts_and_final_before_consuming_u
         metadata.checksum_type.as_ref().map(|v| v.as_str()),
         Some("COMPOSITE")
     );
-    assert_eq!(accepted_v2_sequence(&service).await, 2);
+    assert_eq!(accepted_v3_sequence(&service).await, 2);
 }
 
 #[tokio::test]
@@ -311,7 +311,7 @@ async fn multipart_lost_response_retry_returns_accepted_checksum_after_overwrite
         }))
         .await
         .expect("newer independent write");
-    let before = accepted_v2_sequence(&service).await;
+    let before = accepted_v3_sequence(&service).await;
     let current = head(&service).await;
     assert_ne!(current.checksum_crc64nvme.as_deref(), Some(CRC64));
     let retry = service
@@ -324,7 +324,7 @@ async fn multipart_lost_response_retry_returns_accepted_checksum_after_overwrite
         retry.checksum_type.as_ref().map(|v| v.as_str()),
         Some("FULL_OBJECT")
     );
-    assert_eq!(accepted_v2_sequence(&service).await, before);
+    assert_eq!(accepted_v3_sequence(&service).await, before);
     for change in 0..4 {
         let mut changed = request.clone();
         match change {
@@ -349,7 +349,7 @@ async fn multipart_lost_response_retry_returns_accepted_checksum_after_overwrite
                 .is_err(),
             "changed fact {change}"
         );
-        assert_eq!(accepted_v2_sequence(&service).await, before);
+        assert_eq!(accepted_v3_sequence(&service).await, before);
     }
     assert_eq!(
         head(&service).await.checksum_crc64nvme,

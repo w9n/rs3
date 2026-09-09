@@ -10,10 +10,10 @@ use bytes::Bytes;
 use clap::{Args, ValueEnum};
 use futures_util::stream;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_repository::v2::{
-    UnenforcedQuiescedMaintenanceGuard, V2AnchorState, V2CommitAnchor, V2CommitCoordinator,
-    V2CommitStoreOptions, V2FormatRef, V2KeyringEnvelopeRef, V2MemoryAnchor, V2ProviderProfile,
-    V2Repository,
+use rs3_repository::v3::{
+    UnenforcedQuiescedMaintenanceGuard, V3AnchorState, V3CommitAnchor, V3CommitCoordinator,
+    V3CommitStoreOptions, V3FormatRef, V3KeyringEnvelopeRef, V3MemoryAnchor, V3ProviderProfile,
+    V3Repository,
 };
 use rs3_repository::{
     CommitCoordinatorOptions, DEFAULT_PAYLOAD_SEGMENT_SIZE, RepositoryOptions, RepositoryPutOptions,
@@ -511,7 +511,7 @@ struct FreshProcessHandoff {
     object_size: usize,
     logical_path_len: usize,
     body_pattern_version: u32,
-    anchor: V2AnchorState,
+    anchor: V3AnchorState,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -577,7 +577,7 @@ struct FreshProcessAggregateReport {
 }
 
 impl FreshProcessHandoff {
-    fn new(args: &PerfArgs, backend_dir: PathBuf, anchor: V2AnchorState) -> Self {
+    fn new(args: &PerfArgs, backend_dir: PathBuf, anchor: V3AnchorState) -> Self {
         Self {
             schema: FRESH_PROCESS_HANDOFF_SCHEMA.to_owned(),
             source_revision: option_env!("RS3_BUILD_GIT_SHA")
@@ -1087,7 +1087,7 @@ where
     let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
     let batch_items = args.objects.max(1);
     let coordinator = Arc::new(
-        V2CommitCoordinator::with_options(
+        V3CommitCoordinator::with_options(
             repo,
             anchor,
             CommitCoordinatorOptions::new(
@@ -1186,7 +1186,7 @@ where
     S: BlobStore + Clone + 'static,
 {
     let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
-    let coordinator = V2CommitCoordinator::with_options(repo, anchor, commit_options(args))?
+    let coordinator = V3CommitCoordinator::with_options(repo, anchor, commit_options(args))?
         .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard);
     store
         .reset_operation_counts()
@@ -1302,7 +1302,7 @@ where
 
 struct ParallelWriteMeasurement<S> {
     store: CountingBlobStore<S>,
-    anchor: V2MemoryAnchor,
+    anchor: V3MemoryAnchor,
     body: Bytes,
     parallelism: usize,
     latencies: Vec<Duration>,
@@ -1322,7 +1322,7 @@ where
     let (repo, anchor) = v2_repository_with_store(args, store.clone()).await?;
     let verification_anchor = anchor.clone();
     let coordinator = Arc::new(
-        V2CommitCoordinator::with_options(Arc::clone(&repo), anchor, commit_options(args))?
+        V3CommitCoordinator::with_options(Arc::clone(&repo), anchor, commit_options(args))?
             .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard),
     );
     store
@@ -1462,7 +1462,7 @@ async fn run_fresh_writer_phase(args: &PerfArgs) -> Result<()> {
     let written = perform_parallel_writes(args, store).await?;
     let anchor = written
         .anchor
-        .read_v2()
+        .read_v3()
         .await
         .context("failed to read writer anchor for fresh-process handoff")?
         .context("fresh-process writer produced no accepted anchor")?;
@@ -1537,7 +1537,7 @@ async fn run_fresh_reader_phase(args: &PerfArgs) -> Result<()> {
         FilesystemBlobStore::new(backend_dir)
             .context("failed to open fresh-process filesystem backend")?,
     );
-    let anchor = V2MemoryAnchor::with_state(handoff.anchor);
+    let anchor = V3MemoryAnchor::with_state(handoff.anchor);
     let verification = verify_parallel_reload(args, store, &anchor, &body(args.object_size), None)
         .await
         .context("fresh reader process verification failed")?;
@@ -1705,7 +1705,7 @@ where
 async fn verify_parallel_reload<S>(
     args: &PerfArgs,
     store: CountingBlobStore<S>,
-    anchor: &V2MemoryAnchor,
+    anchor: &V3MemoryAnchor,
     expected_body: &Bytes,
     checkpoint: Option<CheckpointMeasurement>,
 ) -> Result<ReloadVerification>
@@ -2561,12 +2561,12 @@ fn memory_store() -> CountingBlobStore<MemoryBlobStore> {
 async fn v2_repository_with_store<S>(
     args: &PerfArgs,
     store: CountingBlobStore<S>,
-) -> Result<(Arc<V2Repository<CountingBlobStore<S>>>, V2MemoryAnchor)>
+) -> Result<(Arc<V3Repository<CountingBlobStore<S>>>, V3MemoryAnchor)>
 where
     S: BlobStore + Clone,
 {
     let repository = v2_repository(args, store)?;
-    let anchor = V2MemoryAnchor::new();
+    let anchor = V3MemoryAnchor::new();
     repository
         .write_genesis_snapshot(&anchor)
         .await
@@ -2577,14 +2577,14 @@ where
 fn v2_repository<S>(
     args: &PerfArgs,
     store: CountingBlobStore<S>,
-) -> Result<Arc<V2Repository<CountingBlobStore<S>>>>
+) -> Result<Arc<V3Repository<CountingBlobStore<S>>>>
 where
     S: BlobStore + Clone,
 {
     if args.payload_segment_size == Some(0) {
         anyhow::bail!("--payload-segment-size must be greater than zero");
     }
-    Ok(Arc::new(V2Repository::new(
+    Ok(Arc::new(V3Repository::new(
         store,
         keyring()?,
         RepositoryOptions {
@@ -2594,8 +2594,8 @@ where
                 rs3_repository::DEFAULT_DECRYPTED_SEGMENT_CACHE_MAX_BYTES,
             default_retention: None,
         },
-        V2CommitStoreOptions::for_profile(
-            V2ProviderProfile::Dev,
+        V3CommitStoreOptions::for_profile(
+            V3ProviderProfile::Dev,
             perf_repository_id()?,
             perf_keyring_envelope_ref()?,
             perf_format_ref()?,
@@ -2718,16 +2718,16 @@ fn perf_repository_id() -> Result<RepositoryId> {
     RepositoryId::new("rs3-xtask-perf").map_err(Into::into)
 }
 
-fn perf_keyring_envelope_ref() -> Result<V2KeyringEnvelopeRef> {
-    Ok(V2KeyringEnvelopeRef {
+fn perf_keyring_envelope_ref() -> Result<V3KeyringEnvelopeRef> {
+    Ok(V3KeyringEnvelopeRef {
         object_id: BackendObjectId::new("keyrings/perf-bootstrap")
             .context("invalid perf keyring envelope object id")?,
         digest: [6_u8; 32],
     })
 }
 
-fn perf_format_ref() -> Result<V2FormatRef> {
-    Ok(V2FormatRef {
+fn perf_format_ref() -> Result<V3FormatRef> {
+    Ok(V3FormatRef {
         generation: 1,
         digest: hex::encode([7_u8; 32]),
         object_id: BackendObjectId::new(format!(
@@ -3051,7 +3051,7 @@ mod tests {
     };
     use crate::{Cli, Commands};
     use clap::Parser;
-    use rs3_repository::v2::V2AnchorState;
+    use rs3_repository::v3::V3AnchorState;
     use rs3_storage::BlobOperationCounts;
     use rs3_types::{BackendObjectId, KeyId, Sequence};
     use std::path::PathBuf;
@@ -3275,7 +3275,7 @@ mod tests {
     fn fresh_process_handoff_binds_the_requested_repository_facts() {
         let args = fresh_process_args();
         let backend_dir = PathBuf::from("/tmp/rs3-perf-test-backend");
-        let anchor = V2AnchorState {
+        let anchor = V3AnchorState {
             sequence: Sequence::new(9),
             commit_key: BackendObjectId::new("commits/v03/test")
                 .unwrap_or_else(|error| panic!("commit key: {error}")),

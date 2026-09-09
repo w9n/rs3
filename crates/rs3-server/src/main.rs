@@ -9,20 +9,20 @@ mod cli_writer_guard;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rs3_crypto::SecretBytes;
-use rs3_repository::v2::{
-    V2AnchorState, V2ProviderCheckStatus, V2ProviderConformanceReport, V2ProviderProfile,
-    V2RecoveryBundle,
+use rs3_repository::v3::{
+    V3AnchorState, V3ProviderCheckStatus, V3ProviderConformanceReport, V3ProviderProfile,
+    V3RecoveryBundle,
 };
 use rs3_server::{
     AdminReportProfile, AnchorConfig, GatewayMode, PROVIDER_CONFORMANCE_SCHEMA,
-    RepositoryToolConfig, RuntimeConfig, RuntimeV2ProviderConformanceOptions,
-    V2_RESTORE_BUNDLE_SCHEMA, V2AnchorImportOptions, V2AnchorImportReport, V2ProviderCheckConfig,
-    V2RecoveryBundleVerificationOptions, V2RecoveryBundleVerificationReport,
-    V2RepositoryInitReport, backend_kind, check_v2_provider_conformance_from_provider_config,
-    doctor_findings, doctor_probe_from_config, export_v2_recovery_bundle_from_config,
-    import_v2_anchor_from_config, inspect_keyring_envelope_from_tool_config,
+    RepositoryToolConfig, RuntimeConfig, RuntimeV3ProviderConformanceOptions,
+    V3_RESTORE_BUNDLE_SCHEMA, V3AnchorImportOptions, V3AnchorImportReport, V3ProviderCheckConfig,
+    V3RecoveryBundleVerificationOptions, V3RecoveryBundleVerificationReport,
+    V3RepositoryInitReport, backend_kind, check_v3_provider_conformance_from_provider_config,
+    doctor_findings, doctor_probe_from_config, export_v3_recovery_bundle_from_config,
+    import_v3_anchor_from_config, inspect_keyring_envelope_from_tool_config,
     provider_conformance_target_fingerprint, rewrap_keyring_envelope_from_tool_config,
-    runtime_config_profile, verify_v2_recovery_bundle_from_tool_config,
+    runtime_config_profile, verify_v3_recovery_bundle_from_tool_config,
 };
 use rs3_server::{
     KeyringEnvelopeInspectOptions, KeyringEnvelopeInspectReport, KeyringEnvelopeRewrapOptions,
@@ -130,11 +130,11 @@ enum Commands {
         #[arg(long)]
         output: std::path::PathBuf,
     },
-    /// Verify a trusted v2 restore bundle without writing an anchor.
+    /// Verify a trusted v3 restore bundle without writing an anchor.
     VerifyBundle(Box<VerifyBundleArgs>),
     /// Inspect or rewrap encrypted repository keyring envelopes.
     Keyring(Box<KeyringArgs>),
-    /// Initialize a missing v2 repository, verify it, then exit.
+    /// Initialize a missing v3 repository, verify it, then exit.
     Init {
         /// Production checks permit deliberate bootstrap with journaled provider qualification.
         #[arg(long, env = "RS3_INIT_PROFILE", value_enum, default_value_t = DoctorProfile::Production)]
@@ -161,7 +161,7 @@ enum Commands {
         #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
     },
-    /// Probe v2 object-store behavior required by the repository format.
+    /// Probe v3 object-store behavior required by the repository format.
     CheckV2Provider {
         /// Synthetic backing prefix, disjoint from the repository prefix on S3.
         #[arg(long)]
@@ -173,7 +173,7 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = RecoveryReportFormat::Json)]
         format: RecoveryReportFormat,
     },
-    /// Import a trusted v2 anchor after operator recovery review.
+    /// Import a trusted v3 anchor after operator recovery review.
     ImportAnchor(Box<ImportAnchorArgs>),
     /// Operate the in-gateway maintenance supervisor over the admin API.
     Maintenance(Box<MaintenanceArgs>),
@@ -448,9 +448,9 @@ async fn main() -> Result<()> {
         Commands::ExportRestoreBundle { output, format } => {
             let config = RuntimeConfig::from_env()?;
             log_runtime_config(&config);
-            let bundle = export_v2_recovery_bundle_from_config(&config).await?;
+            let bundle = export_v3_recovery_bundle_from_config(&config).await?;
             write_restore_bundle(&output, &bundle)?;
-            print_v2_restore_bundle(&bundle, format)?;
+            print_v3_restore_bundle(&bundle, format)?;
         }
         Commands::AttachBundleSignature {
             bundle_file,
@@ -458,7 +458,7 @@ async fn main() -> Result<()> {
             public_key,
             output,
         } => {
-            let mut bundle = read_v2_recovery_bundle(&bundle_file)?;
+            let mut bundle = read_v3_recovery_bundle(&bundle_file)?;
             attach_bundle_signature(&mut bundle, &signature_hex, &public_key)?;
             write_restore_bundle(&output, &bundle)?;
         }
@@ -479,23 +479,23 @@ async fn main() -> Result<()> {
                     .clone_from(wrapping_key_id);
             }
             log_repository_tool_config(&config);
-            let bundle = read_v2_recovery_bundle(&bundle_file)?;
+            let bundle = read_v3_recovery_bundle(&bundle_file)?;
             let wrapping_key = required_wrapping_key_input(
                 wrapping_key_hex,
                 wrapping_key_hex_file.as_deref(),
                 "--wrapping-key-hex",
                 "--wrapping-key-hex-file",
             )?;
-            let report = verify_v2_recovery_bundle_from_tool_config(
+            let report = verify_v3_recovery_bundle_from_tool_config(
                 &config,
                 bundle,
-                V2RecoveryBundleVerificationOptions {
+                V3RecoveryBundleVerificationOptions {
                     min_sequence: Sequence::new(min_sequence),
                     wrapping_key,
                 },
             )
             .await?;
-            print_v2_recovery_bundle_verification_report(&report, format)?;
+            print_v3_recovery_bundle_verification_report(&report, format)?;
         }
         Commands::Keyring(args) => {
             run_keyring_command(*args).await?;
@@ -515,7 +515,7 @@ async fn main() -> Result<()> {
                 governance_bypass_reviewed,
             )
             .await?;
-            print_v2_repository_init_report(&report, format)?;
+            print_v3_repository_init_report(&report, format)?;
         }
         Commands::WaitForInit {
             journal_file,
@@ -531,11 +531,11 @@ async fn main() -> Result<()> {
             governance_bypass_reviewed,
             format,
         } => {
-            let config = V2ProviderCheckConfig::from_env()?;
-            log_v2_provider_check_config(&config);
-            let report = check_v2_provider_conformance_from_provider_config(
+            let config = V3ProviderCheckConfig::from_env()?;
+            log_v3_provider_check_config(&config);
+            let report = check_v3_provider_conformance_from_provider_config(
                 &config,
-                RuntimeV2ProviderConformanceOptions {
+                RuntimeV3ProviderConformanceOptions {
                     probe_prefix,
                     legal_hold,
                     governance_bypass_reviewed,
@@ -543,7 +543,7 @@ async fn main() -> Result<()> {
             )
             .await?;
             let passed = report.passed();
-            print_v2_provider_conformance_report(&report, &config, format)?;
+            print_v3_provider_conformance_report(&report, &config, format)?;
             if !passed {
                 anyhow::bail!("v2 provider conformance failed");
             }
@@ -553,8 +553,8 @@ async fn main() -> Result<()> {
             log_runtime_config(&config);
             let format = args.format;
             let (bundle, options) = recovery_bundle_from_import_args(&config, *args)?;
-            let report = import_v2_anchor_from_config(&config, bundle, options).await?;
-            print_v2_anchor_import_report(&report, format)?;
+            let report = import_v3_anchor_from_config(&config, bundle, options).await?;
+            print_v3_anchor_import_report(&report, format)?;
         }
         Commands::Maintenance(args) => {
             run_maintenance_command(*args).await?;
@@ -881,8 +881,8 @@ async fn run_keyring_command(args: KeyringArgs) -> Result<()> {
 fn recovery_bundle_from_import_args(
     config: &RuntimeConfig,
     args: ImportAnchorArgs,
-) -> Result<(V2RecoveryBundle, V2AnchorImportOptions)> {
-    let options = V2AnchorImportOptions {
+) -> Result<(V3RecoveryBundle, V3AnchorImportOptions)> {
+    let options = V3AnchorImportOptions {
         min_sequence: Sequence::new(args.min_sequence),
         force_rollback: args.force_rollback,
     };
@@ -900,7 +900,7 @@ fn read_bundle_bytes(path: &str) -> Result<Vec<u8>> {
 }
 
 fn read_bounded_bundle(source: impl Read) -> Result<Vec<u8>> {
-    let maximum = rs3_repository::v2::MAX_RECOVERY_BUNDLE_BYTES;
+    let maximum = rs3_repository::v3::MAX_RECOVERY_BUNDLE_BYTES;
     let mut input = Vec::new();
     source
         .take(maximum as u64 + 1)
@@ -912,13 +912,13 @@ fn read_bounded_bundle(source: impl Read) -> Result<Vec<u8>> {
     Ok(input)
 }
 
-fn read_v2_recovery_bundle(path: &str) -> Result<V2RecoveryBundle> {
-    V2RecoveryBundle::from_object_bytes(&read_bundle_bytes(path)?)
+fn read_v3_recovery_bundle(path: &str) -> Result<V3RecoveryBundle> {
+    V3RecoveryBundle::from_object_bytes(&read_bundle_bytes(path)?)
         .context("failed to parse restore bundle CBOR")
 }
 
-fn parse_restore_bundle(input: &[u8], config: &RuntimeConfig) -> Result<V2RecoveryBundle> {
-    let bundle = V2RecoveryBundle::from_object_bytes(input)
+fn parse_restore_bundle(input: &[u8], config: &RuntimeConfig) -> Result<V3RecoveryBundle> {
+    let bundle = V3RecoveryBundle::from_object_bytes(input)
         .context("failed to parse restore bundle CBOR")?;
     if bundle.repository_id.as_ref() != Some(&config.repository_keys.repository_id) {
         bail!("restore bundle repository ID does not match configured repository ID");
@@ -926,7 +926,7 @@ fn parse_restore_bundle(input: &[u8], config: &RuntimeConfig) -> Result<V2Recove
     Ok(bundle)
 }
 
-fn write_restore_bundle(path: &std::path::Path, bundle: &V2RecoveryBundle) -> Result<()> {
+fn write_restore_bundle(path: &std::path::Path, bundle: &V3RecoveryBundle) -> Result<()> {
     let bytes = bundle.to_object_bytes()?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -940,7 +940,7 @@ fn write_restore_bundle(path: &std::path::Path, bundle: &V2RecoveryBundle) -> Re
 }
 
 fn attach_bundle_signature(
-    bundle: &mut V2RecoveryBundle,
+    bundle: &mut V3RecoveryBundle,
     signature_hex: &str,
     public_key: &str,
 ) -> Result<()> {
@@ -1057,8 +1057,8 @@ fn install_rustls_provider() {
 #[cfg(not(any(feature = "s3", feature = "k8s")))]
 fn install_rustls_provider() {}
 
-fn print_v2_anchor_import_report(
-    report: &V2AnchorImportReport,
+fn print_v3_anchor_import_report(
+    report: &V3AnchorImportReport,
     format: RecoveryReportFormat,
 ) -> Result<()> {
     match format {
@@ -1075,14 +1075,14 @@ fn print_v2_anchor_import_report(
             println!("schema=rs3.v2-anchor-import.v1");
             println!("applied={}", report.applied);
             println!("verified_commit_count={}", report.verified_commit_count);
-            print_v2_anchor_text(&report.anchor);
+            print_v3_anchor_text(&report.anchor);
         }
     }
     Ok(())
 }
 
-fn print_v2_repository_init_report(
-    report: &V2RepositoryInitReport,
+fn print_v3_repository_init_report(
+    report: &V3RepositoryInitReport,
     format: RecoveryReportFormat,
 ) -> Result<()> {
     match format {
@@ -1111,14 +1111,14 @@ fn print_v2_repository_init_report(
                 "probe_observation={}",
                 serde_json::to_string(&report.probe_observation)?
             );
-            print_v2_anchor_text(&report.anchor);
+            print_v3_anchor_text(&report.anchor);
         }
     }
     Ok(())
 }
 
-fn print_v2_recovery_bundle_verification_report(
-    report: &V2RecoveryBundleVerificationReport,
+fn print_v3_recovery_bundle_verification_report(
+    report: &V3RecoveryBundleVerificationReport,
     format: RecoveryReportFormat,
 ) -> Result<()> {
     match format {
@@ -1166,7 +1166,7 @@ fn print_v2_recovery_bundle_verification_report(
             println!("schema=rs3.v2-verify-bundle.v1");
             println!("verified=true");
             println!("repository_id={}", report.repository_id.as_str());
-            print_v2_anchor_text(&report.anchor);
+            print_v3_anchor_text(&report.anchor);
             println!(
                 "weak_subjectivity_floor_sequence={}",
                 report.weak_subjectivity_floor_sequence.get()
@@ -1302,9 +1302,9 @@ fn print_keyring_rewrap_report(
     Ok(())
 }
 
-fn print_v2_provider_conformance_report(
-    report: &V2ProviderConformanceReport,
-    config: &V2ProviderCheckConfig,
+fn print_v3_provider_conformance_report(
+    report: &V3ProviderConformanceReport,
+    config: &V3ProviderCheckConfig,
     format: RecoveryReportFormat,
 ) -> Result<()> {
     let target_fingerprint = provider_conformance_target_fingerprint(config);
@@ -1351,17 +1351,17 @@ fn build_source_revision() -> &'static str {
     option_env!("RS3_BUILD_GIT_SHA").unwrap_or("unknown")
 }
 
-fn print_v2_restore_bundle(bundle: &V2RecoveryBundle, format: RecoveryReportFormat) -> Result<()> {
+fn print_v3_restore_bundle(bundle: &V3RecoveryBundle, format: RecoveryReportFormat) -> Result<()> {
     match format {
         RecoveryReportFormat::Json => {
             println!("{}", serde_json::to_string_pretty(bundle)?);
         }
         RecoveryReportFormat::Text => {
-            println!("schema={V2_RESTORE_BUNDLE_SCHEMA}");
+            println!("schema={V3_RESTORE_BUNDLE_SCHEMA}");
             if let Some(repository_id) = bundle.repository_id.as_ref() {
                 println!("repository_id={}", repository_id.as_str());
             }
-            print_v2_anchor_text(&bundle.anchor);
+            print_v3_anchor_text(&bundle.anchor);
             println!(
                 "weak_subjectivity_floor_sequence={}",
                 bundle.weak_subjectivity_floor_sequence.get()
@@ -1379,7 +1379,7 @@ fn print_v2_restore_bundle(bundle: &V2RecoveryBundle, format: RecoveryReportForm
     Ok(())
 }
 
-fn print_v2_anchor_text(anchor: &V2AnchorState) {
+fn print_v3_anchor_text(anchor: &V3AnchorState) {
     println!("anchor_sequence={}", anchor.sequence.get());
     println!("anchor_commit_key={}", anchor.commit_key.as_str());
     println!("anchor_body_digest={}", hex::encode(anchor.body_digest));
@@ -1526,11 +1526,11 @@ impl From<DoctorProfile> for AdminReportProfile {
     }
 }
 
-fn provider_profile_name(profile: V2ProviderProfile) -> &'static str {
+fn provider_profile_name(profile: V3ProviderProfile) -> &'static str {
     match profile {
-        V2ProviderProfile::Dev => "dev",
-        V2ProviderProfile::AtomicCreate => "atomic-create",
-        V2ProviderProfile::RetainedVersionObjectLock => "retained-version-object-lock",
+        V3ProviderProfile::Dev => "dev",
+        V3ProviderProfile::AtomicCreate => "atomic-create",
+        V3ProviderProfile::RetainedVersionObjectLock => "retained-version-object-lock",
     }
 }
 
@@ -1542,10 +1542,10 @@ fn retention_mode_name(mode: RetentionMode) -> &'static str {
     }
 }
 
-fn provider_check_status_name(status: V2ProviderCheckStatus) -> &'static str {
+fn provider_check_status_name(status: V3ProviderCheckStatus) -> &'static str {
     match status {
-        V2ProviderCheckStatus::Passed => "passed",
-        V2ProviderCheckStatus::Failed => "failed",
+        V3ProviderCheckStatus::Passed => "passed",
+        V3ProviderCheckStatus::Failed => "failed",
     }
 }
 
@@ -1614,7 +1614,7 @@ fn log_runtime_config(config: &RuntimeConfig) {
     );
 }
 
-fn log_v2_provider_check_config(config: &V2ProviderCheckConfig) {
+fn log_v3_provider_check_config(config: &V3ProviderCheckConfig) {
     let backend_kind = backend_kind(&config.backend.endpoint);
     let repository_retention_mode = config
         .repository_retention
@@ -1725,7 +1725,7 @@ mod tests {
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MaintenanceConfig,
         MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig,
         RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
-        V2ProviderCheckConfig, WriterGuardConfig,
+        V3ProviderCheckConfig, WriterGuardConfig,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
@@ -1828,13 +1828,13 @@ mod tests {
     }
 
     struct CliMockMaintenanceRuntime {
-        dry_run: rs3_repository::v2::V2FullGcDryRunReport,
+        dry_run: rs3_repository::v3::V3FullGcDryRunReport,
     }
 
     impl CliMockMaintenanceRuntime {
         fn new() -> Self {
             Self {
-                dry_run: rs3_repository::v2::V2FullGcDryRunReport {
+                dry_run: rs3_repository::v3::V3FullGcDryRunReport {
                     base_sequence: None,
                     chain_live_commit_count: 1,
                     protected_root_count: 0,
@@ -1852,7 +1852,7 @@ mod tests {
                     retention_renewal_bytes: 0,
                     retention_renewal_blocked_count: 0,
                     retention_renewal_blocked_bytes: 0,
-                    planned_cost: rs3_repository::v2::V2MaintenancePlanCost::default(),
+                    planned_cost: rs3_repository::v3::V3MaintenancePlanCost::default(),
                     fits_budgets: true,
                     exact_version_apply_ready: true,
                 },
@@ -1875,9 +1875,9 @@ mod tests {
 
         async fn quick_maintenance_report(
             &self,
-        ) -> Result<rs3_repository::v2::V2MaintenanceReport, rs3_repository::RepositoryError>
+        ) -> Result<rs3_repository::v3::V3MaintenanceReport, rs3_repository::RepositoryError>
         {
-            Ok(rs3_repository::v2::V2MaintenanceReport {
+            Ok(rs3_repository::v3::V3MaintenanceReport {
                 anchor_present: true,
                 verified_commit_count: 1,
                 last_anchored_commit_age_ms: Some(0),
@@ -1905,18 +1905,18 @@ mod tests {
 
         async fn full_gc_dry_run(
             &self,
-            _options: rs3_repository::v2::V2FullGcDryRunOptions,
-        ) -> Result<rs3_repository::v2::V2FullGcDryRunReport, rs3_repository::RepositoryError>
+            _options: rs3_repository::v3::V3FullGcDryRunOptions,
+        ) -> Result<rs3_repository::v3::V3FullGcDryRunReport, rs3_repository::RepositoryError>
         {
             Ok(self.dry_run.clone())
         }
 
         async fn preview_full_gc_plan(
             &self,
-            _options: rs3_repository::v2::V2FullGcApplyOptions,
-        ) -> Result<rs3_repository::v2::V2FullGcPlanPreview, rs3_repository::RepositoryError>
+            _options: rs3_repository::v3::V3FullGcApplyOptions,
+        ) -> Result<rs3_repository::v3::V3FullGcPlanPreview, rs3_repository::RepositoryError>
         {
-            Ok(rs3_repository::v2::V2FullGcPlanPreview {
+            Ok(rs3_repository::v3::V3FullGcPlanPreview {
                 report: self.dry_run.clone(),
                 plan_digest: self.plan_digest(),
             })
@@ -1924,11 +1924,11 @@ mod tests {
 
         async fn run_full_maintenance(
             &self,
-            _options: rs3_repository::v2::V2FullGcApplyOptions,
+            _options: rs3_repository::v3::V3FullGcApplyOptions,
             expected_plan_digest: Option<&str>,
-            _cancellation: &rs3_repository::v2::V2MaintenanceCancellation,
+            _cancellation: &rs3_repository::v3::V3MaintenanceCancellation,
             on_phase: &(dyn Fn(rs3_server::MaintenanceRunPhase) + Send + Sync),
-        ) -> Result<rs3_repository::v2::V2FullMaintenanceReport, rs3_repository::RepositoryError>
+        ) -> Result<rs3_repository::v3::V3FullMaintenanceReport, rs3_repository::RepositoryError>
         {
             on_phase(rs3_server::MaintenanceRunPhase::Quiescing);
             if let Some(expected) = expected_plan_digest
@@ -1939,13 +1939,13 @@ mod tests {
                 });
             }
             on_phase(rs3_server::MaintenanceRunPhase::Applying);
-            Ok(rs3_repository::v2::V2FullMaintenanceReport {
+            Ok(rs3_repository::v3::V3FullMaintenanceReport {
                 dry_run: self.dry_run.clone(),
-                apply: rs3_repository::v2::V2FullGcApplyReport {
+                apply: rs3_repository::v3::V3FullGcApplyReport {
                     dry_run: self.dry_run.clone(),
                     retention_renewed_object_count: 0,
                     retention_renewed_bytes: 0,
-                    orphan_gc: rs3_repository::v2::V2OrphanGcReport::default(),
+                    orphan_gc: rs3_repository::v3::V3OrphanGcReport::default(),
                 },
             })
         }
@@ -1974,7 +1974,7 @@ mod tests {
                     ..rs3_server::MaintenanceConfig::default()
                 },
                 retention_configured: false,
-                orphan_gc: rs3_repository::v2::V2OrphanGcOptions::new_for_test_rehearsal(
+                orphan_gc: rs3_repository::v3::V3OrphanGcOptions::new_for_test_rehearsal(
                     Duration::ZERO,
                 ),
                 retained_provider_conformance: std::sync::Arc::new(|| true),
@@ -2248,9 +2248,9 @@ mod tests {
             std::process::id()
         ));
         let target_fingerprint =
-            provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(&config));
-        let checks = rs3_repository::v2::required_v2_provider_check_names(
-            rs3_repository::v2::V2ProviderProfile::RetainedVersionObjectLock,
+            provider_conformance_target_fingerprint(&V3ProviderCheckConfig::from(&config));
+        let checks = rs3_repository::v3::required_v3_provider_check_names(
+            rs3_repository::v3::V3ProviderProfile::RetainedVersionObjectLock,
         )
         .into_iter()
         .map(|name| TestProviderCheck {
@@ -2392,8 +2392,8 @@ mod tests {
         assert!(enforce_serve_profile(&runtime_config(), DoctorProfile::Local, false).is_ok());
     }
 
-    fn sample_restore_bundle(repository_id: &str) -> rs3_repository::v2::V2RecoveryBundle {
-        let anchor = rs3_repository::v2::V2AnchorState {
+    fn sample_restore_bundle(repository_id: &str) -> rs3_repository::v3::V3RecoveryBundle {
+        let anchor = rs3_repository::v3::V3AnchorState {
             sequence: rs3_types::Sequence::new(7),
             commit_key: BackendObjectId::new(
                 "commits/v03/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -2402,7 +2402,7 @@ mod tests {
             body_digest: [0x11; 32],
             version_id: Some(rs3_types::BackendVersionId::new("version-a").expect("version")),
             signing_key_id: rs3_types::KeyId::new("checkpoint-v1").expect("key"),
-            format_ref: rs3_repository::v2::V2FormatRef {
+            format_ref: rs3_repository::v3::V3FormatRef {
                 generation: 1,
                 digest: "22".repeat(32),
                 object_id: BackendObjectId::new("format/00000000000000000001/abc")
@@ -2413,7 +2413,7 @@ mod tests {
             },
         };
         let mut bundle =
-            rs3_repository::v2::V2RecoveryBundle::from_anchor(anchor, rs3_types::Sequence::new(7));
+            rs3_repository::v3::V3RecoveryBundle::from_anchor(anchor, rs3_types::Sequence::new(7));
         bundle.repository_id = Some(RepositoryId::new(repository_id).expect("repo ID"));
         bundle.repository_salt_digest = Some([0x33; 32]);
         bundle.exported_at_ms = 42;
@@ -2453,7 +2453,7 @@ mod tests {
             std::process::id()
         ));
         super::write_restore_bundle(&path, &bundle).expect("write");
-        let read = super::read_v2_recovery_bundle(path.to_str().expect("path")).expect("read");
+        let read = super::read_v3_recovery_bundle(path.to_str().expect("path")).expect("read");
         assert_eq!(read, bundle);
         read.verify_offline_signature(&public_key).expect("verify");
         assert!(super::write_restore_bundle(&path, &bundle).is_err());
@@ -2466,7 +2466,7 @@ mod tests {
 
     #[test]
     fn bundle_input_is_bounded_and_import_requires_repository_identity() {
-        let maximum = rs3_repository::v2::MAX_RECOVERY_BUNDLE_BYTES;
+        let maximum = rs3_repository::v3::MAX_RECOVERY_BUNDLE_BYTES;
         assert!(super::read_bounded_bundle(std::io::repeat(0)).is_err());
         assert_eq!(
             super::read_bounded_bundle(&vec![0; maximum][..])
@@ -2522,7 +2522,7 @@ mod tests {
     }
 
     #[test]
-    fn import_v2_anchor_reads_bundle_file_and_preserves_operator_options() {
+    fn import_v3_anchor_reads_bundle_file_and_preserves_operator_options() {
         let config = runtime_config();
         let input = sample_restore_bundle("tenant-repository")
             .to_object_bytes()

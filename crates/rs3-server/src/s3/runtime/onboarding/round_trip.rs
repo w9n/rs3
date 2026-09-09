@@ -8,11 +8,11 @@ const WRITE_ATTEMPTS: u8 = 3;
 #[serde(tag = "phase", deny_unknown_fields)]
 pub(super) enum State {
     Planned {
-        base: V2AnchorState,
+        base: V3AnchorState,
         remaining: u8,
     },
     Verified {
-        accepted: V2AnchorState,
+        accepted: V3AnchorState,
         remaining: u8,
     },
     Complete,
@@ -53,18 +53,18 @@ fn fixture(root: &str) -> Result<(LogicalPath, Bytes), S3BoundaryError> {
 async fn reopen(
     config: &RuntimeConfig,
     store: &RuntimeStore,
-    anchor: &RuntimeV2Anchor,
-) -> Result<(V2Repository<RuntimeStore>, V2AnchorState, usize), S3BoundaryError> {
+    anchor: &RuntimeV3Anchor,
+) -> Result<(V3Repository<RuntimeStore>, V3AnchorState, usize), S3BoundaryError> {
     let accepted = anchor
-        .read_v2()
+        .read_v3()
         .await
         .map_err(|_| failed())?
         .ok_or_else(failed)?;
-    let loaded = load_existing_v2_repository(store, &config.repository_keys, &accepted, config)
+    let loaded = load_existing_v3_repository(store, &config.repository_keys, &accepted, config)
         .await
         .map_err(|_| failed())?;
     let options = bootstrap_commit_options(config, &loaded).map_err(|_| failed())?;
-    let repository = V2Repository::new(
+    let repository = V3Repository::new(
         store.clone(),
         loaded.keyring,
         RepositoryOptions {
@@ -80,14 +80,14 @@ async fn reopen(
         .await
         .map_err(|_| failed())?
         .ok_or_else(failed)?;
-    if anchor.read_v2().await.map_err(|_| failed())? != Some(accepted.clone()) {
+    if anchor.read_v3().await.map_err(|_| failed())? != Some(accepted.clone()) {
         return Err(failed());
     }
     Ok((repository, accepted, chain.commits_newest_first.len()))
 }
 
 async fn verify_body(
-    repository: &V2Repository<RuntimeStore>,
+    repository: &V3Repository<RuntimeStore>,
     key: &LogicalPath,
     body: &Bytes,
 ) -> Result<bool, S3BoundaryError> {
@@ -110,10 +110,10 @@ async fn verify_body(
 pub(super) async fn verify<J: Journal>(
     config: &RuntimeConfig,
     store: &RuntimeStore,
-    anchor: &RuntimeV2Anchor,
-    guard: &dyn V2MaintenanceGuard,
+    anchor: &RuntimeV3Anchor,
+    guard: &dyn V3MaintenanceGuard,
     journal: &mut OnboardingJournal<'_, J>,
-    report: &mut V2RepositoryInitReport,
+    report: &mut V3RepositoryInitReport,
 ) -> Result<(), S3BoundaryError> {
     journal.state()?;
     if journal
@@ -125,7 +125,7 @@ pub(super) async fn verify<J: Journal>(
         return Ok(());
     }
     guard
-        .verify_v2_maintenance(None)
+        .verify_v3_maintenance(None)
         .await
         .map_err(|_| failed())?;
     if journal.record.round_trip.is_none() {
@@ -150,7 +150,7 @@ pub(super) async fn verify<J: Journal>(
             journal.record.round_trip = Some(State::Planned { base, remaining });
             journal.persist().await?;
             guard
-                .verify_v2_maintenance(None)
+                .verify_v3_maintenance(None)
                 .await
                 .map_err(|_| failed())?;
             repository
@@ -173,7 +173,7 @@ pub(super) async fn verify<J: Journal>(
             return Err(failed());
         }
         guard
-            .verify_v2_maintenance(Some(&accepted))
+            .verify_v3_maintenance(Some(&accepted))
             .await
             .map_err(|_| failed())?;
         journal.record.round_trip = Some(State::Verified {
@@ -201,7 +201,7 @@ pub(super) async fn verify<J: Journal>(
             });
             journal.persist().await?;
             guard
-                .verify_v2_maintenance(None)
+                .verify_v3_maintenance(None)
                 .await
                 .map_err(|_| failed())?;
             repository
@@ -217,7 +217,7 @@ pub(super) async fn verify<J: Journal>(
             return Err(failed());
         }
         guard
-            .verify_v2_maintenance(Some(&accepted))
+            .verify_v3_maintenance(Some(&accepted))
             .await
             .map_err(|_| failed())?;
         journal.record.round_trip = Some(State::Complete);

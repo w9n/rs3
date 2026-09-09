@@ -1,18 +1,18 @@
 //! White-box properties for the pure planner without widening the production API.
 //!
 //! Compile the same private planner source in this test crate. Staging properties
-//! live beside PendingV2State because they also need private repository state.
+//! live beside PendingV3State because they also need private repository state.
 
 use proptest::prelude::*;
 use rs3_index::run::{
     IndexBlindKey, IndexMutation, IndexPayloadPointer, IndexRun, IndexRunLimits, IndexTombstone,
     IndexUpsert,
 };
-use rs3_repository::v2;
+use rs3_repository::v3;
 use rs3_types::{KeyId, LogicalPath, Sequence};
 use std::collections::BTreeMap;
 
-#[path = "../src/v2/service/packed_compaction.rs"]
+#[path = "../src/v3/service/packed_compaction.rs"]
 mod packed_compaction;
 use packed_compaction::{PackedCompactionSourceRun, plan_packed_run_compaction};
 
@@ -45,7 +45,7 @@ proptest! {
         }
         let planned = plan_packed_run_compaction(sources, &limits, None);
         if group_sizes.values().any(|count| *count > shard_limit) {
-            prop_assert_eq!(planned, Err(v2::V2FormatError::IndexRunLimitExceeded));
+            prop_assert_eq!(planned, Err(v3::V3FormatError::IndexRunLimitExceeded));
         } else {
             // An independent capacity model: whole generations fill each shard
             // until the next group would exceed its mutation count ceiling.
@@ -59,7 +59,7 @@ proptest! {
                 used += count;
             }
             if shard_count >= source_count {
-                prop_assert_eq!(planned, Err(v2::V2FormatError::MaintenanceBudgetExceeded));
+                prop_assert_eq!(planned, Err(v3::V3FormatError::MaintenanceBudgetExceeded));
             } else {
                 let runs = planned.expect("reducing bounded history should compact");
                 prop_assert_eq!(runs.len(), shard_count);
@@ -106,7 +106,7 @@ proptest! {
         let mut sources = vec![source(mutation(key, generation, true)), source(mutation(key, generation, false))];
         if reverse { sources.reverse(); }
         prop_assert_eq!(plan_packed_run_compaction(sources, &IndexRunLimits::default(), None),
-            Err(v2::V2FormatError::InvalidIndexRun));
+            Err(v3::V3FormatError::InvalidIndexRun));
     }
 }
 

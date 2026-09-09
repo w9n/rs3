@@ -3,11 +3,11 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_repository::v2::{
-    UnenforcedQuiescedMaintenanceGuard, V2_SECTION_FLAG_MUST_UNDERSTAND, V2AnchorState,
-    V2CommitAnchor, V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite,
-    V2FormatError, V2FormatRef, V2FullGcApplyOptions, V2FullGcDryRunOptions, V2KeyringEnvelopeRef,
-    V2MemoryAnchor, V2OrphanGcOptions, V2ProviderProfile, V2Result, V2SectionType,
+use rs3_repository::v3::{
+    UnenforcedQuiescedMaintenanceGuard, V3_SECTION_FLAG_MUST_UNDERSTAND, V3AnchorState,
+    V3CommitAnchor, V3CommitSection, V3CommitStore, V3CommitStoreOptions, V3CommitWrite,
+    V3FormatError, V3FormatRef, V3FullGcApplyOptions, V3FullGcDryRunOptions, V3KeyringEnvelopeRef,
+    V3MemoryAnchor, V3OrphanGcOptions, V3ProviderProfile, V3Result, V3SectionType,
 };
 use rs3_storage::MemoryBlobStore;
 use rs3_types::{
@@ -19,8 +19,8 @@ use std::time::Duration;
 #[tokio::test]
 async fn disabled_reclamation_preserves_orphans_until_enabled_apply() {
     let store = MemoryBlobStore::new();
-    let repository = V2CommitStore::new(store, test_keyring(), test_options());
-    let anchor = V2MemoryAnchor::new();
+    let repository = V3CommitStore::new(store, test_keyring(), test_options());
+    let anchor = V3MemoryAnchor::new();
 
     repository
         .write_genesis_snapshot(&anchor)
@@ -29,14 +29,14 @@ async fn disabled_reclamation_preserves_orphans_until_enabled_apply() {
     let failed = repository
         .write_child_commit(
             &FailOnceAnchor::new(anchor.clone()),
-            V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexRun,
-                V2_SECTION_FLAG_MUST_UNDERSTAND,
+            V3CommitWrite::delta(vec![V3CommitSection::new(
+                V3SectionType::IndexRun,
+                V3_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"unanchored maintenance fixture"),
             )]),
         )
         .await;
-    assert_eq!(failed, Err(V2FormatError::AnchorAdvanceFailed));
+    assert_eq!(failed, Err(V3FormatError::AnchorAdvanceFailed));
     assert_eq!(
         repository
             .report_orphans(&anchor)
@@ -88,22 +88,22 @@ async fn disabled_reclamation_preserves_orphans_until_enabled_apply() {
     );
 }
 
-fn apply_options(reclamation_enabled: bool) -> V2FullGcApplyOptions {
-    V2FullGcApplyOptions {
-        dry_run: V2FullGcDryRunOptions::default(),
-        orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+fn apply_options(reclamation_enabled: bool) -> V3FullGcApplyOptions {
+    V3FullGcApplyOptions {
+        dry_run: V3FullGcDryRunOptions::default(),
+        orphan_gc: V3OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
         retained_provider_conformance_passed: false,
         reclamation_enabled,
     }
 }
 
 struct FailOnceAnchor {
-    inner: V2MemoryAnchor,
+    inner: V3MemoryAnchor,
     remaining_failures: AtomicUsize,
 }
 
 impl FailOnceAnchor {
-    fn new(inner: V2MemoryAnchor) -> Self {
+    fn new(inner: V3MemoryAnchor) -> Self {
         Self {
             inner,
             remaining_failures: AtomicUsize::new(1),
@@ -112,16 +112,16 @@ impl FailOnceAnchor {
 }
 
 #[async_trait]
-impl V2CommitAnchor for FailOnceAnchor {
-    async fn read_v2(&self) -> V2Result<Option<V2AnchorState>> {
-        self.inner.read_v2().await
+impl V3CommitAnchor for FailOnceAnchor {
+    async fn read_v3(&self) -> V3Result<Option<V3AnchorState>> {
+        self.inner.read_v3().await
     }
 
-    async fn compare_and_advance_v2(
+    async fn compare_and_advance_v3(
         &self,
-        expected: Option<&V2AnchorState>,
-        next: V2AnchorState,
-    ) -> V2Result<V2AnchorState> {
+        expected: Option<&V3AnchorState>,
+        next: V3AnchorState,
+    ) -> V3Result<V3AnchorState> {
         if self
             .remaining_failures
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -129,21 +129,21 @@ impl V2CommitAnchor for FailOnceAnchor {
             })
             .is_ok()
         {
-            return Err(V2FormatError::AnchorAdvanceFailed);
+            return Err(V3FormatError::AnchorAdvanceFailed);
         }
-        self.inner.compare_and_advance_v2(expected, next).await
+        self.inner.compare_and_advance_v3(expected, next).await
     }
 }
 
-fn test_options() -> V2CommitStoreOptions {
-    V2CommitStoreOptions::for_profile(
-        V2ProviderProfile::Dev,
+fn test_options() -> V3CommitStoreOptions {
+    V3CommitStoreOptions::for_profile(
+        V3ProviderProfile::Dev,
         repository_id("rs3-maintenance-reclamation-test"),
-        V2KeyringEnvelopeRef {
+        V3KeyringEnvelopeRef {
             object_id: object_id("keyrings/00000000000000000001-maintenance"),
             digest: [6_u8; 32],
         },
-        V2FormatRef {
+        V3FormatRef {
             generation: 1,
             digest: hex::encode([7_u8; 32]),
             object_id: object_id(&format!("format/{:020}-{}", 1_u64, hex::encode([7_u8; 32]))),

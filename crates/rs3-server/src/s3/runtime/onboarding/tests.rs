@@ -46,15 +46,15 @@ impl Default for Guard {
     }
 }
 #[async_trait::async_trait]
-impl V2MaintenanceGuard for Guard {
-    async fn verify_v2_maintenance(
+impl V3MaintenanceGuard for Guard {
+    async fn verify_v3_maintenance(
         &self,
-        _: Option<&V2AnchorState>,
-    ) -> rs3_repository::v2::V2Result<()> {
+        _: Option<&V3AnchorState>,
+    ) -> rs3_repository::v3::V3Result<()> {
         if self.0.load(Ordering::SeqCst) {
             Ok(())
         } else {
-            Err(rs3_repository::v2::V2FormatError::MaintenanceAccessRequired)
+            Err(rs3_repository::v3::V3FormatError::MaintenanceAccessRequired)
         }
     }
 }
@@ -79,7 +79,7 @@ impl Default for FixtureProbe<'_> {
 }
 #[async_trait::async_trait]
 impl Probe for FixtureProbe<'_> {
-    async fn observe(&self, _root: String, attempts: u8) -> V2ProbeObservation {
+    async fn observe(&self, _root: String, attempts: u8) -> V3ProbeObservation {
         probe_observation::unavailable(attempts, "fixture-unobserved")
     }
     fn accepts(&self, evidence: &str) -> bool {
@@ -353,7 +353,7 @@ async fn qualification_wrapper_drives_the_real_bootstrap_engine_and_reuses_accep
     let mut config = crate::s3::test_support::runtime_config(true);
     config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 1));
     let store = RuntimeStore::new(rs3_storage::MemoryBlobStore::new());
-    let anchor = RuntimeV2Anchor::new(rs3_repository::v2::V2MemoryAnchor::new());
+    let anchor = RuntimeV3Anchor::new(rs3_repository::v3::V3MemoryAnchor::new());
     let mut backing = MemoryJournal::default();
     let probe = FixtureProbe::default();
     let guard = Guard::default();
@@ -401,7 +401,7 @@ async fn onboarding_generates_and_journals_the_salt_when_none_is_configured() {
     let mut config = crate::s3::test_support::runtime_config(true);
     config.repository_keys.repository_salt_hex = None;
     let store = RuntimeStore::new(rs3_storage::MemoryBlobStore::new());
-    let anchor = RuntimeV2Anchor::new(rs3_repository::v2::V2MemoryAnchor::new());
+    let anchor = RuntimeV3Anchor::new(rs3_repository::v3::V3MemoryAnchor::new());
     let mut backing = MemoryJournal::default();
     let probe = FixtureProbe::default();
     let guard = Guard::default();
@@ -465,7 +465,7 @@ async fn fresh_journal_over_an_anchored_repository_adopts_its_salt_instead_of_ge
     let mut config = crate::s3::test_support::runtime_config(true);
     config.repository_keys.repository_salt_hex = None;
     let store = RuntimeStore::new(rs3_storage::MemoryBlobStore::new());
-    let anchor = RuntimeV2Anchor::new(rs3_repository::v2::V2MemoryAnchor::new());
+    let anchor = RuntimeV3Anchor::new(rs3_repository::v3::V3MemoryAnchor::new());
     let guard = Guard::default();
     let probe = FixtureProbe::default();
     let mut first_journal = MemoryJournal::default();
@@ -551,8 +551,8 @@ async fn fresh_journal_over_an_anchored_repository_adopts_its_salt_instead_of_ge
 
 #[tokio::test]
 async fn projected_readiness_requires_matching_evidence_and_completed_bootstrap() {
-    use rs3_repository::v2::{
-        V2ProviderCheckStatus, V2ProviderConformanceCheck, required_v2_provider_check_names,
+    use rs3_repository::v3::{
+        V3ProviderCheckStatus, V3ProviderConformanceCheck, required_v3_provider_check_names,
     };
     let mut config = crate::s3::test_support::runtime_config(true);
     let store = build_store(&config.backend).await.expect("memory store");
@@ -563,24 +563,24 @@ async fn projected_readiness_requires_matching_evidence_and_completed_bootstrap(
         field_manager: "fixture".to_owned(),
     };
     config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 30));
-    let profile = V2ProviderProfile::RetainedVersionObjectLock;
-    let report = V2ProviderConformanceReport {
+    let profile = V3ProviderProfile::RetainedVersionObjectLock;
+    let report = V3ProviderConformanceReport {
         profile,
-        checks: required_v2_provider_check_names(profile)
+        checks: required_v3_provider_check_names(profile)
             .into_iter()
-            .map(|name| V2ProviderConformanceCheck {
+            .map(|name| V3ProviderConformanceCheck {
                 name,
-                status: V2ProviderCheckStatus::Passed,
+                status: V3ProviderCheckStatus::Passed,
                 reason: None,
             })
             .collect(),
     };
     let evidence =
-        encode_provider_conformance_evidence(&V2ProviderCheckConfig::from(&config), &report)
+        encode_provider_conformance_evidence(&V3ProviderCheckConfig::from(&config), &report)
             .expect("fixture evidence");
     let mut backing = MemoryJournal::default();
     let guard = Guard::default();
-    let anchor = RuntimeV2Anchor::new(rs3_repository::v2::V2MemoryAnchor::new());
+    let anchor = RuntimeV3Anchor::new(rs3_repository::v3::V3MemoryAnchor::new());
     {
         let mut journal = OnboardingJournal::open(&mut backing, &config, None).expect("journal");
         journal
@@ -614,7 +614,7 @@ async fn projected_readiness_requires_matching_evidence_and_completed_bootstrap(
         .await
         .expect("initialize");
         assert!(
-            !v2_bootstrap_journal_is_initialized(
+            !v3_bootstrap_journal_is_initialized(
                 &config,
                 &serde_json::to_vec(&journal.record).expect("journal bytes"),
             )
@@ -632,7 +632,7 @@ async fn projected_readiness_requires_matching_evidence_and_completed_bootstrap(
         .expect("restore fixture");
     }
     let bytes = backing.bytes.as_deref().expect("completed state");
-    assert!(v2_bootstrap_journal_is_initialized(&config, bytes).expect("initialized"));
+    assert!(v3_bootstrap_journal_is_initialized(&config, bytes).expect("initialized"));
     let original: serde_json::Value = serde_json::from_slice(bytes).expect("record");
     for field in [
         "implementation_fingerprint",

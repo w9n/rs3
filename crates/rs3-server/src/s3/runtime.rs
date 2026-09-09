@@ -6,9 +6,9 @@ use super::bounded_io::{
 };
 use super::repository_init;
 #[cfg(feature = "k8s")]
-use super::runtime_builders::build_v2_anchor_with_writer_fence;
-use super::runtime_builders::{StoreBuild, build_store, build_v2_anchor, coordinator_options};
-use super::runtime_handles::{RuntimeStore, RuntimeV2Anchor};
+use super::runtime_builders::build_v3_anchor_with_writer_fence;
+use super::runtime_builders::{StoreBuild, build_store, build_v3_anchor, coordinator_options};
+use super::runtime_handles::{RuntimeStore, RuntimeV3Anchor};
 use super::runtime_keyring::{
     open_gateway_keyring_reference, repository_key_context_for_envelope,
     repository_key_context_for_salt, retained_version_id, retained_version_required, secret_hex,
@@ -16,13 +16,13 @@ use super::runtime_keyring::{
 };
 use crate::admin::{
     AdminReadiness, AdminReadinessSource, AdminRepositoryRuntimeFacts, AdminRuntimeFacts,
-    AdminRuntimeFactsSource, AdminV2CommitCoordinatorSummary,
+    AdminRuntimeFactsSource, AdminV3CommitCoordinatorSummary,
 };
 use crate::config::KEYRING_WRAPPING_KEY_HEX_ENV;
 use crate::maintenance::{MaintenanceRunPhase, MaintenanceRuntime};
 use crate::{
     BackendConfig, GatewayMode, RepositoryFormat, RepositoryKeysConfig, RuntimeConfig,
-    V2ProviderCheckConfig,
+    V3ProviderCheckConfig,
 };
 use bytes::Bytes;
 use futures_util::Stream;
@@ -30,15 +30,15 @@ use rs3_crypto::{KeyRing, MAX_FORMAT_ENVELOPE_OBJECT_BYTES, RepositoryEnvelope};
 use rs3_index::KeyringEnvelopeReference;
 #[cfg(feature = "k8s")]
 use rs3_k8s::WriterFence;
-pub use rs3_repository::v2::V2_RESTORE_BUNDLE_SCHEMA;
-use rs3_repository::v2::{
-    V2AnchorState, V2AuthenticatedReadBody, V2CommitAnchor, V2CommitCoordinator, V2CommitKey,
-    V2CommitStore, V2CommitStoreOptions, V2FormatRef, V2FormatRoot, V2FullGcApplyOptions,
-    V2FullGcDryRunOptions, V2FullGcDryRunReport, V2FullGcPlanPreview, V2FullMaintenanceReport,
-    V2KeyringEnvelopeRootRef, V2MaintenanceCancellation, V2MaintenanceGuard, V2MaintenanceReport,
-    V2ProviderConformanceOptions, V2ProviderConformanceReport, V2ProviderProfile,
-    V2QuickMaintenanceOptions, V2RecoveryBundle, V2Repository, V2ResolvedObject,
-    check_v2_provider_conformance, v2_format_object_id,
+pub use rs3_repository::v3::V3_RESTORE_BUNDLE_SCHEMA;
+use rs3_repository::v3::{
+    V3AnchorState, V3AuthenticatedReadBody, V3CommitAnchor, V3CommitCoordinator, V3CommitKey,
+    V3CommitStore, V3CommitStoreOptions, V3FormatRef, V3FormatRoot, V3FullGcApplyOptions,
+    V3FullGcDryRunOptions, V3FullGcDryRunReport, V3FullGcPlanPreview, V3FullMaintenanceReport,
+    V3KeyringEnvelopeRootRef, V3MaintenanceCancellation, V3MaintenanceGuard, V3MaintenanceReport,
+    V3ProviderConformanceOptions, V3ProviderConformanceReport, V3ProviderProfile,
+    V3QuickMaintenanceOptions, V3RecoveryBundle, V3Repository, V3ResolvedObject,
+    check_v3_provider_conformance, v3_format_object_id,
 };
 use rs3_repository::{
     DeleteOutcome, RepositoryCopyOptions, RepositoryError, RepositoryListEntry,
@@ -61,24 +61,24 @@ mod onboarding;
 mod recovery_view;
 pub use recovery_view::recovery_points_from_config;
 
-const V2_FORMAT_ENVELOPE_CONTENT_TYPE: &str = "application/vnd.rs3.format-envelope+cbor";
+const V3_FORMAT_ENVELOPE_CONTENT_TYPE: &str = "application/vnd.rs3.format-envelope+cbor";
 
-/// Result of importing a trusted v2 anchor bundle.
+/// Result of importing a trusted v3 anchor bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct V2AnchorImportReport {
+pub struct V3AnchorImportReport {
     /// Verified anchor state named by the trusted bundle.
-    pub anchor: V2AnchorState,
+    pub anchor: V3AnchorState,
     /// True when this call recreated a missing anchor.
     pub applied: bool,
     /// Number of commits verified from the imported anchor to the nearest snapshot.
     pub verified_commit_count: usize,
 }
 
-/// Result of one-shot v2 repository initialization or verification.
+/// Result of one-shot v3 repository initialization or verification.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct V2RepositoryInitReport {
+pub struct V3RepositoryInitReport {
     /// Anchor state verified after initialization.
-    pub anchor: V2AnchorState,
+    pub anchor: V3AnchorState,
     /// True when this run completed an unfinished repository initialization.
     pub initialized: bool,
     /// Number of commits verified from the anchor to the nearest snapshot.
@@ -88,7 +88,7 @@ pub struct V2RepositoryInitReport {
     /// Whether journaled bootstrap verified and removed its synthetic payload.
     pub payload_restore_verified: bool,
     /// Last bounded observation of synthetic probe versions, if available.
-    pub probe_observation: Option<V2ProbeObservation>,
+    pub probe_observation: Option<V3ProbeObservation>,
 }
 
 /// Advisory, path-redacted facts about a bounded synthetic probe inventory.
@@ -96,7 +96,7 @@ pub struct V2RepositoryInitReport {
 /// multipart sessions are not covered by object-version listing.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct V2ProbeObservation {
+pub struct V3ProbeObservation {
     /// Reserved attempts included in this observation's namespace.
     pub attempts_covered: u8,
     /// Time of observation, in Unix milliseconds; reused reports keep this time.
@@ -186,18 +186,18 @@ impl DoctorProbeCheck {
     }
 }
 
-/// Operator-provided options for v2 anchor import.
+/// Operator-provided options for v3 anchor import.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct V2AnchorImportOptions {
+pub struct V3AnchorImportOptions {
     /// External weak-subjectivity floor that the imported anchor must satisfy.
     pub min_sequence: Sequence,
     /// Allow importing an anchor below newer commit objects seen in storage.
     pub force_rollback: bool,
 }
 
-/// Runtime options for v2 provider conformance probes.
+/// Runtime options for v3 provider conformance probes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RuntimeV2ProviderConformanceOptions {
+pub struct RuntimeV3ProviderConformanceOptions {
     /// Disjoint S3 backend prefix for synthetic probes. A random prefix is the default.
     pub probe_prefix: Option<String>,
     /// Whether legal-hold add/verify probes should run.
@@ -209,16 +209,16 @@ pub struct RuntimeV2ProviderConformanceOptions {
 #[derive(Clone)]
 pub(super) struct RuntimeRepository {
     store: RuntimeStore,
-    repository: Arc<V2Repository<RuntimeStore>>,
-    recovery_view: Option<Arc<rs3_repository::v2::V2RecoveryView<RuntimeStore>>>,
-    coordinator: Arc<V2CommitCoordinator<RuntimeStore, RuntimeV2Anchor>>,
-    anchor: RuntimeV2Anchor,
+    repository: Arc<V3Repository<RuntimeStore>>,
+    recovery_view: Option<Arc<rs3_repository::v3::V3RecoveryView<RuntimeStore>>>,
+    coordinator: Arc<V3CommitCoordinator<RuntimeStore, RuntimeV3Anchor>>,
+    anchor: RuntimeV3Anchor,
     initialized: bool,
     require_anchor_version: bool,
     #[cfg(test)]
     memory_store: Option<MemoryBlobStore>,
     #[cfg(test)]
-    memory_anchor: Option<rs3_repository::v2::V2MemoryAnchor>,
+    memory_anchor: Option<rs3_repository::v3::V3MemoryAnchor>,
 }
 
 #[derive(Clone)]
@@ -232,7 +232,7 @@ pub(super) struct RuntimeCommittedPut {
 }
 
 pub(super) struct RuntimeResolvedObject {
-    inner: V2ResolvedObject,
+    inner: V3ResolvedObject,
 }
 
 impl RuntimeResolvedObject {
@@ -241,10 +241,10 @@ impl RuntimeResolvedObject {
     }
 }
 
-struct LoadedV2Repository {
+struct LoadedV3Repository {
     keyring: KeyRing,
-    keyring_ref: V2KeyringEnvelopeRootRef,
-    format_ref: V2FormatRef,
+    keyring_ref: V3KeyringEnvelopeRootRef,
+    format_ref: V3FormatRef,
     anchor_present: bool,
     /// Public salt bound into the format root and keyring envelope.
     repository_salt: Vec<u8>,
@@ -252,21 +252,21 @@ struct LoadedV2Repository {
 
 /// A decrypted format root together with the public salt its envelope carried.
 struct OpenedFormatRoot {
-    root: V2FormatRoot,
+    root: V3FormatRoot,
     repository_salt: Vec<u8>,
 }
 
 fn bootstrap_commit_options(
     config: &RuntimeConfig,
-    loaded: &LoadedV2Repository,
-) -> Result<V2CommitStoreOptions, S3BoundaryError> {
-    let provider_profile = v2_provider_profile(&config.backend, config.repository.retention);
+    loaded: &LoadedV3Repository,
+) -> Result<V3CommitStoreOptions, S3BoundaryError> {
+    let provider_profile = v3_provider_profile(&config.backend, config.repository.retention);
     // Recovery history records exact protected object versions. Only the
     // retained profile establishes that provider contract at the gateway
     // boundary; Dev and AtomicCreate retain their native publication path.
-    let recovery_policy = (provider_profile == V2ProviderProfile::RetainedVersionObjectLock)
+    let recovery_policy = (provider_profile == V3ProviderProfile::RetainedVersionObjectLock)
         .then_some(config.recovery.policy);
-    Ok(V2CommitStoreOptions::for_profile(
+    Ok(V3CommitStoreOptions::for_profile(
         provider_profile,
         config.repository_keys.repository_id.clone(),
         loaded.keyring_ref.commit_ref().map_err(repository_init)?,
@@ -295,7 +295,7 @@ impl RuntimeRepository {
         config: &RuntimeConfig,
         writer_fence: WriterFence,
     ) -> Result<Self, S3BoundaryError> {
-        let maintenance_guard: Arc<dyn V2MaintenanceGuard> = Arc::new(writer_fence.clone());
+        let maintenance_guard: Arc<dyn V3MaintenanceGuard> = Arc::new(writer_fence.clone());
         Self::from_config_inner(
             config,
             Some(writer_fence),
@@ -307,7 +307,7 @@ impl RuntimeRepository {
 
     pub(super) async fn from_config_with_maintenance_guard(
         config: &RuntimeConfig,
-        maintenance_guard: Arc<dyn V2MaintenanceGuard>,
+        maintenance_guard: Arc<dyn V3MaintenanceGuard>,
     ) -> Result<Self, S3BoundaryError> {
         Self::from_config_inner(
             config,
@@ -322,7 +322,7 @@ impl RuntimeRepository {
         config: &RuntimeConfig,
         #[cfg(feature = "k8s")] writer_fence: Option<WriterFence>,
         #[cfg(not(feature = "k8s"))] _writer_fence: Option<()>,
-        maintenance_guard: Option<Arc<dyn V2MaintenanceGuard>>,
+        maintenance_guard: Option<Arc<dyn V3MaintenanceGuard>>,
         startup: RuntimeStartup,
     ) -> Result<Self, S3BoundaryError> {
         let store = build_store(&config.backend).await?;
@@ -339,7 +339,7 @@ impl RuntimeRepository {
         store: StoreBuild,
         #[cfg(feature = "k8s")] writer_fence: Option<WriterFence>,
         #[cfg(not(feature = "k8s"))] _writer_fence: Option<()>,
-        maintenance_guard: Option<Arc<dyn V2MaintenanceGuard>>,
+        maintenance_guard: Option<Arc<dyn V3MaintenanceGuard>>,
         startup: RuntimeStartup,
     ) -> Result<Self, S3BoundaryError> {
         if startup == RuntimeStartup::HistoryOnly && config.mode != GatewayMode::RestoreReadOnly {
@@ -359,18 +359,18 @@ impl RuntimeRepository {
         }
         if let Some(guard) = maintenance_guard.as_ref() {
             guard
-                .verify_v2_maintenance(None)
+                .verify_v3_maintenance(None)
                 .await
                 .map_err(repository_init)?;
         }
         #[cfg(feature = "k8s")]
-        let anchor = build_v2_anchor_with_writer_fence(&config.anchor, writer_fence)?;
+        let anchor = build_v3_anchor_with_writer_fence(&config.anchor, writer_fence)?;
         #[cfg(not(feature = "k8s"))]
-        let anchor = build_v2_anchor(&config.anchor)?;
+        let anchor = build_v3_anchor(&config.anchor)?;
         let store_handle = store.handle().clone();
         let anchor_handle = anchor.handle().clone();
-        let provider_profile = v2_provider_profile(&config.backend, config.repository.retention);
-        let loaded = load_or_bootstrap_v2_repository(
+        let provider_profile = v3_provider_profile(&config.backend, config.repository.retention);
+        let loaded = load_or_bootstrap_v3_repository(
             &store_handle,
             &anchor_handle,
             config,
@@ -379,7 +379,7 @@ impl RuntimeRepository {
         .await?;
         let initialized = !loaded.anchor_present;
         let commit_options = bootstrap_commit_options(config, &loaded)?;
-        let repository = Arc::new(V2Repository::new(
+        let repository = Arc::new(V3Repository::new(
             store_handle.clone(),
             loaded.keyring,
             RepositoryOptions {
@@ -411,7 +411,7 @@ impl RuntimeRepository {
                 .await
                 .map_err(repository_init)?;
         }
-        let coordinator = V2CommitCoordinator::with_options(
+        let coordinator = V3CommitCoordinator::with_options(
             Arc::clone(&repository),
             anchor_handle.clone(),
             coordinator_options(config.batching),
@@ -453,7 +453,7 @@ impl RuntimeRepository {
                 .await
                 .map_err(repository_init);
         }
-        let Some(anchor_state) = self.anchor.read_v2().await.map_err(repository_init)? else {
+        let Some(anchor_state) = self.anchor.read_v3().await.map_err(repository_init)? else {
             return Err(repository_init("v3-preview repository anchor is missing"));
         };
         if self.require_anchor_version && anchor_state.version_id.is_none() {
@@ -502,7 +502,7 @@ impl RuntimeRepository {
         key: LogicalPath,
         options: RepositoryPutOptions,
         checksum_policy: Option<rs3_repository::MultipartChecksumPolicy>,
-    ) -> Result<rs3_repository::v2::V3ClientMultipartUpload, RepositoryError> {
+    ) -> Result<rs3_repository::v3::V3ClientMultipartUpload, RepositoryError> {
         self.repository
             .create_multipart_upload(key, options, checksum_policy)
             .await
@@ -512,7 +512,7 @@ impl RuntimeRepository {
         &self,
         id: &rs3_types::MultipartUploadId,
         key: &LogicalPath,
-        selection: &rs3_repository::v2::V3MultipartSelection,
+        selection: &rs3_repository::v3::V3MultipartSelection,
     ) -> Result<Option<rs3_index::completion::CompletionReceipt>, RepositoryError> {
         self.repository
             .accepted_multipart_completion(id, key, selection)
@@ -520,8 +520,8 @@ impl RuntimeRepository {
 
     pub(super) async fn complete_multipart_upload(
         &self,
-        upload: rs3_repository::v2::V3ClientMultipartUpload,
-        selection: rs3_repository::v2::V3MultipartSelection,
+        upload: rs3_repository::v3::V3ClientMultipartUpload,
+        selection: rs3_repository::v3::V3MultipartSelection,
     ) -> Result<rs3_index::completion::CompletionReceipt, RepositoryError> {
         self.coordinator
             .complete_multipart_upload(upload, selection)
@@ -634,7 +634,7 @@ impl RuntimeRepository {
     pub(super) async fn get_resolved_full_stream(
         &self,
         resolved: &RuntimeResolvedObject,
-    ) -> Result<Option<V2AuthenticatedReadBody>, RepositoryError> {
+    ) -> Result<Option<V3AuthenticatedReadBody>, RepositoryError> {
         match &self.recovery_view {
             Some(view) => view.get_resolved_full_stream(&resolved.inner).await,
             None => {
@@ -688,7 +688,7 @@ impl RuntimeRepository {
     }
 
     #[cfg(test)]
-    pub(super) fn memory_v2_anchor(&self) -> Option<&rs3_repository::v2::V2MemoryAnchor> {
+    pub(super) fn memory_v3_anchor(&self) -> Option<&rs3_repository::v3::V3MemoryAnchor> {
         self.memory_anchor.as_ref()
     }
 }
@@ -699,7 +699,7 @@ impl MaintenanceRuntime for RuntimeRepository {
         self.coordinator.has_maintenance_guard()
     }
 
-    async fn quick_maintenance_report(&self) -> Result<V2MaintenanceReport, RepositoryError> {
+    async fn quick_maintenance_report(&self) -> Result<V3MaintenanceReport, RepositoryError> {
         self.repository
             .commit_store()
             .quick_maintenance(&self.anchor)
@@ -711,8 +711,8 @@ impl MaintenanceRuntime for RuntimeRepository {
 
     async fn quick_maintenance_report_with_options(
         &self,
-        options: V2QuickMaintenanceOptions,
-    ) -> Result<V2MaintenanceReport, RepositoryError> {
+        options: V3QuickMaintenanceOptions,
+    ) -> Result<V3MaintenanceReport, RepositoryError> {
         self.repository
             .commit_store()
             .quick_maintenance_with_options(&self.anchor, options)
@@ -724,15 +724,15 @@ impl MaintenanceRuntime for RuntimeRepository {
 
     async fn full_gc_dry_run(
         &self,
-        options: V2FullGcDryRunOptions,
-    ) -> Result<V2FullGcDryRunReport, RepositoryError> {
+        options: V3FullGcDryRunOptions,
+    ) -> Result<V3FullGcDryRunReport, RepositoryError> {
         self.repository.full_gc_dry_run(&self.anchor, options).await
     }
 
     async fn preview_full_gc_plan(
         &self,
-        options: V2FullGcApplyOptions,
-    ) -> Result<V2FullGcPlanPreview, RepositoryError> {
+        options: V3FullGcApplyOptions,
+    ) -> Result<V3FullGcPlanPreview, RepositoryError> {
         self.repository
             .preview_full_gc_plan(&self.anchor, options)
             .await
@@ -740,11 +740,11 @@ impl MaintenanceRuntime for RuntimeRepository {
 
     async fn run_full_maintenance(
         &self,
-        options: V2FullGcApplyOptions,
+        options: V3FullGcApplyOptions,
         expected_plan_digest: Option<&str>,
-        cancellation: &V2MaintenanceCancellation,
+        cancellation: &V3MaintenanceCancellation,
         on_phase: &(dyn Fn(MaintenanceRunPhase) + Send + Sync),
-    ) -> Result<V2FullMaintenanceReport, RepositoryError> {
+    ) -> Result<V3FullMaintenanceReport, RepositoryError> {
         on_phase(MaintenanceRunPhase::Quiescing);
         self.coordinator
             .run_full_maintenance_expected(options, expected_plan_digest, cancellation, &|| {
@@ -760,7 +760,7 @@ impl AdminRuntimeFactsSource for RuntimeRepositoryAdminFacts {
         AdminRuntimeFacts {
             process_started_at_ms: Some(self.process_started_at_ms),
             repository: AdminRepositoryRuntimeFacts {
-                v2_commit_coordinator: Some(AdminV2CommitCoordinatorSummary {
+                v3_commit_coordinator: Some(AdminV3CommitCoordinatorSummary {
                     poisoned: status.poisoned,
                     poison_reason: status.poison_reason,
                 }),
@@ -780,7 +780,7 @@ impl AdminReadinessSource for RuntimeRepositoryAdminFacts {
             return AdminReadiness::unavailable("repository.coordinator-poisoned");
         }
 
-        let anchor = match self.repository.anchor.read_v2().await {
+        let anchor = match self.repository.anchor.read_v3().await {
             Ok(Some(anchor)) => anchor,
             Ok(None) => return AdminReadiness::unavailable("anchor.missing"),
             Err(_) => return AdminReadiness::unavailable("anchor.unavailable"),
@@ -806,7 +806,7 @@ impl AdminReadinessSource for RuntimeRepositoryAdminFacts {
 ///
 /// Prepare before acquiring the writer Lease, then consume under that fence.
 /// This handle neither creates repository objects nor changes the anchor.
-pub struct V2PreparedRepositoryInit {
+pub struct V3PreparedRepositoryInit {
     config: RuntimeConfig,
     store: StoreBuild,
 }
@@ -814,7 +814,7 @@ pub struct V2PreparedRepositoryInit {
 /// Checks a trusted projected S3 onboarding journal without backend or Lease IO.
 /// True means initialization finished with current matching provider evidence;
 /// normal serving must still verify its live anchor and accepted repository.
-pub fn v2_bootstrap_journal_is_initialized(
+pub fn v3_bootstrap_journal_is_initialized(
     config: &RuntimeConfig,
     bytes: &[u8],
 ) -> Result<bool, S3BoundaryError> {
@@ -840,7 +840,7 @@ pub fn v2_bootstrap_journal_is_initialized(
 /// completed initialization under this configuration before it contends for
 /// the writer Lease. A completed record never authorizes writes on its own.
 #[cfg(feature = "k8s")]
-pub async fn v2_bootstrap_journal_state(
+pub async fn v3_bootstrap_journal_state(
     config: &RuntimeConfig,
     journal_secret: &str,
 ) -> Result<Option<Vec<u8>>, S3BoundaryError> {
@@ -866,13 +866,13 @@ pub async fn v2_bootstrap_journal_state(
     .map_err(repository_init)
 }
 
-impl V2PreparedRepositoryInit {
+impl V3PreparedRepositoryInit {
     /// Verifies an already initialized repository without the writer Lease.
     ///
     /// The live anchor and its accepted chain are read exactly as a
     /// restore-readonly gateway reads them; nothing is written and a missing
     /// anchor fails closed toward explicit recovery.
-    pub async fn verify_initialized(self) -> Result<V2RepositoryInitReport, S3BoundaryError> {
+    pub async fn verify_initialized(self) -> Result<V3RepositoryInitReport, S3BoundaryError> {
         let mut config = self.config;
         config.mode = GatewayMode::RestoreReadOnly;
         config.repository.allow_init = false;
@@ -906,7 +906,7 @@ impl V2PreparedRepositoryInit {
 
     /// Initializes local development storage, or verifies a read-only repository.
     /// Mutation-capable Kubernetes initialization requires the fenced method.
-    pub async fn initialize(self) -> Result<V2RepositoryInitReport, S3BoundaryError> {
+    pub async fn initialize(self) -> Result<V3RepositoryInitReport, S3BoundaryError> {
         if self.config.mode.allows_mutation()
             && !matches!(self.config.anchor, crate::AnchorConfig::Memory)
         {
@@ -933,7 +933,7 @@ impl V2PreparedRepositoryInit {
         writer_fence: WriterFence,
         journal_secret: &str,
         governance_bypass_reviewed: bool,
-    ) -> Result<V2RepositoryInitReport, S3BoundaryError> {
+    ) -> Result<V3RepositoryInitReport, S3BoundaryError> {
         let crate::AnchorConfig::KubernetesLease {
             namespace,
             name,
@@ -961,7 +961,7 @@ impl V2PreparedRepositoryInit {
         .await
         .map_err(repository_init)?;
         let anchor =
-            build_v2_anchor_with_writer_fence(&self.config.anchor, Some(writer_fence.clone()))?;
+            build_v3_anchor_with_writer_fence(&self.config.anchor, Some(writer_fence.clone()))?;
         if self.config.backend.is_s3() {
             return onboarding::initialize(
                 &self.config,
@@ -985,12 +985,12 @@ impl V2PreparedRepositoryInit {
     }
 }
 
-/// Initializes a local v2 repository, then verifies its accepted chain.
+/// Initializes a local v3 repository, then verifies its accepted chain.
 /// Kubernetes writers must prepare and initialize under an acquired fence.
-pub async fn init_v2_repository_from_config(
+pub async fn init_v3_repository_from_config(
     config: &RuntimeConfig,
-) -> Result<V2RepositoryInitReport, S3BoundaryError> {
-    V2PreparedRepositoryInit::prepare(config)
+) -> Result<V3RepositoryInitReport, S3BoundaryError> {
+    V3PreparedRepositoryInit::prepare(config)
         .await?
         .initialize()
         .await
@@ -998,8 +998,8 @@ pub async fn init_v2_repository_from_config(
 
 async fn verified_init_report(
     runtime: RuntimeRepository,
-) -> Result<V2RepositoryInitReport, S3BoundaryError> {
-    let Some(anchor) = runtime.anchor.read_v2().await.map_err(repository_init)? else {
+) -> Result<V3RepositoryInitReport, S3BoundaryError> {
+    let Some(anchor) = runtime.anchor.read_v3().await.map_err(repository_init)? else {
         return Err(repository_init(
             "v2 repository initialization did not produce an accepted anchor",
         ));
@@ -1012,7 +1012,7 @@ async fn verified_init_report(
         .ok_or_else(|| {
             repository_init("v2 repository initialization could not verify the accepted anchor")
         })?;
-    Ok(V2RepositoryInitReport {
+    Ok(V3RepositoryInitReport {
         anchor,
         initialized: runtime.initialized,
         verified_commit_count: chain.commits_newest_first.len(),
@@ -1032,7 +1032,7 @@ async fn verified_init_report(
 /// fenced in the same compare-and-swap.
 pub async fn offline_maintenance_runtime_from_config(
     config: &RuntimeConfig,
-    maintenance_guard: Arc<dyn V2MaintenanceGuard>,
+    maintenance_guard: Arc<dyn V3MaintenanceGuard>,
 ) -> Result<Arc<dyn MaintenanceRuntime>, S3BoundaryError> {
     if !matches!(config.anchor, crate::AnchorConfig::Memory) {
         return Err(repository_init(
@@ -1093,8 +1093,8 @@ pub async fn doctor_probe_from_config(config: &RuntimeConfig) -> DoctorProbeRepo
     };
 
     let mut anchor_was_read = false;
-    let anchor_state = match build_v2_anchor(&config.anchor) {
-        Ok(anchor) => match anchor.handle().read_v2().await {
+    let anchor_state = match build_v3_anchor(&config.anchor) {
+        Ok(anchor) => match anchor.handle().read_v3().await {
             Ok(state) => {
                 anchor_was_read = true;
                 checks.push(DoctorProbeCheck::ok(
@@ -1124,7 +1124,7 @@ pub async fn doctor_probe_from_config(config: &RuntimeConfig) -> DoctorProbeRepo
 
     let keyring_result = match store.as_ref() {
         Some(store) if anchor_was_read => match anchor_state.as_ref() {
-            Some(anchor_state) => load_existing_v2_repository(
+            Some(anchor_state) => load_existing_v3_repository(
                 store.handle(),
                 &config.repository_keys,
                 anchor_state,
@@ -1160,23 +1160,23 @@ pub async fn doctor_probe_from_config(config: &RuntimeConfig) -> DoctorProbeRepo
     DoctorProbeReport { checks }
 }
 
-pub(crate) async fn v2_quick_maintenance_from_config(
+pub(crate) async fn v3_quick_maintenance_from_config(
     config: &RuntimeConfig,
-) -> Result<rs3_repository::v2::V2MaintenanceReport, S3BoundaryError> {
+) -> Result<rs3_repository::v3::V3MaintenanceReport, S3BoundaryError> {
     if config.repository.format != RepositoryFormat::V3Preview {
         return Err(repository_init(
             "v2 maintenance requires the v3-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;
-    let anchor = build_v2_anchor(&config.anchor)?;
+    let anchor = build_v3_anchor(&config.anchor)?;
     let anchor_handle = anchor.handle().clone();
-    let Some(anchor_state) = anchor_handle.read_v2().await.map_err(repository_init)? else {
+    let Some(anchor_state) = anchor_handle.read_v3().await.map_err(repository_init)? else {
         return Err(repository_init(
             "v3-preview maintenance requires an accepted anchor",
         ));
     };
-    let loaded = load_existing_v2_repository(
+    let loaded = load_existing_v3_repository(
         store.handle(),
         &config.repository_keys,
         &anchor_state,
@@ -1184,39 +1184,39 @@ pub(crate) async fn v2_quick_maintenance_from_config(
     )
     .await?;
     let commit_options = bootstrap_commit_options(config, &loaded)?;
-    let commit_store = V2CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
+    let commit_store = V3CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
     commit_store
         .quick_maintenance_with_options(
             &anchor_handle,
-            V2QuickMaintenanceOptions {
+            V3QuickMaintenanceOptions {
                 budgets: config.maintenance.budgets(),
                 retention_renewal_horizon: config.maintenance.renewal_horizon,
-                ..V2QuickMaintenanceOptions::default()
+                ..V3QuickMaintenanceOptions::default()
             },
         )
         .await
         .map_err(repository_init)
 }
 
-/// Exports a trusted v2 recovery bundle after verifying the anchor-selected chain.
-pub async fn export_v2_recovery_bundle_from_config(
+/// Exports a trusted v3 recovery bundle after verifying the anchor-selected chain.
+pub async fn export_v3_recovery_bundle_from_config(
     config: &RuntimeConfig,
-) -> Result<V2RecoveryBundle, S3BoundaryError> {
+) -> Result<V3RecoveryBundle, S3BoundaryError> {
     if config.repository.format != RepositoryFormat::V3Preview {
         return Err(repository_init(
             "v2 recovery bundle export requires the v3-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;
-    let anchor = build_v2_anchor(&config.anchor)?;
+    let anchor = build_v3_anchor(&config.anchor)?;
     let anchor_handle = anchor.handle().clone();
-    let Some(anchor_state) = anchor_handle.read_v2().await.map_err(repository_init)? else {
+    let Some(anchor_state) = anchor_handle.read_v3().await.map_err(repository_init)? else {
         return Err(repository_init(
             "v3-preview recovery bundle export requires an accepted anchor",
         ));
     };
-    let provider_profile = v2_provider_profile(&config.backend, config.repository.retention);
-    let loaded = load_existing_v2_repository(
+    let provider_profile = v3_provider_profile(&config.backend, config.repository.retention);
+    let loaded = load_existing_v3_repository(
         store.handle(),
         &config.repository_keys,
         &anchor_state,
@@ -1226,7 +1226,7 @@ pub async fn export_v2_recovery_bundle_from_config(
     let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
     let maintenance_keyring_ref = loaded.keyring_ref.clone();
     let repository_salt_digest = rs3_crypto::Sha256Hasher::digest(&loaded.repository_salt);
-    let commit_options = V2CommitStoreOptions::for_profile(
+    let commit_options = V3CommitStoreOptions::for_profile(
         provider_profile,
         config.repository_keys.repository_id.clone(),
         commit_ref,
@@ -1234,13 +1234,13 @@ pub async fn export_v2_recovery_bundle_from_config(
     )
     .with_maintenance_keyring_envelope_ref(maintenance_keyring_ref)
     .with_retention(config.repository.retention);
-    let commit_store = V2CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
+    let commit_store = V3CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
     commit_store
         .load_replay_chain_from_state(&anchor_state)
         .await
         .map_err(repository_init)?;
 
-    let mut bundle = V2RecoveryBundle::from_anchor(anchor_state.clone(), anchor_state.sequence);
+    let mut bundle = V3RecoveryBundle::from_anchor(anchor_state.clone(), anchor_state.sequence);
     bundle.repository_id = Some(config.repository_keys.repository_id.clone());
     // The signed bundle cross-checks the salt of the anchored format root, so
     // an unconfigured opener still detects a bundle from another lineage.
@@ -1248,21 +1248,21 @@ pub async fn export_v2_recovery_bundle_from_config(
     Ok(bundle)
 }
 
-/// Imports a trusted v2 recovery bundle when the configured anchor is missing.
-pub async fn import_v2_anchor_from_config(
+/// Imports a trusted v3 recovery bundle when the configured anchor is missing.
+pub async fn import_v3_anchor_from_config(
     config: &RuntimeConfig,
-    bundle: V2RecoveryBundle,
-    options: V2AnchorImportOptions,
-) -> Result<V2AnchorImportReport, S3BoundaryError> {
+    bundle: V3RecoveryBundle,
+    options: V3AnchorImportOptions,
+) -> Result<V3AnchorImportReport, S3BoundaryError> {
     if config.repository.format != RepositoryFormat::V3Preview {
         return Err(repository_init(
             "v2 anchor import requires the v3-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;
-    let anchor = build_v2_anchor(&config.anchor)?;
+    let anchor = build_v3_anchor(&config.anchor)?;
     let anchor_handle = anchor.handle().clone();
-    let provider_profile = v2_provider_profile(&config.backend, config.repository.retention);
+    let provider_profile = v3_provider_profile(&config.backend, config.repository.retention);
     if bundle.repository_id.as_ref() != Some(&config.repository_keys.repository_id) {
         return Err(repository_init(
             "trusted v2 restore bundle repository identity is missing or does not match configuration",
@@ -1281,7 +1281,7 @@ pub async fn import_v2_anchor_from_config(
         options.force_rollback,
     )
     .await?;
-    let loaded = load_existing_v2_repository(
+    let loaded = load_existing_v3_repository(
         store.handle(),
         &config.repository_keys,
         &bundle.anchor,
@@ -1291,7 +1291,7 @@ pub async fn import_v2_anchor_from_config(
     reject_bundle_salt_mismatch(bundle.repository_salt_digest, &loaded.repository_salt)?;
     let commit_ref = loaded.keyring_ref.commit_ref().map_err(repository_init)?;
     let maintenance_keyring_ref = loaded.keyring_ref.clone();
-    let commit_options = V2CommitStoreOptions::for_profile(
+    let commit_options = V3CommitStoreOptions::for_profile(
         provider_profile,
         config.repository_keys.repository_id.clone(),
         commit_ref,
@@ -1299,9 +1299,9 @@ pub async fn import_v2_anchor_from_config(
     )
     .with_maintenance_keyring_envelope_ref(maintenance_keyring_ref)
     .with_retention(config.repository.retention);
-    let commit_store = V2CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
+    let commit_store = V3CommitStore::new(store.into_handle(), loaded.keyring, commit_options);
 
-    if let Some(current) = anchor_handle.read_v2().await.map_err(repository_init)? {
+    if let Some(current) = anchor_handle.read_v3().await.map_err(repository_init)? {
         if current != bundle.anchor {
             return Err(repository_init(
                 "configured v2 anchor already exists and differs from the trusted bundle",
@@ -1311,7 +1311,7 @@ pub async fn import_v2_anchor_from_config(
             .load_replay_chain_from_state(&current)
             .await
             .map_err(repository_init)?;
-        return Ok(V2AnchorImportReport {
+        return Ok(V3AnchorImportReport {
             anchor: current,
             applied: false,
             verified_commit_count: chain.commits_newest_first.len(),
@@ -1322,7 +1322,7 @@ pub async fn import_v2_anchor_from_config(
         .recreate_anchor_from_recovery_bundle(&anchor_handle, &bundle, options.min_sequence)
         .await
         .map_err(repository_init)?;
-    Ok(V2AnchorImportReport {
+    Ok(V3AnchorImportReport {
         anchor: bundle.anchor,
         applied: true,
         verified_commit_count: chain.commits_newest_first.len(),
@@ -1330,8 +1330,8 @@ pub async fn import_v2_anchor_from_config(
 }
 
 fn verify_recovery_bundle_trust(
-    bundle: &V2RecoveryBundle,
-    provider_profile: V2ProviderProfile,
+    bundle: &V3RecoveryBundle,
+    provider_profile: V3ProviderProfile,
     min_sequence: Sequence,
     recovery_public_key: Option<&str>,
 ) -> Result<(), S3BoundaryError> {
@@ -1341,7 +1341,7 @@ fn verify_recovery_bundle_trust(
         ));
     }
 
-    if provider_profile != V2ProviderProfile::Dev && bundle.offline_signature.is_none() {
+    if provider_profile != V3ProviderProfile::Dev && bundle.offline_signature.is_none() {
         return Err(repository_init(
             "production v2 anchor import requires an offline bundle signature",
         ));
@@ -1351,7 +1351,7 @@ fn verify_recovery_bundle_trust(
         Some(public_key) => bundle
             .verify_offline_signature(public_key)
             .map_err(repository_init),
-        None if provider_profile == V2ProviderProfile::Dev => Ok(()),
+        None if provider_profile == V3ProviderProfile::Dev => Ok(()),
         None => Err(repository_init(
             "production v2 anchor import requires RS3_RECOVERY_PUBLIC_KEY",
         )),
@@ -1362,14 +1362,14 @@ fn verify_recovery_bundle_trust(
 
 async fn reject_import_stranding_newer_commits<S>(
     store: &S,
-    provider_profile: V2ProviderProfile,
+    provider_profile: V3ProviderProfile,
     import_sequence: Sequence,
     force_rollback: bool,
 ) -> Result<(), S3BoundaryError>
 where
     S: BlobStore,
 {
-    let mode = if provider_profile == V2ProviderProfile::RetainedVersionObjectLock {
+    let mode = if provider_profile == V3ProviderProfile::RetainedVersionObjectLock {
         BlobListMode::Versions
     } else {
         BlobListMode::Current
@@ -1379,7 +1379,7 @@ where
     let mut highest_seen = None;
     while let Some(page) = listing.next_page().await? {
         for metadata in page.entries {
-            let Ok(commit_key) = V2CommitKey::parse(&metadata.object_id) else {
+            let Ok(commit_key) = V3CommitKey::parse(&metadata.object_id) else {
                 continue;
             };
             highest_seen = Some(
@@ -1408,32 +1408,32 @@ where
     Ok(())
 }
 
-/// Runs v2 provider conformance checks for the configured backend/profile.
-pub async fn check_v2_provider_conformance_from_config(
+/// Runs v3 provider conformance checks for the configured backend/profile.
+pub async fn check_v3_provider_conformance_from_config(
     config: &RuntimeConfig,
-    options: RuntimeV2ProviderConformanceOptions,
-) -> Result<V2ProviderConformanceReport, S3BoundaryError> {
-    check_v2_provider_conformance_from_provider_config(
-        &V2ProviderCheckConfig::from(config),
+    options: RuntimeV3ProviderConformanceOptions,
+) -> Result<V3ProviderConformanceReport, S3BoundaryError> {
+    check_v3_provider_conformance_from_provider_config(
+        &V3ProviderCheckConfig::from(config),
         options,
     )
     .await
 }
 
-/// Runs v2 provider conformance checks without requiring full gateway config.
-pub async fn check_v2_provider_conformance_from_provider_config(
-    config: &V2ProviderCheckConfig,
-    options: RuntimeV2ProviderConformanceOptions,
-) -> Result<V2ProviderConformanceReport, S3BoundaryError> {
+/// Runs v3 provider conformance checks without requiring full gateway config.
+pub async fn check_v3_provider_conformance_from_provider_config(
+    config: &V3ProviderCheckConfig,
+    options: RuntimeV3ProviderConformanceOptions,
+) -> Result<V3ProviderConformanceReport, S3BoundaryError> {
     let store = build_store(&config.backend).await?;
-    check_v2_provider_conformance_with_store(config, options, &store).await
+    check_v3_provider_conformance_with_store(config, options, &store).await
 }
 
-async fn check_v2_provider_conformance_with_store(
-    config: &V2ProviderCheckConfig,
-    options: RuntimeV2ProviderConformanceOptions,
+async fn check_v3_provider_conformance_with_store(
+    config: &V3ProviderCheckConfig,
+    options: RuntimeV3ProviderConformanceOptions,
     store: &StoreBuild,
-) -> Result<V2ProviderConformanceReport, S3BoundaryError> {
+) -> Result<V3ProviderConformanceReport, S3BoundaryError> {
     if config.repository_format != RepositoryFormat::V3Preview {
         return Err(repository_init(
             "v2 provider conformance requires the v3-preview repository format",
@@ -1450,10 +1450,10 @@ async fn check_v2_provider_conformance_with_store(
     store
         .validate_write_policy(GatewayMode::ReadWrite, config.repository_retention)
         .await?;
-    let profile = v2_provider_profile(&config.backend, config.repository_retention);
+    let profile = v3_provider_profile(&config.backend, config.repository_retention);
     let prefix = match options.probe_prefix {
         Some(prefix) => prefix,
-        None => default_v2_provider_probe_prefix()?,
+        None => default_v3_provider_probe_prefix()?,
     };
     let probe = store
         .provider_probe_store(prefix.clone(), config.repository_retention)
@@ -1463,39 +1463,39 @@ async fn check_v2_provider_conformance_with_store(
     } else {
         prefix
     };
-    let mut conformance = V2ProviderConformanceOptions::new(profile, relative_prefix)
+    let mut conformance = V3ProviderConformanceOptions::new(profile, relative_prefix)
         .with_legal_hold(options.legal_hold)
         .with_governance_bypass_reviewed(options.governance_bypass_reviewed);
     if let Some(retention) = config.repository_retention {
         conformance = conformance.with_retention(retention);
     }
-    check_v2_provider_conformance(&probe, &conformance)
+    check_v3_provider_conformance(&probe, &conformance)
         .await
         .map_err(repository_init)
 }
 
-async fn load_or_bootstrap_v2_repository(
+async fn load_or_bootstrap_v3_repository(
     store: &RuntimeStore,
-    anchor: &RuntimeV2Anchor,
+    anchor: &RuntimeV3Anchor,
     config: &RuntimeConfig,
-    provider_profile: V2ProviderProfile,
-) -> Result<LoadedV2Repository, S3BoundaryError> {
-    match anchor.read_v2().await.map_err(repository_init)? {
+    provider_profile: V3ProviderProfile,
+) -> Result<LoadedV3Repository, S3BoundaryError> {
+    match anchor.read_v3().await.map_err(repository_init)? {
         Some(anchor_state) => {
-            load_existing_v2_repository(store, &config.repository_keys, &anchor_state, config).await
+            load_existing_v3_repository(store, &config.repository_keys, &anchor_state, config).await
         }
         None => {
-            bootstrap_v2_repository(store, &config.repository_keys, config, provider_profile).await
+            bootstrap_v3_repository(store, &config.repository_keys, config, provider_profile).await
         }
     }
 }
 
-async fn bootstrap_v2_repository(
+async fn bootstrap_v3_repository(
     store: &RuntimeStore,
     keys: &RepositoryKeysConfig,
     config: &RuntimeConfig,
-    provider_profile: V2ProviderProfile,
-) -> Result<LoadedV2Repository, S3BoundaryError> {
+    provider_profile: V3ProviderProfile,
+) -> Result<LoadedV3Repository, S3BoundaryError> {
     if config.mode.requires_anchor() {
         return Err(repository_init(
             "restore-readonly gateway mode requires an accepted v2 commit anchor; run explicit anchor recovery before serving restore",
@@ -1509,7 +1509,7 @@ async fn bootstrap_v2_repository(
 
     let loaded_keyring =
         unanchored_gateway_keyring(store, keys, config.repository.retention, true).await?;
-    reject_v2_bootstrap_with_foreign_objects(
+    reject_v3_bootstrap_with_foreign_objects(
         store,
         provider_profile,
         loaded_keyring
@@ -1520,14 +1520,14 @@ async fn bootstrap_v2_repository(
     .await?;
 
     let keyring_ref =
-        v2_keyring_root_ref(loaded_keyring.envelope_reference.as_ref().ok_or_else(|| {
+        v3_keyring_root_ref(loaded_keyring.envelope_reference.as_ref().ok_or_else(|| {
             repository_init("v2 bootstrap requires a keyring envelope reference")
         })?);
     let signing_key_id = loaded_keyring
         .keyring
         .primary_key_id(KeyPurpose::CheckpointSigning)
         .map_err(repository_init)?;
-    let format_root = V2FormatRoot::new(
+    let format_root = V3FormatRoot::new(
         keys.repository_id.clone(),
         keyring_ref.clone(),
         signing_key_id,
@@ -1550,7 +1550,7 @@ async fn bootstrap_v2_repository(
         "initialized v2 format root in empty repository",
     );
 
-    Ok(LoadedV2Repository {
+    Ok(LoadedV3Repository {
         keyring: loaded_keyring.keyring,
         keyring_ref,
         format_ref,
@@ -1559,19 +1559,19 @@ async fn bootstrap_v2_repository(
     })
 }
 
-async fn load_existing_v2_repository(
+async fn load_existing_v3_repository(
     store: &RuntimeStore,
     keys: &RepositoryKeysConfig,
-    anchor_state: &V2AnchorState,
+    anchor_state: &V3AnchorState,
     config: &RuntimeConfig,
-) -> Result<LoadedV2Repository, S3BoundaryError> {
+) -> Result<LoadedV3Repository, S3BoundaryError> {
     let OpenedFormatRoot {
         root: format_root,
         repository_salt,
     } = open_format_root(store, keys, &anchor_state.format_ref).await?;
     if format_root.repository_id != keys.repository_id
         || format_root.provider_profile
-            != v2_provider_profile(&config.backend, config.repository.retention)
+            != v3_provider_profile(&config.backend, config.repository.retention)
         || format_root.retention != config.repository.retention
         || format_root.signing_key_id != anchor_state.signing_key_id
     {
@@ -1580,14 +1580,14 @@ async fn load_existing_v2_repository(
         ));
     }
 
-    let keyring_reference = keyring_reference_from_v2(&format_root.active_keyring_envelope_ref);
+    let keyring_reference = keyring_reference_from_v3(&format_root.active_keyring_envelope_ref);
     reject_unbound_keyring_override(
         keys.envelope_object_id.as_ref(),
         &keyring_reference.object_id,
     )?;
     let loaded_keyring = open_gateway_keyring_reference(store, keys, &keyring_reference).await?;
     reject_salt_disagreement(&repository_salt, &loaded_keyring.repository_salt)?;
-    Ok(LoadedV2Repository {
+    Ok(LoadedV3Repository {
         keyring: loaded_keyring.keyring,
         keyring_ref: format_root.active_keyring_envelope_ref,
         format_ref: anchor_state.format_ref.clone(),
@@ -1599,19 +1599,19 @@ async fn load_existing_v2_repository(
 async fn store_format_root(
     store: &RuntimeStore,
     keys: &RepositoryKeysConfig,
-    root: &V2FormatRoot,
+    root: &V3FormatRoot,
     retention: Option<RetentionPolicy>,
     repository_salt: &[u8],
-) -> Result<V2FormatRef, S3BoundaryError> {
+) -> Result<V3FormatRef, S3BoundaryError> {
     let envelope = prepare_format_root(keys, root, repository_salt)?;
     let digest = envelope.digest().map_err(repository_init)?;
-    let object_id = v2_format_object_id(envelope.generation, &digest).map_err(repository_init)?;
+    let object_id = v3_format_object_id(envelope.generation, &digest).map_err(repository_init)?;
     let body = Bytes::from(envelope.to_object_bytes().map_err(repository_init)?);
     let metadata = put_format_envelope(store, &object_id, body, retention).await?;
     let version_id =
         retained_version_id(&object_id, &metadata, retention, None).map_err(repository_init)?;
 
-    Ok(V2FormatRef {
+    Ok(V3FormatRef {
         generation: envelope.generation,
         digest,
         object_id,
@@ -1621,7 +1621,7 @@ async fn store_format_root(
 
 fn prepare_format_root(
     keys: &RepositoryKeysConfig,
-    root: &V2FormatRoot,
+    root: &V3FormatRoot,
     repository_salt: &[u8],
 ) -> Result<RepositoryEnvelope, S3BoundaryError> {
     let context = repository_key_context_for_salt(keys, repository_salt)?;
@@ -1651,7 +1651,7 @@ async fn put_format_envelope(
             PutOptions {
                 retention,
                 legal_hold: None,
-                content_type: Some(V2_FORMAT_ENVELOPE_CONTENT_TYPE.to_owned()),
+                content_type: Some(V3_FORMAT_ENVELOPE_CONTENT_TYPE.to_owned()),
                 do_not_recreate: !retained_version_required(retention, None),
             },
         )
@@ -1681,7 +1681,7 @@ async fn put_format_envelope(
 async fn open_format_root(
     store: &RuntimeStore,
     keys: &RepositoryKeysConfig,
-    reference: &V2FormatRef,
+    reference: &V3FormatRef,
 ) -> Result<OpenedFormatRoot, S3BoundaryError> {
     let body = read_bounded_object_at(
         store,
@@ -1695,7 +1695,7 @@ async fn open_format_root(
 
 fn open_format_root_body(
     keys: &RepositoryKeysConfig,
-    reference: &V2FormatRef,
+    reference: &V3FormatRef,
     body: &[u8],
 ) -> Result<OpenedFormatRoot, S3BoundaryError> {
     let envelope = RepositoryEnvelope::from_object_bytes(body, rs3_crypto::EnvelopePurpose::Format)
@@ -1715,7 +1715,7 @@ fn open_format_root_body(
         .open_format(&context, &keys.wrapping_key_id, &wrapping_key)
         .map_err(repository_init)?;
     Ok(OpenedFormatRoot {
-        root: V2FormatRoot::from_plaintext_bytes(&plaintext).map_err(repository_init)?,
+        root: V3FormatRoot::from_plaintext_bytes(&plaintext).map_err(repository_init)?,
         repository_salt: envelope.repository_salt,
     })
 }
@@ -1751,9 +1751,9 @@ fn reject_bundle_salt_mismatch(
     }
 }
 
-async fn reject_v2_bootstrap_with_foreign_objects<S>(
+async fn reject_v3_bootstrap_with_foreign_objects<S>(
     store: &S,
-    provider_profile: V2ProviderProfile,
+    provider_profile: V3ProviderProfile,
     allowed_keyring: Option<&BackendObjectId>,
 ) -> Result<(), S3BoundaryError>
 where
@@ -1769,7 +1769,7 @@ where
     // first commit's anchor compare-and-advance remains the bootstrap safety
     // boundary on eventually consistent object stores.
     for prefix in BOOTSTRAP_EMPTY_CHECK_PREFIXES {
-        let mode = if provider_profile == V2ProviderProfile::RetainedVersionObjectLock {
+        let mode = if provider_profile == V3ProviderProfile::RetainedVersionObjectLock {
             BlobListMode::Versions
         } else {
             BlobListMode::Current
@@ -1797,8 +1797,8 @@ where
     Ok(())
 }
 
-fn v2_keyring_root_ref(reference: &KeyringEnvelopeReference) -> V2KeyringEnvelopeRootRef {
-    V2KeyringEnvelopeRootRef {
+fn v3_keyring_root_ref(reference: &KeyringEnvelopeReference) -> V3KeyringEnvelopeRootRef {
+    V3KeyringEnvelopeRootRef {
         generation: reference.generation,
         digest: reference.digest.clone(),
         object_id: reference.object_id.clone(),
@@ -1824,7 +1824,7 @@ fn reject_unbound_keyring_override(
     }
 }
 
-fn keyring_reference_from_v2(reference: &V2KeyringEnvelopeRootRef) -> KeyringEnvelopeReference {
+fn keyring_reference_from_v3(reference: &V3KeyringEnvelopeRootRef) -> KeyringEnvelopeReference {
     KeyringEnvelopeReference {
         generation: reference.generation,
         digest: reference.digest.clone(),
@@ -1833,21 +1833,21 @@ fn keyring_reference_from_v2(reference: &V2KeyringEnvelopeRootRef) -> KeyringEnv
     }
 }
 
-pub(super) fn v2_provider_profile(
+pub(super) fn v3_provider_profile(
     backend: &BackendConfig,
     retention: Option<RetentionPolicy>,
-) -> V2ProviderProfile {
+) -> V3ProviderProfile {
     if retention.is_some_and(|policy| policy.mode != RetentionMode::None && policy.retain_days > 0)
     {
-        V2ProviderProfile::RetainedVersionObjectLock
+        V3ProviderProfile::RetainedVersionObjectLock
     } else if backend.is_s3() {
-        V2ProviderProfile::AtomicCreate
+        V3ProviderProfile::AtomicCreate
     } else {
-        V2ProviderProfile::Dev
+        V3ProviderProfile::Dev
     }
 }
 
-fn default_v2_provider_probe_prefix() -> Result<String, S3BoundaryError> {
+fn default_v3_provider_probe_prefix() -> Result<String, S3BoundaryError> {
     let mut nonce = [0; 16];
     getrandom::fill(&mut nonce)
         .map_err(|_| repository_init("provider probe identity generation failed"))?;
@@ -1869,9 +1869,9 @@ mod tests {
     use super::super::runtime_handles::RuntimeStore;
     use super::super::runtime_keyring::unanchored_gateway_keyring;
     use super::{
-        RuntimeRepository, V2ProviderProfile, V2RecoveryBundle, doctor_probe_from_config,
-        init_v2_repository_from_config, reject_import_stranding_newer_commits,
-        reject_v2_bootstrap_with_foreign_objects, verify_recovery_bundle_trust,
+        RuntimeRepository, V3ProviderProfile, V3RecoveryBundle, doctor_probe_from_config,
+        init_v3_repository_from_config, reject_import_stranding_newer_commits,
+        reject_v3_bootstrap_with_foreign_objects, verify_recovery_bundle_trust,
     };
     #[cfg(not(feature = "k8s"))]
     use crate::AnchorConfig;
@@ -1881,7 +1881,7 @@ mod tests {
     use bytes::Bytes;
     use rs3_crypto::{KeyRing, RepositoryKeyContext, SecretBytes};
     use rs3_repository::RepositoryPutOptions;
-    use rs3_repository::v2::{V2AnchorState, V2CommitAnchor, V2FormatRef};
+    use rs3_repository::v3::{V3AnchorState, V3CommitAnchor, V3FormatRef};
     use rs3_storage::{
         BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobStore, ByteRange,
         FilesystemBlobStore, MemoryBlobStore, PutOptions, StorageError,
@@ -1930,7 +1930,7 @@ mod tests {
     #[tokio::test]
     async fn prepared_init_is_read_only_until_consumed_and_keeps_its_configuration() {
         let mut config = runtime_config(true);
-        let prepared = super::V2PreparedRepositoryInit::prepare(&config)
+        let prepared = super::V3PreparedRepositoryInit::prepare(&config)
             .await
             .expect("preflight");
         let store = prepared
@@ -1966,7 +1966,7 @@ mod tests {
         // An empty memory anchor over an empty store is the cluster-loss
         // shape: verification must fail closed instead of initializing.
         let config = runtime_config(true);
-        let prepared = super::V2PreparedRepositoryInit::prepare(&config)
+        let prepared = super::V3PreparedRepositoryInit::prepare(&config)
             .await
             .expect("storage preflight");
         let store = prepared
@@ -1993,7 +1993,7 @@ mod tests {
             name: "fixture".to_owned(),
             field_manager: "fixture".to_owned(),
         };
-        let prepared = super::V2PreparedRepositoryInit::prepare(&config)
+        let prepared = super::V3PreparedRepositoryInit::prepare(&config)
             .await
             .expect("storage preflight");
         let store = prepared
@@ -2004,7 +2004,7 @@ mod tests {
         let error = prepared.initialize().await.expect_err("missing fence");
         assert!(error.to_string().contains("acquired writer fence"));
         assert!(store.list_prefix("").await.expect("no writes").is_empty());
-        let prepared = super::V2PreparedRepositoryInit::prepare(&config)
+        let prepared = super::V3PreparedRepositoryInit::prepare(&config)
             .await
             .expect("preflight again");
         let store = prepared
@@ -2042,7 +2042,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
 
         assert!(runtime.memory_store().is_some());
-        assert!(runtime.memory_v2_anchor().is_some());
+        assert!(runtime.memory_v3_anchor().is_some());
     }
 
     #[tokio::test]
@@ -2055,9 +2055,9 @@ mod tests {
         assert!(readiness.check_readiness().await.ready);
 
         let anchor = runtime
-            .memory_v2_anchor()
+            .memory_v3_anchor()
             .unwrap_or_else(|| panic!("memory anchor should exist"))
-            .read_v2()
+            .read_v3()
             .await
             .unwrap_or_else(|error| panic!("{error}"))
             .unwrap_or_else(|| panic!("accepted anchor should exist"));
@@ -2088,15 +2088,15 @@ mod tests {
     async fn offline_runtime_from_config_runs_guarded_maintenance_on_memory_anchor() {
         let runtime = super::offline_maintenance_runtime_from_config(
             &runtime_config(false),
-            Arc::new(rs3_repository::v2::UnenforcedQuiescedMaintenanceGuard),
+            Arc::new(rs3_repository::v3::UnenforcedQuiescedMaintenanceGuard),
         )
         .await
         .unwrap_or_else(|error| panic!("{error}"));
         assert!(runtime.maintenance_guard_configured());
 
-        let options = rs3_repository::v2::V2FullGcApplyOptions {
-            dry_run: rs3_repository::v2::V2FullGcDryRunOptions::default(),
-            orphan_gc: rs3_repository::v2::V2OrphanGcOptions::new_for_test_rehearsal(
+        let options = rs3_repository::v3::V3FullGcApplyOptions {
+            dry_run: rs3_repository::v3::V3FullGcDryRunOptions::default(),
+            orphan_gc: rs3_repository::v3::V3OrphanGcOptions::new_for_test_rehearsal(
                 Duration::ZERO,
             ),
             retained_provider_conformance_passed: true,
@@ -2106,7 +2106,7 @@ mod tests {
             .preview_full_gc_plan(options.clone())
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        let cancellation = rs3_repository::v2::V2MaintenanceCancellation::new();
+        let cancellation = rs3_repository::v3::V3MaintenanceCancellation::new();
         let report = runtime
             .run_full_maintenance(
                 options.clone(),
@@ -2139,7 +2139,7 @@ mod tests {
 
         let rejected = super::offline_maintenance_runtime_from_config(
             &config,
-            Arc::new(rs3_repository::v2::UnenforcedQuiescedMaintenanceGuard),
+            Arc::new(rs3_repository::v3::UnenforcedQuiescedMaintenanceGuard),
         )
         .await;
 
@@ -2150,7 +2150,7 @@ mod tests {
     async fn init_command_initializes_and_verifies_without_static_credentials() {
         let config = runtime_config(false);
 
-        let report = init_v2_repository_from_config(&config)
+        let report = init_v3_repository_from_config(&config)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
 
@@ -2186,7 +2186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_factory_builds_v2_preview_repository() {
+    async fn runtime_factory_builds_v3_preview_repository() {
         let mut config = runtime_config(true);
         config.repository.format = RepositoryFormat::V3Preview;
         let runtime = RuntimeRepository::from_config(&config)
@@ -2203,15 +2203,15 @@ mod tests {
             .list_prefix("commits/v03/")
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        let v2_anchor = runtime
-            .memory_v2_anchor()
+        let v3_anchor = runtime
+            .memory_v3_anchor()
             .unwrap_or_else(|| panic!("missing v2 memory anchor"));
 
         assert_eq!(format_roots.len(), 1);
         assert_eq!(commits.len(), 1);
         assert!(
-            v2_anchor
-                .read_v2()
+            v3_anchor
+                .read_v3()
                 .await
                 .unwrap_or_else(|error| panic!("{error}"))
                 .is_some()
@@ -2354,14 +2354,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_validation_rejects_missing_accepted_v2_commit() {
+    async fn startup_validation_rejects_missing_accepted_v3_commit() {
         let runtime = RuntimeRepository::from_config(&runtime_config(true))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let accepted = runtime
-            .memory_v2_anchor()
+            .memory_v3_anchor()
             .unwrap_or_else(|| panic!("missing v2 memory anchor"))
-            .read_v2()
+            .read_v3()
             .await
             .unwrap_or_else(|error| panic!("{error}"))
             .unwrap_or_else(|| panic!("missing v2 anchor state"));
@@ -2396,7 +2396,7 @@ mod tests {
         config.repository.retention = Some(RetentionPolicy::new(RetentionMode::Compliance, 30));
         let runtime = RuntimeRepository::from_config_with_maintenance_guard(
             &config,
-            Arc::new(rs3_repository::v2::UnenforcedQuiescedMaintenanceGuard),
+            Arc::new(rs3_repository::v3::UnenforcedQuiescedMaintenanceGuard),
         )
         .await
         .unwrap_or_else(|error| panic!("{error}"));
@@ -2416,9 +2416,9 @@ mod tests {
         );
 
         let accepted = runtime
-            .memory_v2_anchor()
+            .memory_v3_anchor()
             .unwrap_or_else(|| panic!("missing v2 memory anchor"))
-            .read_v2()
+            .read_v3()
             .await
             .unwrap_or_else(|error| panic!("{error}"))
             .unwrap_or_else(|| panic!("missing v2 anchor state"));
@@ -2547,7 +2547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_v2_format_root_binds_configured_keyring_envelope() {
+    async fn runtime_v3_format_root_binds_configured_keyring_envelope() {
         let dir = TestDir::new();
         let mut config = runtime_config(true);
         config.backend.endpoint = format!("file://{}", dir.path().display());
@@ -2618,9 +2618,9 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
 
         let accepted = runtime
-            .memory_v2_anchor()
+            .memory_v3_anchor()
             .unwrap_or_else(|| panic!("missing v2 memory anchor"))
-            .read_v2()
+            .read_v3()
             .await
             .unwrap_or_else(|error| panic!("{error}"))
             .unwrap_or_else(|| panic!("missing v2 anchor state"));
@@ -2642,7 +2642,7 @@ mod tests {
                 &wrapping_key,
             )
             .unwrap_or_else(|error| panic!("{error}"));
-        let format_root = rs3_repository::v2::V2FormatRoot::from_plaintext_bytes(&plaintext)
+        let format_root = rs3_repository::v3::V3FormatRoot::from_plaintext_bytes(&plaintext)
             .unwrap_or_else(|error| panic!("{error}"));
         let reference = format_root.active_keyring_envelope_ref;
 
@@ -2753,7 +2753,7 @@ mod tests {
 
         let error = match verify_recovery_bundle_trust(
             &bundle,
-            V2ProviderProfile::Dev,
+            V3ProviderProfile::Dev,
             Sequence::new(8),
             None,
         ) {
@@ -2770,7 +2770,7 @@ mod tests {
 
         let error = match verify_recovery_bundle_trust(
             &bundle,
-            V2ProviderProfile::AtomicCreate,
+            V3ProviderProfile::AtomicCreate,
             Sequence::new(7),
             Some(&recovery_public_key()),
         ) {
@@ -2791,7 +2791,7 @@ mod tests {
 
         let error = match verify_recovery_bundle_trust(
             &bundle,
-            V2ProviderProfile::AtomicCreate,
+            V3ProviderProfile::AtomicCreate,
             Sequence::new(7),
             Some(&public_key),
         ) {
@@ -2809,7 +2809,7 @@ mod tests {
 
         verify_recovery_bundle_trust(
             &bundle,
-            V2ProviderProfile::AtomicCreate,
+            V3ProviderProfile::AtomicCreate,
             Sequence::new(7),
             Some(&public_key),
         )
@@ -2830,7 +2830,7 @@ mod tests {
 
         let error = match reject_import_stranding_newer_commits(
             &store,
-            V2ProviderProfile::Dev,
+            V3ProviderProfile::Dev,
             Sequence::new(7),
             false,
         )
@@ -2857,7 +2857,7 @@ mod tests {
 
         reject_import_stranding_newer_commits(
             &store,
-            V2ProviderProfile::RetainedVersionObjectLock,
+            V3ProviderProfile::RetainedVersionObjectLock,
             Sequence::new(7),
             true,
         )
@@ -2869,9 +2869,9 @@ mod tests {
     async fn bootstrap_empty_check_uses_version_listing_for_retained_profile() {
         let store = VersionOnlyListStore::new(commit_object_id(8));
 
-        let error = match reject_v2_bootstrap_with_foreign_objects(
+        let error = match reject_v3_bootstrap_with_foreign_objects(
             &store,
-            V2ProviderProfile::RetainedVersionObjectLock,
+            V3ProviderProfile::RetainedVersionObjectLock,
             None,
         )
         .await
@@ -2888,8 +2888,8 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_refuses_every_retired_object_class_including_allowed_json_keyring() {
         for profile in [
-            V2ProviderProfile::Dev,
-            V2ProviderProfile::RetainedVersionObjectLock,
+            V3ProviderProfile::Dev,
+            V3ProviderProfile::RetainedVersionObjectLock,
         ] {
             for key in ["commits/v02/old", "objects/v02/old", "keyrings/old.json"] {
                 let store = MemoryBlobStore::new();
@@ -2903,13 +2903,13 @@ mod tests {
                     .await
                     .expect("fixture");
                 assert!(
-                    reject_v2_bootstrap_with_foreign_objects(&store, profile, None)
+                    reject_v3_bootstrap_with_foreign_objects(&store, profile, None)
                         .await
                         .is_err()
                 );
                 if key.ends_with(".json") {
                     assert!(
-                        reject_v2_bootstrap_with_foreign_objects(&store, profile, Some(&object_id))
+                        reject_v3_bootstrap_with_foreign_objects(&store, profile, Some(&object_id))
                             .await
                             .is_err()
                     );
@@ -2950,9 +2950,9 @@ mod tests {
                 .expect("current object probe")
         );
 
-        let result = reject_v2_bootstrap_with_foreign_objects(
+        let result = reject_v3_bootstrap_with_foreign_objects(
             &store,
-            V2ProviderProfile::RetainedVersionObjectLock,
+            V3ProviderProfile::RetainedVersionObjectLock,
             None,
         )
         .await;
@@ -3131,13 +3131,13 @@ mod tests {
         ))
     }
 
-    fn sample_bundle() -> V2RecoveryBundle {
-        V2RecoveryBundle {
+    fn sample_bundle() -> V3RecoveryBundle {
+        V3RecoveryBundle {
             repository_id: Some(
                 RepositoryId::new("test-repository").unwrap_or_else(|error| panic!("{error}")),
             ),
             repository_salt_digest: None,
-            anchor: V2AnchorState {
+            anchor: V3AnchorState {
                 sequence: Sequence::new(7),
                 commit_key: BackendObjectId::new(
                     "commits/v03/00000000000000000007/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -3150,7 +3150,7 @@ mod tests {
                 ),
                 signing_key_id: KeyId::new("checkpoint-v1")
                     .unwrap_or_else(|error| panic!("{error}")),
-                format_ref: V2FormatRef {
+                format_ref: V3FormatRef {
                     generation: 1,
                     digest: "2222222222222222222222222222222222222222222222222222222222222222"
                         .to_owned(),
@@ -3168,7 +3168,7 @@ mod tests {
         }
     }
 
-    fn sign_bundle(bundle: &mut V2RecoveryBundle) -> String {
+    fn sign_bundle(bundle: &mut V3RecoveryBundle) -> String {
         let keyring = KeyRing::generate_random().unwrap_or_else(|error| panic!("{error}"));
         let payload = bundle
             .offline_signature_payload()

@@ -2,8 +2,8 @@
 
 use crate::identity::StaticCredentials;
 use rs3_crypto::{MIN_REPOSITORY_SALT_LEN, SecretBytes, ct_eq, validate_recovery_public_key};
-use rs3_repository::v2::{DEFAULT_RETENTION_RENEWAL_HORIZON, RecoveryPolicy, V2MaintenanceBudgets};
-use rs3_repository::{DEFAULT_PAYLOAD_SEGMENT_SIZE, v2::DEFAULT_V2_STREAM_READ_STALL_TIMEOUT};
+use rs3_repository::v3::{DEFAULT_RETENTION_RENEWAL_HORIZON, RecoveryPolicy, V3MaintenanceBudgets};
+use rs3_repository::{DEFAULT_PAYLOAD_SEGMENT_SIZE, v3::DEFAULT_V3_STREAM_READ_STALL_TIMEOUT};
 use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
 use std::fmt;
@@ -122,9 +122,9 @@ pub struct RuntimeConfig {
     pub static_credentials: Option<StaticCredentials>,
 }
 
-/// Minimal configuration needed to probe v2 provider behavior.
+/// Minimal configuration needed to probe v3 provider behavior.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct V2ProviderCheckConfig {
+pub struct V3ProviderCheckConfig {
     /// Backend object-store settings.
     pub backend: BackendConfig,
     /// Durable repository format selected for the provider check.
@@ -165,7 +165,7 @@ pub struct RepositoryKeyContextConfig {
     pub wrapping_key_id: String,
 }
 
-impl From<&RuntimeConfig> for V2ProviderCheckConfig {
+impl From<&RuntimeConfig> for V3ProviderCheckConfig {
     fn from(config: &RuntimeConfig) -> Self {
         Self {
             backend: config.backend.clone(),
@@ -333,7 +333,7 @@ impl Default for HardeningConfig {
             max_put_object_bytes: DEFAULT_MAX_PUT_OBJECT_BYTES,
             buffered_put_object_bytes: DEFAULT_BUFFERED_PUT_OBJECT_BYTES,
             backend_multipart_part_bytes: DEFAULT_BACKEND_MULTIPART_PART_BYTES,
-            stream_read_stall_timeout: DEFAULT_V2_STREAM_READ_STALL_TIMEOUT,
+            stream_read_stall_timeout: DEFAULT_V3_STREAM_READ_STALL_TIMEOUT,
             max_in_flight_upload_body_bytes: DEFAULT_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES,
             max_in_flight_download_body_bytes: DEFAULT_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES,
             max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
@@ -348,7 +348,7 @@ impl Default for HardeningConfig {
 pub enum AnchorConfig {
     /// In-process anchor for local development and tests.
     Memory,
-    /// Kubernetes Lease object used as the monotonic v2 commit anchor.
+    /// Kubernetes Lease object used as the monotonic v3 commit anchor.
     KubernetesLease {
         /// Kubernetes namespace containing the Lease.
         namespace: String,
@@ -444,7 +444,7 @@ pub struct MaintenanceConfig {
 
 impl Default for MaintenanceConfig {
     fn default() -> Self {
-        let budget_defaults = V2MaintenanceBudgets::default();
+        let budget_defaults = V3MaintenanceBudgets::default();
         Self {
             mode: MaintenanceMode::Auto,
             reclamation_enabled: true,
@@ -476,14 +476,14 @@ impl MaintenanceConfig {
     }
 
     /// Returns maintenance I/O budgets derived from these settings.
-    pub fn budgets(&self) -> V2MaintenanceBudgets {
-        V2MaintenanceBudgets {
+    pub fn budgets(&self) -> V3MaintenanceBudgets {
+        V3MaintenanceBudgets {
             max_inventory_page_count: self.max_inventory_pages,
             max_inventory_item_count: self.max_inventory_items,
             max_history_metadata_bytes: self.max_history_metadata_bytes,
             max_history_pending_bytes: self.max_history_pending_bytes,
             op_pacing_delay: self.pacing_delay,
-            ..V2MaintenanceBudgets::default()
+            ..V3MaintenanceBudgets::default()
         }
     }
 }
@@ -491,7 +491,7 @@ impl MaintenanceConfig {
 /// Provider-conformance evidence settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderConformanceConfig {
-    /// Optional JSON report emitted by `rs3 check-v2-provider`.
+    /// Optional JSON report emitted by `rs3 check-v3-provider`.
     pub report_file: Option<PathBuf>,
     /// Maximum accepted report age before status marks the evidence stale.
     pub max_age: Duration,
@@ -771,8 +771,8 @@ impl RuntimeConfig {
     }
 }
 
-impl V2ProviderCheckConfig {
-    /// Loads v2 provider check configuration from the current process environment.
+impl V3ProviderCheckConfig {
+    /// Loads v3 provider check configuration from the current process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_source(&ProcessEnv)
     }
@@ -1045,7 +1045,7 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
         parse_positive_u64(
             "RS3_STREAM_READ_STALL_TIMEOUT_SECS",
             source.value("RS3_STREAM_READ_STALL_TIMEOUT_SECS"),
-            DEFAULT_V2_STREAM_READ_STALL_TIMEOUT.as_secs(),
+            DEFAULT_V3_STREAM_READ_STALL_TIMEOUT.as_secs(),
         ),
     )
     .map(Duration::from_secs);
@@ -1641,7 +1641,7 @@ pub(crate) fn configured_streaming_upload_working_set_bytes(
         repository.payload_segment_size,
         repository.adaptive_payload_segment_size,
     );
-    rs3_repository::v2::v2_streaming_upload_working_set_bytes(
+    rs3_repository::v3::v3_streaming_upload_working_set_bytes(
         hardening.backend_multipart_part_bytes,
         u64::try_from(payload_segment_bytes).unwrap_or(u64::MAX),
     )
@@ -2482,7 +2482,7 @@ mod tests {
         AnchorConfig, BatchConfig, ConfigError, ConfigSource, GatewayMode, HardeningConfig,
         MaintenanceConfig, MetricsConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
         RepositoryKeyContextConfig, RepositoryKeysConfig, RepositoryToolConfig, RuntimeConfig,
-        StaticCredentials, V2ProviderCheckConfig, WriterGuardConfig,
+        StaticCredentials, V3ProviderCheckConfig, WriterGuardConfig,
     };
     use rs3_types::{RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
@@ -2606,7 +2606,7 @@ mod tests {
             .with(super::REPOSITORY_RETENTION_DAYS_ENV, "7");
 
         let config =
-            V2ProviderCheckConfig::from_source(&source).unwrap_or_else(|error| panic!("{error}"));
+            V3ProviderCheckConfig::from_source(&source).unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(config.backend.endpoint, "https://object.example");
         assert_eq!(config.backend.bucket, "backend-bucket");
@@ -2620,7 +2620,7 @@ mod tests {
 
     #[test]
     fn provider_check_config_still_requires_backend() {
-        let error = V2ProviderCheckConfig::from_source(&TestSource::default())
+        let error = V3ProviderCheckConfig::from_source(&TestSource::default())
             .expect_err("provider check needs a backend to probe");
 
         assert_eq!(
@@ -2695,7 +2695,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_legacy_repository_format_v2_preview() {
+    fn accepts_legacy_repository_format_v3_preview() {
         let source = minimal_source().with(super::REPOSITORY_FORMAT_ENV, "v3-preview");
 
         let config = RuntimeConfig::from_source(&source);
@@ -3111,11 +3111,11 @@ mod tests {
         assert_eq!(budgets.op_pacing_delay, None);
         assert_eq!(
             budgets.max_inventory_page_count,
-            rs3_repository::v2::V2MaintenanceBudgets::default().max_inventory_page_count
+            rs3_repository::v3::V3MaintenanceBudgets::default().max_inventory_page_count
         );
         assert_eq!(
             budgets.max_inventory_item_count,
-            rs3_repository::v2::V2MaintenanceBudgets::default().max_inventory_item_count
+            rs3_repository::v3::V3MaintenanceBudgets::default().max_inventory_item_count
         );
         assert_eq!(budgets.max_history_metadata_bytes, 256 * 1024 * 1024);
         assert_eq!(budgets.max_history_pending_bytes, 64 * 1024 * 1024);

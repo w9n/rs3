@@ -7,13 +7,13 @@
 use crate::maintenance::MaintenanceStatusSnapshot;
 use crate::{
     AnchorConfig, BackendConfig, MaintenanceMode, ProviderConformanceConfig, RuntimeConfig,
-    V2ProviderCheckConfig, WriterGuardConfig,
+    V3ProviderCheckConfig, WriterGuardConfig,
 };
 use async_trait::async_trait;
 #[cfg(target_os = "linux")]
 use rs3_crypto::Sha256Hasher;
 use rs3_crypto::derive_public_fingerprint;
-use rs3_repository::v2::{V2ProviderProfile, required_v2_provider_check_names};
+use rs3_repository::v3::{V3ProviderProfile, required_v3_provider_check_names};
 use rs3_types::{RetentionMode, RetentionPolicy};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -30,7 +30,7 @@ const PROVIDER_EVIDENCE_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
 
 /// Derives the path-safe identity of the exact backend target qualified by a
 /// persisted provider-conformance report.
-pub fn provider_conformance_target_fingerprint(config: &V2ProviderCheckConfig) -> String {
+pub fn provider_conformance_target_fingerprint(config: &V3ProviderCheckConfig) -> String {
     let (retention_mode, retention_days) = match config.repository_retention {
         None => ("unset", 0),
         Some(policy) => (
@@ -105,16 +105,16 @@ pub fn provider_conformance_implementation_fingerprint() -> Option<&'static str>
 /// Encodes bounded preview qualification evidence for the running executable.
 /// Both the check command and deployment onboarding use this representation.
 pub fn encode_provider_conformance_evidence(
-    config: &V2ProviderCheckConfig,
-    report: &rs3_repository::v2::V2ProviderConformanceReport,
+    config: &V3ProviderCheckConfig,
+    report: &rs3_repository::v3::V3ProviderConformanceReport,
 ) -> Result<String, crate::S3BoundaryError> {
     let implementation = provider_conformance_implementation_fingerprint().ok_or_else(|| {
         crate::s3::repository_init("provider evidence cannot identify the running executable")
     })?;
     let profile = match report.profile {
-        V2ProviderProfile::Dev => "dev",
-        V2ProviderProfile::AtomicCreate => "atomic-create",
-        V2ProviderProfile::RetainedVersionObjectLock => "retained-version-object-lock",
+        V3ProviderProfile::Dev => "dev",
+        V3ProviderProfile::AtomicCreate => "atomic-create",
+        V3ProviderProfile::RetainedVersionObjectLock => "retained-version-object-lock",
     };
     let evidence = ProviderConformanceReportJson {
         schema: PROVIDER_CONFORMANCE_SCHEMA.to_owned(),
@@ -130,7 +130,7 @@ pub fn encode_provider_conformance_evidence(
             .iter()
             .map(|check| ProviderConformanceCheckJson {
                 name: check.name.to_owned(),
-                status: if check.status == rs3_repository::v2::V2ProviderCheckStatus::Passed {
+                status: if check.status == rs3_repository::v3::V3ProviderCheckStatus::Passed {
                     "passed"
                 } else {
                     "failed"
@@ -226,8 +226,8 @@ pub struct AdminRuntimeFacts {
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AdminRepositoryRuntimeFacts {
-    /// Live v2 commit-coordinator status, when the report is attached to a running gateway.
-    pub v2_commit_coordinator: Option<AdminV2CommitCoordinatorSummary>,
+    /// Live v3 commit-coordinator status, when the report is attached to a running gateway.
+    pub v3_commit_coordinator: Option<AdminV3CommitCoordinatorSummary>,
 }
 
 /// Preview path-redacted operator status fact report.
@@ -398,14 +398,15 @@ pub struct AdminRepositorySummary {
     pub retention_days: u32,
     /// Whether first-run initialization is allowed when the anchor is missing.
     pub allow_init: bool,
-    /// Live v2 commit-coordinator status, when the report is attached to a running gateway.
-    pub v2_commit_coordinator: Option<AdminV2CommitCoordinatorSummary>,
+    /// Live v3 commit-coordinator status, when the report is attached to a running gateway.
+    #[serde(rename = "v2_commit_coordinator")]
+    pub v3_commit_coordinator: Option<AdminV3CommitCoordinatorSummary>,
 }
 
-/// Live v2 commit coordinator summary.
+/// Live v3 commit coordinator summary.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct AdminV2CommitCoordinatorSummary {
+pub struct AdminV3CommitCoordinatorSummary {
     /// Whether the coordinator is permanently refusing new writes.
     pub poisoned: bool,
     /// Path-redacted reason for a permanent poison state.
@@ -448,8 +449,9 @@ pub struct AdminRestoreSummary {
     pub state: &'static str,
     /// Machine-readable reason code when restore trust is unavailable.
     pub reason_code: Option<&'static str>,
-    /// Accepted v2 anchor summary when available.
-    pub v2_anchor: Option<AdminV2RestoreSummary>,
+    /// Accepted v3 anchor summary when available.
+    #[serde(rename = "v2_anchor")]
+    pub v3_anchor: Option<AdminV3RestoreSummary>,
 }
 
 /// Read-only maintenance status shown by operator reports.
@@ -462,8 +464,9 @@ pub struct AdminMaintenanceSummary {
     pub computed_at_ms: i64,
     /// Machine-readable reason code when maintenance facts are unavailable.
     pub reason_code: Option<&'static str>,
-    /// v2 maintenance facts, when the configured repository format is v2.
-    pub v2: Option<AdminV2MaintenanceSummary>,
+    /// v3 maintenance facts, when the configured repository format is v3.
+    #[serde(rename = "v2")]
+    pub v3: Option<AdminV3MaintenanceSummary>,
     /// Live maintenance supervisor posture, when the supervisor is running.
     pub supervisor: Option<AdminMaintenanceSupervisorSummary>,
 }
@@ -546,25 +549,25 @@ impl From<&MaintenanceStatusSnapshot> for AdminMaintenanceSupervisorSummary {
     }
 }
 
-/// Path-redacted v2 maintenance facts.
+/// Path-redacted v3 maintenance facts.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct AdminV2MaintenanceSummary {
+pub struct AdminV3MaintenanceSummary {
     /// Ciphertext bytes in packs reached by current or conservatively protected dependencies.
     pub packed_payload_stored_bytes: u64,
     /// Distinct ciphertext bytes reached across current and conservatively protected dependencies.
     pub packed_payload_referenced_bytes: u64,
     /// Lower bound on unreferenced pack ciphertext, not immediately deletable bytes.
     pub packed_payload_unreferenced_bytes: u64,
-    /// Whether the v2 anchor is present.
+    /// Whether the v3 anchor is present.
     pub anchor_present: bool,
     /// Verified commit count in the anchor-selected chain.
     pub verified_commit_count: usize,
     /// Age of the accepted chain head in milliseconds.
     pub last_anchored_commit_age_ms: Option<u128>,
-    /// Unanchored v2 commit candidates observed under the commit prefix.
+    /// Unanchored v3 commit candidates observed under the commit prefix.
     pub orphan_candidate_count: usize,
-    /// Total bytes held by unanchored v2 commit candidates.
+    /// Total bytes held by unanchored v3 commit candidates.
     pub orphan_candidate_bytes: u64,
     /// Orphan candidates blocked by retention or legal hold.
     pub protected_orphan_candidate_count: usize,
@@ -590,13 +593,13 @@ pub struct AdminV2MaintenanceSummary {
     pub recovery_clock_uncertainty_ms: Option<u32>,
 }
 
-/// Accepted v2 anchor summary.
+/// Accepted v3 anchor summary.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct AdminV2RestoreSummary {
-    /// Accepted v2 commit sequence.
+pub struct AdminV3RestoreSummary {
+    /// Accepted v3 commit sequence.
     pub sequence: u64,
-    /// Accepted v2 commit body digest.
+    /// Accepted v3 commit body digest.
     pub body_digest: String,
     /// Whether the accepted commit is bound to a provider version ID.
     pub version_bound: bool,
@@ -842,7 +845,7 @@ fn repository_summary(
             .map(|policy| policy.retain_days)
             .unwrap_or(0),
         allow_init: config.repository.allow_init,
-        v2_commit_coordinator: runtime_facts.repository.v2_commit_coordinator.clone(),
+        v3_commit_coordinator: runtime_facts.repository.v3_commit_coordinator.clone(),
     }
 }
 
@@ -1013,7 +1016,7 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
 
 fn provider_summary(config: &RuntimeConfig) -> AdminProviderSummary {
     let target_fingerprint =
-        provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(config));
+        provider_conformance_target_fingerprint(&V3ProviderCheckConfig::from(config));
     AdminProviderSummary {
         selected_profile: selected_provider_profile(config),
         conformance: provider_conformance_summary(
@@ -1125,14 +1128,14 @@ pub(crate) fn provider_conformance_summary_from_bytes(
         return provider_conformance_unavailable("invalid", "provider-conformance.target-mismatch");
     }
     let report_profile = match report.profile.as_str() {
-        "dev" => V2ProviderProfile::Dev,
-        "atomic-create" => V2ProviderProfile::AtomicCreate,
-        "retained-version-object-lock" => V2ProviderProfile::RetainedVersionObjectLock,
+        "dev" => V3ProviderProfile::Dev,
+        "atomic-create" => V3ProviderProfile::AtomicCreate,
+        "retained-version-object-lock" => V3ProviderProfile::RetainedVersionObjectLock,
         _ => {
             return provider_conformance_unavailable("invalid", "provider-conformance.profile");
         }
     };
-    let required_checks = required_v2_provider_check_names(report_profile);
+    let required_checks = required_v3_provider_check_names(report_profile);
     let mut observed_checks = report
         .checks
         .iter()
@@ -1252,15 +1255,15 @@ struct ProviderConformanceCheckJson {
 }
 
 async fn restore_summary(config: &RuntimeConfig) -> AdminRestoreSummary {
-    restore_summary_v2(config).await
+    restore_summary_v3(config).await
 }
 
-async fn restore_summary_v2(config: &RuntimeConfig) -> AdminRestoreSummary {
-    match crate::s3::export_v2_recovery_bundle_from_config(config).await {
+async fn restore_summary_v3(config: &RuntimeConfig) -> AdminRestoreSummary {
+    match crate::s3::export_v3_recovery_bundle_from_config(config).await {
         Ok(bundle) => AdminRestoreSummary {
             state: "verified",
             reason_code: None,
-            v2_anchor: Some(AdminV2RestoreSummary {
+            v3_anchor: Some(AdminV3RestoreSummary {
                 sequence: bundle.anchor.sequence.get(),
                 body_digest: hex::encode(bundle.anchor.body_digest),
                 version_bound: bundle.anchor.version_id.is_some(),
@@ -1272,7 +1275,7 @@ async fn restore_summary_v2(config: &RuntimeConfig) -> AdminRestoreSummary {
         Err(error) => AdminRestoreSummary {
             state: "unavailable",
             reason_code: Some(runtime_error_code(&error)),
-            v2_anchor: None,
+            v3_anchor: None,
         },
     }
 }
@@ -1283,12 +1286,12 @@ pub(crate) async fn admin_maintenance_summary(config: &RuntimeConfig) -> AdminMa
 
 async fn maintenance_summary(config: &RuntimeConfig) -> AdminMaintenanceSummary {
     let computed_at_ms = current_time_ms().unwrap_or(0);
-    match crate::s3::v2_quick_maintenance_from_config(config).await {
+    match crate::s3::v3_quick_maintenance_from_config(config).await {
         Ok(report) => AdminMaintenanceSummary {
             state: "verified",
             computed_at_ms,
             reason_code: None,
-            v2: Some(AdminV2MaintenanceSummary {
+            v3: Some(AdminV3MaintenanceSummary {
                 packed_payload_stored_bytes: report.packed_payload_stored_bytes,
                 packed_payload_referenced_bytes: report.packed_payload_referenced_bytes,
                 packed_payload_unreferenced_bytes: report
@@ -1318,7 +1321,7 @@ async fn maintenance_summary(config: &RuntimeConfig) -> AdminMaintenanceSummary 
             state: "unavailable",
             computed_at_ms,
             reason_code: Some(runtime_error_code(&error)),
-            v2: None,
+            v3: None,
             supervisor: None,
         },
     }
@@ -1330,7 +1333,7 @@ async fn maintenance_summary(config: &RuntimeConfig) -> AdminMaintenanceSummary 
 /// on retained-version provider profiles.
 pub fn provider_conformance_evidence_passed(config: &RuntimeConfig) -> bool {
     let target_fingerprint =
-        provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(config));
+        provider_conformance_target_fingerprint(&V3ProviderCheckConfig::from(config));
     provider_conformance_summary(
         &config.provider_conformance,
         selected_provider_profile(config),
@@ -1539,7 +1542,7 @@ fn current_time_ms() -> Option<i64> {
 mod tests {
     use super::{
         AdminReportProfile, AdminRepositoryRuntimeFacts, AdminRuntimeFacts,
-        AdminV2CommitCoordinatorSummary, PROVIDER_CONFORMANCE_SCHEMA, ProviderConformanceCheckJson,
+        AdminV3CommitCoordinatorSummary, PROVIDER_CONFORMANCE_SCHEMA, ProviderConformanceCheckJson,
         ProviderConformanceReportJson, admin_posture_report,
         admin_posture_report_with_runtime_facts, admin_status_report,
         admin_status_report_with_runtime_facts, backend_kind, current_time_ms, doctor_findings,
@@ -1549,7 +1552,7 @@ mod tests {
         AnchorConfig, BackendConfig, BatchConfig, GatewayMode, HardeningConfig, MaintenanceConfig,
         MetricsConfig, ProviderConformanceConfig, RecoveryConfig, RepositoryConfig,
         RepositoryFormat, RepositoryKeysConfig, RuntimeConfig, StaticCredentials,
-        V2ProviderCheckConfig, WriterGuardConfig,
+        V3ProviderCheckConfig, WriterGuardConfig,
     };
     use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
@@ -1732,7 +1735,7 @@ mod tests {
     #[test]
     fn provider_target_fingerprint_binds_credential_principal() {
         let config = runtime_config();
-        let mut first = V2ProviderCheckConfig::from(&config);
+        let mut first = V3ProviderCheckConfig::from(&config);
         first.principal_fingerprint = Some("a".repeat(64));
         let mut second = first.clone();
         second.principal_fingerprint = Some("b".repeat(64));
@@ -1803,7 +1806,7 @@ mod tests {
         let runtime_facts = AdminRuntimeFacts {
             process_started_at_ms: Some(123),
             repository: AdminRepositoryRuntimeFacts {
-                v2_commit_coordinator: None,
+                v3_commit_coordinator: None,
             },
             maintenance_supervisor: Some(crate::AdminMaintenanceSupervisorSummary {
                 mode: "auto",
@@ -1954,9 +1957,9 @@ mod tests {
         assert_eq!(report.backend.stalled_stream_grace_seconds, 30);
         assert_eq!(report.security.action_posture, "report-only");
         assert_eq!(report.schema, "rs3.admin-status.preview.v1");
-        assert!(report.restore.v2_anchor.is_none());
+        assert!(report.restore.v3_anchor.is_none());
         assert_eq!(report.maintenance.state, "unavailable");
-        assert!(report.maintenance.v2.is_none());
+        assert!(report.maintenance.v3.is_none());
     }
 
     #[tokio::test]
@@ -1965,7 +1968,7 @@ mod tests {
         let runtime_facts = AdminRuntimeFacts {
             process_started_at_ms: Some(123),
             repository: AdminRepositoryRuntimeFacts {
-                v2_commit_coordinator: Some(AdminV2CommitCoordinatorSummary {
+                v3_commit_coordinator: Some(AdminV3CommitCoordinatorSummary {
                     poisoned: true,
                     poison_reason: Some("test-poison".to_owned()),
                 }),
@@ -1997,7 +2000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_status_reports_v2_maintenance_without_paths_when_unavailable() {
+    async fn admin_status_reports_v3_maintenance_without_paths_when_unavailable() {
         let config = runtime_config();
         let report = admin_status_report(&config, AdminReportProfile::Production).await;
         let json = serde_json::to_string(&report).unwrap_or_else(|error| panic!("{error}"));
@@ -2008,8 +2011,8 @@ mod tests {
             Some("runtime.anchor-missing")
         );
         assert_eq!(report.restore.reason_code, Some("runtime.anchor-missing"));
-        assert!(report.restore.v2_anchor.is_none());
-        assert!(report.maintenance.v2.is_none());
+        assert!(report.restore.v3_anchor.is_none());
+        assert!(report.maintenance.v3.is_none());
         assert!(!json.contains("client-private-bucket"));
         assert!(!json.contains("backend-secret-bucket"));
         assert!(!json.contains("tenant/private/prefix"));
@@ -2097,7 +2100,7 @@ mod tests {
         let runtime_facts = AdminRuntimeFacts {
             process_started_at_ms: Some(123),
             repository: AdminRepositoryRuntimeFacts {
-                v2_commit_coordinator: Some(AdminV2CommitCoordinatorSummary {
+                v3_commit_coordinator: Some(AdminV3CommitCoordinatorSummary {
                     poisoned: true,
                     poison_reason: Some("v2 commit batch rollback failed".to_owned()),
                 }),
@@ -2112,7 +2115,7 @@ mod tests {
         );
         let coordinator = report
             .repository
-            .v2_commit_coordinator
+            .v3_commit_coordinator
             .unwrap_or_else(|| panic!("coordinator fact should be attached"));
 
         assert!(coordinator.poisoned);
@@ -2131,7 +2134,7 @@ mod tests {
             super::provider_conformance_summary_from_bytes(
                 &config.provider_conformance,
                 "retained-version-object-lock",
-                &provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(config)),
+                &provider_conformance_target_fingerprint(&V3ProviderCheckConfig::from(config)),
                 config.repository.retention,
                 body,
             )
@@ -2168,7 +2171,7 @@ mod tests {
         ] {
             config.repository.retention = Some(policy);
             assert_ne!(
-                provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(&config)),
+                provider_conformance_target_fingerprint(&V3ProviderCheckConfig::from(&config)),
                 target
             );
             assert_eq!(
@@ -2211,9 +2214,9 @@ mod tests {
 
     fn retained_provider_evidence(config: &RuntimeConfig) -> ProviderConformanceReportJson {
         let target_fingerprint =
-            provider_conformance_target_fingerprint(&V2ProviderCheckConfig::from(config));
-        let checks = rs3_repository::v2::required_v2_provider_check_names(
-            rs3_repository::v2::V2ProviderProfile::RetainedVersionObjectLock,
+            provider_conformance_target_fingerprint(&V3ProviderCheckConfig::from(config));
+        let checks = rs3_repository::v3::required_v3_provider_check_names(
+            rs3_repository::v3::V3ProviderProfile::RetainedVersionObjectLock,
         )
         .into_iter()
         .map(|name| ProviderConformanceCheckJson {

@@ -1,15 +1,15 @@
-//! Deterministic fault-injection invariants for v2 repository workflows.
+//! Deterministic fault-injection invariants for v3 repository workflows.
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream;
 use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
-use rs3_repository::v2::{
-    UnenforcedQuiescedMaintenanceGuard, V2_MAX_HEADER_SIZE, V2CommitAnchor, V2CommitCoordinator,
-    V2CommitSection, V2CommitStore, V2CommitStoreOptions, V2CommitWrite, V2FormatError,
-    V2FormatRef, V2FullGcApplyOptions, V2FullGcDryRunOptions, V2KeyringEnvelopeRef,
-    V2KeyringEnvelopeRootRef, V2MaintenanceBudgets, V2MemoryAnchor, V2OrphanGcOptions,
-    V2ProviderProfile, V2RecoveryBundle, V2SectionType,
+use rs3_repository::v3::{
+    UnenforcedQuiescedMaintenanceGuard, V3_MAX_HEADER_SIZE, V3CommitAnchor, V3CommitCoordinator,
+    V3CommitSection, V3CommitStore, V3CommitStoreOptions, V3CommitWrite, V3FormatError,
+    V3FormatRef, V3FullGcApplyOptions, V3FullGcDryRunOptions, V3KeyringEnvelopeRef,
+    V3KeyringEnvelopeRootRef, V3MaintenanceBudgets, V3MemoryAnchor, V3OrphanGcOptions,
+    V3ProviderProfile, V3RecoveryBundle, V3SectionType,
 };
 use rs3_repository::{RepositoryError, RepositoryOptions, RepositoryPutOptions};
 use rs3_storage::{
@@ -34,7 +34,7 @@ async fn commit_publish_fault_sweep_never_exposes_half_visible_write() {
             let inner = MemoryBlobStore::new();
             let keyring = signing_keyring();
             let options = commit_options();
-            let anchor = V2MemoryAnchor::new();
+            let anchor = V3MemoryAnchor::new();
             let setup = make_repository(inner.clone(), keyring.clone(), options.clone());
             setup
                 .write_genesis_snapshot(&anchor)
@@ -99,7 +99,7 @@ async fn gc_stale_list_preserves_live_payload_refs_and_protected_roots() {
     let keyring = signing_keyring();
     let options = commit_options();
     let repository = make_repository(inner.clone(), keyring.clone(), options.clone());
-    let anchor = V2MemoryAnchor::new();
+    let anchor = V3MemoryAnchor::new();
     let first_key = logical_path("snapshots/gc-stale-live-one.bin");
     let second_key = logical_path("snapshots/gc-stale-live-two.bin");
     let first_body = Bytes::from_static(b"live before stale list snapshot one");
@@ -128,7 +128,7 @@ async fn gc_stale_list_preserves_live_payload_refs_and_protected_roots() {
         .await
         .expect("second live payload should commit");
     let protected_root = anchor
-        .read_v2()
+        .read_v3()
         .await
         .expect("anchor should read")
         .expect("anchor should exist");
@@ -154,12 +154,12 @@ async fn gc_stale_list_preserves_live_payload_refs_and_protected_roots() {
         .apply_full_gc(
             &anchor,
             &UnenforcedQuiescedMaintenanceGuard,
-            V2FullGcApplyOptions {
-                dry_run: V2FullGcDryRunOptions {
+            V3FullGcApplyOptions {
+                dry_run: V3FullGcDryRunOptions {
                     protected_roots: vec![protected_root],
-                    ..V2FullGcDryRunOptions::default()
+                    ..V3FullGcDryRunOptions::default()
                 },
-                orphan_gc: rs3_repository::v2::V2OrphanGcOptions::new_for_test_rehearsal(
+                orphan_gc: rs3_repository::v3::V3OrphanGcOptions::new_for_test_rehearsal(
                     Duration::ZERO,
                 ),
                 retained_provider_conformance_passed: false,
@@ -204,7 +204,7 @@ async fn streaming_put_fault_sweep_never_exposes_partial_object_and_aborts_parts
         let inner = MemoryBlobStore::new();
         let keyring = signing_keyring();
         let options = commit_options();
-        let anchor = V2MemoryAnchor::new();
+        let anchor = V3MemoryAnchor::new();
         let setup = make_repository(inner.clone(), keyring.clone(), options.clone());
         setup
             .write_genesis_snapshot(&anchor)
@@ -221,7 +221,7 @@ async fn streaming_put_fault_sweep_never_exposes_partial_object_and_aborts_parts
             .load_chain_from_anchor(&anchor)
             .await
             .expect("fresh repository should replay genesis");
-        let coordinator = V2CommitCoordinator::new(Arc::clone(&repository), anchor.clone())
+        let coordinator = V3CommitCoordinator::new(Arc::clone(&repository), anchor.clone())
             .expect("coordinator should start");
         let fault_index = store
             .next_operation_index()
@@ -247,7 +247,7 @@ async fn streaming_put_fault_sweep_never_exposes_partial_object_and_aborts_parts
                 body.len() as u64,
                 stream::iter(chunks),
                 RepositoryPutOptions::default(),
-                V2_MAX_HEADER_SIZE + 512,
+                V3_MAX_HEADER_SIZE + 512,
             )
             .await;
         let log = store
@@ -290,7 +290,7 @@ async fn ambiguous_multipart_completion_leaves_only_an_invisible_gc_orphan() {
     let inner = MemoryBlobStore::new();
     let keyring = signing_keyring();
     let options = commit_options();
-    let anchor = V2MemoryAnchor::new();
+    let anchor = V3MemoryAnchor::new();
     make_repository(inner.clone(), keyring.clone(), options.clone())
         .write_genesis_snapshot(&anchor)
         .await
@@ -307,7 +307,7 @@ async fn ambiguous_multipart_completion_leaves_only_an_invisible_gc_orphan() {
         .load_chain_from_anchor(&anchor)
         .await
         .expect("repository should load genesis");
-    let coordinator = V2CommitCoordinator::new(Arc::clone(&repository), anchor.clone())
+    let coordinator = V3CommitCoordinator::new(Arc::clone(&repository), anchor.clone())
         .expect("coordinator should start");
     let key = logical_path("snapshots/ambiguous-complete.bin");
     let result = coordinator
@@ -316,7 +316,7 @@ async fn ambiguous_multipart_completion_leaves_only_an_invisible_gc_orphan() {
             4096,
             stream::iter([Ok::<Bytes, RepositoryError>(Bytes::from(vec![0x4a; 4096]))]),
             RepositoryPutOptions::default(),
-            V2_MAX_HEADER_SIZE + 512,
+            V3_MAX_HEADER_SIZE + 512,
         )
         .await;
     assert!(result.is_err());
@@ -340,7 +340,7 @@ async fn ambiguous_multipart_completion_leaves_only_an_invisible_gc_orphan() {
             .candidates
             .iter()
             .filter(|candidate| {
-                candidate.object_class == rs3_repository::v2::V2OrphanObjectClass::Object
+                candidate.object_class == rs3_repository::v3::V3OrphanObjectClass::Object
             })
             .count(),
         1
@@ -352,8 +352,8 @@ async fn ambiguous_retention_renewal_aborts_before_any_orphan_delete() {
     let inner = MemoryBlobStore::new();
     let keyring = signing_keyring();
     let retention = RetentionPolicy::new(RetentionMode::Compliance, 1);
-    let mut options = V2CommitStoreOptions {
-        provider_profile: V2ProviderProfile::RetainedVersionObjectLock,
+    let mut options = V3CommitStoreOptions {
+        provider_profile: V3ProviderProfile::RetainedVersionObjectLock,
         retention: Some(retention),
         ..commit_options()
     };
@@ -380,14 +380,14 @@ async fn ambiguous_retention_renewal_aborts_before_any_orphan_delete() {
         .await
         .expect("format root should write");
     options.format_ref.version_id = format_metadata.version_id;
-    options.maintenance_keyring_envelope_ref = Some(V2KeyringEnvelopeRootRef {
+    options.maintenance_keyring_envelope_ref = Some(V3KeyringEnvelopeRootRef {
         generation: 1,
         digest: hex::encode(options.keyring_envelope_ref.digest),
         object_id: options.keyring_envelope_ref.object_id.clone(),
         version_id: keyring_metadata.version_id,
     });
-    let anchor = V2MemoryAnchor::new();
-    let setup = V2CommitStore::new(inner.clone(), keyring.clone(), options.clone());
+    let anchor = V3MemoryAnchor::new();
+    let setup = V3CommitStore::new(inner.clone(), keyring.clone(), options.clone());
     let genesis = setup
         .write_genesis_snapshot(&anchor)
         .await
@@ -409,27 +409,27 @@ async fn ambiguous_retention_renewal_aborts_before_any_orphan_delete() {
             FaultAction::error_after_write("ambiguous retention renewal"),
         )],
     );
-    let repository = V2CommitStore::new(store, keyring, options);
+    let repository = V3CommitStore::new(store, keyring, options);
     let result = repository
         .apply_full_gc(
             &anchor,
             &UnenforcedQuiescedMaintenanceGuard,
-            V2FullGcApplyOptions {
-                dry_run: V2FullGcDryRunOptions {
-                    budgets: V2MaintenanceBudgets {
+            V3FullGcApplyOptions {
+                dry_run: V3FullGcDryRunOptions {
+                    budgets: V3MaintenanceBudgets {
                         max_retention_extend_count: Some(3),
-                        ..V2MaintenanceBudgets::default()
+                        ..V3MaintenanceBudgets::default()
                     },
                     retention_renewal_horizon: Duration::from_secs(2 * 24 * 60 * 60),
-                    ..V2FullGcDryRunOptions::default()
+                    ..V3FullGcDryRunOptions::default()
                 },
-                orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+                orphan_gc: V3OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                 retained_provider_conformance_passed: true,
                 reclamation_enabled: true,
             },
         )
         .await;
-    assert_eq!(result, Err(V2FormatError::StorageOperationFailed));
+    assert_eq!(result, Err(V3FormatError::StorageOperationFailed));
     assert!(inner.head(&orphan).await.is_ok());
     let exact = inner
         .head_at(&genesis.commit_key.object_id, genesis.version_id.as_ref())
@@ -446,20 +446,20 @@ async fn weak_subjectivity_floor_rejects_rollback_before_storage_faults() {
     let inner = MemoryBlobStore::new();
     let keyring = signing_keyring();
     let options = commit_options();
-    let repository = V2CommitStore::new(inner.clone(), keyring.clone(), options.clone());
-    let anchor = V2MemoryAnchor::new();
+    let repository = V3CommitStore::new(inner.clone(), keyring.clone(), options.clone());
+    let anchor = V3MemoryAnchor::new();
 
     let genesis = repository
         .write_genesis_snapshot(&anchor)
         .await
         .expect("genesis should write");
-    let old_bundle = V2RecoveryBundle::from_anchor(genesis.anchor_state, Sequence::new(1));
+    let old_bundle = V3RecoveryBundle::from_anchor(genesis.anchor_state, Sequence::new(1));
     repository
         .write_child_commit(
             &anchor,
-            V2CommitWrite::delta(vec![V2CommitSection::new(
-                V2SectionType::IndexRun,
-                rs3_repository::v2::V2_SECTION_FLAG_MUST_UNDERSTAND,
+            V3CommitWrite::delta(vec![V3CommitSection::new(
+                V3SectionType::IndexRun,
+                rs3_repository::v3::V3_SECTION_FLAG_MUST_UNDERSTAND,
                 Bytes::from_static(b"newer state blocks rollback"),
             )]),
         )
@@ -474,17 +474,17 @@ async fn weak_subjectivity_floor_rejects_rollback_before_storage_faults() {
             FaultAction::crash_point(crash_hook.clone()),
         )],
     );
-    let recovery_repository = V2CommitStore::new(faulted_store, keyring, options);
-    let recovered_anchor = V2MemoryAnchor::new();
+    let recovery_repository = V3CommitStore::new(faulted_store, keyring, options);
+    let recovered_anchor = V3MemoryAnchor::new();
     let result = recovery_repository
         .recreate_anchor_from_recovery_bundle(&recovered_anchor, &old_bundle, Sequence::new(2))
         .await;
 
-    assert_eq!(result, Err(V2FormatError::RecoveryBundleRequired));
+    assert_eq!(result, Err(V3FormatError::RecoveryBundleRequired));
     assert_eq!(crash_hook.hit_count(), 0);
     assert_eq!(
         recovered_anchor
-            .read_v2()
+            .read_v3()
             .await
             .expect("recovered anchor should read"),
         None
@@ -494,12 +494,12 @@ async fn weak_subjectivity_floor_rejects_rollback_before_storage_faults() {
 #[tokio::test]
 async fn anchor_cas_conflict_storm_accepts_one_child_per_sequence() {
     let store = MemoryBlobStore::new();
-    let repository = Arc::new(V2CommitStore::new(
+    let repository = Arc::new(V3CommitStore::new(
         store,
         signing_keyring(),
         commit_options(),
     ));
-    let anchor = V2MemoryAnchor::new();
+    let anchor = V3MemoryAnchor::new();
     repository
         .write_genesis_snapshot(&anchor)
         .await
@@ -507,7 +507,7 @@ async fn anchor_cas_conflict_storm_accepts_one_child_per_sequence() {
 
     for round in 0..sweep_len(3, 8) {
         let before = anchor
-            .read_v2()
+            .read_v3()
             .await
             .expect("anchor should read")
             .expect("anchor should exist");
@@ -521,9 +521,9 @@ async fn anchor_cas_conflict_storm_accepts_one_child_per_sequence() {
                 repository
                     .write_child_commit(
                         &anchor,
-                        V2CommitWrite::delta(vec![V2CommitSection::new(
-                            V2SectionType::IndexRun,
-                            rs3_repository::v2::V2_SECTION_FLAG_MUST_UNDERSTAND,
+                        V3CommitWrite::delta(vec![V3CommitSection::new(
+                            V3SectionType::IndexRun,
+                            rs3_repository::v3::V3_SECTION_FLAG_MUST_UNDERSTAND,
                             Bytes::from(format!("round-{round}-contender-{contender}")),
                         )]),
                     )
@@ -536,12 +536,12 @@ async fn anchor_cas_conflict_storm_accepts_one_child_per_sequence() {
         for task in tasks {
             match task.await.expect("writer task should not panic") {
                 Ok(_) => accepted = accepted.saturating_add(1),
-                Err(V2FormatError::StaleAnchor) => stale = stale.saturating_add(1),
+                Err(V3FormatError::StaleAnchor) => stale = stale.saturating_add(1),
                 Err(error) => panic!("unexpected CAS storm error: {error}"),
             }
         }
         let after = anchor
-            .read_v2()
+            .read_v3()
             .await
             .expect("anchor should read")
             .expect("anchor should exist");
@@ -596,12 +596,12 @@ impl PublishFault {
 fn make_repository<S>(
     store: S,
     keyring: KeyRing,
-    commit_options: V2CommitStoreOptions,
-) -> rs3_repository::v2::V2Repository<S>
+    commit_options: V3CommitStoreOptions,
+) -> rs3_repository::v3::V3Repository<S>
 where
     S: BlobStore + Clone,
 {
-    rs3_repository::v2::V2Repository::new(
+    rs3_repository::v3::V3Repository::new(
         store,
         keyring,
         RepositoryOptions::default(),
@@ -609,15 +609,15 @@ where
     )
 }
 
-fn commit_options() -> V2CommitStoreOptions {
-    V2CommitStoreOptions::for_profile(
-        V2ProviderProfile::Dev,
+fn commit_options() -> V3CommitStoreOptions {
+    V3CommitStoreOptions::for_profile(
+        V3ProviderProfile::Dev,
         sample_repository_id(),
-        V2KeyringEnvelopeRef {
+        V3KeyringEnvelopeRef {
             object_id: object_id("keyrings/00000000000000000001-fault-test"),
             digest: [6_u8; 32],
         },
-        V2FormatRef {
+        V3FormatRef {
             generation: 1,
             digest: hex::encode([7_u8; 32]),
             object_id: object_id(&format!("format/{:020}-{}", 1_u64, hex::encode([7_u8; 32]))),
@@ -685,12 +685,12 @@ fn signing_keyring() -> KeyRing {
 
 #[derive(Clone)]
 struct BarrierAdvanceAnchor {
-    inner: V2MemoryAnchor,
+    inner: V3MemoryAnchor,
     barrier: Arc<Barrier>,
 }
 
 impl BarrierAdvanceAnchor {
-    fn new(inner: V2MemoryAnchor, parties: usize) -> Self {
+    fn new(inner: V3MemoryAnchor, parties: usize) -> Self {
         Self {
             inner,
             barrier: Arc::new(Barrier::new(parties)),
@@ -699,20 +699,20 @@ impl BarrierAdvanceAnchor {
 }
 
 #[async_trait]
-impl V2CommitAnchor for BarrierAdvanceAnchor {
-    async fn read_v2(
+impl V3CommitAnchor for BarrierAdvanceAnchor {
+    async fn read_v3(
         &self,
-    ) -> rs3_repository::v2::V2Result<Option<rs3_repository::v2::V2AnchorState>> {
-        self.inner.read_v2().await
+    ) -> rs3_repository::v3::V3Result<Option<rs3_repository::v3::V3AnchorState>> {
+        self.inner.read_v3().await
     }
 
-    async fn compare_and_advance_v2(
+    async fn compare_and_advance_v3(
         &self,
-        expected: Option<&rs3_repository::v2::V2AnchorState>,
-        next: rs3_repository::v2::V2AnchorState,
-    ) -> rs3_repository::v2::V2Result<rs3_repository::v2::V2AnchorState> {
+        expected: Option<&rs3_repository::v3::V3AnchorState>,
+        next: rs3_repository::v3::V3AnchorState,
+    ) -> rs3_repository::v3::V3Result<rs3_repository::v3::V3AnchorState> {
         self.barrier.wait().await;
-        self.inner.compare_and_advance_v2(expected, next).await
+        self.inner.compare_and_advance_v3(expected, next).await
     }
 }
 
@@ -726,7 +726,7 @@ enum CompactionFault {
 }
 
 struct CompactionAuthority {
-    inner: V2MemoryAnchor,
+    inner: V3MemoryAnchor,
     fault: CompactionFault,
     reads: std::sync::atomic::AtomicUsize,
     guards: std::sync::atomic::AtomicUsize,
@@ -735,46 +735,46 @@ struct CompactionAuthority {
 }
 
 impl CompactionAuthority {
-    fn reject(&self) -> rs3_repository::v2::V2Result<()> {
+    fn reject(&self) -> rs3_repository::v3::V3Result<()> {
         self.failures
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err(V2FormatError::StaleAnchor)
+        Err(V3FormatError::StaleAnchor)
     }
 }
 
 #[async_trait]
-impl V2CommitAnchor for CompactionAuthority {
-    async fn read_v2(
+impl V3CommitAnchor for CompactionAuthority {
+    async fn read_v3(
         &self,
-    ) -> rs3_repository::v2::V2Result<Option<rs3_repository::v2::V2AnchorState>> {
+    ) -> rs3_repository::v3::V3Result<Option<rs3_repository::v3::V3AnchorState>> {
         let call = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         if matches!(self.fault, CompactionFault::AnchorRead(target) if target == call) {
             self.reject()?;
         }
-        self.inner.read_v2().await
+        self.inner.read_v3().await
     }
 
-    async fn compare_and_advance_v2(
+    async fn compare_and_advance_v3(
         &self,
-        expected: Option<&rs3_repository::v2::V2AnchorState>,
-        next: rs3_repository::v2::V2AnchorState,
-    ) -> rs3_repository::v2::V2Result<rs3_repository::v2::V2AnchorState> {
+        expected: Option<&rs3_repository::v3::V3AnchorState>,
+        next: rs3_repository::v3::V3AnchorState,
+    ) -> rs3_repository::v3::V3Result<rs3_repository::v3::V3AnchorState> {
         let call = self
             .advances
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if matches!(self.fault, CompactionFault::AnchorCas) && call == 0 {
             self.reject()?;
         }
-        self.inner.compare_and_advance_v2(expected, next).await
+        self.inner.compare_and_advance_v3(expected, next).await
     }
 }
 
 #[async_trait]
-impl rs3_repository::v2::V2MaintenanceGuard for CompactionAuthority {
-    async fn verify_v2_maintenance(
+impl rs3_repository::v3::V3MaintenanceGuard for CompactionAuthority {
+    async fn verify_v3_maintenance(
         &self,
-        _base: Option<&rs3_repository::v2::V2AnchorState>,
-    ) -> rs3_repository::v2::V2Result<()> {
+        _base: Option<&rs3_repository::v3::V3AnchorState>,
+    ) -> rs3_repository::v3::V3Result<()> {
         let call = self
             .guards
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -847,7 +847,7 @@ async fn compaction_fault_case(fault: CompactionFault) -> CompactionTrace {
     let inner = MemoryBlobStore::new();
     let keyring = signing_keyring();
     let options = commit_options();
-    let anchor = V2MemoryAnchor::new();
+    let anchor = V3MemoryAnchor::new();
     let setup = make_repository(inner.clone(), keyring.clone(), options.clone());
     setup
         .write_genesis_snapshot(&anchor)
@@ -887,7 +887,7 @@ async fn compaction_fault_case(fault: CompactionFault) -> CompactionTrace {
         .expect("stage tombstone");
     expected.remove(&deleted);
     let base = anchor
-        .read_v2()
+        .read_v3()
         .await
         .expect("read base")
         .expect("base exists");
@@ -903,13 +903,13 @@ async fn compaction_fault_case(fault: CompactionFault) -> CompactionTrace {
             .await
             .expect("fixture bytes");
         let parsed =
-            rs3_repository::v2::parse_v2_commit_header(&object.object_id, &bytes, &keyring)
+            rs3_repository::v3::parse_v3_commit_header(&object.object_id, &bytes, &keyring)
                 .expect("fixture signed header");
         let spans = parsed
             .header
             .section_index
             .iter()
-            .filter(|section| matches!(section.section_type, V2SectionType::PayloadPack))
+            .filter(|section| matches!(section.section_type, V3SectionType::PayloadPack))
             .map(|section| {
                 let start = parsed.sections_start as u64 + section.offset;
                 start..start + section.length
@@ -985,7 +985,7 @@ async fn compaction_fault_case(fault: CompactionFault) -> CompactionTrace {
             );
         }
         assert_eq!(
-            anchor.read_v2().await.expect("base after fault"),
+            anchor.read_v3().await.expect("base after fault"),
             Some(base.clone())
         );
         let inventory = inner.list_prefix("").await.expect("post-failure inventory");
@@ -1028,7 +1028,7 @@ async fn compaction_fault_case(fault: CompactionFault) -> CompactionTrace {
         );
     }
     let accepted = anchor
-        .read_v2()
+        .read_v3()
         .await
         .expect("accepted anchor")
         .expect("anchor exists");
@@ -1082,7 +1082,7 @@ fn assert_compaction_does_not_read_payload(
 }
 
 async fn assert_compaction_visible_state<S: BlobStore + Clone>(
-    repository: &rs3_repository::v2::V2Repository<S>,
+    repository: &rs3_repository::v3::V3Repository<S>,
     expected: &std::collections::BTreeMap<LogicalPath, Bytes>,
     deleted: &LogicalPath,
 ) {
@@ -1107,20 +1107,20 @@ async fn assert_compaction_visible_state<S: BlobStore + Clone>(
 
 mod sustained_churn {
     use super::*;
-    use rs3_repository::v2::{V2_INDEX_COMPACTION_PAUSE_RUNS, V2AnchorState};
+    use rs3_repository::v3::{V3_INDEX_COMPACTION_PAUSE_RUNS, V3AnchorState};
     use std::collections::BTreeMap;
 
     async fn restore(
         inner: &MemoryBlobStore,
         keys: &KeyRing,
-        options: &V2CommitStoreOptions,
-        anchor: &V2AnchorState,
+        options: &V3CommitStoreOptions,
+        anchor: &V3AnchorState,
         model: &BTreeMap<LogicalPath, Bytes>,
     ) -> (usize, rs3_storage::BlobOperationCounts) {
         let fresh = make_repository(inner.clone(), keys.clone(), options.clone());
         inner.reset_operation_counts().expect("reset replay counts");
         let replay = fresh
-            .load_chain_from_anchor(&V2MemoryAnchor::with_state(anchor.clone()))
+            .load_chain_from_anchor(&V3MemoryAnchor::with_state(anchor.clone()))
             .await
             .expect("fresh replay")
             .expect("accepted root");
@@ -1165,14 +1165,14 @@ mod sustained_churn {
     #[tokio::test]
     #[ignore = "sustained scale lane; run with just test-churn-scale"]
     async fn fixed_live_set_churn_scale() {
-        run_churn(V2_INDEX_COMPACTION_PAUSE_RUNS + 128).await;
+        run_churn(V3_INDEX_COMPACTION_PAUSE_RUNS + 128).await;
     }
 
     async fn run_churn(cycles: usize) {
         let inner = MemoryBlobStore::new();
         let keys = signing_keyring();
         let options = commit_options();
-        let anchor = V2MemoryAnchor::new();
+        let anchor = V3MemoryAnchor::new();
         let mut model = BTreeMap::new();
         let initial = make_repository(inner.clone(), keys.clone(), options.clone());
         initial
@@ -1203,13 +1203,13 @@ mod sustained_churn {
                 .await
                 .expect("initial fixture bytes");
             let parsed =
-                rs3_repository::v2::parse_v2_commit_header(&metadata.object_id, &bytes, &keys)
+                rs3_repository::v3::parse_v3_commit_header(&metadata.object_id, &bytes, &keys)
                     .expect("initial header");
             let spans = parsed
                 .header
                 .section_index
                 .iter()
-                .filter(|s| matches!(s.section_type, V2SectionType::PayloadPack))
+                .filter(|s| matches!(s.section_type, V3SectionType::PayloadPack))
                 .map(|s| {
                     let start = parsed.sections_start as u64 + s.offset;
                     start..start + s.length
@@ -1272,13 +1272,13 @@ mod sustained_churn {
                     .get_range(&id, ByteRange::Full)
                     .await
                     .expect("fixture object");
-                let parsed = rs3_repository::v2::parse_v2_commit_header(&id, &bytes, &keys)
+                let parsed = rs3_repository::v3::parse_v3_commit_header(&id, &bytes, &keys)
                     .expect("signed fixture header");
                 let spans = parsed
                     .header
                     .section_index
                     .iter()
-                    .filter(|s| matches!(s.section_type, V2SectionType::PayloadPack))
+                    .filter(|s| matches!(s.section_type, V3SectionType::PayloadPack))
                     .map(|s| {
                         let start = parsed.sections_start as u64 + s.offset;
                         start..start + s.length
@@ -1306,13 +1306,13 @@ mod sustained_churn {
                     .get_range(id, ByteRange::Full)
                     .await
                     .expect("compaction object");
-                let parsed = rs3_repository::v2::parse_v2_commit_header(id, &bytes, &keys)
+                let parsed = rs3_repository::v3::parse_v3_commit_header(id, &bytes, &keys)
                     .expect("compaction header");
                 payload_write_bytes += parsed
                     .header
                     .section_index
                     .iter()
-                    .filter(|s| matches!(s.section_type, V2SectionType::PayloadPack))
+                    .filter(|s| matches!(s.section_type, V3SectionType::PayloadPack))
                     .map(|s| s.length)
                     .sum::<u64>();
             }
@@ -1333,7 +1333,7 @@ mod sustained_churn {
             );
             let after = repository.active_index_run_count().expect("after runs");
             assert_eq!(after, 1, "one active run independent of churn age");
-            let state = anchor.read_v2().await.expect("anchor").expect("state");
+            let state = anchor.read_v3().await.expect("anchor").expect("state");
             let replay = restore(&inner, &keys, &options, &state, &model).await;
             if cycle == 1 || cycle == 32 {
                 historical.push((state.clone(), model.clone()));
@@ -1381,12 +1381,12 @@ mod sustained_churn {
             .apply_full_gc(
                 &anchor,
                 &UnenforcedQuiescedMaintenanceGuard,
-                V2FullGcApplyOptions {
-                    dry_run: V2FullGcDryRunOptions {
+                V3FullGcApplyOptions {
+                    dry_run: V3FullGcDryRunOptions {
                         protected_roots,
-                        ..V2FullGcDryRunOptions::default()
+                        ..V3FullGcDryRunOptions::default()
                     },
-                    orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+                    orphan_gc: V3OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance_passed: false,
                     reclamation_enabled: true,
                 },
@@ -1398,7 +1398,7 @@ mod sustained_churn {
             "GC actually reclaims obsolete versions"
         );
         let current = anchor
-            .read_v2()
+            .read_v3()
             .await
             .expect("current anchor")
             .expect("root");
@@ -1420,7 +1420,7 @@ mod sustained_churn {
             .await
             .expect("writer restart");
         let runs = repository.active_index_run_count().expect("terminal runs");
-        let coordinator = V2CommitCoordinator::new(Arc::clone(&repository), anchor.clone())
+        let coordinator = V3CommitCoordinator::new(Arc::clone(&repository), anchor.clone())
             .expect("coordinator")
             .with_maintenance_guard(UnenforcedQuiescedMaintenanceGuard);
         let result = coordinator
@@ -1448,7 +1448,7 @@ async fn fully_obsolete_window_publishes_only_a_root_and_preserves_newer_runs() 
     let options = commit_options();
     let store = FaultInjectingBlobStore::new(inner.clone(), Vec::new());
     let repository = make_repository(store.clone(), keys.clone(), options.clone());
-    let anchor = V2MemoryAnchor::new();
+    let anchor = V3MemoryAnchor::new();
     repository
         .write_genesis_snapshot(&anchor)
         .await
@@ -1508,11 +1508,11 @@ async fn fully_obsolete_window_publishes_only_a_root_and_preserves_newer_runs() 
                 .await
                 .expect("root object");
             let parsed =
-                rs3_repository::v2::parse_v2_commit_header(id, &bytes, &keys).expect("signed root");
+                rs3_repository::v3::parse_v3_commit_header(id, &bytes, &keys).expect("signed root");
             assert_eq!(parsed.header.section_index.len(), 1);
             assert_eq!(
                 parsed.header.section_index[0].section_type,
-                V2SectionType::IndexRoot
+                V3SectionType::IndexRoot
             );
         }
     }

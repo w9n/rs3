@@ -33,13 +33,13 @@ async fn content_md5_validates_every_put_body_path_and_keeps_the_prior_etag() {
     let bad = "AAAAAAAAAAAAAAAAAAAAAA==";
     for (threshold, declared) in [(64, Some(4)), (3, Some(4)), (64, None), (3, None)] {
         let service = gateway_service_with_put_body_limits(64, threshold, 5 * 1024 * 1024).await;
-        let base = accepted_v2_sequence(&service).await;
+        let base = accepted_v3_sequence(&service).await;
         let error = service
             .put_object(s3_request(md5_input(b"abcd", declared, bad)))
             .await
             .expect_err("mismatched Content-MD5");
         assert_eq!(error.code().as_str(), "BadDigest");
-        assert_eq!(accepted_v2_sequence(&service).await, base);
+        assert_eq!(accepted_v3_sequence(&service).await, base);
 
         let put = service
             .put_object(s3_request(md5_input(b"abcd", declared, original)))
@@ -48,13 +48,13 @@ async fn content_md5_validates_every_put_body_path_and_keeps_the_prior_etag() {
             .output;
         assert_eq!(put.e_tag, Some(ETag::Strong(original_etag.to_owned())));
 
-        let accepted = accepted_v2_sequence(&service).await;
+        let accepted = accepted_v3_sequence(&service).await;
         let error = service
             .put_object(s3_request(md5_input(b"wxyz", declared, original)))
             .await
             .expect_err("failed replacement");
         assert_eq!(error.code().as_str(), "BadDigest");
-        assert_eq!(accepted_v2_sequence(&service).await, accepted);
+        assert_eq!(accepted_v3_sequence(&service).await, accepted);
         let head = service
             .head_object(s3_request(HeadObjectInput {
                 bucket: "client-bucket".into(),
@@ -71,7 +71,7 @@ async fn content_md5_validates_every_put_body_path_and_keeps_the_prior_etag() {
 #[tokio::test]
 async fn content_md5_does_not_publish_a_truncated_known_length_stream() {
     let service = gateway_service_with_put_body_limits(64, 3, 5 * 1024 * 1024).await;
-    let base = accepted_v2_sequence(&service).await;
+    let base = accepted_v3_sequence(&service).await;
     let error = service
         .put_object(s3_request(md5_input(
             b"abc",
@@ -81,7 +81,7 @@ async fn content_md5_does_not_publish_a_truncated_known_length_stream() {
         .await
         .expect_err("truncated streaming body");
     assert_eq!(error.code().as_str(), "IncompleteBody");
-    assert_eq!(accepted_v2_sequence(&service).await, base);
+    assert_eq!(accepted_v3_sequence(&service).await, base);
 }
 
 #[tokio::test]
@@ -94,13 +94,13 @@ async fn checksum_put_validates_every_body_path_before_publication() {
     let bad = STANDARD.encode([0u8; 32]);
     for (threshold, declared) in [(64, Some(4)), (3, Some(4)), (64, None), (3, None)] {
         let service = gateway_service_with_put_body_limits(64, threshold, 5 * 1024 * 1024).await;
-        let base = accepted_v2_sequence(&service).await;
+        let base = accepted_v3_sequence(&service).await;
         let error = service
             .put_object(s3_request(input(b"abcd", declared, &bad)))
             .await
             .expect_err("mismatch");
         assert_eq!(error.code().as_str(), "BadDigest");
-        assert_eq!(accepted_v2_sequence(&service).await, base);
+        assert_eq!(accepted_v3_sequence(&service).await, base);
         let put = service
             .put_object(s3_request(input(b"abcd", declared, &good)))
             .await
@@ -111,13 +111,13 @@ async fn checksum_put_validates_every_body_path_before_publication() {
             put.checksum_type.as_ref().map(|kind| kind.as_str()),
             Some("FULL_OBJECT")
         );
-        let accepted = accepted_v2_sequence(&service).await;
+        let accepted = accepted_v3_sequence(&service).await;
         let error = service
             .put_object(s3_request(input(b"abcd", declared, &bad)))
             .await
             .expect_err("bad overwrite");
         assert_eq!(error.code().as_str(), "BadDigest");
-        assert_eq!(accepted_v2_sequence(&service).await, accepted);
+        assert_eq!(accepted_v3_sequence(&service).await, accepted);
         let head = service
             .head_object(s3_request(HeadObjectInput {
                 bucket: "client-bucket".into(),

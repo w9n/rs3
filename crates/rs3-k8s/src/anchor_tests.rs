@@ -1,7 +1,7 @@
 use super::*;
 use crate::lease_guard::lease_with_guard_state;
 use crate::test_support::{FakeLeaseApi, Fault, Operation};
-use crate::tests::v2_state;
+use crate::tests::v3_state;
 use k8s_openapi::jiff::Timestamp;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ fn settings() -> LeaseSettings {
 }
 
 fn stored_lease(sequence: u64, version: &str) -> Lease {
-    let mut lease = new_v2_lease("anchor", &v2_state(sequence));
+    let mut lease = new_v3_lease("anchor", &v3_state(sequence));
     lease.metadata.resource_version = Some(version.to_owned());
     lease
 }
@@ -32,13 +32,13 @@ async fn fault(
     });
 }
 
-async fn advance(api: &FakeLeaseApi, expected: Option<u64>, next: u64) -> V2Result<V2AnchorState> {
+async fn advance(api: &FakeLeaseApi, expected: Option<u64>, next: u64) -> V3Result<V3AnchorState> {
     compare_and_advance_lease(
         api,
         &settings(),
         None,
-        expected.map(v2_state).as_ref(),
-        v2_state(next),
+        expected.map(v3_state).as_ref(),
+        v3_state(next),
     )
     .await
 }
@@ -46,10 +46,10 @@ async fn advance(api: &FakeLeaseApi, expected: Option<u64>, next: u64) -> V2Resu
 #[tokio::test]
 async fn missing_anchor_is_created_then_advanced_with_resource_version() {
     let api = FakeLeaseApi::default();
-    assert_eq!(advance(&api, None, 1).await.expect("create"), v2_state(1));
+    assert_eq!(advance(&api, None, 1).await.expect("create"), v3_state(1));
     assert_eq!(
         advance(&api, Some(1), 2).await.expect("advance"),
-        v2_state(2)
+        v3_state(2)
     );
     assert_eq!(
         *api.calls.lock().await,
@@ -63,8 +63,8 @@ async fn missing_anchor_is_created_then_advanced_with_resource_version() {
     let stored = api.lease.lock().await.clone().expect("stored lease");
     assert_eq!(stored.metadata.resource_version.as_deref(), Some("2"));
     assert_eq!(
-        v2_anchor_state_from_lease(&stored).expect("anchor"),
-        v2_state(2)
+        v3_anchor_state_from_lease(&stored).expect("anchor"),
+        v3_state(2)
     );
 }
 
@@ -82,7 +82,7 @@ async fn create_conflict_rereads_and_updates_the_concurrently_created_empty_leas
     .await;
     assert_eq!(
         advance(&api, None, 1).await.expect("retry create race"),
-        v2_state(1)
+        v3_state(1)
     );
     assert_eq!(
         *api.calls.lock().await,
@@ -122,7 +122,7 @@ async fn conflicts_reread_and_reject_a_concurrent_anchor_change() {
         .await;
         assert!(matches!(
             advance(&api, expected, 2).await,
-            Err(V2FormatError::StaleAnchor)
+            Err(V3FormatError::StaleAnchor)
         ));
         assert_eq!(*api.lease.lock().await, Some(other));
         assert_eq!(
@@ -144,7 +144,7 @@ async fn create_and_replace_conflicts_stop_at_sixteen_attempts() {
         }
         assert!(matches!(
             advance(&api, expected, 2).await,
-            Err(V2FormatError::AnchorAdvanceFailed)
+            Err(V3FormatError::AnchorAdvanceFailed)
         ));
         assert_eq!(
             *api.calls.lock().await,
@@ -166,7 +166,7 @@ async fn final_allowed_attempt_can_succeed() {
         }
         assert_eq!(
             advance(&api, expected, 2).await.expect("sixteenth attempt"),
-            v2_state(2)
+            v3_state(2)
         );
         assert_eq!(
             *api.calls.lock().await,
@@ -185,10 +185,10 @@ async fn unexpected_api_failures_fail_closed_without_retrying() {
         fault(&api, operation, LeaseGuardError::ApiUnavailable, None).await;
         let result = advance(&api, expected, 2).await;
         if operation == Operation::Get {
-            assert!(matches!(result, Err(V2FormatError::AnchorReadFailed)));
+            assert!(matches!(result, Err(V3FormatError::AnchorReadFailed)));
             assert_eq!(*api.calls.lock().await, vec![Operation::Get]);
         } else {
-            assert!(matches!(result, Err(V2FormatError::AnchorAdvanceFailed)));
+            assert!(matches!(result, Err(V3FormatError::AnchorAdvanceFailed)));
             assert_eq!(*api.calls.lock().await, vec![Operation::Get, operation]);
         }
         assert_eq!(*api.lease.lock().await, original);
@@ -200,7 +200,7 @@ async fn expected_anchor_is_never_recreated_after_disappearance() {
     let api = FakeLeaseApi::default();
     assert!(matches!(
         advance(&api, Some(1), 2).await,
-        Err(V2FormatError::StaleAnchor)
+        Err(V3FormatError::StaleAnchor)
     ));
     assert_eq!(*api.calls.lock().await, vec![Operation::Get]);
     assert!(api.lease.lock().await.is_none());
@@ -213,14 +213,14 @@ async fn stale_nonmonotonic_and_malformed_candidates_do_not_write() {
     for (expected, next) in [(None, 8), (Some(6), 8), (Some(7), 6)] {
         assert!(matches!(
             advance(&api, expected, next).await,
-            Err(V2FormatError::StaleAnchor)
+            Err(V3FormatError::StaleAnchor)
         ));
     }
-    let mut changed = v2_state(7);
+    let mut changed = v3_state(7);
     changed.body_digest = [42; 32];
     assert!(matches!(
-        compare_and_advance_lease(&api, &settings(), None, Some(&v2_state(7)), changed).await,
-        Err(V2FormatError::StaleAnchor)
+        compare_and_advance_lease(&api, &settings(), None, Some(&v3_state(7)), changed).await,
+        Err(V3FormatError::StaleAnchor)
     ));
     let mut malformed = stored_lease(7, "1");
     malformed
@@ -228,11 +228,11 @@ async fn stale_nonmonotonic_and_malformed_candidates_do_not_write() {
         .annotations
         .as_mut()
         .expect("annotations")
-        .remove(V2_BODY_DIGEST_ANNOTATION);
+        .remove(V3_BODY_DIGEST_ANNOTATION);
     *api.lease.lock().await = Some(malformed);
     assert!(matches!(
         advance(&api, Some(7), 8).await,
-        Err(V2FormatError::AnchorReadFailed)
+        Err(V3FormatError::AnchorReadFailed)
     ));
     assert_eq!(*api.calls.lock().await, vec![Operation::Get; 5]);
 }
@@ -261,8 +261,8 @@ async fn locally_live_fence_cannot_recreate_a_missing_lease() {
     *api.lease.lock().await = None;
     assert!(fence.is_live());
     assert!(matches!(
-        compare_and_advance_lease(&api, &settings(), Some(&fence), None, v2_state(1)).await,
-        Err(V2FormatError::AnchorAdvanceFailed)
+        compare_and_advance_lease(&api, &settings(), Some(&fence), None, v3_state(1)).await,
+        Err(V3FormatError::AnchorAdvanceFailed)
     ));
     assert_eq!(*api.calls.lock().await, vec![Operation::Get]);
 }
@@ -298,8 +298,8 @@ async fn stolen_fence_is_rejected_even_while_local_deadline_is_live() {
         }
         assert!(fence.is_live());
         assert!(matches!(
-            compare_and_advance_lease(&api, &settings(), Some(&fence), None, v2_state(1)).await,
-            Err(V2FormatError::AnchorAdvanceFailed)
+            compare_and_advance_lease(&api, &settings(), Some(&fence), None, v3_state(1)).await,
+            Err(V3FormatError::AnchorAdvanceFailed)
         ));
         assert_eq!(*api.lease.lock().await, Some(stolen));
         let calls = if during_replace {
@@ -333,10 +333,10 @@ async fn renewal_conflict_preserves_the_latest_coordination_metadata() {
     )
     .await;
     assert_eq!(
-        compare_and_advance_lease(&api, &settings(), Some(&fence), None, v2_state(1))
+        compare_and_advance_lease(&api, &settings(), Some(&fence), None, v3_state(1))
             .await
             .expect("retry renewal"),
-        v2_state(1)
+        v3_state(1)
     );
     let stored = api.lease.lock().await.clone().expect("lease");
     assert_eq!(stored.spec, renewed.spec);
@@ -372,11 +372,11 @@ async fn accepted_write_with_lost_response_is_not_republished_from_old_parent() 
     .await;
     assert!(matches!(
         advance(&api, Some(1), 2).await,
-        Err(V2FormatError::AnchorAdvanceFailed)
+        Err(V3FormatError::AnchorAdvanceFailed)
     ));
     assert!(matches!(
         advance(&api, Some(1), 2).await,
-        Err(V2FormatError::StaleAnchor)
+        Err(V3FormatError::StaleAnchor)
     ));
     assert_eq!(
         *api.calls.lock().await,
@@ -386,7 +386,7 @@ async fn accepted_write_with_lost_response_is_not_republished_from_old_parent() 
         advance(&api, Some(2), 2)
             .await
             .expect("reconciled idempotent update"),
-        v2_state(2)
+        v3_state(2)
     );
 }
 
@@ -402,7 +402,7 @@ async fn fencing_read_bumps_the_resource_version_so_earlier_updates_cannot_land(
         fence_and_read_lease(&api, &settings(), None)
             .await
             .expect("fenced read"),
-        Some(v2_state(1))
+        Some(v3_state(1))
     );
     let stored = api.lease.lock().await.clone().expect("lease");
     assert_eq!(stored.metadata.resource_version.as_deref(), Some("2"));
@@ -428,18 +428,18 @@ async fn fencing_read_bumps_the_resource_version_so_earlier_updates_cannot_land(
         fence_and_read_lease(&api, &settings(), None)
             .await
             .expect("second fenced read"),
-        Some(v2_state(1))
+        Some(v3_state(1))
     );
     // Anchor decoding ignores the fence counter, and advances keep it.
     assert_eq!(
         advance(&api, Some(1), 2).await.expect("advance"),
-        v2_state(2)
+        v3_state(2)
     );
     assert_eq!(
         fence_and_read_lease(&api, &settings(), None)
             .await
             .expect("fenced read after advance"),
-        Some(v2_state(2))
+        Some(v3_state(2))
     );
 }
 
@@ -479,6 +479,6 @@ async fn fencing_read_never_creates_a_lease_and_requires_the_live_writer_claim()
     *api.lease.lock().await = Some(stolen);
     assert!(matches!(
         fence_and_read_lease(&api, &settings(), Some(&fence)).await,
-        Err(V2FormatError::AnchorAdvanceFailed)
+        Err(V3FormatError::AnchorAdvanceFailed)
     ));
 }

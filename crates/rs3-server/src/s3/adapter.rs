@@ -17,7 +17,7 @@ use crate::config::configured_streaming_upload_working_set_bytes;
 use crate::{AdminReadinessSource, AdminRuntimeFactsSource, GatewayMode, RuntimeConfig};
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, stream};
-use rs3_repository::v2::V2AuthenticatedReadBody;
+use rs3_repository::v3::V3AuthenticatedReadBody;
 use rs3_repository::{RepositoryCopyOptions, RepositoryError, RepositoryPutOptions};
 use rs3_storage::{ByteRange, StorageError};
 use rs3_types::{PublicBucket, RetentionMode};
@@ -718,7 +718,7 @@ fn reserved_download_body(body: Bytes, reservation: DownloadBodyReservation) -> 
 }
 
 struct ReservedAuthenticatedDownloadBody {
-    body: Mutex<V2AuthenticatedReadBody>,
+    body: Mutex<V3AuthenticatedReadBody>,
     remaining: Option<usize>,
     operation: &'static str,
     _reservation: DownloadBodyReservation,
@@ -768,7 +768,7 @@ impl ByteStream for ReservedAuthenticatedDownloadBody {
 }
 
 fn reserved_authenticated_download_body(
-    body: V2AuthenticatedReadBody,
+    body: V3AuthenticatedReadBody,
     reservation: DownloadBodyReservation,
     operation: &'static str,
 ) -> Body {
@@ -1977,7 +1977,7 @@ mod tests {
     use crate::s3::mapping::collect_body;
     use crate::s3::test_support::runtime_config;
     use bytes::Bytes;
-    use rs3_repository::v2::V2CommitAnchor;
+    use rs3_repository::v3::V3CommitAnchor;
     use rs3_storage::BlobStore;
     use rs3_types::RetentionMode;
     use s3s::dto::{
@@ -2009,7 +2009,7 @@ mod tests {
         ));
         let repository = RuntimeRepository::from_config_with_maintenance_guard(
             &config,
-            Arc::new(rs3_repository::v2::UnenforcedQuiescedMaintenanceGuard),
+            Arc::new(rs3_repository::v3::UnenforcedQuiescedMaintenanceGuard),
         )
         .await
         .unwrap_or_else(|error| panic!("{error}"));
@@ -2161,12 +2161,12 @@ mod tests {
         })
     }
 
-    async fn accepted_v2_sequence(service: &GatewayS3Service) -> u64 {
+    async fn accepted_v3_sequence(service: &GatewayS3Service) -> u64 {
         service
             .repository
-            .memory_v2_anchor()
+            .memory_v3_anchor()
             .unwrap_or_else(|| panic!("missing v2 memory anchor"))
-            .read_v2()
+            .read_v3()
             .await
             .unwrap_or_else(|error| panic!("{error}"))
             .unwrap_or_else(|| panic!("missing v2 anchor state"))
@@ -2174,12 +2174,12 @@ mod tests {
             .get()
     }
 
-    async fn accepted_v2_commit_metadata(service: &GatewayS3Service) -> rs3_storage::BlobMetadata {
+    async fn accepted_v3_commit_metadata(service: &GatewayS3Service) -> rs3_storage::BlobMetadata {
         let accepted = service
             .repository
-            .memory_v2_anchor()
+            .memory_v3_anchor()
             .unwrap_or_else(|| panic!("missing v2 memory anchor"))
-            .read_v2()
+            .read_v3()
             .await
             .unwrap_or_else(|error| panic!("{error}"))
             .unwrap_or_else(|| panic!("missing v2 anchor state"));
@@ -2469,7 +2469,7 @@ mod tests {
             assert_eq!(*error.code(), s3s::S3ErrorCode::PreconditionFailed);
         }
 
-        let sequence = accepted_v2_sequence(&service).await;
+        let sequence = accepted_v3_sequence(&service).await;
         let mut malformed = copy_input(
             "snapshots/conditional-copy-source.bin",
             "snapshots/conditional-copy-malformed.bin",
@@ -2545,7 +2545,7 @@ mod tests {
             .await
             .expect_err("historical source is unsupported");
         assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
-        assert_eq!(accepted_v2_sequence(&service).await, sequence);
+        assert_eq!(accepted_v3_sequence(&service).await, sequence);
     }
 
     #[tokio::test]
@@ -2562,7 +2562,7 @@ mod tests {
             }))
             .await
             .expect("source put");
-        let sequence = accepted_v2_sequence(&service).await;
+        let sequence = accepted_v3_sequence(&service).await;
         service.mode = GatewayMode::RestoreReadOnly;
         let error = service
             .copy_object(s3_request(copy_input(
@@ -2572,7 +2572,7 @@ mod tests {
             .await
             .expect_err("restore-readonly mode rejects copy");
         assert_eq!(*error.code(), s3s::S3ErrorCode::AccessDenied);
-        assert_eq!(accepted_v2_sequence(&service).await, sequence);
+        assert_eq!(accepted_v3_sequence(&service).await, sequence);
     }
 
     #[tokio::test]
@@ -2920,7 +2920,7 @@ mod tests {
             .await;
         assert!(put.is_ok());
 
-        assert_eq!(accepted_v2_sequence(&service).await, 2);
+        assert_eq!(accepted_v3_sequence(&service).await, 2);
 
         let backend_objects = service
             .repository
@@ -3011,7 +3011,7 @@ mod tests {
         let delete = delete.unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(delete.output.delete_marker, Some(false));
 
-        assert_eq!(accepted_v2_sequence(&service).await, 3);
+        assert_eq!(accepted_v3_sequence(&service).await, 3);
 
         let missing = service
             .head_object(s3_request(HeadObjectInput {
@@ -3225,7 +3225,7 @@ mod tests {
             .expect_err("oversized PutObject should be rejected");
 
         assert_eq!(error.code().as_str(), "EntityTooLarge");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -3282,7 +3282,7 @@ mod tests {
             .expect_err("short streaming PutObject body should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -3303,7 +3303,7 @@ mod tests {
             .expect_err("long streaming PutObject body should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -3326,7 +3326,7 @@ mod tests {
             .expect_err("streaming PutObject read error should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3348,7 +3348,7 @@ mod tests {
             .expect_err("stalled streaming PutObject body should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3370,7 +3370,7 @@ mod tests {
             .expect_err("stalled buffered PutObject body should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3391,7 +3391,7 @@ mod tests {
             .expect_err("stalled unknown-length PutObject body should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -3516,7 +3516,7 @@ mod tests {
         assert_eq!(counts.multipart_create, 0);
         assert_eq!(counts.multipart_put, 0);
         assert_eq!(service.upload_body_budget.in_flight_bytes(), 0);
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -3538,7 +3538,7 @@ mod tests {
             .expect_err("unknown-length streaming PutObject read error should be rejected");
 
         assert_eq!(error.code().as_str(), "IncompleteBody");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -3557,7 +3557,7 @@ mod tests {
             .expect_err("oversized declared PutObject length should be rejected");
 
         assert_eq!(error.code().as_str(), "EntityTooLarge");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[test]
@@ -3626,7 +3626,7 @@ mod tests {
             .expect_err("PutObject above in-flight body budget should be rejected");
 
         assert_eq!(error.code().as_str(), "SlowDown");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -3771,7 +3771,7 @@ mod tests {
             .expect_err("streamed PutObject above in-flight body budget should be rejected");
 
         assert_eq!(error.code().as_str(), "SlowDown");
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]
@@ -3912,7 +3912,7 @@ mod tests {
             .expect_err("restore-readonly mode should reject DeleteObjects");
         assert_eq!(*delete_objects.code(), s3s::S3ErrorCode::AccessDenied);
 
-        assert_eq!(accepted_v2_sequence(&service).await, 2);
+        assert_eq!(accepted_v3_sequence(&service).await, 2);
     }
 
     #[tokio::test]
@@ -3934,7 +3934,7 @@ mod tests {
             .await;
         assert!(put.is_ok());
 
-        let commit = accepted_v2_commit_metadata(&service).await;
+        let commit = accepted_v3_commit_metadata(&service).await;
         let retention = commit
             .retention
             .as_ref()
@@ -3980,7 +3980,7 @@ mod tests {
             .expect_err("unqualified retention should be rejected");
 
         assert_eq!(*error.code(), s3s::S3ErrorCode::NotImplemented);
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
     }
 
     #[tokio::test]

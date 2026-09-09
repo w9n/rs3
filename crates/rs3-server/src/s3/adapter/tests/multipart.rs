@@ -100,13 +100,13 @@ async fn multipart_stalled_body_maps_outer_timeout_and_keeps_session_retryable()
             .expect_err("stalled body");
         assert_eq!(error.code().as_str(), "IncompleteBody");
         assert_eq!(service.request_slots.available_permits(), permits);
-        assert_eq!(accepted_v2_sequence(&service).await, 1);
+        assert_eq!(accepted_v3_sequence(&service).await, 1);
         let etag = part(&service, &id, 1, Bytes::from_static(b"body")).await;
         service
             .complete_multipart_upload(s3_request(complete_input(&id, vec![(1, etag)])))
             .await
             .expect("retry completes");
-        assert_eq!(accepted_v2_sequence(&service).await, 2);
+        assert_eq!(accepted_v3_sequence(&service).await, 2);
     }
 }
 
@@ -194,14 +194,14 @@ async fn multipart_routes_replace_select_publish_and_repeat_without_overwriting(
         .await
         .expect_err("stale token");
     assert_eq!(stale.code().as_str(), "InvalidPart");
-    assert_eq!(accepted_v2_sequence(&service).await, 1);
+    assert_eq!(accepted_v3_sequence(&service).await, 1);
     let request = complete_input(&id, vec![(2, first), (9, last)]);
     let result = service
         .complete_multipart_upload(s3_request(request.clone()))
         .await
         .expect("complete")
         .output;
-    assert_eq!(accepted_v2_sequence(&service).await, 2);
+    assert_eq!(accepted_v3_sequence(&service).await, 2);
     let get = service
         .get_object(s3_request(GetObjectInput {
             bucket: "client-bucket".into(),
@@ -223,14 +223,14 @@ async fn multipart_routes_replace_select_publish_and_repeat_without_overwriting(
         }))
         .await
         .expect("overwrite");
-    let before = accepted_v2_sequence(&service).await;
+    let before = accepted_v3_sequence(&service).await;
     let retry = service
         .complete_multipart_upload(s3_request(request))
         .await
         .expect("durable retry")
         .output;
     assert_eq!(retry.e_tag, result.e_tag);
-    assert_eq!(accepted_v2_sequence(&service).await, before);
+    assert_eq!(accepted_v3_sequence(&service).await, before);
     let error = service
         .list_parts(s3_request(list_input(&id)))
         .await
@@ -280,14 +280,14 @@ async fn multipart_parallel_parts_and_completion_freeze() {
     });
     tokio::task::yield_now().await;
     assert!(!completion.is_finished());
-    assert_eq!(accepted_v2_sequence(&service).await, 1);
+    assert_eq!(accepted_v3_sequence(&service).await, 1);
     release.notify_one();
     bounded(writer).await.expect("writer task").expect("part");
     bounded(completion)
         .await
         .expect("completion task")
         .expect("complete selected subset");
-    assert_eq!(accepted_v2_sequence(&service).await, 2);
+    assert_eq!(accepted_v3_sequence(&service).await, 2);
 }
 
 #[tokio::test]
@@ -512,7 +512,7 @@ async fn multipart_expiry_and_admission_release_session_and_part_slots() {
             .await
             .is_err()
     );
-    assert_eq!(accepted_v2_sequence(&service).await, 1);
+    assert_eq!(accepted_v3_sequence(&service).await, 1);
 }
 
 #[tokio::test]
@@ -556,7 +556,7 @@ async fn multipart_owned_part_finishes_after_request_waiter_cancellation() {
     })
     .await;
     assert_eq!(service.request_slots.available_permits(), before);
-    assert_eq!(accepted_v2_sequence(&service).await, 1);
+    assert_eq!(accepted_v3_sequence(&service).await, 1);
 }
 
 #[tokio::test]
@@ -630,7 +630,7 @@ async fn multipart_replacements_serialize_and_duplicate_completions_publish_once
         a.expect("completion").output.e_tag,
         b.expect("repeat").output.e_tag
     );
-    assert_eq!(accepted_v2_sequence(&service).await, 2);
+    assert_eq!(accepted_v3_sequence(&service).await, 2);
 }
 
 #[tokio::test]
@@ -665,7 +665,7 @@ async fn multipart_complete_conditions_and_frontend_limits_precede_publication()
         }))
         .await
         .expect("racing value");
-    let before = accepted_v2_sequence(&service).await;
+    let before = accepted_v3_sequence(&service).await;
     let mut request = request;
     request.if_none_match = Some(ETagCondition::Any);
     let error = service
@@ -673,5 +673,5 @@ async fn multipart_complete_conditions_and_frontend_limits_precede_publication()
         .await
         .expect_err("create-only race");
     assert_eq!(error.code().as_str(), "PreconditionFailed");
-    assert_eq!(accepted_v2_sequence(&service).await, before);
+    assert_eq!(accepted_v3_sequence(&service).await, before);
 }

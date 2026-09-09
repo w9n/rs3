@@ -2,7 +2,7 @@
 
 use crate::model::{RepositoryListEntry, RepositoryObjectMetadata};
 use rs3_index::{
-    DurableManifest, NamespaceEntry, NamespaceIndex, V2StandaloneStreamCarrierReference,
+    DurableManifest, NamespaceEntry, NamespaceIndex, V3StandaloneStreamCarrierReference,
 };
 use rs3_types::{
     BackendObjectId, BackendVersionId, BlindIndexKey, LegalHoldStatus, LogicalPath, ManifestId,
@@ -44,10 +44,10 @@ pub(crate) struct RepositoryState {
     pub(crate) list_entries: BTreeMap<LogicalPath, RepositoryListEntry>,
     /// Highest applied logical mutation generation.
     pub(crate) next_sequence: Sequence,
-    /// Exact standalone carrier facts interned during v2 replay.
-    pub(crate) v2_standalone_carriers: BTreeMap<
+    /// Exact standalone carrier facts interned during v3 replay.
+    pub(crate) v3_standalone_carriers: BTreeMap<
         (BackendObjectId, Option<BackendVersionId>),
-        Arc<V2StandaloneStreamCarrierReference>,
+        Arc<V3StandaloneStreamCarrierReference>,
     >,
 }
 
@@ -59,7 +59,7 @@ impl Default for RepositoryState {
             manifests: BTreeMap::new(),
             list_entries: BTreeMap::new(),
             next_sequence: Sequence::ZERO,
-            v2_standalone_carriers: BTreeMap::new(),
+            v3_standalone_carriers: BTreeMap::new(),
         }
     }
 }

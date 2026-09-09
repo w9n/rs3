@@ -2,7 +2,7 @@
 
 use super::RecoveryReportFormat;
 use anyhow::Result;
-use rs3_repository::v2::V2RecoveryCursor;
+use rs3_repository::v3::V3RecoveryCursor;
 use rs3_server::{GatewayMode, RuntimeConfig, recovery_points_from_config};
 
 pub(super) async fn run(
@@ -11,12 +11,12 @@ pub(super) async fn run(
     format: RecoveryReportFormat,
 ) -> Result<()> {
     let config = RuntimeConfig::from_env_with_mode_override(Some(GatewayMode::RestoreReadOnly))?;
-    let cursor = cursor.map(V2RecoveryCursor::decode).transpose()?;
+    let cursor = cursor.map(V3RecoveryCursor::decode).transpose()?;
     let page = recovery_points_from_config(&config, limit, cursor.as_ref()).await?;
     let next = page
         .next_cursor
         .as_ref()
-        .map(V2RecoveryCursor::encode)
+        .map(V3RecoveryCursor::encode)
         .transpose()?;
     match format {
         RecoveryReportFormat::Json => println!(
