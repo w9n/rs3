@@ -2,7 +2,7 @@
   "schema": 1,
   "date": "2026-09-09",
   "production_revision": "3e879cb72a9cb037cbcffa555164f82b556b4946",
-  "scope": "Local RustFS and Kubernetes Lease regression evidence; no chart/pod, external-provider, crash takeover or elapsed-30-day qualification",
+  "scope": "Local RustFS, Helm gateway and Kubernetes Lease regression evidence; no external-provider, crash takeover or elapsed-30-day qualification",
   "checks": {
     "workspace": {
       "passed": 1115,
@@ -111,12 +111,41 @@
     {
       "lane": "standard retained local gate",
       "outcome": "RustFS readiness timeout over Docker forwarded port; chart lane not reached",
-      "log_sha256": "cd2be53487da0c93919b432447fa98d20211704fbc88ba42b4b0e85e62ded581"
+      "log_sha256": "cd2be53487da0c93919b432447fa98d20211704fbc88ba42b4b0e85e62ded581",
+      "resolved_by": "standard_retained_gate at 25e0747 after host Docker connectivity was repaired"
     },
     {
       "lane": "original recovery relay",
       "outcome": "relay idle timeouts aligned with Lease renewal failure; gateway shut down; corrected fixture passed with the same binary",
       "result_sha256": "72974e9b6b9e4c04ba65e0473cc57ebbba279ad570a144375436204adc87ba5f"
     }
-  ]
+  ],
+  "standard_retained_gate": {
+    "passed": true,
+    "qualification_revision": "25e074791db11cfc715413b24f43079e6c6b339b",
+    "source_manifest_sha256": "6cf2ad9e2ba74aa936001736c98ca0b12b45bd17b81db14fc24578a70cd12d03",
+    "source_unchanged": true,
+    "command": "just preview-gate-v2-retained-local",
+    "gate_exit_code": 0,
+    "log_sha256": "8bf9ab718041b1bab993f1a215b9304164b9e8058f5a9eca5e513a6ef776c739",
+    "result_sha256": "6a2c4a4e62a8838f1c13097d1a6171efd014616b3fc069f03fbe1cc65e02d0fe",
+    "gateway_image_id": "sha256:ffd95dd9bf299beadf76fe5f1ce6f511ccb62ceb434f1bd9aca3ce19638e2a69",
+    "gateway_image_revision": "25e074791db11cfc715413b24f43079e6c6b339b",
+    "provider_image_id": "sha256:41fe89380f4120a337790c02af192c3fe7bb55c3edc2e6e9357b487b47c6ab21",
+    "direct_storage_tests_passed": 6,
+    "gc_rehearsal_passed": true,
+    "gateway_retention_mode": "COMPLIANCE",
+    "gateway_retention_days": 30,
+    "helm_install_and_readiness": true,
+    "s3_smoke": true,
+    "tooling": [
+      "AWS CLI",
+      "rclone",
+      "mc",
+      "restic"
+    ],
+    "v03_lease_anchor_verified": true,
+    "temporary_cluster_deleted": true,
+    "scope": "Disposable local Docker/Kind chart deployment and round trips; no lifecycle upgrade, external-provider, governance-bypass IAM, crash takeover or elapsed-retention claim"
+  }
 }

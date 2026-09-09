@@ -133,7 +133,7 @@ unretained control, maintenance with reclamation disabled and no provider DELETE
 AWS/rclone copy-out and range reads, and graceful readonly/writer restarts without
 changing the accepted anchor.
 
-The standard `just preview-gate-v2-retained-local` attempt stopped at RustFS
+The earlier standard `just preview-gate-v2-retained-local` attempt stopped at RustFS
 readiness because this host's Docker forwarded port timed out while the same
 health endpoint returned HTTP 200 inside the container. The recovery fixture
 therefore used host-network RustFS and a TLS relay into the temporary Kind API.
@@ -153,9 +153,18 @@ retention; it does not test governance-bypass IAM.
 The [qualification receipt](assets/history-qualification-2026-09-09.json) records
 source/binary/result hashes, passed checks, failed attempts and scope boundaries.
 
-These are bounded local regression results. They do not qualify the chart/pod
-lane at this revision, an external provider, governance-bypass IAM, crash takeover
-or an elapsed 30-day retention interval. The separate
+After host Docker connectivity was repaired, the complete standard
+`just preview-gate-v2-retained-local` passes at `25e0747`. It uses the normal
+Docker/Kind network path and covers six retained-storage contract tests, the
+isolated GC rehearsal, a fresh Helm gateway installation with 30-day COMPLIANCE
+retention, readiness, S3 smoke, AWS CLI/rclone/mc/restic round trips, and v03
+Lease-anchor verification. The temporary cluster is deleted after success. Source
+files remained unchanged during the run, and the receipt binds the gateway image
+and logs to that revision. The earlier Docker blocker is resolved.
+
+These are bounded local regression results. They do not qualify an external
+provider, governance-bypass IAM, crash takeover, lifecycle upgrades or an elapsed
+30-day retention interval. The separate
 [100,000-write comparison](performance.md#retained-history-efficiency-september-9-2026)
 uses a controlled in-memory provider and simulated time; its scale must not be
 attributed to this real-provider fixture.
