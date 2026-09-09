@@ -40,7 +40,7 @@ Run the release integration and scheduled hardening gates:
 
 ```sh
 just preview-gate-release
-just preview-gate-v2-nightly
+just preview-gate-v3-nightly
 ```
 
 On the documented pinned runner, retain a dedicated local-disk evidence root

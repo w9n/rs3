@@ -125,7 +125,7 @@ export AWS_ACCESS_KEY_ID=<access-key-id>
 export AWS_SECRET_ACCESS_KEY=<secret-access-key>
 export AWS_REGION=<region>
 export RS3_GOVERNANCE_BYPASS_REVIEWED=true # after IAM or bucket-policy review
-just preview-gate-v2-live <bucket> <endpoint> <region>
+just preview-gate-v3-live <bucket> <endpoint> <region>
 ```
 
 Use an empty bucket or a fresh backend prefix for live trials. When evaluating

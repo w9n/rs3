@@ -196,7 +196,7 @@ values without exposing the endpoint, bucket, or prefix.
 
 ## Provider Conformance Evidence
 
-Run `rs3 check-v2-provider --format json` against the selected backend/profile
+Run `rs3 check-provider --format json` against the selected backend/profile
 and preserve the JSON report outside the backend. Mount that report into the
 gateway and configure the path below so admin reports can show last-known
 provider evidence without running live probes from status.
@@ -236,7 +236,7 @@ operator who can replace both configuration and report.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `RS3_PROVIDER_CONFORMANCE_REPORT_FILE` | no | unset | Local path to a JSON report emitted by `rs3 check-v2-provider --format json`. The path itself is not reported. |
+| `RS3_PROVIDER_CONFORMANCE_REPORT_FILE` | no | unset | Local path to a JSON report emitted by `rs3 check-provider --format json`. The path itself is not reported. |
 | `RS3_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS` | no | `604800` | Maximum report age before admin reports mark provider evidence `stale`. |
 | `RS3_PROVIDER_PRINCIPAL_FINGERPRINT` | governance retention | unset | Lowercase 64-character SHA-256 fingerprint of the exact IAM or service-account principal whose governance-bypass permissions were reviewed. The raw principal is not emitted; changing this value invalidates prior evidence. |
 

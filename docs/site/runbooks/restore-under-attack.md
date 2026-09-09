@@ -1,7 +1,7 @@
 # Restore Under Attack
 
 Do not repair repository state automatically during an incident. First preserve
-evidence, then choose the trusted v2 anchor, then restore with the narrowest
+evidence, then choose the trusted v3 anchor, then restore with the narrowest
 credentials practical.
 
 ## Assume
@@ -18,7 +18,7 @@ Before serving restore traffic, identify or recover:
 
 - repository ID
 - wrapping-key source for the keyring envelope
-- accepted v2 anchor sequence, commit key, commit object version ID when
+- accepted v3 anchor sequence, commit key, commit object version ID when
   available, commit body digest, signing key ID, and format-root reference
 - format-bound keyring-envelope reference
 - backend endpoint, bucket, and prefix
@@ -153,7 +153,7 @@ cargo run -p rs3-server --features s3,k8s -- verify-bundle \
   --wrapping-key-hex-file <wrapping-key-hex-file>
 ```
 
-If a fresh cluster is missing the Kubernetes Lease, import the trusted v2 anchor
+If a fresh cluster is missing the Kubernetes Lease, import the trusted v3 anchor
 after configuring the same repository ID, wrapping-key source, backend, and
 retention settings. The public salt is recovered from the format root the
 bundle's anchor binds and checked against the bundle's salt digest.
@@ -248,14 +248,14 @@ its floor unchanged throughout.
 
 ## 4. If No Bundle Exists, Stop
 
-When the old Lease is gone and no trusted v2 bundle exists, do not promote
+When the old Lease is gone and no trusted v3 bundle exists, do not promote
 backend state by listing storage. A malicious backend can hide newer valid
 commits. Escalate to an operator-held authority, offline audit trail, or
 external anchor record before recreating the Lease.
 
 ## 5. Verify Before Restore
 
-Verify the trusted v2 anchor before using it for restore. The
+Verify the trusted v3 anchor before using it for restore. The
 `rs3 verify-bundle` command and the import path check the signed commit
 chain, format root, and keyring envelope. After the gateway starts from the
 recovered anchor, run the restore client and verify restored application bytes

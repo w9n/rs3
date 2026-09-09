@@ -48,7 +48,7 @@ Repository streaming hashes, random carrier identities and payload nonce
 construction use that boundary. Shared payload layout constants in
 `rs3-types` keep index validation and payload writers aligned.
 
-The repository API entrypoint is `rs3_repository::v2::V2Repository`.
+The repository API entrypoint is `rs3_repository::v3::V3Repository`.
 Tools can store keyring envelopes through
 `rs3_repository::store_keyring_envelope`, passing retention and legal-hold
 policy explicitly. The keyring, cache and runtime options shared by repository

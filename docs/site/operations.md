@@ -37,7 +37,7 @@ reported as the non-blocking `recovery.cluster-loss-readiness` warning:
 signed bundle import after cluster loss needs that key and a signed
 off-cluster bundle, and the warning says so before the outage rather than
 during it. Probe mode additionally checks
-backend reachability, v2 anchor readability (including Kubernetes Lease access
+backend reachability, v3 anchor readability (including Kubernetes Lease access
 when configured), and keyring envelope readability without printing backend
 object names or configured Kubernetes object names.
 
@@ -113,7 +113,7 @@ tooling. `GET /admin/posture` is cheap enough for routine polling and reports
 runtime posture, profile findings, backend and anchor kind, retention settings,
 and last persisted provider-conformance evidence. `GET /admin/status` adds
 restore-trust and maintenance verification and may touch repository state. For
-v2 repositories, status includes verified commit-chain counts, orphan counts,
+v3 repositories, status includes verified commit-chain counts, orphan counts,
 and commit-retention renewal counts using the built-in seven-day renewal
 horizon. For retained Object Lock repositories, accepted predecessors are
 registered automatically in the encrypted
@@ -164,7 +164,7 @@ The gateway uses an encrypted keyring envelope. Operators provide a stable
 repository ID and a wrapping-key source; the public salt is generated at
 initialization, journaled, and recovered from the verified envelope on every
 later start, so it needs no separate custody. For an anchored
-repository, startup reads the accepted v2 anchor, verifies the signed commit
+repository, startup reads the accepted v3 anchor, verifies the signed commit
 chain and format root, and opens the keyring envelope bound through that format
 root. It does not trust S3 listing order or a mutable "latest" object to choose
 repository state.
@@ -399,15 +399,15 @@ with `RS3_REPOSITORY_RETENTION_MODE` and `RS3_REPOSITORY_RETENTION_DAYS`;
 retention protects restore metadata from deletion but does not make a leaked
 old envelope safe.
 
-Purpose-specific v2 data-key rotation is not exposed as a production-preview
+Purpose-specific v3 data-key rotation is not exposed as a production-preview
 CLI command yet. Do not use older rotation workflows against a
-v2 repository. Until v2 rotation is implemented, keep historical keys enabled
+v3 repository. Until v3 rotation is implemented, keep historical keys enabled
 and treat wrapping-key rewrap as envelope hygiene only.
 
 Before disabling or retiring a historical key, first verify the trusted anchored
 commit chain with `rs3 verify-bundle`. That verifies the preserved bundle,
 format root, keyring envelope, and reachable commit chain are still usable, but
-it is not a data-key retirement decision. v2-aware retirement tooling is not
+it is not a data-key retirement decision. v3-aware retirement tooling is not
 part of the current production-preview CLI, so keep historical data keys for at
 least the maximum provider-retention window.
 
@@ -508,7 +508,7 @@ qualified counts, explicit budgets and provider boundaries.
 
 ## Full Maintenance
 
-The read-write gateway runs the v2 full-maintenance supervisor in process. It
+The read-write gateway runs the v3 full-maintenance supervisor in process. It
 renews retention for the exact restore graph and reclaims exact-version orphans
 from one immutable, budgeted plan. Before apply, the coordinator drains pending
 commit work, excludes new repository mutations with the existing staging lock,
@@ -672,7 +672,7 @@ control surfaces, not backup data browsers.
 ## Restore Posture
 
 For routine restores in a healthy repository, keep the single writer gateway in
-`read-write` and use the normal v2 anchor path. Velero writes restore
+`read-write` and use the normal v3 anchor path. Velero writes restore
 result artifacts after data restore; in normal operation those writes should be
 accepted, committed, and anchored like other repository mutations so Velero
 can report `Completed`.
@@ -714,7 +714,7 @@ general retained-provider qualification.
 
     - repository ID
     - wrapping-key source for the keyring envelope
-    - trusted v2 anchor position: sequence, commit key, commit object version ID
+    - trusted v3 anchor position: sequence, commit key, commit object version ID
       when available, commit body digest, signing key ID, and format-root
       reference
     - format-bound keyring-envelope reference
@@ -751,7 +751,7 @@ writers cannot safely coordinate repository state without a stronger shared
 write protocol. Scaled restore readers should use `restore-readonly`.
 
 Disaster recovery into a new cluster requires the repository ID,
-wrapping-key source, and a trusted v2 anchor position from outside S3; the
+wrapping-key source, and a trusted v3 anchor position from outside S3; the
 public salt is recovered from the format root that position binds. Backend
 objects alone are not a latest-state oracle because the backend can hide newer
 valid commits and replay older valid commits.
@@ -814,7 +814,7 @@ preserved bundle after maintenance or major repository changes, and before the
 provider retention window covering its referenced versions can expire. Keep at least one previously verified bundle
 until its replacement has been exported, signed, and verified.
 
-On a new cluster with a missing anchor, import the trusted v2 anchor from that
+On a new cluster with a missing anchor, import the trusted v3 anchor from that
 bundle after configuring the same repository ID, wrapping-key source,
 backend, and retention settings:
 
@@ -833,7 +833,7 @@ It also lists stored v03 commits and refuses to import when it sees a higher
 commit sequence than the bundle names. Use `--force-rollback` only after an
 explicit rollback review accepts stranding those newer commits.
 
-Verify a trusted anchor position before relying on it for restore. For v2, the
+Verify a trusted anchor position before relying on it for restore. For v3, the
 offline verifier and anchor import path both verify the named signed commit
 chain, format root, and keyring envelope. Then run the restore client through
 the recovered gateway and verify restored application bytes. Use S3 CLI checks

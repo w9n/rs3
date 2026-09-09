@@ -46,7 +46,7 @@ Use this ladder to avoid mistaking a green smoke test for a production decision:
 | --- | --- | --- |
 | Read | Production Preview, Security Model, and Repository Format pages make the trust model clear. | The accepted leakage or weak-subjectivity model does not fit the deployment. |
 | Local | `just preview-gate-local` and the local integration lanes pass. | Local restore verification or path-privacy checks fail. |
-| Provider | `check-v2-provider-v2-live` passes against a fresh prefix and preserved JSON report. | The provider cannot prove the selected `atomic-create` or retained-version profile. |
+| Provider | `check-provider-live` passes against a fresh prefix and preserved JSON report. | The provider cannot prove the selected `atomic-create` or retained-version profile. |
 | Restore | Kopia and Velero restore through the anchored gateway and restored bytes match. | Restore succeeds only by bypassing the gateway or anchor model. |
 | Recovery | A trusted restore bundle imports into a new cluster and verifies the same anchor. | The bundle is missing, stale, or only stored inside the failed trust boundary. |
 

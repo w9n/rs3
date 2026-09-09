@@ -29,6 +29,15 @@ anchor. Evaluation repositories must be recreated; no migration or dual reader
 is provided. Current anchor records explicitly carry repository format
 generation 3, distinct from format-root envelope rotation generations.
 
+## Independent version labels
+
+`commits/v03` and `objects/v03` name the preview wire format. The current Rust
+repository API is `rs3_repository::v3`, while current operator recipes use
+`repository` or `v3` names. These labels are independent of retained protocol
+names such as S3 `ListObjectsV2`, serialized report schemas, metric labels,
+cryptographic domain strings, and framing-generation bytes. Those retained
+labels do not enable a v2 reader or compatibility mode.
+
 ## Invariants
 
 - Backend object names are opaque and never derived from logical paths.
@@ -721,7 +730,7 @@ Default replay budgets are independent of the active-run watermarks:
 | Retained encrypted index-section bytes | 64 MiB |
 | One body-verification range read | 8 MiB |
 
-These are `V2ReplayLimits` defaults. They are verifier ceilings, not automatic
+These are `V3ReplayLimits` defaults. They are verifier ceilings, not automatic
 checkpoint triggers. Descriptor-first startup avoids reading unrelated payload
 bytes even though their containing object sizes count toward its object budget.
 

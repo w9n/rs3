@@ -67,6 +67,11 @@ nav:
       - Runbooks:
           - Retention And Object Lock: runbooks/retention-and-object-lock.md
           - Restore Under Attack: runbooks/restore-under-attack.md
+  - Reports:
+      - Bounded Compaction Cost Evidence: reports/bounded-compaction-cost-2026-09-09.md
+      - Gateway and Direct S3 Cost Evidence: reports/direct-storage-cost-2026-09-09.md
+      - Historical Performance Evidence: reports/performance-2026-09-08.md
+      - Historical Qualification Evidence: reports/qualification-history.md
   - Reference:
       - Glossary: reference/glossary.md
       - Configuration: reference/configuration.md

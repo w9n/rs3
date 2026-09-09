@@ -40,7 +40,7 @@ The console may display:
 
 - gateway mode
 - restore trust state and reason code
-- v2 anchor sequence, commit digest, format generation, and version-binding state
+- v3 anchor sequence, commit digest, format generation, and version-binding state
 - backend kind and retention capability
 - anchor kind and external-anchor posture
 - repository retention posture

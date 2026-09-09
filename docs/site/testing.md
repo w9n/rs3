@@ -3,7 +3,7 @@
 Use `just check` for workspace checks and `just fmt` for formatting. Operator
 keyring inspection, rewrap and bundle verification live in `rs3-server`;
 repository initialization uses `rs3-server init`. The xtask CLI contains
-integration lanes, performance tools and the isolated `v2 gc-rehearsal` command.
+integration lanes, performance tools and the isolated `repository gc-rehearsal` command.
 
 Testing is part of the architecture because privacy and rollback behavior are
 product requirements.
@@ -133,7 +133,7 @@ unretained control, maintenance with reclamation disabled and no provider DELETE
 AWS/rclone copy-out and range reads, and graceful readonly/writer restarts without
 changing the accepted anchor.
 
-The earlier standard `just preview-gate-v2-retained-local` attempt stopped at RustFS
+The earlier standard `just preview-gate-v3-retained-local` attempt stopped at RustFS
 readiness because this host's Docker forwarded port timed out while the same
 health endpoint returned HTTP 200 inside the container. The recovery fixture
 therefore used host-network RustFS and a TLS relay into the temporary Kind API.
@@ -154,7 +154,7 @@ The [qualification receipt](assets/history-qualification-2026-09-09.json) record
 source/binary/result hashes, passed checks, failed attempts and scope boundaries.
 
 After host Docker connectivity was repaired, the complete standard
-`just preview-gate-v2-retained-local` passes at `25e0747`. It uses the normal
+`just preview-gate-v3-retained-local` passes at `25e0747`. It uses the normal
 Docker/Kind network path and covers six retained-storage contract tests, the
 isolated GC rehearsal, a fresh Helm gateway installation with 30-day COMPLIANCE
 retention, readiness, S3 smoke, AWS CLI/rclone/mc/restic round trips, and v03
@@ -165,7 +165,7 @@ and logs to that revision. The earlier Docker blocker is resolved.
 These are bounded local regression results. They do not qualify an external
 provider, governance-bypass IAM, crash takeover, lifecycle upgrades or an elapsed
 30-day retention interval. The separate
-[100,000-write comparison](performance.md#retained-history-efficiency-september-9-2026)
+[100,000-write comparison](reports/performance-2026-09-08.md#retained-history-efficiency-september-9-2026)
 uses a controlled in-memory provider and simulated time; its scale must not be
 attributed to this real-provider fixture.
 
@@ -177,18 +177,18 @@ attributed to this real-provider fixture.
 | Preview local gate | `just preview-gate-local` | Default checks, S3-feature checks, and dependency policy checks. |
 | Storage S3 | `just integration-s3-container` | Storage contract against a disposable S3-compatible provider; `just integration-s3-local --mode provided` runs it against an existing endpoint. |
 | Gateway S3 | `just integration-s3-gateway` | Gateway S3 operations through the repository path. |
-| Local v2 nightly gate | `just preview-gate-v2-nightly` | Scheduled or release-candidate gate: S3 feature checks plus v2 S3 tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes against disposable local backends. |
-| Live v2 preview gate | `just preview-gate-v2-live <bucket> <endpoint> <region>` | Consolidated retained-backend gate. Generates fresh sub-prefixes and runs v2 provider conformance, Gateway S3, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes. |
-| Live v2 provider conformance | `just check-v2-provider-v2-live <bucket> <endpoint> <region> <fresh-prefix>` | Runs `rs3 check-v2-provider` for the retained-version/Object Lock profile and emits JSON evidence for admin posture or release artifacts. |
-| Live v2 Gateway S3 | `just integration-s3-gateway-v2-live --backend-bucket <bucket> --endpoint-url <endpoint> --region <region> --backend-prefix <fresh-prefix>` | v3-preview gateway smoke against an existing retained S3-compatible backend, including `mc`, default `rclone lsf`, and backend key privacy checks. |
+| Local v3 nightly gate | `just preview-gate-v3-nightly` | Scheduled or release-candidate gate: S3 feature checks plus v3 S3 tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes against disposable local backends. |
+| Live v3 preview gate | `just preview-gate-v3-live <bucket> <endpoint> <region>` | Consolidated retained-backend gate. Generates fresh sub-prefixes and runs v3 provider conformance, Gateway S3, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes. |
+| Live v3 provider conformance | `just check-provider-live <bucket> <endpoint> <region> <fresh-prefix>` | Runs `rs3 check-provider` for the retained-version/Object Lock profile and emits JSON evidence for admin posture or release artifacts. |
+| Live v3 Gateway S3 | `just integration-s3-gateway-v3-live --backend-bucket <bucket> --endpoint-url <endpoint> --region <region> --backend-prefix <fresh-prefix>` | v3-preview gateway smoke against an existing retained S3-compatible backend, including `mc`, default `rclone lsf`, and backend key privacy checks. |
 | Kopia | `just integration-kopia-gateway` | Real Kopia create, snapshot, and restore through the gateway. |
-| Live v2 Kopia | `just integration-kopia-gateway-v2-live --backend-bucket <bucket> --endpoint-url <endpoint> --region <region> --backend-prefix <fresh-prefix>` | Real Kopia create, snapshot, and restore through a v3-preview gateway against an existing retained backend. |
+| Live v3 Kopia | `just integration-kopia-gateway-v3-live --backend-bucket <bucket> --endpoint-url <endpoint> --region <region> --backend-prefix <fresh-prefix>` | Real Kopia create, snapshot, and restore through a v3-preview gateway against an existing retained backend. |
 | Kubernetes Lease | `just integration-k8s-gateway` | Image build, kind cluster, Helm install, readiness and S3 smoke, including verification that v03 anchor annotations and repository format generation 3 are written. |
 | Kubernetes lifecycle | `just integration-k8s-gateway-lifecycle` | Generated-salt lifecycle test: restarts the gateway, repeats the same Helm command against the live writer without requalification, and upgrades to a rebuilt fixture that requalifies once, reading the earlier object back after every step. The upgrade uses a synthetic revision to invalidate evidence; it does not qualify a second real source revision or assert fail-fast retry ordering. |
 | Velero/Kopia | `just integration-velero-kopia-smoke` | Velero node-agent/Kopia backup and restore smoke. |
-| Live v2 Velero dynamic PVC | `just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-bucket <bucket> --backend-endpoint-url <endpoint> --backend-region <region> --backend-prefix <fresh-prefix>` | Velero/Kopia dynamic-PVC backup and restore through a v3-preview gateway after a gateway restart, against an existing retained backend. |
-| Live v2 Velero Postgres | `just integration-velero-kopia-postgres-v2-live --backend-bucket <bucket> --backend-endpoint-url <endpoint> --backend-region <region> --backend-prefix <fresh-prefix>` | Velero/Kopia Postgres backup and restore through a v3-preview gateway against an existing retained backend. |
-| Preview release gate | `just preview-gate-release` | v2 Kopia gateway, Velero dynamic PVC gateway-restart in normal write mode, and Velero Postgres smoke. The restart lane rejects any gateway container restart during the forced rollout. |
+| Live v3 Velero dynamic PVC | `just integration-velero-kopia-dynamic-pvc-gateway-restart-v3-live --backend-bucket <bucket> --backend-endpoint-url <endpoint> --backend-region <region> --backend-prefix <fresh-prefix>` | Velero/Kopia dynamic-PVC backup and restore through a v3-preview gateway after a gateway restart, against an existing retained backend. |
+| Live v3 Velero Postgres | `just integration-velero-kopia-postgres-v3-live --backend-bucket <bucket> --backend-endpoint-url <endpoint> --backend-region <region> --backend-prefix <fresh-prefix>` | Velero/Kopia Postgres backup and restore through a v3-preview gateway against an existing retained backend. |
+| Preview release gate | `just preview-gate-release` | v3 Kopia gateway, Velero dynamic PVC gateway-restart in normal write mode, and Velero Postgres smoke. The restart lane rejects any gateway container restart during the forced rollout. |
 | Velero strict restore-readonly | `just integration-velero-kopia-dynamic-pvc-restore-readonly-smoke` | Incident-restore behavior: restored bytes verify, Velero artifact writes are denied, and backend writes stay at zero during restore. |
 | Lightweight perf smoke | `just perf-s3-gateway --format jsonl` | Small gateway scenario metrics and amplification. |
 | Gateway perf smoke | `just perf-s3-gateway --objects 32 --object-size 262144 --reads 64 --range-len 4096 --commit-batch-items 8 --concurrency 8 --format jsonl` | Release-profile local gateway run for current v03 request cost, throughput, and amplification. |
@@ -257,7 +257,7 @@ it does not claim a cold kernel page cache. Use a pinned local-disk mount rather
 than `/tmp`, preserve every generated run directory, and record any runner-level
 cache-control procedure separately.
 
-The current gateway no longer has a v1 repository runtime. Commands with `v2`
+The current gateway no longer has a v1 or v2 repository runtime. Commands with `v3`
 in their names keep their existing harness names, but they exercise the only
 supported repository format.
 
@@ -309,7 +309,7 @@ just integration-s3-local --qualification-profile retained-version --object-lock
 For retained gateway qualification, use the guarded Kubernetes fixture:
 
 ```sh
-just preview-gate-v2-retained-local
+just preview-gate-v3-retained-local
 ```
 
 This runs direct Object Lock/exact-version checks, then a 30-day COMPLIANCE
@@ -317,8 +317,8 @@ repository with journaled initialization, a Kubernetes Lease, and AWS CLI,
 rclone, mc and restic round trips. It uses disposable local providers. It does
 not qualify an external provider or demonstrate an elapsed retention window.
 
-The legacy `preview-gate-v2-live`, `integration-s3-gateway-v2-live` and
-`integration-kopia-gateway-v2-live` recipes still include retained local
+The legacy `preview-gate-v3-live`, `integration-s3-gateway-v3-live` and
+`integration-kopia-gateway-v3-live` recipes still include retained local
 memory-anchor launchers. Those launchers cannot meet the current recovery
 maintenance-guard requirement and are not current end-to-end qualification
 commands. For an external backend, qualify the provider and exercise backup

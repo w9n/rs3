@@ -69,7 +69,7 @@ operation. See [S3 storage classes](https://docs.aws.amazon.com/AmazonS3/latest/
 These checks do not qualify renewal permissions, governance bypass or provider
 durability; provider conformance and policy review remain required.
 
-Run `rs3 check-v2-provider --legal-hold --format json` with the serving binary
+Run `rs3 check-provider --legal-hold --format json` with the serving binary
 and backend credentials. S3 qualification uses a separate probe prefix in the
 same bucket, leaving the repository namespace available for fresh initialization.
 Both prefixes must pass Lifecycle inspection. The retained profile sends actual
@@ -146,7 +146,7 @@ Needed: A retain until at least Day 50
 The gateway must extend reused objects and must never shorten retention. If the
 provider cannot extend retention, protected writes fail.
 
-v2 full-GC maintenance reports when current or protected historical-root
+v3 full-GC maintenance reports when current or protected historical-root
 versions need renewal. A guarded apply renews and verifies the exact catalog,
 run, payload, format-root, and keyring-envelope versions before it attempts any
 orphan deletion. It consumes inventory through bounded provider pages, uses one
@@ -224,7 +224,7 @@ failed apply may already have strengthened some exact versions; retention
 extension is intentionally irreversible and the run must be retried from a new
 dry run.
 
-v2 compaction can rewrite the current live namespace into a protected snapshot
+v3 compaction can rewrite the current live namespace into a protected snapshot
 commit after verifying that snapshot with a fresh reader. Old source commits are
 not force-deleted by compaction; they remain subject to exact-version orphan GC,
 provider retention, legal hold, operator budgets, and any protected historical
@@ -312,11 +312,11 @@ evidence. Run with `--require-provider-delete-protection` for protected
 restores, and use S3 CLI probes to confirm provider behavior before trusting a
 new backend.
 
-Before enabling destructive v2 maintenance for a retained backend, run a GC
+Before enabling destructive repository maintenance for a retained backend, run a GC
 rehearsal against a fresh prefix after retained-provider conformance has passed:
 
 ```sh
-just v2-gc-rehearsal-live "$BACKEND_BUCKET" "$ENDPOINT_URL" "$REGION" "$BACKEND_PREFIX"
+just repository-gc-rehearsal-live "$BACKEND_BUCKET" "$ENDPOINT_URL" "$REGION" "$BACKEND_PREFIX"
 ```
 
 The rehearsal writes a retained anchor, one protected orphan, and one
@@ -333,4 +333,4 @@ qualify a retained provider.
 - Freeze write credentials if bad writes continue.
 - Preserve gateway logs, metrics, trusted restore bundles, and anchor state.
 - Compare anchor with retained commit versions where configured.
-- Restore from a verified v2 anchor using read-only credentials where possible.
+- Restore from a verified v3 anchor using read-only credentials where possible.
