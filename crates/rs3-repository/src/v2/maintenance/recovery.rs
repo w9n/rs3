@@ -60,7 +60,6 @@ impl<S: BlobStore> V2CommitStore<S> {
                 commit.clear_retained_sections();
             }
         }
-        reachability.history_pending_bytes = 0;
         reachability.recovery_recoverable_point_count = 1;
         reachability.recovery_oldest_recoverable_publish_time_ms = Some(current_publish_time_ms);
         reachability.recovery_clock_uncertainty_ms = Some(accepted.policy.clock_uncertainty_ms());
@@ -258,7 +257,6 @@ impl<S: BlobStore> V2CommitStore<S> {
         budgets: V2MaintenanceBudgets,
     ) -> V2Result<()> {
         if state.history_metadata_bytes > budgets.max_history_metadata_bytes
-            || state.history_pending_bytes > budgets.max_history_pending_bytes
             || usize_to_u64(state.renewal_targets.len()) > budgets.max_inventory_item_count
         {
             return Err(V2FormatError::MaintenanceBudgetExceeded);
@@ -737,6 +735,23 @@ impl<S: BlobStore> V2CommitStore<S> {
         let graph = reader
             .load_reachability(anchor, &[], budgets, false, false)
             .await?;
+        // Inspect the buffers themselves: a stale bookkeeping counter must not
+        // make the release regression or scale observation pass automatically.
+        let pending_section_bytes = graph
+            .verified_commits
+            .values()
+            .map(AsRef::as_ref)
+            .chain(
+                graph
+                    .current_chain
+                    .iter()
+                    .flat_map(|chain| &chain.commits_newest_first),
+            )
+            .flat_map(|commit| commit.retained_sections.iter().flatten())
+            .try_fold(0_u64, |total, bytes| {
+                total.checked_add(usize_to_u64(bytes.len()))
+            })
+            .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
         Ok(RecoveryMarkObservation {
             targets: graph
                 .renewal_targets
@@ -746,7 +761,7 @@ impl<S: BlobStore> V2CommitStore<S> {
             cutoff: graph.recovery_expire_before_ms,
             expiry_due: graph.recovery_expiry_due_ms,
             accounted_metadata_bytes: graph.history_metadata_bytes,
-            pending_section_bytes: graph.history_pending_bytes,
+            pending_section_bytes,
             peak_pending_section_bytes: graph.history_peak_pending_bytes,
             point_count: graph.recovery_recoverable_point_count,
             oldest_publish_time_ms: graph.recovery_oldest_recoverable_publish_time_ms,

@@ -1214,7 +1214,6 @@ struct V2ReachabilityState {
     recovery_historical_exact_bytes: u64,
     recovery_clock_uncertainty_ms: Option<u32>,
     history_metadata_bytes: u64,
-    history_pending_bytes: u64,
     history_peak_pending_bytes: u64,
     current_catalog_max_run_bytes: u64,
     current_max_section_bytes: u64,

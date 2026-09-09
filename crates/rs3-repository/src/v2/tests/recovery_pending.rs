@@ -124,7 +124,10 @@ async fn recovery_pending_history_skips_old_registry_bytes_and_releases_section_
             .recovery_mark_for_tests(&anchor, V2MaintenanceBudgets::default())
             .await,
     );
-    assert_eq!(graph.pending_section_bytes, 0);
+    assert_eq!(
+        graph.pending_section_bytes, 0,
+        "cached facts and the consumed current chain must contain no section buffers"
+    );
     assert!(graph.peak_pending_section_bytes > 0);
     assert!(graph.peak_pending_section_bytes < 64 * 1024);
     for event in &store.operation_log().expect("operation log")[before..] {
