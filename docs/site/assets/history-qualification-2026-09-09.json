@@ -1,0 +1,122 @@
+{
+  "schema": 1,
+  "date": "2026-09-09",
+  "production_revision": "3e879cb72a9cb037cbcffa555164f82b556b4946",
+  "scope": "Local RustFS and Kubernetes Lease regression evidence; no chart/pod, external-provider, crash takeover or elapsed-30-day qualification",
+  "checks": {
+    "workspace": {
+      "passed": 1115,
+      "failed": 0,
+      "ignored": 9,
+      "log_sha256": "0c168027110e93e8a73996fbf83978c1abebe251b905557ba641a3c98ad41af9"
+    },
+    "added_subset_regression": {
+      "passed": 1,
+      "log_sha256": "ff62ca068bd1f76388feecfb7ef01055080f46d0f128256fad23a74e717c4dd6",
+      "clippy_log_sha256": "71414a35573e3939512b3bd5838831adf9cd02c6ffad908aca95e2b5821c37af"
+    },
+    "full_fault_sweep": {
+      "passed": 10,
+      "ignored_separate_scale": 1,
+      "log_sha256": "85ed44fc87d4a08d6e1ccb849333d94ed4542323d4a352df5bee77b185c4a25b"
+    },
+    "churn": {
+      "cycles": 1024,
+      "historical_restores": 2,
+      "payload_compaction_io_bytes": 0,
+      "log_sha256": "5537376fc3e1c0cd2e5cba567f0546c923711204d1354872101a0f39cef695b2"
+    }
+  },
+  "recovery_fixture": {
+    "passed": true,
+    "source_manifest_sha256": "de6f0ae1ee09b01d2c468d2dc3a6fada3b78a1ef043fe1e810e4094a68adaf62",
+    "binary_sha256": "bed123d426aa56700e680d29f634d508e005772e54b82bf6f6937e1a4d3db82b",
+    "build_receipt_sha256": "19badfdd088f5136053a3c38958d04558323c16b864a30bbac8d5131d5f36d96",
+    "result_sha256": "e386de437c40a63738528e187438fca658cd4d4feb6811b74be9d6becc6dd15c",
+    "runner_sha256": "ac4a6682c3e17d6bc9002b6f532ac6996539d4fcd24cc639cf3ad137c86a44ea",
+    "node_api_relay_sha256": "493d054be2316212a858c2f78a235da0512a01e183a60502f0a1994127a9a14d",
+    "image": "sha256:41fe89380f4120a337790c02af192c3fe7bb55c3edc2e6e9357b487b47c6ab21",
+    "retention_days": 30,
+    "recovery_window_days": 30,
+    "checkpoint_evidence": {
+      "writes": 256,
+      "verified_chain_before": 5,
+      "verified_chain_after": 9
+    },
+    "selected_part_replacement_verified": true,
+    "observed_exact_sources_protected": 2,
+    "physical_hold_enforcement_verified": true,
+    "reclamation_enabled": false,
+    "maintenance_provider_deletes": 0,
+    "rclone_copyout_and_download_check": true,
+    "anchor_unchanged_during_readonly_and_restart": true,
+    "task_resources_cleaned": true
+  },
+  "direct_retained_fixture": {
+    "passed": true,
+    "source_manifest_sha256": "a3d673058553e5b60931ba9ce899ce3f1bb1c3ba192627231f8416ba149c6ff5",
+    "xtask_sha256": "3df0ce4b06af355ccb6485e695ed700b84a3f44ce7f6cfdbcf71b27cb9ba0118",
+    "s3_live_sha256": "853411e14923d8f7732ed843853d9850d51add6dacb2cf442f854ff34e845d7a",
+    "build_receipt_sha256": "f7a2a036857f1cd9fdba01afcf76c37dae08b658044964c7d1003f0075825c44",
+    "result_sha256": "86adc641fa311ec9e71419c139d61fb39c06810fbea5a8334e80e9525b1c175b",
+    "runner_sha256": "3e36dfe86bbce9b76aa243b92291394465cafec0f2484ebb97f531f50c8d2ac2",
+    "image": "sha256:41fe89380f4120a337790c02af192c3fe7bb55c3edc2e6e9357b487b47c6ab21",
+    "gc_rehearsal": {
+      "anchor": {
+        "sequence": 1
+      },
+      "apply": {
+        "deleted_count": 1,
+        "failed_delete_count": 0,
+        "protected_count": 1,
+        "retention_renewed_bytes": 1735,
+        "retention_renewed_object_count": 3,
+        "scanned_count": 2
+      },
+      "backend": {
+        "kind": "s3"
+      },
+      "dry_run_after": {
+        "candidate_commit_count": 1,
+        "fully_dead_commit_count": 0,
+        "planned_delete_count": 0,
+        "retention_blocked_bytes": 29
+      },
+      "dry_run_before": {
+        "candidate_commit_count": 2,
+        "exact_version_apply_ready": true,
+        "fits_budgets": true,
+        "fully_dead_commit_count": 1,
+        "planned_delete_count": 1,
+        "planned_request_count": 20,
+        "retention_blocked_bytes": 29,
+        "unknown_protection_blocked_bytes": 0
+      },
+      "guard": {
+        "mode": "unenforced"
+      },
+      "passed": true,
+      "retention": {
+        "days": 1,
+        "mode": "governance"
+      },
+      "schema": "rs3.xtask.v2-gc-rehearsal.v1",
+      "verification": {
+        "verified_commit_count": 1
+      }
+    },
+    "task_resources_cleaned": true
+  },
+  "failed_attempts": [
+    {
+      "lane": "standard retained local gate",
+      "outcome": "RustFS readiness timeout over Docker forwarded port; chart lane not reached",
+      "log_sha256": "cd2be53487da0c93919b432447fa98d20211704fbc88ba42b4b0e85e62ded581"
+    },
+    {
+      "lane": "original recovery relay",
+      "outcome": "relay idle timeouts aligned with Lease renewal failure; gateway shut down; corrected fixture passed with the same binary",
+      "result_sha256": "72974e9b6b9e4c04ba65e0473cc57ebbba279ad570a144375436204adc87ba5f"
+    }
+  ]
+}

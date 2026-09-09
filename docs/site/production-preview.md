@@ -426,10 +426,11 @@ Preview evidence should show:
 
 ## `v03` Release Blockers
 
-V03 publication chronology remains an implementation gate: the writer signs
-local wall time and replay does not yet reject timestamps at or before the
-parent's. Do not qualify retention history until strict ordering and clock,
-restart and writer-handoff tests pass. Codec fixtures do not prove this property.
+V03 publication and replay enforce strictly increasing parent-to-child times,
+with bounded clock lead and freshness checks for new history acceptance. Local
+clock and restart regressions cover this behavior. These checks do not establish
+external-provider or writer-handoff qualification; codec fixtures alone do not
+prove runtime history safety.
 
 The replacement repository generation must complete all of these together:
 

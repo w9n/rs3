@@ -116,9 +116,49 @@ vectors to temporary corpora so fuzzing does not modify the fixtures. Defaults
 are 60 seconds per target and a 512 MiB per-target RSS ceiling; use
 `RS3_FUZZ_SMOKE_SECONDS` and `RS3_FUZZ_RSS_LIMIT_MB` for an explicit local override.
 
-Strict parent-relative publication-time validation remains unimplemented.
-Codec vectors do not establish that runtime history guarantee or replace
-retained-provider and complete recovery qualification.
+Runtime replay, recovery-history traversal and adoption require strictly
+increasing parent-to-child publication timestamps. New recovery-history
+acceptance also checks freshness against sampled time and declared uncertainty.
+Signed timestamps are not a current-time oracle; codec and runtime checks do not
+replace retained-provider and complete recovery qualification.
+
+## September 9 history-efficiency qualification
+
+At `3e879cb`, the source-bound recovery fixture passes against disposable RustFS
+and Kind with a real Kubernetes Lease. It covers a 4 KiB packed value, a 100 MiB
+multipart value with part replacement, checkpoint/compaction after 256 churn
+writes, selected historical recovery, exact-version COMPLIANCE protection for
+the selected commit and observed restore sources, legal-hold enforcement on an
+unretained control, maintenance with reclamation disabled and no provider DELETE,
+AWS/rclone copy-out and range reads, and graceful readonly/writer restarts without
+changing the accepted anchor.
+
+The standard `just preview-gate-v2-retained-local` attempt stopped at RustFS
+readiness because this host's Docker forwarded port timed out while the same
+health endpoint returned HTTP 200 inside the container. The recovery fixture
+therefore used host-network RustFS and a TLS relay into the temporary Kind API.
+Its first attempt failed when the relay's inherited 10-second socket timeout
+closed idle connections; the gateway stopped after Lease renewal exceeded its
+30-second duration. A copied fixture removed the relay's idle timeout while
+keeping connection and client request deadlines. The successful retry uses the
+same frozen server binary, records the helper hash and cleans all owned resources.
+The failed attempts remain in local evidence.
+
+A separate host-network run passes the direct retained-version storage contract
+and isolated GC rehearsal. It deletes one unprotected version, preserves one
+protected candidate and renews three exact dependencies under the explicitly
+unenforced guard of a disposable prefix. The rehearsal uses one-day GOVERNANCE
+retention; it does not test governance-bypass IAM.
+
+The [qualification receipt](assets/history-qualification-2026-09-09.json) records
+source/binary/result hashes, passed checks, failed attempts and scope boundaries.
+
+These are bounded local regression results. They do not qualify the chart/pod
+lane at this revision, an external provider, governance-bypass IAM, crash takeover
+or an elapsed 30-day retention interval. The separate
+[100,000-write comparison](performance.md#retained-history-efficiency-september-9-2026)
+uses a controlled in-memory provider and simulated time; its scale must not be
+attributed to this real-provider fixture.
 
 ## Important Lanes
 

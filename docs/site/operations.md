@@ -499,6 +499,12 @@ capacity error rather than shortening any promise; writes resume as the oldest
 history pages expire. Batching small writes keeps sustained publication rates
 far below the ceiling; see the
 [repository format reference](reference/repository-format.md) for the bounds.
+This is a format ceiling, not an operating capacity: shared metadata, encoded
+pending-buffer and reachable-target budgets can refuse growth much earlier.
+Size the [history budgets](reference/configuration.md#maintenance)
+against the measured workload and available resources; raising a cap does not
+change retention promises. The [performance reference](performance.md) records
+qualified counts, explicit budgets and provider boundaries.
 
 ## Full Maintenance
 

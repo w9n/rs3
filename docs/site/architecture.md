@@ -134,13 +134,19 @@ deduplication for the primary client workload.
 Recent immutable foreground runs are level 0. Each compaction selects at most
 128 active runs, including older level-1 shards, as one contiguous
 generation window with at most 131,072 mutations and 16 MiB of stored run
-sections. Selection prefers more source runs, then lower mutation/byte cost,
-then older windows, so full live older shards cannot starve smaller newer
-churn. After validating every source, it selects newest mutations
+sections. That read window favors more source runs, then lower mutation/byte
+cost and older windows. Signed catalog sizes rank the complete window and one
+cheaper contiguous subset before fetching either. The compactor reads the better
+estimate first, fetching only signed headers and selected run sections. It tries
+the other candidate only when actual sharding or nonreduction makes that useful,
+reusing fetched sources. Across both plans the original bounds still apply. A
+large older shard can remain unchanged when merging newer runs gives better byte
+cost per catalog entry removed. Every fetched source is fully authenticated;
+corruption fails the operation. After validating selected sources, it selects newest mutations
 and discards upserts proven obsolete by the accepted blinded-key namespace.
 Winning tombstones remain to mask older values. This prevents overwritten or
 deleted versions from filling the catalog indefinitely, including when full
-older shards precede later churn. Runs outside the window retain their exact
+older shards precede later churn. Runs outside the selected window retain their exact
 references. The output contains fewer bounded level-1 generation-range shards;
 an entirely obsolete window needs no replacement run. Level is a storage tier,
 never a compaction epoch. The format accepts only levels 0 and 1.
@@ -217,13 +223,16 @@ compaction error poisons the coordinator immediately instead of allowing writes
 to run past an uncertain maintenance failure. Already accepted reads remain
 available.
 
-Retained writers also track conservative recovery metadata and exact-target
-capacity separately from cached retention coverage. Ordinary publications add
+Retained writers also track conservative recovery metadata, encoded pending
+sections and exact-target capacity separately from cached retention coverage. Ordinary publications add
 bounded costs; a cold cache or exhausted estimate requires an exact candidate
 graph check before acceptance. Foreground admission leaves a small margin for
 an expiry root. The [metadata admission contract](reference/repository-format.md#recovery-metadata-admission)
-describes the shared limits and the separate pending-section, replay and inventory
-constraints. This check does not raise the qualified operating capacity.
+describes the shared limits and the separate replay and inventory constraints.
+Maintenance caches signed commit headers and decodes required historical
+sections one at a time, releasing their encoded bytes before following
+dependencies. Current replay buffers are released after namespace and accepted
+recovery-registry reconstruction. This check does not raise the qualified operating capacity.
 
 The state-flow view below separates the normal write path from the restore read
 path. Bounded nonempty writes pack encrypted values with an index run; large

@@ -238,11 +238,22 @@ capacity through candidate verification without shortening an accepted promise.
 A refusal leaves the accepted namespace and anchor unchanged. Already uploaded
 candidate objects remain unanchored and subject to guarded orphan GC.
 
-This admission check covers metadata bytes and reachable-target count. It does
-not certify the separate 64 MiB pending-section limit, startup replay limits,
-provider inventory, or optional per-pass I/O budgets. Traversal still enforces
-those limits independently. Capacity verification may read obsolete records
-still present in current immutable runs because a future historical traversal
+Admission also bounds encoded pending sections. Maintenance retains the current
+replay chain while decoding its namespace and accepted recovery registry, with
+one bounded catalog-run buffer. It then releases those encoded sections and
+traverses history using cached signed headers and one required section at a time.
+Payload carriers need only their exact identity, length and signed header;
+unreferenced historical Recovery sections are not downloaded. Referenced index
+and recovery sections still undergo exact-length, digest and authenticated
+context verification. Read-chunk scratch is included in the encoded-buffer bound.
+
+The shared pending-section default is 64 MiB. The capacity certificate tracks
+current replay size, the largest catalog run and historical section requirements;
+a root resets the replay-chain component. These are conservative encoded-buffer
+bounds, not an allocator or whole-process RAM limit. Decoded namespace and
+per-section decoder state have separate limits. Startup replay limits, provider
+inventory and optional per-pass I/O budgets remain independently enforced.
+Capacity verification may read obsolete records still present in current immutable runs because a future historical traversal
 would read them too; missing exact dependencies fail closed. This is a read-only
 capacity check, not additional retention or deletion authority. Existing
 oversized repositories are not repaired by this check, and larger configurations
@@ -563,11 +574,19 @@ generation namespace records are the authoritative pack and stream reachability
 map. Foreground runs are level 0. The compactor selects at most 128
 active runs, regardless of level, as a contiguous generation window, capped at
 131,072 source mutations and 16 MiB of stored index-run sections. Catalog facts
-select the window with the most runs; ties prefer fewer mutations, fewer stored
-bytes, then the oldest window. This avoids stalling behind full live older
-shards when newer churn can reduce the catalog. Both maximum-size runs fit
-these ceilings. The compactor validates every source and selects the newest
-mutation for each blinded key.
+select a read window with the most runs; ties prefer fewer mutations, fewer
+stored bytes, then the oldest window. Both maximum-size runs fit these ceilings.
+The compactor validates every fetched source and plans at most two contiguous choices:
+the complete window and one subset ranked by stored-byte cost. Actual output
+sharding determines catalog reduction before a plan wins. The comparison uses
+`(source bytes + 8 MiB) / removed catalog entries`; the fixed term is a scheduling
+weight that amortizes root publication, not measured traffic. Ties retain the
+complete-window plan when both are evaluated. Both choices share one bounded
+read envelope; fallback reuses fetched sources. Catalog estimates choose which
+one to fetch first. This lets
+127 small new runs beat 128 inputs that include a large older shard, avoiding
+repeatedly rewriting that shard. The compactor selects the newest mutation for
+each blinded key.
 The already accepted namespace proves an upsert obsolete when that blinded key
 is absent or has a newer generation. Those upserts are omitted; winning
 tombstones remain. A namespace generation behind a source or inconsistent
@@ -733,8 +752,14 @@ Compaction and catalog publication use this order:
 
 1. Capture the accepted anchor and live Kubernetes `WriterFence` with no
    pending mutations.
-2. Select and verify at most 128 active runs across levels 0 and 1.
-   Merge this contiguous window newest-wins, prune upserts proven obsolete by
+2. Rank a bounded full window and one contiguous subset from authenticated
+   catalog sizes. Fetch the better estimate first; try the alternative only if
+   actual sharding or nonreduction warrants it, reusing fetched sources. At most
+   128 unique runs, 16 MiB of stored run sections and 131,072 mutations are
+   considered. Verify every fetched source using its signed header and exact run
+   section; unrelated payload and recovery sections need no download. Corruption
+   is fatal, while unfetched references remain unchanged.
+   Merge the chosen window newest-wins, prune upserts proven obsolete by
    the accepted blinded-key namespace, retain winning tombstones and normalize
    self-pack references. Preserve every run outside the window unchanged.
 3. Shard the result on generation boundaries and write each metadata-only run
@@ -887,8 +912,8 @@ prove that no protected root requires them.
 
 Frozen canonical fixtures and nine fuzz targets cover current codecs;
 [Testing](../testing.md) maps the executable coverage and its limits. Full
-qualification still requires strict publication chronology, retained-provider
-restart/fault evidence, production-cardinality maintenance and matched recovery
+qualification still requires broader retained-provider restart/fault evidence,
+production-cardinality maintenance and matched recovery
 and amplification results for the exact candidate. Historical v02 measurements
 do not qualify v03. See [Production Preview](../production-preview.md) and
 [Performance](../performance.md) for evidence and release gates.

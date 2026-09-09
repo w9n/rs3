@@ -1,8 +1,9 @@
 # Performance
 
-The [September 9 history experiment](#retained-history-experiment-september-9-2026)
-identifies a default maintenance-budget limit below the format's history ceiling.
-The live-backend comparisons below were measured on September 8.
+The latest [retained-history efficiency comparison](#retained-history-efficiency-september-9-2026)
+measures selective reads, bounded pending buffers and metadata compaction.
+Earlier experiments and the September 8 live-backend comparison retain their
+original source bindings below.
 
 ## Backend comparison: September 8, 2026
 
@@ -44,7 +45,109 @@ Two comparisons have different meanings:
   elapsed budget uses the arithmetic mean of three paired ratios, not the
   ratio of revision medians.
 
+## Retained-history efficiency: September 9, 2026
+
+This matched comparison uses production baseline `cdedf39` and candidate
+`3e879cb`, with the same instrumented workload on both. Each workload runs once
+in a separate release-test process on a shared host. The provider is an
+in-memory exact-version retention model, the anchor is in memory, and retention
+days are simulated. These results do not measure HTTP, Kubernetes, an external
+provider, or isolated gateway RAM.
+
+Both revisions use 256 MiB of history metadata budget at 10,000 writes and an
+explicit 1 GiB at 100,000, with a 64 MiB encoded pending-buffer budget throughout.
+The same budgets apply to publication, traversal, renewal and GC. Server defaults
+remain unchanged; the format's roughly 4.2-million-point ceiling is not an
+operating-capacity claim.
+
+Each serial PUT carries 512 plaintext bytes. Overwrite replaces one key; append
+adds distinct keys. Compaction adds publications. Reopen creates a new repository
+instance in the same test process. A full successful lifecycle includes deletion,
+three sampled historical restores, renewal, authenticated expiry, provider-unlock
+simulation, eligible exact-version GC and final current-state verification.
+
+Body-byte counters exclude HEAD/LIST response metadata, HTTP framing and SDK
+retries. A separate signed-header audit attributes physical storage without
+adding to measured traffic. Encoded pending peaks are conservative phase bounds,
+not allocator or process-RSS measurements.
+
+All four candidate lifecycles pass. Baseline 100,000-append growth, reopen and
+sampled restore pass, but its full history walk fails under the same explicit
+1 GiB metadata / 64 MiB pending budgets. Its later renewal and GC phases are
+therefore unqualified. The candidate completes those phases without changing
+history deadlines or page policy.
+
+### Network and storage results
+
+Values are MiB, shown as **baseline → candidate**. Stored bytes are measured
+after deletion and checkpointing, before expiry/GC. Growth includes automatic
+compaction and verification; it excludes later maintenance scans.
+
+| Workload | Growth body reads | Growth body writes | Stored bytes |
+| --- | ---: | ---: | ---: |
+| 10,000 overwrite | 129.57 → 122.76 | 76.18 → 76.18 | 77.45 → 77.45 |
+| 10,000 append | 131.51 → 127.27 | 79.05 → 79.05 | 80.43 → 80.43 |
+| 100,000 overwrite | 1,422.38 → 1,348.21 | 824.40 → 824.40 | 826.08 → 826.08 |
+| 100,000 append | 5,743.60 → 1,686.03 | 3,004.79 → 1,017.38 | 3,009.57 → 1,019.28 |
+
+At 100,000 appends, body reads fall **70.6%**, written bytes **66.1%**, and
+stored bytes **66.1%**. Growth GETs fall from 821,344 to 713,182 and PUTs from
+103,051 to 101,858. Compaction preserves expensive older shards, reads only
+required run sections and avoids repeatedly rewriting live metadata. IndexRun
+storage falls from 2,368,221,374 B to 179,780,679 B. Recovery storage grows from
+614,382,789 B to 702,192,124 B because the selected compaction schedule publishes
+more roots; the recovery-record layout is unchanged.
+
+| Workload | Full history-scan body reads, baseline → candidate (MiB) | Candidate encoded pending bound (MiB) |
+| --- | ---: | ---: |
+| 10,000 overwrite | 75.00 → 22.43 | 2.58 |
+| 10,000 append | 77.97 → 30.03 | 2.58 |
+| 100,000 overwrite | 806.84 → 224.69 | 2.60 |
+| 100,000 append | incomplete, not comparable → 368.83 | 3.97 |
+
+Candidate traversals release all encoded section buffers by completion. These
+bounds exclude decoded namespace/decoder state and are not a process-memory
+ceiling. Accounted history metadata at 100,000 writes is 496.98 MiB for overwrite
+and 501.75 MiB for append, which explains the explicit 1 GiB configuration.
+
+### Remaining physical overhead
+
+At 100,000 appends, 702,192,124 B of the 1,068,794,750 B pre-GC total belongs to
+Recovery sections; submitted plaintext is 51,200,000 B. Retained predecessor
+records and immutable carriers still dominate size. Smaller history pages would
+consume the fixed page-count capacity sooner, so this change preserves page
+policy and retention promises.
+
+After simulated expiry, observed provider unlock and guarded GC, append storage
+is 320,909,464 B with 99,999 current keys and two retained points. Live packed
+payloads can keep obsolete metadata and unused pack space in their immutable
+carriers. Metadata compaction does not clean payload packs. The unused-byte
+metrics report unused payload space, not removable metadata or immediate GC
+eligibility.
+
+The [numerical evidence](assets/history-efficiency-2026-09-09.json) records full
+production revisions, source/binary/manifest/log hashes, exact budgets, phase
+counters, inventories and all outcomes. Raw logs and build receipts remain local.
+Reproduce each case in a fresh process, selecting `overwrite` or `append`:
+
+```sh
+RS3_HISTORY_SCALE_WRITES=100000 \
+RS3_HISTORY_SCALE_MODE=append \
+RS3_HISTORY_SCALE_METADATA_BYTES=1073741824 \
+RS3_HISTORY_SCALE_PENDING_BYTES=67108864 \
+cargo test --release --lib -p rs3-repository recovery_history_scale \
+  -- --ignored --nocapture --test-threads=1
+```
+
+For 10,000 writes, use `RS3_HISTORY_SCALE_WRITES=10000` and
+`RS3_HISTORY_SCALE_METADATA_BYTES=268435456`. This controlled lane complements
+the local retained-provider checks in [Testing](testing.md); it does not replace
+external-provider or dedicated-runner qualification.
+
 ## Retained-history experiment: September 9, 2026
+
+This earlier experiment used `0eb5064` and predates the repairs measured above.
+Its original default-budget failures remain recorded here.
 
 Both controlled 10,000-write workloads restore three sampled historical points
 after deletion, repository reopen, and retention renewal. They then reject those
@@ -136,8 +239,10 @@ The recorded budget-isolation diagnostic used `RS3_HISTORY_SCALE_WRITES=55000`
 and `RS3_HISTORY_SCALE_DIAGNOSE=1` with `overwrite`. On the measured revision it
 also tried one read-only graph walk with a 512 MiB metadata budget and checked
 fresh-writer refusal under the default. It exited unsuccessfully to preserve
-the default-budget failure. With current admission checks, growth can refuse
-before reaching that diagnostic phase.
+the default-budget failure. That diagnostic option belongs to its recorded
+harness revision. The current harness instead accepts explicit shared metadata
+and pending budgets for the complete lifecycle; growth can refuse before
+reaching the measurement phases.
 
 ### Admission repair after the experiment
 
@@ -154,8 +259,11 @@ restart, current and historical reads, same-budget renewal, expiry, and eventual
 GC. Root and compaction refusals preserve the accepted anchor. The existing
 bounded-successor I/O regression remains in place. These checks establish the
 metadata admission behavior, not a new production capacity or network benchmark.
-The pending-section, inventory, replay and optional I/O limits remain independent;
-there is no general guarantee that every maintenance operation will fit.
+Admission also checks encoded pending buffers, including current replay and
+read scratch. Historical traversal caches signed headers and downloads required
+sections individually. Inventory, startup replay and optional I/O limits remain
+independent; there is no general guarantee that every maintenance operation
+will fit.
 The source-bound tables above remain historical measurements. Existing hard limits, the wire format, retention promises, and the stored-payload
 layout are unchanged.
 
