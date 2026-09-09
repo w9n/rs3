@@ -47,12 +47,22 @@ fn compaction_challenger(
 ) -> crate::v2::V2Result<Option<std::ops::Range<usize>>> {
     let mut best: Option<(std::ops::Range<usize>, CompactionCost)> = None;
     for start in 0..sizes.len() {
-        for end in start + 2..=sizes.len() {
-            if start == 0 && end == sizes.len() {
+        // Reuse each checked prefix sum instead of rescanning every candidate.
+        // The 256-source envelope therefore needs quadratic scoring work and
+        // constant extra memory, with the same oldest-window tie ordering.
+        let mut bytes = COMPACTION_PUBLICATION_COST_BYTES;
+        for (offset, &(_, source_bytes)) in sizes[start..].iter().enumerate() {
+            bytes = bytes
+                .checked_add(source_bytes)
+                .ok_or(V2FormatError::IndexRootLimitExceeded)?;
+            let end = start + offset + 1;
+            if offset == 0 || (start == 0 && end == sizes.len()) {
                 continue;
             }
-            let cost = CompactionCost::new(&sizes[start..end], 1)
-                .ok_or(V2FormatError::IndexRootLimitExceeded)?;
+            let cost = CompactionCost {
+                bytes,
+                reduction: offset,
+            };
             if best
                 .as_ref()
                 .is_none_or(|(_, incumbent)| cost.cheaper_than(*incumbent))
@@ -120,7 +130,7 @@ where
         reducing_output(plan(&mut sources[secondary.clone()].iter().cloned())?)?
     } else {
         // Fetch only the missing prefix and suffix. The disjoint union stays
-        // within the original 128-run/16MiB/131072-mutation envelope.
+        // within the original 256-run/16MiB/131072-mutation envelope.
         let mut all_sources = if primary.start == 0 {
             Vec::with_capacity(sizes.len())
         } else {

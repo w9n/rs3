@@ -1454,7 +1454,7 @@ async fn fully_obsolete_window_publishes_only_a_root_and_preserves_newer_runs() 
         .await
         .expect("genesis");
     let key = logical_path("window/current");
-    for _ in 0..128 {
+    for _ in 0..256 {
         repository
             .put_committed(
                 &anchor,
@@ -1488,7 +1488,7 @@ async fn fully_obsolete_window_publishes_only_a_root_and_preserves_newer_runs() 
         .delete_committed(&anchor, deleted.clone())
         .await
         .expect("tail tombstone");
-    assert_eq!(repository.active_index_run_count().expect("before"), 131);
+    assert_eq!(repository.active_index_run_count().expect("before"), 259);
     inner.reset_operation_counts().expect("reset");
     let start = store.operation_log().expect("trace").len();
     repository

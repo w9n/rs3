@@ -22,7 +22,7 @@ use rs3_storage::BlobStore;
 use rs3_storage::strongest_retention_policy;
 use rs3_types::{LegalHoldStatus, RetentionPolicy};
 
-const V2_PACKED_COMPACTION_MAX_SOURCE_RUNS: usize = 128;
+const V2_PACKED_COMPACTION_MAX_SOURCE_RUNS: usize = 256;
 const V2_PACKED_COMPACTION_MAX_SOURCE_MUTATIONS: u64 = 131_072;
 const V2_PACKED_COMPACTION_MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -638,7 +638,11 @@ mod tests {
     #[test]
     fn selection_respects_all_budgets_and_never_skips_an_interior_run() {
         let small = (1, 1024);
-        assert_eq!(compaction_window(&vec![small; 256]), Ok(0..128));
+        assert_eq!(compaction_window(&vec![small; 257]), Ok(0..256));
+        // Raising the count ceiling does not raise either decoded-mutation
+        // or authenticated encoded-source budget. Both bind before 256 runs.
+        assert_eq!(compaction_window(&[(1024, 1024); 256]), Ok(0..128));
+        assert_eq!(compaction_window(&[(1, 128 * 1024); 256]), Ok(0..128));
         assert_eq!(compaction_window(&[(65_536, 1024); 3]), Ok(0..2));
         assert_eq!(compaction_window(&[(1, 8 * 1024 * 1024); 3]), Ok(0..2));
         assert_eq!(

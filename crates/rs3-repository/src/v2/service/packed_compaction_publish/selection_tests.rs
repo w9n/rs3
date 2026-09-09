@@ -102,8 +102,8 @@ async fn fixture_plan(
 #[tokio::test]
 async fn append_cliff_leaves_large_older_shard_out_of_rewrite() {
     // The accepted 256-run catalog has 129 older append shards and 127 new
-    // single-entry runs. The bounded read envelope includes one older shard.
-    let mut catalog = vec![(128, 128 * 1024); 129];
+    // single-entry runs. The byte-bounded envelope includes one older shard.
+    let mut catalog = vec![(128, 8 * 1024 * 1024); 129];
     catalog.extend(vec![(1, 1024); 127]);
     let envelope = super::super::compaction_window(&catalog).expect("envelope");
     assert_eq!(envelope, 128..256);
@@ -324,5 +324,55 @@ async fn nonreducing_primary_expands_once_and_rejects_corrupt_fallback_input() {
             assert_eq!(selected, 0..4);
             assert_eq!(output.len(), 3);
         }
+    }
+}
+
+#[tokio::test]
+async fn tiny_256_source_window_amortizes_one_publication_without_fallback() {
+    let mut namespace = rs3_index::NamespaceIndex::new();
+    let sources = (0..=255_u8)
+        .map(|key| append_source(u64::from(key) + 1, &[key], &mut namespace))
+        .collect::<Vec<_>>();
+    let sizes = vec![(1, 1024); 256];
+    let (result, reads, plans) =
+        fixture_plan(sources, &sizes, &IndexRunLimits::default(), &namespace).await;
+    let (selected, output) = result.expect("256 small sources reduce");
+    assert_eq!(selected, 0..256);
+    assert_eq!(reads, std::iter::once(0..256).collect::<Vec<_>>());
+    assert_eq!(plans, 1, "a reducing full window needs no fallback");
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].mutations.len(), 256);
+    for (key, mutation) in (0..=255_u8).zip(&output[0].mutations) {
+        assert!(matches!(mutation, IndexMutation::Upsert(entry)
+            if entry.blind_key == IndexBlindKey::from_bytes([key; 32])
+            && entry.generation == Sequence::new(u64::from(key) + 1)));
+    }
+}
+
+#[test]
+fn incremental_challenger_scoring_matches_exhaustive_costs() {
+    for count in [2, 3, 17, 128, 256] {
+        let sizes = (0..count)
+            .map(|index| (1, 1024 + ((index * 7919) % 65536) as u64))
+            .collect::<Vec<_>>();
+        let mut expected = None;
+        for start in 0..count {
+            for end in start + 2..=count {
+                if start == 0 && end == count {
+                    continue;
+                }
+                let cost = CompactionCost::new(&sizes[start..end], 1).expect("cost");
+                if expected
+                    .as_ref()
+                    .is_none_or(|(_, best)| cost.cheaper_than(*best))
+                {
+                    expected = Some((start..end, cost));
+                }
+            }
+        }
+        assert_eq!(
+            compaction_challenger(&sizes).expect("incremental candidate"),
+            expected.map(|(range, _)| range),
+        );
     }
 }
