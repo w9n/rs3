@@ -171,28 +171,22 @@ where
         }
 
         let keyring = self.repository.keyring();
-        let sources = self
-            .load_compaction_sources(keyring.as_ref(), source_refs)
-            .await?;
-        let plan = {
-            let accepted = self
-                .accepted
-                .read()
-                .map_err(|_| RepositoryError::StatePoisoned)?;
-            cost_aware_compaction_plan(
-                sources,
-                &sizes[window.clone()],
-                &IndexRunLimits::default(),
-                &accepted.repository.namespace,
-            )
-        };
-        let (selected, output_runs) = match plan {
-            Ok(plan) => plan,
-            Err(V2FormatError::MaintenanceBudgetExceeded) => {
-                return Err(RepositoryError::MaintenanceNotBeneficial);
-            }
-            Err(error) => return Err(v2_repository_error(error)),
-        };
+        let (selected, output_runs) = cost_aware_compaction_plan(
+            &sizes[window.clone()],
+            |range| self.load_compaction_sources(keyring.as_ref(), &source_refs[range]),
+            |sources| {
+                let accepted = self
+                    .accepted
+                    .read()
+                    .map_err(|_| RepositoryError::StatePoisoned)?;
+                Ok(plan_packed_run_compaction(
+                    sources,
+                    &IndexRunLimits::default(),
+                    Some(&accepted.repository.namespace),
+                ))
+            },
+        )
+        .await?;
         drop(ordered_refs.drain(window.start + selected.start..window.start + selected.end));
         let retained_refs = ordered_refs;
         // Level is a storage tier, not a compaction epoch. Both foreground and
@@ -458,7 +452,7 @@ where
             let location = &expected.location;
             let replay = self
                 .commit_store
-                .read_replay_commit_at(&location.commit_key, location.version_id.as_ref())
+                .read_commit_facts_at(&location.commit_key, location.version_id.as_ref())
                 .await
                 .map_err(v2_repository_error)?;
             let descriptor_index = usize::try_from(location.section_ordinal)
@@ -483,11 +477,22 @@ where
             {
                 return Err(v2_repository_error(V2FormatError::InvalidIndexRoot));
             }
-            let stored_run = replay
-                .retained_sections
-                .get(descriptor_index)
-                .and_then(Option::as_deref)
-                .ok_or_else(|| v2_repository_error(V2FormatError::InvalidIndexRun))?;
+            let pending_limit = self
+                .commit_store
+                .options()
+                .replay_limits
+                .max_retained_bytes
+                .min(
+                    self.commit_store
+                        .options()
+                        .recovery_maintenance_budgets
+                        .max_history_pending_bytes,
+                );
+            let stored_run = self
+                .commit_store
+                .read_metadata_section(&replay, location.section_ordinal, pending_limit)
+                .await
+                .map_err(v2_repository_error)?;
             let actual = apply_packed_index_run(
                 keyring,
                 &self.commit_store.options().repository_id,
@@ -497,7 +502,7 @@ where
                     version_id: replay.version_id.as_ref(),
                     object_len: replay.object_len,
                     section_ordinal: location.section_ordinal,
-                    stored_run,
+                    stored_run: &stored_run,
                     level: expected.level,
                     compaction_generation: expected.compaction_generation,
                     provider_profile: self.commit_store.provider_profile(),
@@ -515,7 +520,7 @@ where
                 &context,
                 &replay.parsed_header.header.self_ref.commit_key,
                 location.section_ordinal,
-                stored_run,
+                &stored_run,
                 &IndexRunLimits::default(),
             )
             .map_err(v2_repository_error)?;

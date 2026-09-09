@@ -1,3 +1,4 @@
+mod compaction_reads;
 mod copy;
 mod copy_retention;
 mod multipart_completion;

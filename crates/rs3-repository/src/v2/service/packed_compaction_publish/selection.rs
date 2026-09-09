@@ -1,12 +1,14 @@
-//! Two bounded contiguous plans, compared by their actual catalog reduction.
+//! Fetch a catalog-ranked window first, with one bounded cached fallback.
 
-use super::plan_packed_run_compaction;
-use super::{IndexRun, IndexRunLimits, PackedCompactionSourceRun, V2FormatError};
+use super::{IndexRun, PackedCompactionSourceRun, V2FormatError, v2_repository_error};
+use crate::error::{RepositoryError, Result};
+use std::future::Future;
+use std::ops::Range;
 
 // A scheduling weight, not an estimate of measured publication traffic. Charge
 // one maximum-size recovery section to amortize roots over catalog reduction.
-// Source bytes proxy rewrite cost. Reads still cover the original bounded
-// envelope even if a subwindow wins; this does not promise fewer input reads.
+// Source bytes proxy read/rewrite cost. Only the chosen window is fetched
+// unless actual sharding or nonreduction requires the bounded fallback.
 const COMPACTION_PUBLICATION_COST_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
@@ -62,56 +64,111 @@ fn compaction_challenger(
     Ok(best.map(|(window, _)| window))
 }
 
-pub(super) fn cost_aware_compaction_plan(
-    sources: Vec<PackedCompactionSourceRun>,
+/// Fetch the better catalog estimate first. Only nonreduction or unexpectedly
+/// expensive actual sharding triggers the other bounded candidate. Estimates
+/// rank work; the encoder's output count alone proves catalog reduction.
+pub(super) async fn cost_aware_compaction_plan<Load, Loaded, Plan>(
     sizes: &[(u32, u64)],
-    limits: &IndexRunLimits,
-    namespace: &rs3_index::NamespaceIndex,
-) -> crate::v2::V2Result<(std::ops::Range<usize>, Vec<IndexRun>)> {
-    if sources.len() != sizes.len() || sources.len() < 2 {
-        return Err(V2FormatError::InvalidIndexRoot);
+    mut load: Load,
+    mut plan: Plan,
+) -> Result<(Range<usize>, Vec<IndexRun>)>
+where
+    Load: FnMut(Range<usize>) -> Loaded,
+    Loaded: Future<Output = Result<Vec<PackedCompactionSourceRun>>>,
+    Plan: FnMut(
+        &mut dyn ExactSizeIterator<Item = PackedCompactionSourceRun>,
+    ) -> Result<crate::v2::V2Result<Vec<IndexRun>>>,
+{
+    let full = 0..sizes.len();
+    if sizes.len() < 2 || super::compaction_window(sizes).map_err(v2_repository_error)? != full {
+        return Err(v2_repository_error(V2FormatError::InvalidIndexRoot));
     }
-    let full = 0..sources.len();
-    let challenger = compaction_challenger(sizes)?;
-    // Clone one decoded source at a time while planning the challenger. Keep
-    // only its output while consuming the full envelope below.
-    let challenger_plan = challenger.map(|window| {
-        let output = plan_packed_run_compaction(
-            sources[window.clone()].iter().cloned(),
-            limits,
-            Some(namespace),
-        );
-        (window, output)
-    });
-    // A valid challenger never hides invalid input elsewhere in the envelope.
-    let full_sources = sources.into_iter();
-    let mut best = match plan_packed_run_compaction(full_sources, limits, Some(namespace)) {
-        Ok(output) => Some((full, output)),
-        Err(V2FormatError::MaintenanceBudgetExceeded) => None,
-        Err(error) => return Err(error),
+    let cost = |window: Range<usize>, outputs| {
+        CompactionCost::new(&sizes[window], outputs)
+            .ok_or_else(|| v2_repository_error(V2FormatError::IndexRootLimitExceeded))
     };
-    if let Some((challenger, output)) = challenger_plan {
-        match output {
-            Ok(output) => {
-                let cost = CompactionCost::new(&sizes[challenger.clone()], output.len())
-                    .ok_or(V2FormatError::IndexRootLimitExceeded)?;
-                let cheaper = match &best {
-                    Some((window, output)) => {
-                        let incumbent = CompactionCost::new(&sizes[window.clone()], output.len())
-                            .ok_or(V2FormatError::IndexRootLimitExceeded)?;
-                        cost.cheaper_than(incumbent)
-                    }
-                    None => true,
-                };
-                if cheaper {
-                    best = Some((challenger, output));
-                }
-            }
-            Err(V2FormatError::MaintenanceBudgetExceeded) => {}
-            Err(error) => return Err(error),
-        }
+    let mut primary = full.clone();
+    let mut secondary = compaction_challenger(sizes).map_err(v2_repository_error)?;
+    if let Some(challenger) = &secondary
+        && cost(challenger.clone(), 1)?.cheaper_than(cost(full.clone(), 1)?)
+    {
+        primary = challenger.clone();
+        secondary = Some(full.clone());
     }
-    best.ok_or(V2FormatError::MaintenanceBudgetExceeded)
+    let sources = load(primary.clone()).await?;
+    if sources.len() != primary.len() {
+        return Err(v2_repository_error(V2FormatError::InvalidIndexRoot));
+    }
+    let mut primary_output = reducing_output(plan(&mut sources.iter().cloned())?)?;
+    if let Some(output) = primary_output.take() {
+        let actual = cost(primary.clone(), output.len())?;
+        let worthwhile = match &secondary {
+            Some(window) => cost(window.clone(), 1)?.cheaper_than(actual),
+            None => false,
+        };
+        if !worthwhile {
+            return Ok((primary, output));
+        }
+        primary_output = Some(output);
+    }
+    let Some(secondary) = secondary else {
+        return Err(RepositoryError::MaintenanceNotBeneficial);
+    };
+
+    let secondary_output = if primary == full {
+        // The alternative is already in the fetched envelope: no new GETs.
+        reducing_output(plan(&mut sources[secondary.clone()].iter().cloned())?)?
+    } else {
+        // Fetch only the missing prefix and suffix. The disjoint union stays
+        // within the original 128-run/16MiB/131072-mutation envelope.
+        let mut all_sources = if primary.start == 0 {
+            Vec::with_capacity(sizes.len())
+        } else {
+            let prefix = load(0..primary.start).await?;
+            if prefix.len() != primary.start {
+                return Err(v2_repository_error(V2FormatError::InvalidIndexRoot));
+            }
+            prefix
+        };
+        all_sources.extend(sources);
+        if primary.end < sizes.len() {
+            let suffix = load(primary.end..sizes.len()).await?;
+            if suffix.len() != sizes.len() - primary.end {
+                return Err(v2_repository_error(V2FormatError::InvalidIndexRoot));
+            }
+            all_sources.extend(suffix);
+        }
+        let mut full_sources = all_sources.into_iter();
+        reducing_output(plan(&mut full_sources)?)?
+    };
+    if let Some(output) = &secondary_output {
+        cost(secondary.clone(), output.len())?;
+    }
+    match (primary_output, secondary_output) {
+        (Some(first), Some(second)) => {
+            let first_cost = cost(primary.clone(), first.len())?;
+            let second_cost = cost(secondary.clone(), second.len())?;
+            if first_cost.cheaper_than(second_cost)
+                || (!second_cost.cheaper_than(first_cost) && primary == full)
+            {
+                Ok((primary, first))
+            } else {
+                Ok((secondary, second))
+            }
+        }
+        (Some(output), None) => Ok((primary, output)),
+        (None, Some(output)) => Ok((secondary, output)),
+        (None, None) => Err(RepositoryError::MaintenanceNotBeneficial),
+    }
+}
+
+fn reducing_output(output: crate::v2::V2Result<Vec<IndexRun>>) -> Result<Option<Vec<IndexRun>>> {
+    match output {
+        Ok(output) => Ok(Some(output)),
+        Err(V2FormatError::MaintenanceBudgetExceeded) => Ok(None),
+        // Selected-source corruption is fatal, never a reason to try fallback.
+        Err(error) => Err(v2_repository_error(error)),
+    }
 }
 
 #[cfg(test)]

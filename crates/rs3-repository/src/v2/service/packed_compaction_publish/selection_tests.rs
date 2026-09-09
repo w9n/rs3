@@ -1,6 +1,9 @@
+use super::super::plan_packed_run_compaction;
 use super::*;
+use rs3_index::run::IndexRunLimits;
 use rs3_index::run::{IndexBlindKey, IndexMutation, IndexTombstone, IndexUpsert};
 use rs3_types::{KeyId, LogicalPath, Sequence};
+use std::cell::{Cell, RefCell};
 
 fn source(sequence: u64, keys: &[u8]) -> PackedCompactionSourceRun {
     PackedCompactionSourceRun {
@@ -69,8 +72,35 @@ fn append_source(
     source
 }
 
-#[test]
-fn append_cliff_leaves_large_older_shard_out_of_rewrite() {
+async fn fixture_plan(
+    sources: Vec<PackedCompactionSourceRun>,
+    sizes: &[(u32, u64)],
+    limits: &IndexRunLimits,
+    namespace: &rs3_index::NamespaceIndex,
+) -> (
+    Result<(Range<usize>, Vec<IndexRun>)>,
+    Vec<Range<usize>>,
+    usize,
+) {
+    let reads = RefCell::new(Vec::new());
+    let plans = Cell::new(0);
+    let output = cost_aware_compaction_plan(
+        sizes,
+        |range| {
+            reads.borrow_mut().push(range.clone());
+            std::future::ready(Ok(sources[range].to_vec()))
+        },
+        |sources| {
+            plans.set(plans.get() + 1);
+            Ok(plan_packed_run_compaction(sources, limits, Some(namespace)))
+        },
+    )
+    .await;
+    (output, reads.into_inner(), plans.get())
+}
+
+#[tokio::test]
+async fn append_cliff_leaves_large_older_shard_out_of_rewrite() {
     // The accepted 256-run catalog has 129 older append shards and 127 new
     // single-entry runs. The bounded read envelope includes one older shard.
     let mut catalog = vec![(128, 128 * 1024); 129];
@@ -93,13 +123,20 @@ fn append_cliff_leaves_large_older_shard_out_of_rewrite() {
     )];
     sources
         .extend((128..255).map(|key| append_source(u64::from(key) - 126, &[key], &mut namespace)));
-    let (selected, output) = cost_aware_compaction_plan(
+    let (result, reads, plans) = fixture_plan(
         sources,
         &catalog[128..],
         &IndexRunLimits::default(),
         &namespace,
     )
-    .expect("append plan");
+    .await;
+    let (selected, output) = result.expect("append plan");
+    assert_eq!(
+        reads,
+        std::iter::once(1..128).collect::<Vec<_>>(),
+        "no fetch of the preserved older source"
+    );
+    assert_eq!(plans, 1);
     assert_eq!(selected, 1..128);
     assert_eq!(output.len(), 1);
     assert_eq!(output[0].mutations.len(), 127);
@@ -126,8 +163,8 @@ fn fixed_publication_cost_amortizes_small_runs_and_ties_are_stable() {
     assert!(CompactionCost::new(&[(1, u64::MAX)], 0).is_none());
 }
 
-#[test]
-fn actual_output_shards_override_the_one_output_ranking_heuristic() {
+#[tokio::test]
+async fn actual_output_shards_override_the_one_output_ranking_heuristic() {
     let sources = vec![
         source(1, &[0, 1]),
         source(2, &[0]),
@@ -152,9 +189,15 @@ fn actual_output_shards_override_the_one_output_ranking_heuristic() {
         max_mutations: 2,
         ..IndexRunLimits::default()
     };
-    let (selected, output) =
-        cost_aware_compaction_plan(sources, &sizes, &limits, &rs3_index::NamespaceIndex::new())
-            .expect("plan");
+    let (result, reads, plans) =
+        fixture_plan(sources, &sizes, &limits, &rs3_index::NamespaceIndex::new()).await;
+    let (selected, output) = result.expect("plan");
+    assert_eq!(
+        reads,
+        [1..5, 0..1],
+        "fallback never refetches cached sources"
+    );
+    assert_eq!(plans, 2);
     // Actual reduction is three for the whole window and two for the cheaper
     // source subset, so the whole window wins despite the initial estimate.
     assert_eq!(selected, 0..5);
@@ -165,8 +208,8 @@ fn actual_output_shards_override_the_one_output_ranking_heuristic() {
     );
 }
 
-#[test]
-fn full_older_shards_allow_repeated_fixed_key_tombstone_churn() {
+#[tokio::test]
+async fn full_older_shards_allow_repeated_fixed_key_tombstone_churn() {
     let limits = IndexRunLimits {
         max_mutations: 32,
         ..IndexRunLimits::default()
@@ -184,13 +227,20 @@ fn full_older_shards_allow_repeated_fixed_key_tombstone_churn() {
             continue;
         }
         let envelope = super::super::compaction_window(&sizes).expect("bounded envelope");
-        let (selected, output) = cost_aware_compaction_plan(
+        let (result, reads, plans) = fixture_plan(
             sources[envelope.clone()].to_vec(),
             &sizes[envelope.clone()],
             &limits,
             &rs3_index::NamespaceIndex::new(),
         )
-        .expect("newer churn reduces");
+        .await;
+        let (selected, output) = result.expect("newer churn reduces");
+        assert_eq!(
+            reads,
+            std::iter::once(0..3).collect::<Vec<_>>(),
+            "cached second candidate adds no source reads"
+        );
+        assert_eq!(plans, 2);
         let selected = envelope.start + selected.start..envelope.start + selected.end;
         assert_eq!(selected, 2..4, "older full shards remain unchanged");
         assert_eq!(output.len(), 1);
@@ -213,27 +263,66 @@ fn full_older_shards_allow_repeated_fixed_key_tombstone_churn() {
     assert_eq!(sources[1].run.mutations.len(), 32);
 }
 
-#[test]
-fn valid_challenger_does_not_hide_invalid_full_envelope_source() {
+#[tokio::test]
+async fn unselected_source_is_not_fetched_and_selected_corruption_never_falls_back() {
     let sizes = [(1, 8 * 1024 * 1024), (1, 1024), (1, 1024), (1, 1024)];
-    assert_eq!(
-        compaction_challenger(&sizes).expect("challenger"),
-        Some(1..4)
-    );
-    // The bad ordinal is outside the otherwise valid challenger.
-    let mut invalid = source(1, &[9]);
-    let IndexMutation::Tombstone(entry) = &mut invalid.run.mutations[0] else {
-        panic!("fixture tombstone");
-    };
-    entry.mutation_ordinal = 1;
-    let sources = vec![invalid, source(2, &[0]), source(3, &[1]), source(4, &[2])];
-    assert_eq!(
-        cost_aware_compaction_plan(
+    for bad_source in [0, 1] {
+        let mut sources = vec![
+            source(1, &[9]),
+            source(2, &[0]),
+            source(3, &[1]),
+            source(4, &[2]),
+        ];
+        let IndexMutation::Tombstone(entry) = &mut sources[bad_source].run.mutations[0] else {
+            panic!("fixture tombstone");
+        };
+        entry.mutation_ordinal = 1;
+        let (result, reads, plans) = fixture_plan(
             sources,
             &sizes,
             &IndexRunLimits::default(),
-            &rs3_index::NamespaceIndex::new()
-        ),
-        Err(V2FormatError::InvalidIndexRun),
-    );
+            &rs3_index::NamespaceIndex::new(),
+        )
+        .await;
+        assert_eq!(reads, std::iter::once(1..4).collect::<Vec<_>>());
+        assert_eq!(plans, 1);
+        assert_eq!(result.is_ok(), bad_source == 0);
+    }
+}
+
+#[tokio::test]
+async fn nonreducing_primary_expands_once_and_rejects_corrupt_fallback_input() {
+    let sizes = [(1, 8 * 1024 * 1024), (2, 1024), (2, 1024), (2, 1024)];
+    let limits = IndexRunLimits {
+        max_mutations: 2,
+        ..IndexRunLimits::default()
+    };
+    for corrupt in [false, true] {
+        let mut namespace = rs3_index::NamespaceIndex::new();
+        // The old upsert is obsolete. Three full newer shards cannot compact
+        // by themselves, but adding the obsolete old run reduces the catalog.
+        let mut old = append_source(1, &[9], &mut rs3_index::NamespaceIndex::new());
+        if corrupt {
+            let IndexMutation::Upsert(entry) = &mut old.run.mutations[0] else {
+                panic!("upsert");
+            };
+            entry.mutation_ordinal = 1;
+        }
+        let sources = vec![
+            old,
+            append_source(2, &[0, 1], &mut namespace),
+            append_source(3, &[2, 3], &mut namespace),
+            append_source(4, &[4, 5], &mut namespace),
+        ];
+        let (result, reads, plans) = fixture_plan(sources, &sizes, &limits, &namespace).await;
+        assert_eq!(reads, [1..4, 0..1]);
+        assert_eq!(plans, 2);
+        if corrupt {
+            assert!(result.is_err());
+        } else {
+            let (selected, output) = result.expect("fallback removes obsolete source");
+            assert_eq!(selected, 0..4);
+            assert_eq!(output.len(), 3);
+        }
+    }
 }
