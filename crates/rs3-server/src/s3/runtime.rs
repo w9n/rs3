@@ -458,7 +458,7 @@ impl RuntimeRepository {
         };
         if self.require_anchor_version && anchor_state.version_id.is_none() {
             return Err(repository_init(
-                "retained v2 repository anchor is missing the commit object version id",
+                "retained v03 repository anchor is missing the commit object version id",
             ));
         }
         self.coordinator
@@ -891,7 +891,7 @@ impl V3PreparedRepositoryInit {
     pub async fn prepare(config: &RuntimeConfig) -> Result<Self, S3BoundaryError> {
         if config.repository.format != RepositoryFormat::V3Preview {
             return Err(repository_init(
-                "v2 repository initialization requires the v3-preview repository format",
+                "v03 repository initialization requires the v3-preview repository format",
             ));
         }
         let store = build_store(&config.backend).await?;
@@ -1001,7 +1001,7 @@ async fn verified_init_report(
 ) -> Result<V3RepositoryInitReport, S3BoundaryError> {
     let Some(anchor) = runtime.anchor.read_v3().await.map_err(repository_init)? else {
         return Err(repository_init(
-            "v2 repository initialization did not produce an accepted anchor",
+            "v03 repository initialization did not produce an accepted anchor",
         ));
     };
     let chain = runtime
@@ -1010,7 +1010,7 @@ async fn verified_init_report(
         .await
         .map_err(repository_init)?
         .ok_or_else(|| {
-            repository_init("v2 repository initialization could not verify the accepted anchor")
+            repository_init("v03 repository initialization could not verify the accepted anchor")
         })?;
     Ok(V3RepositoryInitReport {
         anchor,
@@ -1099,14 +1099,14 @@ pub async fn doctor_probe_from_config(config: &RuntimeConfig) -> DoctorProbeRepo
                 anchor_was_read = true;
                 checks.push(DoctorProbeCheck::ok(
                     "probe.anchor-readable",
-                    "v2 anchor read probe passed",
+                    "v03 anchor read probe passed",
                 ));
                 state
             }
             Err(_) => {
                 checks.push(DoctorProbeCheck::failed(
                     "probe.anchor-readable",
-                    "v2 anchor read probe failed",
+                    "v03 anchor read probe failed",
                     "check Kubernetes Lease access and anchor configuration, then rerun rs3 doctor --probe",
                 ));
                 None
@@ -1115,7 +1115,7 @@ pub async fn doctor_probe_from_config(config: &RuntimeConfig) -> DoctorProbeRepo
         Err(_) => {
             checks.push(DoctorProbeCheck::failed(
                 "probe.anchor-readable",
-                "v2 anchor read probe failed",
+                "v03 anchor read probe failed",
                 "check Kubernetes Lease access and anchor configuration, then rerun rs3 doctor --probe",
             ));
             None
@@ -1165,7 +1165,7 @@ pub(crate) async fn v3_quick_maintenance_from_config(
 ) -> Result<rs3_repository::v3::V3MaintenanceReport, S3BoundaryError> {
     if config.repository.format != RepositoryFormat::V3Preview {
         return Err(repository_init(
-            "v2 maintenance requires the v3-preview repository format",
+            "v03 maintenance requires the v3-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;
@@ -1204,7 +1204,7 @@ pub async fn export_v3_recovery_bundle_from_config(
 ) -> Result<V3RecoveryBundle, S3BoundaryError> {
     if config.repository.format != RepositoryFormat::V3Preview {
         return Err(repository_init(
-            "v2 recovery bundle export requires the v3-preview repository format",
+            "v03 recovery bundle export requires the v3-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;
@@ -1256,7 +1256,7 @@ pub async fn import_v3_anchor_from_config(
 ) -> Result<V3AnchorImportReport, S3BoundaryError> {
     if config.repository.format != RepositoryFormat::V3Preview {
         return Err(repository_init(
-            "v2 anchor import requires the v3-preview repository format",
+            "v03 anchor import requires the v3-preview repository format",
         ));
     }
     let store = build_store(&config.backend).await?;
@@ -1265,7 +1265,7 @@ pub async fn import_v3_anchor_from_config(
     let provider_profile = v3_provider_profile(&config.backend, config.repository.retention);
     if bundle.repository_id.as_ref() != Some(&config.repository_keys.repository_id) {
         return Err(repository_init(
-            "trusted v2 restore bundle repository identity is missing or does not match configuration",
+            "trusted v03 restore bundle repository identity is missing or does not match configuration",
         ));
     }
     verify_recovery_bundle_trust(
@@ -1304,7 +1304,7 @@ pub async fn import_v3_anchor_from_config(
     if let Some(current) = anchor_handle.read_v3().await.map_err(repository_init)? {
         if current != bundle.anchor {
             return Err(repository_init(
-                "configured v2 anchor already exists and differs from the trusted bundle",
+                "configured v03 anchor already exists and differs from the trusted bundle",
             ));
         }
         let chain = commit_store
@@ -1337,13 +1337,13 @@ fn verify_recovery_bundle_trust(
 ) -> Result<(), S3BoundaryError> {
     if bundle.anchor.sequence < min_sequence {
         return Err(repository_init(
-            "trusted v2 restore bundle anchor sequence is below --min-sequence",
+            "trusted v03 restore bundle anchor sequence is below --min-sequence",
         ));
     }
 
     if provider_profile != V3ProviderProfile::Dev && bundle.offline_signature.is_none() {
         return Err(repository_init(
-            "production v2 anchor import requires an offline bundle signature",
+            "production v03 anchor import requires an offline bundle signature",
         ));
     }
 
@@ -1353,7 +1353,7 @@ fn verify_recovery_bundle_trust(
             .map_err(repository_init),
         None if provider_profile == V3ProviderProfile::Dev => Ok(()),
         None => Err(repository_init(
-            "production v2 anchor import requires RS3_RECOVERY_PUBLIC_KEY",
+            "production v03 anchor import requires RS3_RECOVERY_PUBLIC_KEY",
         )),
     }?;
 
@@ -1396,11 +1396,11 @@ where
             highest_seen_sequence = highest_seen.get(),
             import_sequence = import_sequence.get(),
             force_rollback,
-            "v2 anchor import observed newer commit objects than the trusted bundle"
+            "v03 anchor import observed newer commit objects than the trusted bundle"
         );
         if !force_rollback {
             return Err(repository_init(
-                "v2 anchor import would strand newer commit objects; pass --force-rollback only after rollback review",
+                "v03 anchor import would strand newer commit objects; pass --force-rollback only after rollback review",
             ));
         }
     }
@@ -1436,7 +1436,7 @@ async fn check_v3_provider_conformance_with_store(
 ) -> Result<V3ProviderConformanceReport, S3BoundaryError> {
     if config.repository_format != RepositoryFormat::V3Preview {
         return Err(repository_init(
-            "v2 provider conformance requires the v3-preview repository format",
+            "v03 provider conformance requires the v3-preview repository format",
         ));
     }
     if config.repository_retention.is_some_and(|retention| {
@@ -1498,12 +1498,12 @@ async fn bootstrap_v3_repository(
 ) -> Result<LoadedV3Repository, S3BoundaryError> {
     if config.mode.requires_anchor() {
         return Err(repository_init(
-            "restore-readonly gateway mode requires an accepted v2 commit anchor; run explicit anchor recovery before serving restore",
+            "restore-readonly gateway mode requires an accepted v03 commit anchor; run explicit anchor recovery before serving restore",
         ));
     }
     if !config.repository.allow_init {
         return Err(repository_init(
-            "v2 repository initialization requires RS3_ALLOW_REPOSITORY_INIT=true; use explicit anchor recovery for existing repositories",
+            "v03 repository initialization requires RS3_ALLOW_REPOSITORY_INIT=true; use explicit anchor recovery for existing repositories",
         ));
     }
 
@@ -1521,7 +1521,7 @@ async fn bootstrap_v3_repository(
 
     let keyring_ref =
         v3_keyring_root_ref(loaded_keyring.envelope_reference.as_ref().ok_or_else(|| {
-            repository_init("v2 bootstrap requires a keyring envelope reference")
+            repository_init("v03 bootstrap requires a keyring envelope reference")
         })?);
     let signing_key_id = loaded_keyring
         .keyring
@@ -1547,7 +1547,7 @@ async fn bootstrap_v3_repository(
         target: "rs3_repository",
         repository_format = "v3-preview",
         format_generation = format_ref.generation,
-        "initialized v2 format root in empty repository",
+        "initialized v03 format root in empty repository",
     );
 
     Ok(LoadedV3Repository {
@@ -1576,7 +1576,7 @@ async fn load_existing_v3_repository(
         || format_root.signing_key_id != anchor_state.signing_key_id
     {
         return Err(repository_init(
-            "v2 format root does not match the configured repository context",
+            "v03 format root does not match the configured repository context",
         ));
     }
 
@@ -1669,7 +1669,7 @@ async fn put_format_envelope(
             .await?;
             if existing != body {
                 return Err(repository_init(
-                    "v2 format root object conflicts with expected content",
+                    "v03 format root object conflicts with expected content",
                 ));
             }
             Ok(metadata)
@@ -1704,7 +1704,7 @@ fn open_format_root_body(
         || envelope.digest().map_err(repository_init)? != reference.digest
     {
         return Err(repository_init(
-            "v2 format root object does not match the anchor-bound reference",
+            "v03 format root object does not match the anchor-bound reference",
         ));
     }
     // The reference digest above ties this envelope to the anchor, so its
@@ -1727,7 +1727,7 @@ fn reject_salt_disagreement(
 ) -> Result<(), S3BoundaryError> {
     if format_salt != keyring_salt {
         return Err(repository_init(
-            "v2 format root and its bound keyring envelope disagree on the public repository salt",
+            "v03 format root and its bound keyring envelope disagree on the public repository salt",
         ));
     }
     Ok(())
@@ -1740,11 +1740,11 @@ fn reject_bundle_salt_mismatch(
 ) -> Result<(), S3BoundaryError> {
     match digest {
         None => Err(repository_init(
-            "trusted v2 restore bundle lacks the repository salt digest; export it again with this release",
+            "trusted v03 restore bundle lacks the repository salt digest; export it again with this release",
         )),
         Some(digest) if digest != rs3_crypto::Sha256Hasher::digest(repository_salt) => {
             Err(repository_init(
-                "trusted v2 restore bundle salt digest does not match the anchored format root",
+                "trusted v03 restore bundle salt digest does not match the anchored format root",
             ))
         }
         Some(_) => Ok(()),
@@ -2205,7 +2205,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         let v3_anchor = runtime
             .memory_v3_anchor()
-            .unwrap_or_else(|| panic!("missing v2 memory anchor"));
+            .unwrap_or_else(|| panic!("missing v03 memory anchor"));
 
         assert_eq!(format_roots.len(), 1);
         assert_eq!(commits.len(), 1);
@@ -2360,11 +2360,11 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         let accepted = runtime
             .memory_v3_anchor()
-            .unwrap_or_else(|| panic!("missing v2 memory anchor"))
+            .unwrap_or_else(|| panic!("missing v03 memory anchor"))
             .read_v3()
             .await
             .unwrap_or_else(|error| panic!("{error}"))
-            .unwrap_or_else(|| panic!("missing v2 anchor state"));
+            .unwrap_or_else(|| panic!("missing v03 anchor state"));
         runtime
             .memory_store()
             .unwrap_or_else(|| panic!("missing memory store"))
@@ -2417,11 +2417,11 @@ mod tests {
 
         let accepted = runtime
             .memory_v3_anchor()
-            .unwrap_or_else(|| panic!("missing v2 memory anchor"))
+            .unwrap_or_else(|| panic!("missing v03 memory anchor"))
             .read_v3()
             .await
             .unwrap_or_else(|error| panic!("{error}"))
-            .unwrap_or_else(|| panic!("missing v2 anchor state"));
+            .unwrap_or_else(|| panic!("missing v03 anchor state"));
         let commit = runtime
             .memory_store()
             .unwrap_or_else(|| panic!("missing memory store"))
@@ -2619,11 +2619,11 @@ mod tests {
 
         let accepted = runtime
             .memory_v3_anchor()
-            .unwrap_or_else(|| panic!("missing v2 memory anchor"))
+            .unwrap_or_else(|| panic!("missing v03 memory anchor"))
             .read_v3()
             .await
             .unwrap_or_else(|error| panic!("{error}"))
-            .unwrap_or_else(|| panic!("missing v2 anchor state"));
+            .unwrap_or_else(|| panic!("missing v03 anchor state"));
         let body = store
             .get_range(&accepted.format_ref.object_id, ByteRange::Full)
             .await

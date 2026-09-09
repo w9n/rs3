@@ -49,7 +49,7 @@ pub(super) async fn unanchored_gateway_keyring(
 
     if repository_has_anchor_bound_objects(store).await? {
         return Err(repository_init(
-            "v2 commit anchor is missing but repository objects already exist; run explicit anchor recovery instead of choosing backend state",
+            "v03 commit anchor is missing but repository objects already exist; run explicit anchor recovery instead of choosing backend state",
         ));
     }
 
@@ -71,7 +71,7 @@ pub(super) async fn unanchored_gateway_keyring(
         keyrings.extend(page.entries);
         if keyrings.len() > 1 {
             return Err(repository_init(
-                "v2 commit anchor is missing and multiple unanchored keyring envelopes exist; provide an explicit envelope override or recover the anchor",
+                "v03 commit anchor is missing and multiple unanchored keyring envelopes exist; provide an explicit envelope override or recover the anchor",
             ));
         }
     }

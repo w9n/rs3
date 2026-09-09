@@ -863,7 +863,7 @@ fn production_doctor_findings(config: &RuntimeConfig) -> Vec<AdminFinding> {
     if matches!(config.anchor, AnchorConfig::Memory) {
         findings.push(AdminFinding::error(
             "anchor.memory",
-            "production profile requires a durable external v2 commit anchor",
+            "production profile requires a durable external v03 commit anchor",
             "configure RS3_ANCHOR_MODE=kubernetes-lease before exposing the gateway",
         ));
     }
@@ -1356,16 +1356,16 @@ fn runtime_error_code(error: &crate::S3BoundaryError) -> &'static str {
 
 fn repository_init_error_code(reason: &str) -> &'static str {
     if reason.contains("requires an accepted anchor")
-        || reason.contains("v2 commit anchor is missing")
+        || reason.contains("v03 commit anchor is missing")
     {
         "runtime.anchor-missing"
     } else if reason.contains("storage operation failed")
         || reason.contains("failed to create S3 backend")
     {
         "runtime.backend-unreachable"
-    } else if reason.contains("v2 commit")
-        || reason.contains("v2 format root")
-        || reason.contains("stale v2 anchor")
+    } else if reason.contains("v03 commit")
+        || reason.contains("v03 format root")
+        || reason.contains("stale v03 anchor")
         || reason.contains("signature verification failed")
     {
         "runtime.chain-verification"
@@ -1895,16 +1895,37 @@ mod tests {
         );
         assert_eq!(
             runtime_error_code(&crate::S3BoundaryError::RepositoryInit {
-                reason: "v2 storage operation failed".to_owned(),
+                reason: rs3_repository::v3::V3FormatError::StorageOperationFailed.to_string(),
             }),
             "runtime.backend-unreachable"
         );
         assert_eq!(
             runtime_error_code(&crate::S3BoundaryError::RepositoryInit {
-                reason: "v2 commit body digest mismatch".to_owned(),
+                reason: rs3_repository::v3::V3FormatError::BodyDigestMismatch.to_string(),
             }),
             "runtime.chain-verification"
         );
+    }
+
+    #[test]
+    fn runtime_error_code_classifies_current_anchor_and_format_errors() {
+        use rs3_repository::v3::V3FormatError;
+
+        for (error, expected) in [
+            (V3FormatError::MissingAnchor, "runtime.anchor-missing"),
+            (V3FormatError::StaleAnchor, "runtime.chain-verification"),
+            (
+                V3FormatError::InvalidFormatRoot,
+                "runtime.chain-verification",
+            ),
+        ] {
+            assert_eq!(
+                runtime_error_code(&crate::S3BoundaryError::RepositoryInit {
+                    reason: error.to_string(),
+                }),
+                expected,
+            );
+        }
     }
 
     #[test]
@@ -2102,7 +2123,7 @@ mod tests {
             repository: AdminRepositoryRuntimeFacts {
                 v3_commit_coordinator: Some(AdminV3CommitCoordinatorSummary {
                     poisoned: true,
-                    poison_reason: Some("v2 commit batch rollback failed".to_owned()),
+                    poison_reason: Some("v03 commit batch rollback failed".to_owned()),
                 }),
             },
             maintenance_supervisor: None,
@@ -2121,7 +2142,7 @@ mod tests {
         assert!(coordinator.poisoned);
         assert_eq!(
             coordinator.poison_reason.as_deref(),
-            Some("v2 commit batch rollback failed")
+            Some("v03 commit batch rollback failed")
         );
     }
 

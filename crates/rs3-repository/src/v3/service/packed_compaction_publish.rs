@@ -430,7 +430,7 @@ where
                     target: "rs3_repository",
                     operation = "v2_install_packed_compaction",
                     error = %error,
-                    "v2 compaction anchor advanced but local state installation failed; restart is required",
+                    "v03 compaction anchor advanced but local state installation failed; restart is required",
                 );
                 return Err(RepositoryError::AcceptedRecoveryRequired);
             }

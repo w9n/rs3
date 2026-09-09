@@ -2032,13 +2032,13 @@ mod tests {
                 }
                 self.concurrent.fetch_sub(1, Ordering::SeqCst);
                 return Err(RepositoryError::CommitFailed {
-                    reason: "v2 maintenance run was cancelled".to_owned(),
+                    reason: "v03 maintenance run was cancelled".to_owned(),
                 });
             }
             self.concurrent.fetch_sub(1, Ordering::SeqCst);
             if self.always_fail {
                 return Err(RepositoryError::CommitFailed {
-                    reason: "v2 maintenance run failed for test".to_owned(),
+                    reason: "v03 maintenance run failed for test".to_owned(),
                 });
             }
             self.queued_results

@@ -2165,11 +2165,11 @@ mod tests {
         service
             .repository
             .memory_v3_anchor()
-            .unwrap_or_else(|| panic!("missing v2 memory anchor"))
+            .unwrap_or_else(|| panic!("missing v03 memory anchor"))
             .read_v3()
             .await
             .unwrap_or_else(|error| panic!("{error}"))
-            .unwrap_or_else(|| panic!("missing v2 anchor state"))
+            .unwrap_or_else(|| panic!("missing v03 anchor state"))
             .sequence
             .get()
     }
@@ -2178,11 +2178,11 @@ mod tests {
         let accepted = service
             .repository
             .memory_v3_anchor()
-            .unwrap_or_else(|| panic!("missing v2 memory anchor"))
+            .unwrap_or_else(|| panic!("missing v03 memory anchor"))
             .read_v3()
             .await
             .unwrap_or_else(|error| panic!("{error}"))
-            .unwrap_or_else(|| panic!("missing v2 anchor state"));
+            .unwrap_or_else(|| panic!("missing v03 anchor state"));
         service
             .repository
             .memory_store()

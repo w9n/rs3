@@ -49,9 +49,9 @@ pub fn parse_v03_commit_header_bytes(input: &[u8]) {
     let encoded = parsed
         .header
         .encode_header_span()
-        .unwrap_or_else(|error| panic!("parsed v2 commit header failed to re-encode: {error}"));
+        .unwrap_or_else(|error| panic!("parsed v03 commit header failed to re-encode: {error}"));
     let reparsed = parse_v3_commit_header(&object_id, &encoded, &keyring)
-        .unwrap_or_else(|error| panic!("re-encoded v2 commit header failed to parse: {error}"));
+        .unwrap_or_else(|error| panic!("re-encoded v03 commit header failed to parse: {error}"));
 
     assert_eq!(reparsed.header, parsed.header);
     assert_eq!(reparsed.header_len, parsed.header_len);
@@ -76,7 +76,7 @@ pub fn parse_v03_commit_object_bytes(input: &[u8]) {
         .parsed_header
         .header
         .encode_object(section_region)
-        .unwrap_or_else(|error| panic!("parsed v2 commit object failed to re-encode: {error}"));
+        .unwrap_or_else(|error| panic!("parsed v03 commit object failed to re-encode: {error}"));
 
     assert_eq!(encoded, parsed.body);
 }

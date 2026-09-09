@@ -353,7 +353,7 @@ where
                     target: "rs3_repository",
                     operation = "v2_install_genesis",
                     error = %error,
-                    "v2 genesis anchor advanced but local state installation failed; restart is required",
+                    "v03 genesis anchor advanced but local state installation failed; restart is required",
                 );
                 return Err(RepositoryError::AcceptedRecoveryRequired);
             }
@@ -545,7 +545,7 @@ where
                     target: "rs3_repository",
                     operation = "v2_install_index_snapshot",
                     error = %error,
-                    "v2 index-root anchor advanced but local state installation failed; restart is required",
+                    "v03 index-root anchor advanced but local state installation failed; restart is required",
                 );
                 return Err(RepositoryError::AcceptedRecoveryRequired);
             }
@@ -1000,7 +1000,7 @@ where
                 target: "rs3_repository",
                 operation = "v2_install_standalone_commit",
                 error = %error,
-                "v2 standalone anchor advanced but local state installation failed; restart is required",
+                "v03 standalone anchor advanced but local state installation failed; restart is required",
             );
             return Err(RepositoryError::AcceptedRecoveryRequired);
         }
@@ -1284,7 +1284,7 @@ where
                 != requested_protection
         }) {
             return Err(RepositoryError::CommitFailed {
-                reason: "v2 pending batch contains an incompatible protection cohort".to_owned(),
+                reason: "v03 pending batch contains an incompatible protection cohort".to_owned(),
             });
         }
         let existing = lookup_blind_keys
@@ -2290,7 +2290,7 @@ where
                 target: "rs3_repository",
                 operation = "v2_install_accepted_commit",
                 error = %error,
-                "v2 anchor advanced but local state installation failed; restart is required",
+                "v03 anchor advanced but local state installation failed; restart is required",
             );
             return Err(RepositoryError::AcceptedRecoveryRequired);
         }
@@ -2700,7 +2700,7 @@ impl<S> V3Repository<S> {
                 Ordering::Acquire,
             )
             .map_err(|_| RepositoryError::CommitFailed {
-                reason: "v2 repository already has an active mutation owner".to_owned(),
+                reason: "v03 repository already has an active mutation owner".to_owned(),
             })?;
         Ok(Arc::new(V3CoordinatorLease {
             owner: Arc::clone(&self.mutation_owner),
@@ -2717,7 +2717,7 @@ impl<S> V3Repository<S> {
                 Ordering::Acquire,
             )
             .map_err(|_| RepositoryError::CommitFailed {
-                reason: "v2 repository mutation is owned by the active commit coordinator"
+                reason: "v03 repository mutation is owned by the active commit coordinator"
                     .to_owned(),
             })?;
         Ok(V3DirectMutationLease {
@@ -2733,7 +2733,7 @@ impl<S> V3Repository<S> {
             return Ok(());
         }
         Err(RepositoryError::CommitFailed {
-            reason: "v2 commit coordinator does not own this repository".to_owned(),
+            reason: "v03 commit coordinator does not own this repository".to_owned(),
         })
     }
 

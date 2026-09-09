@@ -345,7 +345,7 @@ impl PendingV3State {
     pub(super) fn reset_to_accepted_sequence(&mut self, accepted_sequence: Sequence) -> Result<()> {
         if !self.is_empty() {
             return Err(RepositoryError::CommitFailed {
-                reason: "cannot reset a non-empty v2 staging overlay".to_owned(),
+                reason: "cannot reset a non-empty v03 staging overlay".to_owned(),
             });
         }
         self.allocation_sequence = accepted_sequence;

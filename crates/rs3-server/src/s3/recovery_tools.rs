@@ -119,7 +119,7 @@ pub async fn verify_v3_recovery_bundle_from_tool_config(
     bundle: V3RecoveryBundle,
     options: V3RecoveryBundleVerificationOptions,
 ) -> Result<V3RecoveryBundleVerificationReport, S3BoundaryError> {
-    require_v3_preview(config.repository_format, "v2 restore bundle verification")?;
+    require_v3_preview(config.repository_format, "v03 restore bundle verification")?;
     let store = build_store(&config.backend).await?;
     verify_v3_recovery_bundle_with_store(store.into_handle(), config, bundle, options).await
 }
@@ -136,12 +136,12 @@ where
 {
     if bundle.anchor.sequence < bundle.weak_subjectivity_floor_sequence {
         return Err(repository_init(
-            "trusted v2 restore bundle anchor sequence is below the bundle weak-subjectivity floor",
+            "trusted v03 restore bundle anchor sequence is below the bundle weak-subjectivity floor",
         ));
     }
     if bundle.anchor.sequence < options.min_sequence {
         return Err(repository_init(
-            "trusted v2 restore bundle anchor sequence is below --min-sequence",
+            "trusted v03 restore bundle anchor sequence is below --min-sequence",
         ));
     }
 
@@ -190,7 +190,7 @@ where
         || format_root.signing_key_id != bundle.anchor.signing_key_id
     {
         return Err(repository_init(
-            "v2 format root does not match the configured repository context",
+            "v03 format root does not match the configured repository context",
         ));
     }
 
@@ -362,7 +362,7 @@ fn verify_recovery_bundle_signature(
 ) -> Result<(), S3BoundaryError> {
     if provider_profile != V3ProviderProfile::Dev && bundle.offline_signature.is_none() {
         return Err(repository_init(
-            "production v2 restore bundle verification requires an offline bundle signature",
+            "production v03 restore bundle verification requires an offline bundle signature",
         ));
     }
 
@@ -372,7 +372,7 @@ fn verify_recovery_bundle_signature(
             .map_err(repository_init),
         None if provider_profile == V3ProviderProfile::Dev => Ok(()),
         None => Err(repository_init(
-            "production v2 restore bundle verification requires RS3_RECOVERY_PUBLIC_KEY",
+            "production v03 restore bundle verification requires RS3_RECOVERY_PUBLIC_KEY",
         )),
     }
 }
@@ -426,7 +426,7 @@ where
         || envelope.digest().map_err(repository_init)? != reference.digest
     {
         return Err(repository_init(
-            "v2 format root object does not match the bundle reference",
+            "v03 format root object does not match the bundle reference",
         ));
     }
     // The bundle reference digest ties this envelope to the trusted anchor,
@@ -468,7 +468,7 @@ where
         || envelope.digest().map_err(repository_init)? != reference.digest
     {
         return Err(repository_init(
-            "v2 keyring envelope does not match the format-root reference",
+            "v03 keyring envelope does not match the format-root reference",
         ));
     }
     envelope

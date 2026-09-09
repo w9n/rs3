@@ -1599,7 +1599,7 @@ where
         self.report_orphans_with_protected_roots(anchor, &[]).await
     }
 
-    /// Reports unanchored v2 objects while preserving supplied historical roots.
+    /// Reports unanchored v3 objects while preserving supplied historical roots.
     ///
     /// Supplied roots must bind the active exact format reference.
     pub async fn report_orphans_with_protected_roots<A>(

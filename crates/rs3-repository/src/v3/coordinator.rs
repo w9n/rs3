@@ -196,7 +196,7 @@ impl CoordinatorStatus {
             Ok(state) => state.clone(),
             Err(_error) => V3CommitCoordinatorStatus {
                 poisoned: true,
-                poison_reason: Some("v2 commit coordinator status lock poisoned".to_owned()),
+                poison_reason: Some("v03 commit coordinator status lock poisoned".to_owned()),
             },
         }
     }
@@ -209,7 +209,7 @@ impl CoordinatorStatus {
                     target: "rs3_repository",
                     operation = "v2_commit_coordinator_status",
                     error = %error,
-                    "v2 commit coordinator could not clear status",
+                    "v03 commit coordinator could not clear status",
                 );
             }
         }
@@ -229,7 +229,7 @@ impl CoordinatorStatus {
                     target: "rs3_repository",
                     operation = "v2_commit_coordinator_status",
                     error = %error,
-                    "v2 commit coordinator could not record poisoned status",
+                    "v03 commit coordinator could not record poisoned status",
                 );
             }
         }
@@ -547,7 +547,7 @@ where
                         target: "rs3_repository",
                         operation = "v2_put_committed_enqueue",
                         result = "failed",
-                        "v2 commit coordinator rejected write",
+                        "v03 commit coordinator rejected write",
                     );
                     return Err(RepositoryError::CommitFailed {
                         reason: reason.clone(),
@@ -562,7 +562,7 @@ where
                         pending_items,
                         max_pending_items = self.options.max_pending_items,
                         result = "backpressure",
-                        "v2 commit coordinator rejected write",
+                        "v03 commit coordinator rejected write",
                     );
                     return Err(RepositoryError::CommitBackpressure);
                 }
@@ -603,7 +603,7 @@ where
                 // or the next batch publishes a write whose client saw failure.
                 self.repository.rollback_staged_puts(vec![rollback])?;
                 return Err(commit_failed(
-                    "v2 commit batch contains incompatible protection cohorts",
+                    "v03 commit batch contains incompatible protection cohorts",
                 ));
             }
             let delayed_publish_generation = if should_start_timer {
@@ -623,7 +623,7 @@ where
                 pending_items = batch.waiters.len(),
                 max_batch_items = self.options.max_batch_items,
                 result = "ok",
-                "v2 commit coordinator queued write",
+                "v03 commit coordinator queued write",
             );
 
             if let Some(generation) = delayed_publish_generation.filter(|_| !should_publish_now) {
@@ -656,7 +656,7 @@ where
             }
             Err(_) => {
                 record_v3_commit_put_phase_duration("commit_wait", commit_wait_started.elapsed());
-                return Err(commit_failed("v2 commit waiter was dropped"));
+                return Err(commit_failed("v03 commit waiter was dropped"));
             }
         };
 
@@ -697,7 +697,7 @@ where
         });
         let upload = upload_task
             .await
-            .map_err(|_| commit_failed("v2 standalone upload task failed"))??;
+            .map_err(|_| commit_failed("v03 standalone upload task failed"))??;
         let owned = self.clone_for_owned_task();
         let publication_task = tokio::spawn(async move {
             let _publisher = owned.publisher.lock().await;
@@ -720,7 +720,7 @@ where
                 .read_v3()
                 .await
                 .map_err(v3_commit_error)?
-                .ok_or_else(|| commit_failed("v2 anchor is missing after streamed commit"))?;
+                .ok_or_else(|| commit_failed("v03 anchor is missing after streamed commit"))?;
             Ok(V3CommittedPut {
                 metadata,
                 anchor_state,
@@ -729,7 +729,7 @@ where
         cancel_on_drop.disarm();
         publication_task
             .await
-            .map_err(|_| commit_failed("v2 standalone publication task failed"))?
+            .map_err(|_| commit_failed("v03 standalone publication task failed"))?
     }
 
     /// Completes and verifies the detached carrier, then owns the short fenced
@@ -797,7 +797,7 @@ where
             .read_v3()
             .await
             .map_err(v3_commit_error)?
-            .ok_or_else(|| commit_failed("v2 anchor is missing after streamed commit"))?;
+            .ok_or_else(|| commit_failed("v03 anchor is missing after streamed commit"))?;
         Ok(V3CommittedPut {
             metadata,
             anchor_state,
@@ -846,7 +846,7 @@ where
                 .read_v3()
                 .await
                 .map_err(v3_commit_error)?
-                .ok_or_else(|| commit_failed("v2 anchor is missing after index compaction"));
+                .ok_or_else(|| commit_failed("v03 anchor is missing after index compaction"));
         }
         self.repository
             .write_index_snapshot_coordinated(
@@ -963,7 +963,7 @@ where
                         operation = "v2_index_auto_compaction",
                         active_runs = count,
                         result = "not_reducing",
-                        "v2 writer will retry bounded index compaction at a later watermark",
+                        "v03 writer will retry bounded index compaction at a later watermark",
                     );
                     return Ok(false);
                 }
@@ -978,7 +978,7 @@ where
                 operation = "v2_index_auto_compaction",
                 active_runs = count,
                 result = "guard_unavailable",
-                "v2 index compaction is due but no maintenance guard is configured",
+                "v03 index compaction is due but no maintenance guard is configured",
             );
             return Ok(false);
         }
@@ -987,7 +987,7 @@ where
     }
 
     async fn poison_for_compaction_failure<T>(&self, reason: String) -> Result<T> {
-        let reason = format!("automatic v2 index compaction failed: {reason}");
+        let reason = format!("automatic v03 index compaction failed: {reason}");
         {
             let mut batch = self.batch.lock().await;
             batch.failed = Some(reason.clone());
@@ -1134,7 +1134,7 @@ where
     let result = match published {
         Ok(Some(stored)) => Ok(stored.anchor_state),
         Ok(None) => Err(CommitWaiterError::Failed(
-            "v2 commit batch had no pending index delta".to_owned(),
+            "v03 commit batch had no pending index delta".to_owned(),
         )),
         Err(RepositoryError::AcceptedRecoveryRequired) => {
             Err(CommitWaiterError::AcceptedRecoveryRequired)
@@ -1150,7 +1150,7 @@ where
         waiters = waiter_count,
         result = result_label,
         elapsed_us = elapsed_us(started.elapsed()),
-        "v2 commit coordinator publish completed",
+        "v03 commit coordinator publish completed",
     );
 
     let mut failure = result.as_ref().err().map(|error| {
@@ -1162,7 +1162,7 @@ where
         }
     });
     if accepted_recovery_required {
-        let reason = "v2 publication requires recovery before further mutations".to_owned();
+        let reason = "v03 publication requires recovery before further mutations".to_owned();
         record_v3_commit_batch_publish_failure("local_install");
         failure = Some(PublishFailure {
             reason: reason.clone(),
@@ -1175,10 +1175,10 @@ where
     {
         let poison_reason = match failure.as_ref() {
             Some(failure) => format!(
-                "v2 commit batch publish failed: {}; rollback failed: {}",
+                "v03 commit batch publish failed: {}; rollback failed: {}",
                 failure.reason, error
             ),
-            None => format!("v2 commit batch rollback failed: {error}"),
+            None => format!("v03 commit batch rollback failed: {error}"),
         };
         if let Some(failure) = failure.as_mut() {
             failure.poison_reason = Some(poison_reason.clone());
@@ -1189,7 +1189,7 @@ where
             operation = "v2_commit_batch_rollback",
             error = %error,
             reason = %poison_reason,
-            "v2 commit coordinator failed to restore unaccepted state",
+            "v03 commit coordinator failed to restore unaccepted state",
         );
     }
 

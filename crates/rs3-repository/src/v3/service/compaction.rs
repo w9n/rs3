@@ -125,7 +125,7 @@ where
     /// Runs budgeted retention renewal plus orphan deletion for one quiesced
     /// exclusion window.
     ///
-    /// The caller must hold a window that excludes concurrent v2 publications
+    /// The caller must hold a window that excludes concurrent v3 publications
     /// for the whole call, normally
     /// [`super::super::V3CommitCoordinator::begin_maintenance_window`], and
     /// must pass that window's verified guard. The engine keeps its existing

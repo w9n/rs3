@@ -545,7 +545,7 @@ async fn main() -> Result<()> {
             let passed = report.passed();
             print_v3_provider_conformance_report(&report, &config, format)?;
             if !passed {
-                anyhow::bail!("v2 provider conformance failed");
+                anyhow::bail!("v03 provider conformance failed");
             }
         }
         Commands::ImportAnchor(args) => {
@@ -1635,7 +1635,7 @@ fn log_v3_provider_check_config(config: &V3ProviderCheckConfig) {
         backend_kind,
         repository_retention_mode,
         repository_retention_days,
-        "v2 provider check configuration validated",
+        "v03 provider check configuration validated",
     );
 }
 

@@ -3317,7 +3317,7 @@ async fn v3_repository_range_read_rejects_corrupted_payload_ciphertext() {
             )
             .await,
     );
-    let accepted = must_v3(anchor.read_v3().await).expect("v2 anchor should exist");
+    let accepted = must_v3(anchor.read_v3().await).expect("v03 anchor should exist");
     store.corrupt_ranged_commit_gets_for(accepted.commit_key);
 
     let error = repository
@@ -3359,7 +3359,7 @@ async fn v3_repository_full_read_does_not_cache_unauthenticated_payload_section(
             )
             .await,
     );
-    let accepted = must_v3(anchor.read_v3().await).expect("v2 anchor should exist");
+    let accepted = must_v3(anchor.read_v3().await).expect("v03 anchor should exist");
     store.corrupt_ranged_commit_gets_for(accepted.commit_key);
 
     let corrupted = repository.get_range(&key, ByteRange::Full).await;
@@ -4168,7 +4168,7 @@ async fn v3_commit_coordinator_batches_concurrent_puts_into_one_commit() {
     let (first, second) = tokio::join!(first, second);
     let first = must_repo(first);
     let second = must_repo(second);
-    let accepted = must_v3(anchor.read_v3().await).expect("v2 anchor should exist");
+    let accepted = must_v3(anchor.read_v3().await).expect("v03 anchor should exist");
     let fresh = V3Repository::new(
         store.clone(),
         keyring,
@@ -4176,7 +4176,7 @@ async fn v3_commit_coordinator_batches_concurrent_puts_into_one_commit() {
         options,
     );
     let chain = must_repo(fresh.load_chain_from_anchor(&anchor).await)
-        .expect("v2 chain should load after batch commit");
+        .expect("v03 chain should load after batch commit");
     let listed = must_repo(fresh.list("snapshots/"));
     let commits = must_v3(
         store
@@ -5196,7 +5196,7 @@ async fn v3_repository_admits_only_one_commit_coordinator_instance() {
     assert!(matches!(
         duplicate,
         Err(crate::RepositoryError::CommitFailed { reason })
-            if reason == "v2 repository already has an active mutation owner"
+            if reason == "v03 repository already has an active mutation owner"
     ));
     let direct = repository
         .put_committed(
@@ -5209,7 +5209,7 @@ async fn v3_repository_admits_only_one_commit_coordinator_instance() {
     assert!(matches!(
         direct,
         Err(crate::RepositoryError::CommitFailed { reason })
-            if reason == "v2 repository mutation is owned by the active commit coordinator"
+            if reason == "v03 repository mutation is owned by the active commit coordinator"
     ));
     assert!(matches!(
         repository
@@ -5430,7 +5430,7 @@ async fn v3_commit_coordinator_packs_sixty_four_small_objects_with_bounded_ampli
         (OBJECT_COUNT, 1)
     );
 
-    let accepted = must_v3(anchor.read_v3().await).expect("v2 anchor should exist");
+    let accepted = must_v3(anchor.read_v3().await).expect("v03 anchor should exist");
     let metadata = store
         .head_at(&accepted.commit_key, accepted.version_id.as_ref())
         .await
@@ -5444,7 +5444,7 @@ async fn v3_commit_coordinator_packs_sixty_four_small_objects_with_bounded_ampli
     );
     let fresh = V3Repository::new(store, keyring, RepositoryOptions::default(), options);
     let chain =
-        must_repo(fresh.load_chain_from_anchor(&anchor).await).expect("v2 chain should exist");
+        must_repo(fresh.load_chain_from_anchor(&anchor).await).expect("v03 chain should exist");
     let sections = &chain.commits_newest_first[0]
         .parsed_header
         .header
@@ -5543,7 +5543,7 @@ async fn v3_commit_coordinator_separates_incompatible_protection_cohorts() {
             .load_chain_from_anchor(&anchor)
             .await,
     )
-    .expect("v2 chain should exist");
+    .expect("v03 chain should exist");
     let mut protection = Vec::new();
     for commit in chain.commits_newest_first.iter().take(2) {
         let metadata = store
@@ -5636,7 +5636,7 @@ async fn v3_commit_coordinator_rolls_back_write_rejected_by_cohort_check() {
             .load_chain_from_anchor(&anchor)
             .await,
     )
-    .expect("v2 chain should exist");
+    .expect("v03 chain should exist");
     assert_eq!(chain.commits_newest_first.len(), 2);
 }
 
@@ -5814,7 +5814,7 @@ async fn v3_commit_coordinator_rolls_back_batch_after_anchor_failure() {
     // This drains the batch without publishing an additional snapshot commit.
     must_repo(coordinator.reload_from_anchor().await);
     let later = must_repo(later.await.unwrap_or_else(|error| panic!("{error}")));
-    let accepted = must_v3(anchor.read_v3().await).expect("v2 later anchor should be accepted");
+    let accepted = must_v3(anchor.read_v3().await).expect("v03 later anchor should be accepted");
 
     assert!(matches!(
         first,
@@ -5896,7 +5896,8 @@ async fn v3_commit_coordinator_recovers_after_transient_publish_failure() {
             )
             .await,
     );
-    let accepted = must_v3(anchor.read_v3().await).expect("v2 recovered anchor should be accepted");
+    let accepted =
+        must_v3(anchor.read_v3().await).expect("v03 recovered anchor should be accepted");
     let recovered_status = coordinator.status();
 
     assert_eq!(recovered.anchor_state, accepted);
@@ -6026,7 +6027,7 @@ async fn v3_commit_coordinator_poisons_when_batch_rollback_fails() {
             RepositoryPutOptions::default(),
         )
         .await;
-    let accepted = must_v3(anchor.read_v3().await).expect("v2 genesis anchor should remain");
+    let accepted = must_v3(anchor.read_v3().await).expect("v03 genesis anchor should remain");
     let status = coordinator.status();
 
     assert!(matches!(
@@ -6701,7 +6702,7 @@ async fn v3_index_snapshot_bounds_replay_and_preserves_namespace() {
 
     let fresh = V3Repository::new(store, keyring, RepositoryOptions::default(), options);
     let chain = must_repo(fresh.load_chain_from_anchor(&anchor).await)
-        .expect("v2 chain should load from latest snapshot");
+        .expect("v03 chain should load from latest snapshot");
     let listed = must_repo(fresh.list("snapshots/"));
     let third_body = must_repo(fresh.get_range(&third_key, ByteRange::Full).await);
 
@@ -6812,7 +6813,7 @@ async fn v3_orphan_gc_keeps_live_payload_commits_referenced_by_index_snapshot() 
             .load_chain_from_anchor(&anchor)
             .await,
     )
-    .expect("v2 chain should exist before snapshot");
+    .expect("v03 chain should exist before snapshot");
     let pre_snapshot_payload_commits = before_snapshot
         .commits_newest_first
         .iter()
@@ -7173,7 +7174,7 @@ async fn v3_commit_coordinator_flushes_before_index_snapshot() {
     let pending = tokio::time::timeout(Duration::from_secs(1), pending).await;
     let fresh = V3Repository::new(store, keyring, RepositoryOptions::default(), options);
     let chain = must_repo(fresh.load_chain_from_anchor(&anchor).await)
-        .expect("v2 chain should load after coordinator snapshot");
+        .expect("v03 chain should load after coordinator snapshot");
     let body = must_repo(fresh.get_range(&key, ByteRange::Full).await);
 
     match pending {

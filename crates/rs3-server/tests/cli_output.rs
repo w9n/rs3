@@ -3,7 +3,7 @@
 use serde_json::Value;
 use std::process::{Command, Output};
 
-const PROVIDER_CHECK_LOG_MESSAGE: &str = "v2 provider check configuration validated";
+const PROVIDER_CHECK_LOG_MESSAGE: &str = "v03 provider check configuration validated";
 
 #[test]
 fn json_reports_are_not_polluted_by_plain_tracing_logs() {
