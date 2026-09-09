@@ -19,6 +19,7 @@ pub(super) enum Mutation {
 struct State {
     versions: BTreeMap<(BackendObjectId, BackendVersionId), BlobMetadata>,
     events: Vec<Mutation>,
+    stored_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -26,6 +27,9 @@ pub(super) struct ControlledDeadlineStore {
     inner: MemoryBlobStore,
     now: Arc<AtomicI64>,
     state: Arc<Mutex<State>>,
+    max_versions: usize,
+    max_bytes: u64,
+    record_events: bool,
 }
 
 impl ControlledDeadlineStore {
@@ -34,7 +38,36 @@ impl ControlledDeadlineStore {
             inner: MemoryBlobStore::new(),
             now: Arc::new(AtomicI64::new(now)),
             state: Arc::new(Mutex::new(State::default())),
+            max_versions: MAX_VERSIONS,
+            max_bytes: MAX_BYTES,
+            record_events: true,
         }
+    }
+
+    /// Scale runs count operations separately and avoid retaining a per-call log.
+    pub(super) fn for_scale(now: i64) -> Self {
+        Self {
+            max_versions: 2_000_000,
+            max_bytes: 8 * 1024 * 1024 * 1024,
+            record_events: false,
+            ..Self::new(now)
+        }
+    }
+
+    pub(super) fn occupancy(&self) -> (usize, u64) {
+        let state = self.state.lock().expect("provider state");
+        (state.versions.len(), state.stored_bytes)
+    }
+
+    pub(super) fn latest_deadline(&self) -> i64 {
+        self.state
+            .lock()
+            .expect("provider state")
+            .versions
+            .values()
+            .filter_map(|entry| entry.retain_until_ms)
+            .max()
+            .expect("retained versions")
     }
 
     pub(super) fn now(&self) -> i64 {
@@ -71,6 +104,9 @@ impl ControlledDeadlineStore {
     }
 
     fn record(&self, event: Mutation) {
+        if !self.record_events {
+            return;
+        }
         let mut state = self.state.lock().expect("provider state");
         assert!(state.events.len() < MAX_EVENTS, "bounded mutation journal");
         state.events.push(event);
@@ -105,15 +141,12 @@ impl BlobStore for ControlledDeadlineStore {
     ) -> rs3_storage::Result<BlobMetadata> {
         {
             let state = self.state.lock().expect("provider state");
-            assert!(state.versions.len() < MAX_VERSIONS, "bounded version count");
             assert!(
-                state
-                    .versions
-                    .values()
-                    .map(|entry| entry.content_len)
-                    .sum::<u64>()
-                    + body.len() as u64
-                    <= MAX_BYTES,
+                state.versions.len() < self.max_versions,
+                "bounded version count"
+            );
+            assert!(
+                state.stored_bytes + body.len() as u64 <= self.max_bytes,
                 "bounded stored bytes"
             );
         }
@@ -128,12 +161,20 @@ impl BlobStore for ControlledDeadlineStore {
                 .checked_add(i64::from(policy.retain_days) * DAY)
                 .expect("bounded deadline")
         });
-        self.state.lock().expect("provider state").versions.insert(
-            (
-                id.clone(),
-                metadata.version_id.clone().expect("exact version"),
-            ),
-            metadata.clone(),
+        let mut state = self.state.lock().expect("provider state");
+        state.stored_bytes += metadata.content_len;
+        assert!(
+            state
+                .versions
+                .insert(
+                    (
+                        id.clone(),
+                        metadata.version_id.clone().expect("exact version"),
+                    ),
+                    metadata.clone(),
+                )
+                .is_none(),
+            "new exact version"
         );
         Ok(metadata)
     }
@@ -227,11 +268,14 @@ impl BlobStore for ControlledDeadlineStore {
             return Err(StorageError::RetentionBlocked);
         }
         self.inner.delete_at(id, exact.version_id.as_ref()).await?;
-        self.state
-            .lock()
-            .expect("provider state")
-            .versions
-            .remove(&(id.clone(), exact.version_id.clone().expect("exact version")));
+        {
+            let mut state = self.state.lock().expect("provider state");
+            let removed = state
+                .versions
+                .remove(&(id.clone(), exact.version_id.clone().expect("exact version")))
+                .expect("deleted version");
+            state.stored_bytes -= removed.content_len;
+        }
         self.record(Mutation::Delete(exact));
         Ok(())
     }

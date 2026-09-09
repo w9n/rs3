@@ -1,6 +1,10 @@
 # Performance
 
-## Current results: September 8, 2026
+The [September 9 history experiment](#retained-history-experiment-september-9-2026)
+identifies a default maintenance-budget limit below the format's history ceiling.
+The live-backend comparisons below were measured on September 8.
+
+## Backend comparison: September 8, 2026
 
 The completed v03 comparison shows lower written bytes for local scale workloads,
 but slower large uploads and PostgreSQL-shaped backups. All 120 Kopia content
@@ -39,6 +43,100 @@ Two comparisons have different meanings:
   through the measurement-only forwarding proxy in the same revision. The
   elapsed budget uses the arithmetic mean of three paired ratios, not the
   ratio of revision medians.
+
+## Retained-history experiment: September 9, 2026
+
+Both controlled 10,000-write workloads restore three sampled historical points
+after deletion, repository reopen, and retention renewal. They then reject those
+points after authenticated expiry and verify eventual physical GC.
+These runs exercise the retained-version profile and the 30-day recovery preset.
+Each write publishes a separate 512 B value; automatic metadata compaction adds
+commits. One workload repeatedly overwrites one key; the other adds distinct
+keys. Both delete the latest value before the maintenance checks.
+
+**At 100,000 writes, both workloads fail the full history walk with
+`MaintenanceBudgetExceeded`.** Writes, repository reopen, and three sampled
+historical restores succeed first. The larger runs stop at that failure, so
+renewal and GC are not qualified at 100,000 writes. The 4.2-million-point format
+ceiling is not an operating-capacity claim.
+
+A separate 55,000-overwrite diagnostic isolates the **256 MiB graph-metadata
+budget**: the default walk fails, while changing only that budget to 512 MiB
+allows the same graph to finish with 272.98 MiB accounted. A fresh writer using
+the default budget refuses its next publication before any backend PUT or anchor
+advance. Cached coverage can therefore permit growth that a later maintenance
+pass or restarted writer cannot handle under the default budget. The diagnostic
+does not qualify a larger production configuration or change any runtime limit.
+
+| Measurement at 10,000 writes | Overwrite | Append |
+| --- | ---: | ---: |
+| Accepted points before expiry, including current | 10,081 | 10,081 |
+| Stored bytes after deletion and checkpoint, MiB | 77.45 | 80.43 |
+| Referenced payload ciphertext, MiB | 5.04 | 5.04 |
+| Body bytes read by one full history graph scan, MiB | 75.00 | 77.97 |
+| Accounted graph metadata, MiB | 49.54 | 49.89 |
+| Highest observed whole-process RSS, MiB | 138.07 | 177.19 |
+| Stored bytes after physical GC, MiB | 0.66 | 28.56 |
+
+| Measurement at 100,000 writes | Overwrite | Append |
+| --- | ---: | ---: |
+| Anchor sequence after deletion and checkpoint | 100,784 | 100,801 |
+| Stored bytes before the failed history scan, MiB | 826.08 | 3,009.57 |
+| Body bytes written during growth, MiB | 824.40 | 3,004.79 |
+| Body bytes read during growth, MiB | 1,422.38 | 5,743.60 |
+| History scan | Budget refusal | Budget refusal |
+
+Submitted plaintext totals 48.83 MiB at 100,000 writes. These are serial,
+one-write-per-commit workloads; concurrent batching can reduce history point
+counts. The append workload also retains more metadata from index compaction.
+Growth counters include automatic compaction and verification, and exclude the
+final deletion, forced checkpoint, and diagnostic maintenance scans.
+
+Submitted plaintext totals 4.88 MiB in each workload. The overwrite workload
+ends with no live values; append retains 9,999. Most stored bytes before expiry
+are commit, index, and recovery metadata. All payload ciphertext remains
+referenced through history at that point. Quick reporting, full GC planning,
+and renewal each independently traverse that history, so repeated scans add
+substantial read traffic even when few retention extensions are needed.
+
+Logical expiry and physical reclamation are separate observations. The expiry
+publication can renew the previous accepted graph before advancing the anchor.
+These runs reclaim objects only after crossing observed physical lock deadlines,
+with another renewal keeping current dependencies protected in the meantime.
+They do not establish the earliest possible reclamation time.
+
+The production implementation is based on `0eb5064`; the harness only changes
+tests. These are single release-build runs using a controlled in-memory provider
+and simulated time, without the HTTP gateway or Kubernetes. A reopen constructs
+a new repository instance in the same process. RSS includes the provider,
+driver, and allocator state and excludes swapped-out pages. The shared host was
+under memory pressure. Graph accounting is a conservative byte budget,
+not allocator measurement. Body-byte counters exclude HEAD/LIST response
+metadata, transport framing, and provider-internal retries. These measurements
+do not establish live-S3 throughput, isolated gateway RAM, or production capacity.
+
+The [numerical record](assets/history-capacity-2026-09-09.json) includes phase
+counters, failure outcomes, and hashes binding both harness versions, binaries,
+and raw logs. Raw logs remain local run evidence.
+
+To repeat one workload inside `nix develop`:
+
+```sh
+RS3_HISTORY_SCALE_WRITES=10000 RS3_HISTORY_SCALE_MODE=overwrite \
+  CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=4 cargo test -p rs3-repository \
+  --release --lib recovery_history_scale -- --ignored --nocapture --test-threads=1
+```
+
+Use `append` for the other mode and run each in a separate process. Successful
+runs end with a `HISTORY_SCALE` record whose phase is `complete`. Phase records
+include cumulative counters so setup and verification traffic remain visible.
+Failures retain the last completed phase and fail the test; increasing the
+requested count does not increase production budgets.
+For the budget-isolation diagnostic, set `RS3_HISTORY_SCALE_WRITES=55000` and
+`RS3_HISTORY_SCALE_DIAGNOSE=1` with `overwrite`. It also tries one read-only graph
+walk with a 512 MiB metadata budget and checks fresh-writer refusal under the
+default. The test still exits unsuccessfully to preserve the default-budget
+failure, even when those diagnostic checks succeed.
 
 ## Large uploads
 

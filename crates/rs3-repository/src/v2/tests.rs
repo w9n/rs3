@@ -497,7 +497,7 @@ async fn retained_commit_store(
 }
 
 async fn commit_store_options_with_maintenance_roots(
-    store: &MemoryBlobStore,
+    store: &impl BlobStore,
     profile: V2ProviderProfile,
     retention: Option<RetentionPolicy>,
 ) -> V2CommitStoreOptions {

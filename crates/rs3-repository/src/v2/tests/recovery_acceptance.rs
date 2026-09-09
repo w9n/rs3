@@ -7,6 +7,7 @@ use rs3_storage::{
 
 mod lifecycle;
 mod safety;
+mod scale;
 mod store;
 use store::{ControlledDeadlineStore, Mutation};
 
