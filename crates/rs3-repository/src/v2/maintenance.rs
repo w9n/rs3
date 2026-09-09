@@ -1,5 +1,6 @@
 //! v2 maintenance planning and conservative apply paths.
 
+mod packed_usage;
 mod recovery;
 
 pub(in crate::v2) mod introduced;
@@ -493,6 +494,14 @@ pub struct V2OrphanGcReport {
 /// Redacted v2 quick-maintenance report.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V2MaintenanceReport {
+    /// Ciphertext bytes in exact payload-pack sections with referenced records.
+    /// Excludes commit headers, index metadata, and wholly unreferenced packs.
+    pub packed_payload_stored_bytes: u64,
+    /// Union of referenced record ciphertext bytes in those packs, including
+    /// conservative protected recovery dependencies and deduplicating shared
+    /// physical references, even when history retains obsolete run entries.
+    /// The difference from stored bytes is not immediately reclaimable space.
+    pub packed_payload_referenced_bytes: u64,
     /// True when an anchor was present.
     pub anchor_present: bool,
     /// Verified commit count in the anchor-selected chain.
@@ -563,7 +572,8 @@ pub struct V2MaintenanceBudgets {
     ///
     /// Filtered members such as S3 delete markers count against this ceiling.
     pub max_inventory_item_count: u64,
-    /// Accounted graph metadata ceiling for authenticated history traversal.
+    /// Accounted graph metadata ceiling for authenticated history traversal
+    /// and packed-record reference accounting, including without history.
     /// Independent of the startup replay chain's commit and retained-byte limits.
     pub max_history_metadata_bytes: u64,
     /// Maximum encrypted sections awaiting historical dependency decoding.
@@ -1190,6 +1200,7 @@ enum V2LivePayloadRoot {
 
 #[derive(Clone, Debug, Default)]
 struct V2ReachabilityState {
+    packed_usage: packed_usage::PackedUsage,
     anchor_state: Option<V2AnchorState>,
     current_chain: Option<V2ReplayChain>,
     current_state: Option<RepositoryState>,
@@ -1586,6 +1597,7 @@ where
                 protected_roots,
                 V2MaintenanceBudgets::default(),
                 false,
+                false,
             )
             .await?;
         self.report_orphans_from_reachability(&reachability, V2MaintenanceBudgets::default())
@@ -1913,6 +1925,7 @@ where
         protected_roots: &[V2AnchorState],
         budgets: V2MaintenanceBudgets,
         include_restore_metadata: bool,
+        collect_packed_usage: bool,
     ) -> V2Result<V2ReachabilityState>
     where
         A: V2CommitAnchor,
@@ -1929,6 +1942,7 @@ where
         }
         let mut reachability = V2ReachabilityState {
             anchor_state: anchor_state.clone(),
+            packed_usage: packed_usage::PackedUsage::new(collect_packed_usage),
             ..V2ReachabilityState::default()
         };
 
@@ -2179,6 +2193,12 @@ where
             }
         }
 
+        if reachability.packed_usage.enabled {
+            for entry in state.namespace.live_entries() {
+                reachability.include_packed_usage(entry, budgets)?;
+            }
+        }
+
         Ok(state)
     }
 
@@ -2373,7 +2393,7 @@ where
         A: V2CommitAnchor,
     {
         let reachability = self
-            .load_reachability(anchor, &[], options.budgets, true)
+            .load_reachability(anchor, &[], options.budgets, true, true)
             .await?;
         let chain = reachability.current_chain.as_ref();
         let verified_commit_count = chain
@@ -2443,7 +2463,11 @@ where
         } else {
             V2RetentionRenewalPlan::default()
         };
+        let (packed_payload_stored_bytes, packed_payload_referenced_bytes) =
+            reachability.packed_usage.totals()?;
         Ok(V2MaintenanceReport {
+            packed_payload_stored_bytes,
+            packed_payload_referenced_bytes,
             anchor_present: chain.is_some(),
             verified_commit_count,
             last_anchored_commit_age_ms,
@@ -2551,7 +2575,13 @@ where
         A: V2CommitAnchor,
     {
         let reachability = self
-            .load_reachability(anchor, &options.protected_roots, options.budgets, true)
+            .load_reachability(
+                anchor,
+                &options.protected_roots,
+                options.budgets,
+                true,
+                false,
+            )
             .await?;
         let chain_live_commit_count = reachability
             .current_chain

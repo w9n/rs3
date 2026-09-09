@@ -114,6 +114,12 @@ The replacement `v03` design accepts specific backend-visible leakage:
 Optional mitigations include padding, pack-size normalization, commit batching,
 compaction jitter, and stricter telemetry redaction.
 
+Maintenance metrics and admin reports expose aggregate packed-payload stored,
+referenced and unreferenced ciphertext bytes. These reveal aggregate utilization
+to telemetry readers, with no path, tenant, object ID or version labels. Accounting
+unions current and conservatively protected references, and does not download payloads
+or add backend requests. The totals are observations, never deletion authority.
+
 The removed prototype used `format/`, `keyrings/`, and
 `commits/v01/<sequence>/<random-id>`. The runtime now uses `commits/v03` with
 compact payload-pack, index-run, and index-root sections. No production

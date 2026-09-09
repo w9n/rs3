@@ -1618,6 +1618,17 @@ fn reclaimable_bytes(apply: &V2FullGcApplyReport) -> u64 {
 }
 
 fn record_report_gauges(report: &V2MaintenanceReport, now_ms: i64) {
+    metrics::gauge!("rs3_maintenance_packed_payload_stored_bytes")
+        .set(report.packed_payload_stored_bytes as f64);
+    metrics::gauge!("rs3_maintenance_packed_payload_referenced_bytes")
+        .set(report.packed_payload_referenced_bytes as f64);
+    metrics::gauge!("rs3_maintenance_packed_payload_unreferenced_bytes").set(
+        report
+            .packed_payload_stored_bytes
+            .saturating_sub(report.packed_payload_referenced_bytes) as f64,
+    );
+    metrics::gauge!("rs3_maintenance_packed_payload_observed_timestamp_seconds")
+        .set(now_ms as f64 / 1000.0);
     metrics::gauge!("rs3_maintenance_orphan_candidate_bytes")
         .set(report.reclaimable_orphan_candidate_bytes as f64);
     metrics::gauge!("rs3_maintenance_orphan_candidate_count")
@@ -1630,6 +1641,16 @@ fn record_report_gauges(report: &V2MaintenanceReport, now_ms: i64) {
 }
 
 fn initialize_supervisor_metrics() {
+    // No complete observation exists yet. An unknown inventory must not look
+    // like a measured empty repository; failures preserve the last observation.
+    for name in [
+        "rs3_maintenance_packed_payload_stored_bytes",
+        "rs3_maintenance_packed_payload_referenced_bytes",
+        "rs3_maintenance_packed_payload_unreferenced_bytes",
+        "rs3_maintenance_packed_payload_observed_timestamp_seconds",
+    ] {
+        metrics::gauge!(name).set(f64::NAN);
+    }
     for outcome in [
         OUTCOME_OK,
         OUTCOME_FAILED,
@@ -1690,6 +1711,58 @@ mod tests {
 
     const START_MS: i64 = 1_750_000_000_000;
 
+    #[test]
+    fn packed_payload_metrics_distinguish_unknown_from_zero_and_track_observation_time() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let sample = |metric: &str| -> f64 {
+            let rendered = handle.render();
+            let prefix = format!("{metric} ");
+            rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .expect("unlabelled sample is exposed")
+                .parse()
+                .expect("numeric metric sample")
+        };
+        metrics::with_local_recorder(&recorder, || {
+            super::initialize_supervisor_metrics();
+            assert!(sample("rs3_maintenance_packed_payload_unreferenced_bytes").is_nan());
+            assert!(sample("rs3_maintenance_packed_payload_observed_timestamp_seconds").is_nan());
+
+            let mut report = quick_report();
+            report.packed_payload_stored_bytes = 160;
+            report.packed_payload_referenced_bytes = 96;
+            super::record_report_gauges(&report, START_MS);
+            assert_eq!(sample("rs3_maintenance_packed_payload_stored_bytes"), 160.0);
+            assert_eq!(
+                sample("rs3_maintenance_packed_payload_referenced_bytes"),
+                96.0
+            );
+            assert_eq!(
+                sample("rs3_maintenance_packed_payload_unreferenced_bytes"),
+                64.0
+            );
+            assert_eq!(
+                sample("rs3_maintenance_packed_payload_observed_timestamp_seconds"),
+                START_MS as f64 / 1000.0
+            );
+
+            // A later complete observation can report genuinely zero unused
+            // bytes; startup's unknown sample must not be confused with this.
+            report.packed_payload_referenced_bytes = 160;
+            super::record_report_gauges(&report, START_MS + 1000);
+            assert_eq!(
+                sample("rs3_maintenance_packed_payload_unreferenced_bytes"),
+                0.0
+            );
+            assert_eq!(
+                sample("rs3_maintenance_packed_payload_observed_timestamp_seconds"),
+                START_MS as f64 / 1000.0 + 1.0
+            );
+        });
+    }
+
     struct SimulatedClock {
         now: watch::Sender<i64>,
     }
@@ -1749,6 +1822,8 @@ mod tests {
             recovery_recoverable_point_count: 0,
             recovery_oldest_recoverable_publish_time_ms: None,
             recovery_historical_exact_bytes: 0,
+            packed_payload_stored_bytes: 0,
+            packed_payload_referenced_bytes: 0,
             recovery_clock_uncertainty_ms: None,
         }
     }

@@ -550,6 +550,12 @@ impl From<&MaintenanceStatusSnapshot> for AdminMaintenanceSupervisorSummary {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AdminV2MaintenanceSummary {
+    /// Ciphertext bytes in packs reached by current or conservatively protected dependencies.
+    pub packed_payload_stored_bytes: u64,
+    /// Distinct ciphertext bytes reached across current and conservatively protected dependencies.
+    pub packed_payload_referenced_bytes: u64,
+    /// Lower bound on unreferenced pack ciphertext, not immediately deletable bytes.
+    pub packed_payload_unreferenced_bytes: u64,
     /// Whether the v2 anchor is present.
     pub anchor_present: bool,
     /// Verified commit count in the anchor-selected chain.
@@ -1283,6 +1289,11 @@ async fn maintenance_summary(config: &RuntimeConfig) -> AdminMaintenanceSummary 
             computed_at_ms,
             reason_code: None,
             v2: Some(AdminV2MaintenanceSummary {
+                packed_payload_stored_bytes: report.packed_payload_stored_bytes,
+                packed_payload_referenced_bytes: report.packed_payload_referenced_bytes,
+                packed_payload_unreferenced_bytes: report
+                    .packed_payload_stored_bytes
+                    .saturating_sub(report.packed_payload_referenced_bytes),
                 anchor_present: report.anchor_present,
                 verified_commit_count: report.verified_commit_count,
                 last_anchored_commit_age_ms: report.last_anchored_commit_age_ms,

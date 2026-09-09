@@ -144,7 +144,9 @@ impl<S: BlobStore> V2CommitStore<S> {
         let reader = self.rebind_store(budgeted_store);
         let required = capture.required_coverage_until_ms;
         let result = async {
-            let mut graph = reader.load_reachability(anchor, &[], budgets, true).await?;
+            let mut graph = reader
+                .load_reachability(anchor, &[], budgets, true, false)
+                .await?;
             if graph.anchor_state.as_ref() != Some(base) {
                 return Err(V2FormatError::StaleAnchor);
             }

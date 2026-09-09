@@ -73,7 +73,7 @@ impl<S: BlobStore> V2CommitStore<S> {
         reachability.history_metadata_bytes = reachability
             .renewal_targets
             .keys()
-            .try_fold(0_u64, |total, key| {
+            .try_fold(reachability.history_metadata_bytes, |total, key| {
                 total.checked_add(target_fact_bytes(key))
             })
             .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
@@ -492,6 +492,7 @@ impl<S: BlobStore> V2CommitStore<S> {
                     {
                         return Err(V2FormatError::BodyDigestMismatch);
                     }
+                    state.include_packed_usage(entry, budgets)?;
                     state.include_required_protection(
                         &carrier.commit_key,
                         carrier.commit_version_id.as_ref(),
@@ -602,7 +603,7 @@ fn commit_fact_bytes(commit: &V2ReplayCommit) -> u64 {
         .saturating_add(2 * usize_to_u64(commit.parsed_header.header_len))
 }
 
-fn charge_history_metadata(
+pub(super) fn charge_history_metadata(
     state: &mut V2ReachabilityState,
     bytes: u64,
     budgets: V2MaintenanceBudgets,
@@ -723,7 +724,7 @@ impl<S: BlobStore> V2CommitStore<S> {
     ) -> V2Result<RecoveryMarkObservation> {
         let reader = self.rebind_store(V2MaintenanceBudgetedStore::new(self.store(), budgets));
         let graph = reader
-            .load_reachability(anchor, &[], budgets, false)
+            .load_reachability(anchor, &[], budgets, false, false)
             .await?;
         Ok(RecoveryMarkObservation {
             targets: graph

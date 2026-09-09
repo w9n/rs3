@@ -1,6 +1,7 @@
 mod copy;
 mod copy_retention;
 mod multipart_completion;
+mod packed_usage;
 mod prepared_genesis;
 mod publication_overlap;
 mod publication_time;

@@ -607,6 +607,34 @@ prefix. The optional Helm `PrometheusRule` warns on an approaching or critical
 renewal deadline, repeated failures, budget exhaustion, and stale success. The
 rules and metric labels contain no repository paths or object identifiers.
 
+Automatic maintenance also measures payload space inside packs that still have
+at least one record reached by current state or conservatively protected
+recovery dependencies:
+
+| Metric | Meaning |
+| --- | --- |
+| `rs3_maintenance_packed_payload_stored_bytes` | Total ciphertext bytes in those exact packs. |
+| `rs3_maintenance_packed_payload_referenced_bytes` | Distinct record ciphertext bytes reached across current and protected dependencies; shared copies count once. |
+| `rs3_maintenance_packed_payload_unreferenced_bytes` | Stored minus referenced bytes: a conservative lower bound on unused space inside those packs. |
+| `rs3_maintenance_packed_payload_observed_timestamp_seconds` | Unix time of the last successful automatic planning observation. |
+
+These gauges are `NaN` before the first complete observation. Failed planning
+retains the previous values and timestamp; check freshness before interpreting
+them. They update from existing bounded metadata traversal without payload
+downloads or additional object-store requests. History marking can preserve
+obsolete entries in protected runs, so it may overestimate referenced bytes and
+underestimate unused space. Accounting runs only for quick maintenance reports,
+not foreground publication. The totals exclude detached payloads,
+commit/index overhead and wholly unreferenced packs, which belong to ordinary
+GC accounting. The on-demand admin maintenance report exposes the byte totals
+as `packed_payload_*_bytes` under its `v2` summary, alongside its computation time.
+
+Unreferenced pack bytes are not immediately deletable. Existing GC deletes whole
+unreferenced object versions after protection and age checks; it cannot remove
+individual regions from a pack. Payload-pack cleaning is not implemented. A
+future cleaner would rewrite surviving records and wait until the old carrier
+is no longer needed by any protected root and backend retention allows deletion.
+
 The Helm deployment uses an HTTP startup probe with a ten-minute budget before
 enabling liveness and readiness probes. This lets bounded commit and index
 recovery finish without a liveness restart loop. A process that never exposes

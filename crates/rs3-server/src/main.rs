@@ -1887,6 +1887,8 @@ mod tests {
                 oldest_orphan_age_ms: None,
                 reclaimable_orphan_candidate_count: 0,
                 reclaimable_orphan_candidate_bytes: 0,
+                packed_payload_stored_bytes: 0,
+                packed_payload_referenced_bytes: 0,
                 oldest_reclaimable_orphan_age_ms: None,
                 retention_renewal_commit_count: 0,
                 retention_renewal_bytes: 0,
